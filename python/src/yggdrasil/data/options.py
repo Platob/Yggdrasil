@@ -631,15 +631,28 @@ class CastOptions:
         return self.merged_field.cast_arrow_tabular(table, options=self)
 
     def cast_arrow_batch_iterator(self, batches: Any) -> Any:
-        """Cast a stream of :class:`pa.RecordBatch` and rechunk by ``byte_size``.
+        """Cast a stream of :class:`pa.RecordBatch` and rechunk by ``byte_size`` / ``row_size``.
 
-        Passthrough when ``target_field`` is unbound. Otherwise delegates
-        to :meth:`Field.cast_arrow_batch_iterator`, which routes through
-        the struct-side helper for per-batch tabular cast and streamed
-        ``byte_size`` coalescing.
+        With a bound ``target_field``: per-batch tabular cast + streamed
+        rechunking via :meth:`Field.cast_arrow_batch_iterator` (which
+        routes through the struct-side helper).
+
+        Without a target: rechunk-only when ``byte_size`` / ``row_size``
+        is set, otherwise passthrough. Lets callers that did an
+        in-engine cast upstream still pick up the optimized rechunker.
         """
         if self.target_field is None:
-            return batches
+            if not self.byte_size and not self.row_size:
+                return batches
+            from yggdrasil.data.types.nested.struct_arrow import (
+                rechunk_arrow_batches_by_byte_size,
+            )
+            return rechunk_arrow_batches_by_byte_size(
+                batches,
+                byte_size=self.byte_size,
+                row_size=self.row_size,
+                memory_pool=self.arrow_memory_pool,
+            )
         return self.merged_field.cast_arrow_batch_iterator(batches, options=self)
 
     def fill_arrow_nulls(self, obj: Any, *, default_scalar: Any = None) -> Any:

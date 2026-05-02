@@ -1,21 +1,21 @@
-"""Tests for ObjectType -- the opaque/variant Python object type.
+"""``ObjectType`` — the variant / opaque-Python-object catch-all.
 
-Covers:
-- type_id / children_fields / repr / str
-- Arrow conversion (to_arrow, handles_arrow_type, from_arrow_type error)
-- Polars conversion (to_polars, from_polars_type, handles_polars_type)
-- Spark conversion (to_spark, handles_spark_type, from_spark_type error)
-- Databricks DDL
-- Dict round-trip (to_dict, from_dict, handles_dict)
-- Merge behavior
-- Default values (nullable and non-nullable)
-- Cast bypass — ObjectType returns input unchanged
-- DataType.from_parsed integration for OBJECT
-- DataType.from_pytype integration for `object`
-- DataType.from_str integration for "object"
-- DataType.from_dict integration
+ObjectType has a deliberately weird contract: it claims to be a real
+type but does not own a value shape. That means:
+
+* No engine can *infer* it from a native dtype (``handles_*`` is
+  False / always-False except polars Object).
+* Cast operations are identity — every ``_cast_*`` override returns
+  its input untouched. The base-class fast-path covers the public
+  entry points; the subclass overrides are defensive against direct
+  internal calls (e.g. tabular casts inside a struct walk).
+* Defaults only exist for ``nullable=True``; non-nullable raises
+  because there is no "zero variant".
+
+The file is organized by surface so a regression points at the right
+piece of behavior (basic identity, arrow side, polars side, dict
+serde, merge, defaults, cast bypass).
 """
-
 from __future__ import annotations
 
 import unittest
@@ -29,342 +29,276 @@ from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.primitive import NullType, ObjectType, StringType
 from yggdrasil.polars.tests import PolarsTestCase
 
+
 # ---------------------------------------------------------------------------
-# Basic properties (pure logic, no engine dependency)
+# Identity / dunder
 # ---------------------------------------------------------------------------
 
 
-class TestObjectTypeBasics(unittest.TestCase):
+class TestObjectTypeIdentity(unittest.TestCase):
 
-    def test_type_id(self):
+    def test_type_id(self) -> None:
         self.assertEqual(ObjectType().type_id, DataTypeId.OBJECT)
 
-    def test_children_fields_empty(self):
+    def test_children_fields_is_empty(self) -> None:
         self.assertEqual(ObjectType().children_fields, [])
 
-    def test_repr(self):
+    def test_repr(self) -> None:
         self.assertEqual(repr(ObjectType()), "ObjectType()")
 
-    def test_str(self):
+    def test_str(self) -> None:
         self.assertEqual(str(ObjectType()), "object")
 
-    def test_frozen_dataclass(self):
+    def test_is_frozen(self) -> None:
         obj = ObjectType()
         with self.assertRaises(AttributeError):
-            obj.foo = "bar"
+            obj.foo = "bar"  # type: ignore[attr-defined]
 
-    def test_equality(self):
+    def test_equal_instances_are_equal(self) -> None:
         self.assertEqual(ObjectType(), ObjectType())
 
-    def test_hash(self):
+    def test_equal_instances_share_hash(self) -> None:
         self.assertEqual(hash(ObjectType()), hash(ObjectType()))
 
 
 # ---------------------------------------------------------------------------
-# Arrow conversion
+# Arrow side
 # ---------------------------------------------------------------------------
 
 
 class TestObjectTypeArrow(ArrowTestCase):
 
-    def test_to_arrow(self):
-        pa = self.pa
-        arrow_type = ObjectType().to_arrow()
-        self.assertEqual(arrow_type, pa.large_binary())
+    def test_to_arrow_uses_large_binary(self) -> None:
+        self.assertEqual(ObjectType().to_arrow(), self.pa.large_binary())
 
-    def test_handles_arrow_type_always_false(self):
+    def test_handles_arrow_type_is_always_false(self) -> None:
         pa = self.pa
-        # ObjectType can't be inferred from any Arrow type.
-        self.assertFalse(ObjectType.handles_arrow_type(pa.large_binary()))
-        self.assertFalse(ObjectType.handles_arrow_type(pa.string()))
-        self.assertFalse(ObjectType.handles_arrow_type(pa.int64()))
-        self.assertFalse(ObjectType.handles_arrow_type(pa.null()))
+        for dtype in (pa.large_binary(), pa.string(), pa.int64(), pa.null()):
+            with self.subTest(dtype=dtype):
+                self.assertFalse(ObjectType.handles_arrow_type(dtype))
 
-    def test_from_arrow_type_raises(self):
-        pa = self.pa
+    def test_from_arrow_type_raises_with_helpful_message(self) -> None:
         with self.assertRaisesRegex(TypeError, "Cannot infer ObjectType"):
-            ObjectType.from_arrow_type(pa.large_binary())
+            ObjectType.from_arrow_type(self.pa.large_binary())
 
-    def test_default_arrow_scalar_nullable(self):
-        s = ObjectType().default_arrow_scalar(nullable=True)
-        self.assertIsNone(s.as_py())
-        self.assertEqual(s.type, pa.large_binary())
+    def test_default_arrow_scalar_nullable_returns_typed_null(self) -> None:
+        scalar = ObjectType().default_arrow_scalar(nullable=True)
 
-    def test_default_arrow_scalar_not_nullable_raises(self):
+        self.assertEqual(scalar.type, pa.large_binary())
+        self.assertIsNone(scalar.as_py())
+
+    def test_default_arrow_scalar_non_nullable_raises(self) -> None:
         with self.assertRaisesRegex(NotImplementedError, "nullable=False"):
             ObjectType().default_arrow_scalar(nullable=False)
 
 
 # ---------------------------------------------------------------------------
-# Polars conversion
+# Polars side
 # ---------------------------------------------------------------------------
 
 
 class TestObjectTypePolars(PolarsTestCase):
 
-    def test_to_polars(self):
-        pl = self.pl
-        polars_type = ObjectType().to_polars()
-        self.assertEqual(polars_type, pl.Object)
+    def test_to_polars_is_pl_object(self) -> None:
+        self.assertEqual(ObjectType().to_polars(), self.pl.Object)
 
-    def test_handles_polars_type_true(self):
-        pl = self.pl
-        self.assertTrue(ObjectType.handles_polars_type(pl.Object))
+    def test_handles_polars_type_true_for_object(self) -> None:
+        self.assertTrue(ObjectType.handles_polars_type(self.pl.Object))
 
-    def test_handles_polars_type_false(self):
-        pl = self.pl
-        self.assertFalse(ObjectType.handles_polars_type(pl.String))
-        self.assertFalse(ObjectType.handles_polars_type(pl.Int64))
+    def test_handles_polars_type_false_for_others(self) -> None:
+        for dtype in (self.pl.String, self.pl.Int64):
+            with self.subTest(dtype=dtype):
+                self.assertFalse(ObjectType.handles_polars_type(dtype))
 
-    def test_from_polars_type_object(self):
-        pl = self.pl
-        result = ObjectType.from_polars_type(pl.Object)
-        self.assertIsInstance(result, ObjectType)
+    def test_from_polars_type_object_round_trips(self) -> None:
+        self.assertIsInstance(
+            ObjectType.from_polars_type(self.pl.Object), ObjectType
+        )
 
-    def test_from_polars_type_wrong_type_raises(self):
-        pl = self.pl
+    def test_from_polars_type_rejects_non_object(self) -> None:
         with self.assertRaisesRegex(TypeError, "Expected Polars Object dtype"):
-            ObjectType.from_polars_type(pl.String)
+            ObjectType.from_polars_type(self.pl.String)
 
-    def test_datatype_from_polars_type_dispatch(self):
-        pl = self.pl
-        result = DataType.from_polars_type(pl.Object)
-        self.assertIsInstance(result, ObjectType)
+    def test_datatype_dispatch_resolves_to_object_type(self) -> None:
+        self.assertIsInstance(
+            DataType.from_polars_type(self.pl.Object), ObjectType
+        )
 
 
 # ---------------------------------------------------------------------------
-# Spark conversion (pure logic — no Spark dependency needed)
+# Spark side (no SparkSession needed — pure type-system checks)
 # ---------------------------------------------------------------------------
 
 
 class TestObjectTypeSpark(unittest.TestCase):
 
-    def test_handles_spark_type_always_false(self):
+    def test_handles_spark_type_is_always_false(self) -> None:
         # Spark has no native object type.
         self.assertFalse(ObjectType.handles_spark_type(object()))
 
-    def test_from_spark_type_raises(self):
+    def test_from_spark_type_raises_with_helpful_message(self) -> None:
         with self.assertRaisesRegex(TypeError, "Cannot infer ObjectType"):
             ObjectType.from_spark_type(object())
 
 
 # ---------------------------------------------------------------------------
-# Databricks DDL (pure logic)
+# Databricks DDL
 # ---------------------------------------------------------------------------
 
 
 class TestObjectTypeDDL(unittest.TestCase):
 
-    def test_to_databricks_ddl(self):
+    def test_to_databricks_ddl_is_binary(self) -> None:
         self.assertEqual(ObjectType().to_databricks_ddl(), "BINARY")
 
 
 # ---------------------------------------------------------------------------
-# Dict round-trip (pure logic)
+# Dict serialization
 # ---------------------------------------------------------------------------
 
 
 class TestObjectTypeDict(unittest.TestCase):
 
-    def test_to_dict(self):
+    def test_to_dict_carries_id_and_name(self) -> None:
         d = ObjectType().to_dict()
         self.assertEqual(d["id"], int(DataTypeId.OBJECT))
         self.assertEqual(d["name"], "OBJECT")
 
-    def test_handles_dict_by_id(self):
+    def test_handles_dict_by_id(self) -> None:
         self.assertTrue(ObjectType.handles_dict({"id": int(DataTypeId.OBJECT)}))
 
-    def test_handles_dict_by_name(self):
+    def test_handles_dict_by_name_case_insensitive(self) -> None:
         self.assertTrue(ObjectType.handles_dict({"name": "OBJECT"}))
         self.assertTrue(ObjectType.handles_dict({"name": "object"}))
 
-    def test_handles_dict_false(self):
+    def test_handles_dict_false_for_other_types(self) -> None:
         self.assertFalse(ObjectType.handles_dict({"id": int(DataTypeId.STRING)}))
         self.assertFalse(ObjectType.handles_dict({"name": "STRING"}))
 
-    def test_from_dict(self):
+    def test_from_dict_round_trip(self) -> None:
         d = {"id": int(DataTypeId.OBJECT), "name": "OBJECT"}
-        result = ObjectType.from_dict(d)
-        self.assertIsInstance(result, ObjectType)
+        self.assertIsInstance(ObjectType.from_dict(d), ObjectType)
 
-    def test_dict_round_trip(self):
+    def test_to_dict_from_dict_round_trip(self) -> None:
         original = ObjectType()
-        restored = ObjectType.from_dict(original.to_dict())
-        self.assertEqual(restored, original)
+        self.assertEqual(ObjectType.from_dict(original.to_dict()), original)
 
-    def test_datatype_from_dict_dispatch(self):
+    def test_datatype_from_dict_dispatches_to_object_type(self) -> None:
         d = {"id": int(DataTypeId.OBJECT), "name": "OBJECT"}
-        result = DataType.from_dict(d)
-        self.assertIsInstance(result, ObjectType)
+        self.assertIsInstance(DataType.from_dict(d), ObjectType)
 
 
 # ---------------------------------------------------------------------------
-# Merge (pure logic)
+# Merge
 # ---------------------------------------------------------------------------
 
 
 class TestObjectTypeMerge(unittest.TestCase):
 
-    def test_merge_same_type(self):
+    def test_object_with_object_returns_self(self) -> None:
         a = ObjectType()
-        b = ObjectType()
-        result = a.merge_with(b)
-        self.assertIs(result, a)
+        self.assertIs(a.merge_with(ObjectType()), a)
 
-    def test_merge_null_with_object_returns_object(self):
-        result = NullType().merge_with(ObjectType())
-        self.assertIsInstance(result, ObjectType)
+    def test_null_with_object_resolves_to_object(self) -> None:
+        self.assertIsInstance(NullType().merge_with(ObjectType()), ObjectType)
 
-    def test_merge_with_different_type_keeps_self(self):
+    def test_object_with_string_picks_string_under_default_widening(self) -> None:
+        # OBJECT=0 vs STRING=11; merge prefers the larger type_id when
+        # neither downcast nor upcast is set (`_merge_with_different_id`
+        # default). See base.DataType._merge_with_different_id.
         a = ObjectType()
-        b = StringType()
-        result = a.merge_with(b)
-        # Different type_id, so _merge_with_different_id applies.
-        # OBJECT=0 < STRING=11, so with no upcast/downcast, returns self.
-        assert result == StringType()
-
-# ---------------------------------------------------------------------------
-# Cast bypass — ObjectType returns input unchanged
-# ---------------------------------------------------------------------------
-
-
-class TestObjectTypeCastBypassArrow(ArrowTestCase):
-
-    def test_cast_arrow_array_returns_input_unchanged(self):
-        pa = self.pa
-        obj = ObjectType()
-        arr = pa.array([1, 2, 3], type=pa.int32())
-
-        class _Opts:
-            safe = True
-
-        result = obj._cast_arrow_array(arr, _Opts())
-        # Should be the exact same object — no copy, no cast.
-        self.assertIs(result, arr)
-
-    def test_cast_chunked_array_returns_input_unchanged(self):
-        pa = self.pa
-        obj = ObjectType()
-        arr = pa.chunked_array([[1, 2], [3, 4]], type=pa.int64())
-
-        class _Opts:
-            safe = True
-
-        result = obj._cast_chunked_array(arr, _Opts())
-        self.assertIs(result, arr)
-
-    def test_cast_string_array_returns_input_unchanged(self):
-        pa = self.pa
-        obj = ObjectType()
-        arr = pa.array(["hello", "world"], type=pa.string())
-
-        class _Opts:
-            safe = True
-
-        result = obj._cast_arrow_array(arr, _Opts())
-        self.assertIs(result, arr)
-
-    def test_cast_binary_array_returns_input_unchanged(self):
-        pa = self.pa
-        obj = ObjectType()
-        arr = pa.array([b"\x00", b"\x01"], type=pa.binary())
-
-        class _Opts:
-            safe = True
-
-        result = obj._cast_arrow_array(arr, _Opts())
-        self.assertIs(result, arr)
-
-
-class TestObjectTypeCastBypassPolars(PolarsTestCase):
-
-    def test_cast_polars_series_returns_input_unchanged(self):
-        pl = self.pl
-        obj = ObjectType()
-        s = pl.Series("x", [1, 2, 3], dtype=pl.Int64)
-
-        class _Opts:
-            safe = True
-            target_field = None
-
-        result = obj._cast_polars_series(s, _Opts())
-        self.assertIs(result, s)
+        result = a.merge_with(StringType())
+        self.assertIsInstance(result, StringType)
 
 
 # ---------------------------------------------------------------------------
-# Defaults (pure logic)
+# Defaults
 # ---------------------------------------------------------------------------
 
 
 class TestObjectTypeDefaults(unittest.TestCase):
 
-    def test_default_pyobj_nullable(self):
+    def test_nullable_default_is_none(self) -> None:
         self.assertIsNone(ObjectType().default_pyobj(nullable=True))
 
-    def test_default_pyobj_not_nullable_raises(self):
+    def test_non_nullable_default_raises(self) -> None:
         with self.assertRaisesRegex(NotImplementedError, "not supported"):
             ObjectType().default_pyobj(nullable=False)
 
 
 # ---------------------------------------------------------------------------
-# DataType.from_parsed integration
+# Cast bypass — every cast operation is identity for ObjectType
 # ---------------------------------------------------------------------------
 
 
-class TestFromParsed(unittest.TestCase):
+class _OpaqueOpts:
+    """Minimal stand-in for ``CastOptions`` — only ``safe`` is read."""
 
-    def test_from_str_object(self):
-        result = DataType.from_str("object")
-        self.assertIsInstance(result, ObjectType)
-
-    def test_from_str_any(self):
-        # Parser maps "any" to OBJECT type_id too.
-        result = DataType.from_str("any")
-        self.assertIsInstance(result, ObjectType)
-
-    def test_from_str_variant(self):
-        # Parser maps "variant" to OBJECT type_id.
-        result = DataType.from_str("variant")
-        self.assertIsInstance(result, ObjectType)
-
-    def test_from_str_json_still_string(self):
-        # JSON type_id should remain StringType.
-        result = DataType.from_str("json")
-        self.assertIsInstance(result, StringType)
+    safe = True
+    target_field = None
 
 
-# ---------------------------------------------------------------------------
-# DataType.from_pytype integration
-# ---------------------------------------------------------------------------
+class TestObjectTypeCastBypassArrow(ArrowTestCase):
+
+    def test_arrow_array_passthrough_int(self) -> None:
+        arr = self.pa.array([1, 2, 3], type=self.pa.int32())
+        self.assertIs(ObjectType()._cast_arrow_array(arr, _OpaqueOpts()), arr)
+
+    def test_arrow_array_passthrough_string(self) -> None:
+        arr = self.pa.array(["hello", "world"], type=self.pa.string())
+        self.assertIs(ObjectType()._cast_arrow_array(arr, _OpaqueOpts()), arr)
+
+    def test_arrow_array_passthrough_binary(self) -> None:
+        arr = self.pa.array([b"\x00", b"\x01"], type=self.pa.binary())
+        self.assertIs(ObjectType()._cast_arrow_array(arr, _OpaqueOpts()), arr)
+
+    def test_chunked_array_passthrough(self) -> None:
+        arr = self.pa.chunked_array([[1, 2], [3, 4]], type=self.pa.int64())
+        self.assertIs(ObjectType()._cast_chunked_array(arr, _OpaqueOpts()), arr)
 
 
-class TestFromPytype(unittest.TestCase):
+class TestObjectTypeCastBypassPolars(PolarsTestCase):
 
-    def test_from_pytype_object(self):
-        result = DataType.from_pytype(object)
-        self.assertIsInstance(result, ObjectType)
-
-    def test_from_pytype_any_still_string(self):
-        # `Any` type hint still maps to StringType.
-        result = DataType.from_pytype(Any)
-        self.assertIsInstance(result, StringType)
+    def test_polars_series_passthrough(self) -> None:
+        s = self.pl.Series("x", [1, 2, 3], dtype=self.pl.Int64)
+        self.assertIs(ObjectType()._cast_polars_series(s, _OpaqueOpts()), s)
 
 
 # ---------------------------------------------------------------------------
-# DataType.from_any integration
+# Cross-entry-point integration — DataType.from_str / from_pytype / from_any
 # ---------------------------------------------------------------------------
 
 
-class TestFromAny(unittest.TestCase):
+class TestObjectTypeIntegration(unittest.TestCase):
 
-    def test_from_any_string_object(self):
-        result = DataType.from_any("object")
-        self.assertIsInstance(result, ObjectType)
+    def test_from_str_object(self) -> None:
+        self.assertIsInstance(DataType.from_str("object"), ObjectType)
 
-    def test_from_any_dict_object(self):
-        result = DataType.from_any({"id": int(DataTypeId.OBJECT)})
-        self.assertIsInstance(result, ObjectType)
+    def test_from_str_any_alias(self) -> None:
+        self.assertIsInstance(DataType.from_str("any"), ObjectType)
 
-    def test_from_any_type_id_int(self):
-        result = DataType.from_any(int(DataTypeId.OBJECT))
-        self.assertIsInstance(result, ObjectType)
+    def test_from_str_variant_alias(self) -> None:
+        self.assertIsInstance(DataType.from_str("variant"), ObjectType)
+
+    def test_from_str_json_remains_string(self) -> None:
+        # JSON has its own type_id and stays a StringType.
+        self.assertIsInstance(DataType.from_str("json"), StringType)
+
+    def test_from_pytype_object_class(self) -> None:
+        self.assertIsInstance(DataType.from_pytype(object), ObjectType)
+
+    def test_from_pytype_Any_is_string_not_object(self) -> None:
+        self.assertIsInstance(DataType.from_pytype(Any), StringType)
+
+    def test_from_any_string(self) -> None:
+        self.assertIsInstance(DataType.from_any("object"), ObjectType)
+
+    def test_from_any_dict(self) -> None:
+        self.assertIsInstance(
+            DataType.from_any({"id": int(DataTypeId.OBJECT)}), ObjectType
+        )
+
+    def test_from_any_type_id_int(self) -> None:
+        self.assertIsInstance(
+            DataType.from_any(int(DataTypeId.OBJECT)), ObjectType
+        )

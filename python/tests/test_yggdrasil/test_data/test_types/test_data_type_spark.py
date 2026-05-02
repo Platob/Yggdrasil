@@ -1,3 +1,16 @@
+"""``DataType.from_spark`` / ``to_spark`` and Spark-side cast helpers.
+
+Coverage:
+
+* Inbound — every primitive Spark type promotes to the matching
+  yggdrasil subclass with the correct ``byte_size`` / precision /
+  scale.
+* Outbound — the reverse mapping per-primitive (with a parametrized
+  matrix to keep regressions visible).
+* Compute — ``cast_spark_column`` and ``fill_spark_column_nulls``
+  produce the right values once the expression is bound to a real
+  :class:`SparkSession`.
+"""
 from __future__ import annotations
 
 import pyarrow as pa
@@ -16,9 +29,9 @@ from yggdrasil.data.types.primitive import (
 from yggdrasil.spark.tests import SparkTestCase
 
 
-class TestDataTypeSpark(SparkTestCase):
+class TestFromSparkPrimitives(SparkTestCase):
 
-    def test_from_spark_integer_type(self):
+    def test_integer_type(self) -> None:
         from pyspark.sql.types import IntegerType as SparkInt
 
         dtype = DataType.from_spark(SparkInt())
@@ -27,7 +40,7 @@ class TestDataTypeSpark(SparkTestCase):
         self.assertEqual(dtype.byte_size, 4)
         self.assertTrue(dtype.signed)
 
-    def test_from_spark_long_type(self):
+    def test_long_type(self) -> None:
         from pyspark.sql.types import LongType
 
         dtype = DataType.from_spark(LongType())
@@ -36,21 +49,17 @@ class TestDataTypeSpark(SparkTestCase):
         self.assertEqual(dtype.byte_size, 8)
         self.assertTrue(dtype.signed)
 
-    def test_from_spark_string_type(self):
+    def test_string_type(self) -> None:
         from pyspark.sql.types import StringType as SparkString
 
-        dtype = DataType.from_spark(SparkString())
+        self.assertIsInstance(DataType.from_spark(SparkString()), StringType)
 
-        self.assertIsInstance(dtype, StringType)
-
-    def test_from_spark_boolean_type(self):
+    def test_boolean_type(self) -> None:
         from pyspark.sql.types import BooleanType as SparkBool
 
-        dtype = DataType.from_spark(SparkBool())
+        self.assertIsInstance(DataType.from_spark(SparkBool()), BooleanType)
 
-        self.assertIsInstance(dtype, BooleanType)
-
-    def test_from_spark_double_type(self):
+    def test_double_type(self) -> None:
         from pyspark.sql.types import DoubleType
 
         dtype = DataType.from_spark(DoubleType())
@@ -58,7 +67,7 @@ class TestDataTypeSpark(SparkTestCase):
         self.assertIsInstance(dtype, FloatingPointType)
         self.assertEqual(dtype.byte_size, 8)
 
-    def test_from_spark_float_type(self):
+    def test_float_type(self) -> None:
         from pyspark.sql.types import FloatType
 
         dtype = DataType.from_spark(FloatType())
@@ -66,7 +75,7 @@ class TestDataTypeSpark(SparkTestCase):
         self.assertIsInstance(dtype, FloatingPointType)
         self.assertEqual(dtype.byte_size, 4)
 
-    def test_from_spark_decimal_type(self):
+    def test_decimal_carries_precision_and_scale(self) -> None:
         from pyspark.sql.types import DecimalType as SparkDecimal
 
         dtype = DataType.from_spark(SparkDecimal(10, 2))
@@ -75,21 +84,17 @@ class TestDataTypeSpark(SparkTestCase):
         self.assertEqual(dtype.precision, 10)
         self.assertEqual(dtype.scale, 2)
 
-    def test_from_spark_date_type(self):
+    def test_date_type(self) -> None:
         from pyspark.sql.types import DateType as SparkDate
 
-        dtype = DataType.from_spark(SparkDate())
+        self.assertIsInstance(DataType.from_spark(SparkDate()), DateType)
 
-        self.assertIsInstance(dtype, DateType)
-
-    def test_from_spark_timestamp_type(self):
+    def test_timestamp_type(self) -> None:
         from pyspark.sql.types import TimestampType as SparkTs
 
-        dtype = DataType.from_spark(SparkTs())
+        self.assertIsInstance(DataType.from_spark(SparkTs()), TimestampType)
 
-        self.assertIsInstance(dtype, TimestampType)
-
-    def test_from_spark_struct_type(self):
+    def test_struct_type_promotes_to_yggdrasil_struct(self) -> None:
         from pyspark.sql.types import (
             LongType,
             StringType as SparkString,
@@ -97,16 +102,19 @@ class TestDataTypeSpark(SparkTestCase):
             StructType as SparkStruct,
         )
 
-        spark_schema = SparkStruct([
-            StructField("id", LongType(), nullable=True),
-            StructField("name", SparkString(), nullable=True),
-        ])
+        spark_schema = SparkStruct(
+            [
+                StructField("id", LongType(), nullable=True),
+                StructField("name", SparkString(), nullable=True),
+            ]
+        )
 
-        dtype = DataType.from_spark(spark_schema)
+        self.assertIsInstance(DataType.from_spark(spark_schema), StructType)
 
-        self.assertIsInstance(dtype, StructType)
 
-    def test_to_spark_all_primitives(self):
+class TestToSparkPrimitives(SparkTestCase):
+
+    def test_to_spark_matrix(self) -> None:
         from pyspark.sql import types as T
 
         cases = [
@@ -124,20 +132,21 @@ class TestDataTypeSpark(SparkTestCase):
         ]
         for dtype, expected_spark_cls in cases:
             with self.subTest(dtype=str(dtype)):
-                spark_type = dtype.to_spark()
-                self.assertIsInstance(spark_type, expected_spark_cls)
+                self.assertIsInstance(dtype.to_spark(), expected_spark_cls)
 
-    def test_cast_spark_column_int(self):
+
+class TestSparkCompute(SparkTestCase):
+
+    def test_cast_spark_column_returns_target_values(self) -> None:
         dtype = IntegerType(byte_size=8, signed=True)
         df = self.spark.createDataFrame([(1,), (2,), (3,)], ["x"])
 
         result = dtype.cast_spark_column(df["x"])
-        result_df = df.withColumn("x", result)
-        rows = [r.x for r in result_df.collect()]
+        rows = [r.x for r in df.withColumn("x", result).collect()]
 
         self.assertEqual(rows, [1, 2, 3])
 
-    def test_fill_spark_column_nulls_non_nullable_int(self):
+    def test_fill_spark_column_nulls_with_explicit_default(self) -> None:
         dtype = IntegerType(byte_size=8, signed=True)
         df = self.spark.createDataFrame([(1,), (None,), (3,)], ["x"])
 
@@ -146,7 +155,6 @@ class TestDataTypeSpark(SparkTestCase):
             nullable=False,
             default_scalar=pa.scalar(0, type=pa.int64()),
         )
-        result_df = df.withColumn("x", result)
-        rows = [r.x for r in result_df.collect()]
+        rows = [r.x for r in df.withColumn("x", result).collect()]
 
         self.assertEqual(rows, [1, 0, 3])

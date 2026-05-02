@@ -754,8 +754,8 @@ class Table(DatabricksResource, TabularIO):
         comment = comment or schema_info.comment
         effective_fields: list[Field] = []
         column_definitions: list[str] = []
-        partition_by = schema_info.partition_by
-        cluster_by = schema_info.cluster_by
+        partition_by = schema_info.partition_fields
+        cluster_by = schema_info.cluster_fields
         primary_keys = schema_info.primary_keys
 
         for f in schema_info.children_fields:

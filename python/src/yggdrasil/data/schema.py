@@ -233,14 +233,6 @@ class Schema(BaseMetadata, BaseChildrenFields, MutableMapping[str, Field]):
         return [_.to_arrow_field() for _ in self.fields]
 
     @property
-    def partition_by(self):
-        return [f for f in self.fields if f.partition_by]
-
-    @property
-    def cluster_by(self):
-        return [f for f in self.fields if f.cluster_by]
-
-    @property
     def primary_keys(self):
         return [f for f in self.fields if f.primary_key]
 

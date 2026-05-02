@@ -18,22 +18,29 @@ Design principles
    are themselves streams, or for materialized tables that need
    chunking via ``options.row_size`` / ``options.byte_size``.
 
-3. **Bind source schemas, don't peek.** When we infer a source
+3. **One streaming pipeline.** Per-batch Arrow cast and
+   ``byte_size`` / ``row_size`` rechunking are owned by the nested
+   struct helpers in
+   :mod:`yggdrasil.data.types.nested.struct_arrow` (reachable via
+   :meth:`CastOptions.cast_arrow_batch_iterator`). Every streaming
+   entry point here flattens its input to ``pa.RecordBatch`` and
+   hands it off to that pipeline — no parallel chunkers in this
+   module.
+
+4. **Bind source schemas, don't peek.** When we infer a source
    schema, we bind it onto ``options.source_field`` so it propagates
    downstream and drives :meth:`CastOptions.need_cast` without
    re-inference.
 
-4. **Emit the merged schema.** When both source and target are bound,
+5. **Emit the merged schema.** When both source and target are bound,
    the output schema is :attr:`CastOptions.merged_schema` —
    reconciled per ``schema_mode``. ``RecordBatchReader`` /
    iterator declarations use this.
 
-5. **Honor every options knob.** ``column_names`` projects on the way
+6. **Honor every options knob.** ``column_names`` projects on the way
    in; ``arrow_memory_pool`` threads through pyarrow allocators;
-   ``safe`` flows into engine cast methods; ``row_size``/``byte_size``
-   drive output chunking. ``byte_size`` is resolved against actual
-   ``nbytes`` measurements — exact for bounded objects (Table,
-   RecordBatch), cumulative running average for streams.
+   ``safe`` flows into engine cast methods; ``row_size`` /
+   ``byte_size`` drive output chunking via the nested rechunker.
 """
 
 from __future__ import annotations
@@ -52,6 +59,7 @@ from yggdrasil.data.cast.registry import register_converter
 from yggdrasil.data.schema import Schema, Field
 from yggdrasil.lazy_imports import (
     pandas_module,
+    pyarrow_dataset_module,
     spark_sql_module,
     polars_module,
 )
@@ -128,19 +136,18 @@ def _project(table: pa.Table, options: CastOptions) -> pa.Table:
     return table.select(present) if present else table
 
 
-def _resolve_row_size(options: CastOptions, nbytes: int, num_rows: int) -> CastOptions:
-    """Derive effective row_size from byte_size using measured nbytes.
+def _is_arrow_dataset(obj: Any) -> bool:
+    """Return ``True`` if *obj* is a :class:`pyarrow.dataset.Dataset`.
 
-    Exact for bounded objects (whole-table or whole-batch ``nbytes``).
-    Returns options with byte_size stripped — downstream sees rows only.
+    Lazy-imports ``pyarrow.dataset`` so the base install (pyarrow only)
+    isn't paying for the dataset submodule unless something actually
+    feeds a Dataset into the cast pipeline.
     """
-    if not options.byte_size or num_rows <= 0 or nbytes <= 0:
-        return options.copy(byte_size=None) if options.byte_size else options
-
-    bytes_per_row = max(1, nbytes // num_rows)
-    derived = max(1, options.byte_size // bytes_per_row)
-    effective = min(options.row_size, derived) if options.row_size else derived
-    return options.copy(row_size=effective, byte_size=None)
+    try:
+        ds = pyarrow_dataset_module()
+    except Exception:
+        return False
+    return isinstance(obj, ds.Dataset)
 
 
 # ---------------------------------------------------------------------------
@@ -265,8 +272,23 @@ def any_to_arrow_table(
         options = _bind_source(options, obj.schema)
         table = _project(obj.read_all(), options)
 
+    elif _is_arrow_dataset(obj):
+        # ``Dataset.to_table()`` runs the scanner with column projection
+        # pushed into the file format readers — strictly better than
+        # materializing then projecting on the Arrow side.
+        options = _bind_source(options, obj.schema)
+        projection = _resolve_projection(options)
+        if projection:
+            present = [c for c in projection if c in obj.schema.names]
+            table = obj.to_table(columns=present) if present else obj.to_table()
+        else:
+            table = obj.to_table()
+
     elif isinstance(obj, (Generator, Iterator)):
-        batches = list(_stream_from_iterator(iter(obj), options))
+        batches = list(_flatten_to_arrow_batches(iter(obj), options))
+        if not batches:
+            merged_schema = options.merged_schema or Schema.empty()
+            return pa.Table.from_batches([], schema=merged_schema.to_arrow_schema())
         table = pa.Table.from_batches(batches)
 
     elif isinstance(obj, (list, tuple)):
@@ -277,7 +299,7 @@ def any_to_arrow_table(
         try:
             table = pa.Table.from_pylist(obj)
         except Exception:
-            batches = list(_stream_from_iterator(iter(obj), options))
+            batches = list(_flatten_to_arrow_batches(iter(obj), options))
             table = pa.Table.from_batches(batches)
 
     else:
@@ -329,25 +351,39 @@ def any_to_arrow_batch_iterator(
 ) -> Iterator[pa.RecordBatch]:
     """Convert *any* supported object to a lazy iterator of ``pa.RecordBatch``.
 
+    Per-batch Arrow cast and ``byte_size`` / ``row_size`` rechunking
+    are owned by :meth:`CastOptions.cast_arrow_batch_iterator`, which
+    delegates to the nested struct rechunker. The job here is to
+    *produce* the source batch stream — engine-native casts happen
+    upstream when an engine (polars / spark / pandas) owns the data.
+
     For Polars LazyFrame and Spark DataFrame, the engine-native cast
-    is applied before the streaming serialization — the iterator
-    yields already-cast batches with no Arrow-side rework.
+    is applied before serialization, so the rechunker sees already-
+    cast batches and skips per-batch Arrow rework.
     """
     options = CastOptions.check(options)
 
     if isinstance(obj, pa.Table):
         options = _bind_source(options, obj)
-        return _stream_from_table(obj, options, already_cast=False)
+        return options.cast_arrow_batch_iterator(_project(obj, options).to_batches())
 
     if isinstance(obj, pa.RecordBatch):
         options = _bind_source(options, obj)
-        casted = options.cast_arrow_tabular(obj)
-        options = _resolve_row_size(options, casted.nbytes, casted.num_rows)
-        return _slice_batch(casted, options.row_size)
+        return options.cast_arrow_batch_iterator(iter([obj]))
 
     if isinstance(obj, pa.RecordBatchReader):
         options = _bind_source(options, obj.schema)
-        return _stream_from_reader(obj, options)
+        return options.cast_arrow_batch_iterator(iter(obj))
+
+    if _is_arrow_dataset(obj):
+        options = _bind_source(options, obj.schema)
+        projection = _resolve_projection(options)
+        if projection:
+            present = [c for c in projection if c in obj.schema.names]
+            scanner = obj.scanner(columns=present) if present else obj.scanner()
+        else:
+            scanner = obj.scanner()
+        return options.cast_arrow_batch_iterator(scanner.to_batches())
 
     namespace = ObjectSerde.full_namespace(obj)
 
@@ -368,7 +404,7 @@ def any_to_arrow_batch_iterator(
 
             to_iter = getattr(obj, "toArrowBatchIterator", None)
             if callable(to_iter):
-                return _stream_from_iterator(iter(to_iter()), options)
+                return options.cast_arrow_batch_iterator(iter(to_iter()))
             # No batch-iter API — fall through to generic bulk fallback.
 
     if namespace.startswith("polars."):
@@ -379,188 +415,47 @@ def any_to_arrow_batch_iterator(
         # path — no streaming benefit since data is already materialized.
 
     if isinstance(obj, (Generator, Iterator)):
-        return _stream_from_iterator(obj, options)
+        return options.cast_arrow_batch_iterator(_flatten_to_arrow_batches(obj, options))
 
     if isinstance(obj, (list, tuple)):
-        if obj:
-            return _stream_from_iterator(iter(obj), options)
-        return iter(())
+        if not obj:
+            return iter(())
+        return options.cast_arrow_batch_iterator(_flatten_to_arrow_batches(iter(obj), options))
 
-    # Generic fallback — bulk-convert (cast applied), then slice.
+    # Generic fallback — bulk-convert in-engine (cast applied), then
+    # re-stream the already-cast table through the rechunker.
     table = any_to_arrow_table(obj, options)
-    return _stream_from_table(table, options, already_cast=True)
+    return options.copy(target_field=None).cast_arrow_batch_iterator(table.to_batches())
 
 
-def _stream_from_reader(
-    reader: pa.RecordBatchReader,
-    options: CastOptions,
-) -> Iterator[pa.RecordBatch]:
-    """Cast each upstream batch on the Arrow side, then re-chunk.
-
-    Arrow-side cast here because a ``RecordBatchReader`` is already
-    Arrow — there's no upstream engine to push the cast into. The
-    cast stream feeds :func:`_stream_from_arrow_batches` for
-    cumulative byte-aware re-chunking.
-    """
-    needs_cast = options.target_field is not None and options.need_cast()
-
-    def _cast_stream():
-        for batch in reader:
-            yield options.cast_arrow_tabular(batch) if needs_cast else batch
-
-    yield from _stream_from_arrow_batches(_cast_stream(), options)
-
-
-def _stream_from_iterator(
+def _flatten_to_arrow_batches(
     items: Iterator[Any],
     options: CastOptions,
 ) -> Iterator[pa.RecordBatch]:
-    """Lazily flatten + cast a stream of mixed tabular objects.
+    """Flatten a (possibly nested) iterator of tabular things into ``pa.RecordBatch``.
 
-    Per-item shape may be Arrow (cast Arrow-side) or engine-native
-    (route through ``any_to_arrow_table`` which dispatches in-engine).
-    Flattened cast batches feed :func:`_stream_from_arrow_batches` for
-    cumulative byte-aware re-chunking — only one coalescer in the
-    chain, regardless of nesting depth.
+    Arrow inputs flow through unchanged — the rechunker downstream
+    runs the per-batch cast. Engine-native items (pandas / polars /
+    spark frames, dicts, dataclasses, pylist rows) are routed through
+    :func:`any_to_arrow_table` so the in-engine cast still applies
+    and the result hits the rechunker as already-cast batches.
     """
-
-    def _flatten(it: Iterator[Any], opts: CastOptions, bound: bool):
-        for item in it:
-            if not bound and isinstance(item, (pa.RecordBatch, pa.Table)):
-                opts = _bind_source(opts, item)
-                bound = True
-
-            if isinstance(item, pa.RecordBatch):
-                yield opts.cast_arrow_tabular(item)
-            elif isinstance(item, pa.Table):
-                casted = opts.cast_arrow_tabular(item)
-                yield from casted.to_batches()
-            elif isinstance(item, (Generator, Iterator)):
-                yield from _flatten(item, opts, bound)
-            elif isinstance(item, (list, tuple)):
-                yield from _flatten(iter(item), opts, bound)
-            else:
-                # Engine-native item — any_to_arrow_table casts in-engine.
-                sub = any_to_arrow_table(item, opts)
-                yield from sub.to_batches()
-
-    yield from _stream_from_arrow_batches(
-        _flatten(items, options, options.source_field is not None),
-        options,
-    )
-
-
-def _stream_from_table(
-    table: pa.Table,
-    options: CastOptions,
-    *,
-    already_cast: bool,
-) -> Iterator[pa.RecordBatch]:
-    """Slice a table into target-sized batches, casting per-batch when needed.
-
-    ``byte_size`` is resolved against the table's actual ``nbytes``
-    (exact, single-pass) and stripped — downstream sees only row_size.
-    """
-    options = _resolve_row_size(options, table.nbytes, table.num_rows)
-
-    if already_cast or options.target_field is None:
-        yield from table.to_batches(max_chunksize=options.row_size)
-        return
-
-    options = _bind_source(options, table)
-    if not options.need_cast():
-        yield from table.to_batches(max_chunksize=options.row_size)
-        return
-
-    for batch in table.to_batches(max_chunksize=options.row_size):
-        yield options.cast_arrow_tabular(batch)
-
-
-def _stream_from_arrow_batches(
-    batches: Iterator[pa.RecordBatch],
-    options: CastOptions,
-) -> Iterator[pa.RecordBatch]:
-    """Re-chunk a stream of already-cast Arrow batches to target size.
-
-    Passthrough when no sizing constraint. Otherwise the row target is
-    derived from a cumulative bytes/rows running average — refined as
-    more batches flow through — and batches are coalesced/sliced toward
-    that target. ``byte_size``, once resolved into a row target each
-    pass, is honored continuously; ``row_size`` (if set) is a hard cap.
-    """
-    if not options.row_size and not options.byte_size:
-        yield from batches
-        return
-
-    user_row_cap = options.row_size
-    byte_size = options.byte_size
-
-    cum_bytes = 0
-    cum_rows = 0
-
-    def _current_target() -> Optional[int]:
-        if not byte_size:
-            return user_row_cap
-        if cum_rows <= 0 or cum_bytes <= 0:
-            return user_row_cap
-        bytes_per_row = max(1, cum_bytes // cum_rows)
-        derived = max(1, byte_size // bytes_per_row)
-        return min(user_row_cap, derived) if user_row_cap else derived
-
-    buffer: list[pa.RecordBatch] = []
-    buffered_rows = 0
-
-    def _ingest(batch):
-        nonlocal buffer, buffered_rows, cum_bytes, cum_rows
-        cum_bytes += batch.nbytes
-        cum_rows += batch.num_rows
-        target = _current_target()
-
-        if target is None:
-            # Estimation degenerated; pass through.
-            yield batch
-            return
-
-        # Oversized incoming, nothing buffered → zero-copy slice direct.
-        if batch.num_rows >= target and not buffer:
-            yield from _slice_batch(batch, target)
-            return
-
-        buffer.append(batch)
-        buffered_rows += batch.num_rows
-        if buffered_rows < target:
-            return
-
-        combined = pa.Table.from_batches(buffer).to_batches(max_chunksize=target)
-        for b in combined[:-1]:
-            yield b
-        tail = combined[-1]
-        if tail.num_rows == target:
-            yield tail
-            buffer = []
-            buffered_rows = 0
+    for item in items:
+        if isinstance(item, pa.RecordBatch):
+            yield item
+        elif isinstance(item, pa.Table):
+            yield from item.to_batches()
+        elif isinstance(item, pa.RecordBatchReader):
+            yield from item
+        elif _is_arrow_dataset(item):
+            yield from item.to_batches()
+        elif isinstance(item, (Generator, Iterator)):
+            yield from _flatten_to_arrow_batches(item, options)
+        elif isinstance(item, (list, tuple)):
+            yield from _flatten_to_arrow_batches(iter(item), options)
         else:
-            buffer = [tail]
-            buffered_rows = tail.num_rows
-
-    for batch in batches:
-        yield from _ingest(batch)
-
-    if buffer:
-        target = _current_target() or buffered_rows
-        yield from pa.Table.from_batches(buffer).to_batches(max_chunksize=target)
-
-
-def _slice_batch(
-    batch: pa.RecordBatch,
-    chunksize: Optional[int],
-) -> Iterator[pa.RecordBatch]:
-    """Slice a batch to ``chunksize`` rows. Zero-copy."""
-    if chunksize is None or batch.num_rows <= chunksize:
-        yield batch
-        return
-    for offset in range(0, batch.num_rows, chunksize):
-        yield batch.slice(offset, chunksize)
+            sub = any_to_arrow_table(item, options)
+            yield from sub.to_batches()
 
 
 @register_converter(Any, pa.RecordBatchReader)
@@ -696,10 +591,10 @@ def cast_arrow_record_batch_reader(
 
     merged_schema = options.check_target(data.schema).merged_schema
 
-    def casted_batches(opt=options):
-        yield from _stream_from_reader(data, opt)
-
-    return pa.RecordBatchReader.from_batches(merged_schema.to_arrow_schema(), casted_batches())
+    return pa.RecordBatchReader.from_batches(
+        merged_schema.to_arrow_schema(),
+        options.cast_arrow_batch_iterator(iter(data)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -842,9 +737,11 @@ def _polars_lazy_to_batch_iterator(
     Uses ``LazyFrame.collect_batches(lazy=True)`` — a true pull-based
     streaming iterator over the plan's output. Each yielded polars
     ``DataFrame`` is one streaming-engine chunk; we convert per-chunk
-    to Arrow batches and feed the result into
-    :func:`_stream_from_arrow_batches` for ``row_size`` / ``byte_size``
-    re-chunking.
+    to Arrow batches and hand them to
+    :meth:`CastOptions.cast_arrow_batch_iterator`, which routes
+    through the nested struct rechunker for ``row_size`` /
+    ``byte_size`` re-chunking. Cast is already done in-engine inside
+    :func:`_polars_lazyframe_prep`, so the rechunker only resizes.
 
     Falls back to the older ``collect(streaming=True)`` path on polars
     versions that lack ``collect_batches``. ``collect_batches`` is
@@ -881,4 +778,4 @@ def _polars_lazy_to_batch_iterator(
                 )
             yield from chunk_table.to_batches()
 
-    yield from _stream_from_arrow_batches(_native_batches(), options)
+    yield from options.cast_arrow_batch_iterator(_native_batches())
