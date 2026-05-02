@@ -17,10 +17,9 @@ from .csv_io import CsvIO
 from .json_io import JsonIO
 from .ndjson_io import NDJsonIO
 from .xlsx_io import XlsxIO
-from .zip_io import ZipIO
 
 __all__ = [
     'PrimitiveIO',
     'ArrowIPCIO',
-    'ParquetIO', 'CsvIO', 'JsonIO', 'NDJsonIO', 'XlsxIO', 'ZipIO',
+    'ParquetIO', 'CsvIO', 'JsonIO', 'NDJsonIO', 'XlsxIO',
 ]

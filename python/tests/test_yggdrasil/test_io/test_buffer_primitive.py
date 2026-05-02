@@ -27,15 +27,14 @@ from yggdrasil.io.buffer.primitive import (
     ParquetIO,
     PrimitiveIO,
     XlsxIO,
-    ZipIO,
 )
+from yggdrasil.io.buffer.nested import ZipIO, ZipOptions
 from yggdrasil.io.buffer.primitive.parquet_io import ParquetOptions
 from yggdrasil.io.buffer.primitive.csv_io import CsvOptions
 from yggdrasil.io.buffer.primitive.json_io import JsonOptions
 from yggdrasil.io.buffer.primitive.ndjson_io import NDJsonOptions
 from yggdrasil.io.buffer.primitive.arrow_ipc_io import ArrowIPCOptions
 from yggdrasil.io.buffer.primitive.xlsx_io import XlsxOptions
-from yggdrasil.io.buffer.primitive.zip_io import ZipOptions
 from yggdrasil.io.enums import MimeTypes, MediaType, Mode
 
 
