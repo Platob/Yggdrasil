@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, ClassVar, Optional, Any, TypeVar, Callable, It
 
 from yggdrasil.data.executor import StatementExecutor
 from .statement import SparkPreparedStatement, SparkStatementResult, SparkStatementBatch
-from ..data.cast.options import CastOptions
+from ..data.options import CastOptions
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
