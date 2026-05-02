@@ -82,9 +82,22 @@ TEST_LEAF = "yggdrasil_fs_it/unittest"
 
 
 def _resolve_client() -> Optional[DatabricksClient]:
-    """Return the active :class:`DatabricksClient` or ``None``."""
+    """Return the active :class:`DatabricksClient` or ``None``.
+
+    Constructing a :class:`DatabricksClient` is cheap — it doesn't
+    contact the workspace. We have to actually call into the SDK
+    (``current_user.me()``) to find out whether credentials resolve.
+    Without that probe the tests "skip-or-error" gate flips to
+    ``True`` on every machine, even ones with no Databricks creds.
+    """
+    # Fast path: respect the project-wide ``DATABRICKS_HOST`` gate
+    # (CLAUDE.md). Without a host configured there's no point probing.
+    if not os.environ.get("DATABRICKS_HOST"):
+        return None
     try:
-        return DatabricksClient.current()
+        client = DatabricksClient.current()
+        client.workspace_client().current_user.me()
+        return client
     except Exception:
         return None
 
