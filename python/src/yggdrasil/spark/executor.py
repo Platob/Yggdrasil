@@ -16,14 +16,15 @@ be used standalone — open-source Spark, local PySpark, or composed into
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, ClassVar, Optional, Any, TypeVar, Callable, Iterator
+from typing import TYPE_CHECKING, ClassVar, Optional, Any, TypeVar, Callable, Iterable
 
 from yggdrasil.data.executor import StatementExecutor
 from .statement import SparkPreparedStatement, SparkStatementResult, SparkStatementBatch
-from ..data.cast.options import CastOptions
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
+
+    from .frame import DynamicFrame
 
 logger = logging.getLogger(__name__)
 
@@ -172,25 +173,52 @@ class SparkStatementExecutor(
     
     def parallelize(
         self,
-        inputs: Any,
+        inputs: Iterable[tuple[Any, ...] | list],
+        transformer: Callable[..., OUT],
         *,
-        options: CastOptions | None = None,
-        transformer: Callable[[IN], OUT] | None = None,
-    ):
-        from .cast import any_to_spark_dataframe
+        byte_size: int = 128 * 1024 * 1024,
+    ) -> "DynamicFrame":
+        """Fan ``transformer`` out across Spark executors over ``(args, kwargs)`` pairs.
 
-        options = CastOptions.check(options)
-        df = any_to_spark_dataframe(
-            inputs,
-            options.with_target(options.source_field).with_source(None)
+        Each item in ``inputs`` is a ``(args, kwargs)`` 2-tuple — the
+        positional and keyword arguments for one call.  The pair is
+        pickled into a single binary column, shipped to executors via
+        ``mapInArrow``, and ``transformer(*args, **kwargs)`` is invoked
+        inside the partition.  Results come back as a
+        :class:`DynamicFrame`; call ``.collect()`` for the values, or
+        ``.cast(schema)`` to land them as a typed Spark DataFrame.
+
+        Lenient on shape: a 1-tuple ``(args,)`` or bare positional iterable
+        is accepted and treated as ``(args, {})``.  Anything else raises
+        with the offending item so the caller can fix the input list.
+        """
+        from .frame import DynamicFrame
+
+        def _apply(item: Any) -> OUT:
+            # Normalize each row to (args, kwargs).
+            # The canonical shape is a 2-element [args, kwargs] / (args, kwargs)
+            # where kwargs is a dict. We also accept a 1-element wrapper or a
+            # bare positional iterable so no-kwargs callers don't have to pass
+            # an empty dict every time.
+            if isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[1], dict):
+                args, kwargs = item[0], item[1]
+            elif isinstance(item, (list, tuple)) and len(item) == 1:
+                args, kwargs = item[0], {}
+            elif isinstance(item, (list, tuple)):
+                args, kwargs = item, {}
+            else:
+                raise TypeError(
+                    f"parallelize input must be a (args, kwargs) pair, got {type(item).__name__}: {item!r}. "
+                    "Pass each call as [(arg1, arg2, ...), {'kw': val}] — kwargs may be an empty dict."
+                )
+            return transformer(*args, **kwargs)
+
+        return DynamicFrame.parallelize(
+            function=_apply,
+            inputs=inputs,
+            spark_session=self.resolve_session(),
+            byte_size=byte_size,
         )
-
-        def within_partitions(iterator: Iterator[IN]):
-            for item in iterator:
-                yield transformer(item) if transformer is not None else item
-
-        # TODO: complete
-        raise NotImplementedError
 
 class _scoped_spark_conf:
     """Context manager: stash & set Spark session conf keys; restore on exit."""
