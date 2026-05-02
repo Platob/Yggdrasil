@@ -91,6 +91,10 @@ def test_pandas_timestamp_roundtrip() -> None:
 
 
 def test_pandas_timestamp_timezone_roundtrip() -> None:
+    # Non-UTC timezone resolution requires the ``tzdata`` package
+    # on platforms without a system tz database (alpine/scratch
+    # images, some CI base layers).
+    pytest.importorskip("tzdata")
     ts = pd.Timestamp("2020-01-01 07:34:56.123456789", tz="US/Eastern")
 
     ser, out = _roundtrip(ts)
@@ -141,6 +145,13 @@ def test_pandas_tag_category_and_resolution() -> None:
 def test_pandas_dataframe_falls_back_to_python_serialized_for_unarrowable_object_dtype(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The Python-serialized fallback dumps cell values through the
+    # Serialized dispatch, which hits stdlib pickle first. ``BadThing``
+    # is a local class, unpicklable through stdlib pickle — the
+    # dispatch then falls through to ``cloudpickle`` / ``dill``. Skip
+    # when neither extra is installed.
+    pytest.importorskip("cloudpickle")
+
     class BadThing:
         def __init__(self, x: int) -> None:
             self.x = x

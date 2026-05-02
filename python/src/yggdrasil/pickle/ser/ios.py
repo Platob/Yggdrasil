@@ -291,6 +291,16 @@ class IOSerialized(Serialized[object]):
         if isinstance(obj, io.IOBase):
             return BinaryIOSerialized.from_value(obj, metadata=metadata, codec=codec)
 
+        # Yggdrasil's :class:`BytesIO` doesn't inherit from
+        # :class:`io.IOBase`. It's pre-registered against IOSerialized
+        # (see the ``Tags.register_class`` block at module bottom), so
+        # the dispatch lands here — but the standard ``isinstance``
+        # ladder above wouldn't catch it. Route it through
+        # BinaryIOSerialized so the wire shape and media-type round-trip
+        # match the rest of the IO surface.
+        if isinstance(obj, BytesIO):
+            return BinaryIOSerialized.from_value(obj, metadata=metadata, codec=codec)
+
         return None
 
 

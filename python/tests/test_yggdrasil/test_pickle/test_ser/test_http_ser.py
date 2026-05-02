@@ -46,6 +46,11 @@ def _make_request(
     tags: dict | None = None,
     sent_at: dt.datetime | None = None,
 ) -> PreparedRequest:
+    # ``PreparedRequest.arrow_values`` hashes the body via xxh3 once a
+    # body is present — without ``xxhash`` the request can't be
+    # serialized.
+    if body is not None:
+        pytest.importorskip("xxhash")
     return PreparedRequest.prepare(
         method=method,
         url=url,
@@ -62,6 +67,11 @@ def _make_response(
     tags: dict | None = None,
     request: PreparedRequest | None = None,
 ) -> Response:
+    # Building a Response forces ``arrow_values`` evaluation later
+    # (during wire serialization, dispatch, and dumps/loads), which
+    # hashes the body via xxh3. Without ``xxhash`` installed the whole
+    # surface is unreachable.
+    pytest.importorskip("xxhash")
     req = request or _make_request()
     all_headers = {"Content-Type": "application/json", **(headers or {})}
     buf = BytesIO(body, copy=False)
@@ -76,6 +86,9 @@ def _make_response(
 
 
 def _wire_roundtrip(ser: Serialized) -> Serialized:
+    # The wire format embeds the xxh3 body hash, so any payload with a
+    # body — request or response — fails to write on a base install.
+    pytest.importorskip("xxhash")
     buf = BytesIO()
     ser.write_to(buf)
     return Serialized.read_from(buf, pos=0)

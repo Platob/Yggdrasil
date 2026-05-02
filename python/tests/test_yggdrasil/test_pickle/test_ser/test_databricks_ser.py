@@ -1,10 +1,25 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
 pytest.importorskip("databricks.sdk", reason="databricks-sdk not installed")
+
+# ``databricks.sdk.Config(...)`` runs full credential discovery on
+# construction, which probes Azure IMDS / OIDC metadata endpoints. On
+# a sandbox with no network egress those calls hang for the full
+# request timeout, deadlocking the test suite. Gate on ``DATABRICKS_HOST``
+# (the project-wide convention from CLAUDE.md) so the file is skipped
+# entirely on machines without Databricks credentials.
+if not os.environ.get("DATABRICKS_HOST"):
+    pytest.skip(
+        "DATABRICKS_HOST not set; skipping databricks-sdk serializer tests "
+        "(Config(...) construction probes metadata endpoints and hangs "
+        "without network egress).",
+        allow_module_level=True,
+    )
 
 from yggdrasil.databricks.client import DatabricksClient
 from yggdrasil.databricks.compute.cluster import Cluster
