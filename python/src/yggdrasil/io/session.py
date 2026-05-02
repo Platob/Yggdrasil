@@ -875,25 +875,25 @@ class Session(ABC):
     # ================================================================== #
     # spark_send_many — Spark-native equivalent of _send_many.            #
     #                                                                    #
-    # Mirrors the four-stage pipeline of `_send_many`:                   #
+    # Three-stage pipeline that stays lazy end-to-end:                    #
     #   1. Local cache  — driver-side, per-request effective config      #
     #   2. Remote cache — driver-side batch SQL lookup, grouped by table #
     #   3. Network      — Spark mapInArrow over batched request DF       #
-    #   4. Writeback    — driver-side bulk insert, grouped by write key  #
     #                                                                    #
-    # Returns a Spark DataFrame typed as RESPONSE_ARROW_SCHEMA:           #
-    # cache hits and network results are unioned into a single output.    #
+    # Returns a Spark DataFrame typed as RESPONSE_ARROW_SCHEMA — the      #
+    # union of local-hit, remote-hit, and network-fetch DFs. Network      #
+    # results are NEVER collected to the driver; remote-cache writeback   #
+    # is the caller's responsibility (write the returned DF to the cache  #
+    # table directly).                                                    #
     #                                                                    #
     # Trade-offs vs `_send_many` (local):                                 #
     # - Per-request local/remote cache overrides ARE honoured in stages  #
-    #   1, 2, and 4 (driver-side), but DROPPED in stage 3 — workers see  #
+    #   1 and 2 (driver-side), but DROPPED in stage 3 — workers see      #
     #   only the session-level local cache config. Same trade-off as the #
     #   existing `spark_send`.                                           #
     # - `raise_error=True` does not short-circuit a partial batch; on    #
     #   workers we always run with raise_error=False and the caller is   #
     #   expected to filter the result DF on `response_status_code`.       #
-    #   (The same Arrow round-trip that gives us a typed result also     #
-    #   means error short-circuit would require an eager collect.)        #
     # ================================================================== #
     def _spark_send_many(
         self,
@@ -912,7 +912,7 @@ class Session(ABC):
         session_remote_cfg = config.remote_cache
         session_local_cfg = config.local_cache
 
-        # Materialise — we need the full list to run driver-side stages 1, 2, 4.
+        # Materialise — we need the full list to run driver-side stages 1 and 2.
         all_requests: list[PreparedRequest] = list(requests)
         if not all_requests:
             return spark.createDataFrame([], schema=RESPONSE_SCHEMA.to_spark_schema())
@@ -934,13 +934,9 @@ class Session(ABC):
             len(local_hits), len(after_local),
         )
 
-        # Snapshot per-request effective configs BEFORE any further work.
-        # Keyed by the anonymized URL string, same identity rule as `_send_many`.
-        url_to_remote_cfg: dict[str, CacheConfig] = {
-            str(r.anonymize(mode="remove").url):
-                self._effective_remote_cfg(r, session_remote_cfg)
-            for r in after_local
-        }
+        # Snapshot per-request effective local configs BEFORE any further work,
+        # keyed by anonymized URL — used to route remote-hit backfills to each
+        # request's effective config rather than the session-level fallback.
         url_to_local_cfg: dict[str, CacheConfig] = {
             str(r.anonymize(mode="remove").url):
                 self._effective_local_cfg(r, session_local_cfg)
@@ -970,59 +966,28 @@ class Session(ABC):
             )
 
         # Cache hits → Arrow → Spark DF (driver-side, cheap: already in memory).
-        hit_df = self._responses_to_spark_df(
-            local_hits + remote_hits, spark,
-        )
+        # Local and remote hits stay as separate DFs so the final union mirrors
+        # the three pipeline stages and keeps the network branch lazy.
+        local_df = self._responses_to_spark_df(local_hits, spark)
+        remote_df = self._responses_to_spark_df(remote_hits, spark)
 
         # --- Stage 3: network fetch via mapInArrow ---
+        # Network results stay in Spark — never collected to the driver. If
+        # callers want to persist them to a remote cache table, they should
+        # write the returned DataFrame themselves.
         if after_remote:
-            miss_df = self._spark_fetch_misses(
+            new_responses_df = self._spark_fetch_misses(
                 after_remote, config, spark,
             )
         else:
-            miss_df = None
+            new_responses_df = None
 
-        # Combine cache hits with network results.
-        if hit_df is not None and miss_df is not None:
-            result_df = hit_df.unionByName(miss_df, allowMissingColumns=False)
-        elif miss_df is not None:
-            result_df = miss_df
-        elif hit_df is not None:
-            result_df = hit_df
-        else:
-            result_df = spark.createDataFrame([], schema=RESPONSE_SCHEMA.to_spark_schema())
-
-        # --- Stage 4: bulk remote writeback (driver-side) ---
-        # We write back ONLY network-fetched responses, matching `_send_many`.
-        # Cache hits are by definition already persisted.
-        # Bulk writeback requires Response objects (for anonymize + match_by);
-        # if no per-request remote configs and no enabled remote cache, skip.
-        any_remote = session_remote_cfg.remote_cache_enabled or any(
-            (r.remote_cache_config and r.remote_cache_config.remote_cache_enabled)
-            for r in after_remote
-        )
-        if miss_df is not None and any_remote:
-            # Pull the network-fetched responses back to the driver as Arrow.
-            # This is the unavoidable cost of doing per-request-config-aware
-            # bulk writeback: we need Response objects, not just rows.
-            # Filter to ok responses to match `_send_many` semantics.
-            miss_responses: list[Response] = []
-            failed: list[Response] = []
-            arrow_table = miss_df.toArrow()
-            for response in Response.from_arrow_tabular(arrow_table):
-                if response.ok:
-                    miss_responses.append(response)
-                elif config.raise_error:
-                    failed.append(response)
-
-            if miss_responses:
-                self._persist_remote(
-                    miss_responses, url_to_remote_cfg, session_remote_cfg,
-                )
-
-            if config.raise_error and failed:
-                failed[-1].raise_for_status()
-
+        parts = [df for df in (local_df, remote_df, new_responses_df) if df is not None]
+        if not parts:
+            return spark.createDataFrame([], schema=RESPONSE_SCHEMA.to_spark_schema())
+        result_df = parts[0]
+        for part in parts[1:]:
+            result_df = result_df.unionByName(part, allowMissingColumns=False)
         return result_df
 
     # ------------------------------------------------------------------ #
