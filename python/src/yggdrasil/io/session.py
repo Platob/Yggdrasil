@@ -832,25 +832,27 @@ class Session(ABC):
     # ================================================================== #
     # spark_send_many — Spark-native equivalent of _send_many.            #
     #                                                                    #
-    # Three-stage pipeline that stays lazy end-to-end:                    #
+    # Four-stage pipeline; stages 3 + 4 stay lazy end-to-end:             #
     #   1. Local cache  — driver-side, per-request effective config      #
     #   2. Remote cache — driver-side batch SQL lookup, grouped by table #
     #   3. Network      — Spark mapInArrow over batched request DF       #
+    #   4. Writeback    — `cfg.table.insert(spark_df, ...)` per remote   #
+    #                     write-group, no driver-side collect            #
     #                                                                    #
     # Returns a Spark DataFrame typed as RESPONSE_ARROW_SCHEMA — the      #
-    # union of local-hit, remote-hit, and network-fetch DFs. Network      #
-    # results are NEVER collected to the driver; remote-cache writeback   #
-    # is the caller's responsibility (write the returned DF to the cache  #
-    # table directly).                                                    #
+    # union of local-hit, remote-hit, and network-fetch DFs.              #
     #                                                                    #
     # Trade-offs vs `_send_many` (local):                                 #
     # - Per-request local/remote cache overrides ARE honoured in stages  #
-    #   1 and 2 (driver-side), but DROPPED in stage 3 — workers see      #
-    #   only the session-level local cache config. Same trade-off as the #
-    #   existing `spark_send`.                                           #
+    #   1 and 2 (driver-side), but DROPPED in stages 3 and 4 — workers  #
+    #   and the writeback see only the session-level configs. Same      #
+    #   trade-off as the existing `spark_send`.                          #
     # - `raise_error=True` does not short-circuit a partial batch; on    #
     #   workers we always run with raise_error=False and the caller is   #
     #   expected to filter the result DF on `response_status_code`.       #
+    # - Writeback inserts the un-anonymized response DF; the underlying  #
+    #   `table.insert` accepts a Spark DataFrame transparently, so we    #
+    #   skip the per-Response anonymize that the local path applies.     #
     # ================================================================== #
     def _spark_send_many(
         self,
@@ -929,15 +931,24 @@ class Session(ABC):
         remote_df = self._responses_to_spark_df(remote_hits, spark)
 
         # --- Stage 3: network fetch via mapInArrow ---
-        # Network results stay in Spark — never collected to the driver. If
-        # callers want to persist them to a remote cache table, they should
-        # write the returned DataFrame themselves.
+        # Network results stay in Spark — never collected to the driver.
         if after_remote:
             new_responses_df = self._spark_fetch_misses(
                 after_remote, config, spark,
             )
         else:
             new_responses_df = None
+
+        # --- Stage 4: bulk remote writeback (no driver collect) ---
+        # `cfg.table.insert` accepts a Spark DataFrame transparently and
+        # routes through `spark_insert_into`, so we hand off the lazy
+        # network-result DF without materialising it on the driver.
+        if new_responses_df is not None and session_remote_cfg.remote_cache_enabled:
+            self._spark_persist_remote(
+                new_responses_df,
+                session_remote_cfg,
+                spark=spark,
+            )
 
         parts = [df for df in (local_df, remote_df, new_responses_df) if df is not None]
         if not parts:
@@ -950,6 +961,41 @@ class Session(ABC):
     # ------------------------------------------------------------------ #
     # Helpers for spark_send_many                                         #
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _spark_persist_remote(
+        new_responses_df: "SparkDataFrame",
+        cfg: CacheConfig,
+        *,
+        spark: "SparkSession",
+    ) -> None:
+        """Stage 4 on Spark: bulk-insert successful responses into the remote cache.
+
+        Honours the session-level remote config only — per-request overrides
+        collapse onto it on the spark path, mirroring stage 3 where workers
+        see only the session-level local cache config. ``cfg.table.insert``
+        accepts the Spark DataFrame directly via ``spark_insert_into``, so
+        no driver-side collect is needed.
+        """
+        from pyspark.sql import functions as F
+
+        ok_df = new_responses_df.where(
+            (F.col("response_status_code") >= 200)
+            & (F.col("response_status_code") < 300)
+        )
+
+        LOGGER.debug(
+            "%s ok response(s) into remote cache %s (spark insert)",
+            "Upserting" if cfg.mode == Mode.UPSERT else "Persisting",
+            cfg.table,
+        )
+        cfg.table.insert(
+            ok_df,
+            mode=cfg.mode,
+            match_by=cfg.match_by or None,
+            wait=cfg.wait,
+            spark_session=spark,
+        )
 
     @staticmethod
     def _responses_to_spark_df(
