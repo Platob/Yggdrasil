@@ -1,28 +1,31 @@
-"""Zip archive as a :class:`NestedIO` with single-file storage.
+"""Zip archive as a :class:`BytesIO` with a children surface.
 
-:class:`ZipIO` models a single zip archive on disk as a folder-shaped
-:class:`NestedIO`: its children are zip entries (each yielded as a
-:class:`ZipEntryIO`), reads enumerate the archive's central directory,
-writes mint new entries by name. Unlike :class:`FolderIO` whose
-backing store is a directory tree, :class:`ZipIO`'s backing store is
-one zip file — the children-as-IOs surface matches :class:`NestedIO`'s
-contract, so the same read/write derivations flow through it.
+:class:`ZipIO` IS-A :class:`BytesIO` whose backing bytes are a zip
+archive. On top of the normal :class:`BytesIO` byte surface (read /
+write / seek / spill against the ``.zip`` file), it exposes a children
+surface for the archive's entries:
 
-The contract
-------------
+- :meth:`iter_children` enumerates every entry as a :class:`ZipEntryIO`
+  (file entry) or :class:`ZipEntryFolderIO` (virtual folder entry).
+- :meth:`make_child` mints a fresh entry handle bound to a name.
+- :meth:`folder` returns a :class:`ZipEntryFolderIO` view scoped to a
+  prefix (so consumers can treat ``dir/a.txt`` + ``dir/b.txt`` as a
+  single virtual folder).
 
-A :class:`ZipIO` holds a single :class:`Path` (the archive file).
-:meth:`iter_children` opens the archive and yields one
-:class:`ZipEntryIO` per entry; :meth:`make_child` mints a fresh entry
-handle bound to a name. Each yielded child carries ``parent = self``
-so consumers can walk back up to the archive.
+The byte surface and the children surface stay consistent because
+entry commits go through :meth:`_commit_entry_payload`, which mutates
+the underlying ``.zip`` file directly via :mod:`zipfile`. A caller
+that only ever reads the archive bytes sees a normal
+:class:`BytesIO`; one that walks the children surface sees the
+entries; one that does both gets a coherent view.
 
 Per-entry I/O — :class:`ZipEntryIO` IS-A :class:`BytesIO`
 ---------------------------------------------------------
 
-A :class:`ZipEntryIO` is a :class:`BytesIO` that knows how to read
-and write itself autonomously inside its parent archive. Its
-backing buffer is the entry's payload bytes — full
+A :class:`ZipEntryIO` is a :class:`BytesIO` whose backing buffer is a
+single entry's uncompressed payload. Byte writes mutate only that
+entry's section (its own ``_buf``), and :meth:`_commit` rewrites that
+entry inside the parent archive — never the whole zip. The full
 :class:`BytesIO` surface (read, write, seek, truncate, spill,
 ``memoryview``) plus a few extras:
 
@@ -38,9 +41,19 @@ Tabular reads/writes (Arrow IPC, Parquet, …) flow through the
 :class:`BytesIO` tabular contract: setting a tabular ``media_type``
 on the entry routes :meth:`read_arrow_batches` /
 :meth:`write_arrow_batches` to the registered concrete leaf
-(``ArrowIPCIO``, ``ParquetIO``, …) wrapping the entry's buffer. No
-PrimitiveIO inheritance needed — the entry is a byte buffer with
-parent-aware lifecycle and lets the format leaves do format work.
+(``ArrowIPCIO``, ``ParquetIO``, …) wrapping the entry's buffer.
+
+Virtual folder entries — :class:`ZipEntryFolderIO`
+--------------------------------------------------
+
+Zip entries are flat (one path per entry), but their names commonly
+embed a path-like structure (``dir/a.txt``, ``dir/sub/b.txt``).
+:class:`ZipEntryFolderIO` is a :class:`TabularIO` that views a name
+prefix as a folder: its children are the entries under that prefix,
+yielded as :class:`ZipEntryIO` (direct files) or
+:class:`ZipEntryFolderIO` (sub-prefixes). The class has no byte
+buffer — it's a pure children-surface view; storage stays in the
+parent :class:`ZipIO`.
 
 Dirty tracking
 --------------
@@ -51,7 +64,7 @@ needs to know whether to bother committing back to the parent, so it
 tracks ``_dirty`` itself by overriding the two write primitives
 (``_write_at`` and ``_set_size``). ``_acquire`` clears the flag after
 pulling the entry's bytes in (acquire is not a user-driven mutation);
-``_release`` checks the flag and runs the commit only when it's True.
+``_commit`` runs only when the dirty flag is set.
 
 Optimized commit path
 ---------------------
@@ -71,7 +84,6 @@ Optimized commit path
 from __future__ import annotations
 
 import dataclasses
-import fnmatch
 import io as _io
 import time
 import zipfile
@@ -81,11 +93,19 @@ from weakref import WeakValueDictionary
 import pyarrow as pa
 
 from yggdrasil.data.options import CastOptions
+from yggdrasil.data.schema import Schema
+from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.buffer.bytes_io import BytesIO
-from yggdrasil.io.enums import MediaType, MediaTypes, MimeTypes
-from .base import NestedIO, NestedOptions
+from yggdrasil.io.enums import MediaType, MediaTypes, MimeTypes, Mode
+from .base import NestedOptions
 
-__all__ = ["ZipIO", "ZipOptions", "ZipEntryIO", "ZipEntryOptions"]
+__all__ = [
+    "ZipIO",
+    "ZipOptions",
+    "ZipEntryIO",
+    "ZipEntryOptions",
+    "ZipEntryFolderIO",
+]
 
 
 _ENTRY_PREFIX = "batch-"
@@ -127,11 +147,14 @@ class ZipEntryOptions(CastOptions):
 # ---------------------------------------------------------------------------
 
 
-class ZipIO(NestedIO[ZipOptions]):
-    """A :class:`NestedIO` whose storage is a single zip archive file.
+class ZipIO(BytesIO):
+    """A :class:`BytesIO` whose bytes form a zip archive.
 
-    Children are zip entries, each yielded as a :class:`ZipEntryIO`.
-    The archive itself is one path on disk — there's no folder tree.
+    The byte buffer (or path-bound spill file) IS the ``.zip`` file
+    on disk. On top of the byte surface, :class:`ZipIO` exposes a
+    children surface — its entries, yielded as :class:`ZipEntryIO`
+    (file) or :class:`ZipEntryFolderIO` (virtual folder).
+
     Reading drains every entry's Arrow IPC stream into one batch
     iterator; writing splits the input into one or more entries
     according to :attr:`NestedOptions.child_row_size` /
@@ -153,13 +176,15 @@ class ZipIO(NestedIO[ZipOptions]):
         data: Any = None,
         *,
         path: Any = None,
-        parent: "NestedIO | None" = None,
-        auto_open: bool = False,
+        parent: "TabularIO | None" = None,
+        auto_open: bool | None = False,
         **kwargs: Any,
     ) -> None:
-        super().__init__(
-            data, path=path, parent=parent, auto_open=auto_open, **kwargs
-        )
+        super().__init__(data, path=path, auto_open=auto_open, **kwargs)
+        # Folder-tree linkage for archives nested inside other
+        # children-bearing IOs (FolderIO of zip files, etc.). ``None``
+        # for the top-level handle.
+        self.parent = parent
         # name -> live ZipEntryIO (weak so closed handles drop out).
         # Two opens of the same name share the SAME ZipEntryIO, giving
         # POSIX-shared-fd semantics across handles.
@@ -188,7 +213,7 @@ class ZipIO(NestedIO[ZipOptions]):
         ``parent`` attribute stamped to ``self``; multiple yields for
         the same name share one backing :class:`ZipEntryIO`.
         """
-        if not self.path.exists():
+        if self.path is None or not self.path.exists():
             return
         for name in self._list_entry_names():
             if self._is_ignored_name(name):
@@ -207,7 +232,7 @@ class ZipIO(NestedIO[ZipOptions]):
         pulls existing payload bytes or starts empty, and a dirty
         commit on close writes the entry into the archive. The
         ``media_type`` argument is accepted for parity with the
-        :class:`NestedIO` contract but is ignored — entry framing is
+        children-surface contract but is ignored — entry framing is
         always Arrow IPC for the tabular surface; raw bytes pass
         through unchanged.
         """
@@ -224,6 +249,16 @@ class ZipIO(NestedIO[ZipOptions]):
     def entry(self, name: str) -> "ZipEntryIO":
         return self.make_child(name)
 
+    def folder(self, prefix: str) -> "ZipEntryFolderIO":
+        """View a name prefix inside the archive as a virtual folder.
+
+        Returns a :class:`ZipEntryFolderIO` whose children are the
+        entries under ``prefix``. Useful for archives that embed a
+        directory layout in entry names (``dir/a.txt``,
+        ``dir/sub/b.txt``).
+        """
+        return ZipEntryFolderIO(parent=self, prefix=prefix)
+
     def __iter__(self) -> "Iterator[ZipEntryIO]":
         return self._iter_children(self._default_options())
 
@@ -236,22 +271,26 @@ class ZipIO(NestedIO[ZipOptions]):
         """Return all entry names currently in the archive, sorted."""
         return sorted(self._list_entry_names())
 
-    # ==================================================================
-    # Empty / clear
-    # ==================================================================
-
-    def is_empty(self) -> bool:
-        """True if the archive is missing or has no non-ignored entries."""
-        if not self.path.exists():
-            return True
+    def has_children(self) -> bool:
+        """True iff the archive holds at least one non-ignored entry."""
+        if self.path is None or not self.path.exists():
+            return False
         try:
             with zipfile.ZipFile(self.path.full_path(), mode="r") as zf:
                 for info in zf.infolist():
                     if not self._is_ignored_name(info.filename):
-                        return False
-                return True
+                        return True
+                return False
         except (zipfile.BadZipFile, FileNotFoundError):
-            return True
+            return False
+
+    # ==================================================================
+    # Empty / clear (children-flavored — overrides BytesIO's byte view)
+    # ==================================================================
+
+    def is_empty(self) -> bool:
+        """True if the archive is missing or has no non-ignored entries."""
+        return not self.has_children()
 
     def _is_ignored_name(self, name: str) -> bool:
         """Hide hidden entries (name starts with ``.``) from enumeration."""
@@ -259,7 +298,7 @@ class ZipIO(NestedIO[ZipOptions]):
 
     def _clear_children(self) -> None:
         """Reset the archive to empty by writing a fresh empty zip."""
-        if not self.path.exists():
+        if self.path is None or not self.path.exists():
             return
         with zipfile.ZipFile(
             self.path.full_path(), mode="w", compression=zipfile.ZIP_STORED
@@ -267,8 +306,135 @@ class ZipIO(NestedIO[ZipOptions]):
             pass
 
     # ==================================================================
+    # Mode resolution — folder-flavored, overrides BytesIO's byte view
+    # ==================================================================
+
+    def _resolve_save_mode(self, mode: Any) -> Mode:
+        m = Mode.from_(mode, default=Mode.AUTO)
+
+        if m in (Mode.AUTO, Mode.OVERWRITE, Mode.TRUNCATE):
+            return Mode.OVERWRITE
+
+        if m is Mode.APPEND:
+            return Mode.APPEND
+
+        if m is Mode.IGNORE:
+            return Mode.IGNORE if not self.is_empty() else Mode.OVERWRITE
+
+        if m is Mode.ERROR_IF_EXISTS:
+            if not self.is_empty():
+                raise FileExistsError(
+                    f"{type(self).__name__} write with "
+                    f"Mode.ERROR_IF_EXISTS but archive is non-empty. "
+                    f"Path: {self.path!r}"
+                )
+            return Mode.OVERWRITE
+
+        return m
+
+    # ==================================================================
+    # Read derivation — chain children's batches
+    # ==================================================================
+
+    def _read_arrow_batches(
+        self,
+        options: ZipOptions,
+    ) -> "Iterator[pa.RecordBatch]":
+        """Chain :meth:`iter_children` into a single Arrow batch stream.
+
+        Each entry is opened in turn and its batches are forwarded.
+        Non-tabular entries (no recognized media type) are skipped.
+        """
+        if self.cached:
+            yield from self._read_arrow_batches_from_cache(options)
+            return
+
+        for child in self._iter_children(options):
+            with child:
+                try:
+                    yield from child.read_arrow_batches(options=options)
+                except NotImplementedError:
+                    # Non-tabular entry — skip; bytes still reachable
+                    # via iter_children().
+                    continue
+
+    def _collect_schema(self, options: ZipOptions) -> Schema:
+        """Merge per-entry schemas into a single archive schema."""
+        merged: Schema | None = None
+        for child in self._iter_children(options):
+            with child:
+                try:
+                    schema = child.collect_schema(options=options)
+                except Exception:
+                    continue
+            if merged is None:
+                merged = schema
+            else:
+                merged = merged.merge_with(schema, inplace=True)
+        return merged if merged is not None else Schema.empty()
+
+    # ==================================================================
     # Write derivation — entry-atomic commits, no on-disk staging
     # ==================================================================
+
+    def _write_arrow_batches(
+        self,
+        batches: Iterable[pa.RecordBatch],
+        options: ZipOptions,
+    ) -> None:
+        """Drain *batches* into one or more zip entries.
+
+        Mode dispatch: OVERWRITE clears the archive first, APPEND
+        adds new entries beside existing ones, IGNORE skips when the
+        archive is non-empty.
+        """
+        mode = self._resolve_save_mode(options.mode)
+
+        if mode is Mode.IGNORE:
+            return
+
+        if mode is Mode.UPSERT:
+            self._arrow_upsert_via_rewrite(batches, options)
+            return
+
+        if mode is Mode.OVERWRITE:
+            self._clear_children()
+
+        self._drain_into_children(batches, options)
+
+    def _drain_into_children(
+        self,
+        batches: Iterable[pa.RecordBatch],
+        options: ZipOptions,
+    ) -> None:
+        """Drain *batches* into one or more child entries."""
+        batch_iter = iter(batches)
+        first = next(batch_iter, None)
+        if first is None:
+            return
+
+        media_type = options.child_media_type or self._default_child_media_type()
+        row_threshold = options.child_row_size or 0
+        byte_threshold = options.child_byte_size or 0
+
+        if row_threshold <= 0 and byte_threshold <= 0:
+            self._write_one_child(
+                _chain_first(first, batch_iter),
+                media_type=media_type,
+                options=options,
+            )
+            return
+
+        for chunk in _split_batches(
+            _chain_first(first, batch_iter),
+            row_threshold=row_threshold,
+            byte_threshold=byte_threshold,
+        ):
+            self._write_one_child(
+                chunk,
+                media_type=media_type,
+                options=options,
+            )
 
     def _write_one_child(
         self,
@@ -279,11 +445,11 @@ class ZipIO(NestedIO[ZipOptions]):
     ) -> None:
         """Drain *batches* into one fresh zip entry.
 
-        Overrides :meth:`NestedIO._write_one_child` to skip the
-        staging-file dance: a zip entry is committed atomically to
-        the central directory when the :class:`ZipEntryIO` releases,
-        so there's nothing to rename. On exception we best-effort
-        delete the half-written entry.
+        Skips the staging-file dance NestedIO uses for folder writes:
+        a zip entry is committed atomically to the central directory
+        when the :class:`ZipEntryIO` releases, so there's nothing to
+        rename. On exception we best-effort delete the half-written
+        entry.
         """
         name = self._next_child_name(media_type=media_type, options=options)
         child = self.make_child(name, media_type=media_type)
@@ -314,7 +480,7 @@ class ZipIO(NestedIO[ZipOptions]):
             options.entry_name_template if options is not None else _ENTRY_NAME
         )
         max_idx = -1
-        if self.path.exists():
+        if self.path is not None and self.path.exists():
             try:
                 with zipfile.ZipFile(self.path.full_path(), mode="r") as zf:
                     for n in zf.namelist():
@@ -332,11 +498,39 @@ class ZipIO(NestedIO[ZipOptions]):
         return template.format(max_idx + 1)
 
     # ==================================================================
-    # Entry-namespace internals (used by ZipEntryIO)
+    # Internal helpers
+    # ==================================================================
+
+    def _attach(self, child: Any) -> Any:
+        """Stamp ``child.parent = self`` and return *child*."""
+        try:
+            child.parent = self
+        except (AttributeError, TypeError):
+            pass
+        return child
+
+    def _default_options(self) -> ZipOptions:
+        return self.options_class()()
+
+    def _arrow_upsert_via_rewrite(
+        self,
+        batches: Iterable[pa.RecordBatch],
+        options: ZipOptions,
+    ) -> None:
+        """UPSERT for an archive: append batches as new entries.
+
+        Zip archives don't have a per-row primary key, so UPSERT
+        degrades to APPEND at the entry level — mirrors what
+        :class:`NestedIO` did for folders without a key column.
+        """
+        self._drain_into_children(batches, options)
+
+    # ==================================================================
+    # Entry-namespace internals (used by ZipEntryIO and ZipEntryFolderIO)
     # ==================================================================
 
     def _list_entry_names(self) -> list[str]:
-        if not self.path.exists():
+        if self.path is None or not self.path.exists():
             return []
         try:
             with zipfile.ZipFile(self.path.full_path(), mode="r") as zf:
@@ -345,7 +539,7 @@ class ZipIO(NestedIO[ZipOptions]):
             return []
 
     def _entry_info(self, name: str) -> "zipfile.ZipInfo | None":
-        if not self.path.exists():
+        if self.path is None or not self.path.exists():
             return None
         try:
             with zipfile.ZipFile(self.path.full_path(), mode="r") as zf:
@@ -361,7 +555,7 @@ class ZipIO(NestedIO[ZipOptions]):
 
     def _read_entry_bytes(self, name: str) -> bytes:
         """Return entry ``name``'s uncompressed payload, or empty bytes."""
-        if not self.path.exists():
+        if self.path is None or not self.path.exists():
             return b""
         try:
             with zipfile.ZipFile(self.path.full_path(), mode="r") as zf:
@@ -384,7 +578,8 @@ class ZipIO(NestedIO[ZipOptions]):
         """Persist ``payload`` as the contents of entry ``name``.
 
         Implements per-entry write-back from a :class:`ZipEntryIO`
-        commit. Two paths:
+        commit. Only this entry's section of the archive is rewritten;
+        every other entry is preserved bit-for-bit.
 
         * **Cheap append** — entry doesn't exist (or archive is
           missing). Open the archive in ``"a"`` mode (or ``"w"`` if
@@ -399,6 +594,12 @@ class ZipIO(NestedIO[ZipOptions]):
         Per-entry ``compression`` / ``compresslevel`` overrides take
         precedence over the parent's :class:`ZipOptions` defaults.
         """
+        if self.path is None:
+            raise RuntimeError(
+                f"{type(self).__name__}._commit_entry_payload requires a "
+                "path-bound archive; got an in-memory ZipIO."
+            )
+
         opts = options if options is not None else ZipOptions()
         payload_bytes = bytes(payload)
         effective_compression = (
@@ -433,7 +634,7 @@ class ZipIO(NestedIO[ZipOptions]):
 
     def _delete_entry(self, name: str) -> None:
         """Remove ``name`` from the archive. No-op if not present."""
-        if not self.path.exists() or not self._entry_exists(name):
+        if self.path is None or not self.path.exists() or not self._entry_exists(name):
             return
         opts = ZipOptions()
         zf_kwargs: dict[str, Any] = {"compression": opts.compression}
@@ -468,7 +669,8 @@ class ZipEntryIO(BytesIO):
 
     The entry's uncompressed payload IS this object's backing buffer
     — read/write/seek/truncate behave exactly as on a free-standing
-    :class:`BytesIO`. The "ZipEntry" half adds three things:
+    :class:`BytesIO`, but mutations only ever touch this entry's
+    section. The "ZipEntry" half adds three things:
 
     * **Parent linkage** — :attr:`parent` is the enclosing
       :class:`ZipIO`, :attr:`entry_name` is this entry's filename,
@@ -479,8 +681,9 @@ class ZipEntryIO(BytesIO):
       independently of the parent's defaults.
     * **Parent-aware lifecycle** — ``_acquire`` pulls the entry's
       bytes from the archive's central directory so the buffer
-      reads transparently; ``_release`` commits dirty bytes back
-      via the parent's optimized commit path.
+      reads transparently; ``_commit`` writes dirty bytes back via
+      the parent's optimized commit path (which only rewrites this
+      one entry — never the whole archive).
 
     Tabular I/O (Arrow IPC, Parquet, …) flows through the normal
     :class:`BytesIO` tabular contract: set a tabular ``media_type``
@@ -575,6 +778,13 @@ class ZipEntryIO(BytesIO):
         return MimeTypes.ZIP_ENTRY
 
     # ------------------------------------------------------------------
+    # has_children — entry-as-file is a leaf, never has children
+    # ------------------------------------------------------------------
+
+    def has_children(self) -> bool:
+        return False
+
+    # ------------------------------------------------------------------
     # Dirty tracking — override the two write primitives
     # ------------------------------------------------------------------
     #
@@ -603,6 +813,18 @@ class ZipEntryIO(BytesIO):
             self._dirty = True
         return result
 
+    def _write_arrow_batches(
+        self,
+        batches: "Iterable[pa.RecordBatch]",
+        options: CastOptions,
+    ) -> None:
+        # BytesIO routes the actual write through a registered leaf
+        # (ArrowIPCIO, ParquetIO, …) wrapping our shared backing
+        # buffer. The leaf's _write_at doesn't run through ours, so
+        # mark dirty explicitly here so the entry commits on close.
+        super()._write_arrow_batches(batches, options)
+        self._dirty = True
+
     # ------------------------------------------------------------------
     # Lifecycle — bridge buffer <-> parent entry
     # ------------------------------------------------------------------
@@ -619,22 +841,26 @@ class ZipEntryIO(BytesIO):
             self.replace_with_payload(payload)
         self._dirty = False
 
+    def _commit(self) -> None:
+        # Disposable.close() runs commit() before _release(), and
+        # commit() clears _dirty after _commit succeeds. Routing the
+        # payload-write here (rather than _release) keeps that
+        # contract intact; otherwise _release would observe an
+        # already-cleared dirty flag and silently skip the commit.
+        with self.memoryview() as mv:
+            payload = bytes(mv)
+        self.parent._commit_entry_payload(
+            self._entry_name,
+            payload,
+            compression=self.compression,
+            compresslevel=self.compresslevel,
+        )
+        # Refresh zip_info so a re-open on this same instance sees
+        # the just-committed metadata.
+        self._zip_info = self.parent._entry_info(self._entry_name)
+
     def _release(self) -> None:
         try:
-            if self._dirty:
-                with self.memoryview() as mv:
-                    payload = bytes(mv)
-                self.parent._commit_entry_payload(
-                    self._entry_name,
-                    payload,
-                    compression=self.compression,
-                    compresslevel=self.compresslevel,
-                )
-                # Refresh zip_info so a re-open on this same instance
-                # sees the just-committed metadata.
-                self._zip_info = self.parent._entry_info(self._entry_name)
-                self._dirty = False
-        finally:
             # Drop ourselves from the parent's live map so a fresh
             # open returns a fresh handle.
             live = self.parent._live_entries
@@ -643,6 +869,7 @@ class ZipEntryIO(BytesIO):
                     del live[self._entry_name]
                 except KeyError:  # pragma: no cover - benign race
                     pass
+        finally:
             super()._release()
 
     # ------------------------------------------------------------------
@@ -677,8 +904,322 @@ class ZipEntryIO(BytesIO):
 
 
 # ---------------------------------------------------------------------------
+# ZipEntryFolderIO
+# ---------------------------------------------------------------------------
+
+
+class ZipEntryFolderIO(TabularIO[ZipOptions]):
+    """A virtual sub-folder view into a :class:`ZipIO`.
+
+    Zip entries live in a flat namespace, but their names commonly
+    embed a path-like structure (``dir/a.txt``, ``dir/sub/b.txt``).
+    :class:`ZipEntryFolderIO` exposes one prefix as a folder: its
+    children are the entries that begin with ``prefix``, yielded as
+    :class:`ZipEntryIO` for direct files and as
+    :class:`ZipEntryFolderIO` for sub-prefixes.
+
+    No byte buffer of its own — storage is the parent :class:`ZipIO`.
+    Reads chain children's batches; writes mint new entries under the
+    prefix via the parent's commit path.
+    """
+
+    _FINAL_TABULAR_IO: ClassVar[bool] = True
+
+    @classmethod
+    def default_mime_type(cls):
+        # No public mime — this is a structural view, not a wire format.
+        return None
+
+    @classmethod
+    def options_class(cls):
+        return ZipOptions
+
+    def __init__(
+        self,
+        *,
+        parent: ZipIO,
+        prefix: str,
+    ) -> None:
+        super().__init__()
+        self.parent = parent
+        self._prefix = _normalize_folder_prefix(prefix)
+
+    # ------------------------------------------------------------------
+    # Identity
+    # ------------------------------------------------------------------
+
+    @property
+    def prefix(self) -> str:
+        """The entry-name prefix (always ends with ``/`` or is empty)."""
+        return self._prefix
+
+    @property
+    def path(self):
+        """Pass-through to the parent archive's path.
+
+        :class:`ZipEntryFolderIO` doesn't have its own on-disk path —
+        it's a logical slice of the parent. Surfacing the parent's
+        path keeps tooling that probes ``io.path`` (logging, error
+        messages) honest about where the bytes actually live.
+        """
+        return self.parent.path
+
+    @property
+    def cached(self) -> bool:
+        return self._arrow_table is not None or self._spark_frame is not None
+
+    def unpersist(self) -> None:
+        self._arrow_table = None
+        self._spark_frame = None
+
+    def persist(self, engine="auto", *, data=None) -> "ZipEntryFolderIO":
+        if self.cached:
+            return self
+        if data is None:
+            self._arrow_table = self.read_arrow_table()
+        else:
+            from yggdrasil.arrow.cast import any_to_arrow_table
+            self._arrow_table = any_to_arrow_table(data)
+        return self
+
+    # ------------------------------------------------------------------
+    # Children — slice the parent's central directory by prefix
+    # ------------------------------------------------------------------
+
+    def _direct_children_names(self) -> "Iterator[tuple[str, bool]]":
+        """Yield ``(name, is_folder)`` for direct children under prefix.
+
+        Direct == one path segment past the prefix. Sub-folders
+        collapse into a single entry (``dir/sub/`` rather than every
+        individual ``dir/sub/*`` leaf).
+        """
+        seen_folders: set[str] = set()
+        for full in self.parent._list_entry_names():
+            if not full.startswith(self._prefix):
+                continue
+            tail = full[len(self._prefix):]
+            if not tail or tail.startswith("."):
+                continue
+            slash = tail.find("/")
+            if slash == -1:
+                yield full, False
+                continue
+            sub = tail[: slash + 1]
+            full_sub_prefix = self._prefix + sub
+            if full_sub_prefix in seen_folders:
+                continue
+            seen_folders.add(full_sub_prefix)
+            yield full_sub_prefix, True
+
+    def _iter_children(
+        self,
+        options: ZipOptions,
+    ) -> "Iterator[TabularIO]":
+        for name, is_folder in self._direct_children_names():
+            if is_folder:
+                yield ZipEntryFolderIO(parent=self.parent, prefix=name)
+            else:
+                yield self.parent._open_entry_io(name, auto_open=False)
+
+    def has_children(self) -> bool:
+        return next(self._direct_children_names(), None) is not None
+
+    def list_entries(self, *, recursive: bool = True) -> list[str]:
+        """List entry names under this folder.
+
+        ``recursive=True`` (default) walks every descendant entry
+        (still scoped to the prefix); ``recursive=False`` only
+        yields names one segment past the prefix.
+        """
+        if recursive:
+            return sorted(
+                full
+                for full in self.parent._list_entry_names()
+                if full.startswith(self._prefix) and full != self._prefix
+            )
+        return sorted(name for name, _ in self._direct_children_names())
+
+    def __iter__(self) -> "Iterator[TabularIO]":
+        return self._iter_children(self._has_children_options())
+
+    def __contains__(self, name: object) -> bool:
+        if not isinstance(name, str):
+            return False
+        full = name if name.startswith(self._prefix) else self._prefix + name
+        return self.parent._entry_exists(full)
+
+    # ------------------------------------------------------------------
+    # Mutators — minted via the parent's commit path
+    # ------------------------------------------------------------------
+
+    def make_child(
+        self,
+        name: str,
+        *,
+        media_type: Any = None,
+    ) -> "ZipEntryIO":
+        """Mint a child entry under this folder's prefix."""
+        if "\\" in name:
+            raise ValueError(
+                f"Entry name must not contain backslashes; got {name!r}. "
+                "Use forward slashes."
+            )
+        full = name if name.startswith(self._prefix) else self._prefix + name
+        return self.parent.make_child(full, media_type=media_type)
+
+    def folder(self, sub_prefix: str) -> "ZipEntryFolderIO":
+        """View a deeper sub-prefix as another folder."""
+        normalized = _normalize_folder_prefix(sub_prefix)
+        if not normalized.startswith(self._prefix):
+            normalized = self._prefix + normalized
+        return ZipEntryFolderIO(parent=self.parent, prefix=normalized)
+
+    # ------------------------------------------------------------------
+    # Read/write — chain children
+    # ------------------------------------------------------------------
+
+    def _read_arrow_batches(
+        self,
+        options: ZipOptions,
+    ) -> "Iterator[pa.RecordBatch]":
+        if self.cached:
+            yield from self._read_arrow_batches_from_cache(options)
+            return
+        for child in self._iter_children(options):
+            with child:
+                try:
+                    yield from child.read_arrow_batches(options=options)
+                except NotImplementedError:
+                    continue
+
+    def _write_arrow_batches(
+        self,
+        batches: Iterable[pa.RecordBatch],
+        options: ZipOptions,
+    ) -> None:
+        """Drain *batches* into one or more entries under prefix."""
+        batch_iter = iter(batches)
+        first = next(batch_iter, None)
+        if first is None:
+            return
+
+        media_type = options.child_media_type or MimeTypes.ARROW_IPC
+        row_threshold = options.child_row_size or 0
+        byte_threshold = options.child_byte_size or 0
+
+        chunks: Iterable[Iterable[pa.RecordBatch]]
+        if row_threshold <= 0 and byte_threshold <= 0:
+            chunks = [_chain_first(first, batch_iter)]
+        else:
+            chunks = _split_batches(
+                _chain_first(first, batch_iter),
+                row_threshold=row_threshold,
+                byte_threshold=byte_threshold,
+            )
+
+        for chunk in chunks:
+            name = self.parent._next_child_name(
+                media_type=media_type, options=options
+            )
+            full = name if name.startswith(self._prefix) else self._prefix + name
+            child = self.parent.make_child(full, media_type=media_type)
+            try:
+                with child:
+                    child.write_arrow_batches(chunk, options=options)
+            except Exception:
+                try:
+                    self.parent._delete_entry(full)
+                except Exception:
+                    pass
+                raise
+
+    def is_empty(self) -> bool:
+        return not self.has_children()
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _normalize_folder_prefix(prefix: str) -> str:
+    """Coerce *prefix* to the central-directory slice form.
+
+    Empty / ``"/"`` collapse to the empty string (the whole archive).
+    Other inputs are stripped of leading slashes and given a trailing
+    ``/`` so the prefix match is folder-shaped, not substring-shaped.
+    """
+    if not prefix or prefix in ("/", "."):
+        return ""
+    cleaned = prefix.lstrip("/")
+    if not cleaned:
+        return ""
+    if not cleaned.endswith("/"):
+        cleaned = cleaned + "/"
+    return cleaned
+
+
+def _chain_first(
+    first: pa.RecordBatch,
+    rest: "Iterator[pa.RecordBatch]",
+) -> "Iterator[pa.RecordBatch]":
+    """Yield *first*, then every batch from *rest*."""
+    yield first
+    yield from rest
+
+
+def _split_batches(
+    batches: "Iterator[pa.RecordBatch]",
+    *,
+    row_threshold: int,
+    byte_threshold: int,
+) -> "Iterator[Iterator[pa.RecordBatch]]":
+    """Split a batch iterator into chunks by row / byte threshold.
+
+    ``row_threshold`` wins when both are set. With a row threshold,
+    incoming batches are sliced so each emitted chunk holds exactly
+    ``row_threshold`` rows (the final chunk may be shorter).
+    """
+
+    def _size_bytes(batch: pa.RecordBatch) -> int:
+        try:
+            return int(batch.nbytes)
+        except Exception:
+            return 0
+
+    if row_threshold > 0:
+        pending: list[pa.RecordBatch] = []
+        pending_rows = 0
+        for batch in batches:
+            offset = 0
+            remaining = batch.num_rows
+            while remaining > 0:
+                take = min(remaining, row_threshold - pending_rows)
+                slice_ = batch.slice(offset, take)
+                pending.append(slice_)
+                pending_rows += take
+                offset += take
+                remaining -= take
+                if pending_rows >= row_threshold:
+                    yield iter(pending)
+                    pending = []
+                    pending_rows = 0
+        if pending:
+            yield iter(pending)
+        return
+
+    pending = []
+    nbytes = 0
+    for batch in batches:
+        pending.append(batch)
+        if byte_threshold > 0:
+            nbytes += _size_bytes(batch)
+        if 0 < byte_threshold <= nbytes:
+            yield iter(pending)
+            pending = []
+            nbytes = 0
+    if pending:
+        yield iter(pending)
 
 
 def _zipinfo_mtime(info: zipfile.ZipInfo, *, fallback: float) -> float:

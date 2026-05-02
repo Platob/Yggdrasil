@@ -693,8 +693,10 @@ def _split_batches(
 ) -> Iterator[Iterator[pa.RecordBatch]]:
     """Split a batch iterator into chunks by row / byte threshold.
 
-    ``row_threshold`` wins when both are set. A single batch larger
-    than the threshold goes into its own chunk untouched.
+    ``row_threshold`` wins when both are set. With a row threshold,
+    incoming batches are sliced so each emitted chunk holds exactly
+    ``row_threshold`` rows (the final chunk may be shorter). Without
+    a row threshold, byte accounting accumulates whole batches.
     """
 
     def _size_bytes(batch: pa.RecordBatch) -> int:
@@ -703,26 +705,38 @@ def _split_batches(
         except Exception:
             return 0
 
-    pending: list[pa.RecordBatch] = []
-    rows = 0
+    if row_threshold > 0:
+        pending: list[pa.RecordBatch] = []
+        pending_rows = 0
+        for batch in batches:
+            offset = 0
+            remaining = batch.num_rows
+            while remaining > 0:
+                take = min(remaining, row_threshold - pending_rows)
+                slice_ = batch.slice(offset, take)
+                pending.append(slice_)
+                pending_rows += take
+                offset += take
+                remaining -= take
+                if pending_rows >= row_threshold:
+                    yield iter(pending)
+                    pending = []
+                    pending_rows = 0
+        if pending:
+            yield iter(pending)
+        return
+
+    pending = []
     nbytes = 0
 
     for batch in batches:
         pending.append(batch)
-        rows += batch.num_rows
         if byte_threshold > 0:
             nbytes += _size_bytes(batch)
 
-        flush = False
-        if 0 < row_threshold <= rows:
-            flush = True
-        elif 0 < byte_threshold <= nbytes:
-            flush = True
-
-        if flush:
+        if 0 < byte_threshold <= nbytes:
             yield iter(pending)
             pending = []
-            rows = 0
             nbytes = 0
 
     if pending:

@@ -525,6 +525,34 @@ class TabularIO(Disposable, ABC, Generic[O]):
         """Public wrapper around :meth:`_iter_children`."""
         return self._iter_children(self.check_options(options, overrides=locals()))
 
+    def has_children(self) -> bool:
+        """Return ``True`` iff this IO exposes at least one child.
+
+        Default probes :meth:`_iter_children` with default options and
+        peeks the first element. Subclasses with cheaper introspection
+        (a directory-listing call, a central-directory scan, an
+        already-cached child set) should override.
+
+        Single-buffer leaves with no children surface return ``False``
+        via the inherited empty :meth:`_iter_children`. Folder-shaped
+        IOs (:class:`NestedIO`, :class:`ZipIO`,
+        :class:`ZipEntryFolderIO`) override or rely on the default
+        peek to answer "is this a leaf or a container?".
+        """
+        try:
+            return next(iter(self._iter_children(self._has_children_options())), None) is not None
+        except (FileNotFoundError, StopIteration):
+            return False
+
+    def _has_children_options(self) -> O:
+        """Cheap default options for :meth:`has_children`'s peek.
+
+        Split out so subclasses with mandatory option fields can
+        provide a probe-friendly default without rebuilding
+        :meth:`has_children`.
+        """
+        return self.options_class()()
+
     # ==================================================================
     # Static helpers
     # ==================================================================

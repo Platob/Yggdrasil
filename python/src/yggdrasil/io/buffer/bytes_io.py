@@ -353,7 +353,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 elif isinstance(data, BytesIO):
                     media_type = data._media_type
 
-            if media_type and path is not None:
+            if media_type is None and path is not None:
                 path = P.from_(path)
                 media_type = path.media_type
 
@@ -1424,13 +1424,39 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 raise ValueError(f"Unsupported engine: {engine}")
         return self
 
+    def _tabular_leaf_view(self) -> "TabularIO | None":
+        """Return a registered leaf wrapping self for tabular dispatch.
+
+        ``None`` when self has no tabular media type or self IS the
+        registered leaf for its media type — both signal "no further
+        dispatch available, the caller's _read/_write_arrow_batches
+        is the leaf and must implement the format itself."
+        """
+        mt = self._media_type
+        if mt is None or getattr(mt, "is_octet", False):
+            return None
+        target_cls = TabularIO.media_type_class(mt, default=None)
+        if target_cls is None or target_cls is type(self):
+            return None
+        return target_cls(self, media_type=mt)
+
     def _read_arrow_batches(self, options: CastOptions) -> "Iterator[pa.RecordBatch]":
         """Default — opaque buffer can't yield Arrow batches.
 
-        Concrete leaves (ParquetIO, CsvIO, …) override with format
-        decoding. Calling on an opaque buffer raises rather than
-        silently yielding nothing.
+        When self carries a tabular media type but isn't itself the
+        registered leaf (e.g. a :class:`ZipEntryIO` whose entry name
+        ends in ``.arrow``), dispatch through the registered leaf
+        wrapping self. Otherwise raise — there's no honest decode
+        without a format.
         """
+        view = self._tabular_leaf_view()
+        if view is not None:
+            # Sync the leaf's size to ours BEFORE the read — the leaf
+            # was constructed without seeing self's payload size
+            # (init copies _buf reference, not _size).
+            view._size = self._size
+            yield from view._read_arrow_batches(view.check_options(options))
+            return
         raise NotImplementedError(
             f"{type(self).__name__} has no tabular media type. "
             "Construct via the format leaf (ParquetIO, CsvIO, …) "
@@ -1444,8 +1470,20 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     ) -> None:
         """Default — opaque buffer can't accept Arrow batches.
 
-        Concrete leaves override format-specifically.
+        Same dispatch shape as :meth:`_read_arrow_batches`: a buffer
+        with a tabular media type but no leaf override routes the
+        write through the registered leaf wrapping self.
         """
+        view = self._tabular_leaf_view()
+        if view is not None:
+            view._size = self._size
+            view._pos = self._pos
+            view._write_arrow_batches(batches, view.check_options(options))
+            # Sync the leaf's tracking back — it appended into our
+            # shared bytearray but has its own size/pos cursors.
+            self._size = view._size
+            self._pos = view._pos
+            return
         raise NotImplementedError(
             f"{type(self).__name__} has no tabular media type. "
             "Construct via the format leaf (ParquetIO, CsvIO, …) "
@@ -2068,7 +2106,14 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                     break
                 total += self.write_bytes(chunk)
             return total
-        return self.write_stream(b)
+        # Buffer-protocol fallback (e.g. pyarrow.Buffer) — pyarrow's
+        # IPC writers hand us native Buffer objects, which aren't
+        # bytes/bytearray/memoryview but are memoryview-able.
+        try:
+            mv = memoryview(b)
+        except TypeError:
+            return self.write_stream(b)
+        return self.write_bytes(mv)
 
     def write_stream(self, buffer: BytesIO):
         buffer = BytesIO.from_(buffer)
@@ -2076,6 +2121,11 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
     def write_bytes(self, b: bytes | bytearray | memoryview) -> int:
         mv = memoryview(b)
+        # Normalize to a 1-D unsigned-byte view so internal splices
+        # against bytearray-backed memoryviews don't trip on format /
+        # itemsize mismatches (pa.Buffer hands us format='b').
+        if mv.format != "B" or mv.ndim != 1 or mv.itemsize != 1:
+            mv = mv.cast("B")
         if len(mv) == 0:
             return 0
         n = self._write_at(mv, self._pos)

@@ -1,7 +1,13 @@
 from .base import NestedIO, NestedOptions
 from .folder_io import FolderIO, FolderOptions
 from .partitioned_io import PartitionedFolderIO, PartitionedOptions
-from .zip_io import ZipEntryIO, ZipEntryOptions, ZipIO, ZipOptions
+from .zip_io import (
+    ZipEntryFolderIO,
+    ZipEntryIO,
+    ZipEntryOptions,
+    ZipIO,
+    ZipOptions,
+)
 
 __all__ = [
     "NestedIO",
@@ -13,5 +19,6 @@ __all__ = [
     "ZipIO",
     "ZipOptions",
     "ZipEntryIO",
+    "ZipEntryFolderIO",
     "ZipEntryOptions",
 ]

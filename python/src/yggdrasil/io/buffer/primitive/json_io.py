@@ -219,16 +219,7 @@ class JsonIO(BytesIO):
         pds = pyarrow_dataset_module()
         return pds.dataset(self.path.__fspath__(), format="json")
 
-    def _scan_polars_frame(self, options: JsonOptions) -> "pl.LazyFrame":
-        if not self._can_use_native_scanner(options):
-            return super()._scan_polars_frame(options)
-
-        pl = polars_module()
-        return pl.scan_ndjson(self.path.__fspath__())
-
-    def _read_polars_frame(self, options: JsonOptions) -> "pl.DataFrame":
-        if not self._can_use_native_scanner(options):
-            return super()._read_polars_frame(options)
-
-        pl = polars_module()
-        return pl.read_ndjson(self.path.__fspath__())
+    # No native polars JSON scanner — we serialize as a JSON array
+    # and polars' scan_ndjson / read_ndjson expect newline-delimited
+    # objects. Fall through to the base path (pyarrow JSON reader →
+    # pl.from_arrow), which handles both shapes correctly.
