@@ -1,15 +1,18 @@
-"""Fast-path bypass tests for DataType / Field cast_* entry points.
+"""Cast fast-paths — when does ``cast_*`` skip the actual cast?
 
-Covers the metadata-only short-circuits in `DataType.cast_arrow_array`,
-`cast_polars_series`, `cast_pandas_series`, `cast_spark_column`, the
-tabular variants, and the matching methods on `Field`:
+Three short-circuits are pinned for every engine:
 
-- Same source/target dtype → return input unchanged.
-- Target is ObjectType → return input unchanged without inspecting values.
-- Source is NullType → reinterpret as typed-null of the target dtype without
-  a deep value cast.
+* **Same dtype** — source matches target, no cast performed; the
+  caller's array / series / frame is returned by identity.
+* **ObjectType target** — variant target is a structural no-op;
+  values pass through untouched regardless of source dtype.
+* **NullType source** — Arrow / Polars nulls reinterpret as a typed
+  null at the target dtype, no values are touched.
+
+The same contract is tested at three levels: bare ``DataType.cast_*``
+methods, ``Field.cast_*`` (Object-field skip), and the tabular
+variants on ``StructType``.
 """
-
 from __future__ import annotations
 
 from yggdrasil.arrow.tests import ArrowTestCase
@@ -25,25 +28,33 @@ from yggdrasil.pandas.tests import PandasTestCase
 from yggdrasil.polars.tests import PolarsTestCase
 
 
-class TestCastArrowBypass(ArrowTestCase):
+_INT64 = IntegerType(byte_size=8, signed=True)
 
-    def test_same_dtype_returns_input_unchanged(self):
+
+# ---------------------------------------------------------------------------
+# DataType.cast_arrow_array
+# ---------------------------------------------------------------------------
+
+
+class TestArrowArrayBypass(ArrowTestCase):
+
+    def test_same_dtype_returns_input_identity(self) -> None:
         pa = self.pa
         arr = pa.array([1, 2, 3], type=pa.int64())
 
-        out = IntegerType(byte_size=8, signed=True).cast_arrow_array(arr)
+        out = _INT64.cast_arrow_array(arr)
 
         self.assertIs(out, arr)
 
-    def test_same_chunked_dtype_returns_input_unchanged(self):
+    def test_same_chunked_dtype_returns_input_identity(self) -> None:
         pa = self.pa
         arr = pa.chunked_array([[1, 2], [3]], type=pa.int64())
 
-        out = IntegerType(byte_size=8, signed=True).cast_arrow_array(arr)
+        out = _INT64.cast_arrow_array(arr)
 
         self.assertIs(out, arr)
 
-    def test_object_target_returns_input_unchanged(self):
+    def test_object_target_skips_cast(self) -> None:
         pa = self.pa
         arr = pa.array([1, 2, 3], type=pa.int64())
 
@@ -51,19 +62,21 @@ class TestCastArrowBypass(ArrowTestCase):
 
         self.assertIs(out, arr)
 
-    def test_null_source_reinterprets_without_deep_cast(self):
+    def test_null_source_reinterprets_as_typed_null(self) -> None:
         pa = self.pa
         arr = pa.nulls(4, type=pa.null())
 
-        out = IntegerType(byte_size=8, signed=True).cast_arrow_array(arr)
+        out = _INT64.cast_arrow_array(arr)
 
         self.assertEqual(out.type, pa.int64())
         self.assertEqual(len(out), 4)
         self.assertEqual(out.null_count, 4)
 
-    def test_null_source_chunked_reinterprets(self):
+    def test_null_chunked_source_reinterprets(self) -> None:
         pa = self.pa
-        arr = pa.chunked_array([pa.nulls(2, type=pa.null()), pa.nulls(3, type=pa.null())])
+        arr = pa.chunked_array(
+            [pa.nulls(2, type=pa.null()), pa.nulls(3, type=pa.null())]
+        )
 
         out = StringType().cast_arrow_array(arr)
 
@@ -72,17 +85,22 @@ class TestCastArrowBypass(ArrowTestCase):
         self.assertEqual(out.null_count, 5)
 
 
-class TestCastPolarsBypass(PolarsTestCase):
+# ---------------------------------------------------------------------------
+# DataType.cast_polars_series
+# ---------------------------------------------------------------------------
 
-    def test_same_dtype_returns_input_unchanged(self):
+
+class TestPolarsSeriesBypass(PolarsTestCase):
+
+    def test_same_dtype_returns_input_identity(self) -> None:
         pl = self.pl
         s = pl.Series("x", [1, 2, 3], dtype=pl.Int64)
 
-        out = IntegerType(byte_size=8, signed=True).cast_polars_series(s)
+        out = _INT64.cast_polars_series(s)
 
         self.assertIs(out, s)
 
-    def test_object_target_returns_input_unchanged(self):
+    def test_object_target_skips_cast(self) -> None:
         pl = self.pl
         s = pl.Series("x", [1, 2, 3], dtype=pl.Int64)
 
@@ -90,28 +108,33 @@ class TestCastPolarsBypass(PolarsTestCase):
 
         self.assertIs(out, s)
 
-    def test_null_source_reinterprets_without_deep_cast(self):
+    def test_null_source_reinterprets_as_typed_null(self) -> None:
         pl = self.pl
         s = pl.Series("x", [None, None, None], dtype=pl.Null)
 
-        out = IntegerType(byte_size=8, signed=True).cast_polars_series(s)
+        out = _INT64.cast_polars_series(s)
 
         self.assertEqual(out.dtype, pl.Int64)
         self.assertEqual(out.len(), 3)
         self.assertEqual(out.null_count(), 3)
 
 
-class TestCastPandasBypass(PandasTestCase):
+# ---------------------------------------------------------------------------
+# DataType.cast_pandas_series
+# ---------------------------------------------------------------------------
 
-    def test_same_dtype_returns_input_unchanged(self):
+
+class TestPandasSeriesBypass(PandasTestCase):
+
+    def test_same_dtype_returns_input_identity(self) -> None:
         pd = self.pd
         s = pd.Series([1, 2, 3], name="x", dtype="int64")
 
-        out = IntegerType(byte_size=8, signed=True).cast_pandas_series(s)
+        out = _INT64.cast_pandas_series(s)
 
         self.assertIs(out, s)
 
-    def test_object_target_returns_input_unchanged(self):
+    def test_object_target_skips_cast(self) -> None:
         pd = self.pd
         s = pd.Series(["hello", "world"], name="x")
 
@@ -119,141 +142,126 @@ class TestCastPandasBypass(PandasTestCase):
 
         self.assertIs(out, s)
 
-    def test_null_source_skips_arrow_roundtrip(self):
+    def test_null_source_avoids_arrow_round_trip(self) -> None:
         pd = self.pd
-        s = pd.Series([None, None, None], name="x", dtype="object")
-        # Force the cast options to treat the source as NullType — this is
-        # what happens when upstream metadata declares a null-typed source.
         from yggdrasil.data.options import CastOptions
 
-        src = Field(name="x", dtype=NullType(), nullable=True)
-        opts = CastOptions(source_field=src)
+        # Force the cast to treat the source as NullType (this happens when
+        # upstream metadata declares a null-typed source).
+        s = pd.Series([None, None, None], name="x", dtype="object")
+        opts = CastOptions(source_field=Field(name="x", dtype=NullType(), nullable=True))
 
-        out = IntegerType(byte_size=8, signed=True).cast_pandas_series(s, opts)
+        out = _INT64.cast_pandas_series(s, opts)
 
         self.assertEqual(out.name, "x")
         self.assertEqual(len(out), 3)
         self.assertTrue(out.isna().all())
 
 
-class TestCastArrowTabularBypass(ArrowTestCase):
+# ---------------------------------------------------------------------------
+# Tabular variants — table / frame returned untouched.
+# ---------------------------------------------------------------------------
 
-    def test_same_schema_returns_table_unchanged(self):
+
+class TestArrowTabularBypass(ArrowTestCase):
+
+    def test_same_schema_table_passes_through(self) -> None:
         pa = self.pa
         table = pa.table({"a": [1, 2, 3], "b": ["x", "y", "z"]})
         target = StructType.from_arrow_schema(table.schema)
 
-        out = target.cast_arrow_tabular(table)
+        self.assertIs(target.cast_arrow_tabular(table), table)
 
-        self.assertIs(out, table)
-
-    def test_object_target_returns_table_unchanged(self):
+    def test_object_target_table_passes_through(self) -> None:
         pa = self.pa
         table = pa.table({"a": [1, 2, 3]})
 
-        out = ObjectType().cast_arrow_tabular(table)
-
-        self.assertIs(out, table)
+        self.assertIs(ObjectType().cast_arrow_tabular(table), table)
 
 
-class TestCastPolarsTabularBypass(PolarsTestCase):
+class TestPolarsTabularBypass(PolarsTestCase):
 
-    def test_same_schema_returns_frame_unchanged(self):
+    def test_same_schema_frame_passes_through(self) -> None:
         pl = self.pl
         df = pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
         target = StructType.from_polars_schema(df.schema)
 
-        out = target.cast_polars_tabular(df)
+        self.assertIs(target.cast_polars_tabular(df), df)
 
-        self.assertIs(out, df)
-
-    def test_object_target_returns_frame_unchanged(self):
+    def test_object_target_frame_passes_through(self) -> None:
         pl = self.pl
         df = pl.DataFrame({"a": [1, 2, 3]})
 
-        out = ObjectType().cast_polars_tabular(df)
-
-        self.assertIs(out, df)
+        self.assertIs(ObjectType().cast_polars_tabular(df), df)
 
 
-class TestCastPandasTabularBypass(PandasTestCase):
+class TestPandasTabularBypass(PandasTestCase):
 
-    def test_same_schema_returns_frame_unchanged(self):
+    def test_same_schema_frame_passes_through(self) -> None:
         pd = self.pd
         df = pd.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
         target = StructType.from_pandas(df)
 
-        out = target.cast_pandas_tabular(df)
+        self.assertIs(target.cast_pandas_tabular(df), df)
 
-        self.assertIs(out, df)
-
-    def test_object_target_returns_frame_unchanged(self):
+    def test_object_target_frame_passes_through(self) -> None:
         pd = self.pd
         df = pd.DataFrame({"a": [1, 2, 3]})
 
-        out = ObjectType().cast_pandas_tabular(df)
-
-        self.assertIs(out, df)
+        self.assertIs(ObjectType().cast_pandas_tabular(df), df)
 
 
-class TestFieldCastBypassArrow(ArrowTestCase):
+# ---------------------------------------------------------------------------
+# Field-level Object skip — same contract, but at the Field surface.
+# ---------------------------------------------------------------------------
 
-    def test_object_field_skips_arrow_array_cast(self):
+
+class TestFieldObjectSkipArrow(ArrowTestCase):
+
+    def test_arrow_array_passthrough(self) -> None:
         pa = self.pa
         arr = pa.array([1, 2, 3], type=pa.int64())
-        field = Field(name="x", dtype=ObjectType(), nullable=True)
+        f = Field(name="x", dtype=ObjectType(), nullable=True)
 
-        out = field.cast_arrow_array(arr)
+        self.assertIs(f.cast_arrow_array(arr), arr)
 
-        self.assertIs(out, arr)
-
-    def test_object_field_skips_arrow_tabular_cast(self):
+    def test_arrow_table_passthrough(self) -> None:
         pa = self.pa
         table = pa.table({"a": [1, 2, 3]})
-        field = Field(name="x", dtype=ObjectType(), nullable=True)
+        f = Field(name="x", dtype=ObjectType(), nullable=True)
 
-        out = field.cast_arrow_tabular(table)
-
-        self.assertIs(out, table)
+        self.assertIs(f.cast_arrow_tabular(table), table)
 
 
-class TestFieldCastBypassPolars(PolarsTestCase):
+class TestFieldObjectSkipPolars(PolarsTestCase):
 
-    def test_object_field_skips_polars_series_cast(self):
+    def test_polars_series_passthrough(self) -> None:
         pl = self.pl
         s = pl.Series("x", [1, 2, 3], dtype=pl.Int64)
-        field = Field(name="x", dtype=ObjectType(), nullable=True)
+        f = Field(name="x", dtype=ObjectType(), nullable=True)
 
-        out = field.cast_polars_series(s)
+        self.assertIs(f.cast_polars_series(s), s)
 
-        self.assertIs(out, s)
-
-    def test_object_field_skips_polars_tabular_cast(self):
+    def test_polars_frame_passthrough(self) -> None:
         pl = self.pl
         df = pl.DataFrame({"a": [1, 2, 3]})
-        field = Field(name="x", dtype=ObjectType(), nullable=True)
+        f = Field(name="x", dtype=ObjectType(), nullable=True)
 
-        out = field.cast_polars_tabular(df)
-
-        self.assertIs(out, df)
+        self.assertIs(f.cast_polars_tabular(df), df)
 
 
-class TestFieldCastBypassPandas(PandasTestCase):
+class TestFieldObjectSkipPandas(PandasTestCase):
 
-    def test_object_field_skips_pandas_series_cast(self):
+    def test_pandas_series_passthrough(self) -> None:
         pd = self.pd
         s = pd.Series([1, 2, 3], name="x")
-        field = Field(name="x", dtype=ObjectType(), nullable=True)
+        f = Field(name="x", dtype=ObjectType(), nullable=True)
 
-        out = field.cast_pandas_series(s)
+        self.assertIs(f.cast_pandas_series(s), s)
 
-        self.assertIs(out, s)
-
-    def test_object_field_skips_pandas_tabular_cast(self):
+    def test_pandas_frame_passthrough(self) -> None:
         pd = self.pd
         df = pd.DataFrame({"a": [1, 2, 3]})
-        field = Field(name="x", dtype=ObjectType(), nullable=True)
+        f = Field(name="x", dtype=ObjectType(), nullable=True)
 
-        out = field.cast_pandas_tabular(df)
-
-        self.assertIs(out, df)
+        self.assertIs(f.cast_pandas_tabular(df), df)
