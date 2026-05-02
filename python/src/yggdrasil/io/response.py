@@ -128,6 +128,40 @@ def _sniff_media_from_body(
         )
     return body.media_type
 
+
+def _media_type_from_headers(
+    headers: Mapping[str, str] | None,
+) -> MediaType | None:
+    """Build a :class:`MediaType` from header-declared Content-Type /
+    Content-Encoding alone — no body sniffing.
+
+    Returns ``None`` when neither header is present, or when the
+    declared Content-Type is the generic ``application/octet-stream``
+    placeholder (since that conveys no useful format identity to seed
+    a leaf-class dispatch with). Callers that need to fall back to
+    body sniffing should call :func:`_sniff_media_from_body` instead.
+
+    Used by :class:`Response` / :class:`HTTPResponse` construction to
+    pre-bind a tabular media type onto the buffer BEFORE bytes land,
+    so the buffer is constructed as the right registered leaf
+    (ParquetIO, JsonIO, ArrowIPCIO, …) rather than an opaque
+    :class:`BytesIO` that downstream callers have to re-wrap.
+    """
+    declared_type = _parse_content_type(headers)
+    declared_encoding = _parse_content_encoding(headers)
+
+    if not declared_type and not declared_encoding:
+        return None
+
+    if not declared_encoding and _is_probably_placeholder_content_type(declared_type):
+        return None
+
+    return MediaType.from_many(
+        mime_types=[declared_type, declared_encoding],
+        default=MediaType.from_mime(MimeTypes.OCTET_STREAM),
+    )
+
+
 def _ensure_media_headers(
     headers: MutableMapping[str, str],
     body: BytesIO,
@@ -148,6 +182,20 @@ def _ensure_media_headers(
         headers["Content-Encoding"] = media.codec.name
 
     headers["Content-Length"] = str(body.size)
+
+    # Pre-binding: if headers gave us a useful media type but the
+    # buffer was constructed without one (common when bytes land on
+    # an opaque BytesIO before headers are parsed), set it now so
+    # subsequent .read_arrow_batches / .as_media calls dispatch
+    # through the right leaf.
+    if body._media_type is None and not media.mime_type.is_any_bytes:
+        try:
+            body.with_media_type(media, copy=False)
+        except Exception:
+            # Setting media_type is best-effort here — a buffer that
+            # rejects (e.g. a frozen view) just stays opaque.
+            pass
+
     return media
 
 
@@ -208,13 +256,28 @@ def _parse_tags(obj: Mapping[str, Any], *, prefix: str) -> dict[str, str]:
     return _string_dict(tags if isinstance(tags, Mapping) else None)
 
 
-def _parse_buffer(obj: Mapping[str, Any], *, prefix: str) -> BytesIO:
+def _parse_buffer(
+    obj: Mapping[str, Any],
+    *,
+    prefix: str,
+    media_type: MediaType | None = None,
+) -> BytesIO:
     body = get_from_dict(obj, keys=("buffer", "body", "content", "data", "response_body"), prefix=prefix)
     if body is MISSING:
         body = get_from_dict(obj, keys=("buffer", "body", "content", "data", "response_body"), prefix="")
     if body is MISSING or body is None:
-        return BytesIO()
-    return BytesIO.from_(obj=body)
+        # Empty placeholder buffer — pass media_type so the registry
+        # dispatches to the right leaf (ParquetIO, JsonIO, …) on
+        # construction, sparing downstream callers an as_media call.
+        return BytesIO(media_type=media_type) if media_type is not None else BytesIO()
+    if isinstance(body, BytesIO):
+        if media_type is not None and body._media_type is None:
+            try:
+                body.with_media_type(media_type, copy=False)
+            except Exception:
+                pass
+        return body
+    return BytesIO.from_(obj=body, media_type=media_type) if media_type is not None else BytesIO.from_(obj=body)
 
 
 def _parse_status_code(obj: Mapping[str, Any], *, prefix: str) -> int:
@@ -572,7 +635,11 @@ class Response:
 
         status_code = _parse_status_code(obj, prefix=prefix)
         headers = _parse_headers(obj, prefix=prefix)
-        buffer = _parse_buffer(obj, prefix=prefix)
+        # Pre-infer media type from headers BEFORE constructing the
+        # buffer so a path-bound or in-memory buffer dispatches to the
+        # registered leaf (ParquetIO, ArrowIPCIO, …) on construction.
+        pre_media = _media_type_from_headers(headers)
+        buffer = _parse_buffer(obj, prefix=prefix, media_type=pre_media)
         received_at = _parse_received_at(obj, prefix=prefix)
         tags = _parse_tags(obj, prefix=prefix)
 

@@ -8,7 +8,7 @@ from urllib3 import BaseHTTPResponse
 
 from ..buffer import BytesIO
 from ..request import PreparedRequest
-from ..response import Response
+from ..response import Response, _media_type_from_headers
 
 __all__ = [
     "HTTPResponse"
@@ -26,11 +26,24 @@ class HTTPResponse(Response):
         tags: Optional[Mapping[str, str]],
         received_at: dt.datetime
     ) -> "HTTPResponse":
+        # Pre-infer media type from the response's Content-Type /
+        # Content-Encoding so the buffer is constructed as the
+        # registered leaf (ParquetIO, JsonIO, ArrowIPCIO, …) up
+        # front. Once bytes land via drain_urllib3, callers get a
+        # tabular-ready buffer without an extra as_media() hop.
+        headers = dict(response.headers)
+        pre_media = _media_type_from_headers(headers)
+        buffer = (
+            BytesIO(media_type=pre_media)
+            if pre_media is not None
+            else BytesIO()
+        )
+
         response = cls(
             request=request,
             status_code=response.status,
-            headers=dict(response.headers),
-            buffer=BytesIO(),
+            headers=headers,
+            buffer=buffer,
             tags=tags,
             received_at=received_at
         )
