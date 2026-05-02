@@ -118,6 +118,13 @@ def test_parallelize_return_exceptions_collects_timeout():
 
 
 def test_parallelize_with_process_pool_executor():
+    # ``ProcessPoolExecutor`` ships the worker callable through
+    # ``multiprocessing.reduction.ForkingPickler``, which can't
+    # serialize a local function defined inside a test. The
+    # ``cloudpickle`` / ``dill`` extras swap in a richer pickler
+    # that handles closures; without them this test isn't runnable.
+    pytest.importorskip("cloudpickle")
+
     @parallelize(executor_cls=cf.ProcessPoolExecutor, show_progress=True)
     def cube(x: int) -> int:
         return x * x * x

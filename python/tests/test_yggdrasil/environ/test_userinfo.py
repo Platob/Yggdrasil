@@ -46,7 +46,10 @@ def test_current_compute_url_falls_back_to_local_cwd(userinfo, monkeypatch, tmp_
     monkeypatch.delenv("DATABRICKS_RUNTIME_VERSION", raising=False)
     monkeypatch.setattr(userinfo, "_databricks_current_url", lambda kind="auto": None)
     u = userinfo._current_compute_url(hostname="hostA", cwd=str(tmp_path))
-    assert u.to_string() == f"local://hosta/{tmp_path.as_posix()}"
+    # tmp_path.as_posix() already begins with '/'; URL.to_string()
+    # collapses the host/path separator into a single slash, so the
+    # expectation drops the duplicate.
+    assert u.to_string() == f"local://hosta{tmp_path.as_posix()}"
 
 
 def test_git_inference_and_git_url(userinfo, tmp_path: Path):
@@ -158,7 +161,7 @@ version = "1.2.3"
     monkeypatch.setattr(userinfo, "_safe_getcwd", lambda: str(repo))
 
     ui = userinfo.get_user_info(refresh=True)
-    assert ui.url.to_string() == f"local://hosta/{repo.as_posix()}"
+    assert ui.url.to_string() == f"local://hosta{repo.as_posix()}"
     assert ui.git_url is not None
     assert ui.git_url.to_string() == "https://github.com/acme/my-repo#0123456789ab"
     assert ui.product == "coolproj"
