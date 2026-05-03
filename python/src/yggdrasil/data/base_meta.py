@@ -141,6 +141,7 @@ class BaseMetadata(ABC):
             if not self.metadata:
                 object.__setattr__(self, "metadata", {})
             self.metadata[TAG_PREFIX + _to_bytes(key)] = _to_bytes(value)
+            self._on_metadata_mutated()
 
     def _unset_tag_value(self, key: bytes | str) -> None:
         if not self.metadata:
@@ -148,6 +149,17 @@ class BaseMetadata(ABC):
         self.metadata.pop(TAG_PREFIX + _to_bytes(key), None)
         if not self.metadata:
             object.__setattr__(self, "metadata", None)
+        self._on_metadata_mutated()
+
+    def _on_metadata_mutated(self) -> None:
+        """Hook called whenever this metadata holder's dict changes.
+
+        :class:`~yggdrasil.data.data_field.Field` overrides this to
+        clear its cached arrow / polars / spark projections (and
+        cascade to parents). Default is a no-op so non-Field metadata
+        holders pay nothing.
+        """
+        return None
 
     def _tag_flag(self, key: bytes | str) -> bool:
         value = self._tag_value(key)
@@ -234,6 +246,55 @@ class BaseChildrenFields(ABC):
     def cluster_fields(self):
         return [f for f in self.children_fields if f.cluster_by]
 
+    # ------------------------------------------------------------------
+    # Field lookup map — cached on Field, recomputed on miss elsewhere
+    # ------------------------------------------------------------------
+
+    def _build_field_name_maps(
+        self,
+    ) -> tuple[dict[str, int], dict[str, int]]:
+        """Return ``(exact_map, casefold_map)`` over ``children_fields``.
+
+        Both map field name → index. The exact map dispatches the
+        common case (case-sensitive lookup); the casefold map is the
+        fallback for ``"PRICE"`` -> ``"price"`` style requests.
+        Earlier children win on collision so legacy positional
+        semantics are preserved.
+        """
+        exact: dict[str, int] = {}
+        fold: dict[str, int] = {}
+        for i, f in enumerate(self.children_fields):
+            exact.setdefault(f.name, i)
+            fold.setdefault(f.name.casefold(), i)
+        return exact, fold
+
+    def _field_name_index_maps(
+        self,
+    ) -> tuple[dict[str, int], dict[str, int]]:
+        """Cached ``(exact, casefold)`` name→index maps.
+
+        :class:`~yggdrasil.data.data_field.Field` populates per-instance
+        slots (``_field_name_map`` / ``_field_name_fold_map``) so the
+        maps survive across calls and get cleared on
+        :meth:`Field._invalidate_cache`. Subtypes that don't carry
+        those slots (e.g. struct/map/array dtypes) recompute on each
+        call — still O(N) worst case but the dict path is faster than
+        the legacy double-loop above a handful of fields.
+        """
+        exact = getattr(self, "_field_name_map", None)
+        fold = getattr(self, "_field_name_fold_map", None)
+        if exact is not None and fold is not None:
+            return exact, fold
+        exact, fold = self._build_field_name_maps()
+        # Best-effort: cache when the holder allows attribute assignment
+        # (Field uses ``object.__setattr__`` to bypass frozen).
+        try:
+            object.__setattr__(self, "_field_name_map", exact)
+            object.__setattr__(self, "_field_name_fold_map", fold)
+        except (AttributeError, TypeError):
+            pass
+        return exact, fold
+
     def field(
         self,
         name_or_index: str | int | None = None,
@@ -304,14 +365,12 @@ class BaseChildrenFields(ABC):
                     return indexed_field
 
         if name is not None:
-            for field in available_fields:
-                if field.name == name:
-                    return field
-
-            folded = name.casefold()
-            for field in available_fields:
-                if field.name.casefold() == folded:
-                    return field
+            exact, fold = self._field_name_index_maps()
+            hit = exact.get(name)
+            if hit is None:
+                hit = fold.get(name.casefold())
+            if hit is not None:
+                return available_fields[hit]
 
         if not raise_error:
             return None

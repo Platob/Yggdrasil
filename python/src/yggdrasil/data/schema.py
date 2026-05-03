@@ -135,7 +135,17 @@ def _peel_name_nullable(metadata: Any) -> tuple[Any, str | None, bool | None]:
 
 @dataclasses.dataclass(repr=False, eq=False, frozen=True, init=False)
 class Schema(Field, MutableMapping[str, Field]):
-    """A :class:`Field` whose dtype is a :class:`StructType`."""
+    """A :class:`Field` whose ``dtype`` is a :class:`StructType`.
+
+    Schema is *just* a struct field with the children-shaped
+    convenience surface (mapping / set ops / engine-flavoured schema
+    export) bolted on. The strict ``dtype: StructType`` annotation
+    makes that contract explicit so callers can rely on it without
+    runtime ``isinstance`` checks.
+    """
+
+    # Strict shape — Schema's dtype is always a StructType.
+    dtype: StructType
 
     def __init__(
         self,
@@ -145,6 +155,7 @@ class Schema(Field, MutableMapping[str, Field]):
         name: str | None = None,
         nullable: bool | None = None,
         tags: dict[bytes | str, bytes | str | object] | None = None,
+        parent: "Field | None" = None,
     ) -> None:
         children = _normalize_inner_fields(inner_fields)
         meta, embedded_name, embedded_nullable = _peel_name_nullable(metadata)
@@ -160,6 +171,7 @@ class Schema(Field, MutableMapping[str, Field]):
             nullable=bool(nullable),
             metadata=meta,
             tags=tags,
+            parent=parent,
         )
 
     # ------------------------------------------------------------------
@@ -223,8 +235,18 @@ class Schema(Field, MutableMapping[str, Field]):
     # ------------------------------------------------------------------
 
     def _set_dtype_fields(self, fields: Iterable[Field]) -> None:
-        """Replace the underlying StructType's fields tuple in place."""
+        """Replace the underlying StructType's fields tuple in place.
+
+        Mutating ``self.dtype.fields`` doesn't go through any of
+        Field's ``with_*`` mutators, so the cached arrow / polars /
+        spark projections (and the field-name lookup map) would
+        otherwise miss the change. Invalidate them explicitly and
+        re-adopt the new children so they bubble future mutations
+        back through ``self.parent``.
+        """
         object.__setattr__(self.dtype, "fields", tuple(fields))
+        self._invalidate_cache()
+        self._adopt_children()
 
     @classmethod
     def empty(
@@ -647,31 +669,45 @@ class Schema(Field, MutableMapping[str, Field]):
         return set(raw.decode().split("."))
 
     # ------------------------------------------------------------------
-    # Engine schema export
+    # Engine schema export — Field provides ``to_arrow_schema`` /
+    # ``to_polars_schema`` / ``to_spark_schema`` for any struct-shaped
+    # field; the only thing Schema adds is the constraint-aware
+    # filtering (children with ``constraint_key`` set don't make it
+    # into the engine schema since they're a yggdrasil concept that
+    # has no arrow/polars/spark equivalent).
     # ------------------------------------------------------------------
 
     def to_arrow_schema(self) -> pa.Schema:
-        # Round-trip the schema-level ``name`` / ``nullable`` through
-        # arrow metadata so :meth:`Field.from_arrow_schema` can recover
-        # them — pa.Schema has no native slot for either.
+        if self._arrow_schema is not None:
+            return self._arrow_schema
         meta = dict(self.metadata) if self.metadata else {}
         if self.name and self.name != DEFAULT_FIELD_NAME:
             meta.setdefault(b"name", self.name.encode("utf-8"))
         if self.nullable:
             meta.setdefault(b"nullable", b"true")
-        return pa.schema(self.arrow_fields, metadata=meta or None)
+        built = pa.schema(self.arrow_fields, metadata=meta or None)
+        object.__setattr__(self, "_arrow_schema", built)
+        return built
 
     def to_polars_schema(self) -> "polars.Schema":
+        if self._polars_schema is not None:
+            return self._polars_schema
         pl = get_polars()
-        return pl.Schema(
+        built = pl.Schema(
             [(f.name, f.dtype.to_polars()) for f in self.fields]
         )
+        object.__setattr__(self, "_polars_schema", built)
+        return built
 
     def to_spark_schema(self) -> "pst.StructType":
+        if self._spark_schema is not None:
+            return self._spark_schema
         pyspark_sql = get_spark_sql()
-        return pyspark_sql.types.StructType(
+        built = pyspark_sql.types.StructType(
             [f.to_pyspark_field() for f in self.fields]
         )
+        object.__setattr__(self, "_spark_schema", built)
+        return built
 
     def to_polars_flavor(self) -> "polars.Schema":
         return self.to_polars_schema()
@@ -736,8 +772,8 @@ class Schema(Field, MutableMapping[str, Field]):
             return default
         return cls.from_field(f)
 
-    def to_dict(self):
-        return self.to_field().to_dict()
+    def to_dict(self, dump_parent: bool = False):
+        return self.to_field().to_dict(dump_parent=dump_parent)
 
     def to_field(self) -> Field:
         """Return this schema as a plain :class:`Field`.
