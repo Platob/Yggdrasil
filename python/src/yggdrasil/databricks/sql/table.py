@@ -392,21 +392,31 @@ def _build_delete_insert_statements(
     bridges source → target — callers narrow it to the intersection of
     source-side columns when feeding a fallback so non-matching columns
     are filtered out.
+
+    Databricks/Spark SQL doesn't accept ``DELETE FROM target USING source``;
+    the keyed delete is rendered as ``DELETE FROM target T WHERE EXISTS
+    (...)`` so it parses on Delta.  ``prune_predicates`` lift onto the
+    outer ``WHERE`` so the target scan is bounded before the EXISTS
+    subquery runs.
     """
     cols_quoted = ", ".join(quote_ident(c) for c in columns)
     key_cols = ", ".join(quote_ident(k) for k in match_by)
-    on_condition = _build_match_condition(
-        match_by, left_alias="T", right_alias="S",
-        null_safe=True, extra_predicates=prune_predicates,
+    key_match = " AND ".join(
+        f"T.{quote_ident(k)} <=> S.{quote_ident(k)}"
+        for k in match_by
     )
+    exists_clause = (
+        f"EXISTS (\n"
+        f"  SELECT 1 FROM (\n"
+        f"    SELECT DISTINCT {key_cols} FROM ({source_sql}) AS src\n"
+        f"  ) AS S\n"
+        f"  WHERE {key_match}\n"
+        f")"
+    )
+    where_clauses = [*prune_predicates, exists_clause]
+    where_sql = "\n  AND ".join(where_clauses)
     return [
-        (
-            f"DELETE FROM {target_location} AS T\n"
-            f"USING (\n"
-            f"  SELECT DISTINCT {key_cols} FROM ({source_sql}) AS src\n"
-            f") AS S\n"
-            f"ON {on_condition}"
-        ),
+        f"DELETE FROM {target_location} AS T\nWHERE {where_sql}",
         f"INSERT INTO {target_location} ({cols_quoted})\n{source_sql}",
     ]
 
@@ -2265,6 +2275,9 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
 
         prune_values = prune_values or {}
         if prune_by:
+            # Cache before the distinct().collect() so the temp view backing
+            # the MERGE doesn't re-execute the source plan from scratch.
+            data_df = data_df.cache()
             prune_values = _collect_prune_values_spark(data_df, prune_by)
             logger.debug(
                 "Spark pruning %s -> %s",
@@ -2348,6 +2361,11 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
                 session.catalog.dropTempView(view_name)
             except Exception:
                 logger.debug("Failed to drop temp view %r; continuing.", view_name, exc_info=True)
+            if prune_by:
+                try:
+                    data_df.unpersist()
+                except Exception:
+                    logger.debug("Failed to unpersist cached source; continuing.", exc_info=True)
 
     # =========================================================================
     # sql_insert — query source, no staging
