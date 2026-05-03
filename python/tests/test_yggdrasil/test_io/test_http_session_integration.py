@@ -32,7 +32,6 @@ import pytest
 
 from yggdrasil.io.errors import NotFoundError
 from yggdrasil.io.http_ import HTTPSession
-from yggdrasil.io.local_response_cache import LocalResponseCache
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.send_config import CacheConfig
 
@@ -40,20 +39,24 @@ from yggdrasil.io.send_config import CacheConfig
 def _wait_for_cache(tmp_path: Path, expected: int = 1, timeout: float = 10.0) -> None:
     """Wait until at least *expected* responses have landed in the cache.
 
-    Cache writes go through ``Job.make(...).fire_and_forget()`` so the
-    partitioned-folder write is in flight when the call site returns.
-    Polling on :meth:`LocalResponseCache.count` is the cheapest
-    reliable barrier — it walks the partitioned tree, reads every
-    leaf, and applies the received-window filter the way a real
-    lookup would.
+    Cache writes go through ``Job.make(...).fire_and_forget()`` so
+    the partitioned-folder write is in flight when the call site
+    returns. Polling on the :class:`FolderIO` row count is the
+    cheapest reliable barrier — it walks the partitioned tree and
+    reads every leaf the way a real lookup would.
     """
-    cache = LocalResponseCache(path=tmp_path)
+    from yggdrasil.io.buffer.nested.folder_io import FolderIO
+
+    cache_root = tmp_path / "cache"
     deadline = time.time() + timeout
     while time.time() < deadline:
-        try:
-            n = cache.count()
-        except Exception:
-            n = 0
+        n = 0
+        if cache_root.exists():
+            try:
+                with FolderIO(path=cache_root) as folder:
+                    n = folder.read_arrow_table().num_rows
+            except Exception:
+                n = 0
         if n >= expected:
             return
         time.sleep(0.05)

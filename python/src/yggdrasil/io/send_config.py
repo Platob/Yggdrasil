@@ -12,12 +12,12 @@ from yggdrasil.dataclasses import DEFAULT_WAITING_CONFIG
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.io.enums import Mode
 from yggdrasil.io.request import REQUEST_ARROW_SCHEMA, PreparedRequest
-from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA
+from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
     from yggdrasil.databricks.sql.table import Table
-    from yggdrasil.io.local_response_cache import LocalResponseCache
+    from yggdrasil.io.buffer.nested.folder_io import FolderIO
     from yggdrasil.io.response import Response
 
 
@@ -102,6 +102,37 @@ def _coerce_optional_datetime(value: Any) -> Optional[dt.datetime]:
     if isinstance(value, dt.datetime):
         return value
     return any_to_datetime(value)
+
+
+# Hot dimensions for partition pruning of the local response cache.
+# Method is small-cardinality (a handful of values), host is medium —
+# together they segment the cache enough that a typical lookup reads
+# only one partition's worth of leaves.
+LOCAL_CACHE_PARTITION_COLUMNS: tuple[str, ...] = (
+    "request_method",
+    "request_url_host",
+)
+
+
+def _local_cache_schema():
+    """Return :data:`RESPONSE_SCHEMA` with the local-cache partition tags.
+
+    Marks :data:`LOCAL_CACHE_PARTITION_COLUMNS` as ``partition_by``
+    so :class:`FolderIO` builds the matching Hive layout
+    automatically. Cached on the function for cheap repeat access —
+    the underlying :class:`Schema` is immutable.
+    """
+    cached = getattr(_local_cache_schema, "_cached", None)
+    if cached is not None:
+        return cached
+    schema = RESPONSE_SCHEMA.copy()
+    for name in LOCAL_CACHE_PARTITION_COLUMNS:
+        if name not in schema.names:
+            continue
+        f = schema[name]
+        schema[name] = f.with_partition_by(True, inplace=False)
+    _local_cache_schema._cached = schema
+    return schema
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,22 +381,27 @@ class CacheConfig(_ConfigBase):
             object.__setattr__(self, "path", Path.home() / ".yggdrasil" / "io" / "session")
         return self.path
 
-    def local_cache(self) -> "LocalResponseCache":
-        """Build a :class:`LocalResponseCache` for this config.
+    def local_cache(self) -> "FolderIO":
+        """Build a :class:`FolderIO` over the local response cache.
 
-        Returns the partitioned-folder cache wired to this config's
-        ``path``, ``request_by``, and received-window. Constructed on
-        each call (the cache itself is stateless beyond the on-disk
-        layout); callers that hot-loop should hold onto the returned
-        instance for the duration of a batch.
+        Returns a schema-tagged partitioned folder rooted at
+        ``<path>/cache``. The schema is :data:`RESPONSE_SCHEMA` with
+        ``partition_by=True`` set on ``request_method`` and
+        ``request_url_host`` — :class:`FolderIO` derives the
+        partition layout from those tags and persists the schema to
+        ``<root>/.schema`` on first write so subsequent readers
+        don't have to infer.
+
+        Constructed on each call (the IO itself is stateless beyond
+        the on-disk layout); callers in hot loops should hold onto
+        the returned instance for the duration of a batch.
         """
-        from yggdrasil.io.local_response_cache import LocalResponseCache
+        from yggdrasil.io.buffer.nested.folder_io import FolderIO
+        from yggdrasil.io.fs import LocalPath
 
-        return LocalResponseCache(
-            path=self.local_cache_folder(),
-            match_by=self.request_by or None,
-            received_from=self.received_from,
-            received_to=self.received_to,
+        return FolderIO(
+            path=LocalPath(self.local_cache_folder() / "cache"),
+            schema=_local_cache_schema(),
         )
 
     def request_values(

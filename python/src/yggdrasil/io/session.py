@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional
 
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from yggdrasil.arrow.cast import rechunk_arrow_batches_by_byte_size
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
@@ -20,7 +21,7 @@ from yggdrasil.dataclasses.waiting import (
 )
 from yggdrasil.io.enums import Mode
 from .buffer import BytesIO
-from .local_response_cache import LocalResponseCache
+from .buffer.nested.folder_io import FolderIO, FolderOptions
 from .request import PreparedRequest
 from .response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
 from .response_batch import ResponseBatch
@@ -52,26 +53,138 @@ LOGGER = logging.getLogger(__name__)
 _SPARK_RESPONSE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
 
 
-# Local cache lives in a partitioned folder rooted at the
-# CacheConfig's ``path`` (see :class:`LocalResponseCache`). Reads
-# prune by partition + filter by received-window; writes append-only,
-# concurrent-safe across the job pool.
+# Local cache lives in a partitioned :class:`FolderIO` rooted at
+# ``<CacheConfig.path>/cache``. Partition columns come from
+# ``RESPONSE_SCHEMA``'s ``partition_by``-tagged fields and the schema
+# itself is dropped to ``<root>/.schema`` on first write so future
+# reads pick up the layout without inferring. Reads filter by
+# request-key tuple + received-window; writes are append-only with
+# UUID-named leaves so concurrent fire-and-forget workers can't race
+# on a final filename.
 
 
 def _store_local_arrow_batch(
-    cache: "LocalResponseCache",
+    cache: "FolderIO",
     batch: pa.RecordBatch,
 ) -> None:
     """Append a single Arrow batch to ``cache`` from a worker thread.
 
     Module-level so the fire-and-forget Job pickles cleanly without
-    dragging Session state along. Routes through
-    :meth:`LocalResponseCache._direct_partition_write` — the same
-    UUID-named-leaf path :meth:`LocalResponseCache.store_many` uses
-    for the bulk case — so concurrent fire-and-forget workers
-    can't race on a sequential filename.
+    dragging Session state along. Routes the batch through the
+    folder's ``write_arrow_batches`` with ``Mode.APPEND`` —
+    :class:`FolderIO` resolves the partition tuple from the batch's
+    own columns and drops a UUID-named leaf into the matching
+    directory.
     """
-    cache._direct_partition_write(pa.Table.from_batches([batch]))
+    cache.write_arrow_batches(
+        [batch], options=FolderOptions(mode=Mode.APPEND),
+    )
+
+
+def _request_partition_filter(
+    cache: "FolderIO",
+    requests: "list[PreparedRequest]",
+) -> "pc.Expression | None":
+    """Build a pyarrow predicate pruning to the partitions in ``requests``.
+
+    Walks every request, projects its values for the cache's
+    partition columns, and AND-s an ``isin`` filter per column.
+    Used by the lookup path to skip partitions no incoming request
+    actually touches before the row-level match-by filter runs.
+    Returns ``None`` when the cache isn't partitioned or the
+    request list yields no usable values.
+    """
+    parts = cache._resolve_partition_columns()
+    if not parts:
+        return None
+    expr: "pc.Expression | None" = None
+    for f in parts:
+        try:
+            values = sorted(
+                {r.match_value(f.name) for r in requests},
+                key=lambda v: (v is None, v),
+            )
+        except Exception:
+            continue
+        if not values:
+            continue
+        term = pc.is_in(pc.field(f.name), value_set=pa.array(values))
+        expr = term if expr is None else (expr & term)
+    return expr
+
+
+def _lookup_local_responses(
+    cache: "FolderIO",
+    requests: "list[PreparedRequest]",
+    *,
+    match_by: "tuple[str, ...]",
+    received_from: "Any | None" = None,
+    received_to: "Any | None" = None,
+) -> dict[tuple, Response]:
+    """Bulk lookup by request-key tuple against a folder cache.
+
+    One folder read per call — partition pruning shrinks the set of
+    leaves visited, then we filter rows by request-key tuple + the
+    optional received-window. When several rows share a key the
+    latest one (max ``response_received_at``) wins, giving
+    UPSERT-on-write semantics for free.
+    """
+    if not requests:
+        return {}
+    if not cache.path.exists():
+        return {}
+
+    try:
+        with cache:
+            table = cache.read_arrow_table()
+    except Exception:
+        # Corrupt leaf, race with a concurrent write, schema drift
+        # — fall through to "nothing matches" so callers progress
+        # to the next pipeline stage cleanly.
+        LOGGER.debug(
+            "Local response cache read failed under %s; treating as miss",
+            cache.path, exc_info=True,
+        )
+        return {}
+
+    if table.num_rows == 0:
+        return {}
+
+    if "response_received_at" in table.column_names:
+        if received_from is not None:
+            table = table.filter(
+                pc.greater_equal(
+                    table["response_received_at"],
+                    pa.scalar(received_from),
+                )
+            )
+        if received_to is not None:
+            table = table.filter(
+                pc.less(
+                    table["response_received_at"],
+                    pa.scalar(received_to),
+                )
+            )
+
+    wanted: set[tuple] = {
+        tuple(r.match_value(c) for c in match_by) for r in requests
+    }
+    out: dict[tuple, Response] = {}
+    latest_at: dict[tuple, Any] = {}
+    for response in Response.from_arrow_tabular(table.to_batches()):
+        try:
+            key = tuple(response.match_value(c) for c in match_by)
+        except Exception:
+            continue
+        if key not in wanted:
+            continue
+        ts = response.received_at
+        existing = latest_at.get(key)
+        if existing is None or (ts is not None and ts >= existing):
+            out[key] = response
+            if ts is not None:
+                latest_at[key] = ts
+    return out
 
 
 @dataclass
@@ -159,20 +272,31 @@ class Session(ABC):
     ) -> Optional[Response]:
         """Resolve a single request against the partitioned local cache.
 
-        Returns the cached :class:`Response` or ``None`` on miss.
-        Filtering by ``request_by`` columns and the configured
-        received-window happens inside
-        :meth:`LocalResponseCache.lookup`.
+        Routes through :func:`_lookup_local_responses` — one folder
+        read, partition-pruned by the request's own values, then
+        row-filtered by the ``request_by`` tuple and the configured
+        received-window.
         """
+        match_by = tuple(cache_cfg.request_by or ()) or ("request_url_str",)
         cache = cache_cfg.local_cache()
-        loaded = cache.lookup(request)
+        looked = _lookup_local_responses(
+            cache, [request],
+            match_by=match_by,
+            received_from=cache_cfg.received_from,
+            received_to=cache_cfg.received_to,
+        )
+        try:
+            key = tuple(request.match_value(c) for c in match_by)
+        except Exception:
+            return None
+        loaded = looked.get(key)
         if loaded is None:
             return None
         if not cache_cfg.filter_response(loaded, request=request):
             return None
         LOGGER.debug(
             "Found local %s %s in %s",
-            request.method, request.url, cache.folder_path,
+            request.method, request.url, cache.path,
         )
         return loaded
 
@@ -181,19 +305,20 @@ class Session(ABC):
         response: Response,
         cache_cfg: CacheConfig,
         *,
-        cache: "LocalResponseCache | None" = None,
+        cache: "FolderIO | None" = None,
     ) -> None:
         """Persist one response to the partitioned local cache.
 
         The response is anonymized first (matches the on-disk
-        identity used at lookup time) and the actual write is
-        fired off through the job pool — the partitioned folder
-        write does its own Arrow IPC append, so the caller's thread
-        only pays for the in-memory batch construction.
+        identity used at lookup time) and the actual write is fired
+        off through the job pool — :class:`FolderIO` resolves the
+        partition tuple from the batch's own columns and drops a
+        UUID-named leaf into the matching directory, so concurrent
+        fire-and-forget workers can't race on a final filename.
 
         ``cache`` lets a hot-loop caller reuse a single
-        :class:`LocalResponseCache` instance instead of paying for
-        the per-call construction (cheap but not free).
+        :class:`FolderIO` instance across many writes instead of
+        paying for the per-call construction (cheap but not free).
         """
         if not response.ok:
             return
@@ -341,7 +466,7 @@ class Session(ABC):
         # stale entry can sit on disk indefinitely without
         # affecting correctness; the fresh fetch below will append
         # a newer row that wins on the next read.
-        local_cache: "LocalResponseCache | None" = None
+        local_cache: "FolderIO | None" = None
         if effective_local_cfg.local_cache_enabled:
             local_cache = effective_local_cfg.local_cache()
             if effective_local_cfg.mode != Mode.UPSERT:
@@ -542,9 +667,20 @@ class Session(ABC):
 
         for pkey, (eff, group_reqs) in cfg_groups.items():
             cache = eff.local_cache()
-            looked_up = cache.lookup_many(group_reqs)
+            match_by = tuple(eff.request_by or ()) or ("request_url_str",)
+            looked_up = _lookup_local_responses(
+                cache, group_reqs,
+                match_by=match_by,
+                received_from=eff.received_from,
+                received_to=eff.received_to,
+            )
             for req in group_reqs:
-                cached = looked_up.get(cache._request_key(req))
+                try:
+                    key = tuple(req.match_value(c) for c in match_by)
+                except Exception:
+                    misses.append(req)
+                    continue
+                cached = looked_up.get(key)
                 if cached is None:
                     misses.append(req)
                     continue
@@ -857,12 +993,13 @@ class Session(ABC):
         session-level config for every response would be wrong
         whenever a request carries a custom per-request local
         cache. Responses are anonymized then grouped by the
-        effective cache root so each :class:`LocalResponseCache`
-        takes a single bulk store_many call instead of one
-        :meth:`store` per response — collapsing N small writes into
-        one partitioned-folder commit per root.
+        effective cache root so each :class:`FolderIO` takes a
+        single bulk write instead of one fire-and-forget per
+        response — collapsing N small writes into one
+        partition-routed write per root, with FolderIO's auto-prune
+        path handling the merge when the config is in UPSERT mode.
         """
-        groups: dict[str, tuple["LocalResponseCache", list[Response]]] = {}
+        groups: dict[str, tuple["FolderIO", "CacheConfig", list[Response]]] = {}
         for response in responses:
             url_key = str(response.request.url) if response.request else None
             eff = url_to_local_cfg.get(url_key) if url_key else None
@@ -874,12 +1011,24 @@ class Session(ABC):
             pkey = str(eff.local_cache_folder())
             slot = groups.get(pkey)
             if slot is None:
-                groups[pkey] = (eff.local_cache(), [anonymized])
+                groups[pkey] = (eff.local_cache(), eff, [anonymized])
             else:
-                slot[1].append(anonymized)
+                slot[2].append(anonymized)
 
-        for cache, group_responses in groups.values():
-            cache.store_many(group_responses)
+        for cache, eff, group_responses in groups.values():
+            ok_responses = [r for r in group_responses if r.ok]
+            if not ok_responses:
+                continue
+            table = pa.Table.from_batches([
+                r.to_arrow_batch(parse=False) for r in ok_responses
+            ])
+            mode = Mode.UPSERT if eff.mode == Mode.UPSERT else Mode.APPEND
+            options = FolderOptions(
+                mode=mode,
+                match_by_names=list(eff.request_by or ()) or None,
+            )
+            with cache:
+                cache.write_arrow_table(table, options=options)
 
     def _persist_remote(
         self,

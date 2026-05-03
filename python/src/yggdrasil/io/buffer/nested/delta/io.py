@@ -1,4 +1,4 @@
-"""DeltaIO: the :class:`PartitionedFolderIO` that ties Delta together.
+"""DeltaIO: the partition-capable :class:`FolderIO` that ties Delta together.
 
 Reads
 -----
@@ -12,7 +12,7 @@ Writes — OVERWRITE / APPEND
 ----------------------------
 
 Stage parquet children via the inherited
-:class:`PartitionedFolderIO` machinery (which routes by partition
+:class:`FolderIO` machinery (which routes by partition
 key when partitions are declared); commit one transaction with
 Adds for new files and Removes for previously-live files
 (OVERWRITE only). Failures during the parquet write are caught
@@ -92,12 +92,9 @@ from .deletion_vector import (
 )
 from .replay import ReplayResult, replay_log
 from ..folder_io import (
+    FolderIO,
     FolderOptions,
     _inject_partition_columns,
-)
-from ..partitioned_io import (
-    PartitionedFolderIO,
-    PartitionedOptions,
 )
 
 if TYPE_CHECKING:
@@ -111,7 +108,7 @@ __all__ = ["DeltaIO", "DeltaOptions"]
 # ---------------------------------------------------------------------------
 
 
-class DeltaOptions(PartitionedOptions):
+class DeltaOptions(FolderOptions):
     """Partitioned-folder options + Delta knobs.
 
     :param parquet_compression: child parquet compression. Default
@@ -140,7 +137,7 @@ class DeltaOptions(PartitionedOptions):
 # ---------------------------------------------------------------------------
 
 
-class DeltaIO(PartitionedFolderIO):
+class DeltaIO(FolderIO):
     """Delta Lake table as a partitioned folder.
 
     Construction:
@@ -222,7 +219,7 @@ class DeltaIO(PartitionedFolderIO):
 
     def _resolve_partition_columns(
         self,
-        options: "PartitionedOptions | None" = None,
+        options: "FolderOptions | None" = None,
     ) -> "tuple[Field, ...]":
         if options is not None and options.partition_columns is not None:
             return tuple(Field.from_any(c) for c in options.partition_columns)
