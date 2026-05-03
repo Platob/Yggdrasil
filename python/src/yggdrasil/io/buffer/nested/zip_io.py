@@ -30,6 +30,20 @@ walks children; ``next(zio)`` is rejected to avoid the inherited
 ``BytesIO`` line-iteration semantics quietly returning archive bytes
 instead of an entry.
 
+In-memory archives
+------------------
+
+:class:`ZipIO` supports two backings: a path-bound archive (the
+``.zip`` lives on disk and the bound file IS the archive), and an
+in-memory archive (no path; the parent's ``BytesIO`` buffer IS the
+archive bytes). The children surface works identically in both
+modes — iteration, ``make_child``, commit, and delete all go through
+:meth:`_open_archive_reader` and :meth:`_replace_archive_bytes`,
+which dispatch on whether ``self.path`` is bound. The path-bound
+case still uses zip-native append (``mode="a"``) on cheap commits;
+the in-memory case rewrites the buffer wholesale (zip's central
+directory sits at EOF, so an in-memory append is just a rewrite).
+
 Per-entry I/O — :class:`ZipEntryIO` IS-A :class:`BytesIO`
 ---------------------------------------------------------
 
@@ -215,19 +229,81 @@ class ZipIO(BytesIO):
         """Snapshot ``self._pos`` and restore it on exit.
 
         Children-surface operations (iteration, make_child, commit,
-        delete, clear) talk to the archive via :mod:`zipfile` against
-        ``self.path`` and never touch the parent's byte buffer — but
-        this guard codifies that contract explicitly so a caller mid-
-        stream over the archive bytes can interleave child access
-        without losing its read/write position. It also future-proofs
-        against refactors (e.g. an in-memory backend) that might
-        otherwise quietly mutate ``self._pos``.
+        delete, clear) need to leave the parent's byte cursor alone
+        regardless of whether the archive is path-bound or in-memory.
+        Path-bound ops talk to :mod:`zipfile` against ``self.path``
+        and never touch the buffer; in-memory ops snapshot/replace the
+        buffer wholesale and would otherwise reset ``_pos`` to 0.
+        Snapshot-and-restore makes both paths cursor-safe.
         """
         saved = self._pos
         try:
             yield
         finally:
-            self._pos = saved
+            # Re-clamp in case the archive shrank under us (in-memory
+            # rewrite to fewer bytes); a cursor past EOF is nonsense.
+            self._pos = min(saved, self._size)
+
+    # ------------------------------------------------------------------
+    # Archive backing — path or in-memory bytes, behind one interface
+    # ------------------------------------------------------------------
+
+    def _archive_is_present(self) -> bool:
+        """True iff this :class:`ZipIO` already has archive bytes.
+
+        Path-bound: the bound file exists. In-memory: the buffer is
+        non-empty. ``False`` for the "fresh handle, nothing written
+        yet" case in either mode — callers treat that as "open this
+        as a writable empty archive".
+        """
+        if self.path is not None:
+            return self.path.exists()
+        return self._size > 0
+
+    def _archive_bytes_snapshot(self) -> bytes:
+        """Return the in-memory archive's current bytes without
+        moving ``self._pos`` (only meaningful when ``self.path`` is
+        ``None``; ``to_bytes`` reads ``_buf``/spill directly)."""
+        return self.to_bytes()
+
+    @contextlib.contextmanager
+    def _open_archive_reader(self) -> "Iterator[zipfile.ZipFile]":
+        """Yield a ``zipfile.ZipFile`` reader over the current archive.
+
+        Path-bound: open the bound file. In-memory: feed the buffer's
+        bytes (snapshotted via :meth:`to_bytes`, no cursor side
+        effects) into a fresh ``_io.BytesIO`` and open that. Caller
+        is responsible for handling :class:`zipfile.BadZipFile` and
+        :class:`FileNotFoundError`.
+        """
+        if self.path is not None:
+            with zipfile.ZipFile(self.path.full_path(), mode="r") as zf:
+                yield zf
+            return
+        data = self._archive_bytes_snapshot()
+        if not data:
+            # Empty in-memory archive — surface the same "missing"
+            # signal as a non-existent path file.
+            raise FileNotFoundError("in-memory ZipIO is empty")
+        with zipfile.ZipFile(_io.BytesIO(data), mode="r") as zf:
+            yield zf
+
+    def _replace_archive_bytes(self, payload: bytes) -> None:
+        """Write *payload* as the archive's full backing bytes.
+
+        Path-bound: overwrite the bound file. In-memory: replace the
+        parent's buffer via :meth:`replace_with_payload`. Callers
+        must wrap this in :meth:`_preserve_cursor` to keep the byte
+        cursor stable across the swap.
+        """
+        if self.path is not None:
+            with open(self.path.full_path(), "wb") as fh:
+                fh.write(payload)
+            return
+        # In-memory: wholesale buffer swap. ``replace_with_payload``
+        # resets ``_pos`` to 0; the surrounding ``_preserve_cursor``
+        # restores the caller's position (clamped to the new size).
+        self.replace_with_payload(payload)
 
     # ==================================================================
     # Children — enumerate the archive's central directory
@@ -246,9 +322,11 @@ class ZipIO(BytesIO):
 
         The parent's byte cursor is preserved: names are listed under
         :meth:`_preserve_cursor`, so building or walking the iterator
-        never disturbs ``self._pos``.
+        never disturbs ``self._pos``. Works for both path-bound and
+        in-memory archives — ``_list_entry_names`` dispatches via
+        :meth:`_open_archive_reader`.
         """
-        if self.path is None or not self.path.exists():
+        if not self._archive_is_present():
             return
         with self._preserve_cursor():
             names = [
@@ -339,11 +417,11 @@ class ZipIO(BytesIO):
 
     def has_children(self) -> bool:
         """True iff the archive holds at least one non-ignored entry."""
-        if self.path is None or not self.path.exists():
+        if not self._archive_is_present():
             return False
         with self._preserve_cursor():
             try:
-                with zipfile.ZipFile(self.path.full_path(), mode="r") as zf:
+                with self._open_archive_reader() as zf:
                     for info in zf.infolist():
                         if not self._is_ignored_name(info.filename):
                             return True
@@ -364,14 +442,21 @@ class ZipIO(BytesIO):
         return name.startswith(".")
 
     def _clear_children(self) -> None:
-        """Reset the archive to empty by writing a fresh empty zip."""
-        if self.path is None or not self.path.exists():
+        """Reset the archive to empty by writing a fresh empty zip.
+
+        Works for both path-bound and in-memory archives: stages an
+        empty central directory and pushes the resulting bytes
+        through :meth:`_replace_archive_bytes`.
+        """
+        if not self._archive_is_present():
             return
         with self._preserve_cursor():
+            staged = _io.BytesIO()
             with zipfile.ZipFile(
-                self.path.full_path(), mode="w", compression=zipfile.ZIP_STORED
+                staged, mode="w", compression=zipfile.ZIP_STORED
             ):
                 pass
+            self._replace_archive_bytes(staged.getvalue())
 
     # ==================================================================
     # Mode resolution — folder-flavored, overrides BytesIO's byte view
@@ -548,21 +633,22 @@ class ZipIO(BytesIO):
             options.entry_name_template if options is not None else _ENTRY_NAME
         )
         max_idx = -1
-        if self.path is not None and self.path.exists():
-            try:
-                with zipfile.ZipFile(self.path.full_path(), mode="r") as zf:
-                    for n in zf.namelist():
-                        if not n.startswith(_ENTRY_PREFIX):
-                            continue
-                        stem = n[len(_ENTRY_PREFIX):].split(".", 1)[0]
-                        try:
-                            idx = int(stem)
-                        except ValueError:
-                            continue
-                        if idx > max_idx:
-                            max_idx = idx
-            except (zipfile.BadZipFile, FileNotFoundError):
-                pass
+        if self._archive_is_present():
+            with self._preserve_cursor():
+                try:
+                    with self._open_archive_reader() as zf:
+                        for n in zf.namelist():
+                            if not n.startswith(_ENTRY_PREFIX):
+                                continue
+                            stem = n[len(_ENTRY_PREFIX):].split(".", 1)[0]
+                            try:
+                                idx = int(stem)
+                            except ValueError:
+                                continue
+                            if idx > max_idx:
+                                max_idx = idx
+                except (zipfile.BadZipFile, FileNotFoundError):
+                    pass
         return template.format(max_idx + 1)
 
     # ==================================================================
@@ -598,21 +684,21 @@ class ZipIO(BytesIO):
     # ==================================================================
 
     def _list_entry_names(self) -> list[str]:
-        if self.path is None or not self.path.exists():
+        if not self._archive_is_present():
             return []
         with self._preserve_cursor():
             try:
-                with zipfile.ZipFile(self.path.full_path(), mode="r") as zf:
+                with self._open_archive_reader() as zf:
                     return list(zf.namelist())
             except (zipfile.BadZipFile, FileNotFoundError):
                 return []
 
     def _entry_info(self, name: str) -> "zipfile.ZipInfo | None":
-        if self.path is None or not self.path.exists():
+        if not self._archive_is_present():
             return None
         with self._preserve_cursor():
             try:
-                with zipfile.ZipFile(self.path.full_path(), mode="r") as zf:
+                with self._open_archive_reader() as zf:
                     try:
                         return zf.getinfo(name)
                     except KeyError:
@@ -625,11 +711,11 @@ class ZipIO(BytesIO):
 
     def _read_entry_bytes(self, name: str) -> bytes:
         """Return entry ``name``'s uncompressed payload, or empty bytes."""
-        if self.path is None or not self.path.exists():
+        if not self._archive_is_present():
             return b""
         with self._preserve_cursor():
             try:
-                with zipfile.ZipFile(self.path.full_path(), mode="r") as zf:
+                with self._open_archive_reader() as zf:
                     try:
                         return zf.read(name)
                     except KeyError:
@@ -652,25 +738,22 @@ class ZipIO(BytesIO):
         commit. Only this entry's section of the archive is rewritten;
         every other entry is preserved bit-for-bit.
 
-        * **Cheap append** — entry doesn't exist (or archive is
-          missing). Open the archive in ``"a"`` mode (or ``"w"`` if
-          missing) and append the entry to the central directory.
-          No rewrite.
-        * **Rewrite swap** — entry exists. Stream all other entries
-          through a fresh in-memory archive with ``payload``
-          substituted for ``name``, then atomically replace the
-          file. Required because zip's central directory sits at
-          EOF and per-entry sizes change on rewrite.
+        * **Cheap append (path-bound only)** — entry doesn't exist (or
+          archive is missing). Open the archive in ``"a"`` mode (or
+          ``"w"`` if missing) and append the entry to the central
+          directory. No rewrite.
+        * **Rewrite swap** — entry exists, or the archive is in
+          memory. Stream all other entries through a fresh in-memory
+          archive with ``payload`` substituted for (or appended to)
+          ``name``, then push the resulting bytes back via
+          :meth:`_replace_archive_bytes`. Required because zip's
+          central directory sits at EOF and per-entry sizes change
+          on rewrite — and because in-memory archives have no
+          equivalent of zip-native append.
 
         Per-entry ``compression`` / ``compresslevel`` overrides take
         precedence over the parent's :class:`ZipOptions` defaults.
         """
-        if self.path is None:
-            raise RuntimeError(
-                f"{type(self).__name__}._commit_entry_payload requires a "
-                "path-bound archive; got an in-memory ZipIO."
-            )
-
         opts = options if options is not None else ZipOptions()
         payload_bytes = bytes(payload)
         effective_compression = (
@@ -684,31 +767,43 @@ class ZipIO(BytesIO):
             zf_kwargs["compresslevel"] = effective_compresslevel
 
         with self._preserve_cursor():
-            if not self.path.exists() or not self._entry_exists(name):
-                mode = "a" if self.path.exists() else "w"
-                with zipfile.ZipFile(
-                    self.path.full_path(), mode=mode, **zf_kwargs
-                ) as zf:
-                    zf.writestr(name, payload_bytes)
-                return
+            # Cheap zip-native append: only available when the archive
+            # backing is a real file and the entry doesn't exist yet.
+            if self.path is not None:
+                archive_present = self.path.exists()
+                if not archive_present or not self._entry_exists(name):
+                    mode = "a" if archive_present else "w"
+                    with zipfile.ZipFile(
+                        self.path.full_path(), mode=mode, **zf_kwargs
+                    ) as zf:
+                        zf.writestr(name, payload_bytes)
+                    return
 
-            # Slow path: rewrite archive in place, swapping one entry.
-            # Stage to a fresh BytesIO, then write back to the path.
+            # Rewrite-swap path. Covers:
+            #   * path-bound + existing entry (full rewrite),
+            #   * in-memory + any state (append-as-rewrite or swap).
             staged = _io.BytesIO()
-            with zipfile.ZipFile(self.path.full_path(), mode="r") as src_zf:
-                with zipfile.ZipFile(staged, mode="w", **zf_kwargs) as dst_zf:
-                    for info in src_zf.infolist():
-                        if info.filename == name:
-                            continue
-                        dst_zf.writestr(info, src_zf.read(info.filename))
-                    dst_zf.writestr(name, payload_bytes)
+            with zipfile.ZipFile(staged, mode="w", **zf_kwargs) as dst_zf:
+                if self._archive_is_present():
+                    try:
+                        with self._open_archive_reader() as src_zf:
+                            for info in src_zf.infolist():
+                                if info.filename == name:
+                                    continue
+                                dst_zf.writestr(
+                                    info, src_zf.read(info.filename)
+                                )
+                    except (zipfile.BadZipFile, FileNotFoundError):
+                        # Treat unreadable backing as "fresh archive"
+                        # and let the new entry seed it.
+                        pass
+                dst_zf.writestr(name, payload_bytes)
 
-            with open(self.path.full_path(), "wb") as fh:
-                fh.write(staged.getvalue())
+            self._replace_archive_bytes(staged.getvalue())
 
     def _delete_entry(self, name: str) -> None:
         """Remove ``name`` from the archive. No-op if not present."""
-        if self.path is None or not self.path.exists() or not self._entry_exists(name):
+        if not self._archive_is_present() or not self._entry_exists(name):
             return
         opts = ZipOptions()
         zf_kwargs: dict[str, Any] = {"compression": opts.compression}
@@ -716,14 +811,13 @@ class ZipIO(BytesIO):
             zf_kwargs["compresslevel"] = opts.compresslevel
         with self._preserve_cursor():
             staged = _io.BytesIO()
-            with zipfile.ZipFile(self.path.full_path(), mode="r") as src_zf:
+            with self._open_archive_reader() as src_zf:
                 with zipfile.ZipFile(staged, mode="w", **zf_kwargs) as dst_zf:
                     for info in src_zf.infolist():
                         if info.filename == name:
                             continue
                         dst_zf.writestr(info, src_zf.read(info.filename))
-            with open(self.path.full_path(), "wb") as fh:
-                fh.write(staged.getvalue())
+            self._replace_archive_bytes(staged.getvalue())
 
     def _open_entry_io(self, name: str, *, auto_open: bool) -> "ZipEntryIO":
         existing = self._live_entries.get(name)
