@@ -7,7 +7,7 @@ import pathlib
 import types
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, is_dataclass
-from typing import TYPE_CHECKING, Any, Annotated, Optional, Union, get_args, get_origin, Iterator, Generator, AnyStr
+from typing import TYPE_CHECKING, Any, Annotated, ClassVar, Optional, Union, get_args, get_origin, Iterator, Generator, AnyStr
 
 import pyarrow as pa
 
@@ -80,12 +80,24 @@ def _attach_type_json_metadata(
 
 
 def _strip_internal_metadata(
-    metadata: dict[bytes, bytes] | None,
-) -> dict[bytes, bytes] | None:
+    metadata: dict[bytes, bytes] | dict[str, str] | None,
+) -> dict | None:
+    """Drop yggdrasil-internal metadata keys.
+
+    Currently only :data:`_TYPE_JSON_METADATA_KEY` (the dtype JSON
+    round-trip blob written into engine metadata for the lossy paths,
+    e.g. Spark Map/Array). Accepts both bytes-keyed (Arrow) and
+    string-keyed (Spark) metadata maps.
+    """
     if not metadata:
         return None
 
-    out = {key: value for key, value in metadata.items() if key != _TYPE_JSON_METADATA_KEY}
+    type_json_str = _TYPE_JSON_METADATA_KEY.decode("utf-8")
+    out = {
+        key: value
+        for key, value in metadata.items()
+        if key != _TYPE_JSON_METADATA_KEY and key != type_json_str
+    }
     return out or None
 
 
@@ -225,18 +237,76 @@ def field(
     )
 
 
-@dataclass(frozen=True, slots=True, init=False, repr=False)
+@dataclass(frozen=True, slots=True, init=False, repr=False, eq=False)
 class Field(BaseMetadata, BaseChildrenFields):
     name: str
     dtype: DataType
     nullable: bool = True
     metadata: dict[bytes, bytes] | None = None
+    # Back-pointer to the field this one is nested under (struct
+    # member, map key/value, list item, schema child). ``None`` for
+    # top-level fields. Used by the cache layer to bubble
+    # invalidations up the tree when a child mutates.
+    parent: "Field | None" = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
+    # Lazily-populated engine-flavoured projections. Populated on
+    # first access via :meth:`to_arrow_field` / :meth:`to_arrow_schema`
+    # / :meth:`to_polars_field` / :meth:`to_pyspark_field`; cleared by
+    # :meth:`_invalidate_cache` on any structural mutation (and by
+    # :attr:`parent` cascades).
+    _arrow_field: "pa.Field | None" = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
+    _arrow_schema: "pa.Schema | None" = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
+    _polars_field: Any = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
+    _polars_schema: Any = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
+    _spark_field: Any = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
+    _spark_schema: Any = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
+    # Cached ``{name: index}`` view of ``children_fields`` for O(1)
+    # lookup in :meth:`field_by`. Built on demand by
+    # :meth:`_ensure_field_name_map`; cleared whenever the dtype
+    # changes (which is the only way the children change).
+    _field_name_map: dict[str, int] | None = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
+    _field_name_fold_map: dict[str, int] | None = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
 
     def __repr__(self):
         return self.pretty_format()
 
     def __str__(self):
         return self.pretty_format()
+
+    def __eq__(self, other: Any) -> bool:
+        if other is self:
+            return True
+        if not isinstance(other, Field):
+            return NotImplemented
+        return (
+            self.name == other.name
+            and self.nullable == other.nullable
+            and self.dtype == other.dtype
+            and self.metadata == other.metadata
+        )
+
+    def __hash__(self) -> int:
+        meta_key = (
+            tuple(sorted(self.metadata.items())) if self.metadata else None
+        )
+        return hash((self.name, self.dtype, self.nullable, meta_key))
 
     @classmethod
     def make_default_field(
@@ -255,25 +325,67 @@ class Field(BaseMetadata, BaseChildrenFields):
             metadata=_normalize_metadata(metadata, tags=tags, default_value=default),
         )
 
+    # Tag-flag → short token shown in pretty_format. Order is the
+    # display order in the bracketed marker group; only flags whose
+    # ``_tag_flag`` is truthy appear, so the output stays scannable
+    # for fields with no special role.
+    _PRETTY_TAG_FLAGS: ClassVar[tuple[tuple[bytes, str], ...]] = (
+        (b"primary_key", "PK"),
+        (b"foreign_key", "FK"),
+        (b"constraint_key", "CK"),
+        (b"partition_by", "partition"),
+        (b"cluster_by", "cluster"),
+        (b"sorted", "sorted"),
+    )
+
+    def _pretty_markers(self) -> str:
+        """Bracketed marker group for :meth:`pretty_format`.
+
+        Surfaces the schema-shaping tags a reader most often cares
+        about (primary / foreign / constraint key, partition,
+        cluster, sorted) plus the default value if one is set.
+        Returns an empty string when nothing is set so the common
+        case stays uncluttered.
+        """
+        tokens: list[str] = [
+            label
+            for tag, label in self._PRETTY_TAG_FLAGS
+            if self._tag_flag(tag)
+        ]
+        if self.has_default:
+            try:
+                tokens.append(f"default={self.default!r}")
+            except Exception:
+                # Default decoding can fail for malformed metadata —
+                # don't let a bad default break repr.
+                tokens.append("default=<unparseable>")
+        return f" [{', '.join(tokens)}]" if tokens else ""
+
     def pretty_format(self, indent: int = 2, level: int = 0) -> str:
         """Pretty-print this field with the header on one line and the dtype below.
 
         Layout is uniform across flat and nested dtypes::
 
-            'name'[ not null][ {metadata}]
+            'name'[ not null][ [tags...]][ 'comment']
               <dtype block at level + 1>
 
         ``indent`` is the per-level step in spaces; ``level`` is the
         current depth. The header carries the name, the ``not null``
-        marker, and the metadata repr; the dtype renders on the next
-        line(s) at ``level + 1`` so its body always sits one step in
-        from the field name.
+        marker, the bracketed marker group (primary / foreign /
+        constraint key, partition / cluster / sorted, default value),
+        and the comment; the dtype renders on the next line(s) at
+        ``level + 1`` so its body always sits one step in from the
+        field name.
 
         Examples::
 
-            >>> print(field("id", "int64", nullable=False).pretty_format())
-            'id' not null
-              int64
+            >>> print(field("id", "int64", nullable=False,
+            ...             tags={"primary_key": True}).pretty_format())
+            'id' int64 not null [PK]
+
+            >>> print(field("date", "date32",
+            ...             tags={"partition_by": True}).pretty_format())
+            'date' date32 [partition]
 
             >>> print(field("user", StructType.from_fields([
             ...     field("id", "int64"),
@@ -293,6 +405,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         suffix = ""
         if not self.nullable:
             suffix += " not null"
+
+        suffix += self._pretty_markers()
 
         comment = self.comment
         if comment:
@@ -317,11 +431,78 @@ class Field(BaseMetadata, BaseChildrenFields):
         metadata: dict[bytes | str, bytes | str | object] | None = None,
         tags: dict[bytes | str, bytes | str | object] | None = None,
         default: Any = None,
+        parent: "Field | None" = None,
     ) -> None:
+        resolved_dtype = DataType.from_any(dtype)
         object.__setattr__(self, "name", name)
-        object.__setattr__(self, "dtype", DataType.from_any(dtype))
+        object.__setattr__(self, "dtype", resolved_dtype)
         object.__setattr__(self, "nullable", bool(nullable))
         object.__setattr__(self, "metadata", _normalize_metadata(metadata, tags=tags, default_value=default))
+        object.__setattr__(self, "parent", parent)
+        # Initialize cache slots so the dataclass is fully populated
+        # — accessing an unset slot would raise AttributeError.
+        object.__setattr__(self, "_arrow_field", None)
+        object.__setattr__(self, "_arrow_schema", None)
+        object.__setattr__(self, "_polars_field", None)
+        object.__setattr__(self, "_polars_schema", None)
+        object.__setattr__(self, "_spark_field", None)
+        object.__setattr__(self, "_spark_schema", None)
+        object.__setattr__(self, "_field_name_map", None)
+        object.__setattr__(self, "_field_name_fold_map", None)
+        # Adopt children — set their ``parent`` so they bubble cache
+        # invalidations back up to us when they mutate.
+        self._adopt_children()
+
+    # ==================================================================
+    # Cache layer — invalidation + child adoption
+    # ==================================================================
+
+    def _on_metadata_mutated(self) -> None:
+        """Tag flag setter / unsetter touched ``self.metadata`` —
+        invalidate cached projections (arrow / polars / spark) so the
+        next request rebuilds with the new tags."""
+        self._invalidate_cache()
+
+    def _adopt_children(self) -> None:
+        """Stamp ``self`` as the parent of every child :class:`Field`.
+
+        Walks ``self.dtype.children_fields`` (the dtype-level view of
+        children — works for struct, map, and array). Idempotent:
+        calling it on a field whose children already point at ``self``
+        is a no-op assignment.
+        """
+        for child in self.dtype.children_fields:
+            if isinstance(child, Field) and child.parent is not self:
+                object.__setattr__(child, "parent", self)
+
+    def _invalidate_cache(self, *, cascade: bool = True) -> None:
+        """Drop cached arrow / polars / spark projections.
+
+        Called from every mutator (``with_*``, in-place
+        :meth:`merge_with`) right after the underlying state changes.
+        With ``cascade=True`` (the default), the invalidation walks
+        up the :attr:`parent` chain so an ancestor whose cached arrow
+        schema embedded this field gets rebuilt next time it's
+        requested.
+        """
+        if self._arrow_field is None and self._arrow_schema is None and \
+                self._polars_field is None and self._polars_schema is None and \
+                self._spark_field is None and self._spark_schema is None and \
+                self._field_name_map is None and self._field_name_fold_map is None:
+            # Already clean — still cascade so dirty ancestors clear too.
+            if cascade and self.parent is not None:
+                self.parent._invalidate_cache(cascade=True)
+            return
+        object.__setattr__(self, "_arrow_field", None)
+        object.__setattr__(self, "_arrow_schema", None)
+        object.__setattr__(self, "_polars_field", None)
+        object.__setattr__(self, "_polars_schema", None)
+        object.__setattr__(self, "_spark_field", None)
+        object.__setattr__(self, "_spark_schema", None)
+        object.__setattr__(self, "_field_name_map", None)
+        object.__setattr__(self, "_field_name_fold_map", None)
+        if cascade and self.parent is not None:
+            self.parent._invalidate_cache(cascade=True)
 
     def equals(
         self,
@@ -470,6 +651,7 @@ class Field(BaseMetadata, BaseChildrenFields):
 
         if inplace:
             object.__setattr__(self, "name", name)
+            self._invalidate_cache()
             return self
         return self.copy(name=name)
 
@@ -485,6 +667,8 @@ class Field(BaseMetadata, BaseChildrenFields):
 
         if inplace:
             object.__setattr__(self, "dtype", dtype)
+            self._invalidate_cache()
+            self._adopt_children()
             return self
         return self.copy(dtype=dtype)
 
@@ -494,6 +678,7 @@ class Field(BaseMetadata, BaseChildrenFields):
 
         if inplace:
             object.__setattr__(self, "nullable", bool(nullable))
+            self._invalidate_cache()
             return self
         return self.copy(nullable=bool(nullable))
 
@@ -512,6 +697,7 @@ class Field(BaseMetadata, BaseChildrenFields):
             )
             if inplace:
                 object.__setattr__(self, "metadata", normalized)
+                self._invalidate_cache()
                 return self
             return self.copy(metadata=normalized)
         return self
@@ -531,6 +717,7 @@ class Field(BaseMetadata, BaseChildrenFields):
             )
 
         object.__setattr__(self, "metadata", metadata or None)
+        self._invalidate_cache()
         return self
 
     def copy(
@@ -1318,12 +1505,19 @@ class Field(BaseMetadata, BaseChildrenFields):
 
     @classmethod
     def from_spark_field(cls, value: "pst.StructField", from_metadata: bool = True) -> "Field":
+        # Spark stores metadata as ``dict[str, Any]`` (a Java
+        # ``Metadata`` view). The ``type_json`` round-trip blob — only
+        # written for Map/Array dtypes by :meth:`to_pyspark_field` —
+        # therefore lives under the str key, not the bytes one.
+        type_json_key_str = _TYPE_JSON_METADATA_KEY.decode("utf-8")
         if from_metadata and value.metadata:
-            dtype = value.metadata.get(_TYPE_JSON_METADATA_KEY, None)
-            if dtype is None:
+            dtype_json = value.metadata.get(type_json_key_str, None)
+            if dtype_json is None:
+                dtype_json = value.metadata.get(_TYPE_JSON_METADATA_KEY, None)
+            if dtype_json is None:
                 dtype = DataType.from_spark(value.dataType)
             else:
-                dtype = cls.from_json(dtype)
+                dtype = DataType.from_json(dtype_json)
         else:
             dtype = DataType.from_spark(value.dataType)
 
@@ -1331,19 +1525,27 @@ class Field(BaseMetadata, BaseChildrenFields):
             name=value.name,
             dtype=dtype,
             nullable=value.nullable,
-            metadata=_normalize_metadata(value.metadata, tags=None),
+            metadata=_strip_internal_metadata(_normalize_metadata(value.metadata, tags=None)),
         )
 
     # ==================================================================
     # Exporters — dict / JSON / arrow / polars / spark / databricks DDL
     # ==================================================================
 
-    def to_dict(self) -> dict[str, Any]:
-        dtype = self.dtype.to_dict()
+    def to_dict(self, dump_parent: bool = False) -> dict[str, Any]:
+        """Serialize this field to a JSON-friendly dict.
 
+        ``dump_parent`` (default ``False``) controls whether
+        :attr:`parent` — the structural back-pointer to the field
+        this one is nested under — is included. Children are still
+        emitted via the dtype's ``to_dict`` (a struct field's
+        ``dtype`` carries its members), so dropping ``parent``
+        prevents the recursion that would otherwise echo the whole
+        ancestor chain into every nested field's payload.
+        """
         out = dict(
             name=self.name,
-            dtype=dtype,
+            dtype=self.dtype.to_dict(),
             nullable=self.nullable,
         )
 
@@ -1353,10 +1555,13 @@ class Field(BaseMetadata, BaseChildrenFields):
                 for k, v in self.metadata.items()
             }
 
+        if dump_parent and self.parent is not None:
+            out["parent"] = self.parent.to_dict(dump_parent=False)
+
         return out
 
-    def to_json(self, to_bytes: bool = False) -> AnyStr:
-        payload = self.to_dict()
+    def to_json(self, to_bytes: bool = False, dump_parent: bool = False) -> AnyStr:
+        payload = self.to_dict(dump_parent=dump_parent)
 
         return json_module.dumps(
             payload,
@@ -1372,20 +1577,71 @@ class Field(BaseMetadata, BaseChildrenFields):
     def to_arrow_type(self):
         return self.arrow_type
 
-    def to_arrow_field(self, dump_json: bool = True) -> pa.Field:
-        metadata = self.metadata.copy() if self.metadata else {}
+    def to_arrow_field(self, dump_json: bool = False) -> pa.Field:
+        """Project to a :class:`pa.Field`.
 
+        Arrow preserves nested-type structure (struct, list, map)
+        with per-field metadata recursively, so the dtype intent
+        round-trips natively without us stuffing a ``type_json`` blob
+        into the metadata. Only callers that need the exact
+        :class:`DataType` subclass back (e.g. Decimal precision /
+        Timestamp tz / extension types) should pass
+        ``dump_json=True``.
+
+        ``dump_json`` defaults to ``False``; the cached path is the
+        canonical (no-blob) shape, which is what every internal caller
+        wants now that :meth:`from_arrow_field` falls back through
+        :meth:`DataType.from_arrow_type` when the blob is missing.
+        """
+        if not dump_json and self._arrow_field is not None:
+            return self._arrow_field
+
+        metadata = self.metadata.copy() if self.metadata else {}
         if dump_json:
             metadata[_TYPE_JSON_METADATA_KEY] = self.dtype.to_json(to_bytes=True)
 
-        return pa.field(
+        built = pa.field(
             name=self.name,
             type=self.arrow_type,
             nullable=self.nullable,
-            metadata=metadata,
+            metadata=metadata or None,
         )
+        if not dump_json:
+            object.__setattr__(self, "_arrow_field", built)
+        return built
+
+    def to_arrow_schema(self) -> pa.Schema:
+        """Project this field as a top-level :class:`pa.Schema`.
+
+        Struct-shaped fields (including :class:`~yggdrasil.data.Schema`)
+        unfold their children into the schema's columns; non-struct
+        fields produce a single-column schema with ``self`` as that
+        column. The schema-level metadata mirrors ``self.metadata``,
+        plus the field's name / nullable flag re-embedded as
+        ``b"name"`` / ``b"nullable"`` so :meth:`Field.from_arrow_schema`
+        can recover them (``pa.Schema`` has no native slot for either).
+        """
+        if self._arrow_schema is not None:
+            return self._arrow_schema
+
+        if self.type_id is DataTypeId.STRUCT:
+            arrow_fields = [child.to_arrow_field() for child in self.children_fields]
+        else:
+            arrow_fields = [self.to_arrow_field()]
+
+        meta = dict(self.metadata) if self.metadata else {}
+        if self.name and self.name != DEFAULT_FIELD_NAME:
+            meta.setdefault(b"name", self.name.encode("utf-8"))
+        if self.nullable:
+            meta.setdefault(b"nullable", b"true")
+        built = pa.schema(arrow_fields, metadata=meta or None)
+        object.__setattr__(self, "_arrow_schema", built)
+        return built
 
     def to_polars_field(self) -> "polars.Field":
+        if self._polars_field is not None:
+            return self._polars_field
+
         pl = get_polars()
         built = pl.Field(self.name, self.dtype.to_polars())
         try:
@@ -1396,6 +1652,25 @@ class Field(BaseMetadata, BaseChildrenFields):
             built.metadata = self.metadata
         except AttributeError:
             pass
+        object.__setattr__(self, "_polars_field", built)
+        return built
+
+    def to_polars_schema(self) -> "polars.Schema":
+        """Project this field as a :class:`polars.Schema`.
+
+        Struct-shaped fields unfold into the schema's columns;
+        non-struct fields produce a single-column schema.
+        """
+        if self._polars_schema is not None:
+            return self._polars_schema
+
+        pl = get_polars()
+        if self.type_id is DataTypeId.STRUCT:
+            entries = [(c.name, c.dtype.to_polars()) for c in self.children_fields]
+        else:
+            entries = [(self.name, self.dtype.to_polars())]
+        built = pl.Schema(entries)
+        object.__setattr__(self, "_polars_schema", built)
         return built
 
     def to_polars_flavor(self) -> "polars.Field":
@@ -1403,6 +1678,19 @@ class Field(BaseMetadata, BaseChildrenFields):
         return self.to_polars_field()
 
     def to_pyspark_field(self) -> "pst.StructField":
+        """Project to a Spark :class:`StructField`.
+
+        Spark's :class:`StructType` preserves struct children with
+        their own metadata, so primitive and struct dtypes don't
+        need a ``type_json`` round-trip blob. Spark's :class:`MapType`
+        / :class:`ArrayType` only carry the element / key+value Spark
+        types and lose any field-level metadata on the way through, so
+        we dump the dtype JSON for those (and only those) to recover
+        the original yggdrasil dtype on read.
+        """
+        if self._spark_field is not None:
+            return self._spark_field
+
         import pyspark.sql as pyspark_sql
 
         metadata = (
@@ -1421,12 +1709,50 @@ class Field(BaseMetadata, BaseChildrenFields):
             if self.metadata
             else {}
         )
-        return pyspark_sql.types.StructField(
+        if self._needs_spark_type_json():
+            metadata[_TYPE_JSON_METADATA_KEY.decode("utf-8")] = (
+                self.dtype.to_json(to_bytes=False)
+            )
+        built = pyspark_sql.types.StructField(
             self.name,
             self.dtype.to_spark(),
             self.nullable,
             metadata=metadata,
         )
+        object.__setattr__(self, "_spark_field", built)
+        return built
+
+    def _needs_spark_type_json(self) -> bool:
+        """True iff this field's dtype loses fidelity through Spark.
+
+        Spark's :class:`MapType` / :class:`ArrayType` carry only the
+        element Spark types — no per-field metadata — so a yggdrasil
+        dtype that lives below them (key/value/item field) only
+        round-trips if we dump the parent dtype as JSON. Struct,
+        primitives, and scalars are preserved natively by
+        :class:`StructField`'s recursive metadata, so the dump is
+        skipped there.
+        """
+        return self.type_id in (DataTypeId.MAP, DataTypeId.ARRAY)
+
+    def to_spark_schema(self) -> "pst.StructType":
+        """Project this field as a top-level Spark :class:`StructType`.
+
+        Struct-shaped fields unfold their children into the
+        StructType's fields; non-struct fields produce a single-field
+        StructType.
+        """
+        if self._spark_schema is not None:
+            return self._spark_schema
+
+        pyspark_sql = get_spark_sql()
+        if self.type_id is DataTypeId.STRUCT:
+            fields = [c.to_pyspark_field() for c in self.children_fields]
+        else:
+            fields = [self.to_pyspark_field()]
+        built = pyspark_sql.types.StructType(fields)
+        object.__setattr__(self, "_spark_schema", built)
+        return built
 
     def to_spark_flavor(self) -> "pst.StructField":
         """Spark-native counterpart for this field — a ``StructField``."""
@@ -1445,9 +1771,12 @@ class Field(BaseMetadata, BaseChildrenFields):
         if new_metadata:
             final_metadata.update(new_metadata)
 
-        if base.name != DEFAULT_FIELD_NAME:
-            final_metadata[b"name"] = base.name.encode("utf-8")
-        return Schema.from_any_fields(base.children_fields, metadata=final_metadata)
+        return Schema(
+            inner_fields=base.children_fields,
+            metadata=final_metadata or None,
+            name=base.name if base.name != DEFAULT_FIELD_NAME else None,
+            nullable=base.nullable,
+        )
 
     def to_struct(self):
         dtype = self.dtype.to_struct(name=self.name)

@@ -380,8 +380,11 @@ class TestAdd:
 
         assert list(out.keys()) == ["a", "b", "c"]
         assert out["b"].nullable is False
+        # ``name`` is a Field attribute on Schema now (no longer
+        # carried in metadata); RHS still wins on conflict, mirroring
+        # the dict-union semantics for the metadata side.
+        assert out.name == "right_name"
         assert out.metadata is not None
-        assert out.metadata[b"name"] == b"right_name"
         assert out.metadata[b"comment"] == b"left"
         assert out.metadata[b"description"] == b"right_desc"
 
@@ -405,7 +408,9 @@ class TestAdd:
         assert list(s1.keys()) == ["a", "b"]
         assert s1.metadata is not None
         assert s1.metadata[b"comment"] == b"left"
-        assert s1.metadata[b"name"] == b"right"
+        # ``name`` is no longer carried in metadata; ``s2``'s name
+        # propagates onto the schema itself.
+        assert s1.name == "right"
 
 
 class TestSub:
@@ -448,7 +453,8 @@ class TestAnd:
         assert list(out.keys()) == ["a", "c"]
         assert out.metadata is not None
         assert out.metadata[b"comment"] == b"left"
-        assert out.metadata[b"name"] == b"right"
+        # ``name`` is a Field attribute on Schema; RHS wins on conflict.
+        assert out.name == "right"
 
     def test_iand_mutates_to_intersection(self) -> None:
         s1 = schema(
@@ -465,7 +471,7 @@ class TestAnd:
         assert list(s1.keys()) == ["a", "c"]
         assert s1.metadata is not None
         assert s1.metadata[b"comment"] == b"left"
-        assert s1.metadata[b"name"] == b"right"
+        assert s1.name == "right"
 
 
 class TestOr:
@@ -478,13 +484,13 @@ class TestOr:
         assert list(out.keys()) == ["a", "b"]
         assert out.metadata is not None
         assert out.metadata[b"comment"] == b"left"
-        assert out.metadata[b"name"] == b"right"
+        assert out.name == "right"
 
         s1 |= s2
         assert list(s1.keys()) == ["a", "b"]
         assert s1.metadata is not None
         assert s1.metadata[b"comment"] == b"left"
-        assert s1.metadata[b"name"] == b"right"
+        assert s1.name == "right"
 
 
 # ---------------------------------------------------------------------------
@@ -500,11 +506,10 @@ class TestAutotag:
         out = s.autotag(tags={"semantic_type": "fact"})
 
         assert list(out.keys()) == ["a"]
-        # Metadata is either replaced or kept-by-identity (autotag is
-        # allowed to short-circuit when nothing changes); both are
-        # acceptable signals that the call ran.
         assert out.metadata is not None
-        assert out.metadata != s.metadata or out.metadata is s.metadata
+        # The semantic_type tag landed on the returned schema's
+        # metadata under the standard ``t:`` tag prefix.
+        assert out.metadata.get(b"t:semantic_type") == b"fact"
 
     def test_propagates_dtype_and_field_tags(self) -> None:
         s = schema(
@@ -560,9 +565,13 @@ class TestAutotag:
         assert (out["trade_date"].tags or {})[b"partition_by"] == b"true"
         assert (out["book_id"].tags or {})[b"cluster_by"] == b"true"
 
-        assert out.metadata is not None
-        assert b"partition_by" not in out.metadata
-        assert b"cluster_by" not in out.metadata
+        # ``partition_by`` / ``cluster_by`` were consumed off the
+        # schema's metadata into per-field tags; the only legal
+        # remaining states are "metadata is None" (everything was
+        # consumed) or "neither key is left in the dict".
+        leftover = out.metadata or {}
+        assert b"partition_by" not in leftover
+        assert b"cluster_by" not in leftover
 
 
 # ---------------------------------------------------------------------------

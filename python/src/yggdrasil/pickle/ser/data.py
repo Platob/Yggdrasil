@@ -81,11 +81,13 @@ class DataSerialized(Serialized[object]):
         from yggdrasil.data.data_field import Field
         from yggdrasil.data.schema import Schema
 
-        if isinstance(obj, Field):
-            return FieldSerialized.from_value(obj, metadata=metadata, codec=codec)
-
+        # Schema IS-A Field — keep the more specific check first so
+        # the schema dispatcher fires instead of the generic field one.
         if isinstance(obj, Schema):
             return SchemaSerialized.from_value(obj, metadata=metadata, codec=codec)
+
+        if isinstance(obj, Field):
+            return FieldSerialized.from_value(obj, metadata=metadata, codec=codec)
 
         return None
 
