@@ -370,7 +370,7 @@ class CacheConfig(_ConfigBase):
         return f"'{value.replace(chr(39), chr(39) * 2)}'"
 
     def local_cache_folder(self) -> Path:
-        """Cache root path — defaults to ``~/.yggdrasil/io/session``.
+        """Cache root path — defaults to ``~/.yggdrasil/cache/response``.
 
         Auto-fills ``self.path`` on first access when unset, so the
         returned path is always a real on-disk root the moment any
@@ -378,15 +378,15 @@ class CacheConfig(_ConfigBase):
         per-config (see :class:`yggdrasil.io.response_batch.ResponseBatch`).
         """
         if self.path is None:
-            object.__setattr__(self, "path", Path.home() / ".yggdrasil" / "io" / "session")
+            object.__setattr__(self, "path", Path.home() / ".yggdrasil" / "cache" / "response")
         return self.path
 
     def local_cache(self) -> "FolderIO":
         """Build a :class:`FolderIO` over the local response cache.
 
-        Returns a schema-tagged partitioned folder rooted at
-        ``<path>/cache``. The schema is :data:`RESPONSE_SCHEMA` with
-        ``partition_by=True`` set on ``request_method`` and
+        Returns a schema-tagged partitioned folder rooted directly at
+        :meth:`local_cache_folder`. The schema is :data:`RESPONSE_SCHEMA`
+        with ``partition_by=True`` set on ``request_method`` and
         ``request_url_host`` — :class:`FolderIO` derives the
         partition layout from those tags and persists the schema to
         ``<root>/.schema`` on first write so subsequent readers
@@ -400,7 +400,7 @@ class CacheConfig(_ConfigBase):
         from yggdrasil.io.fs import LocalPath
 
         return FolderIO(
-            path=LocalPath(self.local_cache_folder() / "cache"),
+            path=LocalPath(self.local_cache_folder()),
             schema=_local_cache_schema(),
         )
 
