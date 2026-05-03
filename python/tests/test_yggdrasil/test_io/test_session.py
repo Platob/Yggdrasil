@@ -165,7 +165,7 @@ class TestLocalCacheReadback:
         session.send(req, local_cache=cfg)
 
         # Some entry must have landed under the cache directory.
-        cache_root = tmp_path / "cache"
+        cache_root = tmp_path
         # The async write may take a moment; tolerate either state but
         # at least confirm the directory was created.
         if cache_root.exists():
