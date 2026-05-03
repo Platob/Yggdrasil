@@ -65,8 +65,18 @@ _SEND_MANY_CONFIG_FIELDS: frozenset[str] = _SEND_CONFIG_FIELDS | frozenset(
         "batch_size",
         "ordered",
         "max_in_flight",
+        "max_batch_size",
+        "max_batch_ttl",
     }
 )
+
+
+# Default cap on how long the batcher will wait for an upstream
+# request iterator to fill a chunk before flushing what it has
+# (seconds). Bounds tail latency when requests are produced by a
+# slow generator (paginated API, streaming SQL, etc.) without
+# forcing the caller to think about a TTL up front.
+DEFAULT_MAX_BATCH_TTL: float = 300.0
 
 
 def _validate_request_by(arg: list[str] | tuple[str, ...] | None = None) -> list[str]:
@@ -692,6 +702,7 @@ class SendManyConfig(_ConfigBase):
     ordered: bool = False
     max_in_flight: int | None = None
     max_batch_size: int | None = None
+    max_batch_ttl: float | None = DEFAULT_MAX_BATCH_TTL
 
     def __post_init__(self):
         object.__setattr__(self, "wait", WaitingConfig.from_(self.wait))
@@ -709,6 +720,8 @@ class SendManyConfig(_ConfigBase):
             "batch_size": self.batch_size,
             "ordered": self.ordered,
             "max_in_flight": self.max_in_flight,
+            "max_batch_size": self.max_batch_size,
+            "max_batch_ttl": self.max_batch_ttl,
             "spark_session": None,
         }
 
@@ -722,6 +735,10 @@ class SendManyConfig(_ConfigBase):
         object.__setattr__(self, "batch_size", state["batch_size"])
         object.__setattr__(self, "ordered", state["ordered"])
         object.__setattr__(self, "max_in_flight", state["max_in_flight"])
+        object.__setattr__(self, "max_batch_size", state.get("max_batch_size"))
+        object.__setattr__(
+            self, "max_batch_ttl", state.get("max_batch_ttl", DEFAULT_MAX_BATCH_TTL),
+        )
         object.__setattr__(self, "spark_session", state["spark_session"])
 
     @classmethod

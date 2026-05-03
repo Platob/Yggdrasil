@@ -383,6 +383,64 @@ class TestHttpSessionSendManyLocalCache:
             "second-pass send_many_batches should not touch upstream"
         )
 
+    def test_send_many_batches_max_batch_ttl_flushes_slow_iterator(
+        self, http_server: _Server, tmp_path
+    ):
+        """Slow upstream iterator + short TTL should split into multiple batches.
+
+        The size cap is set well above the request count, so the only
+        thing that can close a chunk is the wall-clock TTL. Each
+        request waits 60 ms before being yielded; a 100 ms TTL flushes
+        roughly every other request.
+        """
+        import time
+
+        from yggdrasil.io.session import ResponseBatch
+
+        pytest.importorskip("xxhash")
+        cache = self._cache(tmp_path)
+        urls = [
+            f"{http_server.base_url}/many-ttl/{i}" for i in range(4)
+        ]
+
+        def _slow_requests():
+            for url in urls:
+                time.sleep(0.06)
+                yield PreparedRequest.prepare(method="GET", url=url)
+
+        with HTTPSession(verify=False) as session:
+            batches = list(
+                session.send_many_batches(
+                    _slow_requests(),
+                    local_cache=cache,
+                    batch_size=100,
+                    max_batch_ttl=0.1,
+                )
+            )
+
+        assert all(isinstance(b, ResponseBatch) for b in batches)
+        total = sum(b.counts.get("new", 0) for b in batches)
+        assert total == len(urls)
+        # TTL should fire at least once mid-iteration, splitting the
+        # work across ≥ 2 chunks. Without the TTL, all 4 requests
+        # would land in a single chunk.
+        assert len(batches) >= 2
+
+    def test_send_many_batches_max_batch_ttl_none_disables_split(
+        self, http_server: _Server, tmp_path
+    ):
+        """``max_batch_ttl=None`` keeps the legacy size-only batching."""
+        pytest.importorskip("xxhash")
+        cache = self._cache(tmp_path)
+        reqs = self._build_requests(http_server.base_url, 3)
+        with HTTPSession(verify=False) as session:
+            batches = list(
+                session.send_many_batches(
+                    iter(reqs), local_cache=cache, max_batch_ttl=None,
+                )
+            )
+        assert len(batches) == 1
+
 
 # ---------------------------------------------------------------------------
 # HTTPSession.send_many with Spark

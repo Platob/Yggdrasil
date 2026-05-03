@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 import logging
 import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional
@@ -548,6 +549,7 @@ class Session(ABC):
         batch_size: int | None = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
+        max_batch_ttl: float | None = None,
         spark_session: Optional["SparkSession"] = None,
         **options,
     ) -> Iterator[Response]:
@@ -561,6 +563,13 @@ class Session(ABC):
         :class:`SparkDataFrame` (or the per-bucket origin breakdown)
         should consume :meth:`send_many_batches` and call
         ``ResponseBatch.to_dataframe()`` themselves.
+
+        ``max_batch_ttl`` (default :data:`DEFAULT_MAX_BATCH_TTL`,
+        300 s) caps how long the batcher will wait for ``requests`` to
+        produce a full chunk before flushing what it has — bounds tail
+        latency when the upstream iterator is slow. ``None`` disables
+        the time cap; the batch only closes when ``batch_size`` is
+        reached or the iterator is exhausted.
         """
         cfg = SendManyConfig.check_arg(
             config,
@@ -573,6 +582,7 @@ class Session(ABC):
             batch_size=batch_size,
             ordered=ordered,
             max_in_flight=max_in_flight,
+            max_batch_ttl=max_batch_ttl,
             spark_session=spark_session,
             **options,
         )
@@ -1122,6 +1132,7 @@ class Session(ABC):
         batch_size: int | None = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
+        max_batch_ttl: float | None = None,
         spark_session: Optional["SparkSession"] = None,
         **options,
     ) -> Iterator[ResponseBatch]:
@@ -1132,6 +1143,12 @@ class Session(ABC):
         downstream consumers can stream partial results uniformly. Each
         yielded batch carries schema-bearing holders even when a stage
         produced no rows — the schema is preserved for empty results.
+
+        ``max_batch_ttl`` (default :data:`DEFAULT_MAX_BATCH_TTL`,
+        300 s) caps how long the batcher waits for ``requests`` to
+        fill one chunk before flushing what's accumulated — keeps
+        downstream stages moving when the upstream iterator is slow.
+        ``None`` disables the time cap.
         """
         cfg = SendManyConfig.check_arg(
             config,
@@ -1144,6 +1161,7 @@ class Session(ABC):
             batch_size=batch_size,
             ordered=ordered,
             max_in_flight=max_in_flight,
+            max_batch_ttl=max_batch_ttl,
             spark_session=spark_session,
             **options,
         )
@@ -1192,17 +1210,44 @@ class Session(ABC):
                 config.max_batch_size or 1024, pool.max_workers * 100
             )
 
-        def _batched(
-            it: Iterator[PreparedRequest], n: int,
-        ) -> Iterator[list[PreparedRequest]]:
-            iterator = iter(it)
-            while True:
-                b = list(itertools.islice(iterator, n))
-                if not b:
-                    break
-                yield b
+        ttl = config.max_batch_ttl
 
-        chunks = _batched(requests, batch_size)
+        def _batched(
+            it: Iterator[PreparedRequest],
+            n: int,
+            ttl_seconds: float | None,
+        ) -> Iterator[list[PreparedRequest]]:
+            # When no TTL is set, fall back to the cheap islice path —
+            # avoids the per-request monotonic() probe.
+            iterator = iter(it)
+            if ttl_seconds is None or ttl_seconds <= 0:
+                while True:
+                    b = list(itertools.islice(iterator, n))
+                    if not b:
+                        break
+                    yield b
+                return
+
+            # Time-bounded path: pull one item at a time and flush
+            # when either the size cap or the wall-clock deadline is
+            # reached. The deadline is reset per chunk so a slow
+            # upstream gets a fresh window after each flush.
+            buf: list[PreparedRequest] = []
+            deadline: float | None = None
+            for item in iterator:
+                if not buf:
+                    deadline = time.monotonic() + ttl_seconds
+                buf.append(item)
+                if len(buf) >= n or (
+                    deadline is not None and time.monotonic() >= deadline
+                ):
+                    yield buf
+                    buf = []
+                    deadline = None
+            if buf:
+                yield buf
+
+        chunks = _batched(requests, batch_size, ttl)
 
         for chunk in chunks:
             if not chunk:
