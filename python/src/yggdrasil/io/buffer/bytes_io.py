@@ -110,6 +110,7 @@ import pyarrow as pa
 
 import yggdrasil.pickle.json as json_module
 from yggdrasil.data.options import CastOptions
+from yggdrasil.disposable import Disposable
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.enums import Codec, MediaType, MimeType, MimeTypes, Mode, ZSTD
 from yggdrasil.io.path_stat import PathStats, PathKind
@@ -412,6 +413,17 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         self._spill_bytes: int = int(spill_bytes)
         self._spill_ttl: int = int(spill_ttl)
         self._metadata = metadata or {}
+        # View state — populated by :meth:`_make_view` only. When
+        # ``parent`` is set AND no own backing is bound (no ``_buf``,
+        # no ``_spill_path``, no ``_transaction_buffer``), this BytesIO
+        # is a window over the parent: reads/writes route through
+        # ``parent.pread`` / ``parent.pwrite`` at ``_view_offset + pos``,
+        # bounded by ``_view_max_size`` if set. ZipEntryIO and other
+        # subclasses that set ``parent`` for navigation always have own
+        # backing, so :attr:`is_view` stays False.
+        self.parent: "BytesIO | None" = None
+        self._view_offset: int = 0
+        self._view_max_size: int | None = None
 
         if path is not None:
             # Path-bound. Caller owns the path; we don't unlink on close.
@@ -837,11 +849,20 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         - Non-local path → delegate to the transaction buffer,
           which is itself a ``BytesIO`` (memory or local-spilled).
         - No path → read from ``_buf``.
+        - View → ``parent.pread`` at ``_view_offset + pos``, bounded
+          by the view's tracked size.
         """
         if n <= 0:
             return b""
         if pos < 0:
             raise ValueError("slice position must be >= 0")
+
+        # View mode: forward to the parent, bounded by our tracked size.
+        if self.is_view:
+            if pos >= self._size:
+                return b""
+            n = min(n, self._size - pos)
+            return self.parent.pread(n, self._view_offset + pos)
 
         # Local-path fast path: positional read against the fd.
         if self._spill_path is not None and self._spill_path.is_local:
@@ -889,6 +910,22 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         if n == 0:
             return 0
 
+        # View mode: forward to parent, capped by ``_view_max_size``.
+        # The view's tracked size grows up to the cap; the parent's
+        # cursor stays put (pwrite is cursorless).
+        if self.is_view:
+            if self._view_max_size is not None:
+                allowed = self._view_max_size - pos
+                if allowed <= 0:
+                    return 0
+                if n > allowed:
+                    data = data[:allowed]
+                    n = len(data)
+            written = self.parent.pwrite(data, self._view_offset + pos)
+            if pos + written > self._size:
+                self._size = pos + written
+            return written
+
         # Auto-spill check fires only for autonomous (no-path) memory
         # buffers. A buffer already bound to a path — local or
         # non-local — never spills at this layer; the path IS the
@@ -931,12 +968,24 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         - **Non-local path** → resize the transaction buffer.
           Remote file gets rewritten on flush.
         - **No path** → resize ``_buf``.
+        - **View** → resize the parent so its bytes past
+          ``_view_offset + n`` are dropped (or zero-extended on grow),
+          then update the view's tracked size.
 
         Spill is one-way — truncate on a spilled buffer truncates
         the file, never demotes back to memory.
         """
         if n < 0:
             raise ValueError("Negative size value")
+
+        if self.is_view:
+            if self._view_max_size is not None:
+                n = min(n, self._view_max_size)
+            self.parent._set_size(self._view_offset + n)
+            self._size = n
+            if self._pos > n:
+                self._pos = n
+            return n
 
         # Local-path fast path: ftruncate on the fd.
         if self._spill_path is not None and self._spill_path.is_local:
@@ -1121,6 +1170,95 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         if self._spill_bytes <= 0:
             return True
         return size >= self._spill_bytes
+
+    # ------------------------------------------------------------------
+    # View mode — bounded window over a parent BytesIO
+    # ------------------------------------------------------------------
+
+    @property
+    def is_view(self) -> bool:
+        """True iff this buffer is a window over :attr:`parent`.
+
+        A view has no own backing — no ``_buf``, no ``_spill_path``,
+        no ``_transaction_buffer`` — and ``parent`` is set. Reads and
+        writes are forwarded to the parent's ``pread`` / ``pwrite``
+        at ``_view_offset + cursor``, leaving the parent's cursor
+        untouched. Subclasses (e.g. :class:`ZipEntryIO`) that set
+        ``parent`` for navigation but allocate their own backing
+        report ``False``.
+        """
+        return (
+            self.parent is not None
+            and self._buf is None
+            and self._spill_path is None
+            and self._transaction_buffer is None
+        )
+
+    @property
+    def start(self) -> int:
+        """Absolute offset in :attr:`parent` where the view starts."""
+        return self._view_offset
+
+    @property
+    def end(self) -> int:
+        """Absolute end offset in :attr:`parent`."""
+        return self._view_offset + self.size
+
+    @property
+    def remaining(self) -> int:
+        """Bytes from the current cursor to the view's logical end."""
+        return max(0, self.size - self._pos)
+
+    @property
+    def max_size(self) -> int | None:
+        """Cap on view growth, or ``None`` for unbounded."""
+        return self._view_max_size
+
+    @classmethod
+    def _make_view(
+        cls,
+        parent: "BytesIO",
+        *,
+        offset: int = 0,
+        size: int = 0,
+        pos: int = 0,
+        max_size: "int | None" = None,
+    ) -> "BytesIO":
+        """Construct a view-mode :class:`BytesIO` over *parent*.
+
+        Bypasses :meth:`__new__`'s registry dispatch — a view is always
+        a plain BytesIO regardless of the parent's concrete subclass.
+        """
+        if offset < 0:
+            raise ValueError("view offset must be >= 0")
+        if size < 0:
+            raise ValueError("view size must be >= 0")
+        if pos < 0:
+            raise ValueError("view pos must be >= 0")
+        if max_size is not None and max_size < 0:
+            raise ValueError("view max_size must be >= 0")
+        if max_size is not None and size > max_size:
+            raise ValueError("view size cannot exceed max_size")
+
+        view = object.__new__(BytesIO)
+        TabularIO.__init__(view, media_type=parent._media_type)
+        view._buf = None
+        view._size = int(size)
+        view._mtime = 0.0
+        view._pos = int(pos)
+        view._spill_fd = None
+        view._spill_path = None
+        view._owns_spill_path = False
+        view._transaction_buffer = None
+        view._mode = parent._mode
+        view._spill_bytes = 0
+        view._spill_ttl = 0
+        view._metadata = {}
+        view.parent = parent
+        view._view_offset = int(offset)
+        view._view_max_size = None if max_size is None else int(max_size)
+        Disposable.open(view)
+        return view
 
     # ------------------------------------------------------------------
     # Cursorless I/O — public thin wrappers around the primitives
@@ -1914,6 +2052,12 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         return True
 
     def _commit(self):
+        if self.is_view:
+            # Writes already landed on the parent via ``pwrite``; the
+            # only remaining work is propagating the parent's flush.
+            self.parent.flush()
+            return
+
         if self._spill_path is None:
             return  # Memory-mode — nothing durable to flush to.
 
@@ -1949,6 +2093,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
           path via ``path.write_bytes(payload)`` — single round-trip,
           implicit truncate-and-replace semantics. Skipped when the
           buffer was opened read-only.
+        - **View**: forward to the parent's :meth:`flush` so the
+          underlying buffer's writes hit storage.
 
         Earlier drafts used ``pwrite(0) + truncate(size)`` here, which
         is correct but pessimistic for backends that implement
@@ -2090,6 +2236,14 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
     def readinto1(self, b) -> int:
         return self.readinto(b)
+
+    def readall(self) -> bytes:
+        """Read from the cursor to EOF, advancing the cursor.
+
+        Matches :meth:`io.RawIOBase.readall`. For a cursorless full-
+        buffer dump that doesn't move ``_pos``, use :meth:`to_bytes`.
+        """
+        return self.read(-1)
 
     def write(self, b: Any, *, batch_size: int = 1024 * 1024) -> int:
         if b is None:
@@ -2443,9 +2597,15 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         pos: int | None = None,
         size: int | None = None,
         max_size: int | None = None,
-    ):
-        from .bytes_view import BytesIOView
+    ) -> "BytesIO":
+        """Return a view :class:`BytesIO` over this buffer's bytes.
 
+        The view has its own cursor; reads/writes route through this
+        buffer's :meth:`pread` / :meth:`pwrite` at
+        ``view_offset + view_cursor``. The parent cursor is never
+        touched. Use :attr:`is_view` to distinguish a view from a
+        concrete buffer.
+        """
         if pos is None:
             pos = self._pos if self._pos < self.size else 0
         pos = int(pos)
@@ -2457,7 +2617,13 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             size = int(size)
             if size < 0:
                 raise ValueError("view length must be >= 0")
-        return BytesIOView(parent=self, start=pos, size=size, pos=0, max_size=max_size)
+        return BytesIO._make_view(
+            parent=self,
+            offset=pos,
+            size=size,
+            pos=0,
+            max_size=max_size,
+        )
 
     @check_transaction()
     def memoryview(self):
