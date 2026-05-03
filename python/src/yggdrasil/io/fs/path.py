@@ -85,12 +85,17 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Literal,
     Optional,
     Tuple,
     Union, )
 
+import pyarrow as pa
+
+from yggdrasil.data.options import CastOptions
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.disposable import Disposable
+from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.enums import MediaType
 from yggdrasil.io.path_stat import PathKind, PathStats
@@ -174,7 +179,7 @@ _STAGING_TMP_RE: re.Pattern = re.compile(r"-(\d+)-(\d+)(?:\.[^./]+)*$")
 # ---------------------------------------------------------------------------
 
 
-class Path(Disposable, os.PathLike, ABC):
+class Path(TabularIO[CastOptions], os.PathLike, ABC):
     """Abstract filesystem path with :class:`pathlib.Path`-like behaviour.
 
     See the module docstring for the design and lifecycle rules.
@@ -218,6 +223,17 @@ class Path(Disposable, os.PathLike, ABC):
     # Construction / dispatch
     # ==================================================================
 
+    @classmethod
+    def default_mime_type(cls):
+        """Path is format-agnostic — never auto-register against a mime type.
+
+        :class:`TabularIO.__init_subclass__` registers concrete subclasses
+        against their default mime; returning ``None`` opts Path (and every
+        scheme-specific subclass) out cleanly. The actual format for a
+        given Path comes from its URL extension at I/O time.
+        """
+        return None
+
     def __init_subclass__(cls, **kwargs: Any) -> None:
         try:
             super().__init_subclass__(**kwargs)
@@ -240,7 +256,9 @@ class Path(Disposable, os.PathLike, ABC):
         temporary: bool = False,
         auto_open: bool = True,
     ) -> None:
-        Disposable.__init__(self)
+        # TabularIO.__init__ runs Disposable.__init__ and seeds the
+        # cache / spill-path slots every TabularIO carries.
+        TabularIO.__init__(self, media_type=None)
 
         if url is not None:
             resolved = URL.from_(url)
@@ -265,12 +283,63 @@ class Path(Disposable, os.PathLike, ABC):
         return
 
     def _release(self) -> None:
+        # Drop any persisted Arrow / Spark cache TabularIO is holding.
+        try:
+            self.unpersist()
+        except Exception:
+            pass
         if not self.temporary:
             return
         try:
             self.unlink(missing_ok=True)
         except Exception:
             pass
+
+    # ==================================================================
+    # TabularIO hooks — open the local file, dispatch to its BytesIO
+    # ==================================================================
+
+    @property
+    def cached(self) -> bool:
+        return self._arrow_table is not None or self._spark_frame is not None
+
+    def unpersist(self) -> None:
+        self._arrow_table = None
+        self._spark_frame = None
+
+    def persist(
+        self,
+        engine: Literal["arrow", "polars", "spark", "auto"] = "auto",
+        *,
+        data: Any | None = None,
+    ) -> "TabularIO":
+        return TabularIO.persist(self, engine, data=data)
+
+    def _read_arrow_batches(self, options: CastOptions) -> Iterator["pa.RecordBatch"]:
+        """Stream Arrow batches by opening the file locally and delegating.
+
+        ``open_io("rb")`` returns a :class:`BytesIO` (or, when the URL
+        carries a tabular extension, the registered format leaf via
+        :meth:`BytesIO.__new__`'s registry dispatch). Either way the
+        buffer's ``_read_arrow_batches`` knows how to decode the bytes;
+        we just bridge open → read → close.
+        """
+        buf = self.open_io("rb")
+        try:
+            yield from buf.read_arrow_batches(options=options)
+        finally:
+            buf.close()
+
+    def _write_arrow_batches(
+        self,
+        batches: Iterable["pa.RecordBatch"],
+        options: CastOptions,
+    ) -> None:
+        buf = self.open_io("wb")
+        try:
+            buf.write_arrow_batches(batches, options=options)
+        finally:
+            buf.close()
 
     # ==================================================================
     # Temporary-flag builders

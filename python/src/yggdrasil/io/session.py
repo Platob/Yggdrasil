@@ -428,7 +428,11 @@ class Session(ABC):
         )
 
         if cfg.spark_session is not None:
-            return self._spark_send_many(requests, config=cfg)
+            parts = list(self._spark_send_many(requests, config=cfg))
+            result_df = parts[0]
+            for part in parts[1:]:
+                result_df = result_df.unionByName(part, allowMissingColumns=False)
+            return result_df
 
         return self._send_many(requests, config=cfg)
 
@@ -858,7 +862,7 @@ class Session(ABC):
         self,
         requests: Iterator[PreparedRequest],
         config: SendManyConfig,
-    ) -> "SparkDataFrame":
+    ) -> "Iterator[SparkDataFrame]":
         from pyspark.sql import functions as F  # noqa: F401
 
         # Resolve Spark session — prefer cfg.spark_session, else auto-create.
@@ -874,7 +878,8 @@ class Session(ABC):
         # Materialise — we need the full list to run driver-side stages 1 and 2.
         all_requests: list[PreparedRequest] = list(requests)
         if not all_requests:
-            return spark.createDataFrame([], schema=RESPONSE_SCHEMA.to_spark_schema())
+            yield spark.createDataFrame([], schema=RESPONSE_SCHEMA.to_spark_schema())
+            return
 
         LOGGER.info(
             "spark_send_many: %s requests (batch_size=%s, remote=%s, local=%s)",
@@ -952,11 +957,9 @@ class Session(ABC):
 
         parts = [df for df in (local_df, remote_df, new_responses_df) if df is not None]
         if not parts:
-            return spark.createDataFrame([], schema=RESPONSE_SCHEMA.to_spark_schema())
-        result_df = parts[0]
-        for part in parts[1:]:
-            result_df = result_df.unionByName(part, allowMissingColumns=False)
-        return result_df
+            yield spark.createDataFrame([], schema=RESPONSE_SCHEMA.to_spark_schema())
+            return
+        yield from parts
 
     # ------------------------------------------------------------------ #
     # Helpers for spark_send_many                                         #
