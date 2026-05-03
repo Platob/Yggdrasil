@@ -48,6 +48,7 @@ class Mode(str, Enum):
     APPEND = "append"
     IGNORE = "ignore"
     UPSERT = "upsert"
+    MERGE = "merge"
     TRUNCATE = "truncate"
     ERROR_IF_EXISTS = "error_if_exists"
 
@@ -243,7 +244,10 @@ STR_MAPPING = {
     "up": Mode.UPSERT,
     "update": Mode.UPSERT,
     "upsert": Mode.UPSERT,
-    "merge": Mode.UPSERT,
+
+    # MERGE — try the engine-native MERGE statement first; the backend may
+    # fall back to a delete-then-insert if MERGE is unavailable.
+    "merge": Mode.MERGE,
 
     "trunc": Mode.TRUNCATE,
     "truncate": Mode.TRUNCATE,
