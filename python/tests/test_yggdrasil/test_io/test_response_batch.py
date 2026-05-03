@@ -15,7 +15,10 @@ from yggdrasil.io.buffer import BytesIO
 from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, Response
-from yggdrasil.io.response_batch import ResponseBatch
+from yggdrasil.io.response_batch import (
+    DEFAULT_REMOTE_TABLE_KEY,
+    ResponseBatch,
+)
 
 
 def _make_response(url: str, status: int = 200) -> Response:
@@ -38,24 +41,37 @@ def _urls(responses: list[Response]) -> list[str]:
 class TestResponseBatchPython:
     def test_empty_batch_is_falsy_and_zero_length(self):
         # Every bucket carries a schema-bearing empty holder so the
-        # batch can answer schema questions even with zero rows.
+        # batch can answer schema questions even with zero rows. The
+        # remote bucket starts as a single-entry dict keyed by the
+        # default placeholder so callers can still introspect schema.
         batch = ResponseBatch()
         assert len(batch) == 0
         assert not batch
         assert batch.counts == {"local": 0, "remote": 0, "new": 0}
+        assert batch.remote_counts == {}
+        assert batch.remote_tables == []
         assert list(batch) == []
-        # All three holders are present (schema-bearing empties), not None.
+        # parts() flattens to local + every remote-table holder + new,
+        # so an empty batch still exposes three holders (one default
+        # remote placeholder).
         assert len(batch.parts()) == 3
         for holder in batch.parts():
             assert isinstance(holder, TabularIO)
             # Schema is preserved — RESPONSE_ARROW_SCHEMA — so callers
             # can introspect column names without ever fetching rows.
             assert holder.schema == RESPONSE_ARROW_SCHEMA
+        # The remote dict has its placeholder default so schema
+        # introspection works without checking for an empty mapping.
+        assert list(batch.remote_hits) == [DEFAULT_REMOTE_TABLE_KEY]
+        assert batch.remote_hits[DEFAULT_REMOTE_TABLE_KEY].schema == (
+            RESPONSE_ARROW_SCHEMA
+        )
 
     def test_lists_are_coerced_to_tabular_holders(self):
         # The constructor lifts list[Response] into TabularIO holders so
-        # all three buckets share one read contract. Verify the public
-        # accessors expose the holders, not the raw lists.
+        # all three buckets share one read contract. A bare list passed
+        # for remote_hits is treated as a single untagged bucket and
+        # stored under the default-table key.
         batch = ResponseBatch(
             local_hits=[_make_response("http://x/local")],
             remote_hits=[
@@ -64,11 +80,40 @@ class TestResponseBatchPython:
             ],
         )
         assert isinstance(batch.local_hits, TabularIO)
-        assert isinstance(batch.remote_hits, TabularIO)
+        assert isinstance(batch.remote_hits, dict)
+        assert list(batch.remote_hits) == [DEFAULT_REMOTE_TABLE_KEY]
+        assert isinstance(batch.remote_hits[DEFAULT_REMOTE_TABLE_KEY], TabularIO)
         # The unsupplied bucket gets a schema-bearing empty holder
         # rather than ``None`` so empty results still expose a schema.
         assert isinstance(batch.new_hits, TabularIO)
         assert batch.new_hits.schema == RESPONSE_ARROW_SCHEMA
+
+    def test_remote_hits_dict_input_preserves_per_table_split(self):
+        # When the caller hands a dict keyed by cache-table full name,
+        # each entry becomes its own holder so downstream consumers
+        # can see which table answered which subset.
+        batch = ResponseBatch(
+            remote_hits={
+                "cat.db.tbl_a": [_make_response("http://x/a1")],
+                "cat.db.tbl_b": [
+                    _make_response("http://x/b1"),
+                    _make_response("http://x/b2"),
+                ],
+            },
+        )
+        assert list(batch.remote_hits) == ["cat.db.tbl_a", "cat.db.tbl_b"]
+        assert batch.remote_tables == ["cat.db.tbl_a", "cat.db.tbl_b"]
+        assert batch.remote_counts == {"cat.db.tbl_a": 1, "cat.db.tbl_b": 2}
+        # ``counts["remote"]`` rolls the per-table breakdown into a
+        # single integer so the existing aggregate API keeps working.
+        assert batch.counts == {"local": 0, "remote": 3, "new": 0}
+        # parts() flattens local + every remote-table holder + new,
+        # so a two-table remote bucket produces four parts total.
+        assert len(batch.parts()) == 4
+        # Iteration walks every remote table in registration order
+        # before yielding new hits.
+        urls = _urls(list(batch))
+        assert urls == ["http://x/a1", "http://x/b1", "http://x/b2"]
 
     def test_iteration_rebuilds_responses_in_pipeline_order(self):
         batch = ResponseBatch(
@@ -125,6 +170,41 @@ class TestResponseBatchPython:
             "http://x/b",
             "http://x/c",
         ]
+
+    def test_extend_merges_remote_per_table_dropping_default_placeholder(self):
+        # ``a`` only carries the placeholder default remote bucket.
+        # Merging in a real per-table bucket from ``b`` should drop
+        # the placeholder so the merged batch reflects only real
+        # cache tables — no stale empty default left behind.
+        a = ResponseBatch(local_hits=[_make_response("http://x/a")])
+        b = ResponseBatch(
+            remote_hits={
+                "cat.db.tbl_a": [_make_response("http://x/b1")],
+                "cat.db.tbl_b": [_make_response("http://x/b2")],
+            },
+        )
+
+        a.extend(b)
+        assert a.remote_tables == ["cat.db.tbl_a", "cat.db.tbl_b"]
+        assert a.remote_counts == {"cat.db.tbl_a": 1, "cat.db.tbl_b": 1}
+        assert a.counts == {"local": 1, "remote": 2, "new": 0}
+
+    def test_extend_appends_into_matching_remote_table_keys(self):
+        # Same table key on both sides → row counts accumulate on the
+        # existing holder rather than producing a duplicate entry.
+        a = ResponseBatch(
+            remote_hits={"cat.db.tbl_a": [_make_response("http://x/a1")]},
+        )
+        b = ResponseBatch(
+            remote_hits={
+                "cat.db.tbl_a": [_make_response("http://x/a2")],
+                "cat.db.tbl_b": [_make_response("http://x/b1")],
+            },
+        )
+
+        a.extend(b)
+        assert a.remote_tables == ["cat.db.tbl_a", "cat.db.tbl_b"]
+        assert a.remote_counts == {"cat.db.tbl_a": 2, "cat.db.tbl_b": 1}
 
     def test_unknown_bucket_input_type_raises(self):
         # Strict on meaning: random objects shouldn't silently become

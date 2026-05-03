@@ -570,14 +570,20 @@ class Session(ABC):
         session_remote_cfg: CacheConfig,
         *,
         spark_session: Optional["SparkSession"] = None,
-    ) -> tuple[list[Response], list[PreparedRequest]]:
+    ) -> tuple[dict[str, list[Response]], list[PreparedRequest]]:
         """Stage 2: scan the remote cache.
 
         UPSERT requests bypass the read entirely (always misses, refetch).
         Non-UPSERT requests are grouped by their effective cache table so we
         execute exactly one batch SQL lookup per table.
+
+        Returns hits as a per-table mapping keyed by
+        ``CacheConfig.table.full_name(safe=True)`` so the downstream
+        :class:`ResponseBatch` can preserve which table answered which
+        subset of the batch — collapsing them back into one bucket
+        would lose that provenance.
         """
-        hits: list[Response] = []
+        hits: dict[str, list[Response]] = {}
         # UPSERT is unconditional miss.
         upsert_reqs = [
             r for r in requests
@@ -601,18 +607,21 @@ class Session(ABC):
                 table_to_reqs[tkey] = []
             table_to_reqs[tkey].append(req)
 
+        total_hits = 0
         for tkey, t_reqs in table_to_reqs.items():
             t_cfg = table_to_cfg[tkey]
             t_hits, t_misses = self._lookup_remote_table(
                 t_cfg, t_reqs, spark_session=spark_session,
             )
-            hits.extend(t_hits)
+            if t_hits:
+                hits[tkey] = t_hits
+                total_hits += len(t_hits)
             misses.extend(t_misses)
 
-        if hits:
+        if total_hits:
             LOGGER.debug(
                 "Batch remote cache: %s/%s hits across %s table(s)",
-                len(hits), len(requests), len(table_to_cfg),
+                total_hits, len(requests), len(table_to_cfg),
             )
         return hits, misses
 
@@ -687,18 +696,18 @@ class Session(ABC):
         session_remote_cfg: CacheConfig,
         *,
         spark: "SparkSession",
-    ) -> tuple["SparkDataFrame", list[PreparedRequest]]:
+    ) -> tuple[dict[str, "SparkDataFrame"], list[PreparedRequest]]:
         """Spark variant of :meth:`_split_remote_cache`.
 
-        Returns ``(hits_df, misses)`` — hits stay as a Spark DataFrame
-        unioned across every per-table lookup so the caller can hand
-        the frame straight to :class:`ResponseBatch` without ever
-        materialising rows on the driver. Misses still come back as a
-        Python list because the driver needs concrete request objects
-        to scatter through stage 3.
+        Returns ``(hits_by_table, misses)`` — hits stay as Spark
+        DataFrames keyed by ``CacheConfig.table.full_name(safe=True)``
+        so the caller can hand them straight to :class:`ResponseBatch`
+        without ever materialising rows on the driver and without
+        losing the per-table provenance to a premature
+        ``unionByName``. Misses still come back as a Python list
+        because the driver needs concrete request objects to scatter
+        through stage 3.
         """
-        from .response import RESPONSE_SCHEMA
-
         upsert_reqs = [
             r for r in requests
             if self._effective_remote_cfg(r, session_remote_cfg).mode == Mode.UPSERT
@@ -720,31 +729,22 @@ class Session(ABC):
                 table_to_reqs[tkey] = []
             table_to_reqs[tkey].append(req)
 
-        hit_frames: list["SparkDataFrame"] = []
+        hits_by_table: dict[str, "SparkDataFrame"] = {}
         for tkey, t_reqs in table_to_reqs.items():
             t_cfg = table_to_cfg[tkey]
             t_hits_df, t_misses = self._lookup_remote_table_spark(
                 t_cfg, t_reqs, spark=spark,
             )
             if t_hits_df is not None:
-                hit_frames.append(t_hits_df)
+                hits_by_table[tkey] = t_hits_df
             misses.extend(t_misses)
-
-        if hit_frames:
-            hits_df = hit_frames[0]
-            for frame in hit_frames[1:]:
-                hits_df = hits_df.unionByName(frame, allowMissingColumns=False)
-        else:
-            hits_df = spark.createDataFrame(
-                [], schema=RESPONSE_SCHEMA.to_spark_schema(),
-            )
 
         if any(table_to_reqs.values()):
             LOGGER.debug(
                 "Batch remote cache (spark): scanned %s table(s) for %s request(s)",
                 len(table_to_cfg), len(requests),
             )
-        return hits_df, misses
+        return hits_by_table, misses
 
     def _lookup_remote_table_spark(
         self,
@@ -1052,7 +1052,12 @@ class Session(ABC):
                 local_hits = self._responses_to_spark(local_hits_list, spark)
             else:
                 local_hits = local_hits_list
-            remote_hits: "list[Response] | SparkDataFrame" = []
+            # Remote hits are split per cache table — keyed by
+            # ``CacheConfig.table.full_name(safe=True)`` — so the
+            # downstream :class:`ResponseBatch` preserves which table
+            # answered which subset. An empty dict tells
+            # ``ResponseBatch`` to install a schema-bearing default.
+            remote_hits: "dict[str, list[Response]] | dict[str, SparkDataFrame]" = {}
             # Default new_hits to None so ResponseBatch coerces it to a
             # schema-bearing empty holder (Spark or Arrow depending on
             # mode) — no special-case for "stage skipped".
@@ -1104,8 +1109,13 @@ class Session(ABC):
                 )
                 # Backfill local cache with remote hits using each request's
                 # effective local config — not the session-level fallback.
+                # Flatten the per-table split here: the local cache
+                # doesn't care which remote table sourced a row, only
+                # the response-to-request mapping by URL.
                 self._backfill_local_cache(
-                    remote_hits, url_to_local_cfg, session_local_cfg,
+                    [r for table_hits in remote_hits.values() for r in table_hits],
+                    url_to_local_cfg,
+                    session_local_cfg,
                 )
 
             if not after_remote:

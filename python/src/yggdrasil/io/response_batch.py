@@ -5,19 +5,22 @@ variant returned a single fused DataFrame. Both lose the *origin* of every
 row — the caller can't tell whether a response came from the local
 on-disk cache, the remote SQL cache, or a fresh network fetch.
 
-:class:`ResponseBatch` keeps that split visible. The three buckets are
-all stored as the same type — :class:`TabularIO` — so Python
+:class:`ResponseBatch` keeps that split visible. The local and new buckets
+are :class:`TabularIO` holders; the remote bucket is a
+``dict[str, TabularIO]`` keyed by remote-cache table full name, because a
+single ``send_many`` chunk can hit several cache tables when requests
+carry per-request remote configs. All holders are the same type — Python
 (:class:`MemoryArrowIO`) and Spark (:class:`MemorySparkIO`) share one
-contract. Empty buckets keep their :data:`RESPONSE_SCHEMA` so a batch
-with no responses still answers schema questions correctly. Iteration
-walks each holder's Arrow batches and rebuilds :class:`Response` objects
-via :meth:`Response.from_arrow_tabular`, so the batch never has to
-special-case which engine produced the rows.
+contract — and empty buckets keep their :data:`RESPONSE_SCHEMA` so a
+batch with no responses still answers schema questions correctly.
+Iteration walks each holder's Arrow batches and rebuilds
+:class:`Response` objects via :meth:`Response.from_arrow_tabular`, so the
+batch never has to special-case which engine produced the rows.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterator, Optional, Union
+from typing import TYPE_CHECKING, Iterator, Mapping, Optional, Union
 
 from .buffer.base import TabularIO
 from .buffer.memory import MemoryArrowIO, MemorySparkIO
@@ -30,15 +33,25 @@ if TYPE_CHECKING:
 __all__ = [
     "ResponseBatch",
     "BucketInput",
+    "RemoteBucketInput",
     "responses_to_tabular",
     "spark_to_tabular",
     "empty_arrow_holder",
     "empty_spark_holder",
+    "DEFAULT_REMOTE_TABLE_KEY",
 ]
 
 
-# What the public constructor accepts per bucket. ``None`` is coerced to
-# a schema-bearing empty holder so every bucket carries
+# Sentinel key used when the remote bucket carries a holder that wasn't
+# tagged with a specific cache-table name — either because the caller
+# passed a bare ``BucketInput`` instead of a per-table mapping, or
+# because the batch is empty and we still want a schema-bearing default
+# entry.
+DEFAULT_REMOTE_TABLE_KEY = ""
+
+
+# What the public constructor accepts per simple bucket. ``None`` is
+# coerced to a schema-bearing empty holder so every bucket carries
 # :data:`RESPONSE_SCHEMA` — Spark when the batch was built with a
 # session, Arrow otherwise. ``TabularIO`` is taken as-is; lists and
 # Spark DataFrames are funnelled through :func:`responses_to_tabular`
@@ -48,6 +61,16 @@ BucketInput = Union[
     "TabularIO",
     "SparkDataFrame",
     None,
+]
+
+
+# What the public constructor accepts for the ``remote_hits`` bucket.
+# In addition to the simple shapes, callers can pass a mapping keyed by
+# remote-cache table full name so the per-table split survives all the
+# way out to the consumer.
+RemoteBucketInput = Union[
+    BucketInput,
+    Mapping[str, BucketInput],
 ]
 
 
@@ -117,7 +140,7 @@ def _coerce_bucket(
     *,
     spark: Optional["SparkSession"] = None,
 ) -> TabularIO:
-    """Funnel any accepted bucket input down to a schema-bearing ``TabularIO``.
+    """Funnel any accepted simple bucket input down to a ``TabularIO``.
 
     Strict on meaning: an unknown shape raises rather than silently
     being treated as Spark. ``None`` is coerced to an empty
@@ -146,6 +169,31 @@ def _coerce_bucket(
     )
 
 
+def _coerce_remote_bucket(
+    value: RemoteBucketInput,
+    *,
+    spark: Optional["SparkSession"] = None,
+) -> dict[str, TabularIO]:
+    """Funnel any accepted remote-bucket input down to a per-table dict.
+
+    Always returns at least one entry so the bucket can answer schema
+    questions even when nothing matched — an empty mapping or ``None``
+    becomes ``{DEFAULT_REMOTE_TABLE_KEY: empty_holder}``. Mapping keys
+    are stringified (cache-table full names already are strings, but
+    this keeps the dict shape uniform regardless of caller). A bare
+    :class:`BucketInput` is treated as a single untagged bucket and
+    stored under :data:`DEFAULT_REMOTE_TABLE_KEY`.
+    """
+    if isinstance(value, Mapping):
+        if not value:
+            return {DEFAULT_REMOTE_TABLE_KEY: _coerce_bucket(None, spark=spark)}
+        return {
+            str(k): _coerce_bucket(v, spark=spark)
+            for k, v in value.items()
+        }
+    return {DEFAULT_REMOTE_TABLE_KEY: _coerce_bucket(value, spark=spark)}
+
+
 # ---------------------------------------------------------------------------
 # ResponseBatch
 # ---------------------------------------------------------------------------
@@ -157,18 +205,20 @@ class ResponseBatch:
     Three buckets, in pipeline order:
 
     - ``local_hits``  — served from the on-disk pickle cache.
-    - ``remote_hits`` — served from the remote SQL cache.
+    - ``remote_hits`` — served from the remote SQL cache, split by
+      cache-table full name (``dict[str, TabularIO]``) so callers can
+      see which configured table answered which subset of the batch.
     - ``new_hits``    — fetched from the network this run.
 
-    Each bucket lives on a private :class:`TabularIO` holder
-    (``_local_response`` / ``_remote_response`` / ``_new_response``);
-    the public ``local_hits`` / ``remote_hits`` / ``new_hits``
-    properties expose them. Constructor inputs go through a coercion
-    step so callers can hand in a ``list[Response]``, a Spark
-    DataFrame, an existing ``TabularIO``, or ``None``. ``None`` and
-    empty inputs become schema-bearing empty holders so every bucket
-    advertises :data:`RESPONSE_SCHEMA` — useful when downstream code
-    inspects the schema before any rows arrive.
+    The local and new buckets live on private :class:`TabularIO` holders
+    (``_local_response`` / ``_new_response``); the remote bucket lives
+    on ``_remote_responses`` — an insertion-ordered ``dict`` so the
+    per-table split survives. Constructor inputs go through coercion so
+    callers can hand in a ``list[Response]``, a Spark DataFrame, an
+    existing ``TabularIO``, ``None``, or — for ``remote_hits`` — a
+    mapping from table key to any of those. ``None`` and empty inputs
+    become schema-bearing empty holders so every bucket advertises
+    :data:`RESPONSE_SCHEMA`.
 
     Iteration rebuilds :class:`Response` objects from each holder's
     Arrow batches via :meth:`Response.from_arrow_tabular`, so the
@@ -179,7 +229,7 @@ class ResponseBatch:
 
     __slots__ = (
         "_local_response",
-        "_remote_response",
+        "_remote_responses",
         "_new_response",
         "spark",
     )
@@ -187,20 +237,22 @@ class ResponseBatch:
     def __init__(
         self,
         local_hits: BucketInput = None,
-        remote_hits: BucketInput = None,
+        remote_hits: RemoteBucketInput = None,
         new_hits: BucketInput = None,
         *,
         spark: Optional["SparkSession"] = None,
     ) -> None:
         self.spark: Optional["SparkSession"] = spark
         self._local_response: TabularIO = _coerce_bucket(local_hits, spark=spark)
-        self._remote_response: TabularIO = _coerce_bucket(remote_hits, spark=spark)
+        self._remote_responses: dict[str, TabularIO] = _coerce_remote_bucket(
+            remote_hits, spark=spark,
+        )
         self._new_response: TabularIO = _coerce_bucket(new_hits, spark=spark)
 
     def __repr__(self) -> str:
         return (
             f"ResponseBatch(local_hits={self._local_response!r}, "
-            f"remote_hits={self._remote_response!r}, "
+            f"remote_hits={self._remote_responses!r}, "
             f"new_hits={self._new_response!r})"
         )
 
@@ -217,12 +269,29 @@ class ResponseBatch:
         self._local_response = _coerce_bucket(value, spark=self.spark)
 
     @property
-    def remote_hits(self) -> TabularIO:
-        return self._remote_response
+    def remote_hits(self) -> dict[str, TabularIO]:
+        """Per-table remote-cache holders, keyed by cache-table full name.
+
+        Always returns at least one entry — :data:`DEFAULT_REMOTE_TABLE_KEY`
+        with a schema-bearing empty holder when the batch carries no
+        remote hits — so callers can introspect schema without checking
+        for an empty dict.
+        """
+        return self._remote_responses
 
     @remote_hits.setter
-    def remote_hits(self, value: BucketInput) -> None:
-        self._remote_response = _coerce_bucket(value, spark=self.spark)
+    def remote_hits(self, value: RemoteBucketInput) -> None:
+        self._remote_responses = _coerce_remote_bucket(value, spark=self.spark)
+
+    @property
+    def remote_tables(self) -> list[str]:
+        """Names of remote-cache tables that contributed to this batch.
+
+        Drops the :data:`DEFAULT_REMOTE_TABLE_KEY` placeholder — that
+        key is bookkeeping for schema-bearing empties, not a real
+        cache table.
+        """
+        return [k for k in self._remote_responses if k != DEFAULT_REMOTE_TABLE_KEY]
 
     @property
     def new_hits(self) -> TabularIO:
@@ -236,12 +305,24 @@ class ResponseBatch:
     # Shape helpers
     # ------------------------------------------------------------------
 
-    def _holders(self) -> tuple[TabularIO, TabularIO, TabularIO]:
-        return (self._local_response, self._remote_response, self._new_response)
+    def _holders(self) -> list[TabularIO]:
+        return [
+            self._local_response,
+            *self._remote_responses.values(),
+            self._new_response,
+        ]
 
     @staticmethod
     def _is_spark_holder(holder: TabularIO) -> bool:
         return isinstance(holder, MemorySparkIO) and holder.frame is not None
+
+    @staticmethod
+    def _holder_count(holder: TabularIO) -> int:
+        if isinstance(holder, MemorySparkIO):
+            return holder.frame.count() if holder.frame is not None else 0
+        if isinstance(holder, MemoryArrowIO):
+            return holder.num_rows
+        return holder.read_arrow_table().num_rows
 
     @property
     def is_spark(self) -> bool:
@@ -249,30 +330,48 @@ class ResponseBatch:
         return any(self._is_spark_holder(h) for h in self._holders())
 
     def parts(self) -> list[TabularIO]:
-        """All bucket holders in pipeline order.
+        """All bucket holders in pipeline order: local, remotes…, new.
 
-        Every bucket is schema-bearing, including empty ones, so this
-        always returns three holders.
+        Every bucket is schema-bearing, including empty ones. The
+        remote tables appear in the order they were registered on this
+        batch (or merged in via :meth:`extend`), so consumers that
+        iterate ``parts()`` see a stable per-table ordering.
         """
-        return list(self._holders())
+        return self._holders()
 
     @property
     def counts(self) -> dict[str, int]:
         """Per-origin row counts.
 
-        For :class:`MemorySparkIO` this triggers ``df.count()``; for
+        ``remote`` is the total summed across every cache table — use
+        :attr:`remote_counts` for the per-table breakdown. For
+        :class:`MemorySparkIO` this triggers ``df.count()``; for
         :class:`MemoryArrowIO` it sums ``num_rows`` across the
         in-memory batches — fine for debugging or small assertions,
         not for hot paths.
         """
+        return {
+            "local": self._holder_count(self._local_response),
+            "remote": sum(
+                self._holder_count(h) for h in self._remote_responses.values()
+            ),
+            "new": self._holder_count(self._new_response),
+        }
+
+    @property
+    def remote_counts(self) -> dict[str, int]:
+        """Row counts per remote-cache table, in registration order.
+
+        Includes the :data:`DEFAULT_REMOTE_TABLE_KEY` entry only when
+        it actually holds rows — the placeholder empty default is
+        elided so the breakdown reflects real cache tables.
+        """
         out: dict[str, int] = {}
-        for name, h in zip(("local", "remote", "new"), self._holders()):
-            if isinstance(h, MemorySparkIO):
-                out[name] = h.frame.count() if h.frame is not None else 0
-            elif isinstance(h, MemoryArrowIO):
-                out[name] = h.num_rows
-            else:
-                out[name] = h.read_arrow_table().num_rows
+        for key, holder in self._remote_responses.items():
+            n = self._holder_count(holder)
+            if key == DEFAULT_REMOTE_TABLE_KEY and n == 0:
+                continue
+            out[key] = n
         return out
 
     # ------------------------------------------------------------------
@@ -344,6 +443,15 @@ class ResponseBatch:
         merges append Arrow batches, Spark merges union Spark frames
         via ``unionByName``. Mixing engines is rejected because it
         would force a hidden Spark conversion at merge time.
+
+        Remote merges are keyed by cache-table name: rows from the
+        same table on both sides are unioned in place; tables present
+        only on ``other`` are inserted at the tail of the per-table
+        dict so iteration order remains deterministic. The
+        placeholder :data:`DEFAULT_REMOTE_TABLE_KEY` empty default is
+        dropped from ``self`` as soon as ``other`` brings in any real
+        table key, so a merged batch never carries a stale empty
+        bucket alongside real per-table data.
         """
         if self.is_spark != other.is_spark:
             raise TypeError(
@@ -352,21 +460,58 @@ class ResponseBatch:
                 "before merging across modes."
             )
 
+        self._merge_simple_holder("_local_response", other._local_response)
+        self._merge_remote(other._remote_responses)
+        self._merge_simple_holder("_new_response", other._new_response)
+        return self
+
+    def _merge_simple_holder(self, attr: str, theirs: TabularIO) -> None:
         from .enums import Mode
 
-        for name in ("_local_response", "_remote_response", "_new_response"):
-            mine = getattr(self, name)
-            theirs = getattr(other, name)
-            if isinstance(theirs, MemorySparkIO) and theirs.frame is not None:
+        mine: TabularIO = getattr(self, attr)
+        if isinstance(theirs, MemorySparkIO) and theirs.frame is not None:
+            if isinstance(mine, MemorySparkIO) and mine.frame is not None:
+                mine.frame = mine.frame.unionByName(
+                    theirs.frame, allowMissingColumns=False,
+                )
+            else:
+                setattr(self, attr, theirs)
+            return
+        mine.write_arrow_batches(theirs.read_arrow_batches(), mode=Mode.APPEND)
+
+    def _merge_remote(self, theirs: dict[str, TabularIO]) -> None:
+        from .enums import Mode
+
+        # Drop our placeholder empty default as soon as the incoming
+        # side brings in any real (non-default) table key — keeps the
+        # merged dict free of bookkeeping entries that would clutter
+        # ``remote_tables`` and ``parts()``.
+        incoming_real = [k for k in theirs if k != DEFAULT_REMOTE_TABLE_KEY]
+        if incoming_real and self._is_placeholder_remote():
+            self._remote_responses = {}
+
+        for key, their_holder in theirs.items():
+            mine = self._remote_responses.get(key)
+            if mine is None:
+                self._remote_responses[key] = their_holder
+                continue
+            if isinstance(their_holder, MemorySparkIO) and their_holder.frame is not None:
                 if isinstance(mine, MemorySparkIO) and mine.frame is not None:
                     mine.frame = mine.frame.unionByName(
-                        theirs.frame, allowMissingColumns=False,
+                        their_holder.frame, allowMissingColumns=False,
                     )
                 else:
-                    setattr(self, name, theirs)
+                    self._remote_responses[key] = their_holder
                 continue
-            mine.write_arrow_batches(theirs.read_arrow_batches(), mode=Mode.APPEND)
-        return self
+            mine.write_arrow_batches(
+                their_holder.read_arrow_batches(), mode=Mode.APPEND,
+            )
+
+    def _is_placeholder_remote(self) -> bool:
+        """True when the remote bucket holds only the empty default entry."""
+        if list(self._remote_responses) != [DEFAULT_REMOTE_TABLE_KEY]:
+            return False
+        return self._holder_count(self._remote_responses[DEFAULT_REMOTE_TABLE_KEY]) == 0
 
     # ------------------------------------------------------------------
     # Spark interop
@@ -381,11 +526,12 @@ class ResponseBatch:
         Works in both modes: Spark-backed holders return their cached
         frame directly (no collect), Arrow-IPC holders go through
         :meth:`TabularIO.read_spark_frame` which materializes on the
-        driver and lifts to Spark. Buckets are unioned with
-        ``allowMissingColumns=False`` because every bucket carries the
-        same :data:`RESPONSE_SCHEMA` — a missing column would mean a
-        real schema drift, and silent column-fill is worse than a loud
-        failure.
+        driver and lifts to Spark. Buckets are unioned in pipeline
+        order — local, then every per-table remote holder, then new —
+        with ``allowMissingColumns=False`` because every bucket
+        carries the same :data:`RESPONSE_SCHEMA`. A missing column
+        would mean a real schema drift, and silent column-fill is
+        worse than a loud failure.
         """
         target_spark = spark or self.spark
         if target_spark is None:

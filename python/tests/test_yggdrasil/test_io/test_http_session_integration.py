@@ -338,12 +338,17 @@ class TestHttpSessionSendManyLocalCache:
         assert batch.counts == {"local": 0, "remote": 0, "new": 3}
         assert len(batch) == 3
         # Even unfilled buckets carry a schema-bearing empty holder
-        # so the batch always advertises the response schema.
+        # so the batch always advertises the response schema. The
+        # remote bucket is a per-table dict whose default placeholder
+        # entry holds the schema-bearing empty.
         assert isinstance(batch.local_hits, TabularIO)
-        assert isinstance(batch.remote_hits, TabularIO)
+        assert isinstance(batch.remote_hits, dict)
+        assert all(isinstance(h, TabularIO) for h in batch.remote_hits.values())
         assert isinstance(batch.new_hits, TabularIO)
         assert batch.local_hits.num_rows == 0
-        assert batch.remote_hits.num_rows == 0
+        # No per-table remote hits — only the default-placeholder
+        # empty holder is present, so the breakdown is empty.
+        assert batch.remote_counts == {}
         assert all(r.status_code == 200 for r in batch)
 
     def test_send_many_batch_second_pass_all_local_hits(
