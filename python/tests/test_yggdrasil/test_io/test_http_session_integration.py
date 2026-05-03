@@ -326,7 +326,7 @@ class TestHttpSessionSendManyLocalCache:
             "second pass should be served entirely from disk"
         )
 
-    def test_send_many_batch_first_pass_all_new_hits(
+    def test_send_many_batches_first_pass_all_new_hits(
         self, http_server: _Server, tmp_path
     ):
         from yggdrasil.io.buffer.base import TabularIO
@@ -336,8 +336,10 @@ class TestHttpSessionSendManyLocalCache:
         cache = self._cache(tmp_path)
         reqs = self._build_requests(http_server.base_url, 3)
         with HTTPSession(verify=False) as session:
-            batch = session.send_many_batch(iter(reqs), local_cache=cache)
+            batches = list(session.send_many_batches(iter(reqs), local_cache=cache))
 
+        assert len(batches) == 1
+        batch = batches[0]
         assert isinstance(batch, ResponseBatch)
         assert batch.counts == {"local": 0, "remote": 0, "new": 3}
         assert len(batch) == 3
@@ -359,7 +361,7 @@ class TestHttpSessionSendManyLocalCache:
         assert batch.remote_counts == {}
         assert all(r.status_code == 200 for r in batch)
 
-    def test_send_many_batch_second_pass_all_local_hits(
+    def test_send_many_batches_second_pass_all_local_hits(
         self, http_server: _Server, tmp_path
     ):
         from yggdrasil.io.session import ResponseBatch
@@ -368,15 +370,17 @@ class TestHttpSessionSendManyLocalCache:
         cache = self._cache(tmp_path)
         reqs = self._build_requests(http_server.base_url, 2)
         with HTTPSession(verify=False) as session:
-            session.send_many_batch(iter(reqs), local_cache=cache)
+            list(session.send_many_batches(iter(reqs), local_cache=cache))
             _wait_for_cache(tmp_path, expected=2)
             http_server.reset_counters()
-            batch = session.send_many_batch(iter(reqs), local_cache=cache)
+            batches = list(session.send_many_batches(iter(reqs), local_cache=cache))
 
+        assert len(batches) == 1
+        batch = batches[0]
         assert isinstance(batch, ResponseBatch)
         assert batch.counts == {"local": 2, "remote": 0, "new": 0}
         assert http_server.counters == {}, (
-            "second-pass send_many_batch should not touch upstream"
+            "second-pass send_many_batches should not touch upstream"
         )
 
 
@@ -404,10 +408,10 @@ def spark_session():
 
 
 class TestHttpSessionSparkSend:
-    def test_send_many_with_spark_returns_dataframe(
+    def test_send_many_with_spark_yields_responses(
         self, http_server: _Server, spark_session
     ):
-        from pyspark.sql import DataFrame as SparkDataFrame
+        from yggdrasil.io.response import Response
 
         reqs = [
             PreparedRequest.prepare(
@@ -416,13 +420,14 @@ class TestHttpSessionSparkSend:
             for i in range(3)
         ]
         with HTTPSession(verify=False) as session:
-            df = session.send_many(iter(reqs), spark_session=spark_session)
+            responses = list(
+                session.send_many(iter(reqs), spark_session=spark_session)
+            )
 
-        assert isinstance(df, SparkDataFrame)
-        rows = df.collect()
-        assert len(rows) == 3
+        assert len(responses) == 3
+        assert all(isinstance(r, Response) for r in responses)
 
-    def test_spark_send_many_paths_all_hit_upstream(
+    def test_send_many_spark_paths_all_hit_upstream(
         self, http_server: _Server, spark_session
     ):
         reqs = [
@@ -432,13 +437,13 @@ class TestHttpSessionSparkSend:
             for i in range(2)
         ]
         with HTTPSession(verify=False) as session:
-            df = session.send_many(iter(reqs), spark_session=spark_session)
-            df.collect()  # force evaluation of mapInArrow workers
+            # Drain the iterator to force evaluation of mapInArrow workers.
+            list(session.send_many(iter(reqs), spark_session=spark_session))
 
         for i in range(2):
             assert http_server.counters.get(f"/spark-real/{i}", 0) >= 1
 
-    def test_spark_send_many_with_local_cache_short_circuits(
+    def test_send_many_spark_with_local_cache_short_circuits(
         self, http_server: _Server, spark_session, tmp_path
     ):
         cache = CacheConfig(
@@ -461,14 +466,15 @@ class TestHttpSessionSparkSend:
             _wait_for_cache(tmp_path, expected=2)
 
             http_server.reset_counters()
-            df = session.send_many(
-                iter(reqs),
-                spark_session=spark_session,
-                local_cache=cache,
+            responses = list(
+                session.send_many(
+                    iter(reqs),
+                    spark_session=spark_session,
+                    local_cache=cache,
+                )
             )
-            rows = df.collect()
 
-        assert len(rows) == 2
+        assert len(responses) == 2
         # The Spark pass reused the warm cache: stage 1 (driver-side)
         # served every request from disk and the worker fanout never
         # touched the upstream counter.
