@@ -858,6 +858,68 @@ class Session(ABC):
     #   `table.insert` accepts a Spark DataFrame transparently, so we    #
     #   skip the per-Response anonymize that the local path applies.     #
     # ================================================================== #
+    def spark_send_many(
+        self,
+        requests: Iterator[PreparedRequest],
+        config: SendManyConfig | SendConfig | Mapping[str, Any] | None = None,
+        *,
+        wait: WaitingConfigArg = None,
+        raise_error: bool = True,
+        normalize: bool | None = None,
+        stream: bool = True,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
+        local_cache: CacheConfig | Mapping[str, Any] | None = None,
+        batch_size: int | None = None,
+        ordered: bool = False,
+        max_in_flight: int | None = None,
+        spark_session: Optional["SparkSession"] = None,
+        **options,
+    ) -> "Iterator[SparkDataFrame]":
+        """Spark-native equivalent of `send_many`, returning DataFrame parts.
+
+        Runs the four-stage pipeline (local cache → remote cache →
+        mapInArrow fetch → bulk writeback) and yields a Spark DataFrame for
+        each non-empty stage — typed as `RESPONSE_ARROW_SCHEMA`. Order
+        matches the pipeline: local hits first, then remote hits, then the
+        lazy network-fetch DF. Use `unionByName` if you want them merged.
+
+        If `spark_session` is None it is auto-resolved via
+        `PyEnv.spark_session(create=True)` — pass an explicit session when
+        running inside an existing Spark application to avoid creating a
+        second one.
+
+        `raise_error=True` does NOT short-circuit a partial batch on the
+        Spark path; workers run with `raise_error=False` and the caller is
+        expected to filter on `response_status_code`. Same trade-off as
+        documented on `_spark_send_many`.
+        """
+        cfg = SendManyConfig.check_arg(
+            config,
+            wait=wait,
+            raise_error=raise_error,
+            normalize=normalize,
+            stream=stream,
+            remote_cache=remote_cache,
+            local_cache=local_cache,
+            batch_size=batch_size,
+            ordered=ordered,
+            max_in_flight=max_in_flight,
+            spark_session=spark_session,
+            **options,
+        )
+
+        # `_spark_send_many` already auto-resolves `cfg.spark_session` when
+        # missing, but we lift the same fallback to the public layer so
+        # downstream stages see a resolved session on `cfg` itself.
+        if cfg.spark_session is None:
+            cfg = cfg.merge(
+                spark_session=PyEnv.spark_session(
+                    create=True, install_spark=False, import_error=True,
+                )
+            )
+
+        yield from self._spark_send_many(requests, config=cfg)
+
     def _spark_send_many(
         self,
         requests: Iterator[PreparedRequest],
