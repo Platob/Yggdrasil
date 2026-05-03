@@ -20,6 +20,15 @@ class TestCastOptionsPredicateFields:
         assert opts.target_predicate is None
         assert opts.children_predicate is None
 
+    def test_legacy_where_field_is_gone(self):
+        # ``where`` used to be a generic predicate slot on
+        # CastOptions; it was replaced by the explicit
+        # ``source_predicate`` (read-side) and ``target_predicate``
+        # (write-side) so callers can't accidentally apply a
+        # filter on the wrong side. Pin the removal so a future
+        # re-add doesn't slip through.
+        assert not hasattr(CastOptions(), "where")
+
     def test_predicates_are_carried_through_copy(self):
         # ``CastOptions.copy`` must round-trip every field — adding
         # a new field is exactly the kind of thing that breaks

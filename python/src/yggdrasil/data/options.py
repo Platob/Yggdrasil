@@ -158,7 +158,6 @@ class CastOptions:
     reset_seek: bool = False
     read_seek: int | None = None
     write_seek: int | None = None
-    where: Predicate | None = None
     #: Predicate evaluated against the source side — used when reading
     #: to filter rows before they reach the cast pipeline. ``None``
     #: means no filter; semantics follow yggdrasil's three-valued

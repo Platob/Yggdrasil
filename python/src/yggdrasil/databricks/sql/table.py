@@ -699,8 +699,17 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
             for name in options.column_names or [c.name for c in self.columns]
         )
         query = f"SELECT {names}"
-        if options.where:
-            query += f" WHERE {expr_to_sql(options.where, dialect=Dialect.DATABRICKS)}"
+        # ``source_predicate`` is the read-side filter on
+        # :class:`CastOptions` — applied as a SQL ``WHERE`` clause
+        # so the warehouse drops non-matching rows before they
+        # reach the cast pipeline. The companion
+        # ``target_predicate`` is honoured by the write path
+        # (:meth:`_write_arrow_batches`) instead.
+        if options.source_predicate is not None:
+            query += (
+                f" WHERE "
+                f"{expr_to_sql(options.source_predicate, dialect=Dialect.DATABRICKS)}"
+            )
 
         for batch in self.execute(query).read_arrow_batches(options=options):
             yield batch
@@ -721,7 +730,11 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
             zorder_by=options.zorder_by,
             optimize_after_merge=options.optimize_after_merge,
             vacuum_hours=options.vacuum_hours,
-            where=options.where,
+            # Write-side filter — ``target_predicate`` survives the
+            # MERGE / UPDATE planning so callers can scope the
+            # destination rewrite without leaking into the read
+            # path.
+            where=options.target_predicate,
             prune_by=options.prune_by,
             prune_values=options.prune_values,
             retry=options.retry,
