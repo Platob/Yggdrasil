@@ -137,7 +137,7 @@ class TestFieldPolarsHelpers:
 
 class TestFieldArrowMetadata:
 
-    def test_to_arrow_field_keeps_user_metadata_and_attaches_type_json(self) -> None:
+    def test_to_arrow_field_keeps_user_metadata_no_type_json_by_default(self) -> None:
         f = Field(
             name="qty",
             dtype=IntegerType(byte_size=8, signed=True),
@@ -149,6 +149,21 @@ class TestFieldArrowMetadata:
 
         assert out.name == "qty"
         assert out.nullable is False
+        assert out.metadata is not None
+        assert b"comment" in out.metadata
+        # Arrow preserves dtype intent natively — no blob by default.
+        assert b"type_json" not in out.metadata
+
+    def test_to_arrow_field_dump_json_attaches_type_json(self) -> None:
+        f = Field(
+            name="qty",
+            dtype=IntegerType(byte_size=8, signed=True),
+            nullable=False,
+            metadata={b"comment": b"quantity"},
+        )
+
+        out = f.to_arrow_field(dump_json=True)
+
         assert out.metadata is not None
         assert b"comment" in out.metadata
         assert b"type_json" in out.metadata

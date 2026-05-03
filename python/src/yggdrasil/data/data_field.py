@@ -80,12 +80,24 @@ def _attach_type_json_metadata(
 
 
 def _strip_internal_metadata(
-    metadata: dict[bytes, bytes] | None,
-) -> dict[bytes, bytes] | None:
+    metadata: dict[bytes, bytes] | dict[str, str] | None,
+) -> dict | None:
+    """Drop yggdrasil-internal metadata keys.
+
+    Currently only :data:`_TYPE_JSON_METADATA_KEY` (the dtype JSON
+    round-trip blob written into engine metadata for the lossy paths,
+    e.g. Spark Map/Array). Accepts both bytes-keyed (Arrow) and
+    string-keyed (Spark) metadata maps.
+    """
     if not metadata:
         return None
 
-    out = {key: value for key, value in metadata.items() if key != _TYPE_JSON_METADATA_KEY}
+    type_json_str = _TYPE_JSON_METADATA_KEY.decode("utf-8")
+    out = {
+        key: value
+        for key, value in metadata.items()
+        if key != _TYPE_JSON_METADATA_KEY and key != type_json_str
+    }
     return out or None
 
 
@@ -1493,12 +1505,19 @@ class Field(BaseMetadata, BaseChildrenFields):
 
     @classmethod
     def from_spark_field(cls, value: "pst.StructField", from_metadata: bool = True) -> "Field":
+        # Spark stores metadata as ``dict[str, Any]`` (a Java
+        # ``Metadata`` view). The ``type_json`` round-trip blob — only
+        # written for Map/Array dtypes by :meth:`to_pyspark_field` —
+        # therefore lives under the str key, not the bytes one.
+        type_json_key_str = _TYPE_JSON_METADATA_KEY.decode("utf-8")
         if from_metadata and value.metadata:
-            dtype = value.metadata.get(_TYPE_JSON_METADATA_KEY, None)
-            if dtype is None:
+            dtype_json = value.metadata.get(type_json_key_str, None)
+            if dtype_json is None:
+                dtype_json = value.metadata.get(_TYPE_JSON_METADATA_KEY, None)
+            if dtype_json is None:
                 dtype = DataType.from_spark(value.dataType)
             else:
-                dtype = cls.from_json(dtype)
+                dtype = DataType.from_json(dtype_json)
         else:
             dtype = DataType.from_spark(value.dataType)
 
@@ -1506,7 +1525,7 @@ class Field(BaseMetadata, BaseChildrenFields):
             name=value.name,
             dtype=dtype,
             nullable=value.nullable,
-            metadata=_normalize_metadata(value.metadata, tags=None),
+            metadata=_strip_internal_metadata(_normalize_metadata(value.metadata, tags=None)),
         )
 
     # ==================================================================
@@ -1558,11 +1577,23 @@ class Field(BaseMetadata, BaseChildrenFields):
     def to_arrow_type(self):
         return self.arrow_type
 
-    def to_arrow_field(self, dump_json: bool = True) -> pa.Field:
-        # Cache only the canonical (with-type-json) shape — that's
-        # what every internal caller asks for. ``dump_json=False`` is
-        # rare (debug / DDL paths) and bypasses the cache.
-        if dump_json and self._arrow_field is not None:
+    def to_arrow_field(self, dump_json: bool = False) -> pa.Field:
+        """Project to a :class:`pa.Field`.
+
+        Arrow preserves nested-type structure (struct, list, map)
+        with per-field metadata recursively, so the dtype intent
+        round-trips natively without us stuffing a ``type_json`` blob
+        into the metadata. Only callers that need the exact
+        :class:`DataType` subclass back (e.g. Decimal precision /
+        Timestamp tz / extension types) should pass
+        ``dump_json=True``.
+
+        ``dump_json`` defaults to ``False``; the cached path is the
+        canonical (no-blob) shape, which is what every internal caller
+        wants now that :meth:`from_arrow_field` falls back through
+        :meth:`DataType.from_arrow_type` when the blob is missing.
+        """
+        if not dump_json and self._arrow_field is not None:
             return self._arrow_field
 
         metadata = self.metadata.copy() if self.metadata else {}
@@ -1573,9 +1604,9 @@ class Field(BaseMetadata, BaseChildrenFields):
             name=self.name,
             type=self.arrow_type,
             nullable=self.nullable,
-            metadata=metadata,
+            metadata=metadata or None,
         )
-        if dump_json:
+        if not dump_json:
             object.__setattr__(self, "_arrow_field", built)
         return built
 
@@ -1647,6 +1678,16 @@ class Field(BaseMetadata, BaseChildrenFields):
         return self.to_polars_field()
 
     def to_pyspark_field(self) -> "pst.StructField":
+        """Project to a Spark :class:`StructField`.
+
+        Spark's :class:`StructType` preserves struct children with
+        their own metadata, so primitive and struct dtypes don't
+        need a ``type_json`` round-trip blob. Spark's :class:`MapType`
+        / :class:`ArrayType` only carry the element / key+value Spark
+        types and lose any field-level metadata on the way through, so
+        we dump the dtype JSON for those (and only those) to recover
+        the original yggdrasil dtype on read.
+        """
         if self._spark_field is not None:
             return self._spark_field
 
@@ -1668,6 +1709,10 @@ class Field(BaseMetadata, BaseChildrenFields):
             if self.metadata
             else {}
         )
+        if self._needs_spark_type_json():
+            metadata[_TYPE_JSON_METADATA_KEY.decode("utf-8")] = (
+                self.dtype.to_json(to_bytes=False)
+            )
         built = pyspark_sql.types.StructField(
             self.name,
             self.dtype.to_spark(),
@@ -1676,6 +1721,19 @@ class Field(BaseMetadata, BaseChildrenFields):
         )
         object.__setattr__(self, "_spark_field", built)
         return built
+
+    def _needs_spark_type_json(self) -> bool:
+        """True iff this field's dtype loses fidelity through Spark.
+
+        Spark's :class:`MapType` / :class:`ArrayType` carry only the
+        element Spark types — no per-field metadata — so a yggdrasil
+        dtype that lives below them (key/value/item field) only
+        round-trips if we dump the parent dtype as JSON. Struct,
+        primitives, and scalars are preserved natively by
+        :class:`StructField`'s recursive metadata, so the dump is
+        skipped there.
+        """
+        return self.type_id in (DataTypeId.MAP, DataTypeId.ARRAY)
 
     def to_spark_schema(self) -> "pst.StructType":
         """Project this field as a top-level Spark :class:`StructType`.
