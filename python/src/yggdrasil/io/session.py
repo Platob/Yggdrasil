@@ -652,6 +652,35 @@ class Session(ABC):
                 misses.append(req)
         return hits, misses
 
+    @staticmethod
+    def _responses_to_spark(
+        responses: list[Response],
+        spark: "SparkSession",
+    ) -> "SparkDataFrame":
+        """Lift a list of :class:`Response` to a schema-bearing Spark frame.
+
+        Used on the spark path to keep every bucket frame-resident.
+        Empty input yields an empty DataFrame keyed to
+        :data:`RESPONSE_SCHEMA` so downstream ``unionByName`` calls never
+        trip on a column-list mismatch. Non-empty input goes through
+        ``pa.Table.from_batches → spark.createDataFrame``; the pandas
+        fallback covers PySpark builds that reject Arrow tables directly.
+        """
+        if not responses:
+            return spark.createDataFrame(
+                [], schema=RESPONSE_SCHEMA.to_spark_schema(),
+            )
+        table = pa.Table.from_batches(
+            [r.to_arrow_batch(parse=False) for r in responses]
+        )
+        try:
+            return spark.createDataFrame(table)
+        except (TypeError, AttributeError):
+            return spark.createDataFrame(
+                table.to_pandas(),
+                schema=RESPONSE_SCHEMA.to_spark_schema(),
+            )
+
     def _split_remote_cache_spark(
         self,
         requests: list[PreparedRequest],
@@ -1011,8 +1040,19 @@ class Session(ABC):
                 continue
 
             # --- Stage 1: local cache ---
-            local_hits, after_local = self._split_local_cache(chunk, session_local_cfg)
-            remote_hits: list[Response] = []
+            local_hits_list, after_local = self._split_local_cache(
+                chunk, session_local_cfg,
+            )
+            # On the spark path, lift driver-read local hits to a Spark
+            # frame straight away so every bucket downstream is
+            # frame-resident — matches stage 2/3 and lets the caller
+            # union holders without a per-bucket type switch.
+            local_hits: "list[Response] | SparkDataFrame"
+            if is_spark:
+                local_hits = self._responses_to_spark(local_hits_list, spark)
+            else:
+                local_hits = local_hits_list
+            remote_hits: "list[Response] | SparkDataFrame" = []
             # Default new_hits to None so ResponseBatch coerces it to a
             # schema-bearing empty holder (Spark or Arrow depending on
             # mode) — no special-case for "stage skipped".
@@ -1045,7 +1085,6 @@ class Session(ABC):
             # (via :meth:`_split_remote_cache_spark`) so ``remote_hits``
             # never collects to the driver and downstream callers can
             # union it with stage 3's Spark output.
-            remote_hits: "list[Response] | SparkDataFrame"
             if is_spark:
                 remote_hits, after_remote = self._split_remote_cache_spark(
                     after_local,
