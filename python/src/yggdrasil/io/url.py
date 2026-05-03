@@ -934,8 +934,11 @@ class URL(os.PathLike):
             return self
 
         base = PurePosixPath(self.path) if self.path else PurePosixPath("/")
-        joined = base.joinpath(*(_join_segment(s) for s in segments))
-        return self._replace(path=str(joined))
+        segments = [_join_segment(s) for s in segments]
+        joined = str(base.joinpath(*segments))
+        if segments and segments[-1].endswith("/") and not joined.endswith("/"):
+            joined = joined + "/"
+        return self._replace(path=joined)
 
     # ------------------------------------------------------------------
     # Pattern matching and relative-path queries

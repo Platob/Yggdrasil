@@ -157,6 +157,64 @@ def _is_arrow_dataset(obj: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def get_arrow_nbytes(obj: Any, default: int = 0) -> int:
+    """Best-effort byte size of an Arrow object.
+
+    ``obj.nbytes`` is the fast path but raises ``NotImplementedError``
+    on arrays containing variadic-buffer types (``string_view``,
+    ``binary_view``, list-view variants) in current pyarrow, because
+    there's no single accumulator for the variadic data buffers. We
+    fall back through:
+
+    1. Container recursion — ``Table`` / ``RecordBatch`` over columns,
+       ``ChunkedArray`` over chunks.
+    2. Direct buffer walk — sum ``buf.size`` for every non-null buffer
+       returned by ``Array.buffers()``. For view types this naturally
+       picks up validity + views + variadic data buffers.
+    3. ``default`` — last resort, never raises.
+
+    Always returns an ``int``; never propagates exceptions from Arrow
+    internals (the caller is sizing batches for chunking, not doing
+    accounting — a slightly off estimate is fine, a crash is not).
+    """
+    if obj is None:
+        return default
+
+    try:
+        return int(obj.nbytes)
+    except (NotImplementedError, AttributeError, TypeError):
+        pass
+    except Exception:
+        pass
+
+    # Container types: recurse into children. Tables / RecordBatches
+    # expose .columns; ChunkedArray exposes .chunks.
+    columns = getattr(obj, "columns", None)
+    if columns is not None:
+        try:
+            return sum(get_arrow_nbytes(c, default=default) for c in columns)
+        except Exception:
+            pass
+
+    chunks = getattr(obj, "chunks", None)
+    if chunks is not None:
+        try:
+            return sum(get_arrow_nbytes(c, default=default) for c in chunks)
+        except Exception:
+            pass
+
+    # Leaf array: walk every buffer. Handles view types (string_view /
+    # binary_view), which is the case .nbytes refuses to size.
+    buffers = getattr(obj, "buffers", None)
+    if callable(buffers):
+        try:
+            return sum(buf.size for buf in buffers() if buf is not None)
+        except Exception:
+            pass
+
+    return default
+
+
 def rechunk_arrow_batches_by_byte_size(
     batches: Iterable[pa.RecordBatch],
     *,
@@ -175,6 +233,11 @@ def rechunk_arrow_batches_by_byte_size(
       per-segment bytes/row ratio to derive a row target.
     * Both set → ``byte_size`` drives the row target; ``row_size``
       caps it (final ``target_rows = min(row_size, derived)``).
+
+    Byte sizing routes through :func:`get_arrow_nbytes` so view-typed
+    arrays (``string_view`` / ``binary_view``) — which raise from
+    ``RecordBatch.nbytes`` in current pyarrow — fall back to a buffer
+    walk instead of crashing the rechunker.
 
     Algorithm (byte_size path):
 
@@ -208,13 +271,17 @@ def rechunk_arrow_batches_by_byte_size(
                 yield batch.slice(offset, row_size)
         return
 
-    def _target_rows(batch: pa.RecordBatch) -> int:
-        bytes_per_row = max(1, batch.nbytes // max(1, batch.num_rows))
+    def _target_rows(batch: pa.RecordBatch, nbytes: int | None = None) -> int:
+        if nbytes is None:
+            nbytes = get_arrow_nbytes(batch)
+        bytes_per_row = max(1, nbytes // max(1, batch.num_rows))
         derived = max(1, byte_size // bytes_per_row)
         return min(row_size, derived) if has_row else derived
 
-    def _slice_to_target(batch: pa.RecordBatch) -> Iterator[pa.RecordBatch]:
-        target = _target_rows(batch)
+    def _slice_to_target(
+        batch: pa.RecordBatch, nbytes: int | None = None
+    ) -> Iterator[pa.RecordBatch]:
+        target = _target_rows(batch, nbytes=nbytes)
         if batch.num_rows <= target:
             yield batch
             return
@@ -228,18 +295,21 @@ def rechunk_arrow_batches_by_byte_size(
         if batch.num_rows == 0:
             continue
 
-        if not buffer and batch.nbytes >= byte_size:
-            yield from _slice_to_target(batch)
+        nbytes = get_arrow_nbytes(batch)
+
+        if not buffer and nbytes >= byte_size:
+            yield from _slice_to_target(batch, nbytes=nbytes)
             continue
 
         buffer.append(batch)
-        buffered_bytes += batch.nbytes
+        buffered_bytes += nbytes
 
         if buffered_bytes < byte_size:
             continue
 
         combined = pa.concat_batches(buffer, memory_pool=memory_pool)
-        target = _target_rows(combined)
+        combined_nbytes = get_arrow_nbytes(combined)
+        target = _target_rows(combined, nbytes=combined_nbytes)
 
         if combined.num_rows <= target:
             # Estimator pushed the row-cap above the combined batch
@@ -250,18 +320,19 @@ def rechunk_arrow_batches_by_byte_size(
             buffered_bytes = 0
             continue
 
-        sliced = list(_slice_to_target(combined))
+        sliced = list(_slice_to_target(combined, nbytes=combined_nbytes))
         for chunk in sliced[:-1]:
             yield chunk
 
         tail = sliced[-1]
-        if tail.nbytes >= byte_size:
+        tail_nbytes = get_arrow_nbytes(tail)
+        if tail_nbytes >= byte_size:
             yield tail
             buffer = []
             buffered_bytes = 0
         else:
             buffer = [tail]
-            buffered_bytes = tail.nbytes
+            buffered_bytes = tail_nbytes
 
     if buffer:
         combined = pa.concat_batches(buffer, memory_pool=memory_pool)
