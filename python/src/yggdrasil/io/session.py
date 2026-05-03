@@ -7,7 +7,6 @@ import logging
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional
 
 import pyarrow as pa
@@ -21,7 +20,7 @@ from yggdrasil.dataclasses.waiting import (
 )
 from yggdrasil.io.enums import Mode
 from .buffer import BytesIO
-from .buffer.primitive import ArrowIPCIO
+from .local_response_cache import LocalResponseCache
 from .request import PreparedRequest
 from .response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
 from .response_batch import ResponseBatch
@@ -53,22 +52,26 @@ LOGGER = logging.getLogger(__name__)
 _SPARK_RESPONSE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
 
 
-# Local cache files are Arrow IPC — one Response per file, written by
-# `_store_local_cached_response` and read back by
-# `_load_local_cached_response` via `Response.from_arrow_tabular`.
-_LOCAL_CACHE_SUFFIX: str = ".arrow"
+# Local cache lives in a partitioned folder rooted at the
+# CacheConfig's ``path`` (see :class:`LocalResponseCache`). Reads
+# prune by partition + filter by received-window; writes append-only,
+# concurrent-safe across the job pool.
 
 
-def _write_local_cache_arrow(batch: pa.RecordBatch, target: Path) -> None:
-    """Persist a single Response Arrow batch to *target* as IPC.
+def _store_local_arrow_batch(
+    cache: "LocalResponseCache",
+    batch: pa.RecordBatch,
+) -> None:
+    """Append a single Arrow batch to ``cache`` from a worker thread.
 
-    Module-level so the fire-and-forget Job can pickle the callable
-    without dragging Session state into the worker thread. The parent
-    directory is created on demand because the staging folder rotates
-    TTL-encoded names; missing intermediate dirs are routine.
+    Module-level so the fire-and-forget Job pickles cleanly without
+    dragging Session state along. Routes through
+    :meth:`LocalResponseCache._direct_partition_write` — the same
+    UUID-named-leaf path :meth:`LocalResponseCache.store_many` uses
+    for the bulk case — so concurrent fire-and-forget workers
+    can't race on a sequential filename.
     """
-    target.parent.mkdir(parents=True, exist_ok=True)
-    ArrowIPCIO(path=str(target)).write_arrow_batches([batch])
+    cache._direct_partition_write(pa.Table.from_batches([batch]))
 
 
 @dataclass
@@ -153,70 +156,55 @@ class Session(ABC):
         self,
         request: PreparedRequest,
         cache_cfg: CacheConfig,
-    ) -> tuple[Optional[Response], Optional[Path]]:
-        filepath = cache_cfg.local_cache_file(
-            request=request,
-            suffix=_LOCAL_CACHE_SUFFIX,
-        )
-        if filepath is None:
-            return None, filepath
+    ) -> Optional[Response]:
+        """Resolve a single request against the partitioned local cache.
 
-        if not filepath.exists():
-            return None, filepath
-
-        try:
-            io = ArrowIPCIO(path=str(filepath))
-            loaded = next(
-                Response.from_arrow_tabular(io.read_arrow_batches()),
-                None,
-            )
-        except Exception:
-            # Corrupted / partial / non-IPC file: drop it so the next
-            # write replaces it. Mirrors the old pickle path's
-            # `clean_corrupted=True` behavior.
-            try:
-                filepath.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return None, filepath
-
+        Returns the cached :class:`Response` or ``None`` on miss.
+        Filtering by ``request_by`` columns and the configured
+        received-window happens inside
+        :meth:`LocalResponseCache.lookup`.
+        """
+        cache = cache_cfg.local_cache()
+        loaded = cache.lookup(request)
         if loaded is None:
-            return None, filepath
-
+            return None
         if not cache_cfg.filter_response(loaded, request=request):
-            return None, filepath
-
+            return None
         LOGGER.debug(
-            "Found local %s %s from %s",
-            request.method, request.url, filepath
+            "Found local %s %s in %s",
+            request.method, request.url, cache.folder_path,
         )
-        return loaded, filepath
+        return loaded
 
     def _store_local_cached_response(
         self,
         response: Response,
         cache_cfg: CacheConfig,
         *,
-        filepath=None,
+        cache: "LocalResponseCache | None" = None,
     ) -> None:
+        """Persist one response to the partitioned local cache.
+
+        The response is anonymized first (matches the on-disk
+        identity used at lookup time) and the actual write is
+        fired off through the job pool — the partitioned folder
+        write does its own Arrow IPC append, so the caller's thread
+        only pays for the in-memory batch construction.
+
+        ``cache`` lets a hot-loop caller reuse a single
+        :class:`LocalResponseCache` instance instead of paying for
+        the per-call construction (cheap but not free).
+        """
         if not response.ok:
             return
 
         anonymized = response.anonymize(mode=cache_cfg.anonymize)
-        target = filepath if filepath else cache_cfg.local_cache_file(
-            request=anonymized.request,
-            suffix=_LOCAL_CACHE_SUFFIX,
-            force=True
-        )
-        if target is None:
-            return
-
-        # Serialize the Response now (on the caller's thread, with the
-        # buffer still live) and hand the Arrow batch + path off to a
-        # fire-and-forget writer. Doing the to_arrow_batch inside the
-        # job would race the buffer's lifetime against unrelated work.
+        cache = cache or cache_cfg.local_cache()
+        # Build the Arrow batch on the caller's thread while the
+        # buffer is still live; the partitioned write goes through
+        # fire-and-forget so the caller doesn't block on disk IO.
         batch = anonymized.to_arrow_batch(parse=False)
-        Job.make(_write_local_cache_arrow, batch, target).fire_and_forget()
+        Job.make(_store_local_arrow_batch, cache, batch).fire_and_forget()
 
     def _load_remote_cached_response(
         self,
@@ -348,26 +336,16 @@ class Session(ABC):
         effective_remote_cfg = request.remote_cache_config or remote_cfg
 
         # --- 1. Check local cache first (fast, disk-based) ---
-        # Pin the filepath BEFORE any session-level mutation of the request
-        # (`_local_send` calls `prepare_to_send` which adds outgoing headers
-        # and changes the cache key). Without this, load and store hash
-        # different shapes of the same request and the cache never hits.
-        local_filepath = None
+        # UPSERT mode skips the lookup outright — the lookup
+        # tie-break already returns the latest matching row, so a
+        # stale entry can sit on disk indefinitely without
+        # affecting correctness; the fresh fetch below will append
+        # a newer row that wins on the next read.
+        local_cache: "LocalResponseCache | None" = None
         if effective_local_cfg.local_cache_enabled:
-            local_filepath = effective_local_cfg.local_cache_file(
-                request=request, suffix=_LOCAL_CACHE_SUFFIX, force=True
-            )
-            if effective_local_cfg.mode == Mode.UPSERT:
-                # Force-evict any stale local entry so the fresh response
-                # can be written in its place after the actual fetch.
-                if local_filepath is not None:
-                    local_filepath.unlink(missing_ok=True)
-                    LOGGER.debug(
-                        "UPSERT: evicted local cache for %s %s",
-                        request.method, request.url,
-                    )
-            else:
-                local_response, _ = self._load_local_cached_response(
+            local_cache = effective_local_cfg.local_cache()
+            if effective_local_cfg.mode != Mode.UPSERT:
+                local_response = self._load_local_cached_response(
                     request, effective_local_cfg
                 )
                 if local_response is not None:
@@ -388,11 +366,11 @@ class Session(ABC):
             )
             if remote_response is not None:
                 # Backfill local cache with the remote hit
-                if effective_local_cfg.local_cache_enabled:
+                if local_cache is not None:
                     self._store_local_cached_response(
                         remote_response,
                         effective_local_cfg,
-                        filepath=local_filepath,
+                        cache=local_cache,
                     )
                 if config.raise_error:
                     remote_response.raise_for_status()
@@ -403,11 +381,11 @@ class Session(ABC):
         response = self._local_send(request, config=config)
         LOGGER.info("Sent %s %s", request.method, request.url)
 
-        if effective_local_cfg.local_cache_enabled:
+        if local_cache is not None:
             self._store_local_cached_response(
                 response,
                 effective_local_cfg,
-                filepath=local_filepath,
+                cache=local_cache,
             )
 
         if effective_remote_cfg.remote_cache_enabled:
@@ -544,31 +522,36 @@ class Session(ABC):
             # Cheap path: no local cache anywhere in this batch.
             return hits, list(batch)
 
+        # Group active requests by their effective config so each
+        # cache root takes one folder read instead of one per
+        # request — that's the whole point of the partitioned
+        # layout. UPSERT-mode and disabled requests fall straight
+        # to misses without touching the cache.
+        cfg_groups: dict[str, tuple[CacheConfig, list[PreparedRequest]]] = {}
         for req in batch:
             eff = self._effective_local_cfg(req, session_local_cfg)
-            if not eff.local_cache_enabled:
+            if not eff.local_cache_enabled or eff.mode == Mode.UPSERT:
                 misses.append(req)
                 continue
-
-            if eff.mode == Mode.UPSERT:
-                evict_path = eff.local_cache_file(req, suffix=_LOCAL_CACHE_SUFFIX, force=True)
-                if evict_path is not None and evict_path.exists():
-                    evict_path.unlink(missing_ok=True)
-                    LOGGER.debug(
-                        "UPSERT: evicted local cache for %s %s",
-                        req.method, req.url,
-                    )
-                misses.append(req)
-                continue
-
-            local_response, _ = self._load_local_cached_response(req, eff)
-            if local_response is not None:
-                # Auto-completes ``path`` on configs that didn't carry
-                # one, so the dict key is always a real on-disk root.
-                pkey = str(eff.local_cache_folder())
-                hits.setdefault(pkey, []).append(local_response)
+            pkey = str(eff.local_cache_folder())
+            slot = cfg_groups.get(pkey)
+            if slot is None:
+                cfg_groups[pkey] = (eff, [req])
             else:
-                misses.append(req)
+                slot[1].append(req)
+
+        for pkey, (eff, group_reqs) in cfg_groups.items():
+            cache = eff.local_cache()
+            looked_up = cache.lookup_many(group_reqs)
+            for req in group_reqs:
+                cached = looked_up.get(cache._request_key(req))
+                if cached is None:
+                    misses.append(req)
+                    continue
+                if not eff.filter_response(cached, request=req):
+                    misses.append(req)
+                    continue
+                hits.setdefault(pkey, []).append(cached)
 
         if hits:
             total = sum(len(v) for v in hits.values())
@@ -869,18 +852,34 @@ class Session(ABC):
     ) -> None:
         """Write remote-cache hits back to the local cache.
 
-        Each response is stored against its originating request's effective
-        local config (looked up by URL) — using the session-level config for
-        every response would be wrong whenever a request carries a custom
-        per-request local cache.
+        Each response is stored against its originating request's
+        effective local config (looked up by URL) — using the
+        session-level config for every response would be wrong
+        whenever a request carries a custom per-request local
+        cache. Responses are anonymized then grouped by the
+        effective cache root so each :class:`LocalResponseCache`
+        takes a single bulk store_many call instead of one
+        :meth:`store` per response — collapsing N small writes into
+        one partitioned-folder commit per root.
         """
+        groups: dict[str, tuple["LocalResponseCache", list[Response]]] = {}
         for response in responses:
             url_key = str(response.request.url) if response.request else None
             eff = url_to_local_cfg.get(url_key) if url_key else None
             if eff is None:
                 eff = session_local_cfg
-            if eff.local_cache_enabled:
-                self._store_local_cached_response(response, eff)
+            if not eff.local_cache_enabled:
+                continue
+            anonymized = response.anonymize(mode=eff.anonymize)
+            pkey = str(eff.local_cache_folder())
+            slot = groups.get(pkey)
+            if slot is None:
+                groups[pkey] = (eff.local_cache(), [anonymized])
+            else:
+                slot[1].append(anonymized)
+
+        for cache, group_responses in groups.values():
+            cache.store_many(group_responses)
 
     def _persist_remote(
         self,

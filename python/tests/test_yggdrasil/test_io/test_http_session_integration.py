@@ -30,43 +30,35 @@ from typing import Iterator
 
 import pytest
 
-from yggdrasil.io.buffer.primitive import ArrowIPCIO
 from yggdrasil.io.errors import NotFoundError
 from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.io.local_response_cache import LocalResponseCache
 from yggdrasil.io.request import PreparedRequest
-from yggdrasil.io.response import Response
 from yggdrasil.io.send_config import CacheConfig
 
 
 def _wait_for_cache(tmp_path: Path, expected: int = 1, timeout: float = 10.0) -> None:
-    """Wait until *expected* cache files exist and are fully readable.
+    """Wait until at least *expected* responses have landed in the cache.
 
     Cache writes go through ``Job.make(...).fire_and_forget()`` so the
-    file may exist (partial / zero-byte) before the IPC writer has
-    flushed. Polling on "Arrow IPC parses to a Response" is the
-    cheapest reliable barrier.
+    partitioned-folder write is in flight when the call site returns.
+    Polling on :meth:`LocalResponseCache.count` is the cheapest
+    reliable barrier — it walks the partitioned tree, reads every
+    leaf, and applies the received-window filter the way a real
+    lookup would.
     """
+    cache = LocalResponseCache(path=tmp_path)
     deadline = time.time() + timeout
     while time.time() < deadline:
-        files = list((tmp_path / "cache").rglob("*.arrow"))
-        if len(files) >= expected:
-            ok = 0
-            for f in files:
-                try:
-                    io = ArrowIPCIO(path=str(f))
-                    loaded = next(
-                        Response.from_arrow_tabular(io.read_arrow_batches()),
-                        None,
-                    )
-                    if loaded is not None:
-                        ok += 1
-                except Exception:
-                    pass
-            if ok >= expected:
-                return
+        try:
+            n = cache.count()
+        except Exception:
+            n = 0
+        if n >= expected:
+            return
         time.sleep(0.05)
     raise AssertionError(
-        f"timed out waiting for {expected} cache file(s) under {tmp_path}"
+        f"timed out waiting for {expected} cached response(s) under {tmp_path}"
     )
 
 
@@ -264,8 +256,17 @@ class TestHttpSessionLocalCache:
         with HTTPSession(verify=False) as session:
             session.get(f"{http_server.base_url}/cache/path-check", local_cache=cache)
         _wait_for_cache(tmp_path, expected=1)
-        cache_files = list((tmp_path / "cache").rglob("*.arrow"))
-        assert cache_files, "expected at least one cache file under tmp_path/cache"
+        # Partitioned layout: at least one leaf lives under
+        # ``cache/request_method=GET/request_url_host=.../`` — assert
+        # on the partitioned shape, not a flat glob, so a layout
+        # change doesn't sneak through unnoticed.
+        cache_root = tmp_path / "cache"
+        leaves = [p for p in cache_root.rglob("*") if p.is_file()]
+        assert leaves, "expected at least one partition leaf under tmp_path/cache"
+        rel_dirs = {str(leaf.parent.relative_to(cache_root)) for leaf in leaves}
+        assert any(
+            d.startswith("request_method=GET") for d in rel_dirs
+        ), f"expected Hive-partitioned layout, got: {sorted(rel_dirs)!r}"
 
     def test_distinct_urls_cache_independently(
         self, http_server: _Server, tmp_path
