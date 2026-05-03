@@ -84,8 +84,12 @@ class TestArrowSchemaPromotion:
 
         schema = src.to_schema()
 
-        assert schema.metadata is not None
-        assert schema.metadata[b"name"] == b"value"
+        # ``name`` is a Schema (= Field) attribute now, no longer
+        # embedded in the metadata dict. Round-trips through
+        # :meth:`Schema.to_arrow_schema`, which re-embeds it under
+        # ``b"name"`` so the arrow schema carries it.
+        assert schema.name == "value"
+        assert schema.to_arrow_schema().metadata[b"name"] == b"value"
 
 
 class TestArrowDefaultsAndFill:

@@ -1489,9 +1489,12 @@ class Field(BaseMetadata, BaseChildrenFields):
         if new_metadata:
             final_metadata.update(new_metadata)
 
-        if base.name != DEFAULT_FIELD_NAME:
-            final_metadata[b"name"] = base.name.encode("utf-8")
-        return Schema.from_any_fields(base.children_fields, metadata=final_metadata)
+        return Schema(
+            inner_fields=base.children_fields,
+            metadata=final_metadata or None,
+            name=base.name if base.name != DEFAULT_FIELD_NAME else None,
+            nullable=base.nullable,
+        )
 
     def to_struct(self):
         dtype = self.dtype.to_struct(name=self.name)

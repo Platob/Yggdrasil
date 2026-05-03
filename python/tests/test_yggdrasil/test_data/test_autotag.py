@@ -199,6 +199,8 @@ class TestSchemaAutotag:
         assert (out["book_id"].tags or {})[b"cluster_by"] == b"true"
 
         # Schema-level keys consumed (so they don't leak through Arrow / Delta).
-        assert out.metadata is not None
-        assert b"partition_by" not in out.metadata
-        assert b"cluster_by" not in out.metadata
+        # ``out.metadata`` is allowed to be ``None`` once everything was
+        # consumed off it.
+        leftover = out.metadata or {}
+        assert b"partition_by" not in leftover
+        assert b"cluster_by" not in leftover
