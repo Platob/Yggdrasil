@@ -317,6 +317,44 @@ class TestHttpSessionSendManyLocalCache:
             "second pass should be served entirely from disk"
         )
 
+    def test_send_many_batch_first_pass_all_new_hits(
+        self, http_server: _Server, tmp_path
+    ):
+        from yggdrasil.io.session import ResponseBatch
+
+        pytest.importorskip("xxhash")
+        cache = self._cache(tmp_path)
+        reqs = self._build_requests(http_server.base_url, 3)
+        with HTTPSession(verify=False) as session:
+            batch = session.send_many_batch(iter(reqs), local_cache=cache)
+
+        assert isinstance(batch, ResponseBatch)
+        assert batch.counts == {"local": 0, "remote": 0, "new": 3}
+        assert len(batch) == 3
+        # Iteration order: local → remote → new. With no cache hits, the
+        # whole batch flows through the new bucket.
+        assert list(batch) == batch.new_hits
+
+    def test_send_many_batch_second_pass_all_local_hits(
+        self, http_server: _Server, tmp_path
+    ):
+        from yggdrasil.io.session import ResponseBatch
+
+        pytest.importorskip("xxhash")
+        cache = self._cache(tmp_path)
+        reqs = self._build_requests(http_server.base_url, 2)
+        with HTTPSession(verify=False) as session:
+            session.send_many_batch(iter(reqs), local_cache=cache)
+            _wait_for_cache(tmp_path, expected=2)
+            http_server.reset_counters()
+            batch = session.send_many_batch(iter(reqs), local_cache=cache)
+
+        assert isinstance(batch, ResponseBatch)
+        assert batch.counts == {"local": 2, "remote": 0, "new": 0}
+        assert http_server.counters == {}, (
+            "second-pass send_many_batch should not touch upstream"
+        )
+
 
 # ---------------------------------------------------------------------------
 # HTTPSession.send_many with Spark
