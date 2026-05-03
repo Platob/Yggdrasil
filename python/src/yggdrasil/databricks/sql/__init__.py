@@ -10,6 +10,7 @@ from .schema import Schema
 from .schemas import Schemas
 from .sql_utils import *
 from .table import Table
+from .table_options import TableOptions
 from .tables import Tables
 from .view import View
 from .views import Views
