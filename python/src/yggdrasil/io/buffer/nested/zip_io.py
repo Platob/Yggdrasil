@@ -325,11 +325,13 @@ class ZipIO(BytesIO):
         """
         if not self._archive_is_present():
             return
+        from yggdrasil.io.buffer.base import matches_children_predicate
+
         names = [
             name
             for name in self._list_entry_names()
             if not self._is_ignored_name(name)
-            and options.matches_name(name)
+            and matches_children_predicate(options, name, path=name, is_dir=False)
         ]
         for name in names:
             yield self._attach(self._open_entry_io(name, auto_open=False))

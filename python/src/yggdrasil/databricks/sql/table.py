@@ -40,7 +40,8 @@ from pyarrow.fs import FileSystem, S3FileSystem
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data import Field
 from yggdrasil.data.data_utils import safe_constraint_name
-from yggdrasil.data.expr import Expr, Predicate
+from yggdrasil.data.expr import Predicate, col as expr_col
+from yggdrasil.data.expr.backends.sql import Dialect, to_sql as expr_to_sql
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema as DataSchema
 from yggdrasil.data.statement import PreparedStatement, StatementResult
@@ -175,13 +176,18 @@ def _build_prune_predicates(
 ) -> list[str]:
     """Convert ``{column: [values]}`` into target-side ``IN`` predicates."""
     predicates: list[str] = []
-    for col, vals in prune_values.items():
+    for column_name, vals in prune_values.items():
         materialized = tuple(vals)
         if not materialized:
             continue
-        pred = Expr(col, flavor="databricks", alias=target_alias).in_(materialized)
-        sql = pred.to_sql()
-        if pred.kind != "leaf":
+        pred = expr_col(column_name, alias=target_alias).is_in(materialized)
+        sql = expr_to_sql(pred, dialect=Dialect.DATABRICKS)
+        # Compound predicates get wrapped so they don't bleed into
+        # the surrounding AND/OR structure when concatenated by
+        # the caller. The new ``InList`` is always a single leaf,
+        # but empty / null-aware variants render to a compound
+        # ``... OR ... IS NULL`` form — wrap defensively.
+        if " OR " in sql or " AND " in sql:
             sql = f"({sql})"
         predicates.append(sql)
     return predicates
@@ -189,11 +195,81 @@ def _build_prune_predicates(
 
 def _wrap_user_predicate(pred: Predicate, *, target_alias: str) -> str:
     """Render a user predicate aliased to ``target_alias`` (parens if compound)."""
-    aliased = pred.with_table_alias(target_alias)
-    sql = aliased.to_sql()
-    if aliased.kind != "leaf":
+    aliased = _alias_columns(pred, target_alias)
+    sql = expr_to_sql(aliased, dialect=Dialect.DATABRICKS)
+    if " OR " in sql or " AND " in sql:
         sql = f"({sql})"
     return sql
+
+
+def _alias_columns(expr, alias: str):
+    """Walk *expr* and stamp every :class:`Column` with ``alias``.
+
+    Used by :func:`_wrap_user_predicate` to lift a user predicate
+    onto the target-side of a MERGE so ``foo`` becomes ``T.foo``.
+    Returns a new tree — the AST is immutable so we never mutate
+    the caller's predicate.
+    """
+    from yggdrasil.data.expr.nodes import (
+        Arithmetic,
+        Between,
+        Cast,
+        Column,
+        Comparison,
+        InList,
+        IsNull,
+        Like,
+        Logical,
+        Not,
+    )
+
+    if isinstance(expr, Column):
+        return type(expr)(name=expr.name, field=expr.field, alias=alias)
+    if isinstance(expr, Comparison):
+        return Comparison(
+            _alias_columns(expr.left, alias),
+            expr.op,
+            _alias_columns(expr.right, alias),
+        )
+    if isinstance(expr, Logical):
+        return Logical(
+            expr.op,
+            tuple(_alias_columns(o, alias) for o in expr.operands),
+        )
+    if isinstance(expr, Not):
+        return Not(_alias_columns(expr.operand, alias))
+    if isinstance(expr, Between):
+        return Between(
+            _alias_columns(expr.target, alias),
+            _alias_columns(expr.low, alias),
+            _alias_columns(expr.high, alias),
+            negated=expr.negated,
+        )
+    if isinstance(expr, InList):
+        return InList(
+            target=_alias_columns(expr.target, alias),
+            values=expr.values,
+            negated=expr.negated,
+            includes_null=expr.includes_null,
+        )
+    if isinstance(expr, IsNull):
+        return IsNull(_alias_columns(expr.target, alias), negated=expr.negated)
+    if isinstance(expr, Like):
+        return Like(
+            target=_alias_columns(expr.target, alias),
+            pattern=expr.pattern,
+            case_insensitive=expr.case_insensitive,
+            negated=expr.negated,
+        )
+    if isinstance(expr, Cast):
+        return Cast(_alias_columns(expr.operand, alias), expr.dtype)
+    if isinstance(expr, Arithmetic):
+        return Arithmetic(
+            expr.op,
+            _alias_columns(expr.left, alias),
+            _alias_columns(expr.right, alias),
+        )
+    return expr
 
 
 def _collect_prune_values_polars(
@@ -623,8 +699,17 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
             for name in options.column_names or [c.name for c in self.columns]
         )
         query = f"SELECT {names}"
-        if options.where:
-            query += f" WHERE {options.where.with_flavor('databricks')}"
+        # ``source_predicate`` is the read-side filter on
+        # :class:`CastOptions` — applied as a SQL ``WHERE`` clause
+        # so the warehouse drops non-matching rows before they
+        # reach the cast pipeline. The companion
+        # ``target_predicate`` is honoured by the write path
+        # (:meth:`_write_arrow_batches`) instead.
+        if options.source_predicate is not None:
+            query += (
+                f" WHERE "
+                f"{expr_to_sql(options.source_predicate, dialect=Dialect.DATABRICKS)}"
+            )
 
         for batch in self.execute(query).read_arrow_batches(options=options):
             yield batch
@@ -645,7 +730,11 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
             zorder_by=options.zorder_by,
             optimize_after_merge=options.optimize_after_merge,
             vacuum_hours=options.vacuum_hours,
-            where=options.where,
+            # Write-side filter — ``target_predicate`` survives the
+            # MERGE / UPDATE planning so callers can scope the
+            # destination rewrite without leaking into the read
+            # path.
+            where=options.target_predicate,
             prune_by=options.prune_by,
             prune_values=options.prune_values,
             retry=options.retry,

@@ -24,8 +24,6 @@ from yggdrasil.io.buffer.nested import (
     FolderOptions,
     NestedIO,
     NestedOptions,
-    PartitionedFolderIO,
-    PartitionedOptions,
 )
 from yggdrasil.io.buffer.nested.folder_io import (
     _coerce_partition_column,
@@ -88,10 +86,6 @@ class TestNestedIOBase:
     def test_options_class_default(self):
         assert NestedIO.options_class() is NestedOptions
         assert FolderIO.options_class() is FolderOptions
-
-    def test_partitioned_options_alias(self):
-        assert PartitionedOptions is FolderOptions
-
 
 # ---------------------------------------------------------------------------
 # FolderIO — flat folder behavior
@@ -167,6 +161,49 @@ class TestFolderIOFlat:
         names = sorted(c.path.name for c in FolderIO(path=str(tmp_path)).iter_children())
         assert ".hidden.parquet" not in names
         assert "visible.parquet" in names
+
+    def test_iter_children_predicate_filters_by_name(self, tmp_path: Path):
+        # ``children_predicate`` replaces the old include / exclude
+        # glob knobs — write the filter as a real predicate against
+        # the discovered child's metadata mapping.
+        from yggdrasil.data.expr import col
+
+        ParquetIO(path=str(tmp_path / "a.parquet")).write_arrow_table(
+            _flat_table(),
+        )
+        ParquetIO(path=str(tmp_path / "b.parquet")).write_arrow_table(
+            _flat_table(),
+        )
+        (tmp_path / "scratch.tmp").write_bytes(b"")
+
+        # Keep only ``.parquet`` leaves.
+        keep = col("name").like("%.parquet")
+        names = sorted(
+            c.path.name
+            for c in FolderIO(path=str(tmp_path)).iter_children(
+                children_predicate=keep,
+            )
+        )
+        assert names == ["a.parquet", "b.parquet"]
+
+    def test_iter_children_predicate_can_use_is_dir_metadata(self, tmp_path: Path):
+        from yggdrasil.data.expr import col
+
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        ParquetIO(path=str(sub / "leaf.parquet")).write_arrow_table(_flat_table())
+        ParquetIO(path=str(tmp_path / "top.parquet")).write_arrow_table(_flat_table())
+
+        # Only top-level files (no sub-folders) — the predicate
+        # introspects ``is_dir`` from the metadata mapping.
+        keep_files = col("is_dir") == False  # noqa: E712
+        children = list(
+            FolderIO(path=str(tmp_path), recursive=False).iter_children(
+                children_predicate=keep_files,
+            )
+        )
+        names = sorted(c.path.name for c in children)
+        assert names == ["top.parquet"]
 
     def test_recursive_descent_through_subfolder(self, tmp_path: Path):
         sub = tmp_path / "sub"
@@ -376,25 +413,152 @@ class TestPartitionedFolder:
 
 
 # ---------------------------------------------------------------------------
-# PartitionedFolderIO — wrapper class
+# Schema-driven partitioning + .schema sidecar
 # ---------------------------------------------------------------------------
 
 
-class TestPartitionedFolderIOClass:
-    def test_default_mime_type(self):
-        assert (
-            PartitionedFolderIO.default_mime_type()
-            == MimeTypes.PARTITIONED_FOLDER
-        )
+def _partitioned_schema_with_tag():
+    """Build a Schema where ``year`` is tagged as a partition column."""
+    from yggdrasil.data.schema import Schema
 
-    def test_round_trip(self, tmp_path: Path):
-        io = PartitionedFolderIO(
-            path=str(tmp_path), partition_columns=["year"]
+    base = Schema.from_arrow(_partitioned_table().schema)
+    base["year"] = base["year"].with_partition_by(True, inplace=False)
+    return base
+
+
+class TestFolderSchemaDrivenPartition:
+    def test_partitions_derive_from_schema_partition_by_tag(self, tmp_path: Path):
+        # ``schema=`` carries a Schema whose ``year`` field is
+        # tagged ``partition_by=True``. FolderIO should pick that
+        # up without an explicit ``partition_columns`` arg and lay
+        # the data down under a Hive-style ``year=*`` subtree.
+        io = FolderIO(path=str(tmp_path), schema=_partitioned_schema_with_tag())
+        io.write_arrow_table(_partitioned_table())
+
+        names = sorted(p.name for p in tmp_path.iterdir() if p.is_dir())
+        assert names == ["year=2024", "year=2025"]
+
+    def test_explicit_partition_columns_override_schema(self, tmp_path: Path):
+        # When a caller passes both ``partition_columns`` and a
+        # tagged ``schema``, the explicit list wins — same priority
+        # the documented resolution order promises.
+        io = FolderIO(
+            path=str(tmp_path),
+            schema=_partitioned_schema_with_tag(),
+            partition_columns=["a"],
         )
         io.write_arrow_table(_partitioned_table())
-        out = io.read_arrow_table()
-        assert out.num_rows == 3
+
+        names = sorted(p.name for p in tmp_path.iterdir() if p.is_dir())
+        # ``a`` becomes the partition column, not ``year``.
+        assert all(name.startswith("a=") for name in names)
+
+    def test_schema_sidecar_persisted_on_first_write(self, tmp_path: Path):
+        # On first write FolderIO drops a ``.schema`` sidecar so
+        # subsequent readers pick up the schema (and the tagged
+        # partition layout) without inferring from leaves.
+        schema = _partitioned_schema_with_tag()
+        io = FolderIO(path=str(tmp_path), schema=schema)
+        io.write_arrow_table(_partitioned_table())
+
+        sidecar = tmp_path / FolderIO.SCHEMA_FILE_NAME
+        assert sidecar.exists()
+        # Sidecar is hidden — the default ``_is_ignored_path`` skips
+        # dot-prefixed entries, so iter_children doesn't surface it.
+        child_names = [p.name for p in tmp_path.iterdir()]
+        assert sidecar.name in child_names  # on disk
+        assert not any(  # not yielded
+            getattr(c, "path", None) == sidecar
+            for c in io._iter_children(io.options_class()())
+        )
+
+    def test_sidecar_round_trips_partition_columns(self, tmp_path: Path):
+        # A reader that didn't pass a schema should still get the
+        # partitioned layout via the persisted sidecar.
+        writer = FolderIO(
+            path=str(tmp_path),
+            schema=_partitioned_schema_with_tag(),
+        )
+        writer.write_arrow_table(_partitioned_table())
+
+        reader = FolderIO(path=str(tmp_path))
+        loaded = reader.declared_schema()
+        assert loaded is not None
+        partition_names = [f.name for f in loaded.partition_fields]
+        assert partition_names == ["year"]
+        # And reads inject the partition column back into the rows.
+        out = reader.read_arrow_table()
         assert "year" in out.column_names
+
+
+# ---------------------------------------------------------------------------
+# Auto-prune UPSERT
+# ---------------------------------------------------------------------------
+
+
+class TestFolderUpsertAutoPrune:
+    def test_upsert_only_rewrites_partitions_touched_by_incoming(
+        self, tmp_path: Path
+    ):
+        # Seed the cache with two partitions: year=2024 and year=2025.
+        # Then UPSERT with rows targeting only year=2025 — the 2024
+        # partition's leaf set must remain untouched (auto-pruned),
+        # while 2025 gets the merged row.
+        io = FolderIO(path=str(tmp_path), partition_columns=["year"])
+        io.write_arrow_table(_partitioned_table())
+
+        before_2024 = sorted(
+            p.name for p in (tmp_path / "year=2024").iterdir()
+        )
+
+        # Build an incoming row whose match-by key (``a``) collides
+        # with one of the seeded year=2025 rows so we exercise the
+        # actual merge, not just an append. Schema matches
+        # ``_partitioned_table`` (a: int64, year: string).
+        incoming = pa.Table.from_pylist([{"a": 3, "year": "2025"}])
+        io.write_arrow_table(
+            incoming,
+            mode=Mode.UPSERT,
+            match_by_names=["a"],
+        )
+
+        after_2024 = sorted(
+            p.name for p in (tmp_path / "year=2024").iterdir()
+        )
+        # Auto-prune: year=2024's leaves are unchanged.
+        assert before_2024 == after_2024
+
+        out = io.read_arrow_table().sort_by([("a", "ascending")])
+        rows = out.to_pylist()
+        # ``a==3`` collided so the existing row was replaced rather
+        # than duplicated — exactly one survives.
+        a3_rows = [r for r in rows if r["a"] == 3]
+        assert len(a3_rows) == 1
+        # And the 2024 partition still has its untouched rows.
+        a_2024 = sorted(r["a"] for r in rows if r["year"] == "2024")
+        assert a_2024 == [1, 2]
+
+    def test_upsert_passes_through_to_base_for_non_partitioned(
+        self, tmp_path: Path
+    ):
+        # Without partition columns there's no tree to prune by —
+        # FolderIO should fall through to the base
+        # read-all/merge/overwrite pattern. Asserting via the public
+        # outcome: an upsert merges as expected.
+        io = FolderIO(path=str(tmp_path))
+        io.write_arrow_table(_flat_table())
+        existing_count = io.read_arrow_table().num_rows
+
+        # Use the same dtypes as ``_flat_table`` (a: int64, b: string).
+        incoming = pa.Table.from_pylist([{"a": 1, "b": "updated"}])
+        io.write_arrow_table(
+            incoming, mode=Mode.UPSERT, match_by_names=["a"],
+        )
+        out = io.read_arrow_table()
+        # The ``a==1`` collision merged one incoming row over an
+        # existing one — row count stays stable, only the content
+        # of the matched row changed.
+        assert out.num_rows == existing_count
 
 
 # ---------------------------------------------------------------------------

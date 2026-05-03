@@ -7,10 +7,10 @@ implementation is internal to this package.
 Top-level entry points
 ----------------------
 
-- :class:`DeltaIO` — :class:`PartitionedFolderIO` subclass; the
-  thing you instantiate to read/write a Delta table.
-- :class:`DeltaOptions` — :class:`PartitionedOptions` subclass
-  with Delta-specific knobs.
+- :class:`DeltaIO` — partition-capable :class:`FolderIO` subclass;
+  the thing you instantiate to read/write a Delta table.
+- :class:`DeltaOptions` — :class:`FolderOptions` subclass with
+  Delta-specific knobs.
 
 Module layout (for reading or extending the package):
 

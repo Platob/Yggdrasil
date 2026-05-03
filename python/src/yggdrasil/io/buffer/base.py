@@ -45,8 +45,6 @@ byte buffers.
 
 from __future__ import annotations
 
-import dataclasses
-import fnmatch
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator as AbcIterator, Mapping
@@ -82,7 +80,12 @@ if TYPE_CHECKING:
     from yggdrasil.io.fs import Path
 
 
-__all__ = ["TabularIO", "ChildrenOptions"]
+__all__ = [
+    "TabularIO",
+    "matches_children_predicate",
+    "inject_static_values_into_batch",
+    "inject_static_values_into_table",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -93,68 +96,129 @@ O = TypeVar("O", bound=CastOptions)
 
 
 # ---------------------------------------------------------------------------
-# Children discovery options
+# Children discovery — predicate-based filter
 # ---------------------------------------------------------------------------
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class ChildrenOptions(CastOptions):
-    """Options carried through :meth:`TabularIO.iter_children`.
+def matches_children_predicate(
+    options: "CastOptions",
+    name: str,
+    *,
+    path: "str | None" = None,
+    is_dir: "bool | None" = None,
+) -> bool:
+    """Evaluate ``options.children_predicate`` against a candidate child.
 
-    Children discovery is conceptually distinct from cast/IO options:
-    it filters which sub-IOs an aggregator (folder, archive, partitioned
-    table) hands back, before any of them is opened or its batches are
-    drained. Discovery knobs collected here:
+    Used by aggregating IOs (folders, archives, partitioned tables)
+    in :meth:`_iter_children` to decide whether to yield a
+    discovered child. The predicate operates on a small mapping
+    describing the child:
 
-    :param include_patterns: glob patterns (``fnmatch``-style, matched
-        against the child's *name*). When set, only children matching at
-        least one pattern are yielded. ``None`` (default) means "no
-        include filter — accept everything not excluded".
-    :param exclude_patterns: glob patterns; matching children are
-        dropped. ``None`` (default) means "no exclude filter".
-    :param exclude_private: skip children whose name starts with ``.``
-        (the conventional hidden/private prefix). Default ``True`` —
-        matches the existing :meth:`NestedIO._is_ignored_path` rule.
-    :param max_depth: clip recursive walks at this depth (``0`` =
-        only this level, ``1`` = one nested level, …). ``None`` (default)
-        means "no depth cap" — recurse as far as :attr:`recursive`
-        allows.
-    :param follow_symlinks: whether to descend into symlinked directories
-        on backends that distinguish them. Default ``False`` — matches
-        the safe default to avoid cycles on local filesystems.
+    - ``name``: the leaf basename — usually all callers pass.
+    - ``path``: full path/string identifier when available.
+    - ``is_dir``: ``True`` for sub-folders, ``False`` for leaf files,
+      ``None`` when the backend can't tell cheaply.
+    - ``is_private``: derived shorthand — ``True`` when ``name``
+      starts with ``.`` so callers can write
+      ``~col("is_private")`` instead of a like-pattern.
 
-    :attr:`recursive` (inherited from :class:`CastOptions`) decides
-    whether sub-folders are walked at all. ``ChildrenOptions`` does not
-    redefine its default, so the base ``False`` still applies; folder
-    IOs that recurse by default carry that intent on the instance.
+    ``options.children_predicate is None`` (the default) means
+    "yield everything" — same as the legacy
+    ``include_patterns is None and exclude_patterns is None``
+    branch. The predicate is compiled once per call via
+    :meth:`Predicate.to_python`; for hot paths the calling IO
+    should compile and reuse the closure.
     """
-
-    include_patterns: tuple[str, ...] | None = None
-    exclude_patterns: tuple[str, ...] | None = None
-    exclude_private: bool = True
-    max_depth: int | None = None
-    follow_symlinks: bool = False
-
-    def matches_name(self, name: str) -> bool:
-        """Apply this options' filters to a candidate child *name*.
-
-        Returns ``True`` if the child should be yielded, ``False`` if
-        the include/exclude/private rules drop it. Pure-string match —
-        no filesystem stat, no IO open. Subclasses with backend-specific
-        introspection are free to layer richer checks on top.
-        """
-        if self.exclude_private and name.startswith("."):
-            return False
-        if self.exclude_patterns:
-            for pattern in self.exclude_patterns:
-                if fnmatch.fnmatchcase(name, pattern):
-                    return False
-        if self.include_patterns:
-            for pattern in self.include_patterns:
-                if fnmatch.fnmatchcase(name, pattern):
-                    return True
-            return False
+    predicate = getattr(options, "children_predicate", None)
+    if predicate is None:
         return True
+    metadata = {
+        "name": name,
+        "path": path if path is not None else name,
+        "is_dir": is_dir,
+        "is_private": name.startswith("."),
+    }
+    try:
+        return predicate.to_python()(metadata) is True
+    except Exception:
+        # A predicate that references an unknown column shouldn't
+        # silently include or exclude — callers building filters
+        # should test their predicates first. Treat eval failures
+        # as a strict "drop" so misconfigured predicates surface
+        # as missing data rather than as bypassing the filter.
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Static-value injection — used by :class:`TabularIO` read paths to
+# attach constant columns to every batch / table on the way out.
+# ---------------------------------------------------------------------------
+
+
+def inject_static_values_into_batch(
+    batch: pa.RecordBatch,
+    values: "Mapping[str, Any] | None",
+) -> pa.RecordBatch:
+    """Append constant columns to *batch* from ``{name: value}``.
+
+    Columns already present in ``batch.schema`` are left
+    untouched — the injection is additive, so a source that
+    already carries (say) a ``year`` column overrides any static
+    ``year`` attached on the IO. Arrow types are inferred from
+    the Python value via :func:`pyarrow.array`; pin a specific
+    dtype by storing a :class:`pyarrow.Scalar` in the map.
+    """
+    if not values:
+        return batch
+    n = batch.num_rows
+    for name, value in values.items():
+        if name in batch.schema.names:
+            continue
+        column = _build_static_column(value, n)
+        batch = batch.append_column(name, column)
+    return batch
+
+
+def inject_static_values_into_table(
+    table: pa.Table,
+    values: "Mapping[str, Any] | None",
+) -> pa.Table:
+    """Table-flavoured counterpart to :func:`inject_static_values_into_batch`."""
+    if not values:
+        return table
+    n = table.num_rows
+    for name, value in values.items():
+        if name in table.column_names:
+            continue
+        column = _build_static_column(value, n)
+        table = table.append_column(name, column)
+    return table
+
+
+def _build_static_column(value: Any, n_rows: int) -> pa.Array:
+    """Build an ``n_rows``-long Arrow array of ``value``.
+
+    A :class:`pyarrow.Scalar` keeps its declared dtype; a Python
+    value goes through :func:`pyarrow.array` for type inference.
+    Empty (``n_rows == 0``) tables get a typed empty array so
+    schema introspection still works downstream.
+    """
+    if isinstance(value, pa.Scalar):
+        return pa.array([value.as_py()] * n_rows, type=value.type)
+    if n_rows == 0:
+        # ``pa.array([])`` is null-typed by default; promote via a
+        # one-element probe so the empty column has the right
+        # dtype on the schema.
+        probe = pa.array([value])
+        return pa.array([], type=probe.type)
+    return pa.array([value] * n_rows)
+
+
+# Internal aliases used by :meth:`TabularIO.read_arrow_batches` /
+# :meth:`TabularIO.read_arrow_table` — kept short on the call site.
+_inject_static_batch = inject_static_values_into_batch
+_inject_static_table = inject_static_values_into_table
+
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -261,6 +325,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         self,
         *args: Any,
         media_type: Any = None,
+        static_values: "Mapping[str, Any] | None" = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the state every :class:`TabularIO` carries.
@@ -277,6 +342,13 @@ class TabularIO(Disposable, ABC, Generic[O]):
           session is reachable, otherwise a :class:`MemoryArrowIO`);
           :meth:`unpersist` clears it. Read paths short-circuit
           through it before touching the source.
+        * ``static_values`` — optional ``{column: value}`` map of
+          constant columns to attach to every batch / table on
+          read. Useful for tagging batches with metadata the
+          source itself doesn't carry (partition values inferred
+          from a path, a ``source="cache"`` marker, ingestion
+          timestamps, etc.). Existing columns with the same name
+          are left untouched — the injection is additive.
         * Spill-path slots — ``_spill_path`` / ``_owns_spill_path``
           used by :class:`BytesIO` (and any byte-buffer-backed
           subclass) to track durable storage. They live on
@@ -302,6 +374,14 @@ class TabularIO(Disposable, ABC, Generic[O]):
         # cache (MemorySparkIO when Spark is reachable, MemoryArrowIO
         # otherwise). Read paths delegate through it when set.
         self._persisted_data: "TabularIO | None" = None
+        # Static value attachments — defensively copied into a plain
+        # ``dict`` so mutations on the caller's mapping after
+        # construction don't leak through. Empty mapping coerces
+        # to ``None`` so the read-path guard stays a single cheap
+        # ``is None`` check.
+        self.static_values: "dict[str, Any] | None" = (
+            dict(static_values) if static_values else None
+        )
         # Buffer-backing slots — concrete byte buffers fill these in;
         # non-byte TabularIOs (StatementResult, NestedIO trees, …)
         # leave them at None.
@@ -556,15 +636,6 @@ class TabularIO(Disposable, ABC, Generic[O]):
         return CastOptions  # type: ignore[return-value]
 
     @classmethod
-    def children_options_class(cls) -> type[ChildrenOptions]:
-        """The :class:`ChildrenOptions` subclass :meth:`iter_children` consumes.
-
-        Subclasses with extra discovery knobs (e.g. partition-aware
-        filters) override to return their richer subclass.
-        """
-        return ChildrenOptions
-
-    @classmethod
     def check_options(
         cls,
         options: "O | None" = None,
@@ -580,29 +651,6 @@ class TabularIO(Disposable, ABC, Generic[O]):
             kwargs.update(kwargs.pop("kwargs", {}))
 
         return cls.options_class().check(options, **kwargs)
-
-    @classmethod
-    def check_children_options(
-        cls,
-        options: "ChildrenOptions | Mapping[str, Any] | None" = None,
-        overrides: "dict | None" = None,
-        **kwargs: Any,
-    ) -> ChildrenOptions:
-        """Resolve a :class:`ChildrenOptions` from any accepted input shape.
-
-        Mirrors :meth:`check_options` but routes through
-        :meth:`children_options_class` so callers (and subclasses)
-        can pass discovery-specific kwargs without polluting
-        :class:`CastOptions`.
-        """
-        if overrides:
-            overrides = {k: v for k, v in overrides.items() if v is not ...}
-            overrides.pop("self", None)
-            options = overrides.pop("options", options)
-            kwargs.update(overrides)
-            kwargs.update(kwargs.pop("kwargs", {}))
-
-        return cls.children_options_class().check(options, **kwargs)
 
     @abstractmethod
     def _read_arrow_batches(self, options: O) -> Iterator[pa.RecordBatch]:
@@ -622,7 +670,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
     ) -> None:
         """Consume Arrow record batches and persist them."""
 
-    def _iter_children(self, options: ChildrenOptions) -> "Iterator[TabularIO]":
+    def _iter_children(self, options: O) -> "Iterator[TabularIO]":
         """Yield this IO's direct children, each as a :class:`TabularIO`.
 
         Single-buffer leaves (``PrimitiveIO``, ``BytesIO`` without a
@@ -638,11 +686,12 @@ class TabularIO(Disposable, ABC, Generic[O]):
         so callers can walk the tree and drain Arrow batches
         uniformly.
 
-        ``options`` carries discovery knobs (:attr:`recursive`,
-        include/exclude patterns, hidden filtering, depth cap).
-        Subclasses are expected to honor them where meaningful;
-        :meth:`ChildrenOptions.matches_name` is the canonical
-        name-based filter.
+        ``options`` is the same :class:`CastOptions` flavour used
+        by reads — :attr:`recursive` controls whether sub-folders
+        are walked, :attr:`children_predicate` filters discovered
+        children by their metadata. The shared
+        :func:`matches_children_predicate` helper applies the
+        predicate uniformly across backends.
 
         Default: yields nothing — the right answer for any
         single-source TabularIO. :class:`NestedIO` re-declares this
@@ -653,7 +702,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
 
     def iter_children_or_self(
         self,
-        options: "ChildrenOptions | Mapping[str, Any] | None" = None,
+        options: "O | Mapping[str, Any] | None" = None,
         **kwargs: Any,
     ) -> "Iterator[TabularIO]":
         if self.has_children():
@@ -663,18 +712,18 @@ class TabularIO(Disposable, ABC, Generic[O]):
 
     def iter_children(
         self,
-        options: "ChildrenOptions | Mapping[str, Any] | None" = None,
+        options: "O | Mapping[str, Any] | None" = None,
         **kwargs: Any,
     ) -> "Iterator[TabularIO]":
         """Public wrapper around :meth:`_iter_children`.
 
-        Accepts a :class:`ChildrenOptions`, a mapping of discovery
-        kwargs, or ``None`` (for "use the defaults"). Discovery kwargs
-        passed positionally as ``**kwargs`` are merged into the
-        resolved options.
+        Accepts a :class:`CastOptions`, a mapping of discovery
+        kwargs (including ``children_predicate``), or ``None`` (for
+        "use the defaults"). Kwargs passed positionally are merged
+        into the resolved options.
         """
         return self._iter_children(
-            self.check_children_options(options, overrides=locals())
+            self.check_options(options, overrides=locals())
         )
 
     def has_children(self) -> bool:
@@ -696,14 +745,14 @@ class TabularIO(Disposable, ABC, Generic[O]):
         except (FileNotFoundError, StopIteration):
             return False
 
-    def _has_children_options(self) -> ChildrenOptions:
+    def _has_children_options(self) -> "O":
         """Cheap default options for :meth:`has_children`'s peek.
 
         Split out so subclasses with mandatory option fields can
         provide a probe-friendly default without rebuilding
         :meth:`has_children`.
         """
-        return self.children_options_class()()
+        return self.options_class()()
 
     # ==================================================================
     # Static helpers
@@ -787,15 +836,24 @@ class TabularIO(Disposable, ABC, Generic[O]):
         options: "O | None" = None,
         **kwargs: Any,
     ) -> Iterator[pa.RecordBatch]:
-        """Yield Arrow record batches. Primary streaming read path."""
+        """Yield Arrow record batches. Primary streaming read path.
+
+        :attr:`static_values` (when set) is injected into every
+        batch as constant columns — additive, so a column that
+        already exists on the underlying source is left
+        untouched.
+        """
+        static = self.static_values
         if self._persisted_data is not None:
-            yield from self._persisted_data.read_arrow_batches(
+            for batch in self._persisted_data.read_arrow_batches(
                 options=options, **kwargs,
-            )
+            ):
+                yield _inject_static_batch(batch, static)
             return
-        yield from self._read_arrow_batches(
+        for batch in self._read_arrow_batches(
             self.check_options(options, overrides=locals())
-        )
+        ):
+            yield _inject_static_batch(batch, static)
 
     def to_arrow_table(
         self,
@@ -809,12 +867,19 @@ class TabularIO(Disposable, ABC, Generic[O]):
         options: "O | None" = None,
         **kwargs: Any,
     ) -> pa.Table:
-        """Read everything into a single :class:`pyarrow.Table`."""
+        """Read everything into a single :class:`pyarrow.Table`.
+
+        :attr:`static_values` is injected as constant columns on
+        the way out, mirroring :meth:`read_arrow_batches`.
+        """
+        static = self.static_values
         if self._persisted_data is not None:
-            return self._persisted_data.read_arrow_table(
+            table = self._persisted_data.read_arrow_table(
                 options=options, **kwargs,
             )
-        return self._read_arrow_table(self.check_options(options, overrides=locals()))
+        else:
+            table = self._read_arrow_table(self.check_options(options, overrides=locals()))
+        return _inject_static_table(table, static)
 
     def _read_arrow_table(self, options: O) -> pa.Table:
         batches = list(self._read_arrow_batches(options))
@@ -1633,4 +1698,29 @@ class TabularIO(Disposable, ABC, Generic[O]):
         self._write_arrow_batches(
             merged.to_batches(max_chunksize=options.row_size),
             options.copy(mode=Mode.OVERWRITE),
+        )
+
+    def _upsert(self, options: O) -> None:
+        """Engine-specific UPSERT hook.
+
+        Canonical entry point for engines that can resolve an UPSERT
+        without staging the full read/merge/overwrite rewrite that
+        :meth:`_arrow_upsert_via_rewrite` performs — Delta and Spark
+        warehouse paths override this to dispatch a native MERGE,
+        keeping the incoming data on the engine side instead of
+        round-tripping through the driver.
+
+        Incoming data is expected to be reachable from the subclass's
+        own state (a staged buffer, a queued batch reader, anything
+        the subclass arranged before the call). The default raises
+        :class:`NotImplementedError` so callers either land on a
+        subclass that implements native MERGE, or invoke
+        :meth:`_arrow_upsert_via_rewrite` with explicit incoming
+        batches.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__}._upsert is not implemented. "
+            "Override on a subclass with native MERGE support, or "
+            "call `_arrow_upsert_via_rewrite(batches, options)` "
+            "with explicit incoming data."
         )

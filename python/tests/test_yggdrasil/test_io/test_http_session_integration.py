@@ -30,43 +30,38 @@ from typing import Iterator
 
 import pytest
 
-from yggdrasil.io.buffer.primitive import ArrowIPCIO
 from yggdrasil.io.errors import NotFoundError
 from yggdrasil.io.http_ import HTTPSession
 from yggdrasil.io.request import PreparedRequest
-from yggdrasil.io.response import Response
 from yggdrasil.io.send_config import CacheConfig
 
 
 def _wait_for_cache(tmp_path: Path, expected: int = 1, timeout: float = 10.0) -> None:
-    """Wait until *expected* cache files exist and are fully readable.
+    """Wait until at least *expected* responses have landed in the cache.
 
-    Cache writes go through ``Job.make(...).fire_and_forget()`` so the
-    file may exist (partial / zero-byte) before the IPC writer has
-    flushed. Polling on "Arrow IPC parses to a Response" is the
-    cheapest reliable barrier.
+    Cache writes go through ``Job.make(...).fire_and_forget()`` so
+    the partitioned-folder write is in flight when the call site
+    returns. Polling on the :class:`FolderIO` row count is the
+    cheapest reliable barrier — it walks the partitioned tree and
+    reads every leaf the way a real lookup would.
     """
+    from yggdrasil.io.buffer.nested.folder_io import FolderIO
+
+    cache_root = tmp_path / "cache"
     deadline = time.time() + timeout
     while time.time() < deadline:
-        files = list((tmp_path / "cache").rglob("*.arrow"))
-        if len(files) >= expected:
-            ok = 0
-            for f in files:
-                try:
-                    io = ArrowIPCIO(path=str(f))
-                    loaded = next(
-                        Response.from_arrow_tabular(io.read_arrow_batches()),
-                        None,
-                    )
-                    if loaded is not None:
-                        ok += 1
-                except Exception:
-                    pass
-            if ok >= expected:
-                return
+        n = 0
+        if cache_root.exists():
+            try:
+                with FolderIO(path=cache_root) as folder:
+                    n = folder.read_arrow_table().num_rows
+            except Exception:
+                n = 0
+        if n >= expected:
+            return
         time.sleep(0.05)
     raise AssertionError(
-        f"timed out waiting for {expected} cache file(s) under {tmp_path}"
+        f"timed out waiting for {expected} cached response(s) under {tmp_path}"
     )
 
 
@@ -264,8 +259,17 @@ class TestHttpSessionLocalCache:
         with HTTPSession(verify=False) as session:
             session.get(f"{http_server.base_url}/cache/path-check", local_cache=cache)
         _wait_for_cache(tmp_path, expected=1)
-        cache_files = list((tmp_path / "cache").rglob("*.arrow"))
-        assert cache_files, "expected at least one cache file under tmp_path/cache"
+        # Partitioned layout: at least one leaf lives under
+        # ``cache/request_method=GET/request_url_host=.../`` — assert
+        # on the partitioned shape, not a flat glob, so a layout
+        # change doesn't sneak through unnoticed.
+        cache_root = tmp_path / "cache"
+        leaves = [p for p in cache_root.rglob("*") if p.is_file()]
+        assert leaves, "expected at least one partition leaf under tmp_path/cache"
+        rel_dirs = {str(leaf.parent.relative_to(cache_root)) for leaf in leaves}
+        assert any(
+            d.startswith("request_method=GET") for d in rel_dirs
+        ), f"expected Hive-partitioned layout, got: {sorted(rel_dirs)!r}"
 
     def test_distinct_urls_cache_independently(
         self, http_server: _Server, tmp_path
@@ -338,12 +342,21 @@ class TestHttpSessionSendManyLocalCache:
         assert batch.counts == {"local": 0, "remote": 0, "new": 3}
         assert len(batch) == 3
         # Even unfilled buckets carry a schema-bearing empty holder
-        # so the batch always advertises the response schema.
-        assert isinstance(batch.local_hits, TabularIO)
-        assert isinstance(batch.remote_hits, TabularIO)
+        # so the batch always advertises the response schema. The
+        # remote bucket is a per-table dict whose default placeholder
+        # entry holds the schema-bearing empty.
+        # Both keyed buckets are dicts; an unfilled stage carries only
+        # the default-placeholder schema-bearing empty holder so the
+        # batch can still answer schema questions.
+        assert isinstance(batch.local_hits, dict)
+        assert all(isinstance(h, TabularIO) for h in batch.local_hits.values())
+        assert isinstance(batch.remote_hits, dict)
+        assert all(isinstance(h, TabularIO) for h in batch.remote_hits.values())
         assert isinstance(batch.new_hits, TabularIO)
-        assert batch.local_hits.num_rows == 0
-        assert batch.remote_hits.num_rows == 0
+        # No per-key hits — only the default placeholders are present,
+        # so both breakdowns elide the empty defaults and read empty.
+        assert batch.local_counts == {}
+        assert batch.remote_counts == {}
         assert all(r.status_code == 200 for r in batch)
 
     def test_send_many_batch_second_pass_all_local_hits(

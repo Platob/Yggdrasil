@@ -1,4 +1,4 @@
-"""DeltaIO: the :class:`PartitionedFolderIO` that ties Delta together.
+"""DeltaIO: the partition-capable :class:`FolderIO` that ties Delta together.
 
 Reads
 -----
@@ -12,7 +12,7 @@ Writes — OVERWRITE / APPEND
 ----------------------------
 
 Stage parquet children via the inherited
-:class:`PartitionedFolderIO` machinery (which routes by partition
+:class:`FolderIO` machinery (which routes by partition
 key when partitions are declared); commit one transaction with
 Adds for new files and Removes for previously-live files
 (OVERWRITE only). Failures during the parquet write are caught
@@ -53,7 +53,7 @@ import time
 import uuid
 from collections.abc import Iterable as IterableABC
 from itertools import chain
-from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Sequence
 
 import pyarrow as pa
 
@@ -92,12 +92,8 @@ from .deletion_vector import (
 )
 from .replay import ReplayResult, replay_log
 from ..folder_io import (
+    FolderIO,
     FolderOptions,
-    _inject_partition_columns,
-)
-from ..partitioned_io import (
-    PartitionedFolderIO,
-    PartitionedOptions,
 )
 
 if TYPE_CHECKING:
@@ -111,7 +107,7 @@ __all__ = ["DeltaIO", "DeltaOptions"]
 # ---------------------------------------------------------------------------
 
 
-class DeltaOptions(PartitionedOptions):
+class DeltaOptions(FolderOptions):
     """Partitioned-folder options + Delta knobs.
 
     :param parquet_compression: child parquet compression. Default
@@ -140,14 +136,14 @@ class DeltaOptions(PartitionedOptions):
 # ---------------------------------------------------------------------------
 
 
-class DeltaIO(PartitionedFolderIO):
+class DeltaIO(FolderIO):
     """Delta Lake table as a partitioned folder.
 
     Construction:
 
         >>> io = DeltaIO(path="/tables/trades/")
         >>> for child in io.iter_children():
-        ...     print(child.path, child.partition_values)
+        ...     print(child.path, child.static_values)
 
     Reads replay ``_delta_log/`` and yield one child IO per live
     AddFile, applying any DV at batch time. Writes go through
@@ -222,7 +218,7 @@ class DeltaIO(PartitionedFolderIO):
 
     def _resolve_partition_columns(
         self,
-        options: "PartitionedOptions | None" = None,
+        options: "FolderOptions | None" = None,
     ) -> "tuple[Field, ...]":
         if options is not None and options.partition_columns is not None:
             return tuple(Field.from_any(c) for c in options.partition_columns)
@@ -302,7 +298,18 @@ class DeltaIO(PartitionedFolderIO):
                 continue
 
             self._attach(child_io)
-            child_io.partition_values = dict(add.partition_values)
+            # Stamp partition values onto the leaf's
+            # ``static_values`` slot (Arrow-typed via the
+            # FolderIO helper) so the inherited
+            # :meth:`TabularIO.read_arrow_batches` injection
+            # picks them up — no per-batch wrapping at the
+            # Delta level. ``deletion_vector`` / ``delta_add_file``
+            # remain free attributes the DV-aware read loop
+            # below consults directly.
+            if add.partition_values:
+                child_io.static_values = self._typed_partition_static(
+                    add.partition_values,
+                )
             child_io.deletion_vector = add.deletion_vector
             child_io.delta_add_file = add
             yield child_io
@@ -319,21 +326,16 @@ class DeltaIO(PartitionedFolderIO):
 
         Per child (AddFile):
 
-        - No DV: stream batches as-is, then inject partition columns
-          using the per-child ``partition_values`` mapping populated
-          by :meth:`iter_children`.
+        - No DV: stream batches as-is. Partition columns are
+          injected automatically by the leaf's own
+          :meth:`TabularIO.read_arrow_batches` via the
+          ``static_values`` stamp set in :meth:`_iter_children`.
         - With DV: decode the bitmap once, track row ordinals
           across batches, mask each batch with ``~bitmap.contains``.
-
-        DV filtering must run *before* partition-column injection —
-        partition columns get appended row-for-row and a row-count
-        change in between would desync.
+          The mask is uniform across columns so the auto-injected
+          partition columns shrink in lockstep with the data
+          columns.
         """
-        partition_cols = self._resolve_partition_columns(options)
-        partition_by_name: Mapping[str, Field] = {
-            c.name: c for c in partition_cols
-        }
-
         for child_io in self._iter_children(options):
             if not isinstance(child_io, TabularIO):
                 continue
@@ -343,7 +345,6 @@ class DeltaIO(PartitionedFolderIO):
                 self._load_dv_bitmap_from_descriptor(dv)
                 if dv is not None else None
             )
-            partition_values = getattr(child_io, "partition_values", {}) or {}
 
             with child_io:
                 row_offset = 0
@@ -364,10 +365,6 @@ class DeltaIO(PartitionedFolderIO):
 
                     if batch.num_rows == 0:
                         continue
-                    if partition_by_name and partition_values:
-                        batch = _inject_partition_columns(
-                            batch, partition_values, partition_by_name,
-                        )
                     yield batch
 
     # ==================================================================

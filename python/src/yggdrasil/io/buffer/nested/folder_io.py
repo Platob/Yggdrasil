@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import dataclasses
 import urllib.parse
+import uuid
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -150,12 +151,19 @@ class FolderIO(NestedIO[FolderOptions]):
         """
         return MimeTypes.PARQUET
 
+    #: Sidecar filename used by :meth:`_persist_schema` /
+    #: :meth:`_load_persisted_schema`. Hidden (``.``-prefix) so the
+    #: default :meth:`_is_ignored_path` skips it during enumeration —
+    #: the schema is metadata, not data.
+    SCHEMA_FILE_NAME: ClassVar[str] = ".schema"
+
     def __init__(
         self,
         data: Any = None,
         *,
         path: Any = None,
         partition_columns: "Sequence[Any] | None" = None,
+        schema: "Schema | pa.Schema | None" = None,
         recursive: bool = True,
         partition_values: "Mapping[str, str | None] | None" = None,
         **kwargs: Any,
@@ -165,8 +173,17 @@ class FolderIO(NestedIO[FolderOptions]):
         :param partition_columns: declared at construction. Order
             matters — it determines the on-disk directory layering.
             Each entry is a :class:`Field` (or anything coercible).
-            Default ``None`` defers to the option / inference
-            fallbacks described in :class:`FolderOptions`.
+            Default ``None`` defers to ``schema``-derived partitions,
+            then to the option / inference fallbacks described in
+            :class:`FolderOptions`.
+        :param schema: declared full :class:`Schema` for the folder
+            (a :class:`pyarrow.Schema` is auto-coerced). When set,
+            partition columns auto-derive from
+            :attr:`Schema.partition_fields` — fields tagged with
+            ``partition_by=True`` — unless ``partition_columns`` is
+            given explicitly. The schema is persisted to
+            ``<root>/<SCHEMA_FILE_NAME>`` on first write so future
+            reads pick it up without inferring from the leaves.
         :param recursive: walk sub-folders during iteration. Default
             True; pass False to clip enumeration at one level.
         :param partition_values: partition values accumulated from
@@ -175,15 +192,110 @@ class FolderIO(NestedIO[FolderOptions]):
             don't pass this themselves.
         """
         super().__init__(data, path=path, **kwargs)
-        self._partition_columns = (
-            tuple(_coerce_partition_column(c) for c in partition_columns)
-            if partition_columns is not None
+        self._declared_schema: "Schema | None" = (
+            schema if isinstance(schema, Schema)
+            else Schema.from_arrow(schema) if schema is not None
             else None
         )
+        # Explicit ``partition_columns`` win; otherwise fall back to
+        # ``schema.partition_fields`` so a single tagged Schema can
+        # carry the whole layout. The deferred (None) state preserves
+        # the legacy precedence — read-time options or layout
+        # inference take over later.
+        if partition_columns is not None:
+            self._partition_columns = tuple(
+                _coerce_partition_column(c) for c in partition_columns
+            )
+        elif self._declared_schema is not None:
+            schema_parts = tuple(self._declared_schema.partition_fields)
+            self._partition_columns = schema_parts or None
+        else:
+            self._partition_columns = None
         self._recursive = recursive
         self.partition_values: "dict[str, str | None] | None" = (
             dict(partition_values) if partition_values else None
         )
+
+    # ==================================================================
+    # Schema sidecar — persist on first write, load on demand
+    # ==================================================================
+
+    def declared_schema(self) -> "Schema | None":
+        """Schema declared at construction or loaded from the sidecar.
+
+        Resolution order, with one-time caching:
+
+        1. Schema passed to the constructor.
+        2. ``<root>/<SCHEMA_FILE_NAME>`` if it exists.
+        3. ``None`` (caller falls back to inference / collect).
+
+        Cached on first hit so repeat calls are free; the cache is
+        only populated, never invalidated — folders are immutable
+        with respect to their declared schema once a write has
+        landed.
+        """
+        if self._declared_schema is not None:
+            return self._declared_schema
+        loaded = self._load_persisted_schema()
+        if loaded is not None:
+            self._declared_schema = loaded
+        return self._declared_schema
+
+    def _load_persisted_schema(self) -> "Schema | None":
+        """Read the sidecar schema, returning ``None`` on miss."""
+        try:
+            sidecar = self.path / self.SCHEMA_FILE_NAME
+        except Exception:
+            return None
+        if not sidecar.exists():
+            return None
+        try:
+            data = sidecar.read_bytes()
+            arrow_schema = pa.ipc.read_schema(pa.BufferReader(data))
+            return Schema.from_arrow(arrow_schema)
+        except Exception:
+            # A corrupt sidecar shouldn't tank reads — drop back to
+            # inference. The next write will re-persist.
+            return None
+
+    def _persist_schema_if_declared(self) -> None:
+        """Drop the sidecar on first write, idempotent thereafter.
+
+        Safe to call from concurrent writers — uses a stage+rename
+        through :meth:`Path.make_staging` so the final ``.schema``
+        file appears atomically. Re-runs are idempotent: the
+        existence check up front skips the write entirely when the
+        sidecar is already in place.
+        """
+        schema = self._declared_schema
+        if schema is None:
+            return
+        sidecar = self.path / self.SCHEMA_FILE_NAME
+        if sidecar.exists():
+            return
+        try:
+            self.path.mkdir(parents=True, exist_ok=True)
+            arrow_schema = (
+                schema.to_arrow_schema() if isinstance(schema, Schema)
+                else schema
+            )
+            sink = pa.BufferOutputStream()
+            with pa.ipc.new_stream(sink, arrow_schema):
+                # Empty stream — schema-only payload.
+                pass
+            sidecar_bytes = sink.getvalue().to_pybytes()
+            try:
+                staging = self.path.make_staging()
+                staging.write_bytes(sidecar_bytes)
+                staging.rename(sidecar)
+            except Exception:
+                # Fall back to a direct write if the staging dance
+                # isn't supported by this filesystem.
+                sidecar.write_bytes(sidecar_bytes)
+        except Exception:
+            # Sidecar persistence is best-effort — never fail a
+            # write because we couldn't drop the metadata.
+            pass
 
     # ==================================================================
     # Children — direct enumeration with transparent recursion
@@ -204,11 +316,14 @@ class FolderIO(NestedIO[FolderOptions]):
         :class:`BytesIO` so callers can still pull bytes from them.
         Unknown / un-readable entries are silently skipped.
 
-        :class:`ChildrenOptions` filters apply: ``include_patterns`` /
-        ``exclude_patterns`` are matched against the entry name,
-        ``exclude_private`` skips dot-prefixed entries (in addition
-        to :meth:`_is_ignored_path` for backend-specific hides like
-        ``_delta_log/``).
+        ``options.children_predicate`` is honoured via the shared
+        :func:`yggdrasil.io.buffer.base.matches_children_predicate`
+        helper. Combined with backend-specific ignores (the default
+        :meth:`_is_ignored_path` hides dot-prefixed entries; Delta
+        adds ``_delta_log/``), this is the canonical filter point —
+        no glob-pattern fallbacks. To exclude files by extension
+        write the predicate explicitly:
+        ``children_predicate=~col("name").like("%.tmp")``.
 
         Each child's ``parent`` attribute is stamped to ``self``.
         Children are returned closed (un-acquired); caller opens
@@ -217,6 +332,8 @@ class FolderIO(NestedIO[FolderOptions]):
         Missing folder is treated as empty: no children yielded,
         no error raised.
         """
+        from yggdrasil.io.buffer.base import matches_children_predicate
+
         if not self.path.exists():
             return
 
@@ -225,8 +342,6 @@ class FolderIO(NestedIO[FolderOptions]):
         for entry in self.path.iterdir():
             if self._is_ignored_path(entry):
                 continue
-            if not options.matches_name(entry.name):
-                continue
 
             try:
                 is_dir = entry.is_dir()
@@ -234,6 +349,12 @@ class FolderIO(NestedIO[FolderOptions]):
                 # Stat failure on a child mid-listing — skip rather
                 # than abort. Listings on remote stores can race
                 # with deletes.
+                continue
+
+            if not matches_children_predicate(
+                options, entry.name,
+                path=str(entry), is_dir=is_dir,
+            ):
                 continue
 
             if is_dir:
@@ -252,22 +373,36 @@ class FolderIO(NestedIO[FolderOptions]):
     def _open_subfolder(self, sub_path: Path) -> "FolderIO":
         """Build a sub-:class:`FolderIO` rooted at *sub_path*.
 
-        Carries forward this folder's partition declaration and the
-        accumulated partition values, augmenting them with any
-        ``key=value`` segment parsed from the sub-folder's name.
+        Carries forward this folder's partition declaration, the
+        declared schema, and the accumulated partition values,
+        augmenting them with any ``key=value`` segment parsed from
+        the sub-folder's name. The accumulated map also becomes
+        :attr:`TabularIO.static_values` on the sub-folder so a
+        direct :meth:`read_arrow_table` against the sub-folder
+        injects the partition columns for free.
         """
         kv = _parse_kv_segment(sub_path.name)
         sub_pv = dict(self.partition_values) if self.partition_values else {}
         if kv is not None:
             sub_pv[kv[0]] = kv[1]
 
-        return type(self)(
+        sub = type(self)(
             path=sub_path,
             partition_columns=self._partition_columns,
+            schema=self._declared_schema,
             recursive=self._recursive,
             partition_values=sub_pv if sub_pv else None,
             auto_open=False,
         )
+        # Mirror the partition-values dict into ``static_values`` so
+        # the inherited :meth:`TabularIO.read_arrow_batches` /
+        # :meth:`TabularIO.read_arrow_table` injection covers
+        # direct reads against the sub-folder. Leaves carry the
+        # same accumulation independently — the additive injection
+        # contract makes the duplicate harmless.
+        if sub_pv:
+            sub.static_values = self._typed_partition_static(sub_pv)
+        return sub
 
     def _open_file_child(
         self,
@@ -279,6 +414,13 @@ class FolderIO(NestedIO[FolderOptions]):
         :class:`BytesIO` for files with no registered tabular
         format. Returns ``None`` if neither can bind (rare —
         usually means the entry vanished mid-listing).
+
+        When the enclosing folder carries
+        :attr:`partition_values`, the leaf's
+        :attr:`TabularIO.static_values` is stamped with the
+        Arrow-typed equivalent so its read path automatically
+        injects the partition columns — no per-batch wrapping
+        needed at the folder level.
         """
         try:
             io = TabularIO.from_path(file_path)
@@ -287,11 +429,15 @@ class FolderIO(NestedIO[FolderOptions]):
 
         # A registered tabular leaf is a :class:`BytesIO` subclass
         # with a format-specific class (so ``type(io) is BytesIO``
-        # would be false). Stamp partition values onto it for
-        # downstream injection by the read path.
+        # would be false). Stamp the typed partition values onto
+        # ``static_values`` so the inherited
+        # :meth:`TabularIO.read_arrow_batches` injection picks
+        # them up — no folder-side per-batch wrapping needed.
         if isinstance(io, BytesIO) and type(io) is not BytesIO:
             if self.partition_values:
-                io.partition_values = dict(self.partition_values)
+                io.static_values = self._typed_partition_static(
+                    self.partition_values,
+                )
             return io
 
         # No tabular registration — fall back to a raw BytesIO so
@@ -300,6 +446,56 @@ class FolderIO(NestedIO[FolderOptions]):
             return BytesIO(path=file_path, auto_open=False)
         except Exception:
             return None
+
+    def _typed_partition_static(
+        self,
+        values: "Mapping[str, str | None]",
+    ) -> "dict[str, Any]":
+        """Build an Arrow-typed ``static_values`` map for ``values``.
+
+        Each value is wrapped in a :class:`pyarrow.Scalar` typed
+        to its declared partition column dtype so the
+        :func:`yggdrasil.io.buffer.base.inject_static_values_into_batch`
+        helper emits a column with the right schema-side type.
+        Falls back to a string scalar when the column isn't
+        declared or the dtype can't translate to Arrow.
+        """
+        cols = self._resolve_partition_columns()
+        by_name = {c.name: c for c in cols} if cols else {}
+        out: dict[str, Any] = {}
+        for key, value in values.items():
+            field = by_name.get(key)
+            arrow_type: "pa.DataType | None" = None
+            if field is not None:
+                for attr in ("to_arrow_dtype", "to_arrow"):
+                    fn = getattr(field.dtype, attr, None)
+                    if callable(fn):
+                        try:
+                            arrow_type = fn()
+                            break
+                        except Exception:
+                            continue
+            if arrow_type is None:
+                arrow_type = pa.string()
+            try:
+                if value is None:
+                    out[key] = pa.scalar(None, type=arrow_type)
+                else:
+                    base = pa.scalar(value, type=pa.string())
+                    out[key] = (
+                        pc.cast(base, arrow_type)
+                        if base.type != arrow_type
+                        else base
+                    )
+            except Exception:
+                # Type coercion failed (e.g. ``"foo"`` → int) —
+                # keep the raw string scalar so the column at
+                # least carries the value verbatim.
+                out[key] = pa.scalar(
+                    None if value is None else str(value),
+                    type=pa.string(),
+                )
+        return out
 
     # ==================================================================
     # Cheap is_empty — avoid full iteration
@@ -389,7 +585,10 @@ class FolderIO(NestedIO[FolderOptions]):
 
         1. ``options.partition_columns`` if explicitly set.
         2. The constructor-declared ``self._partition_columns``.
-        3. Inferred from the first leaf's directory layout (string
+        3. The declared :class:`Schema`'s ``partition_fields`` (the
+           ``partition_by``-tagged fields), whether passed at
+           construction or loaded from the ``.schema`` sidecar.
+        4. Inferred from the first leaf's directory layout (string
            dtype for each, since the path can't tell us more).
 
         Returns a tuple of :class:`Field` instances. Empty tuple
@@ -403,6 +602,15 @@ class FolderIO(NestedIO[FolderOptions]):
 
         if self._partition_columns is not None:
             return self._partition_columns
+
+        schema = self.declared_schema()
+        if schema is not None:
+            schema_parts = tuple(schema.partition_fields)
+            if schema_parts:
+                # Cache the resolution so subsequent calls don't
+                # re-walk the schema on every read/write.
+                self._partition_columns = schema_parts
+                return schema_parts
 
         return self._infer_partition_columns()
 
@@ -432,36 +640,13 @@ class FolderIO(NestedIO[FolderOptions]):
     # Read derivation — chain children with optional partition injection
     # ==================================================================
 
-    def _read_arrow_batches(
-        self,
-        options: FolderOptions,
-    ) -> Iterator[pa.RecordBatch]:
-        """Chain children; inject partition columns when declared."""
-        partition_cols = self._resolve_partition_columns(options)
-        partition_by_name = (
-            {c.name: c for c in partition_cols} if partition_cols else None
-        )
-        strict = bool(options.partition_strict)
-
-        for child in self._iter_children(options):
-            if isinstance(child, NestedIO):
-                with child:
-                    yield from child._read_arrow_batches(options)
-                continue
-
-            if not isinstance(child, TabularIO):
-                continue
-
-            pv = self._partition_values_for(
-                child, partition_cols, strict=strict,
-            )
-            with child:
-                for batch in child.read_arrow_batches(options=options):
-                    if pv and partition_by_name:
-                        batch = _inject_partition_columns(
-                            batch, pv, partition_by_name,
-                        )
-                    yield batch
+    # ``_read_arrow_batches`` is intentionally NOT overridden:
+    # the inherited :meth:`NestedIO._read_arrow_batches` already
+    # iterates children and dispatches to each. Leaves stamped
+    # with :attr:`TabularIO.static_values` (see
+    # :meth:`_open_file_child`) auto-inject their partition
+    # columns when their public read runs, so no per-batch
+    # wrapping at this level is needed.
 
     def _partition_values_for(
         self,
@@ -470,18 +655,17 @@ class FolderIO(NestedIO[FolderOptions]):
         *,
         strict: bool,
     ) -> "Mapping[str, str | None] | None":
-        """Resolve a leaf's partition values.
+        """Resolve a leaf's partition values from its directory path.
 
-        Prefer the leaf's own ``partition_values`` (set by the
-        recursive ``iter_children`` walk). When unset, parse from
-        the child's path relative to root.
+        Used during partition inference and by subclasses (Delta)
+        that handle their own per-leaf metadata. The folder's
+        normal read path doesn't call this — it relies on
+        :attr:`TabularIO.static_values` stamped at child-open
+        time. Kept here for backward-compatible introspection on
+        leaves that weren't opened through this folder.
         """
         if not partition_cols:
             return None
-
-        pv = getattr(child, "partition_values", None)
-        if pv:
-            return pv
 
         leaf_path: Path | None = getattr(child, "path", None)
         if leaf_path is None:
@@ -550,6 +734,13 @@ class FolderIO(NestedIO[FolderOptions]):
         options: FolderOptions,
     ) -> None:
         """Route batches to children, with partition grouping when needed."""
+        # Persist the declared schema sidecar on every write entry —
+        # idempotent: the existence check skips the IO when it's
+        # already there. Keeps a freshly-empty folder's first write
+        # from racing with a concurrent reader that wants the
+        # schema before any data has landed.
+        self._persist_schema_if_declared()
+
         partition_cols = self._resolve_partition_columns(options)
         if not partition_cols:
             super()._write_arrow_batches(batches, options)
@@ -659,6 +850,232 @@ class FolderIO(NestedIO[FolderOptions]):
                     slice_table, partition_names, key, options,
                 )
 
+    # ==================================================================
+    # Upsert — partition-aware with auto-pruned incoming
+    # ==================================================================
+
+    def _arrow_upsert_via_rewrite(
+        self,
+        batches: Any,
+        options: FolderOptions,
+    ) -> None:
+        """UPSERT with auto-pruned partition rewrites.
+
+        For a partitioned folder, the canonical upsert is "merge
+        only the partitions the incoming side actually touches" —
+        anything else would mean reading the entire tree just to
+        merge a handful of distinct partition tuples. We derive the
+        prune set from the incoming table's distinct partition
+        values (or honor ``options.prune_values`` when the caller
+        already pinned them), read each touched partition once,
+        merge with the matching incoming slice, and overwrite
+        in-place by clearing that partition's leaves before the
+        rewrite.
+
+        Non-partitioned folders fall through to the base
+        :meth:`NestedIO._arrow_upsert_via_rewrite` (read-all,
+        merge, overwrite) — no partition tree to prune by.
+        """
+        from yggdrasil.arrow.cast import any_to_arrow_table
+
+        partition_cols = self._resolve_partition_columns(options)
+        if not partition_cols:
+            super()._arrow_upsert_via_rewrite(batches, options)
+            return
+
+        match_by = options.match_by_names
+        if not match_by:
+            raise ValueError(
+                f"{type(self).__name__} UPSERT requires "
+                "options.match_by_names to be a non-empty sequence "
+                "of column names. For 'replace everything,' use "
+                "Mode.OVERWRITE instead."
+            )
+
+        incoming_table = any_to_arrow_table(batches, options)
+        if incoming_table.num_rows == 0:
+            return
+
+        partition_names = [c.name for c in partition_cols]
+        missing = [
+            n for n in partition_names if n not in incoming_table.column_names
+        ]
+        if missing:
+            raise ValueError(
+                f"Partitioned UPSERT missing partition columns "
+                f"{missing!r} in incoming. Available: "
+                f"{list(incoming_table.column_names)!r}."
+            )
+
+        explicit_pruned = self._explicit_prune_tuples(
+            options, partition_names,
+        )
+        sort_keys = [(n, "ascending") for n in partition_names]
+        sorted_incoming = incoming_table.sort_by(sort_keys)
+        partition_view = sorted_incoming.select(partition_names).to_pylist()
+        n = sorted_incoming.num_rows
+
+        run_start = 0
+        run_key = tuple(partition_view[0].get(c) for c in partition_names)
+        for i in range(1, n + 1):
+            next_key = (
+                None if i == n
+                else tuple(partition_view[i].get(c) for c in partition_names)
+            )
+            if i == n or next_key != run_key:
+                if explicit_pruned is None or run_key in explicit_pruned:
+                    self._upsert_partition(
+                        partition_names, run_key,
+                        sorted_incoming.slice(run_start, i - run_start),
+                        options,
+                    )
+                run_start = i
+                if next_key is not None:
+                    run_key = next_key
+
+    def _explicit_prune_tuples(
+        self,
+        options: FolderOptions,
+        partition_names: "Sequence[str]",
+    ) -> "set[tuple] | None":
+        """Resolve ``options.prune_values`` into a set of partition tuples.
+
+        Returns ``None`` when no explicit prune set is configured —
+        callers fall back to "every distinct partition tuple in the
+        incoming side." Honors only the partition columns we know
+        about; extra keys in ``prune_values`` are ignored.
+        """
+        prune = getattr(options, "prune_values", None)
+        if not prune:
+            return None
+        try:
+            value_lists = [
+                tuple(prune[name]) if name in prune else None
+                for name in partition_names
+            ]
+        except Exception:
+            return None
+        if any(v is None for v in value_lists):
+            return None
+        out: set[tuple] = set()
+        for combo in zip(*value_lists):
+            out.add(tuple(combo))
+        return out
+
+    def _upsert_partition(
+        self,
+        partition_names: "Sequence[str]",
+        partition_key: tuple,
+        incoming_slice: pa.Table,
+        options: FolderOptions,
+    ) -> None:
+        """Merge one partition: read existing → merge → overwrite that dir.
+
+        Limits the read/write blast radius to a single ``key=value``
+        directory per call — the whole point of the auto-prune
+        pass. Existing leaves in the partition are removed before
+        the merged rows are re-written, so the partition's content
+        is exactly the union of "existing rows whose key is not in
+        ``incoming``" + "every incoming row" — Hive-MERGE
+        semantics.
+        """
+        partition_values = {
+            name: (None if val is None else str(val))
+            for name, val in zip(partition_names, partition_key)
+        }
+        relative_dir = _partition_path_segment(partition_values)
+        partition_root = (
+            self.path.joinpath(*relative_dir.split("/"))
+            if relative_dir else self.path
+        )
+
+        existing = self._read_partition_table(
+            partition_root, partition_names, partition_key, options,
+        )
+        merged = self.merge_upsert_tables(
+            existing, incoming_slice,
+            match_by=options.match_by_names,
+            update_column_names=options.update_column_names,
+        )
+
+        if partition_root.exists():
+            self._clear_partition_leaves(partition_root)
+
+        self._write_partition_chunk(
+            merged, partition_names, partition_key,
+            options.copy(mode=Mode.APPEND),
+        )
+
+    def _read_partition_table(
+        self,
+        partition_root: Path,
+        partition_names: "Sequence[str]",
+        partition_key: tuple,
+        options: FolderOptions,
+    ) -> pa.Table:
+        """Read all leaves under ``partition_root`` into one table.
+
+        Skips the FolderIO discovery walk — we already know the
+        partition values, so we just read direct leaf files. Empty
+        / missing partition returns an empty table with the merged
+        schema (so :meth:`merge_upsert_tables` has typed columns
+        to work against). Partition columns are injected back in so
+        the merge sees the same shape as the incoming side.
+        """
+        leaf_tables: list[pa.Table] = []
+        if partition_root.exists():
+            for entry in partition_root.iterdir():
+                if entry.is_dir():
+                    continue
+                if self._is_ignored_path(entry):
+                    continue
+                try:
+                    leaf_io = TabularIO.from_path(entry)
+                except Exception:
+                    continue
+                with leaf_io:
+                    try:
+                        leaf_tables.append(leaf_io.read_arrow_table())
+                    except Exception:
+                        continue
+
+        if not leaf_tables:
+            schema = self.declared_schema()
+            if schema is not None:
+                return schema.to_arrow_schema().empty_table()
+            return pa.table({n: pa.array([], type=pa.string())
+                             for n in partition_names})
+
+        existing = pa.concat_tables(leaf_tables, promote_options="default")
+        # Inject partition columns so the merge keys / values line
+        # up across the existing and incoming sides.
+        for name, val in zip(partition_names, partition_key):
+            if name in existing.column_names:
+                continue
+            existing = existing.append_column(
+                name,
+                pa.array([val] * existing.num_rows),
+            )
+        return existing
+
+    def _clear_partition_leaves(self, partition_root: Path) -> None:
+        """Delete leaf files under ``partition_root`` (skip sub-dirs).
+
+        Called from :meth:`_upsert_partition` between read and
+        write. Sub-directories aren't touched — Hive partitioning
+        keys siblings inside the partition, not under it, so any
+        nested directory is foreign and should stay.
+        """
+        for entry in partition_root.iterdir():
+            if entry.is_dir():
+                continue
+            if self._is_ignored_path(entry):
+                continue
+            try:
+                entry.remove(allow_not_found=True)
+            except Exception:
+                pass
+
     def _write_partition_chunk(
         self,
         chunk: pa.Table,
@@ -715,27 +1132,24 @@ class FolderIO(NestedIO[FolderOptions]):
         staging_path.rename(final_path)
 
     def _next_child_name_in(self, parent: Path, *, media_type: Any) -> str:
-        """Like :meth:`_next_child_name` but under an arbitrary parent."""
+        """Mint a unique leaf name under ``parent``.
+
+        Uses a UUID-suffixed ``part-<hex>.<ext>`` form so concurrent
+        writers can't collide on the same final name — the legacy
+        sequential ``part-NNNNN`` scheme silently lost data when two
+        workers raced through ``_finalize_child`` against the same
+        partition (both saw the same ``max_idx``, both renamed to
+        ``part-(max_idx+1)``, the second clobbering the first).
+
+        Parent existence isn't checked here — callers create the
+        directory tree before they ask for a name. ``parent`` is
+        retained on the signature for parity with
+        :meth:`NestedIO._next_child_name` and so subclasses keying
+        off the parent path (Delta, Iceberg) can still override.
+        """
         ext = self._extension_for(media_type)
-        prefix = "part-"
-        max_idx = -1
-
-        if parent.exists():
-            for child in parent.iterdir():
-                name = child.name
-                if not name.startswith(prefix):
-                    continue
-                stem = name[len(prefix):]
-                idx_str = stem.split(".", 1)[0]
-                if not idx_str.isdigit():
-                    continue
-                idx = int(idx_str)
-                if idx > max_idx:
-                    max_idx = idx
-
-        next_idx = max_idx + 1
         suffix = f".{ext}" if ext else ""
-        return f"{prefix}{next_idx:05d}{suffix}"
+        return f"part-{uuid.uuid4().hex}{suffix}"
 
 
 # ---------------------------------------------------------------------------

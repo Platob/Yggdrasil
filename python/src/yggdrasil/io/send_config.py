@@ -12,11 +12,12 @@ from yggdrasil.dataclasses import DEFAULT_WAITING_CONFIG
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.io.enums import Mode
 from yggdrasil.io.request import REQUEST_ARROW_SCHEMA, PreparedRequest
-from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA
+from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
     from yggdrasil.databricks.sql.table import Table
+    from yggdrasil.io.buffer.nested.folder_io import FolderIO
     from yggdrasil.io.response import Response
 
 
@@ -101,6 +102,37 @@ def _coerce_optional_datetime(value: Any) -> Optional[dt.datetime]:
     if isinstance(value, dt.datetime):
         return value
     return any_to_datetime(value)
+
+
+# Hot dimensions for partition pruning of the local response cache.
+# Method is small-cardinality (a handful of values), host is medium —
+# together they segment the cache enough that a typical lookup reads
+# only one partition's worth of leaves.
+LOCAL_CACHE_PARTITION_COLUMNS: tuple[str, ...] = (
+    "request_method",
+    "request_url_host",
+)
+
+
+def _local_cache_schema():
+    """Return :data:`RESPONSE_SCHEMA` with the local-cache partition tags.
+
+    Marks :data:`LOCAL_CACHE_PARTITION_COLUMNS` as ``partition_by``
+    so :class:`FolderIO` builds the matching Hive layout
+    automatically. Cached on the function for cheap repeat access —
+    the underlying :class:`Schema` is immutable.
+    """
+    cached = getattr(_local_cache_schema, "_cached", None)
+    if cached is not None:
+        return cached
+    schema = RESPONSE_SCHEMA.copy()
+    for name in LOCAL_CACHE_PARTITION_COLUMNS:
+        if name not in schema.names:
+            continue
+        f = schema[name]
+        schema[name] = f.with_partition_by(True, inplace=False)
+    _local_cache_schema._cached = schema
+    return schema
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,97 +370,39 @@ class CacheConfig(_ConfigBase):
         return f"'{value.replace(chr(39), chr(39) * 2)}'"
 
     def local_cache_folder(self) -> Path:
+        """Cache root path — defaults to ``~/.yggdrasil/io/session``.
+
+        Auto-fills ``self.path`` on first access when unset, so the
+        returned path is always a real on-disk root the moment any
+        caller asks for it. Used as the key for grouping cache hits
+        per-config (see :class:`yggdrasil.io.response_batch.ResponseBatch`).
+        """
         if self.path is None:
             object.__setattr__(self, "path", Path.home() / ".yggdrasil" / "io" / "session")
         return self.path
 
-    def local_cache_file(
-        self,
-        request: PreparedRequest,
-        *,
-        suffix: str | None = None,
-        force: bool = False
-    ) -> Path | None:
-        if not force and not self.local_cache_enabled:
-            return None
+    def local_cache(self) -> "FolderIO":
+        """Build a :class:`FolderIO` over the local response cache.
 
-        # Lazy import — yggdrasil.io.fs pulls in URL/Disposable plumbing
-        # we don't need at module load time.
+        Returns a schema-tagged partitioned folder rooted at
+        ``<path>/cache``. The schema is :data:`RESPONSE_SCHEMA` with
+        ``partition_by=True`` set on ``request_method`` and
+        ``request_url_host`` — :class:`FolderIO` derives the
+        partition layout from those tags and persists the schema to
+        ``<root>/.schema`` on first write so subsequent readers
+        don't have to infer.
+
+        Constructed on each call (the IO itself is stateless beyond
+        the on-disk layout); callers in hot loops should hold onto
+        the returned instance for the duration of a batch.
+        """
+        from yggdrasil.io.buffer.nested.folder_io import FolderIO
         from yggdrasil.io.fs import LocalPath
 
-        anonymized = request.anonymize(mode="remove")
-        cache_folder = self.local_cache_folder() / "cache"
-        url = anonymized.url
-
-        if url.host:
-            cache_folder = cache_folder / url.host
-
-        if url.path:
-            path_parts = [part for part in url.path.split("/") if part]
-            if path_parts:
-                cache_folder = cache_folder.joinpath(*path_parts)
-
-        suffix = suffix or ".bin"
-        hash_token = anonymized.xxh3_b64(url_safe=True)
-        name_prefix = f"{hash_token}-"
-        now_ts = int(time.time())
-
-        # Wrap the parent as a yggdrasil Path so its staging machinery —
-        # the rate-limited sweep that ages out TTL-encoded siblings —
-        # runs against this cache folder. Returned cache file paths stay
-        # ``pathlib.Path`` so existing callers (pickle.dump/load,
-        # ``session.py``) need no changes.
-        staging_folder = LocalPath(cache_folder)
-        try:
-            staging_folder._sweep_expired_staging()
-        except Exception:
-            pass
-
-        existing: Path | None = None
-        existing_start = 0
-        existing_end = 0
-        try:
-            for child in staging_folder.iterdir():
-                cname = child.name
-                if not cname.startswith(name_prefix) or not cname.endswith(suffix):
-                    continue
-                mid = cname[len(name_prefix):-len(suffix)] if suffix else cname[len(name_prefix):]
-                try:
-                    start_str, end_str = mid.rsplit("-", 1)
-                    child_start = int(start_str)
-                    child_end = int(end_str)
-                except (ValueError, AttributeError):
-                    continue
-                if child_end < now_ts:
-                    continue
-                if child_end > existing_end:
-                    existing = cache_folder / cname
-                    existing_start = child_start
-                    existing_end = child_end
-        except Exception:
-            pass
-
-        if force:
-            if existing is not None:
-                return existing
-            if self.received_ttl:
-                ttl_seconds = max(1, int(self.received_ttl.total_seconds()))
-            else:
-                ttl_seconds = 86400
-            end_ts = now_ts + ttl_seconds
-            return cache_folder / f"{name_prefix}{now_ts}-{end_ts}{suffix}"
-
-        if existing is None:
-            return None
-
-        if self.received_from is not None and existing_start < int(self.received_from.timestamp()):
-            existing.unlink(missing_ok=True)
-            return None
-
-        if self.received_to is not None and existing_start > int(self.received_to.timestamp()):
-            return None
-
-        return existing
+        return FolderIO(
+            path=LocalPath(self.local_cache_folder() / "cache"),
+            schema=_local_cache_schema(),
+        )
 
     def request_values(
         self,
