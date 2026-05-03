@@ -13,6 +13,7 @@ The tests cover:
 
 from __future__ import annotations
 
+import io as _io_module
 import zipfile
 
 import pytest
@@ -21,6 +22,8 @@ from yggdrasil.io.buffer import BytesIO
 from yggdrasil.io.buffer.nested import ZipEntryIO, ZipIO, ZipOptions
 from yggdrasil.io.enums import MimeTypes
 from .._helpers import sample_table
+
+_io_BytesIO = _io_module.BytesIO
 
 
 class TestZipIOBase:
@@ -206,3 +209,252 @@ class TestZipIONesting:
         with zio.make_child("a.txt") as entry:
             entry.write(b"a")
         assert zio.list_entries() == ["a.txt", "z.txt"]
+
+    def test_for_loop_yields_entries(self, tmp_path):
+        zio = ZipIO(path=str(tmp_path / "a.zip"))
+        with zio.make_child("a.txt") as entry:
+            entry.write(b"1")
+        with zio.make_child("b.txt") as entry:
+            entry.write(b"2")
+
+        names = sorted(child.entry_name for child in zio)
+        assert names == ["a.txt", "b.txt"]
+
+    def test_next_on_zio_rejects_line_iteration(self, tmp_path):
+        zio = ZipIO(path=str(tmp_path / "a.zip"))
+        with zio.make_child("a.txt") as entry:
+            entry.write(b"hello\nworld\n")
+        # next(zio) would otherwise fall through to BytesIO's
+        # readline-based iterator and silently return raw archive
+        # bytes — surface that as a clear error instead.
+        with pytest.raises(TypeError, match="not directly iterable"):
+            next(zio)
+
+    def test_hidden_entries_filtered_from_listing(self, tmp_path):
+        zio = ZipIO(path=str(tmp_path / "a.zip"))
+        with zio.make_child("visible.txt") as entry:
+            entry.write(b"v")
+        with zio.make_child(".hidden") as entry:
+            entry.write(b"h")
+
+        assert zio.list_entries() == ["visible.txt"]
+        assert ".hidden" not in zio
+        assert "visible.txt" in zio
+        names = [child.entry_name for child in zio]
+        assert names == ["visible.txt"]
+
+
+class TestZipIOCursorPreservation:
+    """Children-surface ops must not move the parent's byte cursor."""
+
+    def _seed(self, tmp_path):
+        zio = ZipIO(path=str(tmp_path / "a.zip"))
+        with zio.make_child("a.txt") as entry:
+            entry.write(b"hello")
+        with zio.make_child("b.txt") as entry:
+            entry.write(b"world")
+        return zio
+
+    def test_iter_children_preserves_cursor(self, tmp_path):
+        zio = self._seed(tmp_path)
+        zio.open()
+        try:
+            zio.seek(7)
+            pos = zio.tell()
+            list(zio.iter_children())
+            assert zio.tell() == pos
+            for _ in zio:
+                pass
+            assert zio.tell() == pos
+        finally:
+            zio.close()
+
+    def test_make_child_preserves_cursor(self, tmp_path):
+        zio = self._seed(tmp_path)
+        zio.open()
+        try:
+            zio.seek(5)
+            pos = zio.tell()
+            zio.make_child("c.txt")
+            assert zio.tell() == pos
+        finally:
+            zio.close()
+
+    def test_list_entries_and_contains_preserve_cursor(self, tmp_path):
+        zio = self._seed(tmp_path)
+        zio.open()
+        try:
+            zio.seek(3)
+            pos = zio.tell()
+            zio.list_entries()
+            assert zio.tell() == pos
+            assert "a.txt" in zio
+            assert zio.tell() == pos
+            zio.has_children()
+            assert zio.tell() == pos
+        finally:
+            zio.close()
+
+    def test_commit_entry_preserves_parent_cursor(self, tmp_path):
+        zio = self._seed(tmp_path)
+        zio.open()
+        try:
+            zio.seek(4)
+            pos = zio.tell()
+            # Cheap-append path (new entry).
+            with zio.make_child("c.txt") as entry:
+                entry.write(b"!")
+            assert zio.tell() == pos
+            # Rewrite-swap path (existing entry).
+            with zio.make_child("a.txt") as entry:
+                entry.seek(0)
+                entry.truncate(0)
+                entry.write(b"HELLO")
+            assert zio.tell() == pos
+        finally:
+            zio.close()
+
+    def test_delete_entry_preserves_parent_cursor(self, tmp_path):
+        zio = self._seed(tmp_path)
+        zio.open()
+        try:
+            zio.seek(6)
+            pos = zio.tell()
+            with zio.make_child("a.txt") as entry:
+                entry.delete()
+            assert zio.tell() == pos
+        finally:
+            zio.close()
+
+
+class TestZipIOInMemory:
+    """ZipIO without a path: archive bytes live in self's BytesIO buffer."""
+
+    def test_empty_in_memory_archive_has_no_children(self):
+        zio = ZipIO()
+        assert zio.path is None
+        assert zio.is_empty()
+        assert not zio.has_children()
+        assert zio.list_entries() == []
+        assert "anything" not in zio
+        assert list(zio) == []
+
+    def test_make_child_then_read_round_trip_in_memory(self):
+        zio = ZipIO()
+        with zio.make_child("a.txt") as entry:
+            entry.write(b"hello")
+        # Round-trips through the in-memory archive bytes.
+        assert "a.txt" in zio
+        assert zio.list_entries() == ["a.txt"]
+        with zio.make_child("a.txt") as entry:
+            entry.seek(0)
+            assert entry.read() == b"hello"
+
+    def test_in_memory_archive_bytes_are_a_real_zip(self):
+        zio = ZipIO()
+        with zio.make_child("a.txt") as entry:
+            entry.write(b"first")
+        with zio.make_child("b.txt") as entry:
+            entry.write(b"second")
+
+        # The parent's bytes ARE the zip archive — readable by the
+        # standard library directly.
+        archive_bytes = zio.to_bytes()
+        with zipfile.ZipFile(_io_BytesIO(archive_bytes)) as zf:
+            assert sorted(zf.namelist()) == ["a.txt", "b.txt"]
+            assert zf.read("a.txt") == b"first"
+            assert zf.read("b.txt") == b"second"
+
+    def test_in_memory_iter_children_yields_entries(self):
+        zio = ZipIO()
+        with zio.make_child("first.txt") as entry:
+            entry.write(b"1")
+        with zio.make_child("second.txt") as entry:
+            entry.write(b"2")
+        names = sorted(child.entry_name for child in zio)
+        assert names == ["first.txt", "second.txt"]
+
+    def test_in_memory_rewrite_swap_replaces_payload(self):
+        zio = ZipIO()
+        with zio.make_child("a.txt") as entry:
+            entry.write(b"v1")
+        with zio.make_child("b.txt") as entry:
+            entry.write(b"unchanged")
+        with zio.make_child("a.txt") as entry:
+            entry.seek(0)
+            entry.truncate(0)
+            entry.write(b"v2")
+
+        with zipfile.ZipFile(_io_BytesIO(zio.to_bytes())) as zf:
+            assert zf.read("a.txt") == b"v2"
+            assert zf.read("b.txt") == b"unchanged"
+
+    def test_in_memory_delete_removes_entry(self):
+        zio = ZipIO()
+        with zio.make_child("a.txt") as entry:
+            entry.write(b"x")
+        with zio.make_child("b.txt") as entry:
+            entry.write(b"y")
+        with zio.make_child("a.txt") as entry:
+            entry.delete()
+
+        assert zio.list_entries() == ["b.txt"]
+        with zipfile.ZipFile(_io_BytesIO(zio.to_bytes())) as zf:
+            assert zf.namelist() == ["b.txt"]
+
+    def test_in_memory_load_existing_archive_bytes(self):
+        # Build an archive with stdlib, then hand the bytes to ZipIO.
+        scratch = _io_BytesIO()
+        with zipfile.ZipFile(scratch, mode="w") as zf:
+            zf.writestr("a.txt", b"hello")
+            zf.writestr("b.txt", b"world")
+
+        zio = ZipIO(scratch.getvalue())
+        assert zio.path is None
+        assert sorted(zio.list_entries()) == ["a.txt", "b.txt"]
+        with zio.make_child("a.txt") as entry:
+            entry.seek(0)
+            assert entry.read() == b"hello"
+
+    def test_in_memory_commit_preserves_parent_cursor(self):
+        zio = ZipIO()
+        with zio.make_child("a.txt") as entry:
+            entry.write(b"hello")
+
+        # In-memory commits go through replace_with_payload, which
+        # would otherwise reset _pos to 0; _preserve_cursor restores
+        # the caller's position (clamped to the new buffer size).
+        zio.open()
+        try:
+            zio.seek(4)
+            pos = zio.tell()
+            with zio.make_child("b.txt") as entry:
+                entry.write(b"world")
+            assert zio.tell() == pos
+            with zio.make_child("a.txt") as entry:
+                entry.seek(0)
+                entry.truncate(0)
+                entry.write(b"HELLO")
+            assert zio.tell() == pos
+        finally:
+            zio.close()
+
+    def test_in_memory_iter_preserves_parent_cursor(self):
+        zio = ZipIO()
+        with zio.make_child("a.txt") as entry:
+            entry.write(b"hello")
+        with zio.make_child("b.txt") as entry:
+            entry.write(b"world")
+
+        zio.open()
+        try:
+            zio.seek(8)
+            pos = zio.tell()
+            list(zio)
+            assert zio.tell() == pos
+            zio.list_entries()
+            assert zio.tell() == pos
+            assert "a.txt" in zio
+            assert zio.tell() == pos
+        finally:
+            zio.close()
