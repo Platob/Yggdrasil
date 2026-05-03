@@ -47,7 +47,7 @@ def _wait_for_cache(tmp_path: Path, expected: int = 1, timeout: float = 10.0) ->
     """
     from yggdrasil.io.buffer.nested.folder_io import FolderIO
 
-    cache_root = tmp_path / "cache"
+    cache_root = tmp_path
     deadline = time.time() + timeout
     while time.time() < deadline:
         n = 0
@@ -260,12 +260,12 @@ class TestHttpSessionLocalCache:
             session.get(f"{http_server.base_url}/cache/path-check", local_cache=cache)
         _wait_for_cache(tmp_path, expected=1)
         # Partitioned layout: at least one leaf lives under
-        # ``cache/request_method=GET/request_url_host=.../`` — assert
+        # ``<root>/request_method=GET/request_url_host=.../`` — assert
         # on the partitioned shape, not a flat glob, so a layout
         # change doesn't sneak through unnoticed.
-        cache_root = tmp_path / "cache"
+        cache_root = tmp_path
         leaves = [p for p in cache_root.rglob("*") if p.is_file()]
-        assert leaves, "expected at least one partition leaf under tmp_path/cache"
+        assert leaves, "expected at least one partition leaf under tmp_path"
         rel_dirs = {str(leaf.parent.relative_to(cache_root)) for leaf in leaves}
         assert any(
             d.startswith("request_method=GET") for d in rel_dirs

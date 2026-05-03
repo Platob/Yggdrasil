@@ -632,7 +632,7 @@ class Session(ABC):
 
         Hits are grouped by the effective config's local-cache folder
         — keyed via :meth:`CacheConfig.local_cache_folder`, which
-        auto-fills the default ``~/.yggdrasil/io/session`` root on any
+        auto-fills the default ``~/.yggdrasil/cache/response`` root on any
         config that didn't carry a ``path`` — so the per-config split
         survives all the way to :class:`ResponseBatch.local_hits`.
         Collapsing them back into one bucket would lose that
