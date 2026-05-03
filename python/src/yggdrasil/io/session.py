@@ -772,6 +772,47 @@ class Session(ABC):
         for batch in self._send_many_batches(requests, config):
             yield from batch
 
+    def send_many_batches(
+        self,
+        requests: Iterator[PreparedRequest],
+        config: SendManyConfig | SendConfig | Mapping[str, Any] | None = None,
+        *,
+        wait: WaitingConfigArg = None,
+        raise_error: bool = True,
+        normalize: bool | None = None,
+        stream: bool = True,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
+        local_cache: CacheConfig | Mapping[str, Any] | None = None,
+        batch_size: int | None = None,
+        ordered: bool = False,
+        max_in_flight: int | None = None,
+        spark_session: Optional["SparkSession"] = None,
+        **options,
+    ) -> Iterator[ResponseBatch]:
+        """Yield one :class:`ResponseBatch` per processed chunk.
+
+        Public entry point: both Python and Spark modes yield the same
+        ``Iterator[ResponseBatch]`` shape, chunked the same way, so
+        downstream consumers can stream partial results uniformly. Each
+        yielded batch carries schema-bearing holders even when a stage
+        produced no rows — the schema is preserved for empty results.
+        """
+        cfg = SendManyConfig.check_arg(
+            config,
+            wait=wait,
+            raise_error=raise_error,
+            normalize=normalize,
+            stream=stream,
+            remote_cache=remote_cache,
+            local_cache=local_cache,
+            batch_size=batch_size,
+            ordered=ordered,
+            max_in_flight=max_in_flight,
+            spark_session=spark_session,
+            **options,
+        )
+        yield from self._send_many_batches(requests, cfg)
+
     def _send_many_batches(
         self,
         requests: Iterator[PreparedRequest],
@@ -785,12 +826,15 @@ class Session(ABC):
         Arrow insert vs. lazy Spark insert). Mode is picked from
         ``config.spark_session``.
 
-        Spark mode forces a single mega-chunk because ``mapInArrow``
-        wants one DataFrame to scatter; per-request local/remote
-        cache overrides DROP on the worker side (workers and
-        writeback see only the session-level configs) — same
-        trade-off as `spark_send`. Python mode chunks normally so
-        downstream consumers can keep per-batch backpressure.
+        Both modes chunk requests by ``batch_size`` and yield one
+        :class:`ResponseBatch` per chunk so callers see the same
+        streaming shape regardless of engine. In Spark mode each chunk
+        produces its own ``mapInArrow`` job — pass a larger
+        ``batch_size`` (or ``max_batch_size``) when you'd rather
+        amortise scheduler overhead across a single bulk fetch. Empty
+        buckets are returned as schema-bearing holders so a chunk that
+        fully short-circuited on local cache still advertises the
+        response schema for ``remote_hits`` / ``new_hits``.
         """
         spark = config.spark_session
         is_spark = spark is not None
@@ -798,27 +842,31 @@ class Session(ABC):
         session_local_cfg = config.local_cache
 
         if is_spark:
-            # Spark wants the whole list in one chunk for a single
-            # mapInArrow scatter — multiple smaller DFs would create
-            # many Spark jobs and lose the bulk-fetch advantage.
-            chunks: Iterator[list[PreparedRequest]] = iter([list(requests)])
+            # Spark mode has no driver-side thread pool to scale the
+            # default against — fall back to ``max_batch_size`` (or
+            # 1024) so each chunk maps to one ``mapInArrow`` scatter
+            # of bounded width. Callers who want a single mega-chunk
+            # (preserving the original bulk-fetch optimisation) can
+            # pass an explicit ``batch_size`` larger than their
+            # request count.
+            batch_size = config.batch_size or config.max_batch_size or 1024
         else:
             pool = self.job_pool
             batch_size = config.batch_size or min(
                 config.max_batch_size or 1024, pool.max_workers * 100
             )
 
-            def _batched(
-                it: Iterator[PreparedRequest], n: int,
-            ) -> Iterator[list[PreparedRequest]]:
-                iterator = iter(it)
-                while True:
-                    b = list(itertools.islice(iterator, n))
-                    if not b:
-                        break
-                    yield b
+        def _batched(
+            it: Iterator[PreparedRequest], n: int,
+        ) -> Iterator[list[PreparedRequest]]:
+            iterator = iter(it)
+            while True:
+                b = list(itertools.islice(iterator, n))
+                if not b:
+                    break
+                yield b
 
-            chunks = _batched(requests, batch_size)
+        chunks = _batched(requests, batch_size)
 
         for chunk in chunks:
             if not chunk:
@@ -827,9 +875,10 @@ class Session(ABC):
             # --- Stage 1: local cache ---
             local_hits, after_local = self._split_local_cache(chunk, session_local_cfg)
             remote_hits: list[Response] = []
-            new_hits: "list[Response] | SparkDataFrame | None" = (
-                None if is_spark else []
-            )
+            # Default new_hits to None so ResponseBatch coerces it to a
+            # schema-bearing empty holder (Spark or Arrow depending on
+            # mode) — no special-case for "stage skipped".
+            new_hits: "list[Response] | SparkDataFrame | None" = None
 
             if not after_local:
                 yield ResponseBatch(
@@ -966,18 +1015,11 @@ class Session(ABC):
             **options,
         )
 
-        if cfg.spark_session is not None:
-            # Spark mode produces exactly one batch (mega-chunk); take
-            # it as the result rather than running ``extend``, which is
-            # a Python-mode-only merge.
-            for chunk in self._send_many_batches(requests, cfg):
-                return chunk
-            return ResponseBatch(spark=cfg.spark_session)
-
-        # Default-init buckets to empty lists so the merged batch always
-        # exposes Python-mode holders (counts, len, iteration all work
-        # even when every chunk produced zero responses).
-        result = ResponseBatch(local_hits=[], remote_hits=[], new_hits=[])
+        # Default-init the accumulator with the same engine the
+        # pipeline will produce so the first ``extend`` doesn't trip
+        # the Python/Spark mismatch guard. Empty buckets carry their
+        # schemas in either mode.
+        result = ResponseBatch(spark=cfg.spark_session)
         for chunk in self._send_many_batches(requests, cfg):
             result.extend(chunk)
         return result

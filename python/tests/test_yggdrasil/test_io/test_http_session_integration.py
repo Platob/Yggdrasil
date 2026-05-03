@@ -337,10 +337,13 @@ class TestHttpSessionSendManyLocalCache:
         assert isinstance(batch, ResponseBatch)
         assert batch.counts == {"local": 0, "remote": 0, "new": 3}
         assert len(batch) == 3
-        # With no cache hits, only the new bucket should be populated.
-        assert batch.local_hits is None
-        assert batch.remote_hits is None
+        # Even unfilled buckets carry a schema-bearing empty holder
+        # so the batch always advertises the response schema.
+        assert isinstance(batch.local_hits, TabularIO)
+        assert isinstance(batch.remote_hits, TabularIO)
         assert isinstance(batch.new_hits, TabularIO)
+        assert batch.local_hits.num_rows == 0
+        assert batch.remote_hits.num_rows == 0
         assert all(r.status_code == 200 for r in batch)
 
     def test_send_many_batch_second_pass_all_local_hits(
