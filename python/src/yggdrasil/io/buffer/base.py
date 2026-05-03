@@ -1155,6 +1155,102 @@ class TabularIO(Disposable, ABC, Generic[O]):
             # fidelity for free.
             yield from batch.to_pylist()
 
+    # ==================================================================
+    # Record streaming — typed rows sharing a singleton Schema
+    # ==================================================================
+
+    def to_records(
+        self,
+        options: "O | None" = None,
+        **kwargs: Any,
+    ) -> "Iterator[Any]":
+        """Alias for :meth:`read_records`."""
+        return self.read_records(options=options, **kwargs)
+
+    def read_records(
+        self,
+        options: "O | None" = None,
+        **kwargs: Any,
+    ) -> "Iterator[Any]":
+        """Stream rows as :class:`yggdrasil.data.record.Record` objects.
+
+        Each :class:`Record` is a Mapping over one row's values keyed
+        by field name; the underlying :class:`Schema` is materialized
+        once per stream and shared by reference across every yielded
+        record. Lower per-row allocation than :meth:`read_pylist` for
+        sources where the schema is stable across batches (the common
+        case).
+        """
+        return self._read_records(
+            self.check_options(options, overrides=locals())
+        )
+
+    def _read_records(self, options: O) -> "Iterator[Any]":
+        # Default impl: derive Records from `_read_arrow_batches`,
+        # locking the Schema to the first batch's schema. Subclasses
+        # with a row-native source (a SQL cursor, a Spark Row stream)
+        # should override to skip the column→Python materialisation.
+        from yggdrasil.data.record import Record
+
+        yield from Record.from_arrow_batches(
+            self._read_arrow_batches(options),
+        )
+
+    def write_records(
+        self,
+        records: "Iterable[Any]",
+        options: "O | None" = None,
+        **kwargs: Any,
+    ) -> None:
+        """Write a stream of :class:`Record` (or row-mapping) objects."""
+        self._write_records(
+            records, self.check_options(options, overrides=locals()),
+        )
+
+    def _write_records(
+        self,
+        records: "Iterable[Any]",
+        options: O,
+    ) -> None:
+        """Default impl: bucket records by `options.row_size` and
+        delegate to :meth:`_write_arrow_batches`. Subclasses with a
+        row-native sink (a SQL bulk-insert, a Spark createDataFrame)
+        should override to skip the row→Arrow round-trip.
+
+        The first record's schema becomes the writer's target schema —
+        a record with a different schema in the same stream is
+        silently re-aligned via dict-order iteration, so callers that
+        care about strictness should pre-validate.
+        """
+        from yggdrasil.data.record import Record
+
+        chunk_size = max(1, options.row_size or 1024)
+        chunk_rows: list[dict] = []
+        chunk_schema: "pa.Schema | None" = None
+
+        def _flush() -> None:
+            if not chunk_rows:
+                return
+            batch = pa.RecordBatch.from_pylist(chunk_rows, schema=chunk_schema)
+            self._write_arrow_batches([batch], options)
+            chunk_rows.clear()
+
+        for rec in records:
+            if isinstance(rec, Record):
+                if chunk_schema is None:
+                    chunk_schema = rec.schema.to_arrow_schema()
+                chunk_rows.append(rec.to_dict())
+            elif isinstance(rec, Mapping):
+                chunk_rows.append(dict(rec))
+            else:
+                raise TypeError(
+                    f"_write_records expected Record or Mapping rows; "
+                    f"got {type(rec).__name__}: {rec!r}"
+                )
+            if len(chunk_rows) >= chunk_size:
+                _flush()
+        _flush()
+
     def to_pydict(
         self,
         options: "O | None" = None,

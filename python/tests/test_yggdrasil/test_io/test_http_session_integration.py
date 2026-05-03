@@ -30,7 +30,7 @@ from typing import Iterator
 
 import pytest
 
-import yggdrasil.pickle.ser as pickle
+from yggdrasil.io.buffer.primitive import ArrowIPCIO
 from yggdrasil.io.errors import NotFoundError
 from yggdrasil.io.http_ import HTTPSession
 from yggdrasil.io.request import PreparedRequest
@@ -42,18 +42,23 @@ def _wait_for_cache(tmp_path: Path, expected: int = 1, timeout: float = 10.0) ->
     """Wait until *expected* cache files exist and are fully readable.
 
     Cache writes go through ``Job.make(...).fire_and_forget()`` so the
-    file may exist (zero-byte) before pickle has finished. Polling on
-    "load returns a real Response" is the cheapest reliable barrier.
+    file may exist (partial / zero-byte) before the IPC writer has
+    flushed. Polling on "Arrow IPC parses to a Response" is the
+    cheapest reliable barrier.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        files = list((tmp_path / "cache").rglob("*.ypkl"))
+        files = list((tmp_path / "cache").rglob("*.arrow"))
         if len(files) >= expected:
             ok = 0
             for f in files:
                 try:
-                    loaded = pickle.load(f, unpickle=True, default=None)
-                    if isinstance(loaded, Response):
+                    io = ArrowIPCIO(path=str(f))
+                    loaded = next(
+                        Response.from_arrow_tabular(io.read_arrow_batches()),
+                        None,
+                    )
+                    if loaded is not None:
                         ok += 1
                 except Exception:
                     pass
@@ -259,7 +264,7 @@ class TestHttpSessionLocalCache:
         with HTTPSession(verify=False) as session:
             session.get(f"{http_server.base_url}/cache/path-check", local_cache=cache)
         _wait_for_cache(tmp_path, expected=1)
-        cache_files = list((tmp_path / "cache").rglob("*.ypkl"))
+        cache_files = list((tmp_path / "cache").rglob("*.arrow"))
         assert cache_files, "expected at least one cache file under tmp_path/cache"
 
     def test_distinct_urls_cache_independently(
@@ -315,6 +320,47 @@ class TestHttpSessionSendManyLocalCache:
 
         assert http_server.counters == {}, (
             "second pass should be served entirely from disk"
+        )
+
+    def test_send_many_batch_first_pass_all_new_hits(
+        self, http_server: _Server, tmp_path
+    ):
+        from yggdrasil.io.buffer.base import TabularIO
+        from yggdrasil.io.session import ResponseBatch
+
+        pytest.importorskip("xxhash")
+        cache = self._cache(tmp_path)
+        reqs = self._build_requests(http_server.base_url, 3)
+        with HTTPSession(verify=False) as session:
+            batch = session.send_many_batch(iter(reqs), local_cache=cache)
+
+        assert isinstance(batch, ResponseBatch)
+        assert batch.counts == {"local": 0, "remote": 0, "new": 3}
+        assert len(batch) == 3
+        # With no cache hits, only the new bucket should be populated.
+        assert batch.local_hits is None
+        assert batch.remote_hits is None
+        assert isinstance(batch.new_hits, TabularIO)
+        assert all(r.status_code == 200 for r in batch)
+
+    def test_send_many_batch_second_pass_all_local_hits(
+        self, http_server: _Server, tmp_path
+    ):
+        from yggdrasil.io.session import ResponseBatch
+
+        pytest.importorskip("xxhash")
+        cache = self._cache(tmp_path)
+        reqs = self._build_requests(http_server.base_url, 2)
+        with HTTPSession(verify=False) as session:
+            session.send_many_batch(iter(reqs), local_cache=cache)
+            _wait_for_cache(tmp_path, expected=2)
+            http_server.reset_counters()
+            batch = session.send_many_batch(iter(reqs), local_cache=cache)
+
+        assert isinstance(batch, ResponseBatch)
+        assert batch.counts == {"local": 2, "remote": 0, "new": 0}
+        assert http_server.counters == {}, (
+            "second-pass send_many_batch should not touch upstream"
         )
 
 
