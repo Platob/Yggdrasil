@@ -376,14 +376,17 @@ class FolderIO(NestedIO[FolderOptions]):
         Carries forward this folder's partition declaration, the
         declared schema, and the accumulated partition values,
         augmenting them with any ``key=value`` segment parsed from
-        the sub-folder's name.
+        the sub-folder's name. The accumulated map also becomes
+        :attr:`TabularIO.static_values` on the sub-folder so a
+        direct :meth:`read_arrow_table` against the sub-folder
+        injects the partition columns for free.
         """
         kv = _parse_kv_segment(sub_path.name)
         sub_pv = dict(self.partition_values) if self.partition_values else {}
         if kv is not None:
             sub_pv[kv[0]] = kv[1]
 
-        return type(self)(
+        sub = type(self)(
             path=sub_path,
             partition_columns=self._partition_columns,
             schema=self._declared_schema,
@@ -391,6 +394,15 @@ class FolderIO(NestedIO[FolderOptions]):
             partition_values=sub_pv if sub_pv else None,
             auto_open=False,
         )
+        # Mirror the partition-values dict into ``static_values`` so
+        # the inherited :meth:`TabularIO.read_arrow_batches` /
+        # :meth:`TabularIO.read_arrow_table` injection covers
+        # direct reads against the sub-folder. Leaves carry the
+        # same accumulation independently — the additive injection
+        # contract makes the duplicate harmless.
+        if sub_pv:
+            sub.static_values = self._typed_partition_static(sub_pv)
+        return sub
 
     def _open_file_child(
         self,
@@ -402,6 +414,13 @@ class FolderIO(NestedIO[FolderOptions]):
         :class:`BytesIO` for files with no registered tabular
         format. Returns ``None`` if neither can bind (rare —
         usually means the entry vanished mid-listing).
+
+        When the enclosing folder carries
+        :attr:`partition_values`, the leaf's
+        :attr:`TabularIO.static_values` is stamped with the
+        Arrow-typed equivalent so its read path automatically
+        injects the partition columns — no per-batch wrapping
+        needed at the folder level.
         """
         try:
             io = TabularIO.from_path(file_path)
@@ -410,11 +429,15 @@ class FolderIO(NestedIO[FolderOptions]):
 
         # A registered tabular leaf is a :class:`BytesIO` subclass
         # with a format-specific class (so ``type(io) is BytesIO``
-        # would be false). Stamp partition values onto it for
-        # downstream injection by the read path.
+        # would be false). Stamp the typed partition values onto
+        # ``static_values`` so the inherited
+        # :meth:`TabularIO.read_arrow_batches` injection picks
+        # them up — no folder-side per-batch wrapping needed.
         if isinstance(io, BytesIO) and type(io) is not BytesIO:
             if self.partition_values:
-                io.partition_values = dict(self.partition_values)
+                io.static_values = self._typed_partition_static(
+                    self.partition_values,
+                )
             return io
 
         # No tabular registration — fall back to a raw BytesIO so
@@ -423,6 +446,56 @@ class FolderIO(NestedIO[FolderOptions]):
             return BytesIO(path=file_path, auto_open=False)
         except Exception:
             return None
+
+    def _typed_partition_static(
+        self,
+        values: "Mapping[str, str | None]",
+    ) -> "dict[str, Any]":
+        """Build an Arrow-typed ``static_values`` map for ``values``.
+
+        Each value is wrapped in a :class:`pyarrow.Scalar` typed
+        to its declared partition column dtype so the
+        :func:`yggdrasil.io.buffer.base.inject_static_values_into_batch`
+        helper emits a column with the right schema-side type.
+        Falls back to a string scalar when the column isn't
+        declared or the dtype can't translate to Arrow.
+        """
+        cols = self._resolve_partition_columns()
+        by_name = {c.name: c for c in cols} if cols else {}
+        out: dict[str, Any] = {}
+        for key, value in values.items():
+            field = by_name.get(key)
+            arrow_type: "pa.DataType | None" = None
+            if field is not None:
+                for attr in ("to_arrow_dtype", "to_arrow"):
+                    fn = getattr(field.dtype, attr, None)
+                    if callable(fn):
+                        try:
+                            arrow_type = fn()
+                            break
+                        except Exception:
+                            continue
+            if arrow_type is None:
+                arrow_type = pa.string()
+            try:
+                if value is None:
+                    out[key] = pa.scalar(None, type=arrow_type)
+                else:
+                    base = pa.scalar(value, type=pa.string())
+                    out[key] = (
+                        pc.cast(base, arrow_type)
+                        if base.type != arrow_type
+                        else base
+                    )
+            except Exception:
+                # Type coercion failed (e.g. ``"foo"`` → int) —
+                # keep the raw string scalar so the column at
+                # least carries the value verbatim.
+                out[key] = pa.scalar(
+                    None if value is None else str(value),
+                    type=pa.string(),
+                )
+        return out
 
     # ==================================================================
     # Cheap is_empty — avoid full iteration
@@ -567,36 +640,13 @@ class FolderIO(NestedIO[FolderOptions]):
     # Read derivation — chain children with optional partition injection
     # ==================================================================
 
-    def _read_arrow_batches(
-        self,
-        options: FolderOptions,
-    ) -> Iterator[pa.RecordBatch]:
-        """Chain children; inject partition columns when declared."""
-        partition_cols = self._resolve_partition_columns(options)
-        partition_by_name = (
-            {c.name: c for c in partition_cols} if partition_cols else None
-        )
-        strict = bool(options.partition_strict)
-
-        for child in self._iter_children(options):
-            if isinstance(child, NestedIO):
-                with child:
-                    yield from child._read_arrow_batches(options)
-                continue
-
-            if not isinstance(child, TabularIO):
-                continue
-
-            pv = self._partition_values_for(
-                child, partition_cols, strict=strict,
-            )
-            with child:
-                for batch in child.read_arrow_batches(options=options):
-                    if pv and partition_by_name:
-                        batch = _inject_partition_columns(
-                            batch, pv, partition_by_name,
-                        )
-                    yield batch
+    # ``_read_arrow_batches`` is intentionally NOT overridden:
+    # the inherited :meth:`NestedIO._read_arrow_batches` already
+    # iterates children and dispatches to each. Leaves stamped
+    # with :attr:`TabularIO.static_values` (see
+    # :meth:`_open_file_child`) auto-inject their partition
+    # columns when their public read runs, so no per-batch
+    # wrapping at this level is needed.
 
     def _partition_values_for(
         self,
@@ -605,18 +655,17 @@ class FolderIO(NestedIO[FolderOptions]):
         *,
         strict: bool,
     ) -> "Mapping[str, str | None] | None":
-        """Resolve a leaf's partition values.
+        """Resolve a leaf's partition values from its directory path.
 
-        Prefer the leaf's own ``partition_values`` (set by the
-        recursive ``iter_children`` walk). When unset, parse from
-        the child's path relative to root.
+        Used during partition inference and by subclasses (Delta)
+        that handle their own per-leaf metadata. The folder's
+        normal read path doesn't call this — it relies on
+        :attr:`TabularIO.static_values` stamped at child-open
+        time. Kept here for backward-compatible introspection on
+        leaves that weren't opened through this folder.
         """
         if not partition_cols:
             return None
-
-        pv = getattr(child, "partition_values", None)
-        if pv:
-            return pv
 
         leaf_path: Path | None = getattr(child, "path", None)
         if leaf_path is None:
