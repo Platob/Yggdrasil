@@ -716,8 +716,17 @@ class URL(os.PathLike):
 
         scheme = default_scheme or scheme
 
-        query = _decode_maybe(split.query, decode)
-        fragment = _decode_maybe(split.fragment, decode)
+        # URLs sourced from XML/HTML payloads often arrive with ``&`` encoded
+        # as the entity ``&amp;`` (e.g. an Atom feed link, an HTML attribute,
+        # an XML-RPC body). Without this fix, ``urlsplit`` keeps the literal
+        # ``amp;`` and the parameter separator ``&`` is lost — the next pair
+        # in the query gets glued onto the previous key (``amp;update_id``)
+        # and round-trips through Arrow keep the broken form. Decode the
+        # entity here so the query/fragment parse as the caller intended;
+        # callers that genuinely need a literal ``&amp;`` must percent-encode
+        # the ``&`` themselves.
+        query = _decode_maybe(split.query, decode).replace("&amp;", "&")
+        fragment = _decode_maybe(split.fragment, decode).replace("&amp;", "&")
 
         # Fix-up for URLs that lack "//" authority (e.g. "http:example.com/path")
         # but NOT for schemaless strings — those would incorrectly extract the
