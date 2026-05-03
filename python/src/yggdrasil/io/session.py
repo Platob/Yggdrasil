@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional
 
 import pyarrow as pa
 
-import yggdrasil.pickle.ser as pickle
 from yggdrasil.arrow.cast import rechunk_arrow_batches_by_byte_size
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.dataclasses.waiting import (
@@ -22,6 +21,7 @@ from yggdrasil.dataclasses.waiting import (
 )
 from yggdrasil.io.enums import Mode
 from .buffer import BytesIO
+from .buffer.primitive import ArrowIPCIO
 from .request import PreparedRequest
 from .response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
 from .response_batch import ResponseBatch
@@ -51,6 +51,24 @@ LOGGER = logging.getLogger(__name__)
 # cap is sliced row-wise by the shared rechunker, which never splits a
 # single row across batches.
 _SPARK_RESPONSE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
+
+
+# Local cache files are Arrow IPC — one Response per file, written by
+# `_store_local_cached_response` and read back by
+# `_load_local_cached_response` via `Response.from_arrow_tabular`.
+_LOCAL_CACHE_SUFFIX: str = ".arrow"
+
+
+def _write_local_cache_arrow(batch: pa.RecordBatch, target: Path) -> None:
+    """Persist a single Response Arrow batch to *target* as IPC.
+
+    Module-level so the fire-and-forget Job can pickle the callable
+    without dragging Session state into the worker thread. The parent
+    directory is created on demand because the staging folder rotates
+    TTL-encoded names; missing intermediate dirs are routine.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    ArrowIPCIO(path=str(target)).write_arrow_batches([batch])
 
 
 @dataclass
@@ -138,7 +156,7 @@ class Session(ABC):
     ) -> tuple[Optional[Response], Optional[Path]]:
         filepath = cache_cfg.local_cache_file(
             request=request,
-            suffix=".ypkl",
+            suffix=_LOCAL_CACHE_SUFFIX,
         )
         if filepath is None:
             return None, filepath
@@ -146,18 +164,23 @@ class Session(ABC):
         if not filepath.exists():
             return None, filepath
 
-        loaded = pickle.load(
-            filepath,
-            unpickle=True,
-            clean_corrupted=True,
-            default=None,
-        )
-
-        if not isinstance(loaded, Response):
+        try:
+            io = ArrowIPCIO(path=str(filepath))
+            loaded = next(
+                Response.from_arrow_tabular(io.read_arrow_batches()),
+                None,
+            )
+        except Exception:
+            # Corrupted / partial / non-IPC file: drop it so the next
+            # write replaces it. Mirrors the old pickle path's
+            # `clean_corrupted=True` behavior.
             try:
                 filepath.unlink(missing_ok=True)
-            except:
+            except OSError:
                 pass
+            return None, filepath
+
+        if loaded is None:
             return None, filepath
 
         if not cache_cfg.filter_response(loaded, request=request):
@@ -182,11 +205,18 @@ class Session(ABC):
         anonymized = response.anonymize(mode=cache_cfg.anonymize)
         target = filepath if filepath else cache_cfg.local_cache_file(
             request=anonymized.request,
-            suffix=".ypkl",
+            suffix=_LOCAL_CACHE_SUFFIX,
             force=True
         )
+        if target is None:
+            return
 
-        Job.make(pickle.dump, anonymized, target).fire_and_forget()
+        # Serialize the Response now (on the caller's thread, with the
+        # buffer still live) and hand the Arrow batch + path off to a
+        # fire-and-forget writer. Doing the to_arrow_batch inside the
+        # job would race the buffer's lifetime against unrelated work.
+        batch = anonymized.to_arrow_batch(parse=False)
+        Job.make(_write_local_cache_arrow, batch, target).fire_and_forget()
 
     def _load_remote_cached_response(
         self,
@@ -325,7 +355,7 @@ class Session(ABC):
         local_filepath = None
         if effective_local_cfg.local_cache_enabled:
             local_filepath = effective_local_cfg.local_cache_file(
-                request=request, suffix=".ypkl", force=True
+                request=request, suffix=_LOCAL_CACHE_SUFFIX, force=True
             )
             if effective_local_cfg.mode == Mode.UPSERT:
                 # Force-evict any stale local entry so the fresh response
@@ -512,7 +542,7 @@ class Session(ABC):
                 continue
 
             if eff.mode == Mode.UPSERT:
-                evict_path = eff.local_cache_file(req, suffix=".ypkl", force=True)
+                evict_path = eff.local_cache_file(req, suffix=_LOCAL_CACHE_SUFFIX, force=True)
                 if evict_path is not None and evict_path.exists():
                     evict_path.unlink(missing_ok=True)
                     LOGGER.debug(

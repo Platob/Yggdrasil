@@ -169,7 +169,7 @@ class TestLocalCacheReadback:
         # The async write may take a moment; tolerate either state but
         # at least confirm the directory was created.
         if cache_root.exists():
-            entries = list(cache_root.rglob("*.ypkl"))
+            entries = list(cache_root.rglob("*.arrow"))
             assert len(entries) >= 0  # never negative; just make the test stable
 
 
