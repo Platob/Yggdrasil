@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import MISSING, Field, fields, is_dataclass
-from inspect import isclass
+from inspect import Parameter, isclass, signature
 from typing import TYPE_CHECKING, Any, Mapping, Sequence, Optional, Callable, TypeVar, get_type_hints
 
 if TYPE_CHECKING:
@@ -207,6 +207,66 @@ def _withable_field(obj_or_cls: Any, name: str) -> Optional[Field[Any]]:
     return None
 
 
+def _init_param_names(cls: type) -> list[str]:
+    """Names of regular (non-vararg) ``__init__`` parameters in declaration order.
+
+    Returns an empty list when the class has no inspectable ``__init__`` —
+    e.g. C-extension types or classes that inherit ``object.__init__`` only.
+    """
+    init = getattr(cls, "__init__", None)
+    if init is None or init is object.__init__:
+        return []
+    try:
+        sig = signature(init)
+    except (TypeError, ValueError):
+        return []
+
+    names: list[str] = []
+    for i, (name, param) in enumerate(sig.parameters.items()):
+        if i == 0:  # skip self
+            continue
+        if param.kind in (Parameter.VAR_POSITIONAL, Parameter.VAR_KEYWORD):
+            continue
+        names.append(name)
+    return names
+
+
+def _public_attr_names(obj: Any) -> list[str]:
+    """Public instance attribute names for non-dataclass objects.
+
+    Walks ``__dict__`` plus every non-private ``__slots__`` entry up the MRO,
+    skipping anything that starts with ``"_"``. Order: ``__dict__`` first, then
+    slots in MRO order — gives a stable, predictable serialization order.
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+
+    inst_dict = getattr(obj, "__dict__", None)
+    if inst_dict is not None:
+        for key in inst_dict:
+            if not key.startswith("_") and key not in seen:
+                names.append(key)
+                seen.add(key)
+
+    for klass in type(obj).__mro__:
+        slots = klass.__dict__.get("__slots__")
+        if not slots:
+            continue
+        if isinstance(slots, str):
+            slots = (slots,)
+        for slot in slots:
+            if slot.startswith("_") or slot in seen:
+                continue
+            try:
+                getattr(obj, slot)
+            except AttributeError:
+                continue
+            names.append(slot)
+            seen.add(slot)
+
+    return names
+
+
 class YggDataclass:
     """Mixin adding ``copy``, ``with_<field>`` and pickle defaults to dataclasses.
 
@@ -251,42 +311,91 @@ class YggDataclass:
         Positional ``args`` map to init fields in declaration order, exactly
         like calling the dataclass constructor.  Keyword ``kwargs`` override
         by name.  Any field not mentioned is carried over from ``self``.
+
+        Works on non-dataclass subclasses too: init fields are derived from
+        ``__init__``'s signature and any public non-init attributes are
+        carried across via direct assignment after construction.
         """
         cls = type(self)
-        if not is_dataclass(cls):
+        is_dc = is_dataclass(cls)
+
+        if is_dc:
+            init_fields = [f for f in fields(cls) if f.init]
+            init_names = [f.name for f in init_fields]
+        else:
+            init_names = _init_param_names(cls)
+
+        if len(args) > len(init_names):
+            kind = "init fields" if is_dc else "init params"
             raise TypeError(
-                f"{cls.__name__}.copy() requires a @dataclass-decorated class. "
-                f"Apply @dataclass on the subclass and try again."
+                f"{cls.__name__}.copy() takes up to {len(init_names)} positional "
+                f"args, got {len(args)}. {kind.capitalize()} in order: {init_names}."
             )
 
-        init_fields = [f for f in fields(cls) if f.init]
-        init_names = [f.name for f in init_fields]
+        # Start with current values so callers only need to mention what changes.
+        init_kwargs: dict[str, Any] = {}
+        for name in init_names:
+            try:
+                init_kwargs[name] = getattr(self, name)
+            except AttributeError:
+                # Non-dataclass __init__ may take a param the instance never
+                # exposes as an attribute (e.g. it gets transformed before
+                # being stored). Leave it out and let __init__ fill its own
+                # default — error surfaces clearly if there is no default.
+                pass
 
-        if len(args) > len(init_fields):
-            raise TypeError(
-                f"{cls.__name__}.copy() takes up to {len(init_fields)} positional "
-                f"args, got {len(args)}. Init fields in order: {init_names}."
-            )
-
-        new_kwargs: dict[str, Any] = {name: getattr(self, name) for name in init_names}
-
-        for f, value in zip(init_fields, args):
-            if f.name in kwargs:
+        for name, value in zip(init_names, args):
+            if name in kwargs:
                 raise TypeError(
-                    f"{cls.__name__}.copy(): field {f.name!r} given both positionally "
+                    f"{cls.__name__}.copy(): field {name!r} given both positionally "
                     f"and by keyword. Pick one."
                 )
-            new_kwargs[f.name] = value
+            init_kwargs[name] = value
 
+        if is_dc:
+            for key, value in kwargs.items():
+                if key not in init_kwargs and key not in init_names:
+                    raise TypeError(
+                        f"{cls.__name__}.copy(): unknown init field {key!r}. "
+                        f"Valid init fields: {init_names}."
+                    )
+                init_kwargs[key] = value
+            return cls(**init_kwargs)
+
+        # Non-dataclass: anything not in the init signature is applied as a
+        # plain attribute override after construction. Lets users update
+        # post-init state without forcing them to know which fields are
+        # constructor params.
+        extra_overrides: dict[str, Any] = {}
         for key, value in kwargs.items():
-            if key not in new_kwargs:
-                raise TypeError(
-                    f"{cls.__name__}.copy(): unknown init field {key!r}. "
-                    f"Valid init fields: {init_names}."
-                )
-            new_kwargs[key] = value
+            if key in init_names:
+                init_kwargs[key] = value
+            else:
+                extra_overrides[key] = value
 
-        return cls(**new_kwargs)
+        try:
+            new = cls(**init_kwargs)
+        except TypeError as exc:
+            raise TypeError(
+                f"{cls.__name__}.copy(): could not reconstruct via {cls.__name__}(...) "
+                f"with kwargs {sorted(init_kwargs)}. Original error: {exc}. "
+                f"If __init__ takes required arguments not exposed as attributes, "
+                f"pass them explicitly to copy()."
+            ) from exc
+
+        # Carry public non-init state across so the copy actually mirrors self.
+        for name in _public_attr_names(self):
+            if name in init_names or name in extra_overrides:
+                continue
+            try:
+                object.__setattr__(new, name, getattr(self, name))
+            except AttributeError:
+                pass
+
+        for name, value in extra_overrides.items():
+            object.__setattr__(new, name, value)
+
+        return new
 
     # ── dynamic with_<field> ────────────────────────────────────
 
@@ -299,25 +408,41 @@ class YggDataclass:
             )
 
         field_name = name[5:]
-        try:
+
+        if is_dataclass(self):
             target = _withable_field(self, field_name)
-        except TypeError:
-            # Not a dataclass yet (e.g. mixin used without @dataclass).
-            raise AttributeError(
-                f"{type(self).__name__!r} object has no attribute {name!r}"
-            )
-
-        if target is None:
-            available = [
-                f.name for f in fields(self)
-                if f.init or not f.name.startswith("_")
-            ] if is_dataclass(self) else []
-            hint = f" Available fields: {available}." if available else ""
-            raise AttributeError(
-                f"{type(self).__name__!r} has no with_-able field {field_name!r}.{hint}"
-            )
-
-        is_init = target.init
+            if target is None:
+                available = [
+                    f.name for f in fields(self)
+                    if f.init or not f.name.startswith("_")
+                ]
+                raise AttributeError(
+                    f"{type(self).__name__!r} has no with_-able field {field_name!r}. "
+                    f"Available fields: {available}."
+                )
+            is_init = target.init
+        else:
+            # Non-dataclass: every public attribute that exists on self or is
+            # accepted by __init__ is with_-able. Private (leading underscore)
+            # names stay off-limits for symmetry with the dataclass path.
+            if field_name.startswith("_"):
+                raise AttributeError(
+                    f"{type(self).__name__!r} has no with_-able field {field_name!r}: "
+                    f"private (leading underscore) names are not exposed."
+                )
+            init_names = _init_param_names(type(self))
+            exists = field_name in init_names
+            if not exists:
+                # hasattr would recurse through __getattr__; only check the
+                # instance dict / non-private slots we already enumerate.
+                exists = field_name in _public_attr_names(self)
+            if not exists:
+                available = sorted(set(init_names) | set(_public_attr_names(self)))
+                hint = f" Known fields: {available}." if available else ""
+                raise AttributeError(
+                    f"{type(self).__name__!r} has no with_-able field {field_name!r}.{hint}"
+                )
+            is_init = field_name in init_names
 
         def setter(value: Any, *, inplace: bool = False) -> Any:
             if inplace:
@@ -340,7 +465,22 @@ class YggDataclass:
     # ── pickle / copy.deepcopy support ──────────────────────────
 
     def __getstate__(self) -> dict[str, Any]:
-        return {f.name: getattr(self, f.name) for f in _stateful_fields(self)}
+        if is_dataclass(self):
+            return {f.name: getattr(self, f.name) for f in _stateful_fields(self)}
+
+        # Non-dataclass: init params (when present on self) come first so the
+        # serialized order roughly matches the constructor; public non-init
+        # attributes follow.
+        state: dict[str, Any] = {}
+        for name in _init_param_names(type(self)):
+            try:
+                state[name] = getattr(self, name)
+            except AttributeError:
+                continue
+        for name in _public_attr_names(self):
+            if name not in state:
+                state[name] = getattr(self, name)
+        return state
 
     def __setstate__(self, state: Any) -> None:
         if state is None:
@@ -353,16 +493,26 @@ class YggDataclass:
                 f"got {type(state).__name__}."
             )
 
-        cls_fields = _stateful_fields(self)
-        for f in cls_fields:
-            if f.name in payload:
-                object.__setattr__(self, f.name, payload[f.name])
+        if is_dataclass(self):
+            cls_fields = _stateful_fields(self)
+            for f in cls_fields:
+                if f.name in payload:
+                    object.__setattr__(self, f.name, payload[f.name])
+                    continue
+                default = default_value(f)
+                if default is not MISSING:
+                    object.__setattr__(self, f.name, default)
+                elif f.init:
+                    raise TypeError(
+                        f"Cannot restore {type(self).__name__}: missing required field "
+                        f"{f.name!r}. Got keys: {sorted(payload)}."
+                    )
+            return
+
+        # Non-dataclass: the state dict is authoritative. Skip private
+        # (leading underscore) keys so a tampered payload can't smuggle
+        # internal fields back in.
+        for key, value in payload.items():
+            if key.startswith("_"):
                 continue
-            default = default_value(f)
-            if default is not MISSING:
-                object.__setattr__(self, f.name, default)
-            elif f.init:
-                raise TypeError(
-                    f"Cannot restore {type(self).__name__}: missing required field "
-                    f"{f.name!r}. Got keys: {sorted(payload)}."
-                )
+            object.__setattr__(self, key, value)
