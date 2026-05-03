@@ -568,7 +568,7 @@ class Session(ABC):
         )
 
         if cfg.spark_session is not None:
-            return self.send_many_batch(requests, config=cfg).to_dataframe()
+            yield from self.send_many_batch(requests, config=cfg).responses
 
         return self._send_many(requests, config=cfg)
 
@@ -1563,7 +1563,7 @@ class Session(ABC):
         # one row in REQUEST_ARROW_SCHEMA shape. We control partitioning by
         # chunking before handing to createDataFrame.
         request_batches: list[pa.RecordBatch] = [
-            r.to_arrow_batch(parse=False) for r in misses
+            r.prepare_to_send().to_arrow_batch(parse=False) for r in misses
         ]
         request_table = pa.Table.from_batches(request_batches)
         # PySpark 3.4+ accepts a pyarrow.Table directly and preserves the

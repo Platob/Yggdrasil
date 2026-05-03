@@ -433,19 +433,7 @@ class ResponseBatch:
     # ------------------------------------------------------------------
 
     def __iter__(self) -> Iterator[Response]:
-        if self.is_spark:
-            raise TypeError(
-                "ResponseBatch is in Spark mode — iterating Response objects "
-                "would force a driver-side collect via df.toArrow(). Call "
-                "`.to_dataframe()` for the fused DataFrame, or read individual "
-                "`.local_hits` / `.remote_hits` / `.new_hits` holders if you "
-                "really need the Spark frames."
-            )
-        # Route through `read_records` so each Response is built from a
-        # `Record` sharing the holder's singleton Schema — one Schema
-        # allocation per holder regardless of row count.
-        for holder in self._holders():
-            yield from Response.from_records(holder.read_records())
+        return self.iter_responses()
 
     def __len__(self) -> int:
         if self.is_spark:
@@ -484,6 +472,10 @@ class ResponseBatch:
         Python mode only — raises if any holder is Spark-backed.
         """
         return list(self)
+
+    def iter_responses(self):
+        for holder in self._holders():
+            yield from Response.from_records(holder.read_records())
 
     # ------------------------------------------------------------------
     # Mutation / merge

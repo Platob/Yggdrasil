@@ -719,8 +719,8 @@ class PreparedRequest:
 
     def prepare_to_send(
         self,
-        sent_at: dt.datetime | dt.date | str | int | None,
-        headers: Optional[Mapping[str, str]],
+        sent_at: dt.datetime | dt.date | str | int | None = None,
+        headers: Optional[Mapping[str, str]] = None,
     ) -> "PreparedRequest":
         instance = self.before_send(self) if self.before_send else self
 
