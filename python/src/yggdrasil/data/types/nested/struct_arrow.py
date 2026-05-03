@@ -290,7 +290,10 @@ def cast_arrow_batch_iterator(
     )
 
 
-# Re-exported above (``from yggdrasil.arrow.cast import …``) so the historic
-# ``yggdrasil.data.types.nested.struct[_arrow]`` import path keeps working;
-# the function itself lives in :mod:`yggdrasil.arrow.cast` since it's a
-# pure-pyarrow util with no struct-cast coupling.
+# ``rechunk_arrow_batches_by_byte_size`` lives in
+# :mod:`yggdrasil.arrow.cast` (pure-pyarrow util with no struct-cast
+# coupling). It's imported lazily inside
+# :func:`cast_arrow_batch_iterator` to break the circular chain
+# ``arrow.cast -> data.schema -> data.data_field -> data.types ->
+# data.types.nested -> struct_arrow``; callers that need it directly
+# should import from ``yggdrasil.arrow.cast``.

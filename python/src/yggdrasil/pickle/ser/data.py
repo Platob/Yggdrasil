@@ -146,7 +146,14 @@ class FieldSerialized(DataSerialized):
         codec: int | None = None,
     ) -> "Serialized[object] | None":
         from yggdrasil.data.data_field import Field
+        from yggdrasil.data.schema import Schema
 
+        # Schema is-a Field — defer to :class:`SchemaSerialized` so the
+        # type-cache MRO walk in :meth:`Tags.get_class_from_type` can't
+        # mis-route a Schema through the Field handler once the Field
+        # type has been cached.
+        if isinstance(obj, Schema):
+            return None
         if isinstance(obj, Field):
             return cls.from_value(obj, metadata=metadata, codec=codec)
         return None
