@@ -76,7 +76,6 @@ REQUEST_SCHEMA["request_url_scheme"] = schema_field(
     nullable=False,
     metadata={
         "comment": "URL scheme (for example http or https)",
-        "partition_by": "true",
     },
     tags={
         "entity": "request",
@@ -103,12 +102,10 @@ REQUEST_SCHEMA["request_url_host"] = schema_field(
     nullable=False,
     metadata={
         "comment": "Host name, domain, or IP address from the request URL",
-        "partition_by": "true",
     },
     tags={
         "entity": "request",
         "group": "url",
-        "partition_by": True
     },
 )
 
