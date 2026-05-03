@@ -24,7 +24,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Union, TYPE_CHECKING, Mapping, Iterable, Iterator, Literal
+from typing import Any, Callable, Dict, Optional, Union, TYPE_CHECKING, Mapping, Iterable, Iterator, Literal
 
 import pyarrow as pa
 from databricks.sdk.errors import DatabricksError, NotFound
@@ -223,6 +223,110 @@ def _resolve_prune_by(
     return None
 
 
+def _build_delete_insert_statements(
+    *,
+    target_location: str,
+    source_sql: str,
+    columns: list[str],
+    match_by: list[str],
+    prune_predicates: list[str],
+) -> list[str]:
+    """Build the keyed-DELETE + INSERT pair used by upsert and the merge fallback.
+
+    Always emits exactly two statements: a key-scoped ``DELETE`` against
+    target rows whose match keys appear in ``source_sql``, followed by a
+    plain ``INSERT INTO ... SELECT``.  ``columns`` is the projection that
+    bridges source → target — callers narrow it to the intersection of
+    source-side columns when feeding a fallback so non-matching columns
+    are filtered out.
+    """
+    cols_quoted = ", ".join(quote_ident(c) for c in columns)
+    key_cols = ", ".join(quote_ident(k) for k in match_by)
+    on_condition = _build_match_condition(
+        match_by, left_alias="T", right_alias="S",
+        null_safe=True, extra_predicates=prune_predicates,
+    )
+    return [
+        (
+            f"DELETE FROM {target_location} AS T\n"
+            f"USING (\n"
+            f"  SELECT DISTINCT {key_cols} FROM ({source_sql}) AS src\n"
+            f") AS S\n"
+            f"ON {on_condition}"
+        ),
+        f"INSERT INTO {target_location} ({cols_quoted})\n{source_sql}",
+    ]
+
+
+def _build_merge_statement(
+    *,
+    target_location: str,
+    source_sql: str,
+    columns: list[str],
+    match_by: list[str],
+    update_column_names: Optional[list[str]],
+    prune_predicates: list[str],
+    insert_only: bool = False,
+) -> str:
+    """Render a single ``MERGE INTO ...`` statement."""
+    cols_quoted = ", ".join(quote_ident(c) for c in columns)
+    on_condition = _build_match_condition(
+        match_by, left_alias="T", right_alias="S",
+        null_safe=True, extra_predicates=prune_predicates,
+    )
+    insert_clause = (
+        f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
+        f"VALUES ({', '.join(f'S.{quote_ident(c)}' for c in columns)})"
+    )
+    if insert_only:
+        return (
+            f"MERGE INTO {target_location} AS T\n"
+            f"USING (\n{source_sql}\n) AS S\n"
+            f"ON {on_condition}\n"
+            f"{insert_clause}"
+        )
+
+    update_column_names_effective = (
+        update_column_names
+        if update_column_names is not None
+        else [c for c in columns if c not in match_by]
+    )
+    update_clause = ""
+    if update_column_names_effective:
+        update_set = ", ".join(
+            f"T.{quote_ident(c)} = S.{quote_ident(c)}"
+            for c in update_column_names_effective
+        )
+        update_clause = f"WHEN MATCHED THEN UPDATE SET {update_set}\n"
+
+    return (
+        f"MERGE INTO {target_location} AS T\n"
+        f"USING (\n{source_sql}\n) AS S\n"
+        f"ON {on_condition}\n"
+        f"{update_clause}"
+        f"{insert_clause}"
+    )
+
+
+def _append_maintenance_statements(
+    statements: list[str],
+    *,
+    target_location: str,
+    zorder_by: Optional[list[str]],
+    optimize_after_merge: bool,
+    keyed: bool,
+    vacuum_hours: Optional[int],
+) -> None:
+    """Tack on OPTIMIZE / VACUUM statements when configured."""
+    if zorder_by:
+        zorder_cols = ", ".join(quote_ident(c) for c in zorder_by)
+        statements.append(f"OPTIMIZE {target_location} ZORDER BY ({zorder_cols})")
+    if optimize_after_merge and keyed:
+        statements.append(f"OPTIMIZE {target_location}")
+    if vacuum_hours is not None:
+        statements.append(f"VACUUM {target_location} RETAIN {int(vacuum_hours)} HOURS")
+
+
 def _build_dml_statements(
     *,
     target_location: str,
@@ -241,27 +345,31 @@ def _build_dml_statements(
     Path-agnostic — feeds from any source-SQL fragment that names the
     rows to merge.  ``prune_predicates`` are pre-rendered & parenthesized;
     they get AND-stitched onto ``ON`` clauses but NOT plain INSERT.
+
+    Mode dispatch when ``match_by`` is set:
+
+    - :attr:`Mode.UPSERT` → keyed ``DELETE`` then ``INSERT`` (safe on
+      backends without ``MERGE``).
+    - :attr:`Mode.MERGE` / :attr:`Mode.AUTO` → single ``MERGE INTO``
+      statement.  Callers that want fallback semantics on ``MERGE``
+      failure should also build delete-insert statements via
+      :func:`_build_delete_insert_statements` and submit them on
+      failure.
+    - :attr:`Mode.APPEND` → ``MERGE`` with ``WHEN NOT MATCHED THEN INSERT``
+      only (no update of existing rows).
     """
     cols_quoted = ", ".join(quote_ident(c) for c in columns)
     statements: list[str] = []
 
     if mode in (Mode.TRUNCATE, Mode.OVERWRITE):
         if mode == Mode.TRUNCATE and match_by:
-            key_cols = ", ".join(quote_ident(k) for k in match_by)
-            on_condition = _build_match_condition(
-                match_by, left_alias="T", right_alias="S",
-                null_safe=True, extra_predicates=prune_predicates,
-            )
-            statements.extend([
-                (
-                    f"DELETE FROM {target_location} AS T\n"
-                    f"USING (\n"
-                    f"  SELECT DISTINCT {key_cols} FROM ({source_sql}) AS src\n"
-                    f") AS S\n"
-                    f"ON {on_condition}"
-                ),
-                f"INSERT INTO {target_location} ({cols_quoted})\n{source_sql}",
-            ])
+            statements.extend(_build_delete_insert_statements(
+                target_location=target_location,
+                source_sql=source_sql,
+                columns=columns,
+                match_by=match_by,
+                prune_predicates=prune_predicates,
+            ))
         elif mode == Mode.TRUNCATE:
             statements.extend([
                 f"TRUNCATE TABLE {target_location}",
@@ -273,57 +381,117 @@ def _build_dml_statements(
             )
 
     elif match_by:
-        on_condition = _build_match_condition(
-            match_by, left_alias="T", right_alias="S",
-            null_safe=True, extra_predicates=prune_predicates,
-        )
-        insert_clause = (
-            f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
-            f"VALUES ({', '.join(f'S.{quote_ident(c)}' for c in columns)})"
-        )
-
-        if mode == Mode.APPEND:
-            statements.append(
-                f"MERGE INTO {target_location} AS T\n"
-                f"USING (\n{source_sql}\n) AS S\n"
-                f"ON {on_condition}\n"
-                f"{insert_clause}"
-            )
+        if mode == Mode.UPSERT:
+            statements.extend(_build_delete_insert_statements(
+                target_location=target_location,
+                source_sql=source_sql,
+                columns=columns,
+                match_by=match_by,
+                prune_predicates=prune_predicates,
+            ))
         else:
-            update_column_names_effective = (
-                update_column_names
-                if update_column_names is not None
-                else [c for c in columns if c not in match_by]
-            )
-            update_clause = ""
-            if update_column_names_effective:
-                update_set = ", ".join(
-                    f"T.{quote_ident(c)} = S.{quote_ident(c)}"
-                    for c in update_column_names_effective
-                )
-                update_clause = f"WHEN MATCHED THEN UPDATE SET {update_set}\n"
-
-            statements.append(
-                f"MERGE INTO {target_location} AS T\n"
-                f"USING (\n{source_sql}\n) AS S\n"
-                f"ON {on_condition}\n"
-                f"{update_clause}"
-                f"{insert_clause}"
-            )
+            statements.append(_build_merge_statement(
+                target_location=target_location,
+                source_sql=source_sql,
+                columns=columns,
+                match_by=match_by,
+                update_column_names=update_column_names,
+                prune_predicates=prune_predicates,
+                insert_only=mode == Mode.APPEND,
+            ))
     else:
         statements.append(
             f"INSERT INTO {target_location} ({cols_quoted})\n{source_sql}"
         )
 
-    if zorder_by:
-        zorder_cols = ", ".join(quote_ident(c) for c in zorder_by)
-        statements.append(f"OPTIMIZE {target_location} ZORDER BY ({zorder_cols})")
-    if optimize_after_merge and match_by:
-        statements.append(f"OPTIMIZE {target_location}")
-    if vacuum_hours is not None:
-        statements.append(f"VACUUM {target_location} RETAIN {int(vacuum_hours)} HOURS")
-
+    _append_maintenance_statements(
+        statements,
+        target_location=target_location,
+        zorder_by=zorder_by,
+        optimize_after_merge=optimize_after_merge,
+        keyed=bool(match_by),
+        vacuum_hours=vacuum_hours,
+    )
     return statements
+
+
+def _build_merge_fallback_statements(
+    *,
+    target_location: str,
+    source_sql: str,
+    columns: list[str],
+    match_by: list[str],
+    prune_predicates: list[str],
+    zorder_by: Optional[list[str]] = None,
+    optimize_after_merge: bool = False,
+    vacuum_hours: Optional[int] = None,
+) -> list[str]:
+    """Build the DELETE+INSERT statements run after a MERGE failure.
+
+    Mirrors :attr:`Mode.UPSERT`: a keyed ``DELETE`` narrows the target to
+    rows whose match keys appear in the source, then a plain ``INSERT``
+    appends every row from ``source_sql``.  The same projection used by
+    the primary MERGE flows through unchanged — extra source columns are
+    filtered out by the SELECT projection (it only names target columns)
+    and any ``cast_options`` alignment performed upstream is preserved.
+    """
+    statements = _build_delete_insert_statements(
+        target_location=target_location,
+        source_sql=source_sql,
+        columns=columns,
+        match_by=match_by,
+        prune_predicates=prune_predicates,
+    )
+    _append_maintenance_statements(
+        statements,
+        target_location=target_location,
+        zorder_by=zorder_by,
+        optimize_after_merge=optimize_after_merge,
+        keyed=True,
+        vacuum_hours=vacuum_hours,
+    )
+    return statements
+
+
+def _execute_with_merge_fallback(
+    sql_engine: "SQLEngine",
+    *,
+    primary: list,
+    fallback_factory: Optional[Callable[[], list]],
+    wait: WaitingConfigArg,
+    raise_error: bool,
+    engine_name: Literal["api", "spark"],
+    target_location: str,
+):
+    """Submit *primary*; on failure, build and run the fallback batch.
+
+    Used for :attr:`Mode.MERGE`: if any DML in the primary submission
+    fails (after its own retry policy), the caller-supplied
+    ``fallback_factory`` produces a fresh list of prepared statements
+    (the keyed-DELETE + INSERT pair plus any maintenance) which is then
+    submitted in a second batch.  The ``raise_error`` contract is
+    deferred to whichever batch runs last.
+    """
+    if fallback_factory is None:
+        return sql_engine.execute_many(
+            primary, wait=wait, raise_error=raise_error, engine=engine_name,
+        )
+
+    batch = sql_engine.execute_many(
+        primary, wait=wait, raise_error=False, engine=engine_name,
+    )
+    if not batch.failed:
+        if raise_error:
+            batch.raise_for_status()
+        return batch
+
+    logger.warning(
+        "MERGE into %s failed; running DELETE+INSERT fallback.",
+        target_location,
+    )
+    return sql_engine.execute_many(
+        fallback_factory(), wait=wait, raise_error=raise_error, engine=engine_name,
+    )
 
 
 def _delta_conf_for(
@@ -926,7 +1094,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
     ):
         mode = Mode.from_(mode, default=Mode.AUTO)
         alter_table = f"ALTER TABLE {self.full_name(safe=True)}"
-        update_dtype = mode in (Mode.UPSERT, Mode.OVERWRITE)
+        update_dtype = mode in (Mode.UPSERT, Mode.MERGE, Mode.OVERWRITE)
         drop_missing = mode == Mode.OVERWRITE
 
         rename_statements: list[str] = []
@@ -1781,30 +1949,59 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         )
 
         retry_active = retry is not None
-        prepared: list[WarehousePreparedStatement] = []
-        for sql in sql_texts:
-            external_data = (
-                {_ALIAS_TMPSRC: staging}
-                if (f"{{{_ALIAS_TMPSRC}}}" in sql)
-                else None
-            )
-            stmt = WarehousePreparedStatement.prepare(
-                sql,
-                external_data=external_data,
-                catalog_name=target.catalog_name,
-                schema_name=target.schema_name,
-            )
-            if retry_active and _classify_dml(sql):
-                _apply_retry_to_warehouse_statement(stmt, retry)
-            prepared.append(stmt)
+
+        def _prepare_batch(texts: list[str]) -> list[WarehousePreparedStatement]:
+            out: list[WarehousePreparedStatement] = []
+            for sql in texts:
+                external_data = (
+                    {_ALIAS_TMPSRC: staging}
+                    if (f"{{{_ALIAS_TMPSRC}}}" in sql)
+                    else None
+                )
+                stmt = WarehousePreparedStatement.prepare(
+                    sql,
+                    external_data=external_data,
+                    catalog_name=target.catalog_name,
+                    schema_name=target.schema_name,
+                )
+                if retry_active and _classify_dml(sql):
+                    _apply_retry_to_warehouse_statement(stmt, retry)
+                out.append(stmt)
+            return out
+
+        prepared = _prepare_batch(sql_texts)
+
+        fallback_factory: Optional[Callable[[], list[WarehousePreparedStatement]]] = None
+        if mode_enum == Mode.MERGE and match_by:
+            def _build_fallback() -> list[WarehousePreparedStatement]:
+                fb_texts = _build_merge_fallback_statements(
+                    target_location=target_location,
+                    source_sql=source_sql,
+                    columns=columns,
+                    match_by=match_by,
+                    prune_predicates=prune_predicates,
+                    zorder_by=zorder_by,
+                    optimize_after_merge=optimize_after_merge,
+                    vacuum_hours=vacuum_hours,
+                )
+                return _prepare_batch(fb_texts)
+            fallback_factory = _build_fallback
 
         logger.debug(
-            "Arrow insert -> %s | mode=%s match_by=%s prune_by=%s statements=%d retry=%s",
+            "Arrow insert -> %s | mode=%s match_by=%s prune_by=%s statements=%d retry=%s fallback=%s",
             target_location, mode_enum, match_by, prune_by, len(prepared),
-            retry_active,
+            retry_active, bool(fallback_factory),
         )
 
-        return self.sql.execute_many(prepared, wait=wait_cfg, raise_error=raise_error, engine="api")
+        return _execute_with_merge_fallback(
+            self.sql,
+            primary=prepared,
+            fallback_factory=fallback_factory,
+            wait=wait_cfg,
+            raise_error=raise_error,
+            engine_name="api",
+            target_location=target_location,
+        )
 
     # =========================================================================
     # spark_insert — Spark path, temp-view source
@@ -1917,16 +2114,40 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
 
         prepared = [SparkPreparedStatement(text=sql, spark_session=session) for sql in sql_texts]
 
+        fallback_factory: Optional[Callable[[], list[SparkPreparedStatement]]] = None
+        if mode_enum == Mode.MERGE and match_by:
+            def _build_fallback() -> list[SparkPreparedStatement]:
+                fb_texts = _build_merge_fallback_statements(
+                    target_location=target_location,
+                    source_sql=source_sql,
+                    columns=columns,
+                    match_by=match_by,
+                    prune_predicates=prune_predicates,
+                    zorder_by=zorder_by,
+                    optimize_after_merge=optimize_after_merge,
+                    vacuum_hours=vacuum_hours,
+                )
+                return [SparkPreparedStatement(text=sql, spark_session=session) for sql in fb_texts]
+            fallback_factory = _build_fallback
+
         logger.info(
-            "Spark insert -> %s | mode=%s match_by=%s prune_by=%s statements=%d",
-            target_location, mode_enum, match_by, prune_by, len(prepared),
+            "Spark insert -> %s | mode=%s match_by=%s prune_by=%s statements=%d fallback=%s",
+            target_location, mode_enum, match_by, prune_by, len(prepared), bool(fallback_factory),
         )
 
         applied_conf = _delta_conf_for(overwrite_schema, spark_options)
 
         try:
             with sql_engine.spark.scoped_spark_conf(session, applied_conf):
-                return sql_engine.execute_many(prepared, wait=wait, raise_error=raise_error, engine="spark")
+                return _execute_with_merge_fallback(
+                    sql_engine,
+                    primary=prepared,
+                    fallback_factory=fallback_factory,
+                    wait=wait,
+                    raise_error=raise_error,
+                    engine_name="spark",
+                    target_location=target_location,
+                )
         finally:
             try:
                 session.catalog.dropTempView(view_name)
@@ -2072,26 +2293,55 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
 
         retry_active = retry is not None
 
-        prepared: list[WarehousePreparedStatement] = []
-        for sql in sql_texts:
-            stmt = WarehousePreparedStatement.prepare(
-                sql,
-                parameters=source_prepared.parameters,
-                external_volume_paths=source_prepared.external_volume_paths,
-                catalog_name=self.catalog_name,
-                schema_name=self.schema_name,
-            )
-            if retry_active and _classify_dml(sql):
-                _apply_retry_to_warehouse_statement(stmt, retry)
-            prepared.append(stmt)
+        def _prepare_batch(texts: list[str]) -> list[WarehousePreparedStatement]:
+            out: list[WarehousePreparedStatement] = []
+            for sql in texts:
+                stmt = WarehousePreparedStatement.prepare(
+                    sql,
+                    parameters=source_prepared.parameters,
+                    external_volume_paths=source_prepared.external_volume_paths,
+                    catalog_name=self.catalog_name,
+                    schema_name=self.schema_name,
+                )
+                if retry_active and _classify_dml(sql):
+                    _apply_retry_to_warehouse_statement(stmt, retry)
+                out.append(stmt)
+            return out
+
+        prepared = _prepare_batch(sql_texts)
+
+        fallback_factory: Optional[Callable[[], list[WarehousePreparedStatement]]] = None
+        if mode_enum == Mode.MERGE and match_by:
+            def _build_fallback() -> list[WarehousePreparedStatement]:
+                fb_texts = _build_merge_fallback_statements(
+                    target_location=target_location,
+                    source_sql=source_sql,
+                    columns=columns,
+                    match_by=match_by,
+                    prune_predicates=prune_predicates,
+                    zorder_by=zorder_by,
+                    optimize_after_merge=optimize_after_merge,
+                    vacuum_hours=vacuum_hours,
+                )
+                return _prepare_batch(fb_texts)
+            fallback_factory = _build_fallback
 
         logger.info(
-            "SQL insert -> %s | mode=%s match_by=%s statements=%d retry=%s",
+            "SQL insert -> %s | mode=%s match_by=%s statements=%d retry=%s fallback=%s",
             target_location, mode_enum, match_by, len(prepared), retry_active,
+            bool(fallback_factory),
         )
 
         if prepared:
-            self.sql.execute_many(prepared, wait=wait, raise_error=raise_error, engine="api")
+            _execute_with_merge_fallback(
+                self.sql,
+                primary=prepared,
+                fallback_factory=fallback_factory,
+                wait=wait,
+                raise_error=raise_error,
+                engine_name="api",
+                target_location=target_location,
+            )
 
     # =========================================================================
     # Storage & credentials

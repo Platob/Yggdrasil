@@ -20,6 +20,7 @@ class TestModeMembers:
             "APPEND",
             "IGNORE",
             "UPSERT",
+            "MERGE",
             "TRUNCATE",
             "ERROR_IF_EXISTS",
         }
@@ -46,7 +47,7 @@ class TestModeFromAliases:
             ("ignore", Mode.IGNORE),
             ("skip", Mode.IGNORE),
             ("upsert", Mode.UPSERT),
-            ("merge", Mode.UPSERT),
+            ("merge", Mode.MERGE),
             ("truncate", Mode.TRUNCATE),
             ("error_if_exists", Mode.ERROR_IF_EXISTS),
             ("error-if-exists", Mode.ERROR_IF_EXISTS),
