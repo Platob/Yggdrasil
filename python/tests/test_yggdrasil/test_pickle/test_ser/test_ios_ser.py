@@ -96,3 +96,26 @@ def test_ygg_bytesio_no_media_type_no_metadata() -> None:
     out = ser.as_python()
     assert isinstance(out, BytesIO)
     assert out._media_type is None
+
+
+def test_ygg_bytesio_media_type_promotes_subclass() -> None:
+    """Media type on a BytesIO must round-trip to the registered leaf class.
+
+    Regression test: previously the deserializer constructed a plain
+    ``BytesIO`` and post-mutated ``_media_type``, which left the class
+    as ``BytesIO`` instead of the registered leaf (``JsonIO``,
+    ``ParquetIO``, …). Pass media_type to the constructor so
+    ``BytesIO.__new__`` dispatches.
+    """
+    from yggdrasil.io.buffer.primitive.json_io import JsonIO
+
+    src = BytesIO(b'{"a":1}', media_type=MediaType(MimeTypes.JSON))
+    assert isinstance(src, JsonIO)
+
+    ser = Serialized.from_python_object(src)
+    assert ser is not None
+    out = ser.as_python()
+
+    assert isinstance(out, JsonIO)
+    assert out._media_type is not None
+    assert out._media_type.mime_type is MimeTypes.JSON

@@ -1091,7 +1091,19 @@ class Response:
                 headers[header_name] = str(value)
 
         body_bytes = _get("response_body")
-        buffer = BytesIO() if body_bytes is None else BytesIO(body_bytes, copy=False)
+        # Pre-infer media type from the (already-promoted) headers so
+        # the buffer is constructed as the registered leaf (ParquetIO,
+        # JsonIO, …) up front. Setting _media_type post-hoc on a plain
+        # BytesIO doesn't promote the class, so on Arrow round-trips
+        # (incl. yggdrasil.pickle.ser of a Response) the buffer would
+        # otherwise come back opaque even when the media type was known.
+        pre_media = _media_type_from_headers(headers)
+        if body_bytes is None:
+            buffer = BytesIO(media_type=pre_media) if pre_media is not None else BytesIO()
+        elif pre_media is not None:
+            buffer = BytesIO(body_bytes, copy=False, media_type=pre_media)
+        else:
+            buffer = BytesIO(body_bytes, copy=False)
 
         if normalize:
             headers = normalize_headers(headers, body=buffer, is_request=False)
