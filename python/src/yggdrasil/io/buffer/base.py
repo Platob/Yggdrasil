@@ -1040,7 +1040,14 @@ class TabularIO(Disposable, ABC, Generic[O]):
         **kwargs: Any,
     ) -> "SparkDataFrame":
         """Materialize on the driver and build a Spark DataFrame."""
-        if self.cached:
+        # Gate on the actual base-class data slots, not ``self.cached`` —
+        # subclasses (statement results, MemorySparkIO, …) override
+        # ``cached`` to mean "execution complete" or "frame held in a
+        # subclass-specific slot", which doesn't imply the base
+        # ``_spark_frame`` / ``_arrow_table`` slots are populated. Falling
+        # through to ``_read_spark_frame`` lets those subclasses provide
+        # their own materialization path.
+        if self._spark_frame is not None or self._arrow_table is not None:
             return self._read_spark_frame_from_cache(options)
         return self._read_spark_frame(self.check_options(options, overrides=locals()))
 

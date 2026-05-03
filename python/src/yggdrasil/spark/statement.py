@@ -257,6 +257,20 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
         self._persisted_data = None
 
     # -------------------------------------------------------------------------
+    # Spark
+    # -------------------------------------------------------------------------
+
+    def _read_spark_frame(self, options: CastOptions) -> "DataFrame":
+        # Persisted data is already a Spark frame — return it under the
+        # caller's cast options without round-tripping through Arrow.
+        if self._persisted_data is None:
+            raise RuntimeError(
+                "Cannot read Spark frame from a non-started Spark statement; "
+                "call start() first."
+            )
+        return options.cast_spark_tabular(self._persisted_data)
+
+    # -------------------------------------------------------------------------
     # Arrow
     # -------------------------------------------------------------------------
 
