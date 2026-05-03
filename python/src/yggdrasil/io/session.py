@@ -465,7 +465,7 @@ class Session(ABC):
         )
 
         if cfg.spark_session is not None:
-            return self._spark_send_many(requests, config=cfg).to_dataframe()
+            return self.send_many_batch(requests, config=cfg).to_dataframe()
 
         return self._send_many(requests, config=cfg)
 
@@ -779,37 +779,64 @@ class Session(ABC):
     ) -> Iterator[ResponseBatch]:
         """Yield one :class:`ResponseBatch` per processed chunk.
 
-        Each batch carries its own local / remote / network split so a
-        downstream consumer can keep the origin visible — e.g. for
-        per-batch logging, backpressure, or metrics — without buffering
-        the whole run.
+        Single pipeline for both Python and Spark modes — the only
+        differences are stage 3 (fetch misses through the local job
+        pool vs. ``mapInArrow`` over executors) and stage 4 (per-row
+        Arrow insert vs. lazy Spark insert). Mode is picked from
+        ``config.spark_session``.
+
+        Spark mode forces a single mega-chunk because ``mapInArrow``
+        wants one DataFrame to scatter; per-request local/remote
+        cache overrides DROP on the worker side (workers and
+        writeback see only the session-level configs) — same
+        trade-off as `spark_send`. Python mode chunks normally so
+        downstream consumers can keep per-batch backpressure.
         """
-        pool = self.job_pool
+        spark = config.spark_session
+        is_spark = spark is not None
         session_remote_cfg = config.remote_cache
         session_local_cfg = config.local_cache
-        batch_size = config.batch_size or min(
-            config.max_batch_size or 1024, pool.max_workers * 100
-        )
 
-        def _batched(it: Iterator[PreparedRequest], n: int) -> Iterator[list[PreparedRequest]]:
-            iterator = iter(it)
-            while True:
-                b = list(itertools.islice(iterator, n))
-                if not b:
-                    break
-                yield b
+        if is_spark:
+            # Spark wants the whole list in one chunk for a single
+            # mapInArrow scatter — multiple smaller DFs would create
+            # many Spark jobs and lose the bulk-fetch advantage.
+            chunks: Iterator[list[PreparedRequest]] = iter([list(requests)])
+        else:
+            pool = self.job_pool
+            batch_size = config.batch_size or min(
+                config.max_batch_size or 1024, pool.max_workers * 100
+            )
 
-        for chunk in _batched(requests, batch_size):
+            def _batched(
+                it: Iterator[PreparedRequest], n: int,
+            ) -> Iterator[list[PreparedRequest]]:
+                iterator = iter(it)
+                while True:
+                    b = list(itertools.islice(iterator, n))
+                    if not b:
+                        break
+                    yield b
+
+            chunks = _batched(requests, batch_size)
+
+        for chunk in chunks:
+            if not chunk:
+                continue
+
             # --- Stage 1: local cache ---
             local_hits, after_local = self._split_local_cache(chunk, session_local_cfg)
             remote_hits: list[Response] = []
-            new_hits: list[Response] = []
+            new_hits: "list[Response] | SparkDataFrame | None" = (
+                None if is_spark else []
+            )
 
             if not after_local:
                 yield ResponseBatch(
                     local_hits=local_hits,
                     remote_hits=remote_hits,
                     new_hits=new_hits,
+                    spark=spark,
                 )
                 continue
 
@@ -826,10 +853,14 @@ class Session(ABC):
             }
 
             # --- Stage 2: remote cache ---
+            # ``cache_cfg.table.sql.execute(...)`` returns a TabularIO
+            # (StatementResult) we drain via Response.from_arrow_tabular,
+            # so the remote-cache stage is engine-agnostic — same code
+            # for the Python and Spark paths.
             remote_hits, after_remote = self._split_remote_cache(
                 after_local,
                 session_remote_cfg,
-                spark_session=config.spark_session,
+                spark_session=spark,
             )
             # Backfill local cache with remote hits using each request's
             # effective local config — not the session-level fallback.
@@ -842,30 +873,53 @@ class Session(ABC):
                     local_hits=local_hits,
                     remote_hits=remote_hits,
                     new_hits=new_hits,
+                    spark=spark,
                 )
                 continue
 
             # --- Stage 3: fetch misses ---
             failed: list[Response] = []
-            for response in self._fetch_misses(after_remote, config):
-                if response.ok:
-                    new_hits.append(response)
-                elif config.raise_error:
-                    failed.append(response)
+            if is_spark:
+                # Network results stay in Spark — never collected to
+                # the driver. raise_error doesn't short-circuit a
+                # partial mapInArrow batch; callers filter on
+                # response_status_code if they care.
+                new_hits = self._spark_fetch_misses(after_remote, config, spark)
+            else:
+                new_list: list[Response] = []
+                for response in self._fetch_misses(after_remote, config):
+                    if response.ok:
+                        new_list.append(response)
+                    elif config.raise_error:
+                        failed.append(response)
+                new_hits = new_list
 
             # --- Stage 4: bulk remote writeback ---
-            if new_hits:
-                self._persist_remote(
-                    new_hits, url_to_remote_cfg, session_remote_cfg,
-                )
+            if is_spark:
+                # `cfg.table.insert` accepts the Spark DataFrame
+                # directly, so we hand off the lazy DF without
+                # materialising on the driver.
+                if (
+                    new_hits is not None
+                    and session_remote_cfg.remote_cache_enabled
+                ):
+                    self._spark_persist_remote(
+                        new_hits, session_remote_cfg, spark=spark,
+                    )
+            else:
+                if new_hits:
+                    self._persist_remote(
+                        new_hits, url_to_remote_cfg, session_remote_cfg,
+                    )
 
             yield ResponseBatch(
                 local_hits=local_hits,
                 remote_hits=remote_hits,
                 new_hits=new_hits,
+                spark=spark,
             )
 
-            if config.raise_error and failed:
+            if not is_spark and config.raise_error and failed:
                 failed[-1].raise_for_status()
 
     def send_many_batch(
@@ -913,7 +967,12 @@ class Session(ABC):
         )
 
         if cfg.spark_session is not None:
-            return self._spark_send_many(requests, config=cfg)
+            # Spark mode produces exactly one batch (mega-chunk); take
+            # it as the result rather than running ``extend``, which is
+            # a Python-mode-only merge.
+            for chunk in self._send_many_batches(requests, cfg):
+                return chunk
+            return ResponseBatch(spark=cfg.spark_session)
 
         # Default-init buckets to empty lists so the merged batch always
         # exposes Python-mode holders (counts, len, iteration all work
@@ -954,31 +1013,6 @@ class Session(ABC):
                 response.raise_for_status()
             yield response
 
-    # ================================================================== #
-    # spark_send_many — Spark-native equivalent of _send_many.            #
-    #                                                                    #
-    # Four-stage pipeline; stages 3 + 4 stay lazy end-to-end:             #
-    #   1. Local cache  — driver-side, per-request effective config      #
-    #   2. Remote cache — driver-side batch SQL lookup, grouped by table #
-    #   3. Network      — Spark mapInArrow over batched request DF       #
-    #   4. Writeback    — `cfg.table.insert(spark_df, ...)` per remote   #
-    #                     write-group, no driver-side collect            #
-    #                                                                    #
-    # Returns a Spark DataFrame typed as RESPONSE_ARROW_SCHEMA — the      #
-    # union of local-hit, remote-hit, and network-fetch DFs.              #
-    #                                                                    #
-    # Trade-offs vs `_send_many` (local):                                 #
-    # - Per-request local/remote cache overrides ARE honoured in stages  #
-    #   1 and 2 (driver-side), but DROPPED in stages 3 and 4 — workers  #
-    #   and the writeback see only the session-level configs. Same      #
-    #   trade-off as the existing `spark_send`.                          #
-    # - `raise_error=True` does not short-circuit a partial batch; on    #
-    #   workers we always run with raise_error=False and the caller is   #
-    #   expected to filter the result DF on `response_status_code`.       #
-    # - Writeback inserts the un-anonymized response DF; the underlying  #
-    #   `table.insert` accepts a Spark DataFrame transparently, so we    #
-    #   skip the per-Response anonymize that the local path applies.     #
-    # ================================================================== #
     def spark_send_many(
         self,
         requests: Iterator[PreparedRequest],
@@ -996,24 +1030,17 @@ class Session(ABC):
         spark_session: Optional["SparkSession"] = None,
         **options,
     ) -> "ResponseBatch":
-        """Spark-native equivalent of `send_many`, returning a batch view.
+        """Spark-flavored :meth:`send_many_batch` — explicit Spark entry.
 
-        Runs the four-stage pipeline (local cache → remote cache →
-        mapInArrow fetch → bulk writeback) and packages the result as a
-        :class:`ResponseBatch` whose holders are Spark DataFrames typed
-        as ``RESPONSE_SCHEMA``. Call :meth:`ResponseBatch.to_dataframe`
-        to fuse them, or read ``.local_hits`` / ``.remote_hits`` /
-        ``.new_hits`` to walk each origin individually.
+        Same pipeline as :meth:`send_many_batch`; the only difference
+        is that ``spark_session`` is auto-resolved when missing instead
+        of being required up-front. Returns a :class:`ResponseBatch`
+        whose holders are Spark DataFrames; call ``to_dataframe()`` to
+        fuse them or read each origin individually.
 
-        If `spark_session` is None it is auto-resolved via
-        `PyEnv.spark_session(create=True)` — pass an explicit session when
-        running inside an existing Spark application to avoid creating a
-        second one.
-
-        `raise_error=True` does NOT short-circuit a partial batch on the
-        Spark path; workers run with `raise_error=False` and the caller is
-        expected to filter on `response_status_code`. Same trade-off as
-        documented on `_spark_send_many`.
+        ``raise_error=True`` does NOT short-circuit a partial batch on
+        the Spark path — workers run with ``raise_error=False`` and
+        the caller is expected to filter on ``response_status_code``.
         """
         cfg = SendManyConfig.check_arg(
             config,
@@ -1030,9 +1057,6 @@ class Session(ABC):
             **options,
         )
 
-        # `_spark_send_many` already auto-resolves `cfg.spark_session` when
-        # missing, but we lift the same fallback to the public layer so
-        # downstream stages see a resolved session on `cfg` itself.
         if cfg.spark_session is None:
             cfg = cfg.merge(
                 spark_session=PyEnv.spark_session(
@@ -1040,109 +1064,10 @@ class Session(ABC):
                 )
             )
 
-        return self._spark_send_many(requests, config=cfg)
-
-    def _spark_send_many(
-        self,
-        requests: Iterator[PreparedRequest],
-        config: SendManyConfig,
-    ) -> "ResponseBatch":
-        # Resolve Spark session — prefer cfg.spark_session, else auto-create.
-        spark = config.spark_session
-        if spark is None:
-            spark = PyEnv.spark_session(
-                create=True, install_spark=False, import_error=True,
-            )
-
-        session_remote_cfg = config.remote_cache
-        session_local_cfg = config.local_cache
-
-        # Materialise — we need the full list to run driver-side stages 1 and 2.
-        all_requests: list[PreparedRequest] = list(requests)
-        if not all_requests:
-            return ResponseBatch(spark=spark)
-
-        LOGGER.info(
-            "spark_send_many: %s requests (batch_size=%s, remote=%s, local=%s)",
-            len(all_requests),
-            config.batch_size,
-            session_remote_cfg.remote_cache_enabled,
-            session_local_cfg.local_cache_enabled,
-        )
-
-        # --- Stage 1: local cache (driver-side) ---
-        local_hits, after_local = self._split_local_cache(
-            all_requests, session_local_cfg,
-        )
-        LOGGER.debug(
-            "spark_send_many stage 1 (local): %s hits, %s misses",
-            len(local_hits), len(after_local),
-        )
-
-        # Snapshot per-request effective local configs BEFORE any further work,
-        # keyed by anonymized URL — used to route remote-hit backfills to each
-        # request's effective config rather than the session-level fallback.
-        url_to_local_cfg: dict[str, CacheConfig] = {
-            str(r.anonymize(mode="remove").url):
-                self._effective_local_cfg(r, session_local_cfg)
-            for r in after_local
-        }
-
-        # --- Stage 2: remote cache (driver-side, batched per table) ---
-        if after_local:
-            remote_hits, after_remote = self._split_remote_cache(
-                after_local,
-                session_remote_cfg,
-                spark_session=spark,
-            )
-        else:
-            remote_hits, after_remote = [], []
-
-        LOGGER.debug(
-            "spark_send_many stage 2 (remote): %s hits, %s misses",
-            len(remote_hits), len(after_remote),
-        )
-
-        # Backfill local cache with remote hits — must use each request's
-        # effective local config, not the session-level fallback.
-        if remote_hits:
-            self._backfill_local_cache(
-                remote_hits, url_to_local_cfg, session_local_cfg,
-            )
-
-        # --- Stage 3: network fetch via mapInArrow ---
-        # Network results stay in Spark — never collected to the driver.
-        if after_remote:
-            new_responses_df = self._spark_fetch_misses(
-                after_remote, config, spark,
-            )
-        else:
-            new_responses_df = None
-
-        # --- Stage 4: bulk remote writeback (no driver collect) ---
-        # `cfg.table.insert` accepts a Spark DataFrame transparently and
-        # routes through `spark_insert_into`, so we hand off the lazy
-        # network-result DF without materialising it on the driver.
-        if new_responses_df is not None and session_remote_cfg.remote_cache_enabled:
-            self._spark_persist_remote(
-                new_responses_df,
-                session_remote_cfg,
-                spark=spark,
-            )
-
-        # ResponseBatch coerces each bucket through `_coerce_bucket`:
-        # cache hits (Python lists) get serialised into ArrowIPCIO
-        # holders; the network DF gets wrapped in a TabularIO whose
-        # `_spark_frame` slot holds the lazy DF (no driver collect).
-        return ResponseBatch(
-            local_hits=local_hits,
-            remote_hits=remote_hits,
-            new_hits=new_responses_df,
-            spark=spark,
-        )
+        return self.send_many_batch(requests, config=cfg)
 
     # ------------------------------------------------------------------ #
-    # Helpers for spark_send_many                                         #
+    # Spark stage 3 / 4 helpers                                           #
     # ------------------------------------------------------------------ #
 
     @staticmethod
