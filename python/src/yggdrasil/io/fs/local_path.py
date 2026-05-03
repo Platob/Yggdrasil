@@ -59,8 +59,43 @@ __all__ = ["LocalPath"]
 
 _HAS_PREAD = hasattr(os, "pread")
 _HAS_PWRITE = hasattr(os, "pwrite")
+_IS_WINDOWS = os.name == "nt"
 
 _COPY_CHUNK = 4 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# Windows long-path support — apply the ``\\?\`` extended-length prefix at
+# the syscall boundary so partitioned cache layouts that exceed the legacy
+# ``MAX_PATH`` 260-char limit keep working without a registry / manifest
+# opt-in. No-op on non-Windows. The prefix only flows out via
+# :meth:`LocalPath._os_path` to ``os.*`` / ``shutil.*`` / :func:`open`;
+# :meth:`full_path` stays clean for display, error messages, and URL math.
+# ---------------------------------------------------------------------------
+
+_LONG_PATH_PREFIX = "\\\\?\\"
+_LONG_PATH_UNC_PREFIX = "\\\\?\\UNC\\"
+
+
+def _to_long_path(p: str) -> str:
+    if not _IS_WINDOWS or not p:
+        return p
+    if p.startswith(_LONG_PATH_PREFIX):
+        return p
+    abs_p = os.path.abspath(p).replace("/", "\\")
+    if abs_p.startswith("\\\\"):
+        return _LONG_PATH_UNC_PREFIX + abs_p[2:]
+    return _LONG_PATH_PREFIX + abs_p
+
+
+def _strip_long_path(p: str) -> str:
+    if not _IS_WINDOWS or not p:
+        return p
+    if p.startswith(_LONG_PATH_UNC_PREFIX):
+        return "\\\\" + p[len(_LONG_PATH_UNC_PREFIX):]
+    if p.startswith(_LONG_PATH_PREFIX):
+        return p[len(_LONG_PATH_PREFIX):]
+    return p
 
 
 # ---------------------------------------------------------------------------
@@ -153,8 +188,17 @@ class LocalPath(Path):
     def full_path(self) -> str:
         return os.fspath(self.url)
 
+    def _os_path(self) -> str:
+        """:meth:`full_path` with the Windows long-path prefix applied.
+
+        Use anywhere the path string is fed to :mod:`os` / :mod:`shutil` /
+        :func:`open` / :class:`mmap.mmap`; keep :meth:`full_path` for
+        display, error messages, and URL math. No-op on non-Windows.
+        """
+        return _to_long_path(self.full_path())
+
     def _stat(self) -> PathStats:
-        path = self.full_path()
+        path = self._os_path()
         try:
             st = os.stat(path)
         except FileNotFoundError:
@@ -179,7 +223,7 @@ class LocalPath(Path):
 
     def is_symlink(self) -> bool:
         try:
-            return os.path.islink(self.full_path())
+            return os.path.islink(self._os_path())
         except OSError:
             return False
 
@@ -188,13 +232,13 @@ class LocalPath(Path):
         recursive: bool = False,
         allow_not_found: bool = True,
     ) -> Iterator["Path"]:
-        root_path = self.full_path()
+        root_path = self._os_path()
 
         if not recursive:
             try:
                 with os.scandir(root_path) as it:
                     for entry in it:
-                        yield self._from_url(URL.from_(entry.path))
+                        yield self._from_url(URL.from_(_strip_long_path(entry.path)))
             except (FileNotFoundError, NotADirectoryError):
                 if not allow_not_found:
                     raise
@@ -206,7 +250,7 @@ class LocalPath(Path):
             try:
                 with os.scandir(current) as it:
                     for entry in it:
-                        yield self._from_url(URL.from_(entry.path))
+                        yield self._from_url(URL.from_(_strip_long_path(entry.path)))
                         try:
                             if entry.is_dir(follow_symlinks=False):
                                 stack.append(entry.path)
@@ -217,7 +261,7 @@ class LocalPath(Path):
                     raise
 
     def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
-        path = self.full_path()
+        path = self._os_path()
         try:
             if parents:
                 os.makedirs(path, exist_ok=exist_ok)
@@ -229,7 +273,7 @@ class LocalPath(Path):
 
     def _remove_file(self, allow_not_found: bool = True) -> None:
         try:
-            os.remove(self.full_path())
+            os.remove(self._os_path())
         except FileNotFoundError:
             if not allow_not_found:
                 raise
@@ -245,7 +289,7 @@ class LocalPath(Path):
         allow_not_found: bool = True,
         with_root: bool = True,
     ) -> None:
-        path = self.full_path()
+        path = self._os_path()
         try:
             if recursive:
                 if with_root:
@@ -330,7 +374,7 @@ class LocalPath(Path):
             return b""
 
         try:
-            fd = os.open(self.full_path(), os.O_RDONLY)
+            fd = os.open(self._os_path(), os.O_RDONLY)
         except OSError:
             if default is ...:
                 raise
@@ -402,12 +446,13 @@ class LocalPath(Path):
 
         # Honor the parents flag. Fixed vs. previous version which
         # always created parents regardless of the kwarg.
+        os_path = self._os_path()
         if parents:
-            parent = os.path.dirname(self.full_path())
+            parent = os.path.dirname(os_path)
             if parent and not os.path.isdir(parent):
                 os.makedirs(parent, exist_ok=True)
 
-        fd = os.open(self.full_path(), flags, 0o644)
+        fd = os.open(os_path, flags, 0o644)
         try:
             if _HAS_PWRITE:
                 total = 0
@@ -456,7 +501,7 @@ class LocalPath(Path):
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
 
-        os.truncate(self.full_path(), n)
+        os.truncate(self._os_path(), n)
         return n
 
     def touch(
@@ -470,7 +515,7 @@ class LocalPath(Path):
         Avoids the base default's ``write_bytes(b"")`` which would
         truncate an existing file.
         """
-        path = self.full_path()
+        path = self._os_path()
         if parents:
             parent = os.path.dirname(path)
             if parent:
@@ -502,19 +547,19 @@ class LocalPath(Path):
             return super().rename(target_path)
 
         try:
-            os.replace(self.full_path(), target_path.full_path())
+            os.replace(self._os_path(), target_path._os_path())
             return target_path
         except OSError:
             return super().rename(target_path)
 
     def resolve(self, *, strict: bool = False) -> "Path":
         try:
-            resolved = os.path.realpath(self.full_path(), strict=strict)
+            resolved = os.path.realpath(self._os_path(), strict=strict)
         except (OSError, ValueError):
             if strict:
                 raise
-            resolved = os.path.realpath(self.full_path())
-        return self._from_url(URL.from_(resolved))
+            resolved = os.path.realpath(self._os_path())
+        return self._from_url(URL.from_(_strip_long_path(resolved)))
 
     def absolute(self) -> "Path":
         path = self.full_path()
@@ -561,7 +606,7 @@ class LocalPath(Path):
             return memoryview(b"")
 
         try:
-            fd = os.open(self.full_path(), os.O_RDONLY)
+            fd = os.open(self._os_path(), os.O_RDONLY)
         except OSError:
             if raise_error:
                 raise
@@ -585,7 +630,7 @@ class LocalPath(Path):
         flag = os.O_RDONLY if mode == "r" else os.O_RDWR
         access = mmap.ACCESS_READ if mode == "r" else mmap.ACCESS_WRITE
 
-        fd = os.open(self.full_path(), flag)
+        fd = os.open(self._os_path(), flag)
         try:
             return mmap.mmap(fd, size, access=access)
         finally:
@@ -616,7 +661,7 @@ class LocalPath(Path):
 
         # shutil.copyfile uses sendfile / copy_file_range on Linux
         # 3.8+ and falls back to a read/write loop elsewhere.
-        shutil.copyfile(self.full_path(), dest_path.full_path())
+        shutil.copyfile(self._os_path(), dest_path._os_path())
         try:
             return self.size
         except OSError:
