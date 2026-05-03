@@ -1634,3 +1634,29 @@ class TabularIO(Disposable, ABC, Generic[O]):
             merged.to_batches(max_chunksize=options.row_size),
             options.copy(mode=Mode.OVERWRITE),
         )
+
+    def _upsert(self, options: O) -> None:
+        """Engine-specific UPSERT hook.
+
+        Canonical entry point for engines that can resolve an UPSERT
+        without staging the full read/merge/overwrite rewrite that
+        :meth:`_arrow_upsert_via_rewrite` performs — Delta and Spark
+        warehouse paths override this to dispatch a native MERGE,
+        keeping the incoming data on the engine side instead of
+        round-tripping through the driver.
+
+        Incoming data is expected to be reachable from the subclass's
+        own state (a staged buffer, a queued batch reader, a
+        :class:`TabularUpsertBatch` the caller installed before
+        triggering the write). The default raises
+        :class:`NotImplementedError` so callers either land on a
+        subclass that implements native MERGE, or invoke
+        :meth:`_arrow_upsert_via_rewrite` with explicit incoming
+        batches.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__}._upsert is not implemented. "
+            "Override on a subclass with native MERGE support, or "
+            "call `_arrow_upsert_via_rewrite(batches, options)` "
+            "with explicit incoming data."
+        )
