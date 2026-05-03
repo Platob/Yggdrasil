@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING, Any, Iterable, Iterator, Union
 import pyarrow as pa
 
 if TYPE_CHECKING:
+    from pyspark.sql import DataFrame as SparkDataFrame
+
     from .data_field import Field
     from .schema import Schema
 
@@ -181,3 +183,33 @@ class Record(Mapping[str, Any]):
             cols = [batch.column(i) for i in range(batch.num_columns)]
             for i in range(batch.num_rows):
                 yield cls(tuple(c[i].as_py() for c in cols), shared)
+
+    @classmethod
+    def from_spark_frame(
+        cls,
+        frame: "SparkDataFrame",
+        *,
+        schema: "Schema | None" = None,
+    ) -> Iterator["Record"]:
+        """Yield :class:`Record`\\ s from a Spark DataFrame.
+
+        Rows stream lazily through ``frame.toLocalIterator()`` — the
+        DataFrame is never collected as a whole, so the driver stays
+        memory-bounded for large frames. The :class:`Schema` is
+        derived once from :meth:`Field.from_spark` (or taken
+        explicitly) and shared by reference across every yielded
+        record.
+
+        Per-row values come from ``row.asDict(recursive=True)`` so
+        nested structs land as plain Python dicts / lists, matching
+        the Arrow-batch path's ``as_py()`` conventions instead of
+        leaving Spark ``Row`` objects in the field values.
+        """
+        from .data_field import Field
+        from .schema import Schema as _Schema
+
+        if schema is None:
+            schema = _Schema.from_field(Field.from_spark(frame))
+
+        for row in frame.toLocalIterator():
+            yield cls(row.asDict(recursive=True), schema)

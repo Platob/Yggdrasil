@@ -117,3 +117,45 @@ class TestRecordFromArrowBatches:
         batches = pa.table({"x": [1], "y": ["a"]}).to_batches()
         records = list(Record.from_arrow_batches(batches, schema=s))
         assert records[0].schema is s
+
+
+class TestRecordFromSparkFrame:
+    """Spark-side streaming via ``toLocalIterator``.
+
+    Skipped when pyspark isn't installed — the whole class is gated
+    on the optional dep so the rest of the suite stays runnable
+    without it.
+    """
+
+    def setup_method(self):
+        pytest.importorskip("pyspark")
+        from yggdrasil.environ import PyEnv
+        self.spark = PyEnv.spark_session(
+            create=True, install_spark=False, import_error=True,
+        )
+
+    def test_shares_one_schema_across_all_records(self):
+        df = self.spark.createDataFrame(
+            [(1, "a"), (2, "b"), (3, "c")], schema=["x", "y"],
+        )
+        records = list(Record.from_spark_frame(df))
+        assert len(records) == 3
+        first_schema = records[0].schema
+        for r in records[1:]:
+            assert r.schema is first_schema
+
+    def test_values_round_trip_from_spark(self):
+        df = self.spark.createDataFrame(
+            [(1, "a"), (2, "b")], schema=["x", "y"],
+        )
+        records = list(Record.from_spark_frame(df))
+        assert [r.to_dict() for r in records] == [
+            {"x": 1, "y": "a"},
+            {"x": 2, "y": "b"},
+        ]
+
+    def test_explicit_schema_takes_precedence(self):
+        s = _schema()
+        df = self.spark.createDataFrame([(1, "a")], schema=["x", "y"])
+        records = list(Record.from_spark_frame(df, schema=s))
+        assert records[0].schema is s

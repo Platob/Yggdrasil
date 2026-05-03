@@ -159,6 +159,17 @@ class MemorySparkIO(TabularIO[CastOptions]):
         for batch in arrow_table.to_batches(max_chunksize=options.row_size):
             yield options.cast_arrow_tabular(batch)
 
+    def _read_records(self, options: CastOptions) -> "Iterator[Any]":
+        # Skip the Arrow round-trip — `toLocalIterator()` streams
+        # rows from the executors one by one, so the driver memory
+        # footprint stays bounded even for frames that wouldn't fit
+        # in a single ``df.toArrow()`` collect.
+        from yggdrasil.data.record import Record
+
+        if self._frame is None:
+            return
+        yield from Record.from_spark_frame(self._frame)
+
     def _write_arrow_batches(
         self,
         batches: Iterable[pa.RecordBatch],
