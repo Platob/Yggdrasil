@@ -685,7 +685,12 @@ class Schema(Field, MutableMapping[str, Field]):
             meta.setdefault(b"name", self.name.encode("utf-8"))
         if self.nullable:
             meta.setdefault(b"nullable", b"true")
-        built = pa.schema(self.arrow_fields, metadata=meta or None)
+
+        arrow_fields = [f.to_arrow_field() for f in self.fields]
+        if not arrow_fields:
+            return pa.schema([], metadata=meta or None)
+
+        built = pa.schema(arrow_fields, metadata=meta or None)
         object.__setattr__(self, "_arrow_schema", built)
         return built
 
@@ -693,6 +698,10 @@ class Schema(Field, MutableMapping[str, Field]):
         if self._polars_schema is not None:
             return self._polars_schema
         pl = get_polars()
+
+        if not self.fields:
+            return pl.Schema([])
+
         built = pl.Schema(
             [(f.name, f.dtype.to_polars()) for f in self.fields]
         )
@@ -702,10 +711,16 @@ class Schema(Field, MutableMapping[str, Field]):
     def to_spark_schema(self) -> "pst.StructType":
         if self._spark_schema is not None:
             return self._spark_schema
+
         pyspark_sql = get_spark_sql()
+
+        if not self.fields:
+            return pyspark_sql.types.StructType([])
+
         built = pyspark_sql.types.StructType(
             [f.to_pyspark_field() for f in self.fields]
         )
+
         object.__setattr__(self, "_spark_schema", built)
         return built
 
