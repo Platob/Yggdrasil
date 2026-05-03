@@ -404,8 +404,8 @@ class Expression:
 
     # ------------------------------------------------------------------
     # Combination — AND-merge two predicates, identity-merge two equal
-    # scalar expressions. Used by ExecutionSchema.where() to layer
-    # filters and by callers building predicates incrementally.
+    # scalar expressions. Used by callers layering predicates
+    # incrementally (cache-config filters, schema-side validators, …).
     # ------------------------------------------------------------------
 
     def merge_with(self, other: "Expression") -> "Expression":
@@ -560,9 +560,8 @@ class Selector(Column):
     """A :class:`Column` with projection metadata: rename + cast-on-select.
 
     Where :class:`Column` is *just a reference*, :class:`Selector`
-    is *a projection*: it carries the rules
-    :class:`yggdrasil.data.expr.execution_schema.ExecutionSchema`
-    needs to materialize this column on a target frame —
+    is *a projection*: it carries the rules a caller needs to
+    materialize this column on a target frame —
 
     - ``output_name`` (default ``alias`` or ``name``) is what the
       column should be called on the output side;
@@ -570,10 +569,10 @@ class Selector(Column):
       :class:`Field` the value should be cast into when the source
       and target dtypes differ.
 
-    A bare :class:`Column` works as a passthrough Selector — the
-    ExecutionSchema reads it the same way — but :class:`Selector`
-    is what callers reach for when they want to rename / cast in
-    one step:
+    A bare :class:`Column` works as a passthrough Selector — read
+    paths can treat them the same way — but :class:`Selector` is
+    what callers reach for when they want to rename / cast in one
+    step:
 
     .. code-block:: python
 

@@ -72,9 +72,7 @@ def select(
 
     For passthrough projections :func:`col` is enough; reach for
     :func:`select` when the column needs to be renamed or
-    cast-into-a-target-Field as part of the projection. Used by
-    :class:`yggdrasil.data.expr.execution_schema.ExecutionSchema`
-    to build typed-projection plans.
+    cast-into-a-target-Field as part of the projection.
     """
     return Selector(
         name=name,

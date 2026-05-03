@@ -12,9 +12,6 @@ Public surface:
   :func:`any_of`, :func:`neg` — fluent factories.
 - :class:`CompareOp`, :class:`LogicalOp`, :class:`ArithmeticOp` —
   shared operator enums.
-- :class:`ExecutionSchema` — select-and-filter plan; built from
-  Expressions via ``.select()`` / ``.where()`` and applied to
-  Arrow tables via :meth:`ExecutionSchema.arrow_apply`.
 
 Per-engine compilation lives under :mod:`yggdrasil.data.expr.backends`:
 each backend ships ``to_<target>`` and (where introspection is
@@ -27,7 +24,6 @@ directly.
 """
 
 from .builder import all_of, any_of, col, neg, select
-from .execution_schema import ExecutionSchema
 from .nodes import (
     Arithmetic,
     ArithmeticOp,
@@ -57,7 +53,6 @@ __all__ = [
     "Column",
     "Comparison",
     "CompareOp",
-    "ExecutionSchema",
     "Expression",
     "InList",
     "IsNull",
