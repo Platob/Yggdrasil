@@ -1485,6 +1485,7 @@ class Session(ABC):
             mode=cfg.mode,
             match_by=cfg.match_by or None,
             wait=cfg.wait,
+            prune_by=["request_url_path"],
             spark_session=spark,
         )
 
