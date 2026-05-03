@@ -568,7 +568,7 @@ class Session(ABC):
         )
 
         if cfg.spark_session is not None:
-            yield from self.send_many_batch(requests, config=cfg).responses
+            return self.send_many_batch(requests, config=cfg).to_dataframe()
 
         return self._send_many(requests, config=cfg)
 
