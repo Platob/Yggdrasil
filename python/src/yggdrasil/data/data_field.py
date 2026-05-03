@@ -7,7 +7,7 @@ import pathlib
 import types
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, is_dataclass
-from typing import TYPE_CHECKING, Any, Annotated, Optional, Union, get_args, get_origin, Iterator, Generator, AnyStr
+from typing import TYPE_CHECKING, Any, Annotated, ClassVar, Optional, Union, get_args, get_origin, Iterator, Generator, AnyStr
 
 import pyarrow as pa
 
@@ -255,25 +255,67 @@ class Field(BaseMetadata, BaseChildrenFields):
             metadata=_normalize_metadata(metadata, tags=tags, default_value=default),
         )
 
+    # Tag-flag → short token shown in pretty_format. Order is the
+    # display order in the bracketed marker group; only flags whose
+    # ``_tag_flag`` is truthy appear, so the output stays scannable
+    # for fields with no special role.
+    _PRETTY_TAG_FLAGS: ClassVar[tuple[tuple[bytes, str], ...]] = (
+        (b"primary_key", "PK"),
+        (b"foreign_key", "FK"),
+        (b"constraint_key", "CK"),
+        (b"partition_by", "partition"),
+        (b"cluster_by", "cluster"),
+        (b"sorted", "sorted"),
+    )
+
+    def _pretty_markers(self) -> str:
+        """Bracketed marker group for :meth:`pretty_format`.
+
+        Surfaces the schema-shaping tags a reader most often cares
+        about (primary / foreign / constraint key, partition,
+        cluster, sorted) plus the default value if one is set.
+        Returns an empty string when nothing is set so the common
+        case stays uncluttered.
+        """
+        tokens: list[str] = [
+            label
+            for tag, label in self._PRETTY_TAG_FLAGS
+            if self._tag_flag(tag)
+        ]
+        if self.has_default:
+            try:
+                tokens.append(f"default={self.default!r}")
+            except Exception:
+                # Default decoding can fail for malformed metadata —
+                # don't let a bad default break repr.
+                tokens.append("default=<unparseable>")
+        return f" [{', '.join(tokens)}]" if tokens else ""
+
     def pretty_format(self, indent: int = 2, level: int = 0) -> str:
         """Pretty-print this field with the header on one line and the dtype below.
 
         Layout is uniform across flat and nested dtypes::
 
-            'name'[ not null][ {metadata}]
+            'name'[ not null][ [tags...]][ 'comment']
               <dtype block at level + 1>
 
         ``indent`` is the per-level step in spaces; ``level`` is the
         current depth. The header carries the name, the ``not null``
-        marker, and the metadata repr; the dtype renders on the next
-        line(s) at ``level + 1`` so its body always sits one step in
-        from the field name.
+        marker, the bracketed marker group (primary / foreign /
+        constraint key, partition / cluster / sorted, default value),
+        and the comment; the dtype renders on the next line(s) at
+        ``level + 1`` so its body always sits one step in from the
+        field name.
 
         Examples::
 
-            >>> print(field("id", "int64", nullable=False).pretty_format())
-            'id' not null
-              int64
+            >>> print(field("id", "int64", nullable=False,
+            ...             tags={"primary_key": True}).pretty_format())
+            'id' int64 not null [PK]
+
+            >>> print(field("date", "date32",
+            ...             tags={"partition_by": True}).pretty_format())
+            'date' date32 [partition]
 
             >>> print(field("user", StructType.from_fields([
             ...     field("id", "int64"),
@@ -293,6 +335,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         suffix = ""
         if not self.nullable:
             suffix += " not null"
+
+        suffix += self._pretty_markers()
 
         comment = self.comment
         if comment:
