@@ -85,7 +85,6 @@ from typing import (
     Iterable,
     Iterator,
     List,
-    Literal,
     Optional,
     Tuple,
     Union, )
@@ -299,21 +298,8 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
     # TabularIO hooks — open the local file, dispatch to its BytesIO
     # ==================================================================
 
-    @property
-    def cached(self) -> bool:
-        return self._arrow_table is not None or self._spark_frame is not None
-
-    def unpersist(self) -> None:
-        self._arrow_table = None
-        self._spark_frame = None
-
-    def persist(
-        self,
-        engine: Literal["arrow", "polars", "spark", "auto"] = "auto",
-        *,
-        data: Any | None = None,
-    ) -> "TabularIO":
-        return TabularIO.persist(self, engine, data=data)
+    # ``cached`` / ``persist`` / ``unpersist`` come from
+    # :class:`TabularIO` — shared ``_persisted_data`` slot driver.
 
     def _read_arrow_batches(self, options: CastOptions) -> Iterator["pa.RecordBatch"]:
         """Stream Arrow batches by opening the file locally and delegating.

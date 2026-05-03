@@ -289,9 +289,12 @@ class StatementResult(TabularIO, Generic[PS]):
         self.statement = self._PREPARED_STATEMENT_CLASS.from_(statement)
         self.key = key or self.statement.key
         self._cached_schema: Optional[Schema] = None
-        self._persisted_data: Any = None
         self.num_try = num_try or 0
         self._auto_retry_promoted = False
+        # ``_persisted_data`` (Optional[TabularIO]) is initialised by
+        # the :class:`TabularIO` base ``__init__``; subclasses populate
+        # it via :meth:`persist` to expose the materialised result
+        # through the standard cache path.
         super().__init__(**kwargs)
 
     # -------------------------------------------------------------------------

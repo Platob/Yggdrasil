@@ -329,10 +329,6 @@ class DeltaIO(PartitionedFolderIO):
         partition columns get appended row-for-row and a row-count
         change in between would desync.
         """
-        if self.cached:
-            yield from self._read_arrow_batches_from_cache(options)
-            return
-
         partition_cols = self._resolve_partition_columns(options)
         partition_by_name: Mapping[str, Field] = {
             c.name: c for c in partition_cols

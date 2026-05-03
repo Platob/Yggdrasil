@@ -458,22 +458,27 @@ class TestPersist:
         assert not io.cached
 
     def test_persist_idempotent(self, tmpdir_path: Path):
+        from yggdrasil.io.buffer.memory import MemoryArrowIO
+
         path = tmpdir_path / "a.parquet"
         ParquetIO(path=str(path)).write_arrow_table(_sample_table())
 
         io = ParquetIO(path=str(path))
         io.persist(engine="arrow")
-        first = io._arrow_table
+        first = io._persisted_data
+        assert isinstance(first, MemoryArrowIO)
         io.persist(engine="arrow")  # cached → no-op
-        assert io._arrow_table is first
+        assert io._persisted_data is first
 
     def test_persist_with_explicit_data(self):
+        from yggdrasil.io.buffer.memory import MemoryArrowIO
+
         io = ParquetIO()
         table = _sample_table()
         io.persist(engine="arrow", data=table)
         assert io.cached
-        assert io._arrow_table is not None
-        assert io._arrow_table.num_rows == 3
+        assert isinstance(io._persisted_data, MemoryArrowIO)
+        assert io._persisted_data.num_rows == 3
 
     def test_persist_unsupported_engine_raises(self):
         io = ParquetIO()

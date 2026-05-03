@@ -72,17 +72,14 @@ from typing import (
     ClassVar,
     Iterable,
     Iterator,
-    Literal,
     TypeVar,
 )
 
 import pyarrow as pa
 
 from yggdrasil.arrow.cast import any_to_arrow_table
-from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.disposable import Disposable
-from yggdrasil.environ import PyEnv
 from yggdrasil.io.enums import MimeType, Mode
 from yggdrasil.io.fs import Path
 from yggdrasil.io.buffer.base import ChildrenOptions, TabularIO
@@ -239,44 +236,9 @@ class NestedIO(TabularIO[O], ABC):
     def _release(self) -> None:
         self.unpersist()
 
-    @property
-    def cached(self) -> bool:
-        return self._arrow_table is not None or self._spark_frame is not None
-
-    def unpersist(self) -> None:
-        self._arrow_table = None
-        self._spark_frame = None
-
-    def persist(
-        self,
-        engine: Literal["arrow", "polars", "spark", "auto"] = "auto",
-        *,
-        data: Any | None = None,
-    ) -> "NestedIO":
-        if self.cached:
-            return self
-
-        if not engine or engine == "auto":
-            engine = "spark" if PyEnv.in_databricks() else "arrow"
-
-        if data is None:
-            if engine == "spark":
-                self._spark_frame = self.read_spark_frame()
-            elif engine == "arrow":
-                self._arrow_table = self.read_arrow_table()
-            else:
-                raise ValueError(f"Unsupported engine: {engine}")
-        else:
-            if engine == "spark":
-                from yggdrasil.spark.cast import any_to_spark_dataframe
-
-                self._spark_frame = any_to_spark_dataframe(data)
-            elif engine == "arrow":
-                self._arrow_table = any_to_arrow_table(data)
-            else:
-                raise ValueError(f"Unsupported engine: {engine}")
-
-        return self
+    # ``cached`` / ``persist`` / ``unpersist`` come from
+    # :class:`TabularIO` — they drive the shared ``_persisted_data``
+    # slot identically for every NestedIO subclass.
 
     # ------------------------------------------------------------------
     # Options
@@ -446,11 +408,10 @@ class NestedIO(TabularIO[O], ABC):
         Pure :class:`BytesIO` children with no tabular surface are
         skipped — the caller can pull bytes from them via
         :meth:`iter_children` directly.
-        """
-        if self.cached:
-            yield from self._read_arrow_batches_from_cache(options)
-            return
 
+        The cache short-circuit lives on :meth:`TabularIO.read_arrow_batches`
+        — it delegates to ``self._persisted_data`` before this hook runs.
+        """
         for child in self._iter_children(options):
             yield from self._read_child_batches(child, options)
 

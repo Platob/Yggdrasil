@@ -21,7 +21,6 @@ import pyarrow as pa
 
 from yggdrasil.data import Schema
 from yggdrasil.data.options import CastOptions
-from yggdrasil.data.record import Record
 from yggdrasil.data.statement import (
     PreparedStatement,
     StatementResult,
@@ -225,16 +224,20 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
     # -------------------------------------------------------------------------
     # Persisted DataFrame
     # -------------------------------------------------------------------------
+    #
+    # ``cached`` / ``unpersist`` come from :class:`TabularIO` —
+    # ``_persisted_data`` (a :class:`MemorySparkIO` wrapper) is the
+    # single source of truth for "was this statement materialised".
+    # The :class:`TabularIO` read paths delegate to it before the
+    # private ``_read_*`` hooks fire, so we only need to fill in
+    # ``persist`` and the convenience ``spark_dataframe`` accessor.
 
     @property
     def spark_dataframe(self) -> Optional["DataFrame"]:
         """The materialized Spark frame, or ``None`` if not yet started."""
-        return self._persisted_data
-
-    @property
-    def cached(self) -> bool:
-        """True once a frame has been persisted (= post-start, success)."""
-        return self._persisted_data is not None
+        if self._persisted_data is None:
+            return None
+        return getattr(self._persisted_data, "frame", None)
 
     def persist(
         self,
@@ -242,35 +245,31 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
         *,
         data: Any | None = None,
     ) -> "SparkStatementResult":
-        """Stash a materialized frame on this result.
+        """Stash a materialised frame on this result as a :class:`MemorySparkIO`.
 
         ``data`` overrides the persisted frame; otherwise this is a no-op
         (Spark caches lazily on the frame itself, not on this handle).
         """
         if data is not None:
+            from yggdrasil.io.buffer.memory import MemorySparkIO
             from yggdrasil.spark.cast import any_to_spark_dataframe
-            self._persisted_data = any_to_spark_dataframe(data)
+
+            self._persisted_data = MemorySparkIO(any_to_spark_dataframe(data))
         return self
 
-    def unpersist(self) -> None:
-        """Drop the cached frame reference; Spark's cache is unaffected."""
-        self._persisted_data = None
+    # -------------------------------------------------------------------------
+    # Read hooks — forward to the held MemorySparkIO when set so callers
+    # that bypass the public API (or hit ``_read_records`` through the
+    # base default) still see the materialised frame.
+    # -------------------------------------------------------------------------
 
-    # -------------------------------------------------------------------------
-    # Arrow
-    # -------------------------------------------------------------------------
+    def _read_spark_frame(self, options: CastOptions) -> "DataFrame":
+        self._require_started()
+        return self._persisted_data._read_spark_frame(options)
 
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
-        if self._persisted_data is None:
-            raise RuntimeError(
-                "Cannot read Arrow batches from a non-started Spark statement; "
-                "call start() first."
-            )
-        return (
-            options.cast_spark_tabular(self._persisted_data)
-            .toArrow()
-            .to_batches(max_chunksize=options.row_size)
-        )
+        self._require_started()
+        yield from self._persisted_data._read_arrow_batches(options)
 
     def _write_arrow_batches(
         self,
@@ -280,12 +279,15 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
         raise NotImplementedError("Cannot write to Spark via this interface")
 
     def _read_records(self, options: O) -> "Iterator[Any]":
-        schema = self._collect_schema(options)
+        self._require_started()
+        yield from self._persisted_data._read_records(options)
 
-        yield from Record.from_spark_frame(
-            options.cast_spark_tabular(self._persisted_data),
-            schema=schema,
-        )
+    def _require_started(self) -> None:
+        if self._persisted_data is None:
+            raise RuntimeError(
+                "Cannot read from a non-started Spark statement; "
+                "call start() first."
+            )
 
     # -------------------------------------------------------------------------
     # Submit / cancel
