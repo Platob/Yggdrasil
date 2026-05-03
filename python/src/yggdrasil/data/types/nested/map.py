@@ -5,9 +5,13 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.nested import NestedType
@@ -799,24 +803,40 @@ def cast_arrow_struct_array_to_map(
     keys_child_major = pa.concat_arrays(key_arrays, memory_pool=options.arrow_memory_pool)
     values_child_major = pa.concat_arrays(value_arrays, memory_pool=options.arrow_memory_pool)
 
-    row_mask = np.asarray(array.is_null().to_numpy(zero_copy_only=False), dtype=bool)
-    valid_rows = np.flatnonzero(~row_mask)
+    if np is not None:
+        row_mask = np.asarray(array.is_null().to_numpy(zero_copy_only=False), dtype=bool)
+        valid_rows = np.flatnonzero(~row_mask)
 
-    if len(valid_rows) == 0:
-        take_indices = pa.array([], type=pa.int64())
+        if len(valid_rows) == 0:
+            take_indices = pa.array([], type=pa.int64())
+        else:
+            base = np.arange(child_count, dtype=np.int64)[:, None] * row_count
+            reordered = (base + valid_rows[None, :]).T.reshape(-1)
+            take_indices = pa.array(reordered, type=pa.int64())
+
+        counts = np.where(row_mask, 0, child_count).astype(np.int32, copy=False)
+        offsets_np = np.empty(row_count + 1, dtype=np.int32)
+        offsets_np[0] = 0
+        np.cumsum(counts, out=offsets_np[1:])
+        offsets = pa.array(offsets_np, type=pa.int32())
     else:
-        base = np.arange(child_count, dtype=np.int64)[:, None] * row_count
-        reordered = (base + valid_rows[None, :]).T.reshape(-1)
-        take_indices = pa.array(reordered, type=pa.int64())
+        null_mask = array.is_null().to_pylist()
+
+        take_list: list[int] = []
+        offsets_list: list[int] = [0]
+        running = 0
+        for row_idx, is_null in enumerate(null_mask):
+            if not is_null:
+                running += child_count
+                for c in range(child_count):
+                    take_list.append(c * row_count + row_idx)
+            offsets_list.append(running)
+
+        take_indices = pa.array(take_list, type=pa.int64())
+        offsets = pa.array(offsets_list, type=pa.int32())
 
     flat_keys = pc.take(keys_child_major, take_indices, memory_pool=options.arrow_memory_pool)
     flat_values = pc.take(values_child_major, take_indices, memory_pool=options.arrow_memory_pool)
-
-    counts = np.where(row_mask, 0, child_count).astype(np.int32, copy=False)
-    offsets_np = np.empty(row_count + 1, dtype=np.int32)
-    offsets_np[0] = 0
-    np.cumsum(counts, out=offsets_np[1:])
-    offsets = pa.array(offsets_np, type=pa.int32())
 
     return pa.MapArray.from_arrays(
         offsets=offsets,

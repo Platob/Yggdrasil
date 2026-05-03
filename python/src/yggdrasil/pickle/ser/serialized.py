@@ -9,7 +9,6 @@ from types import ModuleType
 from typing import Any, Generic, Mapping, Optional, TypeVar
 
 from yggdrasil.io import BytesIO
-from yggdrasil.io.buffer.bytes_view import BytesIOView
 from yggdrasil.pickle.ser.codec import (
     DEFAULT_CODEC,
     codec_name,
@@ -53,7 +52,7 @@ def _get_guard_stack() -> set[tuple[int, type]]:
 @dataclass(frozen=True, slots=True)
 class Serialized(ABC, Generic[T]):
     head: Header
-    data: BytesIOView
+    data: BytesIO
 
     _cached_obj: Optional[T] = field(
         init=False,
@@ -66,7 +65,7 @@ class Serialized(ABC, Generic[T]):
     def __new__(
         cls,
         head: Header | None = None,
-        data: BytesIOView | None = None,
+        data: BytesIO | None = None,
     ):
         # ``pickle``/``copy`` may call ``__new__`` with no constructor args.
         # Keep zero-arg construction valid for dataclass instance restoration.

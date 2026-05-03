@@ -333,6 +333,7 @@ class ZipIO(BytesIO):
                 name
                 for name in self._list_entry_names()
                 if not self._is_ignored_name(name)
+                and options.matches_name(name)
             ]
         for name in names:
             with self._preserve_cursor():

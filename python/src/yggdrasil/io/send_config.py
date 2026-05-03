@@ -352,6 +352,10 @@ class CacheConfig(_ConfigBase):
         if not force and not self.local_cache_enabled:
             return None
 
+        # Lazy import — yggdrasil.io.fs pulls in URL/Disposable plumbing
+        # we don't need at module load time.
+        from yggdrasil.io.fs import LocalPath
+
         anonymized = request.anonymize(mode="remove")
         cache_folder = self.local_cache_folder() / "cache"
         url = anonymized.url
@@ -364,24 +368,67 @@ class CacheConfig(_ConfigBase):
             if path_parts:
                 cache_folder = cache_folder.joinpath(*path_parts)
 
-        path = cache_folder / f"{anonymized.xxh3_b64(url_safe=True)}{suffix or '.bin'}"
+        suffix = suffix or ".bin"
+        hash_token = anonymized.xxh3_b64(url_safe=True)
+        name_prefix = f"{hash_token}-"
+        now_ts = int(time.time())
+
+        # Wrap the parent as a yggdrasil Path so its staging machinery —
+        # the rate-limited sweep that ages out TTL-encoded siblings —
+        # runs against this cache folder. Returned cache file paths stay
+        # ``pathlib.Path`` so existing callers (pickle.dump/load,
+        # ``session.py``) need no changes.
+        staging_folder = LocalPath(cache_folder)
+        try:
+            staging_folder._sweep_expired_staging()
+        except Exception:
+            pass
+
+        existing: Path | None = None
+        existing_start = 0
+        existing_end = 0
+        try:
+            for child in staging_folder.iterdir():
+                cname = child.name
+                if not cname.startswith(name_prefix) or not cname.endswith(suffix):
+                    continue
+                mid = cname[len(name_prefix):-len(suffix)] if suffix else cname[len(name_prefix):]
+                try:
+                    start_str, end_str = mid.rsplit("-", 1)
+                    child_start = int(start_str)
+                    child_end = int(end_str)
+                except (ValueError, AttributeError):
+                    continue
+                if child_end < now_ts:
+                    continue
+                if child_end > existing_end:
+                    existing = cache_folder / cname
+                    existing_start = child_start
+                    existing_end = child_end
+        except Exception:
+            pass
 
         if force:
-            return path
+            if existing is not None:
+                return existing
+            if self.received_ttl:
+                ttl_seconds = max(1, int(self.received_ttl.total_seconds()))
+            else:
+                ttl_seconds = 86400
+            end_ts = now_ts + ttl_seconds
+            return cache_folder / f"{name_prefix}{now_ts}-{end_ts}{suffix}"
 
-        if not path.exists():
+        if existing is None:
             return None
 
-        mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)
-
-        if self.received_from is not None and mtime < self.received_from:
-            path.unlink(missing_ok=True)
+        if self.received_from is not None and existing_start < int(self.received_from.timestamp()):
+            existing.unlink(missing_ok=True)
             return None
 
-        if self.received_to is not None and mtime > self.received_to:
+        if self.received_to is not None and existing_start > int(self.received_to.timestamp()):
             return None
 
-        return path
+        return existing
 
     def request_values(
         self,

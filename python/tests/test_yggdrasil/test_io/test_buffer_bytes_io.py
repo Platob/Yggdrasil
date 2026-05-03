@@ -1,10 +1,10 @@
-"""Tests for ``yggdrasil.io.buffer.BytesIO`` and ``BytesIOView``.
+"""Tests for ``yggdrasil.io.buffer.BytesIO``.
 
 Covers the documented public surface — construction shapes,
 read/write/seek primitives, the bytes/string/structured surfaces,
 hashing, compression, media-type wiring, copy/replace lifecycle,
-spill-to-disk behavior, path-bound mode, the view layer, and
-``pickle`` round-tripping.
+spill-to-disk behavior, path-bound mode, the view layer
+(``BytesIO`` in view mode), and ``pickle`` round-tripping.
 
 Optional-dependency paths (``xxhash``, ``blake3``, ``zstandard``)
 are gated behind ``pytest.importorskip`` so the suite passes on a
@@ -22,7 +22,6 @@ import struct
 import pytest
 
 from yggdrasil.io.buffer import BytesIO
-from yggdrasil.io.buffer.bytes_view import BytesIOView
 from yggdrasil.io.enums.codec import GZIP, ZSTD
 from yggdrasil.io.enums.media_type import MediaType
 from yggdrasil.io.enums.mime_type import MimeTypes
@@ -958,7 +957,7 @@ class TestDunder:
 
 
 # ===========================================================================
-# BytesIOView
+# BytesIO view-mode (parent + view-relative cursor)
 # ===========================================================================
 
 
@@ -1045,10 +1044,13 @@ class TestBytesIOView:
         with pytest.raises(ValueError):
             v.truncate(-1)
 
-    def test_seek_set_negative_raises(self):
+    def test_seek_set_negative_counts_from_end(self):
+        # BytesIO's seek extends SEEK_SET to support negative offsets
+        # as "count back from end". A view inherits that semantics
+        # since it is a BytesIO.
         v = BytesIO(b"abc").view(pos=0, size=3)
-        with pytest.raises(ValueError):
-            v.seek(-1, _stdio.SEEK_SET)
+        # -1 from a 3-byte view → 3 + -1 + 1 = 3 (one past last byte).
+        assert v.seek(-1, _stdio.SEEK_SET) == 3
 
     def test_seek_cur_clamps_to_zero(self):
         v = BytesIO(b"abc").view(pos=0, size=3)
@@ -1086,21 +1088,22 @@ class TestBytesIOView:
 
     def test_context_manager_closes(self):
         with BytesIO(b"abc").view(pos=0, size=3) as v:
-            assert isinstance(v, BytesIOView)
+            assert isinstance(v, BytesIO)
+            assert v.is_view
         assert v.closed
 
     def test_construction_validation(self):
         parent = BytesIO(b"abc")
         with pytest.raises(ValueError):
-            BytesIOView(parent, start=-1)
+            BytesIO._make_view(parent, offset=-1)
         with pytest.raises(ValueError):
-            BytesIOView(parent, size=-1)
+            BytesIO._make_view(parent, size=-1)
         with pytest.raises(ValueError):
-            BytesIOView(parent, pos=-1)
+            BytesIO._make_view(parent, pos=-1)
         with pytest.raises(ValueError):
-            BytesIOView(parent, max_size=-1)
+            BytesIO._make_view(parent, max_size=-1)
         with pytest.raises(ValueError):
-            BytesIOView(parent, size=10, max_size=5)
+            BytesIO._make_view(parent, size=10, max_size=5)
 
     def test_end_and_remaining(self):
         parent = BytesIO(b"abcdef")

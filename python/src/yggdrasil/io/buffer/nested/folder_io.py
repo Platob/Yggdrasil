@@ -204,13 +204,18 @@ class FolderIO(NestedIO[FolderOptions]):
         :class:`BytesIO` so callers can still pull bytes from them.
         Unknown / un-readable entries are silently skipped.
 
+        :class:`ChildrenOptions` filters apply: ``include_patterns`` /
+        ``exclude_patterns`` are matched against the entry name,
+        ``exclude_private`` skips dot-prefixed entries (in addition
+        to :meth:`_is_ignored_path` for backend-specific hides like
+        ``_delta_log/``).
+
         Each child's ``parent`` attribute is stamped to ``self``.
         Children are returned closed (un-acquired); caller opens
         them inside a ``with`` block.
 
         Missing folder is treated as empty: no children yielded,
-        no error raised. Hidden entries (name starting with ``.``)
-        are filtered out by :meth:`_is_ignored_path`.
+        no error raised.
         """
         if not self.path.exists():
             return
@@ -219,6 +224,8 @@ class FolderIO(NestedIO[FolderOptions]):
 
         for entry in self.path.iterdir():
             if self._is_ignored_path(entry):
+                continue
+            if not options.matches_name(entry.name):
                 continue
 
             try:

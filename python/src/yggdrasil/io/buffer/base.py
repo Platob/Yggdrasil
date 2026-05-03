@@ -45,6 +45,8 @@ byte buffers.
 
 from __future__ import annotations
 
+import dataclasses
+import fnmatch
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator as AbcIterator, Mapping
@@ -80,7 +82,7 @@ if TYPE_CHECKING:
     from yggdrasil.io.fs import Path
 
 
-__all__ = ["TabularIO"]
+__all__ = ["TabularIO", "ChildrenOptions"]
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +90,71 @@ __all__ = ["TabularIO"]
 # ---------------------------------------------------------------------------
 
 O = TypeVar("O", bound=CastOptions)
+
+
+# ---------------------------------------------------------------------------
+# Children discovery options
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ChildrenOptions(CastOptions):
+    """Options carried through :meth:`TabularIO.iter_children`.
+
+    Children discovery is conceptually distinct from cast/IO options:
+    it filters which sub-IOs an aggregator (folder, archive, partitioned
+    table) hands back, before any of them is opened or its batches are
+    drained. Discovery knobs collected here:
+
+    :param include_patterns: glob patterns (``fnmatch``-style, matched
+        against the child's *name*). When set, only children matching at
+        least one pattern are yielded. ``None`` (default) means "no
+        include filter — accept everything not excluded".
+    :param exclude_patterns: glob patterns; matching children are
+        dropped. ``None`` (default) means "no exclude filter".
+    :param exclude_private: skip children whose name starts with ``.``
+        (the conventional hidden/private prefix). Default ``True`` —
+        matches the existing :meth:`NestedIO._is_ignored_path` rule.
+    :param max_depth: clip recursive walks at this depth (``0`` =
+        only this level, ``1`` = one nested level, …). ``None`` (default)
+        means "no depth cap" — recurse as far as :attr:`recursive`
+        allows.
+    :param follow_symlinks: whether to descend into symlinked directories
+        on backends that distinguish them. Default ``False`` — matches
+        the safe default to avoid cycles on local filesystems.
+
+    :attr:`recursive` (inherited from :class:`CastOptions`) decides
+    whether sub-folders are walked at all. ``ChildrenOptions`` does not
+    redefine its default, so the base ``False`` still applies; folder
+    IOs that recurse by default carry that intent on the instance.
+    """
+
+    include_patterns: tuple[str, ...] | None = None
+    exclude_patterns: tuple[str, ...] | None = None
+    exclude_private: bool = True
+    max_depth: int | None = None
+    follow_symlinks: bool = False
+
+    def matches_name(self, name: str) -> bool:
+        """Apply this options' filters to a candidate child *name*.
+
+        Returns ``True`` if the child should be yielded, ``False`` if
+        the include/exclude/private rules drop it. Pure-string match —
+        no filesystem stat, no IO open. Subclasses with backend-specific
+        introspection are free to layer richer checks on top.
+        """
+        if self.exclude_private and name.startswith("."):
+            return False
+        if self.exclude_patterns:
+            for pattern in self.exclude_patterns:
+                if fnmatch.fnmatchcase(name, pattern):
+                    return False
+        if self.include_patterns:
+            for pattern in self.include_patterns:
+                if fnmatch.fnmatchcase(name, pattern):
+                    return True
+            return False
+        return True
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -449,6 +516,15 @@ class TabularIO(Disposable, ABC, Generic[O]):
         return CastOptions  # type: ignore[return-value]
 
     @classmethod
+    def children_options_class(cls) -> type[ChildrenOptions]:
+        """The :class:`ChildrenOptions` subclass :meth:`iter_children` consumes.
+
+        Subclasses with extra discovery knobs (e.g. partition-aware
+        filters) override to return their richer subclass.
+        """
+        return ChildrenOptions
+
+    @classmethod
     def check_options(
         cls,
         options: "O | None" = None,
@@ -464,6 +540,29 @@ class TabularIO(Disposable, ABC, Generic[O]):
             kwargs.update(kwargs.pop("kwargs", {}))
 
         return cls.options_class().check(options, **kwargs)
+
+    @classmethod
+    def check_children_options(
+        cls,
+        options: "ChildrenOptions | Mapping[str, Any] | None" = None,
+        overrides: "dict | None" = None,
+        **kwargs: Any,
+    ) -> ChildrenOptions:
+        """Resolve a :class:`ChildrenOptions` from any accepted input shape.
+
+        Mirrors :meth:`check_options` but routes through
+        :meth:`children_options_class` so callers (and subclasses)
+        can pass discovery-specific kwargs without polluting
+        :class:`CastOptions`.
+        """
+        if overrides:
+            overrides = {k: v for k, v in overrides.items() if v is not ...}
+            overrides.pop("self", None)
+            options = overrides.pop("options", options)
+            kwargs.update(overrides)
+            kwargs.update(kwargs.pop("kwargs", {}))
+
+        return cls.children_options_class().check(options, **kwargs)
 
     @abstractmethod
     def _read_arrow_batches(self, options: O) -> Iterator[pa.RecordBatch]:
@@ -494,7 +593,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
     ) -> None:
         """Consume Arrow record batches and persist them."""
 
-    def _iter_children(self, options: O) -> "Iterator[TabularIO]":
+    def _iter_children(self, options: ChildrenOptions) -> "Iterator[TabularIO]":
         """Yield this IO's direct children, each as a :class:`TabularIO`.
 
         Single-buffer leaves (``PrimitiveIO``, ``BytesIO`` without a
@@ -510,6 +609,12 @@ class TabularIO(Disposable, ABC, Generic[O]):
         so callers can walk the tree and drain Arrow batches
         uniformly.
 
+        ``options`` carries discovery knobs (:attr:`recursive`,
+        include/exclude patterns, hidden filtering, depth cap).
+        Subclasses are expected to honor them where meaningful;
+        :meth:`ChildrenOptions.matches_name` is the canonical
+        name-based filter.
+
         Default: yields nothing — the right answer for any
         single-source TabularIO. :class:`NestedIO` re-declares this
         abstract so folder-shaped subclasses can't accidentally
@@ -519,11 +624,19 @@ class TabularIO(Disposable, ABC, Generic[O]):
 
     def iter_children(
         self,
-        options: "O | None" = None,
+        options: "ChildrenOptions | Mapping[str, Any] | None" = None,
         **kwargs: Any,
     ) -> "Iterator[TabularIO]":
-        """Public wrapper around :meth:`_iter_children`."""
-        return self._iter_children(self.check_options(options, overrides=locals()))
+        """Public wrapper around :meth:`_iter_children`.
+
+        Accepts a :class:`ChildrenOptions`, a mapping of discovery
+        kwargs, or ``None`` (for "use the defaults"). Discovery kwargs
+        passed positionally as ``**kwargs`` are merged into the
+        resolved options.
+        """
+        return self._iter_children(
+            self.check_children_options(options, overrides=locals())
+        )
 
     def has_children(self) -> bool:
         """Return ``True`` iff this IO exposes at least one child.
@@ -544,14 +657,14 @@ class TabularIO(Disposable, ABC, Generic[O]):
         except (FileNotFoundError, StopIteration):
             return False
 
-    def _has_children_options(self) -> O:
+    def _has_children_options(self) -> ChildrenOptions:
         """Cheap default options for :meth:`has_children`'s peek.
 
         Split out so subclasses with mandatory option fields can
         provide a probe-friendly default without rebuilding
         :meth:`has_children`.
         """
-        return self.options_class()()
+        return self.children_options_class()()
 
     # ==================================================================
     # Static helpers

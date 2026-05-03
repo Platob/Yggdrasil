@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Mapping
 
 from yggdrasil.io import BytesIO
-from yggdrasil.io.buffer.bytes_view import BytesIOView
 from yggdrasil.pickle.ser.constants import HEADER_SIZE
 from yggdrasil.pickle.ser.errors import HeaderDecodeError, MetadataDecodeError
 
@@ -195,7 +194,7 @@ class Header:
             metadata=metadata,
         )
 
-    def payload_view(self, buffer: BytesIO) -> BytesIOView:
+    def payload_view(self, buffer: BytesIO) -> BytesIO:
         """Return a zero-copy view of the payload bytes."""
         return buffer.view(pos=self.start, size=self.size)
 
