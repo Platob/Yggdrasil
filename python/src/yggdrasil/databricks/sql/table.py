@@ -150,6 +150,83 @@ def _apply_retry_to_warehouse_statement(
     stmt.retry = WaitingConfig.from_(retry)
 
 
+def _apply_retry_to_statement(
+    stmt: "PreparedStatement",
+    retry: Optional[WaitingConfigArg],
+) -> None:
+    """Install ``retry`` on any prepared statement (warehouse or Spark)."""
+    if retry is None:
+        return
+    if retry is False:
+        stmt.retry = None
+        return
+    stmt.retry = WaitingConfig.from_(retry)
+
+
+def _resolve_retry(retry: Optional[WaitingConfigArg]) -> Optional[WaitingConfig]:
+    """Normalize a caller-supplied retry arg to a :class:`WaitingConfig`.
+
+    ``None`` and ``False`` both disable explicit pre-installation — the
+    statement-level auto-promote on transient failures still runs.  Any
+    other value is coerced through :meth:`WaitingConfig.from_`.
+    """
+    if retry is None or retry is False:
+        return None
+    return WaitingConfig.from_(retry)
+
+
+def _drain_batch_with_retry(
+    batch: "StatementBatch",
+    *,
+    wait: WaitingConfigArg,
+    target_location: str,
+    label: str,
+) -> "StatementBatch":
+    """Retry a failed batch in place when at least one item is retryable.
+
+    The warehouse / Spark statement results auto-promote known-transient
+    failures (Delta concurrency, ``ConcurrentAppendException``, …) to
+    retryable on the first ``raise_for_status`` call.  ``execute_many``
+    only submits + waits, so without an explicit ``batch.retry()`` the
+    auto-promoted config never fires — the exception just propagates.
+
+    This helper closes that gap: it nudges every failed item through
+    ``raise_for_status`` (swallowing the exception) so auto-promote
+    installs a retry config, then runs ``batch.retry()`` if anything is
+    now retryable.  Idempotent on already-successful batches and on
+    batches whose failures aren't transient.
+    """
+    if not batch.failed:
+        return batch
+
+    for key, result in batch.results.items():
+        if not result.failed:
+            continue
+        try:
+            result.raise_for_status()
+        except Exception:
+            # raise_for_status auto-promotes transient failures *before*
+            # re-raising; we only need the side-effect.
+            pass
+
+    retryable = [r for r in batch.results.values() if r.failed and r.retryable]
+    if not retryable:
+        return batch
+
+    logger.info(
+        "Retrying %d transiently-failed statement(s) in %s batch -> %s.",
+        len(retryable), label, target_location,
+    )
+    try:
+        batch.retry(wait=wait, raise_error=False)
+    except Exception:
+        logger.exception(
+            "batch.retry() raised on %s batch -> %s; surfacing original failure.",
+            label, target_location,
+        )
+    return batch
+
+
 def _build_match_condition(
     match_by: list[str],
     *,
@@ -539,22 +616,36 @@ def _execute_with_merge_fallback(
     engine_name: Literal["api", "spark"],
     target_location: str,
 ):
-    """Submit *primary*; on failure, build and run the fallback batch.
+    """Submit *primary*; on failure, retry then build and run the fallback batch.
 
     Used for :attr:`Mode.MERGE`: if any DML in the primary submission
-    fails (after its own retry policy), the caller-supplied
+    fails after its own retry policy (or the auto-promoted retry policy
+    for transient Delta failures), the caller-supplied
     ``fallback_factory`` produces a fresh list of prepared statements
     (the keyed-DELETE + INSERT pair plus any maintenance) which is then
-    submitted in a second batch.  The ``raise_error`` contract is
-    deferred to whichever batch runs last.
+    submitted — and itself retried — in a second batch.  The
+    ``raise_error`` contract is deferred to whichever batch runs last.
+
+    Both batches are drained through :func:`_drain_batch_with_retry` so
+    transient errors like ``ConcurrentAppendException`` retry instead of
+    surfacing immediately.
     """
     if fallback_factory is None:
-        return sql_engine.execute_many(
-            primary, wait=wait, raise_error=raise_error, engine=engine_name,
+        batch = sql_engine.execute_many(
+            primary, wait=wait, raise_error=False, engine=engine_name,
         )
+        _drain_batch_with_retry(
+            batch, wait=wait, target_location=target_location, label="primary",
+        )
+        if raise_error:
+            batch.raise_for_status()
+        return batch
 
     batch = sql_engine.execute_many(
         primary, wait=wait, raise_error=False, engine=engine_name,
+    )
+    _drain_batch_with_retry(
+        batch, wait=wait, target_location=target_location, label="primary",
     )
     if not batch.failed:
         if raise_error:
@@ -562,12 +653,18 @@ def _execute_with_merge_fallback(
         return batch
 
     logger.warning(
-        "MERGE into %s failed; running DELETE+INSERT fallback.",
+        "MERGE into %s failed after retry; running DELETE+INSERT fallback.",
         target_location,
     )
-    return sql_engine.execute_many(
-        fallback_factory(), wait=wait, raise_error=raise_error, engine=engine_name,
+    fb_batch = sql_engine.execute_many(
+        fallback_factory(), wait=wait, raise_error=False, engine=engine_name,
     )
+    _drain_batch_with_retry(
+        fb_batch, wait=wait, target_location=target_location, label="fallback",
+    )
+    if raise_error:
+        fb_batch.raise_for_status()
+    return fb_batch
 
 
 def _delta_conf_for(
@@ -2120,9 +2217,12 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
     ) -> None:
         """Insert into this table using Spark.
 
-        ``retry`` is accepted for API symmetry but ignored — Spark uses
-        driver-side retry, not the warehouse ``StatementResult.retry()``
-        loop.
+        ``retry`` is applied to DML statements (INSERT/MERGE/DELETE/UPDATE)
+        only — TRUNCATE/OPTIMIZE/VACUUM stay non-retryable.
+        :class:`SparkStatementResult` already auto-promotes transient
+        Delta failures (``ConcurrentAppendException``, …) to retryable;
+        passing ``retry=True`` (or any :class:`WaitingConfig` arg) makes
+        the policy explicit instead of relying on auto-promote.
         """
         if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
             return self.sql_insert(
@@ -2135,12 +2235,6 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
                 where=where, prune_by=prune_by,
                 spark_session=spark_session,
                 retry=retry,
-            )
-
-        if retry is not None:
-            logger.debug(
-                "Ignoring retry on spark_insert — Spark statements use "
-                "driver-side retry."
             )
 
         from yggdrasil.spark.cast import any_to_spark_dataframe
@@ -2201,7 +2295,18 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
             vacuum_hours=vacuum_hours,
         )
 
-        prepared = [SparkPreparedStatement(text=sql, spark_session=session) for sql in sql_texts]
+        retry_cfg = _resolve_retry(retry)
+
+        def _prepare_spark_batch(texts: list[str]) -> list[SparkPreparedStatement]:
+            out: list[SparkPreparedStatement] = []
+            for sql in texts:
+                stmt = SparkPreparedStatement(text=sql, spark_session=session)
+                if retry_cfg is not None and _classify_dml(sql):
+                    _apply_retry_to_statement(stmt, retry_cfg)
+                out.append(stmt)
+            return out
+
+        prepared = _prepare_spark_batch(sql_texts)
 
         fallback_factory: Optional[Callable[[], list[SparkPreparedStatement]]] = None
         if mode_enum == Mode.MERGE and match_by:
@@ -2216,12 +2321,13 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
                     optimize_after_merge=optimize_after_merge,
                     vacuum_hours=vacuum_hours,
                 )
-                return [SparkPreparedStatement(text=sql, spark_session=session) for sql in fb_texts]
+                return _prepare_spark_batch(fb_texts)
             fallback_factory = _build_fallback
 
         logger.info(
-            "Spark insert -> %s | mode=%s match_by=%s prune_by=%s statements=%d fallback=%s",
-            target_location, mode_enum, match_by, prune_by, len(prepared), bool(fallback_factory),
+            "Spark insert -> %s | mode=%s match_by=%s prune_by=%s statements=%d retry=%s fallback=%s",
+            target_location, mode_enum, match_by, prune_by, len(prepared),
+            retry_cfg is not None, bool(fallback_factory),
         )
 
         applied_conf = _delta_conf_for(overwrite_schema, spark_options)
