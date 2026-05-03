@@ -23,6 +23,7 @@ from yggdrasil.data import Field, Schema
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.types import IntegerType
 from yggdrasil.data.types.nested.array import ArrayType
+from yggdrasil.arrow.cast import rechunk_arrow_batches_by_byte_size
 from yggdrasil.data.types.nested.struct import (
     StructType,
     cast_arrow_batch_iterator,
@@ -30,7 +31,6 @@ from yggdrasil.data.types.nested.struct import (
     cast_arrow_map_array,
     cast_arrow_struct_array,
     cast_arrow_tabular,
-    rechunk_arrow_batches_by_byte_size,
 )
 
 

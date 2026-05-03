@@ -14,7 +14,7 @@ import pytest
 from yggdrasil.io.buffer import BytesIO
 from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.request import PreparedRequest
-from yggdrasil.io.response import Response
+from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, Response
 from yggdrasil.io.response_batch import ResponseBatch
 
 
@@ -37,15 +37,20 @@ def _urls(responses: list[Response]) -> list[str]:
 
 class TestResponseBatchPython:
     def test_empty_batch_is_falsy_and_zero_length(self):
+        # Every bucket carries a schema-bearing empty holder so the
+        # batch can answer schema questions even with zero rows.
         batch = ResponseBatch()
         assert len(batch) == 0
         assert not batch
         assert batch.counts == {"local": 0, "remote": 0, "new": 0}
         assert list(batch) == []
-        assert batch.parts() == []
-        assert batch.local_hits is None
-        assert batch.remote_hits is None
-        assert batch.new_hits is None
+        # All three holders are present (schema-bearing empties), not None.
+        assert len(batch.parts()) == 3
+        for holder in batch.parts():
+            assert isinstance(holder, TabularIO)
+            # Schema is preserved — RESPONSE_ARROW_SCHEMA — so callers
+            # can introspect column names without ever fetching rows.
+            assert holder.schema == RESPONSE_ARROW_SCHEMA
 
     def test_lists_are_coerced_to_tabular_holders(self):
         # The constructor lifts list[Response] into TabularIO holders so
@@ -60,7 +65,10 @@ class TestResponseBatchPython:
         )
         assert isinstance(batch.local_hits, TabularIO)
         assert isinstance(batch.remote_hits, TabularIO)
-        assert batch.new_hits is None
+        # The unsupplied bucket gets a schema-bearing empty holder
+        # rather than ``None`` so empty results still expose a schema.
+        assert isinstance(batch.new_hits, TabularIO)
+        assert batch.new_hits.schema == RESPONSE_ARROW_SCHEMA
 
     def test_iteration_rebuilds_responses_in_pipeline_order(self):
         batch = ResponseBatch(

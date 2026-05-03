@@ -117,10 +117,14 @@ def test_parallelize_return_exceptions_collects_timeout():
     assert all(isinstance(r, cf.TimeoutError) for r in results)
 
 
+def _cube(x: int) -> int:
+    # Module-level so ``ProcessPoolExecutor`` can pickle it across the
+    # fork/spawn boundary (nested local functions are not picklable).
+    return x * x * x
+
+
 def test_parallelize_with_process_pool_executor():
-    @parallelize(executor_cls=cf.ProcessPoolExecutor, show_progress=True)
-    def cube(x: int) -> int:
-        return x * x * x
+    cube = parallelize(executor_cls=cf.ProcessPoolExecutor, show_progress=True)(_cube)
 
     data = [0, 1, 2, 3, 4]
     result_iter = cube(data)

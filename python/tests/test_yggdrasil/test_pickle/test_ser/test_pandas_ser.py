@@ -138,19 +138,27 @@ def test_pandas_tag_category_and_resolution() -> None:
     assert Tags.get_class(Tags.PANDAS_TIMESTAMP) is PandasTimestampSerialized
 
 
+class _BadThing:
+    # Defined at module level so stdlib ``pickle`` (the first fallback
+    # in :class:`PickleSerialized`) can resolve it without needing
+    # ``cloudpickle`` / ``dill`` installed.
+    def __init__(self, x: int) -> None:
+        self.x = x
+
+    def __eq__(self, other: object) -> bool:
+        return self.x == other.x
+
+    def __hash__(self) -> int:
+        return hash(self.x)
+
+    def __repr__(self) -> str:
+        return f"_BadThing({self.x})"
+
+
 def test_pandas_dataframe_falls_back_to_python_serialized_for_unarrowable_object_dtype(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class BadThing:
-        def __init__(self, x: int) -> None:
-            self.x = x
-
-        def __eq__(self, other: object) -> bool:
-            return self.x == other.x
-
-        def __repr__(self) -> str:
-            return f"BadThing({self.x})"
-
+    BadThing = _BadThing
     df = pd.DataFrame(
         {
             "ok": [1, 2],
