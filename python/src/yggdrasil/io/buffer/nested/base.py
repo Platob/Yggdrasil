@@ -660,7 +660,9 @@ class NestedIO(TabularIO[O], ABC):
         incoming_table = any_to_arrow_table(batches, options)
 
         merged = self.merge_upsert_tables(
-            existing_table, incoming_table, match_by=match_by,
+            existing_table, incoming_table,
+            match_by=match_by,
+            update_column_names=options.update_column_names,
         )
 
         overwrite_options = options.copy(mode=Mode.OVERWRITE)

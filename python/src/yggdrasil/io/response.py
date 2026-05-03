@@ -834,7 +834,14 @@ class Response:
 
         if self.buffer is not None:
             body_bytes = self.buffer.to_bytes()
-            body_hash = self.buffer.xxh3_int64()
+            try:
+                body_hash = self.buffer.xxh3_int64()
+            except ImportError:
+                # ``response_body_hash`` schema field is nullable and the
+                # value is informational, so a missing optional dep
+                # (``xxhash``) shouldn't break the canonical Arrow
+                # projection path that all serializers funnel through.
+                body_hash = None
         else:
             body_bytes = None
             body_hash = None

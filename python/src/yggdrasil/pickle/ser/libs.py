@@ -246,7 +246,24 @@ def _restore_object_state(obj: object, payload: object) -> None:
 # module / class detection and caching
 # ---------------------------------------------------------------------------
 
+_INSTALLED_MODULE_DIR_MARKERS: tuple[str, ...] = (
+    # CPython conventional install locations
+    "site-packages",
+    # Debian/Ubuntu split out distro-installed packages here so the
+    # site-packages-only check missed pandas / pyarrow on those distros.
+    "dist-packages",
+)
+
+
 def _module_file_contains_site_packages(module_name: str | None) -> bool:
+    """``True`` when the module is installed under a packages directory.
+
+    Packaged modules — anything under ``site-packages`` or
+    ``dist-packages`` — are stable across processes and can round-trip
+    by import reference instead of by serialized code. Code defined in
+    the user's project tree, on the other hand, can change between
+    runs and must be serialized in full.
+    """
     if not module_name:
         return False
 
@@ -260,8 +277,8 @@ def _module_file_contains_site_packages(module_name: str | None) -> bool:
         return False
 
     path = module_file if isinstance(module_file, str) else str(module_file)
-    path = path.replace("\\", "/")
-    return "site-packages" in path or "site-packages" in path.lower()
+    path = path.replace("\\", "/").lower()
+    return any(marker in path for marker in _INSTALLED_MODULE_DIR_MARKERS)
 
 
 def _should_reference_only_module(module_name: str | None) -> bool:

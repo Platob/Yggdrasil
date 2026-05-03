@@ -82,9 +82,20 @@ TEST_LEAF = "yggdrasil_fs_it/unittest"
 
 
 def _resolve_client() -> Optional[DatabricksClient]:
-    """Return the active :class:`DatabricksClient` or ``None``."""
+    """Return the active :class:`DatabricksClient` or ``None``.
+
+    ``DatabricksClient.current()`` happily returns a client when
+    ``DATABRICKS_HOST`` is unset, deferring auth failure until the
+    first workspace call. That breaks the ``_skip_if_no_client``
+    gate, so we pin the env-var check up front and probe an auth
+    call to fail fast on missing credentials.
+    """
+    if not os.environ.get("DATABRICKS_HOST"):
+        return None
     try:
-        return DatabricksClient.current()
+        client = DatabricksClient.current()
+        client.workspace_client().current_user.me()
+        return client
     except Exception:
         return None
 

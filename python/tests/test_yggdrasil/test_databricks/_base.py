@@ -27,6 +27,7 @@ Subclass pattern::
 
 from __future__ import annotations
 
+import os
 import unittest
 
 __all__ = ["DatabricksCase"]
@@ -42,8 +43,9 @@ class DatabricksCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        # if not os.environ.get("DATABRICKS_HOST"):
-        #     raise unittest.SkipTest(_SKIP_MSG)
+        if not os.environ.get("DATABRICKS_HOST"):
+            raise unittest.SkipTest(_SKIP_MSG)
+
         from yggdrasil.databricks import DatabricksClient
 
         try:

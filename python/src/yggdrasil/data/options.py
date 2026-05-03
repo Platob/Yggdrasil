@@ -73,6 +73,7 @@ import pyarrow as pa
 from yggdrasil.data.expr import Predicate
 
 from yggdrasil.dataclasses import WaitingConfig
+from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io.enums import Mode
 from yggdrasil.lazy_imports import field_class, schema_class
 
@@ -162,6 +163,30 @@ class CastOptions:
     wait: WaitingConfig = WaitingConfig.default()
     spark_session: "SparkSession | None" = None
     arrow_memory_pool: pa.MemoryPool | None = None
+
+    # --- Upsert / merge shape -------------------------------------------
+    update_column_names: list[str] | None = None
+
+    # --- Partition pruning ----------------------------------------------
+    # ``prune_by`` accepts the literal string ``"auto"`` to mean
+    # "use the partition columns from the target schema" — Table.*_insert
+    # resolves that into a real column list.
+    prune_by: "list[str] | str | None" = None
+    prune_values: Mapping[str, tuple[Any, ...]] | None = None
+
+    # --- Trailing maintenance -------------------------------------------
+    zorder_by: list[str] | None = None
+    optimize_after_merge: bool = False
+    vacuum_hours: int | None = None
+
+    # --- Engine knobs ----------------------------------------------------
+    overwrite_schema: bool | None = None
+    spark_options: dict[str, Any] | None = None
+
+    # --- Statement-level retry ------------------------------------------
+    # Threaded onto each DML WarehousePreparedStatement on the warehouse
+    # path; ignored on Spark (driver-side retry handles it there).
+    retry: WaitingConfigArg | None = None
 
     # ==================================================================
     # Normalization — runs after dataclass init

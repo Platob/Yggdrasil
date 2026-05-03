@@ -59,7 +59,7 @@ from .sql_utils import (
     quote_qualified_ident,
     sql_literal, escape_sql_string,
 )
-from .table_options import TableOptions
+from yggdrasil.data.options import CastOptions
 from ...lazy_imports import aws_config_class
 
 if TYPE_CHECKING:
@@ -76,7 +76,7 @@ if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.warehouse import WarehousePreparedStatement
 
-__all__ = ["Table", "TableOptions"]
+__all__ = ["Table"]
 
 logger = logging.getLogger(__name__)
 
@@ -229,7 +229,7 @@ def _build_dml_statements(
     columns: list[str],
     mode: Mode,
     match_by: Optional[list[str]],
-    update_cols: Optional[list[str]],
+    update_column_names: Optional[list[str]],
     prune_predicates: list[str],
     zorder_by: Optional[list[str]] = None,
     optimize_after_merge: bool = False,
@@ -289,16 +289,16 @@ def _build_dml_statements(
                 f"{insert_clause}"
             )
         else:
-            update_cols_effective = (
-                update_cols
-                if update_cols is not None
+            update_column_names_effective = (
+                update_column_names
+                if update_column_names is not None
                 else [c for c in columns if c not in match_by]
             )
             update_clause = ""
-            if update_cols_effective:
+            if update_column_names_effective:
                 update_set = ", ".join(
                     f"T.{quote_ident(c)} = S.{quote_ident(c)}"
-                    for c in update_cols_effective
+                    for c in update_column_names_effective
                 )
                 update_clause = f"WHEN MATCHED THEN UPDATE SET {update_set}\n"
 
@@ -377,12 +377,12 @@ def _column_type_name_from_ddl(ddl: str) -> ColumnTypeName:
 # Table — per-table resource
 # ===========================================================================
 
-class Table(DatabricksResource, TabularIO[TableOptions]):
+class Table(DatabricksResource, TabularIO[CastOptions]):
     """A single Unity Catalog table — DDL, DML, schema, storage helpers."""
 
     @classmethod
-    def options_class(cls) -> type[TableOptions]:
-        return TableOptions
+    def options_class(cls) -> type[CastOptions]:
+        return CastOptions
 
     def __init__(
         self,
@@ -446,7 +446,7 @@ class Table(DatabricksResource, TabularIO[TableOptions]):
                 data: Any | None = None) -> "TabularIO":
         return self
 
-    def _read_arrow_batches(self, options: TableOptions) -> Iterator[pa.RecordBatch]:
+    def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
         options = options.with_source(source=self.collect_schema())
         safe_char = "`"
         names = ",".join(
@@ -455,7 +455,7 @@ class Table(DatabricksResource, TabularIO[TableOptions]):
         )
         query = f"SELECT {names}"
         if options.where:
-            query += f" WHERE {options.where.with_flavor("databricks")}"
+            query += f" WHERE {options.where.with_flavor('databricks')}"
 
         for batch in self.execute(query).read_arrow_batches(options=options):
             yield batch
@@ -463,7 +463,7 @@ class Table(DatabricksResource, TabularIO[TableOptions]):
     def _write_arrow_batches(
         self,
         batches: Iterable[pa.RecordBatch],
-        options: TableOptions
+        options: CastOptions
     ) -> None:
         options = options.with_target(self.collect_schema(options))
 
@@ -471,7 +471,7 @@ class Table(DatabricksResource, TabularIO[TableOptions]):
             batches,
             mode=options.mode,
             match_by=options.match_by_names,
-            update_cols=options.update_cols,
+            update_column_names=options.update_column_names,
             wait=options.wait,
             zorder_by=options.zorder_by,
             optimize_after_merge=options.optimize_after_merge,
@@ -1459,7 +1459,7 @@ class Table(DatabricksResource, TabularIO[TableOptions]):
         cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
-        update_cols: Optional[list[str]] = None,
+        update_column_names: Optional[list[str]] = None,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
         zorder_by: Optional[list[str]] = None,
@@ -1485,7 +1485,7 @@ class Table(DatabricksResource, TabularIO[TableOptions]):
         common = dict(
             mode=mode,
             match_by=match_by,
-            update_cols=update_cols,
+            update_column_names=update_column_names,
             wait=wait,
             raise_error=raise_error,
             zorder_by=zorder_by,
@@ -1536,7 +1536,7 @@ class Table(DatabricksResource, TabularIO[TableOptions]):
         cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
-        update_cols: Optional[list[str]] = None,
+        update_column_names: Optional[list[str]] = None,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
         zorder_by: Optional[list[str]] = None,
@@ -1555,7 +1555,7 @@ class Table(DatabricksResource, TabularIO[TableOptions]):
             return self.sql_insert(
                 data,
                 mode=mode,
-                match_by=match_by, update_cols=update_cols,
+                match_by=match_by, update_column_names=update_column_names,
                 wait=wait, raise_error=raise_error,
                 zorder_by=zorder_by, optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
@@ -1618,7 +1618,7 @@ class Table(DatabricksResource, TabularIO[TableOptions]):
             columns=columns,
             mode=mode_enum,
             match_by=match_by,
-            update_cols=update_cols,
+            update_column_names=update_column_names,
             prune_predicates=prune_predicates,
             zorder_by=zorder_by,
             optimize_after_merge=optimize_after_merge,
@@ -1664,7 +1664,7 @@ class Table(DatabricksResource, TabularIO[TableOptions]):
         cast_options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
-        update_cols: Optional[list[str]] = None,
+        update_column_names: Optional[list[str]] = None,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
         zorder_by: Optional[list[str]] = None,
@@ -1687,7 +1687,7 @@ class Table(DatabricksResource, TabularIO[TableOptions]):
             return self.sql_insert(
                 data,
                 mode=mode,
-                match_by=match_by, update_cols=update_cols,
+                match_by=match_by, update_column_names=update_column_names,
                 wait=wait, raise_error=raise_error,
                 zorder_by=zorder_by, optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
@@ -1753,7 +1753,7 @@ class Table(DatabricksResource, TabularIO[TableOptions]):
             columns=columns,
             mode=mode_enum,
             match_by=match_by,
-            update_cols=update_cols,
+            update_column_names=update_column_names,
             prune_predicates=prune_predicates,
             zorder_by=zorder_by,
             optimize_after_merge=optimize_after_merge,
@@ -1788,7 +1788,7 @@ class Table(DatabricksResource, TabularIO[TableOptions]):
         *,
         mode: Mode | str | None = None,
         match_by: Optional[list[str]] = None,
-        update_cols: Optional[list[str]] = None,
+        update_column_names: Optional[list[str]] = None,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
         zorder_by: Optional[list[str]] = None,
@@ -1813,7 +1813,7 @@ class Table(DatabricksResource, TabularIO[TableOptions]):
         """
         common = dict(
             mode=mode,
-            match_by=match_by, update_cols=update_cols,
+            match_by=match_by, update_column_names=update_column_names,
             wait=wait, raise_error=raise_error,
             zorder_by=zorder_by, optimize_after_merge=optimize_after_merge,
             vacuum_hours=vacuum_hours,
@@ -1845,7 +1845,7 @@ class Table(DatabricksResource, TabularIO[TableOptions]):
         *,
         mode: Mode | str | None,
         match_by: Optional[list[str]],
-        update_cols: Optional[list[str]],
+        update_column_names: Optional[list[str]],
         wait: WaitingConfigArg,
         raise_error: bool,
         zorder_by: Optional[list[str]],
@@ -1908,7 +1908,7 @@ class Table(DatabricksResource, TabularIO[TableOptions]):
             columns=columns,
             mode=mode_enum,
             match_by=match_by,
-            update_cols=update_cols,
+            update_column_names=update_column_names,
             prune_predicates=prune_predicates,
             zorder_by=zorder_by,
             optimize_after_merge=optimize_after_merge,
