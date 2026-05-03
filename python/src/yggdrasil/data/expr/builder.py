@@ -32,13 +32,14 @@ from .nodes import (
     Logical,
     LogicalOp,
     Not,
+    Selector,
 )
 
 if TYPE_CHECKING:
     from yggdrasil.data.data_field import Field
 
 
-__all__ = ["col", "neg", "all_of", "any_of"]
+__all__ = ["col", "select", "neg", "all_of", "any_of"]
 
 
 def col(
@@ -56,6 +57,32 @@ def col(
     differences via the underlying name.
     """
     return Column(name=name, field=field, alias=alias)
+
+
+def select(
+    name: str,
+    *,
+    field: "Field | None" = None,
+    alias: "str | None" = None,
+    output_name: "str | None" = None,
+    target_field: "Field | None" = None,
+) -> Selector:
+    """Build a :class:`Selector` — a column reference with projection
+    metadata (output name + cast-on-select target).
+
+    For passthrough projections :func:`col` is enough; reach for
+    :func:`select` when the column needs to be renamed or
+    cast-into-a-target-Field as part of the projection. Used by
+    :class:`yggdrasil.data.expr.execution_schema.ExecutionSchema`
+    to build typed-projection plans.
+    """
+    return Selector(
+        name=name,
+        field=field,
+        alias=alias,
+        output_name=output_name,
+        target_field=target_field,
+    )
 
 
 def neg(expr: Expression) -> Not:

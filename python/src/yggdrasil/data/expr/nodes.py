@@ -52,6 +52,7 @@ __all__ = [
     "Expression",
     "Predicate",
     "Column",
+    "Selector",
     "Literal",
     "Comparison",
     "Logical",
@@ -327,23 +328,38 @@ class Expression:
 
         return to_python(self, strict=strict)
 
-    def to_sql(self, *, dialect: "str | None" = None) -> str:
-        """Render to a SQL string for the named dialect.
+    def to_sql(
+        self,
+        flavor: "str | None" = None,
+        *,
+        dialect: "str | None" = None,
+    ) -> str:
+        """Render to a SQL string for the named flavor / dialect.
 
-        Default dialect mirrors yggdrasil's primary target
-        (Databricks). Pass ``"postgres"`` / ``"sqlite"`` /
-        ``"ansi"`` / ``"databricks"`` to switch quoting and
-        literal-rendering rules.
+        ``flavor`` is the canonical parameter name and accepts
+        ``"databricks"`` / ``"postgres"`` / ``"sqlite"`` / ``"mysql"``
+        / ``"ansi"``. ``dialect`` is a deprecated alias kept for
+        callers that already use the older keyword. Default mirrors
+        yggdrasil's primary target (Databricks).
         """
         from .backends.sql import to_sql
 
-        return to_sql(self, dialect=dialect)
+        chosen = flavor if flavor is not None else dialect
+        return to_sql(self, dialect=chosen)
 
-    def to_pyarrow(self):
-        """Lift to a :class:`pyarrow.compute.Expression`."""
+    def to_arrow(self):
+        """Lift to a :class:`pyarrow.compute.Expression`.
+
+        Canonical name; :meth:`to_pyarrow` is kept as an alias so
+        callers don't have to update on rename.
+        """
         from .backends.pyarrow_backend import to_pyarrow
 
         return to_pyarrow(self)
+
+    #: Alias — :meth:`to_arrow` is the canonical name; ``to_pyarrow``
+    #: is kept for code that already imports the long form.
+    to_pyarrow = to_arrow
 
     def to_polars(self):
         """Lift to a :class:`polars.Expr`."""
@@ -356,6 +372,150 @@ class Expression:
         from .backends.pyspark_backend import to_pyspark
 
         return to_pyspark(self)
+
+    #: Alias — Spark callers usually spell this ``to_spark``.
+    to_spark = to_pyspark
+
+    def to_engine(self, engine: str, **kwargs: Any) -> Any:
+        """Dispatch by backend name.
+
+        ``engine`` ∈ ``{"python", "sql", "arrow", "polars", "spark"}``
+        — the same set :meth:`from_` accepts. ``**kwargs`` are
+        forwarded to the matching ``to_*`` method (e.g. SQL takes
+        ``flavor`` / ``strict`` for Python). Useful for code that
+        picks the target at runtime (configuration-driven
+        emitters, dispatch tables, …).
+        """
+        key = engine.strip().lower()
+        if key == "python":
+            return self.to_python(**kwargs)
+        if key == "sql":
+            return self.to_sql(**kwargs)
+        if key in ("arrow", "pyarrow"):
+            return self.to_arrow()
+        if key == "polars":
+            return self.to_polars()
+        if key in ("spark", "pyspark"):
+            return self.to_spark()
+        raise ValueError(
+            f"Unknown engine {engine!r}. Valid: "
+            "python, sql, arrow, polars, spark."
+        )
+
+    # ------------------------------------------------------------------
+    # Combination — AND-merge two predicates, identity-merge two equal
+    # scalar expressions. Used by ExecutionSchema.where() to layer
+    # filters and by callers building predicates incrementally.
+    # ------------------------------------------------------------------
+
+    def merge_with(self, other: "Expression") -> "Expression":
+        """Combine *self* with *other* into a single expression.
+
+        Both sides predicates → conjunction (``self AND other``).
+        Both sides structurally equal → return *self* (idempotent).
+        Anything else raises :class:`TypeError` — a "merge" between
+        a scalar and a different scalar isn't a well-defined
+        operation; callers needing arithmetic combination should
+        spell out the operator (``self + other``, etc.).
+        """
+        if isinstance(self, Predicate) and isinstance(other, Predicate):
+            return Logical(LogicalOp.AND, (self, other))
+        if self.equals(other):
+            return self
+        raise TypeError(
+            "merge_with combines predicates (via AND) or identical "
+            "expressions; got mismatched scalar expressions "
+            f"{type(self).__name__} vs {type(other).__name__}. "
+            "For arithmetic combinations use the explicit operator."
+        )
+
+    # ------------------------------------------------------------------
+    # Class-method lifters — every backend's ``from_*`` rolls up here.
+    # The generic :meth:`from_` sniffs the source's runtime type so
+    # callers that don't know which engine produced an expression can
+    # still hand it to us.
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_(cls, source: Any, **kwargs: Any) -> "Expression":
+        """Auto-detect lifter.
+
+        Routes to the matching ``from_*`` based on the source's
+        runtime type:
+
+        - ``str`` → :meth:`from_sql`
+        - ``pyarrow.compute.Expression`` → :meth:`from_arrow`
+        - ``polars.Expr`` → :meth:`from_polars`
+        - ``pyspark.sql.Column`` → :meth:`from_spark`
+        - already an :class:`Expression` → returned unchanged
+
+        ``**kwargs`` are forwarded to the chosen lifter (e.g. SQL
+        takes ``flavor=`` / ``dialect=``).
+        """
+        if isinstance(source, Expression):
+            return source
+        if isinstance(source, str):
+            return cls.from_sql(source, **kwargs)
+
+        # Module-name sniffing keeps the optional dependencies
+        # truly optional — we never import polars / pyarrow / spark
+        # here, just check what the object claims to be.
+        module = (type(source).__module__ or "").split(".", 1)[0]
+        if module == "pyarrow":
+            return cls.from_arrow(source)
+        if module == "polars":
+            return cls.from_polars(source)
+        if module == "pyspark":
+            return cls.from_spark(source)
+
+        raise TypeError(
+            f"Expression.from_ does not know how to lift "
+            f"{type(source).__module__}.{type(source).__name__}. "
+            "Pass a string (SQL), pyarrow / polars / pyspark "
+            "expression, or an existing yggdrasil Expression."
+        )
+
+    @classmethod
+    def from_sql(
+        cls,
+        sql: str,
+        flavor: "str | None" = None,
+        *,
+        dialect: "str | None" = None,
+    ) -> "Expression":
+        """Parse a SQL predicate string into our AST (sqlglot)."""
+        from .backends.sql import from_sql
+
+        chosen = flavor if flavor is not None else dialect
+        return from_sql(sql, dialect=chosen)
+
+    @classmethod
+    def from_arrow(cls, expr: Any) -> "Expression":
+        """Lift a :class:`pyarrow.compute.Expression`."""
+        from .backends.pyarrow_backend import from_pyarrow
+
+        return from_pyarrow(expr)
+
+    #: Alias — ``from_pyarrow`` matches ``to_pyarrow`` for callers
+    #: that prefer the longer name.
+    from_pyarrow = from_arrow
+
+    @classmethod
+    def from_polars(cls, expr: Any) -> "Expression":
+        """Lift a :class:`polars.Expr`."""
+        from .backends.polars_backend import from_polars
+
+        return from_polars(expr)
+
+    @classmethod
+    def from_spark(cls, expr: Any) -> "Expression":
+        """Lift a :class:`pyspark.sql.Column`."""
+        from .backends.pyspark_backend import from_pyspark
+
+        return from_pyspark(expr)
+
+    #: Alias — ``from_pyspark`` matches ``to_pyspark``.
+    from_pyspark = from_spark
 
 
 @dataclasses.dataclass(frozen=True, slots=True, eq=False)
@@ -393,6 +553,63 @@ class Column(Expression):
     @property
     def dtype(self) -> "DataType | None":
         return self.field.dtype if self.field is not None else None
+
+
+@dataclasses.dataclass(frozen=True, slots=True, eq=False)
+class Selector(Column):
+    """A :class:`Column` with projection metadata: rename + cast-on-select.
+
+    Where :class:`Column` is *just a reference*, :class:`Selector`
+    is *a projection*: it carries the rules
+    :class:`yggdrasil.data.expr.execution_schema.ExecutionSchema`
+    needs to materialize this column on a target frame —
+
+    - ``output_name`` (default ``alias`` or ``name``) is what the
+      column should be called on the output side;
+    - ``target_field`` (default ``field``) is the typed
+      :class:`Field` the value should be cast into when the source
+      and target dtypes differ.
+
+    A bare :class:`Column` works as a passthrough Selector — the
+    ExecutionSchema reads it the same way — but :class:`Selector`
+    is what callers reach for when they want to rename / cast in
+    one step:
+
+    .. code-block:: python
+
+        from yggdrasil.data.expr import select
+
+        s = select("price", alias="price_usd").cast_to(usd_field)
+    """
+
+    output_name: "str | None" = None
+    target_field: "Field | None" = None
+
+    def with_output_name(self, name: str) -> "Selector":
+        return dataclasses.replace(self, output_name=name)
+
+    def cast_to(self, field: "Field") -> "Selector":
+        return dataclasses.replace(self, target_field=field)
+
+    @property
+    def projection_name(self) -> str:
+        """Effective name of the projected column on the output frame."""
+        if self.output_name is not None:
+            return self.output_name
+        if self.alias is not None:
+            return self.alias
+        return self.name
+
+    @property
+    def projection_field(self) -> "Field | None":
+        """Effective :class:`Field` for the projected column.
+
+        Falls back to ``self.field`` when no explicit
+        ``target_field`` was set, so a Selector built from a
+        Field-aware Column projects with the source typing
+        unchanged.
+        """
+        return self.target_field or self.field
 
 
 @dataclasses.dataclass(frozen=True, slots=True, eq=False)
