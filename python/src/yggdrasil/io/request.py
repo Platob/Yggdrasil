@@ -458,12 +458,12 @@ class PreparedRequest:
             }
 
         if isinstance(obj, Mapping):
-            return cls.parse_mapping(obj, normalize=normalize, prefix=prefix)
+            return cls.from_mapping(obj, normalize=normalize, prefix=prefix)
 
         raise ValueError(f"Cannot make {cls.__name__} from {type(obj)}")
 
     @classmethod
-    def parse_mapping(
+    def from_mapping(
         cls,
         obj: Mapping[str, Any],
         *,
@@ -1069,7 +1069,7 @@ class PreparedRequest:
         sent_at_value = _get("request_sent_at")
         sent_at_timestamp = any_to_datetime(sent_at_value)
 
-        return cls.parse_mapping(
+        return cls.from_mapping(
             {
                 "method": _get("request_method") or "GET",
                 "url_str": url_val,

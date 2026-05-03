@@ -205,11 +205,10 @@ class Record(Mapping[str, Any]):
         the Arrow-batch path's ``as_py()`` conventions instead of
         leaving Spark ``Row`` objects in the field values.
         """
-        from .data_field import Field
         from .schema import Schema as _Schema
 
         if schema is None:
-            schema = _Schema.from_field(Field.from_spark(frame))
+            schema = _Schema.from_spark(frame)
 
         for row in frame.toLocalIterator():
             yield cls(row.asDict(recursive=True), schema)

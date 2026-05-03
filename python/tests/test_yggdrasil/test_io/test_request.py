@@ -69,7 +69,7 @@ class TestParse:
         assert req.url.host == "example.com"
 
     def test_parse_mapping_with_url_str(self):
-        req = PreparedRequest.parse_mapping(
+        req = PreparedRequest.from_mapping(
             {"url_str": "https://example.com/x", "method": "POST"}
         )
         assert req.method == "POST"
@@ -77,7 +77,7 @@ class TestParse:
 
     def test_parse_mapping_missing_url_raises(self):
         with pytest.raises(ValueError):
-            PreparedRequest.parse_mapping({"method": "GET"})
+            PreparedRequest.from_mapping({"method": "GET"})
 
 
 # ---------------------------------------------------------------------------

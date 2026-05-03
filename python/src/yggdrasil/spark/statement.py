@@ -21,6 +21,7 @@ import pyarrow as pa
 
 from yggdrasil.data import Schema
 from yggdrasil.data.options import CastOptions
+from yggdrasil.data.record import Record
 from yggdrasil.data.statement import (
     PreparedStatement,
     StatementResult,
@@ -28,6 +29,7 @@ from yggdrasil.data.statement import (
 )
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.environ import PyEnv
+from yggdrasil.io.buffer.base import O
 from yggdrasil.io.enums import MimeType, MimeTypes
 
 if TYPE_CHECKING:
@@ -264,7 +266,11 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
                 "Cannot read Arrow batches from a non-started Spark statement; "
                 "call start() first."
             )
-        return options.cast_spark_tabular(self._persisted_data).toArrow().to_batches()
+        return (
+            options.cast_spark_tabular(self._persisted_data)
+            .toArrow()
+            .to_batches(max_chunksize=options.row_size)
+        )
 
     def _write_arrow_batches(
         self,
@@ -272,6 +278,14 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
         options: CastOptions,
     ) -> None:
         raise NotImplementedError("Cannot write to Spark via this interface")
+
+    def _read_records(self, options: O) -> "Iterator[Any]":
+        schema = self._collect_schema(options)
+
+        yield from Record.from_spark_frame(
+            options.cast_spark_tabular(self._persisted_data),
+            schema=schema,
+        )
 
     # -------------------------------------------------------------------------
     # Submit / cancel
