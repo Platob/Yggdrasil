@@ -278,7 +278,15 @@ class IOSerialized(Serialized[object]):
         metadata: Mapping[bytes, bytes] | None = None,
         codec: int | None = None,
     ) -> Serialized[object] | None:
-        # order matters: most specific first
+        # order matters: most specific first.
+        # yggdrasil BytesIO does NOT inherit ``io.IOBase`` (it's a
+        # TabularIO under :mod:`yggdrasil.io.buffer`), so the stdlib
+        # checks below would miss it. Match it first and route through
+        # the binary path, which already preserves ``_media_type`` via
+        # :func:`_encode_media_type`.
+        if isinstance(obj, BytesIO):
+            return BinaryIOSerialized.from_value(obj, metadata=metadata, codec=codec)
+
         if isinstance(obj, io.BytesIO):
             return BytesBufferSerialized.from_value(obj, metadata=metadata, codec=codec)
 

@@ -400,6 +400,7 @@ class TestBaseExceptionSerialized:
         assert isinstance(ser.as_python(), RuntimeError)
 
     def test_build_exception_with_codec(self) -> None:
+        pytest.importorskip("zstandard")
         from yggdrasil.pickle.ser.constants import CODEC_ZSTD
         exc = KeyError("zstd")
         ser = BaseExceptionSerialized.build_exception(exc, codec=CODEC_ZSTD)
