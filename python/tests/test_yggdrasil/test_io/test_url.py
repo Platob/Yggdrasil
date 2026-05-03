@@ -25,6 +25,11 @@ class TestFromStr:
         assert u.fragment == "frag"
         assert u.userinfo == "user:pw"
 
+    def test_roundtrip_str(self):
+        url = URL.from_str("https://user:pw@example.com:8443/data?x=1&pass=abc#frag")
+        str_url = url.to_string()
+        assert URL.from_str(str_url) == url
+
     def test_default_port_is_normalized_away(self):
         assert URL.from_str("http://example.com:80/").port is None
         assert URL.from_str("https://example.com:443/").port is None
