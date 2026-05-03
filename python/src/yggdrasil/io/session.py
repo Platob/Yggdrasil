@@ -518,15 +518,24 @@ class Session(ABC):
         self,
         batch: list[PreparedRequest],
         session_local_cfg: CacheConfig,
-    ) -> tuple[list[Response], list[PreparedRequest]]:
+    ) -> tuple[dict[str, list[Response]], list[PreparedRequest]]:
         """Stage 1: scan the local cache.
 
-        Returns (hits, misses). UPSERT entries are evicted on the way through
-        so the eventual fresh response can be written in their place.
-        Each request is evaluated against its own effective local cache
-        config (per-request override or session-level fallback).
+        Returns ``(hits_by_path, misses)``. UPSERT entries are evicted
+        on the way through so the eventual fresh response can be
+        written in their place. Each request is evaluated against its
+        own effective local cache config (per-request override or
+        session-level fallback).
+
+        Hits are grouped by the effective config's local-cache folder
+        — keyed via :meth:`CacheConfig.local_cache_folder`, which
+        auto-fills the default ``~/.yggdrasil/io/session`` root on any
+        config that didn't carry a ``path`` — so the per-config split
+        survives all the way to :class:`ResponseBatch.local_hits`.
+        Collapsing them back into one bucket would lose that
+        provenance.
         """
-        hits: list[Response] = []
+        hits: dict[str, list[Response]] = {}
         misses: list[PreparedRequest] = []
 
         if not session_local_cfg.local_cache_enabled and not any(
@@ -554,13 +563,18 @@ class Session(ABC):
 
             local_response, _ = self._load_local_cached_response(req, eff)
             if local_response is not None:
-                hits.append(local_response)
+                # Auto-completes ``path`` on configs that didn't carry
+                # one, so the dict key is always a real on-disk root.
+                pkey = str(eff.local_cache_folder())
+                hits.setdefault(pkey, []).append(local_response)
             else:
                 misses.append(req)
 
         if hits:
+            total = sum(len(v) for v in hits.values())
             LOGGER.debug(
-                "Batch local cache: %s/%s hits", len(hits), len(batch),
+                "Batch local cache: %s/%s hits across %s path(s)",
+                total, len(batch), len(hits),
             )
         return hits, misses
 
@@ -1040,18 +1054,24 @@ class Session(ABC):
                 continue
 
             # --- Stage 1: local cache ---
-            local_hits_list, after_local = self._split_local_cache(
+            local_hits_by_path, after_local = self._split_local_cache(
                 chunk, session_local_cfg,
             )
-            # On the spark path, lift driver-read local hits to a Spark
-            # frame straight away so every bucket downstream is
-            # frame-resident — matches stage 2/3 and lets the caller
-            # union holders without a per-bucket type switch.
-            local_hits: "list[Response] | SparkDataFrame"
+            # On the spark path, lift each path's responses to its own
+            # Spark frame so every bucket downstream is frame-resident
+            # — matches stage 2/3 and lets the caller union holders
+            # without a per-bucket type switch. Empty dict (no local
+            # hits) is left as-is; ResponseBatch installs a
+            # schema-bearing default placeholder, Spark or Arrow as
+            # appropriate.
+            local_hits: "dict[str, list[Response]] | dict[str, SparkDataFrame]"
             if is_spark:
-                local_hits = self._responses_to_spark(local_hits_list, spark)
+                local_hits = {
+                    pkey: self._responses_to_spark(rs, spark)
+                    for pkey, rs in local_hits_by_path.items()
+                }
             else:
-                local_hits = local_hits_list
+                local_hits = local_hits_by_path
             # Remote hits are split per cache table — keyed by
             # ``CacheConfig.table.full_name(safe=True)`` — so the
             # downstream :class:`ResponseBatch` preserves which table

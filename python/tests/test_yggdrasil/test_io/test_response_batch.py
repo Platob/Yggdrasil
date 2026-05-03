@@ -16,6 +16,8 @@ from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, Response
 from yggdrasil.io.response_batch import (
+    DEFAULT_BUCKET_KEY,
+    DEFAULT_LOCAL_PATH_KEY,
     DEFAULT_REMOTE_TABLE_KEY,
     ResponseBatch,
 )
@@ -41,37 +43,40 @@ def _urls(responses: list[Response]) -> list[str]:
 class TestResponseBatchPython:
     def test_empty_batch_is_falsy_and_zero_length(self):
         # Every bucket carries a schema-bearing empty holder so the
-        # batch can answer schema questions even with zero rows. The
-        # remote bucket starts as a single-entry dict keyed by the
-        # default placeholder so callers can still introspect schema.
+        # batch can answer schema questions even with zero rows. Both
+        # local and remote buckets start as single-entry dicts keyed
+        # by the default placeholder so callers can still introspect
+        # schema without checking for an empty mapping.
         batch = ResponseBatch()
         assert len(batch) == 0
         assert not batch
         assert batch.counts == {"local": 0, "remote": 0, "new": 0}
+        assert batch.local_counts == {}
+        assert batch.local_paths == []
         assert batch.remote_counts == {}
         assert batch.remote_tables == []
         assert list(batch) == []
-        # parts() flattens to local + every remote-table holder + new,
-        # so an empty batch still exposes three holders (one default
-        # remote placeholder).
+        # parts() flattens to every local-path holder + every
+        # remote-table holder + new, so an empty batch still exposes
+        # three holders (one default placeholder per keyed bucket).
         assert len(batch.parts()) == 3
         for holder in batch.parts():
             assert isinstance(holder, TabularIO)
             # Schema is preserved — RESPONSE_ARROW_SCHEMA — so callers
             # can introspect column names without ever fetching rows.
             assert holder.schema == RESPONSE_ARROW_SCHEMA
-        # The remote dict has its placeholder default so schema
+        # Both keyed dicts carry their placeholder default so schema
         # introspection works without checking for an empty mapping.
+        assert list(batch.local_hits) == [DEFAULT_LOCAL_PATH_KEY]
         assert list(batch.remote_hits) == [DEFAULT_REMOTE_TABLE_KEY]
-        assert batch.remote_hits[DEFAULT_REMOTE_TABLE_KEY].schema == (
-            RESPONSE_ARROW_SCHEMA
-        )
+        # Local and remote share one default sentinel under the hood.
+        assert DEFAULT_LOCAL_PATH_KEY == DEFAULT_REMOTE_TABLE_KEY == DEFAULT_BUCKET_KEY
 
     def test_lists_are_coerced_to_tabular_holders(self):
         # The constructor lifts list[Response] into TabularIO holders so
         # all three buckets share one read contract. A bare list passed
-        # for remote_hits is treated as a single untagged bucket and
-        # stored under the default-table key.
+        # for local_hits / remote_hits is treated as a single untagged
+        # bucket and stored under the default placeholder key.
         batch = ResponseBatch(
             local_hits=[_make_response("http://x/local")],
             remote_hits=[
@@ -79,7 +84,9 @@ class TestResponseBatchPython:
                 _make_response("http://x/remote-2"),
             ],
         )
-        assert isinstance(batch.local_hits, TabularIO)
+        assert isinstance(batch.local_hits, dict)
+        assert list(batch.local_hits) == [DEFAULT_LOCAL_PATH_KEY]
+        assert isinstance(batch.local_hits[DEFAULT_LOCAL_PATH_KEY], TabularIO)
         assert isinstance(batch.remote_hits, dict)
         assert list(batch.remote_hits) == [DEFAULT_REMOTE_TABLE_KEY]
         assert isinstance(batch.remote_hits[DEFAULT_REMOTE_TABLE_KEY], TabularIO)
@@ -87,6 +94,39 @@ class TestResponseBatchPython:
         # rather than ``None`` so empty results still expose a schema.
         assert isinstance(batch.new_hits, TabularIO)
         assert batch.new_hits.schema == RESPONSE_ARROW_SCHEMA
+
+    def test_local_hits_dict_input_preserves_per_path_split(self):
+        # When the caller hands a dict keyed by local-cache folder
+        # path, each entry becomes its own holder so downstream
+        # consumers can see which cache root answered which subset.
+        batch = ResponseBatch(
+            local_hits={
+                "/var/cache/tenant_a": [_make_response("http://x/a1")],
+                "/var/cache/tenant_b": [
+                    _make_response("http://x/b1"),
+                    _make_response("http://x/b2"),
+                ],
+            },
+        )
+        assert list(batch.local_hits) == [
+            "/var/cache/tenant_a", "/var/cache/tenant_b",
+        ]
+        assert batch.local_paths == [
+            "/var/cache/tenant_a", "/var/cache/tenant_b",
+        ]
+        assert batch.local_counts == {
+            "/var/cache/tenant_a": 1, "/var/cache/tenant_b": 2,
+        }
+        # ``counts["local"]`` rolls the per-path breakdown into a
+        # single integer so the existing aggregate API keeps working.
+        assert batch.counts == {"local": 3, "remote": 0, "new": 0}
+        # parts() flattens every local-path holder + remote default +
+        # new, so a two-path local bucket produces four parts total.
+        assert len(batch.parts()) == 4
+        # Iteration walks every local path in registration order
+        # before yielding remote / new hits.
+        urls = _urls(list(batch))
+        assert urls == ["http://x/a1", "http://x/b1", "http://x/b2"]
 
     def test_remote_hits_dict_input_preserves_per_table_split(self):
         # When the caller hands a dict keyed by cache-table full name,
@@ -144,13 +184,14 @@ class TestResponseBatchPython:
         assert batch.counts == {"local": 2, "remote": 0, "new": 1}
 
     def test_setters_coerce_through_private_holders(self):
-        # Public setters route through `_coerce_bucket`, so a list
-        # written via `batch.local_hits = [...]` shows up as a
-        # TabularIO on the private holder.
+        # Public setters route through `_coerce_keyed_bucket`, so a
+        # bare list written via `batch.local_hits = [...]` shows up
+        # as a single-entry dict under the default placeholder key.
         batch = ResponseBatch()
         batch.local_hits = [_make_response("http://x/1")]
-        assert isinstance(batch.local_hits, TabularIO)
-        assert batch._local_response is batch.local_hits
+        assert isinstance(batch.local_hits, dict)
+        assert list(batch.local_hits) == [DEFAULT_LOCAL_PATH_KEY]
+        assert batch._local_responses is batch.local_hits
 
     def test_extend_merges_in_place_and_returns_self(self):
         a = ResponseBatch(local_hits=[_make_response("http://x/a")])
@@ -188,6 +229,26 @@ class TestResponseBatchPython:
         assert a.remote_tables == ["cat.db.tbl_a", "cat.db.tbl_b"]
         assert a.remote_counts == {"cat.db.tbl_a": 1, "cat.db.tbl_b": 1}
         assert a.counts == {"local": 1, "remote": 2, "new": 0}
+
+    def test_extend_merges_local_per_path_dropping_default_placeholder(self):
+        # ``a`` only carries the placeholder default local bucket.
+        # Merging in real per-path entries from ``b`` should drop the
+        # placeholder so the merged batch reflects only real cache
+        # roots — same invariant as the remote-side merge.
+        a = ResponseBatch(new_hits=[_make_response("http://x/n")])
+        b = ResponseBatch(
+            local_hits={
+                "/var/cache/tenant_a": [_make_response("http://x/a1")],
+                "/var/cache/tenant_b": [_make_response("http://x/b1")],
+            },
+        )
+
+        a.extend(b)
+        assert a.local_paths == ["/var/cache/tenant_a", "/var/cache/tenant_b"]
+        assert a.local_counts == {
+            "/var/cache/tenant_a": 1, "/var/cache/tenant_b": 1,
+        }
+        assert a.counts == {"local": 2, "remote": 0, "new": 1}
 
     def test_extend_appends_into_matching_remote_table_keys(self):
         # Same table key on both sides → row counts accumulate on the
