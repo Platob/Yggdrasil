@@ -27,11 +27,7 @@ __all__ = ["CacheConfig", "SendConfig", "SendManyConfig"]
 _DEFAULT_REQUEST_BY: tuple[str, ...] = (
     "request_method",
     "request_url_host",
-    "request_url_path",
-    "request_url_port",
-    "request_url_query",
-    "request_content_length",
-    "request_body_hash",
+    "request_hash",
 )
 
 _CACHE_CONFIG_FIELDS: frozenset[str] = frozenset(
@@ -118,19 +114,24 @@ def _local_cache_schema():
     """Return :data:`RESPONSE_SCHEMA` with the local-cache partition tags.
 
     Marks :data:`LOCAL_CACHE_PARTITION_COLUMNS` as ``partition_by``
-    so :class:`FolderIO` builds the matching Hive layout
-    automatically. Cached on the function for cheap repeat access —
-    the underlying :class:`Schema` is immutable.
+    and clears the flag on every other field so :class:`FolderIO`
+    only builds the directory tree we actually want — without this
+    reset, fields like ``request_url_path`` (tagged for the remote
+    Delta cache) would re-introduce per-URL directories whose names
+    blow past Windows ``MAX_PATH``. Cached on the function for cheap
+    repeat access — the underlying :class:`Schema` is immutable.
     """
     cached = getattr(_local_cache_schema, "_cached", None)
     if cached is not None:
         return cached
     schema = RESPONSE_SCHEMA.copy()
-    for name in LOCAL_CACHE_PARTITION_COLUMNS:
-        if name not in schema.names:
-            continue
+    keep = set(LOCAL_CACHE_PARTITION_COLUMNS)
+    for name in schema.names:
         f = schema[name]
-        schema[name] = f.with_partition_by(True, inplace=False)
+        if name in keep:
+            schema[name] = f.with_partition_by(True, inplace=False)
+        elif f.partition_by:
+            schema[name] = f.with_partition_by(False, inplace=False)
     _local_cache_schema._cached = schema
     return schema
 

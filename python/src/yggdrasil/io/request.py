@@ -339,6 +339,25 @@ REQUEST_SCHEMA["request_body_hash"] = schema_field(
     },
 )
 
+# 16-char xxh3_64 hex digest over (method, url, body). Short, deterministic,
+# path-safe — used as the local-cache identity key so directory paths don't
+# encode the raw URL (Windows MAX_PATH bites otherwise).
+REQUEST_SCHEMA["request_hash"] = schema_field(
+    "request_hash",
+    pa.string(),
+    nullable=False,
+    metadata={
+        "comment": "16-char hex digest over method+url+body (xxh3_64, blake2b fallback)",
+        "algorithm": "xxh3_64",
+    },
+    tags={
+        "entity": "request",
+        "group": "identity",
+        "algorithm": "xxh3_64",
+        "primary_key": True,
+    },
+)
+
 REQUEST_SCHEMA["request_sent_at"] = schema_field(
     "request_sent_at",
     pa.timestamp("us", "UTC"),
@@ -802,7 +821,10 @@ class PreparedRequest:
 
         if self.buffer is not None:
             body_bytes = self.buffer.to_bytes()
-            body_hash = self.buffer.xxh3_int64()
+            try:
+                body_hash = self.buffer.xxh3_int64()
+            except ImportError:
+                body_hash = None
         else:
             body_bytes = None
             body_hash = None
@@ -830,6 +852,7 @@ class PreparedRequest:
             "request_tags": tags_v,
             "request_body": body_bytes,
             "request_body_hash": body_hash,
+            "request_hash": self.request_hash(),
             "request_sent_at": self.sent_at
         }
 
@@ -896,6 +919,35 @@ class PreparedRequest:
             if url_safe
             else base64.b64encode(h).decode("ascii")
         )
+
+    def request_hash(self) -> str:
+        # 16-char hex digest over (method, url, body) — stable across
+        # processes and short enough to use as a path segment without
+        # tripping Windows MAX_PATH. xxh3_64 is the fastest non-cryptographic
+        # option; blake2b is the stdlib fallback when xxhash isn't installed
+        # so the canonical Arrow projection never produces a null identity.
+        url_bytes = self.url.to_string().encode("utf-8")
+        method_bytes = (self.method or "GET").encode("utf-8")
+        try:
+            import xxhash
+            h = xxhash.xxh3_64()
+            h.update(method_bytes)
+            h.update(b"\x00")
+            h.update(url_bytes)
+            h.update(b"\x00")
+            if self.buffer is not None:
+                h.update(self.buffer.xxh3_64().digest())
+            return h.hexdigest()
+        except ImportError:
+            import hashlib
+            h = hashlib.blake2b(digest_size=8)
+            h.update(method_bytes)
+            h.update(b"\x00")
+            h.update(url_bytes)
+            h.update(b"\x00")
+            if self.buffer is not None:
+                h.update(self.buffer.to_bytes())
+            return h.hexdigest()
 
     def update_headers(
         self,
