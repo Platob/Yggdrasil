@@ -442,6 +442,31 @@ class Session(ABC):
         )
         return self._send(request, cfg)
 
+    def _prepare_request(self, request: PreparedRequest) -> PreparedRequest:
+        """Session-wide request hook fired once per outbound request.
+
+        Default returns *request* unchanged. Subclasses override to inject
+        session-level concerns — auth, signing, correlation IDs, mandatory
+        headers — that should apply to every request leaving this session.
+        Runs in :meth:`_send` just before :meth:`_local_send`, so cache hits
+        bypass it; the per-request ``before_send`` hook still fires inside
+        :meth:`PreparedRequest.prepare_to_send` afterwards. Travels with the
+        session into Spark workers via ``__getstate__`` / ``__setstate__``.
+        """
+        return request
+
+    def _after_send(self, response: Response) -> Response:
+        """Session-wide response hook fired once per completed network send.
+
+        Default returns *response* unchanged. Subclasses override to log,
+        redact, enrich, or wrap responses returned from the wire. Runs in
+        :meth:`_send` after :meth:`_local_send` and before cache writeback,
+        so the persisted response reflects any post-processing. Cache hits
+        bypass it. Travels with the session into Spark workers via
+        ``__getstate__`` / ``__setstate__``.
+        """
+        return response
+
     def _send(
         self,
         request: PreparedRequest,
@@ -502,8 +527,10 @@ class Session(ABC):
                 return remote_response
 
         # --- 3. No cache hit — perform actual request ---
+        request = self._prepare_request(request)
         LOGGER.debug("Sending %s %s", request.method, request.url)
         response = self._local_send(request, config=config)
+        response = self._after_send(response)
         LOGGER.info("Sent %s %s", request.method, request.url)
 
         if local_cache is not None:
@@ -1509,6 +1536,10 @@ class Session(ABC):
         # Capture the session for executor serialisation. Session.__getstate__
         # / __setstate__ are required to make this pickle-safe — otherwise
         # the threading.RLock / JobPoolExecutor will choke at scatter time.
+        # Carrying the live session also carries any subclass overrides of
+        # :meth:`_prepare_request` / :meth:`_after_send` into the workers, so
+        # session-level request signing and response post-processing fire on
+        # the executors exactly as they do on the driver.
         session = self
         response_spark_schema = RESPONSE_SCHEMA.to_spark_schema()
 
