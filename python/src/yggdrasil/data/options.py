@@ -159,6 +159,23 @@ class CastOptions:
     read_seek: int | None = None
     write_seek: int | None = None
     where: Predicate | None = None
+    #: Predicate evaluated against the source side — used when reading
+    #: to filter rows before they reach the cast pipeline. ``None``
+    #: means no filter; semantics follow yggdrasil's three-valued
+    #: logic (UNKNOWN rows are dropped).
+    source_predicate: Predicate | None = None
+    #: Predicate evaluated against the target side — used after the
+    #: cast / write transformation to drop rows that don't satisfy
+    #: the destination's invariants. ``None`` means no filter.
+    target_predicate: Predicate | None = None
+    #: Predicate evaluated against a discovered child (``name``,
+    #: ``path``, ``is_dir``, ``is_private``) for IOs that aggregate
+    #: sub-IOs (folders, zips, partitioned tables). Replaces the
+    #: legacy ``include_patterns`` / ``exclude_patterns`` /
+    #: ``exclude_private`` glob knobs with one composable predicate
+    #: backed by :mod:`yggdrasil.data.expr` — for example
+    #: ``~col("name").like(".%") & col("name").like("%.parquet")``.
+    children_predicate: Predicate | None = None
     read_write_upsert: bool = False
     wait: WaitingConfig = WaitingConfig.default()
     spark_session: "SparkSession | None" = None

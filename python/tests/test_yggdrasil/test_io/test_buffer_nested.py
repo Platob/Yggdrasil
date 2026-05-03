@@ -162,6 +162,49 @@ class TestFolderIOFlat:
         assert ".hidden.parquet" not in names
         assert "visible.parquet" in names
 
+    def test_iter_children_predicate_filters_by_name(self, tmp_path: Path):
+        # ``children_predicate`` replaces the old include / exclude
+        # glob knobs — write the filter as a real predicate against
+        # the discovered child's metadata mapping.
+        from yggdrasil.data.expr import col
+
+        ParquetIO(path=str(tmp_path / "a.parquet")).write_arrow_table(
+            _flat_table(),
+        )
+        ParquetIO(path=str(tmp_path / "b.parquet")).write_arrow_table(
+            _flat_table(),
+        )
+        (tmp_path / "scratch.tmp").write_bytes(b"")
+
+        # Keep only ``.parquet`` leaves.
+        keep = col("name").like("%.parquet")
+        names = sorted(
+            c.path.name
+            for c in FolderIO(path=str(tmp_path)).iter_children(
+                children_predicate=keep,
+            )
+        )
+        assert names == ["a.parquet", "b.parquet"]
+
+    def test_iter_children_predicate_can_use_is_dir_metadata(self, tmp_path: Path):
+        from yggdrasil.data.expr import col
+
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        ParquetIO(path=str(sub / "leaf.parquet")).write_arrow_table(_flat_table())
+        ParquetIO(path=str(tmp_path / "top.parquet")).write_arrow_table(_flat_table())
+
+        # Only top-level files (no sub-folders) — the predicate
+        # introspects ``is_dir`` from the metadata mapping.
+        keep_files = col("is_dir") == False  # noqa: E712
+        children = list(
+            FolderIO(path=str(tmp_path), recursive=False).iter_children(
+                children_predicate=keep_files,
+            )
+        )
+        names = sorted(c.path.name for c in children)
+        assert names == ["top.parquet"]
+
     def test_recursive_descent_through_subfolder(self, tmp_path: Path):
         sub = tmp_path / "sub"
         sub.mkdir()

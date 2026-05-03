@@ -316,11 +316,14 @@ class FolderIO(NestedIO[FolderOptions]):
         :class:`BytesIO` so callers can still pull bytes from them.
         Unknown / un-readable entries are silently skipped.
 
-        :class:`ChildrenOptions` filters apply: ``include_patterns`` /
-        ``exclude_patterns`` are matched against the entry name,
-        ``exclude_private`` skips dot-prefixed entries (in addition
-        to :meth:`_is_ignored_path` for backend-specific hides like
-        ``_delta_log/``).
+        ``options.children_predicate`` is honoured via the shared
+        :func:`yggdrasil.io.buffer.base.matches_children_predicate`
+        helper. Combined with backend-specific ignores (the default
+        :meth:`_is_ignored_path` hides dot-prefixed entries; Delta
+        adds ``_delta_log/``), this is the canonical filter point —
+        no glob-pattern fallbacks. To exclude files by extension
+        write the predicate explicitly:
+        ``children_predicate=~col("name").like("%.tmp")``.
 
         Each child's ``parent`` attribute is stamped to ``self``.
         Children are returned closed (un-acquired); caller opens
@@ -329,6 +332,8 @@ class FolderIO(NestedIO[FolderOptions]):
         Missing folder is treated as empty: no children yielded,
         no error raised.
         """
+        from yggdrasil.io.buffer.base import matches_children_predicate
+
         if not self.path.exists():
             return
 
@@ -337,8 +342,6 @@ class FolderIO(NestedIO[FolderOptions]):
         for entry in self.path.iterdir():
             if self._is_ignored_path(entry):
                 continue
-            if not options.matches_name(entry.name):
-                continue
 
             try:
                 is_dir = entry.is_dir()
@@ -346,6 +349,12 @@ class FolderIO(NestedIO[FolderOptions]):
                 # Stat failure on a child mid-listing — skip rather
                 # than abort. Listings on remote stores can race
                 # with deletes.
+                continue
+
+            if not matches_children_predicate(
+                options, entry.name,
+                path=str(entry), is_dir=is_dir,
+            ):
                 continue
 
             if is_dir:

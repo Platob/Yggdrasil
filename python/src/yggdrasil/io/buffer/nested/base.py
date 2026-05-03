@@ -82,7 +82,8 @@ from yggdrasil.data.schema import Schema
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.enums import MimeType, Mode
 from yggdrasil.io.fs import Path
-from yggdrasil.io.buffer.base import ChildrenOptions, TabularIO
+from yggdrasil.data.options import CastOptions
+from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.lazy_imports import path_class
 
 if TYPE_CHECKING:
@@ -98,15 +99,16 @@ __all__ = ["NestedIO", "NestedOptions"]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class NestedOptions(ChildrenOptions):
+class NestedOptions(CastOptions):
     """Cast options extended with folder-write knobs.
 
     Inherits everything from :class:`CastOptions` (mode, row_size,
-    byte_size, schema-cast hooks, ``recursive``) and the
-    :class:`ChildrenOptions` discovery filters
-    (``include_patterns``/``exclude_patterns``/``exclude_private``/
-    ``max_depth``/``follow_symlinks``).  ``NestedOptions`` adds only
-    knobs the folder writer needs.
+    byte_size, schema-cast hooks, ``recursive``,
+    ``children_predicate``).  ``NestedOptions`` adds only knobs the
+    folder writer needs — sub-IO discovery is filtered uniformly
+    via :attr:`CastOptions.children_predicate` plus the shared
+    :func:`yggdrasil.io.buffer.base.matches_children_predicate`
+    helper.
 
     :param child_media_type: the :class:`MediaType` to mint child
         files as on write. ``None`` (default) means "infer from the
