@@ -43,6 +43,15 @@ class TestFromStr:
     def test_empty_path_becomes_root(self):
         assert URL.from_str("https://example.com").path == "/"
 
+    def test_html_entity_ampersand_in_query_decoded(self):
+        u = URL.from_str("https://example.com/api?foo=1&amp;update_id=202605032129")
+        assert dict(u.query_items()) == {"foo": "1", "update_id": "202605032129"}
+        assert "amp;" not in u.to_string()
+
+    def test_html_entity_ampersand_in_fragment_decoded(self):
+        u = URL.from_str("https://example.com/p#a=1&amp;b=2")
+        assert u.fragment == "a=1&b=2"
+
 
 class TestFromPathlib:
     def test_pathlib_path_becomes_file_url(self, tmp_path):
