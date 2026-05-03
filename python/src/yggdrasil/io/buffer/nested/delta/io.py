@@ -672,6 +672,23 @@ class DeltaIO(PartitionedFolderIO):
         if not incoming_keys:
             return
 
+        # When ``update_column_names`` is set, columns outside the update
+        # list must keep their existing values on a key match. Read the
+        # current full table and let :meth:`_restrict_update_columns`
+        # rebuild the incoming side with preserved column values pulled
+        # from the existing rows that share each key. Fresh rows (no
+        # existing match) keep null in the preserved columns.
+        if options.update_column_names is not None:
+            existing_table = any_to_arrow_table(
+                self._read_arrow_batches(options.copy(read_seek=0)),
+                options,
+            )
+            incoming_table = self._restrict_update_columns(
+                existing_table, incoming_table,
+                match_by=match_by,
+                update_column_names=tuple(options.update_column_names),
+            )
+
         # For each live AddFile that has at least one row matching
         # an incoming key: build the new DV.
         before_files = self._scan_data_files()

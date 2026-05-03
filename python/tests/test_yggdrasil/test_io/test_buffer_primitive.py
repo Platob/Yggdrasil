@@ -120,6 +120,78 @@ class TestPrimitiveIOBase:
 
 
 # ---------------------------------------------------------------------------
+# merge_upsert_tables — update_column_names semantics
+# ---------------------------------------------------------------------------
+
+
+class TestMergeUpsertUpdateColumnNames:
+    """``merge_upsert_tables(update_column_names=...)`` matches MERGE
+    SET semantics: only listed columns take incoming values on a key
+    match; non-key columns outside the list keep existing values.
+    """
+
+    def _existing(self) -> pa.Table:
+        return pa.Table.from_pylist([
+            {"id": 1, "name": "alice", "score": 10, "note": "old"},
+            {"id": 2, "name": "bob",   "score": 20, "note": "old"},
+            {"id": 3, "name": "carol", "score": 30, "note": "old"},
+        ])
+
+    def _incoming(self) -> pa.Table:
+        # ids 2 and 3 collide with existing; id 4 is new.
+        return pa.Table.from_pylist([
+            {"id": 2, "name": "robert", "score": 99, "note": "new"},
+            {"id": 3, "name": "carrie", "score": 88, "note": "new"},
+            {"id": 4, "name": "dave",   "score": 77, "note": "new"},
+        ])
+
+    def test_default_behaviour_replaces_full_row(self):
+        io = ParquetIO()
+        merged = io.merge_upsert_tables(
+            self._existing(), self._incoming(), match_by=["id"],
+        )
+        rows = sorted(merged.to_pylist(), key=lambda r: r["id"])
+        # id=2,3 fully replaced by incoming; id=4 inserted; id=1 kept.
+        assert rows[0] == {"id": 1, "name": "alice", "score": 10, "note": "old"}
+        assert rows[1] == {"id": 2, "name": "robert", "score": 99, "note": "new"}
+        assert rows[2] == {"id": 3, "name": "carrie", "score": 88, "note": "new"}
+        assert rows[3] == {"id": 4, "name": "dave",   "score": 77, "note": "new"}
+
+    def test_update_column_names_preserves_unlisted_columns(self):
+        io = ParquetIO()
+        merged = io.merge_upsert_tables(
+            self._existing(), self._incoming(),
+            match_by=["id"],
+            update_column_names=["score"],  # only "score" gets updated
+        )
+        rows = sorted(merged.to_pylist(), key=lambda r: r["id"])
+        # id=1 untouched.
+        assert rows[0] == {"id": 1, "name": "alice", "score": 10, "note": "old"}
+        # id=2,3: score from incoming, name/note preserved from existing.
+        assert rows[1] == {"id": 2, "name": "bob",   "score": 99, "note": "old"}
+        assert rows[2] == {"id": 3, "name": "carol", "score": 88, "note": "old"}
+        # id=4: pure insert, no existing match -> name carried, note/score
+        # are not in update list and have no existing source -> nulls.
+        assert rows[3] == {"id": 4, "name": None, "score": 77, "note": None}
+
+    def test_update_column_names_empty_list_preserves_everything(self):
+        # Empty update list = nothing changes on match; only inserts apply.
+        io = ParquetIO()
+        merged = io.merge_upsert_tables(
+            self._existing(), self._incoming(),
+            match_by=["id"],
+            update_column_names=[],
+        )
+        rows = sorted(merged.to_pylist(), key=lambda r: r["id"])
+        assert rows[0] == {"id": 1, "name": "alice", "score": 10, "note": "old"}
+        assert rows[1] == {"id": 2, "name": "bob",   "score": 20, "note": "old"}
+        assert rows[2] == {"id": 3, "name": "carol", "score": 30, "note": "old"}
+        # id=4 still gets inserted; non-update preserved-cols come from
+        # existing but there's no matching id=4 there -> nulls.
+        assert rows[3] == {"id": 4, "name": None, "score": None, "note": None}
+
+
+# ---------------------------------------------------------------------------
 # Save-mode resolution
 # ---------------------------------------------------------------------------
 

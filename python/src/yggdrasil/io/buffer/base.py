@@ -1144,8 +1144,21 @@ class TabularIO(Disposable, ABC, Generic[O]):
         incoming: pa.Table,
         *,
         match_by: Sequence[str],
+        update_column_names: Sequence[str] | None = None,
     ) -> pa.Table:
-        """Outer-merge with incoming-wins-on-overlap."""
+        """Outer-merge with incoming-wins-on-overlap.
+
+        With ``update_column_names``, only those columns are taken from
+        the incoming side on a key match; non-key columns outside the
+        update list keep their existing values. Mirrors the warehouse
+        ``MERGE … WHEN MATCHED THEN UPDATE SET <cols>`` semantics so a
+        user can switch between Delta and a buffer-backed target without
+        rewriting the upsert payload.
+
+        ``update_column_names = None`` keeps the historical behaviour:
+        every non-key column on the incoming side overwrites the
+        existing one.
+        """
         match_by = tuple(match_by)
         if not match_by:
             raise ValueError("match_by must contain at least one column name")
@@ -1168,8 +1181,74 @@ class TabularIO(Disposable, ABC, Generic[O]):
         if existing.num_rows == 0:
             return incoming
 
+        if update_column_names is not None:
+            incoming = self._restrict_update_columns(
+                existing, incoming,
+                match_by=match_by,
+                update_column_names=tuple(update_column_names),
+            )
+
         survivors = self._filter_out_matches(existing, incoming, match_by)
         return self.concat_with_schema_union([survivors, incoming])
+
+    def _restrict_update_columns(
+        self,
+        existing: pa.Table,
+        incoming: pa.Table,
+        *,
+        match_by: Sequence[str],
+        update_column_names: Sequence[str],
+    ) -> pa.Table:
+        """Replace incoming non-update columns with values pulled from
+        existing rows that share the same match key.
+
+        For incoming rows whose key has no existing match, columns
+        outside ``update_column_names`` are left as nulls — the row is a
+        plain INSERT and there's nothing to preserve from the target
+        side.
+        """
+        update_set = set(update_column_names)
+        match_set = set(match_by)
+        preserved_cols = [
+            name for name in incoming.column_names
+            if name not in match_set and name not in update_set
+            and name in existing.column_names
+        ]
+        if not preserved_cols:
+            return incoming
+
+        if len(match_by) == 1:
+            col = match_by[0]
+            existing_keys = existing[col].to_pylist()
+            key_to_row = {k: i for i, k in enumerate(existing_keys) if k is not None}
+            incoming_keys = incoming[col].to_pylist()
+        else:
+            existing_keys = list(zip(
+                *[existing[c].to_pylist() for c in match_by]
+            ))
+            key_to_row = {k: i for i, k in enumerate(existing_keys)}
+            incoming_keys = list(zip(
+                *[incoming[c].to_pylist() for c in match_by]
+            ))
+
+        preserved_arrays: dict[str, pa.Array] = {}
+        for name in preserved_cols:
+            existing_col = existing[name].to_pylist()
+            preserved_arrays[name] = pa.array(
+                [
+                    existing_col[key_to_row[k]] if k in key_to_row else None
+                    for k in incoming_keys
+                ],
+                type=existing.schema.field(name).type,
+            )
+
+        new_columns = []
+        for i, name in enumerate(incoming.column_names):
+            if name in preserved_arrays:
+                new_columns.append(preserved_arrays[name])
+            else:
+                new_columns.append(incoming.column(i))
+        return pa.table(new_columns, names=list(incoming.column_names))
 
     def concat_with_schema_union(
         self,
@@ -1291,7 +1370,9 @@ class TabularIO(Disposable, ABC, Generic[O]):
         incoming_table = any_to_arrow_table(batches, options)
 
         merged = self.merge_upsert_tables(
-            existing_table, incoming_table, match_by=match_by,
+            existing_table, incoming_table,
+            match_by=match_by,
+            update_column_names=options.update_column_names,
         )
 
         self._write_arrow_batches(
