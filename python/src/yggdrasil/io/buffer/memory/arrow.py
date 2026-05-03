@@ -54,8 +54,13 @@ class MemoryArrowIO(TabularIO[CastOptions]):
         data: ArrowSource = None,
         *,
         schema: Optional[pa.Schema] = None,
+        **kwargs: Any,
     ) -> None:
-        super().__init__()
+        # ``**kwargs`` forwards :class:`TabularIO`-shared init args
+        # (``static_values``, ``media_type``, …) without listing
+        # them explicitly here — keeps this constructor focused
+        # on the in-memory-specific surface.
+        super().__init__(**kwargs)
         self._batches: list[pa.RecordBatch] = []
         self._schema: Optional[pa.Schema] = schema
         if data is not None:

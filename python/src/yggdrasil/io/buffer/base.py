@@ -80,7 +80,12 @@ if TYPE_CHECKING:
     from yggdrasil.io.fs import Path
 
 
-__all__ = ["TabularIO", "matches_children_predicate"]
+__all__ = [
+    "TabularIO",
+    "matches_children_predicate",
+    "inject_static_values_into_batch",
+    "inject_static_values_into_table",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +147,78 @@ def matches_children_predicate(
         # as a strict "drop" so misconfigured predicates surface
         # as missing data rather than as bypassing the filter.
         return False
+
+
+# ---------------------------------------------------------------------------
+# Static-value injection — used by :class:`TabularIO` read paths to
+# attach constant columns to every batch / table on the way out.
+# ---------------------------------------------------------------------------
+
+
+def inject_static_values_into_batch(
+    batch: pa.RecordBatch,
+    values: "Mapping[str, Any] | None",
+) -> pa.RecordBatch:
+    """Append constant columns to *batch* from ``{name: value}``.
+
+    Columns already present in ``batch.schema`` are left
+    untouched — the injection is additive, so a source that
+    already carries (say) a ``year`` column overrides any static
+    ``year`` attached on the IO. Arrow types are inferred from
+    the Python value via :func:`pyarrow.array`; pin a specific
+    dtype by storing a :class:`pyarrow.Scalar` in the map.
+    """
+    if not values:
+        return batch
+    n = batch.num_rows
+    for name, value in values.items():
+        if name in batch.schema.names:
+            continue
+        column = _build_static_column(value, n)
+        batch = batch.append_column(name, column)
+    return batch
+
+
+def inject_static_values_into_table(
+    table: pa.Table,
+    values: "Mapping[str, Any] | None",
+) -> pa.Table:
+    """Table-flavoured counterpart to :func:`inject_static_values_into_batch`."""
+    if not values:
+        return table
+    n = table.num_rows
+    for name, value in values.items():
+        if name in table.column_names:
+            continue
+        column = _build_static_column(value, n)
+        table = table.append_column(name, column)
+    return table
+
+
+def _build_static_column(value: Any, n_rows: int) -> pa.Array:
+    """Build an ``n_rows``-long Arrow array of ``value``.
+
+    A :class:`pyarrow.Scalar` keeps its declared dtype; a Python
+    value goes through :func:`pyarrow.array` for type inference.
+    Empty (``n_rows == 0``) tables get a typed empty array so
+    schema introspection still works downstream.
+    """
+    if isinstance(value, pa.Scalar):
+        return pa.array([value.as_py()] * n_rows, type=value.type)
+    if n_rows == 0:
+        # ``pa.array([])`` is null-typed by default; promote via a
+        # one-element probe so the empty column has the right
+        # dtype on the schema.
+        probe = pa.array([value])
+        return pa.array([], type=probe.type)
+    return pa.array([value] * n_rows)
+
+
+# Internal aliases used by :meth:`TabularIO.read_arrow_batches` /
+# :meth:`TabularIO.read_arrow_table` — kept short on the call site.
+_inject_static_batch = inject_static_values_into_batch
+_inject_static_table = inject_static_values_into_table
+
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -248,6 +325,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         self,
         *args: Any,
         media_type: Any = None,
+        static_values: "Mapping[str, Any] | None" = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the state every :class:`TabularIO` carries.
@@ -264,6 +342,13 @@ class TabularIO(Disposable, ABC, Generic[O]):
           session is reachable, otherwise a :class:`MemoryArrowIO`);
           :meth:`unpersist` clears it. Read paths short-circuit
           through it before touching the source.
+        * ``static_values`` — optional ``{column: value}`` map of
+          constant columns to attach to every batch / table on
+          read. Useful for tagging batches with metadata the
+          source itself doesn't carry (partition values inferred
+          from a path, a ``source="cache"`` marker, ingestion
+          timestamps, etc.). Existing columns with the same name
+          are left untouched — the injection is additive.
         * Spill-path slots — ``_spill_path`` / ``_owns_spill_path``
           used by :class:`BytesIO` (and any byte-buffer-backed
           subclass) to track durable storage. They live on
@@ -289,6 +374,14 @@ class TabularIO(Disposable, ABC, Generic[O]):
         # cache (MemorySparkIO when Spark is reachable, MemoryArrowIO
         # otherwise). Read paths delegate through it when set.
         self._persisted_data: "TabularIO | None" = None
+        # Static value attachments — defensively copied into a plain
+        # ``dict`` so mutations on the caller's mapping after
+        # construction don't leak through. Empty mapping coerces
+        # to ``None`` so the read-path guard stays a single cheap
+        # ``is None`` check.
+        self.static_values: "dict[str, Any] | None" = (
+            dict(static_values) if static_values else None
+        )
         # Buffer-backing slots — concrete byte buffers fill these in;
         # non-byte TabularIOs (StatementResult, NestedIO trees, …)
         # leave them at None.
@@ -743,15 +836,24 @@ class TabularIO(Disposable, ABC, Generic[O]):
         options: "O | None" = None,
         **kwargs: Any,
     ) -> Iterator[pa.RecordBatch]:
-        """Yield Arrow record batches. Primary streaming read path."""
+        """Yield Arrow record batches. Primary streaming read path.
+
+        :attr:`static_values` (when set) is injected into every
+        batch as constant columns — additive, so a column that
+        already exists on the underlying source is left
+        untouched.
+        """
+        static = self.static_values
         if self._persisted_data is not None:
-            yield from self._persisted_data.read_arrow_batches(
+            for batch in self._persisted_data.read_arrow_batches(
                 options=options, **kwargs,
-            )
+            ):
+                yield _inject_static_batch(batch, static)
             return
-        yield from self._read_arrow_batches(
+        for batch in self._read_arrow_batches(
             self.check_options(options, overrides=locals())
-        )
+        ):
+            yield _inject_static_batch(batch, static)
 
     def to_arrow_table(
         self,
@@ -765,12 +867,19 @@ class TabularIO(Disposable, ABC, Generic[O]):
         options: "O | None" = None,
         **kwargs: Any,
     ) -> pa.Table:
-        """Read everything into a single :class:`pyarrow.Table`."""
+        """Read everything into a single :class:`pyarrow.Table`.
+
+        :attr:`static_values` is injected as constant columns on
+        the way out, mirroring :meth:`read_arrow_batches`.
+        """
+        static = self.static_values
         if self._persisted_data is not None:
-            return self._persisted_data.read_arrow_table(
+            table = self._persisted_data.read_arrow_table(
                 options=options, **kwargs,
             )
-        return self._read_arrow_table(self.check_options(options, overrides=locals()))
+        else:
+            table = self._read_arrow_table(self.check_options(options, overrides=locals()))
+        return _inject_static_table(table, static)
 
     def _read_arrow_table(self, options: O) -> pa.Table:
         batches = list(self._read_arrow_batches(options))
