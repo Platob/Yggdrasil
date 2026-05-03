@@ -15,7 +15,8 @@ __all__ = [
     "serialize_dataclass_state",
     "restore_dataclass_state",
     "default_value",
-    "lazy_property"
+    "lazy_property",
+    "YggDataclass",
 ]
 
 DATACLASS_ARROW_FIELD_CACHE: dict[type, "pa.Field"] = {}
@@ -177,3 +178,191 @@ def lazy_property(
         return created
 
     return factory(self)
+
+
+def _stateful_fields(obj_or_cls: Any) -> list[Field[Any]]:
+    """Fields that participate in the default getstate/setstate contract.
+
+    Rules:
+      - every init=True field
+      - every init=False field whose name does not start with "_"
+
+    Private (leading underscore) non-init fields are treated as internal cache
+    state and skipped on both serialize and restore.
+    """
+    return [
+        f for f in fields(obj_or_cls)
+        if f.init or not f.name.startswith("_")
+    ]
+
+
+def _withable_field(obj_or_cls: Any, name: str) -> Optional[Field[Any]]:
+    """Return the dataclass field that backs ``with_<name>``, or None."""
+    for f in fields(obj_or_cls):
+        if f.name != name:
+            continue
+        if f.init or not f.name.startswith("_"):
+            return f
+        return None
+    return None
+
+
+class YggDataclass:
+    """Mixin adding ``copy``, ``with_<field>`` and pickle defaults to dataclasses.
+
+    Apply ``@dataclass`` (frozen or not, slots or not) to a subclass and you get:
+
+    - ``copy(*args, **kwargs)`` — build a sibling instance, replacing init fields
+      by position and/or keyword. Conflicting positional + keyword for the same
+      field raises ``TypeError`` instead of silently picking a side.
+    - ``with_<field>(value, *, inplace=False)`` — single-field updater. Defaults
+      to returning a fresh copy; ``inplace=True`` mutates the current instance
+      (uses ``object.__setattr__`` so it works on frozen dataclasses too — handy
+      for one-shot rehydration but skip it if you rely on hash stability).
+    - ``__getstate__`` / ``__setstate__`` — pickle/copy support that round-trips
+      every init field plus any non-init field whose name does not start with
+      ``"_"``. Init=False fields starting with ``"_"`` are treated as derived
+      cache state and rebuilt by ``__post_init__`` (or simply left unset).
+
+    Example::
+
+        @dataclass(frozen=True)
+        class Endpoint(YggDataclass):
+            host: str
+            port: int = 443
+            scheme: str = "https"
+
+        ep = Endpoint("api.example.com")
+        ep.with_port(8443)                  # → Endpoint('api.example.com', 8443, 'https')
+        ep.copy(scheme="http", port=80)     # → Endpoint('api.example.com', 80, 'http')
+        ep.copy("other.example.com")        # positional copy, replaces 'host'
+    """
+
+    # Empty slots so the mixin stays compatible with @dataclass(slots=True)
+    # subclasses — adding a __dict__ here would silently re-enable instance
+    # dicts on slotted children.
+    __slots__ = ()
+
+    # ── construction helpers ────────────────────────────────────
+
+    def copy(self, *args: Any, **kwargs: Any) -> "YggDataclass":
+        """Return a new instance with selected init fields replaced.
+
+        Positional ``args`` map to init fields in declaration order, exactly
+        like calling the dataclass constructor.  Keyword ``kwargs`` override
+        by name.  Any field not mentioned is carried over from ``self``.
+        """
+        cls = type(self)
+        if not is_dataclass(cls):
+            raise TypeError(
+                f"{cls.__name__}.copy() requires a @dataclass-decorated class. "
+                f"Apply @dataclass on the subclass and try again."
+            )
+
+        init_fields = [f for f in fields(cls) if f.init]
+        init_names = [f.name for f in init_fields]
+
+        if len(args) > len(init_fields):
+            raise TypeError(
+                f"{cls.__name__}.copy() takes up to {len(init_fields)} positional "
+                f"args, got {len(args)}. Init fields in order: {init_names}."
+            )
+
+        new_kwargs: dict[str, Any] = {name: getattr(self, name) for name in init_names}
+
+        for f, value in zip(init_fields, args):
+            if f.name in kwargs:
+                raise TypeError(
+                    f"{cls.__name__}.copy(): field {f.name!r} given both positionally "
+                    f"and by keyword. Pick one."
+                )
+            new_kwargs[f.name] = value
+
+        for key, value in kwargs.items():
+            if key not in new_kwargs:
+                raise TypeError(
+                    f"{cls.__name__}.copy(): unknown init field {key!r}. "
+                    f"Valid init fields: {init_names}."
+                )
+            new_kwargs[key] = value
+
+        return cls(**new_kwargs)
+
+    # ── dynamic with_<field> ────────────────────────────────────
+
+    def __getattr__(self, name: str) -> Any:
+        # __getattr__ only fires when normal lookup misses, so this stays off
+        # the hot path for real attribute access.
+        if not name.startswith("with_") or len(name) <= 5 or name.startswith("__"):
+            raise AttributeError(
+                f"{type(self).__name__!r} object has no attribute {name!r}"
+            )
+
+        field_name = name[5:]
+        try:
+            target = _withable_field(self, field_name)
+        except TypeError:
+            # Not a dataclass yet (e.g. mixin used without @dataclass).
+            raise AttributeError(
+                f"{type(self).__name__!r} object has no attribute {name!r}"
+            )
+
+        if target is None:
+            available = [
+                f.name for f in fields(self)
+                if f.init or not f.name.startswith("_")
+            ] if is_dataclass(self) else []
+            hint = f" Available fields: {available}." if available else ""
+            raise AttributeError(
+                f"{type(self).__name__!r} has no with_-able field {field_name!r}.{hint}"
+            )
+
+        is_init = target.init
+
+        def setter(value: Any, *, inplace: bool = False) -> Any:
+            if inplace:
+                object.__setattr__(self, field_name, value)
+                return self
+            if is_init:
+                return self.copy(**{field_name: value})
+            new = self.copy()
+            object.__setattr__(new, field_name, value)
+            return new
+
+        setter.__name__ = name
+        setter.__qualname__ = f"{type(self).__name__}.{name}"
+        setter.__doc__ = (
+            f"Return a copy of this {type(self).__name__} with {field_name!r} "
+            f"set to *value*. Pass ``inplace=True`` to mutate this instance instead."
+        )
+        return setter
+
+    # ── pickle / copy.deepcopy support ──────────────────────────
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {f.name: getattr(self, f.name) for f in _stateful_fields(self)}
+
+    def __setstate__(self, state: Any) -> None:
+        if state is None:
+            payload: dict[str, Any] = {}
+        elif isinstance(state, Mapping):
+            payload = dict(state)
+        else:
+            raise TypeError(
+                f"Cannot restore {type(self).__name__}: expected a dict-like state, "
+                f"got {type(state).__name__}."
+            )
+
+        cls_fields = _stateful_fields(self)
+        for f in cls_fields:
+            if f.name in payload:
+                object.__setattr__(self, f.name, payload[f.name])
+                continue
+            default = default_value(f)
+            if default is not MISSING:
+                object.__setattr__(self, f.name, default)
+            elif f.init:
+                raise TypeError(
+                    f"Cannot restore {type(self).__name__}: missing required field "
+                    f"{f.name!r}. Got keys: {sorted(payload)}."
+                )
