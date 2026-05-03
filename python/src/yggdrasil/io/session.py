@@ -652,6 +652,163 @@ class Session(ABC):
                 misses.append(req)
         return hits, misses
 
+    @staticmethod
+    def _responses_to_spark(
+        responses: list[Response],
+        spark: "SparkSession",
+    ) -> "SparkDataFrame":
+        """Lift a list of :class:`Response` to a schema-bearing Spark frame.
+
+        Used on the spark path to keep every bucket frame-resident.
+        Empty input yields an empty DataFrame keyed to
+        :data:`RESPONSE_SCHEMA` so downstream ``unionByName`` calls never
+        trip on a column-list mismatch. Non-empty input goes through
+        ``pa.Table.from_batches → spark.createDataFrame``; the pandas
+        fallback covers PySpark builds that reject Arrow tables directly.
+        """
+        if not responses:
+            return spark.createDataFrame(
+                [], schema=RESPONSE_SCHEMA.to_spark_schema(),
+            )
+        table = pa.Table.from_batches(
+            [r.to_arrow_batch(parse=False) for r in responses]
+        )
+        try:
+            return spark.createDataFrame(table)
+        except (TypeError, AttributeError):
+            return spark.createDataFrame(
+                table.to_pandas(),
+                schema=RESPONSE_SCHEMA.to_spark_schema(),
+            )
+
+    def _split_remote_cache_spark(
+        self,
+        requests: list[PreparedRequest],
+        session_remote_cfg: CacheConfig,
+        *,
+        spark: "SparkSession",
+    ) -> tuple["SparkDataFrame", list[PreparedRequest]]:
+        """Spark variant of :meth:`_split_remote_cache`.
+
+        Returns ``(hits_df, misses)`` — hits stay as a Spark DataFrame
+        unioned across every per-table lookup so the caller can hand
+        the frame straight to :class:`ResponseBatch` without ever
+        materialising rows on the driver. Misses still come back as a
+        Python list because the driver needs concrete request objects
+        to scatter through stage 3.
+        """
+        from .response import RESPONSE_SCHEMA
+
+        upsert_reqs = [
+            r for r in requests
+            if self._effective_remote_cfg(r, session_remote_cfg).mode == Mode.UPSERT
+        ]
+        misses: list[PreparedRequest] = list(upsert_reqs)
+
+        table_to_cfg: dict[str, CacheConfig] = {}
+        table_to_reqs: dict[str, list[PreparedRequest]] = {}
+        for req in requests:
+            if req in upsert_reqs:
+                continue
+            t_cfg = self._effective_remote_cfg(req, session_remote_cfg)
+            if not t_cfg.remote_cache_enabled or t_cfg.mode != Mode.APPEND:
+                misses.append(req)
+                continue
+            tkey = t_cfg.table.full_name(safe=True)
+            if tkey not in table_to_cfg:
+                table_to_cfg[tkey] = t_cfg
+                table_to_reqs[tkey] = []
+            table_to_reqs[tkey].append(req)
+
+        hit_frames: list["SparkDataFrame"] = []
+        for tkey, t_reqs in table_to_reqs.items():
+            t_cfg = table_to_cfg[tkey]
+            t_hits_df, t_misses = self._lookup_remote_table_spark(
+                t_cfg, t_reqs, spark=spark,
+            )
+            if t_hits_df is not None:
+                hit_frames.append(t_hits_df)
+            misses.extend(t_misses)
+
+        if hit_frames:
+            hits_df = hit_frames[0]
+            for frame in hit_frames[1:]:
+                hits_df = hits_df.unionByName(frame, allowMissingColumns=False)
+        else:
+            hits_df = spark.createDataFrame(
+                [], schema=RESPONSE_SCHEMA.to_spark_schema(),
+            )
+
+        if any(table_to_reqs.values()):
+            LOGGER.debug(
+                "Batch remote cache (spark): scanned %s table(s) for %s request(s)",
+                len(table_to_cfg), len(requests),
+            )
+        return hits_df, misses
+
+    def _lookup_remote_table_spark(
+        self,
+        cfg: CacheConfig,
+        requests: list[PreparedRequest],
+        *,
+        spark: "SparkSession",
+    ) -> tuple[Optional["SparkDataFrame"], list[PreparedRequest]]:
+        """Spark variant of :meth:`_lookup_remote_table`.
+
+        Runs the same batch lookup SQL, but keeps the result as a Spark
+        DataFrame instead of materialising :class:`Response` objects on
+        the driver. Misses are computed by collecting the distinct
+        ``request_by`` key tuples back to the driver — bounded by the
+        number of cached rows that match this batch, not by total cache
+        size — and diffing against the input requests.
+
+        :meth:`CacheConfig.filter_response`'s per-row branch is skipped
+        on the spark path: ``received_from`` / ``received_to`` are
+        already encoded in :meth:`CacheConfig.make_batch_lookup_sql`'s
+        ``WHERE`` clause, and the request-key check is what the
+        ``request_tuple`` diff already enforces.
+        """
+        anonymized_batch = [r.anonymize(mode=cfg.anonymize) for r in requests]
+        query = cfg.make_batch_lookup_sql(
+            table_name=cfg.table.full_name(safe=True),
+            requests=anonymized_batch,
+        )
+        try:
+            cache_result = cfg.table.sql.execute(query, spark_session=spark)
+        except Exception as exc:
+            if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
+                cfg.table.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
+                cache_result = cfg.table.sql.execute(query, spark_session=spark)
+            else:
+                raise
+
+        hits_df = cache_result.read_spark_frame()
+
+        key_cols = list(cfg.request_by or [])
+        if not key_cols:
+            # No request-key columns means the SQL can't disambiguate
+            # rows per request; mirror the Python path's behaviour by
+            # treating every input request as a hit when any row came
+            # back, otherwise everything is a miss.
+            try:
+                any_row = hits_df.head(1)
+            except Exception:
+                any_row = None
+            if any_row:
+                return hits_df, []
+            return None, list(requests)
+
+        matched_rows = hits_df.select(*key_cols).distinct().toLocalIterator()
+        matched: set[tuple] = {
+            tuple(row[c] for c in key_cols) for row in matched_rows
+        }
+
+        misses: list[PreparedRequest] = []
+        for req, anon in zip(requests, anonymized_batch):
+            if cfg.request_tuple(anon) not in matched:
+                misses.append(req)
+        return hits_df, misses
+
     def _fetch_misses(
         self,
         misses: list[PreparedRequest],
@@ -765,12 +922,22 @@ class Session(ABC):
     ) -> Iterator[Response]:
         """Stream responses, flattening the per-chunk :class:`ResponseBatch`.
 
-        Iteration order matches :class:`ResponseBatch`: local hits first,
-        then remote hits, then network fetches. Callers that need the
-        origin breakdown should use :meth:`send_many_batch` instead.
+        Iteration order matches :class:`ResponseBatch.parts`: local hits
+        first, then remote hits, then network fetches. Callers that need
+        the origin breakdown should use :meth:`send_many_batch` instead.
+
+        Works in both Python and Spark modes. Spark-backed buckets are
+        drained via the holder's :meth:`TabularIO.read_records`, which
+        for :class:`MemorySparkIO` uses ``df.toLocalIterator()`` — rows
+        stream from the executors one at a time, so the driver memory
+        footprint stays bounded even for large network-fetch batches.
+        :class:`ResponseBatch.__iter__` rejects Spark mode (it would
+        force a ``df.toArrow()`` collect); going through the holders
+        sidesteps that guard.
         """
         for batch in self._send_many_batches(requests, config):
-            yield from batch
+            for holder in batch.parts():
+                yield from Response.from_records(holder.read_records())
 
     def send_many_batches(
         self,
@@ -873,8 +1040,19 @@ class Session(ABC):
                 continue
 
             # --- Stage 1: local cache ---
-            local_hits, after_local = self._split_local_cache(chunk, session_local_cfg)
-            remote_hits: list[Response] = []
+            local_hits_list, after_local = self._split_local_cache(
+                chunk, session_local_cfg,
+            )
+            # On the spark path, lift driver-read local hits to a Spark
+            # frame straight away so every bucket downstream is
+            # frame-resident — matches stage 2/3 and lets the caller
+            # union holders without a per-bucket type switch.
+            local_hits: "list[Response] | SparkDataFrame"
+            if is_spark:
+                local_hits = self._responses_to_spark(local_hits_list, spark)
+            else:
+                local_hits = local_hits_list
+            remote_hits: "list[Response] | SparkDataFrame" = []
             # Default new_hits to None so ResponseBatch coerces it to a
             # schema-bearing empty holder (Spark or Arrow depending on
             # mode) — no special-case for "stage skipped".
@@ -902,20 +1080,33 @@ class Session(ABC):
             }
 
             # --- Stage 2: remote cache ---
-            # ``cache_cfg.table.sql.execute(...)`` returns a TabularIO
-            # (StatementResult) we drain via Response.from_arrow_tabular,
-            # so the remote-cache stage is engine-agnostic — same code
-            # for the Python and Spark paths.
-            remote_hits, after_remote = self._split_remote_cache(
-                after_local,
-                session_remote_cfg,
-                spark_session=spark,
-            )
-            # Backfill local cache with remote hits using each request's
-            # effective local config — not the session-level fallback.
-            self._backfill_local_cache(
-                remote_hits, url_to_local_cfg, session_local_cfg,
-            )
+            # Python path drains the StatementResult into Response
+            # objects. Spark path keeps the result as a Spark DataFrame
+            # (via :meth:`_split_remote_cache_spark`) so ``remote_hits``
+            # never collects to the driver and downstream callers can
+            # union it with stage 3's Spark output.
+            if is_spark:
+                remote_hits, after_remote = self._split_remote_cache_spark(
+                    after_local,
+                    session_remote_cfg,
+                    spark=spark,
+                )
+                # Local-cache backfill from a Spark frame would force a
+                # toLocalIterator on the driver — skip it on the spark
+                # path, matching how stage 3/4 keep network results
+                # frame-resident. Drivers that want a hot local cache
+                # should use the Python path explicitly.
+            else:
+                remote_hits, after_remote = self._split_remote_cache(
+                    after_local,
+                    session_remote_cfg,
+                    spark_session=spark,
+                )
+                # Backfill local cache with remote hits using each request's
+                # effective local config — not the session-level fallback.
+                self._backfill_local_cache(
+                    remote_hits, url_to_local_cfg, session_local_cfg,
+                )
 
             if not after_remote:
                 yield ResponseBatch(
