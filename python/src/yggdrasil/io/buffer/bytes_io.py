@@ -111,7 +111,6 @@ import pyarrow as pa
 import yggdrasil.pickle.json as json_module
 from yggdrasil.data.options import CastOptions
 from yggdrasil.disposable import Disposable
-from yggdrasil.environ import PyEnv
 from yggdrasil.io.enums import Codec, MediaType, MimeType, MimeTypes, Mode, ZSTD
 from yggdrasil.io.path_stat import PathStats, PathKind
 from yggdrasil.io.buffer.base import TabularIO
@@ -788,8 +787,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         """
         # Tabular cache: clear first so a re-open after close starts
         # cold. Pure-Python state — no failure modes worth handling.
-        self._arrow_table = None
-        self._spark_frame = None
+        self.unpersist()
 
         # Close the transaction buffer if we have one. It owns its
         # own spill machinery; closing it releases that.
@@ -1513,59 +1511,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     # for every TabularIO subclass (final-leaf short-circuit, fall
     # through to the registered media class otherwise).
 
-    # ==================================================================
-    # TabularIO contract — cache, default hooks
-    # ==================================================================
-
-    @property
-    def cached(self) -> bool:
-        return self._arrow_table is not None or self._spark_frame is not None
-
-    def unpersist(self) -> None:
-        self._arrow_table = None
-        self._spark_frame = None
-
-    def persist(
-        self,
-        engine: Literal["arrow", "polars", "spark", "auto"] = "auto",
-        *,
-        data: Any | None = None,
-    ) -> "TabularIO":
-        """Cache an Arrow / Spark view of the buffer's tabular content.
-
-        Concrete leaves implement :meth:`_read_arrow_batches`
-        format-specifically; this driver just calls
-        :meth:`read_arrow_table` (or ``read_spark_frame``) and
-        stashes the result on the cache slots. A raw :class:`BytesIO`
-        with no tabular media type fails through ``read_arrow_table``
-        — there's no honest way to materialize tabular bytes without
-        a format.
-        """
-        if self.cached:
-            return self
-
-        if not engine or engine == "auto":
-            engine = "spark" if PyEnv.in_databricks() else "arrow"
-
-        if data is None:
-            if engine == "spark":
-                self._spark_frame = self.read_spark_frame()
-            elif engine == "arrow":
-                self._arrow_table = self.read_arrow_table()
-            else:
-                raise ValueError(f"Unsupported engine: {engine}")
-        else:
-            if engine == "spark":
-                from yggdrasil.spark.cast import any_to_spark_dataframe
-
-                self._spark_frame = any_to_spark_dataframe(data)
-            elif engine == "arrow":
-                from yggdrasil.arrow.cast import any_to_arrow_table
-
-                self._arrow_table = any_to_arrow_table(data)
-            else:
-                raise ValueError(f"Unsupported engine: {engine}")
-        return self
+    # ``cached`` / ``persist`` / ``unpersist`` live on :class:`TabularIO`
+    # — they just drive the shared ``_persisted_data`` slot.
 
     def _tabular_leaf_view(self) -> "TabularIO | None":
         """Return a registered leaf wrapping self for tabular dispatch.

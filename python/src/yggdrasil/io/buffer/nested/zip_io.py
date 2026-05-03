@@ -489,10 +489,6 @@ class ZipIO(BytesIO):
         Each entry is opened in turn and its batches are forwarded.
         Non-tabular entries (no recognized media type) are skipped.
         """
-        if self.cached:
-            yield from self._read_arrow_batches_from_cache(options)
-            return
-
         for child in self._iter_children(options):
             with child:
                 try:
@@ -1120,23 +1116,8 @@ class ZipEntryFolderIO(TabularIO[ZipOptions]):
         """
         return self.parent.path
 
-    @property
-    def cached(self) -> bool:
-        return self._arrow_table is not None or self._spark_frame is not None
-
-    def unpersist(self) -> None:
-        self._arrow_table = None
-        self._spark_frame = None
-
-    def persist(self, engine="auto", *, data=None) -> "ZipEntryFolderIO":
-        if self.cached:
-            return self
-        if data is None:
-            self._arrow_table = self.read_arrow_table()
-        else:
-            from yggdrasil.arrow.cast import any_to_arrow_table
-            self._arrow_table = any_to_arrow_table(data)
-        return self
+    # ``cached`` / ``persist`` / ``unpersist`` come from
+    # :class:`TabularIO` — shared ``_persisted_data`` slot driver.
 
     # ------------------------------------------------------------------
     # Children — slice the parent's central directory by prefix
@@ -1238,9 +1219,6 @@ class ZipEntryFolderIO(TabularIO[ZipOptions]):
         self,
         options: ZipOptions,
     ) -> "Iterator[pa.RecordBatch]":
-        if self.cached:
-            yield from self._read_arrow_batches_from_cache(options)
-            return
         for child in self._iter_children(options):
             with child:
                 try:

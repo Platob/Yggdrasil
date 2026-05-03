@@ -271,8 +271,12 @@ class TabularIO(Disposable, ABC, Generic[O]):
         * ``_media_type`` — the format identity. ``None`` for opaque
           buffers; concrete leaves (ParquetIO, CsvIO, …) fill it from
           their ``default_mime_type`` on construction.
-        * Persist cache slots — ``_arrow_table`` / ``_spark_frame``
-          set by :meth:`persist`, cleared by :meth:`unpersist`.
+        * ``_persisted_data`` — a single :class:`TabularIO` slot
+          holding the materialised cache. :meth:`persist` populates
+          it (with a :class:`MemorySparkIO` when an active Spark
+          session is reachable, otherwise a :class:`MemoryArrowIO`);
+          :meth:`unpersist` clears it. Read paths short-circuit
+          through it before touching the source.
         * Spill-path slots — ``_spill_path`` / ``_owns_spill_path``
           used by :class:`BytesIO` (and any byte-buffer-backed
           subclass) to track durable storage. They live on
@@ -294,9 +298,10 @@ class TabularIO(Disposable, ABC, Generic[O]):
                 self._media_type = None
         else:
             self._media_type = MediaType.from_(media_type)
-        # Persist cache slots
-        self._arrow_table = None
-        self._spark_frame = None
+        # Persist cache slot — a sub-TabularIO holding the materialised
+        # cache (MemorySparkIO when Spark is reachable, MemoryArrowIO
+        # otherwise). Read paths delegate through it when set.
+        self._persisted_data: "TabularIO | None" = None
         # Buffer-backing slots — concrete byte buffers fill these in;
         # non-byte TabularIOs (StatementResult, NestedIO trees, …)
         # leave them at None.
@@ -408,49 +413,82 @@ class TabularIO(Disposable, ABC, Generic[O]):
         return default
 
     @property
-    @abstractmethod
     def cached(self) -> bool:
-        return self._arrow_table is not None or self._spark_frame is not None
+        """True when a sub-:class:`TabularIO` cache is materialised."""
+        return self._persisted_data is not None
 
     def _release(self) -> None:
         self.unpersist()
 
-    @abstractmethod
     def unpersist(self) -> None:
-        self._arrow_table = None
-        self._spark_frame = None
+        """Drop the cache slot and close the held holder, if any."""
+        holder = self._persisted_data
+        self._persisted_data = None
+        if holder is not None:
+            try:
+                holder.close()
+            except Exception:
+                pass
 
-    @abstractmethod
     def persist(
         self,
         engine: Literal["arrow", "polars", "spark", "auto"] = "auto",
         *,
         data: Any | None = None,
     ) -> "TabularIO":
+        """Materialise the source into a :class:`TabularIO` cache.
+
+        ``engine="auto"`` picks Spark when an active SparkSession is
+        reachable (and PySpark is importable), otherwise Arrow. The
+        cache is wrapped in :class:`MemorySparkIO` or
+        :class:`MemoryArrowIO` accordingly and assigned to
+        :attr:`_persisted_data`.
+        """
         if self.cached:
             return self
 
         if not engine or engine == "auto":
-            engine = "spark" if PyEnv.in_databricks() else "arrow"
+            engine = self._auto_persist_engine()
 
-        if data is None:
-            if engine == "spark":
-                self._spark_frame = self.read_spark_frame()
-            elif engine == "arrow":
-                self._arrow_table = self.read_arrow_table()
-            else:
-                raise ValueError(f"Unsupported engine: {engine}")
+        if engine == "spark":
+            from yggdrasil.io.buffer.memory import MemorySparkIO
+            from yggdrasil.spark.cast import any_to_spark_dataframe
+
+            frame = (
+                any_to_spark_dataframe(data)
+                if data is not None
+                else self.read_spark_frame()
+            )
+            self._persisted_data = MemorySparkIO(frame)
+        elif engine == "arrow":
+            from yggdrasil.io.buffer.memory import MemoryArrowIO
+
+            table = (
+                any_to_arrow_table(data)
+                if data is not None
+                else self.read_arrow_table()
+            )
+            self._persisted_data = MemoryArrowIO(table)
         else:
-            if engine == "spark":
-                from yggdrasil.spark.cast import any_to_spark_dataframe
-
-                self._spark_frame = any_to_spark_dataframe(data)
-            elif engine == "arrow":
-                self._arrow_table = any_to_arrow_table(data)
-            else:
-                raise ValueError(f"Unsupported engine: {engine}")
+            raise ValueError(f"Unsupported engine: {engine!r}")
 
         return self
+
+    @staticmethod
+    def _auto_persist_engine() -> Literal["arrow", "spark"]:
+        """Pick ``"spark"`` when a SparkSession is reachable, else ``"arrow"``.
+
+        Looks up an *already-active* SparkSession via :class:`PyEnv`
+        (no creation, no install) — the auto path should never
+        spin up a session as a side effect of caching.
+        """
+        try:
+            session = PyEnv.spark_session(
+                create=False, import_error=False, install_spark=False,
+            )
+        except Exception:
+            session = None
+        return "spark" if session is not None else "arrow"
 
     # ==================================================================
     # Abstract protocol — subclasses implement these
@@ -571,21 +609,10 @@ class TabularIO(Disposable, ABC, Generic[O]):
         """Yield Arrow record batches from the underlying source."""
 
     def _read_arrow_batches_from_cache(self, options: O) -> Iterator[pa.RecordBatch]:
-        """Yield Arrow record batches from the cache."""
-        if not self.cached:
+        """Yield Arrow record batches from the held :attr:`_persisted_data`."""
+        if self._persisted_data is None:
             raise RuntimeError("No cache available")
-
-        if self._arrow_table is None:
-            if self._spark_frame is not None:
-                arrow_table = self._spark_frame.toArrow()
-            else:
-                raise RuntimeError("No cache available")
-        else:
-            arrow_table = self._arrow_table
-
-        yield from options.cast_arrow_tabular(arrow_table).to_batches(
-            max_chunksize=options.row_size
-        )
+        yield from self._persisted_data.read_arrow_batches(options=options)
 
     @abstractmethod
     def _write_arrow_batches(
@@ -761,6 +788,11 @@ class TabularIO(Disposable, ABC, Generic[O]):
         **kwargs: Any,
     ) -> Iterator[pa.RecordBatch]:
         """Yield Arrow record batches. Primary streaming read path."""
+        if self._persisted_data is not None:
+            yield from self._persisted_data.read_arrow_batches(
+                options=options, **kwargs,
+            )
+            return
         yield from self._read_arrow_batches(
             self.check_options(options, overrides=locals())
         )
@@ -778,6 +810,10 @@ class TabularIO(Disposable, ABC, Generic[O]):
         **kwargs: Any,
     ) -> pa.Table:
         """Read everything into a single :class:`pyarrow.Table`."""
+        if self._persisted_data is not None:
+            return self._persisted_data.read_arrow_table(
+                options=options, **kwargs,
+            )
         return self._read_arrow_table(self.check_options(options, overrides=locals()))
 
     def _read_arrow_table(self, options: O) -> pa.Table:
@@ -1039,32 +1075,23 @@ class TabularIO(Disposable, ABC, Generic[O]):
         options: "O | None" = None,
         **kwargs: Any,
     ) -> "SparkDataFrame":
-        """Materialize on the driver and build a Spark DataFrame."""
-        # Gate on the actual base-class data slots, not ``self.cached`` —
-        # subclasses (statement results, MemorySparkIO, …) override
-        # ``cached`` to mean "execution complete" or "frame held in a
-        # subclass-specific slot", which doesn't imply the base
-        # ``_spark_frame`` / ``_arrow_table`` slots are populated. Falling
-        # through to ``_read_spark_frame`` lets those subclasses provide
-        # their own materialization path.
-        if self._spark_frame is not None or self._arrow_table is not None:
-            return self._read_spark_frame_from_cache(options)
+        """Materialize on the driver and build a Spark DataFrame.
+
+        Gates on :attr:`_persisted_data` directly — subclasses
+        (statement results, …) may override ``cached`` to mean
+        "execution complete" rather than "data slot populated", and
+        we don't want to mistake that for a memory cache.
+        """
+        if self._persisted_data is not None:
+            return self._persisted_data.read_spark_frame(
+                options=options, **kwargs,
+            )
         return self._read_spark_frame(self.check_options(options, overrides=locals()))
 
     def _read_spark_frame(self, options: O) -> "SparkDataFrame":
         spark = PyEnv.spark_session(create=True)
         arrow_table = self._read_arrow_table(options)
         return options.cast_spark(spark.createDataFrame(arrow_table))
-
-    def _read_spark_frame_from_cache(self, options: O) -> "SparkDataFrame":
-        if self._spark_frame is None:
-            from yggdrasil.spark.cast import any_to_spark_dataframe
-
-            return any_to_spark_dataframe(self._arrow_table, options=options)
-        else:
-            df = self._spark_frame
-
-        return options.cast_spark_tabular(df)
 
     def write_spark_frame(
         self,

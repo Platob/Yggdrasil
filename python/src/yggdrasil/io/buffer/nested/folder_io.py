@@ -437,10 +437,6 @@ class FolderIO(NestedIO[FolderOptions]):
         options: FolderOptions,
     ) -> Iterator[pa.RecordBatch]:
         """Chain children; inject partition columns when declared."""
-        if self.cached:
-            yield from self._read_arrow_batches_from_cache(options)
-            return
-
         partition_cols = self._resolve_partition_columns(options)
         partition_by_name = (
             {c.name: c for c in partition_cols} if partition_cols else None
