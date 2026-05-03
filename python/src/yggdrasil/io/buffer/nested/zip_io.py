@@ -228,13 +228,14 @@ class ZipIO(BytesIO):
     def _preserve_cursor(self) -> "Iterator[None]":
         """Snapshot ``self._pos`` and restore it on exit.
 
-        Children-surface operations (iteration, make_child, commit,
-        delete, clear) need to leave the parent's byte cursor alone
-        regardless of whether the archive is path-bound or in-memory.
-        Path-bound ops talk to :mod:`zipfile` against ``self.path``
-        and never touch the buffer; in-memory ops snapshot/replace the
-        buffer wholesale and would otherwise reset ``_pos`` to 0.
-        Snapshot-and-restore makes both paths cursor-safe.
+        Only needed around write-back operations that swap the
+        archive's bytes (clear, per-entry commit, per-entry delete) —
+        :meth:`_replace_archive_bytes` calls
+        :meth:`replace_with_payload`, which resets ``_pos`` to 0.
+        Read-only paths (``_open_archive_reader``, name listing,
+        per-entry info / payload reads) hand the buffer to
+        :mod:`zipfile` through a :meth:`BytesIO.view`, so the parent
+        cursor is naturally untouched and doesn't need this guard.
         """
         saved = self._pos
         try:
@@ -260,41 +261,37 @@ class ZipIO(BytesIO):
             return self.path.exists()
         return self._size > 0
 
-    def _archive_bytes_snapshot(self) -> bytes:
-        """Return the in-memory archive's current bytes without
-        moving ``self._pos`` (only meaningful when ``self.path`` is
-        ``None``; ``to_bytes`` reads ``_buf``/spill directly)."""
-        return self.to_bytes()
-
     @contextlib.contextmanager
     def _open_archive_reader(self) -> "Iterator[zipfile.ZipFile]":
         """Yield a ``zipfile.ZipFile`` reader over the current archive.
 
-        Path-bound: open the bound file. In-memory: feed the buffer's
-        bytes (snapshotted via :meth:`to_bytes`, no cursor side
-        effects) into a fresh ``_io.BytesIO`` and open that. Caller
-        is responsible for handling :class:`zipfile.BadZipFile` and
+        Path-bound: open the bound file. In-memory: hand a
+        :meth:`BytesIO.view` of the buffer to ``zipfile.ZipFile`` —
+        the view has its own cursor, so seeks/reads from
+        :mod:`zipfile` (central directory probe, per-entry reads)
+        leave the parent's cursor untouched and avoid copying the
+        archive bytes into a fresh stdlib ``BytesIO``. Caller is
+        responsible for handling :class:`zipfile.BadZipFile` and
         :class:`FileNotFoundError`.
         """
         if self.path is not None:
             with zipfile.ZipFile(self.path.full_path(), mode="r") as zf:
                 yield zf
             return
-        data = self._archive_bytes_snapshot()
-        if not data:
+        if self._size == 0:
             # Empty in-memory archive — surface the same "missing"
             # signal as a non-existent path file.
             raise FileNotFoundError("in-memory ZipIO is empty")
-        with zipfile.ZipFile(_io.BytesIO(data), mode="r") as zf:
+        with self.view(pos=0) as v, zipfile.ZipFile(v, mode="r") as zf:
             yield zf
 
     def _replace_archive_bytes(self, payload: bytes) -> None:
         """Write *payload* as the archive's full backing bytes.
 
         Path-bound: overwrite the bound file. In-memory: replace the
-        parent's buffer via :meth:`replace_with_payload`. Callers
-        must wrap this in :meth:`_preserve_cursor` to keep the byte
-        cursor stable across the swap.
+        parent's buffer via :meth:`replace_with_payload` — which
+        resets ``_pos`` to 0, so callers that care about the byte
+        cursor must wrap this in :meth:`_preserve_cursor`.
         """
         if self.path is not None:
             with open(self.path.full_path(), "wb") as fh:
@@ -320,25 +317,22 @@ class ZipIO(BytesIO):
         ``parent`` attribute stamped to ``self``; multiple yields for
         the same name share one backing :class:`ZipEntryIO`.
 
-        The parent's byte cursor is preserved: names are listed under
-        :meth:`_preserve_cursor`, so building or walking the iterator
-        never disturbs ``self._pos``. Works for both path-bound and
-        in-memory archives — ``_list_entry_names`` dispatches via
-        :meth:`_open_archive_reader`.
+        Read-only — :meth:`_list_entry_names` and the entry's lazy
+        ``_acquire`` go through :meth:`_open_archive_reader`, which
+        feeds :mod:`zipfile` a :meth:`BytesIO.view` for in-memory
+        archives, so neither building nor walking the iterator
+        touches the parent's byte cursor.
         """
         if not self._archive_is_present():
             return
-        with self._preserve_cursor():
-            names = [
-                name
-                for name in self._list_entry_names()
-                if not self._is_ignored_name(name)
-                and options.matches_name(name)
-            ]
+        names = [
+            name
+            for name in self._list_entry_names()
+            if not self._is_ignored_name(name)
+            and options.matches_name(name)
+        ]
         for name in names:
-            with self._preserve_cursor():
-                child = self._attach(self._open_entry_io(name, auto_open=False))
-            yield child
+            yield self._attach(self._open_entry_io(name, auto_open=False))
 
     def make_child(
         self,
@@ -362,8 +356,7 @@ class ZipIO(BytesIO):
                 f"Entry name must not contain backslashes; got {name!r}. "
                 "Use forward slashes."
             )
-        with self._preserve_cursor():
-            return self._attach(self._open_entry_io(name, auto_open=False))
+        return self._attach(self._open_entry_io(name, auto_open=False))
 
     # Convenience alias — name-keyed access to entries without going
     # through the children iterator.
@@ -400,8 +393,7 @@ class ZipIO(BytesIO):
             return False
         if self._is_ignored_name(name):
             return False
-        with self._preserve_cursor():
-            return self._entry_exists(name)
+        return self._entry_exists(name)
 
     def list_entries(self) -> list[str]:
         """Return entry names currently in the archive, sorted.
@@ -409,26 +401,24 @@ class ZipIO(BytesIO):
         Hidden entries (name starting with ``.``) are filtered out to
         match :meth:`_iter_children` / ``__contains__``.
         """
-        with self._preserve_cursor():
-            return sorted(
-                name
-                for name in self._list_entry_names()
-                if not self._is_ignored_name(name)
-            )
+        return sorted(
+            name
+            for name in self._list_entry_names()
+            if not self._is_ignored_name(name)
+        )
 
     def has_children(self) -> bool:
         """True iff the archive holds at least one non-ignored entry."""
         if not self._archive_is_present():
             return False
-        with self._preserve_cursor():
-            try:
-                with self._open_archive_reader() as zf:
-                    for info in zf.infolist():
-                        if not self._is_ignored_name(info.filename):
-                            return True
-                    return False
-            except (zipfile.BadZipFile, FileNotFoundError):
+        try:
+            with self._open_archive_reader() as zf:
+                for info in zf.infolist():
+                    if not self._is_ignored_name(info.filename):
+                        return True
                 return False
+        except (zipfile.BadZipFile, FileNotFoundError):
+            return False
 
     # ==================================================================
     # Empty / clear (children-flavored — overrides BytesIO's byte view)
@@ -635,21 +625,20 @@ class ZipIO(BytesIO):
         )
         max_idx = -1
         if self._archive_is_present():
-            with self._preserve_cursor():
-                try:
-                    with self._open_archive_reader() as zf:
-                        for n in zf.namelist():
-                            if not n.startswith(_ENTRY_PREFIX):
-                                continue
-                            stem = n[len(_ENTRY_PREFIX):].split(".", 1)[0]
-                            try:
-                                idx = int(stem)
-                            except ValueError:
-                                continue
-                            if idx > max_idx:
-                                max_idx = idx
-                except (zipfile.BadZipFile, FileNotFoundError):
-                    pass
+            try:
+                with self._open_archive_reader() as zf:
+                    for n in zf.namelist():
+                        if not n.startswith(_ENTRY_PREFIX):
+                            continue
+                        stem = n[len(_ENTRY_PREFIX):].split(".", 1)[0]
+                        try:
+                            idx = int(stem)
+                        except ValueError:
+                            continue
+                        if idx > max_idx:
+                            max_idx = idx
+            except (zipfile.BadZipFile, FileNotFoundError):
+                pass
         return template.format(max_idx + 1)
 
     # ==================================================================
@@ -687,25 +676,23 @@ class ZipIO(BytesIO):
     def _list_entry_names(self) -> list[str]:
         if not self._archive_is_present():
             return []
-        with self._preserve_cursor():
-            try:
-                with self._open_archive_reader() as zf:
-                    return list(zf.namelist())
-            except (zipfile.BadZipFile, FileNotFoundError):
-                return []
+        try:
+            with self._open_archive_reader() as zf:
+                return list(zf.namelist())
+        except (zipfile.BadZipFile, FileNotFoundError):
+            return []
 
     def _entry_info(self, name: str) -> "zipfile.ZipInfo | None":
         if not self._archive_is_present():
             return None
-        with self._preserve_cursor():
-            try:
-                with self._open_archive_reader() as zf:
-                    try:
-                        return zf.getinfo(name)
-                    except KeyError:
-                        return None
-            except (zipfile.BadZipFile, FileNotFoundError):
-                return None
+        try:
+            with self._open_archive_reader() as zf:
+                try:
+                    return zf.getinfo(name)
+                except KeyError:
+                    return None
+        except (zipfile.BadZipFile, FileNotFoundError):
+            return None
 
     def _entry_exists(self, name: str) -> bool:
         return self._entry_info(name) is not None
@@ -714,15 +701,14 @@ class ZipIO(BytesIO):
         """Return entry ``name``'s uncompressed payload, or empty bytes."""
         if not self._archive_is_present():
             return b""
-        with self._preserve_cursor():
-            try:
-                with self._open_archive_reader() as zf:
-                    try:
-                        return zf.read(name)
-                    except KeyError:
-                        return b""
-            except (zipfile.BadZipFile, FileNotFoundError):
-                return b""
+        try:
+            with self._open_archive_reader() as zf:
+                try:
+                    return zf.read(name)
+                except KeyError:
+                    return b""
+        except (zipfile.BadZipFile, FileNotFoundError):
+            return b""
 
     def _commit_entry_payload(
         self,

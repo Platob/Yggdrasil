@@ -91,12 +91,28 @@ class ParquetIO(BytesIO):
     # ==================================================================
 
     def _collect_schema(self, options: ParquetOptions) -> Schema:
-        """Read the schema from the Parquet footer."""
+        """Read the schema from the Parquet footer.
+
+        Footer probe — must not move the buffer's byte cursor (a
+        caller mid-stream over the same buffer would lose its place).
+        Routes through a :meth:`BytesIO.view`: the view has its own
+        cursor, so :class:`pq.ParquetFile`'s seeks land on the view
+        and leave ``self._pos`` untouched. Codec'd buffers fall back
+        to :meth:`_reading_context`, which materializes a
+        decompressed sibling and yields it (also isolated from
+        ``self``).
+        """
         if self.is_empty():
             return Schema.empty()
 
-        with self._reading_context(options.copy(reset_seek=True)) as io:
-            source = io.arrow_io(mode="rb")
+        if self.codec is not None:
+            with self._reading_context(options) as io:
+                source = io.arrow_io(mode="rb")
+                pf = pq.ParquetFile(source)
+                return Schema.from_arrow(pf.schema_arrow)
+
+        with self.view(pos=0) as v:
+            source = v.arrow_io(mode="rb")
             pf = pq.ParquetFile(source)
             return Schema.from_arrow(pf.schema_arrow)
 
