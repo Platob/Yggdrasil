@@ -206,3 +206,119 @@ class TestZipIONesting:
         with zio.make_child("a.txt") as entry:
             entry.write(b"a")
         assert zio.list_entries() == ["a.txt", "z.txt"]
+
+    def test_for_loop_yields_entries(self, tmp_path):
+        zio = ZipIO(path=str(tmp_path / "a.zip"))
+        with zio.make_child("a.txt") as entry:
+            entry.write(b"1")
+        with zio.make_child("b.txt") as entry:
+            entry.write(b"2")
+
+        names = sorted(child.entry_name for child in zio)
+        assert names == ["a.txt", "b.txt"]
+
+    def test_next_on_zio_rejects_line_iteration(self, tmp_path):
+        zio = ZipIO(path=str(tmp_path / "a.zip"))
+        with zio.make_child("a.txt") as entry:
+            entry.write(b"hello\nworld\n")
+        # next(zio) would otherwise fall through to BytesIO's
+        # readline-based iterator and silently return raw archive
+        # bytes — surface that as a clear error instead.
+        with pytest.raises(TypeError, match="not directly iterable"):
+            next(zio)
+
+    def test_hidden_entries_filtered_from_listing(self, tmp_path):
+        zio = ZipIO(path=str(tmp_path / "a.zip"))
+        with zio.make_child("visible.txt") as entry:
+            entry.write(b"v")
+        with zio.make_child(".hidden") as entry:
+            entry.write(b"h")
+
+        assert zio.list_entries() == ["visible.txt"]
+        assert ".hidden" not in zio
+        assert "visible.txt" in zio
+        names = [child.entry_name for child in zio]
+        assert names == ["visible.txt"]
+
+
+class TestZipIOCursorPreservation:
+    """Children-surface ops must not move the parent's byte cursor."""
+
+    def _seed(self, tmp_path):
+        zio = ZipIO(path=str(tmp_path / "a.zip"))
+        with zio.make_child("a.txt") as entry:
+            entry.write(b"hello")
+        with zio.make_child("b.txt") as entry:
+            entry.write(b"world")
+        return zio
+
+    def test_iter_children_preserves_cursor(self, tmp_path):
+        zio = self._seed(tmp_path)
+        zio.open()
+        try:
+            zio.seek(7)
+            pos = zio.tell()
+            list(zio.iter_children())
+            assert zio.tell() == pos
+            for _ in zio:
+                pass
+            assert zio.tell() == pos
+        finally:
+            zio.close()
+
+    def test_make_child_preserves_cursor(self, tmp_path):
+        zio = self._seed(tmp_path)
+        zio.open()
+        try:
+            zio.seek(5)
+            pos = zio.tell()
+            zio.make_child("c.txt")
+            assert zio.tell() == pos
+        finally:
+            zio.close()
+
+    def test_list_entries_and_contains_preserve_cursor(self, tmp_path):
+        zio = self._seed(tmp_path)
+        zio.open()
+        try:
+            zio.seek(3)
+            pos = zio.tell()
+            zio.list_entries()
+            assert zio.tell() == pos
+            assert "a.txt" in zio
+            assert zio.tell() == pos
+            zio.has_children()
+            assert zio.tell() == pos
+        finally:
+            zio.close()
+
+    def test_commit_entry_preserves_parent_cursor(self, tmp_path):
+        zio = self._seed(tmp_path)
+        zio.open()
+        try:
+            zio.seek(4)
+            pos = zio.tell()
+            # Cheap-append path (new entry).
+            with zio.make_child("c.txt") as entry:
+                entry.write(b"!")
+            assert zio.tell() == pos
+            # Rewrite-swap path (existing entry).
+            with zio.make_child("a.txt") as entry:
+                entry.seek(0)
+                entry.truncate(0)
+                entry.write(b"HELLO")
+            assert zio.tell() == pos
+        finally:
+            zio.close()
+
+    def test_delete_entry_preserves_parent_cursor(self, tmp_path):
+        zio = self._seed(tmp_path)
+        zio.open()
+        try:
+            zio.seek(6)
+            pos = zio.tell()
+            with zio.make_child("a.txt") as entry:
+                entry.delete()
+            assert zio.tell() == pos
+        finally:
+            zio.close()
