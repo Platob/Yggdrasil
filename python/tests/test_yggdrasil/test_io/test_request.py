@@ -247,6 +247,19 @@ class TestArrowRoundtrip:
         assert rebuilt[0].method == "GET"
         assert rebuilt[0].url.host == "example.com"
 
+    def test_from_arrow_decodes_html_entity_ampersand(self):
+        req = PreparedRequest.prepare(
+            method="GET",
+            url="https://example.com/api?foo=1&amp;update_id=202605032129",
+        )
+        tbl = req.to_arrow_table()
+        rebuilt = list(PreparedRequest.from_arrow(tbl))[0]
+        assert dict(rebuilt.url.query_items()) == {
+            "foo": "1",
+            "update_id": "202605032129",
+        }
+        assert "amp;" not in rebuilt.url.to_string()
+
 
 # ---------------------------------------------------------------------------
 # match_value / match_values / match_tuple

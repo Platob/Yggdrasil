@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 import logging
 import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional
@@ -27,7 +28,6 @@ from .response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
 from .response_batch import ResponseBatch
 from .send_config import CacheConfig, SendConfig, SendManyConfig
 from .url import URL
-from ..environ import PyEnv
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession, DataFrame as SparkDataFrame
@@ -549,9 +549,28 @@ class Session(ABC):
         batch_size: int | None = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
+        max_batch_ttl: float | None = None,
         spark_session: Optional["SparkSession"] = None,
         **options,
-    ) -> "Iterator[Response] | SparkDataFrame":
+    ) -> Iterator[Response]:
+        """Stream responses one at a time, in both Python and Spark modes.
+
+        Spark-backed buckets are drained via the holder's
+        :meth:`TabularIO.read_records`, which for :class:`MemorySparkIO`
+        uses ``df.toLocalIterator()`` — rows stream from the executors
+        one at a time, so the driver memory footprint stays bounded
+        even for large network-fetch batches. Callers that want a
+        :class:`SparkDataFrame` (or the per-bucket origin breakdown)
+        should consume :meth:`send_many_batches` and call
+        ``ResponseBatch.to_dataframe()`` themselves.
+
+        ``max_batch_ttl`` (default :data:`DEFAULT_MAX_BATCH_TTL`,
+        300 s) caps how long the batcher will wait for ``requests`` to
+        produce a full chunk before flushing what it has — bounds tail
+        latency when the upstream iterator is slow. ``None`` disables
+        the time cap; the batch only closes when ``batch_size`` is
+        reached or the iterator is exhausted.
+        """
         cfg = SendManyConfig.check_arg(
             config,
             wait=wait,
@@ -563,13 +582,10 @@ class Session(ABC):
             batch_size=batch_size,
             ordered=ordered,
             max_in_flight=max_in_flight,
+            max_batch_ttl=max_batch_ttl,
             spark_session=spark_session,
             **options,
         )
-
-        if cfg.spark_session is not None:
-            return self.send_many_batch(requests, config=cfg).to_dataframe()
-
         return self._send_many(requests, config=cfg)
 
     # ------------------------------------------------------------------ #
@@ -1086,7 +1102,8 @@ class Session(ABC):
 
         Iteration order matches :class:`ResponseBatch.parts`: local hits
         first, then remote hits, then network fetches. Callers that need
-        the origin breakdown should use :meth:`send_many_batch` instead.
+        the origin breakdown should use :meth:`send_many_batches`
+        instead.
 
         Works in both Python and Spark modes. Spark-backed buckets are
         drained via the holder's :meth:`TabularIO.read_records`, which
@@ -1115,6 +1132,7 @@ class Session(ABC):
         batch_size: int | None = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
+        max_batch_ttl: float | None = None,
         spark_session: Optional["SparkSession"] = None,
         **options,
     ) -> Iterator[ResponseBatch]:
@@ -1125,6 +1143,12 @@ class Session(ABC):
         downstream consumers can stream partial results uniformly. Each
         yielded batch carries schema-bearing holders even when a stage
         produced no rows — the schema is preserved for empty results.
+
+        ``max_batch_ttl`` (default :data:`DEFAULT_MAX_BATCH_TTL`,
+        300 s) caps how long the batcher waits for ``requests`` to
+        fill one chunk before flushing what's accumulated — keeps
+        downstream stages moving when the upstream iterator is slow.
+        ``None`` disables the time cap.
         """
         cfg = SendManyConfig.check_arg(
             config,
@@ -1137,6 +1161,7 @@ class Session(ABC):
             batch_size=batch_size,
             ordered=ordered,
             max_in_flight=max_in_flight,
+            max_batch_ttl=max_batch_ttl,
             spark_session=spark_session,
             **options,
         )
@@ -1185,17 +1210,44 @@ class Session(ABC):
                 config.max_batch_size or 1024, pool.max_workers * 100
             )
 
-        def _batched(
-            it: Iterator[PreparedRequest], n: int,
-        ) -> Iterator[list[PreparedRequest]]:
-            iterator = iter(it)
-            while True:
-                b = list(itertools.islice(iterator, n))
-                if not b:
-                    break
-                yield b
+        ttl = config.max_batch_ttl
 
-        chunks = _batched(requests, batch_size)
+        def _batched(
+            it: Iterator[PreparedRequest],
+            n: int,
+            ttl_seconds: float | None,
+        ) -> Iterator[list[PreparedRequest]]:
+            # When no TTL is set, fall back to the cheap islice path —
+            # avoids the per-request monotonic() probe.
+            iterator = iter(it)
+            if ttl_seconds is None or ttl_seconds <= 0:
+                while True:
+                    b = list(itertools.islice(iterator, n))
+                    if not b:
+                        break
+                    yield b
+                return
+
+            # Time-bounded path: pull one item at a time and flush
+            # when either the size cap or the wall-clock deadline is
+            # reached. The deadline is reset per chunk so a slow
+            # upstream gets a fresh window after each flush.
+            buf: list[PreparedRequest] = []
+            deadline: float | None = None
+            for item in iterator:
+                if not buf:
+                    deadline = time.monotonic() + ttl_seconds
+                buf.append(item)
+                if len(buf) >= n or (
+                    deadline is not None and time.monotonic() >= deadline
+                ):
+                    yield buf
+                    buf = []
+                    deadline = None
+            if buf:
+                yield buf
+
+        chunks = _batched(requests, batch_size, ttl)
 
         for chunk in chunks:
             if not chunk:
@@ -1339,143 +1391,6 @@ class Session(ABC):
 
             if not is_spark and config.raise_error and failed:
                 failed[-1].raise_for_status()
-
-    def send_many_batch(
-        self,
-        requests: Iterator[PreparedRequest],
-        config: SendManyConfig | SendConfig | Mapping[str, Any] | None = None,
-        *,
-        wait: WaitingConfigArg = None,
-        raise_error: bool = True,
-        normalize: bool | None = None,
-        stream: bool = True,
-        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
-        local_cache: CacheConfig | Mapping[str, Any] | None = None,
-        batch_size: int | None = None,
-        ordered: bool = False,
-        max_in_flight: int | None = None,
-        spark_session: Optional["SparkSession"] = None,
-        **options,
-    ) -> "ResponseBatch":
-        """Run :meth:`send_many` and return the origin-tagged batch.
-
-        Returns a :class:`ResponseBatch` carrying the local / remote /
-        network buckets — Python lists when running locally, Spark
-        DataFrames when ``spark_session`` is provided. The same accessors
-        (`.local_hits`, `.remote_hits`, `.new_hits`, `.counts`,
-        `.to_dataframe()`) work in both modes.
-
-        The Python path materializes every response in memory; if you only
-        need the flat stream and your batch is huge, prefer the iterator
-        form of :meth:`send_many`.
-        """
-        cfg = SendManyConfig.check_arg(
-            config,
-            wait=wait,
-            raise_error=raise_error,
-            normalize=normalize,
-            stream=stream,
-            remote_cache=remote_cache,
-            local_cache=local_cache,
-            batch_size=batch_size,
-            ordered=ordered,
-            max_in_flight=max_in_flight,
-            spark_session=spark_session,
-            **options,
-        )
-
-        # Default-init the accumulator with the same engine the
-        # pipeline will produce so the first ``extend`` doesn't trip
-        # the Python/Spark mismatch guard. Empty buckets carry their
-        # schemas in either mode.
-        result = ResponseBatch(spark=cfg.spark_session)
-        for chunk in self._send_many_batches(requests, cfg):
-            result.extend(chunk)
-        return result
-
-    def _send_many_local(
-        self,
-        requests: Iterator[PreparedRequest],
-        config: SendManyConfig,
-    ) -> Iterator[Response]:
-        pool = self.job_pool
-        send_config = config.to_send_config(
-            with_remote_cache=False,
-            with_local_cache=True,
-            with_spark=False,
-            raise_error=False
-        )
-
-        for result in pool.as_completed(
-            (
-                # Keep local-only path local-only even when requests carry
-                # per-request remote cache config.
-                Job.make(self.send, r.copy(remote_cache_config=None), send_config)
-                for r in requests
-            ),
-            ordered=config.ordered,
-            max_in_flight=config.max_in_flight or self.pool_maxsize,
-            cancel_on_exit=False,
-            shutdown_on_exit=False,
-            raise_error=True,
-        ):
-            response: Response = result.result
-            if config.raise_error:
-                response.raise_for_status()
-            yield response
-
-    def spark_send_many(
-        self,
-        requests: Iterator[PreparedRequest],
-        config: SendManyConfig | SendConfig | Mapping[str, Any] | None = None,
-        *,
-        wait: WaitingConfigArg = None,
-        raise_error: bool = True,
-        normalize: bool | None = None,
-        stream: bool = True,
-        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
-        local_cache: CacheConfig | Mapping[str, Any] | None = None,
-        batch_size: int | None = None,
-        ordered: bool = False,
-        max_in_flight: int | None = None,
-        spark_session: Optional["SparkSession"] = None,
-        **options,
-    ) -> "ResponseBatch":
-        """Spark-flavored :meth:`send_many_batch` — explicit Spark entry.
-
-        Same pipeline as :meth:`send_many_batch`; the only difference
-        is that ``spark_session`` is auto-resolved when missing instead
-        of being required up-front. Returns a :class:`ResponseBatch`
-        whose holders are Spark DataFrames; call ``to_dataframe()`` to
-        fuse them or read each origin individually.
-
-        ``raise_error=True`` does NOT short-circuit a partial batch on
-        the Spark path — workers run with ``raise_error=False`` and
-        the caller is expected to filter on ``response_status_code``.
-        """
-        cfg = SendManyConfig.check_arg(
-            config,
-            wait=wait,
-            raise_error=raise_error,
-            normalize=normalize,
-            stream=stream,
-            remote_cache=remote_cache,
-            local_cache=local_cache,
-            batch_size=batch_size,
-            ordered=ordered,
-            max_in_flight=max_in_flight,
-            spark_session=spark_session,
-            **options,
-        )
-
-        if cfg.spark_session is None:
-            cfg = cfg.merge(
-                spark_session=PyEnv.spark_session(
-                    create=True, install_spark=False, import_error=True,
-                )
-            )
-
-        return self.send_many_batch(requests, config=cfg)
 
     # ------------------------------------------------------------------ #
     # Spark stage 3 / 4 helpers                                           #
