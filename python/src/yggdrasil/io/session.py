@@ -24,7 +24,7 @@ from yggdrasil.io.enums import Mode
 from .buffer import BytesIO
 from .request import PreparedRequest
 from .response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
-from .response_batch import ResponseBatch, SparkResponseBatch, responses_to_spark_df
+from .response_batch import ResponseBatch, responses_to_spark_df
 from .send_config import CacheConfig, SendConfig, SendManyConfig
 from .url import URL
 from ..environ import PyEnv
@@ -38,7 +38,6 @@ __all__ = [
     "SendConfig",
     "SendManyConfig",
     "ResponseBatch",
-    "SparkResponseBatch",
 ]
 
 
@@ -771,14 +770,17 @@ class Session(ABC):
                 yield b
 
         for chunk in _batched(requests, batch_size):
-            result = ResponseBatch()
-
             # --- Stage 1: local cache ---
             local_hits, after_local = self._split_local_cache(chunk, session_local_cfg)
-            result.local_hits.extend(local_hits)
+            remote_hits: list[Response] = []
+            new_hits: list[Response] = []
 
             if not after_local:
-                yield result
+                yield ResponseBatch(
+                    local_hits=local_hits,
+                    remote_hits=remote_hits,
+                    new_hits=new_hits,
+                )
                 continue
 
             # Snapshot per-request effective configs BEFORE we mutate copies
@@ -804,27 +806,34 @@ class Session(ABC):
             self._backfill_local_cache(
                 remote_hits, url_to_local_cfg, session_local_cfg,
             )
-            result.remote_hits.extend(remote_hits)
 
             if not after_remote:
-                yield result
+                yield ResponseBatch(
+                    local_hits=local_hits,
+                    remote_hits=remote_hits,
+                    new_hits=new_hits,
+                )
                 continue
 
             # --- Stage 3: fetch misses ---
             failed: list[Response] = []
             for response in self._fetch_misses(after_remote, config):
                 if response.ok:
-                    result.new_hits.append(response)
+                    new_hits.append(response)
                 elif config.raise_error:
                     failed.append(response)
 
             # --- Stage 4: bulk remote writeback ---
-            if result.new_hits:
+            if new_hits:
                 self._persist_remote(
-                    result.new_hits, url_to_remote_cfg, session_remote_cfg,
+                    new_hits, url_to_remote_cfg, session_remote_cfg,
                 )
 
-            yield result
+            yield ResponseBatch(
+                local_hits=local_hits,
+                remote_hits=remote_hits,
+                new_hits=new_hits,
+            )
 
             if config.raise_error and failed:
                 failed[-1].raise_for_status()
@@ -845,13 +854,14 @@ class Session(ABC):
         max_in_flight: int | None = None,
         spark_session: Optional["SparkSession"] = None,
         **options,
-    ) -> "ResponseBatch | SparkResponseBatch":
+    ) -> "ResponseBatch":
         """Run :meth:`send_many` and return the origin-tagged batch.
 
-        Returns a :class:`ResponseBatch` (or :class:`SparkResponseBatch`
-        when ``spark_session`` is provided) so the caller can see exactly
-        what came from local cache, remote cache, and the network — handy
-        for logging, metrics, or asserting cache hit-rates in tests.
+        Returns a :class:`ResponseBatch` carrying the local / remote /
+        network buckets — Python lists when running locally, Spark
+        DataFrames when ``spark_session`` is provided. The same accessors
+        (`.local_hits`, `.remote_hits`, `.new_hits`, `.counts`,
+        `.to_dataframe()`) work in both modes.
 
         The Python path materializes every response in memory; if you only
         need the flat stream and your batch is huge, prefer the iterator
@@ -875,7 +885,10 @@ class Session(ABC):
         if cfg.spark_session is not None:
             return self._spark_send_many(requests, config=cfg)
 
-        result = ResponseBatch()
+        # Default-init buckets to empty lists so the merged batch always
+        # exposes Python-mode holders (counts, len, iteration all work
+        # even when every chunk produced zero responses).
+        result = ResponseBatch(local_hits=[], remote_hits=[], new_hits=[])
         for chunk in self._send_many_batches(requests, cfg):
             result.extend(chunk)
         return result
@@ -952,15 +965,15 @@ class Session(ABC):
         max_in_flight: int | None = None,
         spark_session: Optional["SparkSession"] = None,
         **options,
-    ) -> "SparkResponseBatch":
+    ) -> "ResponseBatch":
         """Spark-native equivalent of `send_many`, returning a batch view.
 
         Runs the four-stage pipeline (local cache → remote cache →
         mapInArrow fetch → bulk writeback) and packages the result as a
-        :class:`SparkResponseBatch`. Each origin lives in its own
-        DataFrame typed as ``RESPONSE_SCHEMA``; call
-        :meth:`SparkResponseBatch.to_dataframe` to fuse them, or iterate
-        the batch to walk each part individually.
+        :class:`ResponseBatch` whose holders are Spark DataFrames typed
+        as ``RESPONSE_SCHEMA``. Call :meth:`ResponseBatch.to_dataframe`
+        to fuse them, or read ``.local_hits`` / ``.remote_hits`` /
+        ``.new_hits`` to walk each origin individually.
 
         If `spark_session` is None it is auto-resolved via
         `PyEnv.spark_session(create=True)` — pass an explicit session when
@@ -1003,7 +1016,7 @@ class Session(ABC):
         self,
         requests: Iterator[PreparedRequest],
         config: SendManyConfig,
-    ) -> "SparkResponseBatch":
+    ) -> "ResponseBatch":
         # Resolve Spark session — prefer cfg.spark_session, else auto-create.
         spark = config.spark_session
         if spark is None:
@@ -1017,7 +1030,7 @@ class Session(ABC):
         # Materialise — we need the full list to run driver-side stages 1 and 2.
         all_requests: list[PreparedRequest] = list(requests)
         if not all_requests:
-            return SparkResponseBatch(spark=spark)
+            return ResponseBatch(spark=spark)
 
         LOGGER.info(
             "spark_send_many: %s requests (batch_size=%s, remote=%s, local=%s)",
@@ -1068,7 +1081,7 @@ class Session(ABC):
             )
 
         # Cache hits → Arrow → Spark DF (driver-side, cheap: already in memory).
-        # Each origin keeps its own DF so the SparkResponseBatch mirrors
+        # Each origin keeps its own DF so the ResponseBatch mirrors
         # the three pipeline stages and keeps the network branch lazy.
         local_df = responses_to_spark_df(local_hits, spark)
         remote_df = responses_to_spark_df(remote_hits, spark)
@@ -1093,7 +1106,7 @@ class Session(ABC):
                 spark=spark,
             )
 
-        return SparkResponseBatch(
+        return ResponseBatch(
             local_hits=local_df,
             remote_hits=remote_df,
             new_hits=new_responses_df,
