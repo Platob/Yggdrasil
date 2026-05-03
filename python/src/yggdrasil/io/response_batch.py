@@ -241,10 +241,13 @@ class ResponseBatch:
                 "`.local_hits` / `.remote_hits` / `.new_hits` holders if you "
                 "really need the Spark frames."
             )
+        # Route through `read_records` so each Response is built from a
+        # `Record` sharing the holder's singleton Schema — one Schema
+        # allocation per holder regardless of row count.
         for holder in self._holders():
             if holder is None:
                 continue
-            yield from Response.from_arrow_tabular(holder.read_arrow_batches())
+            yield from Response.from_records(holder.read_records())
 
     def __len__(self) -> int:
         if self.is_spark:

@@ -1070,6 +1070,41 @@ class Response:
                 yield cls._from_arrow_cols(cols, i, normalize=normalize)
 
     @classmethod
+    def from_record(
+        cls,
+        record: "Mapping[str, Any]",
+        *,
+        normalize: bool = False,
+    ) -> "Response":
+        """Build a :class:`Response` from a row-shaped mapping.
+
+        Accepts any :class:`Mapping` keyed by the
+        :data:`RESPONSE_SCHEMA` field names — typically a
+        :class:`yggdrasil.data.record.Record` from
+        :meth:`TabularIO.read_records`, but a plain ``dict`` works
+        too. Missing keys land as ``None``; the ``request_*`` keys
+        are routed through :meth:`PreparedRequest.from_record` so
+        the rebuilt request keeps the same shape as the Arrow
+        round-trip.
+        """
+        return cls._from_get(record.get, normalize=normalize)
+
+    @classmethod
+    def from_records(
+        cls,
+        records: "Iterable[Mapping[str, Any]]",
+        *,
+        normalize: bool = False,
+    ) -> Iterator["Response"]:
+        """Stream :class:`Response` objects from a record iterator.
+
+        Convenience wrapper around :meth:`from_record` for callers
+        that have an iterator out of :meth:`TabularIO.read_records`.
+        """
+        for record in records:
+            yield cls.from_record(record, normalize=normalize)
+
+    @classmethod
     def _from_arrow_cols(
         cls,
         cols: dict[str, Any],
@@ -1077,12 +1112,29 @@ class Response:
         *,
         normalize: bool = False,
     ) -> "Response":
-        def _get(name: str) -> Any:
+        def _arrow_get(name: str) -> Any:
             if name in cols:
                 return cols[name][i].as_py()
             return None
 
-        request = PreparedRequest._from_arrow_cols(cols, i, normalize=normalize)
+        return cls._from_get(_arrow_get, normalize=normalize)
+
+    @classmethod
+    def _from_get(
+        cls,
+        get: "Callable[[str], Any]",
+        *,
+        normalize: bool = False,
+    ) -> "Response":
+        # Single source of truth for "named-getter → Response" — used
+        # by both the Arrow-batch path (`_from_arrow_cols`) and the
+        # Mapping path (`from_record`). Anything that can answer
+        # ``get(field_name)`` for the RESPONSE_SCHEMA field names
+        # qualifies; missing keys come back as ``None``.
+        def _get(name: str) -> Any:
+            return get(name)
+
+        request = PreparedRequest._from_get(_get, normalize=normalize)
 
         headers = _map_to_str_dict(_get("response_headers"))
         for header_name, field_name in _PROMOTED_RESPONSE_HEADER_FIELDS:

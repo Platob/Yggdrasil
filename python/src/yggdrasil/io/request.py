@@ -991,6 +991,21 @@ class PreparedRequest:
                 yield cls._from_arrow_cols(cols, i, normalize=normalize)
 
     @classmethod
+    def from_record(
+        cls,
+        record: "Mapping[str, Any]",
+        *,
+        normalize: bool = True,
+    ) -> "PreparedRequest":
+        """Build a :class:`PreparedRequest` from a row-shaped mapping.
+
+        Same field-name surface as :meth:`_from_arrow_cols`, but
+        sourced from any :class:`Mapping` (typically a
+        :class:`yggdrasil.data.record.Record`).
+        """
+        return cls._from_get(record.get, normalize=normalize)
+
+    @classmethod
     def _from_arrow_cols(
         cls,
         cols: dict[str, Any],
@@ -998,10 +1013,24 @@ class PreparedRequest:
         *,
         normalize: bool = True,
     ) -> "PreparedRequest":
-        def _get(name: str) -> Any:
+        def _arrow_get(name: str) -> Any:
             if name in cols:
                 return cols[name][i].as_py()
             return None
+
+        return cls._from_get(_arrow_get, normalize=normalize)
+
+    @classmethod
+    def _from_get(
+        cls,
+        get: "Callable[[str], Any]",
+        *,
+        normalize: bool = True,
+    ) -> "PreparedRequest":
+        # Single source of truth for "named-getter → PreparedRequest"
+        # — used by both the Arrow-batch path and the Mapping path.
+        def _get(name: str) -> Any:
+            return get(name)
 
         url_str = _get("request_url_str")
         if url_str not in (None, ""):
