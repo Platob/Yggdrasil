@@ -614,6 +614,11 @@ class Field(BaseMetadata, BaseChildrenFields):
     # ==================================================================
 
     def _with_tag_flag(self, key: bytes, value: bool, inplace: bool) -> "Field":
+        # Short-circuit when the desired flag state already matches —
+        # avoids invalidating cached arrow / polars / spark projections
+        # for a no-op tag write.
+        if self._tag_flag(key) == bool(value):
+            return self
         if inplace:
             if value:
                 self._set_tag_value(key, True)
@@ -695,6 +700,10 @@ class Field(BaseMetadata, BaseChildrenFields):
                 tags=tags,
                 default_value=default
             )
+            # Skip the cache drop when the normalized payload is
+            # byte-for-byte equal to what's already stored.
+            if normalized == self.metadata:
+                return self
             if inplace:
                 object.__setattr__(self, "metadata", normalized)
                 self._invalidate_cache()
@@ -703,18 +712,26 @@ class Field(BaseMetadata, BaseChildrenFields):
         return self
 
     def with_default(self, default: Any = None) -> "Field":
-        metadata = dict(self.metadata) if self.metadata is not None else {}
+        current = self.metadata.get(DEFAULT_VALUE_KEY) if self.metadata else None
 
         if default is None:
+            # Already no default — nothing to invalidate.
+            if current is None:
+                return self
+            metadata = dict(self.metadata)
             metadata.pop(DEFAULT_VALUE_KEY, None)
         else:
-            metadata[DEFAULT_VALUE_KEY] = json_module.dumps(
+            encoded = json_module.dumps(
                 default,
                 safe=False,
                 to_bytes=True,
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
+            if current == encoded:
+                return self
+            metadata = dict(self.metadata) if self.metadata is not None else {}
+            metadata[DEFAULT_VALUE_KEY] = encoded
 
         object.__setattr__(self, "metadata", metadata or None)
         self._invalidate_cache()
