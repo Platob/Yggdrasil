@@ -205,13 +205,21 @@ def _encode_media_type(obj: io.IOBase) -> bytes | None:
     return wire
 
 
-def _restore_media_type(buf: BytesIO, metadata: Mapping[bytes, bytes] | None) -> None:
-    """Set ``_media_type`` on *buf* from serialized metadata, if present."""
+def _decode_media_type(metadata: Mapping[bytes, bytes] | None):
+    """Return the ``MediaType`` encoded in *metadata*, or ``None``.
+
+    Returned to the caller (rather than mutated onto an existing buffer)
+    so it can be passed to ``BytesIO(data, media_type=...)``. That route
+    runs the registry dispatch in :meth:`BytesIO.__new__` and lands on
+    the right registered leaf (ParquetIO, JsonIO, …); a post-hoc
+    ``buf._media_type = ...`` would leave the class as the opaque
+    ``BytesIO``.
+    """
     if not metadata:
-        return
+        return None
     raw = metadata.get(_M_MT)
     if raw is None:
-        return
+        return None
     from yggdrasil.io.enums.codec import Codec
     from yggdrasil.io.enums.media_type import MediaType
     from yggdrasil.io.enums.mime_type import MimeType
@@ -225,15 +233,15 @@ def _restore_media_type(buf: BytesIO, metadata: Mapping[bytes, bytes] | None) ->
 
     mt = MimeType._BY_NAME.get(mime_name.lower())
     if mt is None:
-        return
+        return None
 
     c = None
     if codec_name:
         c = Codec.from_(codec_name)
         if c is None:
-            return
+            return None
 
-    buf._media_type = MediaType(mime_type=mt, codec=c)
+    return MediaType(mime_type=mt, codec=c)
 
 
 # ============================================================================
@@ -263,9 +271,10 @@ class IOSerialized(Serialized[object]):
             text = _decode_text_payload(self.decode(), encoding=encoding, errors=errors)
             return io.StringIO(text)
 
-        buf = BytesIO(self.decode())
-        _restore_media_type(buf, self.metadata)
-        return buf
+        media_type = _decode_media_type(self.metadata)
+        if media_type is not None:
+            return BytesIO(self.decode(), media_type=media_type)
+        return BytesIO(self.decode())
 
     def as_python(self) -> object:
         return self.value
@@ -318,9 +327,10 @@ class BinaryIOSerialized(IOSerialized):
 
     @property
     def value(self) -> BytesIO:
-        buf = BytesIO(self.decode())
-        _restore_media_type(buf, self.metadata)
-        return buf
+        media_type = _decode_media_type(self.metadata)
+        if media_type is not None:
+            return BytesIO(self.decode(), media_type=media_type)
+        return BytesIO(self.decode())
 
     def as_python(self) -> BytesIO:
         return self.value

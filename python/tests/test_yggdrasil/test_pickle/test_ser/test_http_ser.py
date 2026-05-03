@@ -419,6 +419,36 @@ class TestResponseRoundTrip:
         _assert_responses_equal(orig, r)
         assert r.request.method == "POST"
 
+    def test_buffer_subclass_preserved_for_known_media_type(self):
+        """Response buffer must come back as the registered leaf class.
+
+        Regression test: ``Response._from_arrow_cols`` previously
+        constructed a plain :class:`BytesIO` and only attached the
+        media type post-hoc, so the buffer class wasn't promoted to
+        the registered leaf (``JsonIO``, ``ParquetIO``, …).
+        """
+        from yggdrasil.io.buffer.primitive.json_io import JsonIO
+        from yggdrasil.io.enums.media_type import MediaType
+        from yggdrasil.io.enums.mime_type import MimeTypes
+
+        req = _make_request()
+        buf = BytesIO(b'{"x":1}', media_type=MediaType(MimeTypes.JSON))
+        assert isinstance(buf, JsonIO)
+        orig = Response(
+            request=req,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            tags={},
+            buffer=buf,
+            received_at=_NOW,
+        )
+        assert isinstance(orig.buffer, JsonIO)
+
+        ser = ResponseSerialized.from_value(orig)
+        r = ser.value
+        assert isinstance(r.buffer, JsonIO)
+        assert r.buffer.to_bytes() == b'{"x":1}'
+
 
 # ---------------------------------------------------------------------------
 # ResponseSerialized — dispatch
