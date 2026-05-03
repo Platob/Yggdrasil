@@ -523,7 +523,7 @@ class ResponseBatch:
         if isinstance(theirs, MemorySparkIO) and theirs.frame is not None:
             if isinstance(mine, MemorySparkIO) and mine.frame is not None:
                 mine.frame = mine.frame.unionByName(
-                    theirs.frame, allowMissingColumns=False,
+                    theirs.frame, allowMissingColumns=True,
                 )
             else:
                 setattr(self, attr, theirs)
@@ -553,7 +553,7 @@ class ResponseBatch:
             if isinstance(their_holder, MemorySparkIO) and their_holder.frame is not None:
                 if isinstance(existing, MemorySparkIO) and existing.frame is not None:
                     existing.frame = existing.frame.unionByName(
-                        their_holder.frame, allowMissingColumns=False,
+                        their_holder.frame, allowMissingColumns=True,
                     )
                 else:
                     mine[key] = their_holder
@@ -584,7 +584,7 @@ class ResponseBatch:
         :meth:`TabularIO.read_spark_frame` which materializes on the
         driver and lifts to Spark. Buckets are unioned in pipeline
         order — every per-path local holder, then every per-table
-        remote holder, then new — with ``allowMissingColumns=False``
+        remote holder, then new — with ``allowMissingColumns=True``
         because every bucket carries the same :data:`RESPONSE_SCHEMA`.
         A missing column would mean a real schema drift, and silent
         column-fill is worse than a loud failure.
@@ -610,5 +610,7 @@ class ResponseBatch:
             )
         result = frames[0]
         for part in frames[1:]:
-            result = result.unionByName(part, allowMissingColumns=False)
+            if "__rn" in part.columns:
+                part = part.drop("__rn")
+            result = result.unionByName(part, allowMissingColumns=True)
         return result

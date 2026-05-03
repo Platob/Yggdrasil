@@ -137,7 +137,7 @@ class MemorySparkIO(TabularIO[CastOptions]):
             return
         if action is Mode.APPEND:
             self.frame = self._frame.unionByName(
-                frame, allowMissingColumns=False,
+                frame, allowMissingColumns=True,
             )
             return
         raise NotImplementedError(
