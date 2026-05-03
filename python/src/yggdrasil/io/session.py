@@ -765,12 +765,22 @@ class Session(ABC):
     ) -> Iterator[Response]:
         """Stream responses, flattening the per-chunk :class:`ResponseBatch`.
 
-        Iteration order matches :class:`ResponseBatch`: local hits first,
-        then remote hits, then network fetches. Callers that need the
-        origin breakdown should use :meth:`send_many_batch` instead.
+        Iteration order matches :class:`ResponseBatch.parts`: local hits
+        first, then remote hits, then network fetches. Callers that need
+        the origin breakdown should use :meth:`send_many_batch` instead.
+
+        Works in both Python and Spark modes. Spark-backed buckets are
+        drained via the holder's :meth:`TabularIO.read_records`, which
+        for :class:`MemorySparkIO` uses ``df.toLocalIterator()`` — rows
+        stream from the executors one at a time, so the driver memory
+        footprint stays bounded even for large network-fetch batches.
+        :class:`ResponseBatch.__iter__` rejects Spark mode (it would
+        force a ``df.toArrow()`` collect); going through the holders
+        sidesteps that guard.
         """
         for batch in self._send_many_batches(requests, config):
-            yield from batch
+            for holder in batch.parts():
+                yield from Response.from_records(holder.read_records())
 
     def send_many_batches(
         self,
