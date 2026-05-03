@@ -6,9 +6,9 @@ row — the caller can't tell whether a response came from the local
 on-disk cache, the remote SQL cache, or a fresh network fetch.
 
 :class:`ResponseBatch` keeps that split visible. The three buckets are
-all stored as the same type — :class:`TabularIO` — so Python (Arrow IPC
-bytes) and Spark (a wrapped ``SparkDataFrame``) share one contract.
-Iteration walks each holder's Arrow batches and rebuilds
+all stored as the same type — :class:`TabularIO` — so Python
+(:class:`MemoryArrowIO`) and Spark (:class:`MemorySparkIO`) share one
+contract. Iteration walks each holder's Arrow batches and rebuilds
 :class:`Response` objects via :meth:`Response.from_arrow_tabular`, so
 the batch never has to special-case which engine produced the rows.
 """
@@ -17,10 +17,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Iterator, Optional, Union
 
-import pyarrow as pa
-
 from .buffer.base import TabularIO
-from .buffer.primitive.arrow_ipc_io import ArrowIPCIO
+from .buffer.memory import MemoryArrowIO, MemorySparkIO
 from .response import RESPONSE_SCHEMA, Response
 
 if TYPE_CHECKING:
@@ -52,35 +50,31 @@ BucketInput = Union[
 # Coercion helpers — one shape in, one TabularIO out
 # ---------------------------------------------------------------------------
 
-def responses_to_tabular(responses: list[Response]) -> Optional[TabularIO]:
-    """Wrap a list of :class:`Response` in an :class:`ArrowIPCIO`.
+def responses_to_tabular(responses: list[Response]) -> Optional[MemoryArrowIO]:
+    """Wrap a list of :class:`Response` in a :class:`MemoryArrowIO`.
 
     Returns ``None`` for an empty list so callers can keep the
     "skipped vs empty" distinction. Each response is serialized via
-    ``to_arrow_batch(parse=False)`` (one row per batch); reads come back
-    through :meth:`Response.from_arrow_tabular`.
+    ``to_arrow_batch(parse=False)`` (one row per batch) and held in
+    memory — no IPC bytes, no spill. Reads come back through
+    :meth:`Response.from_arrow_tabular`.
     """
     if not responses:
         return None
-    io = ArrowIPCIO()
-    io.write_arrow_batches(r.to_arrow_batch(parse=False) for r in responses)
-    return io
+    return MemoryArrowIO(r.to_arrow_batch(parse=False) for r in responses)
 
 
-def spark_to_tabular(df: "SparkDataFrame") -> TabularIO:
-    """Wrap a Spark DataFrame in a :class:`TabularIO` without collecting.
+def spark_to_tabular(df: "SparkDataFrame") -> MemorySparkIO:
+    """Wrap a Spark DataFrame in a :class:`MemorySparkIO` (no collect).
 
-    The DataFrame lives on the IO's persisted ``_spark_frame`` slot, so
-    :meth:`TabularIO.read_spark_frame` returns the original DataFrame
-    untouched (no driver collect). A subsequent
-    :meth:`TabularIO.read_arrow_batches` would route through the cache
-    path and force ``df.toArrow()`` — fine for small batches, but
-    Spark-mode iteration on the :class:`ResponseBatch` is disallowed
-    precisely so callers don't trip over that collect by accident.
+    The DataFrame lives on the holder's mutable ``frame`` slot, so
+    :meth:`TabularIO.read_spark_frame` returns it untouched. A
+    subsequent :meth:`TabularIO.read_arrow_batches` would force
+    ``df.toArrow()`` — fine for small frames, but Spark-mode iteration
+    on the :class:`ResponseBatch` is disallowed precisely so callers
+    don't trip over that collect by accident.
     """
-    io = ArrowIPCIO()
-    io.persist(engine="spark", data=df)
-    return io
+    return MemorySparkIO(df)
 
 
 def _coerce_bucket(value: BucketInput) -> Optional[TabularIO]:
@@ -202,11 +196,11 @@ class ResponseBatch:
 
     @staticmethod
     def _is_spark_holder(holder: Optional[TabularIO]) -> bool:
-        return holder is not None and getattr(holder, "_spark_frame", None) is not None
+        return isinstance(holder, MemorySparkIO) and holder.frame is not None
 
     @property
     def is_spark(self) -> bool:
-        """True if any holder carries a persisted Spark DataFrame."""
+        """True if any holder carries a Spark DataFrame."""
         return any(self._is_spark_holder(h) for h in self._holders())
 
     def parts(self) -> list[TabularIO]:
@@ -217,17 +211,19 @@ class ResponseBatch:
     def counts(self) -> dict[str, int]:
         """Per-origin row counts.
 
-        Skipped holders count as ``0``. For Spark-backed holders this
-        triggers ``df.count()``; for Arrow-IPC holders it materializes
-        the Arrow table to read ``num_rows`` — fine for debugging or
-        small assertions, not for hot paths.
+        Skipped holders count as ``0``. For :class:`MemorySparkIO`
+        this triggers ``df.count()``; for :class:`MemoryArrowIO` it
+        sums ``num_rows`` across the in-memory batches — fine for
+        debugging or small assertions, not for hot paths.
         """
         out: dict[str, int] = {}
         for name, h in zip(("local", "remote", "new"), self._holders()):
             if h is None:
                 out[name] = 0
-            elif self._is_spark_holder(h):
-                out[name] = h._spark_frame.count()  # type: ignore[union-attr]
+            elif isinstance(h, MemorySparkIO):
+                out[name] = h.frame.count() if h.frame is not None else 0
+            elif isinstance(h, MemoryArrowIO):
+                out[name] = h.num_rows
             else:
                 out[name] = h.read_arrow_table().num_rows
         return out
@@ -287,11 +283,9 @@ class ResponseBatch:
         too sneaky to do silently. Convert one side first if you need
         that.
 
-        Per-bucket merges read both holders' batches and write a fresh
-        :class:`ArrowIPCIO`. The IPC file format has a single footer,
-        so partial appends would have to rewrite the whole thing
-        anyway — one merged write is cheaper than two writes plus a
-        rewrite.
+        Per-bucket merges append the other side's batches into our
+        :class:`MemoryArrowIO` holder — no IPC rewrite, just a list
+        extend on the held batches.
         """
         if self.is_spark or other.is_spark:
             raise TypeError(
@@ -299,6 +293,8 @@ class ResponseBatch:
                 "with `to_dataframe()` and union the DataFrames yourself if "
                 "you need to merge across modes."
             )
+
+        from .enums import Mode
 
         for name in ("_local_response", "_remote_response", "_new_response"):
             mine = getattr(self, name)
@@ -308,11 +304,7 @@ class ResponseBatch:
             if mine is None:
                 setattr(self, name, theirs)
                 continue
-            merged = ArrowIPCIO()
-            merged.write_arrow_batches(
-                _chain_batches(mine, theirs)
-            )
-            setattr(self, name, merged)
+            mine.write_arrow_batches(theirs.read_arrow_batches(), mode=Mode.APPEND)
         return self
 
     # ------------------------------------------------------------------
@@ -346,8 +338,8 @@ class ResponseBatch:
         for holder in self._holders():
             if holder is None:
                 continue
-            if self._is_spark_holder(holder):
-                frames.append(holder._spark_frame)  # type: ignore[union-attr]
+            if isinstance(holder, MemorySparkIO) and holder.frame is not None:
+                frames.append(holder.frame)
             else:
                 frames.append(holder.read_spark_frame())
 
@@ -361,8 +353,3 @@ class ResponseBatch:
         return result
 
 
-def _chain_batches(
-    *holders: TabularIO,
-) -> Iterator[pa.RecordBatch]:
-    for h in holders:
-        yield from h.read_arrow_batches()
