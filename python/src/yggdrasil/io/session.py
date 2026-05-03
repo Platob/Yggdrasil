@@ -1891,9 +1891,7 @@ class Session(ABC):
 
         if params:
             parsed = URL.from_(full_url, normalize=normalize)
-            items = list(parsed.query_items(keep_blank_values=True))
-            items.extend((key, value) for key, value in params.items())
-            full_url = parsed.with_query_items(tuple(items))
+            full_url = parsed.with_query_items(params)
 
         return PreparedRequest.prepare(
             method=method,

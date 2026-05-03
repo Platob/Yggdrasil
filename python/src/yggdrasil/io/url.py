@@ -1293,18 +1293,47 @@ class URL(os.PathLike):
             out.setdefault(key, []).append(value)
         return out
 
-    def add_query_item(self, key: str, value: str | None, replace: bool = True) -> URL:
+    def add_query_item(
+        self,
+        key: str,
+        value: str | None | Sequence[str | None],
+        replace: bool = True,
+    ) -> URL:
+        """Add or replace one or more values for ``key`` in the query string.
+
+        ``value`` may be:
+
+        - a scalar (``str`` or ``None``) — appended as a single ``(key, v)``
+          pair, with ``None`` coerced to ``""``,
+        - a ``list`` / ``tuple`` of scalars — appended as one pair per
+          element. ``None`` elements coerce to ``""``.
+
+        When ``replace=True`` (the default), every existing pair with the
+        same ``key`` is removed first. Combined with an empty sequence,
+        this clears the key entirely; combined with a non-empty sequence,
+        it sets the key to exactly those values. With ``replace=False``,
+        new pairs are appended without touching existing ones.
+
+        Generators / arbitrary iterables are intentionally not accepted:
+        a single-pass iterator that gets exhausted during validation
+        would be a footgun, and ``str`` would be ambiguously iterable.
+        Materialize first if you have one.
+        """
         if key is None:
             raise ValueError("key cannot be None")
 
         key_text = str(key)
-        value_text = "" if value is None else str(value)
+
+        if isinstance(value, (list, tuple)):
+            new_values: list[str] = ["" if v is None else str(v) for v in value]
+        else:
+            new_values = ["" if value is None else str(value)]
 
         items = list(self.query_items(keep_blank_values=True))
         if replace:
             items = [(k, v) for k, v in items if k != key_text]
 
-        items.append((key_text, value_text))
+        items.extend((key_text, v) for v in new_values)
         items.sort(key=lambda item: (item[0], item[1]))
         return self.with_query(urlencode(items, doseq=True))
 
