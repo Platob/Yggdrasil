@@ -976,6 +976,14 @@ class Session(ABC):
         see only the session-level local cache config. ``cfg.table.insert``
         accepts the Spark DataFrame directly via ``spark_insert_into``, so
         no driver-side collect is needed.
+
+        Before inserting, APPEND-mode writes are de-duplicated against the
+        existing remote rows via a ``left_anti`` join on the anonymized
+        request identity (``request_url_path`` + ``request_url_query``) —
+        the remote table stores anonymized requests (cf. ``_persist_remote``),
+        so a row whose path+query already lives in the cache is suppressed
+        rather than re-inserted. UPSERT mode keeps its read-free fast path
+        and relies on ``match_by`` to collapse duplicates server-side.
         """
         from pyspark.sql import functions as F
 
@@ -983,6 +991,28 @@ class Session(ABC):
             (F.col("response_status_code") >= 200)
             & (F.col("response_status_code") < 300)
         )
+
+        if cfg.mode != Mode.UPSERT:
+            table_name = cfg.table.full_name(safe=True)
+            try:
+                existing_df = spark.sql(
+                    "SELECT DISTINCT request_url_path, request_url_query "
+                    f"FROM {table_name}"
+                )
+            except Exception as exc:
+                # Table doesn't exist yet — nothing to dedup against; the
+                # downstream `cfg.table.insert` handles creation. Match the
+                # error-string sniff used by `_lookup_remote_table`.
+                if "TABLE_OR_VIEW_NOT_FOUND" not in str(exc):
+                    raise
+                existing_df = None
+
+            if existing_df is not None:
+                ok_df = ok_df.join(
+                    existing_df,
+                    on=["request_url_path", "request_url_query"],
+                    how="left_anti",
+                )
 
         LOGGER.debug(
             "%s ok response(s) into remote cache %s (spark insert)",
