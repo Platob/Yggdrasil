@@ -818,16 +818,24 @@ class PyEnv:
     # uv resolution / runtime installation
     # ---------------------------------------------------------------------
 
-    def has_uv(self) -> bool:
-        """
-        Return ``True`` if ``uv`` appears usable for this interpreter.
+    def _is_current_interpreter(self) -> bool:
+        """``True`` when :attr:`python_path` points to the running interpreter."""
+        return self.python_path.resolve() == Path(sys.executable).resolve()
+
+    def _locate_uv(self) -> Path | None:
+        """Look up ``uv`` without attempting to install it.
+
+        Probe order: env-local binary, ``uv`` on PATH, ``python -m uv``.
+        Returns the resolved binary path, the python_path sentinel for
+        the module-launched form, or ``None`` if uv isn't reachable.
         """
         local = self.bin_path / ("uv.exe" if self.is_windows else "uv")
         if local.is_file():
-            return True
+            return local.resolve()
 
-        if shutil.which("uv"):
-            return True
+        which_uv = shutil.which("uv")
+        if which_uv:
+            return Path(which_uv).resolve()
 
         try:
             subprocess.run(
@@ -838,81 +846,58 @@ class PyEnv:
                 capture_output=True,
                 check=True,
             )
-            return True
+            return self.python_path
         except Exception:
-            return False
+            return None
 
-    @staticmethod
-    def _install_package_with_pip_api(package: str) -> None:
-        """
-        Install a package into this interpreter using pip's internal Python API
-        instead of spawning a public CLI command.
+    def has_uv(self) -> bool:
+        """``True`` if ``uv`` is reachable for this interpreter."""
+        return self._locate_uv() is not None
 
-        Notes
-        -----
-        This is intentionally a fallback path. pip's internal API is not stable,
-        but it works well enough as a last-resort bootstrap mechanism.
+    def _run_pip_internal(self, *args: str) -> None:
+        """Run pip through its internal API as a private fallback.
+
+        Only safe for the current interpreter — pip's internal API
+        mutates the running process, so it can't target a different
+        interpreter.
         """
+        if not self._is_current_interpreter():
+            raise RuntimeError(
+                "pip internal fallback is only supported for the current interpreter"
+            )
+
         try:
             from pip._internal.cli.main import main as pip_main  # type: ignore
         except Exception as exc:
             raise RuntimeError("pip internal API is unavailable") from exc
 
-        argv = ["install", package]
-        rc = pip_main(argv)
+        rc = pip_main(list(args))
         if rc != 0:
-            raise RuntimeError(f"pip internal API failed installing {package!r} with exit code {rc}")
-
-    def _is_current_interpreter(self) -> bool:
-        """``True`` when :attr:`python_path` points to the running interpreter."""
-        return self.python_path.resolve() == Path(sys.executable).resolve()
+            raise RuntimeError(f"pip internal API failed with exit code {rc}")
 
     def ensure_uv(self, *, install_runtime: bool = True) -> Path | None:
         """
         Resolve ``uv`` for this environment and optionally install it at runtime.
 
         Resolution order:
-        1. local env script
-        2. uv on PATH
-        3. python -m uv
-        4. install via pip subprocess
-        5. install via pip internal API fallback
+        1. cached path
+        2. env-local binary / PATH / ``python -m uv``
+        3. install via ``python -m pip install uv`` (subprocess), with
+           pip-internal-API fallback for the current interpreter.
         """
         if self._uv_bin and self._uv_bin.exists():
             return self._uv_bin
 
-        local = self.bin_path / ("uv.exe" if self.is_windows else "uv")
-        if local.is_file():
-            self._uv_bin = local.resolve()
+        located = self._locate_uv()
+        if located is not None:
+            self._uv_bin = located
             return self._uv_bin
-
-        which_uv = shutil.which("uv")
-        if which_uv:
-            self._uv_bin = Path(which_uv).resolve()
-            return self._uv_bin
-
-        try:
-            subprocess.run(
-                [str(self.python_path), "-m", "uv", "--version"],
-                cwd=str(self.cwd),
-                env=dict(os.environ),
-                text=True,
-                capture_output=True,
-                check=True,
-            )
-            self._uv_bin = self.python_path
-            return self._uv_bin
-        except Exception:
-            pass
 
         if not install_runtime:
             return None
 
         logger.info("PyEnv.ensure_uv: installing uv into runtime interpreter %s", self.python_path)
 
-        install_errors: list[Exception] = []
-
-        # First try normal isolated subprocess install
         try:
             subprocess.run(
                 [str(self.python_path), "-m", "pip", "install", "uv"],
@@ -923,49 +908,28 @@ class PyEnv:
                 check=True,
             )
         except Exception as exc:
-            install_errors.append(exc)
-
-            # Fallback: private in-process pip API, only when this PyEnv points to
-            # the current interpreter. We cannot safely mutate a different interpreter
-            # in-process.
-            if self.python_path.resolve() != Path(sys.executable).resolve():
+            # Private in-process pip API fallback — only safe for the
+            # running interpreter.
+            if not self._is_current_interpreter():
                 raise RuntimeError(
                     "Failed to install uv with pip subprocess, and pip internal fallback "
                     "is only supported for the current interpreter."
                 ) from exc
 
             try:
-                self._install_package_with_pip_api("uv")
+                self._run_pip_internal("install", "uv")
             except Exception as inner_exc:
-                install_errors.append(inner_exc)
                 raise RuntimeError(
                     "Failed to install uv with both pip subprocess and pip internal fallback"
                 ) from inner_exc
 
-        if local.is_file():
-            self._uv_bin = local.resolve()
-            return self._uv_bin
-
-        which_uv = shutil.which("uv")
-        if which_uv:
-            self._uv_bin = Path(which_uv).resolve()
-            return self._uv_bin
-
-        try:
-            subprocess.run(
-                [str(self.python_path), "-m", "uv", "--version"],
-                cwd=str(self.cwd),
-                env=dict(os.environ),
-                text=True,
-                capture_output=True,
-                check=True,
-            )
-            self._uv_bin = self.python_path
-            return self._uv_bin
-        except Exception as exc:
+        located = self._locate_uv()
+        if located is None:
             raise FileNotFoundError(
                 f"Installed uv attempt completed for {self.python_path}, but no usable uv command was found"
-            ) from exc
+            )
+        self._uv_bin = located
+        return self._uv_bin
 
     @property
     def uv_path(self) -> Path:
@@ -994,26 +958,6 @@ class PyEnv:
 
         return [str(uv_ref)]
 
-    def _run_pip_internal(self, *args: str) -> None:
-        """
-        Run pip through its internal API as a private fallback.
-
-        Only safe for the current interpreter.
-        """
-        if not self._is_current_interpreter():
-            raise RuntimeError(
-                "pip internal fallback is only supported for the current interpreter"
-            )
-
-        try:
-            from pip._internal.cli.main import main as pip_main  # type: ignore
-        except Exception as exc:
-            raise RuntimeError("pip internal API is unavailable") from exc
-
-        rc = pip_main(list(args))
-        if rc != 0:
-            raise RuntimeError(f"pip internal API failed with exit code {rc}")
-
     def install(
         self,
         *packages: str,
@@ -1040,7 +984,7 @@ class PyEnv:
             return None
 
         wait_cfg = WaitingConfig.from_(wait)
-        pip_cmd = self._pip_cmd_args(prefer_uv=prefer_uv) + ["install"]
+        pip_cmd = self._pip_cmd_args("install", prefer_uv=prefer_uv)
         tmp_req: Path | None = None
 
         if requirements is not None:
@@ -1156,8 +1100,7 @@ class PyEnv:
         if not packages:
             return None
 
-        cmd = self._pip_cmd_args(prefer_uv=prefer_uv) + [
-            "install",
+        cmd = self._pip_cmd_args("install", prefer_uv=prefer_uv) + [
             "--upgrade",
             *[str(safe_pip_name(p)) for p in packages],
             *extra_args,
@@ -1196,8 +1139,7 @@ class PyEnv:
         if not packages:
             return None
 
-        cmd = self._pip_cmd_args(prefer_uv=prefer_uv) + [
-            "uninstall",
+        cmd = self._pip_cmd_args("uninstall", prefer_uv=prefer_uv) + [
             *[str(safe_pip_name(p)) for p in packages],
             *extra_args,
         ]
@@ -1211,8 +1153,17 @@ class PyEnv:
     ) -> SystemCommand:
         """
         Run an arbitrary pip subcommand against this environment.
+
+        First positional ``args`` element is the subcommand
+        (``install``, ``freeze``, ``list``, …); the rest are passed
+        through verbatim. With ``prefer_uv=True`` the call goes
+        through ``uv pip <subcommand> --python <p>`` so installs land
+        in the venv that owns ``python_path``.
         """
-        cmd = self._pip_cmd_args(prefer_uv=prefer_uv) + list(args)
+        if not args:
+            raise ValueError("pip() requires at least the subcommand argument")
+        subcommand, rest = args[0], args[1:]
+        cmd = self._pip_cmd_args(subcommand, prefer_uv=prefer_uv) + list(rest)
         logger.debug("PyEnv.pip: cmd=%s cwd=%s", cmd, self.cwd)
         return SystemCommand.run_lazy(cmd, cwd=self.cwd).wait(wait)
 
@@ -1456,21 +1407,29 @@ class PyEnv:
 
     def _pip_cmd_args(
         self,
+        subcommand: str,
+        *,
         python: str | Path | None = None,
         prefer_uv: bool | None = None,
     ) -> list[str]:
         """
-        Build the base pip invocation prefix.
+        Build a ``pip <subcommand>`` invocation prefix anchored on ``python_path``.
 
-        * prefer_uv=True  -> ``uv run --python <python> python -m pip``
-        * prefer_uv=False -> ``<python> -m pip``
+        * prefer_uv=True  -> ``uv pip <subcommand> --python <python>``
+        * prefer_uv=False -> ``<python> -m pip <subcommand>``
+
+        ``uv run --python <p> python -m pip`` was the historical form,
+        but ``uv run`` provisions an ephemeral managed env when ``<p>``
+        isn't a project venv, so installs leaked out of the caller's
+        venv. ``uv pip --python <p>`` targets the venv that owns
+        ``<p>`` directly.
         """
         prefer_uv = self.prefer_uv if prefer_uv is None else prefer_uv
         p = Path(python).expanduser().resolve() if python is not None else self.python_path
 
         if prefer_uv:
             try:
-                return [*self._uv_base_cmd(install_runtime=True), "run", "--python", str(p), "python", "-m", "pip"]
+                return [*self._uv_base_cmd(install_runtime=True), "pip", subcommand, "--python", str(p)]
             except Exception:
                 logger.warning(
                     "PyEnv._pip_cmd_args: uv unavailable for %s, falling back to pip",
@@ -1478,7 +1437,7 @@ class PyEnv:
                     exc_info=True,
                 )
 
-        return [str(p), "-m", "pip"]
+        return [str(p), "-m", "pip", subcommand]
 
     def _uv_run_prefix(self, python: str | Path | None = None) -> list[str]:
         """

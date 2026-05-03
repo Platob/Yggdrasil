@@ -556,7 +556,7 @@ class TestUvResolution:
 
     def test_pip_cmd_falls_back(self, monkeypatch, env):
         monkeypatch.setattr(env, "_uv_base_cmd", lambda **kw: (_ for _ in ()).throw(RuntimeError()))
-        assert env._pip_cmd_args() == [str(env.python_path), "-m", "pip"]
+        assert env._pip_cmd_args("install") == [str(env.python_path), "-m", "pip", "install"]
 
     def test_uv_run_prefix(self, monkeypatch, env):
         monkeypatch.setattr(env, "_uv_base_cmd", lambda install_runtime=True: ["uv"])

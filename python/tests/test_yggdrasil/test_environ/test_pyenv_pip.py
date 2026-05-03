@@ -52,45 +52,39 @@ class TestPyEnvPip:
     def test_pip_cmd_args_default(self) -> None:
         """Test _pip_cmd_args returns valid command list."""
         env = PyEnv.current()
-        cmd = env._pip_cmd_args()
+        cmd = env._pip_cmd_args("install")
         assert isinstance(cmd, list)
         assert len(cmd) > 0
-        # Command should start with either uv or python
-        assert any(
-            "uv" in str(cmd[0]).lower() or "python" in str(cmd[0]).lower()
-            for part in cmd[:2]
-        )
+        assert "pip" in cmd
+        assert "install" in cmd
 
     def test_pip_cmd_args_with_python_path(self) -> None:
         """Test _pip_cmd_args with explicit python path."""
         env = PyEnv.current()
-        cmd = env._pip_cmd_args(python=env.python_path)
+        cmd = env._pip_cmd_args("install", python=env.python_path)
         assert isinstance(cmd, list)
         assert len(cmd) > 0
-        assert str(env.python_path) in cmd or any(
-            str(env.python_path) in str(part) for part in cmd
-        )
+        assert any(str(env.python_path) in str(part) for part in cmd)
 
     def test_pip_cmd_args_prefer_uv_false(self) -> None:
         """Test _pip_cmd_args with prefer_uv=False."""
         env = PyEnv.current()
-        cmd = env._pip_cmd_args(prefer_uv=False)
+        cmd = env._pip_cmd_args("install", prefer_uv=False)
         assert isinstance(cmd, list)
-        assert len(cmd) >= 3
-        # Should be [python, '-m', 'pip', ...]
-        assert "python" in str(cmd[0]).lower()
-        assert "-m" in cmd
-        assert "pip" in cmd
+        # Should be [<python>, '-m', 'pip', 'install']
+        assert cmd == [str(env.python_path), "-m", "pip", "install"]
 
     def test_pip_cmd_args_prefer_uv_true(self) -> None:
         """Test _pip_cmd_args with prefer_uv=True."""
         env = PyEnv.current()
         if env.has_uv():
-            cmd = env._pip_cmd_args(prefer_uv=True)
+            cmd = env._pip_cmd_args("install", prefer_uv=True)
             assert isinstance(cmd, list)
-            # Should contain uv run --python python -m pip pattern
-            cmd_str = " ".join(cmd)
-            assert "uv" in cmd_str or "python" in cmd_str
+            # Should be [<uv>, 'pip', 'install', '--python', <p>]
+            assert "pip" in cmd
+            assert "install" in cmd
+            assert "--python" in cmd
+            assert str(env.python_path) in cmd
 
     def test_pip_list_execution(self) -> None:
         """Test that pip list command can execute."""
@@ -134,33 +128,31 @@ class TestPyEnvPip:
 class TestPipCommandGeneration:
     """Test pip command generation for Windows compatibility."""
 
-    def test_uv_run_syntax_with_python(self) -> None:
-        """Test that uv run --python syntax is used correctly."""
+    def test_uv_pip_syntax_with_python(self) -> None:
+        """``uv pip <subcommand> --python <p>`` is used so installs land
+        in the venv that owns ``<p>`` (instead of an ephemeral ``uv run``
+        env)."""
         env = PyEnv.current()
         if env.has_uv():
-            cmd = env._pip_cmd_args(prefer_uv=True)
-            cmd_str = " ".join(cmd)
-            # Should use uv run --python pattern
-            if "uv" in cmd_str:
-                assert "run" in cmd_str
-                assert "--python" in cmd_str
+            cmd = env._pip_cmd_args("install", prefer_uv=True)
+            assert "pip" in cmd
+            assert "install" in cmd
+            assert "--python" in cmd
+            assert str(env.python_path) in cmd
 
     def test_python_fallback_syntax(self) -> None:
         """Test that python -m pip fallback syntax is correct."""
         env = PyEnv.current()
-        cmd = env._pip_cmd_args(prefer_uv=False)
-        assert len(cmd) >= 3
-        assert str(env.python_path) in str(cmd[0])
-        assert cmd[1] == "-m"
-        assert cmd[2] == "pip"
+        cmd = env._pip_cmd_args("install", prefer_uv=False)
+        assert cmd == [str(env.python_path), "-m", "pip", "install"]
 
     def test_pip_args_with_packages(self) -> None:
         """Test pip install command generation with package names."""
         env = PyEnv.current()
         # Don't actually install, just test command generation
-        base_cmd = env._pip_cmd_args()
+        base_cmd = env._pip_cmd_args("install")
         assert "pip" in base_cmd
-        # Full command would be: base_cmd + ["install", "package_name"]
+        assert "install" in base_cmd
 
 
 if __name__ == "__main__":

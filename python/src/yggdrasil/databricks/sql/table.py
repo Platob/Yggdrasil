@@ -455,7 +455,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         )
         query = f"SELECT {names}"
         if options.where:
-            query += f" WHERE {options.where.with_flavor("databricks")}"
+            query += f" WHERE {options.where.with_flavor('databricks')}"
 
         for batch in self.execute(query).read_arrow_batches(options=options):
             yield batch
