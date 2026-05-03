@@ -392,6 +392,7 @@ class Session(ABC):
             mode=mode if mode is not None else cache_cfg.mode,
             match_by=cache_cfg.match_by or None,
             wait=cache_cfg.wait,
+            prune_values={"request_url_path": batch["request_url_path"]},
             spark_session=spark_session,
         )
 
