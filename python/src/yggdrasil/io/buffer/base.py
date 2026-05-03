@@ -1711,9 +1711,8 @@ class TabularIO(Disposable, ABC, Generic[O]):
         round-tripping through the driver.
 
         Incoming data is expected to be reachable from the subclass's
-        own state (a staged buffer, a queued batch reader, a
-        :class:`TabularUpsertBatch` the caller installed before
-        triggering the write). The default raises
+        own state (a staged buffer, a queued batch reader, anything
+        the subclass arranged before the call). The default raises
         :class:`NotImplementedError` so callers either land on a
         subclass that implements native MERGE, or invoke
         :meth:`_arrow_upsert_via_rewrite` with explicit incoming
