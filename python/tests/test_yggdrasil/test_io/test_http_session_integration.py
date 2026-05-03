@@ -320,6 +320,7 @@ class TestHttpSessionSendManyLocalCache:
     def test_send_many_batch_first_pass_all_new_hits(
         self, http_server: _Server, tmp_path
     ):
+        from yggdrasil.io.buffer.base import TabularIO
         from yggdrasil.io.session import ResponseBatch
 
         pytest.importorskip("xxhash")
@@ -331,9 +332,11 @@ class TestHttpSessionSendManyLocalCache:
         assert isinstance(batch, ResponseBatch)
         assert batch.counts == {"local": 0, "remote": 0, "new": 3}
         assert len(batch) == 3
-        # Iteration order: local → remote → new. With no cache hits, the
-        # whole batch flows through the new bucket.
-        assert list(batch) == batch.new_hits
+        # With no cache hits, only the new bucket should be populated.
+        assert batch.local_hits is None
+        assert batch.remote_hits is None
+        assert isinstance(batch.new_hits, TabularIO)
+        assert all(r.status_code == 200 for r in batch)
 
     def test_send_many_batch_second_pass_all_local_hits(
         self, http_server: _Server, tmp_path

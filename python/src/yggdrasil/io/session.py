@@ -24,7 +24,7 @@ from yggdrasil.io.enums import Mode
 from .buffer import BytesIO
 from .request import PreparedRequest
 from .response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
-from .response_batch import ResponseBatch, responses_to_spark_df
+from .response_batch import ResponseBatch
 from .send_config import CacheConfig, SendConfig, SendManyConfig
 from .url import URL
 from ..environ import PyEnv
@@ -1080,12 +1080,6 @@ class Session(ABC):
                 remote_hits, url_to_local_cfg, session_local_cfg,
             )
 
-        # Cache hits → Arrow → Spark DF (driver-side, cheap: already in memory).
-        # Each origin keeps its own DF so the ResponseBatch mirrors
-        # the three pipeline stages and keeps the network branch lazy.
-        local_df = responses_to_spark_df(local_hits, spark)
-        remote_df = responses_to_spark_df(remote_hits, spark)
-
         # --- Stage 3: network fetch via mapInArrow ---
         # Network results stay in Spark — never collected to the driver.
         if after_remote:
@@ -1106,9 +1100,13 @@ class Session(ABC):
                 spark=spark,
             )
 
+        # ResponseBatch coerces each bucket through `_coerce_bucket`:
+        # cache hits (Python lists) get serialised into ArrowIPCIO
+        # holders; the network DF gets wrapped in a TabularIO whose
+        # `_spark_frame` slot holds the lazy DF (no driver collect).
         return ResponseBatch(
-            local_hits=local_df,
-            remote_hits=remote_df,
+            local_hits=local_hits,
+            remote_hits=remote_hits,
             new_hits=new_responses_df,
             spark=spark,
         )
