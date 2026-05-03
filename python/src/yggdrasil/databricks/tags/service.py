@@ -710,6 +710,152 @@ class EntityTags(DatabricksService):
         # the cache for each successful write/delete; nothing more to do.
         return None
 
+    def update_entities_tags(
+        self,
+        tags_by_entity: (
+            Mapping[tuple[str, str], list[EntityTagAssignment] | Mapping]
+            | Iterable[EntityTagAssignment]
+            | None
+        ) = None,
+        *,
+        mode: ModeLike | None = None,
+        parallel_entities: int | bool | None = None,
+        parallel_per_entity: int | bool | None = None,
+        cache_ttl: float | None = 300.0,
+        continue_on_error: bool = True,
+    ) -> dict[tuple[str, str], BaseException | None]:
+        """Apply tag batches to many entities in parallel.
+
+        Multi-entity counterpart of :meth:`update_entity_tags`. Each entity's
+        batch is dispatched to ``update_entity_tags`` with the same *mode*
+        and *cache_ttl*; entities are processed concurrently up to
+        *parallel_entities*.
+
+        Input shapes
+        ------------
+        Either:
+          * ``Mapping[(entity_type, entity_name), tags]`` — explicit grouping;
+            ``tags`` may be a list of :class:`EntityTagAssignment`, a
+            ``{key: value}`` mapping, or any shape :func:`_safe_assignment`
+            accepts.
+          * ``Iterable[EntityTagAssignment]`` — flat stream; grouped here by
+            ``(entity_type, entity_name)`` carried on each assignment.
+
+        Parallelism
+        -----------
+        *parallel_entities* sizes the outer pool (entities run concurrently);
+        *parallel_per_entity* is forwarded to each ``update_entity_tags``
+        call. Defaults: 4 entities at a time, 1 write at a time within an
+        entity — keeps the total worker budget bounded and matches the
+        original ``parallel: bool → 4`` convention.
+
+        Errors
+        ------
+        With ``continue_on_error=True`` (default), per-entity failures are
+        captured in the returned mapping rather than aborting the whole run;
+        callers inspect the result to surface partial success. With
+        ``continue_on_error=False``, the first exception propagates after
+        cancelling pending entities.
+
+        Returns
+        -------
+        A ``{(entity_type, entity_name): None | BaseException}`` mapping with
+        one entry per input entity. ``None`` denotes success.
+        """
+        # ---- normalize input into a {(et, en): [assignments]} dict --------
+        grouped: dict[tuple[str, str], list[EntityTagAssignment]] = {}
+
+        if tags_by_entity is None:
+            return {}
+
+        if isinstance(tags_by_entity, Mapping):
+            for (et, en), batch in tags_by_entity.items():
+                if not (et and en):
+                    raise ValueError(
+                        "update_entities_tags: mapping keys must be "
+                        "(entity_type, entity_name) tuples with both set."
+                    )
+                if isinstance(batch, Mapping):
+                    items = batch.items()
+                else:
+                    items = batch or ()
+                grouped[(et, en)] = [
+                    _safe_assignment(et, en, t) for t in items if t
+                ]
+        else:
+            # Flat iterable of EntityTagAssignment — group by (et, en).
+            for raw in tags_by_entity:
+                if raw is None:
+                    continue
+                assignment = (
+                    raw if isinstance(raw, EntityTagAssignment)
+                    else _safe_assignment("", "", raw)
+                )
+                et, en = assignment.entity_type, assignment.entity_name
+                if not (et and en):
+                    raise ValueError(
+                        "update_entities_tags: flat-iterable input requires "
+                        "entity_type and entity_name on every assignment; "
+                        f"got {assignment!r}."
+                    )
+                grouped.setdefault((et, en), []).append(assignment)
+
+        # OVERWRITE with an empty batch is meaningful (clear all tags); other
+        # modes drop empty entries to avoid a wasted list() round-trip.
+        resolved_mode = Mode.from_(mode, default=Mode.UPSERT)
+        if resolved_mode == Mode.AUTO:
+            resolved_mode = Mode.UPSERT
+        if resolved_mode != Mode.OVERWRITE:
+            grouped = {k: v for k, v in grouped.items() if v}
+
+        if not grouped:
+            return {}
+
+        # ---- normalize parallelism (same convention as the single-entity API)
+        if isinstance(parallel_entities, bool):
+            parallel_entities = 4 if parallel_entities else 1
+        else:
+            parallel_entities = int(parallel_entities) if parallel_entities is not None else 4
+
+        # parallel_per_entity is passed through; bool→4 handled by update_entity_tags.
+
+        # ---- dispatch -----------------------------------------------------
+        results: dict[tuple[str, str], BaseException | None] = {}
+
+        def _run_one(key: tuple[str, str]) -> tuple[tuple[str, str], BaseException | None]:
+            et, en = key
+            try:
+                self.update_entity_tags(
+                    assignments=grouped[key],
+                    entity_type=et,
+                    entity_name=en,
+                    mode=resolved_mode,
+                    parallel=parallel_per_entity,
+                    cache_ttl=cache_ttl,
+                )
+                return key, None
+            except BaseException as exc:  # noqa: BLE001 — captured for caller
+                if not continue_on_error:
+                    raise
+                logger.exception(
+                    "[update_entities_tags] %s:%s failed: %s",
+                    et, en, exc,
+                )
+                return key, exc
+
+        keys = list(grouped.keys())
+
+        if parallel_entities > 1 and len(keys) > 1:
+            with ThreadPoolExecutor(max_workers=parallel_entities) as executor:
+                for key, err in executor.map(_run_one, keys):
+                    results[key] = err
+        else:
+            for key in keys:
+                k, err = _run_one(key)
+                results[k] = err
+
+        return results
+
     # -------------------------------------------------------------------------
     # Delete API
     # -------------------------------------------------------------------------

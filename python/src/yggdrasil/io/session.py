@@ -323,7 +323,7 @@ class Session(ABC):
             if effective_local_cfg.mode == Mode.UPSERT:
                 # Force-evict any stale local entry so the fresh response
                 # can be written in its place after the actual fetch.
-                if local_filepath is not None and local_filepath.exists():
+                if local_filepath is not None:
                     local_filepath.unlink(missing_ok=True)
                     LOGGER.debug(
                         "UPSERT: evicted local cache for %s %s",

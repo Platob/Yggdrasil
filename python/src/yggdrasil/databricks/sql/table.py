@@ -37,9 +37,9 @@ from databricks.sdk.service.catalog import (
     TableType, EntityTagAssignment,
 )
 from pyarrow.fs import FileSystem, S3FileSystem
-
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data import Field
+from yggdrasil.data.data_utils import safe_constraint_name
 from yggdrasil.data.expr import Expr, Predicate
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema as DataSchema
@@ -49,18 +49,19 @@ from yggdrasil.dataclasses.expiring import Expiring, RefreshResult
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io import URL
+from yggdrasil.io.buffer.base import TabularIO, O
 from yggdrasil.io.buffer.primitive import ParquetIO
-from yggdrasil.io.enums import MimeTypes, MimeType
+from yggdrasil.io.enums import MimeTypes, MimeType, MediaType
 from yggdrasil.io.enums.mode import ModeLike, Mode
-from yggdrasil.io.buffer.base import TabularIO
+from yggdrasil.lazy_imports import aws_config_class
+
 from .column import Column
 from .sql_utils import (
     quote_ident,
     quote_qualified_ident,
     sql_literal, escape_sql_string,
 )
-from yggdrasil.data.options import CastOptions
-from ...lazy_imports import aws_config_class
+from ..fs import VolumePath
 
 if TYPE_CHECKING:
     import delta
@@ -481,7 +482,24 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
             prune_values=options.prune_values,
             retry=options.retry,
         )
-    
+
+    def _read_spark_frame(self, options: O) -> "SparkDataFrame":
+        return self.sql.execute(
+            f"SELECT * FROM {self.full_name(safe=True)}"
+        ).read_spark_frame(options)
+
+    def _write_spark_frame(
+        self,
+        frame: "SparkDataFrame",
+        options: O,
+    ) -> None:
+        return self.spark_insert(
+            frame,
+            mode=options.mode,
+            match_by=options.match_by_names,
+            wait=options.wait
+        )
+
     # Properties
     
     @property
@@ -500,15 +518,18 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         cls,
         obj: Any,
         *,
+        media_type: MediaType | None = None,
+        default: Any = ...,
         catalog_name: str | None = None,
         schema_name: str | None = None,
         table_name: str | None = None,
-        service: "Tables"
+        service: "Tables",
+        **kwargs,
     ):
         if isinstance(obj, cls):
             return obj
 
-        return cls.parse_str(
+        return cls.from_str(
             location=str(obj) if obj is not None else None,
             catalog_name=catalog_name,
             schema_name=schema_name,
@@ -517,7 +538,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         )
 
     @classmethod
-    def parse_str(
+    def from_str(
         cls,
         location: str | None = None,
         *,
@@ -1056,7 +1077,9 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         wait_result: bool = True,
         auto_tag: bool = True,
     ) -> "Table":
-        schema_info = DataSchema.from_any(description).autotag()
+        schema_info = DataSchema.from_any(description)
+        if auto_tag:
+            schema_info = schema_info.autotag()
         comment = comment or schema_info.comment
         effective_fields: list[Field] = []
         column_definitions: list[str] = []
@@ -1065,9 +1088,6 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         primary_keys = schema_info.primary_keys
 
         for f in schema_info.children_fields:
-            if f.primary_key and f.nullable:
-                f = f.with_nullable(False, inplace=True)
-
             effective_fields.append(f)
             column_definitions.append(f.to_databricks_ddl())
 
@@ -1171,11 +1191,151 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         if schema_info.tags:
             self.set_tags(schema_info.tags)
 
-        for f in effective_fields:
-            if f.tags:
-                self.column(f.name).set_tags(f.tags)
+            # Per-column tags in one parallelised pass rather than N sequential
+            # round-trips. validate=False: column names are authoritative here
+            # (we just emitted the DDL from these same fields).
+        column_tag_batches = {
+            f.name: f.tags for f in effective_fields if f.tags
+        }
+        if column_tag_batches:
+            self.update_columns_tags(column_tag_batches, validate=False)
 
         return self
+
+    def update_columns_tags(
+        self,
+        tags_by_column: Mapping[str, Mapping[str, str] | list[EntityTagAssignment]] | None,
+        *,
+        mode: ModeLike | None = None,
+        parallel_columns: int | bool | None = None,
+        parallel_per_column: int | bool | None = None,
+        cache_ttl: float | None = 300.0,
+        continue_on_error: bool = True,
+        validate: bool = True,
+    ) -> dict[str, BaseException | None]:
+        """Apply tag batches to many columns of this table in parallel.
+
+        Per-column counterpart of :meth:`set_tags`. Each column's batch is
+        routed through :meth:`EntityTags.update_entities_tags` with the same
+        *mode* and *cache_ttl*; columns are processed concurrently up to
+        *parallel_columns*.
+
+        Args:
+            tags_by_column:
+                Mapping of column name to its tag batch. Each batch may be a
+                ``{tag_key: tag_value}`` dict or a list of
+                :class:`EntityTagAssignment` (entity addressing on the
+                assignments is filled in here — callers don't need to set it).
+            mode:
+                Batch mode applied per column. See
+                :meth:`EntityTags.update_entity_tags` for semantics.
+            parallel_columns:
+                Outer concurrency — columns processed at once. Defaults to 4.
+            parallel_per_column:
+                Inner concurrency — writes within a single column's batch.
+                Defaults to 1; bump only when the workspace can absorb the
+                extra load (rate limits are workspace-wide).
+            cache_ttl:
+                TTL for the per-column tag-list cache reads used to diff
+                before writing. ``None`` bypasses the cache.
+            continue_on_error:
+                When ``True`` (default), per-column failures are returned in
+                the result rather than aborting the whole call. With
+                ``False``, the first exception propagates.
+            validate:
+                When ``True`` (default), unknown column names raise
+                :class:`ValueError` before any write goes out. Turn off when
+                applying tags speculatively against a partially-known schema.
+
+        Returns:
+            ``{column_name: None | BaseException}``. ``None`` denotes success.
+        """
+        if not tags_by_column:
+            return {}
+
+        # ---- validate column names against the table schema --------------
+        # Cheap local check — saves a round trip on the typo case where the
+        # API would otherwise return an opaque "entity not found".
+        if validate:
+            known = {c.name for c in self.columns}
+            unknown = [name for name in tags_by_column if name not in known]
+            if unknown:
+                raise ValueError(
+                    f"Unknown column(s) on {self.full_name()}: {sorted(unknown)}. "
+                    f"Pass validate=False to apply tags anyway."
+                )
+
+        # ---- normalise into the {(et, en): batch} shape ------------------
+        # Each column is its own UC entity; we build entity names eagerly so
+        # the assignments carry the right identity and update_entities_tags
+        # can group/dispatch directly without re-deriving them.
+        full = self.full_name()
+        grouped: dict[tuple[str, str], list[EntityTagAssignment]] = {}
+
+        for col_name, batch in tags_by_column.items():
+            entity_name = f"{full}.{col_name}"
+            key = ("columns", entity_name)
+
+            if not batch:
+                # OVERWRITE with an empty batch clears all tags for that
+                # column; other modes drop the entry. update_entities_tags
+                # does this filter itself, but normalising here keeps the
+                # column→entity mapping symmetric on the way back out.
+                grouped[key] = []
+                continue
+
+            if isinstance(batch, Mapping):
+                assignments = [
+                    EntityTagAssignment(
+                        entity_type="columns",
+                        entity_name=entity_name,
+                        tag_key=str(k),
+                        tag_value=str(v) if v is not None else "",
+                    )
+                    for k, v in batch.items()
+                ]
+            else:
+                # List of EntityTagAssignment — stamp our entity addressing
+                # over whatever the caller put on them, since we own the
+                # routing here. Copying via from_dict/to_dict keeps the
+                # frozen-ness intact without touching SDK internals.
+                assignments = []
+                for a in batch:
+                    if not isinstance(a, EntityTagAssignment):
+                        raise TypeError(
+                            f"update_columns_tags: expected EntityTagAssignment "
+                            f"in list batch for column {col_name!r}, got {type(a)}"
+                        )
+                    d = a.as_dict() if hasattr(a, "as_dict") else dict(a.__dict__)
+                    d["entity_type"] = "columns"
+                    d["entity_name"] = entity_name
+                    assignments.append(EntityTagAssignment.from_dict(d))
+
+            grouped[key] = assignments
+
+        # ---- dispatch via the multi-entity service -----------------------
+        raw_results = self.client.entity_tags.update_entities_tags(
+            tags_by_entity=grouped,
+            mode=mode,
+            parallel_entities=parallel_columns,
+            parallel_per_entity=parallel_per_column,
+            cache_ttl=cache_ttl,
+            continue_on_error=continue_on_error,
+        )
+
+        # ---- pivot results back to column-name keyspace ------------------
+        # Strip the ``"columns"`` entity_type and the table prefix from the
+        # entity_name so callers don't have to know we routed through the
+        # multi-entity API underneath.
+        prefix = f"{full}."
+        out: dict[str, BaseException | None] = {}
+        for (entity_type, entity_name), err in raw_results.items():
+            col_name = (
+                entity_name[len(prefix):]
+                if entity_name.startswith(prefix) else entity_name
+            )
+            out[col_name] = err
+        return out
 
     @staticmethod
     def _build_inline_constraints(primary_keys: Iterable[Field]) -> list[str]:
@@ -1186,8 +1346,6 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         CHECK predicates aren't part of this layer.  Those go through
         :meth:`_apply_post_create_constraints`.
         """
-        from yggdrasil.data.data_utils import safe_constraint_name
-
         pk_fields = [f for f in primary_keys if f and f.primary_key]
         if not pk_fields:
             return []
@@ -1195,7 +1353,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         col_names = [f.name for f in pk_fields]
         constraint_name = safe_constraint_name(col_names, prefix="pk")
         cols = ", ".join(quote_ident(n) for n in col_names)
-        return [f"CONSTRAINT {quote_ident(constraint_name)} PRIMARY KEY ({cols})"]
+        return [f"CONSTRAINT {quote_ident(constraint_name)} PRIMARY KEY ({cols}) RELY"]
 
     def _apply_post_create_constraints(self, schema_info: DataSchema) -> None:
         """Push FK / CHECK constraint Fields through the SDK constraints API.
@@ -1265,8 +1423,6 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         for position, f in enumerate(schema_info.children_fields):
             if f.constraint_key:
                 continue
-            if f.primary_key and f.nullable:
-                f = f.with_nullable(False, inplace=True)
             effective_fields.append(f)
             column_infos.append(self._field_to_column_info(f, position=position))
 
@@ -1548,7 +1704,6 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         retry: Optional[WaitingConfigArg] = None,
     ) -> None:
         """Insert through the warehouse SQL path with staged Parquet."""
-        from yggdrasil.databricks.fs import VolumePath
         from yggdrasil.databricks.warehouse import WarehousePreparedStatement
 
         if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):

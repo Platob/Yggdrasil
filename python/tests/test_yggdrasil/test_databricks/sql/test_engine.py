@@ -25,7 +25,7 @@ class TestSQLEngine(DatabricksCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls.engine = cls.workspace.sql(catalog_name="trading", schema_name="unittest")
+        cls.engine = cls.client.sql(catalog_name="trading", schema_name="unittest")
 
     @staticmethod
     def _sample_table() -> pa.Table:

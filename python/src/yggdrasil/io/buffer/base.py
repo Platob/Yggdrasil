@@ -460,8 +460,10 @@ class TabularIO(Disposable, ABC, Generic[O]):
     def from_(
         cls,
         obj: Any,
+        *,
         media_type: MediaType | None = None,
-        default: Any = ...
+        default: Any = ...,
+        **kwargs: Any
     ):
         if cls._FINAL_TABULAR_IO and isinstance(obj, cls):
             return obj
@@ -621,6 +623,16 @@ class TabularIO(Disposable, ABC, Generic[O]):
         inherit the empty default.
         """
         return iter(())
+
+    def iter_children_or_self(
+        self,
+        options: "ChildrenOptions | Mapping[str, Any] | None" = None,
+        **kwargs: Any,
+    ) -> "Iterator[TabularIO]":
+        if self.has_children():
+            yield from self.iter_children(options, **kwargs)
+        else:
+            yield self
 
     def iter_children(
         self,

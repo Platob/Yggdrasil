@@ -351,6 +351,11 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             if data is not None:
                 if isinstance(data, P):
                     path = path if path is not None else data
+                elif isinstance(data, str):
+                    parsed_path = P.from_(data, default=None)
+                    if path is None and parsed_path is not None:
+                        path = parsed_path
+                        media_type = parsed_path.url.media_type
                 elif isinstance(data, BytesIO):
                     media_type = data._media_type
 
@@ -1976,7 +1981,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         else:
             owner = "<not allocated>"
         return (
-            f"<{target_class.__name__} [{spilled}/{internal}/{opened}] {owner}"
+            f"<{target_class.__name__} [{spilled}/{internal}/{opened}] {owner!r} "
             f"size={self.size}, pos={self.tell()}, mode={self._mode}{mt}>"
         )
 
