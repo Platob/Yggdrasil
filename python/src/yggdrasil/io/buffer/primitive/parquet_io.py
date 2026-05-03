@@ -240,6 +240,16 @@ class ParquetIO(BytesIO):
     # ==================================================================
 
     def _can_use_native_scanner(self, options: ParquetOptions) -> bool:
+        """True iff parquet's native readers can be invoked directly.
+
+        Path-bound local: hand the path to the reader (fastest —
+        memory-mapped reads, native filter pushdown). Otherwise
+        (in-memory, non-local path) route through a
+        :meth:`BytesIO.view`: the reader sees a self-contained
+        file-like over the buffer's bytes and the parent cursor
+        stays untouched. Codec'd buffers and casting/filtering
+        options still fall back to the generic Arrow batch reader.
+        """
         if not type(self)._NATIVE_SCANNER_OK:
             return False
         if self.is_empty():
@@ -248,10 +258,6 @@ class ParquetIO(BytesIO):
             return False
         if self.codec is not None:
             return False
-        if self.path is None:
-            return False
-        if not self.path.is_local:
-            return False
         return True
 
     def _read_arrow_dataset(self, options: ParquetOptions) -> "pds.Dataset":
@@ -259,18 +265,40 @@ class ParquetIO(BytesIO):
             return super()._read_arrow_dataset(options)
 
         pds = pyarrow_dataset_module()
-        return pds.dataset(self.path.__fspath__(), format="parquet")
+        if self.path is not None and self.path.is_local:
+            return pds.dataset(self.path.__fspath__(), format="parquet")
+
+        # In-memory or non-local: ``pds.dataset`` doesn't accept
+        # file-likes, so parse the footer through a view and wrap
+        # the resulting table. The view's cursor isolates the read
+        # from any caller mid-stream over ``self``.
+        with self.view(pos=0) as v:
+            source = v.arrow_io(mode="rb")
+            table = pq.read_table(source)
+        return pds.dataset(table)
 
     def _scan_polars_frame(self, options: ParquetOptions) -> "pl.LazyFrame":
         if not self._can_use_native_scanner(options):
             return super()._scan_polars_frame(options)
 
         pl = polars_module()
-        return pl.scan_parquet(self.path.__fspath__())
+        if self.path is not None and self.path.is_local:
+            return pl.scan_parquet(self.path.__fspath__())
+
+        # ``pl.scan_parquet`` accepts a file-like and pulls the
+        # bytes it needs at scan time (footer + planning), so the
+        # view can be closed once the LazyFrame exists. The view's
+        # cursor isolates the scan from ``self._pos``.
+        with self.view(pos=0) as v:
+            return pl.scan_parquet(v)
 
     def _read_polars_frame(self, options: ParquetOptions) -> "pl.DataFrame":
         if not self._can_use_native_scanner(options):
             return super()._read_polars_frame(options)
 
         pl = polars_module()
-        return pl.read_parquet(self.path.__fspath__(), use_pyarrow=False)
+        if self.path is not None and self.path.is_local:
+            return pl.read_parquet(self.path.__fspath__(), use_pyarrow=False)
+
+        with self.view(pos=0) as v:
+            return pl.read_parquet(v, use_pyarrow=False)
