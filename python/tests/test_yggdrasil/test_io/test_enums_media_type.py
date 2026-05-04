@@ -111,6 +111,26 @@ class TestFromUrl:
         assert mt.mime_type is MimeTypes.CSV
         assert mt.codec is GZIP
 
+    def test_dotted_chain_snappy_parquet(self):
+        # Spark / Databricks Delta convention: ``part-xxx.snappy.parquet``.
+        # ``parquet`` wins as the outer format; ``snappy`` is parquet's
+        # internal page codec, not an outer wrapper, so the resulting
+        # MediaType has no outer codec — DeltaIO opens the file as a
+        # plain parquet leaf and the parquet reader handles the page
+        # decompression itself.
+        from yggdrasil.io.url import URL
+
+        mt = MediaType.from_url(URL.from_str("/data/part-00000.snappy.parquet"))
+        assert mt.mime_type is MimeTypes.PARQUET
+        assert mt.codec is None
+
+    def test_dotted_chain_zstd_parquet(self):
+        from yggdrasil.io.url import URL
+
+        mt = MediaType.from_url(URL.from_str("/data/part-00000.zstd.parquet"))
+        assert mt.mime_type is MimeTypes.PARQUET
+        assert mt.codec is None
+
 
 # ---------------------------------------------------------------------------
 # Property accessors
