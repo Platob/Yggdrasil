@@ -49,12 +49,15 @@ class TestParseCatalogColumnInfoStruct:
             "path": False,
             "query": True,
         }
+        # The DDL renderer never emits ``NOT NULL`` on struct children,
+        # but the parsed dtype keeps the constraint so other engine
+        # paths (Arrow, Polars, Spark) still see it.
         ddl = f.to_databricks_ddl(put_name=False, put_not_null=False, put_comment=False)
-        assert "`scheme` STRING NOT NULL" in ddl
-        assert "`host` STRING NOT NULL" in ddl
-        assert "`path` STRING NOT NULL" in ddl
-        assert "`userinfo` STRING," in ddl
-        assert "`query` STRING>" in ddl
+        assert "NOT NULL" not in ddl
+        assert ddl == (
+            "STRUCT<`scheme` STRING, `userinfo` STRING, `host` STRING, "
+            "`path` STRING, `query` STRING>"
+        )
 
     def test_struct_falls_back_to_type_text_when_type_json_missing(self):
         # Without ``type_json`` the parser must still populate the

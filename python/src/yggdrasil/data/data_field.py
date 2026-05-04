@@ -2196,8 +2196,19 @@ class Field(BaseMetadata, BaseChildrenFields):
             return f"{name_str}{sql_type}{nullable_str}{comment_str}"
 
         if pa.types.is_struct(self.arrow_type):
+            # Nested children never carry ``NOT NULL`` in the rendered DDL.
+            # Spark/Delta refuse the implicit cast between two structs that
+            # differ only in child nullability (``DATATYPE_MISMATCH.``
+            # ``CAST_WITHOUT_SUGGESTION``), and the parquet reader used by
+            # ``MERGE … USING parquet.`<path>``` always hands back nullable
+            # children regardless of file metadata — keeping them nullable
+            # at the schema-rendering layer matches that and lets the
+            # MERGE go through.
             struct_body = ", ".join(
-                Field.from_arrow(child).to_databricks_ddl(put_comment=False)
+                Field.from_arrow(child).to_databricks_ddl(
+                    put_comment=False,
+                    put_not_null=False,
+                )
                 for child in self.arrow_type
             )
             return f"{name_str}STRUCT<{struct_body}>{nullable_str}{comment_str}"
