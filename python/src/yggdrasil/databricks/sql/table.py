@@ -77,6 +77,46 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.sql.schema import Schema as UCSchema
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.warehouse import WarehousePreparedStatement
+    from yggdrasil.io.buffer.nested.delta import DeltaIO
+    from yggdrasil.io.fs import Path
+
+
+# Modes that only need read credentials. Anything outside this set
+# (OVERWRITE, APPEND, UPSERT, MERGE, TRUNCATE, ERROR_IF_EXISTS) needs
+# READ_WRITE — UC will refuse the write path on a managed table, but
+# we still ask for the right scope so an external table gets one.
+_READ_ONLY_MODES = frozenset({Mode.AUTO})
+
+
+def _resolve_table_operation(
+    operation: "TableOperation | ModeLike | None",
+    table_type: "TableType | None",
+) -> TableOperation:
+    """Resolve a user-facing operation hint into a UC :class:`TableOperation`.
+
+    ``None`` defaults to READ for managed tables, READ_WRITE for
+    external. A :class:`TableOperation` passes through. A
+    :class:`Mode` / mode-like string is mapped read-only-or-not, then
+    collapsed to READ for managed tables (UC won't vend write creds
+    for those).
+    """
+    if isinstance(operation, TableOperation):
+        op = operation
+    elif operation is None:
+        op = (
+            TableOperation.READ if table_type == TableType.MANAGED
+            else TableOperation.READ_WRITE
+        )
+    else:
+        mode = Mode.from_(operation, default=Mode.AUTO)
+        op = (
+            TableOperation.READ if mode in _READ_ONLY_MODES
+            else TableOperation.READ_WRITE
+        )
+
+    if op == TableOperation.READ_WRITE and table_type == TableType.MANAGED:
+        op = TableOperation.READ
+    return op
 
 __all__ = ["Table"]
 
@@ -2582,13 +2622,46 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
 
         return infos.storage_location
 
-    def storage_location(self, operation: TableOperation = TableOperation.READ) -> str:
-        if operation == TableOperation.READ_WRITE and self.infos.table_type == TableType.MANAGED:
-            operation = TableOperation.READ
+    def storage_location(
+        self,
+        operation: "TableOperation | ModeLike | None" = None,
+    ) -> "Path":
+        """Return the table's backing storage location as an addressable :class:`Path`.
 
-        return self.aws(
-            operation=operation
-        ).s3.path(self.infos.storage_location)
+        ``operation`` accepts a :class:`TableOperation`, a :class:`Mode`,
+        a :class:`Mode`-like string (``"read"``, ``"overwrite"``,
+        ``"append"``, …), or ``None``.
+
+        Resolution:
+
+        - ``None`` (the default) picks ``READ`` for managed tables
+          (Unity Catalog only ever vends read creds for those) and
+          ``READ_WRITE`` for external tables.
+        - A :class:`TableOperation` is used as-is.
+        - A :class:`Mode` / string is mapped to ``READ`` for read-only
+          modes and ``READ_WRITE`` otherwise; managed tables still
+          collapse to ``READ`` because Unity Catalog will refuse
+          to vend write credentials for them.
+        """
+        op = _resolve_table_operation(operation, self.infos.table_type)
+        return self.aws(operation=op).s3.path(self.infos.storage_location)
+
+    def tabular_io(
+        self,
+        operation: "TableOperation | ModeLike | None" = None,
+    ) -> "DeltaIO":
+        """Open this table's underlying Delta storage as a :class:`DeltaIO`.
+
+        Convenience over :meth:`storage_location` + ``DeltaIO.from_path``:
+        resolves the right credential :class:`TableOperation` from the
+        table type and the requested mode, then binds a DeltaIO to the
+        backing :class:`S3Path`. The returned IO carries the
+        auto-refreshing credentials from :meth:`aws`, so reads survive
+        STS token rotation without caller-side re-binding.
+        """
+        from yggdrasil.io.buffer.nested.delta import DeltaIO
+
+        return DeltaIO.from_path(self.storage_location(operation=operation))
 
     def aws(self, operation: TableOperation = TableOperation.READ) -> "AWSClient":
         """Return an :class:`AWSClient` whose credentials self-refresh

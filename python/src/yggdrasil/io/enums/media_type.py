@@ -124,21 +124,27 @@ class MediaType:
         default: Any = ...
     ):
         mt = MimeType.from_(mime_type, default=None)
-        codec = Codec.from_(codec, default=None)
+        codec_resolved = Codec.from_(codec, default=None)
 
-        if mt is None and codec is None:
+        if mt is None and codec_resolved is None:
             if default is ...:
                 raise ValueError(
                     f"Cannot parse {cls.__name__} from {mime_type!r}"
                 )
             return default
 
-        if mime_type.is_codec:
+        if mt is None:
+            return cls(mime_type=MimeTypes.OCTET_STREAM, codec=codec_resolved)
+
+        if mt.is_codec:
+            # Caller passed a codec mime as the format; demote to
+            # OCTET_STREAM and prefer the resolved codec field if it
+            # carries a non-codec format... otherwise fold mt into codec.
             return cls(
                 mime_type=MimeTypes.OCTET_STREAM,
-                codec=Codec.from_mime(mime_type)
+                codec=codec_resolved or Codec.from_mime(mt),
             )
-        return cls(mime_type=mime_type, codec=codec)
+        return cls(mime_type=mt, codec=codec_resolved)
 
     @classmethod
     def from_many(
@@ -146,6 +152,24 @@ class MediaType:
         mime_types: Iterable[MimeType],
         default: "MediaType" = ...,
     ) -> "MediaType":
+        """Compose a MediaType from an ordered mime list (e.g. URL extensions).
+
+        Two conventions land here:
+
+        - ``trades.csv.zst`` → ``["csv", "zst"]``: the codec is the
+          *outer wrapper* (you have to unzst before you can parse
+          csv) → ``MediaType(CSV, codec=ZSTD)``.
+        - ``part-xxx.zstd.parquet`` → ``["zstd", "parquet"]``: the
+          format is the *outer wrapper* and the codec is the parquet
+          page-codec hint baked into the file. Parquet handles the
+          decompression internally → ``MediaType(PARQUET)`` with no
+          outer codec; setting one would route the read through a
+          decompressor that doesn't belong on this byte stream.
+
+        Order matters: the **last** mime decides. Last-is-codec
+        promotes the codec to the wrapper slot; last-is-format keeps
+        the format alone and drops earlier codec hints.
+        """
         parsed = MimeType.parse_many(mime_types)
 
         if not parsed:
@@ -153,9 +177,26 @@ class MediaType:
                 raise ValueError(
                     f"Cannot parse {cls.__name__} from {mime_types!r}"
                 )
+            return default
 
-        # No codec found in rest (and no ambiguous second mime).
-        return cls.from_mime(*parsed, default=default)
+        if len(parsed) == 1:
+            return cls.from_mime(parsed[0], default=default)
+
+        last = parsed[-1]
+        if last.is_codec:
+            # Codec is the outer wrapper. Pick the first non-codec
+            # mime as the format if any, else codec-only payload.
+            format_mime = next((m for m in parsed if not m.is_codec), None)
+            return cls.from_mime(
+                mime_type=format_mime,
+                codec=last,
+                default=default,
+            )
+
+        # Last is a format → format wins, codec extensions before it
+        # are page-codec hints (parquet/orc/...) and don't belong in
+        # the wrapper slot.
+        return cls.from_mime(mime_type=last, default=default)
 
     # ------------------------------------------------------------------
     # Magic / IO sniffers — two-stage (outer wrapper + inner format)
