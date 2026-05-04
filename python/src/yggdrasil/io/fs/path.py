@@ -167,10 +167,12 @@ _STAGING_SWEPT: ExpiringDict[str, bool] = ExpiringDict(
 
 
 # Match a TTL-encoded staging filename's trailing ``-<start>-<end>(.ext)*``.
-# Group 2 is the end_ts (epoch seconds).  Anchored at end of string so the
-# extension trail is part of the match; works for any prefix scheme that
-# precedes the timestamps with a dash.
-_STAGING_TMP_RE: re.Pattern = re.compile(r"-(\d+)-(\d+)(?:\.[^./]+)*$")
+# Time-sortable layout: prefix-{start}-{end}-{seed}(.ext)*
+# Group 1 is the start_ts (epoch seconds), group 2 is the end_ts.
+# Anchored at start (after a dash-separated prefix) so the regex
+# captures the leading timestamps without being fooled by digits
+# that appear inside the random seed.
+_STAGING_TMP_RE: re.Pattern = re.compile(r"-(\d+)-(\d+)-[0-9a-f]+(?:\.[^/]+)?$")
 
 
 # ---------------------------------------------------------------------------
@@ -350,8 +352,17 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
     ) -> "Path":
         """Mint a unique sibling/child path with a TTL-encoded name.
 
-        Filename layout: ``{prefix}{token}-{start}-{end}{suffix}`` so
-        :meth:`make_staging`'s sweep can recognize and age it.
+        Filename layout (time-sortable):
+        ``{prefix}{start}-{end}-{token}{suffix}``.
+
+        ``start`` and ``end`` come first so a plain lexical sort of
+        a directory's tmp files yields chronological order — handy
+        for tailing a stream of staged writes or for time-based
+        sweeps that prefer the oldest files. ``token`` is a random
+        16-char hex tiebreaker.
+
+        :data:`yggdrasil.io.fs.path._STAGING_TMP_RE` matches the
+        leading timestamps for the cleanup sweep.
         """
         seed = os.urandom(8).hex()
         prefix = prefix or ""
@@ -360,9 +371,13 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         if ttl is None:
             name = f"{prefix}{seed}{suffix}"
         else:
+            # Zero-pad to 12 digits so lexical order matches numeric
+            # order across the full epoch range we'll see in
+            # practice (today is ~1.7e9, 12 digits covers up to
+            # year 33658).
             start = int(time.time())
             end = start + ttl
-            name = f"{prefix}{seed}-{start}-{end}{suffix}"
+            name = f"{prefix}{start:012d}-{end:012d}-{seed}{suffix}"
 
         out = (self if append else self.parent) / name
         if temporary:

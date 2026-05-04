@@ -56,8 +56,6 @@ from :class:`FolderIO` and overrides:
 from __future__ import annotations
 
 import dataclasses
-import os
-import time
 import urllib.parse
 import uuid
 from typing import (
@@ -73,7 +71,6 @@ from typing import (
 import pyarrow as pa
 import pyarrow.compute as pc
 
-import yggdrasil.pickle.json as json_module
 from yggdrasil.data.schema import Field, Schema
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.enums import MimeType, MimeTypes, Mode
@@ -145,6 +142,26 @@ class FolderIO(NestedIO[FolderOptions]):
     def options_class(cls) -> type[FolderOptions]:
         return FolderOptions
 
+    def __new__(cls, data: Any = None, *args: Any, **kwargs: Any):
+        """Construct a folder IO, auto-upgrading to :class:`YGGFolderIO`
+        when the target already carries a ``.ygg/`` sidecar.
+
+        Calls placed against :class:`FolderIO` directly opt in to the
+        upgrade; callers that explicitly construct :class:`YGGFolderIO`
+        or another subclass keep their requested type. This keeps
+        ``FolderIO(path="/tmp/store/")`` ergonomic for plain folders
+        and one-call-correct for folders that already have sidecar
+        state.
+        """
+        if cls is FolderIO:
+            raw = kwargs.get("path", data)
+            if raw is not None and _has_ygg_sidecar(raw):
+                # Local import to avoid a circular import on module
+                # load (ygg_folder_io imports back from this module).
+                from .ygg_folder_io import YGGFolderIO
+                return NestedIO.__new__(YGGFolderIO, data, *args, **kwargs)
+        return NestedIO.__new__(cls, data, *args, **kwargs)
+
     def _default_child_media_type(self) -> Any:
         """Parquet is the canonical folder-of-tables payload.
 
@@ -160,23 +177,6 @@ class FolderIO(NestedIO[FolderOptions]):
     #: the schema is metadata, not data.
     SCHEMA_FILE_NAME: ClassVar[str] = ".schema"
 
-    #: Hidden subfolder used for out-of-band metadata: streaming-write
-    #: checkpoints, key/value attributes, schema-version pinning. The
-    #: name starts with ``.`` so the default :meth:`_is_ignored_path`
-    #: hides it from data enumeration; readers/writers reach it
-    #: through :meth:`ygg_path`, :meth:`checkpoint`,
-    #: :meth:`list_checkpoints`, :meth:`write_metadata`,
-    #: :meth:`read_metadata`.
-    YGG_DIR_NAME: ClassVar[str] = ".ygg"
-
-    #: File under :attr:`YGG_DIR_NAME` that holds the append-only
-    #: checkpoint log. JSON Lines: one record per
-    #: :meth:`checkpoint` call.
-    CHECKPOINT_LOG_NAME: ClassVar[str] = "checkpoints.jsonl"
-
-    #: Subfolder under :attr:`YGG_DIR_NAME` that holds key/value
-    #: metadata as ``<key>.json`` files.
-    METADATA_DIR_NAME: ClassVar[str] = "metadata"
 
     def __init__(
         self,
@@ -317,214 +317,6 @@ class FolderIO(NestedIO[FolderOptions]):
             # Sidecar persistence is best-effort — never fail a
             # write because we couldn't drop the metadata.
             pass
-
-    # ==================================================================
-    # ``.ygg`` sidecar — checkpoints, metadata, schema-pinning
-    # ==================================================================
-
-    @property
-    def ygg_path(self) -> Path:
-        """Hidden ``.ygg/`` subfolder used for out-of-band metadata.
-
-        Created lazily by :meth:`checkpoint` / :meth:`write_metadata`;
-        readers can call :meth:`list_checkpoints` / :meth:`read_metadata`
-        without ever touching the folder when no metadata has landed
-        yet (both methods short-circuit on a missing sidecar).
-
-        The sidecar is hidden from :meth:`iter_children` — checkpoints
-        and metadata are not data, so they don't show up when callers
-        drain the folder.
-        """
-        return self.path / self.YGG_DIR_NAME
-
-    @property
-    def _ygg_checkpoint_log(self) -> Path:
-        return self.ygg_path / self.CHECKPOINT_LOG_NAME
-
-    @property
-    def _ygg_metadata_dir(self) -> Path:
-        return self.ygg_path / self.METADATA_DIR_NAME
-
-    def checkpoint(
-        self,
-        message: "str | None" = None,
-        **extra: Any,
-    ) -> dict[str, Any]:
-        """Append a checkpoint record to ``.ygg/checkpoints.jsonl``.
-
-        A checkpoint is the streaming-write equivalent of a commit:
-        it records that the writer considers everything written up
-        to *this point* a coherent unit, with optional caller-supplied
-        ``message`` and arbitrary ``**extra`` fields. The record's
-        canonical fields are::
-
-            {
-                "id": <monotonic int>,
-                "ts": <epoch seconds, float>,
-                "pid": <writer process id>,
-                "files": <current child filenames at checkpoint time>,
-                "num_files": <len of files>,
-                "message": <optional str>,
-                ...extra...,
-            }
-
-        Concurrency: when this :class:`FolderIO` was constructed with
-        ``concurrent=True``, the folder-root lock already serialises
-        the writer; otherwise concurrent ``checkpoint()`` calls take
-        a transient ``-w.lock`` against the log file via
-        :meth:`Path.lock`. Two writers therefore can't tear each
-        other's JSON lines.
-        """
-        record: dict[str, Any] = {
-            "id": self._next_checkpoint_id(),
-            "ts": time.time(),
-            "pid": os.getpid(),
-            "files": self._current_child_filenames(),
-            "message": message,
-        }
-        record["num_files"] = len(record["files"])
-        record.update(extra)
-
-        line = json_module.dumps(record, to_bytes=False).encode("utf-8") + b"\n"
-
-        self.ygg_path.mkdir(parents=True, exist_ok=True)
-        log = self._ygg_checkpoint_log
-
-        # Hold a short exclusive lock on the log so concurrent
-        # checkpointers serialise on the append. This is independent
-        # of the folder-root lock — the folder-root lock may already
-        # be held by a long-running writer; we still want
-        # ``checkpoint()`` to be a quick atomic append.
-        with log.lock(write=True, wait=30):
-            log.write_bytes(line, mode="ab")
-        return record
-
-    def list_checkpoints(self) -> list[dict[str, Any]]:
-        """Read every checkpoint record from ``.ygg/checkpoints.jsonl``.
-
-        Records are returned in append order (oldest first). Lines
-        that fail to parse are silently skipped — the log is meant
-        to survive partial / torn writes from a crashed peer. An
-        empty or missing log returns ``[]``.
-        """
-        log = self._ygg_checkpoint_log
-        # EAFP read: ``raise_error=False`` returns ``b""`` when the
-        # log is missing, saving the extra ``exists()`` round-trip on
-        # remote backends.
-        try:
-            blob = log.read_bytes(raise_error=False)
-        except OSError:
-            return []
-        if not blob:
-            return []
-        out: list[dict[str, Any]] = []
-        for raw in blob.decode("utf-8", errors="replace").splitlines():
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                obj = json_module.loads(line)
-            except Exception:
-                continue
-            if isinstance(obj, dict):
-                out.append(obj)
-        return out
-
-    def latest_checkpoint(self) -> "dict[str, Any] | None":
-        """The most recent checkpoint record, or ``None`` if none."""
-        records = self.list_checkpoints()
-        return records[-1] if records else None
-
-    def _next_checkpoint_id(self) -> int:
-        prev = self.latest_checkpoint()
-        if prev is None:
-            return 1
-        try:
-            return int(prev.get("id", 0)) + 1
-        except (TypeError, ValueError):
-            return 1
-
-    def _current_child_filenames(self) -> list[str]:
-        """Names of the *direct* tabular children at this moment.
-
-        Used by :meth:`checkpoint` to record what was visible when
-        the checkpoint was taken, so a reader replaying the log can
-        reconstruct the folder's state at each commit point. Hidden
-        / sidecar entries are filtered via :meth:`_is_ignored_path`.
-        """
-        try:
-            entries = self.path.iterdir()
-        except (OSError, FileNotFoundError):
-            return []
-        names: list[str] = []
-        for entry in entries:
-            if self._is_ignored_path(entry):
-                continue
-            names.append(entry.name)
-        names.sort()
-        return names
-
-    def write_metadata(self, key: str, value: Any) -> None:
-        """Persist a JSON-serialisable value at ``.ygg/metadata/<key>.json``.
-
-        ``key`` must be a non-empty ASCII slug (no path separators);
-        this is sidecar metadata, not a free-form filesystem.
-        ``value`` goes through ``json_module.dumps`` (yggdrasil's
-        JSON helper, with Arrow-friendly defaults), so anything it
-        accepts works.
-
-        Writes are atomic via stage+rename so a concurrent reader
-        either sees the previous value or the new one — never a
-        partial write.
-        """
-        slug = _validate_metadata_key(key)
-        self._ygg_metadata_dir.mkdir(parents=True, exist_ok=True)
-        target = self._ygg_metadata_dir / f"{slug}.json"
-        payload = json_module.dumps(value)
-        try:
-            staging = self._ygg_metadata_dir.make_staging(media_type=MimeTypes.JSON)
-            staging.write_bytes(payload)
-            staging.rename(target)
-        except Exception:
-            # Backend doesn't support staging — fall back to a direct
-            # write. Worst case: a concurrent reader sees a partial
-            # write, retries.
-            target.write_bytes(payload)
-
-    def read_metadata(self, key: str, default: Any = None) -> Any:
-        """Load the value at ``.ygg/metadata/<key>.json`` or return *default*.
-
-        Missing keys, missing sidecar, and parse errors all collapse
-        to the *default* — read-side metadata is best-effort.
-        """
-        slug = _validate_metadata_key(key)
-        target = self._ygg_metadata_dir / f"{slug}.json"
-        try:
-            blob = target.read_bytes(raise_error=False)
-        except OSError:
-            return default
-        if not blob:
-            return default
-        try:
-            return json_module.loads(blob)
-        except Exception:
-            return default
-
-    def list_metadata_keys(self) -> list[str]:
-        """All keys present under ``.ygg/metadata/`` — sorted, slug form."""
-        directory = self._ygg_metadata_dir
-        try:
-            entries = directory.iterdir()
-        except (OSError, FileNotFoundError):
-            return []
-        keys: list[str] = []
-        for entry in entries:
-            name = entry.name
-            if not name.endswith(".json"):
-                continue
-            keys.append(name[:-5])
-        keys.sort()
-        return keys
 
     # ==================================================================
     # Children — direct enumeration with transparent recursion
@@ -1386,32 +1178,26 @@ class FolderIO(NestedIO[FolderOptions]):
 # ---------------------------------------------------------------------------
 
 
-_METADATA_KEY_VALID = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-."
-)
 
+def _has_ygg_sidecar(path_like: Any) -> bool:
+    """One-round-trip probe: does ``path_like`` carry a ``.ygg/`` folder?
 
-def _validate_metadata_key(key: str) -> str:
-    """Reject path-separator / traversal / empty keys for ``.ygg/metadata``.
-
-    The sidecar is metadata, not a free-form filesystem; allowing
-    arbitrary names invites traversal (``../``) and collisions with
-    the JSON-extension convention (``foo.json/`` as a directory).
-    Keep the alphabet narrow.
+    Used by :meth:`FolderIO.__new__` to auto-upgrade plain
+    :class:`FolderIO` constructions to :class:`YGGFolderIO` when the
+    target already has sidecar state. Failures (path doesn't parse,
+    backend transient, permission denied) collapse to ``False`` so
+    we never accidentally fail a plain construction.
     """
-    if not isinstance(key, str) or not key:
-        raise ValueError(
-            f"Metadata key must be a non-empty string; got {key!r}."
-        )
-    bad = [c for c in key if c not in _METADATA_KEY_VALID]
-    if bad:
-        raise ValueError(
-            f"Metadata key {key!r} contains invalid characters "
-            f"{sorted(set(bad))!r}. Allowed: alphanumerics, '_', '-', '.'."
-        )
-    if key in (".", ".."):
-        raise ValueError(f"Metadata key {key!r} is reserved.")
-    return key
+    try:
+        if isinstance(path_like, Path):
+            probe = path_like
+        else:
+            probe = Path.from_(path_like, default=None)
+        if probe is None:
+            return False
+        return (probe / ".ygg").exists()
+    except Exception:
+        return False
 
 
 def _coerce_partition_column(value: Any) -> Field:

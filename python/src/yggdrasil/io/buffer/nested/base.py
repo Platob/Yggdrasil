@@ -94,12 +94,12 @@ if TYPE_CHECKING:
 __all__ = ["NestedIO", "NestedOptions"]
 
 
-# Staging filenames carry ``-<start_ts>-<end_ts>(.ext)*`` after the
-# ``tmp-<seed>`` prefix; ``_is_ignored_path`` uses this to skip them
-# during enumeration so parallel readers never see half-finalized
-# files. Mirror of ``yggdrasil.io.fs.path._STAGING_TMP_RE``.
+# Time-sortable staging layout: ``<prefix>-<start>-<end>-<seed>(.ext)*``.
+# ``_is_ignored_path`` uses this to skip in-flight staging files so
+# parallel readers never see half-finalized writes. Mirror of
+# ``yggdrasil.io.fs.path._STAGING_TMP_RE``.
 _STAGING_TMP_RE: "re.Pattern[str]" = re.compile(
-    r"-(\d+)-(\d+)(?:\.[^./]+)*$"
+    r"-(\d+)-(\d+)-[0-9a-f]+(?:\.[^/]+)?$"
 )
 
 

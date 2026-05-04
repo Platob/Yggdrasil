@@ -405,9 +405,14 @@ class TestMemoryThreadLock:
 
 
 def _make_spill_file(directory, *, end_epoch, ext="bin", seed="deadbeef0badf00d"):
-    """Drop a fake spill file with a controlled TTL into *directory*."""
+    """Drop a fake spill file with a controlled TTL into *directory*.
+
+    Filename matches the time-sortable layout produced by
+    ``_mint_spill_path``: ``tmp-{start}-{end}-{seed}.{ext}`` with
+    zero-padded timestamps.
+    """
     start = end_epoch - 1
-    name = f"tmp-{seed}-{start}-{end_epoch}.{ext}"
+    name = f"tmp-{start:012d}-{end_epoch:012d}-{seed}.{ext}"
     full = os.path.join(directory, name)
     with open(full, "wb") as fh:
         fh.write(b"")

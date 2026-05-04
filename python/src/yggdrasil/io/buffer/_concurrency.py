@@ -67,10 +67,12 @@ except ImportError:  # pragma: no cover — exotic platform
     _HAS_MSVCRT = False
 
 
-# Mirrors the format produced by ``_mint_spill_path``:
-#   tmp-<16hex>-<start>-<end>.<ext>
+# Mirrors the time-sortable format produced by ``_mint_spill_path``:
+#   tmp-<start>-<end>-<16hex>.<ext>
+# ``start`` and ``end`` are zero-padded epoch seconds; the seed is
+# 16 lowercase hex chars. Lexical sort matches chronological order.
 _SPILL_FILENAME_RE = re.compile(
-    r"^tmp-[0-9a-f]+-(?P<start>\d+)-(?P<end>\d+)\.[^/\\\s]+$"
+    r"^tmp-(?P<start>\d+)-(?P<end>\d+)-[0-9a-f]+\.[^/\\\s]+$"
 )
 
 # Sentinel filename for the directory-level cleanup lock.

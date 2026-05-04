@@ -3028,9 +3028,12 @@ def _pwrite_bounded(fd: int, data, pos: int) -> int:
 def _mint_spill_path(ext: str, ttl_seconds: int) -> "Path":
     """Mint a fresh temp file path under :func:`tempfile.gettempdir`.
 
-    The TTL is encoded in the filename so external cleanup workers
-    can delete stale files lexically without re-stat'ing every entry.
-    The file itself is not created here — the caller writes to it.
+    Filename layout (time-sortable): ``tmp-{start}-{end}-{seed}.{ext}``.
+    Both timestamps are zero-padded to 12 digits so a lexical sort
+    of the temp directory yields chronological order — useful for
+    debugging, stream-tail tools, and the stale-cleanup sweep that
+    walks files oldest-first. The file itself is not created here
+    — the caller writes to it.
 
     Calls :func:`maybe_cleanup_stale_spill_files` before minting so
     the tempdir doesn't accumulate orphans from crashed workers. The
@@ -3041,7 +3044,7 @@ def _mint_spill_path(ext: str, ttl_seconds: int) -> "Path":
     seed = os.urandom(8).hex()
     start = int(time.time())
     end = start + ttl_seconds
-    name = f"tmp-{seed}-{start}-{end}.{ext}"
+    name = f"tmp-{start:012d}-{end:012d}-{seed}.{ext}"
     return local_path_class().from_pathlib(
         pathlib.Path(os.path.join(tempfile.gettempdir(), name))
     )
