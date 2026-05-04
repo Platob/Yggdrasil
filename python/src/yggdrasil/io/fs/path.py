@@ -974,6 +974,96 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         return s.mtime
 
     # ==================================================================
+    # Local mirror — opt-in remote→local caching
+    # ==================================================================
+    #
+    # Cross-cutting helper for backends that pay a network round-trip
+    # on every read. ``local_mirror`` keeps a sized/mtime-validated
+    # copy under ``~/.yggdrasil/mirror`` and serves it on cache hits
+    # without re-downloading. See :mod:`yggdrasil.io.fs.mirror` for
+    # the freshness model and on-disk layout.
+
+    def mirror_path(self, *, root: "Optional[Path]" = None) -> "Path":
+        """Return the canonical :class:`LocalPath` this path mirrors to.
+
+        Pure mapping — no I/O, no directory creation, no remote stat.
+        For local paths this is the identity. See
+        :meth:`local_mirror` for the I/O-bearing counterpart.
+        """
+        from yggdrasil.io.fs.mirror import mirror_path_for
+        return mirror_path_for(self, root=root)
+
+    def local_mirror(
+        self,
+        *,
+        ttl: float = 60.0,
+        force_refresh: bool = False,
+        root: "Optional[Path]" = None,
+        sweep: bool = True,
+        max_age: float = 7 * 24 * 60 * 60.0,
+    ) -> "Path":
+        """Return a local copy of *self*, refreshed if the remote changed.
+
+        For a local path this is the identity. For a remote path,
+        the mirror lives under ``~/.yggdrasil/mirror/<scheme>/<host>/<key>``
+        with a ``.<name>.ygmirror.json`` sidecar carrying the
+        ``(size, mtime, kind)`` from the last download. The mirror
+        is reused as long as the sidecar matches the remote ``stat``;
+        a process-local :class:`ExpiringDict` collapses repeat
+        validations within ``ttl`` seconds so hot loops don't even
+        round-trip the stat.
+
+        Pass ``ttl=0`` to disable the in-process verdict cache (every
+        call stats the remote once). Pass ``force_refresh=True`` to
+        ignore both the verdict and the sidecar and always download.
+
+        Mirror tree maintenance reuses the staging-sweep contract:
+        the first call against a given ``root`` in this process
+        triggers a single rate-limited sweep that deletes mirror
+        files older than ``max_age`` seconds (default: 7 days).
+        Pass ``sweep=False`` to skip that maintenance pass.
+        """
+        from yggdrasil.io.fs.mirror import ensure_local_mirror
+        return ensure_local_mirror(
+            self,
+            ttl=ttl,
+            force_refresh=force_refresh,
+            root=root,
+            sweep=sweep,
+            max_age=max_age,
+        )
+
+    def invalidate_mirror(self) -> None:
+        """Drop the in-process freshness verdict for *self*.
+
+        The next :meth:`local_mirror` call will re-stat the remote
+        and re-download iff the stat differs from the sidecar.
+        Does NOT delete the on-disk mirror file or sidecar.
+        """
+        from yggdrasil.io.fs.mirror import invalidate_mirror as _inv
+        _inv(self)
+
+    def as_mirror(
+        self,
+        *,
+        ttl: float = 60.0,
+        root: "Optional[Path]" = None,
+    ) -> "Path":
+        """Wrap *self* in a :class:`MirrorPath` proxy.
+
+        The returned path serves reads through the local mirror
+        (refreshed every ``ttl`` seconds) and applies writes locally
+        first, asynchronously syncing to *self* via daemon threads.
+        Call :meth:`MirrorPath.flush` to drain pending uploads.
+
+        For local paths this is still useful as a uniform handle
+        — :class:`MirrorPath` short-circuits the mirror dance and
+        delegates straight to the local filesystem.
+        """
+        from yggdrasil.io.fs.mirror_path import MirrorPath
+        return MirrorPath(self, root=root, ttl=ttl)
+
+    # ==================================================================
     # Listing / walking
     # ==================================================================
 

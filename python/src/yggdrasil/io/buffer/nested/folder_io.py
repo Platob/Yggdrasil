@@ -187,6 +187,8 @@ class FolderIO(NestedIO[FolderOptions]):
         schema: "Schema | pa.Schema | None" = None,
         recursive: bool = True,
         partition_values: "Mapping[str, str | None] | None" = None,
+        mirror_leaves: bool = False,
+        mirror_ttl: float = 60.0,
         **kwargs: Any,
     ) -> None:
         """Construct a folder IO.
@@ -211,8 +213,25 @@ class FolderIO(NestedIO[FolderOptions]):
             an enclosing tree. Set by :meth:`iter_children` when
             handing back a sub-:class:`FolderIO`; users normally
             don't pass this themselves.
+        :param mirror_leaves: when ``True`` and a leaf path is
+            non-local, wrap it in a :class:`MirrorPath` so reads go
+            through the local mirror under
+            ``~/.yggdrasil/mirror``. Default ``False`` — opt in
+            because not every folder layout has immutable leaves
+            (only Delta-style append-only ones do safely). Hot
+            metadata (the ``.schema`` sidecar, the Delta
+            ``_delta_log/``, the folder listing itself) is
+            intentionally NOT mirrored — those change on every
+            write and need authoritative remote reads.
+        :param mirror_ttl: freshness window passed to
+            :meth:`MirrorPath.local_mirror`. Default 60s; a longer
+            value is fine for truly immutable leaves (Delta
+            AddFiles), shorter for plain folders where leaves
+            could be replaced in place.
         """
         super().__init__(data, path=path, **kwargs)
+        self._mirror_leaves = bool(mirror_leaves)
+        self._mirror_ttl = float(mirror_ttl)
         self._declared_schema: "Schema | None" = (
             schema if isinstance(schema, Schema)
             else Schema.from_arrow(schema) if schema is not None
@@ -442,7 +461,21 @@ class FolderIO(NestedIO[FolderOptions]):
         Arrow-typed equivalent so its read path automatically
         injects the partition columns — no per-batch wrapping
         needed at the folder level.
+
+        When ``mirror_leaves=True`` was passed at construction and
+        ``file_path`` is non-local, the path is wrapped in a
+        :class:`MirrorPath` so repeat reads serve from the local
+        mirror. Local paths bypass the wrap (no benefit, just
+        overhead).
         """
+        if (
+            self._mirror_leaves
+            and isinstance(file_path, Path)
+            and not file_path.is_local
+        ):
+            from yggdrasil.io.fs.mirror_path import MirrorPath
+            file_path = MirrorPath(file_path, ttl=self._mirror_ttl)
+
         try:
             io = TabularIO.from_path(file_path)
         except Exception:

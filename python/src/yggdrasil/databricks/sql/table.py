@@ -2591,13 +2591,37 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         ).s3.path(self.infos.storage_location)
 
     def aws(self, operation: TableOperation = TableOperation.READ) -> "AWSClient":
-        credentials = self.temporary_credentials(operation=operation)
-        return aws_config_class()(
-            access_key_id=credentials.aws_temp_credentials.access_key_id,
-            secret_access_key=credentials.aws_temp_credentials.secret_access_key,
-            session_token=credentials.aws_temp_credentials.session_token,
-            region="eu-central-1",
-        ).to_client()
+        """Return an :class:`AWSClient` whose credentials self-refresh
+        from :meth:`temporary_credentials`.
+
+        The returned client carries a botocore
+        :class:`RefreshableCredentials`-backed session: every signing
+        request that runs after the token's near-expiry window
+        re-invokes :meth:`temporary_credentials` and rotates the
+        underlying creds in place. No caller-side refresh dance.
+        """
+        from yggdrasil.aws.config import AwsCredentials
+
+        def _refresh() -> AwsCredentials:
+            creds = self.temporary_credentials(operation=operation)
+            aws = creds.aws_temp_credentials
+            expiration = getattr(creds, "expiration_time", None)
+            return AwsCredentials(
+                access_key_id=aws.access_key_id,
+                secret_access_key=aws.secret_access_key,
+                session_token=aws.session_token,
+                expiration=(
+                    expiration.isoformat()
+                    if expiration is not None and hasattr(expiration, "isoformat")
+                    else (str(expiration) if expiration is not None else None)
+                ),
+            )
+
+        return (
+            aws_config_class()
+            .from_refresher(_refresh, region="eu-central-1")
+            .to_client()
+        )
 
     def temporary_credentials(self, operation: TableOperation = TableOperation.READ):
         return (
