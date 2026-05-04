@@ -48,6 +48,7 @@ class ArrayType(NestedType):
     list_size: int | None = None
     large: bool = False
     view: bool = False
+    fixed_size: bool = False
 
     @classmethod
     def class_type_id(cls) -> DataTypeId:
@@ -90,6 +91,7 @@ class ArrayType(NestedType):
             and self.list_size == other.list_size
             and self.large == other.large
             and self.view == other.view
+            and self.fixed_size == other.fixed_size
         )
 
     def _merge_with_same_id(
@@ -124,6 +126,7 @@ class ArrayType(NestedType):
             list_size=list_size,
             large=large,
             view=self.view or other.view,
+            fixed_size=self.fixed_size or other.fixed_size,
         )
 
     @property
@@ -147,6 +150,7 @@ class ArrayType(NestedType):
         list_size: int | None = None,
         large: bool = False,
         view: bool = False,
+        fixed_size: bool = False,
     ):
         _f = field_class()
         item_field = _f.from_any(item_field)
@@ -157,11 +161,18 @@ class ArrayType(NestedType):
         if list_size is not None and list_size < 0:
             list_size = None
 
+        # ``list_size`` already implies the fixed-size variant in Arrow; keep
+        # the boolean in sync so callers that pass only one of the two get a
+        # consistent type.
+        if list_size is not None:
+            fixed_size = True
+
         return cls(
             item_field=item_field,
             list_size=list_size,
             large=large,
             view=view,
+            fixed_size=fixed_size,
         )
 
     @classmethod
@@ -213,6 +224,7 @@ class ArrayType(NestedType):
                 list_size=dtype.list_size,
                 large=False,
                 view=False,
+                fixed_size=True,
             )
 
         raise TypeError(f"Unsupported Arrow data type: {dtype!r}")
@@ -279,6 +291,7 @@ class ArrayType(NestedType):
                 list_size=value.get("list_size"),
                 large=bool(value.get("large", False)),
                 view=bool(value.get("view", False)),
+                fixed_size=bool(value.get("fixed_size", value.get("list_size") is not None)),
             )
         except Exception as e:
             if default is ...:
@@ -365,6 +378,8 @@ class ArrayType(NestedType):
             base["large"] = True
         if self.view:
             base["view"] = True
+        if self.fixed_size:
+            base["fixed_size"] = True
 
         return base
 

@@ -23,11 +23,14 @@ __all__ = ["StringType"]
 class StringType(PrimitiveType):
     large: bool = False
     view: bool = False
+    fixed_size: bool = False
 
     def pretty_format(self, indent: int = 2, level: int = 0) -> str:
         pad = " " * (indent * level)
         s = "large_string" if self.large else "string"
         s = s + "_view" if self.view else s
+        if self.fixed_size:
+            s = s + "_fixed"
         return f"{pad}{s}"
 
     @classmethod
@@ -84,6 +87,7 @@ class StringType(PrimitiveType):
             return cls(
                 large=bool(value.get("large", False)),
                 view=bool(value.get("view", False)),
+                fixed_size=bool(value.get("fixed_size", False)),
                 byte_size=value.get("byte_size"),
             )
         except Exception as e:
