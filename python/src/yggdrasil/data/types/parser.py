@@ -145,31 +145,48 @@ class ParsedDataType:
         cls,
         value: str,
         *,
-        raise_error: bool = True,
-        default: DataTypeId = DataTypeId.OBJECT,
+        default: Any = ...,
     ) -> "ParsedDataType":
-        parser = _Parser(value, raise_error=raise_error, default=default)
+        """Parse a DataType string.
+
+        On parse failure the dispatch is driven by ``default``:
+
+        * ``default = ...`` (the sentinel default) — re-raise the
+          underlying :class:`ValueError`.  Use this when the caller
+          treats parse failure as a programming error.
+        * ``default`` is a :class:`ParsedDataType` — return it as-is.
+        * ``default`` is a :class:`DataTypeId` — wrap into a bare
+          :class:`ParsedDataType` with no metadata.
+        * Anything else (including ``None``) — collapse to
+          :data:`DataTypeId.OBJECT`, the "I don't know what this is,
+          treat it as opaque" type. Strings used to land here too;
+          OBJECT keeps the value untouched whereas STRING would have
+          coerced through ``str()`` on cast.
+        """
+        parser = _Parser(value, default=default)
 
         try:
             return parser.parse()
         except ValueError as e:
-            if raise_error:
+            if default is ...:
                 raise ValueError(
                     f"Failed to parse DataType string {value!r} as a DataType: {e}"
                 ) from e
-            return cls(type_id=default, metadata=DataTypeMetadata())
+            if isinstance(default, ParsedDataType):
+                return default
+            if isinstance(default, DataTypeId):
+                return cls(type_id=default, metadata=DataTypeMetadata())
+            return cls(type_id=DataTypeId.OBJECT, metadata=DataTypeMetadata())
 
     @classmethod
     def parse_type_id(
         cls,
         value: str,
         *,
-        raise_error: bool = True,
-        default: DataTypeId = DataTypeId.OBJECT,
+        default: Any = ...,
     ) -> DataTypeId:
         return cls.parse(
             value,
-            raise_error=raise_error,
             default=default,
         ).type_id
 
@@ -558,11 +575,13 @@ class _Lexer:
 
 
 class _Parser:
-    def __init__(self, text: str, *, raise_error: bool, default: DataTypeId) -> None:
+    def __init__(self, text: str, *, default: Any = ...) -> None:
         self.text = text
         self.tokens = _Lexer(text).lex()
         self.index = 0
-        self.raise_error = raise_error
+        # Stored for subclass / debug use; the parser body always
+        # raises on failure and lets :meth:`ParsedDataType.parse`
+        # decide whether to re-raise or fall back to ``default``.
         self.default = default
 
     def parse(self) -> ParsedDataType:
@@ -1530,11 +1549,14 @@ def _canonical_name(name: str) -> tuple[str, DataTypeId | None]:
 def parse_data_type(
     value: str,
     *,
-    raise_error: bool = True,
-    default: DataTypeId = DataTypeId.OBJECT,
+    default: Any = ...,
 ) -> ParsedDataType:
+    """Module-level alias for :meth:`ParsedDataType.parse`.
+
+    See that method for the ``default`` semantics — passing
+    :data:`...` raises on failure, anything else is a fallback.
+    """
     return ParsedDataType.parse(
         value,
-        raise_error=raise_error,
         default=default,
     )
