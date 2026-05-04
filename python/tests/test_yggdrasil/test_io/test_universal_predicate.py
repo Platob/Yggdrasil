@@ -223,6 +223,99 @@ class TestDeltaPartitionPruning:
 # ---------------------------------------------------------------------------
 
 
+class TestParquetPushdown:
+    """ParquetIO pushes predicates into ``pyarrow.dataset`` when possible.
+
+    The pushdown path uses the parquet footer's per-row-group min/max
+    stats to skip whole row groups before any data is decompressed —
+    a different code path from the universal per-batch filter at the
+    TabularIO layer. We can't easily probe ``pa.dataset`` internals
+    from here, but we can observe the contract: the result is the
+    same as the universal-filter path, AND the pushdown helper is
+    chosen when the predicate compiles cleanly.
+    """
+
+    def _write_three_groups(self, path: pathlib.Path) -> None:
+        # Three small row groups so the footer has enough metadata
+        # to drive pushdown at row-group granularity.
+        import pyarrow.parquet as pq
+
+        pq.write_table(
+            pa.concat_tables([
+                pa.table({"id": pa.array([1, 2, 3]), "v": ["a", "b", "c"]}),
+                pa.table({"id": pa.array([4, 5, 6]), "v": ["d", "e", "f"]}),
+                pa.table({"id": pa.array([7, 8, 9]), "v": ["g", "h", "i"]}),
+            ]),
+            str(path),
+            row_group_size=3,
+        )
+
+    def test_pushdown_returns_filtered_batches(self, tmp_path):
+        target = tmp_path / "rg.parquet"
+        self._write_three_groups(target)
+
+        with ParquetIO(path=str(target), mode="rb") as r:
+            out = r.read_arrow_table(predicate=col("id") >= 7)
+        assert sorted(out["id"].to_pylist()) == [7, 8, 9]
+
+    def test_pushdown_helper_is_invoked(self, tmp_path, monkeypatch):
+        # Spy on _iter_with_pushdown to confirm the pushdown branch
+        # is taken when a predicate is present. The result is the
+        # same either way; this test pins the *path* taken.
+        from yggdrasil.io.buffer.primitive import parquet_io as parquet_mod
+
+        target = tmp_path / "spy.parquet"
+        self._write_three_groups(target)
+
+        seen: list[bool] = []
+        original = parquet_mod.ParquetIO._iter_with_pushdown
+
+        def spy(self, **kwargs):
+            seen.append(True)
+            return original(self, **kwargs)
+
+        monkeypatch.setattr(
+            parquet_mod.ParquetIO, "_iter_with_pushdown", spy,
+        )
+
+        with ParquetIO(path=str(target), mode="rb") as r:
+            out = r.read_arrow_table(predicate=col("id") < 5)
+        assert seen == [True]
+        assert sorted(out["id"].to_pylist()) == [1, 2, 3, 4]
+
+    def test_pushdown_skipped_when_no_predicate(self, tmp_path, monkeypatch):
+        from yggdrasil.io.buffer.primitive import parquet_io as parquet_mod
+
+        target = tmp_path / "no-pred.parquet"
+        self._write_three_groups(target)
+
+        seen: list[bool] = []
+        original = parquet_mod.ParquetIO._iter_with_pushdown
+
+        def spy(self, **kwargs):
+            seen.append(True)
+            return original(self, **kwargs)
+
+        monkeypatch.setattr(
+            parquet_mod.ParquetIO, "_iter_with_pushdown", spy,
+        )
+
+        with ParquetIO(path=str(target), mode="rb") as r:
+            out = r.read_arrow_table()
+        assert seen == []
+        assert out.num_rows == 9
+
+    def test_missing_column_falls_back_to_unfiltered(self, tmp_path):
+        target = tmp_path / "missing.parquet"
+        self._write_three_groups(target)
+
+        # Predicate column is absent — pushdown returns None and
+        # the universal filter's missing-column rule keeps every row.
+        with ParquetIO(path=str(target), mode="rb") as r:
+            out = r.read_arrow_table(predicate=col("absent") > 0)
+        assert out.num_rows == 9
+
+
 class TestYGGFolderPredicate:
     def test_predicate_filters_through_ygg_folder(self, tmp_path):
         with YGGFolderIO(path=str(tmp_path)) as io:

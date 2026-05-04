@@ -246,10 +246,20 @@ Rules:
   coherent boolean, so the filter degrades to a no-op for that
   source rather than dropping every row. Crucial for
   heterogeneous-source folders.
-- **Backends with native pushdown clear the option** before
-  reaching the per-batch evaluator (Delta partition pruning,
-  warehouse SQL `WHERE`). The evaluator is the universal
-  fallback, not a duplicate filter.
+- **Backends with native pushdown** push the predicate into the
+  storage layer instead of evaluating per batch:
+  - **Parquet** — `ParquetIO._iter_with_pushdown` lifts the
+    predicate to `pa.compute.Expression` and routes through
+    `pa.dataset.dataset(...).scanner(filter=...)`. The dataset
+    scanner uses the parquet footer's per-row-group min/max stats
+    to skip whole row groups before any decompression.
+  - **Delta** — `DeltaIO` partition pruning skips whole AddFiles
+    whose partition values can't satisfy the predicate.
+  - **Warehouse SQL** — predicate becomes the SQL `WHERE`.
+  When pushdown can't take the predicate (missing column, exotic
+  expression node, dataset API unavailable) the IO falls back to
+  the unfiltered read; the universal filter at the TabularIO
+  layer applies it per batch as a safety net.
 - **`iter_children(predicate=...)`** is the canonical knob for
   filtering child IOs by their metadata
   (`{name, path, is_dir, is_private}`):
