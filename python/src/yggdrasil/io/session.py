@@ -1511,7 +1511,17 @@ class Session(ABC):
             (pickle.dumps(r.copy(remote_cache_config=None), protocol=pickle.HIGHEST_PROTOCOL),)
             for r in misses
         ]
-        request_df = spark.createDataFrame(req_rows, req_schema)
+
+        # Spread requests across many partitions so mapInArrow scatters
+        # across the whole cluster instead of piling them onto a handful
+        # of executors. ``createDataFrame`` defaults to a single partition
+        # for small Python lists, which serialises stage 3. Target one
+        # request per partition, capped at ``defaultParallelism * 8`` so
+        # huge request lists don't explode into thousands of micro-tasks
+        # whose scheduler overhead dominates the actual fetch.
+        default_par = max(spark.sparkContext.defaultParallelism, 1)
+        n_parts = max(1, min(len(req_rows), default_par * 8))
+        request_df = spark.createDataFrame(req_rows, req_schema).repartition(n_parts)
 
         # Per-executor send config: remote cache disabled (driver-only),
         # local cache passthrough, no spark session, raise_error=False so
