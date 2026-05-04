@@ -454,9 +454,50 @@ class AWSClient:
 
     def _build_session(self) -> "boto3.Session":
         boto3 = boto3_module()
+        if self.config.has_refresher():
+            return self._build_refresher_session(boto3)
         if self.config.has_assume_role():
             return self._build_assume_role_session(boto3)
         return self._build_simple_session(boto3)
+
+    def _build_refresher_session(self, boto3) -> "boto3.Session":
+        """Build a Session whose credentials auto-refresh via
+        :attr:`AWSConfig.refresher`.
+
+        This is the path taken when credentials are vended by an
+        external service (Databricks
+        ``temporary_path_credentials`` / ``temporary_table_credentials``,
+        an STS broker, a custom credential service). The refresher
+        callback is invoked once for the seed metadata and then again
+        on every botocore refresh cycle (~5 min before token expiry),
+        exactly the same wiring as
+        :meth:`_build_assume_role_session` but with a caller-supplied
+        callback rather than a built-in STS AssumeRole driver.
+        """
+        botocore = botocore_module()
+        refresher = self.config.refresher
+        assert refresher is not None  # gated by has_refresher() above
+
+        from .config import _refresher_to_metadata
+
+        def refresh():
+            return _refresher_to_metadata(refresher)
+
+        refreshable = (
+            botocore.credentials.RefreshableCredentials
+            .create_from_metadata(
+                metadata=refresh(),
+                refresh_using=refresh,
+                method="ygg-refresher",
+            )
+        )
+
+        botocore_session = botocore.session.get_session()
+        botocore_session._credentials = refreshable
+        if self.config.region:
+            botocore_session.set_config_variable("region", self.config.region)
+
+        return boto3.Session(botocore_session=botocore_session)
 
     def _build_simple_session(self, boto3) -> "boto3.Session":
         """Static / profile / default-chain session."""

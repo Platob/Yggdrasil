@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from typing import Mapping, Optional, TYPE_CHECKING
+from typing import Any, Callable, Mapping, Optional, TYPE_CHECKING, Union
 
 if TYPE_CHECKING:
     from .client import AWSClient
@@ -34,7 +34,13 @@ if TYPE_CHECKING:
 __all__ = [
     "AwsCredentials",
     "AWSConfig",
+    "CredentialsRefresher",
 ]
+
+
+# Refresher callable: returns a fresh :class:`AwsCredentials` (or the
+# botocore metadata dict — both shapes are accepted for ergonomics).
+CredentialsRefresher = Callable[[], Union["AwsCredentials", Mapping[str, Any]]]
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +182,36 @@ class AWSConfig:
     """``"path"`` or ``"virtual"``. ``None`` lets boto pick (virtual
     by default for AWS, path for many S3-compatibles)."""
 
+    # --- External credential refresher --------------------------------------
+
+    refresher: Optional[CredentialsRefresher] = dataclasses.field(
+        default=None, repr=False, compare=False, hash=False,
+    )
+    """Callable that returns fresh credentials before they expire.
+
+    Set this when the credentials come from a vending service that
+    keeps minting them — Databricks ``temporary_path_credentials`` /
+    ``temporary_table_credentials`` / external STS broker — so an
+    :class:`AWSClient` built from this config can drive a
+    botocore :class:`RefreshableCredentials`-backed session that
+    survives token rotation.
+
+    Two accepted return shapes:
+
+    - :class:`AwsCredentials` — the canonical Yggdrasil record.
+    - ``Mapping`` matching botocore's metadata
+      (``{"access_key", "secret_key", "token", "expiry_time"}``).
+
+    The callable is invoked from inside botocore's refresh hook
+    (~5 min before token expiry). It must be idempotent and
+    thread-safe; botocore serializes calls but a runaway refresh
+    that hangs blocks every signing thread.
+
+    Excluded from equality / hashing: callables aren't comparable,
+    and two configs vending creds via different refreshers are still
+    "the same" config from a downstream identity standpoint.
+    """
+
     # ------------------------------------------------------------------
     # Coercion entry points
     # ------------------------------------------------------------------
@@ -187,15 +223,69 @@ class AWSConfig:
         *,
         region: Optional[str] = None,
         endpoint_url: Optional[str] = None,
+        refresher: Optional[CredentialsRefresher] = None,
         **kwargs,
     ) -> "AWSConfig":
-        """Build an AWSConfig wrapping a static :class:`AwsCredentials`."""
+        """Build an AWSConfig wrapping a static :class:`AwsCredentials`.
+
+        Pass ``refresher`` for self-renewing temporary credentials.
+        See :attr:`AWSConfig.refresher`.
+        """
         return cls(
             access_key_id=creds.access_key_id,
             secret_access_key=creds.secret_access_key,
             session_token=creds.session_token,
             region=region,
             endpoint_url=endpoint_url,
+            refresher=refresher,
+            **kwargs,
+        )
+
+    @classmethod
+    def from_refresher(
+        cls,
+        refresher: CredentialsRefresher,
+        *,
+        region: Optional[str] = None,
+        endpoint_url: Optional[str] = None,
+        **kwargs,
+    ) -> "AWSConfig":
+        """Build a self-refreshing AWSConfig from a credentials callback.
+
+        The first :meth:`to_client` reads a seed snapshot by invoking
+        *refresher* once; subsequent botocore refresh cycles re-invoke
+        it. Useful when credentials come from a vending service::
+
+            def vend() -> AwsCredentials:
+                resp = volume.temporary_credentials(operation=op)
+                aws = resp.aws_temp_credentials
+                return AwsCredentials(
+                    access_key_id=aws.access_key_id,
+                    secret_access_key=aws.secret_access_key,
+                    session_token=aws.session_token,
+                    expiration=resp.expiration_time.isoformat(),
+                )
+
+            client = AWSConfig.from_refresher(vend, region="eu-central-1").to_client()
+            client.s3_client().list_buckets()  # creds auto-refreshed
+        """
+        seed = _coerce_refresher_output(refresher())
+        if isinstance(seed, AwsCredentials):
+            access_key_id = seed.access_key_id
+            secret_access_key = seed.secret_access_key
+            session_token = seed.session_token
+        else:
+            access_key_id = seed.get("access_key")
+            secret_access_key = seed.get("secret_key")
+            session_token = seed.get("token")
+
+        return cls(
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            session_token=session_token,
+            region=region,
+            endpoint_url=endpoint_url,
+            refresher=refresher,
             **kwargs,
         )
 
@@ -227,3 +317,60 @@ class AWSConfig:
 
     def has_static_credentials(self) -> bool:
         return bool(self.access_key_id and self.secret_access_key)
+
+    def has_refresher(self) -> bool:
+        """True iff a :attr:`refresher` callback is wired up.
+
+        Drives :meth:`AWSClient._build_session` to mint a
+        :class:`RefreshableCredentials`-backed session instead of a
+        static one.
+        """
+        return self.refresher is not None
+
+    def refresh_metadata(self) -> Mapping[str, Any]:
+        """Invoke :attr:`refresher` and return botocore-shaped metadata.
+
+        Raises :class:`RuntimeError` when no refresher is set.
+        """
+        if self.refresher is None:
+            raise RuntimeError(
+                "AWSConfig.refresh_metadata() requires a refresher; "
+                "none is set. Build the config via "
+                "AWSConfig.from_refresher(...) or assign config.refresher."
+            )
+        return _refresher_to_metadata(self.refresher)
+
+
+# ---------------------------------------------------------------------------
+# Refresher adapters
+# ---------------------------------------------------------------------------
+
+
+def _coerce_refresher_output(
+    obj: Union[AwsCredentials, Mapping[str, Any]],
+) -> Union[AwsCredentials, Mapping[str, Any]]:
+    """Normalize a refresher's return value into one of the two
+    accepted shapes; raise :class:`TypeError` otherwise."""
+    if isinstance(obj, AwsCredentials):
+        return obj
+    if isinstance(obj, Mapping):
+        return obj
+    raise TypeError(
+        "AWSConfig refresher must return an AwsCredentials or a "
+        "Mapping with access_key/secret_key/token/expiry_time keys; "
+        f"got {type(obj).__name__}."
+    )
+
+
+def _refresher_to_metadata(
+    refresher: CredentialsRefresher,
+) -> Mapping[str, Any]:
+    """Adapter: invoke *refresher* and return a botocore metadata dict.
+
+    Accepts both the canonical :class:`AwsCredentials` shape and the
+    raw mapping shape so callers don't have to wrap themselves.
+    """
+    raw = _coerce_refresher_output(refresher())
+    if isinstance(raw, AwsCredentials):
+        return dict(raw.to_botocore_metadata())
+    return dict(raw)

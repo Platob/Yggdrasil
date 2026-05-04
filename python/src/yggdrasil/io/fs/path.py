@@ -1043,6 +1043,26 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         from yggdrasil.io.fs.mirror import invalidate_mirror as _inv
         _inv(self)
 
+    def as_mirror(
+        self,
+        *,
+        ttl: float = 60.0,
+        root: "Optional[Path]" = None,
+    ) -> "Path":
+        """Wrap *self* in a :class:`MirrorPath` proxy.
+
+        The returned path serves reads through the local mirror
+        (refreshed every ``ttl`` seconds) and applies writes locally
+        first, asynchronously syncing to *self* via daemon threads.
+        Call :meth:`MirrorPath.flush` to drain pending uploads.
+
+        For local paths this is still useful as a uniform handle
+        — :class:`MirrorPath` short-circuits the mirror dance and
+        delegates straight to the local filesystem.
+        """
+        from yggdrasil.io.fs.mirror_path import MirrorPath
+        return MirrorPath(self, root=root, ttl=ttl)
+
     # ==================================================================
     # Listing / walking
     # ==================================================================
