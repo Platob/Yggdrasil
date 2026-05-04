@@ -1502,28 +1502,22 @@ class Session(ABC):
         fanning out via the session's local thread pool. Per-request remote
         cache configs are stripped (driver concern); per-request local cache
         configs are dropped on workers (they see only the session config).
-        """
-        # Build the request DataFrame on the driver. Each request becomes
-        # one row in REQUEST_ARROW_SCHEMA shape. We control partitioning by
-        # chunking before handing to createDataFrame.
-        request_batches: list[pa.RecordBatch] = [
-            r.prepare_to_send().to_arrow_batch(parse=False) for r in misses
-        ]
-        request_table = pa.Table.from_batches(request_batches)
-        # PySpark 3.4+ accepts a pyarrow.Table directly and preserves the
-        # full schema (maps, nullable bytes). The pandas fallback drops
-        # type information for object-typed columns and fails on empty
-        # maps, which `request_headers` and `request_tags` produce
-        # whenever the request carries no extras.
-        try:
-            request_df = spark.createDataFrame(request_table)
-        except (TypeError, AttributeError):
-            from .request import REQUEST_SCHEMA
 
-            request_df = spark.createDataFrame(
-                request_table.to_pandas(),
-                schema=REQUEST_SCHEMA.to_spark_schema(),
-            )
+        Requests cross the wire as a single pickled-bytes column. Pickle
+        preserves the full :class:`PreparedRequest` (closures, buffer,
+        cache configs) without the per-engine schema dance that the Arrow
+        round-trip needed.
+        """
+        import pickle
+
+        from pyspark.sql.types import BinaryType, StructField, StructType
+
+        req_schema = StructType([StructField("request", BinaryType(), nullable=False)])
+        req_rows = [
+            (pickle.dumps(r.copy(remote_cache_config=None), protocol=pickle.HIGHEST_PROTOCOL),)
+            for r in misses
+        ]
+        request_df = spark.createDataFrame(req_rows, req_schema)
 
         # Per-executor send config: remote cache disabled (driver-only),
         # local cache passthrough, no spark session, raise_error=False so
@@ -1538,38 +1532,24 @@ class Session(ABC):
         # Capture the session for executor serialisation. Session.__getstate__
         # / __setstate__ are required to make this pickle-safe — otherwise
         # the threading.RLock / JobPoolExecutor will choke at scatter time.
-        # Carrying the live session also carries any subclass overrides of
-        # :meth:`_prepare_request` / :meth:`_after_send` into the workers, so
-        # session-level request signing and response post-processing fire on
-        # the executors exactly as they do on the driver.
         session = self
         response_spark_schema = RESPONSE_SCHEMA.to_spark_schema()
 
         def _send_partition(
             batches: Iterator[pa.RecordBatch],
         ) -> Iterator[pa.RecordBatch]:
-            # All imports local — keeps the closure self-contained on workers.
-            from yggdrasil.io.request import PreparedRequest as _Req
+            import pickle as _pickle
 
             for batch in batches:
-                # Decode this partition's slice of requests.
-                partition_requests = list(_Req.from_arrow(batch, normalize=False))
+                partition_requests = [
+                    _pickle.loads(buf)
+                    for buf in batch.column("request").to_pylist()
+                ]
                 if not partition_requests:
                     continue
 
-                # Strip per-request remote cache (driver concern) and run the
-                # full `send_many` pipeline locally — local cache + thread
-                # pool fanout — yielding Response objects.
-                local_only_iter = (
-                    r.copy(remote_cache_config=None) for r in partition_requests
-                )
-
-                # Stream each Response → 1-row Arrow batch → rechunker.
-                # The rechunker groups consecutive small responses so each
-                # emitted batch stays below the byte cap; an oversized row
-                # is emitted alone (slice degenerates to a 1-row chunk).
                 def _row_batches() -> Iterator[pa.RecordBatch]:
-                    for resp in session.send_many(local_only_iter, send_config):
+                    for resp in session.send_many(iter(partition_requests), send_config):
                         yield resp.to_arrow_batch(parse=False)
 
                 yield from rechunk_arrow_batches_by_byte_size(
