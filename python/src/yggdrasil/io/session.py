@@ -848,9 +848,7 @@ class Session(ABC):
         Used on the spark path to keep every bucket frame-resident.
         Empty input yields an empty DataFrame keyed to
         :data:`RESPONSE_SCHEMA` so downstream ``unionByName`` calls never
-        trip on a column-list mismatch. Non-empty input goes through
-        ``pa.Table.from_batches → spark.createDataFrame``; the pandas
-        fallback covers PySpark builds that reject Arrow tables directly.
+        trip on a column-list mismatch.
         """
         if not responses:
             return spark.createDataFrame(
@@ -859,13 +857,7 @@ class Session(ABC):
         table = pa.Table.from_batches(
             [r.to_arrow_batch(parse=False) for r in responses]
         )
-        try:
-            return spark.createDataFrame(table)
-        except (TypeError, AttributeError):
-            return spark.createDataFrame(
-                table.to_pandas(),
-                schema=RESPONSE_SCHEMA.to_spark_schema(),
-            )
+        return spark.createDataFrame(table)
 
     def _split_remote_cache_spark(
         self,
