@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from yggdrasil.arrow.cast import rechunk_arrow_batches_by_byte_size
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.dataclasses.waiting import (
     DEFAULT_WAITING_CONFIG,
@@ -42,15 +41,6 @@ __all__ = [
 
 
 LOGGER = logging.getLogger(__name__)
-
-
-# Cap on per-batch byte size when emitting responses from a Spark
-# `mapInArrow` worker. 128 MiB matches Spark's default Arrow batch
-# preference and keeps a single oversized response from inflating the
-# whole partition's output. A response that is itself larger than the
-# cap is sliced row-wise by the shared rechunker, which never splits a
-# single row across batches.
-_SPARK_RESPONSE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
 
 
 # Local cache lives in a partitioned :class:`FolderIO` rooted at
@@ -1498,35 +1488,20 @@ class Session(ABC):
     ) -> "SparkDataFrame":
         """Stage 3 on Spark: scatter misses to workers via mapInArrow.
 
-        Each Spark partition becomes one `send_many` call on the executor,
-        fanning out via the session's local thread pool. Per-request remote
-        cache configs are stripped (driver concern); per-request local cache
-        configs are dropped on workers (they see only the session config).
+        Each request is pickled into a single binary column, scattered with
+        ``createDataFrame`` (CPickleSerializer + parallelize), and sent on
+        the worker via :meth:`send`. Responses come back as Arrow batches
+        through ``mapInArrow``.
         """
-        # Pickle each prepared request into a binary blob and ship it via
-        # Spark's standard pickle transport (createDataFrame from a list goes
-        # through CPickleSerializer + parallelize). This avoids the Arrow IPC
-        # request encoding entirely and round-trips the full PreparedRequest
-        # object — including any subclass state — so workers don't have to
-        # reconstruct it from a flattened Arrow row.
         import pickle
 
         from pyspark.sql.types import BinaryType, StructField, StructType
 
         proto = pickle.HIGHEST_PROTOCOL
-        request_pickles = [
-            (pickle.dumps(r.prepare_to_send(), protocol=proto),) for r in misses
-        ]
-        request_pickle_schema = StructType([
-            StructField("request_pickle", BinaryType(), nullable=False),
-        ])
-        request_df = spark.createDataFrame(
-            request_pickles, schema=request_pickle_schema,
-        )
+        req_schema = StructType([StructField("request", BinaryType())])
+        req_rows = [(pickle.dumps(r, protocol=proto),) for r in misses]
 
-        # Per-executor send config: remote cache disabled (driver-only),
-        # local cache passthrough, no spark session, raise_error=False so
-        # individual failures don't blow up the whole partition.
+        session = self
         send_config = config.to_send_config(
             with_remote_cache=False,
             with_local_cache=True,
@@ -1534,56 +1509,15 @@ class Session(ABC):
             raise_error=False,
         )
 
-        # Capture the session for executor serialisation. Session.__getstate__
-        # / __setstate__ are required to make this pickle-safe — otherwise
-        # the threading.RLock / JobPoolExecutor will choke at scatter time.
-        # Carrying the live session also carries any subclass overrides of
-        # :meth:`_prepare_request` / :meth:`_after_send` into the workers, so
-        # session-level request signing and response post-processing fire on
-        # the executors exactly as they do on the driver.
-        session = self
-        response_spark_schema = RESPONSE_SCHEMA.to_spark_schema()
-
-        def _send_partition(
-            batches: Iterator[pa.RecordBatch],
-        ) -> Iterator[pa.RecordBatch]:
-            # All imports local — keeps the closure self-contained on workers.
-            import pickle as _pickle
-
+        def _part(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
+            import pickle as _pkl
             for batch in batches:
-                if batch.num_rows == 0:
-                    continue
-                # Unpickle the binary column back into PreparedRequest objects.
-                blob_col = batch.column(0)
-                partition_requests = [
-                    _pickle.loads(b.as_py())
-                    for b in blob_col
-                    if b.is_valid
-                ]
-                if not partition_requests:
-                    continue
+                for buf in batch.column("request").to_pylist():
+                    req = _pkl.loads(buf)
+                    yield session.send(req, send_config).to_arrow_batch(parse=False)
 
-                # Strip per-request remote cache (driver concern) and run the
-                # full `send_many` pipeline locally — local cache + thread
-                # pool fanout — yielding Response objects.
-                local_only_iter = (
-                    r.copy(remote_cache_config=None) for r in partition_requests
-                )
-
-                # Stream each Response → 1-row Arrow batch → rechunker.
-                # The rechunker groups consecutive small responses so each
-                # emitted batch stays below the byte cap; an oversized row
-                # is emitted alone (slice degenerates to a 1-row chunk).
-                def _row_batches() -> Iterator[pa.RecordBatch]:
-                    for resp in session.send_many(local_only_iter, send_config):
-                        yield resp.to_arrow_batch(parse=False)
-
-                yield from rechunk_arrow_batches_by_byte_size(
-                    _row_batches(),
-                    byte_size=_SPARK_RESPONSE_BATCH_BYTE_LIMIT,
-                )
-
-        return request_df.mapInArrow(_send_partition, schema=response_spark_schema)
+        seed = spark.createDataFrame(req_rows, req_schema)
+        return seed.mapInArrow(_part, RESPONSE_SCHEMA.to_spark_schema())
     
     def get(
         self,
