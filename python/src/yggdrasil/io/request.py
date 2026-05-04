@@ -43,23 +43,12 @@ _REQUEST_SCHEMA_JSON_TAGS: dict[str, str] = {
 # Nested URL struct — parsed components for joins / replay. The full
 # string isn't kept here; ``private_url_hash`` covers exact identity
 # and ``URL.from_(struct)`` reassembles the URL from its parts.
-#
-# Children are declared nullable even though the Python side coerces
-# scheme / host / path to ``""`` instead of ``None`` (see
-# :func:`_build_url_struct`). Spark's Parquet reader drops the
-# required/optional distinction on struct children when reading a
-# staged file via ``parquet.\`<path>\```, so a NOT NULL declaration
-# on the target Delta table can't be honored through the merge round
-# trip — the cast from ``STRUCT<x: STRING>`` to
-# ``STRUCT<x: STRING NOT NULL>`` fails with
-# ``DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION`` even when every value
-# is in fact non-null.
 REQUEST_URL_STRUCT = pa.struct([
-    pa.field("scheme",   pa.string(), nullable=True),
+    pa.field("scheme",   pa.string(), nullable=False),
     pa.field("userinfo", pa.string(), nullable=True),
-    pa.field("host",     pa.string(), nullable=True),
+    pa.field("host",     pa.string(), nullable=False),
     pa.field("port",     pa.int32(),  nullable=True),
-    pa.field("path",     pa.string(), nullable=True),
+    pa.field("path",     pa.string(), nullable=False),
     pa.field("query",    pa.string(), nullable=True),
     pa.field("fragment", pa.string(), nullable=True),
 ])
