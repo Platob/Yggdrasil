@@ -333,9 +333,21 @@ def ensure_local_mirror(
     local = mirror_path_for(path, root=root)
     cache_key = path.full_path()
 
+    # ── Layer 1: in-process verdict cache ────────────────────────────
+    # Checked BEFORE the sweep so hot loops (parquet footer probes,
+    # config reloads) skip every maintenance hop on cache hit. The
+    # sweep's own rate-limit dict access is locked, and adding it to
+    # the fast path measurably cost on tight inner loops.
+    if not force_refresh and ttl > 0:
+        cached_verdict = _MIRROR_FRESH.get(cache_key)
+        if cached_verdict is not None and local.exists():
+            return local
+
     # Opportunistic, rate-limited sweep of stale mirror files. Runs
     # at most once per process per root per day; the staging-sweep
     # pattern guarantees concurrent callers converge to one sweep.
+    # Deferred past the verdict-hit short-circuit so the cache
+    # fast-path stays allocation-free.
     if sweep:
         try:
             sweep_mirror_root(root=root, max_age=max_age)
@@ -343,12 +355,6 @@ def ensure_local_mirror(
             LOGGER.debug(
                 "Mirror sweep failed; continuing with fetch", exc_info=True,
             )
-
-    # ── Layer 1: in-process verdict cache ────────────────────────────
-    if not force_refresh and ttl > 0:
-        cached_verdict = _MIRROR_FRESH.get(cache_key)
-        if cached_verdict is not None and local.exists():
-            return local
 
     # ── Layer 2: stat the remote, compare to sidecar ─────────────────
     try:

@@ -194,6 +194,27 @@ class TestFileLock:
         finally:
             ex.release()
 
+    def test_stale_probe_gate_first_iteration(self, tmp_path):
+        """Iter 0 always probes — wait=0 callers must be able to break a
+        dead-holder sidecar on their single attempt."""
+        lock = FileLock(str(tmp_path / "x.lock"))
+        assert lock._should_probe_stale(0) is True
+
+    def test_stale_probe_gate_throttles_subsequent_iterations(self, tmp_path):
+        """After iter 0 the gate combines an every-Nth-iteration count
+        with a wall-clock floor; without backdating the timer no
+        further probe should fire even at the count boundary."""
+        lock = FileLock(str(tmp_path / "x.lock"))
+        lock._should_probe_stale(0)  # primes the timer
+        # Boundary iteration but the wall-clock floor blocks us.
+        assert lock._should_probe_stale(_concurrency._STALE_PROBE_EVERY_N) is False
+        # Non-boundary iterations short-circuit on the count alone.
+        assert lock._should_probe_stale(1) is False
+        assert lock._should_probe_stale(_concurrency._STALE_PROBE_EVERY_N - 1) is False
+        # Once enough wall-clock passes, the boundary fires again.
+        lock._last_stale_probe_at -= _concurrency._STALE_PROBE_MIN_INTERVAL_S * 2
+        assert lock._should_probe_stale(_concurrency._STALE_PROBE_EVERY_N) is True
+
     @pytest.mark.skipif(_IS_WINDOWS, reason="POSIX flock semantics")
     def test_shared_blocks_exclusive_on_same_file(self, tmp_path):
         path = str(tmp_path / "x.lock")

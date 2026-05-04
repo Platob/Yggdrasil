@@ -304,3 +304,28 @@ class TestSweep:
 
         remote.local_mirror(root=root, max_age=7 * 24 * 3600)
         assert not old.exists()
+
+    def test_verdict_cache_hit_skips_sweep(self, tmp_path, remote, monkeypatch):
+        """Hot loops must not pay for the sweep machinery on cache hits.
+
+        After the first call has stamped the verdict cache, a follow-up
+        :meth:`local_mirror` must short-circuit without calling
+        :func:`sweep_mirror_root` at all.
+        """
+        from yggdrasil.io.fs import mirror as mirror_mod
+
+        root = LocalPath.from_(tmp_path)
+        # Warm the cache (this call is allowed to sweep).
+        remote.local_mirror(root=root)
+
+        sweep_calls = []
+        original = mirror_mod.sweep_mirror_root
+
+        def counting_sweep(*args, **kwargs):
+            sweep_calls.append((args, kwargs))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(mirror_mod, "sweep_mirror_root", counting_sweep)
+        # Cache-hit path: must not invoke sweep.
+        remote.local_mirror(root=root)
+        assert sweep_calls == []

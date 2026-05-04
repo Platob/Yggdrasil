@@ -84,6 +84,18 @@ _CLEANUP_LOCK_NAME = ".ygg-spill-cleanup.lock"
 _CLEANUP_INTERVAL_S = 600.0
 _last_cleanup_at: float = 0.0
 
+# Stale-lock probes are expensive — local for FileLock (one open +
+# read) and remote for AtomicLock (a pread, possibly a stat). On a
+# healthy contended lock the holder is alive and the probe is pure
+# overhead. We always run it on the FIRST contention iteration so
+# wait=0 callers can break a dead-holder sidecar immediately, then
+# back off: every Nth iteration AND at most once per probe-window.
+# With the default ~50 ms poll cadence, every-8th-iteration plus the
+# 5 s window keeps wait=N callers responsive while cutting up to ~90%
+# of the probe round-trips on a busy lock.
+_STALE_PROBE_EVERY_N: int = 8
+_STALE_PROBE_MIN_INTERVAL_S: float = 5.0
+
 
 # ---------------------------------------------------------------------------
 # FileLock
@@ -122,6 +134,33 @@ class AbstractLock:
             self.release()
         except Exception:
             pass
+
+    # -- shared throttling for stale-lock probes ---------------------
+
+    def _should_probe_stale(self, iteration: int) -> bool:
+        """Decide whether this iteration should run a stale-lock probe.
+
+        Always probes on iteration 0 (so ``wait=0`` callers can break
+        a dead sidecar immediately). Otherwise gates on every-Nth
+        iteration *and* a minimum wall-clock interval; the wall-clock
+        floor protects against fast polling configs that would otherwise
+        pass the count gate too often.
+
+        Subclasses must own a ``_last_stale_probe_at: float`` slot
+        initialised to ``0.0`` and reset to ``0.0`` at the top of each
+        :meth:`acquire` call so a fresh contention loop always gets
+        the iteration-0 probe.
+        """
+        if iteration == 0:
+            self._last_stale_probe_at = time.monotonic()
+            return True
+        if iteration % _STALE_PROBE_EVERY_N != 0:
+            return False
+        now = time.monotonic()
+        if now - self._last_stale_probe_at < _STALE_PROBE_MIN_INTERVAL_S:
+            return False
+        self._last_stale_probe_at = now
+        return True
 
 
 class FileLock(AbstractLock):
@@ -173,7 +212,7 @@ class FileLock(AbstractLock):
     write outright; the caller still gets the durable backing.
     """
 
-    __slots__ = ("_path", "_wait", "_shared", "_fd")
+    __slots__ = ("_path", "_wait", "_shared", "_fd", "_last_stale_probe_at")
 
     # Default poll cadence when ``wait=None`` (wait forever).
     _DEFAULT_POLL_S: float = 0.05
@@ -191,6 +230,11 @@ class FileLock(AbstractLock):
         )
         self._shared = bool(shared)
         self._fd: Optional[int] = None
+        # Monotonic timestamp of the most recent staleness probe.
+        # Reset to 0 each acquire so a fresh contention loop always
+        # gets to run a first-iteration probe; thereafter it gates
+        # by ``_STALE_PROBE_EVERY_N`` and ``_STALE_PROBE_MIN_INTERVAL_S``.
+        self._last_stale_probe_at: float = 0.0
 
     @property
     def shared(self) -> bool:
@@ -247,6 +291,9 @@ class FileLock(AbstractLock):
         # attempt, raise on contention" shape, handled below.
         start = time.time() if wait is not None and wait.timeout > 0 else None
         iteration = 0
+        # Reset so the first contention iteration always probes —
+        # critical for ``wait=0`` callers facing a stale sidecar.
+        self._last_stale_probe_at = 0.0
 
         while True:
             try:
@@ -278,7 +325,10 @@ class FileLock(AbstractLock):
             # the orphaned lock file so a stat-only observer doesn't
             # see a "lock present" indicator forever. Best effort —
             # the actual flock release happened at process death.
-            self._try_break_stale_lock()
+            # Throttled so a busy lock doesn't pay for the open+read
+            # on every poll iteration.
+            if self._should_probe_stale(iteration):
+                self._try_break_stale_lock()
 
             # ``wait=WaitingConfig(timeout=0)`` — single-attempt mode.
             if wait is not None and wait.timeout == 0:
@@ -467,6 +517,7 @@ class AtomicLock(AbstractLock):
     __slots__ = (
         "_path", "_wait", "_shared", "_held",
         "_stale_after_s", "_owner_payload",
+        "_last_stale_probe_at",
     )
 
     def __init__(
@@ -489,6 +540,10 @@ class AtomicLock(AbstractLock):
             else float(stale_after_seconds)
         )
         self._owner_payload: bytes = b""
+        # See ``FileLock._last_stale_probe_at`` — same throttling
+        # rationale, even more important here because the probe
+        # is one-or-two remote round-trips.
+        self._last_stale_probe_at: float = 0.0
 
     @property
     def held(self) -> bool:
@@ -514,6 +569,10 @@ class AtomicLock(AbstractLock):
         wait = self._wait
         start = time.time() if wait is not None and wait.timeout > 0 else None
         iteration = 0
+        # Reset so the first iteration always probes — same rationale
+        # as :meth:`FileLock.acquire`. The remote round-trip cost of
+        # the probe makes the throttle materially more impactful here.
+        self._last_stale_probe_at = 0.0
         payload = f"{os.getpid()} {int(time.time())}\n".encode("ascii")
 
         while True:
@@ -528,7 +587,9 @@ class AtomicLock(AbstractLock):
                 # gets unlinked AND retried in the same iteration —
                 # ``wait=0`` callers shouldn't have to know about
                 # ghost sidecars to make progress against them.
-                if self._maybe_break_stale():
+                # Throttled to keep contended-but-healthy locks from
+                # paying remote round-trips on every poll.
+                if self._should_probe_stale(iteration) and self._maybe_break_stale():
                     continue
             except OSError as exc:
                 # Backend transient — treat like contention so the
