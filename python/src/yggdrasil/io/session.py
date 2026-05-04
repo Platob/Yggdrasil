@@ -450,9 +450,8 @@ class Session(ABC):
         session-level concerns — auth, signing, correlation IDs, mandatory
         headers — that should apply to every request leaving this session.
         Runs in :meth:`_send` just before :meth:`_local_send`, so cache hits
-        bypass it; the per-request ``before_send`` hook still fires inside
-        :meth:`PreparedRequest.prepare_to_send` afterwards. Travels with the
-        session into Spark workers via ``__getstate__`` / ``__setstate__``.
+        bypass it. Travels with the session into Spark workers via
+        ``__getstate__`` / ``__setstate__``.
         """
         return request
 
@@ -1566,7 +1565,6 @@ class Session(ABC):
         headers: Mapping[str, str] | None = None,
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
-        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = True,
@@ -1582,7 +1580,6 @@ class Session(ABC):
             headers=headers,
             body=body,
             tags=tags,
-            before_send=before_send,
             wait=wait,
             raise_error=raise_error,
             stream=stream,
@@ -1601,7 +1598,6 @@ class Session(ABC):
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
-        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = True,
@@ -1618,7 +1614,6 @@ class Session(ABC):
             body=body,
             tags=tags,
             json=json,
-            before_send=before_send,
             wait=wait,
             raise_error=raise_error,
             stream=stream,
@@ -1637,7 +1632,6 @@ class Session(ABC):
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
-        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = True,
@@ -1654,7 +1648,6 @@ class Session(ABC):
             body=body,
             tags=tags,
             json=json,
-            before_send=before_send,
             wait=wait,
             raise_error=raise_error,
             stream=stream,
@@ -1673,7 +1666,6 @@ class Session(ABC):
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
-        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = True,
@@ -1690,7 +1682,6 @@ class Session(ABC):
             body=body,
             tags=tags,
             json=json,
-            before_send=before_send,
             wait=wait,
             raise_error=raise_error,
             stream=stream,
@@ -1709,7 +1700,6 @@ class Session(ABC):
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
-        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = True,
@@ -1726,7 +1716,6 @@ class Session(ABC):
             body=body,
             tags=tags,
             json=json,
-            before_send=before_send,
             wait=wait,
             raise_error=raise_error,
             stream=stream,
@@ -1744,7 +1733,6 @@ class Session(ABC):
         headers: Mapping[str, str] | None = None,
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
-        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = False,
@@ -1760,7 +1748,6 @@ class Session(ABC):
             headers=headers,
             body=body,
             tags=tags,
-            before_send=before_send,
             wait=wait,
             raise_error=raise_error,
             stream=stream,
@@ -1779,7 +1766,6 @@ class Session(ABC):
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
-        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = True,
@@ -1796,7 +1782,6 @@ class Session(ABC):
             body=body,
             tags=tags,
             json=json,
-            before_send=before_send,
             wait=wait,
             raise_error=raise_error,
             stream=stream,
@@ -1815,7 +1800,6 @@ class Session(ABC):
         headers: Mapping[str, str] | None = None,
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
-        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
         json: Any | None = None,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
@@ -1833,7 +1817,6 @@ class Session(ABC):
             tags=tags,
             json=json,
             normalize=normalize,
-            before_send=before_send,
         )
 
         return self.send(
@@ -1854,8 +1837,6 @@ class Session(ABC):
         headers: Mapping[str, str] | None = None,
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
-        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
-        after_received: Callable[[Response], Response] | None = None,
         local_cache_config: Optional[CacheConfig] = None,
         remote_cache_config: Optional[CacheConfig] = None,
         *,
@@ -1881,8 +1862,6 @@ class Session(ABC):
             tags=tags,
             json=json,
             normalize=normalize,
-            before_send=before_send,
-            after_received=after_received,
             local_cache_config=local_cache_config,
             remote_cache_config=remote_cache_config
         )

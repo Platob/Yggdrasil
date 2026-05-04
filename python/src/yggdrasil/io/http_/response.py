@@ -43,7 +43,7 @@ class HTTPResponse(Response):
         )
         buffer.seek(0)
 
-        response = cls(
+        return cls(
             request=request,
             status_code=response.status,
             headers=headers,
@@ -51,11 +51,6 @@ class HTTPResponse(Response):
             tags=tags,
             received_at=received_at
         )
-
-        if request.prepare_response is not None:
-            return request.prepare_response(response)
-
-        return response
 
     def drain_urllib3(
         self,

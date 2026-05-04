@@ -392,12 +392,12 @@ def _epoch_us_to_utc_datetime(value: int) -> dt.datetime:
 class PreparedRequest:
     """Immutable-ish request descriptor — fields are normalized in __init__.
 
-    ``before_send`` / ``prepare_response`` are per-request hooks set after
-    construction (typically by builders). ``_session`` is a transient
-    back-reference used by :meth:`attach_session`; it's deliberately
-    excluded from :meth:`__getstate__` so a request stays portable when
-    pickled to Spark executors and re-binds via ``attach_session`` once it
-    lands on the worker.
+    ``_session`` is a transient back-reference used by
+    :meth:`attach_session`; it's deliberately excluded from
+    :meth:`__getstate__` so a request stays portable when pickled to
+    Spark executors and re-binds via ``attach_session`` once it lands
+    on the worker. Per-request request/response hooks live on the
+    owning :class:`Session` (``_prepare_request`` / ``_prepare_response``).
     """
 
     def __init__(
@@ -426,11 +426,6 @@ class PreparedRequest:
         )
         self.local_cache_config = local_cache_config
         self.remote_cache_config = remote_cache_config
-
-        # Post-construction hooks — set by builders / sessions, never
-        # passed to the constructor directly.
-        self.before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = None
-        self.prepare_response: Optional[Callable[["Response"], "Response"]] = None
         self._session: "Session | None" = None
 
     def __repr__(self) -> str:
@@ -659,8 +654,6 @@ class PreparedRequest:
         headers: Optional[MutableMapping[str, str]] = None,
         body: Optional[Any] = None,
         tags: Optional[Mapping[str, str]] = None,
-        before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = None,
-        after_received: Optional[Callable[["Response"], "Response"]] = None,
         local_cache_config: Optional[CacheConfig] = None,
         remote_cache_config: Optional[CacheConfig] = None,
         *,
@@ -694,7 +687,7 @@ class PreparedRequest:
                 from .http_ import HTTPRequest
                 out_class = HTTPRequest
 
-        built = out_class(
+        return out_class(
             method=str(method),
             url=parsed_url,
             headers=normalize_headers(out_headers, is_request=True, body=request_body) if normalize else out_headers,
@@ -704,9 +697,6 @@ class PreparedRequest:
             local_cache_config=local_cache_config,
             remote_cache_config=remote_cache_config,
         )
-        built.before_send = before_send
-        built.prepare_response = after_received
-        return built
 
     def copy(
         self,
@@ -717,8 +707,6 @@ class PreparedRequest:
         buffer: Optional[BytesIO] = ...,
         tags: Optional[Mapping[str, str]] = None,
         sent_at: int | None = None,
-        before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = ...,
-        prepare_response: Optional[Callable[["Response"], "Response"]] = ...,
         local_cache_config: Optional["CacheConfig"] = ...,
         remote_cache_config: Optional["CacheConfig"] = ...,
         normalize: bool = True,
@@ -736,7 +724,7 @@ class PreparedRequest:
 
         new_tags = dict(self.tags) if tags is None else _string_dict(tags)
 
-        built = self.__class__(
+        return self.__class__(
             method=self.method if method is None else str(method),
             url=new_url,
             headers=new_headers,
@@ -747,26 +735,20 @@ class PreparedRequest:
             remote_cache_config=self.remote_cache_config if remote_cache_config is ... else remote_cache_config,
         )
 
-        built.before_send = self.before_send if before_send is ... else before_send
-        built.prepare_response = self.prepare_response if prepare_response is ... else prepare_response
-        return built
-
     def prepare_to_send(
         self,
         sent_at: dt.datetime | dt.date | str | int | None = None,
         headers: Optional[Mapping[str, str]] = None,
     ) -> "PreparedRequest":
-        instance = self.before_send(self) if self.before_send else self
-
-        if instance.headers is None:
-            instance.headers = {}
+        if self.headers is None:
+            self.headers = {}
 
         if headers:
-            instance.headers.update(_string_dict(headers))
+            self.headers.update(_string_dict(headers))
 
-        instance.sent_at = dt.datetime.now(dt.timezone.utc) if sent_at is None else any_to_datetime(sent_at)
+        self.sent_at = dt.datetime.now(dt.timezone.utc) if sent_at is None else any_to_datetime(sent_at)
 
-        return instance
+        return self
 
     @property
     def body(self) -> Optional[BytesIO]:
