@@ -224,12 +224,12 @@ class TestMatchValue:
     def test_response_keys(self):
         pytest.importorskip("xxhash")
         resp = make_response(status_code=200)
-        assert resp.match_value("response_status_code") == 200
+        assert resp.match_value("status_code") == 200
 
     def test_request_keys_delegated(self):
         pytest.importorskip("xxhash")
         resp = make_response()
-        assert resp.match_value("request_method") == "GET"
+        assert resp.match_value("request.method") == "GET"
 
     def test_unsupported_key_raises(self):
         pytest.importorskip("xxhash")

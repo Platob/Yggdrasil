@@ -24,14 +24,13 @@ if TYPE_CHECKING:
 __all__ = ["CacheConfig", "SendConfig", "SendManyConfig"]
 
 
+# Identity-by-default — ``url_hash`` is a stable URL-based identity
+# that survives header anonymization (the cache stores anonymized
+# requests so a header-derived ``hash`` would change between write
+# and read). For dedup that should respect body/headers too, callers
+# can pass ``request_by=["hash"]`` explicitly.
 _DEFAULT_REQUEST_BY: tuple[str, ...] = (
-    "request_method",
-    "request_url_host",
-    "request_url_path",
-    "request_url_port",
-    "request_url_query",
-    "request_content_length",
-    "request_body_hash",
+    "url_hash",
 )
 
 _CACHE_CONFIG_FIELDS: frozenset[str] = frozenset(
@@ -79,9 +78,19 @@ _SEND_MANY_CONFIG_FIELDS: frozenset[str] = _SEND_CONFIG_FIELDS | frozenset(
 DEFAULT_MAX_BATCH_TTL: float = 300.0
 
 
+def _is_valid_request_key(key: str) -> bool:
+    head, _, _ = key.partition(".")
+    return head in REQUEST_ARROW_SCHEMA.names
+
+
+def _is_valid_response_key(key: str) -> bool:
+    head, _, _ = key.partition(".")
+    return head in RESPONSE_ARROW_SCHEMA.names
+
+
 def _validate_request_by(arg: list[str] | tuple[str, ...] | None = None) -> list[str]:
     keys = list(_DEFAULT_REQUEST_BY if not arg else arg)
-    invalid = [key for key in keys if key not in REQUEST_ARROW_SCHEMA.names]
+    invalid = [key for key in keys if not _is_valid_request_key(key)]
     if invalid:
         raise ValueError(
             f"Invalid request_by key(s): {invalid!r}. "
@@ -97,7 +106,7 @@ def _validate_response_by(
         return None
 
     keys = list(arg)
-    invalid = [key for key in keys if key not in RESPONSE_ARROW_SCHEMA.names]
+    invalid = [key for key in keys if not _is_valid_response_key(key)]
     if invalid:
         raise ValueError(
             f"Invalid response_by key(s): {invalid!r}. "
@@ -115,12 +124,13 @@ def _coerce_optional_datetime(value: Any) -> Optional[dt.datetime]:
 
 
 # Hot dimensions for partition pruning of the local response cache.
-# Method is small-cardinality (a handful of values), host is medium —
-# together they segment the cache enough that a typical lookup reads
-# only one partition's worth of leaves.
+# Only the embedded request struct exists at the top level now, so
+# partitioning falls back to the response status code (small
+# cardinality) — it segments the cache enough that a typical lookup
+# reads only one partition's worth of leaves without forcing us to
+# walk into the nested ``request`` struct for partition columns.
 LOCAL_CACHE_PARTITION_COLUMNS: tuple[str, ...] = (
-    "request_method",
-    "request_url_host",
+    "status_code",
 )
 
 
@@ -396,11 +406,11 @@ class CacheConfig(_ConfigBase):
 
         Returns a schema-tagged partitioned folder rooted directly at
         :meth:`local_cache_folder`. The schema is :data:`RESPONSE_SCHEMA`
-        with ``partition_by=True`` set on ``request_method`` and
-        ``request_url_host`` — :class:`FolderIO` derives the
-        partition layout from those tags and persists the schema to
-        ``<root>/.schema`` on first write so subsequent readers
-        don't have to infer.
+        with ``partition_by=True`` set on the columns named in
+        :data:`LOCAL_CACHE_PARTITION_COLUMNS` — :class:`FolderIO`
+        derives the partition layout from those tags and persists the
+        schema to ``<root>/.schema`` on first write so subsequent
+        readers don't have to infer.
 
         Constructed on each call (the IO itself is stateless beyond
         the on-disk layout); callers in hot loops should hold onto
@@ -515,10 +525,10 @@ class CacheConfig(_ConfigBase):
                     clauses.append(f"{key} = {self.sql_literal(value)}")
 
         if self.received_from is not None:
-            clauses.append(f"response_received_at >= {self.sql_literal(self.received_from)}")
+            clauses.append(f"received_at >= {self.sql_literal(self.received_from)}")
 
         if self.received_to is not None:
-            clauses.append(f"response_received_at < {self.sql_literal(self.received_to)}")
+            clauses.append(f"received_at < {self.sql_literal(self.received_to)}")
 
         return " AND ".join(clauses) if clauses else "1=1"
 
@@ -559,7 +569,7 @@ class CacheConfig(_ConfigBase):
                 "SELECT * FROM ("
                 "  SELECT t.*, row_number() OVER ("
                 f"    PARTITION BY {partition_by} "
-                "    ORDER BY response_received_at DESC"
+                "    ORDER BY received_at DESC"
                 "  ) AS __rn "
                 f"  FROM ({base_query}) t"
                 ") ranked WHERE __rn = 1"
@@ -597,7 +607,7 @@ class CacheConfig(_ConfigBase):
                 "SELECT * FROM ("
                 "  SELECT t.*, row_number() OVER ("
                 f"    PARTITION BY {partition_by} "
-                "    ORDER BY response_received_at DESC"
+                "    ORDER BY received_at DESC"
                 "  ) AS __rn "
                 f"  FROM ({base_query}) t"
                 ") ranked WHERE __rn = 1"

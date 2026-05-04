@@ -25,7 +25,13 @@ if TYPE_CHECKING:
     from .session import Session
 
 
-__all__ = ["PreparedRequest", "REQUEST_SCHEMA", "REQUEST_ARROW_SCHEMA"]
+__all__ = [
+    "PreparedRequest",
+    "REQUEST_SCHEMA",
+    "REQUEST_ARROW_SCHEMA",
+    "REQUEST_URL_STRUCT",
+    "REQUEST_HEADERS_STRUCT",
+]
 
 
 _REQUEST_SCHEMA_JSON_TAGS: dict[str, str] = {
@@ -35,336 +41,141 @@ _REQUEST_SCHEMA_JSON_TAGS: dict[str, str] = {
 }
 
 
+# Nested URL struct — full string for replay plus parsed components for joins.
+REQUEST_URL_STRUCT = pa.struct([
+    pa.field("str",      pa.string(), nullable=False),
+    pa.field("scheme",   pa.string(), nullable=False),
+    pa.field("userinfo", pa.string(), nullable=True),
+    pa.field("host",     pa.string(), nullable=False),
+    pa.field("port",     pa.int32(),  nullable=True),
+    pa.field("path",     pa.string(), nullable=False),
+    pa.field("query",    pa.string(), nullable=True),
+    pa.field("fragment", pa.string(), nullable=True),
+])
+
+
+# Promoted-header struct + ``other`` map for the long tail.
+REQUEST_HEADERS_STRUCT = pa.struct([
+    pa.field("host",              pa.string(), nullable=True),
+    pa.field("user_agent",        pa.string(), nullable=True),
+    pa.field("accept",            pa.string(), nullable=True),
+    pa.field("accept_encoding",   pa.string(), nullable=True),
+    pa.field("accept_language",   pa.string(), nullable=True),
+    pa.field("content_type",      pa.string(), nullable=True),
+    pa.field("content_length",    pa.int64(),  nullable=False),
+    pa.field("content_encoding",  pa.string(), nullable=True),
+    pa.field("transfer_encoding", pa.string(), nullable=True),
+    pa.field("other",             pa.map_(pa.string(), pa.string()), nullable=True),
+])
+
+
 REQUEST_SCHEMA = schema(
     fields=[],
     metadata={
         "comment": "Prepared request flattened into deterministic columns for logging and replay.",
-        "time_column": "request_sent_at",
+        "time_column": "sent_at",
     },
     tags=_REQUEST_SCHEMA_JSON_TAGS,
 )
 
-REQUEST_SCHEMA["request_method"] = schema_field(
-    "request_method",
-    pa.string(),
-    nullable=False,
-    metadata={
-        "comment": "HTTP method (GET, POST, etc.)",
-    },
-    tags={
-        "entity": "request",
-        "group": "routing",
-    },
-)
-
-REQUEST_SCHEMA["request_url_str"] = schema_field(
-    "request_url_str",
-    pa.string(),
-    nullable=False,
-    metadata={
-        "comment": "Full request URL as deterministic string",
-    },
-    tags={
-        "entity": "request",
-        "group": "url",
-        "primary_key": True,
-    },
-)
-
-REQUEST_SCHEMA["request_url_scheme"] = schema_field(
-    "request_url_scheme",
-    pa.string(),
-    nullable=False,
-    metadata={
-        "comment": "URL scheme (for example http or https)",
-    },
-    tags={
-        "entity": "request",
-        "group": "url",
-    },
-)
-
-REQUEST_SCHEMA["request_url_userinfo"] = schema_field(
-    "request_url_userinfo",
-    pa.string(),
-    nullable=True,
-    metadata={
-        "comment": "Userinfo from URL authority (for example user:pass)",
-    },
-    tags={
-        "entity": "request",
-        "group": "url",
-    },
-)
-
-REQUEST_SCHEMA["request_url_host"] = schema_field(
-    "request_url_host",
-    pa.string(),
-    nullable=False,
-    metadata={
-        "comment": "Host name, domain, or IP address from the request URL",
-    },
-    tags={
-        "entity": "request",
-        "group": "url",
-    },
-)
-
-REQUEST_SCHEMA["request_url_port"] = schema_field(
-    "request_url_port",
-    pa.int32(),
-    nullable=True,
-    metadata={
-        "comment": "Port number if explicitly specified in the URL",
-    },
-    tags={
-        "entity": "request",
-        "group": "url",
-    },
-)
-
-REQUEST_SCHEMA["request_url_path"] = schema_field(
-    "request_url_path",
-    pa.string(),
-    nullable=False,
-    metadata={
-        "comment": "Path component of the request URL",
-        "partition_by": "true",
-    },
-    tags={
-        "entity": "request",
-        "group": "url",
-        "partition_by": True
-    },
-)
-
-REQUEST_SCHEMA["request_url_query"] = schema_field(
-    "request_url_query",
-    pa.string(),
-    nullable=True,
-    metadata={
-        "comment": "Raw query string without leading question mark",
-    },
-    tags={
-        "entity": "request",
-        "group": "url",
-    },
-)
-
-REQUEST_SCHEMA["request_url_fragment"] = schema_field(
-    "request_url_fragment",
-    pa.string(),
-    nullable=True,
-    metadata={
-        "comment": "Fragment identifier without leading hash",
-    },
-    tags={
-        "entity": "request",
-        "group": "url",
-    },
-)
-
-REQUEST_SCHEMA["request_host"] = schema_field(
-    "request_host",
-    pa.string(),
-    nullable=True,
-    metadata={
-        "comment": "HTTP Host header",
-    },
-    tags={
-        "entity": "request",
-        "group": "headers",
-    },
-)
-
-REQUEST_SCHEMA["request_user_agent"] = schema_field(
-    "request_user_agent",
-    pa.string(),
-    nullable=True,
-    metadata={
-        "comment": "HTTP User-Agent header",
-    },
-    tags={
-        "entity": "request",
-        "group": "headers",
-    },
-)
-
-REQUEST_SCHEMA["request_accept"] = schema_field(
-    "request_accept",
-    pa.string(),
-    nullable=True,
-    metadata={
-        "comment": "HTTP Accept header",
-    },
-    tags={
-        "entity": "request",
-        "group": "headers",
-    },
-)
-
-REQUEST_SCHEMA["request_accept_encoding"] = schema_field(
-    "request_accept_encoding",
-    pa.string(),
-    nullable=True,
-    metadata={
-        "comment": "HTTP Accept-Encoding header",
-    },
-    tags={
-        "entity": "request",
-        "group": "headers",
-    },
-)
-
-REQUEST_SCHEMA["request_accept_language"] = schema_field(
-    "request_accept_language",
-    pa.string(),
-    nullable=True,
-    metadata={
-        "comment": "HTTP Accept-Language header",
-    },
-    tags={
-        "entity": "request",
-        "group": "headers",
-    },
-)
-
-REQUEST_SCHEMA["request_content_type"] = schema_field(
-    "request_content_type",
-    pa.string(),
-    nullable=True,
-    metadata={
-        "comment": "HTTP Content-Type header",
-    },
-    tags={
-        "entity": "request",
-        "group": "headers",
-    },
-)
-
-REQUEST_SCHEMA["request_content_length"] = schema_field(
-    "request_content_length",
+REQUEST_SCHEMA["hash"] = schema_field(
+    "hash",
     pa.int64(),
     nullable=False,
     metadata={
-        "comment": "HTTP Content-Length header parsed as integer when possible",
+        "comment": "xxh3_64 digest over (method, url, headers, body) — primary identity",
+        "algorithm": "xxh3_64",
     },
-    tags={
-        "entity": "request",
-        "group": "headers",
-    },
-)
+    tags={"primary_key": "true"},
+).autotag()
 
-REQUEST_SCHEMA["request_content_encoding"] = schema_field(
-    "request_content_encoding",
+REQUEST_SCHEMA["method"] = schema_field(
+    "method",
     pa.string(),
-    nullable=True,
-    metadata={
-        "comment": "HTTP Content-Encoding header",
-    },
-    tags={
-        "entity": "request",
-        "group": "headers",
-    },
-)
+    nullable=False,
+    metadata={"comment": "HTTP method (GET, POST, etc.)"},
+).autotag()
 
-REQUEST_SCHEMA["request_transfer_encoding"] = schema_field(
-    "request_transfer_encoding",
-    pa.string(),
-    nullable=True,
-    metadata={
-        "comment": "HTTP Transfer-Encoding header",
-    },
-    tags={
-        "entity": "request",
-        "group": "headers",
-    },
-)
+REQUEST_SCHEMA["url"] = schema_field(
+    "url",
+    REQUEST_URL_STRUCT,
+    nullable=False,
+    metadata={"comment": "Parsed URL components with full string for replay"},
+).autotag()
 
-REQUEST_SCHEMA["request_headers"] = schema_field(
-    "request_headers",
-    pa.map_(pa.string(), pa.string()),
-    nullable=True,
-    metadata={
-        "comment": "Request headers excluding promoted common headers",
-        "keys_sorted": "false",
-    },
-    tags={
-        "entity": "request",
-        "group": "headers",
-    },
-)
-
-REQUEST_SCHEMA["request_tags"] = schema_field(
-    "request_tags",
-    pa.map_(pa.string(), pa.string()),
+REQUEST_SCHEMA["url_hash"] = schema_field(
+    "url_hash",
+    pa.int64(),
     nullable=False,
     metadata={
-        "comment": "Request tags merged with URL query params; explicit tags win on conflict",
+        "comment": "xxh3_64 digest of url.str — stable URL identity for joins/dedup",
+        "algorithm": "xxh3_64",
     },
-    tags={
-        "entity": "request",
-        "group": "tags",
-    },
-)
+).autotag()
 
-REQUEST_SCHEMA["request_body"] = schema_field(
-    "request_body",
+REQUEST_SCHEMA["headers"] = schema_field(
+    "headers",
+    REQUEST_HEADERS_STRUCT,
+    nullable=False,
+    metadata={"comment": "Promoted common headers + remaining headers map"},
+).autotag()
+
+REQUEST_SCHEMA["tags"] = schema_field(
+    "tags",
+    pa.map_(pa.string(), pa.string()),
+    nullable=False,
+    metadata={"comment": "Request tags merged with URL query params; explicit tags win on conflict"},
+).autotag()
+
+REQUEST_SCHEMA["body"] = schema_field(
+    "body",
     pa.binary(),
     nullable=True,
-    metadata={
-        "comment": "Raw request body bytes",
-    },
-    tags={
-        "entity": "request",
-        "group": "payload",
-    },
-)
+    metadata={"comment": "Raw request body bytes"},
+).autotag()
 
-REQUEST_SCHEMA["request_body_hash"] = schema_field(
-    "request_body_hash",
+REQUEST_SCHEMA["body_size"] = schema_field(
+    "body_size",
+    pa.int64(),
+    nullable=False,
+    metadata={
+        "comment": "Length of body in bytes; 0 when body is absent",
+        "unit": "bytes",
+    },
+).autotag()
+
+REQUEST_SCHEMA["body_hash"] = schema_field(
+    "body_hash",
     pa.int64(),
     nullable=True,
     metadata={
-        "comment": "Signed Int64 XXH3 digest of request_body",
+        "comment": "xxh3_64 digest of body bytes; null when body is absent",
         "algorithm": "xxh3_64",
     },
-    tags={
-        "entity": "request",
-        "group": "payload",
-        "algorithm": "xxh3_64",
-        "primary_key": True,
-    },
-)
+).autotag()
 
-REQUEST_SCHEMA["request_sent_at"] = schema_field(
-    "request_sent_at",
+REQUEST_SCHEMA["sent_at"] = schema_field(
+    "sent_at",
     pa.timestamp("us", "UTC"),
     nullable=False,
-    metadata={
-        "comment": "UTC timestamp when request was dispatched",
-        "unit": "us",
-        "tz": "UTC",
-    },
-    tags={
-        "entity": "request",
-        "group": "timing",
-    },
-)
+    metadata={"comment": "UTC timestamp when request was dispatched"},
+).autotag()
 
 REQUEST_ARROW_SCHEMA: pa.Schema = REQUEST_SCHEMA.to_arrow_schema()
 
-_REQUEST_FIELD_NAMES: frozenset[str] = frozenset(REQUEST_SCHEMA.field_names())
+
+# Header-name → headers-struct field-name. The struct also carries an
+# ``other`` map for headers that don't get a promoted slot.
 _PROMOTED_REQUEST_HEADER_FIELDS: tuple[tuple[str, str], ...] = (
-    ("Host", "request_host"),
-    ("User-Agent", "request_user_agent"),
-    ("Accept", "request_accept"),
-    ("Accept-Encoding", "request_accept_encoding"),
-    ("Accept-Language", "request_accept_language"),
-    ("Content-Type", "request_content_type"),
-    ("Content-Length", "request_content_length"),
-    ("Content-Encoding", "request_content_encoding"),
-    ("Transfer-Encoding", "request_transfer_encoding"),
+    ("Host", "host"),
+    ("User-Agent", "user_agent"),
+    ("Accept", "accept"),
+    ("Accept-Encoding", "accept_encoding"),
+    ("Accept-Language", "accept_language"),
+    ("Content-Type", "content_type"),
+    ("Content-Length", "content_length"),
+    ("Content-Encoding", "content_encoding"),
+    ("Transfer-Encoding", "transfer_encoding"),
 )
 
 
@@ -387,6 +198,70 @@ def _map_as_str_dict(value: Any) -> dict[str, str]:
 
 def _epoch_us_to_utc_datetime(value: int) -> dt.datetime:
     return dt.datetime.fromtimestamp(value / 1_000_000, tz=dt.timezone.utc)
+
+
+def _xxh3_int64_str(text: str) -> int:
+    """Signed-int64 xxh3_64 digest of *text*.
+
+    Returns 0 on missing optional ``xxhash`` so the schema's nullable
+    semantics still hold without forcing the dependency.
+    """
+    if not text:
+        return 0
+    try:
+        import xxhash
+    except ImportError:
+        return 0
+    u = xxhash.xxh3_64(text.encode("utf-8")).intdigest()
+    return u if u < 2**63 else u - 2**64
+
+
+def _build_url_struct(url: URL) -> dict[str, Any]:
+    """Build the URL struct value (matches REQUEST_URL_STRUCT)."""
+    return {
+        "str":      url.to_string(),
+        "scheme":   url.scheme or "",
+        "userinfo": url.userinfo,
+        "host":     url.host or "",
+        "port":     url.port if url.port not in (None, 0) else None,
+        "path":     url.path or "",
+        "query":    url.query,
+        "fragment": url.fragment,
+    }
+
+
+def _build_headers_struct(promoted: PromotedHeaders) -> dict[str, Any]:
+    """Build the headers struct value (matches REQUEST_HEADERS_STRUCT)."""
+    return {
+        "host":              promoted.host,
+        "user_agent":        promoted.user_agent,
+        "accept":            promoted.accept,
+        "accept_encoding":   promoted.accept_encoding,
+        "accept_language":   promoted.accept_language,
+        "content_type":      promoted.content_type,
+        "content_length":    promoted.content_length or 0,
+        "content_encoding":  promoted.content_encoding,
+        "transfer_encoding": promoted.transfer_encoding,
+        "other":             promoted.remaining or None,
+    }
+
+
+def _flatten_headers_struct(value: Any) -> dict[str, str]:
+    """Recompose a flat header dict from a headers-struct value."""
+    if not value:
+        return {}
+    if not isinstance(value, Mapping):
+        return _map_as_str_dict(value)
+
+    out: dict[str, str] = {}
+    for header_name, struct_field in _PROMOTED_REQUEST_HEADER_FIELDS:
+        v = value.get(struct_field)
+        if v not in (None, "", 0):
+            out[header_name] = str(v)
+    other = value.get("other")
+    if other:
+        out.update(_map_as_str_dict(other))
+    return out
 
 
 class PreparedRequest:
@@ -437,8 +312,7 @@ class PreparedRequest:
     def __getstate__(self) -> dict[str, Any]:
         # Drop the transient session back-reference so requests stay
         # cleanly picklable for cross-executor transport. Re-bind on the
-        # worker via :meth:`attach_session` (typically from a Spark
-        # broadcast variable).
+        # worker via :meth:`attach_session`.
         state = self.__dict__.copy()
         state.pop("_session", None)
         return state
@@ -452,25 +326,15 @@ class PreparedRequest:
     # ------------------------------------------------------------------
 
     def attach_session(self, session: "Session") -> "PreparedRequest":
-        """Bind *session* as this request's owning session.
-
-        The reference is transient — :meth:`__getstate__` drops it so a
-        pickled-and-shipped request lands on the worker without a stale
-        session. Workers re-bind via this method, typically from a
-        ``sparkContext.broadcast`` variable so the session is shipped
-        once per executor instead of once per task closure.
-        """
         self._session = session
         return self
 
     def detach_session(self) -> "PreparedRequest":
-        """Drop any attached session reference and return self."""
         self._session = None
         return self
 
     @property
     def session(self) -> "Session | None":
-        """The session currently attached via :meth:`attach_session`, or None."""
         return self._session
 
     # ------------------------------------------------------------------
@@ -482,15 +346,6 @@ class PreparedRequest:
         config: "SendConfig | Mapping[str, Any] | None" = None,
         **kwargs: Any,
     ) -> "Response":
-        """Send this request through its attached session.
-
-        Routes through :meth:`Session.send`, which builds the effective
-        :class:`SendConfig` from *config* + *kwargs* (wait, raise_error,
-        stream, remote_cache, local_cache, spark_session, …). Raises
-        :class:`RuntimeError` if no session is attached — callers should
-        either go through ``session.send(req)`` directly or bind a
-        session first via :meth:`attach_session`.
-        """
         return self._send(config, **kwargs)
 
     def _send(
@@ -512,7 +367,6 @@ class PreparedRequest:
         obj: Any,
         *,
         normalize: bool = True,
-        prefix: str = "request_",
     ) -> "PreparedRequest":
         if isinstance(obj, str):
             obj = {
@@ -520,7 +374,7 @@ class PreparedRequest:
             }
 
         if isinstance(obj, Mapping):
-            return cls.from_mapping(obj, normalize=normalize, prefix=prefix)
+            return cls.from_mapping(obj, normalize=normalize)
 
         raise ValueError(f"Cannot make {cls.__name__} from {type(obj)}")
 
@@ -530,14 +384,13 @@ class PreparedRequest:
         obj: Mapping[str, Any],
         *,
         normalize: bool = True,
-        prefix: str = "request_",
     ) -> "PreparedRequest":
-        method = cls._parse_method(obj, prefix=prefix)
-        url = cls._parse_url(obj, normalize=normalize, prefix=prefix)
-        headers = cls._parse_headers(obj, prefix=prefix)
-        tags = cls._parse_tags(obj, prefix=prefix)
-        buffer = cls._parse_buffer(obj, prefix=prefix)
-        sent_at = cls._parse_sent_at_timestamp(obj, prefix=prefix)
+        method = cls._parse_method(obj)
+        url = cls._parse_url(obj, normalize=normalize)
+        headers = cls._parse_headers(obj)
+        tags = cls._parse_tags(obj)
+        buffer = cls._parse_buffer(obj)
+        sent_at = cls._parse_sent_at_timestamp(obj)
 
         if cls is PreparedRequest:
             if url.is_http:
@@ -549,7 +402,7 @@ class PreparedRequest:
                     headers=headers,
                     tags=tags,
                     buffer=buffer,
-                    sent_at=sent_at
+                    sent_at=sent_at,
                 )
 
         return cls(
@@ -558,12 +411,12 @@ class PreparedRequest:
             headers=headers,
             tags=tags,
             buffer=buffer,
-            sent_at=sent_at
+            sent_at=sent_at,
         )
 
     @staticmethod
-    def _parse_method(obj: Mapping[str, Any], *, prefix: str) -> str:
-        method = get_from_dict(obj, keys=("method",), prefix=prefix)
+    def _parse_method(obj: Mapping[str, Any]) -> str:
+        method = get_from_dict(obj, keys=("method",), prefix=None)
         return "GET" if method is MISSING or method in (None, "") else str(method)
 
     @classmethod
@@ -572,109 +425,73 @@ class PreparedRequest:
         obj: Mapping[str, Any],
         *,
         normalize: bool,
-        prefix: str,
     ) -> URL:
-        url_str = get_from_dict(obj, keys=("url_str", "url", "href", "uri", "request_url_str"), prefix=prefix)
-        url_struct = get_from_dict(obj, keys=("url", "request_url"), prefix=prefix)
+        # Accept either a flat string ("url"/"href"/"uri"), a struct dict
+        # ({"str": ..., "scheme": ..., ...}), or pre-built URL instance.
+        url_value = get_from_dict(obj, keys=("url", "href", "uri"), prefix=None)
 
-        if url_str is not MISSING and url_str not in (None, ""):
-            return URL.from_(url_str, normalize=normalize)
+        if isinstance(url_value, URL):
+            return URL.from_(url_value, normalize=normalize)
 
-        if isinstance(url_struct, Mapping):
+        if isinstance(url_value, str) and url_value:
+            return URL.from_(url_value, normalize=normalize)
+
+        if isinstance(url_value, Mapping):
+            full = url_value.get("str")
+            if full:
+                return URL.from_(str(full), normalize=normalize)
             return URL.from_(
                 {
-                    "scheme": url_struct.get("scheme") or "",
-                    "userinfo": url_struct.get("userinfo") or "",
-                    "host": url_struct.get("host") or "",
-                    "port": url_struct.get("port") or 0,
-                    "path": url_struct.get("path") or "",
-                    "query": url_struct.get("query") or "",
-                    "fragment": url_struct.get("fragment") or "",
+                    "scheme":   url_value.get("scheme") or "",
+                    "userinfo": url_value.get("userinfo") or "",
+                    "host":     url_value.get("host") or "",
+                    "port":     url_value.get("port") or 0,
+                    "path":     url_value.get("path") or "",
+                    "query":    url_value.get("query") or "",
+                    "fragment": url_value.get("fragment") or "",
                 },
                 normalize=normalize,
             )
 
-        scheme = get_from_dict(obj, ("url_scheme",), prefix=prefix)
-        userinfo = get_from_dict(obj, ("url_userinfo",), prefix=prefix)
-        host = get_from_dict(obj, ("url_host",), prefix=prefix)
-        port = get_from_dict(obj, ("url_port",), prefix=prefix)
-        path = get_from_dict(obj, ("url_path",), prefix=prefix)
-        query = get_from_dict(obj, ("url_query",), prefix=prefix)
-        fragment = get_from_dict(obj, ("url_fragment",), prefix=prefix)
-
-        parts = (scheme, userinfo, host, port, path, query, fragment)
-        if not any(part is not MISSING for part in parts):
-            raise ValueError(
-                "PreparedRequest.parse_dict: missing url/url_str/request_url_str or exploded url fields"
-            )
-
-        return URL.from_(
-            {
-                "scheme": "" if scheme in (MISSING, None) else str(scheme),
-                "userinfo": "" if userinfo in (MISSING, None) else str(userinfo),
-                "host": "" if host in (MISSING, None) else str(host),
-                "port": 0 if port is MISSING or port in (None, "") else int(port),
-                "path": "" if path in (MISSING, None) else str(path),
-                "query": "" if query in (MISSING, None) else str(query),
-                "fragment": "" if fragment in (MISSING, None) else str(fragment),
-            },
-            normalize=normalize,
+        raise ValueError(
+            "PreparedRequest.from_mapping: missing url — pass a URL, a string, "
+            "or a {'str' | 'scheme'/'host'/...} struct."
         )
 
     @staticmethod
-    def _parse_headers(obj: Mapping[str, Any], *, prefix: str) -> MutableMapping[str, str]:
-        headers = get_from_dict(obj, keys=("headers",), prefix=prefix)
+    def _parse_headers(obj: Mapping[str, Any]) -> MutableMapping[str, str]:
+        headers = get_from_dict(obj, keys=("headers",), prefix=None)
         if isinstance(headers, Mapping):
-            parsed = _string_dict(headers)
-            if parsed:
-                return parsed
-
-        dumped_headers = {
-            "Host": get_from_dict(obj, keys=("host",), prefix=prefix),
-            "User-Agent": get_from_dict(obj, keys=("user_agent",), prefix=prefix),
-            "Accept": get_from_dict(obj, keys=("accept",), prefix=prefix),
-            "Accept-Encoding": get_from_dict(obj, keys=("accept_encoding",), prefix=prefix),
-            "Accept-Language": get_from_dict(obj, keys=("accept_language",), prefix=prefix),
-            "Content-Type": get_from_dict(obj, keys=("content_type",), prefix=prefix),
-            "Content-Length": get_from_dict(obj, keys=("content_length",), prefix=prefix),
-            "Content-Encoding": get_from_dict(obj, keys=("content_encoding",), prefix=prefix),
-            "Transfer-Encoding": get_from_dict(obj, keys=("transfer_encoding",), prefix=prefix),
-            "Location": get_from_dict(obj, keys=("location",), prefix=prefix),
-            "ETag": get_from_dict(obj, keys=("etag",), prefix=prefix),
-            "Last-Modified": get_from_dict(obj, keys=("last_modified",), prefix=prefix),
-        }
-
-        out: dict[str, str] = {}
-        for header_name, value in dumped_headers.items():
-            if value is MISSING or value in (None, ""):
-                continue
-            out[header_name] = str(value)
-
-        return out
+            # Either a flat dict OR the headers-struct dict — flatten
+            # the struct shape into header-name keyed strings.
+            if any(k in headers for k, _ in _PROMOTED_REQUEST_HEADER_FIELDS):
+                return _string_dict(headers)
+            if "other" in headers and any(
+                struct_name in headers for _, struct_name in _PROMOTED_REQUEST_HEADER_FIELDS
+            ):
+                return _flatten_headers_struct(headers)
+            # Possibly a struct value with mostly None fields plus other.
+            struct_keys = {struct_name for _, struct_name in _PROMOTED_REQUEST_HEADER_FIELDS} | {"other"}
+            if headers and set(headers.keys()).issubset(struct_keys):
+                return _flatten_headers_struct(headers)
+            return _string_dict(headers)
+        return {}
 
     @staticmethod
-    def _parse_tags(obj: Mapping[str, Any], *, prefix: str) -> dict[str, str]:
-        tags = get_from_dict(obj, keys=("tags", "request_tags"), prefix=prefix)
+    def _parse_tags(obj: Mapping[str, Any]) -> dict[str, str]:
+        tags = get_from_dict(obj, keys=("tags",), prefix=None)
         return _string_dict(tags if isinstance(tags, Mapping) else None)
 
     @staticmethod
-    def _parse_buffer(obj: Mapping[str, Any], *, prefix: str) -> Optional[BytesIO]:
-        buffer = get_from_dict(obj, keys=("buffer", "body", "content", "data"), prefix=prefix)
+    def _parse_buffer(obj: Mapping[str, Any]) -> Optional[BytesIO]:
+        buffer = get_from_dict(obj, keys=("buffer", "body", "content", "data"), prefix=None)
         if buffer is MISSING or buffer is None:
             return None
         return BytesIO.from_(buffer)
 
     @staticmethod
-    def _parse_sent_at_timestamp(obj: Mapping[str, Any], *, prefix: str) -> dt.datetime:
-        value = get_from_dict(
-            obj,
-            keys=(
-                "sent_at_timestamp",
-                "sent_at",
-                "request_sent_at",
-            ),
-            prefix=prefix,
-        )
+    def _parse_sent_at_timestamp(obj: Mapping[str, Any]) -> dt.datetime:
+        value = get_from_dict(obj, keys=("sent_at_timestamp", "sent_at"), prefix=None)
         return any_to_datetime(value) if value not in (None, "", MISSING) else dt.datetime.fromtimestamp(
             0, tz=dt.timezone.utc
         )
@@ -841,48 +658,92 @@ class PreparedRequest:
         return int(self.sent_at.timestamp() * 1_000_000)
 
     @property
+    def body_size(self) -> int:
+        return self.buffer.size if self.buffer is not None else 0
+
+    @property
+    def body_hash(self) -> Optional[int]:
+        if self.buffer is None:
+            return None
+        try:
+            return self.buffer.xxh3_int64()
+        except ImportError:
+            return None
+
+    @property
+    def url_hash(self) -> int:
+        return _xxh3_int64_str(self.url.to_string())
+
+    @property
+    def hash(self) -> int:
+        try:
+            return self.xxh3_64().intdigest() if False else self._compute_identity_hash()
+        except ImportError:
+            return 0
+
+    def _compute_identity_hash(self) -> int:
+        try:
+            import xxhash
+        except ImportError:
+            return 0
+        h = xxhash.xxh3_64()
+        h.update(self.method.encode("utf-8"))
+        h.update(b"\x00")
+        h.update(self.url.to_string().encode("utf-8"))
+        h.update(b"\x00")
+        for k in sorted(self.headers or {}):
+            h.update(str(k).encode("utf-8"))
+            h.update(b"=")
+            h.update(str(self.headers[k]).encode("utf-8"))
+            h.update(b"\x00")
+        if self.buffer is not None:
+            h.update(self.buffer.xxh3_64().digest())
+        u = h.intdigest()
+        return u if u < 2**63 else u - 2**64
+
+    @property
     def arrow_values(self) -> dict[str, Any]:
-        u = self.url
         promoted = PromotedHeaders.extract(self.headers or {})
 
-        tags_v = dict(u.query_items())
+        tags_v = dict(self.url.query_items())
         if self.tags:
             tags_v.update(_string_dict(self.tags))
 
-        if self.buffer is not None:
-            body_bytes = self.buffer.to_bytes()
-            body_hash = self.buffer.xxh3_int64()
-        else:
-            body_bytes = None
-            body_hash = None
-
         return {
-            "request_method": self.method,
-            "request_url_str": u.to_string(),
-            "request_url_scheme": u.scheme,
-            "request_url_userinfo": u.userinfo,
-            "request_url_host": u.host,
-            "request_url_port": u.port,
-            "request_url_path": u.path,
-            "request_url_query": u.query,
-            "request_url_fragment": u.fragment,
-            "request_host": promoted.host or DEFAULT_HOSTNAME,
-            "request_user_agent": promoted.user_agent,
-            "request_accept": promoted.accept,
-            "request_accept_encoding": promoted.accept_encoding,
-            "request_accept_language": promoted.accept_language,
-            "request_content_type": promoted.content_type,
-            "request_content_length": promoted.content_length or 0,
-            "request_content_encoding": promoted.content_encoding,
-            "request_transfer_encoding": promoted.transfer_encoding,
-            "request_headers": promoted.remaining,
-            "request_tags": tags_v,
-            "request_body": body_bytes,
-            "request_body_hash": body_hash,
-            "request_sent_at": self.sent_at
+            "hash":      self._compute_identity_hash(),
+            "method":    self.method,
+            "url":       _build_url_struct(self.url),
+            "url_hash":  self.url_hash,
+            "headers":   _build_headers_struct(promoted),
+            "tags":      tags_v,
+            "body":      self.buffer.to_bytes() if self.buffer is not None else None,
+            "body_size": self.body_size,
+            "body_hash": self.body_hash,
+            "sent_at":   self.sent_at,
         }
 
     def match_value(self, key: str) -> Any:
+        # Support dotted paths (``url.path``, ``headers.content_type``)
+        # alongside the flat top-level field names.
+        if "." in key:
+            head, _, tail = key.partition(".")
+            values = self.arrow_values
+            if head in values:
+                container = values[head]
+                if isinstance(container, Mapping):
+                    if tail in container:
+                        return container[tail]
+                    if "." in tail:
+                        # Nested deeper; recurse-by-mapping.
+                        sub_head, _, sub_tail = tail.partition(".")
+                        nested = container.get(sub_head)
+                        if isinstance(nested, Mapping) and sub_tail in nested:
+                            return nested[sub_tail]
+                raise ValueError(
+                    f"Unsupported request match key: {key!r}. "
+                    f"Must be within: {REQUEST_ARROW_SCHEMA.names!r}"
+                )
+
         values = self.arrow_values
         if key in values:
             return values[key]
@@ -1045,12 +906,7 @@ class PreparedRequest:
         *,
         normalize: bool = True,
     ) -> "PreparedRequest":
-        """Build a :class:`PreparedRequest` from a row-shaped mapping.
-
-        Same field-name surface as :meth:`_from_arrow_cols`, but
-        sourced from any :class:`Mapping` (typically a
-        :class:`yggdrasil.data.record.Record`).
-        """
+        """Build a :class:`PreparedRequest` from a row-shaped mapping."""
         return cls._from_get(record.get, normalize=normalize)
 
     @classmethod
@@ -1075,60 +931,22 @@ class PreparedRequest:
         *,
         normalize: bool = True,
     ) -> "PreparedRequest":
-        # Single source of truth for "named-getter → PreparedRequest"
-        # — used by both the Arrow-batch path and the Mapping path.
-        def _get(name: str) -> Any:
-            return get(name)
-
-        url_str = _get("request_url_str")
-        if url_str not in (None, ""):
-            url_val = str(url_str)
-            url_struct = None
-        else:
-            scheme = _get("request_url_scheme")
-            userinfo = _get("request_url_userinfo")
-            host = _get("request_url_host")
-            port = _get("request_url_port")
-            path = _get("request_url_path")
-            query = _get("request_url_query")
-            fragment = _get("request_url_fragment")
-
-            if any(part not in (None, "", 0) for part in (scheme, userinfo, host, port, path, query, fragment)):
-                url_val = None
-                url_struct = {
-                    "scheme": scheme or "",
-                    "userinfo": userinfo or "",
-                    "host": host or "",
-                    "port": 0 if port in (None, "") else int(port),
-                    "path": path or "/",
-                    "query": query or "",
-                    "fragment": fragment or "",
-                }
-            else:
-                url_val = ""
-                url_struct = None
-
-        headers = _map_as_str_dict(_get("request_headers"))
-        for header_name, field_name in _PROMOTED_REQUEST_HEADER_FIELDS:
-            value = _get(field_name)
-            if value not in (None, ""):
-                headers[header_name] = str(value)
-
-        sent_at_value = _get("request_sent_at")
-        sent_at_timestamp = any_to_datetime(sent_at_value)
+        # Single source of truth for "named-getter → PreparedRequest" —
+        # used by both the Arrow-batch path and the Mapping path.
+        url_value = get("url")
+        headers_value = get("headers")
+        sent_at_value = get("sent_at")
 
         return cls.from_mapping(
             {
-                "method": _get("request_method") or "GET",
-                "url_str": url_val,
-                "url": url_struct,
-                "headers": headers,
-                "tags": _map_as_str_dict(_get("request_tags")),
-                "buffer": _get("request_body"),
-                "sent_at_timestamp": sent_at_timestamp,
+                "method":   get("method") or "GET",
+                "url":      url_value,
+                "headers":  headers_value if headers_value is not None else {},
+                "tags":     _map_as_str_dict(get("tags")),
+                "buffer":   get("body"),
+                "sent_at":  any_to_datetime(sent_at_value) if sent_at_value not in (None, "") else None,
             },
             normalize=normalize,
-            prefix="",
         )
 
     def apply(

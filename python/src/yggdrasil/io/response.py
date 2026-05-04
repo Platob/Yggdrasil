@@ -18,7 +18,15 @@ from yggdrasil.dataclasses.dataclass import get_from_dict
 from .buffer import BytesIO
 from .enums import Codec, MediaType, MimeTypes
 from .headers import DEFAULT_HOSTNAME, PromotedHeaders, normalize_headers
-from .request import PreparedRequest, REQUEST_SCHEMA
+from .request import (
+    PreparedRequest,
+    REQUEST_SCHEMA,
+    REQUEST_HEADERS_STRUCT,
+    _build_headers_struct,
+    _flatten_headers_struct,
+    _map_as_str_dict,
+    _string_dict,
+)
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -31,9 +39,9 @@ if TYPE_CHECKING:
 
 __all__ = [
     "Response",
-    "BASE_SCHEMA",
     "RESPONSE_SCHEMA",
     "RESPONSE_ARROW_SCHEMA",
+    "RESPONSE_HEADERS_STRUCT",
 ]
 
 
@@ -134,21 +142,6 @@ def _sniff_media_from_body(
 def _media_type_from_headers(
     headers: Mapping[str, str] | None,
 ) -> MediaType | None:
-    """Build a :class:`MediaType` from header-declared Content-Type /
-    Content-Encoding alone — no body sniffing.
-
-    Returns ``None`` when neither header is present, or when the
-    declared Content-Type is the generic ``application/octet-stream``
-    placeholder (since that conveys no useful format identity to seed
-    a leaf-class dispatch with). Callers that need to fall back to
-    body sniffing should call :func:`_sniff_media_from_body` instead.
-
-    Used by :class:`Response` / :class:`HTTPResponse` construction to
-    pre-bind a tabular media type onto the buffer BEFORE bytes land,
-    so the buffer is constructed as the right registered leaf
-    (ParquetIO, JsonIO, ArrowIPCIO, …) rather than an opaque
-    :class:`BytesIO` that downstream callers have to re-wrap.
-    """
     declared_type = _parse_content_type(headers)
     declared_encoding = _parse_content_encoding(headers)
 
@@ -185,92 +178,47 @@ def _ensure_media_headers(
 
     headers["Content-Length"] = str(body.size)
 
-    # Pre-binding: if headers gave us a useful media type but the
-    # buffer was constructed without one (common when bytes land on
-    # an opaque BytesIO before headers are parsed), set it now so
-    # subsequent .read_arrow_batches / .as_media calls dispatch
-    # through the right leaf.
     if body._media_type is None and not media.mime_type.is_any_bytes:
         try:
             body.with_media_type(media, copy=False)
         except Exception:
-            # Setting media_type is best-effort here — a buffer that
-            # rejects (e.g. a frozen view) just stays opaque.
             pass
 
     return media
-
-
-def _string_dict(arg: Optional[Mapping[Any, Any]]) -> dict[str, str]:
-    if not arg:
-        return {}
-    return {str(k): str(v) for k, v in arg.items()}
-
-
-def _map_to_str_dict(value: Any) -> dict[str, str]:
-    if not value:
-        return {}
-    if isinstance(value, Mapping):
-        return {str(k): str(v) for k, v in value.items() if k is not None and v is not None}
-    try:
-        return {str(k): str(v) for k, v in value if k is not None and v is not None}
-    except Exception:
-        return {}
 
 
 # ---------------------------------------------------------------------------
 # Parsing helpers
 # ---------------------------------------------------------------------------
 
-def _parse_headers(obj: Mapping[str, Any], *, prefix: str) -> MutableMapping[str, str]:
-    headers = get_from_dict(obj, keys=("headers", "header", "hdrs", "response_headers"), prefix=prefix)
-    if headers is MISSING:
-        headers = get_from_dict(obj, keys=("headers", "header", "hdrs", "response_headers"), prefix="")
-
-    if not isinstance(headers, Mapping):
-        headers = {} if headers is MISSING else dict(headers)
-
-    headers = _string_dict(headers)
-
-    dumped_headers = {
-        "Host": get_from_dict(obj, keys=("host",), prefix=prefix),
-        "User-Agent": get_from_dict(obj, keys=("user_agent",), prefix=prefix),
-        "Accept": get_from_dict(obj, keys=("accept",), prefix=prefix),
-        "Accept-Encoding": get_from_dict(obj, keys=("accept_encoding",), prefix=prefix),
-        "Accept-Language": get_from_dict(obj, keys=("accept_language",), prefix=prefix),
-        "Content-Type": get_from_dict(obj, keys=("content_type",), prefix=prefix),
-        "Content-Length": get_from_dict(obj, keys=("content_length",), prefix=prefix),
-        "Content-Encoding": get_from_dict(obj, keys=("content_encoding",), prefix=prefix),
-        "Transfer-Encoding": get_from_dict(obj, keys=("transfer_encoding",), prefix=prefix),
-    }
-
-    for k, v in dumped_headers.items():
-        if v is not MISSING and v not in (None, ""):
-            headers[k] = v
-
-    return headers
+def _parse_response_headers(obj: Mapping[str, Any]) -> MutableMapping[str, str]:
+    headers = get_from_dict(obj, keys=("headers",), prefix=None)
+    if isinstance(headers, Mapping):
+        # Headers may already be a flat header→value dict, or the
+        # struct shape (promoted fields + ``other`` map).
+        struct_keys = {
+            "host", "user_agent", "accept", "accept_encoding",
+            "accept_language", "content_type", "content_length",
+            "content_encoding", "transfer_encoding", "other",
+        }
+        if headers and set(headers.keys()).issubset(struct_keys):
+            return _flatten_headers_struct(headers)
+        return _string_dict(headers)
+    return {}
 
 
-def _parse_tags(obj: Mapping[str, Any], *, prefix: str) -> dict[str, str]:
-    tags = get_from_dict(obj, keys=("tags", "response_tags"), prefix=prefix)
-    if tags is MISSING:
-        tags = get_from_dict(obj, keys=("tags", "response_tags"), prefix="")
+def _parse_response_tags(obj: Mapping[str, Any]) -> dict[str, str]:
+    tags = get_from_dict(obj, keys=("tags",), prefix=None)
     return _string_dict(tags if isinstance(tags, Mapping) else None)
 
 
-def _parse_buffer(
+def _parse_response_buffer(
     obj: Mapping[str, Any],
     *,
-    prefix: str,
     media_type: MediaType | None = None,
 ) -> BytesIO:
-    body = get_from_dict(obj, keys=("buffer", "body", "content", "data", "response_body"), prefix=prefix)
-    if body is MISSING:
-        body = get_from_dict(obj, keys=("buffer", "body", "content", "data", "response_body"), prefix="")
+    body = get_from_dict(obj, keys=("buffer", "body", "content", "data"), prefix=None)
     if body is MISSING or body is None:
-        # Empty placeholder buffer — pass media_type so the registry
-        # dispatches to the right leaf (ParquetIO, JsonIO, …) on
-        # construction, sparing downstream callers an as_media call.
         return BytesIO(media_type=media_type) if media_type is not None else BytesIO()
     if isinstance(body, BytesIO):
         if media_type is not None and body._media_type is None:
@@ -282,25 +230,15 @@ def _parse_buffer(
     return BytesIO.from_(obj=body, media_type=media_type) if media_type is not None else BytesIO.from_(obj=body)
 
 
-def _parse_status_code(obj: Mapping[str, Any], *, prefix: str) -> int:
-    status = get_from_dict(obj, keys=("status_code", "status", "code"), prefix=prefix)
-    if status is MISSING:
-        status = get_from_dict(obj, keys=("status_code", "status", "code"), prefix="")
+def _parse_status_code(obj: Mapping[str, Any]) -> int:
+    status = get_from_dict(obj, keys=("status_code", "status", "code"), prefix=None)
     if status is MISSING or status in (None, ""):
         raise ValueError("Response.parse_mapping: missing status_code/status/code")
     return int(status) if isinstance(status, int) else int(float(str(status).strip()))
 
 
-def _parse_received_at(obj: Mapping[str, Any], *, prefix: str) -> dt.datetime:
-    keys = (
-        "received_at_timestamp",
-        "received_at",
-        "response_received_at",
-    )
-    value = get_from_dict(obj, keys=keys, prefix=prefix)
-    if value is MISSING:
-        value = get_from_dict(obj, keys=keys, prefix="")
-
+def _parse_received_at(obj: Mapping[str, Any]) -> dt.datetime:
+    value = get_from_dict(obj, keys=("received_at_timestamp", "received_at"), prefix=None)
     if value is MISSING:
         return dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)
     return any_to_datetime(value)
@@ -326,7 +264,7 @@ _HOP_BY_HOP: frozenset[str] = frozenset({
 # Arrow schemas
 # ---------------------------------------------------------------------------
 
-_RESPONSE_BASE_SCHEMA_JSON_TAGS: dict[str, str] = {
+_RESPONSE_SCHEMA_JSON_TAGS: dict[str, str] = {
     "domain": "http",
     "entity": "response",
     "layer": "bronze",
@@ -334,229 +272,120 @@ _RESPONSE_BASE_SCHEMA_JSON_TAGS: dict[str, str] = {
 }
 
 
-BASE_SCHEMA = schema(
+# Response-side headers struct mirrors the request shape so producers /
+# consumers share one normalized layout.
+RESPONSE_HEADERS_STRUCT = REQUEST_HEADERS_STRUCT
+
+
+RESPONSE_SCHEMA = schema(
     fields=[],
     metadata={
         "comment": "Response record (single row), designed for deterministic logging and replay.",
-        "time_column": "response_received_at",
+        "time_column": "received_at",
     },
-    tags=_RESPONSE_BASE_SCHEMA_JSON_TAGS,
+    tags=_RESPONSE_SCHEMA_JSON_TAGS,
 )
 
-BASE_SCHEMA["response_status_code"] = schema_field(
-    "response_status_code",
+RESPONSE_SCHEMA["request"] = schema_field(
+    "request",
+    REQUEST_SCHEMA.dtype.to_arrow(),
+    nullable=False,
+    metadata={"comment": "Embedded request that produced this response"},
+).autotag()
+
+RESPONSE_SCHEMA["hash"] = schema_field(
+    "hash",
+    pa.int64(),
+    nullable=False,
+    metadata={
+        "comment": "xxh3_64 digest over (request.hash, status_code, headers, body) — primary identity",
+        "algorithm": "xxh3_64",
+    },
+    tags={"primary_key": "true"},
+).autotag()
+
+RESPONSE_SCHEMA["status_code"] = schema_field(
+    "status_code",
     pa.int32(),
     nullable=False,
-    metadata={
-        "comment": "HTTP status code returned by the server",
-    },
-    tags={
-        "entity": "response",
-        "group": "status",
-    },
-)
+    metadata={"comment": "HTTP status code returned by the server"},
+).autotag()
 
-BASE_SCHEMA["response_host"] = schema_field(
-    "response_host",
-    pa.string(),
-    nullable=True,
-    metadata={
-        "comment": "HTTP Host header",
-    },
-    tags={
-        "entity": "response",
-        "group": "headers",
-    },
-)
-
-BASE_SCHEMA["response_user_agent"] = schema_field(
-    "response_user_agent",
-    pa.string(),
-    nullable=True,
-    metadata={
-        "comment": "HTTP User-Agent header",
-    },
-    tags={
-        "entity": "response",
-        "group": "headers",
-    },
-)
-
-BASE_SCHEMA["response_accept"] = schema_field(
-    "response_accept",
-    pa.string(),
-    nullable=True,
-    metadata={
-        "comment": "HTTP Accept header",
-    },
-    tags={
-        "entity": "response",
-        "group": "headers",
-    },
-)
-
-BASE_SCHEMA["response_accept_encoding"] = schema_field(
-    "response_accept_encoding",
-    pa.string(),
-    nullable=True,
-    metadata={
-        "comment": "HTTP Accept-Encoding header",
-    },
-    tags={
-        "entity": "response",
-        "group": "headers",
-    },
-)
-
-BASE_SCHEMA["response_accept_language"] = schema_field(
-    "response_accept_language",
-    pa.string(),
-    nullable=True,
-    metadata={
-        "comment": "HTTP Accept-Language header",
-    },
-    tags={
-        "entity": "response",
-        "group": "headers",
-    },
-)
-
-BASE_SCHEMA["response_content_type"] = schema_field(
-    "response_content_type",
-    pa.string(),
-    nullable=True,
-    metadata={
-        "comment": "HTTP Content-Type header",
-    },
-    tags={
-        "entity": "response",
-        "group": "headers",
-    },
-)
-
-BASE_SCHEMA["response_content_length"] = schema_field(
-    "response_content_length",
-    pa.int64(),
+RESPONSE_SCHEMA["headers"] = schema_field(
+    "headers",
+    RESPONSE_HEADERS_STRUCT,
     nullable=False,
-    metadata={
-        "comment": "HTTP Content-Length header parsed as integer",
-    },
-    tags={
-        "entity": "response",
-        "group": "headers",
-    },
-)
+    metadata={"comment": "Promoted common headers + remaining headers map"},
+).autotag()
 
-BASE_SCHEMA["response_content_encoding"] = schema_field(
-    "response_content_encoding",
-    pa.string(),
-    nullable=True,
-    metadata={
-        "comment": "HTTP Content-Encoding header",
-    },
-    tags={
-        "entity": "response",
-        "group": "headers",
-    },
-)
-
-BASE_SCHEMA["response_transfer_encoding"] = schema_field(
-    "response_transfer_encoding",
-    pa.string(),
-    nullable=True,
-    metadata={
-        "comment": "HTTP Transfer-Encoding header",
-    },
-    tags={
-        "entity": "response",
-        "group": "headers",
-    },
-)
-
-BASE_SCHEMA["response_headers"] = schema_field(
-    "response_headers",
+RESPONSE_SCHEMA["tags"] = schema_field(
+    "tags",
     pa.map_(pa.string(), pa.string()),
     nullable=True,
-    metadata={
-        "comment": "Response headers excluding promoted common headers",
-        "keys_sorted": "false",
-    },
-    tags={
-        "entity": "response",
-        "group": "headers",
-    },
-)
+    metadata={"comment": "Arbitrary string tags attached to this response"},
+).autotag()
 
-BASE_SCHEMA["response_tags"] = schema_field(
-    "response_tags",
-    pa.map_(pa.string(), pa.string()),
-    nullable=True,
-    metadata={
-        "comment": "Arbitrary string tags attached to this response",
-    },
-    tags={
-        "entity": "response",
-        "group": "tags",
-    },
-)
-
-BASE_SCHEMA["response_body"] = schema_field(
-    "response_body",
+RESPONSE_SCHEMA["body"] = schema_field(
+    "body",
     pa.binary(),
     nullable=True,
-    metadata={
-        "comment": "Raw binary payload of the response",
-    },
-    tags={
-        "entity": "response",
-        "group": "payload",
-    },
-)
+    metadata={"comment": "Raw binary payload of the response"},
+).autotag()
 
-BASE_SCHEMA["response_body_hash"] = schema_field(
-    "response_body_hash",
+RESPONSE_SCHEMA["body_size"] = schema_field(
+    "body_size",
+    pa.int64(),
+    nullable=False,
+    metadata={
+        "comment": "Length of body in bytes; 0 when body is absent",
+        "unit": "bytes",
+    },
+).autotag()
+
+RESPONSE_SCHEMA["body_hash"] = schema_field(
+    "body_hash",
     pa.int64(),
     nullable=True,
     metadata={
-        "comment": "Signed Int64 XXH3 digest of response_body",
+        "comment": "xxh3_64 digest of body bytes; null when body is absent",
         "algorithm": "xxh3_64",
     },
-    tags={
-        "entity": "response",
-        "group": "payload",
-        "algorithm": "xxh3_64",
-    },
-)
+).autotag()
 
-BASE_SCHEMA["response_received_at"] = schema_field(
-    "response_received_at",
+RESPONSE_SCHEMA["received_at"] = schema_field(
+    "received_at",
     pa.timestamp("us", "UTC"),
     nullable=False,
-    metadata={
-        "comment": "UTC timestamp when the response was captured",
-        "unit": "us",
-        "tz": "UTC",
-    },
-    tags={
-        "entity": "response",
-        "group": "timing",
-    },
-)
+    metadata={"comment": "UTC timestamp when the response was captured"},
+).autotag()
 
-RESPONSE_SCHEMA = REQUEST_SCHEMA + BASE_SCHEMA
-RESPONSE_ARROW_SCHEMA = RESPONSE_SCHEMA.to_arrow_schema()
+RESPONSE_ARROW_SCHEMA: pa.Schema = RESPONSE_SCHEMA.to_arrow_schema()
 
-_PROMOTED_RESPONSE_HEADER_FIELDS: tuple[tuple[str, str], ...] = (
-    ("Host", "response_host"),
-    ("User-Agent", "response_user_agent"),
-    ("Accept", "response_accept"),
-    ("Accept-Encoding", "response_accept_encoding"),
-    ("Accept-Language", "response_accept_language"),
-    ("Content-Type", "response_content_type"),
-    ("Content-Length", "response_content_length"),
-    ("Content-Encoding", "response_content_encoding"),
-    ("Transfer-Encoding", "response_transfer_encoding"),
-)
+
+def _compute_response_identity_hash(
+    request_hash: int,
+    status_code: int,
+    headers: Mapping[str, str] | None,
+    body: BytesIO | None,
+) -> int:
+    try:
+        import xxhash
+    except ImportError:
+        return 0
+    h = xxhash.xxh3_64()
+    h.update(int(request_hash).to_bytes(8, "little", signed=True))
+    h.update(b"\x00")
+    h.update(int(status_code).to_bytes(4, "little", signed=False))
+    h.update(b"\x00")
+    for k in sorted(headers or {}):
+        h.update(str(k).encode("utf-8"))
+        h.update(b"=")
+        h.update(str(headers[k]).encode("utf-8"))
+        h.update(b"\x00")
+    if body is not None:
+        h.update(body.xxh3_64().digest())
+    u = h.intdigest()
+    return u if u < 2**63 else u - 2**64
 
 
 # ---------------------------------------------------------------------------
@@ -564,12 +393,7 @@ _PROMOTED_RESPONSE_HEADER_FIELDS: tuple[tuple[str, str], ...] = (
 # ---------------------------------------------------------------------------
 
 class Response:
-    """HTTP response model — paired with the originating :class:`PreparedRequest`.
-
-    Plain class with explicit ``__slots__`` (no dataclass decorator) so
-    we have full control over construction, pickling, and the
-    transient session back-reference set via :meth:`attach_session`.
-    """
+    """HTTP response model — paired with the originating :class:`PreparedRequest`."""
 
     __slots__ = (
         "request",
@@ -610,9 +434,6 @@ class Response:
         return self.__repr__()
 
     def __getstate__(self) -> dict[str, Any]:
-        # Walk __slots__ explicitly because slotted classes don't carry
-        # a __dict__. Drop the transient session ref so responses stay
-        # portable across executors.
         return {
             name: getattr(self, name)
             for name in self.__slots__
@@ -625,16 +446,14 @@ class Response:
         self._session = None
 
     # ------------------------------------------------------------------
-    # Session attachment — symmetric with PreparedRequest.attach_session
+    # Session attachment
     # ------------------------------------------------------------------
 
     def attach_session(self, session: "Session") -> "Response":
-        """Bind *session* as this response's owning session (transient)."""
         self._session = session
         return self
 
     def detach_session(self) -> "Response":
-        """Drop any attached session reference and return self."""
         self._session = None
         return self
 
@@ -675,26 +494,22 @@ class Response:
         obj: Mapping[str, Any],
         *,
         normalize: bool = True,
-        prefix: str = "response_",
     ) -> "Response":
         if not obj:
             raise ValueError("Response.parse_mapping: empty mapping")
 
-        req_obj = get_from_dict(obj, keys=("request",), prefix="")
+        req_obj = get_from_dict(obj, keys=("request",), prefix=None)
         request = PreparedRequest.parse(
             obj if req_obj is MISSING or req_obj in (None, "") else req_obj,
             normalize=normalize,
         )
 
-        status_code = _parse_status_code(obj, prefix=prefix)
-        headers = _parse_headers(obj, prefix=prefix)
-        # Pre-infer media type from headers BEFORE constructing the
-        # buffer so a path-bound or in-memory buffer dispatches to the
-        # registered leaf (ParquetIO, ArrowIPCIO, …) on construction.
+        status_code = _parse_status_code(obj)
+        headers = _parse_response_headers(obj)
         pre_media = _media_type_from_headers(headers)
-        buffer = _parse_buffer(obj, prefix=prefix, media_type=pre_media)
-        received_at = _parse_received_at(obj, prefix=prefix)
-        tags = _parse_tags(obj, prefix=prefix)
+        buffer = _parse_response_buffer(obj, media_type=pre_media)
+        received_at = _parse_received_at(obj)
+        tags = _parse_response_tags(obj)
 
         if normalize:
             headers = normalize_headers(headers, body=buffer, is_request=False)
@@ -870,12 +685,34 @@ class Response:
         return None
 
     # ------------------------------------------------------------------
-    # Timestamps
+    # Timestamps / hashes
     # ------------------------------------------------------------------
 
     @property
     def received_at_timestamp(self) -> int:
         return int(self.received_at.timestamp() * 1000000)
+
+    @property
+    def body_size(self) -> int:
+        return self.buffer.size if self.buffer is not None else 0
+
+    @property
+    def body_hash(self) -> Optional[int]:
+        if self.buffer is None:
+            return None
+        try:
+            return self.buffer.xxh3_int64()
+        except ImportError:
+            return None
+
+    @property
+    def hash(self) -> int:
+        return _compute_response_identity_hash(
+            request_hash=self.request._compute_identity_hash(),
+            status_code=self.status_code,
+            headers=self.headers,
+            body=self.buffer,
+        )
 
     # ------------------------------------------------------------------
     # Matching / projection
@@ -885,46 +722,65 @@ class Response:
     def arrow_values(self) -> dict[str, Any]:
         promoted = PromotedHeaders.extract(self.headers or {}, host=DEFAULT_HOSTNAME)
 
+        body_bytes: bytes | None
+        body_hash: int | None
         if self.buffer is not None:
             body_bytes = self.buffer.to_bytes()
             try:
                 body_hash = self.buffer.xxh3_int64()
             except ImportError:
-                # ``response_body_hash`` schema field is nullable and the
-                # value is informational, so a missing optional dep
-                # (``xxhash``) shouldn't break the canonical Arrow
-                # projection path that all serializers funnel through.
                 body_hash = None
         else:
             body_bytes = None
             body_hash = None
 
         return {
-            **self.request.arrow_values,
-            "response_status_code": self.status_code,
-            "response_host": promoted.host or DEFAULT_HOSTNAME,
-            "response_user_agent": promoted.user_agent,
-            "response_accept": promoted.accept,
-            "response_accept_encoding": promoted.accept_encoding,
-            "response_accept_language": promoted.accept_language,
-            "response_content_type": promoted.content_type,
-            "response_content_length": promoted.content_length or 0,
-            "response_content_encoding": promoted.content_encoding,
-            "response_transfer_encoding": promoted.transfer_encoding,
-            "response_headers": promoted.remaining,
-            "response_tags": _string_dict(self.tags),
-            "response_body": body_bytes,
-            "response_body_hash": body_hash,
-            "response_received_at": self.received_at,
+            "request":     self.request.arrow_values,
+            "hash":        self.hash,
+            "status_code": self.status_code,
+            "headers":     _build_headers_struct(promoted),
+            "tags":        _string_dict(self.tags) or None,
+            "body":        body_bytes,
+            "body_size":   self.body_size,
+            "body_hash":   body_hash,
+            "received_at": self.received_at,
         }
 
     def match_value(self, key: str) -> Any:
+        # Dotted-path lookup walks the nested struct shape:
+        # ``request.method``, ``request.url.host``, ``headers.content_type``.
+        if "." in key:
+            head, _, tail = key.partition(".")
+            if head == "request":
+                return self.request.match_value(tail)
+            values = self.arrow_values
+            if head in values:
+                container = values[head]
+                cursor: Any = container
+                for part in tail.split("."):
+                    if isinstance(cursor, Mapping) and part in cursor:
+                        cursor = cursor[part]
+                    else:
+                        raise ValueError(
+                            f"Unsupported response match key: {key!r}. "
+                            f"Must be within: {RESPONSE_ARROW_SCHEMA.names!r}"
+                        )
+                return cursor
+            raise ValueError(
+                f"Unsupported response match key: {key!r}. "
+                f"Must be within: {RESPONSE_ARROW_SCHEMA.names!r}"
+            )
+
+        # Top-level response columns win, but request-side keys
+        # (``method``, ``url``, ``url_hash``, …) fall through to the
+        # embedded request so the cache layer can match-by request
+        # identity without forcing a ``request.`` prefix everywhere.
         values = self.arrow_values
-        if key in values:
+        if key in values and key != "request":
             return values[key]
-        if hasattr(self, key):
+        if hasattr(self, key) and key not in REQUEST_SCHEMA.names:
             return getattr(self, key)
-        if key.startswith("request_"):
+        if key in REQUEST_SCHEMA.names:
             return self.request.match_value(key)
         raise ValueError(
             f"Unsupported response match key: {key!r}. "
@@ -1132,17 +988,7 @@ class Response:
         *,
         normalize: bool = False,
     ) -> "Response":
-        """Build a :class:`Response` from a row-shaped mapping.
-
-        Accepts any :class:`Mapping` keyed by the
-        :data:`RESPONSE_SCHEMA` field names — typically a
-        :class:`yggdrasil.data.record.Record` from
-        :meth:`TabularIO.read_records`, but a plain ``dict`` works
-        too. Missing keys land as ``None``; the ``request_*`` keys
-        are routed through :meth:`PreparedRequest.from_record` so
-        the rebuilt request keeps the same shape as the Arrow
-        round-trip.
-        """
+        """Build a :class:`Response` from a row-shaped mapping."""
         return cls._from_get(record.get, normalize=normalize)
 
     @classmethod
@@ -1152,11 +998,6 @@ class Response:
         *,
         normalize: bool = False,
     ) -> Iterator["Response"]:
-        """Stream :class:`Response` objects from a record iterator.
-
-        Convenience wrapper around :meth:`from_record` for callers
-        that have an iterator out of :meth:`TabularIO.read_records`.
-        """
         for record in records:
             yield cls.from_record(record, normalize=normalize)
 
@@ -1182,29 +1023,19 @@ class Response:
         *,
         normalize: bool = False,
     ) -> "Response":
-        # Single source of truth for "named-getter → Response" — used
-        # by both the Arrow-batch path (`_from_arrow_cols`) and the
-        # Mapping path (`from_record`). Anything that can answer
-        # ``get(field_name)`` for the RESPONSE_SCHEMA field names
-        # qualifies; missing keys come back as ``None``.
-        def _get(name: str) -> Any:
-            return get(name)
+        request_value = get("request")
+        if isinstance(request_value, Mapping):
+            request = PreparedRequest._from_get(request_value.get, normalize=normalize)
+        else:
+            request = PreparedRequest._from_get(get, normalize=normalize)
 
-        request = PreparedRequest._from_get(_get, normalize=normalize)
+        headers_value = get("headers")
+        if isinstance(headers_value, Mapping):
+            headers = _flatten_headers_struct(headers_value)
+        else:
+            headers = {}
 
-        headers = _map_to_str_dict(_get("response_headers"))
-        for header_name, field_name in _PROMOTED_RESPONSE_HEADER_FIELDS:
-            value = _get(field_name)
-            if value not in (None, ""):
-                headers[header_name] = str(value)
-
-        body_bytes = _get("response_body")
-        # Pre-infer media type from the (already-promoted) headers so
-        # the buffer is constructed as the registered leaf (ParquetIO,
-        # JsonIO, …) up front. Setting _media_type post-hoc on a plain
-        # BytesIO doesn't promote the class, so on Arrow round-trips
-        # (incl. yggdrasil.pickle.ser of a Response) the buffer would
-        # otherwise come back opaque even when the media type was known.
+        body_bytes = get("body")
         pre_media = _media_type_from_headers(headers)
         if body_bytes is None:
             buffer = BytesIO(media_type=pre_media) if pre_media is not None else BytesIO()
@@ -1223,11 +1054,11 @@ class Response:
 
         return out_class(
             request=request,
-            status_code=_get("response_status_code") or 0,
+            status_code=get("status_code") or 0,
             headers=headers,
-            tags=_map_to_str_dict(_get("response_tags")),
+            tags=_map_as_str_dict(get("tags")),
             buffer=buffer,
-            received_at=_get("response_received_at") or 0,
+            received_at=get("received_at") or 0,
         )
 
     # ------------------------------------------------------------------
@@ -1287,12 +1118,7 @@ class Response:
 # ---------------------------------------------------------------------------
 # Cast registry — intercept Any->Arrow routes so Response instances (and
 # engine-specific subclasses like HTTPResponse) use their own Arrow projection
-# instead of falling back to the generic polars path, which doesn't know
-# about Response.
-#
-# We patch the wildcard entries rather than registering (Response, pa.*)
-# because dispatch checks `Any -> to_hint` before MRO lookup, so a plain
-# subclass registration would never win for an instance of a wildcard target.
+# instead of falling back to the generic polars path.
 # ---------------------------------------------------------------------------
 
 from yggdrasil.arrow import cast as _arrow_cast  # noqa: E402

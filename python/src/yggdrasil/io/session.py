@@ -150,18 +150,18 @@ def _lookup_local_responses(
     if table.num_rows == 0:
         return {}
 
-    if "response_received_at" in table.column_names:
+    if "received_at" in table.column_names:
         if received_from is not None:
             table = table.filter(
                 pc.greater_equal(
-                    table["response_received_at"],
+                    table["received_at"],
                     pa.scalar(received_from),
                 )
             )
         if received_to is not None:
             table = table.filter(
                 pc.less(
-                    table["response_received_at"],
+                    table["received_at"],
                     pa.scalar(received_to),
                 )
             )
@@ -277,7 +277,7 @@ class Session(ABC):
         row-filtered by the ``request_by`` tuple and the configured
         received-window.
         """
-        match_by = tuple(cache_cfg.request_by or ()) or ("request_url_str",)
+        match_by = tuple(cache_cfg.request_by or ()) or ("url_hash",)
         cache = cache_cfg.local_cache()
         looked = _lookup_local_responses(
             cache, [request],
@@ -392,7 +392,7 @@ class Session(ABC):
             mode=mode if mode is not None else cache_cfg.mode,
             match_by=cache_cfg.match_by or None,
             wait=cache_cfg.wait,
-            prune_values={"request_url_path": batch["request_url_path"]},
+            prune_values={"hash": batch["hash"]},
             spark_session=spark_session,
         )
 
@@ -710,7 +710,7 @@ class Session(ABC):
 
         for pkey, (eff, group_reqs) in cfg_groups.items():
             cache = eff.local_cache()
-            match_by = tuple(eff.request_by or ()) or ("request_url_str",)
+            match_by = tuple(eff.request_by or ()) or ("url_hash",)
             looked_up = _lookup_local_responses(
                 cache, group_reqs,
                 match_by=match_by,
@@ -1109,7 +1109,7 @@ class Session(ABC):
                 mode=mode,
                 match_by=cfg.match_by or None,
                 wait=cfg.wait,
-                prune_values={"request_url_path": batches["request_url_path"]},
+                prune_values={"hash": batches["hash"]},
             )
 
     def _send_many(
@@ -1431,25 +1431,25 @@ class Session(ABC):
         no driver-side collect is needed.
 
         Before inserting, APPEND-mode writes are de-duplicated against the
-        existing remote rows via a ``left_anti`` join on the anonymized
-        request identity (``request_url_path`` + ``request_url_query``) —
-        the remote table stores anonymized requests (cf. ``_persist_remote``),
-        so a row whose path+query already lives in the cache is suppressed
-        rather than re-inserted. UPSERT mode keeps its read-free fast path
-        and relies on ``match_by`` to collapse duplicates server-side.
+        existing remote rows via a ``left_anti`` join on the response
+        ``hash`` column — the remote table stores anonymized requests
+        (cf. ``_persist_remote``), so a row whose hash already lives in
+        the cache is suppressed rather than re-inserted. UPSERT mode
+        keeps its read-free fast path and relies on ``match_by`` to
+        collapse duplicates server-side.
         """
         from pyspark.sql import functions as F
 
         ok_df = new_responses_df.where(
-            (F.col("response_status_code") >= 200)
-            & (F.col("response_status_code") < 300)
+            (F.col("status_code") >= 200)
+            & (F.col("status_code") < 300)
         )
 
         if cfg.mode != Mode.UPSERT:
             table_name = cfg.table.full_name(safe=True)
             try:
                 existing_df = spark.sql(
-                    "SELECT DISTINCT request_url_path, request_url_query "
+                    "SELECT DISTINCT hash "
                     f"FROM {table_name}"
                 )
             except Exception as exc:
@@ -1463,7 +1463,7 @@ class Session(ABC):
             if existing_df is not None:
                 ok_df = ok_df.join(
                     existing_df,
-                    on=["request_url_path", "request_url_query"],
+                    on=["hash"],
                     how="left_anti",
                 )
 
@@ -1477,7 +1477,7 @@ class Session(ABC):
             mode=cfg.mode,
             match_by=cfg.match_by or None,
             wait=cfg.wait,
-            prune_by=["request_url_path"],
+            prune_by=["hash"],
             spark_session=spark,
         )
 

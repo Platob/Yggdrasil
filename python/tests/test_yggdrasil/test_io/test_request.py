@@ -70,7 +70,7 @@ class TestParse:
 
     def test_parse_mapping_with_url_str(self):
         req = PreparedRequest.from_mapping(
-            {"url_str": "https://example.com/x", "method": "POST"}
+            {"url": "https://example.com/x", "method": "POST"}
         )
         assert req.method == "POST"
         assert req.url.path == "/x"
@@ -269,8 +269,8 @@ class TestArrowRoundtrip:
 class TestMatchValue:
     def test_basic_lookup(self):
         req = PreparedRequest.prepare(method="GET", url="https://example.com/x")
-        assert req.match_value("request_method") == "GET"
-        assert req.match_value("request_url_host") == "example.com"
+        assert req.match_value("method") == "GET"
+        assert req.match_value("url.host") == "example.com"
 
     def test_unsupported_key_raises(self):
         req = PreparedRequest.prepare(method="GET", url="https://example.com/")
@@ -279,12 +279,12 @@ class TestMatchValue:
 
     def test_match_values_returns_dict(self):
         req = PreparedRequest.prepare(method="GET", url="https://example.com/x")
-        values = req.match_values(["request_method", "request_url_host"])
-        assert values == {"request_method": "GET", "request_url_host": "example.com"}
+        values = req.match_values(["method", "url.host"])
+        assert values == {"method": "GET", "url.host": "example.com"}
 
     def test_match_tuple_preserves_order(self):
         req = PreparedRequest.prepare(method="POST", url="https://example.com/x")
-        tup = req.match_tuple(["request_method", "request_url_path"])
+        tup = req.match_tuple(["method", "url.path"])
         assert tup == ("POST", "/x")
 
 
