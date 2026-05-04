@@ -109,6 +109,12 @@ excel = [
   "fastexcel"
 ]
 
+postgres = [
+  "psycopg[binary]>=3.1",
+  "adbc-driver-postgresql>=1.0",
+  "adbc-driver-manager>=1.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/Platob/Yggdrasil"
 Repository = "https://github.com/Platob/Yggdrasil"
@@ -122,6 +128,7 @@ ygg-api = "yggdrasil.fastapi.main:main"
 asyncio_mode = "strict"
 markers = [
   "integration: marks tests that require a live Databricks workspace (skipped when DATABRICKS_HOST is not set)",
+  "postgres_integration: marks tests that require a live Postgres instance (skipped when POSTGRES_URI is not set)",
 ]
 
 [tool.setuptools]
