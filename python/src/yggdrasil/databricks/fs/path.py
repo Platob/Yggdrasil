@@ -555,6 +555,7 @@ class DatabricksPath(Path):
                 raise
             self.parent.mkdir(parents=True, exist_ok=True)
             self._remote_upload(payload)
+        self.invalidate_mirror()
         return len(payload)
 
     # ==================================================================
