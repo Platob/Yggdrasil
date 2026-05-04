@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass
 from typing import Mapping, Optional
 
 from urllib3 import BaseHTTPResponse
@@ -15,8 +14,11 @@ __all__ = [
 ]
 
 
-@dataclass(slots=True)
 class HTTPResponse(Response):
+    # No new fields — inherits ``Response.__slots__`` so the parent's
+    # slotted layout still applies.
+    __slots__ = ()
+
 
     @classmethod
     def from_urllib3(

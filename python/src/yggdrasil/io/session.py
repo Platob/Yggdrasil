@@ -1495,10 +1495,13 @@ class Session(ABC):
         cache configs are stripped (driver concern); per-request local cache
         configs are dropped on workers (they see only the session config).
 
-        Requests cross the wire as a single pickled-bytes column. Pickle
-        preserves the full :class:`PreparedRequest` (closures, buffer,
-        cache configs) without the per-engine schema dance that the Arrow
-        round-trip needed.
+        The session is shipped to executors via ``sparkContext.broadcast``
+        — once per executor instead of once per task closure — and
+        re-attached to each request on the worker via
+        :meth:`PreparedRequest.attach_session`. Requests cross the wire
+        as a single pickled-bytes column; pickle preserves the full
+        :class:`PreparedRequest` (closures, buffer, cache configs)
+        without the per-engine schema dance the Arrow round-trip needed.
         """
         import pickle
 
@@ -1521,10 +1524,12 @@ class Session(ABC):
             raise_error=False,
         )
 
-        # Capture the session for executor serialisation. Session.__getstate__
-        # / __setstate__ are required to make this pickle-safe — otherwise
-        # the threading.RLock / JobPoolExecutor will choke at scatter time.
-        session = self
+        # Broadcast the session so every executor receives the
+        # (pickle-safe) session state once and reuses it across tasks,
+        # rather than re-shipping a closure-captured copy per partition.
+        # Session.__getstate__ / __setstate__ make this pickle-safe by
+        # dropping the threading.RLock and JobPoolExecutor.
+        session_bc = spark.sparkContext.broadcast(self)
         response_spark_schema = RESPONSE_SCHEMA.to_spark_schema()
 
         def _send_partition(
@@ -1532,9 +1537,10 @@ class Session(ABC):
         ) -> Iterator[pa.RecordBatch]:
             import pickle as _pickle
 
+            session = session_bc.value
             for batch in batches:
                 partition_requests = [
-                    _pickle.loads(buf)
+                    _pickle.loads(buf).attach_session(session)
                     for buf in batch.column("request").to_pylist()
                 ]
                 if not partition_requests:
