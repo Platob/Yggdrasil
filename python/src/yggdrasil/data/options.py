@@ -608,7 +608,8 @@ class CastOptions:
         self,
         source: Any | None = None,
         target: Any | None = None,
-        check_names=False, check_dtypes=True, check_metadata=False
+        check_names=False, check_dtypes=True, check_metadata=False,
+        check_nullable: bool = False,
     ) -> bool:
         """Return ``True`` if source and target fields differ enough to need casting.
 
@@ -621,6 +622,15 @@ class CastOptions:
         (pandas preserves indices through metadata, arrow carries codec
         hints in field metadata) and comparing on it would demand a
         cast for cosmetic differences.
+
+        ``check_nullable`` is off by default because nullability rarely
+        warrants a real value-level cast — primitives and lists pass
+        through unchanged when only the flag differs. Tabular / struct
+        casts pass ``check_nullable=True`` so the rebuild fires when
+        child fields differ on nullability: Spark / Delta refuse to
+        implicitly cast nullable→``NOT NULL`` inside a struct (even
+        when the data is in fact non-null), so the cast has to emit
+        the target's field types verbatim to keep MERGE happy.
         """
         clean = self.check_source(source, copy=False).check_target(target, copy=False)
         src = clean.source_field
@@ -633,7 +643,7 @@ class CastOptions:
             check_names=check_names,
             check_dtypes=check_dtypes,
             check_metadata=check_metadata,
-            check_nullable=False
+            check_nullable=check_nullable,
         )
 
     def finalize(self, obj: Any, *, default_scalar: Any = None) -> Any:

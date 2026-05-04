@@ -58,7 +58,13 @@ def cast_arrow_struct_array(
     array: pa.StructArray,
     options: "CastOptions",
 ):
-    if not options.need_cast(array):
+    # Struct casts honour child nullability — a ``STRING NOT NULL``
+    # child is structurally different from a nullable one, and Spark /
+    # Delta refuse the implicit cast on the wire even when no value is
+    # null. The rebuild emits ``pa.StructArray.from_arrays`` with the
+    # target's field shapes, so firing on a nullability-only mismatch
+    # is essentially free (no per-row work, just a metadata rebind).
+    if not options.need_cast(array, check_nullable=True):
         return array
 
     if options.source_field.dtype.type_id != DataTypeId.STRUCT:
@@ -188,7 +194,33 @@ def cast_arrow_tabular(
     if not isinstance(data, (pa.Table, pa.RecordBatch)):
         raise TypeError(f"Unsupported tabular type: {type(data)!r}")
 
-    if not options.need_cast(data, check_names=True):
+    # Tabular bypass: identity-return only when every target child
+    # matches the source one for name + dtype + nullability. The
+    # default ``need_cast`` ignores nullability (correct for scalar
+    # bypass — flipping a flag is value-free) but a tabular cast also
+    # has to honour child nullability: a column declared
+    # ``STRUCT<x: STRING NOT NULL>`` is structurally different from a
+    # nullable variant, and Spark / Delta refuse the implicit cast
+    # downstream even when no value is null. Firing on a
+    # nullability-only mismatch is cheap — the rebuild collapses to a
+    # ``pa.Table.from_arrays(arrays, schema=target_schema)`` metadata
+    # rebind rather than a per-row copy.
+    src = options.source_field
+    tgt = options.target_field
+    if src is None or tgt is None:
+        return data
+    src_children = src.children_fields
+    tgt_children = tgt.children_fields
+    if len(src_children) == len(tgt_children) and all(
+        s.equals(
+            t,
+            check_names=True,
+            check_dtypes=True,
+            check_nullable=True,
+            check_metadata=False,
+        )
+        for s, t in zip(src_children, tgt_children)
+    ):
         return data
 
     source_schema = options.source_schema
