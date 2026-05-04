@@ -156,8 +156,7 @@ class TestLocalCacheReadback:
         # path active. A successful send drops a pickled response file
         # under the cache root; the file is named after the anonymized
         # request hash.
-        cfg = CacheConfig(
-            path=tmp_path,
+        cfg = CacheConfig.check_arg(tmp_path,
             received_from="2020-01-01T00:00:00Z",
         )
         session = StubSession()

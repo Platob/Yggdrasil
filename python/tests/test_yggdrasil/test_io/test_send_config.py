@@ -60,8 +60,11 @@ class TestCacheConfigCheckArgPolymorphism:
         assert cfg.received_from == when
 
     def test_path_arg(self, tmp_path):
+        from yggdrasil.io.buffer.nested.folder_io import FolderIO
+
         cfg = CacheConfig.check_arg(tmp_path)
-        assert cfg.path == tmp_path
+        assert isinstance(cfg.tabular, FolderIO)
+        assert str(cfg.tabular.path) == str(tmp_path)
 
 
 class TestCacheConfigEnabledFlags:
@@ -100,40 +103,40 @@ class TestCacheConfigSqlLiteral:
 class TestCacheConfigMatchBy:
     def test_combines_request_by_and_response_by(self):
         cfg = CacheConfig(
-            request_by=["request_method"],
-            response_by=["response_status_code"],
+            request_by=["method"],
+            response_by=["status_code"],
         )
-        assert cfg.match_by == ["request_method", "response_status_code"]
+        assert cfg.match_by == ["method", "status_code"]
 
 
 class TestCacheConfigSqlClauses:
     def test_request_clause_matches_values(self):
-        cfg = CacheConfig(request_by=["request_method"])
+        cfg = CacheConfig(request_by=["method"])
         req = make_request()
         clause = cfg.sql_request_clause(req)
-        assert "request_method" in clause
+        assert "method" in clause
         assert "GET" in clause
 
     def test_request_clause_no_request_returns_truthy(self):
-        cfg = CacheConfig(request_by=["request_method"])
+        cfg = CacheConfig(request_by=["method"])
         assert cfg.sql_request_clause(None) == "1=1"
 
     def test_response_clause_includes_received_window(self):
         cfg = CacheConfig(received_from=dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc))
         clause = cfg.sql_response_clause(None)
-        assert "response_received_at" in clause
+        assert "received_at" in clause
 
 
 class TestCacheConfigLookupSql:
     def test_make_lookup_sql_includes_select(self):
         cfg = CacheConfig(
-            request_by=["request_method"],
+            request_by=["method"],
         )
         sql = cfg.make_lookup_sql("cache_table", make_request())
         assert "SELECT * FROM cache_table" in sql
 
     def test_make_batch_lookup_sql_or_combines(self):
-        cfg = CacheConfig(request_by=["request_method"])
+        cfg = CacheConfig(request_by=["method"])
         reqs = [make_request(method="GET"), make_request(method="POST")]
         sql = cfg.make_batch_lookup_sql("tbl", reqs)
         assert " OR " in sql or "method" in sql

@@ -123,11 +123,14 @@ def _lookup_local_responses(
 ) -> dict[tuple, Response]:
     """Bulk lookup by request-key tuple against a folder cache.
 
-    One folder read per call — partition pruning shrinks the set of
-    leaves visited, then we filter rows by request-key tuple + the
-    optional received-window. When several rows share a key the
-    latest one (max ``response_received_at``) wins, giving
-    UPSERT-on-write semantics for free.
+    One folder read per call. The read result is partition-pruned by
+    the input requests' ``partition_key`` set so we only walk leaves
+    whose endpoint bucket matches an incoming request — typically
+    one or two partitions for an endpoint-focused batch instead of
+    the whole tree. Row-level filtering by request-key tuple +
+    received-window happens after. When several rows share a key
+    the latest one (max ``received_at``) wins, giving UPSERT-on-write
+    semantics for free.
     """
     if not requests:
         return {}
@@ -150,21 +153,41 @@ def _lookup_local_responses(
     if table.num_rows == 0:
         return {}
 
-    if "response_received_at" in table.column_names:
+    # Partition prune: keep only rows whose ``partition_key`` matches
+    # one of the incoming requests' endpoint buckets. With the
+    # endpoint-derived partition_key (xxh3_64 of host+path), a typical
+    # send_many burst against a handful of endpoints prunes the
+    # post-read table down by orders of magnitude before the per-row
+    # match-by walk.
+    partition_filter = _request_partition_filter(cache, requests)
+    if partition_filter is not None:
+        try:
+            table = table.filter(partition_filter)
+        except Exception:
+            LOGGER.debug(
+                "Partition filter against local cache %s failed; "
+                "falling back to full-table scan",
+                cache.path, exc_info=True,
+            )
+
+    if "received_at" in table.column_names:
         if received_from is not None:
             table = table.filter(
                 pc.greater_equal(
-                    table["response_received_at"],
+                    table["received_at"],
                     pa.scalar(received_from),
                 )
             )
         if received_to is not None:
             table = table.filter(
                 pc.less(
-                    table["response_received_at"],
+                    table["received_at"],
                     pa.scalar(received_to),
                 )
             )
+
+    if table.num_rows == 0:
+        return {}
 
     wanted: set[tuple] = {
         tuple(r.match_value(c) for c in match_by) for r in requests
@@ -277,7 +300,7 @@ class Session(ABC):
         row-filtered by the ``request_by`` tuple and the configured
         received-window.
         """
-        match_by = tuple(cache_cfg.request_by or ()) or ("request_url_str",)
+        match_by = tuple(cache_cfg.request_by or ()) or ("public_url_hash",)
         cache = cache_cfg.local_cache()
         looked = _lookup_local_responses(
             cache, [request],
@@ -341,21 +364,28 @@ class Session(ABC):
         if not cache_cfg.remote_cache_enabled:
             return None
 
-
+        # Skip the per-request ``anonymize()`` when the match keys are
+        # all ``public_*`` — the SQL clause and the response-side
+        # join key both come out identical without it.
+        lookup_request = (
+            request
+            if cache_cfg.request_by_is_public
+            else request.anonymize(mode=cache_cfg.anonymize)
+        )
         query = cache_cfg.make_batch_lookup_sql(
-            table_name=cache_cfg.table.full_name(safe=True),
-            requests=[request.anonymize(mode=cache_cfg.anonymize)],
+            table_name=cache_cfg.tabular.full_name(safe=True),
+            requests=[lookup_request],
         )
 
         try:
-            cache_result = cache_cfg.table.sql.execute(
+            cache_result = cache_cfg.tabular.sql.execute(
                 query,
                 spark_session=spark_session,
             )
         except Exception as exc:
             if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
-                cache_cfg.table.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
-                cache_result = cache_cfg.table.sql.execute(
+                cache_cfg.tabular.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
+                cache_result = cache_cfg.tabular.sql.execute(
                     query,
                     spark_session=spark_session,
                 )
@@ -368,7 +398,7 @@ class Session(ABC):
                     "Found remote %s %s in %s",
                     request.method,
                     request.url,
-                    cache_cfg.table,
+                    cache_cfg.tabular,
                 )
                 return response
 
@@ -387,12 +417,22 @@ class Session(ABC):
 
         batch = response.anonymize(mode=cache_cfg.anonymize).to_arrow_batch(parse=False)
 
-        cache_cfg.table.insert(
+        cache_cfg.tabular.insert(
             batch,
             mode=mode if mode is not None else cache_cfg.mode,
             match_by=cache_cfg.match_by or None,
             wait=cache_cfg.wait,
-            prune_values={"request_url_path": batch["request_url_path"]},
+            # Two-level prune: ``partition_key`` triggers Delta file
+            # pruning (partition column on RESPONSE_SCHEMA);
+            # ``public_hash`` narrows the merge's target side to the
+            # exact row identities being upserted, so the MERGE join
+            # can short-circuit on the int64 equality before
+            # touching anything else. Both keys are int64 so the IN
+            # literals stay compact.
+            prune_values={
+                "partition_key": batch["partition_key"],
+                "public_hash":   batch["public_hash"],
+            },
             spark_session=spark_session,
         )
 
@@ -653,7 +693,7 @@ class Session(ABC):
         landed in the bucket first.
         """
         return (
-            cfg.table.full_name(safe=True),
+            cfg.tabular.full_name(safe=True),
             cfg.mode,
             tuple(cfg.match_by) if cfg.match_by else (),
             bool(cfg.wait),
@@ -710,7 +750,7 @@ class Session(ABC):
 
         for pkey, (eff, group_reqs) in cfg_groups.items():
             cache = eff.local_cache()
-            match_by = tuple(eff.request_by or ()) or ("request_url_str",)
+            match_by = tuple(eff.request_by or ()) or ("public_url_hash",)
             looked_up = _lookup_local_responses(
                 cache, group_reqs,
                 match_by=match_by,
@@ -777,7 +817,7 @@ class Session(ABC):
             if not t_cfg.remote_cache_enabled or t_cfg.mode != Mode.APPEND:
                 misses.append(req)
                 continue
-            tkey = t_cfg.table.full_name(safe=True)
+            tkey = t_cfg.tabular.full_name(safe=True)
             if tkey not in table_to_cfg:
                 table_to_cfg[tkey] = t_cfg
                 table_to_reqs[tkey] = []
@@ -808,18 +848,30 @@ class Session(ABC):
         *,
         spark_session: Optional["SparkSession"] = None,
     ) -> tuple[list[Response], list[PreparedRequest]]:
-        """Execute one batch SQL lookup against a single cache table."""
-        anonymized_batch = [r.anonymize(mode=cfg.anonymize) for r in requests]
+        """Execute one batch SQL lookup against a single cache table.
+
+        When ``cfg.request_by_is_public`` holds, the per-request
+        ``anonymize()`` pass is skipped — ``public_*`` match keys hash
+        to the same value on the original and the anonymized request,
+        so the lookup tuple and SQL clause both come out identical
+        without paying for one URL parse + header normalize per
+        request.
+        """
+        if cfg.request_by_is_public:
+            lookup_batch: list[PreparedRequest] = list(requests)
+        else:
+            lookup_batch = [r.anonymize(mode=cfg.anonymize) for r in requests]
+
         query = cfg.make_batch_lookup_sql(
-            table_name=cfg.table.full_name(safe=True),
-            requests=anonymized_batch,
+            table_name=cfg.tabular.full_name(safe=True),
+            requests=lookup_batch,
         )
         try:
-            cache_result = cfg.table.sql.execute(query, spark_session=spark_session)
+            cache_result = cfg.tabular.sql.execute(query, spark_session=spark_session)
         except Exception as exc:
             if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
-                cfg.table.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
-                cache_result = cfg.table.sql.execute(query, spark_session=spark_session)
+                cfg.tabular.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
+                cache_result = cfg.tabular.sql.execute(query, spark_session=spark_session)
             else:
                 raise
 
@@ -829,8 +881,8 @@ class Session(ABC):
 
         hits: list[Response] = []
         misses: list[PreparedRequest] = []
-        for req, anon in zip(requests, anonymized_batch):
-            candidate = result_map.get(cfg.request_tuple(anon))
+        for req, lookup in zip(requests, lookup_batch):
+            candidate = result_map.get(cfg.request_tuple(lookup))
             if candidate is not None and cfg.filter_response(candidate, request=req):
                 hits.append(candidate)
             else:
@@ -891,7 +943,7 @@ class Session(ABC):
             if not t_cfg.remote_cache_enabled or t_cfg.mode != Mode.APPEND:
                 misses.append(req)
                 continue
-            tkey = t_cfg.table.full_name(safe=True)
+            tkey = t_cfg.tabular.full_name(safe=True)
             if tkey not in table_to_cfg:
                 table_to_cfg[tkey] = t_cfg
                 table_to_reqs[tkey] = []
@@ -936,17 +988,20 @@ class Session(ABC):
         ``WHERE`` clause, and the request-key check is what the
         ``request_tuple`` diff already enforces.
         """
-        anonymized_batch = [r.anonymize(mode=cfg.anonymize) for r in requests]
+        if cfg.request_by_is_public:
+            lookup_batch: list[PreparedRequest] = list(requests)
+        else:
+            lookup_batch = [r.anonymize(mode=cfg.anonymize) for r in requests]
         query = cfg.make_batch_lookup_sql(
-            table_name=cfg.table.full_name(safe=True),
-            requests=anonymized_batch,
+            table_name=cfg.tabular.full_name(safe=True),
+            requests=lookup_batch,
         )
         try:
-            cache_result = cfg.table.sql.execute(query, spark_session=spark)
+            cache_result = cfg.tabular.sql.execute(query, spark_session=spark)
         except Exception as exc:
             if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
-                cfg.table.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
-                cache_result = cfg.table.sql.execute(query, spark_session=spark)
+                cfg.tabular.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
+                cache_result = cfg.tabular.sql.execute(query, spark_session=spark)
             else:
                 raise
 
@@ -972,8 +1027,8 @@ class Session(ABC):
         }
 
         misses: list[PreparedRequest] = []
-        for req, anon in zip(requests, anonymized_batch):
-            if cfg.request_tuple(anon) not in matched:
+        for req, lookup in zip(requests, lookup_batch):
+            if cfg.request_tuple(lookup) not in matched:
                 misses.append(req)
         return hits_df, misses
 
@@ -1097,19 +1152,22 @@ class Session(ABC):
                 "%s %s response(s) in remote cache %s",
                 "Upserting" if mode == Mode.UPSERT else "Persisting",
                 len(group_responses),
-                cfg.table,
+                cfg.tabular,
             )
             batches = pa.Table.from_batches([
                 r.to_arrow_batch(parse=False)
                 for r in group_responses
             ]).combine_chunks()
 
-            cfg.table.insert(
+            cfg.tabular.insert(
                 batches,
                 mode=mode,
                 match_by=cfg.match_by or None,
                 wait=cfg.wait,
-                prune_values={"request_url_path": batches["request_url_path"]},
+                prune_values={
+                    "partition_key": batches["partition_key"],
+                    "public_hash":   batches["public_hash"],
+                },
             )
 
     def _send_many(
@@ -1385,7 +1443,7 @@ class Session(ABC):
 
             # --- Stage 4: bulk remote writeback ---
             if is_spark:
-                # `cfg.table.insert` accepts the Spark DataFrame
+                # `cfg.tabular.insert` accepts the Spark DataFrame
                 # directly, so we hand off the lazy DF without
                 # materialising on the driver.
                 if (
@@ -1426,35 +1484,53 @@ class Session(ABC):
 
         Honours the session-level remote config only — per-request overrides
         collapse onto it on the spark path, mirroring stage 3 where workers
-        see only the session-level local cache config. ``cfg.table.insert``
+        see only the session-level local cache config. ``cfg.tabular.insert``
         accepts the Spark DataFrame directly via ``spark_insert_into``, so
         no driver-side collect is needed.
 
         Before inserting, APPEND-mode writes are de-duplicated against the
-        existing remote rows via a ``left_anti`` join on the anonymized
-        request identity (``request_url_path`` + ``request_url_query``) —
-        the remote table stores anonymized requests (cf. ``_persist_remote``),
-        so a row whose path+query already lives in the cache is suppressed
-        rather than re-inserted. UPSERT mode keeps its read-free fast path
-        and relies on ``match_by`` to collapse duplicates server-side.
+        existing remote rows via a ``left_anti`` join on the response
+        ``hash`` column — the remote table stores anonymized requests
+        (cf. ``_persist_remote``), so a row whose hash already lives in
+        the cache is suppressed rather than re-inserted. UPSERT mode
+        keeps its read-free fast path and relies on ``match_by`` to
+        collapse duplicates server-side.
         """
         from pyspark.sql import functions as F
 
         ok_df = new_responses_df.where(
-            (F.col("response_status_code") >= 200)
-            & (F.col("response_status_code") < 300)
+            (F.col("status_code") >= 200)
+            & (F.col("status_code") < 300)
         )
 
         if cfg.mode != Mode.UPSERT:
-            table_name = cfg.table.full_name(safe=True)
+            table_name = cfg.tabular.full_name(safe=True)
+            # Restrict the SELECT DISTINCT to the partitions actually
+            # in play — ``partition_key`` is the table's partition
+            # column so the engine prunes the existing-rows scan
+            # before reading any data files.
             try:
-                existing_df = spark.sql(
-                    "SELECT DISTINCT request_url_path, request_url_query "
-                    f"FROM {table_name}"
-                )
+                wanted_partitions = [
+                    row["partition_key"]
+                    for row in ok_df.select("partition_key").distinct().collect()
+                ]
+            except Exception:
+                wanted_partitions = []
+            try:
+                if wanted_partitions:
+                    literals = ", ".join(str(int(v)) for v in wanted_partitions)
+                    existing_df = spark.sql(
+                        "SELECT DISTINCT partition_key, public_hash "
+                        f"FROM {table_name} WHERE partition_key IN ({literals})"
+                    )
+                else:
+                    existing_df = spark.sql(
+                        "SELECT DISTINCT partition_key, public_hash "
+                        f"FROM {table_name}"
+                    )
             except Exception as exc:
                 # Table doesn't exist yet — nothing to dedup against; the
-                # downstream `cfg.table.insert` handles creation. Match the
+                # downstream `cfg.tabular.insert` handles creation. Match the
                 # error-string sniff used by `_lookup_remote_table`.
                 if "TABLE_OR_VIEW_NOT_FOUND" not in str(exc):
                     raise
@@ -1463,21 +1539,21 @@ class Session(ABC):
             if existing_df is not None:
                 ok_df = ok_df.join(
                     existing_df,
-                    on=["request_url_path", "request_url_query"],
+                    on=["partition_key", "public_hash"],
                     how="left_anti",
                 )
 
         LOGGER.debug(
             "%s ok response(s) into remote cache %s (spark insert)",
             "Upserting" if cfg.mode == Mode.UPSERT else "Persisting",
-            cfg.table,
+            cfg.tabular,
         )
-        cfg.table.insert(
+        cfg.tabular.insert(
             ok_df,
             mode=cfg.mode,
             match_by=cfg.match_by or None,
             wait=cfg.wait,
-            prune_by=["request_url_path"],
+            prune_by=["partition_key", "public_hash"],
             spark_session=spark,
         )
 

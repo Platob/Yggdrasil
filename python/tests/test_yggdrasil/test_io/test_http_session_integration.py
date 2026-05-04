@@ -43,9 +43,14 @@ def _wait_for_cache(tmp_path: Path, expected: int = 1, timeout: float = 10.0) ->
     the partitioned-folder write is in flight when the call site
     returns. Polling on the :class:`FolderIO` row count is the
     cheapest reliable barrier — it walks the partitioned tree and
-    reads every leaf the way a real lookup would.
+    reads every leaf the way a real lookup would. Pass
+    :data:`RESPONSE_SCHEMA` so partition columns come back typed
+    (the cache writes them as ``int64``; without the schema the
+    Hive parser would hand them back as strings and a multi-leaf
+    read would fail to concat).
     """
     from yggdrasil.io.buffer.nested.folder_io import FolderIO
+    from yggdrasil.io.response import RESPONSE_SCHEMA
 
     cache_root = tmp_path
     deadline = time.time() + timeout
@@ -53,7 +58,7 @@ def _wait_for_cache(tmp_path: Path, expected: int = 1, timeout: float = 10.0) ->
         n = 0
         if cache_root.exists():
             try:
-                with FolderIO(path=cache_root) as folder:
+                with FolderIO(path=cache_root, schema=RESPONSE_SCHEMA) as folder:
                     n = folder.read_arrow_table().num_rows
             except Exception:
                 n = 0
@@ -227,8 +232,7 @@ class TestHttpSessionRealRequest:
 # installed.
 class TestHttpSessionLocalCache:
     def _cache(self, tmp_path) -> CacheConfig:
-        return CacheConfig(
-            path=tmp_path,
+        return CacheConfig.check_arg(tmp_path,
             received_from="2020-01-01T00:00:00Z",
         )
 
@@ -260,15 +264,15 @@ class TestHttpSessionLocalCache:
             session.get(f"{http_server.base_url}/cache/path-check", local_cache=cache)
         _wait_for_cache(tmp_path, expected=1)
         # Partitioned layout: at least one leaf lives under
-        # ``<root>/request_method=GET/request_url_host=.../`` — assert
-        # on the partitioned shape, not a flat glob, so a layout
-        # change doesn't sneak through unnoticed.
+        # ``<root>/partition_key=YYYYMMDD/`` — assert on the
+        # partitioned shape, not a flat glob, so a layout change
+        # doesn't sneak through unnoticed.
         cache_root = tmp_path
         leaves = [p for p in cache_root.rglob("*") if p.is_file()]
         assert leaves, "expected at least one partition leaf under tmp_path"
         rel_dirs = {str(leaf.parent.relative_to(cache_root)) for leaf in leaves}
         assert any(
-            d.startswith("request_method=GET") for d in rel_dirs
+            d.startswith("partition_key=") for d in rel_dirs
         ), f"expected Hive-partitioned layout, got: {sorted(rel_dirs)!r}"
 
     def test_distinct_urls_cache_independently(
@@ -286,8 +290,7 @@ class TestHttpSessionLocalCache:
 
 class TestHttpSessionSendManyLocalCache:
     def _cache(self, tmp_path) -> CacheConfig:
-        return CacheConfig(
-            path=tmp_path,
+        return CacheConfig.check_arg(tmp_path,
             received_from="2020-01-01T00:00:00Z",
         )
 
@@ -504,8 +507,7 @@ class TestHttpSessionSparkSend:
     def test_send_many_spark_with_local_cache_short_circuits(
         self, http_server: _Server, spark_session, tmp_path
     ):
-        cache = CacheConfig(
-            path=tmp_path,
+        cache = CacheConfig.check_arg(tmp_path,
             received_from="2020-01-01T00:00:00Z",
         )
         reqs = [

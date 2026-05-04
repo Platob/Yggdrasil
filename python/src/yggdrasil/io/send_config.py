@@ -16,7 +16,7 @@ from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
-    from yggdrasil.databricks.sql.table import Table
+    from yggdrasil.io.buffer.base import TabularIO
     from yggdrasil.io.buffer.nested.folder_io import FolderIO
     from yggdrasil.io.response import Response
 
@@ -24,20 +24,19 @@ if TYPE_CHECKING:
 __all__ = ["CacheConfig", "SendConfig", "SendManyConfig"]
 
 
+# Identity-by-default — ``public_url_hash`` is the URL-based identity
+# computed against ``url.anonymize('remove')``, so it stays stable
+# across the cache's anonymize step (writes drop userinfo + sensitive
+# query params; reads strip the same; both sides hash to the same
+# int64). For dedup that should also respect body / headers, callers
+# can pass ``request_by=["public_hash"]`` explicitly.
 _DEFAULT_REQUEST_BY: tuple[str, ...] = (
-    "request_method",
-    "request_url_host",
-    "request_url_path",
-    "request_url_port",
-    "request_url_query",
-    "request_content_length",
-    "request_body_hash",
+    "public_url_hash",
 )
 
 _CACHE_CONFIG_FIELDS: frozenset[str] = frozenset(
     {
-        "path",
-        "table",
+        "tabular",
         "request_by",
         "response_by",
         "mode",
@@ -79,9 +78,19 @@ _SEND_MANY_CONFIG_FIELDS: frozenset[str] = _SEND_CONFIG_FIELDS | frozenset(
 DEFAULT_MAX_BATCH_TTL: float = 300.0
 
 
+def _is_valid_request_key(key: str) -> bool:
+    head, _, _ = key.partition(".")
+    return head in REQUEST_ARROW_SCHEMA.names
+
+
+def _is_valid_response_key(key: str) -> bool:
+    head, _, _ = key.partition(".")
+    return head in RESPONSE_ARROW_SCHEMA.names
+
+
 def _validate_request_by(arg: list[str] | tuple[str, ...] | None = None) -> list[str]:
     keys = list(_DEFAULT_REQUEST_BY if not arg else arg)
-    invalid = [key for key in keys if key not in REQUEST_ARROW_SCHEMA.names]
+    invalid = [key for key in keys if not _is_valid_request_key(key)]
     if invalid:
         raise ValueError(
             f"Invalid request_by key(s): {invalid!r}. "
@@ -97,13 +106,37 @@ def _validate_response_by(
         return None
 
     keys = list(arg)
-    invalid = [key for key in keys if key not in RESPONSE_ARROW_SCHEMA.names]
+    invalid = [key for key in keys if not _is_valid_response_key(key)]
     if invalid:
         raise ValueError(
             f"Invalid response_by key(s): {invalid!r}. "
             f"Must be within: {RESPONSE_ARROW_SCHEMA.names!r}"
         )
     return keys
+
+
+def _is_tabular_io(arg: Any) -> bool:
+    """Duck-test ``arg`` for a :class:`TabularIO`-shaped object.
+
+    Used by :meth:`CacheConfig.check_arg` so the test doesn't pull
+    in :class:`TabularIO` (and its transitive ``yggdrasil.io.buffer``
+    imports) at config-construction time. Anything that exposes
+    both ``read_arrow_batches`` and ``write_arrow_batches`` qualifies
+    — covers :class:`FolderIO`, :class:`Table`, and any third-party
+    adapter following the same surface.
+    """
+    return (
+        callable(getattr(arg, "read_arrow_batches", None))
+        and callable(getattr(arg, "write_arrow_batches", None))
+    )
+
+
+def _folderio_for_local_cache(path: Path) -> "FolderIO":
+    """Wrap a local filesystem :class:`Path` into a schema-tagged FolderIO."""
+    from yggdrasil.io.buffer.nested.folder_io import FolderIO
+    from yggdrasil.io.fs import LocalPath
+
+    return FolderIO(path=LocalPath(path), schema=RESPONSE_SCHEMA)
 
 
 def _coerce_optional_datetime(value: Any) -> Optional[dt.datetime]:
@@ -114,35 +147,15 @@ def _coerce_optional_datetime(value: Any) -> Optional[dt.datetime]:
     return any_to_datetime(value)
 
 
-# Hot dimensions for partition pruning of the local response cache.
-# Method is small-cardinality (a handful of values), host is medium —
-# together they segment the cache enough that a typical lookup reads
-# only one partition's worth of leaves.
-LOCAL_CACHE_PARTITION_COLUMNS: tuple[str, ...] = (
-    "request_method",
-    "request_url_host",
+# Hot dimensions for partition pruning of the local response cache —
+# kept here for callers that introspect the cache layout. The same
+# tag now lives on :data:`RESPONSE_SCHEMA` itself (set via the
+# schema-level ``partition_by`` autotag), so :class:`FolderIO`
+# derives the Hive partition layout straight from the schema without
+# any per-cache rewriting.
+LOCAL_CACHE_PARTITION_COLUMNS: tuple[str, ...] = tuple(
+    f.name for f in RESPONSE_SCHEMA.children_fields if f._tag_flag(b"partition_by")
 )
-
-
-def _local_cache_schema():
-    """Return :data:`RESPONSE_SCHEMA` with the local-cache partition tags.
-
-    Marks :data:`LOCAL_CACHE_PARTITION_COLUMNS` as ``partition_by``
-    so :class:`FolderIO` builds the matching Hive layout
-    automatically. Cached on the function for cheap repeat access —
-    the underlying :class:`Schema` is immutable.
-    """
-    cached = getattr(_local_cache_schema, "_cached", None)
-    if cached is not None:
-        return cached
-    schema = RESPONSE_SCHEMA.copy()
-    for name in LOCAL_CACHE_PARTITION_COLUMNS:
-        if name not in schema.names:
-            continue
-        f = schema[name]
-        schema[name] = f.with_partition_by(True, inplace=False)
-    _local_cache_schema._cached = schema
-    return schema
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,8 +223,14 @@ class _ConfigBase:
 class CacheConfig(_ConfigBase):
     _FIELD_NAMES: ClassVar[frozenset[str]] = _CACHE_CONFIG_FIELDS
 
-    path: Optional[Path] = field(default=None, hash=False, compare=False)
-    table: Optional["Table"] = field(default=None, hash=False, compare=False)
+    # Unified backend slot — accepts any :class:`TabularIO` subclass:
+    # :class:`FolderIO` for an on-disk cache, :class:`Table` (Databricks)
+    # for a remote cache, or any other registered tabular adapter.
+    # Both backends share the same partitioning / primary-key /
+    # match-by rules driven from RESPONSE_SCHEMA, so the cache flow
+    # in Session is the same regardless of where the rows actually
+    # land.
+    tabular: Optional["TabularIO"] = field(default=None, hash=False, compare=False)
     request_by: Optional[list[str]] = field(default=None, hash=False, compare=False)
     response_by: Optional[list[str]] = field(default=None, hash=False, compare=False)
     mode: Mode = Mode.APPEND
@@ -277,12 +296,12 @@ class CacheConfig(_ConfigBase):
         object.__setattr__(self, "received_from", state["received_from"])
         object.__setattr__(self, "received_to", state["received_to"])
         object.__setattr__(self, "received_ttl", state["received_ttl"])
-        # `path` and `table` are intentionally excluded from __getstate__
-        # (paths don't survive process boundaries; tables hold a live
-        # Databricks client). Initialize the slots to None so attribute
-        # access on the deserialized side doesn't AttributeError.
-        object.__setattr__(self, "path", state.get("path"))
-        object.__setattr__(self, "table", state.get("table"))
+        # ``tabular`` is intentionally excluded from __getstate__ —
+        # local FolderIO paths don't survive process boundaries and
+        # remote Table handles wrap a live Databricks client. Init
+        # to None so attribute access on the deserialized side
+        # doesn't AttributeError.
+        object.__setattr__(self, "tabular", state.get("tabular"))
         object.__setattr__(self, "anonymize", state.get("anonymize", "remove"))
 
     @classmethod
@@ -299,10 +318,10 @@ class CacheConfig(_ConfigBase):
             return cls.parse_mapping(arg, **overrides)
 
         if isinstance(arg, Path):
-            overrides["path"] = arg
+            overrides["tabular"] = _folderio_for_local_cache(arg)
 
-        elif hasattr(arg, "create") and callable(getattr(arg, "create")):
-            overrides["table"] = arg
+        elif _is_tabular_io(arg):
+            overrides["tabular"] = arg
 
         elif isinstance(arg, dt.datetime):
             overrides["received_from"] = arg
@@ -328,12 +347,33 @@ class CacheConfig(_ConfigBase):
         return self.mode in (Mode.APPEND, Mode.AUTO)
 
     @property
+    def is_local_tabular(self) -> bool:
+        """True when ``tabular`` is a :class:`FolderIO` (on-disk cache).
+
+        Used to dispatch between FolderIO write semantics
+        (``write_arrow_batches`` + ``FolderOptions``) and
+        Databricks-Table write semantics (``insert(..., match_by=...,
+        prune_by=...)``) inside :class:`Session`.
+        """
+        from yggdrasil.io.buffer.nested.folder_io import FolderIO
+        return isinstance(self.tabular, FolderIO)
+
+    @property
     def local_cache_enabled(self):
-        return self.cache_enabled and self.received_from is not None or self.received_to is not None
+        # Two ways to opt into a local cache layer:
+        #   1) ``tabular`` is set to a FolderIO (explicit local backend);
+        #   2) a ``received_from`` / ``received_to`` window is set, in
+        #      which case ``local_cache()`` lazy-builds a FolderIO at
+        #      the default path on first read.
+        if not self.cache_enabled:
+            return False
+        if self.is_local_tabular:
+            return True
+        return self.received_from is not None or self.received_to is not None
 
     @property
     def remote_cache_enabled(self):
-        return self.cache_enabled and self.table is not None
+        return self.cache_enabled and self.tabular is not None and not self.is_local_tabular
 
     @property
     def match_by(self) -> list[str]:
@@ -341,6 +381,23 @@ class CacheConfig(_ConfigBase):
             *(self.request_by or ()),
             *(self.response_by or ()),
         ]
+
+    @property
+    def request_by_is_public(self) -> bool:
+        """True when every ``request_by`` key is anonymization-invariant.
+
+        ``public_hash`` / ``public_url_hash`` (and any future ``public_*``
+        column) are computed against ``url.anonymize('remove')`` plus
+        ``normalize_headers(anonymize=True)``, so they hash to the same
+        int64 whether the caller looks them up on the original request or
+        on the anonymized form stored in the cache. When this predicate
+        holds the lookup paths can skip the per-request ``anonymize()``
+        pass before computing ``request_tuple`` / interpolating the SQL
+        clause — the saving is one URL parse + one header normalize per
+        request per lookup, which adds up on send_many bursts.
+        """
+        keys = self.request_by or ()
+        return bool(keys) and all(str(k).startswith("public_") for k in keys)
 
     @property
     def defined_received_from(self) -> dt.datetime:
@@ -380,39 +437,45 @@ class CacheConfig(_ConfigBase):
         return f"'{value.replace(chr(39), chr(39) * 2)}'"
 
     def local_cache_folder(self) -> Path:
-        """Cache root path — defaults to ``~/.yggdrasil/cache/response``.
+        """Filesystem root for the local cache.
 
-        Auto-fills ``self.path`` on first access when unset, so the
-        returned path is always a real on-disk root the moment any
-        caller asks for it. Used as the key for grouping cache hits
-        per-config (see :class:`yggdrasil.io.response_batch.ResponseBatch`).
+        Returns ``self.tabular.path`` when ``tabular`` is a
+        :class:`FolderIO`, otherwise the default
+        ``~/.yggdrasil/cache/response``. Used as the per-config key
+        for grouping cache hits in
+        :class:`yggdrasil.io.response_batch.ResponseBatch`.
         """
-        if self.path is None:
-            object.__setattr__(self, "path", Path.home() / ".yggdrasil" / "cache" / "response")
-        return self.path
+        if self.is_local_tabular:
+            return Path(str(self.tabular.path))
+        return Path.home() / ".yggdrasil" / "cache" / "response"
 
     def local_cache(self) -> "FolderIO":
-        """Build a :class:`FolderIO` over the local response cache.
+        """Return the local-cache :class:`FolderIO`.
 
-        Returns a schema-tagged partitioned folder rooted directly at
-        :meth:`local_cache_folder`. The schema is :data:`RESPONSE_SCHEMA`
-        with ``partition_by=True`` set on ``request_method`` and
-        ``request_url_host`` — :class:`FolderIO` derives the
-        partition layout from those tags and persists the schema to
-        ``<root>/.schema`` on first write so subsequent readers
-        don't have to infer.
-
-        Constructed on each call (the IO itself is stateless beyond
-        the on-disk layout); callers in hot loops should hold onto
-        the returned instance for the duration of a batch.
+        Returns ``self.tabular`` when it's already a FolderIO,
+        otherwise lazy-builds a default one rooted at
+        :meth:`local_cache_folder` (and caches it back into
+        ``tabular`` so subsequent calls return the same instance).
+        The schema is :data:`RESPONSE_SCHEMA` — its
+        ``partition_by``-tagged ``partition_key`` column drives the
+        Hive layout automatically.
         """
         from yggdrasil.io.buffer.nested.folder_io import FolderIO
         from yggdrasil.io.fs import LocalPath
 
-        return FolderIO(
+        if self.is_local_tabular:
+            return self.tabular  # type: ignore[return-value]
+
+        folder = FolderIO(
             path=LocalPath(self.local_cache_folder()),
-            schema=_local_cache_schema(),
+            schema=RESPONSE_SCHEMA,
         )
+        # Cache the lazy-built FolderIO so repeated send_many()
+        # calls don't keep re-instantiating it. Frozen-dataclass
+        # safe via ``object.__setattr__``.
+        if self.tabular is None:
+            object.__setattr__(self, "tabular", folder)
+        return folder
 
     def request_values(
         self,
@@ -515,10 +578,10 @@ class CacheConfig(_ConfigBase):
                     clauses.append(f"{key} = {self.sql_literal(value)}")
 
         if self.received_from is not None:
-            clauses.append(f"response_received_at >= {self.sql_literal(self.received_from)}")
+            clauses.append(f"received_at >= {self.sql_literal(self.received_from)}")
 
         if self.received_to is not None:
-            clauses.append(f"response_received_at < {self.sql_literal(self.received_to)}")
+            clauses.append(f"received_at < {self.sql_literal(self.received_to)}")
 
         return " AND ".join(clauses) if clauses else "1=1"
 
@@ -548,6 +611,17 @@ class CacheConfig(_ConfigBase):
         identity_by: Optional[Iterable[str]] = None,
     ) -> str:
         where_clause = self.sql_clause(request=request, response=response)
+        # Single-request partition prune — narrows the SQL engine's
+        # data-file scan to one partition before any per-row predicate.
+        if request is not None:
+            partition_clause = (
+                f"partition_key = {self.sql_literal(request.partition_key)}"
+            )
+            where_clause = (
+                f"({partition_clause}) AND ({where_clause})"
+                if where_clause != "1=1"
+                else partition_clause
+            )
         base_query = f"SELECT * FROM {table_name}"
         if where_clause != "1=1":
             base_query += f" WHERE {where_clause}"
@@ -559,7 +633,7 @@ class CacheConfig(_ConfigBase):
                 "SELECT * FROM ("
                 "  SELECT t.*, row_number() OVER ("
                 f"    PARTITION BY {partition_by} "
-                "    ORDER BY response_received_at DESC"
+                "    ORDER BY received_at DESC"
                 "  ) AS __rn "
                 f"  FROM ({base_query}) t"
                 ") ranked WHERE __rn = 1"
@@ -574,13 +648,29 @@ class CacheConfig(_ConfigBase):
         *,
         identity_by: Optional[Iterable[str]] = None,
     ) -> str:
+        request_list = list(requests)
         request_clauses = " OR ".join(
             f"({self.sql_request_clause(req)})"
-            for req in requests
+            for req in request_list
         )
         response_clause = self.sql_response_clause(None)
 
+        # Partition prune: ``partition_key`` is the table's partition
+        # column (declared on RESPONSE_SCHEMA). An ``IN (…)`` clause
+        # over the request batch's distinct partition_keys lets the
+        # SQL engine skip every other partition before evaluating the
+        # per-request OR — turns a full-table scan into an N-partition
+        # read on a partition-pruned engine (Delta / Iceberg / etc.).
+        partition_clause = ""
+        if request_list:
+            partition_keys = sorted({r.partition_key for r in request_list})
+            if partition_keys:
+                literals = ", ".join(self.sql_literal(v) for v in partition_keys)
+                partition_clause = f"partition_key IN ({literals})"
+
         where_parts: list[str] = []
+        if partition_clause:
+            where_parts.append(f"({partition_clause})")
         if request_clauses:
             where_parts.append(f"({request_clauses})")
         if response_clause != "1=1":
@@ -597,7 +687,7 @@ class CacheConfig(_ConfigBase):
                 "SELECT * FROM ("
                 "  SELECT t.*, row_number() OVER ("
                 f"    PARTITION BY {partition_by} "
-                "    ORDER BY response_received_at DESC"
+                "    ORDER BY received_at DESC"
                 "  ) AS __rn "
                 f"  FROM ({base_query}) t"
                 ") ranked WHERE __rn = 1"
