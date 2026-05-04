@@ -435,3 +435,42 @@ class YGGFolderIO(FolderIO):
             return Stats.from_ipc(blob)
         except Exception:
             return None
+
+    # ==================================================================
+    # Spark — Arrow → Spark via the dedicated connector
+    # ==================================================================
+
+    def spark_connector(self) -> "Any":
+        """Build a :class:`YGGFolderSparkConnector` over this IO."""
+        from .ygg_folder_spark import YGGFolderSparkConnector
+
+        return YGGFolderSparkConnector(self)
+
+    def _read_spark_frame(self, options: Any) -> "Any":
+        """Materialise this folder as a Spark DataFrame.
+
+        Routes through the connector's ``mapInArrow`` pipe so
+        predicate / row-size / partition-pruning options on
+        :class:`CastOptions` flow through unchanged. Falls back to
+        the inherited driver-side ``createDataFrame`` if anything
+        Spark-related raises (no SparkSession, mapInArrow not
+        supported by the local PySpark, …).
+        """
+        try:
+            return self.spark_connector().read_batch(options=options)
+        except Exception:
+            return super()._read_spark_frame(options)
+
+    def _scan_spark_frame(self, options: Any) -> "Any":
+        """Streaming :class:`DataFrame` over this folder.
+
+        Backed by Spark's native parquet streaming source through
+        :meth:`YGGFolderSparkConnector.read_stream`. Falls back to
+        the universal ``_scan_spark_frame`` (spill-to-temp parquet)
+        on failure — typically when the folder hasn't been written
+        yet so there's no committed schema.
+        """
+        try:
+            return self.spark_connector().read_stream(options=options)
+        except Exception:
+            return super()._scan_spark_frame(options)

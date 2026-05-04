@@ -148,6 +148,40 @@ the data view. In-flight staging files
 (`tmp-<start>-<end>-<seed>.<ext>` — time-sortable) are also
 hidden, so a parallel reader never picks up a half-written child.
 
+### YGGFolderIO ↔ Spark — `mapInArrow` connector
+
+`YGGFolderIO.spark_connector()` returns a
+`YGGFolderSparkConnector` with two pipes:
+
+```python
+io = YGGFolderIO(path="s3://bucket/data/")
+
+# Batch — Arrow → Spark via mapInArrow.
+df = io.spark_connector().read_batch(spark, predicate=col("id") > 100)
+
+# Streaming — Spark's native parquet streaming source.
+stream_df = io.spark_connector().read_stream(spark)
+```
+
+`io._read_spark_frame` and `io._scan_spark_frame` are overridden
+to route through the connector by default, so
+`io.read_spark_frame()` / `io.scan_spark_frame()` now use the
+mapInArrow path automatically.
+
+PySpark 4.0+ exposes `pyspark.sql.datasource`. When that's
+available, `register_datasource(spark)` plugs in a
+`"yggfolder"` data source so SQL-style callers can write::
+
+    spark.read.format("yggfolder").load("/path/to/folder")
+
+The function returns `False` on older PySpark — the connector
+methods still work either way.
+
+`iter_children()` yields a mix of leaf `TabularIO` and sub-
+`NestedIO`; the data-source's `partitions()` flattens to leaves
+via `_iter_leaf_paths`, so partitioned/nested layouts work
+without callers wiring a recursive walk by hand.
+
 ### Stats — format-agnostic columnar statistics
 
 `yggdrasil.io.stats.Stats` is the canonical place for columnar
