@@ -158,15 +158,19 @@ class CastOptions:
     reset_seek: bool = False
     read_seek: int | None = None
     write_seek: int | None = None
-    #: Predicate evaluated against the source side — used when reading
-    #: to filter rows before they reach the cast pipeline. ``None``
-    #: means no filter; semantics follow yggdrasil's three-valued
-    #: logic (UNKNOWN rows are dropped).
-    source_predicate: Predicate | None = None
-    #: Predicate evaluated against the target side — used after the
-    #: cast / write transformation to drop rows that don't satisfy
-    #: the destination's invariants. ``None`` means no filter.
-    target_predicate: Predicate | None = None
+    #: Row-level predicate. Evaluated by every IO that reads tabular
+    #: rows: applied to each Arrow batch before it leaves the read
+    #: pipeline so callers don't have to wrap the result by hand.
+    #:
+    #: When the predicate references a column the *source* doesn't
+    #: have (different schema, optional column not present in this
+    #: file), the predicate degrades to *accept everything* —
+    #: missing inputs can't yield a coherent boolean, and the
+    #: alternative ("drop everything") is almost always wrong for
+    #: heterogeneous-source folders. Backends that can push the
+    #: predicate down (Delta, warehouse SQL) skip the per-batch
+    #: filter once they've translated it.
+    predicate: Predicate | None = None
     #: Predicate evaluated against a discovered child (``name``,
     #: ``path``, ``is_dir``, ``is_private``) for IOs that aggregate
     #: sub-IOs (folders, zips, partitioned tables). Replaces the

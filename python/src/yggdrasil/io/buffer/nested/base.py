@@ -65,6 +65,7 @@ Save mode semantics
 from __future__ import annotations
 
 import dataclasses
+import re
 from abc import ABC, abstractmethod
 from typing import (
     TYPE_CHECKING,
@@ -91,6 +92,15 @@ if TYPE_CHECKING:
 
 
 __all__ = ["NestedIO", "NestedOptions"]
+
+
+# Time-sortable staging layout: ``<prefix>-<start>-<end>-<seed>(.ext)*``.
+# ``_is_ignored_path`` uses this to skip in-flight staging files so
+# parallel readers never see half-finalized writes. Mirror of
+# ``yggdrasil.io.fs.path._STAGING_TMP_RE``.
+_STAGING_TMP_RE: "re.Pattern[str]" = re.compile(
+    r"-(\d+)-(\d+)-[0-9a-f]+(?:\.[^/]+)?$"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +201,8 @@ class NestedIO(TabularIO[O], ABC):
         media_type: Any = None,
         parent: "NestedIO | None" = None,
         auto_open: bool = False,
+        concurrent: bool = False,
+        lock_wait: Any = None,
         **kwargs: Any,
     ) -> None:
         """Initialize from a folder path.
@@ -206,11 +218,25 @@ class NestedIO(TabularIO[O], ABC):
         first ``with`` entry or explicit :meth:`open`. This matches
         the no-surprises rule callers rely on: building a handle
         should not start probing storage.
+
+        ``concurrent=True`` enables cross-process serialisation: an
+        ``.rw.lock`` sidecar against the folder root is acquired on
+        :meth:`_acquire` and released on :meth:`_release`. The lock
+        is conservative — exclusive across reads and writes — because
+        a folder doesn't carry a single mode the way :class:`BytesIO`
+        does. Callers that need finer granularity should split read
+        and write blocks with their own
+        ``self.path.lock(read=...)`` / ``write=...)`` calls.
+
+        ``lock_wait`` follows :class:`WaitingConfig` conventions
+        (``None`` = wait forever, ``N`` = ``N`` seconds with backoff,
+        ``WaitingConfig(...)`` for full control). Raises
+        :class:`TimeoutError` once the deadline elapses.
         """
         # Common TabularIO state (cache slots, _media_type, spill
         # placeholders) — NestedIO subclasses don't use _spill_path
         # but the consistent default is harmless.
-        TabularIO.__init__(self, media_type=media_type)
+        TabularIO.__init__(self, media_type=media_type, concurrent=concurrent)
         self.parent: "NestedIO | None" = parent
 
         raw = path if path is not None else data
@@ -224,6 +250,14 @@ class NestedIO(TabularIO[O], ABC):
         else:
             self.path = path_class().from_(raw)
 
+        # Concurrency: lock the folder root for the IO's lifetime when
+        # ``concurrent=True``. Inherited from :class:`TabularIO`, but
+        # the actual lock object lives here because it's keyed off
+        # :attr:`path`. ``lock_wait`` is a :class:`WaitingConfig`
+        # argument — see ``Path.lock``.
+        self._lock_wait: Any = lock_wait
+        self._path_lock = None
+
         if auto_open:
             Disposable.open(self)
 
@@ -234,9 +268,32 @@ class NestedIO(TabularIO[O], ABC):
     def _acquire(self) -> None:
         if not self.path.opened:
             self.path.open()
+        if self.concurrent and self._path_lock is None:
+            try:
+                lock = self.path.lock(
+                    read=True, write=True,
+                    wait=self._lock_wait,
+                )
+            except Exception:
+                lock = None
+            if lock is not None:
+                try:
+                    lock.acquire()
+                except TimeoutError:
+                    raise
+                except Exception:
+                    lock = None
+            self._path_lock = lock
 
     def _release(self) -> None:
         self.unpersist()
+        lock = self._path_lock
+        self._path_lock = None
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:
+                pass
 
     # ``cached`` / ``persist`` / ``unpersist`` come from
     # :class:`TabularIO` — they drive the shared ``_persisted_data``
@@ -391,11 +448,25 @@ class NestedIO(TabularIO[O], ABC):
     def _is_ignored_path(self, child: Path) -> bool:
         """Return True for paths that should be hidden from enumeration.
 
-        Default: hide hidden files (name starts with ``.``).
+        Default rules:
+
+        - Hide dot-prefixed entries (``.schema``, ``.ygg/``, …).
+        - Hide in-flight staging files
+          (``tmp-<seed>-<start>-<end>.<ext>``) so a parallel reader
+          doesn't pick up a half-written file mid-stage. The
+          finalize step renames staging into its final
+          ``part-NNNN.<ext>`` shape; only finalized children are
+          ever exposed.
+
         Subclasses (DeltaIO, IcebergIO) override to also hide their
         own metadata directories (``_delta_log/``, ``metadata/``).
         """
-        return child.name.startswith(".")
+        name = child.name
+        if name.startswith("."):
+            return True
+        if name.startswith("tmp-") and _STAGING_TMP_RE.search(name):
+            return True
+        return False
 
     # ==================================================================
     # Read derivation — chain children directly

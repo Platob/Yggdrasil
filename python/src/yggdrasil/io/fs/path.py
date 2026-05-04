@@ -167,10 +167,12 @@ _STAGING_SWEPT: ExpiringDict[str, bool] = ExpiringDict(
 
 
 # Match a TTL-encoded staging filename's trailing ``-<start>-<end>(.ext)*``.
-# Group 2 is the end_ts (epoch seconds).  Anchored at end of string so the
-# extension trail is part of the match; works for any prefix scheme that
-# precedes the timestamps with a dash.
-_STAGING_TMP_RE: re.Pattern = re.compile(r"-(\d+)-(\d+)(?:\.[^./]+)*$")
+# Time-sortable layout: prefix-{start}-{end}-{seed}(.ext)*
+# Group 1 is the start_ts (epoch seconds), group 2 is the end_ts.
+# Anchored at start (after a dash-separated prefix) so the regex
+# captures the leading timestamps without being fooled by digits
+# that appear inside the random seed.
+_STAGING_TMP_RE: re.Pattern = re.compile(r"-(\d+)-(\d+)-[0-9a-f]+(?:\.[^/]+)?$")
 
 
 # ---------------------------------------------------------------------------
@@ -350,8 +352,17 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
     ) -> "Path":
         """Mint a unique sibling/child path with a TTL-encoded name.
 
-        Filename layout: ``{prefix}{token}-{start}-{end}{suffix}`` so
-        :meth:`make_staging`'s sweep can recognize and age it.
+        Filename layout (time-sortable):
+        ``{prefix}{start}-{end}-{token}{suffix}``.
+
+        ``start`` and ``end`` come first so a plain lexical sort of
+        a directory's tmp files yields chronological order — handy
+        for tailing a stream of staged writes or for time-based
+        sweeps that prefer the oldest files. ``token`` is a random
+        16-char hex tiebreaker.
+
+        :data:`yggdrasil.io.fs.path._STAGING_TMP_RE` matches the
+        leading timestamps for the cleanup sweep.
         """
         seed = os.urandom(8).hex()
         prefix = prefix or ""
@@ -360,9 +371,13 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         if ttl is None:
             name = f"{prefix}{seed}{suffix}"
         else:
+            # Zero-pad to 12 digits so lexical order matches numeric
+            # order across the full epoch range we'll see in
+            # practice (today is ~1.7e9, 12 digits covers up to
+            # year 33658).
             start = int(time.time())
             end = start + ttl
-            name = f"{prefix}{seed}-{start}-{end}{suffix}"
+            name = f"{prefix}{start:012d}-{end:012d}-{seed}{suffix}"
 
         out = (self if append else self.parent) / name
         if temporary:
@@ -557,6 +572,112 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
     @property
     def is_local(self) -> bool:
         return False
+
+    # ==================================================================
+    # Concurrency — sidecar locks
+    # ==================================================================
+
+    def lock_path(self, *, read: bool = False, write: bool = True) -> str:
+        """Return the canonical sidecar lock-file path for this path.
+
+        The lock filename carries an access-intent suffix
+        (``.r.lock`` / ``.w.lock`` / ``.rw.lock``), so external
+        tooling can identify what kind of lock is held without
+        opening the file. Read locks are typically *skippable* by
+        cleanup or monitoring tools — multiple of them coexist by
+        design.
+
+        Override on a subclass that needs a different sidecar
+        location (e.g. a backend that forbids hidden files in the
+        target directory). The default builds ``<dir>/.<basename>.{suffix}.lock``
+        from :meth:`full_path`.
+        """
+        from yggdrasil.io.buffer._concurrency import lock_path_for
+        return lock_path_for(self.full_path(), read=read, write=write)
+
+    def lock(
+        self,
+        *,
+        read: bool = False,
+        write: bool = True,
+        wait: Any = None,
+        stale_after_seconds: Any = None,
+    ) -> "Any":
+        """Build (but don't acquire) a cross-process lock for this path.
+
+        Usage::
+
+            with path.lock(write=True, wait=30):
+                path.write_bytes(payload)
+
+        Backend dispatch:
+
+        - **Local paths** → :class:`FileLock` (``fcntl`` /
+          ``msvcrt``). Kernel-enforced, OS-released on process
+          death. Honours shared/exclusive (``LOCK_SH`` / ``LOCK_EX``).
+        - **Remote paths** (S3, GCS, ABFS, Databricks volumes,
+          memory FS, …) → :class:`AtomicLock`. The sidecar is
+          created with ``xb`` (atomic exclusive); other writers
+          poll until it disappears. ``shared`` is accepted for
+          parity but ignored — the lock is always exclusive.
+
+        ``wait`` is a :class:`WaitingConfig` argument: ``None``
+        (wait forever), a number (seconds), a ``dict`` of overrides,
+        or a ready-made :class:`WaitingConfig`. Backoff and retry
+        come from the config's ``interval`` / ``backoff`` /
+        ``max_interval`` knobs; on contention the lock loop calls
+        :meth:`WaitingConfig.sleep` and raises :class:`TimeoutError`
+        once the deadline is reached.
+
+        ``stale_after_seconds`` (atomic-lock only) controls how long
+        a lingering sidecar is tolerated before the next acquirer
+        force-unlinks it. Zero / negative disables staleness
+        recovery (correctness > liveness). Defaults to 15 minutes
+        — long enough that an honest holder heartbeating once per
+        minute is safe.
+
+        Semantics for the suffix:
+
+        - ``read=True, write=False`` → ``.r.lock``
+        - ``read=False, write=True`` (default) → ``.w.lock``
+        - ``read=True, write=True`` → ``.rw.lock``
+
+        On platforms / backends without :mod:`fcntl` /
+        :mod:`msvcrt` support and without ``xb`` mode, the returned
+        lock degrades to a no-op — the caller's I/O still proceeds,
+        just without cross-process coordination. Subclasses for
+        backends with a native CAS primitive (S3 conditional PUT,
+        GCS preconditions) can override this method entirely.
+        """
+        # Lazy import — _concurrency imports are leaves but the full
+        # ``yggdrasil.io.buffer`` package pulls in NestedIO which in
+        # turn imports ``Path``, so module-level imports here would
+        # close the cycle.
+        from yggdrasil.io.buffer._concurrency import AtomicLock, FileLock
+
+        suffix_path_str = self.lock_path(read=read, write=write)
+        if self.is_local:
+            return FileLock(
+                suffix_path_str,
+                shared=(read and not write),
+                wait=wait,
+            )
+        # Build a sibling :class:`Path` of the same backend pointing
+        # at the sidecar location. Atomic-create needs the same
+        # filesystem semantics as the target (exclusive-create,
+        # unlink, stat) — co-locating the sidecar is the simplest
+        # way to inherit them without the user wiring per-backend
+        # knobs.
+        try:
+            sidecar = type(self).from_(suffix_path_str)
+        except Exception:
+            sidecar = Path.from_(suffix_path_str)
+        return AtomicLock(
+            sidecar,
+            shared=(read and not write),
+            wait=wait,
+            stale_after_seconds=stale_after_seconds,
+        )
 
     # ==================================================================
     # Coercion entry points
@@ -996,10 +1117,19 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         parents: bool = True,
     ) -> None:
         del mode
-        if self.exists():
-            if not exist_ok:
-                raise FileExistsError(f"Path already exists: {self.full_path()!r}")
-            return
+        # EAFP: try atomic exclusive-create when ``exist_ok=False``.
+        # The backend tells us via FileExistsError whether the file
+        # was already there — no separate ``exists()`` round-trip.
+        if not exist_ok:
+            try:
+                self.write_bytes(b"", mode="xb", parents=parents)
+                return
+            except FileExistsError:
+                raise FileExistsError(
+                    f"Path already exists: {self.full_path()!r}"
+                )
+        # exist_ok=True: ``wb`` is fine — it overwrites an empty
+        # file with empty bytes (no-op semantically) or creates one.
         self.write_bytes(b"", parents=parents)
 
     def resolve(self, *, strict: bool = False) -> "Path":
@@ -1069,7 +1199,10 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         if pos < 0:
             raise ValueError("pwrite position must be >= 0")
 
-        existing = self.read_bytes(raise_error=False) if self.exists() else b""
+        # EAFP: read directly. ``read_bytes(raise_error=False)``
+        # returns ``b""`` when the file is missing, saving the extra
+        # ``exists()`` round-trip on remote backends.
+        existing = self.read_bytes(raise_error=False)
         end = pos + n
 
         if end <= len(existing):

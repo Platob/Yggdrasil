@@ -806,16 +806,15 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
             for name in options.column_names or [c.name for c in self.columns]
         )
         query = f"SELECT {names}"
-        # ``source_predicate`` is the read-side filter on
-        # :class:`CastOptions` — applied as a SQL ``WHERE`` clause
-        # so the warehouse drops non-matching rows before they
-        # reach the cast pipeline. The companion
-        # ``target_predicate`` is honoured by the write path
-        # (:meth:`_write_arrow_batches`) instead.
-        if options.source_predicate is not None:
+        # The unified ``predicate`` on CastOptions becomes a SQL
+        # ``WHERE`` so the warehouse drops non-matching rows before
+        # they reach the cast pipeline. Pushdown is the whole point —
+        # round-tripping rows through Arrow just to filter them on
+        # the driver wastes a round trip per batch.
+        if options.predicate is not None:
             query += (
                 f" WHERE "
-                f"{expr_to_sql(options.source_predicate, dialect=Dialect.DATABRICKS)}"
+                f"{expr_to_sql(options.predicate, dialect=Dialect.DATABRICKS)}"
             )
 
         for batch in self.execute(query).read_arrow_batches(options=options):
@@ -837,11 +836,11 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
             zorder_by=options.zorder_by,
             optimize_after_merge=options.optimize_after_merge,
             vacuum_hours=options.vacuum_hours,
-            # Write-side filter — ``target_predicate`` survives the
-            # MERGE / UPDATE planning so callers can scope the
-            # destination rewrite without leaking into the read
-            # path.
-            where=options.target_predicate,
+            # Write-side filter — the unified ``predicate`` survives
+            # the MERGE / UPDATE planning so callers can scope the
+            # destination rewrite. The same predicate is consulted by
+            # the read path; backends decide which scope applies.
+            where=options.predicate,
             prune_by=options.prune_by,
             prune_values=options.prune_values,
             retry=options.retry,

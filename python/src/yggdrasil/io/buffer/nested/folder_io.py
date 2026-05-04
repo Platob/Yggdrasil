@@ -142,6 +142,26 @@ class FolderIO(NestedIO[FolderOptions]):
     def options_class(cls) -> type[FolderOptions]:
         return FolderOptions
 
+    def __new__(cls, data: Any = None, *args: Any, **kwargs: Any):
+        """Construct a folder IO, auto-upgrading to :class:`YGGFolderIO`
+        when the target already carries a ``.ygg/`` sidecar.
+
+        Calls placed against :class:`FolderIO` directly opt in to the
+        upgrade; callers that explicitly construct :class:`YGGFolderIO`
+        or another subclass keep their requested type. This keeps
+        ``FolderIO(path="/tmp/store/")`` ergonomic for plain folders
+        and one-call-correct for folders that already have sidecar
+        state.
+        """
+        if cls is FolderIO:
+            raw = kwargs.get("path", data)
+            if raw is not None and _has_ygg_sidecar(raw):
+                # Local import to avoid a circular import on module
+                # load (ygg_folder_io imports back from this module).
+                from .ygg_folder_io import YGGFolderIO
+                return NestedIO.__new__(YGGFolderIO, data, *args, **kwargs)
+        return NestedIO.__new__(cls, data, *args, **kwargs)
+
     def _default_child_media_type(self) -> Any:
         """Parquet is the canonical folder-of-tables payload.
 
@@ -156,6 +176,7 @@ class FolderIO(NestedIO[FolderOptions]):
     #: default :meth:`_is_ignored_path` skips it during enumeration —
     #: the schema is metadata, not data.
     SCHEMA_FILE_NAME: ClassVar[str] = ".schema"
+
 
     def __init__(
         self,
@@ -1155,6 +1176,28 @@ class FolderIO(NestedIO[FolderOptions]):
 # ---------------------------------------------------------------------------
 # Module-private helpers — partition path / leaf walk / column injection
 # ---------------------------------------------------------------------------
+
+
+
+def _has_ygg_sidecar(path_like: Any) -> bool:
+    """One-round-trip probe: does ``path_like`` carry a ``.ygg/`` folder?
+
+    Used by :meth:`FolderIO.__new__` to auto-upgrade plain
+    :class:`FolderIO` constructions to :class:`YGGFolderIO` when the
+    target already has sidecar state. Failures (path doesn't parse,
+    backend transient, permission denied) collapse to ``False`` so
+    we never accidentally fail a plain construction.
+    """
+    try:
+        if isinstance(path_like, Path):
+            probe = path_like
+        else:
+            probe = Path.from_(path_like, default=None)
+        if probe is None:
+            return False
+        return (probe / ".ygg").exists()
+    except Exception:
+        return False
 
 
 def _coerce_partition_column(value: Any) -> Field:

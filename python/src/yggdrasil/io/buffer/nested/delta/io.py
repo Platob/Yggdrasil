@@ -315,57 +315,126 @@ class DeltaIO(FolderIO):
             yield child_io
 
     # ==================================================================
-    # Read derivation — chain children, apply DV per file
+    # Read derivation — chain children, apply DV + predicate per file
     # ==================================================================
 
     def _read_arrow_batches(
         self,
         options: DeltaOptions,
     ) -> Iterator[pa.RecordBatch]:
-        """Stream batches, filtering rows whose ordinal is in the DV.
+        """Stream batches over live AddFiles, with three filters:
 
-        Per child (AddFile):
+        1. **Partition pruning** — when ``options.predicate`` references
+           only partition columns, evaluate the predicate against each
+           AddFile's partition values and skip files whose values
+           can't satisfy it. One round-trip avoided per pruned file.
+        2. **Deletion vector** — decode the AddFile's DV (if any) and
+           drop rows whose ordinal falls inside the bitmap. The DV
+           decode is per-file; ordinals reset per AddFile.
+        3. **Row predicate** — applied at the
+           :class:`TabularIO` layer in :meth:`_iter_public_batches`,
+           so we don't repeat it here. Predicates that reference
+           data columns flow through naturally; partition-only
+           predicates are caught by step (1).
 
-        - No DV: stream batches as-is. Partition columns are
-          injected automatically by the leaf's own
-          :meth:`TabularIO.read_arrow_batches` via the
-          ``static_values`` stamp set in :meth:`_iter_children`.
-        - With DV: decode the bitmap once, track row ordinals
-          across batches, mask each batch with ``~bitmap.contains``.
-          The mask is uniform across columns so the auto-injected
-          partition columns shrink in lockstep with the data
-          columns.
+        Partition columns are injected by the leaf's own
+        :meth:`TabularIO.read_arrow_batches` via the
+        ``static_values`` stamp set in :meth:`_iter_children`, so the
+        DV mask shrinks data and partition columns in lockstep.
         """
+        predicate = getattr(options, "predicate", None)
+        prune_fn = self._build_partition_prune_fn(predicate)
+
         for child_io in self._iter_children(options):
             if not isinstance(child_io, TabularIO):
                 continue
 
-            dv = getattr(child_io, "deletion_vector", None)
-            dv_bitmap = (
-                self._load_dv_bitmap_from_descriptor(dv)
-                if dv is not None else None
-            )
+            add = getattr(child_io, "delta_add_file", None)
+            if (
+                prune_fn is not None
+                and add is not None
+                and not prune_fn(add.partition_values or {})
+            ):
+                continue
 
-            with child_io:
-                row_offset = 0
-                for batch in child_io.read_arrow_batches(options=options):
-                    n = batch.num_rows
-                    if dv_bitmap is not None and len(dv_bitmap) > 0:
-                        mask_values = [
-                            (row_offset + i) not in dv_bitmap
-                            for i in range(n)
-                        ]
-                        if not any(mask_values):
-                            row_offset += n
-                            continue
-                        if not all(mask_values):
-                            mask = pa.array(mask_values, type=pa.bool_())
-                            batch = batch.filter(mask)
+            yield from self._read_addfile_batches(child_io, options)
+
+    def _read_addfile_batches(
+        self,
+        child_io: TabularIO,
+        options: DeltaOptions,
+    ) -> Iterator[pa.RecordBatch]:
+        """Drain one AddFile's batches with its DV applied row-wise."""
+        dv = getattr(child_io, "deletion_vector", None)
+        dv_bitmap = (
+            self._load_dv_bitmap_from_descriptor(dv)
+            if dv is not None else None
+        )
+        has_dv = dv_bitmap is not None and len(dv_bitmap) > 0
+
+        with child_io:
+            row_offset = 0
+            for batch in child_io.read_arrow_batches(options=options):
+                n = batch.num_rows
+                if has_dv:
+                    mask_values = [
+                        (row_offset + i) not in dv_bitmap
+                        for i in range(n)
+                    ]
+                    row_offset += n
+                    if not any(mask_values):
+                        continue
+                    if not all(mask_values):
+                        mask = pa.array(mask_values, type=pa.bool_())
+                        batch = batch.filter(mask)
+                else:
                     row_offset += n
 
-                    if batch.num_rows == 0:
-                        continue
-                    yield batch
+                if batch.num_rows == 0:
+                    continue
+                yield batch
+
+    def _build_partition_prune_fn(self, predicate: Any):
+        """Build a callable that decides whether to scan a partition.
+
+        Returns ``None`` when there's no predicate, when the
+        predicate references non-partition columns, or when
+        compilation fails. The callable takes an AddFile's
+        ``partition_values`` mapping and returns ``False`` to skip
+        the file. Three-valued logic: UNKNOWN keeps the file (we
+        can't prove the predicate fails on this partition).
+        """
+        if predicate is None:
+            return None
+
+        try:
+            from yggdrasil.data.expr.nodes import free_columns
+        except Exception:
+            return None
+        try:
+            cols = set(free_columns(predicate))
+        except Exception:
+            return None
+        if not cols:
+            return None
+
+        partition_names = {f.name for f in self._resolve_partition_columns()}
+        if not cols.issubset(partition_names):
+            return None
+
+        try:
+            fn = predicate.to_python()
+        except Exception:
+            return None
+
+        def keep(partition_values: dict) -> bool:
+            try:
+                verdict = fn(partition_values or {})
+            except Exception:
+                return True  # Can't decide → don't prune.
+            return verdict is not False
+
+        return keep
 
     # ==================================================================
     # DV loading — handles all three storage types
@@ -474,21 +543,40 @@ class DeltaIO(FolderIO):
         batches: "IterableABC[pa.RecordBatch]",
         options: DeltaOptions,
     ) -> None:
+        """Single-transaction write dispatch.
+
+        Resolution rules (applied to the resolved
+        :class:`Mode` from :meth:`_resolve_save_mode`):
+
+        - ``IGNORE`` → no-op, no commit.
+        - ``UPSERT`` → DV-emitting merge-on-read (see
+          :meth:`_delta_upsert`); requires
+          ``options.match_by_names``.
+        - ``OVERWRITE`` / ``APPEND`` → stage parquet via
+          :class:`FolderIO`'s child machinery, then a single
+          commit with Add (and Remove for OVERWRITE) actions.
+        - Anything else raises — Delta's commit semantics are
+          enumerable, no point inventing modes that don't map to
+          a transaction.
+
+        Failures during the parquet write are caught by the
+        inherited path; failures during the commit roll back the
+        new parquet files before re-raising so the table is left
+        consistent with whatever's already been committed.
+        """
         mode = self._resolve_save_mode(options.mode)
         if mode is Mode.IGNORE:
             return
-
         if mode is Mode.UPSERT:
             self._delta_upsert(batches, options)
             return
-
-        if mode not in (Mode.OVERWRITE, Mode.APPEND):
-            raise NotImplementedError(
-                f"DeltaIO supports OVERWRITE / APPEND / UPSERT; got "
-                f"resolved action {mode!r}."
-            )
-
-        self._delta_overwrite_or_append(batches, options, mode)
+        if mode in (Mode.OVERWRITE, Mode.APPEND):
+            self._delta_overwrite_or_append(batches, options, mode)
+            return
+        raise NotImplementedError(
+            f"DeltaIO supports OVERWRITE / APPEND / UPSERT; got "
+            f"resolved action {mode!r}."
+        )
 
     # ------------------------------------------------------------------
     # OVERWRITE / APPEND
@@ -1137,10 +1225,12 @@ class DeltaIO(FolderIO):
 
     def _scan_data_files(self) -> set[str]:
         """List all parquet files under the table root, relative paths."""
+        from ..folder_io import _walk_leaves
+
         out: set[str] = set()
         if not self.path.exists():
             return out
-        for leaf in self._walk_leaves(self.path):
+        for leaf in _walk_leaves(self.path, self._is_ignored_path):
             if not leaf.name.lower().endswith(".parquet"):
                 continue
             try:
@@ -1190,6 +1280,8 @@ class DeltaIO(FolderIO):
     def _partition_values_from_relpath(
         self, rel_path: str, partition_names: Sequence[str],
     ) -> dict[str, str | None]:
+        from ..folder_io import _parse_kv_segment
+
         if not partition_names:
             return {}
         parts = rel_path.split("/")
@@ -1201,7 +1293,7 @@ class DeltaIO(FolderIO):
             )
         out: dict[str, str | None] = {}
         for segment, expected in zip(kv_segments, partition_names):
-            kv = self._parse_kv_segment(segment)
+            kv = _parse_kv_segment(segment)
             if kv is None or kv[0] != expected:
                 raise ValueError(
                     f"Path segment {segment!r} doesn't match expected "

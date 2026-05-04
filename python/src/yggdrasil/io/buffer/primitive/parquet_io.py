@@ -124,7 +124,22 @@ class ParquetIO(BytesIO):
         self,
         options: ParquetOptions,
     ) -> Iterator[pa.RecordBatch]:
-        """Yield Arrow record batches from the Parquet file."""
+        """Yield Arrow record batches from the Parquet file.
+
+        ``options.predicate`` is pushed down to
+        :mod:`pyarrow.dataset` when possible — that path uses the
+        Parquet footer's per-row-group min/max stats to skip whole
+        row groups, then evaluates the residual filter row-wise.
+        Two failure modes fall back to the unfiltered ``iter_batches``
+        path, where the universal predicate filter at the TabularIO
+        layer takes over instead:
+
+        - The predicate references a column the parquet file
+          doesn't have (Arrow raises on filter binding).
+        - ``predicate.to_arrow()`` doesn't know how to compile the
+          expression (rare for typed comparisons; possible for
+          exotic UDF-shaped nodes).
+        """
         if self.remaining_bytes() == 0:
             return
 
@@ -133,13 +148,98 @@ class ParquetIO(BytesIO):
             source.seek(0)
             with pq.ParquetFile(source) as pf:
                 read_options = options.check_source(pf.schema_arrow)
+                columns = read_options.select_source_column_names()
+                batch_size = read_options.row_size or 65536
+                predicate = getattr(read_options, "predicate", None)
 
+                if predicate is not None:
+                    pushed = self._iter_with_pushdown(
+                        source=source,
+                        schema=pf.schema_arrow,
+                        predicate=predicate,
+                        columns=columns,
+                        batch_size=batch_size,
+                        read_options=read_options,
+                    )
+                    if pushed is not None:
+                        yield from pushed
+                        return
+
+                # No predicate, or pushdown unavailable — fall back
+                # to the plain reader; the universal filter at the
+                # TabularIO layer applies the predicate per batch
+                # if it's still on the options.
                 for batch in pf.iter_batches(
-                    batch_size=read_options.row_size or 65536,
+                    batch_size=batch_size,
                     use_threads=read_options.use_threads,
-                    columns=read_options.select_source_column_names(),
+                    columns=columns,
                 ):
                     yield read_options.cast_arrow_tabular(batch)
+
+    def _iter_with_pushdown(
+        self,
+        *,
+        source: "pa.NativeFile",
+        schema: "pa.Schema",
+        predicate: "object",
+        columns: "list[str] | None",
+        batch_size: int,
+        read_options: "ParquetOptions",
+    ) -> "Iterator[pa.RecordBatch] | None":
+        """Try the :mod:`pyarrow.dataset` path with predicate pushdown.
+
+        Returns an iterator on success, ``None`` when pushdown isn't
+        applicable (predicate references a missing column, fails to
+        compile to a :class:`pa.compute.Expression`, or the dataset
+        API isn't importable). The caller falls back to the
+        unfiltered path; the universal predicate filter then applies.
+        """
+        try:
+            arrow_expr = predicate.to_arrow()
+        except Exception:
+            return None
+
+        try:
+            from yggdrasil.data.expr.nodes import free_columns
+            cols = free_columns(predicate)
+        except Exception:
+            cols = ()
+        schema_names = set(schema.names)
+        if cols and not set(cols).issubset(schema_names):
+            # Universal "missing column → accept everything" rule —
+            # let the fallback path emit the data unfiltered.
+            return None
+
+        try:
+            pds = pyarrow_dataset_module()
+        except Exception:
+            return None
+
+        try:
+            scanner = pds.dataset(
+                source,
+                format="parquet",
+                schema=schema,
+            ).scanner(
+                filter=arrow_expr,
+                columns=columns,
+                batch_size=batch_size,
+                use_threads=read_options.use_threads,
+            )
+        except Exception:
+            return None
+
+        return self._wrap_pushdown_batches(scanner, read_options)
+
+    @staticmethod
+    def _wrap_pushdown_batches(
+        scanner: "pds.Scanner",
+        read_options: "ParquetOptions",
+    ) -> Iterator[pa.RecordBatch]:
+        for batch in scanner.to_batches():
+            if batch.num_rows == 0:
+                continue
+            yield read_options.cast_arrow_tabular(batch)
 
     # ==================================================================
     # Write path

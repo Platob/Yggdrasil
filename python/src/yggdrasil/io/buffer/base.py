@@ -221,6 +221,84 @@ _inject_static_table = inject_static_values_into_table
 
 
 # ---------------------------------------------------------------------------
+# Universal row-level predicate
+# ---------------------------------------------------------------------------
+
+
+def _apply_predicate_filter(
+    batch: pa.RecordBatch,
+    predicate: Any,
+) -> pa.RecordBatch:
+    """Filter *batch* by *predicate*, with missing-column = accept-all.
+
+    Resolution rules, in order:
+
+    1. ``predicate is None`` — return the batch unchanged.
+    2. The predicate references a column the batch doesn't carry —
+       return the batch unchanged. The column's missing entirely on
+       this side, so we can't evaluate the boolean. Treating that
+       as "drop everything" would silently disappear all rows from a
+       heterogeneous-source folder; "accept everything" lets the
+       caller still see the data and fix their predicate (or
+       union-correct the schema upstream).
+    3. Compile the predicate to a Python row-callable via
+       :meth:`Predicate.to_python` and apply it. The cost is row-wise
+       but yggdrasil predicates are simple enough that it's
+       negligible compared to the I/O of producing the batch in
+       the first place — and backends with native pushdown (Delta,
+       warehouse SQL) clear the option before reaching this layer
+       so the cost is paid only when nothing better is available.
+
+    Three-valued logic: UNKNOWN (``None``) is treated as drop, mirroring
+    SQL's ``WHERE`` semantics.
+    """
+    if predicate is None:
+        return batch
+
+    free_cols = _predicate_columns(predicate)
+    schema_names = set(batch.schema.names)
+    if free_cols and not free_cols.issubset(schema_names):
+        return batch
+
+    try:
+        fn = predicate.to_python()
+    except Exception:
+        return batch
+
+    rows = batch.to_pylist()
+    if not rows:
+        return batch
+
+    keep = []
+    for row in rows:
+        try:
+            verdict = fn(row)
+        except Exception:
+            verdict = None
+        keep.append(verdict is True)
+
+    if all(keep):
+        return batch
+    if not any(keep):
+        return pa.RecordBatch.from_pylist([], schema=batch.schema)
+    mask = pa.array(keep, type=pa.bool_())
+    return batch.filter(mask)
+
+
+def _predicate_columns(predicate: Any) -> "frozenset[str]":
+    """Names of every column the predicate references, or empty
+    when the predicate doesn't expose a free-columns helper."""
+    try:
+        from yggdrasil.data.expr.nodes import free_columns
+    except Exception:
+        return frozenset()
+    try:
+        return frozenset(free_columns(predicate))
+    except Exception:
+        return frozenset()
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -326,6 +404,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         *args: Any,
         media_type: Any = None,
         static_values: "Mapping[str, Any] | None" = None,
+        concurrent: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the state every :class:`TabularIO` carries.
@@ -392,6 +471,15 @@ class TabularIO(Disposable, ABC, Generic[O]):
         # :meth:`_release`.
         self._spark_scan_spill: "str | None" = None
         self._spark_scan_cleanup = None
+        # Opt-in concurrency safety. When True, byte-buffer subclasses
+        # serialise public read/write operations against an in-process
+        # ``threading.RLock`` (memory mode) and acquire a sidecar
+        # ``FileLock`` against any caller-owned path. Off by default
+        # — yggdrasil's primary use is single-threaded driver code,
+        # and the lock overhead isn't worth paying every time. Flip to
+        # True from concurrency-aware callers (Spark task threads,
+        # ``ProcessPoolExecutor`` workers, …).
+        self.concurrent: bool = bool(concurrent)
 
     # ==================================================================
     # Tabular view shortcut — at TabularIO so every subclass shares it
@@ -715,29 +803,51 @@ class TabularIO(Disposable, ABC, Generic[O]):
 
     def iter_children_or_self(
         self,
+        predicate: "Predicate | None" = None,
+        *,
         options: "O | Mapping[str, Any] | None" = None,
         **kwargs: Any,
     ) -> "Iterator[TabularIO]":
         if self.has_children():
-            yield from self.iter_children(options, **kwargs)
+            yield from self.iter_children(
+                predicate, options=options, **kwargs,
+            )
         else:
             yield self
 
     def iter_children(
         self,
+        predicate: "Predicate | None" = None,
+        *,
         options: "O | Mapping[str, Any] | None" = None,
         **kwargs: Any,
     ) -> "Iterator[TabularIO]":
         """Public wrapper around :meth:`_iter_children`.
 
-        Accepts a :class:`CastOptions`, a mapping of discovery
-        kwargs (including ``children_predicate``), or ``None`` (for
-        "use the defaults"). Kwargs passed positionally are merged
-        into the resolved options.
+        ``predicate`` is the canonical knob for filtering discovered
+        children — it's evaluated against the metadata mapping
+        ``{name, path, is_dir, is_private}`` per candidate. ``None``
+        (default) means "yield everything." When provided, the
+        predicate replaces ``options.children_predicate`` for this
+        call.
+
+        ``options`` is still accepted as the lower-level escape hatch
+        (callers who want to drive partition / row-size / mode knobs
+        for the eventual read or who already have an options object
+        in hand). Extra kwargs merge into the resolved options.
+
+        Examples::
+
+            for child in folder.iter_children():
+                ...
+
+            for child in folder.iter_children(~col("name").like("_%")):
+                ...
         """
-        return self._iter_children(
-            self.check_options(options, overrides=locals())
-        )
+        resolved = self.check_options(options, overrides=locals())
+        if predicate is not None:
+            resolved = resolved.copy(children_predicate=predicate)
+        return self._iter_children(resolved)
 
     def has_children(self) -> bool:
         """Return ``True`` iff this IO exposes at least one child.
@@ -853,20 +963,43 @@ class TabularIO(Disposable, ABC, Generic[O]):
 
         :attr:`static_values` (when set) is injected into every
         batch as constant columns — additive, so a column that
-        already exists on the underlying source is left
-        untouched.
+        already exists on the underlying source is left untouched.
+
+        :attr:`CastOptions.predicate` (when set) is applied to every
+        batch before yielding. Backends that pushed it down already
+        (warehouse SQL, Delta) clear the option before reaching this
+        point so the per-batch filter is a no-op there. When the
+        predicate references a column the batch doesn't carry the
+        filter degrades to *accept everything* — see
+        :func:`_apply_predicate_filter`.
         """
-        static = self.static_values
         if self._persisted_data is not None:
             for batch in self._persisted_data.read_arrow_batches(
                 options=options, **kwargs,
             ):
-                yield _inject_static_batch(batch, static)
+                yield batch
             return
-        for batch in self._read_arrow_batches(
+        yield from self._iter_public_batches(
             self.check_options(options, overrides=locals())
-        ):
-            yield _inject_static_batch(batch, static)
+        )
+
+    def _iter_public_batches(self, options: O) -> Iterator[pa.RecordBatch]:
+        """Internal: drain ``_read_arrow_batches`` with static-values
+        injection and the universal predicate filter applied.
+
+        Every public read that ultimately serves bytes to a caller
+        funnels through here, so static columns and predicate
+        filtering happen once and only once regardless of which
+        engine surface (Arrow, Polars, Pandas, Spark, pylist) the
+        caller picked.
+        """
+        static = self.static_values
+        predicate = getattr(options, "predicate", None)
+        for batch in self._read_arrow_batches(options):
+            batch = _inject_static_batch(batch, static)
+            batch = _apply_predicate_filter(batch, predicate)
+            if batch is not None and batch.num_rows > 0:
+                yield batch
 
     def to_arrow_table(
         self,
@@ -882,20 +1015,19 @@ class TabularIO(Disposable, ABC, Generic[O]):
     ) -> pa.Table:
         """Read everything into a single :class:`pyarrow.Table`.
 
-        :attr:`static_values` is injected as constant columns on
-        the way out, mirroring :meth:`read_arrow_batches`.
+        :attr:`static_values` is injected at batch level via
+        :meth:`_iter_public_batches`, so the resulting table already
+        carries the static columns by the time it lands here. The
+        same path also applies :attr:`CastOptions.predicate`.
         """
-        static = self.static_values
         if self._persisted_data is not None:
-            table = self._persisted_data.read_arrow_table(
+            return self._persisted_data.read_arrow_table(
                 options=options, **kwargs,
             )
-        else:
-            table = self._read_arrow_table(self.check_options(options, overrides=locals()))
-        return _inject_static_table(table, static)
+        return self._read_arrow_table(self.check_options(options, overrides=locals()))
 
     def _read_arrow_table(self, options: O) -> pa.Table:
-        batches = list(self._read_arrow_batches(options))
+        batches = list(self._iter_public_batches(options))
         if not batches:
             schema = (
                 getattr(options, "target_schema", None)
