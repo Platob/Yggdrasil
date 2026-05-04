@@ -2220,8 +2220,28 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
             prune_predicates.append(_wrap_user_predicate(where, target_alias="T"))
 
         columns = list(existing_schema.field_names())
-        cols_quoted = ", ".join(quote_ident(c) for c in columns)
-        source_sql = f"SELECT {cols_quoted} FROM {{{_ALIAS_TMPSRC}}}"
+        # Explicit per-column CAST to the target field's DDL coerces the
+        # staged Parquet rows to the target table's schema. Spark's
+        # ``parquet.`<path>``` reader drops the ``NOT NULL`` flag on
+        # struct children regardless of the file metadata, so a plain
+        # ``SELECT col FROM parquet.\`...\``` hands the merge a source
+        # whose nested types are uniformly nullable; the merge then
+        # fails with ``DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION`` when
+        # the target keeps any ``STRUCT<x: STRING NOT NULL>`` shape.
+        # ``to_databricks_ddl`` renders ``NOT NULL`` on struct children
+        # even with ``put_not_null=False`` (which only suppresses the
+        # column-level flag), so the CAST round-trips the constraint
+        # back onto the source side. Mirrors the projection used by
+        # :meth:`sql_insert`.
+        cast_projection = ", ".join(
+            (
+                f"CAST({quote_ident(f.name)} AS "
+                f"{f.to_databricks_ddl(put_name=False, put_not_null=False, put_comment=False)})"
+                f" AS {quote_ident(f.name)}"
+            )
+            for f in existing_schema.fields
+        )
+        source_sql = f"SELECT {cast_projection} FROM {{{_ALIAS_TMPSRC}}}"
 
         sql_texts = _build_dml_statements(
             target_location=target_location,
