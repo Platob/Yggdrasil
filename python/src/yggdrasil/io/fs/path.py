@@ -94,6 +94,7 @@ import pyarrow as pa
 from yggdrasil.data.options import CastOptions
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.disposable import Disposable
+from yggdrasil.io.buffer._concurrency import FileLock, lock_path_for
 from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.enums import MediaType
@@ -557,6 +558,66 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
     @property
     def is_local(self) -> bool:
         return False
+
+    # ==================================================================
+    # Concurrency — sidecar locks
+    # ==================================================================
+
+    def lock_path(self, *, read: bool = False, write: bool = True) -> str:
+        """Return the canonical sidecar lock-file path for this path.
+
+        The lock filename carries an access-intent suffix
+        (``-r.lock`` / ``-w.lock`` / ``-rw.lock``), so external
+        tooling can identify what kind of lock is held without
+        opening the file. Read locks are typically *skippable* by
+        cleanup or monitoring tools — multiple of them coexist by
+        design.
+
+        Override on a subclass that needs a different sidecar
+        location (e.g. a backend that forbids hidden files in the
+        target directory). The default builds ``<dir>/.<basename>{-suffix}.lock``
+        from :meth:`full_path`.
+        """
+        return lock_path_for(self.full_path(), read=read, write=write)
+
+    def lock(
+        self,
+        *,
+        read: bool = False,
+        write: bool = True,
+        timeout: Optional[float] = None,
+        poll: float = 0.05,
+    ) -> "FileLock":
+        """Build (but don't acquire) a cross-process lock for this path.
+
+        Usage::
+
+            with path.lock(write=True, timeout=30):
+                path.write_bytes(payload)
+
+        Semantics:
+
+        - ``read=True, write=False`` → shared (``LOCK_SH``); multiple
+          readers coexist on the same lock file.
+        - ``read=False, write=True`` (default) → exclusive
+          (``LOCK_EX``).
+        - ``read=True, write=True`` → exclusive on the ``-rw.lock``
+          file (mode-flag is informational; the kernel-level lock is
+          exclusive because the caller is mutating).
+
+        On platforms / backends without :mod:`fcntl` /
+        :mod:`msvcrt` support, the returned lock degrades to a
+        no-op — the caller's I/O still proceeds, just without
+        cross-process coordination. Subclasses for backends with a
+        native CAS primitive (S3 conditional PUT, GCS preconditions)
+        can override to plug in a stronger guarantee.
+        """
+        return FileLock(
+            self.lock_path(read=read, write=write),
+            shared=(read and not write),
+            timeout=timeout,
+            poll=poll,
+        )
 
     # ==================================================================
     # Coercion entry points

@@ -103,6 +103,7 @@ import os
 import pathlib
 import struct
 import tempfile
+import threading
 import time
 from typing import IO, TYPE_CHECKING, Any, Optional, Union, Literal
 
@@ -113,6 +114,10 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.enums import Codec, MediaType, MimeType, MimeTypes, Mode, ZSTD
 from yggdrasil.io.path_stat import PathStats, PathKind
+from yggdrasil.io.buffer._concurrency import (
+    FileLock,
+    maybe_cleanup_stale_spill_files,
+)
 from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.types import BytesLike
 from yggdrasil.io.url import URL
@@ -152,6 +157,27 @@ def _as_contiguous_mv(mv: memoryview) -> memoryview:
     fast path stays zero-copy.
     """
     return mv if mv.c_contiguous else memoryview(mv.tobytes())
+
+
+def _under_thread_lock(func):
+    """Acquire ``self._thread_lock`` for the duration of ``func``.
+
+    Zero-cost when concurrency is off — the early branch on
+    ``self._thread_lock is None`` skips the ``with`` machinery
+    entirely. Re-entrant: the lock is :class:`threading.RLock`, so
+    nested calls (e.g. a public method that calls another public
+    method) don't deadlock.
+    """
+
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        lock = self._thread_lock
+        if lock is None:
+            return func(self, *args, **kwargs)
+        with lock:
+            return func(self, *args, **kwargs)
+
+    return wrapper
 
 
 def check_transaction():
@@ -396,12 +422,14 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         auto_open: bool | None = None,
         mode: str = "rb+",
         metadata: dict | None = None,
+        concurrent: bool = False,
+        lock_timeout: float | None = None,
         **kwargs
     ) -> None:
         # Funnel cache slots, _media_type, and the spill-path
         # placeholders through the TabularIO base. We then refine
         # the spill bindings below for the buffer-specific cases.
-        TabularIO.__init__(self, media_type=media_type)
+        TabularIO.__init__(self, media_type=media_type, concurrent=concurrent)
 
         # Buffer-specific per-instance state.
         self._buf: bytearray | None = bytearray()
@@ -417,6 +445,21 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         self._spill_bytes: int = int(spill_bytes)
         self._spill_ttl: int = int(spill_ttl)
         self._metadata = metadata or {}
+        # Concurrency: when ``concurrent=True`` the buffer:
+        #
+        # - serialises in-process readers/writers via a
+        #   ``threading.RLock`` (memory-mode and local fd mode).
+        # - acquires a sidecar :class:`FileLock` against any
+        #   caller-owned path so concurrent processes don't tear each
+        #   other's writes.
+        #
+        # Self-owned spill files (random tempdir name) skip the file
+        # lock — their path is unique by construction.
+        self._lock_timeout: float | None = lock_timeout
+        self._path_lock: "FileLock | None" = None
+        self._thread_lock: "threading.RLock | None" = (
+            threading.RLock() if self.concurrent else None
+        )
         # View state — populated by :meth:`_make_view` only. When
         # ``parent`` is set AND no own backing is bound (no ``_buf``,
         # no ``_spill_path``, no ``_transaction_buffer``), this BytesIO
@@ -525,6 +568,16 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         self._mode = src._mode
         self._spill_bytes = src._spill_bytes
         self._spill_ttl = src._spill_ttl
+        # Lock state propagates so a copy of a path-bound buffer keeps
+        # the same concurrency posture; the locks themselves aren't
+        # shared — the copy mints its own on _acquire if needed, and
+        # gets its own RLock so cross-copy synchronisation isn't
+        # implied where the caller didn't ask for it.
+        self.concurrent = src.concurrent
+        self._lock_timeout = src._lock_timeout
+        self._thread_lock = (
+            threading.RLock() if src.concurrent else None
+        )
 
     def _init_from_filelike(self, src: Any) -> None:
         """Drain a file-like from current cursor to end."""
@@ -649,13 +702,115 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     # Disposable hooks — fd lifecycle
     # ------------------------------------------------------------------
 
+    def _should_lock_path(self) -> bool:
+        """True when path-level concurrent-access protection should kick in.
+
+        Lock only when:
+
+        - the caller opted into concurrency safety
+          (``concurrent=True``),
+        - we have a real path bound (no point locking a memory
+          buffer),
+        - the path is *external* — caller-owned. Self-owned spills
+          live under a unique random name, so two processes can't
+          collide. Skipping the lock there avoids an extra fd per
+          buffer in the common case.
+
+        Read-only opens still take a *shared* lock — multiple
+        readers coexist, but a concurrent exclusive writer blocks
+        until they release. Mode-aware suffix
+        (``-r.lock`` / ``-w.lock`` / ``-rw.lock``) keeps each access
+        kind on its own lock file for visibility; readers and
+        writers therefore don't block each other across kinds, by
+        design.
+        """
+        if not self.concurrent:
+            return False
+        if self._spill_path is None:
+            return False
+        if self._owns_spill_path:
+            return False
+        return True
+
+    def _lock_modes(self) -> tuple[bool, bool]:
+        """Decompose :attr:`_mode` into ``(read, write)`` access intent."""
+        m = self._mode
+        write = any(c in m for c in "wax+")
+        # Pure 'wb' / 'ab' / 'xb' (no '+') don't read; tag as
+        # write-only. 'rb' is pure read; everything else is mixed.
+        if "+" in m:
+            read = True
+        else:
+            read = "r" in m
+        return read, write
+
+    def _acquire_path_lock(self) -> None:
+        """Take the mode-suffixed sidecar lock for the bound path.
+
+        Delegates to :meth:`Path.lock` so every backend can plug in a
+        backend-specific locking primitive (S3 conditional PUT, GCS
+        preconditions, …) by overriding the method on its
+        :class:`Path` subclass. The default :class:`FileLock`-backed
+        implementation lives in
+        :mod:`yggdrasil.io.buffer._concurrency` and works on any
+        local-mount-style filesystem.
+        """
+        if self._path_lock is not None:
+            return
+        if not self._should_lock_path():
+            return
+
+        read, write = self._lock_modes()
+        try:
+            lock = self._spill_path.lock(
+                read=read,
+                write=write,
+                timeout=self._lock_timeout,
+            )
+        except Exception:
+            # Backend doesn't support a Path.lock surface — skip
+            # rather than failing the operation outright.
+            return
+        try:
+            lock.acquire()
+        except TimeoutError:
+            raise
+        except Exception:
+            # Best-effort: a backend that exposes lock() but raises
+            # on acquire (transient backend error, missing perms)
+            # shouldn't block the caller's I/O.
+            return
+        self._path_lock = lock
+
+    def _release_path_lock(self) -> None:
+        lock = self._path_lock
+        self._path_lock = None
+        if lock is None:
+            return
+        try:
+            lock.release()
+        except Exception:
+            pass
+
     def _acquire(self) -> None:
         """Open the spill backing."""
         if self._spill_path is None:
             return
 
+        # Acquire the cross-process lock BEFORE any backend-specific
+        # opening work. If we raced and another writer holds it,
+        # blocking here means we don't truncate (``wb`` mode includes
+        # ``O_TRUNC``) the file while the holder is still writing.
+        # Hits both local and non-local paths so backend-specific
+        # ``Path.lock`` overrides participate uniformly.
+        self._acquire_path_lock()
+
         if not self._spill_path.is_local:
-            self._acquire_transaction_buffer()
+            try:
+                self._acquire_transaction_buffer()
+            except Exception:
+                self._release_path_lock()
+                raise
             return
 
         if self._spill_fd is not None:
@@ -672,7 +827,12 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 os.makedirs(parent_str, exist_ok=True)
             flags |= os.O_CREAT
 
-        fd = os.open(local_str_path, flags, 0o644)
+        try:
+            fd = os.open(local_str_path, flags, 0o644)
+        except Exception:
+            # Open failed — drop the lock so the next acquirer can try.
+            self._release_path_lock()
+            raise
         self._spill_fd = fd
 
         # Seed size from fstat.
@@ -817,6 +977,10 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 pass
             self._spill_path = None
 
+        # Release the cross-process lock last — once this returns,
+        # another writer can take over the same target path safely.
+        self._release_path_lock()
+
     def _ensure_spill_fd(self) -> int:
         """Open the spill fd lazily; return it.
 
@@ -837,14 +1001,24 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 "memory-backed and flushes via write_bytes on close."
             )
         # Reuse _acquire's open shape so flags / parents stay consistent.
+        # Take the path lock first if we're in a write mode against a
+        # caller-owned path — the lazy open path bypasses _acquire, so
+        # we'd otherwise miss the concurrency guard for callers that
+        # write before opening explicitly.
+        self._acquire_path_lock()
         flags = _flags_for_mode(self._mode)
-        fd = os.open(self._spill_path.full_path(), flags, 0o644)
+        try:
+            fd = os.open(self._spill_path.full_path(), flags, 0o644)
+        except Exception:
+            self._release_path_lock()
+            raise
         self._spill_fd = fd
         return fd
 
     # ------------------------------------------------------------------
     # Three core primitives — only branch sites for memory vs spilled
     # ------------------------------------------------------------------
+    @_under_thread_lock
     def _slice(self, pos: int, n: int) -> bytes:
         """Read *n* bytes at *pos*. Handles all three backings.
 
@@ -889,6 +1063,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
         return b""
 
+    @_under_thread_lock
     def _write_at(self, data: memoryview, pos: int) -> int:
         """Write *mv* at *pos*. Grows backing, auto-spills on threshold.
 
@@ -964,6 +1139,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
         raise RuntimeError(f"Cannot write to {self!r}: no backing")
 
+    @_under_thread_lock
     def _set_size(self, n: int) -> int:
         """Truncate or extend backing to exactly *n* bytes.
 
@@ -1257,6 +1433,15 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         view._spill_bytes = 0
         view._spill_ttl = 0
         view._metadata = {}
+        # Concurrency slots — view mirrors the parent's posture but
+        # owns its own RLock so cross-view nesting doesn't accidentally
+        # share state. Path lock is irrelevant: a view has no own path.
+        view.concurrent = parent.concurrent
+        view._lock_timeout = None
+        view._path_lock = None
+        view._thread_lock = (
+            threading.RLock() if parent.concurrent else None
+        )
         view.parent = parent
         view._view_offset = int(offset)
         view._view_max_size = None if max_size is None else int(max_size)
@@ -2837,7 +3022,13 @@ def _mint_spill_path(ext: str, ttl_seconds: int) -> "Path":
     The TTL is encoded in the filename so external cleanup workers
     can delete stale files lexically without re-stat'ing every entry.
     The file itself is not created here — the caller writes to it.
+
+    Calls :func:`maybe_cleanup_stale_spill_files` before minting so
+    the tempdir doesn't accumulate orphans from crashed workers. The
+    cleanup is throttled in-process and serialised cross-process,
+    so it never dominates the spill hot path.
     """
+    maybe_cleanup_stale_spill_files()
     seed = os.urandom(8).hex()
     start = int(time.time())
     end = start + ttl_seconds

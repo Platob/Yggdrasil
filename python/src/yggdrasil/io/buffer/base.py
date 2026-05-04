@@ -326,6 +326,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         *args: Any,
         media_type: Any = None,
         static_values: "Mapping[str, Any] | None" = None,
+        concurrent: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the state every :class:`TabularIO` carries.
@@ -392,6 +393,15 @@ class TabularIO(Disposable, ABC, Generic[O]):
         # :meth:`_release`.
         self._spark_scan_spill: "str | None" = None
         self._spark_scan_cleanup = None
+        # Opt-in concurrency safety. When True, byte-buffer subclasses
+        # serialise public read/write operations against an in-process
+        # ``threading.RLock`` (memory mode) and acquire a sidecar
+        # ``FileLock`` against any caller-owned path. Off by default
+        # — yggdrasil's primary use is single-threaded driver code,
+        # and the lock overhead isn't worth paying every time. Flip to
+        # True from concurrency-aware callers (Spark task threads,
+        # ``ProcessPoolExecutor`` workers, …).
+        self.concurrent: bool = bool(concurrent)
 
     # ==================================================================
     # Tabular view shortcut — at TabularIO so every subclass shares it
