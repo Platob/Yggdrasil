@@ -333,6 +333,23 @@ class CacheConfig(_ConfigBase):
         ]
 
     @property
+    def request_by_is_public(self) -> bool:
+        """True when every ``request_by`` key is anonymization-invariant.
+
+        ``public_hash`` / ``public_url_hash`` (and any future ``public_*``
+        column) are computed against ``url.anonymize('remove')`` plus
+        ``normalize_headers(anonymize=True)``, so they hash to the same
+        int64 whether the caller looks them up on the original request or
+        on the anonymized form stored in the cache. When this predicate
+        holds the lookup paths can skip the per-request ``anonymize()``
+        pass before computing ``request_tuple`` / interpolating the SQL
+        clause — the saving is one URL parse + one header normalize per
+        request per lookup, which adds up on send_many bursts.
+        """
+        keys = self.request_by or ()
+        return bool(keys) and all(str(k).startswith("public_") for k in keys)
+
+    @property
     def defined_received_from(self) -> dt.datetime:
         if self.received_from:
             return self.received_from.timestamp()

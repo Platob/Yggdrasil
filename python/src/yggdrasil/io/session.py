@@ -341,10 +341,17 @@ class Session(ABC):
         if not cache_cfg.remote_cache_enabled:
             return None
 
-
+        # Skip the per-request ``anonymize()`` when the match keys are
+        # all ``public_*`` — the SQL clause and the response-side
+        # join key both come out identical without it.
+        lookup_request = (
+            request
+            if cache_cfg.request_by_is_public
+            else request.anonymize(mode=cache_cfg.anonymize)
+        )
         query = cache_cfg.make_batch_lookup_sql(
             table_name=cache_cfg.table.full_name(safe=True),
-            requests=[request.anonymize(mode=cache_cfg.anonymize)],
+            requests=[lookup_request],
         )
 
         try:
@@ -808,11 +815,23 @@ class Session(ABC):
         *,
         spark_session: Optional["SparkSession"] = None,
     ) -> tuple[list[Response], list[PreparedRequest]]:
-        """Execute one batch SQL lookup against a single cache table."""
-        anonymized_batch = [r.anonymize(mode=cfg.anonymize) for r in requests]
+        """Execute one batch SQL lookup against a single cache table.
+
+        When ``cfg.request_by_is_public`` holds, the per-request
+        ``anonymize()`` pass is skipped — ``public_*`` match keys hash
+        to the same value on the original and the anonymized request,
+        so the lookup tuple and SQL clause both come out identical
+        without paying for one URL parse + header normalize per
+        request.
+        """
+        if cfg.request_by_is_public:
+            lookup_batch: list[PreparedRequest] = list(requests)
+        else:
+            lookup_batch = [r.anonymize(mode=cfg.anonymize) for r in requests]
+
         query = cfg.make_batch_lookup_sql(
             table_name=cfg.table.full_name(safe=True),
-            requests=anonymized_batch,
+            requests=lookup_batch,
         )
         try:
             cache_result = cfg.table.sql.execute(query, spark_session=spark_session)
@@ -829,8 +848,8 @@ class Session(ABC):
 
         hits: list[Response] = []
         misses: list[PreparedRequest] = []
-        for req, anon in zip(requests, anonymized_batch):
-            candidate = result_map.get(cfg.request_tuple(anon))
+        for req, lookup in zip(requests, lookup_batch):
+            candidate = result_map.get(cfg.request_tuple(lookup))
             if candidate is not None and cfg.filter_response(candidate, request=req):
                 hits.append(candidate)
             else:
@@ -936,10 +955,13 @@ class Session(ABC):
         ``WHERE`` clause, and the request-key check is what the
         ``request_tuple`` diff already enforces.
         """
-        anonymized_batch = [r.anonymize(mode=cfg.anonymize) for r in requests]
+        if cfg.request_by_is_public:
+            lookup_batch: list[PreparedRequest] = list(requests)
+        else:
+            lookup_batch = [r.anonymize(mode=cfg.anonymize) for r in requests]
         query = cfg.make_batch_lookup_sql(
             table_name=cfg.table.full_name(safe=True),
-            requests=anonymized_batch,
+            requests=lookup_batch,
         )
         try:
             cache_result = cfg.table.sql.execute(query, spark_session=spark)
@@ -972,8 +994,8 @@ class Session(ABC):
         }
 
         misses: list[PreparedRequest] = []
-        for req, anon in zip(requests, anonymized_batch):
-            if cfg.request_tuple(anon) not in matched:
+        for req, lookup in zip(requests, lookup_batch):
+            if cfg.request_tuple(lookup) not in matched:
                 misses.append(req)
         return hits_df, misses
 
