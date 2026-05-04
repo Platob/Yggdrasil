@@ -169,7 +169,14 @@ def parse_catalog_column_info_field(obj: CatalogColumnInfo) -> Field:
         metadata.update(parsed.metadata or {})
         partition_by = partition_by or parsed.partition_by
 
-    if obj.type_text and (dtype.type_id.is_any_or_null or dtype.type_id.is_nested):
+    if obj.type_text and dtype.type_id.is_any_or_null:
+        dtype = dtype.merge_with(DataType.from_str(obj.type_text))
+    elif obj.type_text and dtype.type_id.is_nested and not obj.type_json:
+        # ``type_text`` from the catalog drops nested-child nullability
+        # (``struct<x:string>`` instead of ``struct<x:string NOT NULL>``)
+        # so merging it over a populated ``type_json`` dtype clobbers
+        # ``NOT NULL`` on struct children — only fall back to it when
+        # ``type_json`` didn't supply the nested structure.
         dtype = dtype.merge_with(DataType.from_str(obj.type_text))
 
     if isinstance(dtype, ArrayType):
