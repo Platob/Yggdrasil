@@ -264,9 +264,9 @@ RESPONSE_SCHEMA = schema(
         "time_column": "received_at",
         # Schema-level identity / partitioning hints — ``autotag`` at
         # the bottom of this block propagates them to the matching
-        # children (``hash`` becomes a primary-key column,
-        # ``status_code`` becomes a partition column).
-        "primary_key": ["hash"],
+        # children. ``public_hash`` is the primary key (stable across
+        # ``anonymize='remove'``); ``status_code`` is the partition column.
+        "primary_key": ["public_hash"],
         "partition_by": ["status_code"],
     },
     tags=_RESPONSE_SCHEMA_JSON_TAGS,
@@ -279,12 +279,24 @@ RESPONSE_SCHEMA["request"] = schema_field(
     metadata={"comment": "Embedded request that produced this response"},
 ).autotag()
 
-RESPONSE_SCHEMA["hash"] = schema_field(
-    "hash",
+RESPONSE_SCHEMA["private_hash"] = schema_field(
+    "private_hash",
     pa.int64(),
     nullable=False,
     metadata={
-        "comment": "xxh3_64 digest over (request.hash, status_code, headers, body) — primary identity",
+        "comment": "xxh3_64 digest over (request.private_hash, status_code, headers, body) "
+                   "including sensitive bits — local-fidelity identity for replay.",
+        "algorithm": "xxh3_64",
+    },
+).autotag()
+
+RESPONSE_SCHEMA["public_hash"] = schema_field(
+    "public_hash",
+    pa.int64(),
+    nullable=False,
+    metadata={
+        "comment": "xxh3_64 digest over (request.public_hash, status_code, anonymized headers, body) — "
+                   "stable across cache anonymization and the right key for cross-system identity.",
         "algorithm": "xxh3_64",
     },
 ).autotag()
@@ -695,11 +707,29 @@ class Response:
             return None
 
     @property
-    def hash(self) -> int:
+    def private_hash(self) -> int:
+        """Local-fidelity identity over the request's private hash + raw
+        response headers / body."""
         return _compute_response_identity_hash(
-            request_hash=self.request._compute_identity_hash(),
+            request_hash=self.request.private_hash,
             status_code=self.status_code,
             headers=self.headers,
+            body=self.buffer,
+        )
+
+    @property
+    def public_hash(self) -> int:
+        """Cross-system identity stable across ``anonymize='remove'``."""
+        return _compute_response_identity_hash(
+            request_hash=self.request.public_hash,
+            status_code=self.status_code,
+            headers=normalize_headers(
+                self.headers or {},
+                is_request=False,
+                add_missing=False,
+                anonymize=True,
+                mode="remove",
+            ),
             body=self.buffer,
         )
 
@@ -722,15 +752,16 @@ class Response:
             body_hash = None
 
         return {
-            "request":     self.request.arrow_values,
-            "hash":        self.hash,
-            "status_code": self.status_code,
-            "headers":     _string_dict(self.headers),
-            "tags":        _string_dict(self.tags) or None,
-            "body":        body_bytes,
-            "body_size":   self.body_size,
-            "body_hash":   body_hash,
-            "received_at": self.received_at,
+            "request":      self.request.arrow_values,
+            "private_hash": self.private_hash,
+            "public_hash":  self.public_hash,
+            "status_code":  self.status_code,
+            "headers":      _string_dict(self.headers),
+            "tags":         _string_dict(self.tags) or None,
+            "body":         body_bytes,
+            "body_size":    self.body_size,
+            "body_hash":    body_hash,
+            "received_at":  self.received_at,
         }
 
     def match_value(self, key: str) -> Any:

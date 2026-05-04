@@ -60,20 +60,34 @@ REQUEST_SCHEMA = schema(
         "time_column": "sent_at",
         # Schema-level identity / partitioning hints — ``autotag`` at
         # the bottom of this block propagates them to the matching
-        # children (``hash`` becomes a primary-key column, ``method``
-        # becomes a partition column).
-        "primary_key": ["hash"],
+        # children. ``public_hash`` is the primary key (stable across
+        # ``anonymize='remove'``); ``method`` is the partition column.
+        "primary_key": ["public_hash"],
         "partition_by": ["method"],
     },
     tags=_REQUEST_SCHEMA_JSON_TAGS,
 )
 
-REQUEST_SCHEMA["hash"] = schema_field(
-    "hash",
+REQUEST_SCHEMA["private_hash"] = schema_field(
+    "private_hash",
     pa.int64(),
     nullable=False,
     metadata={
-        "comment": "xxh3_64 digest over (method, url, headers, body) — primary identity",
+        "comment": "xxh3_64 digest over (method, url, headers, body) including sensitive bits "
+                   "(URL userinfo, Authorization / API-key headers). Local identity only — "
+                   "use ``public_hash`` for cross-system joins / cache lookups.",
+        "algorithm": "xxh3_64",
+    },
+).autotag()
+
+REQUEST_SCHEMA["public_hash"] = schema_field(
+    "public_hash",
+    pa.int64(),
+    nullable=False,
+    metadata={
+        "comment": "xxh3_64 digest over the anonymize='remove' projection of "
+                   "(method, url, headers, body). Stable across cache anonymization, so this "
+                   "is the right key for dedup / cross-system identity.",
         "algorithm": "xxh3_64",
     },
 ).autotag()
@@ -92,12 +106,25 @@ REQUEST_SCHEMA["url"] = schema_field(
     metadata={"comment": "Parsed URL components with full string for replay"},
 ).autotag()
 
-REQUEST_SCHEMA["url_hash"] = schema_field(
-    "url_hash",
+REQUEST_SCHEMA["private_url_hash"] = schema_field(
+    "private_url_hash",
     pa.int64(),
     nullable=False,
     metadata={
-        "comment": "xxh3_64 digest of url.str — stable URL identity for joins/dedup",
+        "comment": "xxh3_64 digest of ``url.str`` including userinfo and full query — "
+                   "matches the URL exactly as captured.",
+        "algorithm": "xxh3_64",
+    },
+).autotag()
+
+REQUEST_SCHEMA["public_url_hash"] = schema_field(
+    "public_url_hash",
+    pa.int64(),
+    nullable=False,
+    metadata={
+        "comment": "xxh3_64 digest of ``url.anonymize('remove').to_string()`` — drops "
+                   "userinfo and sensitive query params so this hash is stable across "
+                   "anonymization. The default cache match key.",
         "algorithm": "xxh3_64",
     },
 ).autotag()
@@ -601,30 +628,58 @@ class PreparedRequest:
             return None
 
     @property
-    def url_hash(self) -> int:
+    def private_url_hash(self) -> int:
+        """xxh3_64 of the URL exactly as captured (userinfo + full query)."""
         return _xxh3_int64_str(self.url.to_string())
 
     @property
-    def hash(self) -> int:
-        try:
-            return self.xxh3_64().intdigest() if False else self._compute_identity_hash()
-        except ImportError:
-            return 0
+    def public_url_hash(self) -> int:
+        """xxh3_64 of the URL after ``anonymize('remove')`` — userinfo and
+        sensitive query params dropped, so this hash is stable across the
+        cache's anonymize step."""
+        return _xxh3_int64_str(self.url.anonymize(mode="remove").to_string())
 
-    def _compute_identity_hash(self) -> int:
+    @property
+    def private_hash(self) -> int:
+        """xxh3_64 over (method, url, headers, body) including sensitive
+        bits — the local-fidelity identity for replay."""
+        return self._compute_identity_hash(anonymize=False)
+
+    @property
+    def public_hash(self) -> int:
+        """xxh3_64 over the anonymize='remove' projection of
+        (method, url, headers, body) — the cross-system identity that
+        survives cache anonymization."""
+        return self._compute_identity_hash(anonymize=True)
+
+    def _compute_identity_hash(self, *, anonymize: bool = False) -> int:
         try:
             import xxhash
         except ImportError:
             return 0
+
+        if anonymize:
+            url_str = self.url.anonymize(mode="remove").to_string()
+            headers = normalize_headers(
+                self.headers or {},
+                is_request=True,
+                add_missing=False,
+                anonymize=True,
+                mode="remove",
+            )
+        else:
+            url_str = self.url.to_string()
+            headers = self.headers or {}
+
         h = xxhash.xxh3_64()
         h.update(self.method.encode("utf-8"))
         h.update(b"\x00")
-        h.update(self.url.to_string().encode("utf-8"))
+        h.update(url_str.encode("utf-8"))
         h.update(b"\x00")
-        for k in sorted(self.headers or {}):
+        for k in sorted(headers):
             h.update(str(k).encode("utf-8"))
             h.update(b"=")
-            h.update(str(self.headers[k]).encode("utf-8"))
+            h.update(str(headers[k]).encode("utf-8"))
             h.update(b"\x00")
         if self.buffer is not None:
             h.update(self.buffer.xxh3_64().digest())
@@ -638,16 +693,18 @@ class PreparedRequest:
             tags_v.update(_string_dict(self.tags))
 
         return {
-            "hash":      self._compute_identity_hash(),
-            "method":    self.method,
-            "url":       _build_url_struct(self.url),
-            "url_hash":  self.url_hash,
-            "headers":   _string_dict(self.headers),
-            "tags":      tags_v,
-            "body":      self.buffer.to_bytes() if self.buffer is not None else None,
-            "body_size": self.body_size,
-            "body_hash": self.body_hash,
-            "sent_at":   self.sent_at,
+            "private_hash":     self.private_hash,
+            "public_hash":      self.public_hash,
+            "method":           self.method,
+            "url":              _build_url_struct(self.url),
+            "private_url_hash": self.private_url_hash,
+            "public_url_hash":  self.public_url_hash,
+            "headers":          _string_dict(self.headers),
+            "tags":             tags_v,
+            "body":             self.buffer.to_bytes() if self.buffer is not None else None,
+            "body_size":        self.body_size,
+            "body_hash":        self.body_hash,
+            "sent_at":          self.sent_at,
         }
 
     def match_value(self, key: str) -> Any:

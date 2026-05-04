@@ -24,13 +24,14 @@ if TYPE_CHECKING:
 __all__ = ["CacheConfig", "SendConfig", "SendManyConfig"]
 
 
-# Identity-by-default — ``url_hash`` is a stable URL-based identity
-# that survives header anonymization (the cache stores anonymized
-# requests so a header-derived ``hash`` would change between write
-# and read). For dedup that should respect body/headers too, callers
-# can pass ``request_by=["hash"]`` explicitly.
+# Identity-by-default — ``public_url_hash`` is the URL-based identity
+# computed against ``url.anonymize('remove')``, so it stays stable
+# across the cache's anonymize step (writes drop userinfo + sensitive
+# query params; reads strip the same; both sides hash to the same
+# int64). For dedup that should also respect body / headers, callers
+# can pass ``request_by=["public_hash"]`` explicitly.
 _DEFAULT_REQUEST_BY: tuple[str, ...] = (
-    "url_hash",
+    "public_url_hash",
 )
 
 _CACHE_CONFIG_FIELDS: frozenset[str] = frozenset(

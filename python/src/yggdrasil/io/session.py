@@ -277,7 +277,7 @@ class Session(ABC):
         row-filtered by the ``request_by`` tuple and the configured
         received-window.
         """
-        match_by = tuple(cache_cfg.request_by or ()) or ("url_hash",)
+        match_by = tuple(cache_cfg.request_by or ()) or ("public_url_hash",)
         cache = cache_cfg.local_cache()
         looked = _lookup_local_responses(
             cache, [request],
@@ -392,7 +392,7 @@ class Session(ABC):
             mode=mode if mode is not None else cache_cfg.mode,
             match_by=cache_cfg.match_by or None,
             wait=cache_cfg.wait,
-            prune_values={"hash": batch["hash"]},
+            prune_values={"public_hash": batch["public_hash"]},
             spark_session=spark_session,
         )
 
@@ -710,7 +710,7 @@ class Session(ABC):
 
         for pkey, (eff, group_reqs) in cfg_groups.items():
             cache = eff.local_cache()
-            match_by = tuple(eff.request_by or ()) or ("url_hash",)
+            match_by = tuple(eff.request_by or ()) or ("public_url_hash",)
             looked_up = _lookup_local_responses(
                 cache, group_reqs,
                 match_by=match_by,
@@ -1109,7 +1109,7 @@ class Session(ABC):
                 mode=mode,
                 match_by=cfg.match_by or None,
                 wait=cfg.wait,
-                prune_values={"hash": batches["hash"]},
+                prune_values={"public_hash": batches["public_hash"]},
             )
 
     def _send_many(
@@ -1449,7 +1449,7 @@ class Session(ABC):
             table_name = cfg.table.full_name(safe=True)
             try:
                 existing_df = spark.sql(
-                    "SELECT DISTINCT hash "
+                    "SELECT DISTINCT public_hash "
                     f"FROM {table_name}"
                 )
             except Exception as exc:
@@ -1463,7 +1463,7 @@ class Session(ABC):
             if existing_df is not None:
                 ok_df = ok_df.join(
                     existing_df,
-                    on=["hash"],
+                    on=["public_hash"],
                     how="left_anti",
                 )
 
@@ -1477,7 +1477,7 @@ class Session(ABC):
             mode=cfg.mode,
             match_by=cfg.match_by or None,
             wait=cfg.wait,
-            prune_by=["hash"],
+            prune_by=["public_hash"],
             spark_session=spark,
         )
 
