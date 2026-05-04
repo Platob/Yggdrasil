@@ -17,13 +17,10 @@ from yggdrasil.data.schema import schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
 from .buffer import BytesIO
 from .enums import Codec, MediaType, MimeTypes
-from .headers import DEFAULT_HOSTNAME, PromotedHeaders, normalize_headers
+from .headers import normalize_headers
 from .request import (
     PreparedRequest,
     REQUEST_SCHEMA,
-    REQUEST_HEADERS_STRUCT,
-    _build_headers_struct,
-    _flatten_headers_struct,
     _map_as_str_dict,
     _string_dict,
 )
@@ -41,7 +38,6 @@ __all__ = [
     "Response",
     "RESPONSE_SCHEMA",
     "RESPONSE_ARROW_SCHEMA",
-    "RESPONSE_HEADERS_STRUCT",
 ]
 
 
@@ -193,18 +189,7 @@ def _ensure_media_headers(
 
 def _parse_response_headers(obj: Mapping[str, Any]) -> MutableMapping[str, str]:
     headers = get_from_dict(obj, keys=("headers",), prefix=None)
-    if isinstance(headers, Mapping):
-        # Headers may already be a flat header→value dict, or the
-        # struct shape (promoted fields + ``other`` map).
-        struct_keys = {
-            "host", "user_agent", "accept", "accept_encoding",
-            "accept_language", "content_type", "content_length",
-            "content_encoding", "transfer_encoding", "other",
-        }
-        if headers and set(headers.keys()).issubset(struct_keys):
-            return _flatten_headers_struct(headers)
-        return _string_dict(headers)
-    return {}
+    return _map_as_str_dict(headers)
 
 
 def _parse_response_tags(obj: Mapping[str, Any]) -> dict[str, str]:
@@ -272,11 +257,6 @@ _RESPONSE_SCHEMA_JSON_TAGS: dict[str, str] = {
 }
 
 
-# Response-side headers struct mirrors the request shape so producers /
-# consumers share one normalized layout.
-RESPONSE_HEADERS_STRUCT = REQUEST_HEADERS_STRUCT
-
-
 RESPONSE_SCHEMA = schema(
     fields=[],
     metadata={
@@ -313,9 +293,9 @@ RESPONSE_SCHEMA["status_code"] = schema_field(
 
 RESPONSE_SCHEMA["headers"] = schema_field(
     "headers",
-    RESPONSE_HEADERS_STRUCT,
+    pa.map_(pa.string(), pa.string()),
     nullable=False,
-    metadata={"comment": "Promoted common headers + remaining headers map"},
+    metadata={"comment": "All response headers as a name→value map"},
 ).autotag()
 
 RESPONSE_SCHEMA["tags"] = schema_field(
@@ -720,8 +700,6 @@ class Response:
 
     @property
     def arrow_values(self) -> dict[str, Any]:
-        promoted = PromotedHeaders.extract(self.headers or {}, host=DEFAULT_HOSTNAME)
-
         body_bytes: bytes | None
         body_hash: int | None
         if self.buffer is not None:
@@ -738,7 +716,7 @@ class Response:
             "request":     self.request.arrow_values,
             "hash":        self.hash,
             "status_code": self.status_code,
-            "headers":     _build_headers_struct(promoted),
+            "headers":     _string_dict(self.headers),
             "tags":        _string_dict(self.tags) or None,
             "body":        body_bytes,
             "body_size":   self.body_size,
@@ -1029,11 +1007,7 @@ class Response:
         else:
             request = PreparedRequest._from_get(get, normalize=normalize)
 
-        headers_value = get("headers")
-        if isinstance(headers_value, Mapping):
-            headers = _flatten_headers_struct(headers_value)
-        else:
-            headers = {}
+        headers = _map_as_str_dict(get("headers"))
 
         body_bytes = get("body")
         pre_media = _media_type_from_headers(headers)

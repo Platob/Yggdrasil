@@ -16,7 +16,7 @@ from yggdrasil.dataclasses.dataclass import get_from_dict
 from yggdrasil.io.enums import MediaType, MimeTypes
 from .buffer import BytesIO
 from .enums import GZIP, Codec, MimeType
-from .headers import DEFAULT_HOSTNAME, PromotedHeaders, normalize_headers
+from .headers import normalize_headers
 from .url import URL
 
 if TYPE_CHECKING:
@@ -30,7 +30,6 @@ __all__ = [
     "REQUEST_SCHEMA",
     "REQUEST_ARROW_SCHEMA",
     "REQUEST_URL_STRUCT",
-    "REQUEST_HEADERS_STRUCT",
 ]
 
 
@@ -51,21 +50,6 @@ REQUEST_URL_STRUCT = pa.struct([
     pa.field("path",     pa.string(), nullable=False),
     pa.field("query",    pa.string(), nullable=True),
     pa.field("fragment", pa.string(), nullable=True),
-])
-
-
-# Promoted-header struct + ``other`` map for the long tail.
-REQUEST_HEADERS_STRUCT = pa.struct([
-    pa.field("host",              pa.string(), nullable=True),
-    pa.field("user_agent",        pa.string(), nullable=True),
-    pa.field("accept",            pa.string(), nullable=True),
-    pa.field("accept_encoding",   pa.string(), nullable=True),
-    pa.field("accept_language",   pa.string(), nullable=True),
-    pa.field("content_type",      pa.string(), nullable=True),
-    pa.field("content_length",    pa.int64(),  nullable=False),
-    pa.field("content_encoding",  pa.string(), nullable=True),
-    pa.field("transfer_encoding", pa.string(), nullable=True),
-    pa.field("other",             pa.map_(pa.string(), pa.string()), nullable=True),
 ])
 
 
@@ -115,9 +99,9 @@ REQUEST_SCHEMA["url_hash"] = schema_field(
 
 REQUEST_SCHEMA["headers"] = schema_field(
     "headers",
-    REQUEST_HEADERS_STRUCT,
+    pa.map_(pa.string(), pa.string()),
     nullable=False,
-    metadata={"comment": "Promoted common headers + remaining headers map"},
+    metadata={"comment": "All request headers as a name→value map"},
 ).autotag()
 
 REQUEST_SCHEMA["tags"] = schema_field(
@@ -162,21 +146,6 @@ REQUEST_SCHEMA["sent_at"] = schema_field(
 ).autotag()
 
 REQUEST_ARROW_SCHEMA: pa.Schema = REQUEST_SCHEMA.to_arrow_schema()
-
-
-# Header-name → headers-struct field-name. The struct also carries an
-# ``other`` map for headers that don't get a promoted slot.
-_PROMOTED_REQUEST_HEADER_FIELDS: tuple[tuple[str, str], ...] = (
-    ("Host", "host"),
-    ("User-Agent", "user_agent"),
-    ("Accept", "accept"),
-    ("Accept-Encoding", "accept_encoding"),
-    ("Accept-Language", "accept_language"),
-    ("Content-Type", "content_type"),
-    ("Content-Length", "content_length"),
-    ("Content-Encoding", "content_encoding"),
-    ("Transfer-Encoding", "transfer_encoding"),
-)
 
 
 def _string_dict(arg: Optional[Mapping[Any, Any]]) -> dict[str, str]:
@@ -228,40 +197,6 @@ def _build_url_struct(url: URL) -> dict[str, Any]:
         "query":    url.query,
         "fragment": url.fragment,
     }
-
-
-def _build_headers_struct(promoted: PromotedHeaders) -> dict[str, Any]:
-    """Build the headers struct value (matches REQUEST_HEADERS_STRUCT)."""
-    return {
-        "host":              promoted.host,
-        "user_agent":        promoted.user_agent,
-        "accept":            promoted.accept,
-        "accept_encoding":   promoted.accept_encoding,
-        "accept_language":   promoted.accept_language,
-        "content_type":      promoted.content_type,
-        "content_length":    promoted.content_length or 0,
-        "content_encoding":  promoted.content_encoding,
-        "transfer_encoding": promoted.transfer_encoding,
-        "other":             promoted.remaining or None,
-    }
-
-
-def _flatten_headers_struct(value: Any) -> dict[str, str]:
-    """Recompose a flat header dict from a headers-struct value."""
-    if not value:
-        return {}
-    if not isinstance(value, Mapping):
-        return _map_as_str_dict(value)
-
-    out: dict[str, str] = {}
-    for header_name, struct_field in _PROMOTED_REQUEST_HEADER_FIELDS:
-        v = value.get(struct_field)
-        if v not in (None, "", 0):
-            out[header_name] = str(v)
-    other = value.get("other")
-    if other:
-        out.update(_map_as_str_dict(other))
-    return out
 
 
 class PreparedRequest:
@@ -461,21 +396,7 @@ class PreparedRequest:
     @staticmethod
     def _parse_headers(obj: Mapping[str, Any]) -> MutableMapping[str, str]:
         headers = get_from_dict(obj, keys=("headers",), prefix=None)
-        if isinstance(headers, Mapping):
-            # Either a flat dict OR the headers-struct dict — flatten
-            # the struct shape into header-name keyed strings.
-            if any(k in headers for k, _ in _PROMOTED_REQUEST_HEADER_FIELDS):
-                return _string_dict(headers)
-            if "other" in headers and any(
-                struct_name in headers for _, struct_name in _PROMOTED_REQUEST_HEADER_FIELDS
-            ):
-                return _flatten_headers_struct(headers)
-            # Possibly a struct value with mostly None fields plus other.
-            struct_keys = {struct_name for _, struct_name in _PROMOTED_REQUEST_HEADER_FIELDS} | {"other"}
-            if headers and set(headers.keys()).issubset(struct_keys):
-                return _flatten_headers_struct(headers)
-            return _string_dict(headers)
-        return {}
+        return _map_as_str_dict(headers)
 
     @staticmethod
     def _parse_tags(obj: Mapping[str, Any]) -> dict[str, str]:
@@ -703,8 +624,6 @@ class PreparedRequest:
 
     @property
     def arrow_values(self) -> dict[str, Any]:
-        promoted = PromotedHeaders.extract(self.headers or {})
-
         tags_v = dict(self.url.query_items())
         if self.tags:
             tags_v.update(_string_dict(self.tags))
@@ -714,7 +633,7 @@ class PreparedRequest:
             "method":    self.method,
             "url":       _build_url_struct(self.url),
             "url_hash":  self.url_hash,
-            "headers":   _build_headers_struct(promoted),
+            "headers":   _string_dict(self.headers),
             "tags":      tags_v,
             "body":      self.buffer.to_bytes() if self.buffer is not None else None,
             "body_size": self.body_size,
@@ -941,7 +860,7 @@ class PreparedRequest:
             {
                 "method":   get("method") or "GET",
                 "url":      url_value,
-                "headers":  headers_value if headers_value is not None else {},
+                "headers":  _map_as_str_dict(headers_value),
                 "tags":     _map_as_str_dict(get("tags")),
                 "buffer":   get("body"),
                 "sent_at":  any_to_datetime(sent_at_value) if sent_at_value not in (None, "") else None,
