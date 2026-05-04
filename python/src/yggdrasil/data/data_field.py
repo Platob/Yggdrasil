@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import json
 import os
 import pathlib
 import types
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, is_dataclass
-from typing import TYPE_CHECKING, Any, Annotated, ClassVar, Optional, Union, get_args, get_origin, Iterator, Generator, AnyStr
+from typing import TYPE_CHECKING, Any, Annotated, ClassVar, Optional, Union, get_args, get_origin, Iterator, Generator, AnyStr, overload
 
 import pyarrow as pa
 
@@ -213,6 +215,67 @@ def _parse_field_name_token(value: str) -> tuple[str, bool | None]:
     if token.endswith("!"):
         return token[:-1].strip(), False
     return token, None
+
+
+def _normalize_inner_fields(value: Any) -> list["Field"]:
+    """Coerce *value* into an ordered list of :class:`Field` children.
+
+    Accepts ``None`` (empty), a single ``Field``, a mapping
+    (``{name: field}`` — names are forced to match), or any iterable
+    of field-like inputs.
+    """
+    if value is None:
+        return []
+    if isinstance(value, Field):
+        return [value]
+    if isinstance(value, Mapping):
+        out: list[Field] = []
+        for key, raw in value.items():
+            f = Field.from_any(raw)
+            if f.name != key:
+                f = f.copy(name=key)
+            out.append(f)
+        return out
+    return [Field.from_any(_) for _ in value]
+
+
+def _peel_name_nullable(metadata: Any) -> tuple[Any, str | None, bool | None]:
+    """Pop ``b"name"`` / ``b"nullable"`` out of *metadata* if present.
+
+    Schema-shaped Fields stash ``name`` / ``nullable`` as first-class
+    attributes, but legacy callers commonly thread them via the
+    metadata dict. Strip the keys when they exist so they don't appear
+    twice; return *metadata* unchanged when neither key is present.
+    """
+    if not isinstance(metadata, Mapping):
+        return metadata, None, None
+    if (
+        b"name" not in metadata and "name" not in metadata
+        and b"nullable" not in metadata and "nullable" not in metadata
+    ):
+        return metadata, None, None
+
+    cleaned = dict(metadata)
+    raw_name = cleaned.pop(b"name", None)
+    if raw_name is None:
+        raw_name = cleaned.pop("name", None)
+    name: str | None = None
+    if raw_name is not None:
+        name = raw_name.decode("utf-8") if isinstance(raw_name, bytes) else str(raw_name)
+
+    raw_nullable = cleaned.pop(b"nullable", None)
+    if raw_nullable is None:
+        raw_nullable = cleaned.pop("nullable", None)
+    nullable: bool | None = None
+    if raw_nullable is not None:
+        if isinstance(raw_nullable, bytes):
+            nullable = raw_nullable.startswith(b"t") or raw_nullable.startswith(b"T")
+        elif isinstance(raw_nullable, bool):
+            nullable = raw_nullable
+        else:
+            nullable = str(raw_nullable).lower().startswith("t")
+
+    return cleaned, name, nullable
 
 
 # ======================================================================
@@ -519,7 +582,10 @@ class Field(BaseMetadata, BaseChildrenFields):
         conversion. Returns ``False`` on coercion failure instead of raising.
 
         - ``check_names``: compare this field's name and recurse into child
-          field names for nested types.
+          field names for nested types. For struct-shaped fields the
+          comparison is order-independent (children matched by name)
+          when ``check_names`` is True, mirroring how Arrow schemas are
+          name-keyed.
         - ``check_dtypes``: recurse into the dtype and compare ``nullable``
           (both are structural, schema-defining attributes).
         - ``check_metadata``: compare this field's metadata and recurse.
@@ -546,11 +612,52 @@ class Field(BaseMetadata, BaseChildrenFields):
         if check_metadata and self.metadata != other.metadata:
             return False
 
-        if check_dtypes and not self.dtype.equals(
-            other.dtype,
-            check_metadata=check_metadata,
-        ):
-            return False
+        if check_dtypes:
+            # Struct-shaped fields are name-keyed schemas: when names
+            # matter, match children by name (reorder-tolerant); when
+            # names don't, fall back to a positional walk so a renamed
+            # column can still match its peer.
+            if (
+                self.type_id is DataTypeId.STRUCT
+                and other.type_id is DataTypeId.STRUCT
+            ):
+                self_children = self.children_fields
+                other_children = other.children_fields
+                if len(self_children) != len(other_children):
+                    return False
+                if check_names:
+                    seen: set[str] = set()
+                    for sf in self_children:
+                        of = other.field_by(name=sf.name, raise_error=False)
+                        if of is None:
+                            return False
+                        if not sf.equals(
+                            of,
+                            check_names=check_names,
+                            check_dtypes=check_dtypes,
+                            check_nullable=check_nullable,
+                            check_metadata=check_metadata,
+                        ):
+                            return False
+                        seen.add(sf.name)
+                    for of in other_children:
+                        if of.name not in seen:
+                            return False
+                else:
+                    for sf, of in zip(self_children, other_children):
+                        if not sf.equals(
+                            of,
+                            check_names=check_names,
+                            check_dtypes=check_dtypes,
+                            check_nullable=check_nullable,
+                            check_metadata=check_metadata,
+                        ):
+                            return False
+            elif not self.dtype.equals(
+                other.dtype,
+                check_metadata=check_metadata,
+            ):
+                return False
 
         return True
 
@@ -608,6 +715,110 @@ class Field(BaseMetadata, BaseChildrenFields):
 
     def _empty_tags(self) -> dict[bytes, bytes]:
         return {}
+
+    # ==================================================================
+    # Schema-shaped views — meaningful when ``self.dtype`` is a struct;
+    # quietly empty otherwise so callers don't have to type-check first.
+    # ==================================================================
+
+    @property
+    def fields(self) -> list["Field"]:
+        """Children excluding constraint-only fields."""
+        return [f for f in self.children_fields if not f.constraint_key]
+
+    @property
+    def inner_fields(self) -> "OrderedDict[str, Field]":
+        """Compat view of the children as an ordered ``{name: field}`` map."""
+        return OrderedDict((f.name, f) for f in self.children_fields)
+
+    @property
+    def arrow_fields(self) -> list[pa.Field]:
+        return [f.to_arrow_field() for f in self.fields]
+
+    @property
+    def primary_keys(self) -> list["Field"]:
+        return [f for f in self.fields if f.primary_key]
+
+    @property
+    def foreign_keys(self) -> list["Field"]:
+        return [f for f in self.fields if f.foreign_key]
+
+    @property
+    def constraints(self) -> list["Field"]:
+        return [f for f in self.children_fields if f.constraint_key]
+
+    def is_empty(self) -> bool:
+        return len(self.children_fields) == 0
+
+    @classmethod
+    def empty(
+        cls,
+        metadata: dict[bytes | str, bytes | str | object] | None = None,
+        tags: dict[bytes | str, bytes | str | object] | None = None,
+    ) -> "Field":
+        return cls._make_struct(
+            children=(),
+            metadata=_normalize_metadata(metadata, tags=tags),
+        )
+
+    @classmethod
+    def _make_struct(
+        cls,
+        children: Iterable["Field"] = (),
+        *,
+        name: str = DEFAULT_FIELD_NAME,
+        nullable: bool = False,
+        metadata: dict[bytes, bytes] | None = None,
+    ) -> "Field":
+        """Construct a struct-shaped instance bypassing subclass init shims.
+
+        Used by mapping mutators / set ops / autotag — the Schema
+        subclass keeps a backwards-compat ``__init__(inner_fields=...)``
+        signature, but the underlying state is pure :class:`Field`.
+        Going through ``__new__`` + ``Field.__init__`` lets the same
+        code construct either a ``Field`` or a ``Schema`` based on
+        ``cls``.
+        """
+        inst = cls.__new__(cls)
+        Field.__init__(
+            inst,
+            name=name,
+            dtype=StructType(fields=tuple(children)),
+            nullable=bool(nullable),
+            metadata=metadata,
+        )
+        return inst
+
+    def _set_dtype_fields(self, fields: Iterable["Field"]) -> None:
+        """Replace the underlying StructType's fields tuple in place.
+
+        Mutating the dtype directly doesn't go through any of Field's
+        ``with_*`` mutators, so the cached arrow / polars / spark
+        projections (and the field-name lookup map) would otherwise
+        miss the change. Invalidate them explicitly and re-adopt the
+        new children so they bubble future mutations back through
+        ``self.parent``.
+        """
+        object.__setattr__(self.dtype, "fields", tuple(fields))
+        self._invalidate_cache()
+        self._adopt_children()
+
+    def _pop_field_name_list(self, key: bytes) -> set[str]:
+        """Pop a ``key`` -> field-name-list entry off ``self.metadata``.
+
+        Accepts a JSON array (``'["a","b"]'``) or a dot-separated string
+        (``"a.b"``). Returns an empty set when the key is missing or
+        empty — and removes the key either way so it does not leak
+        through to the engine schemas.
+        """
+        if not self.metadata:
+            return set()
+        raw = self.metadata.pop(key, None)
+        if not raw:
+            return set()
+        if raw.startswith(b"[") and raw.endswith(b"]"):
+            return set(json.loads(raw))
+        return set(raw.decode().split("."))
 
     # ==================================================================
     # Tag flags — partition_by / cluster_by / primary_key / foreign_key
@@ -745,17 +956,60 @@ class Field(BaseMetadata, BaseChildrenFields):
         nullable: bool | None = None,
         metadata: dict[bytes | str, bytes | str | object] | None = None,
         tags: dict[bytes | str, bytes | str | object] | None = None,
+        fields: Iterable["Field | pa.Field"] | None = None,
     ) -> "Field":
-        return Field(
-            name=self.name if name is None else name,
-            dtype=self.dtype if dtype is None else DataType.from_any(dtype),
-            nullable=self.nullable if nullable is None else bool(nullable),
-            metadata=(
-                (dict(self.metadata) if self.metadata is not None else None)
-                if metadata is None and tags is None
-                else _normalize_metadata(metadata, tags=tags)
-            )
+        # ``fields=`` is the schema-shaped escape hatch: build a
+        # struct dtype from the given children, deep-copying them so
+        # the copy is a fresh tree. Conflicts with ``dtype=`` since
+        # both target the dtype slot — fail loudly when both arrive.
+        if fields is not None:
+            if dtype is not None:
+                raise TypeError(
+                    "Field.copy: pass either fields= or dtype=, not both"
+                )
+            children = [
+                f.copy() if isinstance(f, Field) else Field.from_any(f)
+                for f in _normalize_inner_fields(fields)
+            ]
+            new_dtype: DataType = StructType(fields=tuple(children))
+        elif dtype is None:
+            # Deep-copy struct children so the copy doesn't share child
+            # state with self — mirrors Schema.copy's old behaviour.
+            if isinstance(self.dtype, StructType):
+                new_dtype = StructType(
+                    fields=tuple(c.copy() for c in self.dtype.fields)
+                )
+            else:
+                new_dtype = self.dtype
+        else:
+            new_dtype = DataType.from_any(dtype)
+
+        meta = (
+            (dict(self.metadata) if self.metadata is not None else None)
+            if metadata is None and tags is None
+            else _normalize_metadata(metadata, tags=tags)
         )
+        # Honour legacy ``name`` / ``nullable`` embedded in the metadata
+        # dict so callers passing ``metadata={"name": ...}`` still
+        # update the field's first-class name slot.
+        meta, embedded_name, embedded_nullable = _peel_name_nullable(meta)
+
+        if name is None:
+            name = embedded_name if embedded_name is not None else self.name
+        if nullable is None:
+            nullable = (
+                embedded_nullable if embedded_nullable is not None else self.nullable
+            )
+
+        inst = type(self).__new__(type(self))
+        Field.__init__(
+            inst,
+            name=name,
+            dtype=new_dtype,
+            nullable=bool(nullable),
+            metadata=meta,
+        )
+        return inst
 
     def merge_with(
         self,
@@ -845,7 +1099,10 @@ class Field(BaseMetadata, BaseChildrenFields):
             metadata=metadata,
         )
 
-    def autotag(self) -> "Field":
+    def autotag(
+        self,
+        tags: dict[AnyStr, AnyStr] | None = None,
+    ) -> "Field":
         """Stamp this field with tags derived from its dtype and name.
 
         Writes Databricks-friendly auto-tags in place:
@@ -859,14 +1116,46 @@ class Field(BaseMetadata, BaseChildrenFields):
           patterns, plus ``pii`` / ``sensitive`` stamps for columns that
           obviously carry personal or credential data.
 
-        Returns self for fluent chaining. Idempotent when the dtype and name
-        are unchanged.
-        """
-        tags: dict[bytes, bytes] = dict(self.dtype.autotag())
-        if not self.nullable:
-            tags[b"nullable"] = b"false"
+        For struct-shaped fields (schemas) ``primary_key`` /
+        ``partition_by`` / ``cluster_by`` entries on this field's
+        metadata get consumed into per-child tags, and each child is
+        autotagged in turn — so ``schema.autotag()`` propagates without
+        the caller having to walk children manually.
 
-        self.update_tags(tags)
+        Returns a new struct-shaped Field for schema-style autotagging,
+        or ``self`` for primitive autotagging — both modes also stamp
+        in place so existing ``f.autotag()`` chains keep working.
+        """
+        if self.type_id is DataTypeId.STRUCT:
+            primary_key_names = self._pop_field_name_list(b"primary_key")
+            partition_by_names = self._pop_field_name_list(b"partition_by")
+            cluster_by_names = self._pop_field_name_list(b"cluster_by")
+
+            new_fields: list[Field] = []
+            for f in self.children_fields:
+                if primary_key_names and f.name in primary_key_names:
+                    f.with_primary_key(True, inplace=True)
+                if partition_by_names and f.name in partition_by_names:
+                    f.with_partition_by(True, inplace=True)
+                if cluster_by_names and f.name in cluster_by_names:
+                    f.with_cluster_by(True, inplace=True)
+                new_fields.append(f.autotag())
+
+            self.update_tags(tags)
+            return type(self)._make_struct(
+                children=new_fields,
+                metadata=self.metadata,
+                name=self.name,
+                nullable=self.nullable,
+            )
+
+        my_tags: dict[bytes, bytes] = dict(self.dtype.autotag())
+        if not self.nullable:
+            my_tags[b"nullable"] = b"false"
+
+        self.update_tags(my_tags)
+        if tags:
+            self.update_tags(tags)
         return self
 
     # ==================================================================
@@ -879,17 +1168,79 @@ class Field(BaseMetadata, BaseChildrenFields):
             first = next(obj, None)
 
             if first is None:
-                return None, cls(name="", dtype=NullType())
+                return None, cls._make_blank()
 
             obj = itertools.chain((first,), obj)
 
-            return obj, cls.from_(first)
+            return obj, cls._coerce_to_cls(cls.from_(first))
         elif isinstance(obj, list):
             if not obj:
-                return obj, cls(name="", dtype=NullType())
-            return obj, cls.from_(obj[0])
+                return obj, cls._make_blank()
+            return obj, cls._coerce_to_cls(cls.from_(obj[0]))
         else:
-            return obj, cls.from_(obj)
+            return obj, cls._coerce_to_cls(cls.from_(obj))
+
+    @classmethod
+    def _make_blank(cls) -> "Field":
+        """Empty / null-typed instance — used as the peek fallback.
+
+        Subclasses with schema-shaped ``__init__`` (e.g. ``Schema``)
+        can't accept ``Field``'s direct (name, dtype) call; build via
+        ``__new__`` + ``Field.__init__`` to bypass the shim.
+        """
+        inst = cls.__new__(cls)
+        Field.__init__(inst, name="", dtype=NullType())
+        return inst
+
+    @classmethod
+    def _coerce_to_cls(cls, value: "Field") -> "Field":
+        """Lift a plain :class:`Field` to ``cls`` if needed.
+
+        Subclass classmethods (e.g. ``Schema.from_arrow``) want a
+        ``cls`` instance back. When the inherited factory hands us a
+        plain Field, route it through :meth:`from_field` so the result
+        matches the caller's expectations.
+        """
+        if cls is Field or isinstance(value, cls):
+            return value
+        return cls.from_field(value)
+
+    @classmethod
+    def from_field(cls, f: "Field") -> "Field":
+        """Lift a :class:`Field` to ``cls``.
+
+        For ``cls is Field`` this is identity. For subclasses (e.g.
+        :class:`Schema`) it normalises the input to the subclass shape
+        — for struct dtypes we keep the children, for non-struct we
+        wrap the field as a single-child struct so the schema-shape
+        contract holds.
+        """
+        if cls is Field or isinstance(f, cls):
+            return f
+        struct_field = f.to_struct()
+        return cls._make_struct(
+            children=struct_field.children_fields,
+            metadata=struct_field.metadata,
+            name=struct_field.name,
+            nullable=struct_field.nullable,
+        )
+
+    @classmethod
+    def from_any_fields(
+        cls,
+        fields: Iterable["Field | Any"],
+        metadata: dict[bytes | str, bytes | str | object] | None = None,
+        tags: dict[bytes | str, bytes | str | object] | None = None,
+    ) -> "Field":
+        """Build a struct-shaped instance from a list of fields."""
+        meta = _normalize_metadata(metadata, tags=tags)
+        meta, embedded_name, embedded_nullable = _peel_name_nullable(meta)
+        return cls._make_struct(
+            children=[Field.from_any(f) for f in fields],
+            metadata=meta,
+            name=embedded_name if embedded_name is not None else DEFAULT_FIELD_NAME,
+            nullable=bool(embedded_nullable) if embedded_nullable is not None else False,
+        )
 
     # ==================================================================
     # Constructors — generic dispatch entry points
@@ -944,6 +1295,12 @@ class Field(BaseMetadata, BaseChildrenFields):
         if isinstance(obj, cls):
             return obj
 
+        # Cross-cast within the Field hierarchy — caller asked for cls
+        # (e.g. Schema) but handed us a sibling Field. Lift through
+        # :meth:`from_field` so the result matches the requested class.
+        if isinstance(obj, Field):
+            return cls.from_field(obj)
+
         if isinstance(obj, DataType):
             return cls(
                 name=name or DEFAULT_FIELD_NAME,
@@ -955,7 +1312,7 @@ class Field(BaseMetadata, BaseChildrenFields):
 
         if ns.startswith("yggdrasil"):
             if isinstance(obj, schema_class()):
-                return obj.to_field()
+                return cls.from_field(obj)
         elif ns.startswith("pyarrow"):
             return cls.from_arrow(obj)
         elif ns.startswith("polars"):
@@ -1642,7 +1999,9 @@ class Field(BaseMetadata, BaseChildrenFields):
             return self._arrow_schema
 
         if self.type_id is DataTypeId.STRUCT:
-            arrow_fields = [child.to_arrow_field() for child in self.children_fields]
+            # ``self.fields`` excludes constraint-only children — those
+            # are a yggdrasil concept with no Arrow equivalent.
+            arrow_fields = [child.to_arrow_field() for child in self.fields]
         else:
             arrow_fields = [self.to_arrow_field()]
 
@@ -1683,15 +2042,22 @@ class Field(BaseMetadata, BaseChildrenFields):
 
         pl = get_polars()
         if self.type_id is DataTypeId.STRUCT:
-            entries = [(c.name, c.dtype.to_polars()) for c in self.children_fields]
+            entries = [(c.name, c.dtype.to_polars()) for c in self.fields]
         else:
             entries = [(self.name, self.dtype.to_polars())]
         built = pl.Schema(entries)
         object.__setattr__(self, "_polars_schema", built)
         return built
 
-    def to_polars_flavor(self) -> "polars.Field":
-        """Polars-native counterpart for this field — a ``pl.Field``."""
+    def to_polars_flavor(self) -> "polars.Field | polars.Schema":
+        """Polars-native counterpart for this field.
+
+        Struct-shaped fields project to a :class:`polars.Schema` (the
+        natural shape for a column collection); other dtypes project
+        to a :class:`polars.Field`.
+        """
+        if self.type_id is DataTypeId.STRUCT:
+            return self.to_polars_schema()
         return self.to_polars_field()
 
     def to_pyspark_field(self) -> "pst.StructField":
@@ -1764,15 +2130,21 @@ class Field(BaseMetadata, BaseChildrenFields):
 
         pyspark_sql = get_spark_sql()
         if self.type_id is DataTypeId.STRUCT:
-            fields = [c.to_pyspark_field() for c in self.children_fields]
+            fields = [c.to_pyspark_field() for c in self.fields]
         else:
             fields = [self.to_pyspark_field()]
         built = pyspark_sql.types.StructType(fields)
         object.__setattr__(self, "_spark_schema", built)
         return built
 
-    def to_spark_flavor(self) -> "pst.StructField":
-        """Spark-native counterpart for this field — a ``StructField``."""
+    def to_spark_flavor(self) -> "pst.StructField | pst.StructType":
+        """Spark-native counterpart for this field.
+
+        Struct-shaped fields project to a :class:`pyspark.sql.types.StructType`;
+        other dtypes project to a :class:`StructField`.
+        """
+        if self.type_id is DataTypeId.STRUCT:
+            return self.to_spark_schema()
         return self.to_pyspark_field()
 
     def to_schema(
@@ -2667,6 +3039,276 @@ class Field(BaseMetadata, BaseChildrenFields):
             f"Field.finalize: unsupported input {type(obj).__name__!r} "
             f"(module={ns!r})"
         )
+
+    # ==================================================================
+    # Mapping surface — meaningful for struct-shaped fields (schemas);
+    # delegates to ``self.dtype.fields`` so the struct dtype stays the
+    # single source of truth for children.
+    # ==================================================================
+
+    def __setitem__(self, key: str, value: "Field | pa.Field") -> None:
+        if not isinstance(key, str):
+            raise TypeError(
+                f"Field assignment key must be str; got {type(key).__name__}"
+            )
+
+        f = Field.from_any(value)
+        if f.name != key:
+            f = f.copy(name=key)
+
+        new_fields: list[Field] = []
+        replaced = False
+        for existing in self.children_fields:
+            if existing.name == key:
+                new_fields.append(f)
+                replaced = True
+            else:
+                new_fields.append(existing)
+        if not replaced:
+            new_fields.append(f)
+        self._set_dtype_fields(new_fields)
+
+    def __delitem__(self, key: int | str) -> None:
+        resolved = self.field(key)
+        self._set_dtype_fields(
+            f for f in self.children_fields if f.name != resolved.name
+        )
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(f.name for f in self.children_fields)
+
+    def __len__(self) -> int:
+        return len(self.children_fields)
+
+    def __contains__(self, key: object) -> bool:
+        return self.field(key, raise_error=False) is not None
+
+    def __bool__(self) -> bool:
+        # Struct fields are truthy iff they have children — mirrors a
+        # mapping's ``bool``. Non-struct fields fall back to the
+        # default-true behaviour (a primitive Field is always truthy).
+        if isinstance(self.dtype, StructType):
+            return bool(self.dtype.fields)
+        return True
+
+    @overload
+    def get(self, key: int, default: None = None) -> "Field | None": ...
+    @overload
+    def get(self, key: str, default: None = None) -> "Field | None": ...
+    @overload
+    def get(self, key: int | str, default: Any = None) -> Any: ...
+
+    def get(self, key: int | str, default: Any = None) -> Any:
+        resolved = self.field(key, raise_error=False)
+        if resolved is None:
+            return default
+        return resolved
+
+    @overload
+    def pop(self, key: int) -> "Field": ...
+    @overload
+    def pop(self, key: str) -> "Field": ...
+    @overload
+    def pop(self, key: int | str, default: Any = None) -> "Field | Any": ...
+
+    def pop(self, key: int | str, default: Any = ...):
+        resolved = self.field(key, raise_error=False)
+        if resolved is None:
+            if default is ...:
+                if isinstance(key, int):
+                    raise IndexError(key)
+                raise KeyError(key)
+            return default
+        self._set_dtype_fields(
+            f for f in self.children_fields if f.name != resolved.name
+        )
+        return resolved
+
+    def setdefault(self, key: str, default: "Field | pa.Field | None" = None) -> "Field":
+        if not isinstance(key, str):
+            raise TypeError(
+                f"Field.setdefault key must be str; got {type(key).__name__}"
+            )
+
+        resolved = self.field(key, raise_error=False)
+        if resolved is not None:
+            return resolved
+
+        if default is None:
+            raise ValueError("Field.setdefault requires a Field default for new keys")
+
+        f = Field.from_any(default)
+        if f.name != key:
+            f = f.copy(name=key)
+        self._set_dtype_fields(list(self.children_fields) + [f])
+        return f
+
+    def keys(self) -> list[str]:
+        return [f.name for f in self.children_fields]
+
+    def values(self) -> list["Field"]:
+        return list(self.children_fields)
+
+    def items(self) -> list[tuple[str, "Field"]]:
+        return [(f.name, f) for f in self.children_fields]
+
+    def popitem(self, last: bool = True) -> tuple[str, "Field"]:
+        fields = list(self.children_fields)
+        if not fields:
+            raise KeyError("popitem(): field is empty")
+        idx = -1 if last else 0
+        f = fields.pop(idx)
+        self._set_dtype_fields(fields)
+        return f.name, f
+
+    def clear(self) -> None:
+        self._set_dtype_fields(())
+
+    def append(self, *more_fields: "Field | pa.Field") -> "Field":
+        out = self.copy()
+        for value in more_fields:
+            f = Field.from_any(value)
+            out[f.name] = f
+        return out
+
+    def extend(self, fields: Iterable["Field | pa.Field"]) -> "Field":
+        out = self.copy()
+        for value in fields:
+            f = Field.from_any(value)
+            out[f.name] = f
+        return out
+
+    def update(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        # Mapping.update — accept another mapping/iterable of pairs or
+        # kwargs. We don't inherit MutableMapping's mixin (Field is a
+        # frozen dataclass) so spell it out.
+        if args:
+            if len(args) > 1:
+                raise TypeError(
+                    f"update expected at most 1 positional argument, got {len(args)}"
+                )
+            other = args[0]
+            if isinstance(other, Mapping):
+                for k in other:
+                    self[k] = other[k]
+            else:
+                for k, v in other:
+                    self[k] = v
+        for k, v in kwargs.items():
+            self[k] = v
+
+    # ==================================================================
+    # Set operators — schema reconciliation reads like set algebra.
+    # ==================================================================
+
+    @staticmethod
+    def _merge_metadata(
+        left: dict[bytes, bytes] | None,
+        right: dict[bytes, bytes] | None,
+    ) -> dict[bytes, bytes] | None:
+        if not left and not right:
+            return None
+        return {**(left or {}), **(right or {})} or None
+
+    @classmethod
+    def _coerce_other(cls, other: Any) -> "Field":
+        if isinstance(other, cls):
+            return other
+        if isinstance(other, Field):
+            return cls.from_field(other)
+        return cls.from_any(other)
+
+    @staticmethod
+    def _rhs_wins_name(left: "Field", right: "Field") -> str:
+        """RHS-wins conflict resolution mirroring metadata merge semantics."""
+        if right.name and right.name != DEFAULT_FIELD_NAME:
+            return right.name
+        return left.name
+
+    def __add__(self, other: Any) -> "Field":
+        other = self._coerce_other(other)
+        merged: "OrderedDict[str, Field]" = OrderedDict(
+            (f.name, f.copy()) for f in self.children_fields
+        )
+        for f in other.children_fields:
+            merged[f.name] = f.copy()
+        return type(self)._make_struct(
+            children=merged.values(),
+            metadata=self._merge_metadata(self.metadata, other.metadata),
+            name=self._rhs_wins_name(self, other),
+            nullable=self.nullable or other.nullable,
+        )
+
+    def __radd__(self, other: Any) -> "Field":
+        if other == 0:
+            return self.copy()
+        other = self._coerce_other(other)
+        return other.__add__(self)
+
+    def __iadd__(self, other: Any) -> "Field":
+        other = self._coerce_other(other)
+        merged = list(self.children_fields)
+        seen = {f.name: i for i, f in enumerate(merged)}
+        for f in other.children_fields:
+            if f.name in seen:
+                merged[seen[f.name]] = f.copy()
+            else:
+                seen[f.name] = len(merged)
+                merged.append(f.copy())
+        self._set_dtype_fields(merged)
+        object.__setattr__(self, "metadata", self._merge_metadata(self.metadata, other.metadata))
+        if other.name and other.name != DEFAULT_FIELD_NAME:
+            object.__setattr__(self, "name", other.name)
+        return self
+
+    def __sub__(self, other: Any) -> "Field":
+        other = self._coerce_other(other)
+        remove_names = {f.name for f in other.children_fields}
+        return type(self)._make_struct(
+            children=[f.copy() for f in self.children_fields if f.name not in remove_names],
+            metadata=dict(self.metadata) if self.metadata else None,
+            name=self.name,
+            nullable=self.nullable,
+        )
+
+    def __isub__(self, other: Any) -> "Field":
+        other = self._coerce_other(other)
+        remove_names = {f.name for f in other.children_fields}
+        self._set_dtype_fields(
+            f for f in self.children_fields if f.name not in remove_names
+        )
+        return self
+
+    def __and__(self, other: Any) -> "Field":
+        other = self._coerce_other(other)
+        keep_names = {f.name for f in other.children_fields}
+        return type(self)._make_struct(
+            children=[f.copy() for f in self.children_fields if f.name in keep_names],
+            metadata=self._merge_metadata(self.metadata, other.metadata),
+            name=self._rhs_wins_name(self, other),
+            nullable=self.nullable or other.nullable,
+        )
+
+    def __iand__(self, other: Any) -> "Field":
+        other = self._coerce_other(other)
+        keep_names = {f.name for f in other.children_fields}
+        self._set_dtype_fields(
+            f for f in self.children_fields if f.name in keep_names
+        )
+        object.__setattr__(self, "metadata", self._merge_metadata(self.metadata, other.metadata))
+        if other.name and other.name != DEFAULT_FIELD_NAME:
+            object.__setattr__(self, "name", other.name)
+        return self
+
+    def __or__(self, other: Any) -> "Field":
+        return self.__add__(other)
+
+    def __ror__(self, other: Any) -> "Field":
+        other = self._coerce_other(other)
+        return other.__add__(self)
+
+    def __ior__(self, other: Any) -> "Field":
+        return self.__iadd__(other)
 
 
 # ======================================================================
