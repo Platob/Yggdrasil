@@ -5,11 +5,12 @@ import pyarrow as pa
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.types import BinaryType, StructField, StructType
 
+from pyspark.cloudpickle import dumps, loads
+
 from yggdrasil.arrow.cast import any_to_arrow_batch_iterator, any_to_arrow_table
 from yggdrasil.data import schema as schema_builder, field as field_builder, Schema
 from yggdrasil.data.options import CastOptions
 from yggdrasil.environ import PyEnv
-from yggdrasil.pickle.ser.serde import loads, dumps
 
 __all__ = [
     "DynamicFrame",
@@ -261,6 +262,69 @@ class DynamicFrame:
             schema=_spark_dynamic_schema(),
         )
 
+        return type(self)(df=result_df)
+
+    def apply(
+        self,
+        function: Callable[[Any], Any],
+        schema: Schema | None = None,
+        *,
+        byte_size: int = 128 * 1024 * 1024,
+    ) -> "DynamicFrame":
+        """Map ``function`` over each row, optionally casting outputs against ``schema``.
+
+        Without a schema this is :meth:`map` — one function output, one
+        re-pickled row.
+
+        With a schema the function may return any tabular shape
+        (dict, dataclass, list-of-rows, polars/pandas/arrow frame,
+        ``pa.RecordBatch``). Outputs are streamed through
+        :func:`any_to_arrow_batch_iterator` so the per-batch Arrow cast
+        and ``byte_size`` rechunking run in one pass; each row of the
+        cast batches becomes one re-pickled (``dict``) row in the
+        returned DynamicFrame. Useful when the function fans out
+        (single input → many output rows) or returns loosely-shaped
+        data that needs normalisation before downstream stages.
+        """
+        if schema is None:
+            return self.map(function, byte_size=byte_size)
+
+        schema = Schema.from_any(schema)
+        function_pickle = dumps(function)
+
+        def _apply_batches(
+            batches: Iterator[pa.RecordBatch],
+        ) -> Iterator[pa.RecordBatch]:
+            func = loads(function_pickle)
+            options = CastOptions(
+                target_field=schema,
+                safe=False,
+                byte_size=byte_size,
+            )
+
+            def _outputs() -> Iterator[Any]:
+                for batch in batches:
+                    col = batch.column(0)
+                    n = batch.num_rows
+                    if n == 0:
+                        continue
+                    yield [func(loads(col[i].as_py())) for i in range(n)]
+
+            out: list[dict[str, bytes]] = []
+            out_bytes = 0
+            for cast_batch in any_to_arrow_batch_iterator(_outputs(), options=options):
+                for row in cast_batch.to_pylist():
+                    ser = dumps(row)
+                    if out and out_bytes + len(ser) > byte_size:
+                        yield pa.RecordBatch.from_pylist(out, schema=_ARROW_DYNAMIC_SCHEMA)  # noqa
+                        out = []
+                        out_bytes = 0
+                    out.append({PICKLE_COLUMN_NAME: ser})
+                    out_bytes += len(ser)
+            if out:
+                yield pa.RecordBatch.from_pylist(out, schema=_ARROW_DYNAMIC_SCHEMA)  # noqa
+
+        result_df = self.df.mapInArrow(_apply_batches, schema=_spark_dynamic_schema())
         return type(self)(df=result_df)
 
     def filter(
