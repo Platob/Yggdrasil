@@ -214,7 +214,7 @@ class BaseMetadata(ABC):
         if not self.metadata:
             return None
 
-        comment = self.metadata.get(b"comment", None)
+        comment = self.metadata.get(b"comment") or self.metadata.get(b"description")
 
         if comment:
             return comment.decode('utf-8')
