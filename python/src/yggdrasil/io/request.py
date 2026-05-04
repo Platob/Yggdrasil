@@ -61,23 +61,24 @@ REQUEST_SCHEMA = schema(
         "time_column": "sent_at",
         # Schema-level identity / partitioning hints — ``autotag`` at
         # the bottom of this block propagates them to the matching
-        # children. ``public_hash`` is the primary key (stable across
-        # ``anonymize='remove'``); ``partition_key`` is the
-        # day-bucket partition column derived from ``sent_at``.
-        "primary_key": ["public_hash"],
+        # children. The primary key is composite ``(hash, body_size)``;
+        # ``partition_key`` (the only ``partition_by`` column) is
+        # derived from :meth:`PreparedRequest.partition_values`.
+        "primary_key": ["hash", "body_size"],
         "partition_by": ["partition_key"],
     },
     tags=_REQUEST_SCHEMA_JSON_TAGS,
 )
 
-REQUEST_SCHEMA["private_hash"] = schema_field(
-    "private_hash",
+REQUEST_SCHEMA["hash"] = schema_field(
+    "hash",
     pa.int64(),
     nullable=False,
     metadata={
-        "comment": "xxh3_64 digest over (method, url, headers, body) including sensitive bits "
-                   "(URL userinfo, Authorization / API-key headers). Local identity only — "
-                   "use ``public_hash`` for cross-system joins / cache lookups.",
+        "comment": "xxh3_64 digest over (method, url, headers, body) — overall request "
+                   "identity. Includes sensitive bits (URL userinfo, Authorization / "
+                   "API-key headers); use ``public_hash`` for cross-system joins / "
+                   "cache lookups that must survive anonymization.",
         "algorithm": "xxh3_64",
     },
 ).autotag()
@@ -184,9 +185,11 @@ REQUEST_SCHEMA["partition_key"] = schema_field(
     pa.int64(),
     nullable=False,
     metadata={
-        "comment": "xxh3_64 digest of ``f'{url.host}{url.path}'`` — endpoint-bucket "
-                   "partition column, so all requests against the same host+path land "
-                   "in the same leaf and a per-endpoint cache lookup scans one partition.",
+        "comment": "xxh3_64 digest of the request's ``partition_values`` — the only "
+                   "``partition_by`` column. Override "
+                   ":meth:`PreparedRequest.partition_values` to pick a different "
+                   "endpoint-grouping strategy; the default groups by URL host+path "
+                   "so every call to the same endpoint shares one partition leaf.",
         "algorithm": "xxh3_64",
     },
 ).autotag()
@@ -636,10 +639,29 @@ class PreparedRequest:
     def sent_at_timestamp(self) -> int:
         return int(self.sent_at.timestamp() * 1_000_000)
 
+    def partition_values(self) -> dict[str, Any]:
+        """Hook for subclasses to define what feeds ``partition_key``.
+
+        Returns the ordered mapping that gets fed to :attr:`partition_key`'s
+        xxh3_64 digest. Override to bucket requests differently —
+        e.g. by tenant id, by ``url.host`` only, by a fixed shard.
+        Order is stable: the helper concatenates values in iteration
+        order so two configs that disagree on key ordering hash to
+        different partitions.
+
+        Default: ``{"host": url.host, "path": url.path}`` — every
+        call to the same endpoint shares one partition leaf.
+        """
+        return {
+            "host": self.url.host or "",
+            "path": self.url.path or "",
+        }
+
     @property
     def partition_key(self) -> int:
-        """xxh3_64 of ``f'{url.host}{url.path}'`` — endpoint partition key."""
-        return _xxh3_int64_str(f"{self.url.host or ''}{self.url.path or ''}")
+        """xxh3_64 of the joined :meth:`partition_values` — int64 partition column."""
+        joined = "\x00".join(str(v) for v in self.partition_values().values())
+        return _xxh3_int64_str(joined)
 
     @property
     def body_size(self) -> int:
@@ -667,9 +689,14 @@ class PreparedRequest:
         return _xxh3_int64_str(self.url.anonymize(mode="remove").to_string())
 
     @property
-    def private_hash(self) -> int:
-        """xxh3_64 over (method, url, headers, body) including sensitive
-        bits — the local-fidelity identity for replay."""
+    def hash(self) -> int:
+        """xxh3_64 over (method, url, headers, body) — overall identity,
+        including sensitive bits (userinfo, Authorization, …).
+
+        Use :attr:`public_hash` for matches that should survive cache
+        anonymization (drops userinfo / sensitive query params / sensitive
+        headers).
+        """
         return self._compute_identity_hash(anonymize=False)
 
     @property
@@ -720,7 +747,7 @@ class PreparedRequest:
             tags_v.update(_string_dict(self.tags))
 
         return {
-            "private_hash":     self.private_hash,
+            "hash":             self.hash,
             "public_hash":      self.public_hash,
             "method":           self.method,
             "url":              _build_url_struct(self.url),

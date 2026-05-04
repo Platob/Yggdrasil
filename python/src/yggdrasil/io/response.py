@@ -264,10 +264,11 @@ RESPONSE_SCHEMA = schema(
         "time_column": "received_at",
         # Schema-level identity / partitioning hints — ``autotag`` at
         # the bottom of this block propagates them to the matching
-        # children. ``public_hash`` is the primary key (stable across
-        # ``anonymize='remove'``); ``partition_key`` is the day-bucket
-        # partition column derived from ``received_at``.
-        "primary_key": ["public_hash"],
+        # children. The primary key is composite ``(hash, body_size)``;
+        # ``partition_key`` (the only ``partition_by`` column) is
+        # derived from :meth:`Response.partition_values` and matches
+        # the embedded request's partition_key so they co-locate.
+        "primary_key": ["hash", "body_size"],
         "partition_by": ["partition_key"],
     },
     tags=_RESPONSE_SCHEMA_JSON_TAGS,
@@ -280,13 +281,13 @@ RESPONSE_SCHEMA["request"] = schema_field(
     metadata={"comment": "Embedded request that produced this response"},
 ).autotag()
 
-RESPONSE_SCHEMA["private_hash"] = schema_field(
-    "private_hash",
+RESPONSE_SCHEMA["hash"] = schema_field(
+    "hash",
     pa.int64(),
     nullable=False,
     metadata={
-        "comment": "xxh3_64 digest over (request.private_hash, status_code, headers, body) "
-                   "including sensitive bits — local-fidelity identity for replay.",
+        "comment": "xxh3_64 digest over (request.hash, status_code, headers, body) — "
+                   "overall response identity, including sensitive bits.",
         "algorithm": "xxh3_64",
     },
 ).autotag()
@@ -362,9 +363,10 @@ RESPONSE_SCHEMA["partition_key"] = schema_field(
     pa.int64(),
     nullable=False,
     metadata={
-        "comment": "xxh3_64 digest of ``f'{request.url.host}{request.url.path}'`` — "
-                   "endpoint-bucket partition column, equal to the embedded request's "
-                   "``partition_key`` so request+response always co-locate.",
+        "comment": "xxh3_64 digest of the response's ``partition_values`` — the only "
+                   "``partition_by`` column. Equal to the embedded request's "
+                   "``partition_key`` (default behaviour) so request+response always "
+                   "co-locate. Override :meth:`Response.partition_values` to change.",
         "algorithm": "xxh3_64",
     },
 ).autotag()
@@ -717,11 +719,22 @@ class Response:
     def received_at_timestamp(self) -> int:
         return int(self.received_at.timestamp() * 1000000)
 
+    def partition_values(self) -> dict[str, Any]:
+        """Hook for subclasses to define what feeds ``partition_key``.
+
+        Default: delegates to the embedded request so request and
+        response rows share the same partition_key and co-locate.
+        Override to give responses an independent partition strategy
+        (e.g. partition by status class for an audit table).
+        """
+        return self.request.partition_values()
+
     @property
     def partition_key(self) -> int:
-        """xxh3_64 of ``f'{request.url.host}{request.url.path}'`` — same value
-        as the embedded request's ``partition_key`` so both rows co-locate."""
-        return self.request.partition_key
+        """xxh3_64 of the joined :meth:`partition_values` — int64 partition column."""
+        joined = "\x00".join(str(v) for v in self.partition_values().values())
+        from .request import _xxh3_int64_str
+        return _xxh3_int64_str(joined)
 
     @property
     def body_size(self) -> int:
@@ -737,11 +750,10 @@ class Response:
             return None
 
     @property
-    def private_hash(self) -> int:
-        """Local-fidelity identity over the request's private hash + raw
-        response headers / body."""
+    def hash(self) -> int:
+        """Overall identity over (request.hash, status_code, headers, body)."""
         return _compute_response_identity_hash(
-            request_hash=self.request.private_hash,
+            request_hash=self.request.hash,
             status_code=self.status_code,
             headers=self.headers,
             body=self.buffer,
@@ -783,7 +795,7 @@ class Response:
 
         return {
             "request":       self.request.arrow_values,
-            "private_hash":  self.private_hash,
+            "hash":          self.hash,
             "public_hash":   self.public_hash,
             "status_code":   self.status_code,
             "headers":       _string_dict(self.headers),
