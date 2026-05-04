@@ -1706,6 +1706,13 @@ class DataType(BaseChildrenFields, ABC):
         if default_scalar is None or default_scalar in ({}, []):
             return column
 
+        # ``F.lit`` introspects the value via ``_get_object_id`` and a
+        # ``pyarrow.Scalar`` doesn't carry that — silently drops to a
+        # no-op fill. Unwrap to its Python value first so ``F.lit``
+        # picks the matching Spark literal type.
+        if isinstance(default_scalar, pa.Scalar):
+            default_scalar = default_scalar.as_py()
+
         try:
             defaults = F.lit(default_scalar)
         except Exception as e:

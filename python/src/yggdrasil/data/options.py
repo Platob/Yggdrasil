@@ -476,10 +476,16 @@ class CastOptions:
         that want to pin a source schema before running a batch walk.
         """
         if self.source_field is None and obj is not None:
-            return self.with_source(
-                obj() if callable(obj) else field_class().from_(obj),
-                copy=copy
-            )
+            try:
+                peeked = obj() if callable(obj) else field_class().from_(obj)
+            except (TypeError, ValueError):
+                # Some inputs can't be peeked into a Field — e.g. an
+                # unbound pyspark ``Column`` carries no usable dtype
+                # (``df["x"]`` resolves through the DataFrame schema,
+                # not the Column object). Treat those as "no source"
+                # rather than crashing the cast pipeline.
+                return self
+            return self.with_source(peeked, copy=copy)
         return self
 
     def check_target(
