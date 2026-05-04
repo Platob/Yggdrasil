@@ -58,6 +58,12 @@ REQUEST_SCHEMA = schema(
     metadata={
         "comment": "Prepared request flattened into deterministic columns for logging and replay.",
         "time_column": "sent_at",
+        # Schema-level identity / partitioning hints — ``autotag`` at
+        # the bottom of this block propagates them to the matching
+        # children (``hash`` becomes a primary-key column, ``method``
+        # becomes a partition column).
+        "primary_key": ["hash"],
+        "partition_by": ["method"],
     },
     tags=_REQUEST_SCHEMA_JSON_TAGS,
 )
@@ -70,7 +76,6 @@ REQUEST_SCHEMA["hash"] = schema_field(
         "comment": "xxh3_64 digest over (method, url, headers, body) — primary identity",
         "algorithm": "xxh3_64",
     },
-    tags={"primary_key": "true"},
 ).autotag()
 
 REQUEST_SCHEMA["method"] = schema_field(
@@ -144,6 +149,10 @@ REQUEST_SCHEMA["sent_at"] = schema_field(
     nullable=False,
     metadata={"comment": "UTC timestamp when request was dispatched"},
 ).autotag()
+
+# Propagate schema-level ``primary_key`` / ``partition_by`` down to
+# the matching children (consumes those metadata keys in place).
+REQUEST_SCHEMA = REQUEST_SCHEMA.autotag()
 
 REQUEST_ARROW_SCHEMA: pa.Schema = REQUEST_SCHEMA.to_arrow_schema()
 

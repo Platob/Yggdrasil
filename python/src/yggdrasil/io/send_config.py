@@ -123,36 +123,15 @@ def _coerce_optional_datetime(value: Any) -> Optional[dt.datetime]:
     return any_to_datetime(value)
 
 
-# Hot dimensions for partition pruning of the local response cache.
-# Only the embedded request struct exists at the top level now, so
-# partitioning falls back to the response status code (small
-# cardinality) — it segments the cache enough that a typical lookup
-# reads only one partition's worth of leaves without forcing us to
-# walk into the nested ``request`` struct for partition columns.
-LOCAL_CACHE_PARTITION_COLUMNS: tuple[str, ...] = (
-    "status_code",
+# Hot dimensions for partition pruning of the local response cache —
+# kept here for callers that introspect the cache layout. The same
+# tag now lives on :data:`RESPONSE_SCHEMA` itself (set via the
+# schema-level ``partition_by`` autotag), so :class:`FolderIO`
+# derives the Hive partition layout straight from the schema without
+# any per-cache rewriting.
+LOCAL_CACHE_PARTITION_COLUMNS: tuple[str, ...] = tuple(
+    f.name for f in RESPONSE_SCHEMA.children_fields if f._tag_flag(b"partition_by")
 )
-
-
-def _local_cache_schema():
-    """Return :data:`RESPONSE_SCHEMA` with the local-cache partition tags.
-
-    Marks :data:`LOCAL_CACHE_PARTITION_COLUMNS` as ``partition_by``
-    so :class:`FolderIO` builds the matching Hive layout
-    automatically. Cached on the function for cheap repeat access —
-    the underlying :class:`Schema` is immutable.
-    """
-    cached = getattr(_local_cache_schema, "_cached", None)
-    if cached is not None:
-        return cached
-    schema = RESPONSE_SCHEMA.copy()
-    for name in LOCAL_CACHE_PARTITION_COLUMNS:
-        if name not in schema.names:
-            continue
-        f = schema[name]
-        schema[name] = f.with_partition_by(True, inplace=False)
-    _local_cache_schema._cached = schema
-    return schema
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,7 +400,7 @@ class CacheConfig(_ConfigBase):
 
         return FolderIO(
             path=LocalPath(self.local_cache_folder()),
-            schema=_local_cache_schema(),
+            schema=RESPONSE_SCHEMA,
         )
 
     def request_values(

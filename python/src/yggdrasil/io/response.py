@@ -262,6 +262,12 @@ RESPONSE_SCHEMA = schema(
     metadata={
         "comment": "Response record (single row), designed for deterministic logging and replay.",
         "time_column": "received_at",
+        # Schema-level identity / partitioning hints — ``autotag`` at
+        # the bottom of this block propagates them to the matching
+        # children (``hash`` becomes a primary-key column,
+        # ``status_code`` becomes a partition column).
+        "primary_key": ["hash"],
+        "partition_by": ["status_code"],
     },
     tags=_RESPONSE_SCHEMA_JSON_TAGS,
 )
@@ -281,7 +287,6 @@ RESPONSE_SCHEMA["hash"] = schema_field(
         "comment": "xxh3_64 digest over (request.hash, status_code, headers, body) — primary identity",
         "algorithm": "xxh3_64",
     },
-    tags={"primary_key": "true"},
 ).autotag()
 
 RESPONSE_SCHEMA["status_code"] = schema_field(
@@ -338,6 +343,10 @@ RESPONSE_SCHEMA["received_at"] = schema_field(
     nullable=False,
     metadata={"comment": "UTC timestamp when the response was captured"},
 ).autotag()
+
+# Propagate schema-level ``primary_key`` / ``partition_by`` down to
+# the matching children (consumes those metadata keys in place).
+RESPONSE_SCHEMA = RESPONSE_SCHEMA.autotag()
 
 RESPONSE_ARROW_SCHEMA: pa.Schema = RESPONSE_SCHEMA.to_arrow_schema()
 
