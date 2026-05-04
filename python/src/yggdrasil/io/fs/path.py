@@ -94,7 +94,6 @@ import pyarrow as pa
 from yggdrasil.data.options import CastOptions
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.disposable import Disposable
-from yggdrasil.io.buffer._concurrency import FileLock, lock_path_for
 from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.enums import MediaType
@@ -567,7 +566,7 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         """Return the canonical sidecar lock-file path for this path.
 
         The lock filename carries an access-intent suffix
-        (``-r.lock`` / ``-w.lock`` / ``-rw.lock``), so external
+        (``.r.lock`` / ``.w.lock`` / ``.rw.lock``), so external
         tooling can identify what kind of lock is held without
         opening the file. Read locks are typically *skippable* by
         cleanup or monitoring tools — multiple of them coexist by
@@ -575,9 +574,10 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
 
         Override on a subclass that needs a different sidecar
         location (e.g. a backend that forbids hidden files in the
-        target directory). The default builds ``<dir>/.<basename>{-suffix}.lock``
+        target directory). The default builds ``<dir>/.<basename>.{suffix}.lock``
         from :meth:`full_path`.
         """
+        from yggdrasil.io.buffer._concurrency import lock_path_for
         return lock_path_for(self.full_path(), read=read, write=write)
 
     def lock(
@@ -585,38 +585,83 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         *,
         read: bool = False,
         write: bool = True,
-        timeout: Optional[float] = None,
-        poll: float = 0.05,
-    ) -> "FileLock":
+        wait: Any = None,
+        stale_after_seconds: Any = None,
+    ) -> "Any":
         """Build (but don't acquire) a cross-process lock for this path.
 
         Usage::
 
-            with path.lock(write=True, timeout=30):
+            with path.lock(write=True, wait=30):
                 path.write_bytes(payload)
 
-        Semantics:
+        Backend dispatch:
 
-        - ``read=True, write=False`` → shared (``LOCK_SH``); multiple
-          readers coexist on the same lock file.
-        - ``read=False, write=True`` (default) → exclusive
-          (``LOCK_EX``).
-        - ``read=True, write=True`` → exclusive on the ``-rw.lock``
-          file (mode-flag is informational; the kernel-level lock is
-          exclusive because the caller is mutating).
+        - **Local paths** → :class:`FileLock` (``fcntl`` /
+          ``msvcrt``). Kernel-enforced, OS-released on process
+          death. Honours shared/exclusive (``LOCK_SH`` / ``LOCK_EX``).
+        - **Remote paths** (S3, GCS, ABFS, Databricks volumes,
+          memory FS, …) → :class:`AtomicLock`. The sidecar is
+          created with ``xb`` (atomic exclusive); other writers
+          poll until it disappears. ``shared`` is accepted for
+          parity but ignored — the lock is always exclusive.
+
+        ``wait`` is a :class:`WaitingConfig` argument: ``None``
+        (wait forever), a number (seconds), a ``dict`` of overrides,
+        or a ready-made :class:`WaitingConfig`. Backoff and retry
+        come from the config's ``interval`` / ``backoff`` /
+        ``max_interval`` knobs; on contention the lock loop calls
+        :meth:`WaitingConfig.sleep` and raises :class:`TimeoutError`
+        once the deadline is reached.
+
+        ``stale_after_seconds`` (atomic-lock only) controls how long
+        a lingering sidecar is tolerated before the next acquirer
+        force-unlinks it. Zero / negative disables staleness
+        recovery (correctness > liveness). Defaults to 15 minutes
+        — long enough that an honest holder heartbeating once per
+        minute is safe.
+
+        Semantics for the suffix:
+
+        - ``read=True, write=False`` → ``.r.lock``
+        - ``read=False, write=True`` (default) → ``.w.lock``
+        - ``read=True, write=True`` → ``.rw.lock``
 
         On platforms / backends without :mod:`fcntl` /
-        :mod:`msvcrt` support, the returned lock degrades to a
-        no-op — the caller's I/O still proceeds, just without
-        cross-process coordination. Subclasses for backends with a
-        native CAS primitive (S3 conditional PUT, GCS preconditions)
-        can override to plug in a stronger guarantee.
+        :mod:`msvcrt` support and without ``xb`` mode, the returned
+        lock degrades to a no-op — the caller's I/O still proceeds,
+        just without cross-process coordination. Subclasses for
+        backends with a native CAS primitive (S3 conditional PUT,
+        GCS preconditions) can override this method entirely.
         """
-        return FileLock(
-            self.lock_path(read=read, write=write),
+        # Lazy import — _concurrency imports are leaves but the full
+        # ``yggdrasil.io.buffer`` package pulls in NestedIO which in
+        # turn imports ``Path``, so module-level imports here would
+        # close the cycle.
+        from yggdrasil.io.buffer._concurrency import AtomicLock, FileLock
+
+        suffix_path_str = self.lock_path(read=read, write=write)
+        if self.is_local:
+            return FileLock(
+                suffix_path_str,
+                shared=(read and not write),
+                wait=wait,
+            )
+        # Build a sibling :class:`Path` of the same backend pointing
+        # at the sidecar location. Atomic-create needs the same
+        # filesystem semantics as the target (exclusive-create,
+        # unlink, stat) — co-locating the sidecar is the simplest
+        # way to inherit them without the user wiring per-backend
+        # knobs.
+        try:
+            sidecar = type(self).from_(suffix_path_str)
+        except Exception:
+            sidecar = Path.from_(suffix_path_str)
+        return AtomicLock(
+            sidecar,
             shared=(read and not write),
-            timeout=timeout,
-            poll=poll,
+            wait=wait,
+            stale_after_seconds=stale_after_seconds,
         )
 
     # ==================================================================
@@ -1057,10 +1102,19 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         parents: bool = True,
     ) -> None:
         del mode
-        if self.exists():
-            if not exist_ok:
-                raise FileExistsError(f"Path already exists: {self.full_path()!r}")
-            return
+        # EAFP: try atomic exclusive-create when ``exist_ok=False``.
+        # The backend tells us via FileExistsError whether the file
+        # was already there — no separate ``exists()`` round-trip.
+        if not exist_ok:
+            try:
+                self.write_bytes(b"", mode="xb", parents=parents)
+                return
+            except FileExistsError:
+                raise FileExistsError(
+                    f"Path already exists: {self.full_path()!r}"
+                )
+        # exist_ok=True: ``wb`` is fine — it overwrites an empty
+        # file with empty bytes (no-op semantically) or creates one.
         self.write_bytes(b"", parents=parents)
 
     def resolve(self, *, strict: bool = False) -> "Path":
@@ -1130,7 +1184,10 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         if pos < 0:
             raise ValueError("pwrite position must be >= 0")
 
-        existing = self.read_bytes(raise_error=False) if self.exists() else b""
+        # EAFP: read directly. ``read_bytes(raise_error=False)``
+        # returns ``b""`` when the file is missing, saving the extra
+        # ``exists()`` round-trip on remote backends.
+        existing = self.read_bytes(raise_error=False)
         end = pos + n
 
         if end <= len(existing):

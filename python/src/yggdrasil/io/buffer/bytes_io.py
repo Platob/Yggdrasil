@@ -423,7 +423,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         mode: str = "rb+",
         metadata: dict | None = None,
         concurrent: bool = False,
-        lock_timeout: float | None = None,
+        lock_wait: Any = None,
         **kwargs
     ) -> None:
         # Funnel cache slots, _media_type, and the spill-path
@@ -453,9 +453,15 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         #   caller-owned path so concurrent processes don't tear each
         #   other's writes.
         #
+        # ``lock_wait`` follows :class:`WaitingConfig` conventions:
+        # ``None`` waits forever, a number is a timeout in seconds,
+        # a dict / WaitingConfig gives full backoff control. On
+        # contention the lock retries with exponential backoff and
+        # raises :class:`TimeoutError` once the deadline is hit.
+        #
         # Self-owned spill files (random tempdir name) skip the file
         # lock — their path is unique by construction.
-        self._lock_timeout: float | None = lock_timeout
+        self._lock_wait: Any = lock_wait
         self._path_lock: "FileLock | None" = None
         self._thread_lock: "threading.RLock | None" = (
             threading.RLock() if self.concurrent else None
@@ -574,7 +580,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # gets its own RLock so cross-copy synchronisation isn't
         # implied where the caller didn't ask for it.
         self.concurrent = src.concurrent
-        self._lock_timeout = src._lock_timeout
+        self._lock_wait = src._lock_wait
         self._thread_lock = (
             threading.RLock() if src.concurrent else None
         )
@@ -765,7 +771,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             lock = self._spill_path.lock(
                 read=read,
                 write=write,
-                timeout=self._lock_timeout,
+                wait=self._lock_wait,
             )
         except Exception:
             # Backend doesn't support a Path.lock surface — skip
@@ -873,19 +879,6 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         wants_truncate = "w" in mode
         wants_excl = "x" in mode
 
-        # Probe existence for modes whose semantics depend on it.
-        exists = None
-        if wants_excl or (("r" in mode or "a" in mode) and not wants_truncate):
-            try:
-                exists = path.exists()
-            except Exception:
-                exists = None
-
-        if wants_excl and exists:
-            raise FileExistsError(
-                f"Cannot exclusively create {path.full_path()!r}: file exists."
-            )
-
         # Build an empty transaction buffer first; fill it below. The
         # inner BytesIO inherits our spill threshold so a multi-GiB
         # remote download spills locally rather than blowing memory.
@@ -899,23 +892,39 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             auto_open=True
         )
 
-        if wants_truncate or wants_excl:
+        if wants_truncate:
             # Start empty regardless of file's current state.
             self._size = 0
             self._pos = 0
             return
 
-        # Read modes ('rb', 'rb+') and append ('ab', 'ab+').
-        # Fill via pread. ``n=-1`` reads to EOF.
+        # Fail-first existence semantics: don't ``path.exists()`` —
+        # that's an extra round-trip on remote backends and races
+        # the actual operation. Try the read; the backend tells us
+        # via FileNotFoundError whether the file was there. The same
+        # exception then drives the ``xb`` exclusive-create branch.
         try:
             existing = path.pread(n=-1, pos=0)
+            already_present = True
         except FileNotFoundError:
             existing = None
-        except OSError:
-            existing = None
+            already_present = False
+
+        if wants_excl and already_present:
+            raise FileExistsError(
+                f"Cannot exclusively create {path.full_path()!r}: file exists."
+            )
+
+        if wants_excl:
+            # Exclusive-create against a non-existent path: empty start.
+            self._size = 0
+            self._pos = 0
+            return
 
         if existing is None:
-            # Append modes — empty starting buffer is fine.
+            # Append/read modes against a missing file — empty buffer
+            # is fine. Append will create on flush; read of empty
+            # bytes is correct.
             existing = b""
 
         if existing:
@@ -1437,7 +1446,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # owns its own RLock so cross-view nesting doesn't accidentally
         # share state. Path lock is irrelevant: a view has no own path.
         view.concurrent = parent.concurrent
-        view._lock_timeout = None
+        view._lock_wait = None
         view._path_lock = None
         view._thread_lock = (
             threading.RLock() if parent.concurrent else None

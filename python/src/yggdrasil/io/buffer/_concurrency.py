@@ -37,8 +37,12 @@ import tempfile
 import time
 from typing import Optional, Union
 
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+
 
 __all__ = [
+    "AbstractLock",
+    "AtomicLock",
     "FileLock",
     "lock_path_for",
     "lock_suffix_for",
@@ -84,13 +88,61 @@ _last_cleanup_at: float = 0.0
 # ---------------------------------------------------------------------------
 
 
-class FileLock:
+class AbstractLock:
+    """Common surface every lock variant exposes.
+
+    Concrete subclasses ship the actual mechanics (kernel flock for
+    local fs, atomic exclusive-create for remote backends). Callers
+    only care about the four-method API: ``acquire`` / ``release`` /
+    ``held`` / context-manager support. :meth:`Path.lock` returns
+    whichever subclass fits the backend.
+    """
+
+    @property
+    def held(self) -> bool:  # pragma: no cover — abstract
+        raise NotImplementedError
+
+    def acquire(self) -> None:  # pragma: no cover — abstract
+        raise NotImplementedError
+
+    def release(self) -> None:  # pragma: no cover — abstract
+        raise NotImplementedError
+
+    def __enter__(self) -> "AbstractLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
+    def __del__(self) -> None:  # pragma: no cover — defensive
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
+class FileLock(AbstractLock):
     """Advisory cross-process lock keyed by a sidecar lock file.
 
     Usage::
 
-        with FileLock(lock_path, timeout=30):
+        with FileLock(lock_path, wait=30):
             # critical section — writes to the materialised path
+
+    Wait semantics are driven by a :class:`WaitingConfig`:
+
+    - ``wait=None`` — wait forever, polling at a fixed cadence.
+    - ``wait=N`` — wait up to ``N`` seconds (coerced via
+      :meth:`WaitingConfig.from_`). Backoff between attempts.
+    - ``wait=0`` — single attempt, raise :class:`TimeoutError` on
+      contention.
+    - ``wait=WaitingConfig(...)`` — full control: ``timeout``,
+      ``interval``, ``backoff``, ``max_interval``, ``retries``.
+
+    On contention the loop calls :meth:`WaitingConfig.sleep`,
+    which applies exponential backoff capped at ``max_interval`` and
+    raises :class:`TimeoutError` once the deadline is reached.
 
     Shared vs exclusive:
 
@@ -119,26 +171,32 @@ class FileLock:
     write outright; the caller still gets the durable backing.
     """
 
-    __slots__ = ("_path", "_timeout", "_poll", "_shared", "_fd")
+    __slots__ = ("_path", "_wait", "_shared", "_fd")
+
+    # Default poll cadence when ``wait=None`` (wait forever).
+    _DEFAULT_POLL_S: float = 0.05
 
     def __init__(
         self,
         path: Union[str, "os.PathLike[str]"],
         *,
         shared: bool = False,
-        timeout: Optional[float] = None,
-        poll: float = 0.05,
+        wait: "WaitingConfigArg | None" = None,
     ) -> None:
         self._path: str = os.fspath(path)
-        # ``None`` → wait forever; ``0`` → single attempt + raise on contention.
-        self._timeout = timeout
-        self._poll = max(0.001, float(poll))
+        self._wait: "WaitingConfig | None" = (
+            WaitingConfig.from_(wait) if wait is not None else None
+        )
         self._shared = bool(shared)
         self._fd: Optional[int] = None
 
     @property
     def shared(self) -> bool:
         return self._shared
+
+    @property
+    def wait(self) -> "WaitingConfig | None":
+        return self._wait
 
     # -- lifecycle ----------------------------------------------------
 
@@ -151,11 +209,12 @@ class FileLock:
         return self._path
 
     def acquire(self) -> None:
-        """Block (up to ``timeout``) until the lock is held.
+        """Block (up to the wait deadline) until the lock is held.
 
-        Raises :class:`TimeoutError` when ``timeout`` elapses without
-        the lock being obtained. Re-entrant on the same instance:
-        a second call while already held is a no-op.
+        Raises :class:`TimeoutError` when the configured
+        :class:`WaitingConfig` deadline elapses without the lock
+        being obtained. Re-entrant on the same instance: a second
+        call while already held is a no-op.
         """
         if self._fd is not None:
             return
@@ -178,20 +237,25 @@ class FileLock:
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
 
-        deadline = (
-            None if self._timeout is None
-            else time.monotonic() + max(0.0, self._timeout)
-        )
+        wait = self._wait
+        # ``start`` activates the timeout-enforcement branch in
+        # ``WaitingConfig.sleep``. Skipped when wait is None or has
+        # ``timeout=0`` (= no timeout, poll forever) — except that
+        # ``wait=WaitingConfig(timeout=0)`` is also the "single
+        # attempt, raise on contention" shape, handled below.
+        start = time.time() if wait is not None and wait.timeout > 0 else None
+        iteration = 0
 
         while True:
             try:
                 fd = os.open(self._path, flags, 0o644)
             except OSError as exc:
                 # Parent dir gone (race with cleanup), permission
-                # denied, etc. Retry briefly — the parent may have
-                # just been recreated by another writer.
-                if deadline is None or time.monotonic() < deadline:
-                    time.sleep(self._poll)
+                # denied, etc. If we're under a wait budget, retry
+                # briefly; otherwise surface the error.
+                if wait is None or wait.timeout > 0:
+                    self._sleep_or_raise(wait, iteration, start)
+                    iteration += 1
                     continue
                 raise TimeoutError(
                     f"Could not open lock file {self._path!r}: {exc}"
@@ -214,16 +278,28 @@ class FileLock:
             # the actual flock release happened at process death.
             self._try_break_stale_lock()
 
-            if self._timeout == 0:
+            # ``wait=WaitingConfig(timeout=0)`` — single-attempt mode.
+            if wait is not None and wait.timeout == 0:
                 raise TimeoutError(
                     f"Lock {self._path!r} is held by another process"
                 )
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Could not acquire lock on {self._path!r} within "
-                    f"{self._timeout}s"
-                )
-            time.sleep(self._poll)
+
+            # Retry with backoff, honouring the wait budget.
+            self._sleep_or_raise(wait, iteration, start)
+            iteration += 1
+
+    @classmethod
+    def _sleep_or_raise(
+        cls,
+        wait: "WaitingConfig | None",
+        iteration: int,
+        start: "float | None",
+    ) -> None:
+        """Sleep one polling iteration; raise when the deadline is hit."""
+        if wait is None:
+            time.sleep(cls._DEFAULT_POLL_S)
+            return
+        wait.sleep(iteration, start=start)
 
     def release(self) -> None:
         """Release the lock; idempotent."""
@@ -349,14 +425,200 @@ class FileLock:
                     pass
 
 
+class AtomicLock(AbstractLock):
+    """Cross-filesystem advisory lock via atomic exclusive-create.
+
+    Works on *any* :class:`yggdrasil.io.fs.Path` backend that
+    surfaces ``xb`` mode through :meth:`Path.open_io` (i.e. raises
+    :class:`FileExistsError` when the file already exists). The
+    sidecar's existence IS the lock: the first writer to create it
+    wins; everyone else polls until it disappears.
+
+    Use :class:`FileLock` for local-mount paths — it's faster (one
+    fd, kernel-level enforcement, OS-released on death). Reach for
+    :class:`AtomicLock` when the backend is remote (S3, GCS, ABFS,
+    Databricks volumes, in-memory filesystem) and ``fcntl`` doesn't
+    apply. :meth:`Path.lock` already picks the right one.
+
+    Caveats vs :class:`FileLock`:
+
+    - **No shared lock.** Atomic exclusive-create is binary; the
+      ``shared=`` flag is accepted for API parity but ignored — the
+      lock is always exclusive. Readers and writers using different
+      sidecar names (``.r.lock`` / ``.w.lock``) won't interlock.
+    - **Crash recovery is timestamp-based.** On a remote backend
+      the kernel can't release the lock; if the holder crashed,
+      the sidecar lingers until ``stale_after_seconds`` elapses, at
+      which point any acquirer force-unlinks it.
+    - **Eventual consistency.** On weakly-consistent backends an
+      atomic-create can succeed for two callers within the
+      consistency window. The lock degrades to "best effort" in
+      that case — same as flock-on-NFS-without-lockd.
+    """
+
+    # Default age past which a lingering sidecar is presumed stale
+    # and force-unlinked. Tuned high enough that an honest holder
+    # heartbeating every minute is safe; tighten/loosen via the
+    # ``stale_after_seconds`` constructor kwarg.
+    DEFAULT_STALE_AFTER_S: float = 15 * 60.0
+
+    __slots__ = (
+        "_path", "_wait", "_shared", "_held",
+        "_stale_after_s", "_owner_payload",
+    )
+
+    def __init__(
+        self,
+        path: Any,
+        *,
+        shared: bool = False,
+        wait: "WaitingConfigArg | None" = None,
+        stale_after_seconds: "float | None" = None,
+    ) -> None:
+        self._path = path  # yggdrasil Path
+        self._wait: "WaitingConfig | None" = (
+            WaitingConfig.from_(wait) if wait is not None else None
+        )
+        self._shared = bool(shared)  # accepted for parity; not enforced
+        self._held: bool = False
+        self._stale_after_s: float = (
+            self.DEFAULT_STALE_AFTER_S
+            if stale_after_seconds is None
+            else float(stale_after_seconds)
+        )
+        self._owner_payload: bytes = b""
+
+    @property
+    def held(self) -> bool:
+        return self._held
+
+    @property
+    def shared(self) -> bool:
+        return self._shared
+
+    @property
+    def path(self) -> Any:
+        return self._path
+
+    @property
+    def wait(self) -> "WaitingConfig | None":
+        return self._wait
+
+    def acquire(self) -> None:
+        """Block (up to the wait deadline) until the sidecar can be created."""
+        if self._held:
+            return
+
+        wait = self._wait
+        start = time.time() if wait is not None and wait.timeout > 0 else None
+        iteration = 0
+        payload = f"{os.getpid()} {int(time.time())}\n".encode("ascii")
+
+        while True:
+            try:
+                with self._path.open_io("xb") as io:
+                    io.write_bytes(payload)
+                self._held = True
+                self._owner_payload = payload
+                return
+            except FileExistsError:
+                # Stale-break runs inline so a crashed-holder sidecar
+                # gets unlinked AND retried in the same iteration —
+                # ``wait=0`` callers shouldn't have to know about
+                # ghost sidecars to make progress against them.
+                if self._maybe_break_stale():
+                    continue
+            except OSError as exc:
+                # Backend transient — treat like contention so the
+                # wait config can decide whether to keep retrying.
+                if wait is not None and wait.timeout == 0:
+                    raise TimeoutError(
+                        f"Could not create lock {self._path!r}: {exc}"
+                    ) from exc
+
+            if wait is not None and wait.timeout == 0:
+                raise TimeoutError(
+                    f"Lock {self._path!r} is held by another process"
+                )
+
+            FileLock._sleep_or_raise(wait, iteration, start)
+            iteration += 1
+
+    def release(self) -> None:
+        if not self._held:
+            return
+        self._held = False
+        try:
+            self._path.unlink(missing_ok=True)
+        except Exception:
+            # Backend rejected the unlink; the lock will eventually
+            # age out via the staleness check on the next acquirer.
+            pass
+        self._owner_payload = b""
+
+    def _maybe_break_stale(self) -> bool:
+        """Force-unlink the sidecar if it's older than the staleness window.
+
+        Returns ``True`` when a stale sidecar was actually unlinked,
+        so the caller knows to retry the create. ``False`` when
+        nothing needed doing.
+
+        Remote backends don't release the lock on process death, so
+        a crashed writer would otherwise wedge the lock forever.
+        Two-stage check: prefer the *embedded* timestamp (written
+        by the holder at acquire time, so it survives copies and
+        mtime resets), fall back to ``stat.mtime`` if the embedded
+        bytes are unparseable.
+        """
+        if self._stale_after_s <= 0:
+            return False
+        now = time.time()
+        recorded_age: "float | None" = None
+
+        # Embedded timestamp (preferred — survives backend mtime quirks).
+        try:
+            head = self._path.pread(64, 0)
+        except Exception:
+            head = None
+        if head:
+            try:
+                parts = head.decode("ascii", errors="ignore").split()
+                if len(parts) >= 2:
+                    recorded_age = now - float(parts[1])
+            except (ValueError, IndexError):
+                pass
+
+        # Mtime fallback.
+        if recorded_age is None:
+            try:
+                stat = self._path.stat()
+            except Exception:
+                return False
+            mtime = (
+                getattr(stat, "mtime", None)
+                or getattr(stat, "modified", None)
+            )
+            if isinstance(mtime, (int, float)) and mtime > 0:
+                recorded_age = now - float(mtime)
+
+        if recorded_age is None or recorded_age <= self._stale_after_s:
+            return False
+
+        try:
+            self._path.unlink(missing_ok=True)
+            return True
+        except Exception:
+            return False
+
+
 def lock_suffix_for(*, read: bool, write: bool) -> str:
-    """Return the mode-flag suffix used by :func:`lock_path_for`.
+    """Return the mode-flag token used by :func:`lock_path_for`.
 
     ``read`` and ``write`` describe the *intended access*:
 
-    - read-only access → ``-r``
-    - write-only access → ``-w``
-    - both → ``-rw``
+    - read-only access → ``r``
+    - write-only access → ``w``
+    - both → ``rw``
 
     Callers with neither set are treated as ``write=True`` (the
     conservative default — locking implies mutation intent).
@@ -364,10 +626,10 @@ def lock_suffix_for(*, read: bool, write: bool) -> str:
     if not (read or write):
         write = True
     if read and write:
-        return "-rw"
+        return "rw"
     if read:
-        return "-r"
-    return "-w"
+        return "r"
+    return "w"
 
 
 def lock_path_for(
@@ -378,13 +640,13 @@ def lock_path_for(
 ) -> str:
     """Return the canonical sidecar lock-file path for *target*.
 
-    Encoded as ``<dir>/.<basename>-{r|w|rw}.lock`` — hidden, scoped
+    Encoded as ``<dir>/.<basename>.{r|w|rw}.lock`` — hidden, scoped
     to the same directory so readers/writers without filesystem-level
-    privileges still discover the lock; suffixed with the access
-    intent so external tooling can identify what kind of lock is
-    held without reading the file's contents.
+    privileges still discover the lock; the mode-flag segment lets
+    external tooling identify what kind of lock is held without
+    reading the file's contents.
 
-    Read locks (``-r.lock``) are typically *skippable* by cleanup or
+    Read locks (``.r.lock``) are typically *skippable* by cleanup or
     monitoring tools — multiple of them coexist by design and don't
     indicate contention.
     """
@@ -392,7 +654,7 @@ def lock_path_for(
     parent = os.path.dirname(target) or "."
     base = os.path.basename(target) or "_"
     suffix = lock_suffix_for(read=read, write=write)
-    return os.path.join(parent, f".{base}{suffix}.lock")
+    return os.path.join(parent, f".{base}.{suffix}.lock")
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +691,7 @@ def cleanup_stale_spill_files(
         now = time.time()
 
     lock_path = os.path.join(directory, _CLEANUP_LOCK_NAME)
-    lock = FileLock(lock_path, timeout=0)
+    lock = FileLock(lock_path, wait=0)
     try:
         try:
             lock.acquire()
