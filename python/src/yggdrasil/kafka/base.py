@@ -30,11 +30,13 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator
 import pyarrow as pa
 
 from yggdrasil.data.options import CastOptions
+from yggdrasil.environ import PyEnv
 from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.enums import MimeType, MimeTypes
 
 if TYPE_CHECKING:
     from confluent_kafka import Consumer, Producer
+    from pyspark.sql import DataFrame as SparkDataFrame
 
 
 __all__ = ["KafkaIO", "default_value_serializer", "default_value_deserializer"]
@@ -293,6 +295,38 @@ class KafkaIO(TabularIO[CastOptions]):
 
         if buffer:
             yield self._records_to_batch(buffer)
+
+    def _scan_spark_frame(self, options: CastOptions) -> "SparkDataFrame":
+        """Native Spark Structured Streaming source for Kafka.
+
+        Skips the parquet-spill fallback in :class:`TabularIO` and
+        wires straight into Spark's built-in ``kafka`` source —
+        ``spark.readStream.format("kafka")`` — so ``isStreaming`` is
+        ``True`` and the consumer keeps tailing the topic for the
+        lifetime of the streaming query.
+
+        ``key`` and ``value`` arrive as Spark ``BinaryType`` columns;
+        callers typically follow with a ``selectExpr("CAST(value AS
+        STRING)")`` and a JSON / Avro decode to recover the row
+        shape. We don't apply :attr:`value_deserializer` here — the
+        Spark side has its own decoders that fuse into the streaming
+        plan.
+        """
+        spark = PyEnv.spark_session(create=True)
+
+        reader = (
+            spark.readStream.format("kafka")
+            .option("kafka.bootstrap.servers", self.bootstrap_servers)
+            .option("subscribe", self.topic)
+        )
+        if self.group_id:
+            reader = reader.option("kafka.group.id", self.group_id)
+        # Forward every passthrough config under the ``kafka.``
+        # prefix so SASL/SSL credentials reach the Spark Kafka
+        # source unchanged.
+        for key, value in {**self.config, **self.consumer_config}.items():
+            reader = reader.option(f"kafka.{key}", str(value))
+        return reader.load()
 
     def _records_to_batch(self, records: list[dict[str, Any]]) -> pa.RecordBatch:
         """Build a :class:`pa.RecordBatch` from a list of decoded rows.

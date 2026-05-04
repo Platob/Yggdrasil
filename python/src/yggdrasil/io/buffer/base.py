@@ -387,6 +387,11 @@ class TabularIO(Disposable, ABC, Generic[O]):
         # leave them at None.
         self._spill_path = None
         self._owns_spill_path = True
+        # Lazy spill directory used by :meth:`scan_spark_frame`'s
+        # default fallback. Populated on first scan, cleaned up by
+        # :meth:`_release`.
+        self._spark_scan_spill: "str | None" = None
+        self._spark_scan_cleanup = None
 
     # ==================================================================
     # Tabular view shortcut — at TabularIO so every subclass shares it
@@ -499,6 +504,14 @@ class TabularIO(Disposable, ABC, Generic[O]):
 
     def _release(self) -> None:
         self.unpersist()
+        cleanup = getattr(self, "_spark_scan_cleanup", None)
+        if cleanup is not None:
+            try:
+                cleanup()
+            except Exception:
+                pass
+            self._spark_scan_spill = None
+            self._spark_scan_cleanup = None
 
     def unpersist(self) -> None:
         """Drop the cache slot and close the held holder, if any."""
@@ -1157,6 +1170,80 @@ class TabularIO(Disposable, ABC, Generic[O]):
         spark = PyEnv.spark_session(create=True)
         arrow_table = self._read_arrow_table(options)
         return options.cast_spark(spark.createDataFrame(arrow_table))
+
+    def scan_spark(
+        self,
+        options: "O | None" = None,
+        **kwargs: Any,
+    ) -> "SparkDataFrame":
+        return self.scan_spark_frame(options=options, **kwargs)
+
+    def scan_spark_frame(
+        self,
+        options: "O | None" = None,
+        **kwargs: Any,
+    ) -> "SparkDataFrame":
+        """Return a Spark Structured Streaming :class:`DataFrame`.
+
+        The Spark counterpart of :meth:`scan_polars_frame`. Unlike
+        :meth:`read_spark_frame` (which materializes on the driver),
+        the returned frame has ``isStreaming == True`` so it can be
+        composed with ``writeStream`` / ``foreachBatch`` / windowed
+        aggregations. Subclasses with a native streaming source
+        (Kafka, Delta, a directory of parquet files, …) should
+        override :meth:`_scan_spark_frame` to use that source
+        directly; the default below is the universal fallback.
+        """
+        if self._persisted_data is not None:
+            return self._persisted_data.scan_spark_frame(
+                options=options, **kwargs,
+            )
+        return self._scan_spark_frame(
+            self.check_options(options, overrides=locals())
+        )
+
+    def _scan_spark_frame(self, options: O) -> "SparkDataFrame":
+        """Default: spill Arrow batches to a managed temp directory
+        and read it back through Spark's structured-streaming
+        parquet source.
+
+        This always produces a streaming :class:`DataFrame` (the
+        directory is monitored by Spark's file source), at the cost
+        of one full pass through the underlying source on entry.
+        Subclasses with a true streaming origin should override —
+        the spill is the universal fallback, not a recommendation.
+        """
+        import shutil
+        import tempfile
+        import pyarrow.parquet as pq
+
+        spark = PyEnv.spark_session(create=True)
+        schema = self.collect_schema(options).to_spark_schema()
+
+        # Spill once, owned by this IO so :meth:`_release` cleans up.
+        # A previous scan on the same instance is reused — Spark holds
+        # the directory open through the streaming query, and a fresh
+        # spill would race the reader.
+        spill = getattr(self, "_spark_scan_spill", None)
+        if spill is None:
+            spill = tempfile.mkdtemp(prefix="ygg-spark-scan-")
+            self._spark_scan_spill = spill
+            self._spark_scan_cleanup = lambda p=spill: shutil.rmtree(
+                p, ignore_errors=True,
+            )
+            try:
+                for index, batch in enumerate(self._read_arrow_batches(options)):
+                    pq.write_table(
+                        pa.Table.from_batches([batch], schema=batch.schema),
+                        f"{spill}/part-{index:08d}.parquet",
+                    )
+            except Exception:
+                self._spark_scan_cleanup()
+                self._spark_scan_spill = None
+                self._spark_scan_cleanup = None
+                raise
+
+        return spark.readStream.schema(schema).parquet(spill)
 
     def write_spark_frame(
         self,
