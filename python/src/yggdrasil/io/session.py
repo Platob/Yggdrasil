@@ -422,7 +422,17 @@ class Session(ABC):
             mode=mode if mode is not None else cache_cfg.mode,
             match_by=cache_cfg.match_by or None,
             wait=cache_cfg.wait,
-            prune_values={"partition_key": batch["partition_key"]},
+            # Two-level prune: ``partition_key`` triggers Delta file
+            # pruning (partition column on RESPONSE_SCHEMA);
+            # ``public_hash`` narrows the merge's target side to the
+            # exact row identities being upserted, so the MERGE join
+            # can short-circuit on the int64 equality before
+            # touching anything else. Both keys are int64 so the IN
+            # literals stay compact.
+            prune_values={
+                "partition_key": batch["partition_key"],
+                "public_hash":   batch["public_hash"],
+            },
             spark_session=spark_session,
         )
 
@@ -1154,7 +1164,10 @@ class Session(ABC):
                 mode=mode,
                 match_by=cfg.match_by or None,
                 wait=cfg.wait,
-                prune_values={"partition_key": batches["partition_key"]},
+                prune_values={
+                    "partition_key": batches["partition_key"],
+                    "public_hash":   batches["public_hash"],
+                },
             )
 
     def _send_many(
@@ -1540,7 +1553,7 @@ class Session(ABC):
             mode=cfg.mode,
             match_by=cfg.match_by or None,
             wait=cfg.wait,
-            prune_by=["partition_key"],
+            prune_by=["partition_key", "public_hash"],
             spark_session=spark,
         )
 
