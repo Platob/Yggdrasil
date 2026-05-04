@@ -61,9 +61,10 @@ REQUEST_SCHEMA = schema(
         # Schema-level identity / partitioning hints — ``autotag`` at
         # the bottom of this block propagates them to the matching
         # children. ``public_hash`` is the primary key (stable across
-        # ``anonymize='remove'``); ``method`` is the partition column.
+        # ``anonymize='remove'``); ``partition_key`` is the
+        # day-bucket partition column derived from ``sent_at``.
         "primary_key": ["public_hash"],
-        "partition_by": ["method"],
+        "partition_by": ["partition_key"],
     },
     tags=_REQUEST_SCHEMA_JSON_TAGS,
 )
@@ -175,6 +176,18 @@ REQUEST_SCHEMA["sent_at"] = schema_field(
     pa.timestamp("us", "UTC"),
     nullable=False,
     metadata={"comment": "UTC timestamp when request was dispatched"},
+).autotag()
+
+REQUEST_SCHEMA["partition_key"] = schema_field(
+    "partition_key",
+    pa.int64(),
+    nullable=False,
+    metadata={
+        "comment": "Day-bucket of ``sent_at`` as ``yyyymmdd`` (UTC). Used as the "
+                   "partition column for the local + remote response cache so leaf "
+                   "files split per UTC day without a string-typed Hive segment.",
+        "unit": "yyyymmdd",
+    },
 ).autotag()
 
 REQUEST_SCHEMA["_pkl"] = schema_field(
@@ -626,6 +639,12 @@ class PreparedRequest:
         return int(self.sent_at.timestamp() * 1_000_000)
 
     @property
+    def partition_key(self) -> int:
+        """Day-bucket of ``sent_at`` as ``yyyymmdd`` (UTC int64)."""
+        ts = self.sent_at
+        return ts.year * 10000 + ts.month * 100 + ts.day
+
+    @property
     def body_size(self) -> int:
         return self.buffer.size if self.buffer is not None else 0
 
@@ -716,6 +735,7 @@ class PreparedRequest:
             "body_size":        self.body_size,
             "body_hash":        self.body_hash,
             "sent_at":          self.sent_at,
+            "partition_key":    self.partition_key,
             # ``_pkl`` is a placeholder column populated externally by
             # the pickle serializer; the deterministic projection path
             # leaves it null so writers don't pay for a pickle dump

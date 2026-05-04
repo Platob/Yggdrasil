@@ -265,9 +265,10 @@ RESPONSE_SCHEMA = schema(
         # Schema-level identity / partitioning hints — ``autotag`` at
         # the bottom of this block propagates them to the matching
         # children. ``public_hash`` is the primary key (stable across
-        # ``anonymize='remove'``); ``status_code`` is the partition column.
+        # ``anonymize='remove'``); ``partition_key`` is the day-bucket
+        # partition column derived from ``received_at``.
         "primary_key": ["public_hash"],
-        "partition_by": ["status_code"],
+        "partition_by": ["partition_key"],
     },
     tags=_RESPONSE_SCHEMA_JSON_TAGS,
 )
@@ -354,6 +355,18 @@ RESPONSE_SCHEMA["received_at"] = schema_field(
     pa.timestamp("us", "UTC"),
     nullable=False,
     metadata={"comment": "UTC timestamp when the response was captured"},
+).autotag()
+
+RESPONSE_SCHEMA["partition_key"] = schema_field(
+    "partition_key",
+    pa.int64(),
+    nullable=False,
+    metadata={
+        "comment": "Day-bucket of ``received_at`` as ``yyyymmdd`` (UTC). Used as the "
+                   "partition column for the local + remote response cache so leaf "
+                   "files split per UTC day without a string-typed Hive segment.",
+        "unit": "yyyymmdd",
+    },
 ).autotag()
 
 RESPONSE_SCHEMA["_pkl"] = schema_field(
@@ -705,6 +718,12 @@ class Response:
         return int(self.received_at.timestamp() * 1000000)
 
     @property
+    def partition_key(self) -> int:
+        """Day-bucket of ``received_at`` as ``yyyymmdd`` (UTC int64)."""
+        ts = self.received_at
+        return ts.year * 10000 + ts.month * 100 + ts.day
+
+    @property
     def body_size(self) -> int:
         return self.buffer.size if self.buffer is not None else 0
 
@@ -763,20 +782,21 @@ class Response:
             body_hash = None
 
         return {
-            "request":      self.request.arrow_values,
-            "private_hash": self.private_hash,
-            "public_hash":  self.public_hash,
-            "status_code":  self.status_code,
-            "headers":      _string_dict(self.headers),
-            "tags":         _string_dict(self.tags) or None,
-            "body":         body_bytes,
-            "body_size":    self.body_size,
-            "body_hash":    body_hash,
-            "received_at":  self.received_at,
+            "request":       self.request.arrow_values,
+            "private_hash":  self.private_hash,
+            "public_hash":   self.public_hash,
+            "status_code":   self.status_code,
+            "headers":       _string_dict(self.headers),
+            "tags":          _string_dict(self.tags) or None,
+            "body":          body_bytes,
+            "body_size":     self.body_size,
+            "body_hash":     body_hash,
+            "received_at":   self.received_at,
+            "partition_key": self.partition_key,
             # ``_pkl`` is a placeholder column populated externally by
             # the pickle serializer; null here keeps the deterministic
             # projection path side-effect-free.
-            "_pkl":         None,
+            "_pkl":          None,
         }
 
     def match_value(self, key: str) -> Any:

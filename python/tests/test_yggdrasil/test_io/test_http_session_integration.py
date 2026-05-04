@@ -260,15 +260,15 @@ class TestHttpSessionLocalCache:
             session.get(f"{http_server.base_url}/cache/path-check", local_cache=cache)
         _wait_for_cache(tmp_path, expected=1)
         # Partitioned layout: at least one leaf lives under
-        # ``<root>/status_code=200/`` — assert on the partitioned
-        # shape, not a flat glob, so a layout change doesn't sneak
-        # through unnoticed.
+        # ``<root>/partition_key=YYYYMMDD/`` — assert on the
+        # partitioned shape, not a flat glob, so a layout change
+        # doesn't sneak through unnoticed.
         cache_root = tmp_path
         leaves = [p for p in cache_root.rglob("*") if p.is_file()]
         assert leaves, "expected at least one partition leaf under tmp_path"
         rel_dirs = {str(leaf.parent.relative_to(cache_root)) for leaf in leaves}
         assert any(
-            d.startswith("status_code=") for d in rel_dirs
+            d.startswith("partition_key=") for d in rel_dirs
         ), f"expected Hive-partitioned layout, got: {sorted(rel_dirs)!r}"
 
     def test_distinct_urls_cache_independently(
