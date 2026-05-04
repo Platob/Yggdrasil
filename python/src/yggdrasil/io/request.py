@@ -145,7 +145,7 @@ REQUEST_SCHEMA["tags"] = schema_field(
 
 REQUEST_SCHEMA["body"] = schema_field(
     "body",
-    pa.binary(),
+    pa.large_binary(),
     nullable=True,
     metadata={"comment": "Raw request body bytes"},
 ).autotag()
@@ -175,6 +175,17 @@ REQUEST_SCHEMA["sent_at"] = schema_field(
     pa.timestamp("us", "UTC"),
     nullable=False,
     metadata={"comment": "UTC timestamp when request was dispatched"},
+).autotag()
+
+REQUEST_SCHEMA["_pkl"] = schema_field(
+    "_pkl",
+    pa.large_binary(),
+    nullable=True,
+    metadata={
+        "comment": "Placeholder for a full ``PreparedRequest`` pickle blob — populated "
+                   "by the pickle serializer for lossless round-trips, left null on the "
+                   "deterministic-columns-only path.",
+    },
 ).autotag()
 
 # Propagate schema-level ``primary_key`` / ``partition_by`` down to
@@ -705,6 +716,11 @@ class PreparedRequest:
             "body_size":        self.body_size,
             "body_hash":        self.body_hash,
             "sent_at":          self.sent_at,
+            # ``_pkl`` is a placeholder column populated externally by
+            # the pickle serializer; the deterministic projection path
+            # leaves it null so writers don't pay for a pickle dump
+            # when the structured columns are enough.
+            "_pkl":             None,
         }
 
     def match_value(self, key: str) -> Any:

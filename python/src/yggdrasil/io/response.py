@@ -324,7 +324,7 @@ RESPONSE_SCHEMA["tags"] = schema_field(
 
 RESPONSE_SCHEMA["body"] = schema_field(
     "body",
-    pa.binary(),
+    pa.large_binary(),
     nullable=True,
     metadata={"comment": "Raw binary payload of the response"},
 ).autotag()
@@ -354,6 +354,17 @@ RESPONSE_SCHEMA["received_at"] = schema_field(
     pa.timestamp("us", "UTC"),
     nullable=False,
     metadata={"comment": "UTC timestamp when the response was captured"},
+).autotag()
+
+RESPONSE_SCHEMA["_pkl"] = schema_field(
+    "_pkl",
+    pa.large_binary(),
+    nullable=True,
+    metadata={
+        "comment": "Placeholder for a full ``Response`` pickle blob — populated by the "
+                   "pickle serializer for lossless round-trips, left null on the "
+                   "deterministic-columns-only path.",
+    },
 ).autotag()
 
 # Propagate schema-level ``primary_key`` / ``partition_by`` down to
@@ -762,6 +773,10 @@ class Response:
             "body_size":    self.body_size,
             "body_hash":    body_hash,
             "received_at":  self.received_at,
+            # ``_pkl`` is a placeholder column populated externally by
+            # the pickle serializer; null here keeps the deterministic
+            # projection path side-effect-free.
+            "_pkl":         None,
         }
 
     def match_value(self, key: str) -> Any:
