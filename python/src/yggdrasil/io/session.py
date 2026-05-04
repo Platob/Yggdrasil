@@ -450,13 +450,12 @@ class Session(ABC):
         session-level concerns — auth, signing, correlation IDs, mandatory
         headers — that should apply to every request leaving this session.
         Runs in :meth:`_send` just before :meth:`_local_send`, so cache hits
-        bypass it; the per-request ``before_send`` hook still fires inside
-        :meth:`PreparedRequest.prepare_to_send` afterwards. Travels with the
-        session into Spark workers via ``__getstate__`` / ``__setstate__``.
+        bypass it. Travels with the session into Spark workers via
+        ``__getstate__`` / ``__setstate__``.
         """
         return request
 
-    def _after_send(self, response: Response) -> Response:
+    def _prepare_response(self, response: Response) -> Response:
         """Session-wide response hook fired once per completed network send.
 
         Default returns *response* unchanged. Subclasses override to log,
@@ -531,7 +530,7 @@ class Session(ABC):
         request = self._prepare_request(request)
         LOGGER.debug("Sending %s %s", request.method, request.url)
         response = self._local_send(request, config=config)
-        response = self._after_send(response)
+        response = self._prepare_response(response)
         LOGGER.info("Sent %s %s", request.method, request.url)
 
         if local_cache is not None:
@@ -848,9 +847,7 @@ class Session(ABC):
         Used on the spark path to keep every bucket frame-resident.
         Empty input yields an empty DataFrame keyed to
         :data:`RESPONSE_SCHEMA` so downstream ``unionByName`` calls never
-        trip on a column-list mismatch. Non-empty input goes through
-        ``pa.Table.from_batches → spark.createDataFrame``; the pandas
-        fallback covers PySpark builds that reject Arrow tables directly.
+        trip on a column-list mismatch.
         """
         if not responses:
             return spark.createDataFrame(
@@ -859,13 +856,7 @@ class Session(ABC):
         table = pa.Table.from_batches(
             [r.to_arrow_batch(parse=False) for r in responses]
         )
-        try:
-            return spark.createDataFrame(table)
-        except (TypeError, AttributeError):
-            return spark.createDataFrame(
-                table.to_pandas(),
-                schema=RESPONSE_SCHEMA.to_spark_schema(),
-            )
+        return spark.createDataFrame(table)
 
     def _split_remote_cache_spark(
         self,
@@ -1502,28 +1493,35 @@ class Session(ABC):
         fanning out via the session's local thread pool. Per-request remote
         cache configs are stripped (driver concern); per-request local cache
         configs are dropped on workers (they see only the session config).
-        """
-        # Build the request DataFrame on the driver. Each request becomes
-        # one row in REQUEST_ARROW_SCHEMA shape. We control partitioning by
-        # chunking before handing to createDataFrame.
-        request_batches: list[pa.RecordBatch] = [
-            r.prepare_to_send().to_arrow_batch(parse=False) for r in misses
-        ]
-        request_table = pa.Table.from_batches(request_batches)
-        # PySpark 3.4+ accepts a pyarrow.Table directly and preserves the
-        # full schema (maps, nullable bytes). The pandas fallback drops
-        # type information for object-typed columns and fails on empty
-        # maps, which `request_headers` and `request_tags` produce
-        # whenever the request carries no extras.
-        try:
-            request_df = spark.createDataFrame(request_table)
-        except (TypeError, AttributeError):
-            from .request import REQUEST_SCHEMA
 
-            request_df = spark.createDataFrame(
-                request_table.to_pandas(),
-                schema=REQUEST_SCHEMA.to_spark_schema(),
-            )
+        The session is shipped to executors via ``sparkContext.broadcast``
+        — once per executor instead of once per task closure — and
+        re-attached to each request on the worker via
+        :meth:`PreparedRequest.attach_session`. Requests cross the wire
+        as a single pickled-bytes column; pickle preserves the full
+        :class:`PreparedRequest` (closures, buffer, cache configs)
+        without the per-engine schema dance the Arrow round-trip needed.
+        """
+        import pickle
+
+        from pyspark.sql.types import BinaryType, StructField, StructType
+
+        req_schema = StructType([StructField("request", BinaryType(), nullable=False)])
+        req_rows = [
+            (pickle.dumps(r.copy(remote_cache_config=None), protocol=pickle.HIGHEST_PROTOCOL),)
+            for r in misses
+        ]
+
+        # Spread requests across many partitions so mapInArrow scatters
+        # across the whole cluster instead of piling them onto a handful
+        # of executors. ``createDataFrame`` defaults to a single partition
+        # for small Python lists, which serialises stage 3. Target one
+        # request per partition, capped at ``defaultParallelism * 8`` so
+        # huge request lists don't explode into thousands of micro-tasks
+        # whose scheduler overhead dominates the actual fetch.
+        default_par = max(spark.sparkContext.defaultParallelism, 1)
+        n_parts = max(1, min(len(req_rows), default_par * 8))
+        request_df = spark.createDataFrame(req_rows, req_schema).repartition(n_parts)
 
         # Per-executor send config: remote cache disabled (driver-only),
         # local cache passthrough, no spark session, raise_error=False so
@@ -1535,41 +1533,30 @@ class Session(ABC):
             raise_error=False,
         )
 
-        # Capture the session for executor serialisation. Session.__getstate__
-        # / __setstate__ are required to make this pickle-safe — otherwise
-        # the threading.RLock / JobPoolExecutor will choke at scatter time.
-        # Carrying the live session also carries any subclass overrides of
-        # :meth:`_prepare_request` / :meth:`_after_send` into the workers, so
-        # session-level request signing and response post-processing fire on
-        # the executors exactly as they do on the driver.
-        session = self
+        # Broadcast the session so every executor receives the
+        # (pickle-safe) session state once and reuses it across tasks,
+        # rather than re-shipping a closure-captured copy per partition.
+        # Session.__getstate__ / __setstate__ make this pickle-safe by
+        # dropping the threading.RLock and JobPoolExecutor.
+        session_bc = spark.sparkContext.broadcast(self)
         response_spark_schema = RESPONSE_SCHEMA.to_spark_schema()
 
         def _send_partition(
             batches: Iterator[pa.RecordBatch],
         ) -> Iterator[pa.RecordBatch]:
-            # All imports local — keeps the closure self-contained on workers.
-            from yggdrasil.io.request import PreparedRequest as _Req
+            import pickle as _pickle
 
+            session = session_bc.value
             for batch in batches:
-                # Decode this partition's slice of requests.
-                partition_requests = list(_Req.from_arrow(batch, normalize=False))
+                partition_requests = [
+                    _pickle.loads(buf).attach_session(session)
+                    for buf in batch.column("request").to_pylist()
+                ]
                 if not partition_requests:
                     continue
 
-                # Strip per-request remote cache (driver concern) and run the
-                # full `send_many` pipeline locally — local cache + thread
-                # pool fanout — yielding Response objects.
-                local_only_iter = (
-                    r.copy(remote_cache_config=None) for r in partition_requests
-                )
-
-                # Stream each Response → 1-row Arrow batch → rechunker.
-                # The rechunker groups consecutive small responses so each
-                # emitted batch stays below the byte cap; an oversized row
-                # is emitted alone (slice degenerates to a 1-row chunk).
                 def _row_batches() -> Iterator[pa.RecordBatch]:
-                    for resp in session.send_many(local_only_iter, send_config):
+                    for resp in session.send_many(iter(partition_requests), send_config):
                         yield resp.to_arrow_batch(parse=False)
 
                 yield from rechunk_arrow_batches_by_byte_size(
@@ -1588,7 +1575,6 @@ class Session(ABC):
         headers: Mapping[str, str] | None = None,
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
-        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = True,
@@ -1604,7 +1590,6 @@ class Session(ABC):
             headers=headers,
             body=body,
             tags=tags,
-            before_send=before_send,
             wait=wait,
             raise_error=raise_error,
             stream=stream,
@@ -1623,7 +1608,6 @@ class Session(ABC):
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
-        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = True,
@@ -1640,7 +1624,6 @@ class Session(ABC):
             body=body,
             tags=tags,
             json=json,
-            before_send=before_send,
             wait=wait,
             raise_error=raise_error,
             stream=stream,
@@ -1659,7 +1642,6 @@ class Session(ABC):
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
-        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = True,
@@ -1676,7 +1658,6 @@ class Session(ABC):
             body=body,
             tags=tags,
             json=json,
-            before_send=before_send,
             wait=wait,
             raise_error=raise_error,
             stream=stream,
@@ -1695,7 +1676,6 @@ class Session(ABC):
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
-        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = True,
@@ -1712,7 +1692,6 @@ class Session(ABC):
             body=body,
             tags=tags,
             json=json,
-            before_send=before_send,
             wait=wait,
             raise_error=raise_error,
             stream=stream,
@@ -1731,7 +1710,6 @@ class Session(ABC):
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
-        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = True,
@@ -1748,7 +1726,6 @@ class Session(ABC):
             body=body,
             tags=tags,
             json=json,
-            before_send=before_send,
             wait=wait,
             raise_error=raise_error,
             stream=stream,
@@ -1766,7 +1743,6 @@ class Session(ABC):
         headers: Mapping[str, str] | None = None,
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
-        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = False,
@@ -1782,7 +1758,6 @@ class Session(ABC):
             headers=headers,
             body=body,
             tags=tags,
-            before_send=before_send,
             wait=wait,
             raise_error=raise_error,
             stream=stream,
@@ -1801,7 +1776,6 @@ class Session(ABC):
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
-        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = True,
@@ -1818,7 +1792,6 @@ class Session(ABC):
             body=body,
             tags=tags,
             json=json,
-            before_send=before_send,
             wait=wait,
             raise_error=raise_error,
             stream=stream,
@@ -1837,7 +1810,6 @@ class Session(ABC):
         headers: Mapping[str, str] | None = None,
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
-        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
         json: Any | None = None,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
@@ -1855,7 +1827,6 @@ class Session(ABC):
             tags=tags,
             json=json,
             normalize=normalize,
-            before_send=before_send,
         )
 
         return self.send(
@@ -1876,8 +1847,6 @@ class Session(ABC):
         headers: Mapping[str, str] | None = None,
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
-        before_send: Callable[[PreparedRequest], PreparedRequest] | None = None,
-        after_received: Callable[[Response], Response] | None = None,
         local_cache_config: Optional[CacheConfig] = None,
         remote_cache_config: Optional[CacheConfig] = None,
         *,
@@ -1903,8 +1872,6 @@ class Session(ABC):
             tags=tags,
             json=json,
             normalize=normalize,
-            before_send=before_send,
-            after_received=after_received,
             local_cache_config=local_cache_config,
             remote_cache_config=remote_cache_config
         )

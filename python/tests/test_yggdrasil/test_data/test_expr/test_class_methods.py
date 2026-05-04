@@ -64,6 +64,9 @@ class TestFromDispatch:
         assert Expression.from_(p) is p
 
     def test_from_sql_string(self):
+        # The SQL lifter requires the optional ``sqlglot`` extra;
+        # skip rather than fail when running on a base install.
+        pytest.importorskip("sqlglot")
         e = Expression.from_("a > 5")
         assert isinstance(e, Predicate)
         # Round-trip: ``a`` becomes a Column, ``5`` a Literal — the

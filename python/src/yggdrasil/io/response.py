@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import warnings
-from dataclasses import MISSING, dataclass, replace, field
+from dataclasses import MISSING
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional
 
 import polars as pl
@@ -25,6 +25,8 @@ if TYPE_CHECKING:
     from fastapi import Response as FastAPIResponse
     from pyspark.sql import DataFrame as SparkDataFrame, Row as SparkRow
     from starlette.responses import Response as StarletteResponse
+
+    from .session import Session
 
 
 __all__ = [
@@ -561,33 +563,84 @@ _PROMOTED_RESPONSE_HEADER_FIELDS: tuple[tuple[str, str], ...] = (
 # Response dataclass
 # ---------------------------------------------------------------------------
 
-@dataclass(slots=True)
 class Response:
-    request: PreparedRequest
-    status_code: int
-    headers: MutableMapping[str, str] = field(compare=False, hash=False, repr=False)
-    tags: MutableMapping[str, str] = field(compare=False, hash=False, repr=False)
-    buffer: BytesIO = field(compare=False, hash=False, repr=False)
-    received_at: dt.datetime = field(compare=False, hash=False, repr=False)
+    """HTTP response model — paired with the originating :class:`PreparedRequest`.
 
-    _id_cache: int | None = field(default=None, init=False, compare=False, hash=False, repr=False)
+    Plain class with explicit ``__slots__`` (no dataclass decorator) so
+    we have full control over construction, pickling, and the
+    transient session back-reference set via :meth:`attach_session`.
+    """
 
-    def __post_init__(self) -> None:
-        self.status_code = int(self.status_code)
-        self.headers = _string_dict(self.headers)
-        self.tags = _string_dict(self.tags)
-        self.received_at = any_to_datetime(self.received_at)
+    __slots__ = (
+        "request",
+        "status_code",
+        "headers",
+        "tags",
+        "buffer",
+        "received_at",
+        "_id_cache",
+        "_session",
+    )
 
-        if not isinstance(self.buffer, BytesIO):
-            self.buffer = BytesIO(self.buffer, copy=False)
+    def __init__(
+        self,
+        request: PreparedRequest,
+        status_code: int,
+        headers: MutableMapping[str, str],
+        tags: MutableMapping[str, str],
+        buffer: BytesIO,
+        received_at: dt.datetime,
+    ) -> None:
+        self.request = request
+        self.status_code = int(status_code)
+        self.headers = _string_dict(headers)
+        self.tags = _string_dict(tags)
+        self.received_at = any_to_datetime(received_at)
+        self.buffer = buffer if isinstance(buffer, BytesIO) else BytesIO(buffer, copy=False)
 
         _ensure_media_headers(self.headers, self.buffer)
+
+        self._id_cache: int | None = None
+        self._session: "Session | None" = None
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}<r={self.request} s={self.status_code} b={self.body!r}>"
 
     def __str__(self) -> str:
         return self.__repr__()
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Walk __slots__ explicitly because slotted classes don't carry
+        # a __dict__. Drop the transient session ref so responses stay
+        # portable across executors.
+        return {
+            name: getattr(self, name)
+            for name in self.__slots__
+            if name != "_session"
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        for name, value in state.items():
+            setattr(self, name, value)
+        self._session = None
+
+    # ------------------------------------------------------------------
+    # Session attachment — symmetric with PreparedRequest.attach_session
+    # ------------------------------------------------------------------
+
+    def attach_session(self, session: "Session") -> "Response":
+        """Bind *session* as this response's owning session (transient)."""
+        self._session = session
+        return self
+
+    def detach_session(self) -> "Response":
+        """Drop any attached session reference and return self."""
+        self._session = None
+        return self
+
+    @property
+    def session(self) -> "Session | None":
+        return self._session
 
     # ------------------------------------------------------------------
     # Construction
@@ -900,9 +953,9 @@ class Response:
         if not mode:
             return self
 
-        return replace(
-            self,
+        return self.__class__(
             request=self.request.anonymize(mode=mode),
+            status_code=self.status_code,
             headers=normalize_headers(
                 self.headers,
                 is_request=False,
@@ -910,6 +963,9 @@ class Response:
                 body=self.body,
                 anonymize=True,
             ),
+            tags=self.tags,
+            buffer=self.buffer,
+            received_at=self.received_at,
         )
 
     # ------------------------------------------------------------------

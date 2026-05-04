@@ -775,6 +775,14 @@ class Schema(Field, MutableMapping[str, Field]):
         return cls.from_field(Field.from_arrow(obj))
 
     @classmethod
+    def from_spark(cls, obj: Any, from_metadata: bool = True) -> "Schema":
+        # Field.from_spark routes through ``cls(name=..., dtype=...,
+        # nullable=..., metadata=...)`` — Schema's init takes
+        # ``inner_fields``, not ``dtype``, so the inherited path raises.
+        # Lift the Field result instead.
+        return cls.from_field(Field.from_spark(obj, from_metadata=from_metadata))
+
+    @classmethod
     def from_path(cls, path: Any) -> "Schema":
         return path_class().from_(path).as_media().collect_schema()
 

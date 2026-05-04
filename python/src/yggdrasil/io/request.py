@@ -4,7 +4,7 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import json as json_module
-from dataclasses import MISSING, dataclass, field, replace
+from dataclasses import MISSING
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional
 
 import pyarrow as pa
@@ -21,7 +21,8 @@ from .url import URL
 
 if TYPE_CHECKING:
     from .response import Response
-    from .send_config import CacheConfig
+    from .send_config import CacheConfig, SendConfig
+    from .session import Session
 
 
 __all__ = ["PreparedRequest", "REQUEST_SCHEMA", "REQUEST_ARROW_SCHEMA"]
@@ -388,58 +389,122 @@ def _epoch_us_to_utc_datetime(value: int) -> dt.datetime:
     return dt.datetime.fromtimestamp(value / 1_000_000, tz=dt.timezone.utc)
 
 
-@dataclass
 class PreparedRequest:
-    method: str
-    url: URL
-    headers: MutableMapping[str, str]
-    tags: MutableMapping[str, str]
-    buffer: Optional[BytesIO]
-    sent_at: dt.datetime
+    """Immutable-ish request descriptor — fields are normalized in __init__.
 
-    # Per-request cache-config overrides.  When set they take precedence over
-    # the session-level CacheConfig for this individual request only.
-    local_cache_config: Optional["CacheConfig"] = field(
-        default=None,
-        compare=False,
-        repr=False,
-    )
-    remote_cache_config: Optional["CacheConfig"] = field(
-        default=None,
-        compare=False,
-        repr=False,
-    )
+    ``_session`` is a transient back-reference used by
+    :meth:`attach_session`; it's deliberately excluded from
+    :meth:`__getstate__` so a request stays portable when pickled to
+    Spark executors and re-binds via ``attach_session`` once it lands
+    on the worker. Per-request request/response hooks live on the
+    owning :class:`Session` (``_prepare_request`` / ``_prepare_response``).
+    """
 
-    before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = field(
-        default=None,
-        init=False,
-        hash=False,
-        compare=False,
-    )
-    prepare_response: Optional[Callable[["Response"], "Response"]] = field(
-        default=None,
-        init=False,
-        hash=False,
-        compare=False,
-    )
-
-    def __post_init__(self) -> None:
-        self.method = self.method or "GET"
-        self.url = URL.from_(self.url)
-        self.headers = _string_dict(self.headers)
-        self.tags = _string_dict(self.tags)
-        self.sent_at = any_to_datetime(self.sent_at) if self.sent_at else dt.datetime.fromtimestamp(
-            0, tz=dt.timezone.utc
+    def __init__(
+        self,
+        method: str,
+        url: URL,
+        headers: MutableMapping[str, str],
+        tags: MutableMapping[str, str],
+        buffer: Optional[BytesIO],
+        sent_at: Optional[dt.datetime],
+        local_cache_config: Optional["CacheConfig"] = None,
+        remote_cache_config: Optional["CacheConfig"] = None,
+    ) -> None:
+        self.method = method or "GET"
+        self.url = URL.from_(url)
+        self.headers = _string_dict(headers)
+        self.tags = _string_dict(tags)
+        self.sent_at = (
+            any_to_datetime(sent_at) if sent_at
+            else dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)
         )
-
-        if self.buffer is not None and not isinstance(self.buffer, BytesIO):
-            self.buffer = BytesIO.from_(self.buffer)
+        self.buffer = (
+            BytesIO.from_(buffer)
+            if buffer is not None and not isinstance(buffer, BytesIO)
+            else buffer
+        )
+        self.local_cache_config = local_cache_config
+        self.remote_cache_config = remote_cache_config
+        self._session: "Session | None" = None
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}<{self.method} {self.url.to_string()!r}>"
 
     def __str__(self) -> str:
         return self.url.to_string()
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Drop the transient session back-reference so requests stay
+        # cleanly picklable for cross-executor transport. Re-bind on the
+        # worker via :meth:`attach_session` (typically from a Spark
+        # broadcast variable).
+        state = self.__dict__.copy()
+        state.pop("_session", None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._session = None
+
+    # ------------------------------------------------------------------
+    # Session attachment — used by Spark broadcast on the worker side
+    # ------------------------------------------------------------------
+
+    def attach_session(self, session: "Session") -> "PreparedRequest":
+        """Bind *session* as this request's owning session.
+
+        The reference is transient — :meth:`__getstate__` drops it so a
+        pickled-and-shipped request lands on the worker without a stale
+        session. Workers re-bind via this method, typically from a
+        ``sparkContext.broadcast`` variable so the session is shipped
+        once per executor instead of once per task closure.
+        """
+        self._session = session
+        return self
+
+    def detach_session(self) -> "PreparedRequest":
+        """Drop any attached session reference and return self."""
+        self._session = None
+        return self
+
+    @property
+    def session(self) -> "Session | None":
+        """The session currently attached via :meth:`attach_session`, or None."""
+        return self._session
+
+    # ------------------------------------------------------------------
+    # Sending — delegates to the attached session
+    # ------------------------------------------------------------------
+
+    def send(
+        self,
+        config: "SendConfig | Mapping[str, Any] | None" = None,
+        **kwargs: Any,
+    ) -> "Response":
+        """Send this request through its attached session.
+
+        Routes through :meth:`Session.send`, which builds the effective
+        :class:`SendConfig` from *config* + *kwargs* (wait, raise_error,
+        stream, remote_cache, local_cache, spark_session, …). Raises
+        :class:`RuntimeError` if no session is attached — callers should
+        either go through ``session.send(req)`` directly or bind a
+        session first via :meth:`attach_session`.
+        """
+        return self._send(config, **kwargs)
+
+    def _send(
+        self,
+        config: "SendConfig | Mapping[str, Any] | None" = None,
+        **kwargs: Any,
+    ) -> "Response":
+        if self._session is None:
+            raise RuntimeError(
+                f"{type(self).__name__}.send requires an attached session — "
+                "call request.attach_session(session) first, or use "
+                "session.send(request) directly."
+            )
+        return self._session.send(self, config, **kwargs)
 
     @classmethod
     def parse(
@@ -622,8 +687,6 @@ class PreparedRequest:
         headers: Optional[MutableMapping[str, str]] = None,
         body: Optional[Any] = None,
         tags: Optional[Mapping[str, str]] = None,
-        before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = None,
-        after_received: Optional[Callable[["Response"], "Response"]] = None,
         local_cache_config: Optional[CacheConfig] = None,
         remote_cache_config: Optional[CacheConfig] = None,
         *,
@@ -657,7 +720,7 @@ class PreparedRequest:
                 from .http_ import HTTPRequest
                 out_class = HTTPRequest
 
-        built = out_class(
+        return out_class(
             method=str(method),
             url=parsed_url,
             headers=normalize_headers(out_headers, is_request=True, body=request_body) if normalize else out_headers,
@@ -667,9 +730,6 @@ class PreparedRequest:
             local_cache_config=local_cache_config,
             remote_cache_config=remote_cache_config,
         )
-        built.before_send = before_send
-        built.prepare_response = after_received
-        return built
 
     def copy(
         self,
@@ -680,8 +740,6 @@ class PreparedRequest:
         buffer: Optional[BytesIO] = ...,
         tags: Optional[Mapping[str, str]] = None,
         sent_at: int | None = None,
-        before_send: Optional[Callable[["PreparedRequest"], "PreparedRequest"]] = ...,
-        prepare_response: Optional[Callable[["Response"], "Response"]] = ...,
         local_cache_config: Optional["CacheConfig"] = ...,
         remote_cache_config: Optional["CacheConfig"] = ...,
         normalize: bool = True,
@@ -699,7 +757,7 @@ class PreparedRequest:
 
         new_tags = dict(self.tags) if tags is None else _string_dict(tags)
 
-        built = self.__class__(
+        return self.__class__(
             method=self.method if method is None else str(method),
             url=new_url,
             headers=new_headers,
@@ -710,26 +768,20 @@ class PreparedRequest:
             remote_cache_config=self.remote_cache_config if remote_cache_config is ... else remote_cache_config,
         )
 
-        built.before_send = self.before_send if before_send is ... else before_send
-        built.prepare_response = self.prepare_response if prepare_response is ... else prepare_response
-        return built
-
     def prepare_to_send(
         self,
         sent_at: dt.datetime | dt.date | str | int | None = None,
         headers: Optional[Mapping[str, str]] = None,
     ) -> "PreparedRequest":
-        instance = self.before_send(self) if self.before_send else self
-
-        if instance.headers is None:
-            instance.headers = {}
+        if self.headers is None:
+            self.headers = {}
 
         if headers:
-            instance.headers.update(_string_dict(headers))
+            self.headers.update(_string_dict(headers))
 
-        instance.sent_at = dt.datetime.now(dt.timezone.utc) if sent_at is None else any_to_datetime(sent_at)
+        self.sent_at = dt.datetime.now(dt.timezone.utc) if sent_at is None else any_to_datetime(sent_at)
 
-        return instance
+        return self
 
     @property
     def body(self) -> Optional[BytesIO]:
@@ -937,8 +989,7 @@ class PreparedRequest:
         if not mode:
             return self
 
-        return replace(
-            self,
+        return self.copy(
             headers=normalize_headers(
                 self.headers,
                 is_request=True,
