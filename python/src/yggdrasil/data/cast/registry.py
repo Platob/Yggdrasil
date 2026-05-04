@@ -290,71 +290,62 @@ def convert(
     """
     Convert `value` to `target_hint` using registered converters + built-ins.
 
-    Behavior summary:
-      - Optional[T] / T|None allows None to pass through.
-      - If value is None and target isn't optional, returns default_scalar(target_hint).
-      - Uses registry converters first (including Any->target wildcard).
-      - Supports:
-          * Enum conversion (by name or value)
-          * dataclass conversion from Mapping
-          * list/set/tuple/dict/Mapping recursive conversion
-          * pyarrow Array/ChunkedArray/Table/RecordBatch -> Python list for iterables
-      - Raises TypeError if no conversion path exists.
+    Dispatch order (cheapest first):
+      1) ``Optional[T]`` unwrap.
+      2) ``None`` → ``None`` if optional, else ``default_scalar(target)``.
+      3) ``Any`` / ``object`` target → identity passthrough.
+      4) ``isinstance(value, target_hint)`` → identity passthrough.
+      5) Registry lookup (exact / wildcard / namespace / MRO / one-hop composition).
+      6) ``Enum`` member resolution and ``dataclass`` from-mapping coercion.
+      7) Container generics — ``list`` / ``set`` / ``tuple`` / ``dict`` / ``Mapping``.
+      8) ``TypeError`` — no path found.
+
+    Options are normalized through ``CastOptions.check`` only when the caller
+    actually supplied one — the no-options call site (the common one) skips the
+    allocation entirely.
     """
     from yggdrasil.arrow.python_defaults import default_scalar
     from yggdrasil.data.options import CastOptions
 
     is_optional, target_hint = unwrap_optional(target_hint)
 
-    # Ultra-fast path: no options, no kwargs
-    if options is None and not kwargs:
-        try:
-            if isinstance(value, target_hint):
-                return value  # type: ignore[return-value]
-        except Exception:
-            pass
-
-        if value is None:
-            return None if is_optional else default_scalar(target_hint)  # type: ignore[return-value]
-
-    # Normalize options (CastOptions, Arrow types, kwargs, etc.)
-    options = CastOptions.check(options, **kwargs)
-
     if value is None:
         return None if is_optional else default_scalar(target_hint)  # type: ignore[return-value]
 
-    source_type = type(value)
-    conv = find_converter(source_type, target_hint)
+    if target_hint is Any or target_hint is object:
+        return value  # type: ignore[return-value]
+
+    target_is_type = isinstance(target_hint, type)
+    if target_is_type:
+        try:
+            if isinstance(value, target_hint):
+                return value  # type: ignore[return-value]
+        except TypeError:
+            # Generic aliases / parameterized types raise here; ignore and dispatch.
+            pass
+
+    if options is not None or kwargs:
+        options = CastOptions.check(options, **kwargs)
+
+    conv = find_converter(type(value), target_hint)
     if conv is not None:
         return conv(value, options)  # type: ignore[return-value]
+
+    if target_is_type:
+        if issubclass(target_hint, enum.Enum):
+            return convert_to_python_enum(value, target_hint, options=options)  # type: ignore[return-value]
+        if dataclasses.is_dataclass(target_hint):
+            return convert_to_python_dataclass(value, target_hint, options=options)  # type: ignore[return-value]
 
     origin = get_origin(target_hint) or target_hint
     args = get_args(target_hint)
 
-    # Enum helper
-    if isinstance(target_hint, type) and issubclass(target_hint, enum.Enum):
-        return convert_to_python_enum(value, target_hint, options=options)  # type: ignore[return-value]
-
-    # dataclass helper
-    if isinstance(target_hint, type) and dataclasses.is_dataclass(target_hint):
-        return convert_to_python_dataclass(value, target_hint, options=options)  # type: ignore[return-value]
-
-    # containers
-    if origin in {list, set}:
+    if origin is list or origin is set:
         return convert_to_python_iterable(value, origin, args, options=options)  # type: ignore[return-value]
-
     if origin is tuple:
         return convert_tuple(value, args, options)  # type: ignore[return-value]
-
-    if origin in {dict, Mapping}:
+    if origin is dict or origin is Mapping:
         return convert_mapping(value, origin, args, options)  # type: ignore[return-value]
-
-    # last-resort identity-ish
-    try:
-        if target_hint is Any or isinstance(value, target_hint):
-            return value  # type: ignore[return-value]
-    except Exception:
-        pass
 
     raise TypeError(f"No converter registered for {type(value)} -> {target_hint}")
 
@@ -589,51 +580,75 @@ def convert_to_python_iterable(
 
 
 # ----------------------------
-# Default registrations
+# Default registrations — base Python types delegate to DataType._convert_pyobj
 # ----------------------------
+#
+# Why delegate?
+# -------------
+# Each scalar Python type already has a canonical coercion path on its
+# matching DataType subclass (IntegerType/FloatingPointType/BooleanType/
+# StringType/...). Routing the registry through ``DataType._convert_pyobj``
+# keeps a single source of truth for parse semantics — feature code that
+# does ``convert("123", int)`` and engine code that hits ``IntegerType``
+# during schema-driven ingest end up on the same code path.
+
+# Cached primitive-DataType singletons keyed by Python type. ``DataType``
+# instances are frozen, hashable, and idempotent — building one per
+# convert() call would dwarf the actual coercion work.
+_PRIMITIVE_DTYPE_CACHE: dict[type, Any] = {}
+
+
+def _primitive_dtype(target: type) -> Any:
+    """Return the cached :class:`DataType` matching *target* (e.g. ``int`` → ``IntegerType``)."""
+    cached = _PRIMITIVE_DTYPE_CACHE.get(target)
+    if cached is not None:
+        return cached
+
+    from yggdrasil.data.types.base import DataType
+
+    dtype = DataType.from_pytype(target)
+    _PRIMITIVE_DTYPE_CACHE[target] = dtype
+    return dtype
+
 
 @register_converter(str, int)
 def str_to_int(value: str, opts: Any) -> int:
-    """Parse int from string. Empty string -> 0 (fast + predictable)."""
-    return 0 if value == "" else int(value)
+    """Parse int from string via ``IntegerType``. Empty string → 0."""
+    if value == "":
+        return 0
+    return _primitive_dtype(int)._convert_pyobj(value, safe=True)
 
 
 @register_converter(str, float)
 def str_to_float(value: str, opts: Any) -> float:
-    """
-    Parse float from string.
+    """Parse float from string via ``FloatingPointType``.
 
-    If opts has `default_value` and input is empty string, returns that.
+    Honors ``opts.default_value`` when input is the empty string — convenient
+    for CSV/Excel ingest where missing cells round-trip as ``""``.
     """
-    default_value = getattr(opts, "default_value", None)
-    if value == "" and default_value is not None:
-        return default_value
-    return float(value)
+    if value == "":
+        default_value = getattr(opts, "default_value", None)
+        if default_value is not None:
+            return default_value
+    return _primitive_dtype(float)._convert_pyobj(value, safe=True)
 
 
 @register_converter(str, bool)
 def str_to_bool(value: str, opts: Any) -> bool:
+    """Parse bool from string via ``BooleanType``.
+
+    Empty string is rejected (use ``opts.default_value`` to opt in to a
+    fallback). The accepted truthy/falsy tokens are owned by ``BooleanType``.
     """
-    Parse bool from string.
-
-    Truthy:  true, 1, yes, y, t
-    Falsy:   false, 0, no, n, f
-
-    If opts has `default_value` and input is empty string, returns that.
-    """
-    default_value = getattr(opts, "default_value", None)
-    if value == "" and default_value is not None:
-        return default_value
-
-    s = value.strip().lower()
-    if s in {"true", "1", "yes", "y", "t"}:
-        return True
-    if s in {"false", "0", "no", "n", "f"}:
-        return False
-    raise ValueError(f"Cannot parse boolean from {value!r}")
+    if value == "":
+        default_value = getattr(opts, "default_value", None)
+        if default_value is not None:
+            return default_value
+        raise ValueError(f"Cannot parse boolean from {value!r}")
+    return _primitive_dtype(bool)._convert_pyobj(value, safe=True)
 
 
 @register_converter(int, str)
 def int_to_str(value: int, _: Any) -> str:
-    """Stringify int."""
-    return str(value)
+    """Stringify int via ``StringType``."""
+    return _primitive_dtype(str)._convert_pyobj(value, safe=True)
