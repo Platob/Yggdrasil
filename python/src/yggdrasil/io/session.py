@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import gzip
+import hashlib
 import itertools
 import logging
+import os
+import pickle
+import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional
 
 import pyarrow as pa
-import pyarrow.compute as pc
 
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.dataclasses.waiting import (
@@ -21,7 +26,6 @@ from yggdrasil.dataclasses.waiting import (
 )
 from yggdrasil.io.enums import Mode
 from .buffer import BytesIO
-from .buffer.nested.folder_io import FolderIO, FolderOptions
 from .request import PreparedRequest
 from .response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
 from .response_batch import ResponseBatch
@@ -43,138 +47,76 @@ __all__ = [
 LOGGER = logging.getLogger(__name__)
 
 
-# Local cache lives in a partitioned :class:`FolderIO` rooted at
-# ``<CacheConfig.path>/cache``. Partition columns come from
-# ``RESPONSE_SCHEMA``'s ``partition_by``-tagged fields and the schema
-# itself is dropped to ``<root>/.schema`` on first write so future
-# reads pick up the layout without inferring. Reads filter by
-# request-key tuple + received-window; writes are append-only with
-# UUID-named leaves so concurrent fire-and-forget workers can't race
-# on a final filename.
+# Local cache stores one compressed pickle file per request key under
+# :meth:`CacheConfig.local_cache_folder`. The filename is a SHA1 of the
+# match-by tuple; the file body is gzip-compressed pickle of the
+# anonymized :class:`Response`. Writes go through tmp + rename so a
+# concurrent reader never sees a half-written file; reads tolerate
+# missing / corrupt files by treating them as cache misses.
 
 
-def _store_local_arrow_batch(
-    cache: "FolderIO",
-    batch: pa.RecordBatch,
-) -> None:
-    """Append a single Arrow batch to ``cache`` from a worker thread.
+def _local_cache_match_by(cache_cfg: CacheConfig) -> tuple[str, ...]:
+    return tuple(cache_cfg.request_by or ()) or ("request_url_str",)
 
-    Module-level so the fire-and-forget Job pickles cleanly without
-    dragging Session state along. Routes the batch through the
-    folder's ``write_arrow_batches`` with ``Mode.APPEND`` —
-    :class:`FolderIO` resolves the partition tuple from the batch's
-    own columns and drops a UUID-named leaf into the matching
-    directory.
+
+def _local_cache_key(obj: "PreparedRequest | Response", match_by: tuple[str, ...]) -> str:
+    """SHA1-hash the match-by tuple for one request or response.
+
+    Stable across processes and across request/response pairs because
+    both expose the same ``match_value`` keys via their Arrow schema.
     """
-    cache.write_arrow_batches(
-        [batch], options=FolderOptions(mode=Mode.APPEND),
-    )
-
-
-def _request_partition_filter(
-    cache: "FolderIO",
-    requests: "list[PreparedRequest]",
-) -> "pc.Expression | None":
-    """Build a pyarrow predicate pruning to the partitions in ``requests``.
-
-    Walks every request, projects its values for the cache's
-    partition columns, and AND-s an ``isin`` filter per column.
-    Used by the lookup path to skip partitions no incoming request
-    actually touches before the row-level match-by filter runs.
-    Returns ``None`` when the cache isn't partitioned or the
-    request list yields no usable values.
-    """
-    parts = cache._resolve_partition_columns()
-    if not parts:
-        return None
-    expr: "pc.Expression | None" = None
-    for f in parts:
+    parts: list[str] = []
+    for col in match_by:
         try:
-            values = sorted(
-                {r.match_value(f.name) for r in requests},
-                key=lambda v: (v is None, v),
-            )
+            v = obj.match_value(col)
         except Exception:
-            continue
-        if not values:
-            continue
-        term = pc.is_in(pc.field(f.name), value_set=pa.array(values))
-        expr = term if expr is None else (expr & term)
-    return expr
+            v = None
+        parts.append("" if v is None else str(v))
+    raw = "\x00".join(parts).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
 
 
-def _lookup_local_responses(
-    cache: "FolderIO",
-    requests: "list[PreparedRequest]",
-    *,
-    match_by: "tuple[str, ...]",
-    received_from: "Any | None" = None,
-    received_to: "Any | None" = None,
-) -> dict[tuple, Response]:
-    """Bulk lookup by request-key tuple against a folder cache.
+def _local_cache_file(folder: Path, key: str) -> Path:
+    return folder / f"{key}.pkl.gz"
 
-    One folder read per call — partition pruning shrinks the set of
-    leaves visited, then we filter rows by request-key tuple + the
-    optional received-window. When several rows share a key the
-    latest one (max ``response_received_at``) wins, giving
-    UPSERT-on-write semantics for free.
+
+def _store_pickle_response(file_path: Path, response: Response) -> None:
+    """Atomically write a gzip-compressed pickle of *response* to *file_path*.
+
+    Module-level so the fire-and-forget :class:`Job` pickles cleanly
+    without dragging Session state along.
     """
-    if not requests:
-        return {}
-    if not cache.path.exists():
-        return {}
-
+    folder = file_path.parent
+    folder.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".tmp-", suffix=".pkl.gz", dir=str(folder))
     try:
-        with cache:
-            table = cache.read_arrow_table()
+        with os.fdopen(fd, "wb") as raw:
+            with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=6) as gz:
+                pickle.dump(response, gz, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_name, str(file_path))
     except Exception:
-        # Corrupt leaf, race with a concurrent write, schema drift
-        # — fall through to "nothing matches" so callers progress
-        # to the next pipeline stage cleanly.
-        LOGGER.debug(
-            "Local response cache read failed under %s; treating as miss",
-            cache.path, exc_info=True,
-        )
-        return {}
-
-    if table.num_rows == 0:
-        return {}
-
-    if "response_received_at" in table.column_names:
-        if received_from is not None:
-            table = table.filter(
-                pc.greater_equal(
-                    table["response_received_at"],
-                    pa.scalar(received_from),
-                )
-            )
-        if received_to is not None:
-            table = table.filter(
-                pc.less(
-                    table["response_received_at"],
-                    pa.scalar(received_to),
-                )
-            )
-
-    wanted: set[tuple] = {
-        tuple(r.match_value(c) for c in match_by) for r in requests
-    }
-    out: dict[tuple, Response] = {}
-    latest_at: dict[tuple, Any] = {}
-    for response in Response.from_arrow_tabular(table.to_batches()):
         try:
-            key = tuple(response.match_value(c) for c in match_by)
-        except Exception:
-            continue
-        if key not in wanted:
-            continue
-        ts = response.received_at
-        existing = latest_at.get(key)
-        if existing is None or (ts is not None and ts >= existing):
-            out[key] = response
-            if ts is not None:
-                latest_at[key] = ts
-    return out
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _load_pickle_response(file_path: Path) -> Optional[Response]:
+    """Load a gzip-compressed pickled :class:`Response`, or return ``None``."""
+    if not file_path.exists():
+        return None
+    try:
+        with gzip.open(str(file_path), "rb") as gz:
+            return pickle.load(gz)
+    except Exception:
+        # Corrupt file, partial write, schema drift across versions —
+        # treat as miss so the caller refetches and overwrites cleanly.
+        LOGGER.debug(
+            "Local response cache read failed for %s; treating as miss",
+            file_path, exc_info=True,
+        )
+        return None
 
 
 @dataclass
@@ -260,33 +202,27 @@ class Session(ABC):
         request: PreparedRequest,
         cache_cfg: CacheConfig,
     ) -> Optional[Response]:
-        """Resolve a single request against the partitioned local cache.
+        """Resolve a single request against the pickle-file local cache.
 
-        Routes through :func:`_lookup_local_responses` — one folder
-        read, partition-pruned by the request's own values, then
-        row-filtered by the ``request_by`` tuple and the configured
-        received-window.
+        Hashes the request's match-by tuple to a filename under
+        :meth:`CacheConfig.local_cache_folder`, gunzips and unpickles
+        the stored :class:`Response`, then applies the cache config's
+        filter (request_by columns + received-window).
         """
-        match_by = tuple(cache_cfg.request_by or ()) or ("request_url_str",)
-        cache = cache_cfg.local_cache()
-        looked = _lookup_local_responses(
-            cache, [request],
-            match_by=match_by,
-            received_from=cache_cfg.received_from,
-            received_to=cache_cfg.received_to,
-        )
+        match_by = _local_cache_match_by(cache_cfg)
+        folder = cache_cfg.local_cache_folder()
         try:
-            key = tuple(request.match_value(c) for c in match_by)
+            key = _local_cache_key(request, match_by)
         except Exception:
             return None
-        loaded = looked.get(key)
+        loaded = _load_pickle_response(_local_cache_file(folder, key))
         if loaded is None:
             return None
         if not cache_cfg.filter_response(loaded, request=request):
             return None
         LOGGER.debug(
             "Found local %s %s in %s",
-            request.method, request.url, cache.path,
+            request.method, request.url, folder,
         )
         return loaded
 
@@ -294,32 +230,28 @@ class Session(ABC):
         self,
         response: Response,
         cache_cfg: CacheConfig,
-        *,
-        cache: "FolderIO | None" = None,
     ) -> None:
-        """Persist one response to the partitioned local cache.
+        """Persist one response to the pickle-file local cache.
 
-        The response is anonymized first (matches the on-disk
-        identity used at lookup time) and the actual write is fired
-        off through the job pool — :class:`FolderIO` resolves the
-        partition tuple from the batch's own columns and drops a
-        UUID-named leaf into the matching directory, so concurrent
-        fire-and-forget workers can't race on a final filename.
-
-        ``cache`` lets a hot-loop caller reuse a single
-        :class:`FolderIO` instance across many writes instead of
-        paying for the per-call construction (cheap but not free).
+        Anonymizes the response (matching the on-disk identity used
+        at lookup time), derives the cache filename from the
+        match-by tuple, and writes a gzip-compressed pickle through
+        the job pool — fire-and-forget so the caller doesn't block
+        on disk IO. The atomic tmp+rename in
+        :func:`_store_pickle_response` keeps concurrent readers from
+        observing a half-written file.
         """
         if not response.ok:
             return
 
         anonymized = response.anonymize(mode=cache_cfg.anonymize)
-        cache = cache or cache_cfg.local_cache()
-        # Build the Arrow batch on the caller's thread while the
-        # buffer is still live; the partitioned write goes through
-        # fire-and-forget so the caller doesn't block on disk IO.
-        batch = anonymized.to_arrow_batch(parse=False)
-        Job.make(_store_local_arrow_batch, cache, batch).fire_and_forget()
+        match_by = _local_cache_match_by(cache_cfg)
+        try:
+            key = _local_cache_key(anonymized, match_by)
+        except Exception:
+            return
+        file_path = _local_cache_file(cache_cfg.local_cache_folder(), key)
+        Job.make(_store_pickle_response, file_path, anonymized).fire_and_forget()
 
     def _load_remote_cached_response(
         self,
@@ -477,22 +409,17 @@ class Session(ABC):
         effective_remote_cfg = request.remote_cache_config or remote_cfg
 
         # --- 1. Check local cache first (fast, disk-based) ---
-        # UPSERT mode skips the lookup outright — the lookup
-        # tie-break already returns the latest matching row, so a
-        # stale entry can sit on disk indefinitely without
-        # affecting correctness; the fresh fetch below will append
-        # a newer row that wins on the next read.
-        local_cache: "FolderIO | None" = None
-        if effective_local_cfg.local_cache_enabled:
-            local_cache = effective_local_cfg.local_cache()
-            if effective_local_cfg.mode != Mode.UPSERT:
-                local_response = self._load_local_cached_response(
-                    request, effective_local_cfg
-                )
-                if local_response is not None:
-                    if config.raise_error:
-                        local_response.raise_for_status()
-                    return local_response
+        # UPSERT mode skips the lookup outright — a fresh fetch will
+        # overwrite the existing pickle file in place.
+        local_enabled = effective_local_cfg.local_cache_enabled
+        if local_enabled and effective_local_cfg.mode != Mode.UPSERT:
+            local_response = self._load_local_cached_response(
+                request, effective_local_cfg
+            )
+            if local_response is not None:
+                if config.raise_error:
+                    local_response.raise_for_status()
+                return local_response
 
         # --- 2. Check remote cache (slower, SQL-based) ---
         # Skip when the effective config demands a forced refresh (UPSERT).
@@ -506,12 +433,9 @@ class Session(ABC):
                 spark_session=config.spark_session,
             )
             if remote_response is not None:
-                # Backfill local cache with the remote hit
-                if local_cache is not None:
+                if local_enabled:
                     self._store_local_cached_response(
-                        remote_response,
-                        effective_local_cfg,
-                        cache=local_cache,
+                        remote_response, effective_local_cfg,
                     )
                 if config.raise_error:
                     remote_response.raise_for_status()
@@ -524,12 +448,8 @@ class Session(ABC):
         response = self._after_send(response)
         LOGGER.info("Sent %s %s", request.method, request.url)
 
-        if local_cache is not None:
-            self._store_local_cached_response(
-                response,
-                effective_local_cfg,
-                cache=local_cache,
-            )
+        if local_enabled:
+            self._store_local_cached_response(response, effective_local_cfg)
 
         if effective_remote_cfg.remote_cache_enabled:
             # Pass the effective config so that its mode (UPSERT or APPEND)
@@ -658,19 +578,13 @@ class Session(ABC):
     ) -> tuple[dict[str, list[Response]], list[PreparedRequest]]:
         """Stage 1: scan the local cache.
 
-        Returns ``(hits_by_path, misses)``. UPSERT entries are evicted
-        on the way through so the eventual fresh response can be
-        written in their place. Each request is evaluated against its
-        own effective local cache config (per-request override or
-        session-level fallback).
-
-        Hits are grouped by the effective config's local-cache folder
-        — keyed via :meth:`CacheConfig.local_cache_folder`, which
-        auto-fills the default ``~/.yggdrasil/cache/response`` root on any
-        config that didn't carry a ``path`` — so the per-config split
-        survives all the way to :class:`ResponseBatch.local_hits`.
-        Collapsing them back into one bucket would lose that
-        provenance.
+        Each request maps to a single keyed pickle file under its
+        effective :meth:`CacheConfig.local_cache_folder`, so the lookup
+        is one ``Path.exists`` + ``gzip.open`` per request — no batch
+        scan of the whole cache. UPSERT-mode and disabled requests fall
+        straight to misses without touching disk. Hits stay grouped by
+        cache folder so :class:`ResponseBatch.local_hits` preserves the
+        per-config split.
         """
         hits: dict[str, list[Response]] = {}
         misses: list[PreparedRequest] = []
@@ -678,50 +592,18 @@ class Session(ABC):
         if not session_local_cfg.local_cache_enabled and not any(
             r.local_cache_config for r in batch
         ):
-            # Cheap path: no local cache anywhere in this batch.
             return hits, list(batch)
 
-        # Group active requests by their effective config so each
-        # cache root takes one folder read instead of one per
-        # request — that's the whole point of the partitioned
-        # layout. UPSERT-mode and disabled requests fall straight
-        # to misses without touching the cache.
-        cfg_groups: dict[str, tuple[CacheConfig, list[PreparedRequest]]] = {}
         for req in batch:
             eff = self._effective_local_cfg(req, session_local_cfg)
             if not eff.local_cache_enabled or eff.mode == Mode.UPSERT:
                 misses.append(req)
                 continue
-            pkey = str(eff.local_cache_folder())
-            slot = cfg_groups.get(pkey)
-            if slot is None:
-                cfg_groups[pkey] = (eff, [req])
-            else:
-                slot[1].append(req)
-
-        for pkey, (eff, group_reqs) in cfg_groups.items():
-            cache = eff.local_cache()
-            match_by = tuple(eff.request_by or ()) or ("request_url_str",)
-            looked_up = _lookup_local_responses(
-                cache, group_reqs,
-                match_by=match_by,
-                received_from=eff.received_from,
-                received_to=eff.received_to,
-            )
-            for req in group_reqs:
-                try:
-                    key = tuple(req.match_value(c) for c in match_by)
-                except Exception:
-                    misses.append(req)
-                    continue
-                cached = looked_up.get(key)
-                if cached is None:
-                    misses.append(req)
-                    continue
-                if not eff.filter_response(cached, request=req):
-                    misses.append(req)
-                    continue
-                hits.setdefault(pkey, []).append(cached)
+            cached = self._load_local_cached_response(req, eff)
+            if cached is None:
+                misses.append(req)
+                continue
+            hits.setdefault(str(eff.local_cache_folder()), []).append(cached)
 
         if hits:
             total = sum(len(v) for v in hits.values())
@@ -1023,17 +905,10 @@ class Session(ABC):
         """Write remote-cache hits back to the local cache.
 
         Each response is stored against its originating request's
-        effective local config (looked up by URL) — using the
-        session-level config for every response would be wrong
-        whenever a request carries a custom per-request local
-        cache. Responses are anonymized then grouped by the
-        effective cache root so each :class:`FolderIO` takes a
-        single bulk write instead of one fire-and-forget per
-        response — collapsing N small writes into one
-        partition-routed write per root, with FolderIO's auto-prune
-        path handling the merge when the config is in UPSERT mode.
+        effective local config (looked up by URL) and goes through
+        :meth:`_store_local_cached_response`, which fires one
+        gzip-pickle write per response off through the job pool.
         """
-        groups: dict[str, tuple["FolderIO", "CacheConfig", list[Response]]] = {}
         for response in responses:
             url_key = str(response.request.url) if response.request else None
             eff = url_to_local_cfg.get(url_key) if url_key else None
@@ -1041,28 +916,7 @@ class Session(ABC):
                 eff = session_local_cfg
             if not eff.local_cache_enabled:
                 continue
-            anonymized = response.anonymize(mode=eff.anonymize)
-            pkey = str(eff.local_cache_folder())
-            slot = groups.get(pkey)
-            if slot is None:
-                groups[pkey] = (eff.local_cache(), eff, [anonymized])
-            else:
-                slot[2].append(anonymized)
-
-        for cache, eff, group_responses in groups.values():
-            ok_responses = [r for r in group_responses if r.ok]
-            if not ok_responses:
-                continue
-            table = pa.Table.from_batches([
-                r.to_arrow_batch(parse=False) for r in ok_responses
-            ])
-            mode = Mode.UPSERT if eff.mode == Mode.UPSERT else Mode.APPEND
-            options = FolderOptions(
-                mode=mode,
-                match_by_names=list(eff.request_by or ()) or None,
-            )
-            with cache:
-                cache.write_arrow_table(table, options=options)
+            self._store_local_cached_response(response, eff)
 
     def _persist_remote(
         self,
