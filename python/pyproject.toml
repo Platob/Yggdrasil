@@ -101,6 +101,10 @@ mongo = [
   "mongoengine>=0.29",
 ]
 
+kafka = [
+  "confluent-kafka>=2.4",
+]
+
 excel = [
   "fastexcel"
 ]

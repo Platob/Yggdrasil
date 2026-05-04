@@ -816,6 +816,17 @@ class MimeTypes:
         )
     )
 
+    # Kafka — a topic, addressed by broker + topic name. Streaming
+    # tabular source; values can be any of the registered codecs
+    # (JSON, Avro, Protobuf, plain bytes).
+    KAFKA_TOPIC = MimeType.define(
+        MimeType(
+            "KAFKA_TOPIC",
+            "application/vnd.apache.kafka.topic",
+            is_tabular=True,
+        )
+    )
+
     # --- Fallback ---
     OCTET_STREAM = MimeType.define(
         MimeType("OCTET_STREAM", "application/octet-stream")
