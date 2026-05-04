@@ -456,7 +456,7 @@ class Session(ABC):
         """
         return request
 
-    def _after_send(self, response: Response) -> Response:
+    def _prepare_response(self, response: Response) -> Response:
         """Session-wide response hook fired once per completed network send.
 
         Default returns *response* unchanged. Subclasses override to log,
@@ -531,7 +531,7 @@ class Session(ABC):
         request = self._prepare_request(request)
         LOGGER.debug("Sending %s %s", request.method, request.url)
         response = self._local_send(request, config=config)
-        response = self._after_send(response)
+        response = self._prepare_response(response)
         LOGGER.info("Sent %s %s", request.method, request.url)
 
         if local_cache is not None:
