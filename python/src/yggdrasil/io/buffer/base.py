@@ -89,6 +89,67 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
+# Frame-shaped lift — pyarrow / polars / pandas / pyspark / pylist
+# ---------------------------------------------------------------------------
+
+
+def _is_frame_shaped(obj: Any) -> bool:
+    """True when *obj* is one of the shapes :class:`MemoryArrowIO` ingests.
+
+    Cheap probe — used by :meth:`TabularIO.__new__` to decide whether
+    to short-circuit dispatch to :class:`MemoryArrowIO` before the
+    media-type / path resolution path runs. Mirrors the type set
+    accepted by :meth:`MemoryArrowIO._ingest` exactly so the two
+    don't drift.
+    """
+    if obj is None:
+        return False
+    if isinstance(obj, (pa.Table, pa.RecordBatch)):
+        return True
+    module = (type(obj).__module__ or "").split(".", 1)[0]
+    if module in ("polars", "pandas", "pyspark"):
+        return True
+    if isinstance(obj, list) and obj and all(isinstance(r, dict) for r in obj):
+        return True
+    if (
+        isinstance(obj, dict) and obj
+        and all(isinstance(v, (list, tuple)) for v in obj.values())
+    ):
+        return True
+    return False
+
+
+def _lift_tabular_data(obj: Any) -> "TabularIO | None":
+    """Wrap a dataframe-shaped *obj* in :class:`MemoryArrowIO`, or return None.
+
+    Recognised shapes:
+
+    - :class:`pyarrow.Table` / :class:`pyarrow.RecordBatch`
+    - polars :class:`DataFrame` / :class:`LazyFrame` (LazyFrame is
+      collected once on entry — the holder is in-memory by design)
+    - pandas :class:`DataFrame`
+    - pyspark :class:`DataFrame` (driver-side pull via ``toArrow``
+      when available, else ``toPandas``)
+    - ``list[dict]`` rows / ``dict[str, list]`` columns — we accept
+      these because they're what most callers reach for first when
+      they don't have an engine handy.
+
+    Returns ``None`` when *obj* doesn't match any of those — the
+    caller (:meth:`TabularIO.from_`) then falls through to the
+    bytes-buffer path.
+
+    Implementation note: we delegate the actual ingestion to
+    :class:`MemoryArrowIO` constructor — which handles every shape
+    listed above via :meth:`MemoryArrowIO._ingest`. This stays a
+    thin wrapper so the type-set lives in one place.
+    """
+    if not _is_frame_shaped(obj):
+        return None
+    from yggdrasil.io.buffer.memory import MemoryArrowIO
+    return MemoryArrowIO(obj)
+
+
+# ---------------------------------------------------------------------------
 # Type aliases
 # ---------------------------------------------------------------------------
 
@@ -384,6 +445,16 @@ class TabularIO(Disposable, ABC, Generic[O]):
             if isinstance(data, bytes_io_class()):
                 media_type = media_type or data._media_type
                 path = path or data.path
+            elif media_type is None and path is None and _is_frame_shaped(data):
+                # No bytes, no path, no media-type pin, but the data
+                # already speaks rows / columns — route to
+                # :class:`MemoryArrowIO`. ``__init__`` runs once
+                # against the (now correctly-typed) class and ingests
+                # via :meth:`MemoryArrowIO._ingest`, which accepts
+                # the same frame shapes :func:`_lift_tabular_data`
+                # recognises.
+                from yggdrasil.io.buffer.memory import MemoryArrowIO
+                return object.__new__(MemoryArrowIO)
 
         if media_type is not None:
             media_type = MediaType.from_(media_type)
@@ -684,15 +755,56 @@ class TabularIO(Disposable, ABC, Generic[O]):
         default: Any = ...,
         **kwargs: Any
     ):
+        """Lift *obj* into a :class:`TabularIO`.
+
+        Resolution order:
+
+        1. *obj* is already an instance of *cls* on a final-leaf
+           class — pass through.
+        2. *obj* is a known dataframe-shaped object (pyarrow
+           ``Table`` / ``RecordBatch``, polars ``DataFrame`` /
+           ``LazyFrame``, pandas ``DataFrame``, pyspark
+           ``DataFrame``, ``list[dict]``, ``dict[str, list]``) —
+           wrap in :class:`MemoryArrowIO` so the full Arrow / Polars
+           / Pandas / Spark surface lights up immediately. The
+           wrapper materialises eagerly: registering a polars
+           LazyFrame here drains it now; registering a Spark
+           DataFrame pulls it to Arrow once on the driver. Drop in
+           a :class:`StatementResult` instead when you want lazy
+           pull semantics.
+        3. *obj* parses as a byte buffer / path — go through the
+           legacy :meth:`from_bytes_io` path so registered media
+           leaves (Parquet, CSV, Arrow IPC, …) win factory
+           dispatch.
+        4. Nothing matched — return *default* (or raise when
+           *default* is the ``...`` sentinel).
+        """
         if cls._FINAL_TABULAR_IO and isinstance(obj, cls):
             return obj
 
+        # Already a TabularIO of any flavour — pass through.
+        if isinstance(obj, TabularIO):
+            return obj
+
+        # Dataframe-like inputs lift to an in-memory Arrow holder.
+        # Skip when the caller explicitly pinned a media type — they
+        # mean the byte-buffer path.
+        if media_type is None:
+            lifted = _lift_tabular_data(obj)
+            if lifted is not None:
+                return lifted
+
         buffer = bytes_io_class().from_(obj, media_type=media_type, default=None)
-        
+
         if buffer is None:
             if default is ...:
                 raise RuntimeError(
-                    f"No tabular IO registered for media_type {media_type!r}"
+                    f"Cannot lift {type(obj).__module__}.{type(obj).__name__} "
+                    f"into a {cls.__name__}. Accepted: TabularIO, pyarrow "
+                    "Table/RecordBatch, polars DataFrame/LazyFrame, pandas "
+                    "DataFrame, pyspark DataFrame, list[dict], dict[str, "
+                    "list], BytesIO, Path, or anything bytes_io_class().from_ "
+                    f"recognises (media_type={media_type!r})."
                 )
             return default
 
