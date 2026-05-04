@@ -40,9 +40,10 @@ _REQUEST_SCHEMA_JSON_TAGS: dict[str, str] = {
 }
 
 
-# Nested URL struct — full string for replay plus parsed components for joins.
+# Nested URL struct — parsed components for joins / replay. The full
+# string isn't kept here; ``private_url_hash`` covers exact identity
+# and ``URL.from_(struct)`` reassembles the URL from its parts.
 REQUEST_URL_STRUCT = pa.struct([
-    pa.field("str",      pa.string(), nullable=False),
     pa.field("scheme",   pa.string(), nullable=False),
     pa.field("userinfo", pa.string(), nullable=True),
     pa.field("host",     pa.string(), nullable=False),
@@ -112,8 +113,8 @@ REQUEST_SCHEMA["private_url_hash"] = schema_field(
     pa.int64(),
     nullable=False,
     metadata={
-        "comment": "xxh3_64 digest of ``url.str`` including userinfo and full query — "
-                   "matches the URL exactly as captured.",
+        "comment": "xxh3_64 digest of the full URL string (scheme, userinfo, host, port, "
+                   "path, query, fragment) — matches the URL exactly as captured.",
         "algorithm": "xxh3_64",
     },
 ).autotag()
@@ -183,10 +184,10 @@ REQUEST_SCHEMA["partition_key"] = schema_field(
     pa.int64(),
     nullable=False,
     metadata={
-        "comment": "Day-bucket of ``sent_at`` as ``yyyymmdd`` (UTC). Used as the "
-                   "partition column for the local + remote response cache so leaf "
-                   "files split per UTC day without a string-typed Hive segment.",
-        "unit": "yyyymmdd",
+        "comment": "xxh3_64 digest of ``f'{url.host}{url.path}'`` — endpoint-bucket "
+                   "partition column, so all requests against the same host+path land "
+                   "in the same leaf and a per-endpoint cache lookup scans one partition.",
+        "algorithm": "xxh3_64",
     },
 ).autotag()
 
@@ -248,7 +249,6 @@ def _xxh3_int64_str(text: str) -> int:
 def _build_url_struct(url: URL) -> dict[str, Any]:
     """Build the URL struct value (matches REQUEST_URL_STRUCT)."""
     return {
-        "str":      url.to_string(),
         "scheme":   url.scheme or "",
         "userinfo": url.userinfo,
         "host":     url.host or "",
@@ -421,8 +421,9 @@ class PreparedRequest:
         *,
         normalize: bool,
     ) -> URL:
-        # Accept either a flat string ("url"/"href"/"uri"), a struct dict
-        # ({"str": ..., "scheme": ..., ...}), or pre-built URL instance.
+        # Accept either a flat string ("url"/"href"/"uri"), a struct
+        # dict ({"scheme": ..., "host": ..., "path": ...}), or a
+        # pre-built URL instance.
         url_value = get_from_dict(obj, keys=("url", "href", "uri"), prefix=None)
 
         if isinstance(url_value, URL):
@@ -432,9 +433,6 @@ class PreparedRequest:
             return URL.from_(url_value, normalize=normalize)
 
         if isinstance(url_value, Mapping):
-            full = url_value.get("str")
-            if full:
-                return URL.from_(str(full), normalize=normalize)
             return URL.from_(
                 {
                     "scheme":   url_value.get("scheme") or "",
@@ -450,7 +448,7 @@ class PreparedRequest:
 
         raise ValueError(
             "PreparedRequest.from_mapping: missing url — pass a URL, a string, "
-            "or a {'str' | 'scheme'/'host'/...} struct."
+            "or a {scheme/host/...} struct."
         )
 
     @staticmethod
@@ -640,9 +638,8 @@ class PreparedRequest:
 
     @property
     def partition_key(self) -> int:
-        """Day-bucket of ``sent_at`` as ``yyyymmdd`` (UTC int64)."""
-        ts = self.sent_at
-        return ts.year * 10000 + ts.month * 100 + ts.day
+        """xxh3_64 of ``f'{url.host}{url.path}'`` — endpoint partition key."""
+        return _xxh3_int64_str(f"{self.url.host or ''}{self.url.path or ''}")
 
     @property
     def body_size(self) -> int:

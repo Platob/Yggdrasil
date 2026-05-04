@@ -362,10 +362,10 @@ RESPONSE_SCHEMA["partition_key"] = schema_field(
     pa.int64(),
     nullable=False,
     metadata={
-        "comment": "Day-bucket of ``received_at`` as ``yyyymmdd`` (UTC). Used as the "
-                   "partition column for the local + remote response cache so leaf "
-                   "files split per UTC day without a string-typed Hive segment.",
-        "unit": "yyyymmdd",
+        "comment": "xxh3_64 digest of ``f'{request.url.host}{request.url.path}'`` — "
+                   "endpoint-bucket partition column, equal to the embedded request's "
+                   "``partition_key`` so request+response always co-locate.",
+        "algorithm": "xxh3_64",
     },
 ).autotag()
 
@@ -719,9 +719,9 @@ class Response:
 
     @property
     def partition_key(self) -> int:
-        """Day-bucket of ``received_at`` as ``yyyymmdd`` (UTC int64)."""
-        ts = self.received_at
-        return ts.year * 10000 + ts.month * 100 + ts.day
+        """xxh3_64 of ``f'{request.url.host}{request.url.path}'`` — same value
+        as the embedded request's ``partition_key`` so both rows co-locate."""
+        return self.request.partition_key
 
     @property
     def body_size(self) -> int:

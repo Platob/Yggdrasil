@@ -43,9 +43,14 @@ def _wait_for_cache(tmp_path: Path, expected: int = 1, timeout: float = 10.0) ->
     the partitioned-folder write is in flight when the call site
     returns. Polling on the :class:`FolderIO` row count is the
     cheapest reliable barrier — it walks the partitioned tree and
-    reads every leaf the way a real lookup would.
+    reads every leaf the way a real lookup would. Pass
+    :data:`RESPONSE_SCHEMA` so partition columns come back typed
+    (the cache writes them as ``int64``; without the schema the
+    Hive parser would hand them back as strings and a multi-leaf
+    read would fail to concat).
     """
     from yggdrasil.io.buffer.nested.folder_io import FolderIO
+    from yggdrasil.io.response import RESPONSE_SCHEMA
 
     cache_root = tmp_path
     deadline = time.time() + timeout
@@ -53,7 +58,7 @@ def _wait_for_cache(tmp_path: Path, expected: int = 1, timeout: float = 10.0) ->
         n = 0
         if cache_root.exists():
             try:
-                with FolderIO(path=cache_root) as folder:
+                with FolderIO(path=cache_root, schema=RESPONSE_SCHEMA) as folder:
                     n = folder.read_arrow_table().num_rows
             except Exception:
                 n = 0
