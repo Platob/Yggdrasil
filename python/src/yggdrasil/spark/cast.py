@@ -37,6 +37,7 @@ pattern where nested structures are stored as JSON strings in a flat column
 
 from __future__ import annotations
 
+import pickle
 from typing import Any, Optional
 
 import pyarrow as pa
@@ -59,10 +60,10 @@ __all__ = [
     "cast_spark_dataframe",
 ]
 
-#: Cap on per-batch Arrow size handed to ``createDataFrame``. 128 MiB matches
-#: Spark's preferred Arrow batch size and keeps a single oversized chunk from
-#: pinning a partition's working memory.
-_SPARK_ARROW_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
+#: Per-chunk byte cap when slicing an Arrow table prior to pickling. Keeps a
+#: single oversized chunk from pinning a partition's working memory while still
+#: amortising pickle / parallelize overhead across many rows.
+_SPARK_PICKLE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
 
 
 @register_converter(Any, T.StructField)
@@ -113,15 +114,33 @@ def any_to_spark_dataframe(
         install_spark=False,
     )
 
+    spark_schema = opts.merged_schema.to_spark_schema()
+
     if obj is None:
-        return spark.createDataFrame([], schema=opts.merged_schema.to_spark_schema())
+        return spark.createDataFrame([], schema=spark_schema)
 
     arrow_table = any_to_arrow_table(obj, options=opts)
-    rechunked = list(rechunk_arrow_batches_by_byte_size(
+    field_names = list(spark_schema.names)
+    proto = pickle.HIGHEST_PROTOCOL
+
+    # Slice the Arrow table into byte-bounded record batches so each pickle
+    # payload stays within a sensible memory budget, then ship the rows to the
+    # JVM via Spark's standard pickle transport (parallelize + flatMap) instead
+    # of the Arrow IPC fast path.
+    chunks: list[bytes] = []
+    for batch in rechunk_arrow_batches_by_byte_size(
         arrow_table.to_batches(),
-        byte_size=_SPARK_ARROW_BATCH_BYTE_LIMIT,
+        byte_size=_SPARK_PICKLE_BATCH_BYTE_LIMIT,
         memory_pool=opts.arrow_memory_pool,
-    ))
-    arrow_table = pa.Table.from_batches(rechunked, schema=arrow_table.schema)
-    df = spark.createDataFrame(arrow_table, schema=opts.merged_schema.to_spark_schema())
+    ):
+        rows = [tuple(record.get(name) for name in field_names)
+                for record in batch.to_pylist()]
+        if rows:
+            chunks.append(pickle.dumps(rows, protocol=proto))
+
+    if not chunks:
+        return spark.createDataFrame([], schema=spark_schema)
+
+    rdd = spark.sparkContext.parallelize(chunks, numSlices=len(chunks)).flatMap(pickle.loads)
+    df = spark.createDataFrame(rdd, schema=spark_schema)
     return opts.cast_spark(df)
