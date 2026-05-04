@@ -37,73 +37,30 @@ __all__ = [
 def coerce_source(obj: Any) -> TabularIO:
     """Lift *obj* into a :class:`TabularIO`.
 
-    Accepted shapes (each lands on the canonical adapter):
+    Thin shim around :meth:`TabularIO.from_` plus a path-string
+    fast path. The bulk of the type-handling (pyarrow Table /
+    RecordBatch, polars DF / LazyFrame, pandas DF, pyspark DF,
+    ``list[dict]``, ``dict[str, list]``) lives on :meth:`TabularIO.from_`
+    so anywhere else in yggdrasil that wants to lift "anything"
+    into a :class:`TabularIO` gets the same shape support without
+    re-implementing the ladder.
 
-    - already a :class:`TabularIO` — pass-through.
-    - :class:`pyarrow.Table` / :class:`pyarrow.RecordBatch` — wrap in
-      :class:`MemoryArrowIO`.
-    - polars / pandas DataFrame — converted to Arrow then wrapped.
-    - Spark DataFrame — pulled to Arrow once, then wrapped (the
-      whole point of registering on a context is that subsequent
-      reads are cheap; we materialize on registration).
-    - ``list[dict]`` — built into an Arrow table.
-    - path-like string / :class:`os.PathLike` — opened via
-      :meth:`TabularIO.from_path`, so a parquet file or folder
-      registers as itself.
-
-    Anything else raises :class:`TypeError` with the type name so
-    callers know what to wrap before passing in.
+    The path-string branch stays here because :func:`TabularIO.from_`
+    treats unknown strings as bytes-buffer fodder; for SQL
+    registration we want path strings to open via
+    :meth:`TabularIO.from_path` so a parquet file or folder lands
+    as the right subclass.
     """
     if isinstance(obj, TabularIO):
         return obj
 
-    import pyarrow as pa
-
-    from yggdrasil.io.buffer.memory import MemoryArrowIO
-
-    if isinstance(obj, pa.Table):
-        return MemoryArrowIO(obj)
-    if isinstance(obj, pa.RecordBatch):
-        return MemoryArrowIO(pa.Table.from_batches([obj]))
-
-    module = (type(obj).__module__ or "").split(".", 1)[0]
-    if module == "polars":
-        import polars as pl
-
-        if isinstance(obj, pl.LazyFrame):
-            obj = obj.collect()
-        return MemoryArrowIO(obj.to_arrow())
-    if module == "pandas":
-        return MemoryArrowIO(pa.Table.from_pandas(obj))
-    if module == "pyspark":
-        # toArrow() exists on Spark 4+; older versions go through
-        # toPandas. We materialize once on register so the rest of
-        # the executor never has to round-trip through Spark again.
-        to_arrow = getattr(obj, "toArrow", None)
-        if to_arrow is not None:
-            return MemoryArrowIO(to_arrow())
-        return MemoryArrowIO(pa.Table.from_pandas(obj.toPandas()))
-
-    if isinstance(obj, list) and obj and all(isinstance(r, dict) for r in obj):
-        return MemoryArrowIO(pa.Table.from_pylist(obj))
-    if isinstance(obj, dict) and obj and all(
-        isinstance(v, list) for v in obj.values()
-    ):
-        return MemoryArrowIO(pa.Table.from_pydict(obj))
-
     if isinstance(obj, (str, bytes)) or hasattr(obj, "__fspath__"):
-        # Path-like: hand off to TabularIO's path opener so a
-        # parquet file / folder / CSV registers as the right
-        # subclass — the registry inside TabularIO does the dispatch.
+        # Path-like: open as the right registered media leaf so a
+        # parquet file / folder / CSV registers as itself rather
+        # than as a generic byte buffer.
         return TabularIO.from_path(obj)  # type: ignore[arg-type]
 
-    raise TypeError(
-        f"Cannot register {type(obj).__module__}.{type(obj).__name__} "
-        "as a SQL source. Accepted: TabularIO, pyarrow Table/Batch, "
-        "polars DataFrame/LazyFrame, pandas DataFrame, pyspark DataFrame, "
-        "list[dict], dict[str, list], or a path string. Wrap manually "
-        "via MemoryArrowIO(...) if you have something more exotic."
-    )
+    return TabularIO.from_(obj)
 
 
 class SqlContext:

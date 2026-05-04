@@ -6,6 +6,28 @@ writes mutate the held batch list in place subject to ``options.mode``
 no-op when non-empty). Use this when you want a :class:`TabularIO`
 over Arrow data you already have on the driver and don't want to pay
 the IPC serialization round-trip.
+
+What we ingest
+--------------
+
+:meth:`_ingest` accepts the shapes a real caller actually has
+on hand without forcing a manual conversion to Arrow:
+
+- :class:`pyarrow.Table` / :class:`pyarrow.RecordBatch`
+- polars :class:`DataFrame` / :class:`LazyFrame` (LazyFrame
+  collects on ingest — the holder is in-memory by design; for
+  streaming-laziness use :meth:`TabularIO.scan_polars_frame` or
+  build a custom IO instead)
+- pandas :class:`DataFrame`
+- pyspark :class:`DataFrame` (driver-side via ``toArrow`` on
+  Spark 4+, ``toPandas`` otherwise — one materialization, no
+  repeat trips)
+- ``list[dict]`` rows / ``dict[str, list]`` columns
+- any iterable yielding the above
+
+That keeps the most common conversion glue on this side of the
+API instead of every caller writing the same five-line ``isinstance``
+ladder.
 """
 
 from __future__ import annotations
@@ -23,10 +45,15 @@ __all__ = ["MemoryArrowIO"]
 
 
 # Anything we know how to ingest into the internal batch list.
+# The annotation lists the canonical Arrow shapes plus ``Any`` so
+# typecheckers don't fight users handing in a polars / pandas /
+# spark frame — :meth:`_ingest` recognises those at runtime via
+# module-name sniffing.
 ArrowSource = Union[
     pa.RecordBatch,
     pa.Table,
     Iterable[Union[pa.RecordBatch, pa.Table]],
+    Any,
     None,
 ]
 
@@ -197,11 +224,67 @@ class MemoryArrowIO(TabularIO[CastOptions]):
             self._batches.append(source)
             if self._schema is None:
                 self._schema = source.schema
-        elif isinstance(source, pa.Table):
+            return
+        if isinstance(source, pa.Table):
             for batch in source.to_batches():
                 self._batches.append(batch)
             if self._schema is None:
                 self._schema = source.schema
-        else:
-            for inner in source:
-                self._ingest(inner)
+            return
+
+        # Module-name sniffing keeps optional engine deps out of
+        # the import graph — we only touch a frame's API once we've
+        # confirmed it's an instance of one we know how to drain.
+        module = (type(source).__module__ or "").split(".", 1)[0]
+        if module == "polars":
+            import polars as pl
+
+            # LazyFrame collects here; the in-memory holder is the
+            # wrong tool for streaming-laziness anyway. Reach for
+            # ``scan_polars_frame`` on a different IO if you want
+            # that.
+            if isinstance(source, pl.LazyFrame):
+                source = source.collect()
+            self._ingest(source.to_arrow())
+            return
+        if module == "pandas":
+            self._ingest(pa.Table.from_pandas(source))
+            return
+        if module == "pyspark":
+            to_arrow = getattr(source, "toArrow", None)
+            if to_arrow is not None:
+                self._ingest(to_arrow())
+                return
+            self._ingest(pa.Table.from_pandas(source.toPandas()))
+            return
+
+        # Pure-Python row-list / column-dict shapes.
+        if isinstance(source, list) and source and all(
+            isinstance(r, dict) for r in source
+        ):
+            self._ingest(pa.Table.from_pylist(source))
+            return
+        if (
+            isinstance(source, dict) and source
+            and all(isinstance(v, (list, tuple)) for v in source.values())
+        ):
+            self._ingest(pa.Table.from_pydict({
+                k: list(v) for k, v in source.items()
+            }))
+            return
+
+        # Iterable fallback — recurse so a caller can pass a
+        # generator of Tables / batches and have it streamed in.
+        try:
+            iterator = iter(source)
+        except TypeError as exc:
+            raise TypeError(
+                f"MemoryArrowIO can't ingest "
+                f"{type(source).__module__}.{type(source).__name__}: "
+                f"{source!r}. Accepted: pyarrow Table/RecordBatch, polars "
+                "DataFrame/LazyFrame, pandas DataFrame, pyspark DataFrame, "
+                "list[dict], dict[str, list], or an iterable of any of "
+                "those."
+            ) from exc
+        for inner in iterator:
+            self._ingest(inner)
