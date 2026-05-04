@@ -555,6 +555,17 @@ class CacheConfig(_ConfigBase):
         identity_by: Optional[Iterable[str]] = None,
     ) -> str:
         where_clause = self.sql_clause(request=request, response=response)
+        # Single-request partition prune — narrows the SQL engine's
+        # data-file scan to one partition before any per-row predicate.
+        if request is not None:
+            partition_clause = (
+                f"partition_key = {self.sql_literal(request.partition_key)}"
+            )
+            where_clause = (
+                f"({partition_clause}) AND ({where_clause})"
+                if where_clause != "1=1"
+                else partition_clause
+            )
         base_query = f"SELECT * FROM {table_name}"
         if where_clause != "1=1":
             base_query += f" WHERE {where_clause}"
@@ -581,13 +592,29 @@ class CacheConfig(_ConfigBase):
         *,
         identity_by: Optional[Iterable[str]] = None,
     ) -> str:
+        request_list = list(requests)
         request_clauses = " OR ".join(
             f"({self.sql_request_clause(req)})"
-            for req in requests
+            for req in request_list
         )
         response_clause = self.sql_response_clause(None)
 
+        # Partition prune: ``partition_key`` is the table's partition
+        # column (declared on RESPONSE_SCHEMA). An ``IN (…)`` clause
+        # over the request batch's distinct partition_keys lets the
+        # SQL engine skip every other partition before evaluating the
+        # per-request OR — turns a full-table scan into an N-partition
+        # read on a partition-pruned engine (Delta / Iceberg / etc.).
+        partition_clause = ""
+        if request_list:
+            partition_keys = sorted({r.partition_key for r in request_list})
+            if partition_keys:
+                literals = ", ".join(self.sql_literal(v) for v in partition_keys)
+                partition_clause = f"partition_key IN ({literals})"
+
         where_parts: list[str] = []
+        if partition_clause:
+            where_parts.append(f"({partition_clause})")
         if request_clauses:
             where_parts.append(f"({request_clauses})")
         if response_clause != "1=1":

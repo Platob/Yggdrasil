@@ -123,11 +123,14 @@ def _lookup_local_responses(
 ) -> dict[tuple, Response]:
     """Bulk lookup by request-key tuple against a folder cache.
 
-    One folder read per call — partition pruning shrinks the set of
-    leaves visited, then we filter rows by request-key tuple + the
-    optional received-window. When several rows share a key the
-    latest one (max ``response_received_at``) wins, giving
-    UPSERT-on-write semantics for free.
+    One folder read per call. The read result is partition-pruned by
+    the input requests' ``partition_key`` set so we only walk leaves
+    whose endpoint bucket matches an incoming request — typically
+    one or two partitions for an endpoint-focused batch instead of
+    the whole tree. Row-level filtering by request-key tuple +
+    received-window happens after. When several rows share a key
+    the latest one (max ``received_at``) wins, giving UPSERT-on-write
+    semantics for free.
     """
     if not requests:
         return {}
@@ -150,6 +153,23 @@ def _lookup_local_responses(
     if table.num_rows == 0:
         return {}
 
+    # Partition prune: keep only rows whose ``partition_key`` matches
+    # one of the incoming requests' endpoint buckets. With the
+    # endpoint-derived partition_key (xxh3_64 of host+path), a typical
+    # send_many burst against a handful of endpoints prunes the
+    # post-read table down by orders of magnitude before the per-row
+    # match-by walk.
+    partition_filter = _request_partition_filter(cache, requests)
+    if partition_filter is not None:
+        try:
+            table = table.filter(partition_filter)
+        except Exception:
+            LOGGER.debug(
+                "Partition filter against local cache %s failed; "
+                "falling back to full-table scan",
+                cache.path, exc_info=True,
+            )
+
     if "received_at" in table.column_names:
         if received_from is not None:
             table = table.filter(
@@ -165,6 +185,9 @@ def _lookup_local_responses(
                     pa.scalar(received_to),
                 )
             )
+
+    if table.num_rows == 0:
+        return {}
 
     wanted: set[tuple] = {
         tuple(r.match_value(c) for c in match_by) for r in requests
@@ -399,7 +422,7 @@ class Session(ABC):
             mode=mode if mode is not None else cache_cfg.mode,
             match_by=cache_cfg.match_by or None,
             wait=cache_cfg.wait,
-            prune_values={"public_hash": batch["public_hash"]},
+            prune_values={"partition_key": batch["partition_key"]},
             spark_session=spark_session,
         )
 
@@ -1131,7 +1154,7 @@ class Session(ABC):
                 mode=mode,
                 match_by=cfg.match_by or None,
                 wait=cfg.wait,
-                prune_values={"public_hash": batches["public_hash"]},
+                prune_values={"partition_key": batches["partition_key"]},
             )
 
     def _send_many(
@@ -1469,11 +1492,29 @@ class Session(ABC):
 
         if cfg.mode != Mode.UPSERT:
             table_name = cfg.table.full_name(safe=True)
+            # Restrict the SELECT DISTINCT to the partitions actually
+            # in play — ``partition_key`` is the table's partition
+            # column so the engine prunes the existing-rows scan
+            # before reading any data files.
             try:
-                existing_df = spark.sql(
-                    "SELECT DISTINCT public_hash "
-                    f"FROM {table_name}"
-                )
+                wanted_partitions = [
+                    row["partition_key"]
+                    for row in ok_df.select("partition_key").distinct().collect()
+                ]
+            except Exception:
+                wanted_partitions = []
+            try:
+                if wanted_partitions:
+                    literals = ", ".join(str(int(v)) for v in wanted_partitions)
+                    existing_df = spark.sql(
+                        "SELECT DISTINCT partition_key, public_hash "
+                        f"FROM {table_name} WHERE partition_key IN ({literals})"
+                    )
+                else:
+                    existing_df = spark.sql(
+                        "SELECT DISTINCT partition_key, public_hash "
+                        f"FROM {table_name}"
+                    )
             except Exception as exc:
                 # Table doesn't exist yet — nothing to dedup against; the
                 # downstream `cfg.table.insert` handles creation. Match the
@@ -1485,7 +1526,7 @@ class Session(ABC):
             if existing_df is not None:
                 ok_df = ok_df.join(
                     existing_df,
-                    on=["public_hash"],
+                    on=["partition_key", "public_hash"],
                     how="left_anti",
                 )
 
@@ -1499,7 +1540,7 @@ class Session(ABC):
             mode=cfg.mode,
             match_by=cfg.match_by or None,
             wait=cfg.wait,
-            prune_by=["public_hash"],
+            prune_by=["partition_key"],
             spark_session=spark,
         )
 
