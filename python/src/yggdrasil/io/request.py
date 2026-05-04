@@ -21,7 +21,7 @@ from .url import URL
 
 if TYPE_CHECKING:
     from .response import Response
-    from .send_config import CacheConfig
+    from .send_config import CacheConfig, SendConfig
     from .session import Session
 
 
@@ -472,6 +472,39 @@ class PreparedRequest:
     def session(self) -> "Session | None":
         """The session currently attached via :meth:`attach_session`, or None."""
         return self._session
+
+    # ------------------------------------------------------------------
+    # Sending — delegates to the attached session
+    # ------------------------------------------------------------------
+
+    def send(
+        self,
+        config: "SendConfig | Mapping[str, Any] | None" = None,
+        **kwargs: Any,
+    ) -> "Response":
+        """Send this request through its attached session.
+
+        Routes through :meth:`Session.send`, which builds the effective
+        :class:`SendConfig` from *config* + *kwargs* (wait, raise_error,
+        stream, remote_cache, local_cache, spark_session, …). Raises
+        :class:`RuntimeError` if no session is attached — callers should
+        either go through ``session.send(req)`` directly or bind a
+        session first via :meth:`attach_session`.
+        """
+        return self._send(config, **kwargs)
+
+    def _send(
+        self,
+        config: "SendConfig | Mapping[str, Any] | None" = None,
+        **kwargs: Any,
+    ) -> "Response":
+        if self._session is None:
+            raise RuntimeError(
+                f"{type(self).__name__}.send requires an attached session — "
+                "call request.attach_session(session) first, or use "
+                "session.send(request) directly."
+            )
+        return self._session.send(self, config, **kwargs)
 
     @classmethod
     def parse(
