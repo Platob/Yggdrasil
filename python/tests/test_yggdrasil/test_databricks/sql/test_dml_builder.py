@@ -1,8 +1,8 @@
 """Unit tests for the SQL builder in :mod:`yggdrasil.databricks.sql.table`.
 
-These exercise :func:`_build_dml_statements` and the merge-fallback
-factory directly — no Databricks needed. They lock in the post-cleanup
-behaviour:
+These exercise :func:`_build_dml_statements`, the merge-fallback
+factory, and the Databricks-side prune helpers directly — no
+Databricks needed. They lock in the post-cleanup behaviour:
 
 - ``Mode.AUTO`` / ``Mode.APPEND`` with ``match_by`` emit a single
   insert-only ``MERGE … WHEN NOT MATCHED THEN INSERT`` (no update
@@ -18,17 +18,24 @@ behaviour:
   ``INSERT``.
 - Maintenance statements (``OPTIMIZE`` / ``VACUUM``) tail the DML in the
   expected order.
+- The Databricks-side prune-value collectors (Polars-on-Parquet for
+  the warehouse staging path, distinct collect for the Spark path)
+  feed the predicate builder with the right shape.
 """
 
 from __future__ import annotations
 
+import pyarrow as pa
 import pytest
 
 from yggdrasil.databricks.sql.table import (
     _build_delete_insert_statements,
     _build_dml_statements,
     _build_merge_fallback_statements,
+    _collect_prune_values_polars,
+    _resolve_prune_by,
 )
+from yggdrasil.io.buffer.primitive import ParquetIO
 from yggdrasil.io.enums import Mode
 
 
@@ -345,3 +352,97 @@ class TestMergeFallbackStatements:
         assert sqls[1].startswith("INSERT INTO")
         assert sqls[2] == f"OPTIMIZE {TARGET}"
         assert sqls[3] == f"VACUUM {TARGET} RETAIN 12 HOURS"
+
+
+# ---------------------------------------------------------------------------
+# Databricks-side prune helpers
+#
+# These adapters bridge the engine-agnostic SQL builder above with the
+# two write paths: ``arrow_insert`` stages a Parquet buffer and reads
+# distinct prune values via Polars; ``spark_insert`` keeps the source
+# DataFrame and uses ``distinct().collect()``.
+# ---------------------------------------------------------------------------
+
+
+class TestResolvePruneBy:
+
+    def test_explicit_list_passes_through(self):
+        partitions = [pa.field("year", pa.int32())]  # ignored when not "auto"
+        assert _resolve_prune_by(["region"], partitions) == ["region"]
+
+    def test_auto_pulls_from_partition_fields(self):
+        partitions = [
+            pa.field("year", pa.int32()),
+            pa.field("month", pa.int32()),
+        ]
+        assert _resolve_prune_by("auto", partitions) == ["year", "month"]
+
+    def test_auto_with_no_partitions_is_none(self):
+        # No partition fields → AUTO gracefully degrades to "no prune".
+        # Empty list, not "auto" string, lands here.
+        assert _resolve_prune_by("auto", []) is None
+
+    def test_none_returns_none(self):
+        assert _resolve_prune_by(None, [pa.field("x", pa.int32())]) is None
+
+    def test_empty_list_returns_none(self):
+        assert _resolve_prune_by([], [pa.field("x", pa.int32())]) is None
+
+
+class TestCollectPruneValuesPolars:
+    """Verifies the warehouse-staging path's prune-value capture.
+
+    ``arrow_insert`` writes the source to a ``ParquetIO`` buffer, then
+    runs this helper to harvest the distinct values per prune column
+    *before* shipping to Volume staging. The values flow back into
+    :func:`_build_prune_predicates` to bound the target rewrite.
+    """
+
+    @pytest.fixture
+    def buffer(self):
+        polars = pytest.importorskip("polars")  # noqa: F841
+        table = pa.table({
+            "region": ["eu", "us", "eu", "ap"],
+            "tier":   ["gold", "gold", "plat", "gold"],
+            "id":     [1, 2, 3, 4],
+        })
+        buf = ParquetIO()
+        buf.write_arrow_table(table)
+        buf.seek(0)
+        try:
+            yield buf
+        finally:
+            buf.clear()
+
+    def test_single_column_returns_distinct_values(self, buffer):
+        out = _collect_prune_values_polars(buffer, ["region"])
+        # Order isn't promised by ``.unique()``; assert as a set.
+        assert set(out) == {"region"}
+        assert set(out["region"]) == {"eu", "us", "ap"}
+
+    def test_multiple_columns_each_distinct_independently(self, buffer):
+        out = _collect_prune_values_polars(buffer, ["region", "tier"])
+        # Each key gets its own distinct list — *not* a Cartesian product
+        # of (region, tier) tuples. The downstream predicate builder
+        # ANDs per-column ``IN`` lists, so independent distincts are
+        # what it expects.
+        assert set(out) == {"region", "tier"}
+        assert set(out["region"]) == {"eu", "us", "ap"}
+        assert set(out["tier"]) == {"gold", "plat"}
+
+    def test_nullable_values_survive_distinct(self):
+        polars = pytest.importorskip("polars")  # noqa: F841
+        table = pa.table({
+            "region": pa.array(["eu", None, "eu", None, "us"]),
+        })
+        buf = ParquetIO()
+        try:
+            buf.write_arrow_table(table)
+            buf.seek(0)
+            out = _collect_prune_values_polars(buf, ["region"])
+            # NULL match keys ride through distinct as Python ``None`` —
+            # the predicate builder uses ``is_in`` with ``includes_null``,
+            # so the None is meaningful.
+            assert set(out["region"]) == {"eu", "us", None}
+        finally:
+            buf.clear()
