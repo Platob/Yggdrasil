@@ -476,6 +476,33 @@ class TestParserSQLSyntax:
             ),
         )
 
+    def test_struct_field_not_null_phrase(self) -> None:
+        parsed = ParsedDataType.parse(
+            "STRUCT<scheme: STRING NOT NULL, userinfo: STRING, "
+            "host: STRING NOT NULL, port: INT, path: STRING NOT NULL, "
+            "query: STRING, fragment: STRING>"
+        )
+        assert parsed.type_id is DataTypeId.STRUCT
+        names_nullable = [
+            (c.name, c.metadata.nullable) for c in parsed.children
+        ]
+        assert names_nullable == [
+            ("scheme", False),
+            ("userinfo", None),
+            ("host", False),
+            ("port", None),
+            ("path", False),
+            ("query", None),
+            ("fragment", None),
+        ]
+
+    def test_struct_field_non_null_phrase(self) -> None:
+        parsed = ParsedDataType.parse("struct<a: int NON NULL, b: string>")
+        assert [(c.name, c.metadata.nullable) for c in parsed.children] == [
+            ("a", False),
+            ("b", None),
+        ]
+
     def test_recursive_nested_expression(self) -> None:
         assert ParsedDataType.parse(
             "array<map<string, struct<a:int,b:array<string>>>> | null"

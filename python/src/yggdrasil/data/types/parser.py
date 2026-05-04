@@ -1322,14 +1322,30 @@ class _Parser:
 
         self._expect_any_punct(":", "=")
         field_type = self.parse_type()
+
+        if self._match_ident_phrase("not", "null") or self._match_ident_phrase(
+            "non", "null"
+        ):
+            if nullable is True:
+                return self._fail(
+                    f"Struct field {name!r} marks both nullable ('?') and "
+                    "non-nullable ('NOT NULL'); pick one"
+                )
+            nullable = False
+        elif self._peek_punct("!"):
+            self._advance()
+            nullable = False
+        elif self._peek_punct("?"):
+            self._advance()
+            nullable = True
+
+        effective_nullable = (
+            nullable if nullable is not None else field_type.metadata.nullable
+        )
+
         return ParsedDataType(
             type_id=field_type.type_id,
-            metadata=replace(
-                field_type.metadata,
-                nullable=(
-                    nullable if nullable is not None else field_type.metadata.nullable
-                ),
-            ),
+            metadata=replace(field_type.metadata, nullable=effective_nullable),
             name=name,
             children=field_type.children,
         )
