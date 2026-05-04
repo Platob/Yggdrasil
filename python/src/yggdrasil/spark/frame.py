@@ -1,12 +1,13 @@
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 import pyarrow as pa
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.types import BinaryType, StructField, StructType
 
+from yggdrasil.arrow.cast import any_to_arrow_batch_iterator, any_to_arrow_table
 from yggdrasil.data import schema as schema_builder, field as field_builder, Schema
-from yggdrasil.data.options import CastOptions, convert
+from yggdrasil.data.options import CastOptions
 from yggdrasil.environ import PyEnv
 from yggdrasil.pickle.ser.serde import loads, dumps
 
@@ -85,6 +86,30 @@ def inputs_map_partition(
         yield pa.RecordBatch.from_pylist(out, schema=_ARROW_DYNAMIC_SCHEMA) # noqa
 
 
+def _iter_unpickled(batches: Iterator[pa.RecordBatch]) -> Iterator[Any]:
+    """Yield the unpickled inner object from each row of a dynamic batch stream."""
+    for batch in batches:
+        col = batch.column(0)
+        for i in range(batch.num_rows):
+            yield loads(col[i].as_py())
+
+
+def _iter_unpickled_groups(batches: Iterator[pa.RecordBatch]) -> Iterator[list[Any]]:
+    """Yield one list of unpickled objects per input batch.
+
+    Grouping per input batch lets the downstream tabular conversion
+    take the fast ``pa.Table.from_pylist`` path when the inner objects
+    are homogeneous record-shaped (dicts, dataclasses) — much cheaper
+    than a per-row trip through the cast registry.
+    """
+    for batch in batches:
+        col = batch.column(0)
+        n = batch.num_rows
+        if n == 0:
+            continue
+        yield [loads(col[i].as_py()) for i in range(n)]
+
+
 def outputs_map_partition(
     batches: Iterator[pa.RecordBatch],
     schema: Schema,
@@ -93,40 +118,18 @@ def outputs_map_partition(
 ) -> Iterator[pa.RecordBatch]:
     schema = Schema.from_any(schema)
 
-    out_batches: list[pa.RecordBatch] = []
-    out_bytes = 0
+    def _tables() -> Iterator[pa.Table]:
+        for group in _iter_unpickled_groups(batches):
+            yield any_to_arrow_table(group)
 
-    def flush() -> Iterator[pa.RecordBatch]:
-        nonlocal out_batches, out_bytes
-        if out_batches:
-            yield from out_batches
-            out_batches = []
-            out_bytes = 0
-
-    for batch in batches:
-        col = batch.column(0)
-
-        for i in range(batch.num_rows):
-            obj = loads(col[i].as_py())
-
-            rb = convert(
-                obj,
-                target_hint=pa.RecordBatch,
-                options=CastOptions(target_field=schema.to_arrow_schema(), safe=False),
-            )
-
-            if rb.num_rows == 0:
-                continue
-
-            rb_size = rb.nbytes
-
-            if out_batches and (out_bytes + rb_size > byte_size):
-                yield from flush()
-
-            out_batches.append(rb)
-            out_bytes += rb_size
-
-    yield from flush()
+    return any_to_arrow_batch_iterator(
+        _tables(),
+        options=CastOptions(
+            target_field=schema,
+            safe=False,
+            byte_size=byte_size,
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,18 +137,50 @@ class DynamicFrame:
     df: DataFrame
 
     @property
-    def sparkSession(self):
-        return self.df
+    def sparkSession(self) -> SparkSession:
+        return self.df.sparkSession
 
     @property
     def schema(self):
         return self.df.schema
 
+    def __iter__(self) -> Iterator[Any]:
+        return self.to_local_iterator()
+
+    def count(self) -> int:
+        return self.df.count()
+
+    @classmethod
+    def from_iterable(
+        cls,
+        items: Iterable[Any],
+        *,
+        spark_session: SparkSession | None = None,
+    ) -> "DynamicFrame":
+        """Build a ``DynamicFrame`` directly from an in-memory iterable.
+
+        Each element is pickled into its own row. Use this when no map
+        function is needed up front — call :meth:`map` or :meth:`cast`
+        downstream to apply transforms or impose a schema.
+        """
+        if spark_session is None:
+            spark_session = PyEnv.spark_session(
+                create=True,
+                install_spark=False,
+                import_error=True,
+            )
+
+        df = spark_session.createDataFrame(
+            ((dumps(x),) for x in items),
+            schema=_spark_dynamic_schema(),
+        )
+        return cls(df=df)
+
     @classmethod
     def parallelize(
         cls,
         function: Callable[[Any], Any],
-        inputs: Iterator[Any],
+        inputs: Iterable[Any],
         *,
         spark_session: SparkSession | None = None,
         byte_size: int = 128 * 1024 * 1024,
@@ -228,6 +263,44 @@ class DynamicFrame:
 
         return type(self)(df=result_df)
 
+    def filter(
+        self,
+        predicate: Callable[[Any], bool],
+        *,
+        byte_size: int = 128 * 1024 * 1024,
+    ) -> "DynamicFrame":
+        """Drop rows where ``predicate(unpickled_obj)`` is false.
+
+        The predicate is evaluated against the unpickled inner object,
+        not the binary payload — so callers can write schemaless filters
+        ("keep dicts where status == 'ok'") without first casting.
+        """
+        predicate_pickle = dumps(predicate)
+
+        def _filter_batches(
+            batches: Iterator[pa.RecordBatch],
+        ) -> Iterator[pa.RecordBatch]:
+            pred = loads(predicate_pickle)
+            out: list[dict[str, bytes]] = []
+            out_bytes = 0
+            for batch in batches:
+                col = batch.column(0)
+                for i in range(batch.num_rows):
+                    ser = col[i].as_py()
+                    if not pred(loads(ser)):
+                        continue
+                    if out and out_bytes + len(ser) > byte_size:
+                        yield pa.RecordBatch.from_pylist(out, schema=_ARROW_DYNAMIC_SCHEMA)  # noqa
+                        out = []
+                        out_bytes = 0
+                    out.append({PICKLE_COLUMN_NAME: ser})
+                    out_bytes += len(ser)
+            if out:
+                yield pa.RecordBatch.from_pylist(out, schema=_ARROW_DYNAMIC_SCHEMA)  # noqa
+
+        result_df = self.df.mapInArrow(_filter_batches, schema=_spark_dynamic_schema())
+        return type(self)(df=result_df)
+
     def collect(self) -> list[Any]:
         return [loads(row[PICKLE_COLUMN_NAME]) for row in self.df.collect()]
 
@@ -241,6 +314,12 @@ class DynamicFrame:
         *,
         byte_size: int = 128 * 1024 * 1024,
     ) -> DataFrame:
+        """Materialise rows against ``schema`` as a typed Spark DataFrame.
+
+        Each pickled inner object is unpickled inside the executor and
+        streamed through :func:`any_to_arrow_batch_iterator`, which runs
+        the per-batch Arrow cast and ``byte_size`` rechunking in one pass.
+        """
         schema = Schema.from_any(schema)
 
         return self.df.mapInArrow(
@@ -252,5 +331,38 @@ class DynamicFrame:
             schema=schema.to_spark_schema(),
         )
 
-    def toArrow(self, schema: Schema | None = None):
-        return self.cast(schema=schema).toArrow()
+    def toArrow(
+        self,
+        schema: Schema | None = None,
+        *,
+        byte_size: int = 128 * 1024 * 1024,
+    ) -> pa.Table:
+        """Return a ``pa.Table``. With ``schema=None`` the table is built by
+        inferring shape from the unpickled rows on the driver."""
+        if schema is None:
+            return any_to_arrow_table(
+                self.to_local_iterator(),
+                options=CastOptions(byte_size=byte_size, safe=False),
+            )
+        return self.cast(schema=schema, byte_size=byte_size).toArrow()
+
+    def toPandas(
+        self,
+        schema: Schema | None = None,
+        *,
+        byte_size: int = 128 * 1024 * 1024,
+    ):
+        """Return a ``pandas.DataFrame``. Schemaless when ``schema is None``."""
+        if schema is None:
+            return self.toArrow(byte_size=byte_size).to_pandas()
+        return self.cast(schema=schema, byte_size=byte_size).toPandas()
+
+    def toPolars(
+        self,
+        schema: Schema | None = None,
+        *,
+        byte_size: int = 128 * 1024 * 1024,
+    ):
+        """Return a ``polars.DataFrame``. Schemaless when ``schema is None``."""
+        from yggdrasil.polars.lib import polars as pl
+        return pl.from_arrow(self.toArrow(schema=schema, byte_size=byte_size))
