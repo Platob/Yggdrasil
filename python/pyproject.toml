@@ -109,6 +109,10 @@ excel = [
   "fastexcel"
 ]
 
+sql = [
+  "sqlglot",
+]
+
 postgres = [
   "psycopg[binary]>=3.1",
   "adbc-driver-postgresql>=1.0",
