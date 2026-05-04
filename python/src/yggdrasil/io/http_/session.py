@@ -369,16 +369,15 @@ class HTTPSession(Session):
 
         final_df = pl.concat(frames, how="diagonal_relaxed", rechunk=True)
 
-        result.buffer.truncate(size=0)
+        new_buffer = ArrowIPCIO(media_type=MediaTypes.ARROW_IPC)
+        new_buffer.write_arrow_table(
+            final_df.to_arrow(compat_level=pl.CompatLevel.newest()),
+            compression="zstd",
+        )
+        new_buffer.seek(0)
 
-        with ArrowIPCIO() as b:
-            b.write_arrow_table(
-                final_df.to_arrow(compat_level=pl.CompatLevel.newest()),
-                compression="zstd"
-            )
-
-        b.seek(0)
-        result.buffer.replace_with_payload(b)
+        result.buffer.close()
+        result.buffer = new_buffer
         result.set_media_type(MediaTypes.ARROW_IPC)
 
         result.update_tags({
