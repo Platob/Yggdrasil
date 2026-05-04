@@ -232,8 +232,7 @@ class TestHttpSessionRealRequest:
 # installed.
 class TestHttpSessionLocalCache:
     def _cache(self, tmp_path) -> CacheConfig:
-        return CacheConfig(
-            path=tmp_path,
+        return CacheConfig.check_arg(tmp_path,
             received_from="2020-01-01T00:00:00Z",
         )
 
@@ -291,8 +290,7 @@ class TestHttpSessionLocalCache:
 
 class TestHttpSessionSendManyLocalCache:
     def _cache(self, tmp_path) -> CacheConfig:
-        return CacheConfig(
-            path=tmp_path,
+        return CacheConfig.check_arg(tmp_path,
             received_from="2020-01-01T00:00:00Z",
         )
 
@@ -509,8 +507,7 @@ class TestHttpSessionSparkSend:
     def test_send_many_spark_with_local_cache_short_circuits(
         self, http_server: _Server, spark_session, tmp_path
     ):
-        cache = CacheConfig(
-            path=tmp_path,
+        cache = CacheConfig.check_arg(tmp_path,
             received_from="2020-01-01T00:00:00Z",
         )
         reqs = [

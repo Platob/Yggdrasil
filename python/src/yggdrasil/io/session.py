@@ -373,19 +373,19 @@ class Session(ABC):
             else request.anonymize(mode=cache_cfg.anonymize)
         )
         query = cache_cfg.make_batch_lookup_sql(
-            table_name=cache_cfg.table.full_name(safe=True),
+            table_name=cache_cfg.tabular.full_name(safe=True),
             requests=[lookup_request],
         )
 
         try:
-            cache_result = cache_cfg.table.sql.execute(
+            cache_result = cache_cfg.tabular.sql.execute(
                 query,
                 spark_session=spark_session,
             )
         except Exception as exc:
             if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
-                cache_cfg.table.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
-                cache_result = cache_cfg.table.sql.execute(
+                cache_cfg.tabular.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
+                cache_result = cache_cfg.tabular.sql.execute(
                     query,
                     spark_session=spark_session,
                 )
@@ -398,7 +398,7 @@ class Session(ABC):
                     "Found remote %s %s in %s",
                     request.method,
                     request.url,
-                    cache_cfg.table,
+                    cache_cfg.tabular,
                 )
                 return response
 
@@ -417,7 +417,7 @@ class Session(ABC):
 
         batch = response.anonymize(mode=cache_cfg.anonymize).to_arrow_batch(parse=False)
 
-        cache_cfg.table.insert(
+        cache_cfg.tabular.insert(
             batch,
             mode=mode if mode is not None else cache_cfg.mode,
             match_by=cache_cfg.match_by or None,
@@ -693,7 +693,7 @@ class Session(ABC):
         landed in the bucket first.
         """
         return (
-            cfg.table.full_name(safe=True),
+            cfg.tabular.full_name(safe=True),
             cfg.mode,
             tuple(cfg.match_by) if cfg.match_by else (),
             bool(cfg.wait),
@@ -817,7 +817,7 @@ class Session(ABC):
             if not t_cfg.remote_cache_enabled or t_cfg.mode != Mode.APPEND:
                 misses.append(req)
                 continue
-            tkey = t_cfg.table.full_name(safe=True)
+            tkey = t_cfg.tabular.full_name(safe=True)
             if tkey not in table_to_cfg:
                 table_to_cfg[tkey] = t_cfg
                 table_to_reqs[tkey] = []
@@ -863,15 +863,15 @@ class Session(ABC):
             lookup_batch = [r.anonymize(mode=cfg.anonymize) for r in requests]
 
         query = cfg.make_batch_lookup_sql(
-            table_name=cfg.table.full_name(safe=True),
+            table_name=cfg.tabular.full_name(safe=True),
             requests=lookup_batch,
         )
         try:
-            cache_result = cfg.table.sql.execute(query, spark_session=spark_session)
+            cache_result = cfg.tabular.sql.execute(query, spark_session=spark_session)
         except Exception as exc:
             if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
-                cfg.table.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
-                cache_result = cfg.table.sql.execute(query, spark_session=spark_session)
+                cfg.tabular.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
+                cache_result = cfg.tabular.sql.execute(query, spark_session=spark_session)
             else:
                 raise
 
@@ -943,7 +943,7 @@ class Session(ABC):
             if not t_cfg.remote_cache_enabled or t_cfg.mode != Mode.APPEND:
                 misses.append(req)
                 continue
-            tkey = t_cfg.table.full_name(safe=True)
+            tkey = t_cfg.tabular.full_name(safe=True)
             if tkey not in table_to_cfg:
                 table_to_cfg[tkey] = t_cfg
                 table_to_reqs[tkey] = []
@@ -993,15 +993,15 @@ class Session(ABC):
         else:
             lookup_batch = [r.anonymize(mode=cfg.anonymize) for r in requests]
         query = cfg.make_batch_lookup_sql(
-            table_name=cfg.table.full_name(safe=True),
+            table_name=cfg.tabular.full_name(safe=True),
             requests=lookup_batch,
         )
         try:
-            cache_result = cfg.table.sql.execute(query, spark_session=spark)
+            cache_result = cfg.tabular.sql.execute(query, spark_session=spark)
         except Exception as exc:
             if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
-                cfg.table.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
-                cache_result = cfg.table.sql.execute(query, spark_session=spark)
+                cfg.tabular.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
+                cache_result = cfg.tabular.sql.execute(query, spark_session=spark)
             else:
                 raise
 
@@ -1152,14 +1152,14 @@ class Session(ABC):
                 "%s %s response(s) in remote cache %s",
                 "Upserting" if mode == Mode.UPSERT else "Persisting",
                 len(group_responses),
-                cfg.table,
+                cfg.tabular,
             )
             batches = pa.Table.from_batches([
                 r.to_arrow_batch(parse=False)
                 for r in group_responses
             ]).combine_chunks()
 
-            cfg.table.insert(
+            cfg.tabular.insert(
                 batches,
                 mode=mode,
                 match_by=cfg.match_by or None,
@@ -1443,7 +1443,7 @@ class Session(ABC):
 
             # --- Stage 4: bulk remote writeback ---
             if is_spark:
-                # `cfg.table.insert` accepts the Spark DataFrame
+                # `cfg.tabular.insert` accepts the Spark DataFrame
                 # directly, so we hand off the lazy DF without
                 # materialising on the driver.
                 if (
@@ -1484,7 +1484,7 @@ class Session(ABC):
 
         Honours the session-level remote config only — per-request overrides
         collapse onto it on the spark path, mirroring stage 3 where workers
-        see only the session-level local cache config. ``cfg.table.insert``
+        see only the session-level local cache config. ``cfg.tabular.insert``
         accepts the Spark DataFrame directly via ``spark_insert_into``, so
         no driver-side collect is needed.
 
@@ -1504,7 +1504,7 @@ class Session(ABC):
         )
 
         if cfg.mode != Mode.UPSERT:
-            table_name = cfg.table.full_name(safe=True)
+            table_name = cfg.tabular.full_name(safe=True)
             # Restrict the SELECT DISTINCT to the partitions actually
             # in play — ``partition_key`` is the table's partition
             # column so the engine prunes the existing-rows scan
@@ -1530,7 +1530,7 @@ class Session(ABC):
                     )
             except Exception as exc:
                 # Table doesn't exist yet — nothing to dedup against; the
-                # downstream `cfg.table.insert` handles creation. Match the
+                # downstream `cfg.tabular.insert` handles creation. Match the
                 # error-string sniff used by `_lookup_remote_table`.
                 if "TABLE_OR_VIEW_NOT_FOUND" not in str(exc):
                     raise
@@ -1546,9 +1546,9 @@ class Session(ABC):
         LOGGER.debug(
             "%s ok response(s) into remote cache %s (spark insert)",
             "Upserting" if cfg.mode == Mode.UPSERT else "Persisting",
-            cfg.table,
+            cfg.tabular,
         )
-        cfg.table.insert(
+        cfg.tabular.insert(
             ok_df,
             mode=cfg.mode,
             match_by=cfg.match_by or None,

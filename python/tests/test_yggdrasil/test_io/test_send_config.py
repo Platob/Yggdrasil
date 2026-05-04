@@ -60,8 +60,11 @@ class TestCacheConfigCheckArgPolymorphism:
         assert cfg.received_from == when
 
     def test_path_arg(self, tmp_path):
+        from yggdrasil.io.buffer.nested.folder_io import FolderIO
+
         cfg = CacheConfig.check_arg(tmp_path)
-        assert cfg.path == tmp_path
+        assert isinstance(cfg.tabular, FolderIO)
+        assert str(cfg.tabular.path) == str(tmp_path)
 
 
 class TestCacheConfigEnabledFlags:
