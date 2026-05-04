@@ -97,6 +97,40 @@ with path.lock(write=True, wait=60):
     path.write_bytes(payload)
 ```
 
+### `.ygg/` sidecar — checkpoints + metadata for streaming folders
+
+`FolderIO` (and any `NestedIO` subclass) carries an out-of-band
+sidecar at `<root>/.ygg/` for streaming-write coordination:
+
+- `.ygg/checkpoints.jsonl` — append-only JSON Lines log. Each
+  `folder_io.checkpoint(message=..., **extra)` call writes one
+  record `{id, ts, pid, files, num_files, message, ...extra}` and
+  takes a transient write lock on the log so concurrent
+  checkpointers don't tear lines.
+- `.ygg/metadata/<key>.json` — per-key value store via
+  `write_metadata(key, value)` / `read_metadata(key, default)` /
+  `list_metadata_keys()`. Keys are slugged
+  (alphanumerics + `_-.`); writes are stage+rename atomic.
+
+```python
+with FolderIO(path="s3://bucket/ingest/", concurrent=True) as io:
+    for batch in producer():
+        io.write_arrow_batches([batch], mode=Mode.APPEND)
+        io.checkpoint(rows=batch.num_rows, source="kafka:ingest-7")
+
+# Downstream consumer
+with FolderIO(path="s3://bucket/ingest/") as r:
+    last = r.latest_checkpoint()
+    if last:
+        resume_from(last["id"])
+```
+
+Both `iter_children` and `read_arrow_batches` skip the `.ygg/`
+folder — checkpoint and metadata records never contaminate the
+data view. Staging files (`tmp-<seed>-<start>-<end>.<ext>`) are
+also hidden, so a parallel reader never picks up a half-written
+child.
+
 ### Spill-temp cleanup
 
 `BytesIO` mints temp files under `tempfile.gettempdir()` with the TTL

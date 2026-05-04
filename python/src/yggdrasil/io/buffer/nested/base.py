@@ -65,6 +65,7 @@ Save mode semantics
 from __future__ import annotations
 
 import dataclasses
+import re
 from abc import ABC, abstractmethod
 from typing import (
     TYPE_CHECKING,
@@ -91,6 +92,15 @@ if TYPE_CHECKING:
 
 
 __all__ = ["NestedIO", "NestedOptions"]
+
+
+# Staging filenames carry ``-<start_ts>-<end_ts>(.ext)*`` after the
+# ``tmp-<seed>`` prefix; ``_is_ignored_path`` uses this to skip them
+# during enumeration so parallel readers never see half-finalized
+# files. Mirror of ``yggdrasil.io.fs.path._STAGING_TMP_RE``.
+_STAGING_TMP_RE: "re.Pattern[str]" = re.compile(
+    r"-(\d+)-(\d+)(?:\.[^./]+)*$"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -438,11 +448,25 @@ class NestedIO(TabularIO[O], ABC):
     def _is_ignored_path(self, child: Path) -> bool:
         """Return True for paths that should be hidden from enumeration.
 
-        Default: hide hidden files (name starts with ``.``).
+        Default rules:
+
+        - Hide dot-prefixed entries (``.schema``, ``.ygg/``, …).
+        - Hide in-flight staging files
+          (``tmp-<seed>-<start>-<end>.<ext>``) so a parallel reader
+          doesn't pick up a half-written file mid-stage. The
+          finalize step renames staging into its final
+          ``part-NNNN.<ext>`` shape; only finalized children are
+          ever exposed.
+
         Subclasses (DeltaIO, IcebergIO) override to also hide their
         own metadata directories (``_delta_log/``, ``metadata/``).
         """
-        return child.name.startswith(".")
+        name = child.name
+        if name.startswith("."):
+            return True
+        if name.startswith("tmp-") and _STAGING_TMP_RE.search(name):
+            return True
+        return False
 
     # ==================================================================
     # Read derivation — chain children directly
