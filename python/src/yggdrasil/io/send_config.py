@@ -407,6 +407,19 @@ class CacheConfig(_ConfigBase):
         ]
 
     @property
+    def sql_match_by(self) -> list[str]:
+        # Cache-table column names for the merge join. Request-side keys
+        # are stored on the response table under the flattened
+        # ``request_<col>`` form (cf. :data:`RESPONSE_SCHEMA`), so a
+        # bare ``public_url_hash`` / ``method`` / etc. needs the
+        # ``request_`` prefix before it can be referenced as a target
+        # column in a Delta MERGE. Response-side keys map 1:1 already.
+        return [
+            *(_request_column_sql_name(k) for k in (self.request_by or ())),
+            *(self.response_by or ()),
+        ]
+
+    @property
     def request_by_is_public(self) -> bool:
         """True when every ``request_by`` key is anonymization-invariant.
 

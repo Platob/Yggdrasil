@@ -108,6 +108,23 @@ class TestCacheConfigMatchBy:
         )
         assert cfg.match_by == ["method", "status_code"]
 
+    def test_sql_match_by_prefixes_request_keys(self):
+        cfg = CacheConfig(
+            request_by=["public_url_hash", "method"],
+            response_by=["status_code"],
+        )
+        # Request-side keys are stored on the response cache table
+        # under ``request_<col>``; the merge must reference that form.
+        assert cfg.sql_match_by == [
+            "request_public_url_hash",
+            "request_method",
+            "status_code",
+        ]
+
+    def test_sql_match_by_passes_through_already_prefixed(self):
+        cfg = CacheConfig(request_by=["request_public_url_hash"])
+        assert cfg.sql_match_by == ["request_public_url_hash"]
+
 
 class TestCacheConfigSqlClauses:
     def test_request_clause_matches_values(self):

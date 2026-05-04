@@ -430,7 +430,7 @@ class Session(ABC):
         cache_cfg.tabular.insert(
             batch,
             mode=mode if mode is not None else cache_cfg.mode,
-            match_by=cache_cfg.match_by or None,
+            match_by=cache_cfg.sql_match_by or None,
             wait=cache_cfg.wait,
             # Two-level prune: ``partition_key`` triggers Delta file
             # pruning (partition column on RESPONSE_SCHEMA);
@@ -1181,7 +1181,7 @@ class Session(ABC):
             cfg.tabular.insert(
                 batches,
                 mode=mode,
-                match_by=cfg.match_by or None,
+                match_by=cfg.sql_match_by or None,
                 wait=cfg.wait,
                 prune_values={
                     "partition_key": batches["partition_key"],
@@ -1570,7 +1570,7 @@ class Session(ABC):
         cfg.tabular.insert(
             ok_df,
             mode=cfg.mode,
-            match_by=cfg.match_by or None,
+            match_by=cfg.sql_match_by or None,
             wait=cfg.wait,
             prune_by=["partition_key", "public_hash"],
             spark_session=spark,
