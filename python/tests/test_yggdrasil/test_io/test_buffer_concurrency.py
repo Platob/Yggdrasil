@@ -16,10 +16,12 @@ fresh files and unrelated names alone.
 from __future__ import annotations
 
 import os
+import pathlib
 import sys
 import threading
 import time
 
+import pyarrow as pa
 import pytest
 
 from yggdrasil.io.buffer import BytesIO
@@ -31,6 +33,12 @@ from yggdrasil.io.buffer._concurrency import (
     maybe_cleanup_stale_spill_files,
 )
 import yggdrasil.io.buffer._concurrency as _concurrency
+from yggdrasil.io.buffer.nested.folder_io import FolderIO
+from yggdrasil.io.buffer.primitive.arrow_ipc_io import ArrowIPCIO
+from yggdrasil.io.buffer.primitive.csv_io import CsvIO
+from yggdrasil.io.buffer.primitive.json_io import JsonIO
+from yggdrasil.io.buffer.primitive.ndjson_io import NDJsonIO
+from yggdrasil.io.buffer.primitive.parquet_io import ParquetIO
 from yggdrasil.io.fs import LocalPath
 
 
@@ -490,3 +498,224 @@ class TestCleanupStaleSpillFiles:
         )
         assert removed_third == 1
         assert not os.path.exists(path2)
+
+
+# ---------------------------------------------------------------------------
+# Primitive IO integration — locking flows through BytesIO inheritance
+# ---------------------------------------------------------------------------
+
+# Each primitive leaf is a BytesIO subclass, so the ``concurrent``
+# kwarg is inherited transparently. These tests exercise the full
+# round-trip (write → read) under concurrent=True for the file
+# formats we support, then verify the sidecar lock file appears for
+# the right mode and disappears on close.
+
+_TABLE = pa.table({"id": pa.array([1, 2, 3], type=pa.int64()),
+                   "name": pa.array(["a", "b", "c"])})
+
+
+def _expect_lock(target: str, *, suffix: str) -> str:
+    parent = os.path.dirname(target)
+    base = os.path.basename(target)
+    return os.path.join(parent, f".{base}{suffix}.lock")
+
+
+class TestPrimitiveIOConcurrency:
+
+    @pytest.mark.parametrize(
+        "io_cls,filename",
+        [
+            (ParquetIO, "data.parquet"),
+            (ArrowIPCIO, "data.arrow"),
+            (CsvIO, "data.csv"),
+            (JsonIO, "data.json"),
+            (NDJsonIO, "data.ndjson"),
+        ],
+    )
+    def test_write_lock_sidecar_appears_during_write(
+        self, tmp_path, io_cls, filename,
+    ):
+        target = tmp_path / filename
+        lock_path = _expect_lock(str(target), suffix="-rw")
+        with io_cls(path=str(target), mode="wb+", concurrent=True) as io:
+            io.write_arrow_table(_TABLE)
+            assert os.path.exists(lock_path)
+        assert not os.path.exists(lock_path)
+        assert target.exists() and target.stat().st_size > 0
+
+    @pytest.mark.parametrize(
+        "io_cls,filename",
+        [
+            (ParquetIO, "rt.parquet"),
+            (ArrowIPCIO, "rt.arrow"),
+            (CsvIO, "rt.csv"),
+        ],
+    )
+    def test_concurrent_round_trip(self, tmp_path, io_cls, filename):
+        target = tmp_path / filename
+        with io_cls(path=str(target), mode="wb+", concurrent=True) as w:
+            w.write_arrow_table(_TABLE)
+        with io_cls(path=str(target), mode="rb", concurrent=True) as r:
+            tbl = r.read_arrow_table()
+        assert tbl.num_rows == _TABLE.num_rows
+        assert tbl.column_names == _TABLE.column_names
+
+    def test_no_lock_when_concurrent_false(self, tmp_path):
+        target = tmp_path / "default.parquet"
+        with ParquetIO(path=str(target), mode="wb+") as io:
+            io.write_arrow_table(_TABLE)
+        # No -*.lock files leftover.
+        assert not any(
+            n.startswith(".") and n.endswith(".lock")
+            for n in os.listdir(tmp_path)
+        )
+
+    @pytest.mark.skipif(_IS_WINDOWS, reason="POSIX flock semantics")
+    def test_concurrent_writers_serialise_via_lock(self, tmp_path):
+        target = tmp_path / "race.parquet"
+        # Hold the rw-lock externally; a concurrent ParquetIO writer
+        # with a short timeout must surface TimeoutError.
+        outer = FileLock(_expect_lock(str(target), suffix="-rw"))
+        outer.acquire()
+        try:
+            with pytest.raises(TimeoutError):
+                ParquetIO(
+                    path=str(target),
+                    mode="wb+",
+                    concurrent=True,
+                    lock_timeout=0.05,
+                ).open()
+        finally:
+            outer.release()
+        # After release, a fresh writer succeeds.
+        with ParquetIO(
+            path=str(target),
+            mode="wb+",
+            concurrent=True,
+            lock_timeout=1.0,
+        ) as io:
+            io.write_arrow_table(_TABLE)
+        assert target.exists()
+
+    @pytest.mark.skipif(_IS_WINDOWS, reason="POSIX flock semantics")
+    def test_two_threads_write_parquet_one_winner(self, tmp_path):
+        target = tmp_path / "thread-race.parquet"
+        a = pa.table({"v": pa.array(["A"] * 10)})
+        b = pa.table({"v": pa.array(["B"] * 10)})
+
+        def write(payload, hold):
+            with ParquetIO(
+                path=str(target),
+                mode="wb+",
+                concurrent=True,
+                lock_timeout=5.0,
+            ) as io:
+                io.write_arrow_table(payload)
+                time.sleep(hold)
+
+        ta = threading.Thread(target=write, args=(a, 0.1))
+        tb = threading.Thread(target=write, args=(b, 0.0))
+        ta.start()
+        time.sleep(0.02)
+        tb.start()
+        ta.join(timeout=5.0)
+        tb.join(timeout=5.0)
+
+        # File holds exactly one of the two payloads (no torn parquet
+        # footer, no mixed bytes).
+        with ParquetIO(path=str(target), mode="rb") as r:
+            final = r.read_arrow_table()
+        assert final.num_rows == 10
+        col = final["v"].to_pylist()
+        assert col in (["A"] * 10, ["B"] * 10)
+
+
+# ---------------------------------------------------------------------------
+# Nested IO integration — folder-root lock
+# ---------------------------------------------------------------------------
+
+
+class TestNestedIOConcurrency:
+    def _expect_folder_lock(self, folder: pathlib.Path) -> str:
+        # FolderIO locks via Path.lock(read=True, write=True) which
+        # produces ``<dir>/.<basename>-rw.lock``.
+        parent = str(folder.parent)
+        base = folder.name or "_"
+        return os.path.join(parent, f".{base}-rw.lock")
+
+    def test_concurrent_off_by_default_no_lock_file(self, tmp_path):
+        folder = tmp_path / "store"
+        folder.mkdir()
+        with FolderIO(path=str(folder)) as io:
+            assert io._path_lock is None
+        assert not os.path.exists(self._expect_folder_lock(folder))
+
+    def test_concurrent_acquires_and_releases_folder_lock(self, tmp_path):
+        folder = tmp_path / "store"
+        folder.mkdir()
+        lock_path = self._expect_folder_lock(folder)
+        with FolderIO(path=str(folder), concurrent=True) as io:
+            assert io._path_lock is not None
+            assert os.path.exists(lock_path)
+        assert not os.path.exists(lock_path)
+
+    @pytest.mark.skipif(_IS_WINDOWS, reason="POSIX flock semantics")
+    def test_two_concurrent_folder_handles_serialise(self, tmp_path):
+        folder = tmp_path / "store"
+        folder.mkdir()
+
+        # First handle holds the rw-lock; the second must time out.
+        a = FolderIO(path=str(folder), concurrent=True)
+        a.open()
+        try:
+            b = FolderIO(path=str(folder), concurrent=True, lock_timeout=0.05)
+            with pytest.raises(TimeoutError):
+                b.open()
+        finally:
+            a.close()
+
+        # Once a is closed, c can acquire.
+        with FolderIO(
+            path=str(folder),
+            concurrent=True,
+            lock_timeout=1.0,
+        ) as c:
+            assert c._path_lock is not None
+
+    @pytest.mark.skipif(_IS_WINDOWS, reason="POSIX flock semantics")
+    def test_threaded_folder_writers_do_not_overlap(self, tmp_path):
+        """Two threaded FolderIO instances with concurrent=True against
+        the same folder enter their critical sections sequentially,
+        not in parallel — verified by tracking the high-water-mark of
+        simultaneously-held locks."""
+        folder = tmp_path / "store"
+        folder.mkdir()
+
+        active = 0
+        peak = 0
+        peak_lock = threading.Lock()
+
+        def worker():
+            nonlocal active, peak
+            with FolderIO(
+                path=str(folder),
+                concurrent=True,
+                lock_timeout=5.0,
+            ) as io:
+                with peak_lock:
+                    active += 1
+                    if active > peak:
+                        peak = active
+                # Hold for a moment so a parallel attempt would surface.
+                time.sleep(0.05)
+                with peak_lock:
+                    active -= 1
+                _ = io  # quiet unused-var
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
+
+        assert peak == 1, f"FolderIO concurrent=True peak overlap was {peak}"
