@@ -1503,27 +1503,26 @@ class Session(ABC):
         cache configs are stripped (driver concern); per-request local cache
         configs are dropped on workers (they see only the session config).
         """
-        # Build the request DataFrame on the driver. Each request becomes
-        # one row in REQUEST_ARROW_SCHEMA shape. We control partitioning by
-        # chunking before handing to createDataFrame.
-        request_batches: list[pa.RecordBatch] = [
-            r.prepare_to_send().to_arrow_batch(parse=False) for r in misses
-        ]
-        request_table = pa.Table.from_batches(request_batches)
-        # PySpark 3.4+ accepts a pyarrow.Table directly and preserves the
-        # full schema (maps, nullable bytes). The pandas fallback drops
-        # type information for object-typed columns and fails on empty
-        # maps, which `request_headers` and `request_tags` produce
-        # whenever the request carries no extras.
-        try:
-            request_df = spark.createDataFrame(request_table)
-        except (TypeError, AttributeError):
-            from .request import REQUEST_SCHEMA
+        # Pickle each prepared request into a binary blob and ship it via
+        # Spark's standard pickle transport (createDataFrame from a list goes
+        # through CPickleSerializer + parallelize). This avoids the Arrow IPC
+        # request encoding entirely and round-trips the full PreparedRequest
+        # object — including any subclass state — so workers don't have to
+        # reconstruct it from a flattened Arrow row.
+        import pickle
 
-            request_df = spark.createDataFrame(
-                request_table.to_pandas(),
-                schema=REQUEST_SCHEMA.to_spark_schema(),
-            )
+        from pyspark.sql.types import BinaryType, StructField, StructType
+
+        proto = pickle.HIGHEST_PROTOCOL
+        request_pickles = [
+            (pickle.dumps(r.prepare_to_send(), protocol=proto),) for r in misses
+        ]
+        request_pickle_schema = StructType([
+            StructField("request_pickle", BinaryType(), nullable=False),
+        ])
+        request_df = spark.createDataFrame(
+            request_pickles, schema=request_pickle_schema,
+        )
 
         # Per-executor send config: remote cache disabled (driver-only),
         # local cache passthrough, no spark session, raise_error=False so
@@ -1549,11 +1548,18 @@ class Session(ABC):
             batches: Iterator[pa.RecordBatch],
         ) -> Iterator[pa.RecordBatch]:
             # All imports local — keeps the closure self-contained on workers.
-            from yggdrasil.io.request import PreparedRequest as _Req
+            import pickle as _pickle
 
             for batch in batches:
-                # Decode this partition's slice of requests.
-                partition_requests = list(_Req.from_arrow(batch, normalize=False))
+                if batch.num_rows == 0:
+                    continue
+                # Unpickle the binary column back into PreparedRequest objects.
+                blob_col = batch.column(0)
+                partition_requests = [
+                    _pickle.loads(b.as_py())
+                    for b in blob_col
+                    if b.is_valid
+                ]
                 if not partition_requests:
                     continue
 
