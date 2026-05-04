@@ -72,4 +72,8 @@ class HTTPResponse(Response):
             if release_conn:
                 response.release_conn()
 
+        # Rewind so callers (to_polars, json_load, as_media, paginated
+        # combiners, …) read from byte 0 rather than from EOF.
+        buffer.seek(0)
+
         return self
