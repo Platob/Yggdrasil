@@ -157,6 +157,7 @@ class DeltaIO(FolderIO):
         self._log_dir: Path = self.path / "_delta_log"
         self._replay_cache: ReplayResult | None = None
         self._replay_cache_version: int = -1
+        self._column_rename_map_cache: dict[str, str] | None | bool = False  # False = not computed
 
     @classmethod
     def options_class(cls):
@@ -211,6 +212,7 @@ class DeltaIO(FolderIO):
     def _invalidate_replay_cache(self) -> None:
         self._replay_cache = None
         self._replay_cache_version = -1
+        self._column_rename_map_cache = False
 
     # ==================================================================
     # Partition column resolution — from Metadata
@@ -290,8 +292,10 @@ class DeltaIO(FolderIO):
 
         for add in replay.live_files:
             child_path = self.path.joinpath(*add.path.split("/"))
-            if not child_path.exists():
-                continue
+            # Skip the exists() check here — the replay says the file is
+            # live, and we'll get a clear FileNotFoundError on read if it's
+            # actually gone. Saves one HeadObject per AddFile on S3-backed
+            # tables which adds up fast on wide tables.
 
             child_io = self._open_file_child(child_path)
             if child_io is None:
@@ -345,6 +349,9 @@ class DeltaIO(FolderIO):
         predicate = getattr(options, "predicate", None)
         prune_fn = self._build_partition_prune_fn(predicate)
 
+        # Pre-compute column rename map once for the whole read, not per-file.
+        rename_map = self._build_column_rename_map()
+
         for child_io in self._iter_children(options):
             if not isinstance(child_io, TabularIO):
                 continue
@@ -357,12 +364,14 @@ class DeltaIO(FolderIO):
             ):
                 continue
 
-            yield from self._read_addfile_batches(child_io, options)
+            yield from self._read_addfile_batches(child_io, options, rename_map=rename_map)
 
     def _read_addfile_batches(
         self,
         child_io: TabularIO,
         options: DeltaOptions,
+        *,
+        rename_map: dict[str, str] | None = None,
     ) -> Iterator[pa.RecordBatch]:
         """Drain one AddFile's batches with its DV applied row-wise."""
         dv = getattr(child_io, "deletion_vector", None)
@@ -371,6 +380,7 @@ class DeltaIO(FolderIO):
             if dv is not None else None
         )
         has_dv = dv_bitmap is not None and len(dv_bitmap) > 0
+
 
         with child_io:
             row_offset = 0
@@ -392,9 +402,49 @@ class DeltaIO(FolderIO):
 
                 if batch.num_rows == 0:
                     continue
+
+                if rename_map:
+                    batch = _rename_batch(batch, rename_map)
+
                 yield batch
 
+    def _build_column_rename_map(self) -> dict[str, str] | None:
+        """Build physical→logical column rename map for columnMapping tables.
+
+        Returns ``None`` when column mapping is off (mode ``"none"`` or
+        absent) — the common case for tables we wrote ourselves. When
+        the table uses ``name`` or ``id`` mapping, returns a dict from
+        physical parquet column name to logical Delta column name,
+        extracted from each field's ``delta.columnMapping.physicalName``
+        metadata entry.
+
+        Cached per-instance alongside the replay cache.
+        """
+        if self._column_rename_map_cache is not False:
+            return self._column_rename_map_cache  # type: ignore[return-value]
+
+        try:
+            replay = self._replay()
+        except (FileNotFoundError, ValueError):
+            self._column_rename_map_cache = None
+            return None
+        if replay.metadata is None:
+            self._column_rename_map_cache = None
+            return None
+
+        mode = replay.metadata.configuration.get("delta.columnMapping.mode", "none")
+        if mode == "none":
+            self._column_rename_map_cache = None
+            return None
+
+        rename: dict[str, str] = {}
+        _collect_physical_to_logical(replay.metadata.schema, rename)
+        result = rename or None
+        self._column_rename_map_cache = result
+        return result
+
     def _build_partition_prune_fn(self, predicate: Any):
+
         """Build a callable that decides whether to scan a partition.
 
         Returns ``None`` when there's no predicate, when the
@@ -1328,3 +1378,88 @@ class _DVWritePlan:
     new_bitmap: "BitMap64"
     original_row_count: int | None
     materialized_path: Path | None
+
+
+# ---------------------------------------------------------------------------
+# Column mapping helpers
+# ---------------------------------------------------------------------------
+
+
+def _collect_physical_to_logical(
+    schema: Schema,
+    out: dict[str, str],
+    *,
+    _prefix: str = "",
+) -> None:
+    """Walk *schema* fields and populate *out* with physical→logical mappings.
+
+    Handles nested structs recursively. The physical name lives in
+    each field's metadata under ``delta.columnMapping.physicalName``.
+    """
+    for field in schema.fields:
+        meta = getattr(field, "metadata", None) or {}
+        # Metadata keys can be bytes (Arrow convention) or strings.
+        physical = None
+        for key in (b"delta.columnMapping.physicalName", "delta.columnMapping.physicalName"):
+            val = meta.get(key)
+            if val is not None:
+                physical = val.decode("utf-8") if isinstance(val, (bytes, bytearray)) else str(val)
+                break
+
+        if physical and physical != field.name:
+            out[_prefix + physical] = _prefix + field.name
+
+        # Recurse into struct children so nested physical names get mapped.
+        sub_fields = getattr(field, "fields", None)
+        if sub_fields:
+            child_prefix = (_prefix + field.name + ".") if _prefix else ""
+            for sub in sub_fields:
+                sub_meta = getattr(sub, "metadata", None) or {}
+                sub_physical = None
+                for key in (b"delta.columnMapping.physicalName", "delta.columnMapping.physicalName"):
+                    val = sub_meta.get(key)
+                    if val is not None:
+                        sub_physical = val.decode("utf-8") if isinstance(val, (bytes, bytearray)) else str(val)
+                        break
+                if sub_physical and sub_physical != sub.name:
+                    out[sub_physical] = sub.name
+
+
+def _rename_batch(
+    batch: pa.RecordBatch,
+    rename_map: dict[str, str],
+) -> pa.RecordBatch:
+    """Rename columns in *batch* using *rename_map* (physical→logical).
+
+    Columns not in the map keep their existing name. Handles nested
+    struct fields by recursively renaming child fields.
+    """
+    new_names = [rename_map.get(name, name) for name in batch.schema.names]
+
+    # Recursively rename struct child fields.
+    new_fields: list[pa.Field] = []
+    for i, field in enumerate(batch.schema):
+        logical_name = new_names[i]
+        new_field = _rename_field(field, logical_name, rename_map)
+        new_fields.append(new_field)
+
+    new_schema = pa.schema(new_fields, metadata=batch.schema.metadata)
+    return pa.RecordBatch.from_arrays(batch.columns, schema=new_schema)
+
+
+def _rename_field(
+    field: pa.Field,
+    logical_name: str,
+    rename_map: dict[str, str],
+) -> pa.Field:
+    """Rename a single Arrow field, recursing into struct children."""
+    typ = field.type
+    if pa.types.is_struct(typ):
+        new_children: list[pa.Field] = []
+        for child in typ:
+            child_logical = rename_map.get(child.name, child.name)
+            new_children.append(_rename_field(child, child_logical, rename_map))
+        new_type = pa.struct(new_children)
+        return pa.field(logical_name, new_type, nullable=field.nullable, metadata=field.metadata)
+    return field.with_name(logical_name)
+

@@ -66,6 +66,8 @@ MAX_LEGACY_WRITER_VERSION: int = 6
 SUPPORTED_READER_FEATURES: FrozenSet[str] = frozenset({
     "deletionVectors",
     "v2Checkpoint",
+    "columnMapping",
+    "timestampNtz",
 })
 
 #: Writer features we implement. Used on write when we emit our own
@@ -82,8 +84,6 @@ SUPPORTED_WRITER_FEATURES: FrozenSet[str] = frozenset({
 #: Reader features we know about but don't support. Listing them
 #: explicitly produces a clearer error message than "unknown feature".
 KNOWN_REFUSED_READER_FEATURES: FrozenSet[str] = frozenset({
-    "columnMapping",
-    "timestampNtz",
     "rowTracking",
     "typeWidening",
     "typeWidening-preview",
@@ -105,6 +105,9 @@ TOLERATED_WRITER_FEATURES: FrozenSet[str] = frozenset({
     "changeDataFeed",
     "identityColumns",
     "domainMetadata",
+    "columnMapping",
+    "timestampNtz",
+    "rowTracking",
 })
 
 

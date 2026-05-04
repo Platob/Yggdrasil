@@ -258,6 +258,7 @@ class ManagedTableIntegrationCase(DatabricksCase):
         self._assert_data_files_exist()
 
         delta = self._delta_io()
+        existing_files = list(delta.path.ls(recursive=True, allow_not_found=True))
         result = delta.read_arrow_table()
 
         # struct<a, s> may surface as a single struct column or flattened.

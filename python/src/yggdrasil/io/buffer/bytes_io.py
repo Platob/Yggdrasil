@@ -494,7 +494,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         if auto_open is None:
             auto_open = self._spill_path is not None and not self._owns_spill_path
 
-        if auto_open:
+        if auto_open and not self._acquired:
             self.open()
 
     # ------------------------------------------------------------------
@@ -1716,13 +1716,13 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         dispatch available, the caller's _read/_write_arrow_batches
         is the leaf and must implement the format itself."
         """
-        mt = self._media_type
+        mt = self.media_type
         if mt is None or getattr(mt, "is_octet", False):
             return None
         target_cls = TabularIO.media_type_class(mt, default=None)
         if target_cls is None or target_cls is type(self):
             return None
-        return target_cls(self, media_type=mt)
+        return target_cls.from_(self, media_type=mt)
 
     def _read_arrow_batches(self, options: CastOptions) -> "Iterator[pa.RecordBatch]":
         """Default — opaque buffer can't yield Arrow batches.
@@ -1742,7 +1742,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             yield from view._read_arrow_batches(view.check_options(options))
             return
         raise NotImplementedError(
-            f"{type(self).__name__} has no tabular media type. "
+            f"{type(self).__name__}: {self.synthetic_content()} has no tabular media type. "
             "Construct via the format leaf (ParquetIO, CsvIO, …) "
             "or pass media_type= to dispatch through the registry."
         )

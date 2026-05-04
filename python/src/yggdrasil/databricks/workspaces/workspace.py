@@ -17,7 +17,6 @@ __all__ = [
 LOGGER = logging.getLogger(__name__)
 
 
-@dataclass
 class Workspace(DatabricksClient):
     pass
 

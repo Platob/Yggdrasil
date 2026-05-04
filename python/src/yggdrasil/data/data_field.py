@@ -1374,12 +1374,12 @@ class Field(BaseMetadata, BaseChildrenFields):
             raise ValueError("Cannot build Field from empty list")
 
         try:
-            table = pa.table(value)
+            table = pa.Table.from_pylist(value)
             return cls.from_arrow(table)
         except Exception:
             pass
 
-        for item in range(min(len(value), 50)):
+        for item in range(min(len(value), 5)):
             try:
                 return cls.from_any(value[item])
             except Exception:

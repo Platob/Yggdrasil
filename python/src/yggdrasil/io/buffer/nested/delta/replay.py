@@ -143,7 +143,12 @@ def replay_log(log_dir: Path) -> ReplayResult:
 
 
 def latest_commit_version(log_dir: Path) -> int:
-    """Highest commit version present, or -1 if no log."""
+    """Highest commit version present, or -1 if no log.
+
+    Uses a single listing call; the results warm the stat cache on
+    S3-backed paths so subsequent exists() / read calls on individual
+    commit files are free.
+    """
     if not log_dir.exists():
         return -1
     out = -1

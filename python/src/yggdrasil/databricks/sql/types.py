@@ -169,9 +169,17 @@ def parse_catalog_column_info_field(obj: CatalogColumnInfo) -> Field:
         metadata.update(parsed.metadata or {})
         partition_by = partition_by or parsed.partition_by
 
-    if obj.type_text and dtype.type_id.is_any_or_null:
+    if obj.type_text and (dtype.type_id.is_any_or_null or dtype.type_id.is_nested):
         dtype = dtype.merge_with(DataType.from_str(obj.type_text))
 
+    if isinstance(dtype, ArrayType):
+        if not dtype.item_field.name:
+            dtype.item_field.with_name("item", inplace=True)
+    elif isinstance(dtype, MapType):
+        if not dtype.key_field.name:
+            dtype.key_field.with_name("key", inplace=True)
+        if not dtype.value_field.name:
+            dtype.value_field.with_name("value", inplace=True)
     if isinstance(dtype, TimestampType):
         if dtype.tz:
             if dtype.tz in REPLACE_TIMEZONES.keys():

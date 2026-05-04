@@ -1448,7 +1448,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         column_definitions: list[str] = []
         partition_by = schema_info.partition_fields
         cluster_by = schema_info.cluster_fields
-        primary_keys = schema_info.primary_keys
+        primary_keys = schema_info.primary_fields
 
         for f in schema_info.children_fields:
             effective_fields.append(f)
@@ -1464,7 +1464,9 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         # FK / CHECK constraints can't be expressed inline against an
         # arbitrary parent table (the SDK ``table_constraints`` API does
         # the cross-table reference); they're applied post-create below.
-        constraint_clauses = self._build_inline_constraints(primary_keys)
+        constraint_clauses = self._build_inline_constraints(
+            self.full_name(safe=False), primary_keys
+        )
 
         table_definitions = column_definitions + constraint_clauses
 
@@ -1542,6 +1544,8 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
                     wait=True,
                 )
                 self.sql.execute(statement, wait=wait_result)
+            elif "CONSTRAINT_ALREADY_EXISTS_IN_SCHEMA" in str(exc):
+                pass
             else:
                 raise
 
@@ -1701,7 +1705,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         return out
 
     @staticmethod
-    def _build_inline_constraints(primary_keys: Iterable[Field]) -> list[str]:
+    def _build_inline_constraints(prefix: str, primary_keys: Iterable[Field]) -> list[str]:
         """Render inline DDL ``CONSTRAINT … PRIMARY KEY(…)`` clauses.
 
         FK / CHECK aren't emitted inline: FK needs a parent reference that
@@ -1714,7 +1718,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
             return []
 
         col_names = [f.name for f in pk_fields]
-        constraint_name = safe_constraint_name(col_names, prefix="pk")
+        constraint_name = safe_constraint_name(col_names, prefix="pk_" + prefix)
         cols = ", ".join(quote_ident(n) for n in col_names)
         return [f"CONSTRAINT {quote_ident(constraint_name)} PRIMARY KEY ({cols}) RELY"]
 

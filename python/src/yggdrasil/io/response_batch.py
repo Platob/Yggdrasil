@@ -335,6 +335,10 @@ class ResponseBatch:
     def new_hits(self, value: BucketInput) -> None:
         self._new_response = _coerce_bucket(value, spark=self.spark)
 
+    def new_responses(self) -> Iterator[Response]:
+        """Flat list of every new response, in registration order."""
+        yield from Response.from_records(self._new_response.read_records())
+
     # ------------------------------------------------------------------
     # Shape helpers
     # ------------------------------------------------------------------

@@ -50,9 +50,8 @@ T = TypeVar("T")
 TC = TypeVar("TC", bound="DatabricksClient")
 TS = TypeVar("TS", bound="DatabricksService")
 
-_ALLOWED = re.compile(r"^[\d \w\+\-=\.:/@]*$") # noqa
-_SANITIZE = re.compile(r"[^\d \w\+\-=\.:/@]+") # noqa
-
+_ALLOWED = re.compile(r"^[\d \w\+\-=\.:/@]*$")  # noqa
+_SANITIZE = re.compile(r"[^\d \w\+\-=\.:/@]+")  # noqa
 
 
 def getenv(name: str) -> Optional[str]:
@@ -71,13 +70,13 @@ def env_field(
     *,
     repr_: bool = False,
     compare: bool = True,
-    hash_: bool = True
+    hash_: bool = True,
 ):
     return field(
         default_factory=getenv_factory(name),
         repr=repr_,
         compare=compare,
-        hash=hash_
+        hash=hash_,
     )
 
 
@@ -90,6 +89,18 @@ class DatabricksClient:
       - config: Config
 
     Extra wrapper-only metadata is kept separately.
+
+    Cross-process / cross-host serialization is supported via
+    :meth:`__getstate__` / :meth:`__setstate__`. SDK clients, Configs,
+    and lazy sub-service caches are dropped (all rebuild on demand from
+    the dataclass fields). A best-effort *session token snapshot* is
+    carried alongside so the receiving side can warm-start without
+    re-running the auth dance (browser flow, MSI probe, gcloud, etc).
+
+    If the deserializing host is itself a Databricks runtime (driver
+    node), the carried credentials are discarded and ``auth_type`` is
+    forced to ``"runtime"`` — DBR's notebook-scoped auth is short-lived,
+    identity-correct, and the right default in that environment.
     """
 
     # Databricks / generic
@@ -139,29 +150,154 @@ class DatabricksClient:
     _account_config: Optional[Config] = field(default=None, init=False, repr=False, compare=False, hash=False)
     _account_client: Optional[DAC] = field(default=None, init=False, repr=False, compare=False, hash=False)
 
+    # Serializable session-token snapshot, populated on __getstate__ and
+    # consumed on __setstate__. Off-cluster only — DBR runtime ignores it.
+    _session_token: Optional[dict[str, Any]] = field(
+        default=None, init=False, repr=False, compare=False, hash=False
+    )
+
+    # ----- transport policy -------------------------------------------------
+
+    # Attributes that must NOT cross a process / host boundary verbatim.
+    # SDK clients hold sockets and threads; cached Configs hold credential
+    # providers bound to the *source* host's filesystem (token-cache.json,
+    # ~/.databrickscfg, IMDS, gcloud DAC, etc). Sub-service caches hold
+    # back-references to ``self`` and re-hydrate lazily via @property.
+    _TRANSIENT_STATE: ClassVar[frozenset[str]] = frozenset({
+        "_workspace_client",
+        "_account_client",
+        "_workspace_config",
+        "_account_config",
+        "_was_connected",
+        "_workspace", "_sql", "_entity_tags", "_warehouses", "_compute",
+        "_secrets", "_iam", "_tables", "_views", "_columns_svc",
+        "_catalogs", "_schemas", "_genie", "_filesystem",
+    })
+
+    # Config attributes worth snapshotting for warm restart on another host.
+    # PAT / OAuth secret fields already live on DatabricksClient itself and
+    # round-trip via normal dataclass state — no need to duplicate them here.
+    _SESSION_TOKEN_KEYS: ClassVar[tuple[str, ...]] = (
+        "token",
+        "token_audience",
+        "auth_type",
+    )
+
     def __post_init__(self):
         if self.account_id:
             if not self.host:
-                object.__setattr__(self, "host", f"https://accounts.cloud.databricks.com")
+                object.__setattr__(self, "host", "https://accounts.cloud.databricks.com")
 
         if self.host:
             normalized = self.host.split("://")[-1].split("/")[0]
             object.__setattr__(self, "host", f"https://{normalized}")
 
+    # -------------------------------------------------------------------------
+    # Serialization
+    # -------------------------------------------------------------------------
+
     def __getstate__(self):
+        """
+        Serialize for transport across processes / hosts.
+
+        Drops SDK clients, Configs, and lazy sub-service caches (they all
+        rebuild from the dataclass fields on demand). Captures a session
+        token snapshot from the live Config so the receiving side can warm
+        start without re-running an interactive or environment-bound auth.
+        """
         state = self.__dict__.copy()
-        state.pop("_workspace_client", None)
-        state.pop("_account_client", None)
-        state.pop("_workspace_config", None)
-        state.pop("_account_config", None)
+
+        for key in self._TRANSIENT_STATE:
+            state.pop(key, None)
+
+        # Best-effort. We don't *construct* a Config here — pickling must
+        # never trigger a browser flow or network round-trip.
+        state["_session_token"] = self._snapshot_session_token()
+
         return state
 
     def __setstate__(self, state):
+        """
+        Rehydrate after transport.
+
+        Inside a Databricks runtime (driver node), DBR's notebook-scoped
+        credentials win unconditionally: we force ``auth_type="runtime"``
+        and clear any sender-bound credential fields that would otherwise
+        bias ``_make_base_config`` toward the wrong path.
+
+        Off-cluster, the carried session token is restored onto ``self``
+        so the next ``make_config()`` call picks it up via the normal
+        field path — no Config exists yet at unpickle time.
+        """
+        # Initialize transient slots so attribute access is safe even if
+        # the pickle pre-dates a field addition.
+        for key in self._TRANSIENT_STATE:
+            self.__dict__[key] = None
+        self.__dict__["_session_token"] = None
+
         self.__dict__.update(state)
-        self._workspace_client = None
-        self._account_client = None
-        self._workspace_config = None
-        self._account_config = None
+
+        if self.is_in_databricks_environment():
+            self.auth_type = "runtime"
+            self.token = None
+            self.client_id = None
+            self.client_secret = None
+            self.profile = None
+            self.config_file = None
+            self._session_token = None
+            return
+
+        self._restore_session_token(state.get("_session_token"))
+
+    def _snapshot_session_token(self) -> Optional[dict[str, Any]]:
+        """
+        Capture a minimal, transportable view of the active session token.
+
+        Returns the previously stored snapshot (if any) when no Config has
+        been materialized yet — pickling must not trigger Config construction.
+        """
+        config = self._workspace_config or self._account_config
+        if config is None:
+            return self._session_token
+
+        snap: dict[str, Any] = {}
+        for key in self._SESSION_TOKEN_KEYS:
+            value = getattr(config, key, None)
+            if value is not None:
+                snap[key] = value
+
+        # Some SDK versions cache the resolved Authorization header on the
+        # Config; grab it if present, but never call authenticate() — that
+        # could hit the network mid-pickle.
+        try:
+            headers = getattr(config, "_inner", None)
+            if isinstance(headers, dict) and "Authorization" in headers:
+                snap["authorization"] = headers["Authorization"]
+        except Exception:  # noqa: BLE001 - snapshot is best-effort
+            pass
+
+        return snap or None
+
+    def _restore_session_token(self, snap: Optional[dict[str, Any]]) -> None:
+        """
+        Apply a snapshot produced by :meth:`_snapshot_session_token`.
+
+        Only fills fields that are not already set on ``self`` —
+        explicit constructor-provided values win over a stale carried token.
+        """
+        if not snap:
+            return
+
+        if not self.token and "token" in snap:
+            self.token = snap["token"]
+        if not self.token_audience and "token_audience" in snap:
+            self.token_audience = snap["token_audience"]
+        if not self.auth_type and "auth_type" in snap:
+            self.auth_type = snap["auth_type"]
+
+        # Forward the full snapshot so a downstream re-pickle can pass it on
+        # even before make_config() runs on this host.
+        self._session_token = snap
 
     # -------------------------------------------------------------------------
     # URLResource
@@ -207,10 +343,7 @@ class DatabricksClient:
         )
 
     @classmethod
-    def parse(
-        cls,
-        obj: Any,
-    ):
+    def parse(cls, obj: Any):
         if isinstance(obj, cls):
             return obj
         elif isinstance(obj, URL):
@@ -221,13 +354,12 @@ class DatabricksClient:
         elif isinstance(obj, dict):
             return cls(**obj)
         else:
-            raise ValueError(f"Cannot parse {cls.__name__} from object of type {type(obj)}: {obj!r}")
+            raise ValueError(
+                f"Cannot parse {cls.__name__} from object of type {type(obj)}: {obj!r}"
+            )
 
     @classmethod
-    def from_parsed_url(
-        cls: Type[TC],
-        url: URL,
-    ) -> TC:
+    def from_parsed_url(cls: Type[TC], url: URL) -> TC:
         if not url.path:
             raise ValueError(f"Invalid path for {cls.__name__}: {url!r}")
 
@@ -293,6 +425,7 @@ class DatabricksClient:
     # -------------------------------------------------------------------------
     # Connection lifecycle
     # -------------------------------------------------------------------------
+
     @property
     def config(self):
         if self._workspace_config is None or self._account_config is None:
@@ -306,7 +439,7 @@ class DatabricksClient:
             else:
                 try:
                     return self.workspace_config
-                except:
+                except Exception:
                     return self.account_config
         return self._workspace_config or self._account_config
 
@@ -321,7 +454,6 @@ class DatabricksClient:
     def account_config(self) -> Config:
         if self._account_config is None:
             config = self.make_config(client_type=ClientType.ACCOUNT)
-
             object.__setattr__(self, "_account_config", config)
         return self._account_config
 
@@ -331,7 +463,7 @@ class DatabricksClient:
 
     def _make_base_config(
         self,
-        client_type: Optional[ClientType] = None
+        client_type: Optional[ClientType] = None,
     ):
         if client_type == ClientType.ACCOUNT:
             host = "https://accounts.cloud.databricks.com"
@@ -344,56 +476,123 @@ class DatabricksClient:
         if not self.cluster_id and not self.serverless_compute_id:
             self.serverless_compute_id = "auto"
 
-        config = Config(
-            host=host,
-            token=self.token,
-            client_id=self.client_id,
-            client_secret=self.client_secret,
-            account_id=self.account_id,
-            cluster_id=self.cluster_id,
-            serverless_compute_id=self.serverless_compute_id,
-            token_audience=self.token_audience,
-            azure_workspace_resource_id=self.azure_workspace_resource_id,
-            azure_use_msi=self.azure_use_msi,
-            azure_client_secret=self.azure_client_secret,
-            azure_client_id=self.azure_client_id,
-            azure_tenant_id=self.azure_tenant_id,
-            azure_environment=self.azure_environment,
-            google_credentials=self.google_credentials,
-            google_service_account=self.google_service_account,
-            profile=self.profile,
-            config_file=self.config_file,
-            auth_type=self.auth_type,
-            http_timeout_seconds=self.http_timeout_seconds,
-            retry_timeout_seconds=self.retry_timeout_seconds,
-            debug_truncate_bytes=self.debug_truncate_bytes,
-            debug_headers=self.debug_headers,
-            rate_limit=self.rate_limit,
-            product=self.product,
-            product_version=self.product_version,
-        )
-
-        # if client_type is not None:
-        #     if config.client_type != client_type:
-        #         raise ValueError(f"Config client_type {config.client_type} does not match expected {client_type}")
+        try:
+            config = Config(
+                host=host,
+                token=self.token,
+                client_id=self.client_id,
+                client_secret=self.client_secret,
+                account_id=self.account_id,
+                cluster_id=self.cluster_id,
+                serverless_compute_id=self.serverless_compute_id,
+                token_audience=self.token_audience,
+                azure_workspace_resource_id=self.azure_workspace_resource_id,
+                azure_use_msi=self.azure_use_msi,
+                azure_client_secret=self.azure_client_secret,
+                azure_client_id=self.azure_client_id,
+                azure_tenant_id=self.azure_tenant_id,
+                azure_environment=self.azure_environment,
+                google_credentials=self.google_credentials,
+                google_service_account=self.google_service_account,
+                profile=self.profile,
+                config_file=self.config_file,
+                auth_type=self.auth_type,
+                http_timeout_seconds=self.http_timeout_seconds,
+                retry_timeout_seconds=self.retry_timeout_seconds,
+                debug_truncate_bytes=self.debug_truncate_bytes,
+                debug_headers=self.debug_headers,
+                rate_limit=self.rate_limit,
+                product=self.product,
+                product_version=self.product_version,
+            )
+        except Exception as e:
+            raise ValueError(self._diagnose_config_error(e, client_type, host)) from e
 
         return config
 
-    def make_config(
+    def _diagnose_config_error(
         self,
-        client_type: Optional[ClientType] = None
-    ):
+        error: Exception,
+        client_type: Optional[ClientType],
+        host: Optional[str],
+    ) -> str:
+        """Build an actionable error message explaining why Config() failed."""
+        target = "account" if client_type == ClientType.ACCOUNT else "workspace"
+        lines = [f"Failed to build Databricks {target} config: {error}"]
+
+        if not host:
+            lines.append(
+                "  - host is missing. Set DATABRICKS_HOST "
+                "(e.g. 'https://adb-1234567890123456.7.azuredatabricks.net') "
+                "or pass host=... to DatabricksClient(...)."
+            )
+
+        if client_type == ClientType.ACCOUNT and not self.account_id:
+            lines.append(
+                "  - account_id is missing. Set DATABRICKS_ACCOUNT_ID "
+                "or pass account_id=... (required for account-level clients)."
+            )
+
+        has_pat = bool(self.token)
+        has_oauth = bool(self.client_id and self.client_secret)
+        has_azure_sp = bool(self.azure_client_id and self.azure_client_secret and self.azure_tenant_id)
+        has_azure_msi = self.azure_use_msi is True
+        has_gcp = bool(self.google_credentials or self.google_service_account)
+        has_profile = bool(self.profile)
+        in_runtime = self.is_in_databricks_environment()
+
+        if not any((has_pat, has_oauth, has_azure_sp, has_azure_msi, has_gcp, has_profile, in_runtime)):
+            lines.append(
+                "  - no credentials found. Provide one of:\n"
+                "      * DATABRICKS_TOKEN (PAT)\n"
+                "      * DATABRICKS_CLIENT_ID + DATABRICKS_CLIENT_SECRET (OAuth M2M)\n"
+                "      * ARM_CLIENT_ID + ARM_CLIENT_SECRET + ARM_TENANT_ID (Azure SP)\n"
+                "      * GOOGLE_CREDENTIALS or DATABRICKS_GOOGLE_SERVICE_ACCOUNT (GCP)\n"
+                "      * DATABRICKS_CONFIG_PROFILE pointing to a profile in ~/.databrickscfg"
+            )
+
+        if self.client_id and not self.client_secret:
+            lines.append("  - client_id is set but client_secret is missing (OAuth requires both).")
+        if self.client_secret and not self.client_id:
+            lines.append("  - client_secret is set but client_id is missing (OAuth requires both).")
+
+        if self.auth_type:
+            lines.append(
+                f"  - auth_type explicitly set to {self.auth_type!r} — "
+                f"clear it to let the SDK auto-detect."
+            )
+
+        if self.profile and self.config_file:
+            lines.append(
+                f"  - using profile {self.profile!r} from {self.config_file!r}; "
+                f"verify the profile exists and has valid fields."
+            )
+        elif self.profile:
+            lines.append(
+                f"  - using profile {self.profile!r} from ~/.databrickscfg; "
+                f"verify the profile exists."
+            )
+
+        return "\n".join(lines)
+
+    def make_config(self, client_type: Optional[ClientType] = None):
         try:
             config = self._make_base_config(client_type=client_type)
-        except ValueError:
-            if self.auth_type is None:
-                object.__setattr__(
-                    self, "auth_type",
-                    "runtime" if self.is_in_databricks_environment() else "external-browser"
-                )
-                config = self._make_base_config(client_type=client_type)
-            else:
+        except Exception as first_err:
+            if self.auth_type is not None:
                 raise
+
+            fallback_auth = "runtime" if self.is_in_databricks_environment() else "external-browser"
+            object.__setattr__(self, "auth_type", fallback_auth)
+
+            try:
+                config = self._make_base_config(client_type=client_type)
+            except Exception as second_err:
+                raise ValueError(
+                    f"Failed to build Databricks config with auto-detected auth.\n"
+                    f"  initial attempt (auth_type=None): {first_err}\n"
+                    f"  fallback attempt (auth_type={fallback_auth!r}): {second_err}"
+                ) from second_err
 
         for key in (
             "auth_type",
@@ -402,12 +601,12 @@ class DatabricksClient:
             "azure_client_id", "azure_tenant_id", "azure_environment",
             "google_credentials", "google_service_account",
             "http_timeout_seconds", "retry_timeout_seconds", "debug_truncate_bytes",
-            "debug_headers", "rate_limit"
+            "debug_headers", "rate_limit",
         ):
             value = getattr(config, key, None)
             if value is not None:
                 object.__setattr__(self, key, value)
-                
+
         return config
 
     @property
@@ -495,7 +694,12 @@ class DatabricksClient:
             self.set_account_id(record.get("account_id"))
             return self.account_id
 
-        raise ValueError(f"Could not find account_id for workspace_id {workspace_id!r}")
+        raise ValueError(
+            f"Could not find account_id for workspace_id {workspace_id!r} in "
+            f"system.access.workspaces_latest. Verify the current identity has "
+            f"SELECT on system.access.workspaces_latest, that the workspace is "
+            f"in RUNNING status, or set DATABRICKS_ACCOUNT_ID explicitly."
+        )
 
     def set_account_id(self, account_id: str) -> "DatabricksClient":
         if account_id:
@@ -560,12 +764,12 @@ class DatabricksClient:
 
         return s
 
-    # Path
+    # ------------------------------------------------------------------ Path
 
     def dbfs_path(
         self,
         parts: Union[list[str], str],
-        temporary: bool = False
+        temporary: bool = False,
     ):
         """Create a DatabricksPath in this workspace.
 
@@ -581,7 +785,7 @@ class DatabricksClient:
         return DatabricksPath.from_(
             obj=parts,
             client=self,
-            temporary=temporary
+            temporary=temporary,
         )
 
     @staticmethod
@@ -631,7 +835,7 @@ class DatabricksClient:
         base_path = base_path or self._base_tmp_path(
             catalog_name=catalog_name,
             schema_name=schema_name,
-            volume_name=volume_name
+            volume_name=volume_name,
         )
 
         rnd = os.urandom(4).hex()
@@ -646,7 +850,7 @@ class DatabricksClient:
         self.clean_tmp_folder(
             raise_error=False,
             wait=False,
-            base_path=base_path
+            base_path=base_path,
         )
 
         return self.dbfs_path(f"{base_path}/{temp_path}")
@@ -665,22 +869,19 @@ class DatabricksClient:
         base_path = base_path or self._base_tmp_path(
             catalog_name=catalog_name,
             schema_name=schema_name,
-            volume_name=volume_name
+            volume_name=volume_name,
         )
 
         if is_checked_tmp_path(
             host=self.base_url.to_string(),
-            base_path=base_path
+            base_path=base_path,
         ):
             return self
 
         if wait.timeout:
             base_path = self.dbfs_path(base_path)
 
-            LOGGER.debug(
-                "Cleaning temp path %s",
-                base_path
-            )
+            LOGGER.debug("Cleaning temp path %s", base_path)
 
             for path in base_path.ls(recursive=False, allow_not_found=True):
                 if path.name.startswith("tmp"):
@@ -692,10 +893,7 @@ class DatabricksClient:
                         if end and time.time() > end:
                             path.remove(recursive=True)
 
-            LOGGER.info(
-                "Cleaned temp path %s",
-                base_path
-            )
+            LOGGER.info("Cleaned temp path %s", base_path)
         else:
             (
                 Job
@@ -920,10 +1118,8 @@ class DatabricksClient:
         """Short alias for :attr:`filesystem`."""
         return self.filesystem
 
-    def spark_connect(
-        self,
-    ):
-        from databricks.connect import DatabricksSession # noqa
+    def spark_connect(self):
+        from databricks.connect import DatabricksSession  # noqa
 
         session = (
             DatabricksSession().builder
@@ -938,29 +1134,25 @@ DATABRICKS_CLIENT_INIT_NAMES = frozenset(f.name for f in fields(DatabricksClient
 CHECKED_TMP_WORKSPACES: ExpiringDict[str, set[str]] = ExpiringDict()
 
 
-def is_checked_tmp_path(
-    host: str,
-    base_path: str
-):
+def is_checked_tmp_path(host: str, base_path: str):
     existing = CHECKED_TMP_WORKSPACES.get(host)
 
     if existing is None:
         CHECKED_TMP_WORKSPACES[host] = set(base_path)
-
         return False
 
     if base_path in existing:
         return True
 
     existing.add(base_path)
-
     return False
+
 
 @dataclass
 class DatabricksService(ABC):
     client: DatabricksClient = field(
         default_factory=DatabricksClient.current,
-        repr=False, compare=False, hash=False
+        repr=False, compare=False, hash=False,
     )
 
     _current: ClassVar[Optional["DatabricksService"]] = None
@@ -969,9 +1161,7 @@ class DatabricksService(ABC):
         pass
 
     def __getstate__(self):
-        return {
-            "client": self.client,
-        }
+        return {"client": self.client}
 
     def __setstate__(self, state):
         self.client = state["client"]
@@ -979,7 +1169,7 @@ class DatabricksService(ABC):
     @staticmethod
     def check_client(
         client: Optional[DatabricksClient] = None,
-        **client_kwargs: Any
+        **client_kwargs: Any,
     ):
         if client is None and not client_kwargs:
             return DatabricksClient.current()
@@ -1022,9 +1212,7 @@ class DatabricksService(ABC):
         mod = __import__(f"yggdrasil.databricks.{cls.service_name()}", fromlist=[cls.__name__])
         service_cls = getattr(mod, cls.__name__)
 
-        return service_cls(
-            client=DatabricksClient.from_parsed_url(url)
-        )
+        return service_cls(client=DatabricksClient.from_parsed_url(url))
 
     def to_url(self, scheme: str | None = None) -> URL:
         return (
@@ -1102,25 +1290,19 @@ class DatabricksService(ABC):
 class DatabricksResource(ABC):
     service: DatabricksService = field(
         default_factory=DatabricksService.current,
-        repr=False, compare=False, hash=False
+        repr=False, compare=False, hash=False,
     )
 
     def __getstate__(self):
         state = super().__getstate__()
         state["service"] = self.service
-
         return state
 
     def __setstate__(self, state):
         object.__setattr__(self, "service", state["service"])
         super().__setstate__(state)
 
-    def __init__(
-        self,
-        service=None,
-        *args,
-        **kwargs
-    ):
+    def __init__(self, service=None, *args, **kwargs):
         self.service = DatabricksService.current() if service is None else service
         super().__init__(*args, **kwargs)
 
@@ -1132,4 +1314,3 @@ class DatabricksResource(ABC):
     def sql(self) -> "SQLEngine":
         """Shorthand for ``self.service.client.sql`` — the active :class:`SQLEngine`."""
         return self.client.sql
-

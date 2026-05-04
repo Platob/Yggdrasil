@@ -197,20 +197,48 @@ class S3Path(Path):
         return type(self)(url=url, service=self._service)
 
     # ==================================================================
-    # Stat
+    # Cache key helpers
+    # ==================================================================
+
+    def _cache_key(self) -> str:
+        """Stable cache key for this path: ``bucket/key``."""
+        return f"{self.bucket}/{self.key}"
+
+    def _ls_cache_key(self, recursive: bool) -> str:
+        """Cache key for a listing: ``bucket/prefix/`` + mode suffix."""
+        prefix = self.key
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+        mode = "r" if recursive else "f"
+        return f"{self.bucket}/{prefix}:{mode}"
+
+    # ==================================================================
+    # Stat — cached through the service's ExpiringDict
     # ==================================================================
 
     def _stat(self) -> PathStats:
         """One HeadObject call; falls through to a list-objects probe
         for prefixes that are pure directories (no object at the key).
+
+        Results are cached on the service's stat_cache for a short TTL
+        so hot loops (DeltaIO replay, repeated exists() checks) pay
+        only one round-trip per key.
         """
         if not self.key:
-            # Bucket root. HeadBucket would tell us the bucket exists
-            # but not whether anything's in it. Treat the root as a
-            # directory always — concrete contents come from _ls.
             return PathStats(size=0, mtime=0.0, kind=PathKind.DIRECTORY, mode=0)
 
-        # Try HeadObject for an exact-key match.
+        cache = self._service.stat_cache
+        ck = self._cache_key()
+        cached = cache.get(ck)
+        if cached is not None:
+            return cached
+
+        result = self._stat_uncached()
+        cache.set(ck, result)
+        return result
+
+    def _stat_uncached(self) -> PathStats:
+        """The real HeadObject + directory-probe logic, no cache."""
         botocore = botocore_module()
         try:
             response = self.client.head_object(
@@ -219,8 +247,6 @@ class S3Path(Path):
         except botocore.exceptions.ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
             status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-            # 404 / NoSuchKey → fall through to directory probe below.
-            # All other errors propagate (e.g. 403 = caller's problem).
             if code not in ("404", "NoSuchKey", "NotFound") and status != 404:
                 raise
         else:
@@ -231,9 +257,6 @@ class S3Path(Path):
                 mode=0,
             )
 
-        # No object at that key — could be a directory prefix.
-        # ListObjectsV2 with prefix=key+"/" max-keys=1 tells us
-        # whether anything's there.
         prefix = self.key
         if not prefix.endswith("/"):
             prefix = prefix + "/"
@@ -263,11 +286,28 @@ class S3Path(Path):
     ) -> Iterator["S3Path"]:
         """List children. Non-recursive uses ``Delimiter="/"`` to get
         common-prefixes (directory analogues) plus immediate keys.
+
+        Results are cached on the service's ls_cache so repeated
+        ``iterdir()`` / ``ls()`` on the same prefix within the TTL
+        window reuse the same listing. The cache stores lightweight
+        tuples of (key, is_prefix) pairs — no S3Path objects kept
+        alive beyond iteration.
         """
+        ls_cache = self._service.ls_cache
+        ck = self._ls_cache_key(recursive)
+        cached = ls_cache.get(ck)
+        if cached is not None:
+            # Replay cached child keys. Also warm the stat cache for
+            # file entries we saw during the original listing.
+            for child_key, child_size, child_mtime in cached:
+                child = self._make_child(child_key)
+                yield child
+            return
+
+        # Miss — run the real listing and cache the results.
+        entries: list[tuple[str, int | None, float | None]] = []
+
         prefix = self.key
-        # The bucket root has no prefix; otherwise ensure trailing "/"
-        # so we don't accidentally match siblings of a key (e.g.
-        # listing "data" shouldn't match "data2.txt").
         if prefix and not prefix.endswith("/"):
             prefix = prefix + "/"
 
@@ -276,31 +316,51 @@ class S3Path(Path):
             kwargs["Delimiter"] = "/"
 
         paginator = self.client.get_paginator("list_objects_v2")
+        stat_cache = self._service.stat_cache
 
         try:
             pages = paginator.paginate(**kwargs)
             for page in pages:
-                # Common prefixes = "subdirectories" in the non-recursive case.
                 for cp in page.get("CommonPrefixes") or ():
                     sub_prefix = cp.get("Prefix")
                     if not sub_prefix:
                         continue
-                    yield self._make_child(sub_prefix)
+                    entries.append((sub_prefix, None, None))
+                    # Warm stat cache — this prefix is a directory.
+                    dir_ck = f"{self.bucket}/{sub_prefix.rstrip('/')}"
+                    stat_cache.set(
+                        dir_ck,
+                        PathStats(size=0, mtime=0.0, kind=PathKind.DIRECTORY, mode=0),
+                    )
                 for obj in page.get("Contents") or ():
                     key = obj.get("Key")
                     if not key:
                         continue
-                    # Skip directory placeholder objects (key ends in
-                    # "/" with size 0) — they're listed as common
-                    # prefixes when non-recursive; including them
-                    # again would duplicate.
                     if not recursive and key.endswith("/") and obj.get("Size", 0) == 0:
                         continue
-                    yield self._make_child(key)
+                    obj_size = int(obj.get("Size", 0))
+                    obj_mtime = _mtime_from_response(obj)
+                    entries.append((key, obj_size, obj_mtime))
+                    # Warm stat cache — we already know size + mtime.
+                    file_ck = f"{self.bucket}/{key}"
+                    stat_cache.set(
+                        file_ck,
+                        PathStats(
+                            size=obj_size,
+                            mtime=obj_mtime,
+                            kind=PathKind.FILE,
+                            mode=0,
+                        ),
+                    )
         except Exception:
             if allow_not_found:
                 return
             raise
+
+        ls_cache.set(ck, tuple(entries))
+
+        for child_key, _, _ in entries:
+            yield self._make_child(child_key)
 
     def _make_child(self, key: str) -> "S3Path":
         """Build a child :class:`S3Path` from an absolute key string."""
@@ -341,6 +401,7 @@ class S3Path(Path):
             if allow_not_found:
                 return
             raise
+        self._service.invalidate_cache(self.bucket, self.key)
 
     def _remove_dir(
         self,
@@ -581,6 +642,7 @@ class S3Path(Path):
                 Key=self.key,
                 Body=payload,
             )
+            self._service.invalidate_cache(self.bucket, self.key)
             return len(payload)
 
         # Multipart via upload_fileobj. boto3 needs a file-like with
@@ -599,6 +661,8 @@ class S3Path(Path):
             # don't close the caller's file-like.
             if total is not None and callable(close) and fileobj is not src:
                 close()
+
+        self._service.invalidate_cache(self.bucket, self.key)
 
         # ``total`` is None when we couldn't size the source up front;
         # post-upload we don't have a cheap byte count without a HEAD.
