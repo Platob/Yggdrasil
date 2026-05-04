@@ -502,7 +502,7 @@ class EntityTags(DatabricksService):
             assignment = EntityTagAssignment(
                 entity_type=entity_type,
                 entity_name=entity_name,
-                tag_key=key,
+                tag_key=_safe_str(key),
                 tag_value=_safe_str(value),
                 source_type=source_type or _DEFAULT_SOURCE_TYPE,
             )
