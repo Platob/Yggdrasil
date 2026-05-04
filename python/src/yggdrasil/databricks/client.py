@@ -313,6 +313,15 @@ class DatabricksClient:
             return URL.from_str(self.make_config().host)
         return URL.from_str(self.host)
 
+    @property
+    def explore_url(self) -> URL:
+        """Workspace UI root for the Catalog Explorer (``/explore/data``).
+
+        Mirrors :attr:`Catalog.explore_url` / :attr:`Schema.explore_url` so
+        the whole resource hierarchy advertises a deep-link in one place.
+        """
+        return self.base_url.with_path("/explore/data")
+
     def to_url(self, scheme: str | None = None) -> URL:
         query: dict[str, Any] = {}
         keys = [

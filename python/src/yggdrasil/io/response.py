@@ -274,12 +274,62 @@ RESPONSE_SCHEMA = schema(
     tags=_RESPONSE_SCHEMA_JSON_TAGS,
 )
 
-RESPONSE_SCHEMA["request"] = schema_field(
-    "request",
-    REQUEST_SCHEMA.dtype.to_arrow(),
-    nullable=False,
-    metadata={"comment": "Embedded request that produced this response"},
-).autotag()
+# Unnest the request schema directly into the response schema with a
+# ``request_`` prefix. Flattening turns nested struct lookups into
+# top-level column accesses, which engines (Delta, Spark, Polars,
+# Arrow) can predicate-push and column-prune against without having
+# to crack the struct open. ``_pkl`` is intentionally skipped — the
+# response carries its own pickle slot and a per-request blob would
+# duplicate the same bytes.
+_REQUEST_FIELD_NAMES_FOR_UNNEST: tuple[str, ...] = tuple(
+    f.name for f in REQUEST_SCHEMA.children_fields if f.name != "_pkl"
+)
+
+# Tags that must NOT cross over from REQUEST_SCHEMA. The
+# response-level schema has its own ``partition_key`` (which already
+# carries ``partition_by``) and its own composite ``primary_key`` —
+# leaking those flags onto the unnested ``request_*`` fields would
+# add a redundant partition column to the on-disk Hive layout and
+# duplicate the primary-key declaration.
+_REQUEST_TAG_DROP: frozenset[bytes] = frozenset({
+    b"partition_by",
+    b"primary_key",
+    # ``Field.tags`` lives in metadata under a ``t:`` prefix — drop
+    # both spellings so an autotag() call on the unnested field
+    # doesn't re-stamp the schema-level partition / primary-key
+    # markers we want only on the response side.
+    b"t:partition_by",
+    b"t:primary_key",
+})
+
+
+def _decode_meta_kv(value: Any) -> Any:
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8")
+    return value
+
+
+for _req_field_name in _REQUEST_FIELD_NAMES_FOR_UNNEST:
+    _src_field = REQUEST_SCHEMA[_req_field_name]
+    _src_meta = dict(_src_field.metadata or {})
+    _existing_comment = _src_meta.get(b"comment") or _src_meta.get("comment")
+    _comment_str = _decode_meta_kv(_existing_comment)
+    _src_meta_clean: dict[str, Any] = {}
+    for _k, _v in _src_meta.items():
+        # Skip schema-level partitioning / primary-key flags inherited
+        # from the request — they belong to the response's own columns.
+        _k_bytes = _k.encode("utf-8") if isinstance(_k, str) else bytes(_k)
+        if _k_bytes in _REQUEST_TAG_DROP:
+            continue
+        _src_meta_clean[_decode_meta_kv(_k)] = _decode_meta_kv(_v)
+    if _comment_str:
+        _src_meta_clean["comment"] = f"[request] {_comment_str}"
+    RESPONSE_SCHEMA[f"request_{_req_field_name}"] = schema_field(
+        f"request_{_req_field_name}",
+        _src_field.arrow_type,
+        nullable=_src_field.nullable,
+        metadata=_src_meta_clean,
+    ).autotag()
 
 RESPONSE_SCHEMA["hash"] = schema_field(
     "hash",
@@ -793,8 +843,15 @@ class Response:
             body_bytes = None
             body_hash = None
 
+        request_values = self.request.arrow_values
+        flat_request: dict[str, Any] = {
+            f"request_{k}": v
+            for k, v in request_values.items()
+            if k != "_pkl"
+        }
+
         return {
-            "request":       self.request.arrow_values,
+            **flat_request,
             "hash":          self.hash,
             "public_hash":   self.public_hash,
             "status_code":   self.status_code,
@@ -813,9 +870,12 @@ class Response:
 
     def match_value(self, key: str) -> Any:
         # Dotted-path lookup walks the nested struct shape:
-        # ``request.method``, ``request.url.host``, ``headers.content_type``.
+        # ``request.method`` (legacy), ``request_url.host``,
+        # ``headers.content_type``.
         if "." in key:
             head, _, tail = key.partition(".")
+            # Legacy ``request.X`` form — pre-flatten callers used the
+            # nested struct shape; route through the embedded request.
             if head == "request":
                 return self.request.match_value(tail)
             values = self.arrow_values
@@ -836,12 +896,14 @@ class Response:
                 f"Must be within: {RESPONSE_ARROW_SCHEMA.names!r}"
             )
 
-        # Top-level response columns win, but request-side keys
-        # (``method``, ``url``, ``url_hash``, …) fall through to the
-        # embedded request so the cache layer can match-by request
-        # identity without forcing a ``request.`` prefix everywhere.
+        # Top-level response columns win, including the unnested
+        # ``request_*`` ones populated by ``arrow_values``. Bare
+        # request-side keys (``method``, ``url``, ``public_url_hash``, …)
+        # still fall through to the embedded request so the cache layer
+        # can match-by request identity without rewriting every
+        # ``request_by`` list with the ``request_`` prefix.
         values = self.arrow_values
-        if key in values and key != "request":
+        if key in values:
             return values[key]
         if hasattr(self, key) and key not in REQUEST_SCHEMA.names:
             return getattr(self, key)
@@ -1034,7 +1096,10 @@ class Response:
                 for inner in obj:
                     yield from _iter_batches(inner)
 
-        response_cols = [f.name for f in RESPONSE_ARROW_SCHEMA]
+        # ``request`` is included for back-compat with pre-unnest
+        # batches that still carry a single nested ``request`` struct
+        # column instead of the flattened ``request_*`` columns.
+        response_cols = [f.name for f in RESPONSE_ARROW_SCHEMA] + ["request"]
 
         for rb in _iter_batches(batch):
             available = rb.schema.names
@@ -1088,9 +1153,19 @@ class Response:
         *,
         normalize: bool = False,
     ) -> "Response":
+        # Three layouts are supported:
+        #  1) flattened ``request_<col>`` columns (current schema);
+        #  2) legacy nested ``request`` struct (pre-unnest snapshots
+        #     and round-tripping through ``arrow_values``);
+        #  3) flat top-level request columns (``method``, ``url`` ...) —
+        #     used by ``parse_mapping`` callers that bypass the schema.
         request_value = get("request")
         if isinstance(request_value, Mapping):
             request = PreparedRequest._from_get(request_value.get, normalize=normalize)
+        elif get("request_url") is not None or get("request_method") is not None:
+            def _request_get(name: str) -> Any:
+                return get(f"request_{name}")
+            request = PreparedRequest._from_get(_request_get, normalize=normalize)
         else:
             request = PreparedRequest._from_get(get, normalize=normalize)
 

@@ -346,12 +346,17 @@ class Session(ABC):
         if not response.ok:
             return
 
-        anonymized = response.anonymize(mode=cache_cfg.anonymize)
         cache = cache or cache_cfg.local_cache()
-        # Build the Arrow batch on the caller's thread while the
-        # buffer is still live; the partitioned write goes through
-        # fire-and-forget so the caller doesn't block on disk IO.
-        batch = anonymized.to_arrow_batch(parse=False)
+        # The original response is persisted as-is — userinfo and
+        # sensitive headers stay in the row. Cache matching on the
+        # read path uses the ``public_*`` hash columns, which are
+        # computed from the anonymize='remove' projection and so
+        # remain stable whether the lookup carries the original
+        # request or an anonymized one. Build the Arrow batch on
+        # the caller's thread while the buffer is still live; the
+        # partitioned write goes through fire-and-forget so the
+        # caller doesn't block on disk IO.
+        batch = response.to_arrow_batch(parse=False)
         Job.make(_store_local_arrow_batch, cache, batch).fire_and_forget()
 
     def _load_remote_cached_response(
@@ -415,7 +420,12 @@ class Session(ABC):
         if not response.ok:
             return
 
-        batch = response.anonymize(mode=cache_cfg.anonymize).to_arrow_batch(parse=False)
+        # Persist the response as-is; cache lookups match on the
+        # ``public_*`` hash columns which already collapse to the
+        # anonymize='remove' projection, so writing the original
+        # row keeps the userinfo/headers available for replay
+        # without breaking deduplication.
+        batch = response.to_arrow_batch(parse=False)
 
         cache_cfg.tabular.insert(
             batch,
@@ -1097,13 +1107,14 @@ class Session(ABC):
                 eff = session_local_cfg
             if not eff.local_cache_enabled:
                 continue
-            anonymized = response.anonymize(mode=eff.anonymize)
+            # Store the response unchanged; matching uses the
+            # ``public_*`` hash columns at lookup time.
             pkey = str(eff.local_cache_folder())
             slot = groups.get(pkey)
             if slot is None:
-                groups[pkey] = (eff.local_cache(), eff, [anonymized])
+                groups[pkey] = (eff.local_cache(), eff, [response])
             else:
-                slot[2].append(anonymized)
+                slot[2].append(response)
 
         for cache, eff, group_responses in groups.values():
             ok_responses = [r for r in group_responses if r.ok]
@@ -1135,8 +1146,16 @@ class Session(ABC):
         """
         groups: dict[tuple, tuple[CacheConfig, list[Response]]] = {}
         for response in responses:
-            anonymized = response.anonymize(mode="remove")
-            url_key = str(anonymized.request.url) if anonymized.request else None
+            # Per-request lookup keys still use the anonymized URL
+            # because that's how :meth:`_send_many_batches` keyed the
+            # ``url_to_remote_cfg`` map; the *stored* response is the
+            # original. Match-by/identity all hash through the
+            # ``public_*`` columns so anonymizing the row before
+            # insert isn't required to keep cache lookups consistent.
+            url_key = (
+                str(response.request.anonymize(mode="remove").url)
+                if response.request else None
+            )
             eff = url_to_remote_cfg.get(url_key) if url_key else None
             if eff is None:
                 eff = session_remote_cfg
@@ -1145,7 +1164,7 @@ class Session(ABC):
             gkey = self._remote_write_group_key(eff)
             if gkey not in groups:
                 groups[gkey] = (eff, [])
-            groups[gkey][1].append(anonymized)
+            groups[gkey][1].append(response)
 
         for (_, mode, _, _, _), (cfg, group_responses) in groups.items():
             LOGGER.debug(

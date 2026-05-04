@@ -105,6 +105,11 @@ class Catalog(DatabricksResource):
     def url(self) -> URL:
         return self.client.base_url.with_path(f"/explore/data/{self.catalog_name}")
 
+    @property
+    def explore_url(self) -> URL:
+        """Workspace UI URL pointing at this catalog's Catalog Explorer page."""
+        return self.url
+
     # ── cache management ──────────────────────────────────────────────────────
 
     def _reset_cache(self, invalidate_cache: bool = False) -> None:

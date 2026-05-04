@@ -88,6 +88,20 @@ if TYPE_CHECKING:
 _READ_ONLY_MODES = frozenset({Mode.AUTO})
 
 
+def _coerce_tag_str(value: Any) -> str:
+    """Coerce a tag key/value to a UTF-8 string.
+
+    PyArrow stores schema/field metadata as ``bytes``, so the
+    auto-tags propagated from :data:`yggdrasil.data.Schema` flow
+    through here as ``b"primary_key"`` / ``b"true"``. ``str(b"x")``
+    would render the literal ``"b'x'"`` — what the Databricks API
+    actually receives — so decode bytes-shaped tags before forwarding.
+    """
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).decode("utf-8", errors="replace")
+    return str(value)
+
+
 def _resolve_table_operation(
     operation: "TableOperation | ModeLike | None",
     table_type: "TableType | None",
@@ -1703,8 +1717,8 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
                     EntityTagAssignment(
                         entity_type="columns",
                         entity_name=entity_name,
-                        tag_key=str(k),
-                        tag_value=str(v) if v is not None else "",
+                        tag_key=_coerce_tag_str(k),
+                        tag_value=_coerce_tag_str(v) if v is not None else "",
                     )
                     for k, v in batch.items()
                 ]

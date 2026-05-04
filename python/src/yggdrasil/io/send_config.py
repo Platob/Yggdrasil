@@ -80,12 +80,36 @@ DEFAULT_MAX_BATCH_TTL: float = 300.0
 
 def _is_valid_request_key(key: str) -> bool:
     head, _, _ = key.partition(".")
-    return head in REQUEST_ARROW_SCHEMA.names
+    if head in REQUEST_ARROW_SCHEMA.names:
+        return True
+    # Accept the flattened ``request_<col>`` form too — same column,
+    # different spelling — so callers can write the request_by keys
+    # in either shape.
+    if head.startswith("request_") and head[len("request_"):] in REQUEST_ARROW_SCHEMA.names:
+        return True
+    return False
 
 
 def _is_valid_response_key(key: str) -> bool:
     head, _, _ = key.partition(".")
     return head in RESPONSE_ARROW_SCHEMA.names
+
+
+def _request_column_sql_name(key: str) -> str:
+    """SQL column name for a request-side ``request_by`` key.
+
+    The response-cache table stores requests as flattened
+    ``request_<col>`` columns (cf. :data:`RESPONSE_SCHEMA`), so a
+    user-supplied ``request_by`` key that names a bare request column
+    (``public_url_hash``, ``method`` …) needs the ``request_`` prefix
+    when emitted into SQL. Already-prefixed keys pass through.
+    """
+    head, sep, tail = key.partition(".")
+    if head in REQUEST_ARROW_SCHEMA.names:
+        prefixed = f"request_{head}"
+    else:
+        prefixed = head
+    return prefixed + (sep + tail if sep else "")
 
 
 def _validate_request_by(arg: list[str] | tuple[str, ...] | None = None) -> list[str]:
@@ -557,10 +581,11 @@ class CacheConfig(_ConfigBase):
 
         if request is not None:
             for key, value in self.request_values(request).items():
+                column = _request_column_sql_name(key)
                 if value is None:
-                    clauses.append(f"{key} IS NULL")
+                    clauses.append(f"{column} IS NULL")
                 else:
-                    clauses.append(f"{key} = {self.sql_literal(value)}")
+                    clauses.append(f"{column} = {self.sql_literal(value)}")
 
         return " AND ".join(clauses) if clauses else "1=1"
 
@@ -628,7 +653,12 @@ class CacheConfig(_ConfigBase):
 
         identity_cols = list(identity_by) if identity_by is not None else self.match_by
         if identity_cols:
-            partition_by = ", ".join(identity_cols)
+            partition_by = ", ".join(
+                _request_column_sql_name(col)
+                if col.partition(".")[0] in REQUEST_ARROW_SCHEMA.names
+                else col
+                for col in identity_cols
+            )
             return (
                 "SELECT * FROM ("
                 "  SELECT t.*, row_number() OVER ("
@@ -682,7 +712,12 @@ class CacheConfig(_ConfigBase):
 
         identity_cols = list(identity_by) if identity_by is not None else self.match_by
         if identity_cols:
-            partition_by = ", ".join(identity_cols)
+            partition_by = ", ".join(
+                _request_column_sql_name(col)
+                if col.partition(".")[0] in REQUEST_ARROW_SCHEMA.names
+                else col
+                for col in identity_cols
+            )
             return (
                 "SELECT * FROM ("
                 "  SELECT t.*, row_number() OVER ("
