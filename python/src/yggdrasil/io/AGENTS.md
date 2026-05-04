@@ -191,6 +191,43 @@ from yggdrasil.io.buffer._concurrency import cleanup_stale_spill_files
 cleanup_stale_spill_files()  # uses tempfile.gettempdir() by default
 ```
 
+## Predicates — one knob, applied everywhere
+
+`CastOptions.predicate` is the single row-level filter. Every IO
+that yields tabular rows funnels through
+`TabularIO._iter_public_batches`, which evaluates the predicate
+per batch before the rows leave the read pipeline.
+
+```python
+from yggdrasil.data.expr import col
+
+with ParquetIO(path=path, mode="rb") as io:
+    table = io.read_arrow_table(predicate=col("price") > 100)
+```
+
+Rules:
+
+- **Missing column → accept everything.** A predicate that
+  references a column the source doesn't carry can't yield a
+  coherent boolean, so the filter degrades to a no-op for that
+  source rather than dropping every row. Crucial for
+  heterogeneous-source folders.
+- **Backends with native pushdown clear the option** before
+  reaching the per-batch evaluator (Delta partition pruning,
+  warehouse SQL `WHERE`). The evaluator is the universal
+  fallback, not a duplicate filter.
+- **`iter_children(predicate=...)`** is the canonical knob for
+  filtering child IOs by their metadata
+  (`{name, path, is_dir, is_private}`):
+
+```python
+for child in folder.iter_children(~col("name").like(".%")):
+    ...
+```
+
+The legacy `source_predicate` / `target_predicate` split is gone —
+one `predicate` slot, every IO honours it.
+
 ## Style rules specific to this layer
 
 ### EAFP — don't pre-check existence
