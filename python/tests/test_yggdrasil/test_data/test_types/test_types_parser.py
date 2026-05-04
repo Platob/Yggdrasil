@@ -622,13 +622,26 @@ class TestParserEdgeCases:
 
     def test_empty_with_default_returns_default(self) -> None:
         assert ParsedDataType.parse(
-            "", raise_error=False, default=DataTypeId.NULL
+            "", default=DataTypeId.NULL
         ) == ParsedDataType(DataTypeId.NULL, DataTypeMetadata())
 
     def test_invalid_with_default_returns_default(self) -> None:
         assert ParsedDataType.parse(
-            "map<string>", raise_error=False, default=DataTypeId.NULL
+            "map<string>", default=DataTypeId.NULL
         ) == ParsedDataType(DataTypeId.NULL, DataTypeMetadata())
+
+    def test_invalid_with_object_default_returns_object(self) -> None:
+        assert ParsedDataType.parse(
+            "map<string>", default=DataTypeId.OBJECT
+        ) == ParsedDataType(DataTypeId.OBJECT, DataTypeMetadata())
+
+    def test_invalid_with_string_default_falls_back_to_object(self) -> None:
+        # Anything that isn't a DataTypeId / ParsedDataType / Ellipsis
+        # collapses to OBJECT — strings used to land here, but OBJECT
+        # is the safer "I don't know what this is" type.
+        assert ParsedDataType.parse(
+            "map<string>", default=None
+        ) == ParsedDataType(DataTypeId.OBJECT, DataTypeMetadata())
 
     def test_map_requires_two_children(self) -> None:
         with pytest.raises(ValueError, match="exactly two"):

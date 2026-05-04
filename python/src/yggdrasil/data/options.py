@@ -67,7 +67,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import Any, Mapping, TypeVar, Union, TYPE_CHECKING
+from typing import Any, Iterable, Mapping, TypeVar, Union, TYPE_CHECKING
 
 import pyarrow as pa
 from yggdrasil.data.expr import Predicate
@@ -95,6 +95,25 @@ __all__ = [
     "CastOptions",
     "CastOptionsArg",
 ]
+
+
+def _struct_of_objects(columns: "Iterable[str]") -> "Schema":
+    """Build a :class:`Schema` from *columns* with :class:`ObjectType` fields.
+
+    Used by :meth:`CastOptions.check` when the caller passed a bare
+    ``columns=`` list and no source/target peek bound a schema. The
+    children default to :class:`ObjectType` so casts pass through
+    untouched — the caller can later refine the dtype with a real
+    ``source_field`` / ``target_field`` once they know more.
+    """
+    # Local imports to avoid the bootstrap cycle described above —
+    # this helper only fires when a caller actually passed columns.
+    from yggdrasil.data.data_field import Field as _Field
+    from yggdrasil.data.schema import Schema as _Schema
+    from yggdrasil.data.types.primitive.object import ObjectType
+
+    children = [_Field(name=str(c), dtype=ObjectType()) for c in columns]
+    return _Schema(inner_fields=children)
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +226,17 @@ class CastOptions:
     # Threaded onto each DML WarehousePreparedStatement on the warehouse
     # path; ignored on Spark (driver-side retry handles it there).
     retry: WaitingConfigArg | None = None
+
+    # --- Capture inserted rows as a return value -----------------------
+    # When True, mutating tabular operations (table inserts, MERGE-style
+    # writes, …) hand back the rows they actually wrote as a
+    # :class:`TabularIO` — typically a :class:`MemoryArrowIO` or a
+    # :class:`MemorySparkIO` depending on the engine that ran the write.
+    # Default ``False`` keeps the historical "fire-and-forget" return
+    # contract; flip it on when downstream code wants to chain on the
+    # newly-appended payload (logging, follow-up tasks, downstream
+    # writes) without re-querying the target.
+    return_data: bool = False
 
     # ==================================================================
     # Normalization — runs after dataclass init
@@ -330,21 +360,44 @@ class CastOptions:
         table's shape. ``source_field=`` / ``target_field=`` (via
         ``**overrides``) remain the explicit form.
 
+        ``columns=`` shortcut: a sequence of column names. When the
+        caller didn't bind a source by any other means (no
+        ``source=`` peek, no ``source_field=`` override, the wrapped
+        options didn't carry one either), the names are promoted to
+        a struct-shaped source field whose children default to
+        :class:`ObjectType` — a "I have these columns, no idea what's
+        in them yet" placeholder that downstream casts treat as
+        passthroughs. Ignored when the source is already bound, so
+        callers can pass it defensively without clobbering richer
+        schemas.
+
         :raises TypeError: if *options* is a type the dispatch table
             doesn't cover.
         """
+        # ``columns`` is not a CastOptions field — pop it from both
+        # ``overrides`` and any Mapping-shaped ``options`` before the
+        # field-name filter in :meth:`_build` discards it.
+        columns = overrides.pop("columns", None)
+        if columns is None and isinstance(options, Mapping):
+            options = dict(options)
+            columns = options.pop("columns", None)
+
         # 1. None / ... → fresh construction.
         if options is None or options is ...:
-            return cls._build(overrides, source=source, target=target)
+            instance = cls._build(overrides, source=source, target=target)
 
         # 2. Already a CastOptions — reuse via copy if overrides
         # given, otherwise passthrough. Typed check with ``cls`` so a
         # subclass CastOptions stays on its subclass.
-        if isinstance(options, cls):
-            if not overrides and source is ... and target is ... and not overrides:
-                return options
-            return options.copy(source=source, target=target, **overrides)
-        if isinstance(options, CastOptions):
+        elif isinstance(options, cls):
+            if (
+                not overrides and source is ... and target is ...
+                and not columns
+            ):
+                instance = options
+            else:
+                instance = options.copy(source=source, target=target, **overrides)
+        elif isinstance(options, CastOptions):
             # Different CastOptions subclass → re-home onto cls. Only
             # carry over fields shared with cls (base CastOptions
             # always; format-specific fields stay on their owner). A
@@ -360,23 +413,28 @@ class CastOptions:
                 if f.name in carry
             }
             merged.update(overrides)
-            return cls._build(merged, source=source, target=target)
+            instance = cls._build(merged, source=source, target=target)
 
         # 3. Mapping → merge into overrides (explicit kwargs win).
-        if isinstance(options, Mapping):
+        elif isinstance(options, Mapping):
             merged = {**options, **overrides}
-            return cls._build(merged, source=source, target=target)
+            instance = cls._build(merged, source=source, target=target)
 
         # 4. Schema-shaped → promote to a target_field hint.
-        if isinstance(options, (pa.DataType, pa.Field, pa.Schema, field_class(), schema_class())):
+        elif isinstance(options, (pa.DataType, pa.Field, pa.Schema, field_class(), schema_class())):
             overrides.setdefault("target_field", options)
-            return cls._build(overrides, source=source, target=target)
+            instance = cls._build(overrides, source=source, target=target)
 
-        raise TypeError(
-            f"CastOptions.check cannot coerce {type(options).__name__}. "
-            "Expected CastOptions, dict, pa.DataType/Field/Schema, "
-            "yggdrasil Field/Schema, or None."
-        )
+        else:
+            raise TypeError(
+                f"CastOptions.check cannot coerce {type(options).__name__}. "
+                "Expected CastOptions, dict, pa.DataType/Field/Schema, "
+                "yggdrasil Field/Schema, or None."
+            )
+
+        if columns and instance.source_field is None:
+            instance = instance.copy(source_field=_struct_of_objects(columns))
+        return instance
 
     @classmethod
     @functools.cache

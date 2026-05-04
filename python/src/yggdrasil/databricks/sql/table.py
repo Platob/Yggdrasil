@@ -147,7 +147,13 @@ _ALIAS_TMPSRC = "__tmpsrc__"
 #   - ``append``    insert-only; with ``match_by`` only non-matching rows
 #   - ``overwrite`` drop, then insert
 #   - ``truncate``  in-place wipe + insert; with ``match_by`` targeted DELETE
-#   - ``auto``      default; with ``match_by`` upsert
+#   - ``auto``      default; with ``match_by`` only non-matching rows
+#                   (lightweight append: target is probed by the match
+#                   keys only, no full read)
+#   - ``upsert`` /
+#     ``merge``     MERGE INTO with full update-and-insert; the
+#                   keyed-DELETE + INSERT pair is emitted as a
+#                   fallback when the engine MERGE fails.
 #
 # Merge ``ON`` is built null-safe (``<=>``) so NULL matches NULL.
 #
@@ -551,15 +557,18 @@ def _build_dml_statements(
 
     Mode dispatch when ``match_by`` is set:
 
-    - :attr:`Mode.UPSERT` → keyed ``DELETE`` then ``INSERT`` (safe on
-      backends without ``MERGE``).
-    - :attr:`Mode.MERGE` / :attr:`Mode.AUTO` → single ``MERGE INTO``
+    - :attr:`Mode.UPSERT` / :attr:`Mode.MERGE` → single ``MERGE INTO``
       statement.  Callers that want fallback semantics on ``MERGE``
       failure should also build delete-insert statements via
       :func:`_build_delete_insert_statements` and submit them on
-      failure.
-    - :attr:`Mode.APPEND` → ``MERGE`` with ``WHEN NOT MATCHED THEN INSERT``
-      only (no update of existing rows).
+      failure.  (UPSERT historically dispatched a keyed-DELETE +
+      INSERT pair; the call sites still emit that pair as the MERGE
+      fallback so backends without native MERGE keep working.)
+    - :attr:`Mode.APPEND` / :attr:`Mode.AUTO` → ``MERGE`` with
+      ``WHEN NOT MATCHED THEN INSERT`` only (no update of existing
+      rows).  AUTO with match keys means "append only the new keys" —
+      the engine probes target by match-by columns and skips matched
+      rows, so existing rows are never re-read or rewritten.
     """
     cols_quoted = ", ".join(quote_ident(c) for c in columns)
     statements: list[str] = []
@@ -584,24 +593,20 @@ def _build_dml_statements(
             )
 
     elif match_by:
-        if mode == Mode.UPSERT:
-            statements.extend(_build_delete_insert_statements(
-                target_location=target_location,
-                source_sql=source_sql,
-                columns=columns,
-                match_by=match_by,
-                prune_predicates=prune_predicates,
-            ))
-        else:
-            statements.append(_build_merge_statement(
-                target_location=target_location,
-                source_sql=source_sql,
-                columns=columns,
-                match_by=match_by,
-                update_column_names=update_column_names,
-                prune_predicates=prune_predicates,
-                insert_only=mode == Mode.APPEND,
-            ))
+        statements.append(_build_merge_statement(
+            target_location=target_location,
+            source_sql=source_sql,
+            columns=columns,
+            match_by=match_by,
+            update_column_names=update_column_names,
+            prune_predicates=prune_predicates,
+            # AUTO/APPEND with match keys means "append only new keys":
+            # MERGE WHEN NOT MATCHED THEN INSERT, no update branch.
+            # UPSERT/MERGE want the full update-and-insert merge.  The
+            # delete-insert pair stays available as a fallback emitted
+            # at the call site for backends without native MERGE.
+            insert_only=mode in (Mode.APPEND, Mode.AUTO),
+        ))
     else:
         statements.append(
             f"INSERT INTO {target_location} ({cols_quoted})\n{source_sql}"
@@ -884,6 +889,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
             prune_by=options.prune_by,
             prune_values=options.prune_values,
             retry=options.retry,
+            return_data=options.return_data,
         )
 
     def _read_spark_frame(self, options: O) -> "SparkDataFrame":
@@ -900,7 +906,8 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
             frame,
             mode=options.mode,
             match_by=options.match_by_names,
-            wait=options.wait
+            wait=options.wait,
+            return_data=options.return_data,
         )
 
     # Properties
@@ -1991,8 +1998,9 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
         spark_session: Optional["SparkSession"] = None,
+        return_data: bool = False,
         **kwargs
-    ) -> None:
+    ) -> "TabularIO | None":
         """Insert *data* into this table — thin wrapper over :meth:`insert_into`."""
         return self.insert_into(
             data,
@@ -2001,6 +2009,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
             wait=wait,
             raise_error=raise_error,
             spark_session=spark_session,
+            return_data=return_data,
             **kwargs,
         )
 
@@ -2034,7 +2043,8 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         prune_by: list[str] | str | None = None,
         prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
-    ) -> None:
+        return_data: bool = False,
+    ) -> "TabularIO | None":
         """Insert *data* into this table using the most appropriate backend.
 
         Routing:
@@ -2044,6 +2054,14 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         - Spark DataFrame (or anything when a ``SparkSession`` is reachable)
           → :meth:`spark_insert`
         - Otherwise → :meth:`arrow_insert` (warehouse path with Volume staging)
+
+        Returns ``None`` by default. With ``return_data=True`` the
+        backend that ran the write hands back its source payload as a
+        :class:`TabularIO` — :class:`MemoryArrowIO` from
+        :meth:`arrow_insert`, :class:`MemorySparkIO` from
+        :meth:`spark_insert`, the input :class:`StatementResult` from
+        :meth:`sql_insert` — for downstream chaining without
+        re-querying the target.
         """
         common = dict(
             mode=mode,
@@ -2058,6 +2076,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
             prune_by=prune_by,
             prune_values=prune_values,
             retry=retry,
+            return_data=return_data,
         )
 
         if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
@@ -2109,8 +2128,14 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         prune_by: list[str] | str | None = None,
         prune_values: Mapping[str, list[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
-    ) -> None:
-        """Insert through the warehouse SQL path with staged Parquet."""
+        return_data: bool = False,
+    ) -> "TabularIO | None":
+        """Insert through the warehouse SQL path with staged Parquet.
+
+        With ``return_data=True``, returns a :class:`MemoryArrowIO`
+        wrapping the staged source rows so callers can chain on the
+        payload without re-reading from the target.
+        """
         from yggdrasil.databricks.warehouse import WarehousePreparedStatement
 
         if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
@@ -2123,6 +2148,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
                 vacuum_hours=vacuum_hours,
                 where=where, prune_by=prune_by,
                 retry=retry,
+                return_data=return_data,
             )
 
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
@@ -2153,6 +2179,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         )
 
         prune_values = prune_values or {}
+        output_data: "TabularIO | None" = None
         with ParquetIO() as buffer:
             buffer.write_table(data, cast_options)
             buffer.seek(0)
@@ -2164,6 +2191,14 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
                 )
             buffer.seek(0)
             staging.write_stream(buffer)
+            # Capture the staged payload as a MemoryArrowIO before
+            # the buffer is cleared.  Read straight off the spilled
+            # Parquet so the holder shares the same row chunking the
+            # warehouse will see.
+            if return_data:
+                from yggdrasil.io.buffer.memory.arrow import MemoryArrowIO
+                buffer.seek(0)
+                output_data = MemoryArrowIO(buffer.read_arrow_table())
 
         buffer.clear()
         prune_predicates = _build_prune_predicates(prune_values, target_alias="T") if prune_values else []
@@ -2211,7 +2246,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         prepared = _prepare_batch(sql_texts)
 
         fallback_factory: Optional[Callable[[], list[WarehousePreparedStatement]]] = None
-        if mode_enum == Mode.MERGE and match_by:
+        if mode_enum in (Mode.MERGE, Mode.UPSERT) and match_by:
             def _build_fallback() -> list[WarehousePreparedStatement]:
                 fb_texts = _build_merge_fallback_statements(
                     target_location=target_location,
@@ -2232,7 +2267,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
             retry_active, bool(fallback_factory),
         )
 
-        return _execute_with_merge_fallback(
+        _execute_with_merge_fallback(
             self.sql,
             primary=prepared,
             fallback_factory=fallback_factory,
@@ -2241,6 +2276,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
             engine_name="api",
             target_location=target_location,
         )
+        return output_data
 
     # =========================================================================
     # spark_insert — Spark path, temp-view source
@@ -2267,7 +2303,8 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         prune_values: dict[str, tuple[Any, ...]] | None = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         retry: Optional[WaitingConfigArg] = None,
-    ) -> None:
+        return_data: bool = False,
+    ) -> "TabularIO | None":
         """Insert into this table using Spark.
 
         ``retry`` is applied to DML statements (INSERT/MERGE/DELETE/UPDATE)
@@ -2276,6 +2313,11 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         Delta failures (``ConcurrentAppendException``, …) to retryable;
         passing ``retry=True`` (or any :class:`WaitingConfig` arg) makes
         the policy explicit instead of relying on auto-promote.
+
+        With ``return_data=True``, returns a :class:`MemorySparkIO`
+        wrapping the materialised source DataFrame — handy for
+        chaining downstream transforms without re-querying the
+        target.
         """
         if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
             return self.sql_insert(
@@ -2288,6 +2330,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
                 where=where, prune_by=prune_by,
                 spark_session=spark_session,
                 retry=retry,
+                return_data=return_data,
             )
 
         from yggdrasil.spark.cast import any_to_spark_dataframe
@@ -2365,7 +2408,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         prepared = _prepare_spark_batch(sql_texts)
 
         fallback_factory: Optional[Callable[[], list[SparkPreparedStatement]]] = None
-        if mode_enum == Mode.MERGE and match_by:
+        if mode_enum in (Mode.MERGE, Mode.UPSERT) and match_by:
             def _build_fallback() -> list[SparkPreparedStatement]:
                 fb_texts = _build_merge_fallback_statements(
                     target_location=target_location,
@@ -2390,7 +2433,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
 
         try:
             with sql_engine.spark.scoped_spark_conf(session, applied_conf):
-                return _execute_with_merge_fallback(
+                _execute_with_merge_fallback(
                     sql_engine,
                     primary=prepared,
                     fallback_factory=fallback_factory,
@@ -2404,11 +2447,20 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
                 session.catalog.dropTempView(view_name)
             except Exception:
                 logger.debug("Failed to drop temp view %r; continuing.", view_name, exc_info=True)
-            if prune_by:
+            if prune_by and not return_data:
+                # Keep the cached source alive when the caller asked
+                # for it back — :class:`MemorySparkIO` is the consumer
+                # and unpersisting here would force a re-execution
+                # downstream.
                 try:
                     data_df.unpersist()
                 except Exception:
                     logger.debug("Failed to unpersist cached source; continuing.", exc_info=True)
+
+        if return_data:
+            from yggdrasil.io.buffer.memory.spark import MemorySparkIO
+            return MemorySparkIO(data_df)
+        return None
 
     # =========================================================================
     # sql_insert — query source, no staging
@@ -2431,7 +2483,8 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         prune_by: list[str] | str | None = None,
         prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
-    ) -> None:
+        return_data: bool = False,
+    ) -> "TabularIO | None":
         """Insert into this table from a SQL source query.
 
         Smart dispatch:
@@ -2442,6 +2495,11 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         3. Otherwise → warehouse-side ``INSERT … SELECT`` /
            ``MERGE … USING (q)`` with a CAST projection aligning the
            user's query schema to the target.
+
+        With ``return_data=True``, hands back the underlying
+        :class:`StatementResult` (or the materialised frame from a
+        cached one) so callers can stream the same rows the warehouse
+        just inserted.
         """
         common = dict(
             mode=mode,
@@ -2456,7 +2514,10 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         if isinstance(statement, StatementResult) and statement.cached:
             spark_df = getattr(statement, "spark_dataframe", None)
             cached = spark_df if spark_df is not None else statement.to_arrow_table()
-            return self.insert_into(data=cached, spark_session=spark_session, **common)
+            return self.insert_into(
+                data=cached, spark_session=spark_session,
+                return_data=return_data, **common,
+            )
 
         if spark_session is None:
             spark_session = self.sql.spark.resolve_session(create=False)
@@ -2467,9 +2528,19 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
                 else (statement.text if isinstance(statement, PreparedStatement) else str(statement))
             )
             df = spark_session.sql(text)
-            return self.spark_insert(data=df, spark_session=spark_session, **common)
+            return self.spark_insert(
+                data=df, spark_session=spark_session,
+                return_data=return_data, **common,
+            )
 
-        return self._sql_insert_warehouse_fallback(statement, **common)
+        self._sql_insert_warehouse_fallback(statement, **common)
+        if return_data and isinstance(statement, StatementResult):
+            # The warehouse path doesn't materialise rows on its own,
+            # but the caller's :class:`StatementResult` is already a
+            # :class:`TabularIO` over the same source query — hand it
+            # back so ``return_data=True`` stays consistent across paths.
+            return statement
+        return None
 
     def _sql_insert_warehouse_fallback(
         self,
@@ -2567,7 +2638,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         prepared = _prepare_batch(sql_texts)
 
         fallback_factory: Optional[Callable[[], list[WarehousePreparedStatement]]] = None
-        if mode_enum == Mode.MERGE and match_by:
+        if mode_enum in (Mode.MERGE, Mode.UPSERT) and match_by:
             def _build_fallback() -> list[WarehousePreparedStatement]:
                 fb_texts = _build_merge_fallback_statements(
                     target_location=target_location,

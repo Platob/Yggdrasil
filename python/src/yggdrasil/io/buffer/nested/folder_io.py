@@ -143,23 +143,35 @@ class FolderIO(NestedIO[FolderOptions]):
         return FolderOptions
 
     def __new__(cls, data: Any = None, *args: Any, **kwargs: Any):
-        """Construct a folder IO, auto-upgrading to :class:`YGGFolderIO`
-        when the target already carries a ``.ygg/`` sidecar.
+        """Construct a folder IO, auto-upgrading on sidecar detection.
 
-        Calls placed against :class:`FolderIO` directly opt in to the
-        upgrade; callers that explicitly construct :class:`YGGFolderIO`
-        or another subclass keep their requested type. This keeps
-        ``FolderIO(path="/tmp/store/")`` ergonomic for plain folders
-        and one-call-correct for folders that already have sidecar
-        state.
+        Detection order on a bare :class:`FolderIO` construction:
+
+        1. ``_delta_log/`` directory present → :class:`DeltaIO`. Delta
+           tables look like a folder of parquet files plus a
+           ``_delta_log/`` of JSON commits; the replay path needs the
+           Delta-specific reader to honour adds / removes / DV.
+        2. ``.ygg/`` sidecar present → :class:`YGGFolderIO`.
+
+        Callers that explicitly construct :class:`YGGFolderIO`,
+        :class:`DeltaIO` or another subclass keep their requested
+        type. The probes are local-stat-only and swallow failures —
+        a missing or unreadable folder collapses to plain
+        :class:`FolderIO` rather than raising during construction.
         """
         if cls is FolderIO:
             raw = kwargs.get("path", data)
-            if raw is not None and _has_ygg_sidecar(raw):
-                # Local import to avoid a circular import on module
-                # load (ygg_folder_io imports back from this module).
-                from .ygg_folder_io import YGGFolderIO
-                return NestedIO.__new__(YGGFolderIO, data, *args, **kwargs)
+            if raw is not None:
+                if _has_delta_log(raw):
+                    # Local import to avoid pulling Delta on every
+                    # FolderIO use (Delta has heavier deps).
+                    from .delta.io import DeltaIO
+                    return NestedIO.__new__(DeltaIO, data, *args, **kwargs)
+                if _has_ygg_sidecar(raw):
+                    # Local import to avoid a circular import on module
+                    # load (ygg_folder_io imports back from this module).
+                    from .ygg_folder_io import YGGFolderIO
+                    return NestedIO.__new__(YGGFolderIO, data, *args, **kwargs)
         return NestedIO.__new__(cls, data, *args, **kwargs)
 
     def _default_child_media_type(self) -> Any:
@@ -1221,6 +1233,28 @@ def _has_ygg_sidecar(path_like: Any) -> bool:
     backend transient, permission denied) collapse to ``False`` so
     we never accidentally fail a plain construction.
     """
+    return _has_marker(path_like, ".ygg")
+
+
+def _has_delta_log(path_like: Any) -> bool:
+    """One-round-trip probe: does ``path_like`` carry a ``_delta_log/``?
+
+    Used by :meth:`FolderIO.__new__` to auto-upgrade plain
+    :class:`FolderIO` constructions to :class:`DeltaIO` when the
+    target already looks like a Delta table. Same forgiving error
+    discipline as :func:`_has_ygg_sidecar`.
+    """
+    return _has_marker(path_like, "_delta_log")
+
+
+def _has_marker(path_like: Any, marker: str) -> bool:
+    """Return ``True`` if ``path_like`` exists and contains *marker*.
+
+    Shared backend for the sidecar / log probes — a single round
+    trip, swallowing every transient error. Both probes treat
+    "couldn't decide" as "no" so a stat hiccup never upgrades a
+    plain folder to a typed subclass it shouldn't be.
+    """
     try:
         if isinstance(path_like, Path):
             probe = path_like
@@ -1228,7 +1262,7 @@ def _has_ygg_sidecar(path_like: Any) -> bool:
             probe = Path.from_(path_like, default=None)
         if probe is None:
             return False
-        return (probe / ".ygg").exists()
+        return (probe / marker).exists()
     except Exception:
         return False
 
