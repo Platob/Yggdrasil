@@ -248,3 +248,161 @@ class TestApply:
         resp = make_response()
         result = resp.apply(lambda r: make_response(status_code=999, request=r.request))
         assert result.status_code == 999
+
+
+# ---------------------------------------------------------------------------
+# HTTPResponse.drain_urllib3 — Content-Length resync
+# ---------------------------------------------------------------------------
+
+
+class _FakeUrllib3Response:
+    """Minimal stand-in for ``urllib3.BaseHTTPResponse``."""
+
+    def __init__(self, body: bytes, headers: dict[str, str], status: int = 200):
+        self._body = body
+        self.headers = headers
+        self.status = status
+        self.released = False
+
+    def stream(self, amt: int = 65536):
+        view = memoryview(self._body)
+        for start in range(0, len(view), amt):
+            yield bytes(view[start:start + amt])
+
+    def read(self) -> bytes:
+        return self._body
+
+    def release_conn(self) -> None:
+        self.released = True
+
+
+class TestDrainContentLengthSync:
+    def _fake(self, body: bytes, *, declared_length: str | None = None):
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if declared_length is not None:
+            headers["Content-Length"] = declared_length
+        return _FakeUrllib3Response(body, headers)
+
+    def test_streamed_drain_syncs_content_length(self):
+        from yggdrasil.io.http_ import HTTPResponse
+
+        body = b'{"hello":"world"}'
+        raw = self._fake(body, declared_length=str(len(body)))
+        resp = HTTPResponse.from_urllib3(
+            request=make_request(),
+            response=raw,
+            tags=None,
+            received_at=EPOCH,
+        )
+
+        # Pre-drain: ``Response.__init__`` ran with an empty buffer, so
+        # the header should currently report 0.
+        assert resp.headers["Content-Length"] == "0"
+
+        resp.drain_urllib3(raw, stream=True)
+
+        assert resp.buffer.size == len(body)
+        assert resp.headers["Content-Length"] == str(len(body))
+        assert raw.released is True
+
+    def test_nonstreamed_drain_syncs_content_length(self):
+        from yggdrasil.io.http_ import HTTPResponse
+
+        body = b"x" * 4096
+        raw = self._fake(body, declared_length=str(len(body)))
+        resp = HTTPResponse.from_urllib3(
+            request=make_request(),
+            response=raw,
+            tags=None,
+            received_at=EPOCH,
+        )
+
+        resp.drain_urllib3(raw, stream=False)
+
+        assert resp.headers["Content-Length"] == str(len(body))
+        assert int(resp.headers["Content-Length"]) == resp.buffer.size
+
+    def test_drain_overwrites_stale_remote_length(self):
+        from yggdrasil.io.http_ import HTTPResponse
+
+        body = b'{"a":1}'
+        # Remote claims a wrong length — we still trust the bytes that
+        # actually landed.
+        raw = self._fake(body, declared_length="999999")
+        resp = HTTPResponse.from_urllib3(
+            request=make_request(),
+            response=raw,
+            tags=None,
+            received_at=EPOCH,
+        )
+
+        resp.drain_urllib3(raw, stream=True)
+
+        assert resp.headers["Content-Length"] == str(len(body))
+
+    def test_drain_backfills_missing_content_type_from_buffer(self):
+        from yggdrasil.io.http_ import HTTPResponse
+
+        # JSON body, but the server didn't bother to send Content-Type.
+        body = b'{"hello":"world"}'
+        raw = _FakeUrllib3Response(body, headers={})
+        resp = HTTPResponse.from_urllib3(
+            request=make_request(),
+            response=raw,
+            tags=None,
+            received_at=EPOCH,
+        )
+
+        resp.drain_urllib3(raw, stream=True)
+
+        # Content-Type should now be present and reflect what the
+        # buffer actually contains (json, not octet-stream).
+        ct = resp.headers.get("Content-Type", "")
+        assert ct, "Content-Type should be backfilled after drain"
+        assert "json" in ct.lower(), f"expected json content-type, got {ct!r}"
+        assert resp.headers["Content-Length"] == str(len(body))
+
+    def test_drain_backfills_placeholder_content_type(self):
+        from yggdrasil.io.http_ import HTTPResponse
+
+        body = b'{"k":1}'
+        raw = _FakeUrllib3Response(
+            body,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        resp = HTTPResponse.from_urllib3(
+            request=make_request(),
+            response=raw,
+            tags=None,
+            received_at=EPOCH,
+        )
+
+        resp.drain_urllib3(raw, stream=True)
+
+        # ``application/octet-stream`` is treated as a placeholder and
+        # gets replaced with the sniffed media after drain.
+        ct = resp.headers["Content-Type"]
+        assert "octet-stream" not in ct.lower()
+        assert "json" in ct.lower()
+
+    def test_drain_preserves_explicit_content_type(self):
+        from yggdrasil.io.http_ import HTTPResponse
+
+        # Server picked a non-placeholder Content-Type — the drain
+        # resync must not override it (the server's declaration wins).
+        body = b'{"hello":"world"}'
+        raw = _FakeUrllib3Response(
+            body,
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+        resp = HTTPResponse.from_urllib3(
+            request=make_request(),
+            response=raw,
+            tags=None,
+            received_at=EPOCH,
+        )
+
+        resp.drain_urllib3(raw, stream=True)
+
+        assert resp.headers["Content-Type"].startswith("text/plain")
+        assert resp.headers["Content-Length"] == str(len(body))

@@ -7,7 +7,7 @@ from urllib3 import BaseHTTPResponse
 
 from ..buffer import BytesIO, TabularIO
 from ..request import PreparedRequest
-from ..response import Response, _media_type_from_headers
+from ..response import Response, _ensure_media_headers, _media_type_from_headers
 
 __all__ = [
     "HTTPResponse"
@@ -75,5 +75,12 @@ class HTTPResponse(Response):
         # Rewind so callers (to_polars, json_load, as_media, paginated
         # combiners, …) read from byte 0 rather than from EOF.
         buffer.seek(0)
+
+        # Resync Content-Length (and Content-Type/Encoding) to the
+        # post-drain buffer. ``Response.__init__`` ran while the buffer
+        # was still empty, so it stamped ``Content-Length: 0`` over the
+        # remote's value — re-running here matches the persisted header
+        # to the bytes that actually landed.
+        _ensure_media_headers(self.headers, buffer)
 
         return self
