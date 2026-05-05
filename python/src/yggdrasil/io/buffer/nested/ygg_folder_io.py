@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any, ClassVar, TYPE_CHECKING
+from typing import Any, ClassVar, Iterator, TYPE_CHECKING
 
 import pyarrow as pa
 
@@ -454,6 +454,267 @@ class YGGFolderIO(FolderIO):
             return Stats.from_ipc(blob)
         except Exception:
             return None
+
+    # ==================================================================
+    # Optimize — small-file compaction
+    # ==================================================================
+
+    #: Per-bucket target size for :meth:`optimize`. Mirrors the Delta /
+    #: Iceberg default; large enough that the rewrite cost amortises
+    #: across many rows, small enough that a single bucket fits
+    #: comfortably in memory and in one parquet row group.
+    OPTIMIZE_TARGET_BYTES: ClassVar[int] = 128 * 1024 * 1024
+
+    #: Minimum small-file count per leaf folder before
+    #: :meth:`optimize` will compact. Folders at or below this skip
+    #: the rewrite — the win on a 3-file folder isn't worth a fsync.
+    OPTIMIZE_MIN_FILES: ClassVar[int] = 5
+
+    def optimize(
+        self,
+        *,
+        target_bytes: "int | None" = None,
+        min_files: "int | None" = None,
+        wait: Any = None,
+    ) -> "YGGFolderIO":
+        """Compact small leaf files into ``~target_bytes`` chunks.
+
+        Walks every leaf folder under :attr:`path` (a leaf folder
+        is any folder that contains data files, not subfolders).
+        Folders carrying more than ``min_files`` files smaller
+        than ``target_bytes`` are repacked: small files are
+        bin-packed into buckets summing to ``~target_bytes``,
+        each bucket is written to a single new file, and the
+        consumed sources are removed. Files already at or above
+        the target survive untouched, so a healthy folder pays
+        nothing.
+
+        Concurrency:
+
+        - Each leaf-folder rewrite holds an exclusive ``.w.lock``
+          on the leaf so a parallel optimizer can't fight us for
+          the same files.
+        - :meth:`_read_arrow_batches` takes a shared ``.r.lock``
+          on the same leaf during reads, so a caller iterating
+          batches while an optimize is running waits at the leaf
+          boundary instead of seeing half-deleted files.
+
+        ``wait`` (default ``None`` = wait forever) follows the
+        :class:`WaitingConfig` convention used by
+        :meth:`Path.lock`. Returns ``self`` so call sites can
+        chain ``cache.optimize().read_arrow_table()``.
+        """
+        target = int(target_bytes if target_bytes is not None else self.OPTIMIZE_TARGET_BYTES)
+        threshold = int(min_files if min_files is not None else self.OPTIMIZE_MIN_FILES)
+
+        if target <= 0 or threshold <= 0:
+            return self
+        if not self.path.exists():
+            return self
+
+        for leaf_folder in self._walk_optimize_leaves(self.path):
+            self._compact_leaf_folder(
+                leaf_folder,
+                target_bytes=target,
+                min_files=threshold,
+                wait=wait,
+            )
+        return self
+
+    def _walk_optimize_leaves(self, root: Path) -> "Iterator[Path]":
+        """Yield each folder containing data-file children under ``root``.
+
+        Subfolders propagate the walk; ignored entries (dotfiles,
+        in-flight staging files) don't count as data and never
+        trigger a "leaf" classification on their own.
+        """
+        try:
+            entries = list(root.iterdir())
+        except (OSError, FileNotFoundError):
+            return
+
+        files: list[Path] = []
+        subfolders: list[Path] = []
+        for entry in entries:
+            if self._is_ignored_path(entry):
+                continue
+            try:
+                if entry.is_dir():
+                    subfolders.append(entry)
+                else:
+                    files.append(entry)
+            except Exception:
+                continue
+
+        if files:
+            yield root
+
+        for sub in subfolders:
+            yield from self._walk_optimize_leaves(sub)
+
+    def _compact_leaf_folder(
+        self,
+        leaf: Path,
+        *,
+        target_bytes: int,
+        min_files: int,
+        wait: Any,
+    ) -> None:
+        """Bin-pack the small files in ``leaf`` into ``~target_bytes`` chunks.
+
+        Files at or above ``target_bytes`` survive untouched. Small
+        files below the threshold are sorted (oldest first) and
+        first-fit-decreasing-style packed into buckets; buckets
+        carrying a single file are dropped (no compaction needed).
+        Each surviving bucket is written to one staging file, then
+        atomically renamed; the consumed sources are removed last
+        so a reader holding the shared lock sees either the old
+        layout or the new one.
+
+        ``min_files`` is checked against the *small file* count, not
+        the total — an otherwise-fine folder with one stray small
+        leaf doesn't get rewritten just because it crossed the
+        threshold by accident.
+        """
+        try:
+            entries = [e for e in leaf.iterdir() if not self._is_ignored_path(e)]
+        except (OSError, FileNotFoundError):
+            return
+
+        small: list[tuple[Path, int]] = []
+        for entry in entries:
+            try:
+                if entry.is_dir():
+                    continue
+                size = entry.size
+            except Exception:
+                continue
+            if size < target_bytes:
+                small.append((entry, size))
+
+        if len(small) <= min_files:
+            return
+
+        # Oldest-first ordering keeps the first compacted file
+        # closest to the original write order — useful for time-
+        # sortable part names so reads still stream chronologically.
+        small.sort(key=lambda pair: pair[0].name)
+
+        buckets: list[list[Path]] = []
+        current: list[Path] = []
+        current_size = 0
+        for entry, size in small:
+            if current and current_size + size > target_bytes:
+                buckets.append(current)
+                current = []
+                current_size = 0
+            current.append(entry)
+            current_size += size
+        if current:
+            buckets.append(current)
+
+        # A bucket of size 1 is a no-op (renaming a single file to
+        # itself doesn't help), so drop those before paying for the
+        # lock.
+        buckets = [b for b in buckets if len(b) > 1]
+        if not buckets:
+            return
+
+        media_type = self._default_child_media_type()
+
+        # ``read=True, write=True`` selects the ``.rw.lock`` sidecar
+        # so a concurrent ``_read_arrow_batches`` (which acquires
+        # the same lock) actually blocks. The ``.w.lock`` /
+        # ``.r.lock`` variants live in separate files and don't
+        # serialise across read/write directions.
+        with leaf.lock(read=True, write=True, wait=wait):
+            for bucket in buckets:
+                self._write_compact_bucket(
+                    leaf, bucket, media_type=media_type,
+                )
+
+    def _write_compact_bucket(
+        self,
+        leaf: Path,
+        sources: "list[Path]",
+        *,
+        media_type: Any,
+    ) -> None:
+        """Read every file in ``sources`` and write one merged file.
+
+        Per-source read failures abort the bucket — better to
+        leave the small files in place than land an incomplete
+        merge. The merged write goes through :meth:`Path.make_staging`
+        so a crashed compactor leaves a recognisable ``tmp-…``
+        sidecar that the next read enumeration ignores.
+        """
+        from yggdrasil.io.buffer.base import TabularIO
+
+        tables: list[pa.Table] = []
+        for source in sources:
+            try:
+                source_io = TabularIO.from_path(source)
+            except Exception:
+                return
+            with source_io:
+                try:
+                    tables.append(source_io.read_arrow_table())
+                except Exception:
+                    return
+
+        if not tables:
+            return
+
+        merged = pa.concat_tables(tables, promote_options="default")
+        if merged.num_rows == 0:
+            return
+
+        staging = leaf.make_staging(media_type=media_type)
+        try:
+            target_io = TabularIO.from_path(staging, media_type=media_type)
+            with target_io:
+                target_io.write_arrow_table(merged)
+        except Exception:
+            try:
+                staging.remove(allow_not_found=True)
+            except Exception:
+                pass
+            return
+
+        final_name = self._next_child_name_in(leaf, media_type=media_type)
+        final_path = leaf / final_name
+        try:
+            staging.rename(final_path)
+        except Exception:
+            try:
+                staging.remove(allow_not_found=True)
+            except Exception:
+                pass
+            return
+
+        # Sources are dropped last so a reader who acquired the
+        # shared lock right before us sees the old files in full;
+        # a reader who arrived during our write waits on the lock
+        # until we're done, then sees only the compacted result.
+        for source in sources:
+            try:
+                source.remove(allow_not_found=True)
+            except Exception:
+                pass
+
+    def _read_arrow_batches(self, options: Any) -> "Iterator[pa.RecordBatch]":
+        """Take the root ``.rw.lock`` before draining children.
+
+        The lock pairs with the per-leaf-folder lock
+        :meth:`optimize` holds while compacting — both sides land
+        on ``.rw.lock`` so a reader that arrives mid-compaction
+        waits at the folder boundary instead of racing with the
+        in-flight file rewrite. The lock is the same exclusive
+        kind ``concurrent=True`` uses on construction, so callers
+        already opting into cross-process safety pay no extra cost.
+        """
+        with self.path.lock(read=True, write=True):
+            yield from super()._read_arrow_batches(options)
 
     # ==================================================================
     # Spark — Arrow → Spark via the dedicated connector

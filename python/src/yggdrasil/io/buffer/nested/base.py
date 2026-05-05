@@ -64,15 +64,18 @@ Save mode semantics
 
 from __future__ import annotations
 
+import concurrent.futures as cf
 import dataclasses
 import re
 from abc import ABC, abstractmethod
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     ClassVar,
     Iterable,
     Iterator,
+    Sequence,
     TypeVar,
 )
 
@@ -132,11 +135,22 @@ class NestedOptions(CastOptions):
     :param child_byte_size: same as ``child_row_size`` but in
         approximate bytes. Mutually exclusive with
         ``child_row_size`` (row threshold wins if both set).
+    :param max_workers: thread-pool size for naturally-parallel
+        folder operations: clearing children before an OVERWRITE,
+        per-child schema collection, per-leaf reads behind a
+        partition merge, and per-partition writes/upserts. ``0``
+        or ``1`` (default) keeps the legacy single-threaded path
+        — no executor is created. Higher values fan the work out
+        across a :class:`concurrent.futures.ThreadPoolExecutor`;
+        the work is I/O-bound (path stat, leaf bytes, Arrow C++
+        decoders that drop the GIL) so threads scale well on
+        local SSDs and remote object stores alike.
     """
 
     child_media_type: Any = None
     child_row_size: int = 0
     child_byte_size: int = 0
+    max_workers: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -425,18 +439,28 @@ class NestedIO(TabularIO[O], ABC):
     # Folder mutators — used by the write path
     # ==================================================================
 
-    def _clear_children(self) -> None:
+    def _clear_children(self, *, max_workers: int = 0) -> None:
         """Remove every non-ignored child of the folder.
 
         Used by OVERWRITE. Does not remove the folder itself —
         concurrent readers may hold the directory handle.
+
+        ``max_workers`` mirrors :attr:`NestedOptions.max_workers`:
+        ``0`` / ``1`` removes serially, higher values fan the
+        per-child ``remove`` calls across a thread pool. Removal
+        is independent across siblings — order doesn't matter,
+        and per-child failures stay best-effort regardless of
+        execution mode.
         """
         if not self.path.exists():
             return
 
-        for child in self.path.iterdir():
-            if self._is_ignored_path(child):
-                continue
+        targets = [
+            child for child in self.path.iterdir()
+            if not self._is_ignored_path(child)
+        ]
+
+        def _remove_one(child: Path) -> None:
             try:
                 child.remove(recursive=True, allow_not_found=True)
             except Exception:
@@ -444,6 +468,8 @@ class NestedIO(TabularIO[O], ABC):
                 # (race with another writer, permissions), the
                 # subsequent write will surface the failure.
                 pass
+
+        _run_in_threads(targets, _remove_one, max_workers=max_workers)
 
     def _is_ignored_path(self, child: Path) -> bool:
         """Return True for paths that should be hidden from enumeration.
@@ -514,24 +540,35 @@ class NestedIO(TabularIO[O], ABC):
         # Skip — the caller can still reach it via iter_children.
 
     def _collect_schema(self, options: O) -> Schema:
-        """Merge per-child schemas into a single folder schema."""
-        merged: Schema | None = None
+        """Merge per-child schemas into a single folder schema.
 
-        for child in self._iter_children(options):
-            schema: Schema | None = None
+        Per-child schema collection is independent and runs in
+        parallel when ``options.max_workers > 1``; the merge is
+        sequential and deterministic so the result matches the
+        single-threaded order of children.
+        """
+        children = list(self._iter_children(options))
+
+        def _collect_one(child: Any) -> "Schema | None":
             if isinstance(child, NestedIO):
                 with child:
-                    schema = child._collect_schema(options)
-            elif isinstance(child, TabularIO):
+                    return child._collect_schema(options)
+            if isinstance(child, TabularIO):
                 with child:
                     try:
-                        schema = child.collect_schema(options=options)
+                        return child.collect_schema(options=options)
                     except Exception:
-                        schema = None
+                        return None
+            return None
 
+        schemas = _run_in_threads(
+            children, _collect_one, max_workers=options.max_workers,
+        )
+
+        merged: Schema | None = None
+        for schema in schemas:
             if schema is None:
                 continue
-
             if merged is None:
                 merged = schema
             else:
@@ -566,7 +603,7 @@ class NestedIO(TabularIO[O], ABC):
             return
 
         if mode is Mode.OVERWRITE:
-            self._clear_children()
+            self._clear_children(max_workers=options.max_workers)
 
         self._drain_into_children(batches, options)
 
@@ -713,6 +750,40 @@ class NestedIO(TabularIO[O], ABC):
 # ---------------------------------------------------------------------------
 # Internal stream helpers
 # ---------------------------------------------------------------------------
+
+
+T_item = TypeVar("T_item")
+T_result = TypeVar("T_result")
+
+
+def _run_in_threads(
+    items: "Sequence[T_item] | Iterable[T_item]",
+    fn: "Callable[[T_item], T_result]",
+    *,
+    max_workers: int,
+) -> "list[T_result]":
+    """Apply ``fn`` to each of *items* and return results in input order.
+
+    ``max_workers <= 1`` runs serially in the calling thread — no
+    executor is created, no thread overhead is paid. Higher values
+    spin a :class:`concurrent.futures.ThreadPoolExecutor` capped at
+    ``min(max_workers, len(items))`` so a 32-worker setting against
+    a 3-leaf folder doesn't allocate 32 threads. Failures propagate
+    as the first raised exception once the executor drains.
+
+    Used by the folder write/read paths for per-child remove,
+    per-child schema collection, per-leaf reads behind a partition
+    merge, and per-partition writes — all naturally I/O-bound and
+    independent across items.
+    """
+    materialized = list(items)
+    if not materialized:
+        return []
+    if max_workers is None or max_workers <= 1 or len(materialized) == 1:
+        return [fn(item) for item in materialized]
+    workers = min(max_workers, len(materialized))
+    with cf.ThreadPoolExecutor(max_workers=workers) as executor:
+        return list(executor.map(fn, materialized))
 
 
 def _chain_first(

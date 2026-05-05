@@ -44,6 +44,7 @@ _CACHE_CONFIG_FIELDS: frozenset[str] = frozenset(
         "received_from",
         "received_to",
         "wait",
+        "mirror_local_to_remote",
     }
 )
 
@@ -156,11 +157,19 @@ def _is_tabular_io(arg: Any) -> bool:
 
 
 def _folderio_for_local_cache(path: Path) -> "FolderIO":
-    """Wrap a local filesystem :class:`Path` into a schema-tagged FolderIO."""
-    from yggdrasil.io.buffer.nested.folder_io import FolderIO
+    """Wrap a local filesystem :class:`Path` into a schema-tagged folder.
+
+    Returns a :class:`YGGFolderIO` rather than a plain
+    :class:`FolderIO` so the local cache can lean on the
+    ``.ygg/`` sidecar (stats, checkpoints, kv metadata) without a
+    second wrapper. The data layout is identical — any other
+    reader still sees a plain Hive-partitioned tree — so callers
+    that point a FolderIO at the same path still work.
+    """
+    from yggdrasil.io.buffer.nested.ygg_folder_io import YGGFolderIO
     from yggdrasil.io.fs import LocalPath
 
-    return FolderIO(path=LocalPath(path), schema=RESPONSE_SCHEMA)
+    return YGGFolderIO(path=LocalPath(path), schema=RESPONSE_SCHEMA)
 
 
 def _coerce_optional_datetime(value: Any) -> Optional[dt.datetime]:
@@ -263,6 +272,14 @@ class CacheConfig(_ConfigBase):
     received_to: Optional[dt.datetime] = None
     received_ttl: Optional[dt.timedelta] = None
     wait: WaitingConfig = False
+    # When True, the session pushes local-cache hits up to the remote
+    # cache as a bulk UPSERT before stage 3 (network fetch). This is
+    # the "diff sync" path: anything the local cache has that remote
+    # might not — historical responses persisted only on disk, a
+    # warm-started session, etc. — gets mirrored upstream in one
+    # write per group instead of waiting for a fresh network call to
+    # repopulate remote. Default False keeps the legacy behavior.
+    mirror_local_to_remote: bool = False
 
     @staticmethod
     def _check_mapping(values: MutableMapping[str, Any]):
@@ -310,6 +327,7 @@ class CacheConfig(_ConfigBase):
             "received_from": self.received_from,
             "received_to": self.received_to,
             "received_ttl": self.received_ttl,
+            "mirror_local_to_remote": self.mirror_local_to_remote,
         }
 
     def __setstate__(self, state):
@@ -327,6 +345,10 @@ class CacheConfig(_ConfigBase):
         # doesn't AttributeError.
         object.__setattr__(self, "tabular", state.get("tabular"))
         object.__setattr__(self, "anonymize", state.get("anonymize", "remove"))
+        object.__setattr__(
+            self, "mirror_local_to_remote",
+            state.get("mirror_local_to_remote", False),
+        )
 
     @classmethod
     def check_arg(
@@ -487,26 +509,22 @@ class CacheConfig(_ConfigBase):
         return Path.home() / ".yggdrasil" / "cache" / "response"
 
     def local_cache(self) -> "FolderIO":
-        """Return the local-cache :class:`FolderIO`.
+        """Return the local-cache folder.
 
         Returns ``self.tabular`` when it's already a FolderIO,
-        otherwise lazy-builds a default one rooted at
+        otherwise lazy-builds a :class:`YGGFolderIO` rooted at
         :meth:`local_cache_folder` (and caches it back into
         ``tabular`` so subsequent calls return the same instance).
         The schema is :data:`RESPONSE_SCHEMA` — its
         ``partition_by``-tagged ``partition_key`` column drives the
-        Hive layout automatically.
+        Hive layout automatically; the ``.ygg/`` sidecar lets the
+        cache attach stats / checkpoints without a separate
+        wrapper.
         """
-        from yggdrasil.io.buffer.nested.folder_io import FolderIO
-        from yggdrasil.io.fs import LocalPath
-
         if self.is_local_tabular:
             return self.tabular  # type: ignore[return-value]
 
-        folder = FolderIO(
-            path=LocalPath(self.local_cache_folder()),
-            schema=RESPONSE_SCHEMA,
-        )
+        folder = _folderio_for_local_cache(self.local_cache_folder())
         # Cache the lazy-built FolderIO so repeated send_many()
         # calls don't keep re-instantiating it. Frozen-dataclass
         # safe via ``object.__setattr__``.

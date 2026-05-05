@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional
 
 import pyarrow as pa
-import pyarrow.compute as pc
 
 from yggdrasil.arrow.cast import rechunk_arrow_batches_by_byte_size
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
@@ -81,23 +80,26 @@ def _store_local_arrow_batch(
     )
 
 
-def _request_partition_filter(
+def _request_partition_predicate(
     cache: "FolderIO",
     requests: "list[PreparedRequest]",
-) -> "pc.Expression | None":
-    """Build a pyarrow predicate pruning to the partitions in ``requests``.
+) -> "Any | None":
+    """Build a universal predicate pruning to the partitions in ``requests``.
 
     Walks every request, projects its values for the cache's
-    partition columns, and AND-s an ``isin`` filter per column.
-    Used by the lookup path to skip partitions no incoming request
-    actually touches before the row-level match-by filter runs.
-    Returns ``None`` when the cache isn't partitioned or the
-    request list yields no usable values.
+    partition columns, and AND-s a per-column ``is_in`` term.
+    Returned as a :mod:`yggdrasil.data.expr` :class:`Predicate`
+    so the caller can hand it to ``options.predicate`` and get
+    Hive-partition + row-group pruning at the leaf parquet
+    reader. Returns ``None`` when the cache isn't partitioned or
+    no usable values come out.
     """
+    from yggdrasil.data.expr import col
+
     parts = cache._resolve_partition_columns()
     if not parts:
         return None
-    expr: "pc.Expression | None" = None
+    expr: "Any | None" = None
     for f in parts:
         try:
             values = sorted(
@@ -108,9 +110,68 @@ def _request_partition_filter(
             continue
         if not values:
             continue
-        term = pc.is_in(pc.field(f.name), value_set=pa.array(values))
+        term = col(f.name).is_in(values)
         expr = term if expr is None else (expr & term)
     return expr
+
+
+def _request_body_hash_predicate(
+    requests: "list[PreparedRequest]",
+) -> "Any | None":
+    """Universal predicate keeping rows whose ``request_body_hash`` matches.
+
+    Two requests with the same URL / method / public_url_hash but
+    different POST bodies hash to distinct ``body_hash`` values, so
+    a cache keyed only by URL would let one alias the other. The
+    flattened ``request_body_hash`` column on the response cache
+    holds the request side's body digest verbatim — this helper
+    keeps rows whose digest matches one of the incoming bodies,
+    plus rows where the column is null (empty-body GETs cached
+    alongside their POST siblings).
+
+    Returned as a :mod:`yggdrasil.data.expr` :class:`Predicate`
+    so the call site can compose it with the partition predicate
+    and pass a single ``options.predicate`` down to the parquet
+    reader. Returns ``None`` when no useful value can be derived
+    from the request set.
+    """
+    from yggdrasil.data.expr import col
+
+    hashes: set[Any] = set()
+    for r in requests:
+        try:
+            hashes.add(r.body_hash)
+        except Exception:
+            continue
+    if not hashes:
+        return None
+
+    has_null = None in hashes
+    non_null = sorted(h for h in hashes if h is not None)
+
+    if non_null and has_null:
+        # ``is_in`` already mixes the null branch when ``includes_null``
+        # is set on the underlying InList — but the builder strips
+        # nulls out of the value list, so reattach the null term
+        # explicitly. ``OR`` is what the previous pyarrow expression
+        # produced, kept identical here so behaviour doesn't drift.
+        column = col("request_body_hash")
+        return column.is_in(non_null) | column.is_null()
+    if non_null:
+        return col("request_body_hash").is_in(non_null)
+    if has_null:
+        return col("request_body_hash").is_null()
+    return None
+
+
+def _combine_predicates(*exprs: "Any") -> "Any | None":
+    """``AND`` together any number of optional :class:`Predicate`s."""
+    out: "Any | None" = None
+    for expr in exprs:
+        if expr is None:
+            continue
+        out = expr if out is None else (out & expr)
+    return out
 
 
 def _lookup_local_responses(
@@ -137,9 +198,30 @@ def _lookup_local_responses(
     if not cache.path.exists():
         return {}
 
+    from yggdrasil.data.expr import col
+    from yggdrasil.data.options import CastOptions
+
+    # Push the partition / body-hash / received-window prune as a
+    # single :class:`Predicate` so the parquet reader's
+    # row-group / Hive-partition pruning skips the matching files
+    # before any bytes hit the driver. Anything we can't express
+    # (corrupt expr, unsupported backend) collapses to a None
+    # predicate and the unfiltered read still runs — the universal
+    # ``apply_predicate`` step at the TabularIO layer is the
+    # backstop that re-applies the filter on the materialised
+    # batches.
+    predicate = _combine_predicates(
+        _request_partition_predicate(cache, requests),
+        _request_body_hash_predicate(requests),
+        col("received_at") >= received_from if received_from is not None else None,
+        col("received_at") < received_to if received_to is not None else None,
+    )
+
+    options = CastOptions(predicate=predicate) if predicate is not None else None
+
     try:
         with cache:
-            table = cache.read_arrow_table()
+            table = cache.read_arrow_table(options=options)
     except Exception:
         # Corrupt leaf, race with a concurrent write, schema drift
         # — fall through to "nothing matches" so callers progress
@@ -149,42 +231,6 @@ def _lookup_local_responses(
             cache.path, exc_info=True,
         )
         return {}
-
-    if table.num_rows == 0:
-        return {}
-
-    # Partition prune: keep only rows whose ``partition_key`` matches
-    # one of the incoming requests' endpoint buckets. With the
-    # endpoint-derived partition_key (xxh3_64 of host+path), a typical
-    # send_many burst against a handful of endpoints prunes the
-    # post-read table down by orders of magnitude before the per-row
-    # match-by walk.
-    partition_filter = _request_partition_filter(cache, requests)
-    if partition_filter is not None:
-        try:
-            table = table.filter(partition_filter)
-        except Exception:
-            LOGGER.debug(
-                "Partition filter against local cache %s failed; "
-                "falling back to full-table scan",
-                cache.path, exc_info=True,
-            )
-
-    if "received_at" in table.column_names:
-        if received_from is not None:
-            table = table.filter(
-                pc.greater_equal(
-                    table["received_at"],
-                    pa.scalar(received_from),
-                )
-            )
-        if received_to is not None:
-            table = table.filter(
-                pc.less(
-                    table["received_at"],
-                    pa.scalar(received_to),
-                )
-            )
 
     if table.num_rows == 0:
         return {}
@@ -1189,6 +1235,68 @@ class Session(ABC):
                 },
             )
 
+    def _mirror_local_hits_to_remote(
+        self,
+        local_hits_by_path: Mapping[str, "list[Response]"],
+        url_to_remote_cfg: Mapping[str, CacheConfig],
+        session_remote_cfg: CacheConfig,
+    ) -> None:
+        """Bulk-upsert local-cache hits into the remote cache.
+
+        Runs between stage 2 (remote cache lookup) and stage 3
+        (network fetch) when ``CacheConfig.mirror_local_to_remote``
+        is set on the active remote config. The "diff" is implicit:
+        the remote MERGE handles deduplication on
+        ``(partition_key, public_hash)`` so hits the remote already
+        knows about become idempotent no-ops, and only genuinely new
+        rows land. Coupled with stage 4's network-driven persist,
+        this keeps the remote cache eventually-consistent with the
+        local one without forcing a network call to repopulate.
+
+        Activation is gated on the *remote* config — local-only
+        sessions skip it entirely. Per-request remote config
+        overrides are honoured the same way :meth:`_persist_remote`
+        honours them: the URL-keyed map fed in by
+        :meth:`_send_many_batches` is the source of truth, with the
+        session-level config as the fallback.
+        """
+        if not local_hits_by_path:
+            return
+
+        flat: list[Response] = [
+            r for hits in local_hits_by_path.values() for r in hits
+        ]
+        if not flat:
+            return
+
+        # Filter down to responses whose effective remote cache is
+        # both enabled AND opted into the mirror — keeps a session
+        # that toggles the flag for one cache from accidentally
+        # syncing into another.
+        keep: list[Response] = []
+        for response in flat:
+            url_key = (
+                str(response.request.anonymize(mode="remove").url)
+                if response.request else None
+            )
+            eff = url_to_remote_cfg.get(url_key) if url_key else None
+            if eff is None:
+                eff = session_remote_cfg
+            if not eff.remote_cache_enabled:
+                continue
+            if not eff.mirror_local_to_remote:
+                continue
+            keep.append(response)
+
+        if not keep:
+            return
+
+        LOGGER.debug(
+            "Mirroring %s local-cache hit(s) to remote cache",
+            len(keep),
+        )
+        self._persist_remote(keep, url_to_remote_cfg, session_remote_cfg)
+
     def _send_many(
         self,
         requests: Iterator[PreparedRequest],
@@ -1379,7 +1487,32 @@ class Session(ABC):
             # mode) — no special-case for "stage skipped".
             new_hits: "list[Response] | SparkDataFrame | None" = None
 
+            # Snapshot per-request effective configs BEFORE we mutate copies
+            # for the worker pool. Keyed by URL string — the natural identity
+            # for matching a response back to its originating request. We
+            # cover the *whole* chunk (not just ``after_local``) so the
+            # local-hit mirror below can resolve per-request remote configs
+            # for responses that never reached stage 2.
+            url_to_remote_cfg: dict[str, CacheConfig] = {
+                str(r.anonymize(mode="remove").url): self._effective_remote_cfg(r, session_remote_cfg)
+                for r in chunk
+            }
+            url_to_local_cfg: dict[str, CacheConfig] = {
+                str(r.anonymize(mode="remove").url): self._effective_local_cfg(r, session_local_cfg)
+                for r in chunk
+            }
+
             if not after_local:
+                # Even when every request is a local hit we may still
+                # owe the remote a diff — call the mirror before the
+                # early return so an all-cache batch keeps the remote
+                # in sync without ever hitting the network.
+                if not is_spark:
+                    self._mirror_local_hits_to_remote(
+                        local_hits_by_path,
+                        url_to_remote_cfg,
+                        session_remote_cfg,
+                    )
                 yield ResponseBatch(
                     local_hits=local_hits,
                     remote_hits=remote_hits,
@@ -1387,18 +1520,6 @@ class Session(ABC):
                     spark=spark,
                 )
                 continue
-
-            # Snapshot per-request effective configs BEFORE we mutate copies
-            # for the worker pool. Keyed by URL string — the natural identity
-            # for matching a response back to its originating request.
-            url_to_remote_cfg: dict[str, CacheConfig] = {
-                str(r.anonymize(mode="remove").url): self._effective_remote_cfg(r, session_remote_cfg)
-                for r in after_local
-            }
-            url_to_local_cfg: dict[str, CacheConfig] = {
-                str(r.anonymize(mode="remove").url): self._effective_local_cfg(r, session_local_cfg)
-                for r in after_local
-            }
 
             # --- Stage 2: remote cache ---
             # Python path drains the StatementResult into Response
@@ -1432,6 +1553,17 @@ class Session(ABC):
                     [r for table_hits in remote_hits.values() for r in table_hits],
                     url_to_local_cfg,
                     session_local_cfg,
+                )
+                # Mirror local-cache hits to remote in bulk before any
+                # network fetch fires, when the remote config opts in.
+                # The remote MERGE deduplicates on the partition / public
+                # hash so this is idempotent for rows the remote already
+                # knows about — net effect is "diff sync" of any local
+                # entries the remote was missing.
+                self._mirror_local_hits_to_remote(
+                    local_hits_by_path,
+                    url_to_remote_cfg,
+                    session_remote_cfg,
                 )
 
             if not after_remote:

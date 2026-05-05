@@ -77,7 +77,7 @@ from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.enums import MimeType, MimeTypes, Mode
 from yggdrasil.io.fs import Path
 from yggdrasil.io.buffer.base import TabularIO
-from .base import NestedIO, NestedOptions
+from .base import NestedIO, NestedOptions, _run_in_threads
 
 if TYPE_CHECKING:
     pass
@@ -822,7 +822,7 @@ class FolderIO(NestedIO[FolderOptions]):
             self._arrow_upsert_via_rewrite(batches, options)
             return
         if mode is Mode.OVERWRITE:
-            self._clear_children()
+            self._clear_children(max_workers=options.max_workers)
 
         if options.sort_partitions:
             self._write_partitioned_sorted(batches, partition_names, options)
@@ -835,7 +835,12 @@ class FolderIO(NestedIO[FolderOptions]):
         partition_names: "Sequence[str]",
         options: FolderOptions,
     ) -> None:
-        """Materialize, sort, group → one child per partition combination."""
+        """Materialize, sort, group → one child per partition combination.
+
+        Per-partition chunk writes are independent (distinct
+        ``key=value/`` directories, distinct staging files) and fan
+        out across ``options.max_workers`` threads when set.
+        """
         batch_iter = iter(batches)
         first = next(batch_iter, None)
         if first is None:
@@ -862,6 +867,7 @@ class FolderIO(NestedIO[FolderOptions]):
         if n == 0:
             return
 
+        chunks: list[tuple[pa.Table, tuple]] = []
         run_start = 0
         run_key: tuple = tuple(
             partition_rows[0].get(name) for name in partition_names
@@ -874,13 +880,18 @@ class FolderIO(NestedIO[FolderOptions]):
                     partition_rows[i].get(name) for name in partition_names
                 )
             if i == n or next_key != run_key:
-                slice_table = table.slice(run_start, i - run_start)
-                self._write_partition_chunk(
-                    slice_table, partition_names, run_key, options,
-                )
+                chunks.append((table.slice(run_start, i - run_start), run_key))
                 run_start = i
                 if next_key is not None:
                     run_key = next_key
+
+        def _write_one(item: "tuple[pa.Table, tuple]") -> None:
+            slice_table, key = item
+            self._write_partition_chunk(
+                slice_table, partition_names, key, options,
+            )
+
+        _run_in_threads(chunks, _write_one, max_workers=options.max_workers)
 
     def _write_partitioned_streaming(
         self,
@@ -888,7 +899,15 @@ class FolderIO(NestedIO[FolderOptions]):
         partition_names: "Sequence[str]",
         options: FolderOptions,
     ) -> None:
-        """No-sort routing: one child per (batch, partition) pair."""
+        """No-sort routing: one child per (batch, partition) pair.
+
+        Within each batch the per-partition slices write
+        independently and run in parallel under
+        ``options.max_workers``. Batches themselves stay sequential
+        — the input is a generator and we don't want to materialize
+        the whole stream just to fan it out.
+        """
+        max_workers = options.max_workers
         for batch in batches:
             if batch.num_rows == 0:
                 continue
@@ -911,11 +930,18 @@ class FolderIO(NestedIO[FolderOptions]):
                 key = tuple(row.get(name) for name in partition_names)
                 buckets.setdefault(key, []).append(i)
 
-            for key, indices in buckets.items():
-                slice_table = sub_table.take(pa.array(indices))
+            chunks = [
+                (sub_table.take(pa.array(indices)), key)
+                for key, indices in buckets.items()
+            ]
+
+            def _write_one(item: "tuple[pa.Table, tuple]") -> None:
+                slice_table, key = item
                 self._write_partition_chunk(
                     slice_table, partition_names, key, options,
                 )
+
+            _run_in_threads(chunks, _write_one, max_workers=max_workers)
 
     # ==================================================================
     # Upsert — partition-aware with auto-pruned incoming
@@ -982,6 +1008,10 @@ class FolderIO(NestedIO[FolderOptions]):
         partition_view = sorted_incoming.select(partition_names).to_pylist()
         n = sorted_incoming.num_rows
 
+        # Build the per-partition workload first, then fan it out.
+        # Each tuple writes to its own ``key=value/`` directory so
+        # the per-partition merges are independent.
+        partition_work: list[tuple[tuple, pa.Table]] = []
         run_start = 0
         run_key = tuple(partition_view[0].get(c) for c in partition_names)
         for i in range(1, n + 1):
@@ -991,14 +1021,23 @@ class FolderIO(NestedIO[FolderOptions]):
             )
             if i == n or next_key != run_key:
                 if explicit_pruned is None or run_key in explicit_pruned:
-                    self._upsert_partition(
-                        partition_names, run_key,
+                    partition_work.append((
+                        run_key,
                         sorted_incoming.slice(run_start, i - run_start),
-                        options,
-                    )
+                    ))
                 run_start = i
                 if next_key is not None:
                     run_key = next_key
+
+        def _upsert_one(item: "tuple[tuple, pa.Table]") -> None:
+            key, slice_table = item
+            self._upsert_partition(
+                partition_names, key, slice_table, options,
+            )
+
+        _run_in_threads(
+            partition_work, _upsert_one, max_workers=options.max_workers,
+        )
 
     def _explicit_prune_tuples(
         self,
@@ -1088,23 +1127,37 @@ class FolderIO(NestedIO[FolderOptions]):
         schema (so :meth:`merge_upsert_tables` has typed columns
         to work against). Partition columns are injected back in so
         the merge sees the same shape as the incoming side.
+
+        Per-leaf reads run in parallel under
+        ``options.max_workers`` — each leaf opens its own IO so the
+        reads don't fight over shared state.
         """
-        leaf_tables: list[pa.Table] = []
+        leaves: list[Path] = []
         if partition_root.exists():
             for entry in partition_root.iterdir():
                 if entry.is_dir():
                     continue
                 if self._is_ignored_path(entry):
                     continue
+                leaves.append(entry)
+
+        def _read_leaf(entry: Path) -> "pa.Table | None":
+            try:
+                leaf_io = TabularIO.from_path(entry)
+            except Exception:
+                return None
+            with leaf_io:
                 try:
-                    leaf_io = TabularIO.from_path(entry)
+                    return leaf_io.read_arrow_table()
                 except Exception:
-                    continue
-                with leaf_io:
-                    try:
-                        leaf_tables.append(leaf_io.read_arrow_table())
-                    except Exception:
-                        continue
+                    return None
+
+        leaf_tables = [
+            t for t in _run_in_threads(
+                leaves, _read_leaf, max_workers=options.max_workers,
+            )
+            if t is not None
+        ]
 
         if not leaf_tables:
             schema = self.declared_schema()
