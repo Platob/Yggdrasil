@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import os
 import pathlib
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from typing import Union
+
+from yggdrasil.disposable import Disposable
 
 from .io_stats import IOStats
 
@@ -38,8 +40,16 @@ PathLike = Union[str, "os.PathLike[str]", pathlib.PurePath]
 _COPY_CHUNK = 4 * 1024 * 1024
 
 
-class Holder(ABC):
-    """Position-addressable byte holder.
+class Holder(Disposable):
+    """Position-addressable byte holder + :class:`Disposable` lifecycle.
+
+    A holder IS a Disposable: it can be opened, closed, used in a
+    ``with`` block, marked dirty / clean. Concrete subclasses
+    (:class:`yggdrasil.io.memory.Memory`,
+    :class:`yggdrasil.io.fs.Path`) plug acquire/release into the
+    Disposable hooks so :class:`BytesIO` can compose with either
+    one through the same API and seamlessly swap (e.g. on spill)
+    without branching at every call site.
 
     Subclasses implement five primitives:
 

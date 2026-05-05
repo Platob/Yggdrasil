@@ -114,6 +114,7 @@ if TYPE_CHECKING:
     import xxhash
     from collections.abc import Iterable, Iterator
     from yggdrasil.io.fs import Path
+    from yggdrasil.io.holder import Holder
 
 
 __all__ = ["BytesIO", "BufferLike"]
@@ -613,6 +614,29 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     def ctx(self) -> "Path | None":
         """The path acting as our active I/O context, or ``None``."""
         return self._ctx
+
+    @property
+    def _owner(self) -> "Holder | None":
+        """The active byte holder behind this buffer.
+
+        - **Spilled / path-bound** → the bound :class:`Path` (already
+          a :class:`Holder`). Mutates through the path's
+          :meth:`acquire_io` flow.
+        - **Memory mode** → a :class:`Memory` aliasing the same
+          ``bytearray`` the buffer mutates internally
+          (:meth:`Memory.view`, zero-copy). Read/write operations
+          through the Holder interface land on the same bytes the
+          buffer's primitives do; spill swaps the property over to
+          the path without changing the call surface.
+        - **View mode** (window over a parent buffer) → ``None``.
+          Views forward to ``self.parent`` directly.
+        """
+        from yggdrasil.io.memory import Memory  # avoid import cycle
+        if self._spill_path is not None:
+            return self._spill_path
+        if self._buf is not None:
+            return Memory.view(self._buf, self._size)
+        return None
 
     @property
     def metadata(self) -> dict[str, Any]:

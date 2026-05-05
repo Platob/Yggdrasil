@@ -15,6 +15,8 @@ from __future__ import annotations
 import time
 from typing import Any, Optional, Union
 
+from yggdrasil.disposable import Disposable
+
 from .holder import Holder
 
 
@@ -56,43 +58,79 @@ class Memory(Holder):
         ]] = None,
         *,
         media_type: Any = None,
+        auto_open: bool = True,
     ) -> None:
+        Disposable.__init__(self)
         self._mtime: float = time.time()
         self._media_type: Any = media_type
 
         if data is None:
             self._buf: bytearray = bytearray()
             self._size: int = 0
-            return
-
-        if isinstance(data, Memory):
+        elif isinstance(data, Memory):
             self._buf = bytearray(memoryview(data._buf)[: data._size])
             self._size = data._size
             if media_type is None:
                 self._media_type = data._media_type
-            return
-
-        if isinstance(data, int):
+        elif isinstance(data, int):
             if data < 0:
                 raise ValueError(
                     f"Memory(int) capacity must be >= 0, got {data!r}"
                 )
             self._buf = bytearray(data)
             self._size = 0
-            return
-
-        if isinstance(data, (bytes, bytearray, memoryview)):
+        elif isinstance(data, (bytes, bytearray, memoryview)):
             mv = memoryview(data)
             if mv.format != "B" or mv.ndim != 1 or mv.itemsize != 1:
                 mv = mv.cast("B")
             self._buf = bytearray(mv if mv.c_contiguous else bytes(mv))
             self._size = len(self._buf)
-            return
+        else:
+            raise TypeError(
+                f"Memory does not accept data of type {type(data).__name__!r}. "
+                "Pass bytes / bytearray / memoryview / int (capacity) / Memory."
+            )
 
-        raise TypeError(
-            f"Memory does not accept data of type {type(data).__name__!r}. "
-            "Pass bytes / bytearray / memoryview / int (capacity) / Memory."
-        )
+        if auto_open:
+            self.open()
+
+    # ``_acquire`` / ``_release`` are inherited as no-ops from
+    # :class:`Disposable`. Memory's bytes survive a ``close()`` —
+    # the bytearray is owned by Python and freed on GC. Use
+    # :meth:`clear` to drop the payload explicitly.
+
+    @classmethod
+    def view(
+        cls,
+        buf: bytearray,
+        size: Optional[int] = None,
+        *,
+        media_type: Any = None,
+    ) -> "Memory":
+        """Construct a :class:`Memory` aliasing an existing bytearray.
+
+        Zero-copy: ``buf`` is shared with the returned Memory.
+        Mutations through :meth:`write_mv` / :meth:`truncate` /
+        :meth:`reserve` propagate to ``buf`` directly. Closing the
+        returned Memory does not free ``buf`` — the bytearray's
+        lifetime is the caller's.
+
+        ``size`` defaults to ``len(buf)``; pass an explicit size when
+        the visible payload is shorter than the underlying capacity
+        (e.g. when the caller pre-allocated extra bytes).
+
+        Used by :class:`BytesIO` as the in-memory ``_owner``: the
+        same bytearray BytesIO mutates directly is exposed through
+        the :class:`Holder` interface for backend-agnostic callers.
+        """
+        m = cls.__new__(cls)
+        Disposable.__init__(m)
+        m._buf = buf
+        m._size = len(buf) if size is None else int(size)
+        m._mtime = time.time()
+        m._media_type = media_type
+        m._acquired = True
+        return m
 
     # ------------------------------------------------------------------
     # Holder primitives
