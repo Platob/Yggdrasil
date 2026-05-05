@@ -73,12 +73,12 @@ class TestPrimitiveDDL(unittest.TestCase):
             with self.subTest(tz=tz):
                 self.assertEqual(TimestampType(tz=tz).to_databricks_ddl(), "TIMESTAMP_NTZ")
 
-    def test_timestamp_unknown_zone_falls_back_to_ntz(self) -> None:
-        # Unparseable tz strings can't be proven UTC — fall back to naive.
-        self.assertEqual(
-            TimestampType(tz="Not/AZone").to_databricks_ddl(),
-            "TIMESTAMP_NTZ",
-        )
+    def test_timestamp_unknown_zone_rejected_at_construction(self) -> None:
+        # ``TimestampType.tz`` is :class:`Timezone | None`, so an
+        # unparseable IANA string fails fast in ``__post_init__`` rather
+        # than silently flowing through to DDL render.
+        with self.assertRaises(ValueError):
+            TimestampType(tz="Not/AZone")
 
     def test_duration_widens_to_bigint(self) -> None:
         # Duration has no native Databricks counterpart; carry as int64.

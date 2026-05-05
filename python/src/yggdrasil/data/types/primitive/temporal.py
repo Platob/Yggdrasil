@@ -32,6 +32,8 @@ from typing import TYPE_CHECKING, Any, Union
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from yggdrasil.data.enums.timeunit import TimeUnit
+from yggdrasil.data.enums.timezone import Timezone
 from yggdrasil.io.enums import Mode
 
 from .base import PrimitiveType
@@ -60,23 +62,35 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
-# Shared constants
+# Shared constants — sourced from :class:`TimeUnit` so every temporal
+# class agrees on what the canonical tokens are. The legacy dict names
+# are kept as thin views for the existing call sites; new code should
+# reach for :class:`TimeUnit` properties directly.
 # ---------------------------------------------------------------------------
 
 # Seconds per one unit. Used for scalar epoch math.
 _TEMPORAL_UNIT_SECONDS: dict[str, float] = {
-    "s": 1.0,
-    "ms": 1.0e-3,
-    "us": 1.0e-6,
-    "ns": 1.0e-9,
+    TimeUnit.SECOND.value:      TimeUnit.SECOND.seconds,
+    TimeUnit.MILLISECOND.value: TimeUnit.MILLISECOND.seconds,
+    TimeUnit.MICROSECOND.value: TimeUnit.MICROSECOND.seconds,
+    TimeUnit.NANOSECOND.value:  TimeUnit.NANOSECOND.seconds,
 }
 
 # Unit precision rank — higher = finer precision. Used by merge to pick the
 # "widest" unit when combining two temporal types.
-_TEMPORAL_UNIT_ORDER: dict[str, int] = {"s": 0, "ms": 1, "us": 2, "ns": 3}
+_TEMPORAL_UNIT_ORDER: dict[str, int] = {
+    TimeUnit.SECOND.value:      TimeUnit.SECOND.order,
+    TimeUnit.MILLISECOND.value: TimeUnit.MILLISECOND.order,
+    TimeUnit.MICROSECOND.value: TimeUnit.MICROSECOND.order,
+    TimeUnit.NANOSECOND.value:  TimeUnit.NANOSECOND.order,
+}
 
 # Polars only supports ms/us/ns units for Datetime/Duration natively.
-_POLARS_UNITS = frozenset({"ms", "us", "ns"})
+_POLARS_UNITS = frozenset({
+    TimeUnit.MILLISECOND.value,
+    TimeUnit.MICROSECOND.value,
+    TimeUnit.NANOSECOND.value,
+})
 
 # ---------------------------------------------------------------------------
 # Minimal string format catalogues (ISO + Excel/CSV)
@@ -494,6 +508,14 @@ class TemporalType(PrimitiveType, ABC):
     tz: str | None = None
 
     def __post_init__(self):
+        if self.unit is not None:
+            # Funnel any spelling — short token, plural, ``TimeUnit``
+            # member, etc. — through the enum so downstream code can
+            # rely on the canonical string token. Subclasses with extra
+            # __post_init__ logic call ``super().__post_init__()`` first.
+            normalized = TimeUnit.parse(self.unit, default=None)
+            if normalized is not None and normalized.value != self.unit:
+                object.__setattr__(self, "unit", normalized.value)
         if self.tz and self.tz in UTC_ALIAS_TIMEZONES:
             object.__setattr__(self, "tz", "UTC")
 
@@ -530,7 +552,7 @@ class TemporalType(PrimitiveType, ABC):
             self.to_spark(),
             safe=options.safe,
             unit=self.unit,
-            tz=self.tz,
+            tz=str(self.tz) if self.tz else None,
         )
         return self.fill_spark_column_nulls(
             casted, nullable=self._target_nullable(options)
@@ -590,7 +612,7 @@ class TemporalType(PrimitiveType, ABC):
             source_tz=source_dtype.time_zone
             if isinstance(source_dtype, pl.Datetime)
             else None,
-            target_tz=self.tz,
+            target_tz=str(self.tz) if self.tz else None,
         )
         return self.fill_polars_array_nulls(
             casted, nullable=self._target_nullable(options)
@@ -620,7 +642,7 @@ class TemporalType(PrimitiveType, ABC):
             source_tz=getattr(source_dtype, "time_zone", None)
             if isinstance(source_dtype, pl.Datetime)
             else None,
-            target_tz=self.tz,
+            target_tz=str(self.tz) if self.tz else None,
             to_expr=True,
         )
         return self.fill_polars_array_nulls(
@@ -707,14 +729,17 @@ class TemporalType(PrimitiveType, ABC):
 
     def to_dict(self) -> dict[str, Any]:
         base = super().to_dict()
-        return {**base, "unit": self.unit, "tz": self.tz}
+        # ``self.tz`` is ``str`` on most temporal types but
+        # :class:`Timezone` on :class:`TimestampType`; ``str(...)``
+        # collapses both to the canonical IANA token for serialization.
+        return {**base, "unit": self.unit, "tz": str(self.tz) if self.tz else None}
 
     def autotag(self) -> dict[bytes, bytes]:
         tags = super().autotag()
         if self.unit:
             tags[b"unit"] = self.unit.encode("utf-8")
         if self.tz:
-            tags[b"tz"] = self.tz.encode("utf-8")
+            tags[b"tz"] = str(self.tz).encode("utf-8")
         return tags
 
 
@@ -729,6 +754,7 @@ class DateType(TemporalType):
     tz: str | None = None
 
     def __post_init__(self):
+        super().__post_init__()
         object.__setattr__(self, "byte_size", 4)
 
     @classmethod
@@ -832,6 +858,7 @@ class TimeType(TemporalType):
     tz: str | None = None
 
     def __post_init__(self):
+        super().__post_init__()
         object.__setattr__(self, "byte_size", 4 if self.unit in {"s", "ms"} else 8)
 
     @classmethod
@@ -920,9 +947,24 @@ class TimeType(TemporalType):
 @dataclass(frozen=True, repr=False)
 class TimestampType(TemporalType):
     unit: str = "us"
-    tz: str | None = None
+    # Stored as :class:`Timezone` (or ``None``) so consumers can call
+    # ``self.tz.is_utc()`` / ``.utc_offset(...)`` without parsing the
+    # IANA token on every access. The constructor still accepts plain
+    # strings — :meth:`__post_init__` parses them to a Timezone, so
+    # ``TimestampType(tz="UTC")`` and existing dict / Arrow / Polars
+    # paths keep working unchanged.
+    tz: "Timezone | None" = None
 
     def __post_init__(self):
+        # Skip parent's UTC-alias coercion — :meth:`Timezone.parse_str`
+        # already canonicalizes UTC equivalents (``Etc/UTC``, ``GMT``,
+        # ``+00:00``) to the ``UTC`` IANA name.
+        if self.unit is not None:
+            normalized = TimeUnit.parse(self.unit, default=None)
+            if normalized is not None and normalized.value != self.unit:
+                object.__setattr__(self, "unit", normalized.value)
+        if self.tz is not None and not isinstance(self.tz, Timezone):
+            object.__setattr__(self, "tz", Timezone.parse_str(self.tz))
         object.__setattr__(self, "byte_size", 8)
 
     @classmethod
@@ -977,12 +1019,23 @@ class TimestampType(TemporalType):
     def handles_dict(cls, value: dict[str, Any]) -> bool:
         return cls._matches_dict(value, DataTypeId.TIMESTAMP)
 
+    @property
+    def tz_iana(self) -> str | None:
+        """IANA token for :attr:`tz`, or ``None`` when naive.
+
+        Bridge for engine APIs (``pa.timestamp``, ``pl.Datetime``,
+        Spark) that take a string. New code should prefer ``self.tz``
+        directly — it carries :class:`Timezone` helpers like
+        ``is_utc()`` and ``utc_offset()``.
+        """
+        return self.tz.iana if self.tz is not None else None
+
     def to_arrow(self) -> "pa.DataType":
-        return pa.timestamp(unit=self.unit, tz=self.tz)
+        return pa.timestamp(unit=self.unit, tz=self.tz_iana)
 
     def to_polars(self) -> "polars.DataType":
         pl = get_polars()
-        return pl.Datetime(time_unit=self.unit, time_zone=self.tz)
+        return pl.Datetime(time_unit=self.unit, time_zone=self.tz_iana)
 
     def to_spark(self) -> Any:
         spark = get_spark_sql()
@@ -997,12 +1050,7 @@ class TimestampType(TemporalType):
         # round-trips without a silent shift.
         if self.tz is None:
             return "TIMESTAMP_NTZ"
-        from yggdrasil.data.enums.timezone import Timezone
-
-        try:
-            return "TIMESTAMP" if Timezone.parse_str(self.tz).is_utc() else "TIMESTAMP_NTZ"
-        except (TypeError, ValueError):
-            return "TIMESTAMP_NTZ"
+        return "TIMESTAMP" if self.tz.is_utc() else "TIMESTAMP_NTZ"
 
     def default_pyobj(self, nullable: bool) -> Any:
         if nullable:
@@ -1067,6 +1115,7 @@ class DurationType(TemporalType):
     tz: str | None = None
 
     def __post_init__(self):
+        super().__post_init__()
         object.__setattr__(self, "byte_size", 8)
 
     @classmethod
