@@ -46,9 +46,12 @@ from .sql_utils import (
 )
 
 if TYPE_CHECKING:
+    from yggdrasil.data.types import DataType
+
     from .catalog import Catalog
     from .engine import SQLEngine
     from .schema import Schema as UCSchema
+    from .table import Table
     from .views import Views
 
 __all__ = ["View"]
@@ -554,6 +557,123 @@ class View(DatabricksResource):
             return self
         self.sql.execute(self.set_tags_ddl(tags, tag_collation=tag_collation))
         return self
+
+    # ── concat_tables — UNION view across multiple tables/views ──────────────
+
+    def concat_tables(
+        self,
+        tables: Iterable["Table | View"],
+        *,
+        by_name: bool = True,
+        cast: bool = True,
+        comment: str | None = None,
+        mode: ModeLike = Mode.OVERWRITE,
+    ) -> "View":
+        """Create or replace this view as the ``UNION ALL`` of *tables*.
+
+        When ``cast`` is ``True`` (default), the union is "smart": column
+        names are aligned across inputs, types are promoted to the widest
+        compatible :class:`DataType` via ``merge_with(upcast=True)``, every
+        column is wrapped in an explicit ``CAST(... AS <ddl>)``, and any
+        column missing from a given input is emitted as ``CAST(NULL AS
+        <ddl>)``.  This means inputs with diverging schemas (extra columns,
+        slightly different numeric widths, ``INT`` vs ``BIGINT`` vs
+        ``DECIMAL``) still concatenate cleanly — the resulting view exposes
+        the unified, promoted schema in the order columns are first seen.
+
+        When ``cast`` is ``False`` the method falls back to a plain
+        ``SELECT * FROM <table> UNION ALL [BY NAME] ...`` — Databricks does
+        the column matching at query time and any type mismatch surfaces as
+        a SQL error.
+
+        Args:
+            tables:
+                Iterable of :class:`Table` or :class:`View` instances to
+                union.  At least one input is required.
+            by_name:
+                When ``True`` (default), align columns by name across
+                inputs.  Ignored when ``cast`` is ``True`` because explicit
+                projection always aligns by the unified column order.
+            cast:
+                Enable smart type promotion + explicit ``CAST`` projection.
+                Set to ``False`` to emit a plain ``SELECT *`` union and let
+                Databricks reconcile schemas.
+            comment:
+                Optional ``COMMENT`` for the view DDL.
+            mode:
+                Passed through to :meth:`create`.  Defaults to
+                :attr:`Mode.OVERWRITE` so the view is created or replaced
+                atomically.
+
+        Returns:
+            ``self`` after the view has been created or replaced.
+        """
+        tables_list = list(tables)
+        if not tables_list:
+            raise ValueError("concat_tables requires at least one table")
+
+        if cast:
+            query = self._build_smart_union_query(tables_list)
+        else:
+            separator = "\nUNION ALL BY NAME\n" if by_name else "\nUNION ALL\n"
+            query = separator.join(
+                f"SELECT * FROM {t.full_name(safe=True)}"
+                for t in tables_list
+            )
+
+        return self.create(query, mode=mode, comment=comment)
+
+    @staticmethod
+    def _build_smart_union_query(
+        tables_list: list["Table | View"],
+    ) -> str:
+        """Render a ``UNION ALL`` query with explicit per-column casts.
+
+        Walks every input's ``columns``, accumulates a unified schema
+        (first-seen column order, types promoted via ``merge_with(upcast=
+        True)``), then projects each input to that schema — substituting
+        ``CAST(NULL AS <ddl>)`` for absent columns.
+        """
+        from yggdrasil.io.enums.mode import Mode as _Mode
+
+        column_order: list[str] = []
+        unified: dict[str, "DataType"] = {}
+        per_table: list[dict[str, "DataType"]] = []
+
+        for tbl in tables_list:
+            cols: dict[str, "DataType"] = {}
+            for c in tbl.columns:
+                cols[c.name] = c.field.dtype
+                if c.name not in unified:
+                    column_order.append(c.name)
+                    unified[c.name] = c.field.dtype
+                else:
+                    unified[c.name] = unified[c.name].merge_with(
+                        c.field.dtype, mode=_Mode.UPSERT, upcast=True,
+                    )
+            per_table.append(cols)
+
+        if not column_order:
+            raise ValueError(
+                "concat_tables: input tables have no columns to union; "
+                "ensure each input has been resolved against the catalog"
+            )
+
+        select_blocks: list[str] = []
+        for tbl, cols in zip(tables_list, per_table):
+            exprs: list[str] = []
+            for name in column_order:
+                ddl = unified[name].to_databricks_ddl()
+                qname = quote_ident(name)
+                source = qname if name in cols else "NULL"
+                exprs.append(f"CAST({source} AS {ddl}) AS {qname}")
+
+            select_blocks.append(
+                "SELECT\n  " + ",\n  ".join(exprs)
+                + f"\nFROM {tbl.full_name(safe=True)}"
+            )
+
+        return "\nUNION ALL\n".join(select_blocks)
 
     # ── grants (GrantsMixin) ──────────────────────────────────────────────────
 
