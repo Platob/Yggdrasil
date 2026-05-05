@@ -10,10 +10,11 @@ A :class:`BytesIO` has one of two backings at any moment:
   ``spill_bytes``.
 - **path-bound** — a :class:`Path` plus an :class:`OpenContext`
   produced by :meth:`Path.open_context`. The context owns the live
-  state: a long-lived ``os.open`` fd for local paths, a scratch
-  :class:`BytesIO` filled via :meth:`Path._pread` for remote paths.
-  Buffers forward every primitive (``pread`` / ``pwrite`` /
-  ``truncate``) to the context.
+  state: a long-lived ``os.open`` fd for local paths, or a thin
+  passthrough whose ``pread`` / ``pwrite`` / ``truncate`` lands
+  straight on the path's own method for everything else. Buffers
+  forward every primitive to the context — there is no transaction
+  or scratch buffer in between.
 
 The path-bound file is either:
 
@@ -25,20 +26,20 @@ The path-bound file is either:
 Why the context lives on Path
 -----------------------------
 
-Earlier drafts kept a fd or a "transaction buffer" inside the
-buffer itself, branching on ``path.is_local`` at every read and
-write. That branching duplicated state (each backend had to know
-about both shapes) and meant the buffer carried backend-specific
-plumbing.
+Earlier drafts kept a fd or a scratch "transaction buffer" inside
+the buffer itself, branching on ``path.is_local`` at every read
+and write. That branching duplicated state and meant the buffer
+carried backend-specific plumbing.
 
 Moving the live state to :class:`Path.open_context` collapses both
 shapes into one API. The buffer's three primitives forward to
 ``ctx.pread`` / ``ctx.pwrite`` / ``ctx.truncate`` without caring
 which backing is underneath. Local paths return a fd-backed
-context; remote paths return a buffer-backed context that commits
-on flush; future backends (S3 multipart, fsspec adapters) plug in
-by overriding :meth:`Path.open_context` and never need to touch
-this file.
+context; everything else gets a passthrough whose primitives land
+straight on the path's own method — no scratch buffer, no commit
+on flush. Backends that want batched I/O (S3 multipart, paginated
+APIs) override :meth:`Path.open_context` to return a custom
+context, but the default has no hidden allocation.
 
 Lifecycle
 ---------
@@ -500,9 +501,11 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         n = len(mv)
         src = _as_contiguous_mv(mv)
         if n > self._spill_bytes:
+            # Hand the bytes to a freshly minted local path — the
+            # path's ``write_bytes`` owns the syscall side, the
+            # buffer just supplies the payload.
             path = _mint_spill_path(self._ext_hint(), self._spill_ttl)
-            with open(path.full_path(), "wb") as fh:
-                fh.write(src)
+            path.write_bytes(src)
             self._buf = None
             self._size = n
             self._spill_path = path
@@ -560,15 +563,23 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 self._init_from_bytes(memoryview(src.read()))
                 return
 
+            # Mint a spill path, stream the source through ``ctx.pwrite``
+            # at the path so the syscall side is the path's concern.
             path = _mint_spill_path(self._ext_hint(), self._spill_ttl)
+            ctx = path.open_context("wb+")
             total = 0
-            with open(path.full_path(), "wb") as fh:
+            try:
                 while True:
                     chunk = src.read(_COPY_CHUNK_SIZE)
                     if not chunk:
                         break
-                    fh.write(chunk)
-                    total += len(chunk)
+                    written = ctx.pwrite(chunk, total)
+                    if written == 0:
+                        break
+                    total += written
+                ctx.flush()
+            finally:
+                ctx.close()
             self._buf = None
             self._size = total
             self._spill_path = path
@@ -578,20 +589,25 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
         # No seek/tell — drain blind, decide spill vs memory after.
         path = _mint_spill_path(self._ext_hint(), self._spill_ttl)
+        ctx = path.open_context("wb+")
         total = 0
-        with open(path.full_path(), "wb") as fh:
+        try:
             while True:
                 chunk = src.read(_COPY_CHUNK_SIZE)
                 if not chunk:
                     break
-                fh.write(chunk)
-                total += len(chunk)
+                written = ctx.pwrite(chunk, total)
+                if written == 0:
+                    break
+                total += written
+            ctx.flush()
+        finally:
+            ctx.close()
 
         if total <= self._spill_bytes:
-            with open(path.full_path(), "rb") as fh:
-                payload = fh.read()
+            payload = path.read_bytes()
             try:
-                os.unlink(path.full_path())
+                path.unlink(missing_ok=True)
             except OSError:
                 pass
             self._buf = bytearray(payload)
@@ -663,25 +679,6 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     def ctx(self) -> "OpenContext | None":
         """The active per-open context, or ``None`` for memory mode."""
         return self._ctx
-
-    @property
-    def _transaction_buffer(self) -> "BytesIO | None":
-        """Back-compat: scratch buffer of a remote-buffered context.
-
-        Returns the inner :class:`BytesIO` when the active context is a
-        :class:`_BufferOpenContext` (remote / abstract paths). Returns
-        ``None`` for fd-backed contexts (local paths) and for buffers
-        in memory mode. Tests and external probes that asserted on
-        ``bio._transaction_buffer`` keep working.
-        """
-        ctx = self._ctx
-        if ctx is None:
-            return None
-        return getattr(ctx, "_buffer", None)
-
-    @property
-    def transaction_buffer(self):
-        return self._transaction_buffer
 
     @property
     def metadata(self) -> dict[str, Any]:
@@ -798,11 +795,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             return
 
         try:
-            self._ctx = self._spill_path.open_context(
-                self._mode,
-                spill_bytes=self._spill_bytes,
-                spill_ttl=self._spill_ttl,
-            )
+            self._ctx = self._spill_path.open_context(self._mode)
         except Exception:
             # Open failed — drop the lock so the next acquirer can try.
             self._release_path_lock()
@@ -827,9 +820,10 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
         1. **Drop tabular caches first** — pure Python state, can't
            fail meaningfully, want them out before any byte ops.
-        2. **Close the context.** ``ctx.close()`` flushes a dirty
-           remote-buffered context to the path via :meth:`Path._pwrite`
-           and closes any underlying fd or scratch buffer.
+        2. **Close the context.** ``ctx.close()`` releases any
+           underlying fd. Path-bound writes already hit the path
+           via :meth:`Path.pwrite` on each ``ctx.pwrite``, so close
+           has nothing to commit beyond the bookkeeping.
         3. **Unlink the spill file** if owned. Caller-owned paths
            are left alone.
         4. **Release the cross-process lock** so the next writer can
@@ -839,9 +833,9 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # cold. Pure-Python state — no failure modes worth handling.
         self.unpersist()
 
-        # Close the open context. It owns the live state — fd or
-        # scratch buffer — and commits dirty remote writes back to
-        # the path on close.
+        # Close the open context. It owns the live state — typically
+        # a long-lived fd for local paths — and resets any per-open
+        # bookkeeping when it dies.
         if self._ctx is not None:
             try:
                 self._ctx.close()
@@ -881,11 +875,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # that write before opening explicitly.
         self._acquire_path_lock()
         try:
-            self._ctx = self._spill_path.open_context(
-                self._mode,
-                spill_bytes=self._spill_bytes,
-                spill_ttl=self._spill_ttl,
-            )
+            self._ctx = self._spill_path.open_context(self._mode)
         except Exception:
             self._release_path_lock()
             raise
@@ -899,8 +889,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         """Read *n* bytes at *pos*. Two backings:
 
         - Path-bound → forward to the open context's ``pread``, which
-          uses ``os.pread`` for local paths and the scratch buffer
-          for remote.
+          uses ``os.pread`` for local paths and ``Path.pread`` for
+          remote.
         - Memory mode → slice from ``_buf``.
         - View → ``parent.pread`` at ``_view_offset + pos``, bounded
           by the view's tracked size.
@@ -938,11 +928,11 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         because writes are valid against unacquired (autonomous,
         memory-mode) buffers, and ``mark_dirty`` raises in that
         state. The set mirrors the conditions in :meth:`_commit`:
-        view buffers (parent flush needed) and remote-buffered
-        contexts (whose dirty bytes must commit on close) are the
-        only shapes with anything durable to push. Local fd-backed
-        contexts (writes already in the kernel) and pure-memory
-        buffers stay clean.
+        view buffers (parent flush needed) are the only shape with
+        anything durable to push. Path-bound contexts already
+        commit each ``ctx.pwrite`` straight to the path's
+        :meth:`pwrite`, so there's nothing held back to flush;
+        memory-mode buffers have nowhere to flush to.
         """
         if not self._acquired:
             return
@@ -1035,8 +1025,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         """Truncate or extend backing to exactly *n* bytes.
 
         - **Path-bound** → ``ctx.truncate(n)``. Local fd-backed
-          contexts call ``os.ftruncate``; remote buffer-backed
-          contexts resize the scratch buffer (rewritten on flush).
+          contexts call ``os.ftruncate``; remote contexts forward
+          to :meth:`Path.truncate`.
         - **No path** → resize ``_buf``.
         - **View** → resize the parent so its bytes past
           ``_view_offset + n`` are dropped (or zero-extended on grow),
@@ -1099,19 +1089,21 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         After this returns, ``_buf`` is None, ``_spill_path`` is set,
         ``_ctx`` is opened. The caller can immediately use positional
         ops via ``_ctx.pread`` / ``_ctx.pwrite`` without a second open.
+
+        The path owns the syscall side: we hand the payload to the
+        path's ``write_bytes`` and immediately open a context against
+        it. There is no buffer-side fd handling.
         """
         if self._buf is None:
             return  # Already spilled, or no backing.
 
         path = _mint_spill_path(self._ext_hint(), self._spill_ttl)
-        # Write the in-memory payload to disk in one shot. Direct
-        # write here is faster than going through a context — we've
-        # just minted the path and own it exclusively, no concurrency
-        # concerns and the open-write-close pattern fits a one-shot
-        # bulk write better than a long-lived ctx.
-        with open(path.full_path(), "wb") as fh:
-            if self._size:
-                fh.write(memoryview(self._buf)[: self._size])
+        if self._size:
+            path.write_bytes(memoryview(self._buf)[: self._size])
+        else:
+            # write_bytes on b"" creates a zero-byte file — same shape
+            # as the one we'd build via ``open(path, "wb")`` and close.
+            path.write_bytes(b"")
 
         self._buf = None
         self._spill_path = path
@@ -1122,11 +1114,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # the spill is internal scratch we own. Mode preservation
         # matters only for the path-bound case, where the user
         # picked the mode.
-        self._ctx = path.open_context(
-            "rb+",
-            spill_bytes=self._spill_bytes,
-            spill_ttl=self._spill_ttl,
-        )
+        self._ctx = path.open_context("rb+")
 
     def _ext_hint(self) -> str:
         """File extension suggestion for spill files."""
@@ -1148,9 +1136,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         Two shapes:
 
         - **Path-bound** → ``ctx.size``. For local fd contexts this
-          is a live ``os.fstat``; for remote buffer contexts it's the
-          working scratch buffer's size (the remote file may differ
-          until flush).
+          is a live ``os.fstat``; for remote passthrough contexts
+          it's a live ``Path.stat`` round-trip.
         - **Memory-mode** → ``_size``.
 
         For "what's on the remote right now", use :meth:`stat`,
@@ -1171,7 +1158,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         """Modification time of the buffer's working backing.
 
         Same dispatch as :attr:`size`: live ``fstat`` for local
-        fd-mode, scratch-buffer mtime for remote-buffered (the
+        fd-mode, ``Path.stat().mtime`` for remote-buffered (the
         remote file's mtime is exposed via :meth:`stat` if the
         caller wants it).
         """
@@ -1500,10 +1487,10 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
         Always re-fetches; never cached. Distinct from :attr:`size`
         / :attr:`mtime`, which reflect the **buffer's** working
-        state. The two can differ for remote-buffered backings:
-        ``stat()`` returns whatever the remote file looks like
-        right now; ``size``/``mtime`` reflect the in-memory working
-        copy.
+        state — for path-bound buffers the two converge by
+        construction (every ``ctx.pwrite`` already lands on the
+        path), but the call still issues a fresh ``Path.stat`` for
+        remote backings.
 
         Three shapes:
 
@@ -1849,8 +1836,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         """
         # External path binding — share the binding. Neither instance
         # owns the file, so both can point at it without lifecycle
-        # conflicts. The new instance will acquire its own fd / its own
-        # transaction buffer on open.
+        # conflicts. The new instance will acquire its own context on
+        # open.
         if target_class is None:
             target_class = type(self)
 
@@ -1900,11 +1887,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # new path.
         src_ctx = self._ensure_ctx()
         new_path = _mint_spill_path(new_instance._ext_hint(), new_instance._spill_ttl)
-        dst_ctx = new_path.open_context(
-            "rb+",
-            spill_bytes=new_instance._spill_bytes,
-            spill_ttl=new_instance._spill_ttl,
-        )
+        dst_ctx = new_path.open_context("rb+")
         try:
             pos = 0
             while pos < size:
@@ -2065,20 +2048,10 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
           :meth:`_commit`.)
         - **Local fd context**: no-op. Writes already hit the kernel
           via :func:`os.pwrite`.
-        - **Remote buffer context**: commit the scratch buffer back
-          to the path via :meth:`Path._pwrite` — single round-trip,
-          implicit truncate-and-replace semantics. Skipped when the
-          buffer was opened read-only.
-
-        Earlier drafts used ``pwrite(0) + truncate(size)`` here, which
-        is correct but pessimistic for backends that implement
-        ``pwrite`` as read-modify-write (Databricks, S3, …). For
-        those, writing ``payload`` at offset 0 reads the whole remote
-        file, splices, uploads — then truncate reads it again. The
-        simpler ``_pwrite(buffer)`` is one upload, naturally
-        truncating, and matches the "the entire transaction buffer
-        is the new file content" semantic that's actually being
-        expressed.
+        - **Remote passthrough context**: also a no-op. Every
+          ``ctx.pwrite`` already issued a :meth:`Path.pwrite`
+          syscall, so there's nothing buffered between the buffer
+          and the path.
         """
         return self.commit()
 
@@ -2559,8 +2532,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             return h
 
         # Path-bound (remote) or memory: hash whatever the
-        # ``memoryview`` accessor returns. Buffer-backed contexts'
-        # memoryview routes through the scratch buffer's own dispatch.
+        # ``memoryview`` accessor returns — for remote paths this
+        # round-trips a fresh ``Path.pread`` of the whole payload.
         mv = self.memoryview()
         if mv:
             h.update(mv)
@@ -2617,8 +2590,9 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
         - Memory mode (no path) → direct bytearray view.
         - Path-bound → forward to ``ctx.memoryview()``. Local fd
-          contexts return an mmap-backed view; remote buffer
-          contexts return a view over the scratch buffer.
+          contexts return an mmap-backed view; remote passthrough
+          contexts round-trip a ``Path.pread`` of the whole payload
+          and wrap it.
         - Empty → empty memoryview.
 
         For local-spilled mode, the returned mmap-backed view's

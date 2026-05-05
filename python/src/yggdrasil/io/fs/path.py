@@ -881,34 +881,28 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
     def open_context(
         self,
         mode: str = "rb",
-        *,
-        spill_bytes: int = 128 * 1024 * 1024,
-        spill_ttl: int = 86400,
+        **kwargs: Any,
     ) -> "OpenContext":
-        """Open a per-IO context bound to this path.
+        """Open a per-I/O context bound to this path.
 
         For local paths the returned context wraps a single long-lived
         ``os.open`` fd; positional reads/writes route through
-        :func:`os.pread` / :func:`os.pwrite`. For remote paths the
-        context holds a scratch :class:`BytesIO` filled via
-        :meth:`_pread`; reads/writes hit the scratch and are committed
-        back via :meth:`_pwrite` on flush.
+        :func:`os.pread` / :func:`os.pwrite`. For every other path
+        the default returned context is a thin passthrough — every
+        ``ctx.pread`` / ``ctx.pwrite`` / ``ctx.truncate`` lands on
+        the path's own method, no scratch buffer in between. There
+        is no transaction buffer.
 
         :class:`yggdrasil.io.buffer.BytesIO` calls this on its own
-        ``_acquire`` and forwards every primitive (``pread``,
-        ``pwrite``, ``truncate``, …) through the returned context.
-        Backends that want a custom backing (e.g. an S3 path that
-        streams a multipart upload directly without buffering in
-        memory) override this method to return a custom
-        :class:`OpenContext`.
+        ``_acquire`` and forwards every primitive through the
+        returned context. Backends that want batched I/O (S3
+        multipart, paginated APIs, persistent connections) override
+        this method to return a custom :class:`OpenContext`. The
+        default carries no hidden allocation.
         """
-        from yggdrasil.io.fs._open_context import _BufferOpenContext
-        return _BufferOpenContext(
-            self,
-            mode,
-            spill_bytes=spill_bytes,
-            spill_ttl=spill_ttl,
-        )
+        del kwargs  # accepted for forward compat with custom backends
+        from yggdrasil.io.fs._open_context import _PathOpenContext
+        return _PathOpenContext(self, mode)
 
     # ==================================================================
     # URL-delegated pure-path API

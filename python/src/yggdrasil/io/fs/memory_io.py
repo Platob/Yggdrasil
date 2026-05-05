@@ -66,14 +66,12 @@ __all__ = ["MemoryPath"]
 class _MemoryOpenContext(OpenContext):
     """In-memory open context: forwards every primitive to the path's buffer.
 
-    Distinct from :class:`_BufferOpenContext` in two ways:
-
-    - **No copy on acquire.** The path's buffer is already the live
-      bytes; loading a scratch copy would only duplicate them.
-    - **No commit on flush.** Writes hit the buffer directly, so the
-      "push to durable backing" step that the remote-buffered
-      context does is a no-op here. The buffer IS the durable
-      backing for the in-memory case.
+    Same passthrough shape as :class:`_PathOpenContext` but specialised
+    for the in-memory case: ``ctx.pread`` / ``ctx.pwrite`` /
+    ``ctx.truncate`` go straight against the path's :class:`BytesIO`,
+    no path-level method dispatch in the middle. There is no scratch
+    buffer and no commit on flush — writes are already final the
+    moment they land on the underlying buffer.
 
     Mode handling matches the rest of the OpenContext family:
 
@@ -401,22 +399,14 @@ class MemoryPath(Path):
     # I/O surface
     # ------------------------------------------------------------------
 
-    def open_context(
-        self,
-        mode: str = "rb",
-        *,
-        spill_bytes: int = 128 * 1024 * 1024,
-        spill_ttl: int = 86400,
-    ) -> OpenContext:
+    def open_context(self, mode: str = "rb", **kwargs: Any) -> OpenContext:
         """Return an :class:`OpenContext` over this path's buffer.
 
         The context forwards directly to :attr:`buffer` — no copy on
-        acquire, no commit on flush. ``spill_bytes`` / ``spill_ttl``
-        are accepted for signature parity with the base
-        :meth:`Path.open_context` but ignored: the buffer manages
-        its own spill behaviour internally.
+        acquire, no commit on flush. Spill is the inner buffer's
+        own concern; the path doesn't touch it.
         """
-        del spill_bytes, spill_ttl
+        del kwargs
         return _MemoryOpenContext(self, mode)
 
     def _pread(self) -> BytesIO:
