@@ -27,11 +27,12 @@ Repository = "https://github.com/Platob/Yggdrasil"
 
 # ── maturin ───────────────────────────────────────────────────────────────────
 [tool.maturin]
-# The compiled extension installs as yggdrasil/rust.abi3.so, making it
-# importable as `yggdrasil.rust` and its submodules as `yggdrasil.rust.data`,
-# `yggdrasil.rust.io`, etc.  This extends the yggdrasil namespace package
-# without requiring any changes to the pure-Python ygg package.
-module-name = "yggdrasil.rust"
+# Build the compiled extension as the top-level `_yggrs` module so it
+# can install side-by-side with `ygg` (which owns `yggdrasil/`).
+# `yggdrasil.rust` is exposed via the Python-side bridge in
+# `yggdrasil/rs.py`, which re-publishes the `_yggrs` submodules under
+# the `yggdrasil.rust.<name>` namespace at import time.
+module-name = "_yggrs"
 # Enable the PyO3 extension-module feature
 features = ["pyo3/extension-module"]
 # Strip debug symbols → smaller wheels

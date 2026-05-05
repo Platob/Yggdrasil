@@ -49,12 +49,22 @@ from urllib.parse import (
 
 import pyarrow as pa
 
+from yggdrasil import rs as _rs
 from yggdrasil.io.parameters import anonymize_parameters
 from yggdrasil.lazy_imports import (
     bytes_io_class,
     media_type_class,
     mime_type_class,
 )
+
+# Hot-path delegation: when the Rust extension is loaded, hand off URL
+# parsing and percent-encoding to native kernels. The Python fallback
+# below is preserved for environments without `yggrs` (e.g. odd
+# packaging environments where the optional native wheel isn't present);
+# `ygg` now requires `yggrs`, so in normal installs this branch is
+# always taken. Functions are read once at module-import time so the
+# hot path stays a direct attribute lookup.
+_RS_URL = _rs.io_url
 
 __all__ = [
     "URL",
@@ -219,22 +229,35 @@ def _join_segment(seg: Any) -> str:
 
 
 def _encode_userinfo(userinfo: str) -> str:
-    return quote(userinfo, safe=":!$&'()*+,;=") if userinfo else ""
+    if not userinfo:
+        return ""
+    if _RS_URL is not None:
+        return _RS_URL.encode_userinfo(userinfo)
+    return quote(userinfo, safe=":!$&'()*+,;=")
 
 
 def _encode_path(path: str, safe: str = _SAFE_PATH) -> str:
+    # The Rust kernel uses the canonical safe set + the same "no space →
+    # also keep '%'" rule as the Python fallback. Custom safe sets are a
+    # rare debug knob, so detour into the Python fallback when one is
+    # supplied.
+    if _RS_URL is not None and safe is _SAFE_PATH:
+        return _RS_URL.encode_path(path)
     if safe:
         if " " not in path:
             safe = safe + "%"
-
     return quote(path, safe=safe or "")
 
 
 def _encode_query(query: str) -> str:
+    if _RS_URL is not None:
+        return _RS_URL.encode_query(query)
     return quote(query, safe=_SAFE_QUERY + "%")
 
 
 def _encode_fragment(fragment: str) -> str:
+    if _RS_URL is not None:
+        return _RS_URL.encode_fragment(fragment)
     return quote(fragment, safe=_SAFE_FRAGMENT + "%")
 
 
@@ -251,6 +274,8 @@ def _p(value: int | None) -> int:
 
 
 def _normalize_query(query: str) -> str:
+    if _RS_URL is not None:
+        return _RS_URL.normalize_query(query)
     query = query.lstrip("?")
     if not query:
         return ""
@@ -269,6 +294,9 @@ def _parse_port(value: Any) -> int:
 
 
 def _parse_netloc(netloc: str, *, decode: bool) -> tuple[str, str, int]:
+    if _RS_URL is not None:
+        userinfo, host, port = _RS_URL.parse_netloc(netloc, decode=decode)
+        return userinfo, host, port
     if not netloc:
         return "", "", _NO_PORT
 
@@ -729,49 +757,62 @@ class URL(os.PathLike):
         decode: bool = False,
         normalize: bool = True,
     ) -> URL:
-        split = urlsplit(raw)
-        userinfo, host, port = _parse_netloc(split.netloc, decode=decode)
+        if _RS_URL is not None:
+            # Rust handles split + netloc + Windows drive fix-up + entity
+            # decoding + the missing-authority recovery. We keep the
+            # final normalize pass in Python because `_normalize_path`'s
+            # `os.path.realpath` branch for `file://` URLs is platform-
+            # sensitive and lives in the Python helper.
+            scheme, userinfo, host, port, path, query, fragment = _RS_URL.parse_url(
+                raw,
+                default_scheme=default_scheme,
+                decode=decode,
+                normalize=False,
+            )
+        else:
+            split = urlsplit(raw)
+            userinfo, host, port = _parse_netloc(split.netloc, decode=decode)
 
-        scheme = split.scheme
+            scheme = split.scheme
 
-        path = _decode_maybe(split.path, decode)
+            path = _decode_maybe(split.path, decode)
 
-        # A single-letter "scheme" is a Windows drive letter (e.g. C:/path
-        # or C:\path). Reattach the drive to the path, normalize backslash
-        # separators inside this branch, and force the file scheme so
-        # ``URL.from_str("C:\\foo")`` matches ``URL.from_(Path("C:\\foo"))``.
-        if scheme and len(scheme) == 1 and scheme.isalpha():
-            drive = scheme.upper()
-            rest = path.replace("\\", "/")
-            if not rest.startswith("/"):
-                rest = "/" + rest
-            path = f"/{drive}:{rest}"
-            scheme = "file"
+            # A single-letter "scheme" is a Windows drive letter (e.g. C:/path
+            # or C:\path). Reattach the drive to the path, normalize backslash
+            # separators inside this branch, and force the file scheme so
+            # ``URL.from_str("C:\\foo")`` matches ``URL.from_(Path("C:\\foo"))``.
+            if scheme and len(scheme) == 1 and scheme.isalpha():
+                drive = scheme.upper()
+                rest = path.replace("\\", "/")
+                if not rest.startswith("/"):
+                    rest = "/" + rest
+                path = f"/{drive}:{rest}"
+                scheme = "file"
 
-        scheme = default_scheme or scheme
+            scheme = default_scheme or scheme
 
-        # URLs sourced from XML/HTML payloads often arrive with ``&`` encoded
-        # as the entity ``&amp;`` (e.g. an Atom feed link, an HTML attribute,
-        # an XML-RPC body). Without this fix, ``urlsplit`` keeps the literal
-        # ``amp;`` and the parameter separator ``&`` is lost — the next pair
-        # in the query gets glued onto the previous key (``amp;update_id``)
-        # and round-trips through Arrow keep the broken form. Decode the
-        # entity here so the query/fragment parse as the caller intended;
-        # callers that genuinely need a literal ``&amp;`` must percent-encode
-        # the ``&`` themselves.
-        query = _decode_maybe(split.query, decode).replace("&amp;", "&")
-        fragment = _decode_maybe(split.fragment, decode).replace("&amp;", "&")
+            # URLs sourced from XML/HTML payloads often arrive with ``&`` encoded
+            # as the entity ``&amp;`` (e.g. an Atom feed link, an HTML attribute,
+            # an XML-RPC body). Without this fix, ``urlsplit`` keeps the literal
+            # ``amp;`` and the parameter separator ``&`` is lost — the next pair
+            # in the query gets glued onto the previous key (``amp;update_id``)
+            # and round-trips through Arrow keep the broken form. Decode the
+            # entity here so the query/fragment parse as the caller intended;
+            # callers that genuinely need a literal ``&amp;`` must percent-encode
+            # the ``&`` themselves.
+            query = _decode_maybe(split.query, decode).replace("&amp;", "&")
+            fragment = _decode_maybe(split.fragment, decode).replace("&amp;", "&")
 
-        # Fix-up for URLs that lack "//" authority (e.g. "http:example.com/path")
-        # but NOT for schemaless strings — those would incorrectly extract the
-        # first path segment as the host.
-        if scheme and scheme not in ("file",) and not host and path:
-            if "/" in path:
-                host, path = path.split("/", 1)
-                path = "/" + path.lstrip("/")
-            else:
-                host = path
-                path = "/"
+            # Fix-up for URLs that lack "//" authority (e.g. "http:example.com/path")
+            # but NOT for schemaless strings — those would incorrectly extract the
+            # first path segment as the host.
+            if scheme and scheme not in ("file",) and not host and path:
+                if "/" in path:
+                    host, path = path.split("/", 1)
+                    path = "/" + path.lstrip("/")
+                else:
+                    host = path
+                    path = "/"
 
         if normalize:
             scheme, host, port, path, query, fragment = _normalize_components(
