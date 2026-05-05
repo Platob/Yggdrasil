@@ -8,7 +8,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional, Sequence
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -113,6 +113,53 @@ def _request_partition_filter(
     return expr
 
 
+def _request_body_hash_filter(
+    column_names: "Sequence[str]",
+    requests: "list[PreparedRequest]",
+) -> "pc.Expression | None":
+    """Narrow a cache scan to rows whose ``request_body_hash`` matches.
+
+    Two requests with the same URL / method / public_url_hash but
+    different POST bodies hash to distinct ``body_hash`` values, so
+    a cache keyed only by URL would let one alias the other. The
+    flattened ``request_body_hash`` column on the response cache
+    holds the request side's body digest verbatim — this helper
+    builds an Arrow predicate keeping only rows whose digest
+    matches one of the incoming bodies, plus rows where the column
+    is null (empty-body GETs cached alongside their POST siblings).
+
+    Returns ``None`` when the cache's table doesn't carry the
+    column (older schema, custom cache layouts) or when no useful
+    value can be derived from the request set — both cases fall
+    back to the caller's existing row-level match-by walk.
+    """
+    if "request_body_hash" not in column_names:
+        return None
+
+    hashes: set[Any] = set()
+    for r in requests:
+        try:
+            hashes.add(r.body_hash)
+        except Exception:
+            continue
+    if not hashes:
+        return None
+
+    non_null = sorted(h for h in hashes if h is not None)
+    has_null = None in hashes
+
+    expr: "pc.Expression | None" = None
+    if non_null:
+        expr = pc.is_in(
+            pc.field("request_body_hash"),
+            value_set=pa.array(non_null, type=pa.int64()),
+        )
+    if has_null:
+        null_term = pc.is_null(pc.field("request_body_hash"))
+        expr = null_term if expr is None else (expr | null_term)
+    return expr
+
+
 def _lookup_local_responses(
     cache: "FolderIO",
     requests: "list[PreparedRequest]",
@@ -166,6 +213,27 @@ def _lookup_local_responses(
         except Exception:
             LOGGER.debug(
                 "Partition filter against local cache %s failed; "
+                "falling back to full-table scan",
+                cache.path, exc_info=True,
+            )
+
+    # Body-hash prune: with POST traffic the same endpoint bucket
+    # will hold many siblings that differ only on body, so without
+    # this filter the post-partition row walk re-decodes every
+    # body just to discard it. ``request_body_hash`` is the
+    # int64 xxh3_64 of the request body — matching it against the
+    # incoming body-hash set narrows the table down to the rows
+    # whose request body actually corresponds to one of the
+    # callers, before any Response object is materialized.
+    body_hash_filter = _request_body_hash_filter(
+        table.column_names, requests,
+    )
+    if body_hash_filter is not None:
+        try:
+            table = table.filter(body_hash_filter)
+        except Exception:
+            LOGGER.debug(
+                "request_body_hash filter against local cache %s failed; "
                 "falling back to full-table scan",
                 cache.path, exc_info=True,
             )

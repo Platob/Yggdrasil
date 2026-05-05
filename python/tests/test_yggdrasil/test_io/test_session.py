@@ -182,3 +182,108 @@ class TestContextManager:
         with StubSession() as session:
             session.send(make_request())
         # Exit must not raise even without a job pool created.
+
+
+# ---------------------------------------------------------------------------
+# Local cache: request_body_hash filter
+# ---------------------------------------------------------------------------
+
+
+class TestRequestBodyHashFilter:
+    """Cache lookup narrows by ``request_body_hash`` before row walk."""
+
+    def _prep(self, body):
+        return PreparedRequest.prepare(
+            method="POST" if body else "GET",
+            url="https://example.com/x",
+            headers={},
+            body=body,
+        )
+
+    def test_filter_keeps_matching_and_nulls(self):
+        pa = pytest.importorskip("pyarrow")
+        from yggdrasil.io.session import _request_body_hash_filter
+
+        post = self._prep(b"aaa")
+        get_ = self._prep(None)
+
+        table = pa.table({
+            "request_body_hash": pa.array(
+                [post.body_hash, 1234, None], type=pa.int64(),
+            ),
+            "value": [1, 2, 3],
+        })
+
+        expr = _request_body_hash_filter(table.column_names, [post, get_])
+        kept = table.filter(expr)
+        assert kept.column("value").to_pylist() == [1, 3]
+
+    def test_filter_skips_when_column_absent(self):
+        from yggdrasil.io.session import _request_body_hash_filter
+
+        post = self._prep(b"aaa")
+        assert _request_body_hash_filter(["a", "b"], [post]) is None
+
+    def test_filter_only_non_null(self):
+        pa = pytest.importorskip("pyarrow")
+        from yggdrasil.io.session import _request_body_hash_filter
+
+        post = self._prep(b"aaa")
+        table = pa.table({
+            "request_body_hash": pa.array(
+                [post.body_hash, post.body_hash + 1, None], type=pa.int64(),
+            ),
+        })
+        expr = _request_body_hash_filter(table.column_names, [post])
+        kept = table.filter(expr)
+        assert kept.column("request_body_hash").to_pylist() == [post.body_hash]
+
+    def test_lookup_distinguishes_post_bodies(self, tmp_path):
+        """Two POSTs to the same URL with different bodies don't alias.
+
+        The cache row carrying body ``aaa`` must not be returned when
+        a request with body ``bbb`` is looked up — even though both
+        share ``public_url_hash``.
+        """
+        pytest.importorskip("pyarrow")
+        pytest.importorskip("xxhash")
+
+        from yggdrasil.io.buffer.nested import FolderOptions
+        from yggdrasil.io.enums import Mode
+        from yggdrasil.io.response import Response
+        from yggdrasil.io.session import _lookup_local_responses
+        from yggdrasil.io.send_config import _folderio_for_local_cache
+        import datetime as dt
+
+        cache = _folderio_for_local_cache(tmp_path)
+
+        # Persist two responses, one per body. APPEND so the second
+        # write doesn't overwrite the first — Mode.AUTO collapses to
+        # OVERWRITE on a FolderIO write.
+        append_opts = FolderOptions(mode=Mode.APPEND)
+        for body in (b"aaa", b"bbb"):
+            req = self._prep(body)
+            resp = Response(
+                request=req,
+                status_code=200,
+                headers={"Content-Type": "application/json"},
+                tags={},
+                buffer=b'{"ok":true}',
+                received_at=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+            )
+            with cache:
+                cache.write_arrow_batches(
+                    [resp.to_arrow_batch(parse=False)],
+                    options=append_opts,
+                )
+
+        # Look up by body=aaa only.
+        req_aaa = self._prep(b"aaa")
+        looked = _lookup_local_responses(
+            cache, [req_aaa],
+            match_by=("public_url_hash", "request_body_hash"),
+        )
+        assert len(looked) == 1
+        key = (req_aaa.public_url_hash, req_aaa.body_hash)
+        assert key in looked
+        assert looked[key].request.body_hash == req_aaa.body_hash

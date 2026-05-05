@@ -875,6 +875,17 @@ class PreparedRequest:
             return values[key]
         if hasattr(self, key):
             return getattr(self, key)
+        # Accept the flattened ``request_<col>`` form too — same
+        # column, different spelling. The send_config validator
+        # already lets callers write either shape, so the lookup
+        # path needs to round-trip both without forcing the cache
+        # caller to strip the prefix before each match_value().
+        if key.startswith("request_"):
+            tail = key[len("request_"):]
+            if tail in values:
+                return values[tail]
+            if hasattr(self, tail):
+                return getattr(self, tail)
         raise ValueError(
             f"Unsupported request match key: {key!r}. "
             f"Must be within: {REQUEST_ARROW_SCHEMA.names!r}"
