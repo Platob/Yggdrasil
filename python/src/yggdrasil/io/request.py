@@ -121,8 +121,9 @@ REQUEST_SCHEMA["private_url_hash"] = schema_field(
     pa.int64(),
     nullable=False,
     metadata={
-        "comment": "xxh3_64 digest of the full URL string (scheme, userinfo, host, port, "
-                   "path, query, fragment) — matches the URL exactly as captured.",
+        "comment": "xxh3_64 digest of (method, full URL string) — scheme, userinfo, host, "
+                   "port, path, query, fragment exactly as captured. Method is mixed in "
+                   "so ``GET /x`` and ``POST /x`` don't collide.",
         "algorithm": "xxh3_64",
     },
 ).autotag()
@@ -132,9 +133,10 @@ REQUEST_SCHEMA["public_url_hash"] = schema_field(
     pa.int64(),
     nullable=False,
     metadata={
-        "comment": "xxh3_64 digest of ``url.anonymize('remove').to_string()`` — drops "
-                   "userinfo and sensitive query params so this hash is stable across "
-                   "anonymization. The default cache match key.",
+        "comment": "xxh3_64 digest of (method, ``url.anonymize('remove').to_string()``) — "
+                   "userinfo and sensitive query params dropped, method mixed in so verbs "
+                   "stay distinct. Stable across anonymization and the default cache match "
+                   "key.",
         "algorithm": "xxh3_64",
     },
 ).autotag()
@@ -685,15 +687,17 @@ class PreparedRequest:
 
     @property
     def private_url_hash(self) -> int:
-        """xxh3_64 of the URL exactly as captured (userinfo + full query)."""
-        return _xxh3_int64_str(self.url.to_string())
+        """xxh3_64 of (method, URL) exactly as captured (userinfo + full query)."""
+        return _xxh3_int64_str(f"{self.method}\x00{self.url.to_string()}")
 
     @property
     def public_url_hash(self) -> int:
-        """xxh3_64 of the URL after ``anonymize('remove')`` — userinfo and
+        """xxh3_64 of (method, URL) after ``anonymize('remove')`` — userinfo and
         sensitive query params dropped, so this hash is stable across the
-        cache's anonymize step."""
-        return _xxh3_int64_str(self.url.anonymize(mode="remove").to_string())
+        cache's anonymize step. Method is mixed in so verbs don't collide."""
+        return _xxh3_int64_str(
+            f"{self.method}\x00{self.url.anonymize(mode='remove').to_string()}"
+        )
 
     @property
     def hash(self) -> int:

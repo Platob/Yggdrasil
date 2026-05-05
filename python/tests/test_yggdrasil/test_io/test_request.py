@@ -188,6 +188,35 @@ class TestHashing:
         req = PreparedRequest.prepare(method="GET", url="https://example.com/")
         assert isinstance(req.xxh3_b64(), str)
 
+    def test_url_hashes_distinguish_method(self):
+        # GET /x and POST /x must hash to different cache keys —
+        # otherwise a POST response would be served for a GET (and vice
+        # versa) when ``public_url_hash`` is used as the match key.
+        pytest.importorskip("xxhash")
+        get_req = PreparedRequest.prepare(method="GET", url="https://example.com/x")
+        post_req = PreparedRequest.prepare(method="POST", url="https://example.com/x")
+
+        assert get_req.private_url_hash != post_req.private_url_hash
+        assert get_req.public_url_hash != post_req.public_url_hash
+
+    def test_url_hashes_stable_across_method_equal_calls(self):
+        pytest.importorskip("xxhash")
+        a = PreparedRequest.prepare(method="GET", url="https://example.com/x")
+        b = PreparedRequest.prepare(method="GET", url="https://example.com/x")
+        assert a.private_url_hash == b.private_url_hash
+        assert a.public_url_hash == b.public_url_hash
+
+    def test_public_url_hash_drops_userinfo(self):
+        # Regression — the public hash still anonymizes userinfo even
+        # though method is now mixed in.
+        pytest.importorskip("xxhash")
+        plain = PreparedRequest.prepare(method="GET", url="https://example.com/x")
+        with_user = PreparedRequest.prepare(
+            method="GET", url="https://alice:pw@example.com/x"
+        )
+        assert plain.public_url_hash == with_user.public_url_hash
+        assert plain.private_url_hash != with_user.private_url_hash
+
 
 # ---------------------------------------------------------------------------
 # Anonymize
