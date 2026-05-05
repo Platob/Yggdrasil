@@ -47,6 +47,35 @@ cd rust
 maturin build --release
 ```
 
+### Platform prerequisites
+
+`maturin` shells out to `cargo`, which needs a working C linker for the host
+target.
+
+- **Linux**: `gcc` + `pkg-config` (e.g. `apt install build-essential pkg-config`).
+- **macOS**: Xcode Command Line Tools (`xcode-select --install`).
+- **Windows**: install [Build Tools for Visual Studio 2022](https://visualstudio.microsoft.com/downloads/?q=build+tools)
+  with the **"Desktop development with C++"** workload — that ships `link.exe`,
+  which the default `x86_64-pc-windows-msvc` target requires. Without it,
+  `maturin develop` fails with:
+
+  ```
+  error: linker `link.exe` not found
+  note: the msvc targets depend on the msvc linker but `link.exe` was not found
+  ```
+
+  The published Windows wheel on PyPI is MSVC-built, so MSVC is the supported
+  local toolchain. If you cannot install it, you can fall back to the GNU
+  toolchain for development only — install `mingw-w64` (`gcc` on PATH) and run:
+
+  ```bash
+  rustup target add x86_64-pc-windows-gnu
+  maturin develop --extras dev --target x86_64-pc-windows-gnu
+  ```
+
+  GNU-built artifacts are fine for local iteration but won't be ABI-identical
+  to the released MSVC wheels.
+
 ### abi3-py310 stable ABI
 
 `Cargo.toml` enables `pyo3/abi3-py310`.  This means maturin emits a
