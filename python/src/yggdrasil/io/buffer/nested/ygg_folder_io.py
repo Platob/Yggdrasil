@@ -180,6 +180,8 @@ class YGGFolderIO(FolderIO):
     def checkpoint(
         self,
         message: "str | None" = None,
+        *,
+        owner: "str | None" = None,
         **extra: Any,
     ) -> dict[str, Any]:
         """Append a checkpoint record to ``.ygg/checkpoints.jsonl``.
@@ -190,11 +192,28 @@ class YGGFolderIO(FolderIO):
         ``message`` and arbitrary ``**extra`` fields. Concurrent
         ``checkpoint()`` callers serialise on a transient ``.w.lock``
         against the log file so JSON lines never tear.
+
+        ``owner`` is a compute-identifier URL (see
+        :func:`yggdrasil.io.buffer._concurrency.compute_identifier_url`
+        for the schemes). When omitted, the local process's URL is
+        used. Pass an explicit ``owner`` when committing on behalf of
+        another process — for example, a Spark driver recording that
+        a distributed write across workers belongs to its own job.
         """
+        from yggdrasil.io.buffer._concurrency import compute_identifier_url
+
+        if owner is None:
+            owner = compute_identifier_url()
+
         record: dict[str, Any] = {
             "id": self._next_checkpoint_id(),
             "ts": time.time(),
+            # ``pid`` retained for back-compat with readers that look
+            # it up by name; ``owner`` is the canonical attribution
+            # going forward (carries hostname + Databricks job/run/
+            # task tags or whatever the caller supplied).
             "pid": os.getpid(),
+            "owner": owner,
             "files": self._current_child_filenames(),
             "message": message,
         }

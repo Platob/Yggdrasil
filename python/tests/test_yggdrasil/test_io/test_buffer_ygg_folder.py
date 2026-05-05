@@ -97,6 +97,35 @@ class TestYggSidecar:
         assert recs[0]["rows_seen"] == 128
         assert recs[0]["source"] == "ingest-job-7"
 
+    def test_checkpoint_records_compute_owner_url(self, tmp_path):
+        """Each checkpoint stamps a compute-identifier URL so a
+        downstream replay can attribute it to a specific machine /
+        Databricks job / pipeline run."""
+        with YGGFolderIO(path=str(tmp_path)) as io:
+            io.write_arrow_table(_make_table(0))
+            record = io.checkpoint("attributed")
+        assert "owner" in record
+        url = record["owner"]
+        # Default fallback shape outside Databricks env.
+        assert isinstance(url, str)
+        assert url.startswith("host://") or url.startswith("databricks://")
+
+    def test_checkpoint_accepts_explicit_owner_override(self, tmp_path):
+        """Spark drivers commit on behalf of distributed workers —
+        the explicit ``owner`` override lets the single commit point
+        attribute the whole batch to one job rather than to whichever
+        local process happened to write the log line."""
+        with YGGFolderIO(path=str(tmp_path)) as io:
+            io.write_arrow_table(_make_table(0))
+            record = io.checkpoint(
+                "spark-batch",
+                owner="databricks://shared-cluster/1?host=driver&job=42&run=99",
+            )
+        assert (
+            record["owner"]
+            == "databricks://shared-cluster/1?host=driver&job=42&run=99"
+        )
+
     def test_corrupt_log_lines_are_skipped(self, tmp_path):
         ygg = tmp_path / ".ygg"
         ygg.mkdir()

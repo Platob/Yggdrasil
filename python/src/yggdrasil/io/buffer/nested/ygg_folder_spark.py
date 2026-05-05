@@ -54,6 +54,15 @@ __all__ = [
 ]
 
 
+#: Spark conf key that carries the driver's
+#: :func:`yggdrasil.io.buffer._concurrency.compute_identifier_url`
+#: across to executor processes. Workers pick the same value back up
+#: when they read ``$YGG_OWNER_URL`` (Spark propagates ``executorEnv``
+#: bindings to executor processes at task start).
+_OWNER_URL_SPARK_CONF: str = "spark.yggdrasil.owner_url"
+_OWNER_URL_EXECUTOR_ENV: str = "spark.executorEnv.YGG_OWNER_URL"
+
+
 def _iter_leaf_paths(io: "Any") -> "Iterator[str]":
     """Recursively flatten a NestedIO tree to its tabular leaf paths.
 
@@ -124,6 +133,85 @@ class YGGFolderSparkConnector:
         return self._io
 
     # ==================================================================
+    # Owner-URL propagation — share the driver's identifier with workers
+    # ==================================================================
+
+    @staticmethod
+    def driver_owner_url() -> str:
+        """Compute (or return the propagated) compute-identifier URL.
+
+        Convenience accessor — equivalent to calling
+        :func:`yggdrasil.io.buffer._concurrency.compute_identifier_url`
+        directly. Useful when a caller wants to capture the URL
+        on the driver before invoking a Spark write so the same
+        value can be plumbed to executors.
+        """
+        from yggdrasil.io.buffer._concurrency import compute_identifier_url
+
+        return compute_identifier_url()
+
+    @classmethod
+    def propagate_owner_url(
+        cls,
+        spark: "SparkSession",
+        owner_url: "str | None" = None,
+    ) -> str:
+        """Plumb a shared compute-identifier URL into the Spark session.
+
+        Captures the driver's URL (or the caller-supplied ``owner_url``)
+        and pushes it onto the Spark conf so executor-side code that
+        reads ``$YGG_OWNER_URL`` — including
+        :func:`compute_identifier_url` itself — returns the same
+        value as the driver. That way any locks taken by worker tasks
+        (and any checkpoints they happen to record) carry the driver's
+        attribution: same job id, same task key, same overall identity.
+
+        Two conf keys are stamped:
+
+        - ``spark.yggdrasil.owner_url`` — readable by driver-side code
+          via ``spark.conf.get(...)``. Used by :meth:`commit_checkpoint`
+          to default the ``owner`` field.
+        - ``spark.executorEnv.YGG_OWNER_URL`` — Spark propagates
+          ``executorEnv.*`` bindings into the OS environment of newly
+          launched executors, so worker processes pick the URL up
+          via :data:`OWNER_URL_ENV` without any extra wiring.
+
+        Returns the URL that was set so callers can stash it for
+        use in subsequent ``mapInArrow`` / ``foreachPartition``
+        closures (executor processes already running before this call
+        won't pick up the executorEnv binding — pass via closure
+        instead in that case).
+        """
+        if owner_url is None:
+            owner_url = cls.driver_owner_url()
+        try:
+            conf = spark.conf
+        except AttributeError as exc:
+            raise RuntimeError(
+                "SparkSession.conf is unavailable — cannot propagate "
+                "the owner URL. Pass spark=... to a real SparkSession."
+            ) from exc
+        try:
+            conf.set(_OWNER_URL_SPARK_CONF, owner_url)
+        except Exception:
+            # Conf set on a stopped / RPC-detached session is a
+            # warning, not a fatal — driver-side code can still use
+            # the URL via the returned value.
+            LOGGER.debug(
+                "Failed to set %s on Spark conf; continuing.",
+                _OWNER_URL_SPARK_CONF, exc_info=True,
+            )
+        try:
+            conf.set(_OWNER_URL_EXECUTOR_ENV, owner_url)
+        except Exception:
+            LOGGER.debug(
+                "Failed to set %s on Spark conf; executor processes "
+                "started before this call will not pick it up via env.",
+                _OWNER_URL_EXECUTOR_ENV, exc_info=True,
+            )
+        return owner_url
+
+    # ==================================================================
     # Batch — Arrow → Spark via mapInArrow
     # ==================================================================
 
@@ -170,6 +258,65 @@ class YGGFolderSparkConnector:
 
         trigger = spark_session.range(1).repartition(1)
         return trigger.mapInArrow(pump, spark_schema)
+
+    # ==================================================================
+    # Write — record a checkpoint with shared driver-owner attribution
+    # ==================================================================
+
+    def commit_checkpoint(
+        self,
+        spark: "SparkSession | None" = None,
+        *,
+        message: "str | None" = None,
+        owner: "str | None" = None,
+        propagate: bool = True,
+        **extra: Any,
+    ) -> dict:
+        """Record a YGG checkpoint with a Spark-aware owner attribution.
+
+        Intended to follow a Spark write into the folder root —
+        e.g.::
+
+            df.write.mode("append").parquet(io.path.full_path())
+            connector.commit_checkpoint(spark, message="batch 42")
+
+        The driver's compute-identifier URL is captured once and
+        used as the ``owner`` field of the checkpoint record so the
+        single commit point attributes the entire distributed write
+        (every worker that contributed parquet files) to one job /
+        run / task tuple. When ``propagate`` is ``True`` (default),
+        the URL is also stamped onto the Spark conf via
+        :meth:`propagate_owner_url` so any new executor processes
+        — and any subsequent worker-side calls to
+        :func:`compute_identifier_url` — return the same value, in
+        turn making any locks they take share the same id.
+
+        ``extra`` flows through to the checkpoint record verbatim,
+        same shape as :meth:`YGGFolderIO.checkpoint`.
+        """
+        spark_session = _resolve_spark_session(spark, create=False) if spark is not None else None
+        if spark_session is None and propagate:
+            try:
+                spark_session = _resolve_spark_session(None, create=False)
+            except RuntimeError:
+                # No active session — skip propagation, still record
+                # the driver-local owner.
+                spark_session = None
+
+        if owner is None:
+            owner = self.driver_owner_url()
+
+        if propagate and spark_session is not None:
+            try:
+                self.propagate_owner_url(spark_session, owner)
+            except Exception:
+                LOGGER.debug(
+                    "Owner-URL propagation failed; checkpoint will "
+                    "still record %r as the driver owner.", owner,
+                    exc_info=True,
+                )
+
+        return self._io.checkpoint(message=message, owner=owner, **extra)
 
     # ==================================================================
     # Stream — Spark's native parquet streaming source
