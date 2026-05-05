@@ -11,7 +11,12 @@ from typing import Any, Literal, Mapping, Optional, Sequence
 
 import pyarrow as pa
 
-from yggdrasil.io.url import URL, URL_STRUCT
+from yggdrasil.io.url import URL
+
+# Sentinel for the lazy ``url`` / ``git_url`` caches. ``None`` is a
+# valid computed result (no detectable compute / repo), so we can't
+# use it to mean "not yet computed".
+_UNSET: Any = object()
 
 __all__ = [
     "UserInfo",
@@ -56,13 +61,10 @@ _LASTNAME_PARTICLES = {
 USERINFO_SCHEMA: pa.Schema = pa.schema([
     pa.field("hash",            pa.int64(),  nullable=False),
     pa.field("key",             pa.string(), nullable=False),
-    pa.field("cwd",             pa.string(), nullable=False),
     pa.field("hostname",        pa.string(), nullable=False),
     pa.field("email",           pa.string(), nullable=True),
     pa.field("first_name",      pa.string(), nullable=True),
     pa.field("last_name",       pa.string(), nullable=True),
-    pa.field("url",             URL_STRUCT,  nullable=True),
-    pa.field("git_url",         URL_STRUCT,  nullable=True),
     pa.field("product",         pa.string(), nullable=True),
     pa.field("product_version", pa.string(), nullable=True),
 ])
@@ -76,15 +78,26 @@ USERINFO_STRUCT: pa.StructType = pa.struct(list(USERINFO_SCHEMA))
 @dataclass(frozen=True, slots=True)
 class UserInfo:
     key: str = ""
-    cwd: str = ""
     hostname: str = ""
     email: str | None = None
     first_name: str | None = None
     last_name: str | None = None
-    url: URL | None = None
-    git_url: URL | None = None
     product: str | None = None
     product_version: str | None = None
+
+    # ``cwd`` / ``url`` / ``git_url`` are derived per-process via the
+    # ``@property`` accessors below — they probe ``os.getcwd``, the
+    # Databricks runtime, ``dbutils``, and the on-disk ``.git`` tree.
+    # All three are too costly to run on every ``UserInfo``
+    # construction (e.g. when deserializing from struct on each
+    # request) and they shouldn't travel across the wire either —
+    # the receiver's filesystem is the only one that can answer the
+    # question correctly. Stored in ``init=False`` slots with the
+    # ``_UNSET`` sentinel so each lookup fires at most once per
+    # instance, matching the rest of the dataclass's frozen contract.
+    _cwd_cache: Any = field(default=_UNSET, init=False, repr=False, compare=False)
+    _url_cache: Any = field(default=_UNSET, init=False, repr=False, compare=False)
+    _git_url_cache: Any = field(default=_UNSET, init=False, repr=False, compare=False)
 
     @classmethod
     def current(cls) -> "UserInfo":
@@ -94,6 +107,47 @@ class UserInfo:
     def hash(self) -> int:
         """xxh3_64 digest over (key, hostname, email, url, git_url) — int64."""
         return _userinfo_hash(self)
+
+    @property
+    def cwd(self) -> str:
+        """Resolve the current working directory lazily (memoized)."""
+        cached = self._cwd_cache
+        if cached is not _UNSET:
+            return cached
+        result = _safe_getcwd()
+        object.__setattr__(self, "_cwd_cache", result)
+        return result
+
+    @property
+    def url(self) -> URL | None:
+        """Compute URL (Databricks link or ``local://`` for the cwd) lazily.
+
+        Result is memoized per instance — the resolution probes the
+        Databricks runtime / dbutils context and does a path
+        normalization, neither of which should fire repeatedly on the
+        request hot path.
+        """
+        cached = self._url_cache
+        if cached is not _UNSET:
+            return cached
+        result = _current_compute_url(hostname=self.hostname, cwd=self.cwd)
+        object.__setattr__(self, "_url_cache", result)
+        return result
+
+    @property
+    def git_url(self) -> URL | None:
+        """Compute the git remote URL lazily (walks parents of ``cwd``).
+
+        Memoized — the walk hits the filesystem (HEAD, packed-refs,
+        config) and ``UserInfo.git_url`` is read once per request in
+        sanitization paths.
+        """
+        cached = self._git_url_cache
+        if cached is not _UNSET:
+            return cached
+        result = _git_url_from_info(_git_info(self.cwd))
+        object.__setattr__(self, "_git_url_cache", result)
+        return result
 
     def with_email(self, email: str | None) -> "UserInfo":
         first_name, last_name = _names_from_email(email)
@@ -105,33 +159,39 @@ class UserInfo:
         )
 
     def to_struct_dict(self) -> dict[str, Any]:
-        """Flatten into the dict shape that matches :data:`USERINFO_STRUCT`."""
+        """Flatten into the dict shape that matches :data:`USERINFO_STRUCT`.
+
+        ``cwd`` / ``url`` / ``git_url`` are intentionally excluded —
+        they're per-process derived values, not part of the wire
+        contract; the receiver re-derives them from its own context.
+        """
         return {
             "hash":            self.hash,
             "key":             self.key,
-            "cwd":             self.cwd,
             "hostname":        self.hostname,
             "email":           self.email,
             "first_name":      self.first_name,
             "last_name":       self.last_name,
-            "url":             _url_to_struct(self.url),
-            "git_url":         _url_to_struct(self.git_url),
             "product":         self.product,
             "product_version": self.product_version,
         }
 
     @classmethod
     def from_struct_dict(cls, value: Mapping[str, Any]) -> "UserInfo":
-        """Inverse of :meth:`to_struct_dict` — drops the derived ``hash``."""
+        """Inverse of :meth:`to_struct_dict` — drops derived fields.
+
+        ``hash`` is recomputed by the property; ``cwd`` / ``url`` /
+        ``git_url`` are lazy per-process properties and are likewise
+        ignored if present on the input — reconstructing them from
+        the struct would defeat the lazy contract on the receiving
+        side, which re-derives them locally.
+        """
         return cls(
             key=str(value.get("key") or ""),
-            cwd=str(value.get("cwd") or ""),
             hostname=str(value.get("hostname") or ""),
             email=_or_none(value.get("email")),
             first_name=_or_none(value.get("first_name")),
             last_name=_or_none(value.get("last_name")),
-            url=_url_from_struct(value.get("url")),
-            git_url=_url_from_struct(value.get("git_url")),
             product=_or_none(value.get("product")),
             product_version=_or_none(value.get("product_version")),
         )
@@ -147,24 +207,22 @@ def get_user_info(*, refresh: bool = False) -> UserInfo:
     if _CURRENT_CACHE is not None and not refresh:
         return _CURRENT_CACHE
 
-    cwd = _safe_getcwd()
     hostname = socket.gethostname()
     email = _get_upn_email() or _guess_email_from_env()
     first_name, last_name = _names_from_email(email)
-    url = _current_compute_url(hostname=hostname, cwd=cwd)
-    git_data = _git_info(cwd)
-    git_url = _git_url_from_info(git_data)
-    product, product_version = _infer_project(cwd)
+    # Project inference is the only eager consumer of ``cwd`` here —
+    # it walks parents looking for ``pyproject.toml`` and stamps the
+    # result onto a stable ``product`` / ``product_version`` pair.
+    # ``cwd`` / ``url`` / ``git_url`` are lazy properties on
+    # ``UserInfo`` and re-resolve from process state on first access.
+    product, product_version = _infer_project(_safe_getcwd())
 
     info = UserInfo(
         key=_get_key(),
-        cwd=cwd,
         hostname=hostname,
         email=email,
         first_name=first_name,
         last_name=last_name,
-        url=url,
-        git_url=git_url,
         product=product,
         product_version=product_version,
     )
@@ -186,34 +244,6 @@ def _names_from_email(email: str | None) -> tuple[str | None, str | None]:
         return None, None
     first, last, _ = parsed
     return first, last
-
-
-def _url_to_struct(url: URL | None) -> dict[str, Any] | None:
-    if url is None:
-        return None
-    return {
-        "scheme":   url.scheme or "",
-        "userinfo": url.userinfo,
-        "host":     url.host or "",
-        "port":     url.port if url.port not in (None, 0) else None,
-        "path":     url.path or "",
-        "query":    url.query,
-        "fragment": url.fragment,
-    }
-
-
-def _url_from_struct(value: Any) -> URL | None:
-    if value is None:
-        return None
-    if isinstance(value, URL):
-        return value
-    if isinstance(value, str):
-        return URL.from_str(value) if value else None
-    if isinstance(value, Mapping):
-        if not any(value.get(k) for k in ("scheme", "host", "path")):
-            return None
-        return URL.from_dict(dict(value))
-    return None
 
 
 def _or_none(value: Any) -> str | None:

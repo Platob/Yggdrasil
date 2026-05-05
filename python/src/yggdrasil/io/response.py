@@ -359,7 +359,9 @@ RESPONSE_SCHEMA["receiver"] = schema_field(
     metadata={
         "comment": "Snapshot of :class:`~yggdrasil.environ.UserInfo` for the receiver "
                    "— defaults to ``UserInfo.current()``. Carries identity (key, "
-                   "email, hostname, url, git_url, product) plus a stable ``hash``.",
+                   "email, hostname, product) plus a stable ``hash``. Per-process "
+                   "fields (cwd, url, git_url) are lazy properties on UserInfo and "
+                   "are not part of the wire contract.",
     },
 ).autotag()
 

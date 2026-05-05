@@ -97,6 +97,12 @@ __all__ = [
 ]
 
 
+# Sentinel for the merged_field / merged_schema caches. ``None`` is a
+# valid computed result (no source and no target → no merge), so we
+# can't use it to mean "not yet computed".
+_UNSET: Any = object()
+
+
 def _struct_of_objects(columns: "Iterable[str]") -> "Schema":
     """Build a :class:`Schema` from *columns* with :class:`ObjectType` fields.
 
@@ -238,6 +244,29 @@ class CastOptions:
     # writes) without re-querying the target.
     return_data: bool = False
 
+    # --- Memoization slots ---------------------------------------------
+    # ``merged_field`` and ``merged_schema`` are read repeatedly by every
+    # cast / fill / alias entry point on this class — once per dispatch
+    # call, often dozens of times across a single batch pipeline. The
+    # underlying ``Field.merge_with`` walks the full struct tree on each
+    # call. ``CastOptions`` is frozen, so the inputs to those merges
+    # (``source_field``, ``target_field``, ``schema_mode``) cannot
+    # change for a given instance — making the result safe to cache for
+    # the lifetime of the options object.
+    #
+    # ``init=False`` keeps the slots out of the constructor signature
+    # (callers should never set the cache directly); ``compare=False``
+    # keeps two functionally identical CastOptions equal regardless of
+    # which one happened to have its cache warmed; ``repr=False`` keeps
+    # the cache out of the dataclass-generated repr (the custom repr
+    # below also skips non-repr fields).
+    _merged_field_cache: Any = dataclasses.field(
+        default=_UNSET, init=False, repr=False, compare=False
+    )
+    _merged_schema_cache: Any = dataclasses.field(
+        default=_UNSET, init=False, repr=False, compare=False
+    )
+
     # ==================================================================
     # Normalization — runs after dataclass init
     # ==================================================================
@@ -288,15 +317,31 @@ class CastOptions:
 
     @property
     def merged_field(self) -> Field | None:
+        cached = self._merged_field_cache
+        if cached is not _UNSET:
+            return cached
         if self.source_field and self.target_field:
-            return self.target_field.merge_with(self.source_field, mode=self.schema_mode)
-        return self.target_field or self.source_field
+            result = self.target_field.merge_with(
+                self.source_field, mode=self.schema_mode
+            )
+        else:
+            result = self.target_field or self.source_field
+        object.__setattr__(self, "_merged_field_cache", result)
+        return result
 
     @property
     def merged_schema(self) -> Schema | None:
+        cached = self._merged_schema_cache
+        if cached is not _UNSET:
+            return cached
         if self.source_field and self.target_field:
-            return self.target_schema.merge_with(self.source_schema, mode=self.schema_mode)
-        return self.target_schema or self.source_schema
+            result = self.target_schema.merge_with(
+                self.source_schema, mode=self.schema_mode
+            )
+        else:
+            result = self.target_schema or self.source_schema
+        object.__setattr__(self, "_merged_schema_cache", result)
+        return result
 
     def select_source_column_names(self) -> list[str] | None:
         """The source field's column names, if a source field is bound."""
@@ -439,7 +484,7 @@ class CastOptions:
     @classmethod
     @functools.cache
     def field_names(cls) -> frozenset[str]:
-        """Frozenset of this class's dataclass field names.
+        """Frozenset of this class's constructor-accepting field names.
 
         Used by :meth:`_build` to filter ``**overrides`` down to keys
         the constructor will accept — callers funnel mixed kwargs
@@ -447,10 +492,15 @@ class CastOptions:
         kwargs straight through), and we don't want a stray
         ``filter=`` or ``columns=`` to crash construction.
 
+        Excludes ``init=False`` fields (the private memoization slots
+        for ``merged_field`` / ``merged_schema``); those are not valid
+        ``__init__`` keywords and a copy via ``dataclasses.replace``
+        would crash if it tried to forward them.
+
         Cached per-class via :func:`functools.cache` so subclasses
         with extra fields get their own expanded set on first access.
         """
-        return frozenset(f.name for f in dataclasses.fields(cls))
+        return frozenset(f.name for f in dataclasses.fields(cls) if f.init)
 
     @classmethod
     def _build(
@@ -584,8 +634,13 @@ class CastOptions:
             return self
 
         if copy:
+            # ``replace`` drops init=False fields back to their
+            # defaults, which clears the merged_* caches for free.
             return dataclasses.replace(self, source_field=source)
         object.__setattr__(self, "source_field", source)
+        # In-place edit invalidates whatever the merged_* caches held.
+        object.__setattr__(self, "_merged_field_cache", _UNSET)
+        object.__setattr__(self, "_merged_schema_cache", _UNSET)
         return self
 
     def with_target(self: T, target: "Field", copy: bool = True) -> T:
@@ -598,6 +653,8 @@ class CastOptions:
         if copy:
             return dataclasses.replace(self, target_field=target)
         object.__setattr__(self, "target_field", target)
+        object.__setattr__(self, "_merged_field_cache", _UNSET)
+        object.__setattr__(self, "_merged_schema_cache", _UNSET)
         return self
 
     # ==================================================================
@@ -906,6 +963,10 @@ class CastOptions:
         """
         parts: list[str] = []
         for field in dataclasses.fields(self):
+            if not field.repr:
+                # Internal cache slots (and any other repr=False fields
+                # a subclass adds) shouldn't bleed into debug output.
+                continue
             value = getattr(self, field.name)
             default = field.default
             if default is dataclasses.MISSING:
