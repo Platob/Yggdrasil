@@ -89,6 +89,7 @@ class Tables(DatabricksService):
             )
 
         return Tables(
+            client=self.client,
             catalog_name=catalog_name,
             schema_name=schema_name,
             table_name=table_name

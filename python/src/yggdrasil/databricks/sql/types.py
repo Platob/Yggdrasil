@@ -31,7 +31,7 @@ COLUMN_TYPE_MAP = {
     ColumnTypeName.NULL: NullType(),
     ColumnTypeName.SHORT: FloatingPointType(byte_size=2),
     ColumnTypeName.STRING: StringType(),
-    ColumnTypeName.STRUCT: StructType.empty(),
+    # ColumnTypeName.STRUCT: StructType.empty(),
     # ColumnTypeName.TABLE_TYPE: StructType.empty(),
     ColumnTypeName.TIMESTAMP: TimestampType(unit="us", tz="UTC"),
     ColumnTypeName.TIMESTAMP_NTZ: TimestampType(unit="us"),
@@ -125,7 +125,7 @@ def parse_sql_column_info(obj: SQLColumnInfo) -> Field:
                     tz = REPLACE_TIMEZONES.get(dtype.tz, dtype.tz)
                     dtype = TimestampType(unit=dtype.unit, tz=tz)
 
-    elif dtype.type_id.is_nested:
+    elif dtype.type_id.is_any_or_null or dtype.type_id.is_nested:
         dtype = DataType.from_str(obj.type_text)
 
     metadata = {}
