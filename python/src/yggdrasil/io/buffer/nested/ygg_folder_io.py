@@ -114,17 +114,36 @@ def is_ygg_folder(path: "Path | str | os.PathLike") -> bool:
     """Probe ``<path>/.ygg/`` to classify a folder.
 
     Returns ``True`` when the directory exists and has a ``.ygg``
-    subdirectory; ``False`` for plain folders or missing paths. The
-    probe is a single backend round-trip (``Path.exists``), kept
-    cheap because :meth:`FolderIO.__new__` calls it on every folder
-    construction.
+    subdirectory; ``False`` for plain folders or missing paths.
+
+    Local paths take a fast path through :func:`os.path.isdir` —
+    one direct ``stat`` syscall, no Path / URL allocation, no
+    backend round-trip. :meth:`FolderIO.__new__` calls this probe
+    on every folder construction, so the saved allocations add up
+    quickly when a hot loop repeatedly opens the same folder.
     """
+    if isinstance(path, str):
+        # Fast path for the most common caller shape (string path).
+        if path and "://" not in path:
+            try:
+                return os.path.isdir(os.path.join(path, YGGFolderIO.YGG_DIR_NAME))
+            except (OSError, ValueError):
+                return False
+    if isinstance(path, os.PathLike) and not isinstance(path, Path):
+        try:
+            return os.path.isdir(os.path.join(os.fspath(path), YGGFolderIO.YGG_DIR_NAME))
+        except (OSError, ValueError):
+            return False
     if not isinstance(path, Path):
         try:
             path = Path.from_(path)
         except Exception:
             return False
     try:
+        if path.is_local:
+            return os.path.isdir(
+                os.path.join(path.full_path(), YGGFolderIO.YGG_DIR_NAME)
+            )
         return (path / YGGFolderIO.YGG_DIR_NAME).exists()
     except Exception:
         return False
@@ -200,25 +219,71 @@ class YGGFolderIO(FolderIO):
     STATS_FILENAME: ClassVar[str] = STATS_FILENAME
 
     # ==================================================================
-    # Sidecar paths
+    # Sidecar paths — memoised on first access
     # ==================================================================
+    #
+    # Each property used to rebuild a fresh :class:`Path` per call
+    # via ``self.path / NAME``. On hot loops (e.g. a thousand
+    # ``checkpoint()`` calls in a streaming pipeline) that's a
+    # thousand redundant Path allocations. Cache the four sidecar
+    # paths on the instance and reuse them.
 
     @property
     def ygg_path(self) -> Path:
         """Hidden ``.ygg/`` subfolder used for out-of-band metadata."""
-        return self.path / self.YGG_DIR_NAME
+        cached = self.__dict__.get("_ygg_path_cache")
+        if cached is None:
+            cached = self.path / self.YGG_DIR_NAME
+            self.__dict__["_ygg_path_cache"] = cached
+        return cached
 
     @property
     def _ygg_checkpoint_log(self) -> Path:
-        return self.ygg_path / self.CHECKPOINT_LOG_NAME
+        cached = self.__dict__.get("_ygg_log_cache")
+        if cached is None:
+            cached = self.ygg_path / self.CHECKPOINT_LOG_NAME
+            self.__dict__["_ygg_log_cache"] = cached
+        return cached
 
     @property
     def _ygg_metadata_dir(self) -> Path:
-        return self.ygg_path / self.METADATA_DIR_NAME
+        cached = self.__dict__.get("_ygg_meta_dir_cache")
+        if cached is None:
+            cached = self.ygg_path / self.METADATA_DIR_NAME
+            self.__dict__["_ygg_meta_dir_cache"] = cached
+        return cached
 
     @property
     def _ygg_stats_path(self) -> Path:
-        return self.ygg_path / self.STATS_FILENAME
+        cached = self.__dict__.get("_ygg_stats_cache")
+        if cached is None:
+            cached = self.ygg_path / self.STATS_FILENAME
+            self.__dict__["_ygg_stats_cache"] = cached
+        return cached
+
+    def _ensure_ygg_dir(self) -> None:
+        """``mkdir(parents=True, exist_ok=True)`` — at most once per instance.
+
+        ``exist_ok=True`` makes the syscall idempotent, but it's not
+        free: every call still pays a stat (and on remote backends, a
+        round-trip). The dir lives for the entire lifetime of the
+        folder once created, so a per-instance "I've already mkdir'd
+        this" flag is correct and trivial to maintain.
+        """
+        if self.__dict__.get("_ygg_dir_ensured"):
+            return
+        self.ygg_path.mkdir(parents=True, exist_ok=True)
+        self.__dict__["_ygg_dir_ensured"] = True
+
+    def _ensure_metadata_dir(self) -> None:
+        if self.__dict__.get("_ygg_meta_dir_ensured"):
+            return
+        self._ygg_metadata_dir.mkdir(parents=True, exist_ok=True)
+        self.__dict__["_ygg_meta_dir_ensured"] = True
+        # The metadata dir lives under .ygg/, so creating it implies
+        # the parent — mark it so future ``_ensure_ygg_dir`` calls
+        # short-circuit too.
+        self.__dict__["_ygg_dir_ensured"] = True
 
     # ==================================================================
     # Checkpoints
@@ -291,7 +356,7 @@ class YGGFolderIO(FolderIO):
             json_module.dumps(record, to_bytes=False).encode("utf-8") + b"\n"
         )
 
-        self.ygg_path.mkdir(parents=True, exist_ok=True)
+        self._ensure_ygg_dir()
         log = self._ygg_checkpoint_log
 
         # Local files: rely on POSIX / Windows ``O_APPEND`` atomicity
@@ -305,12 +370,16 @@ class YGGFolderIO(FolderIO):
         if log.is_local and len(line) <= self._APPEND_ATOMIC_LIMIT:
             try:
                 log.write_bytes(line, mode="ab")
+                # Bump the in-memory id counter on success so the
+                # next call skips the tail read entirely.
+                self.__dict__["_cached_next_id"] = record["id"] + 1
                 return record
             except OSError:
                 pass
 
         with log.lock(write=True, wait=30):
             log.write_bytes(line, mode="ab")
+        self.__dict__["_cached_next_id"] = record["id"] + 1
         return record
 
     def list_checkpoints(self) -> list[dict[str, Any]]:
@@ -388,13 +457,28 @@ class YGGFolderIO(FolderIO):
         return None
 
     def _next_checkpoint_id(self) -> int:
+        """In-memory counter, seeded once from the on-disk tail.
+
+        After the first call, subsequent ``checkpoint()``s skip the
+        ``stat`` + ``pread`` entirely — the writer instance owns its
+        own monotonic id stream. Concurrent writers from different
+        processes can still race here exactly as they always have:
+        the on-disk log tolerates duplicate ids and ``list_checkpoints``
+        returns them in append order.
+        """
+        cached = self.__dict__.get("_cached_next_id")
+        if cached is not None:
+            return cached
         prev = self._read_last_checkpoint_record()
         if prev is None:
-            return 1
-        try:
-            return int(prev.get("id", 0)) + 1
-        except (TypeError, ValueError):
-            return 1
+            seeded = 1
+        else:
+            try:
+                seeded = int(prev.get("id", 0)) + 1
+            except (TypeError, ValueError):
+                seeded = 1
+        self.__dict__["_cached_next_id"] = seeded
+        return seeded
 
     def _current_child_filenames(self) -> list[str]:
         """Names of the *direct* tabular children at this moment.
@@ -428,7 +512,7 @@ class YGGFolderIO(FolderIO):
         partial write.
         """
         slug = _validate_metadata_key(key)
-        self._ygg_metadata_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_metadata_dir()
         target = self._ygg_metadata_dir / f"{slug}.json"
         payload = json_module.dumps(value)
         try:
@@ -555,7 +639,7 @@ class YGGFolderIO(FolderIO):
         """
         if stats is None:
             stats = self.collect_stats(distinct=distinct, per_file=per_file)
-        self.ygg_path.mkdir(parents=True, exist_ok=True)
+        self._ensure_ygg_dir()
         payload = stats.to_ipc()
         target = self._ygg_stats_path
         try:
