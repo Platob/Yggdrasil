@@ -36,9 +36,11 @@ classes by name.
 
 from __future__ import annotations
 
+import itertools
 import os
 import time
-from typing import Any, ClassVar, Iterator, TYPE_CHECKING
+import urllib.parse
+from typing import Any, ClassVar, Iterable, Iterator, Mapping, TYPE_CHECKING
 
 import pyarrow as pa
 
@@ -476,6 +478,7 @@ class YGGFolderIO(FolderIO):
         target_bytes: "int | None" = None,
         min_files: "int | None" = None,
         wait: Any = None,
+        partitions: "Mapping[str, Iterable[Any]] | None" = None,
     ) -> "YGGFolderIO":
         """Compact small leaf files into ``~target_bytes`` chunks.
 
@@ -488,6 +491,17 @@ class YGGFolderIO(FolderIO):
         consumed sources are removed. Files already at or above
         the target survive untouched, so a healthy folder pays
         nothing.
+
+        ``partitions`` scopes the optimize to a specific set of
+        partition tuples — a mapping from partition column name to
+        the values to touch (e.g. ``{"partition_key": [123, 456]}``).
+        Only the leaf folders matching the cartesian product of those
+        values are visited; the rest of the tree is left alone. This
+        is the smart-optimize path used after a partition-routed
+        write (cf. :meth:`Session._send_many`): a batch only touches
+        a handful of partitions, and we don't want a full-tree walk
+        to amortise compaction across the whole cache. When
+        ``partitions`` is ``None`` (default), every leaf is walked.
 
         Concurrency:
 
@@ -512,7 +526,12 @@ class YGGFolderIO(FolderIO):
         if not self.path.exists():
             return self
 
-        for leaf_folder in self._walk_optimize_leaves(self.path):
+        if partitions:
+            leaves = self._partition_leaves(partitions)
+        else:
+            leaves = self._walk_optimize_leaves(self.path)
+
+        for leaf_folder in leaves:
             self._compact_leaf_folder(
                 leaf_folder,
                 target_bytes=target,
@@ -520,6 +539,115 @@ class YGGFolderIO(FolderIO):
                 wait=wait,
             )
         return self
+
+    def _partition_leaves(
+        self,
+        partitions: "Mapping[str, Iterable[Any]]",
+    ) -> "Iterator[Path]":
+        """Yield the leaf folders matching ``partitions``.
+
+        ``partitions`` maps partition column names to the values
+        whose leaves should be visited; the cartesian product of
+        the per-column value sets is materialised and translated
+        into ``key=value/key=value`` paths under :attr:`path` —
+        the exact layout
+        :func:`yggdrasil.io.buffer.nested.folder_io._partition_path_segment`
+        writes. Missing folders are silently skipped (a partition
+        with no rows simply has no leaf yet), and unknown column
+        names raise so a typo doesn't quietly become a no-op.
+        """
+        partition_cols = self._resolve_partition_columns()
+        if not partition_cols:
+            return iter(())
+
+        names = [c.name for c in partition_cols]
+        unknown = [k for k in partitions.keys() if k not in names]
+        if unknown:
+            raise ValueError(
+                f"Unknown partition column(s) {unknown!r} for "
+                f"{type(self).__name__} at {self.path!r}. "
+                f"Known partition columns: {names!r}."
+            )
+
+        # Per-column ordered, de-duplicated value lists. Missing
+        # columns fall through to "every value present on disk for
+        # this column," letting callers prune on a subset of the
+        # partition tuple (e.g. a date-partitioned table where only
+        # ``partition_key`` is known).
+        per_column: list[list[Any]] = []
+        for name in names:
+            if name in partitions:
+                seen: set[Any] = set()
+                values: list[Any] = []
+                for v in partitions[name]:
+                    if v is None:
+                        # Null partition values can't round-trip
+                        # through a Hive path segment — skip.
+                        continue
+                    if v in seen:
+                        continue
+                    seen.add(v)
+                    values.append(v)
+                if not values:
+                    return iter(())
+                per_column.append(values)
+            else:
+                per_column.append(self._existing_partition_values(name))
+
+        return self._iter_partition_leaves(names, per_column)
+
+    def _existing_partition_values(self, column: str) -> "list[Any]":
+        """Enumerate the on-disk values for a single partition column.
+
+        Walks the layer of the tree that carries ``column=<value>/``
+        directories and returns the raw (un-decoded) values. Used
+        only when a caller pins some partition columns and lets
+        others fan out across whatever's already there.
+        """
+        prefix = f"{column}="
+        out: list[Any] = []
+        # The partition layer is rooted at ``self.path`` plus any
+        # higher-level partition columns. We don't bother modelling
+        # higher levels here — for the local cache the partition
+        # layer is one deep (``partition_key=…``), and a caller
+        # passing a deeper partition spec will have pinned that
+        # column explicitly.
+        try:
+            entries = list(self.path.iterdir())
+        except (OSError, FileNotFoundError):
+            return out
+        for entry in entries:
+            try:
+                if not entry.is_dir():
+                    continue
+            except Exception:
+                continue
+            name = entry.name
+            if not name.startswith(prefix):
+                continue
+            raw = name[len(prefix):]
+            try:
+                out.append(urllib.parse.unquote(raw))
+            except Exception:
+                continue
+        return out
+
+    def _iter_partition_leaves(
+        self,
+        names: "list[str]",
+        per_column: "list[list[Any]]",
+    ) -> "Iterator[Path]":
+        for combo in itertools.product(*per_column):
+            segments = [
+                f"{name}={urllib.parse.quote(str(value), safe='')}"
+                for name, value in zip(names, combo)
+            ]
+            leaf = self.path.joinpath(*segments)
+            try:
+                if leaf.exists():
+                    yield leaf
+            except Exception:
+                continue
 
     def _walk_optimize_leaves(self, root: Path) -> "Iterator[Path]":
         """Yield each folder containing data-file children under ``root``.
@@ -701,20 +829,6 @@ class YGGFolderIO(FolderIO):
                 source.remove(allow_not_found=True)
             except Exception:
                 pass
-
-    def _read_arrow_batches(self, options: Any) -> "Iterator[pa.RecordBatch]":
-        """Take the root ``.rw.lock`` before draining children.
-
-        The lock pairs with the per-leaf-folder lock
-        :meth:`optimize` holds while compacting — both sides land
-        on ``.rw.lock`` so a reader that arrives mid-compaction
-        waits at the folder boundary instead of racing with the
-        in-flight file rewrite. The lock is the same exclusive
-        kind ``concurrent=True`` uses on construction, so callers
-        already opting into cross-process safety pay no extra cost.
-        """
-        with self.path.lock(read=True, write=True):
-            yield from super()._read_arrow_batches(options)
 
     # ==================================================================
     # Spark — Arrow → Spark via the dedicated connector
