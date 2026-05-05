@@ -287,3 +287,108 @@ class TestRequestBodyHashFilter:
         key = (req_aaa.public_url_hash, req_aaa.body_hash)
         assert key in looked
         assert looked[key].request.body_hash == req_aaa.body_hash
+
+
+class TestMirrorLocalToRemote:
+    """``CacheConfig.mirror_local_to_remote`` pushes local hits up to remote."""
+
+    def test_default_flag_is_false(self):
+        assert CacheConfig().mirror_local_to_remote is False
+
+    def test_pickle_roundtrip_preserves_flag(self):
+        import pickle as _pickle
+
+        cfg = CacheConfig(mirror_local_to_remote=True)
+        loaded = _pickle.loads(_pickle.dumps(cfg))
+        assert loaded.mirror_local_to_remote is True
+
+    def test_mirror_helper_is_noop_when_flag_off(self):
+        from yggdrasil.io.response import Response
+        import datetime as dt
+
+        session = StubSession()
+
+        # A fake response carrying a request whose URL maps to a
+        # remote cfg with the flag OFF — the mirror should not
+        # call _persist_remote.
+        req = make_request(method="GET", url="https://example.com/a")
+        resp = Response(
+            request=req,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            tags={},
+            buffer=b"{}",
+            received_at=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+        )
+
+        called: list = []
+
+        def _spy(self, responses, url_to_remote_cfg, session_remote_cfg):
+            called.append(list(responses))
+
+        Session._persist_remote, original = _spy, Session._persist_remote
+        try:
+            session._mirror_local_hits_to_remote(
+                {"path-a": [resp]},
+                url_to_remote_cfg={
+                    str(req.anonymize(mode="remove").url): CacheConfig(
+                        mirror_local_to_remote=False,
+                    ),
+                },
+                session_remote_cfg=CacheConfig(),
+            )
+        finally:
+            Session._persist_remote = original
+
+        assert called == []
+
+    def test_mirror_helper_calls_persist_when_flag_on(self):
+        from yggdrasil.io.response import Response
+        import datetime as dt
+
+        session = StubSession()
+
+        req = make_request(method="GET", url="https://example.com/a")
+        resp = Response(
+            request=req,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            tags={},
+            buffer=b"{}",
+            received_at=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+        )
+
+        # Stand in for a TabularIO with the surface ``remote_cache_enabled``
+        # consults — has both read and write callables, plus
+        # ``full_name``. The mirror should call _persist_remote with the
+        # local hit; we capture the call instead of letting it actually
+        # try to insert.
+        class _FakeTabular:
+            def read_arrow_batches(self): ...
+            def write_arrow_batches(self): ...
+            def full_name(self, safe=False): return "fake.table"
+
+        cfg = CacheConfig(
+            tabular=_FakeTabular(),
+            mirror_local_to_remote=True,
+        )
+
+        captured: list[list[Response]] = []
+
+        def _spy(self, responses, url_to_remote_cfg, session_remote_cfg):
+            captured.append(list(responses))
+
+        Session._persist_remote, original = _spy, Session._persist_remote
+        try:
+            session._mirror_local_hits_to_remote(
+                {"path-a": [resp]},
+                url_to_remote_cfg={
+                    str(req.anonymize(mode="remove").url): cfg,
+                },
+                session_remote_cfg=cfg,
+            )
+        finally:
+            Session._persist_remote = original
+
+        assert len(captured) == 1
+        assert captured[0] == [resp]

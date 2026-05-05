@@ -1257,6 +1257,68 @@ class Session(ABC):
                 },
             )
 
+    def _mirror_local_hits_to_remote(
+        self,
+        local_hits_by_path: Mapping[str, "list[Response]"],
+        url_to_remote_cfg: Mapping[str, CacheConfig],
+        session_remote_cfg: CacheConfig,
+    ) -> None:
+        """Bulk-upsert local-cache hits into the remote cache.
+
+        Runs between stage 2 (remote cache lookup) and stage 3
+        (network fetch) when ``CacheConfig.mirror_local_to_remote``
+        is set on the active remote config. The "diff" is implicit:
+        the remote MERGE handles deduplication on
+        ``(partition_key, public_hash)`` so hits the remote already
+        knows about become idempotent no-ops, and only genuinely new
+        rows land. Coupled with stage 4's network-driven persist,
+        this keeps the remote cache eventually-consistent with the
+        local one without forcing a network call to repopulate.
+
+        Activation is gated on the *remote* config — local-only
+        sessions skip it entirely. Per-request remote config
+        overrides are honoured the same way :meth:`_persist_remote`
+        honours them: the URL-keyed map fed in by
+        :meth:`_send_many_batches` is the source of truth, with the
+        session-level config as the fallback.
+        """
+        if not local_hits_by_path:
+            return
+
+        flat: list[Response] = [
+            r for hits in local_hits_by_path.values() for r in hits
+        ]
+        if not flat:
+            return
+
+        # Filter down to responses whose effective remote cache is
+        # both enabled AND opted into the mirror — keeps a session
+        # that toggles the flag for one cache from accidentally
+        # syncing into another.
+        keep: list[Response] = []
+        for response in flat:
+            url_key = (
+                str(response.request.anonymize(mode="remove").url)
+                if response.request else None
+            )
+            eff = url_to_remote_cfg.get(url_key) if url_key else None
+            if eff is None:
+                eff = session_remote_cfg
+            if not eff.remote_cache_enabled:
+                continue
+            if not eff.mirror_local_to_remote:
+                continue
+            keep.append(response)
+
+        if not keep:
+            return
+
+        LOGGER.debug(
+            "Mirroring %s local-cache hit(s) to remote cache",
+            len(keep),
+        )
+        self._persist_remote(keep, url_to_remote_cfg, session_remote_cfg)
+
     def _send_many(
         self,
         requests: Iterator[PreparedRequest],
@@ -1447,7 +1509,32 @@ class Session(ABC):
             # mode) — no special-case for "stage skipped".
             new_hits: "list[Response] | SparkDataFrame | None" = None
 
+            # Snapshot per-request effective configs BEFORE we mutate copies
+            # for the worker pool. Keyed by URL string — the natural identity
+            # for matching a response back to its originating request. We
+            # cover the *whole* chunk (not just ``after_local``) so the
+            # local-hit mirror below can resolve per-request remote configs
+            # for responses that never reached stage 2.
+            url_to_remote_cfg: dict[str, CacheConfig] = {
+                str(r.anonymize(mode="remove").url): self._effective_remote_cfg(r, session_remote_cfg)
+                for r in chunk
+            }
+            url_to_local_cfg: dict[str, CacheConfig] = {
+                str(r.anonymize(mode="remove").url): self._effective_local_cfg(r, session_local_cfg)
+                for r in chunk
+            }
+
             if not after_local:
+                # Even when every request is a local hit we may still
+                # owe the remote a diff — call the mirror before the
+                # early return so an all-cache batch keeps the remote
+                # in sync without ever hitting the network.
+                if not is_spark:
+                    self._mirror_local_hits_to_remote(
+                        local_hits_by_path,
+                        url_to_remote_cfg,
+                        session_remote_cfg,
+                    )
                 yield ResponseBatch(
                     local_hits=local_hits,
                     remote_hits=remote_hits,
@@ -1455,18 +1542,6 @@ class Session(ABC):
                     spark=spark,
                 )
                 continue
-
-            # Snapshot per-request effective configs BEFORE we mutate copies
-            # for the worker pool. Keyed by URL string — the natural identity
-            # for matching a response back to its originating request.
-            url_to_remote_cfg: dict[str, CacheConfig] = {
-                str(r.anonymize(mode="remove").url): self._effective_remote_cfg(r, session_remote_cfg)
-                for r in after_local
-            }
-            url_to_local_cfg: dict[str, CacheConfig] = {
-                str(r.anonymize(mode="remove").url): self._effective_local_cfg(r, session_local_cfg)
-                for r in after_local
-            }
 
             # --- Stage 2: remote cache ---
             # Python path drains the StatementResult into Response
@@ -1500,6 +1575,17 @@ class Session(ABC):
                     [r for table_hits in remote_hits.values() for r in table_hits],
                     url_to_local_cfg,
                     session_local_cfg,
+                )
+                # Mirror local-cache hits to remote in bulk before any
+                # network fetch fires, when the remote config opts in.
+                # The remote MERGE deduplicates on the partition / public
+                # hash so this is idempotent for rows the remote already
+                # knows about — net effect is "diff sync" of any local
+                # entries the remote was missing.
+                self._mirror_local_hits_to_remote(
+                    local_hits_by_path,
+                    url_to_remote_cfg,
+                    session_remote_cfg,
                 )
 
             if not after_remote:
