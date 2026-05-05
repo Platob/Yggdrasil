@@ -313,37 +313,20 @@ class LocalPath(Path):
             if not allow_not_found:
                 raise
 
-    # ``_open`` falls through to :meth:`Path._open` (default — returns
-    # ``BytesIO(path=self, ...)``).
-
     # ==================================================================
-    # Open context — long-lived fd
+    # Local fd acquire — single long-lived os.open fd
     # ==================================================================
 
-    def open_context(self, mode: str = "rb", **kwargs: Any):
-        """Local-path open context: a single long-lived ``os.open`` fd.
+    def _open_fd(self, mode: str) -> None:
+        """Bind ``self._fd`` to a fresh ``os.open`` fd for *mode*.
 
-        Subsequent ``ctx.pread`` / ``ctx.pwrite`` / ``ctx.truncate``
-        calls reuse that fd via :func:`os.pread` / :func:`os.pwrite` /
-        :func:`os.ftruncate`. ``ctx.fileno()`` exposes the fd for
-        consumers that want it directly (mmap, pyarrow ``OSFile``).
-
-        Tests sometimes spoof :attr:`is_local` to ``False`` to drive
-        the remote-buffered codepath against a real local file. When
-        that happens, fall back to the base buffer context so the
-        spoof actually exercises remote semantics.
+        Auto-creates the parent directory for write/append/exclusive
+        modes so callers don't have to pre-mkdir. Read-only modes
+        leave the parent alone (a missing parent surfaces as
+        ``FileNotFoundError``).
         """
-        if not self.is_local:
-            return super().open_context(mode, **kwargs)
-
-        from yggdrasil.io.fs._open_context import _FdOpenContext
-
         os_path = self._os_path()
         flags = _flags_for_mode(mode)
-        # Match ``BytesIO``'s create-on-write behaviour for path-bound
-        # opens — ``wb`` / ``ab`` / ``xb`` / ``rb+`` should bring the
-        # parent into existence rather than failing on a missing
-        # directory.
         if (
             "w" in mode
             or "a" in mode
@@ -355,8 +338,7 @@ class LocalPath(Path):
                 os.makedirs(parent_str, exist_ok=True)
             flags |= os.O_CREAT
 
-        fd = os.open(os_path, flags, 0o644)
-        return _FdOpenContext(self, mode, fd=fd)
+        self._fd = os.open(os_path, flags, 0o644)
 
     # ==================================================================
     # Abstract hooks — whole-file primitives
@@ -414,10 +396,16 @@ class LocalPath(Path):
         and one wins — so callers like the streaming-folder log
         rely on this override to keep their JSON-line invariants.
 
+        ``mode="xb"`` rides ``O_EXCL`` so the create-and-write is
+        atomic — used by the AtomicLock sidecar dance, where two
+        concurrent acquirers must not both succeed. The base
+        implementation does an ``exists()`` check first and is
+        therefore racy.
+
         Other modes fall through to the base implementation (which
         funnels through :meth:`_pwrite`).
         """
-        if mode != "ab":
+        if mode not in ("ab", "xb"):
             return super().write_bytes(data, mode=mode, parents=parents)
 
         mv = memoryview(data)
@@ -426,8 +414,6 @@ class LocalPath(Path):
         if mv.format != "B" or mv.ndim != 1 or mv.itemsize != 1:
             mv = mv.cast("B")
         n = len(mv)
-        if n == 0:
-            return 0
 
         os_path = self._os_path()
         if parents:
@@ -435,7 +421,10 @@ class LocalPath(Path):
             if parent and not os.path.isdir(parent):
                 os.makedirs(parent, exist_ok=True)
 
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if mode == "ab":
+            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        else:  # xb
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
         if hasattr(os, "O_BINARY"):
@@ -443,13 +432,15 @@ class LocalPath(Path):
 
         fd = os.open(os_path, flags, 0o644)
         try:
+            if n == 0:
+                return 0
             view = mv
             total = 0
             while view:
                 written = os.write(fd, view)
                 if written == 0:
                     raise io.BlockingIOError(
-                        f"Short append at offset {total}"
+                        f"Short write at offset {total}"
                     )
                 view = view[written:]
                 total += written
@@ -519,21 +510,21 @@ class LocalPath(Path):
         *,
         default: Any = ...,
     ) -> bytes:
-        """Positional read via :func:`os.pread` (POSIX) or
-        ``lseek+read`` fallback. Single syscall pair per call,
-        opens a fresh fd, closes it before returning.
+        """Positional read via :func:`os.pread`.
 
-        ``n < 0`` reads from *pos* to EOF. Stat is done first to
-        size the read; if stat fails and *default* is supplied
-        (anything other than the ``...`` sentinel), returns
-        *default* instead of raising.
+        If the path has an active backing (acquired fd or transaction
+        buffer), routes through :class:`Path.pread` to use it. Otherwise
+        opens a fresh ``os.O_RDONLY`` fd, performs the read, closes it.
         """
+        if self.io_open:
+            return Path.pread(self, n, pos, default=default)
+
         if pos < 0:
             raise ValueError("pread position must be >= 0")
 
         if n < 0:
             try:
-                size = self.size
+                size = int(self._stat().size)
             except OSError:
                 if default is ...:
                     raise
@@ -589,15 +580,16 @@ class LocalPath(Path):
         *,
         parents: bool = True,
     ) -> int:
-        """Positional write via :func:`os.pwrite` (POSIX) or
-        ``lseek+write`` fallback. Single syscall pair per call.
+        """Positional write via :func:`os.pwrite`.
 
-        Honors ``parents``: when True, missing parent directories
-        are created via :func:`os.makedirs`. When False, a missing
-        parent surfaces as the underlying OSError. The previous
-        version always created parents regardless of the flag —
-        a real bug for callers explicitly requesting strict mode.
+        If the path has an active backing (acquired fd or transaction
+        buffer), routes through :class:`Path.pwrite` to use it.
+        Otherwise opens a fresh ``os.O_WRONLY|O_CREAT`` fd, performs
+        the write, closes it. Honors ``parents`` when True.
         """
+        if self.io_open:
+            return Path.pwrite(self, data, pos, parents=parents)
+
         mv = memoryview(data)
         if not mv.c_contiguous:
             mv = memoryview(bytes(mv))
@@ -655,17 +647,15 @@ class LocalPath(Path):
     def truncate(self, n: int, *, parents: bool = True) -> int:
         """Local fast path — single ``os.truncate`` syscall.
 
-        POSIX ``truncate(2)`` already implements the contract:
-
-        - shrink drops the tail
-        - extend zero-pads
-        - missing path → ``OSError(ENOENT)`` → ``FileNotFoundError``
-        - directory target → ``IsADirectoryError`` (Linux EISDIR)
-
-        ``parents`` is accepted for signature parity but unused —
-        :func:`os.truncate` won't create parent directories, and
-        silently auto-creating them here would diverge from POSIX.
+        If the path has an active backing, routes through
+        :class:`Path.truncate` to use it. Otherwise calls
+        :func:`os.truncate` directly. ``parents`` is accepted for
+        signature parity but unused — :func:`os.truncate` won't create
+        parent directories.
         """
+        if self.io_open:
+            return Path.truncate(self, n, parents=parents)
+
         del parents
 
         if n < 0:

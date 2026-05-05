@@ -8,13 +8,10 @@ A :class:`BytesIO` has one of two backings at any moment:
 - **memory** — a :class:`bytearray`. Fast for small/medium payloads.
   Used when there's no path bound and the payload fits under
   ``spill_bytes``.
-- **path-bound** — a :class:`Path` plus an :class:`OpenContext`
-  produced by :meth:`Path.open_context`. The context owns the live
-  state: a long-lived ``os.open`` fd for local paths, or a thin
-  passthrough whose ``pread`` / ``pwrite`` / ``truncate`` lands
-  straight on the path's own method for everything else. Buffers
-  forward every primitive to the context — there is no transaction
-  or scratch buffer in between.
+- **path-bound** — a :class:`Path` whose ``acquire_io`` set up its
+  own fd (local) or transaction :class:`BytesIO` (remote). The
+  buffer forwards every positional op (``pread`` / ``pwrite`` /
+  ``truncate``) straight to the path; the path is the I/O state.
 
 The path-bound file is either:
 
@@ -22,24 +19,6 @@ The path-bound file is either:
   :func:`tempfile.gettempdir`. Unlinked on close.
 - **external** (``_owns_spill_path = False``) — supplied by the
   caller via the ``path=`` constructor kwarg. Never unlinked.
-
-Why the context lives on Path
------------------------------
-
-Earlier drafts kept a fd or a scratch "transaction buffer" inside
-the buffer itself, branching on ``path.is_local`` at every read
-and write. That branching duplicated state and meant the buffer
-carried backend-specific plumbing.
-
-Moving the live state to :class:`Path.open_context` collapses both
-shapes into one API. The buffer's three primitives forward to
-``ctx.pread`` / ``ctx.pwrite`` / ``ctx.truncate`` without caring
-which backing is underneath. Local paths return a fd-backed
-context; everything else gets a passthrough whose primitives land
-straight on the path's own method — no scratch buffer, no commit
-on flush. Backends that want batched I/O (S3 multipart, paginated
-APIs) override :meth:`Path.open_context` to return a custom
-context, but the default has no hidden allocation.
 
 Lifecycle
 ---------
@@ -50,7 +29,7 @@ enter a ``with`` block still see :meth:`close` do the right thing.
 
 - :meth:`_acquire` opens the open context for path-bound buffers:
   * memory mode → no-op.
-  * path-bound → :meth:`Path.open_context` with the buffer's mode.
+  * path-bound → :meth:`Path.acquire_io` with the buffer's mode.
 - :meth:`flush` calls ``ctx.flush()`` — a no-op for fd-backed
   contexts (writes already in the kernel via :func:`os.pwrite`)
   and a path commit for buffer-backed contexts.
@@ -123,7 +102,6 @@ if TYPE_CHECKING:
     import xxhash
     from collections.abc import Iterable, Iterator
     from yggdrasil.io.fs import Path
-    from yggdrasil.io.fs._open_context import OpenContext
 
 
 __all__ = ["BytesIO", "BufferLike"]
@@ -385,10 +363,11 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         self._size: int = 0
         self._mtime: float = 0
         self._pos: int = 0
-        # Per-open context — fd-backed for local paths, scratch
-        # buffer-backed for remote. None when the buffer is in
-        # memory mode (no path) or unacquired.
-        self._ctx: "OpenContext | None" = None
+        # Per-open IO state. When acquired, points at ``self._spill_path``
+        # — the path itself owns the active fd or transaction buffer.
+        # ``None`` for memory-mode buffers and pre-acquire path-bound
+        # buffers.
+        self._ctx: "Path | None" = None
         self._mode: str = mode or "rb+"
         self._spill_bytes: int = int(spill_bytes)
         self._spill_ttl: int = int(spill_ttl)
@@ -563,23 +542,23 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 self._init_from_bytes(memoryview(src.read()))
                 return
 
-            # Mint a spill path, stream the source through ``ctx.pwrite``
-            # at the path so the syscall side is the path's concern.
+            # Mint a spill path, stream the source through the path's
+            # own ``pwrite`` so the syscall side is the path's concern.
             path = _mint_spill_path(self._ext_hint(), self._spill_ttl)
-            ctx = path.open_context("wb+")
+            path.acquire_io("wb+")
             total = 0
             try:
                 while True:
                     chunk = src.read(_COPY_CHUNK_SIZE)
                     if not chunk:
                         break
-                    written = ctx.pwrite(chunk, total)
+                    written = path.pwrite(chunk, total)
                     if written == 0:
                         break
                     total += written
-                ctx.flush()
+                path.flush()
             finally:
-                ctx.close()
+                path.close_io()
             self._buf = None
             self._size = total
             self._spill_path = path
@@ -589,20 +568,20 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
         # No seek/tell — drain blind, decide spill vs memory after.
         path = _mint_spill_path(self._ext_hint(), self._spill_ttl)
-        ctx = path.open_context("wb+")
+        path.acquire_io("wb+")
         total = 0
         try:
             while True:
                 chunk = src.read(_COPY_CHUNK_SIZE)
                 if not chunk:
                     break
-                written = ctx.pwrite(chunk, total)
+                written = path.pwrite(chunk, total)
                 if written == 0:
                     break
                 total += written
-            ctx.flush()
+            path.flush()
         finally:
-            ctx.close()
+            path.close_io()
 
         if total <= self._spill_bytes:
             payload = path.read_bytes()
@@ -676,8 +655,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         return self._spill_path is not None
 
     @property
-    def ctx(self) -> "OpenContext | None":
-        """The active per-open context, or ``None`` for memory mode."""
+    def ctx(self) -> "Path | None":
+        """The path acting as our active I/O context, or ``None``."""
         return self._ctx
 
     @property
@@ -779,7 +758,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             pass
 
     def _acquire(self) -> None:
-        """Open the per-open context against the bound path."""
+        """Acquire the bound path's I/O state (fd or transaction buffer)."""
         if self._spill_path is None:
             return
 
@@ -787,27 +766,25 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # opening work. If we raced and another writer holds it,
         # blocking here means we don't truncate (``wb`` mode includes
         # ``O_TRUNC``) the file while the holder is still writing.
-        # Hits both local and remote paths so backend-specific
-        # ``Path.lock`` overrides participate uniformly.
         self._acquire_path_lock()
 
         if self._ctx is not None:
             return
 
         try:
-            self._ctx = self._spill_path.open_context(self._mode)
+            self._spill_path.acquire_io(self._mode)
         except Exception:
-            # Open failed — drop the lock so the next acquirer can try.
             self._release_path_lock()
             raise
+        self._ctx = self._spill_path
 
         # Path-bound buffers don't keep an in-memory bytearray — the
-        # context owns the working bytes.
+        # path owns the working bytes.
         self._buf = None
-        self._size = self._ctx.size
-        self._mtime = self._ctx.mtime
+        self._size = int(self._spill_path.size)
+        mt = self._spill_path.mtime
+        self._mtime = float(mt) if mt is not None else 0.0
 
-        # Append modes start the visible cursor at EOF.
         if "a" in self._mode:
             self._pos = self._size
         else:
@@ -833,12 +810,11 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # cold. Pure-Python state — no failure modes worth handling.
         self.unpersist()
 
-        # Close the open context. It owns the live state — typically
-        # a long-lived fd for local paths — and resets any per-open
-        # bookkeeping when it dies.
+        # Drop the path's I/O state — its ``close_io`` flushes the
+        # transaction buffer (remote) or closes the fd (local).
         if self._ctx is not None:
             try:
-                self._ctx.close()
+                self._ctx.close_io()
             except Exception:
                 pass
             self._ctx = None
@@ -856,8 +832,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # another writer can take over the same target path safely.
         self._release_path_lock()
 
-    def _ensure_ctx(self) -> "OpenContext":
-        """Open the per-open context lazily; return it.
+    def _ensure_ctx(self) -> "Path":
+        """Lazily acquire the bound path's I/O state; return the path.
 
         Raises if there's no path to open against. Memory-mode buffers
         have no ctx — callers that need positional path I/O against a
@@ -875,10 +851,11 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # that write before opening explicitly.
         self._acquire_path_lock()
         try:
-            self._ctx = self._spill_path.open_context(self._mode)
+            self._spill_path.acquire_io(self._mode)
         except Exception:
             self._release_path_lock()
             raise
+        self._ctx = self._spill_path
         return self._ctx
 
     # ------------------------------------------------------------------
@@ -1109,12 +1086,11 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         self._spill_path = path
         self._owns_spill_path = True
 
-        # Open a context against the new path. ``rb+`` so subsequent
-        # reads AND writes work regardless of the original mode —
-        # the spill is internal scratch we own. Mode preservation
-        # matters only for the path-bound case, where the user
-        # picked the mode.
-        self._ctx = path.open_context("rb+")
+        # Acquire the new path's IO state. ``rb+`` so subsequent reads
+        # AND writes work regardless of the original mode — the spill
+        # is internal scratch we own.
+        path.acquire_io("rb+")
+        self._ctx = path
 
     def _ext_hint(self) -> str:
         """File extension suggestion for spill files."""
@@ -1386,7 +1362,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # ------------------------------------------------------------------
         if self._ctx is not None:
             try:
-                self._ctx.close()
+                self._ctx.close_io()
             except Exception:
                 pass
             self._ctx = None
@@ -1883,11 +1859,11 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             return new_instance
 
         # Owned spilled: copy the spill file via chunked pread→pwrite
-        # against the source's open context and a fresh context on the
-        # new path.
+        # against the source's acquired path and a fresh acquire on
+        # the new path.
         src_ctx = self._ensure_ctx()
         new_path = _mint_spill_path(new_instance._ext_hint(), new_instance._spill_ttl)
-        dst_ctx = new_path.open_context("rb+")
+        new_path.acquire_io("rb+")
         try:
             pos = 0
             while pos < size:
@@ -1895,13 +1871,13 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 chunk = src_ctx.pread(want, pos)
                 if not chunk:
                     break
-                written = dst_ctx.pwrite(chunk, pos)
+                written = new_path.pwrite(chunk, pos)
                 if written == 0:
                     break
                 pos += written
-            dst_ctx.flush()
+            new_path.flush()
         finally:
-            dst_ctx.close()
+            new_path.close_io()
 
         new_instance._buf = None
         new_instance._spill_path = new_path
@@ -2757,7 +2733,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
         if self._ctx is not None:
             try:
-                self._ctx.close()
+                self._ctx.close_io()
             except Exception:
                 pass
             self._ctx = None

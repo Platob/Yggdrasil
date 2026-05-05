@@ -402,7 +402,6 @@ class S3Path(Path):
                 return
             raise
         self._service.invalidate_cache(self.bucket, self.key)
-        self.invalidate_mirror()
 
     def _remove_dir(
         self,
@@ -622,7 +621,6 @@ class S3Path(Path):
                 Body=payload,
             )
             self._service.invalidate_cache(self.bucket, self.key)
-            self.invalidate_mirror()
             return len(payload)
 
         # Multipart via upload_fileobj. boto3 needs a file-like with
@@ -643,7 +641,6 @@ class S3Path(Path):
                 close()
 
         self._service.invalidate_cache(self.bucket, self.key)
-        self.invalidate_mirror()
 
         # ``total`` is None when we couldn't size the source up front;
         # post-upload we don't have a cheap byte count without a HEAD.

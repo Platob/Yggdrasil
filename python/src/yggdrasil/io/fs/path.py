@@ -1,77 +1,31 @@
 """Abstract filesystem path — ``pathlib.Path``-like API over :class:`URL`.
 
-Design
-------
+Path is the I/O resource. ``_acquire`` opens it: a long-lived
+``os.open`` fd for local paths, an in-memory transaction
+:class:`BytesIO` for remote ones (downloaded via :meth:`_pread`,
+committed via :meth:`_pwrite` on flush/close). All positional ops
+(:meth:`pread`, :meth:`pwrite`, :meth:`truncate`, :meth:`fileno`,
+:meth:`memoryview`) read or splice that single backing — no extra
+context object, no scratch buffer in between.
 
-* :class:`Path` is *not* a dataclass and has no metadata cache.
-  Pure-path manipulation (``parent``, ``joinpath``, ``name``, …)
-  delegates to :class:`URL`. Filesystem-flavoured calls (``stat``,
-  ``ls``, ``mkdir``, ``read_bytes``, ``copy_to``, …) live here on
-  top of a small abstract surface.
-* Subclasses implement seven hooks: :meth:`full_path`,
-  :meth:`_stat`, :meth:`_ls`, :meth:`_mkdir`, :meth:`_remove_file`,
-  :meth:`_remove_dir`, :meth:`_open`. Everything else derives.
-* :class:`Path` participates in the :class:`Disposable` graph from
-  :mod:`yggdrasil.disposable` so temp-file lifecycle and PathIO
-  ownership compose with the rest of the codebase.
+Backings are lazy. Constructing a path doesn't open anything;
+the first I/O op (or an explicit :meth:`acquire_io`) sets up the
+fd/transaction-buffer. The path's :class:`Disposable` ``_release``
+flushes and closes whatever's open.
 
-Lifecycle rules
----------------
-
-Every Path is constructed in the **open** state — :meth:`Disposable.open`
-runs from the constructor unless ``auto_open=False`` is passed —
-so naive callers never have to think about it. Acquire is a true
-no-op (Path doesn't materialize files just because someone built a
-reference to one). Release honors :attr:`temporary` and unlinks the
-backing file when set, dirty-bit-irrelevant.
-
-The lifecycle ``open()`` is intentionally separate from the I/O
-``open_io()``. ``Disposable.open()`` takes no arguments (it's the
-lifecycle "acquire") and returns ``self``; ``open_io(mode, …)`` takes
-a mode and returns a :class:`PathIO`. The earlier draft tried to
-overload ``open`` to mean both, which produced an infinite recursion
-inside the Path-level ``open(mode)`` shadow. The names are kept
-distinct here on purpose.
-
-Temporary paths
----------------
-
-:attr:`temporary` is a settable flag. Default ``False``. When True,
-:meth:`_release` unlinks the underlying file (``missing_ok=True``,
-exceptions swallowed). :meth:`with_tmp_name` mints a unique sibling
-or child path with the flag set; :meth:`as_temporary` /
-:meth:`as_persistent` flip it on an existing instance.
-
-When a :class:`PathIO` is opened against a temporary path, the
-PathIO adds the path as an owned child of the IO via
-:meth:`Disposable.add_owned`. The graph's claim refcount keeps
-the path alive until every PathIO over it has closed AND the path
-itself has closed — only then does the unlink fire.
-
-Staging
--------
-
-:meth:`make_staging` is the canonical entry point for "give me a
-fresh temporary file under this directory, and clean up any
-expired siblings while you're there." All backends share:
-
-- the TTL-encoded filename format (``…-<start_ts>-<end_ts>.<ext>``)
-  so external sweepers can age files lexically without coordinating
-  with the in-process rate limiter;
-- the per-parent rate-limited sweep (``ExpiringDict``-backed)
-  so a high-throughput caller doesn't flood the backend's listing
-  API on every staging call.
-
-Subclasses that need backend-specific bring-up (UC hierarchy for
-:class:`VolumePath`, prefix construction for an S3 bucket, …)
-provide their own factory that builds the parent path, then call
-:meth:`make_staging` on it.
+Subclasses implement seven hooks: :meth:`full_path`, :meth:`_stat`,
+:meth:`_ls`, :meth:`_mkdir`, :meth:`_remove_file`, :meth:`_remove_dir`,
+:meth:`_pread`, :meth:`_pwrite`. Local backends override
+:meth:`_open_fd` to plug in their own fd opener; remote backends
+inherit the default transaction-buffer behavior.
 """
 
 from __future__ import annotations
 
+import contextlib
 import io
 import logging
+import mmap
 import os
 import pathlib
 import re
@@ -87,7 +41,8 @@ from typing import (
     List,
     Optional,
     Tuple,
-    Union, )
+    Union,
+)
 
 import pyarrow as pa
 
@@ -97,9 +52,6 @@ from yggdrasil.disposable import Disposable
 from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.enums import MediaType
-
-if False:  # TYPE_CHECKING fence — avoid circular import at runtime
-    from yggdrasil.io.fs._open_context import OpenContext
 from yggdrasil.io.path_stat import PathKind, PathStats
 from yggdrasil.io.url import URL
 from yggdrasil.lazy_imports import local_path_class, tabular_io_class, PATH_SCHEME_FACTORY
@@ -107,6 +59,10 @@ from yggdrasil.lazy_imports import local_path_class, tabular_io_class, PATH_SCHE
 __all__ = ["Path", "register_path_class"]
 
 LOGGER = logging.getLogger(__name__)
+
+
+_HAS_PREAD = hasattr(os, "pread")
+_HAS_PWRITE = hasattr(os, "pwrite")
 
 
 # ---------------------------------------------------------------------------
@@ -124,11 +80,7 @@ def register_path_class(cls: type) -> type:
 
 
 def _select_path_class(obj: Any, default: type = ...) -> type:
-    """Pick the best :class:`Path` subclass for *obj*.
-
-    Order: exact-type match, registered handles() match, LocalPath
-    fallback. Lazy-loaded to break import cycles.
-    """
+    """Pick the best :class:`Path` subclass for *obj*."""
     if isinstance(obj, Path):
         target = type(obj)
         if target is not Path:
@@ -152,14 +104,8 @@ def _select_path_class(obj: Any, default: type = ...) -> type:
 
 
 # ---------------------------------------------------------------------------
-# Staging sweep rate-limit
+# Staging sweep rate-limit — TTL'd dict keyed by parent full_path()
 # ---------------------------------------------------------------------------
-#
-# Process-global TTL'd dict mapping ``parent.full_path()`` -> a sentinel
-# value.  An entry's *presence* signals "swept recently"; its absence
-# signals "due for a sweep."  ``ExpiringDict`` handles the expiry, the
-# size bound, and the thread-safety; we just use it as a "have we done
-# this in the last N seconds" oracle.
 
 _STAGING_SWEEP_INTERVAL_S: float = 300.0       # 5 minutes default
 _STAGING_SWEEP_MAX_KEYS: int = 256
@@ -168,62 +114,40 @@ _STAGING_SWEPT: ExpiringDict[str, bool] = ExpiringDict(
     max_size=_STAGING_SWEEP_MAX_KEYS,
 )
 
-
-# Match a TTL-encoded staging filename's trailing ``-<start>-<end>(.ext)*``.
-# Time-sortable layout: prefix-{start}-{end}-{seed}(.ext)*
-# Group 1 is the start_ts (epoch seconds), group 2 is the end_ts.
-# Anchored at start (after a dash-separated prefix) so the regex
-# captures the leading timestamps without being fooled by digits
-# that appear inside the random seed.
+# Match a TTL-encoded staging filename: ``<prefix>-<start>-<end>-<seed>(.ext)*``
 _STAGING_TMP_RE: re.Pattern = re.compile(r"-(\d+)-(\d+)-[0-9a-f]+(?:\.[^/]+)?$")
 
 
 # ---------------------------------------------------------------------------
-# Path — abstract, URL-delegating
+# Path
 # ---------------------------------------------------------------------------
 
 
 class Path(TabularIO[CastOptions], os.PathLike, ABC):
     """Abstract filesystem path with :class:`pathlib.Path`-like behaviour.
 
-    See the module docstring for the design and lifecycle rules.
+    Acquire-driven I/O state. ``_acquire`` opens the path: local paths
+    get an :func:`os.open` fd, remote paths get a transaction
+    :class:`BytesIO`. Positional ops (:meth:`pread`, :meth:`pwrite`,
+    :meth:`truncate`) flow through whichever backing is active.
+    ``_release`` commits the buffer (if dirty) and closes the fd.
 
-    Abstract hooks
-    --------------
-    - :meth:`full_path`     — absolute string rendering.
-    - :meth:`_stat`         — backend stat → :class:`PathStats`.
-    - :meth:`_ls`           — list children.
-    - :meth:`_mkdir`        — create directory.
-    - :meth:`_remove_file`  — delete file.
-    - :meth:`_remove_dir`   — delete directory.
-    - :meth:`_pread`        — whole-file read → :class:`BytesIO`.
-    - :meth:`_pwrite`       — whole-file write from :class:`BytesIO`.
-
-    :meth:`_open` is concrete by default — it returns
-    ``BytesIO(path=self, **options)``, which leans on
-    :meth:`_pread` / :meth:`_pwrite` for transport. Backends with
-    extra setup (lazy SDK connect, mode normalisation) override it
-    and ``super()._open(...)`` through.
-
-    Whole-file primitives are intentionally minimal: every backend
-    can express "give me the bytes" / "replace the bytes" cheaply.
-    Random-access reads (:meth:`pread`) and positional writes
-    (:meth:`pwrite`) have default implementations on top, so a
-    backend without native range support gets correct (if O(file
-    size)) behaviour for free. Backends with a real positional API
-    (``os.pread``, HTTP ``Range:`` requests) override
-    :meth:`pread` / :meth:`pwrite` for the fast path.
+    Concrete backends override the seven abstract hooks
+    (:meth:`full_path`, :meth:`_stat`, :meth:`_ls`, :meth:`_mkdir`,
+    :meth:`_remove_file`, :meth:`_remove_dir`, :meth:`_pread`,
+    :meth:`_pwrite`) plus :meth:`_open_fd` for local-fd backends.
     """
 
     scheme: ClassVar[str] = ""
-    __slots__ = ("url", "temporary")
+    __slots__ = (
+        "url",
+        "temporary",
+        "_mode",
+        "_fd",
+        "_transaction_buffer",
+        "_dirty",
+    )
 
-    # Override on a subclass to tighten/loosen the staging-sweep rate
-    # limit for that backend.  The module-level default applies to any
-    # backend that doesn't override.  Currently the rate limit is shared
-    # across backends via the module-level ExpiringDict — overriding here
-    # changes only the *check* threshold the override caller sees, not
-    # the dict TTL.  In practice 5 min is fine for every known backend.
     _STAGING_SWEEP_INTERVAL: ClassVar[float] = _STAGING_SWEEP_INTERVAL_S
 
     # ==================================================================
@@ -232,13 +156,7 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
 
     @classmethod
     def default_mime_type(cls):
-        """Path is format-agnostic — never auto-register against a mime type.
-
-        :class:`TabularIO.__init_subclass__` registers concrete subclasses
-        against their default mime; returning ``None`` opts Path (and every
-        scheme-specific subclass) out cleanly. The actual format for a
-        given Path comes from its URL extension at I/O time.
-        """
+        """Path is format-agnostic — never auto-register against a mime type."""
         return None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
@@ -261,10 +179,9 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         *,
         url: URL | None = None,
         temporary: bool = False,
+        mode: str = "rb+",
         auto_open: bool = True,
     ) -> None:
-        # TabularIO.__init__ runs Disposable.__init__ and seeds the
-        # cache / spill-path slots every TabularIO carries.
         TabularIO.__init__(self, media_type=None)
 
         if url is not None:
@@ -278,21 +195,31 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
 
         self.url = resolved
         self.temporary = bool(temporary)
+        self._mode = mode
+        self._fd = -1
+        self._transaction_buffer: "BytesIO | None" = None
+        self._dirty = False
 
         if auto_open:
             Disposable.open(self)
 
     # ==================================================================
-    # Disposable hooks
+    # Disposable hooks — lifecycle is cheap; I/O backings are lazy
     # ==================================================================
 
     def _acquire(self) -> None:
+        # Lifecycle marker only. The fd / transaction_buffer is opened
+        # lazily by ``_ensure_io`` on the first positional op so naked
+        # construction stays cheap.
         return
 
     def _release(self) -> None:
-        # Drop any persisted Arrow / Spark cache TabularIO is holding.
         try:
             self.unpersist()
+        except Exception:
+            pass
+        try:
+            self.close_io()
         except Exception:
             pass
         if not self.temporary:
@@ -303,21 +230,184 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
             pass
 
     # ==================================================================
-    # TabularIO hooks — open the local file, dispatch to its BytesIO
+    # I/O acquire — fd (local) or transaction_buffer:BytesIO (remote)
     # ==================================================================
 
-    # ``cached`` / ``persist`` / ``unpersist`` come from
-    # :class:`TabularIO` — shared ``_persisted_data`` slot driver.
+    @property
+    def io_open(self) -> bool:
+        """True when an fd or a transaction buffer is currently bound."""
+        return self._fd >= 0 or self._transaction_buffer is not None
+
+    @property
+    def fd(self) -> int:
+        """The currently-bound fd, or ``-1`` if none."""
+        return self._fd
+
+    @property
+    def transaction_buffer(self) -> "BytesIO | None":
+        """The currently-bound transaction buffer, or ``None``."""
+        return self._transaction_buffer
+
+    @property
+    def mode(self) -> str:
+        """The mode used for the next acquire (or already-open backing)."""
+        return self._mode
+
+    @mode.setter
+    def mode(self, value: str) -> None:
+        if self.io_open and value != self._mode:
+            raise RuntimeError(
+                f"Cannot change mode while {self!r} is open. "
+                "Call close_io() first."
+            )
+        self._mode = value
+
+    @property
+    def dirty(self) -> bool:
+        """True when the transaction buffer has uncommitted writes."""
+        return self._dirty
+
+    @property
+    def is_writing(self) -> bool:
+        """True when the active mode includes any write semantics."""
+        return any(c in self._mode for c in "wax+")
+
+    def acquire_io(self, mode: Optional[str] = None) -> "Path":
+        """Open the fd (local) or transaction buffer (remote) explicitly.
+
+        Idempotent for the same mode. If a different mode was already
+        open, closes and reopens. Returns ``self`` so the call chains.
+        """
+        if mode is not None and mode != self._mode:
+            if self.io_open:
+                self.close_io()
+            self._mode = mode
+        self._ensure_io()
+        return self
+
+    def close_io(self) -> None:
+        """Close the fd / commit and close the transaction buffer."""
+        buf = self._transaction_buffer
+        self._transaction_buffer = None
+        if buf is not None:
+            try:
+                if self._dirty:
+                    buf.seek(0)
+                    self._pwrite(buf)
+            finally:
+                try:
+                    if buf.opened:
+                        buf.close()
+                except Exception:
+                    pass
+        if self._fd >= 0:
+            fd, self._fd = self._fd, -1
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._dirty = False
+
+    @contextlib.contextmanager
+    def opened(self, mode: str = "rb+") -> "Iterator[Path]":
+        """Context manager: acquire I/O backing, release on exit."""
+        prev_mode = self._mode
+        was_open = self.io_open
+        self.acquire_io(mode)
+        try:
+            yield self
+        finally:
+            if not was_open:
+                self.close_io()
+            if not was_open:
+                self._mode = prev_mode
+
+    def _ensure_io(self) -> None:
+        """Open the fd or transaction_buffer if it isn't already."""
+        if self.io_open:
+            return
+        if self.is_local:
+            self._open_fd(self._mode)
+        else:
+            self._open_transaction_buffer(self._mode)
+
+    def _open_fd(self, mode: str) -> None:
+        """Local backend hook: bind ``self._fd`` to a fresh fd.
+
+        Default raises — :class:`LocalPath` overrides. Backends that
+        report :attr:`is_local` ``True`` must implement this.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} reports is_local=True but does not "
+            "override _open_fd."
+        )
+
+    def _open_transaction_buffer(self, mode: str) -> None:
+        """Default remote backend behavior: download into a transaction buffer.
+
+        Pulls the path's current bytes via :meth:`_pread`, splices into
+        a fresh :class:`BytesIO`, applies mode-specific policy
+        (truncate for ``w``, fail-if-exists for ``x``, fail-if-missing
+        for ``r`` without ``+``). Subsequent :meth:`pwrite` /
+        :meth:`truncate` mutate the buffer; :meth:`flush` /
+        :meth:`close_io` commits via :meth:`_pwrite`.
+        """
+        buf = BytesIO()
+        buf.open()
+
+        wants_existing = (
+            "r" in mode or "+" in mode or "a" in mode or "x" in mode
+        )
+        existing_loaded = False
+        if wants_existing:
+            try:
+                src = self._pread()
+            except FileNotFoundError:
+                if "r" in mode and "+" not in mode:
+                    buf.close()
+                    raise
+            else:
+                try:
+                    payload = src.to_bytes()
+                    if payload:
+                        buf.write(payload)
+                        existing_loaded = True
+                finally:
+                    src.close()
+
+        if "x" in mode and existing_loaded:
+            buf.close()
+            raise FileExistsError(
+                f"Cannot exclusively create {self.full_path()!r}: file exists."
+            )
+        if "w" in mode:
+            buf.truncate(0)
+
+        buf.seek(0)
+        self._transaction_buffer = buf
+        # Don't flag dirty for the initial download — only writes flag it.
+
+    def flush(self) -> None:
+        """Commit the transaction buffer to the path (no-op for fd / clean)."""
+        if not self._dirty or self._transaction_buffer is None:
+            return
+        buf = self._transaction_buffer
+        prev_pos = buf.tell()
+        buf.seek(0)
+        try:
+            self._pwrite(buf)
+        finally:
+            try:
+                buf.seek(prev_pos)
+            except Exception:
+                pass
+        self._dirty = False
+
+    # ==================================================================
+    # TabularIO hooks — open the path, dispatch to its BytesIO
+    # ==================================================================
 
     def _read_arrow_batches(self, options: CastOptions) -> Iterator["pa.RecordBatch"]:
-        """Stream Arrow batches by opening the file locally and delegating.
-
-        ``open_io("rb")`` returns a :class:`BytesIO` (or, when the URL
-        carries a tabular extension, the registered format leaf via
-        :meth:`BytesIO.__new__`'s registry dispatch). Either way the
-        buffer's ``_read_arrow_batches`` knows how to decode the bytes;
-        we just bridge open → read → close.
-        """
         buf = self.open_io("rb")
         try:
             yield from buf.read_arrow_batches(options=options)
@@ -356,20 +446,7 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         *,
         temporary: bool = True,
     ) -> "Path":
-        """Mint a unique sibling/child path with a TTL-encoded name.
-
-        Filename layout (time-sortable):
-        ``{prefix}{start}-{end}-{token}{suffix}``.
-
-        ``start`` and ``end`` come first so a plain lexical sort of
-        a directory's tmp files yields chronological order — handy
-        for tailing a stream of staged writes or for time-based
-        sweeps that prefer the oldest files. ``token`` is a random
-        16-char hex tiebreaker.
-
-        :data:`yggdrasil.io.fs.path._STAGING_TMP_RE` matches the
-        leading timestamps for the cleanup sweep.
-        """
+        """Mint a unique sibling/child path with a TTL-encoded name."""
         seed = os.urandom(8).hex()
         prefix = prefix or ""
         suffix = suffix or ""
@@ -377,10 +454,6 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         if ttl is None:
             name = f"{prefix}{seed}{suffix}"
         else:
-            # Zero-pad to 12 digits so lexical order matches numeric
-            # order across the full epoch range we'll see in
-            # practice (today is ~1.7e9, 12 digits covers up to
-            # year 33658).
             start = int(time.time())
             end = start + ttl
             name = f"{prefix}{start:012d}-{end:012d}-{seed}{suffix}"
@@ -403,44 +476,18 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         sweep: bool = True,
         force_sweep: bool = False,
     ) -> "Path":
-        """Mint a fresh temporary staging file under this directory.
-
-        ``path`` (optional) joins onto ``self`` first — pass a string
-        like ``"sub/dir"`` or a list of segments ``["sub", "dir"]`` to
-        nest the staging area under a subpath.  ``None`` (default) uses
-        ``self`` as the parent directly.
-
-        Pre-cleans the parent directory of expired siblings with the
-        same TTL-encoded name format, rate-limited per-parent so
-        high-throughput callers don't flood the backend's listing API.
-        Default rate limit: one sweep per parent per
-        :data:`_STAGING_SWEEP_INTERVAL_S` seconds (process-global).
-
-        Returns a ``temporary=True`` :class:`Path` whose name encodes
-        the lifetime so external sweepers can age it lexically.
-
-        Subclass hook
-        -------------
-        Subclasses needing backend-specific bring-up (e.g. UC hierarchy
-        creation for :class:`VolumePath`) compute the parent path and
-        call ``super().make_staging(...)``.  See
-        :meth:`VolumePath.staging_path` for the canonical example.
-        """
+        """Mint a fresh temporary staging file under this directory."""
         parent = self if path is None else self._join_segments(path)
 
         if sweep:
             try:
                 parent._sweep_expired_staging(force=force_sweep)
             except Exception:
-                # Sweep is best-effort.  A failed listing on a
-                # not-yet-existing parent is fine — the staging write
-                # below will create it.
                 LOGGER.debug(
                     "Staging sweep failed for %s; continuing",
                     parent, exc_info=True,
                 )
 
-        # Build the file: parent / "{tmp_prefix}{token}-{start}-{end}{ext}"
         ext = self._staging_extension(media_type)
         suffix = f".{ext}" if ext else ""
         return parent.with_tmp_name(
@@ -452,15 +499,12 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         )
 
     def _join_segments(self, path: Union[str, Iterable[str]]) -> "Path":
-        """Resolve ``path`` against ``self``, accepting str or segment list."""
         if isinstance(path, str):
             return self / path
-        # Iterable of segments — fall through joinpath.
         return self.joinpath(*path)
 
     @staticmethod
     def _staging_extension(media_type: Union["MediaType", str, None]) -> str:
-        """Resolve the staging file extension from a media-type hint."""
         if media_type is None:
             return ""
         try:
@@ -468,36 +512,15 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
             mt = MediaType.from_(media_type, default=MediaTypes.PARQUET)
             return mt.full_extension or ""
         except Exception:
-            # If MediaType resolution fails (no enum match), treat the
-            # input as a literal extension string.
             if isinstance(media_type, str):
                 return media_type.lstrip(".")
             return ""
 
     def _sweep_expired_staging(self, *, force: bool = False) -> bool:
-        """Best-effort sweep of expired staging files under this directory.
-
-        Returns ``True`` if a sweep ran, ``False`` if the rate limiter
-        skipped this call.
-
-        Rate-limited per parent ``full_path()`` via the module-level
-        :data:`_STAGING_SWEPT` :class:`ExpiringDict` — at most one
-        sweep per :data:`_STAGING_SWEEP_INTERVAL_S` per parent per
-        process.  The check-and-stamp is one ``ExpiringDict`` op so
-        concurrent callers in the same parent converge to one sweep
-        per interval.
-        """
         key = self.full_path()
-
         if not force:
-            # `__contains__` on ExpiringDict drops stale entries; if the
-            # key is still alive we've already swept this interval.
             if key in _STAGING_SWEPT:
                 return False
-
-        # Stamp BEFORE the walk so concurrent callers see "swept" and
-        # skip.  Even if the walk fails, the stamp gates retries to the
-        # next interval (failures are best-effort).
         _STAGING_SWEPT[key] = True
 
         now_ts = int(time.time())
@@ -528,11 +551,6 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
 
     @classmethod
     def reset_staging_sweep_state(cls, parent_full_path: Optional[str] = None) -> None:
-        """Test/maintenance hook: drop the rate-limit stamp.
-
-        ``None`` clears every tracked parent (next call to any parent
-        will sweep); a specific path clears just that parent.
-        """
         if parent_full_path is None:
             _STAGING_SWEPT.clear()
         else:
@@ -584,20 +602,6 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
     # ==================================================================
 
     def lock_path(self, *, read: bool = False, write: bool = True) -> str:
-        """Return the canonical sidecar lock-file path for this path.
-
-        The lock filename carries an access-intent suffix
-        (``.r.lock`` / ``.w.lock`` / ``.rw.lock``), so external
-        tooling can identify what kind of lock is held without
-        opening the file. Read locks are typically *skippable* by
-        cleanup or monitoring tools — multiple of them coexist by
-        design.
-
-        Override on a subclass that needs a different sidecar
-        location (e.g. a backend that forbids hidden files in the
-        target directory). The default builds ``<dir>/.<basename>.{suffix}.lock``
-        from :meth:`full_path`.
-        """
         from yggdrasil.io.buffer._concurrency import lock_path_for
         return lock_path_for(self.full_path(), read=read, write=write)
 
@@ -609,56 +613,7 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         wait: Any = None,
         stale_after_seconds: Any = None,
     ) -> "Any":
-        """Build (but don't acquire) a cross-process lock for this path.
-
-        Usage::
-
-            with path.lock(write=True, wait=30):
-                path.write_bytes(payload)
-
-        Backend dispatch:
-
-        - **Local paths** → :class:`FileLock` (``fcntl`` /
-          ``msvcrt``). Kernel-enforced, OS-released on process
-          death. Honours shared/exclusive (``LOCK_SH`` / ``LOCK_EX``).
-        - **Remote paths** (S3, GCS, ABFS, Databricks volumes,
-          memory FS, …) → :class:`AtomicLock`. The sidecar is
-          created with ``xb`` (atomic exclusive); other writers
-          poll until it disappears. ``shared`` is accepted for
-          parity but ignored — the lock is always exclusive.
-
-        ``wait`` is a :class:`WaitingConfig` argument: ``None``
-        (wait forever), a number (seconds), a ``dict`` of overrides,
-        or a ready-made :class:`WaitingConfig`. Backoff and retry
-        come from the config's ``interval`` / ``backoff`` /
-        ``max_interval`` knobs; on contention the lock loop calls
-        :meth:`WaitingConfig.sleep` and raises :class:`TimeoutError`
-        once the deadline is reached.
-
-        ``stale_after_seconds`` (atomic-lock only) controls how long
-        a lingering sidecar is tolerated before the next acquirer
-        force-unlinks it. Zero / negative disables staleness
-        recovery (correctness > liveness). Defaults to 15 minutes
-        — long enough that an honest holder heartbeating once per
-        minute is safe.
-
-        Semantics for the suffix:
-
-        - ``read=True, write=False`` → ``.r.lock``
-        - ``read=False, write=True`` (default) → ``.w.lock``
-        - ``read=True, write=True`` → ``.rw.lock``
-
-        On platforms / backends without :mod:`fcntl` /
-        :mod:`msvcrt` support and without ``xb`` mode, the returned
-        lock degrades to a no-op — the caller's I/O still proceeds,
-        just without cross-process coordination. Subclasses for
-        backends with a native CAS primitive (S3 conditional PUT,
-        GCS preconditions) can override this method entirely.
-        """
-        # Lazy import — _concurrency imports are leaves but the full
-        # ``yggdrasil.io.buffer`` package pulls in NestedIO which in
-        # turn imports ``Path``, so module-level imports here would
-        # close the cycle.
+        """Build (but don't acquire) a cross-process lock for this path."""
         from yggdrasil.io.buffer._concurrency import AtomicLock, FileLock
 
         suffix_path_str = self.lock_path(read=read, write=write)
@@ -668,12 +623,6 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
                 shared=(read and not write),
                 wait=wait,
             )
-        # Build a sibling :class:`Path` of the same backend pointing
-        # at the sidecar location. Atomic-create needs the same
-        # filesystem semantics as the target (exclusive-create,
-        # unlink, stat) — co-locating the sidecar is the simplest
-        # way to inherit them without the user wiring per-backend
-        # knobs.
         try:
             sidecar = type(self).from_(suffix_path_str)
         except Exception:
@@ -781,73 +730,16 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         with_root: bool = True,
     ) -> None: ...
 
-    def _open(
-        self,
-        mode: str = "rb",
-        *,
-        encoding: Optional[str] = None,
-        errors: Optional[str] = None,
-        newline: Optional[str] = None,
-        auto_open: bool = True,
-        touch: bool = False,
-    ) -> BytesIO:
-        """Default open: bind a :class:`BytesIO` to *self*.
-
-        Concrete now — every backend's I/O goes through the same
-        path-bound :class:`BytesIO`. Acquire pulls bytes via
-        :meth:`_pread`, commit pushes via :meth:`_pwrite`. Backends
-        only have to teach those two whole-file primitives; the
-        buffer takes care of cursors, spill, transactions, and mode
-        semantics.
-
-        ``encoding`` / ``errors`` / ``newline`` are accepted for
-        signature parity with :func:`builtins.open`; this layer is
-        binary-only. ``touch`` honors the "create on read of a
-        missing file" ergonomic by promoting through :meth:`touch`
-        when the caller asks for it.
-        """
-        del encoding, errors, newline  # binary-only at this layer
-
-        if touch and "r" in mode and "+" not in mode and not self.exists():
-            self.touch(exist_ok=True, parents=True)
-
-        return BytesIO(path=self, mode=mode, auto_open=auto_open)
-
     @abstractmethod
     def _pread(self) -> BytesIO:
-        """Whole-file read primitive — return a fresh :class:`BytesIO`.
-
-        Backends materialise the file's current bytes into the
-        returned buffer. The buffer is the caller's; it should be
-        treated as ephemeral (close after use). Missing files raise
-        :class:`FileNotFoundError`.
-
-        This is THE read primitive every other read operation
-        (:meth:`pread`, :meth:`read_bytes`, :meth:`pwrite`'s RMW
-        leg, :meth:`truncate`'s shrink leg) is built on top of.
-        Backends with a native range-read (POSIX ``os.pread``, S3
-        ``GetObject Range:``) should also override :meth:`pread` so
-        partial reads don't pay the whole-file download.
-        """
+        """Whole-file read primitive — return a fresh :class:`BytesIO`."""
 
     @abstractmethod
     def _pwrite(self, data: BytesIO) -> int:
-        """Whole-file write primitive — replace *self* with *data*'s bytes.
-
-        Implementations should overwrite (not splice) — *data*'s
-        full content from cursor 0 becomes the new file content,
-        truncating any prior tail. Returns the number of bytes
-        written.
-
-        Receives a :class:`BytesIO` so backends with a streaming
-        upload (multipart) can avoid materialising the whole payload
-        in memory. ``parents`` semantics — auto-create missing
-        parent directories — are the implementation's responsibility
-        and should be honored when the backend has the concept.
-        """
+        """Whole-file write primitive — replace *self* with *data*'s bytes."""
 
     # ==================================================================
-    # I/O entry point — distinct from the lifecycle Disposable.open()
+    # I/O entry points
     # ==================================================================
 
     def open_io(
@@ -860,49 +752,16 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         auto_open: bool = True,
         touch: bool = False,
     ) -> BytesIO:
+        """Open a :class:`BytesIO` bound to *self* with the given mode."""
+        del encoding, errors, newline  # binary-only at this layer
+
         if not self.opened:
             Disposable.open(self)
 
-        io = self._open(
-            mode,
-            encoding=encoding,
-            errors=errors,
-            newline=newline,
-            auto_open=auto_open,
-            touch=touch,
-        )
+        if touch and "r" in mode and "+" not in mode and not self.exists():
+            self.touch(exist_ok=True, parents=True)
 
-        return io
-
-    # ==================================================================
-    # Open context — fd for local, scratch buffer for remote
-    # ==================================================================
-
-    def open_context(
-        self,
-        mode: str = "rb",
-        **kwargs: Any,
-    ) -> "OpenContext":
-        """Open a per-I/O context bound to this path.
-
-        For local paths the returned context wraps a single long-lived
-        ``os.open`` fd; positional reads/writes route through
-        :func:`os.pread` / :func:`os.pwrite`. For every other path
-        the default returned context is a thin passthrough — every
-        ``ctx.pread`` / ``ctx.pwrite`` / ``ctx.truncate`` lands on
-        the path's own method, no scratch buffer in between. There
-        is no transaction buffer.
-
-        :class:`yggdrasil.io.buffer.BytesIO` calls this on its own
-        ``_acquire`` and forwards every primitive through the
-        returned context. Backends that want batched I/O (S3
-        multipart, paginated APIs, persistent connections) override
-        this method to return a custom :class:`OpenContext`. The
-        default carries no hidden allocation.
-        """
-        del kwargs  # accepted for forward compat with custom backends
-        from yggdrasil.io.fs._open_context import _PathOpenContext
-        return _PathOpenContext(self, mode)
+        return BytesIO(path=self, mode=mode, auto_open=auto_open)
 
     # ==================================================================
     # URL-delegated pure-path API
@@ -1052,104 +911,31 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
 
     @property
     def size(self) -> int:
+        if self._fd >= 0:
+            try:
+                return int(os.fstat(self._fd).st_size)
+            except OSError:
+                pass
+        if self._transaction_buffer is not None:
+            return int(self._transaction_buffer.size)
         return int(self._stat().size)
 
     @property
     def mtime(self) -> Optional[float]:
+        if self._fd >= 0:
+            try:
+                return float(os.fstat(self._fd).st_mtime)
+            except OSError:
+                return None
+        if self._transaction_buffer is not None:
+            try:
+                return float(self._transaction_buffer.mtime)
+            except Exception:
+                return None
         s = self._stat()
         if s.kind == PathKind.MISSING:
             return None
         return s.mtime
-
-    # ==================================================================
-    # Local mirror — opt-in remote→local caching
-    # ==================================================================
-    #
-    # Cross-cutting helper for backends that pay a network round-trip
-    # on every read. ``local_mirror`` keeps a sized/mtime-validated
-    # copy under ``~/.yggdrasil/mirror`` and serves it on cache hits
-    # without re-downloading. See :mod:`yggdrasil.io.fs.mirror` for
-    # the freshness model and on-disk layout.
-
-    def mirror_path(self, *, root: "Optional[Path]" = None) -> "Path":
-        """Return the canonical :class:`LocalPath` this path mirrors to.
-
-        Pure mapping — no I/O, no directory creation, no remote stat.
-        For local paths this is the identity. See
-        :meth:`local_mirror` for the I/O-bearing counterpart.
-        """
-        from yggdrasil.io.fs.mirror import mirror_path_for
-        return mirror_path_for(self, root=root)
-
-    def local_mirror(
-        self,
-        *,
-        ttl: float = 60.0,
-        force_refresh: bool = False,
-        root: "Optional[Path]" = None,
-        sweep: bool = True,
-        max_age: float = 7 * 24 * 60 * 60.0,
-    ) -> "Path":
-        """Return a local copy of *self*, refreshed if the remote changed.
-
-        For a local path this is the identity. For a remote path,
-        the mirror lives under ``~/.yggdrasil/mirror/<scheme>/<host>/<key>``
-        with a ``.<name>.ygmirror.json`` sidecar carrying the
-        ``(size, mtime, kind)`` from the last download. The mirror
-        is reused as long as the sidecar matches the remote ``stat``;
-        a process-local :class:`ExpiringDict` collapses repeat
-        validations within ``ttl`` seconds so hot loops don't even
-        round-trip the stat.
-
-        Pass ``ttl=0`` to disable the in-process verdict cache (every
-        call stats the remote once). Pass ``force_refresh=True`` to
-        ignore both the verdict and the sidecar and always download.
-
-        Mirror tree maintenance reuses the staging-sweep contract:
-        the first call against a given ``root`` in this process
-        triggers a single rate-limited sweep that deletes mirror
-        files older than ``max_age`` seconds (default: 7 days).
-        Pass ``sweep=False`` to skip that maintenance pass.
-        """
-        from yggdrasil.io.fs.mirror import ensure_local_mirror
-        return ensure_local_mirror(
-            self,
-            ttl=ttl,
-            force_refresh=force_refresh,
-            root=root,
-            sweep=sweep,
-            max_age=max_age,
-        )
-
-    def invalidate_mirror(self) -> None:
-        """Drop the in-process freshness verdict for *self*.
-
-        The next :meth:`local_mirror` call will re-stat the remote
-        and re-download iff the stat differs from the sidecar.
-        Does NOT delete the on-disk mirror file or sidecar.
-        """
-        from yggdrasil.io.fs.mirror import invalidate_mirror as _inv
-        _inv(self)
-
-    def as_mirror(
-        self,
-        *,
-        ttl: float = 60.0,
-        root: "Optional[Path]" = None,
-    ) -> "Path":
-        """Wrap *self* in a :class:`MirrorPath` proxy.
-
-        The returned path serves reads through the local mirror
-        (refreshed every ``ttl`` seconds) and applies writes locally
-        first, asynchronously syncing to *self* via daemon threads.
-        Call :meth:`MirrorPath.flush` to drain pending uploads.
-
-        For local paths this is still useful as a uniform handle
-        — :class:`MirrorPath` short-circuits the mirror dance and
-        delegates straight to the local filesystem.
-        """
-        from yggdrasil.io.fs.mirror_path import MirrorPath
-        return MirrorPath(self, root=root, ttl=ttl)
 
     # ==================================================================
     # Listing / walking
@@ -1295,9 +1081,6 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         parents: bool = True,
     ) -> None:
         del mode
-        # EAFP: try atomic exclusive-create when ``exist_ok=False``.
-        # The backend tells us via FileExistsError whether the file
-        # was already there — no separate ``exists()`` round-trip.
         if not exist_ok:
             try:
                 self.write_bytes(b"", mode="xb", parents=parents)
@@ -1306,8 +1089,6 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
                 raise FileExistsError(
                     f"Path already exists: {self.full_path()!r}"
                 )
-        # exist_ok=True: ``wb`` is fine — it overwrites an empty
-        # file with empty bytes (no-op semantically) or creates one.
         self.write_bytes(b"", parents=parents)
 
     def resolve(self, *, strict: bool = False) -> "Path":
@@ -1328,19 +1109,25 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         *,
         default: Any = ...,
     ) -> bytes:
-        """Positional read derived from :meth:`_pread`.
+        """Positional read.
 
-        Default implementation downloads the whole file via
-        :meth:`_pread` and slices in memory. Backends with a native
-        range read (``os.pread``, ``GetObject Range:``) should
-        override to avoid the whole-file fetch on partial reads.
-
-        ``n < 0`` reads from *pos* to end of file.
+        If the path has an active fd or transaction buffer, reads from
+        it. Otherwise does a single-shot :meth:`_pread` + slice. ``n <
+        0`` reads from *pos* to EOF.
         """
         if pos < 0:
             raise ValueError("pread position must be >= 0")
         if n == 0:
             return b""
+
+        if self._fd >= 0:
+            return _fd_pread(self._fd, n, pos)
+
+        if self._transaction_buffer is not None:
+            buf = self._transaction_buffer
+            if n < 0:
+                n = max(0, buf.size - pos)
+            return buf.pread(n, pos) if n else b""
 
         try:
             bio = self._pread()
@@ -1367,17 +1154,13 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         *,
         parents: bool = True,
     ) -> int:
-        """Positional write derived from :meth:`_pread` + :meth:`_pwrite`.
+        """Positional write.
 
-        Read–modify–write: pull the existing object, splice *data*
-        in at *pos* (zero-padding past EOF as POSIX pwrite would),
-        push it back. Backends with a native positional write
-        (``os.pwrite``) should override to skip the read leg.
-
-        ``parents`` is forwarded — :meth:`_pwrite` is responsible
-        for honoring it on backends that can create directories.
+        Active fd: single :func:`os.pwrite`. Active transaction buffer:
+        splice in place, mark dirty (commit on flush/close). Otherwise
+        single-shot RMW via :meth:`_pread` + :meth:`_pwrite`.
         """
-        del parents  # consumed by _pwrite implementations
+        del parents
         mv = memoryview(data)
         if not mv.c_contiguous:
             mv = memoryview(bytes(mv))
@@ -1389,6 +1172,16 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         if pos < 0:
             raise ValueError("pwrite position must be >= 0")
 
+        if self._fd >= 0:
+            return _fd_pwrite(self._fd, mv, pos)
+
+        if self._transaction_buffer is not None:
+            written = self._transaction_buffer.pwrite(mv, pos)
+            if written:
+                self._dirty = True
+            return written
+
+        # Single-shot RMW.
         try:
             bio = self._pread()
         except FileNotFoundError:
@@ -1402,8 +1195,77 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         finally:
             bio.close()
 
+    def truncate(self, n: int, *, parents: bool = True) -> int:
+        del parents
+        if n < 0:
+            raise ValueError(f"truncate size must be >= 0, got {n!r}")
+
+        if self._fd >= 0:
+            os.ftruncate(self._fd, n)
+            return n
+
+        if self._transaction_buffer is not None:
+            if int(self._transaction_buffer.size) != n:
+                self._dirty = True
+            self._transaction_buffer.truncate(n)
+            return n
+
+        stat = self._stat()
+        if stat.kind == PathKind.MISSING:
+            raise FileNotFoundError(
+                f"Cannot truncate non-existent path {self.full_path()!r}. "
+                "Call touch() first if you want create-or-resize semantics."
+            )
+        if stat.kind == PathKind.DIRECTORY:
+            raise IsADirectoryError(
+                f"Cannot truncate directory {self.full_path()!r}"
+            )
+
+        current = int(stat.size)
+        if n == current:
+            return n
+
+        bio = self._pread()
+        try:
+            bio.truncate(n)
+            bio.seek(0)
+            self._pwrite(bio)
+            return n
+        finally:
+            bio.close()
+
+    def fileno(self) -> int:
+        """Return the underlying fd, opening one if needed.
+
+        Local backends produce a real fd. Remote backends raise
+        :class:`OSError` — they have no kernel-side fd to expose.
+        """
+        if self._fd >= 0:
+            return self._fd
+        if self.is_local:
+            self._ensure_io()
+            if self._fd >= 0:
+                return self._fd
+        raise OSError(
+            f"{type(self).__name__} has no underlying file descriptor"
+        )
+
     def read_bytes(self, *, raise_error: bool = True) -> bytes:
-        """Whole-file read via :meth:`_pread`."""
+        """Whole-file read."""
+        if self._fd >= 0:
+            try:
+                size = int(os.fstat(self._fd).st_size)
+            except OSError:
+                if raise_error:
+                    raise
+                return b""
+            if size == 0:
+                return b""
+            return _fd_pread(self._fd, size, 0)
+
+        if self._transaction_buffer is not None:
+            return self._transaction_buffer.to_bytes()
+
         try:
             bio = self._pread()
         except (OSError, ValueError):
@@ -1422,17 +1284,14 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         mode: str = "wb",
         parents: bool = True,
     ) -> int:
-        """Whole-file write via :meth:`_pwrite`.
+        """Whole-file write. Modes: ``wb`` / ``xb`` / ``ab``.
 
-        Modes:
-        - ``wb`` (default): replace the whole file with *data*.
-        - ``xb``: same, but raise :class:`FileExistsError` if the
-          file already exists.
-        - ``ab``: append *data* at end of file.
-
-        ``parents`` is forwarded to :meth:`_pwrite`.
+        ``xb`` is best-effort atomic at the base layer (``exists()``
+        check then write). Backends with a real exclusive-create
+        primitive (POSIX ``O_EXCL``, S3 conditional PUT) override
+        this to make ``xb`` race-free.
         """
-        del parents  # consumed by _pwrite implementations
+        del parents
         if mode not in ("wb", "xb", "ab"):
             raise ValueError(
                 f"write_bytes mode must be one of 'wb', 'xb', 'ab'; got {mode!r}"
@@ -1451,7 +1310,6 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
             )
 
         if mode == "ab":
-            # Append: load existing, seek-to-end, write, push back.
             try:
                 bio = self._pread()
             except FileNotFoundError:
@@ -1467,44 +1325,11 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
             finally:
                 bio.close()
 
-        # wb / xb: replace whole file.
         bio = BytesIO()
         bio.open()
         try:
             if n > 0:
                 bio.write(bytes(mv))
-            bio.seek(0)
-            self._pwrite(bio)
-            return n
-        finally:
-            bio.close()
-
-    def truncate(self, n: int, *, parents: bool = True) -> int:
-        del parents  # consumed by _pwrite implementations
-        if n < 0:
-            raise ValueError(f"truncate size must be >= 0, got {n!r}")
-
-        stat = self._stat()
-        if stat.kind == PathKind.MISSING:
-            raise FileNotFoundError(
-                f"Cannot truncate non-existent path {self.full_path()!r}. "
-                "Call touch() first if you want create-or-resize semantics."
-            )
-        if stat.kind == PathKind.DIRECTORY:
-            raise IsADirectoryError(
-                f"Cannot truncate directory {self.full_path()!r}"
-            )
-
-        current = int(stat.size)
-        if n == current:
-            return n
-
-        # Pull, resize the in-memory buffer (truncate or zero-extend),
-        # push back. POSIX-equivalent semantics fall out of BytesIO's
-        # ``truncate``.
-        bio = self._pread()
-        try:
-            bio.truncate(n)
             bio.seek(0)
             self._pwrite(bio)
             return n
@@ -1539,7 +1364,7 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         buffer: BytesIO,
         *,
         batch_size: int = 1024 * 1024,
-        parents: bool = True
+        parents: bool = True,
     ):
         buffer = BytesIO.from_(buffer)
         return self._write_bytes_io(buffer, batch_size=batch_size, parents=parents)
@@ -1549,25 +1374,9 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         buffer: BytesIO,
         *,
         batch_size: int = 1024 * 1024,
-        parents: bool = True
+        parents: bool = True,
     ):
-        """Drain *buffer* into *self* via :meth:`_pwrite`.
-
-        Two fast paths kept:
-
-        - **src local-spilled, dst local** — :func:`shutil.copyfile`,
-          which routes through ``sendfile`` / ``fcopyfile`` /
-          ``CopyFileEx`` for kernel-side zero-copy.
-        - **src memory-mode, dst local with no path-bound buffer
-          machinery in between** — implicit via the same primitive.
-
-        Otherwise, we hand the whole buffer to :meth:`_pwrite`. The
-        backend decides how to drive the upload (multipart, single
-        PUT, fd splice). ``batch_size`` is forwarded for backends
-        that stream their upload; the in-process splice path
-        ignores it.
-        """
-        del batch_size  # reserved for backend-driven streaming uploads
+        del batch_size
         buffer = BytesIO.from_(buffer)
         if not buffer.opened:
             buffer.open()
@@ -1576,7 +1385,6 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
             finally:
                 buffer.close()
 
-        # Local-spilled src + local dst → kernel-side zero-copy.
         if (
             buffer.spilled
             and buffer.is_local
@@ -1591,8 +1399,6 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
                 pass
             return buffer.size
 
-        # General path: rewind and hand to _pwrite. The backend chooses
-        # the upload shape (multipart, single PUT, fd splice).
         prev_pos = buffer.tell()
         buffer.seek(0)
         try:
@@ -1603,7 +1409,6 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
             except Exception:
                 pass
         return buffer.size
-
 
     # ==================================================================
     # Streaming copy / write_from_stream
@@ -1616,31 +1421,6 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         batch_size: int = 4 * 1024 * 1024,
         parents: bool = True,
     ) -> int:
-        """Copy self to *dest*. Path-to-Path; chooses the fastest available shape.
-
-        Fast paths, in priority order:
-
-        1. **Local → local** — :func:`shutil.copyfile`, which uses
-           ``os.sendfile`` (Linux), ``fcopyfile`` (macOS), or
-           ``CopyFileEx`` (Windows) under the hood. Kernel-side
-           zero-copy on supported platforms; no userspace bytes touched.
-        2. **Same-type non-local → same-type non-local** — left to
-           subclasses to override (e.g. S3 server-side copy). Falls
-           through to the stream loop here.
-        3. **Streaming loop** — read the source via ``open_io("rb")``,
-           write the dest via ``open_io("wb")``, ``batch_size`` chunks.
-           Always correct, memory-bounded by ``batch_size``.
-
-        For mid-size cross-backend copies (one local, one remote)
-        where the buffered ``BytesIO`` already holds the whole payload
-        in memory or in a single mmap-able file, the dest's
-        ``write_bytes`` path is one round-trip vs. N for the loop.
-        That's handled implicitly: ``write_stream`` from the source's
-        ``open_io`` falls back to the loop, which is fine — backends
-        that benefit from single-shot uploads (Databricks, S3) already
-        aggregate the loop's chunks into one PUT in their ``BytesIO``
-        subclass's ``flush``.
-        """
         dest_path = Path.from_(dest)
         if dest_path == self:
             return self.size
@@ -1648,32 +1428,18 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         if parents:
             dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # --- Fast path 1: local → local via shutil.copyfile ---------------
-        # Both ends are local files on the same kernel — let the OS do
-        # the copy. shutil.copyfile picks sendfile/fcopyfile/CopyFileEx
-        # based on platform and falls back to its own optimized loop
-        # if those aren't available.
         if self.is_local and dest_path.is_local:
             src_full = self.full_path()
             dst_full = dest_path.full_path()
-            # Confirm source is a regular file before handing to shutil.
-            # shutil.copyfile would raise SameFileError on os.path.samefile;
-            # we already short-circuited equal paths above, but the local
-            # paths could differ textually while pointing to the same
-            # inode (symlinks, bind mounts). Let shutil's own check handle
-            # that — it raises SameFileError, which is the right behavior.
             try:
                 shutil.copyfile(src_full, dst_full)
             except shutil.SameFileError:
                 return self.size
-            # shutil.copyfile doesn't return bytes copied; stat the
-            # destination. Avoids a second open just to len() the source.
             try:
                 return int(dest_path._stat().size)
             except Exception:
                 return self.size
 
-        # --- Fallback: streaming loop -------------------------------------
         return self._copy_to_via_stream(dest_path, batch_size=batch_size)
 
     def _copy_to_via_stream(
@@ -1682,14 +1448,8 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         *,
         batch_size: int,
     ) -> int:
-        """Fallback path-to-path copy via paired open_io streams."""
         total = 0
         with self.open_io("rb") as src, dest_path.open_io("wb") as dst:
-            # If the source BytesIO is local-spilled, hand its mmap
-            # memoryview to write() in one shot — saves N chunked
-            # syscalls for medium files, and the dst's write() handles
-            # buffer-protocol inputs without an extra copy in the
-            # bytes-fast path.
             if (
                 isinstance(src, BytesIO)
                 and src.spilled
@@ -1700,8 +1460,6 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
                     n = dst.write(mv)
                     return int(n) if n is not None else len(mv)
                 finally:
-                    # Release the mmap before src closes — some platforms
-                    # are strict about closing a file with live maps.
                     del mv
 
             while True:
@@ -1719,38 +1477,15 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         batch_size: int = 4 * 1024 * 1024,
         parents: bool = True,
     ) -> int:
-        """Stream *src* into self.
-
-        Fast paths when *src* is a yggdrasil :class:`BytesIO`:
-
-        - **src local-spilled, self local** → :func:`shutil.copyfile`
-          between the two backing files. Kernel-side on supported
-          platforms; bypasses the open/loop/close cycle entirely.
-        - **src local-spilled, self non-local** → hand the source's
-          mmap :meth:`memoryview` to ``self.write_bytes`` in one
-          shot. One upload round-trip instead of N chunked writes.
-        - **src memory-mode** → ``self.write_bytes(src.to_bytes())``
-          directly. The source's bytes are already contiguous; the
-          stream loop would just chunk them back up.
-
-        Stdlib :class:`io.BytesIO` is also single-shotted via
-        :meth:`getvalue`. Anything else (HTTP response, pipe, named
-        pipe, stdin) falls through to the streaming loop.
-        """
-        # Fast paths for yggdrasil BytesIO sources -------------------------
         if isinstance(src, BytesIO):
             return self.write_bytes_io(src)
 
-        # Stdlib io.BytesIO — single-shot getvalue() also wins here.
         if isinstance(src, io.BytesIO):
-            # tell() so we respect any pre-positioned cursor, the same
-            # way the loop would.
             start = src.tell()
             payload = src.getvalue()[start:]
             self.write_bytes(payload, parents=parents)
             return len(payload)
 
-        # --- Fallback: streaming loop -------------------------------------
         total = 0
         with self.open_io("wb") as dst:
             while True:
@@ -1762,7 +1497,7 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         return total
 
     # ==================================================================
-    # memoryview / mmap — default fallbacks
+    # memoryview / mmap
     # ==================================================================
 
     def memoryview(
@@ -1824,7 +1559,7 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         return f"{type(self).__name__}({self.url!r})"
 
     # ==================================================================
-    # Context manager — single-shot, file-like idiom
+    # Context manager
     # ==================================================================
 
     def __enter__(self) -> "Path":
@@ -1841,6 +1576,79 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         if exc_type is not None:
             self._dirty = False
         self.close()
+
+
+# ---------------------------------------------------------------------------
+# fd helpers — POSIX pread/pwrite with portable fallbacks
+# ---------------------------------------------------------------------------
+
+
+def _fd_pread(fd: int, n: int, pos: int) -> bytes:
+    if n <= 0:
+        return b""
+    if _HAS_PREAD:
+        chunks: list[bytes] = []
+        remaining = n
+        offset = pos
+        while remaining > 0:
+            chunk = os.pread(fd, remaining, offset)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            got = len(chunk)
+            remaining -= got
+            offset += got
+        return b"".join(chunks)
+    saved = os.lseek(fd, 0, os.SEEK_CUR)
+    try:
+        os.lseek(fd, pos, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = n
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        try:
+            os.lseek(fd, saved, os.SEEK_SET)
+        except OSError:
+            pass
+
+
+def _fd_pwrite(fd: int, mv: memoryview, pos: int) -> int:
+    if mv.format != "B" or mv.ndim != 1 or mv.itemsize != 1:
+        mv = mv.cast("B")
+    if not mv.c_contiguous:
+        mv = memoryview(bytes(mv))
+    n = len(mv)
+    if n == 0:
+        return 0
+    if _HAS_PWRITE:
+        total = 0
+        while total < n:
+            written = os.pwrite(fd, bytes(mv[total:]), pos + total)
+            if written == 0:
+                raise io.BlockingIOError(f"Short write at offset {pos + total}")
+            total += written
+        return total
+    saved = os.lseek(fd, 0, os.SEEK_CUR)
+    try:
+        os.lseek(fd, pos, os.SEEK_SET)
+        total = 0
+        while total < n:
+            written = os.write(fd, bytes(mv[total:]))
+            if written == 0:
+                raise io.BlockingIOError(f"Short write at offset {pos + total}")
+            total += written
+        return total
+    finally:
+        try:
+            os.lseek(fd, saved, os.SEEK_SET)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------

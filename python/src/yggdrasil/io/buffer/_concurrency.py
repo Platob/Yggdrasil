@@ -783,8 +783,12 @@ class AtomicLock(AbstractLock):
 
         while True:
             try:
-                with self._path.open_io("xb") as io:
-                    io.write_bytes(payload)
+                # Drive the atomic create directly through the path —
+                # going through ``open_io`` would route through the
+                # path's shared acquire state, which races when many
+                # threads try to claim the lock against the same
+                # ``Path`` instance.
+                self._path.write_bytes(payload, mode="xb")
                 self._held = True
                 self._owner_payload = payload
                 return

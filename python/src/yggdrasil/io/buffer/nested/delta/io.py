@@ -153,17 +153,6 @@ class DeltaIO(FolderIO):
     _FINAL_TABULAR_IO: ClassVar[bool] = True
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        # Delta AddFiles are immutable: once a parquet leaf appears in
-        # a commit, its bytes never change (compaction writes a NEW
-        # file with a new path). That makes leaf-level mirroring safe
-        # by default — turn it on unless the caller opts out. The
-        # ``_delta_log/`` directory is intentionally NOT mirrored:
-        # it grows on every commit, the replay path enumerates it on
-        # demand, and a cached log is the wrong answer.
-        kwargs.setdefault("mirror_leaves", True)
-        # AddFile leaves never change in place — a longer freshness
-        # window costs nothing and saves stat round-trips.
-        kwargs.setdefault("mirror_ttl", 24 * 60 * 60.0)
         super().__init__(*args, **kwargs)
         self._log_dir: Path = self.path / "_delta_log"
         self._replay_cache: ReplayResult | None = None
