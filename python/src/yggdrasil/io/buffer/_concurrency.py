@@ -32,10 +32,11 @@ from __future__ import annotations
 import errno
 import os
 import re
+import socket
 import sys
 import tempfile
 import time
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 
@@ -44,6 +45,8 @@ __all__ = [
     "AbstractLock",
     "AtomicLock",
     "FileLock",
+    "OWNER_URL_ENV",
+    "compute_identifier_url",
     "lock_path_for",
     "lock_suffix_for",
     "cleanup_stale_spill_files",
@@ -95,6 +98,189 @@ _last_cleanup_at: float = 0.0
 # of the probe round-trips on a busy lock.
 _STALE_PROBE_EVERY_N: int = 8
 _STALE_PROBE_MIN_INTERVAL_S: float = 5.0
+
+
+def _safe_hostname() -> str:
+    """Return ``socket.gethostname()`` with whitespace sanitised.
+
+    The sidecar payload is whitespace-delimited, so a hostname
+    containing tabs/newlines/spaces would corrupt the parser's field
+    boundaries. Such hostnames are vanishingly rare on real systems
+    but cheap to defend against. Falls back to ``"unknown"`` on any
+    OS-level failure (e.g. tightly sandboxed containers without
+    a hostname configured).
+    """
+    try:
+        host = socket.gethostname() or "unknown"
+    except OSError:
+        return "unknown"
+    # Replace any whitespace with ``_`` so the field stays
+    # split-on-whitespace-safe on the consumer side.
+    return re.sub(r"\s+", "_", host)
+
+
+# Cached at module load — hostname is process-stable AND fork-safe.
+# ``socket.gethostname`` is cheap, but each lock-acquire shouldn't
+# pay the syscall. PID, by contrast, MUST be re-read per call so a
+# forked child gets its own identifier.
+_HOSTNAME: str = _safe_hostname()
+
+
+#: Env var that overrides :func:`compute_identifier_url`. When set, the
+#: function returns the value verbatim — used to propagate a driver-
+#: derived URL to Spark executors / subprocesses so every worker
+#: writing on behalf of the same job records the *same* owner. The
+#: name is exposed publicly so callers can plumb it into Spark conf
+#: via ``spark.executorEnv.YGG_OWNER_URL`` or pass-through env.
+OWNER_URL_ENV: str = "YGG_OWNER_URL"
+
+
+def compute_identifier_url() -> str:
+    """Return a URL-shaped identifier for the *current* compute owner.
+
+    Used as the third field of the lock's owner-info payload so a
+    sidecar on a remote backend (S3, GCS, ABFS, network FS, …) can
+    name its holder unambiguously across machines and pipelines —
+    PID alone collides cross-host, hostname alone hides the job /
+    run / task running on it.
+
+    Resolution order:
+
+    1. ``$YGG_OWNER_URL`` if set (verbatim) — the propagation hook
+       used by the Spark connector and other coordinators that need
+       worker processes to share an id with their driver.
+    2. **Databricks** (``DATABRICKS_RUNTIME_VERSION`` or
+       ``DB_CLUSTER_ID`` set) →
+       ``databricks://<cluster_id>/<pid>?host=<hostname>&job=<id>&run=<id>&task=<key>&notebook=<path>``
+       with each query field omitted when the underlying env var
+       is not set.
+    3. **Fallback** → ``host://<hostname>/<pid>``.
+
+    Pipeline detection is best-effort and env-var-only — we don't
+    reach into Spark / dbutils, that would couple the lock primitive
+    to heavyweight optional deps.
+
+    Always called fresh — the PID changes after ``os.fork()``, so a
+    cached URL would mis-attribute child processes.
+    """
+    from urllib.parse import quote, urlencode
+
+    env = os.environ.get
+
+    override = env(OWNER_URL_ENV)
+    if override:
+        # Sanitise: strip whitespace so the field stays
+        # split-on-whitespace-safe in the lock payload.
+        sanitised = re.sub(r"\s+", "_", override.strip())
+        if sanitised:
+            return sanitised
+
+    pid = os.getpid()
+
+    cluster = env("DB_CLUSTER_ID") or env("DATABRICKS_CLUSTER_ID")
+    if cluster or env("DATABRICKS_RUNTIME_VERSION"):
+        # ``host`` is always carried so the same-host stale-break
+        # check still works for FileLocks held by a Databricks driver
+        # against a local (DBFS-mounted) sidecar.
+        params: list[tuple[str, str]] = [
+            ("host", _HOSTNAME),
+            ("pid", str(pid)),
+        ]
+        # Job / Run / Task / Notebook tags — Databricks exposes a
+        # rotating cast of these depending on runtime version and
+        # workflow surface. Take the union and let the sidecar carry
+        # whichever ones happen to be set.
+        for env_key, qs_key in (
+            ("DATABRICKS_JOB_ID", "job"),
+            ("DATABRICKS_JOB_RUN_ID", "run"),
+            ("DATABRICKS_RUN_ID", "run"),
+            ("DATABRICKS_TASK_KEY", "task"),
+            ("DATABRICKS_TASK_RUN_ID", "task_run"),
+            ("DB_NOTEBOOK_PATH", "notebook"),
+            ("DB_NOTEBOOK_ID", "notebook_id"),
+        ):
+            value = env(env_key)
+            if value:
+                params.append((qs_key, value))
+        encoded = urlencode(params)
+        cluster_seg = quote(cluster or "cluster", safe="")
+        return f"databricks://{cluster_seg}/{pid}?{encoded}"
+
+    return f"host://{quote(_HOSTNAME, safe='')}/{pid}"
+
+
+def _host_from_owner_url(url: Optional[str]) -> Optional[str]:
+    """Extract the originating hostname from a compute-identifier URL.
+
+    For ``host://<host>/<pid>`` the netloc IS the hostname. For
+    ``databricks://<cluster>/<pid>?host=<host>&…`` the hostname rides
+    in the query string (the netloc is the cluster id). Anything
+    unknown or unparseable returns ``None`` so the caller skips the
+    same-host probe rather than guessing.
+    """
+    if not url:
+        return None
+    from urllib.parse import parse_qsl, unquote, urlparse
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    if parsed.scheme == "host":
+        netloc = parsed.netloc or parsed.path.lstrip("/")
+        return unquote(netloc) or None
+    if parsed.query:
+        for key, value in parse_qsl(parsed.query):
+            if key == "host" and value:
+                return value
+    return None
+
+
+def _build_owner_payload() -> bytes:
+    """Owner-info payload for both lock variants.
+
+    Format: ``{pid} {epoch} {compute_url}\\n`` (ASCII). Whitespace-
+    delimited so the existing positional parser still works — older
+    payloads (PID-only or PID+epoch) parse on the same offsets, with
+    the missing tail fields surfaced as ``None``.
+
+    The trailing field is :func:`compute_identifier_url` — see its
+    docstring for the schemes (``databricks://`` / ``host://``).
+    """
+    return f"{os.getpid()} {int(time.time())} {compute_identifier_url()}\n".encode("ascii")
+
+
+def _parse_owner_payload(head: bytes) -> Tuple[Optional[int], Optional[float], Optional[str]]:
+    """Decode an owner-info payload into ``(pid, epoch, compute_url)``.
+
+    Any field that's missing or unparseable comes back as ``None`` —
+    callers degrade gracefully (skip the same-host check, fall back
+    to mtime, etc.). Backward-compatible with the legacy PID-only
+    and PID+epoch payloads from before compute URLs were written.
+    """
+    if not head:
+        return None, None, None
+    try:
+        text = head.decode("ascii", errors="ignore")
+    except Exception:
+        return None, None, None
+    parts = text.split()
+    pid: Optional[int] = None
+    epoch: Optional[float] = None
+    compute_url: Optional[str] = None
+    if parts:
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            pid = None
+    if len(parts) >= 2:
+        try:
+            epoch = float(parts[1])
+        except ValueError:
+            epoch = None
+    if len(parts) >= 3:
+        compute_url = parts[2]
+    return pid, epoch, compute_url
 
 
 # ---------------------------------------------------------------------------
@@ -436,14 +622,15 @@ class FileLock(AbstractLock):
                 pass
 
     def _write_owner_info(self, fd: int) -> None:
-        """Stamp PID + timestamp into the lock file for diagnostics."""
+        """Stamp PID + timestamp + hostname into the lock file for diagnostics.
+
+        Hostname disambiguates owners across machines for sidecars
+        on shared / network filesystems where PID alone collides.
+        """
         try:
             os.ftruncate(fd, 0)
             os.lseek(fd, 0, os.SEEK_SET)
-            os.write(
-                fd,
-                f"{os.getpid()} {int(time.time())}\n".encode("ascii"),
-            )
+            os.write(fd, _build_owner_payload())
         except OSError:
             pass
 
@@ -454,18 +641,33 @@ class FileLock(AbstractLock):
         crashed process's fd); this just cleans up the visible
         sidecar so users / monitors don't see a perpetual
         ``.lock`` file.
+
+        Cross-host safety: ``os.kill(pid, 0)`` only proves liveness
+        for *this host's* process table. If the recorded hostname
+        doesn't match ours, we can't conclude the holder is dead —
+        leave the sidecar alone and let mtime-based recovery (or
+        the holder's own release) handle it.
         """
         try:
             with open(self._path, "rb") as fh:
-                head = fh.read(64)
+                # 512 B is more than enough for a Databricks compute
+                # URL even with all optional job/run/task/notebook
+                # query params populated.
+                head = fh.read(512)
         except OSError:
             return
-        try:
-            pid_str = head.decode("ascii", errors="ignore").split()[0]
-            pid = int(pid_str)
-        except (ValueError, IndexError):
+        pid, _epoch, compute_url = _parse_owner_payload(head)
+        if pid is None or pid <= 0 or pid == os.getpid():
             return
-        if pid <= 0 or pid == os.getpid():
+        # Cross-host safety: extract the originating hostname from
+        # the compute identifier URL and skip the local liveness
+        # probe when the holder lives on another machine. Legacy
+        # payloads without a URL (compute_url is None) keep the old
+        # same-host behaviour — those were local-fs-only by
+        # construction since AtomicLock didn't write owner info
+        # before either.
+        host = _host_from_owner_url(compute_url)
+        if host is not None and host != _HOSTNAME:
             return
         try:
             os.kill(pid, 0)
@@ -573,7 +775,11 @@ class AtomicLock(AbstractLock):
         # as :meth:`FileLock.acquire`. The remote round-trip cost of
         # the probe makes the throttle materially more impactful here.
         self._last_stale_probe_at = 0.0
-        payload = f"{os.getpid()} {int(time.time())}\n".encode("ascii")
+        # Hostname is part of the payload — for a remote sidecar
+        # (S3 / GCS / ABFS / network FS) the holder is plausibly
+        # on a different machine, and downstream tooling needs a
+        # way to attribute the lock without guessing.
+        payload = _build_owner_payload()
 
         while True:
             try:
@@ -639,17 +845,16 @@ class AtomicLock(AbstractLock):
         recorded_age: "float | None" = None
 
         # Embedded timestamp (preferred — survives backend mtime quirks).
+        # Read 128 bytes — enough for ``{pid} {epoch} {hostname}\n``
+        # even with a long FQDN, while still cheap on every backend.
         try:
-            head = self._path.pread(64, 0)
+            head = self._path.pread(128, 0)
         except Exception:
             head = None
         if head:
-            try:
-                parts = head.decode("ascii", errors="ignore").split()
-                if len(parts) >= 2:
-                    recorded_age = now - float(parts[1])
-            except (ValueError, IndexError):
-                pass
+            _pid, epoch, _host = _parse_owner_payload(head)
+            if epoch is not None:
+                recorded_age = now - epoch
 
         # Mtime fallback.
         if recorded_age is None:
