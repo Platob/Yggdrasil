@@ -41,19 +41,24 @@ class TestDataTypeAutotag:
         assert b"byte_size" not in StringType().autotag()
 
     def test_integer_carries_signed_flag(self) -> None:
+        # Specialized integer subclasses (``Int32Type``, ``UInt16Type``,
+        # ...) emit their own ``type_name`` so the tag carries width
+        # straight to downstream filters.
         signed = IntegerType(byte_size=4, signed=True).autotag()
         assert signed == {
-            b"type_name": b"integer",
+            b"type_name": b"int32",
             b"byte_size": b"4",
             b"signed": b"true",
         }
 
         unsigned = IntegerType(byte_size=2, signed=False).autotag()
+        assert unsigned[b"type_name"] == b"uint16"
         assert unsigned[b"signed"] == b"false"
 
     def test_float_carries_kind_and_size(self) -> None:
+        # ``Float64Type`` here — see :meth:`FloatingPointType.__new__`.
         assert FloatingPointType(byte_size=8).autotag() == {
-            b"type_name": b"float",
+            b"type_name": b"float64",
             b"byte_size": b"8",
         }
 
@@ -117,7 +122,8 @@ class TestFieldAutotag:
 
         assert out is f
         tags = f.tags or {}
-        assert tags[b"type_name"] == b"integer"
+        # Specialized id ``Int64Type`` ⇒ ``type_name=int64``.
+        assert tags[b"type_name"] == b"int64"
         assert tags[b"nullable"] == b"false"
         assert b"role" not in tags
 
@@ -162,7 +168,7 @@ class TestSchemaAutotag:
         out = s.autotag(tags={"layer": "silver"})
 
         id_tags = out["user_id"].tags or {}
-        assert id_tags[b"type_name"] == b"integer"
+        assert id_tags[b"type_name"] == b"int64"
         assert id_tags[b"signed"] == b"true"
         assert id_tags[b"nullable"] == b"false"
         assert id_tags[b"primary_key"] == b"true"

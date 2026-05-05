@@ -56,8 +56,9 @@ from :class:`FolderIO` and overrides:
 from __future__ import annotations
 
 import dataclasses
+import os
+import time
 import urllib.parse
-import uuid
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -1197,25 +1198,46 @@ class FolderIO(NestedIO[FolderOptions]):
         final_path = partition_root / final_name
         staging_path.rename(final_path)
 
+    def _next_child_name(self, *, media_type: Any) -> str:
+        """Mint a unique leaf name under :attr:`path`.
+
+        Replaces the inherited sequential ``part-NNNNN`` form (race-
+        prone under concurrent writers — two workers both compute the
+        same ``max_idx`` and clobber each other on rename) with the
+        time-sortable ``part-{epoch_ms}-{seed}.{ext}`` shape that
+        :meth:`_next_child_name_in` already uses for partitioned
+        writes. Both write paths now mint names the same way.
+        """
+        return self._mint_part_name(media_type)
+
     def _next_child_name_in(self, parent: Path, *, media_type: Any) -> str:
         """Mint a unique leaf name under ``parent``.
 
-        Uses a UUID-suffixed ``part-<hex>.<ext>`` form so concurrent
-        writers can't collide on the same final name — the legacy
-        sequential ``part-NNNNN`` scheme silently lost data when two
-        workers raced through ``_finalize_child`` against the same
-        partition (both saw the same ``max_idx``, both renamed to
-        ``part-(max_idx+1)``, the second clobbering the first).
+        Same scheme as :meth:`_next_child_name` — kept as a separate
+        entry point so subclasses keying off the parent directory
+        (Delta, Iceberg) can override the name without losing the
+        partition-write hook.
+        """
+        return self._mint_part_name(media_type)
 
-        Parent existence isn't checked here — callers create the
-        directory tree before they ask for a name. ``parent`` is
-        retained on the signature for parity with
-        :meth:`NestedIO._next_child_name` and so subclasses keying
-        off the parent path (Delta, Iceberg) can still override.
+    def _mint_part_name(self, media_type: Any) -> str:
+        """Build a ``part-{epoch_ms}-{seed}.{ext}`` leaf name.
+
+        ``epoch_ms`` (13 digits, milliseconds since epoch) sorts
+        chronologically under a plain lexical listing, which makes
+        tailing a stream of writes or running time-based sweeps
+        cheap. ``seed`` is 16 hex chars / 64 bits of entropy from
+        ``os.urandom`` — wide enough that two writers landing in the
+        same millisecond effectively never collide. The extension
+        comes from :meth:`_extension_for` so engine-specific suffixes
+        (``.snappy.parquet``, ``.zstd.parquet``, plain ``.parquet``)
+        round-trip unchanged.
         """
         ext = self._extension_for(media_type)
         suffix = f".{ext}" if ext else ""
-        return f"part-{uuid.uuid4().hex}{suffix}"
+        epoch_ms = int(time.time() * 1000)
+        seed = os.urandom(8).hex()
+        return f"part-{epoch_ms}-{seed}{suffix}"
 
 
 # ---------------------------------------------------------------------------

@@ -52,7 +52,7 @@ class TestParseCatalogColumnInfoStruct:
         # The DDL renderer never emits ``NOT NULL`` on struct children,
         # but the parsed dtype keeps the constraint so other engine
         # paths (Arrow, Polars, Spark) still see it.
-        ddl = f.to_databricks_ddl(put_name=False, put_not_null=False, put_comment=False)
+        ddl = f.to_databricks_ddl(with_name=False, with_nullable=False, with_comment=False)
         assert "NOT NULL" not in ddl
         assert ddl == (
             "STRUCT<`scheme` STRING, `userinfo` STRING, `host` STRING, "

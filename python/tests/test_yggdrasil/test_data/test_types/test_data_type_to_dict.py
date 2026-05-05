@@ -34,7 +34,10 @@ class TestPrimitiveDictRoundTrip(unittest.TestCase):
         d = original.to_dict()
         restored = DataType.from_dict(d)
 
-        self.assertEqual(d["id"], int(DataTypeId.INTEGER))
+        # ``IntegerType(byte_size=8, signed=True)`` redirects to the
+        # specialized ``Int64Type`` via ``__new__``; the dict id reflects
+        # the concrete subclass rather than the abstract ``INTEGER``.
+        self.assertEqual(d["id"], int(DataTypeId.INT64))
         self.assertIsInstance(restored, IntegerType)
         self.assertEqual(restored.byte_size, 8)
         self.assertTrue(restored.signed)
@@ -82,10 +85,17 @@ class TestPrimitiveDictRoundTrip(unittest.TestCase):
         self.assertEqual(restored.unit, "us")
 
     def test_timestamp_naive_preserves_none_tz(self) -> None:
+        from yggdrasil.data.enums.timezone import Timezone
+
         restored = DataType.from_dict(TimestampType(tz=None, unit="us").to_dict())
 
         self.assertIsInstance(restored, TimestampType)
-        self.assertIsNone(restored.tz)
+        # Naive timestamps now carry ``Timezone.NAIVE`` rather than
+        # ``None`` so the field type stays non-optional. ``__bool__``
+        # is False on the sentinel.
+        self.assertEqual(restored.tz, Timezone.NAIVE)
+        self.assertTrue(restored.tz.is_naive())
+        self.assertFalse(restored.tz)
 
     def test_duration_carries_unit(self) -> None:
         restored = DataType.from_dict(DurationType(unit="us").to_dict())

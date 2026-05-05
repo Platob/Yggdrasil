@@ -60,7 +60,19 @@ __all__ = [
     "BooleanType",
     "NumericType",
     "IntegerType",
+    "Int8Type",
+    "Int16Type",
+    "Int32Type",
+    "Int64Type",
+    "UInt8Type",
+    "UInt16Type",
+    "UInt32Type",
+    "UInt64Type",
     "FloatingPointType",
+    "Float8Type",
+    "Float16Type",
+    "Float32Type",
+    "Float64Type",
     "DecimalType",
     "TemporalType",
     "DateType",
@@ -153,6 +165,35 @@ def _literal_values_to_hint(values: tuple[object, ...]) -> object:
 
 
 DATA_TYPE_CLASSES: dict[int, type["DataType"]] = {}
+
+
+# ---------------------------------------------------------------------
+# Specialized fixed-width integer / float type-id tables.
+#
+# Mirrors :data:`yggdrasil.data.types.primitive.numeric._SPECIALIZED_INTEGER_TYPES`
+# but keyed by ``DataTypeId`` so ``from_parsed`` can recover ``(byte_size,
+# signed)`` from a specialized id without re-scanning the canonical
+# alias name. Generic ``INTEGER`` / ``FLOAT`` ids fall through to the
+# byte_size hint already on the parsed metadata.
+# ---------------------------------------------------------------------
+
+_INT_TYPE_ID_TO_PARAMS: dict[DataTypeId, tuple[int, bool]] = {
+    DataTypeId.INT8:   (1, True),
+    DataTypeId.INT16:  (2, True),
+    DataTypeId.INT32:  (4, True),
+    DataTypeId.INT64:  (8, True),
+    DataTypeId.UINT8:  (1, False),
+    DataTypeId.UINT16: (2, False),
+    DataTypeId.UINT32: (4, False),
+    DataTypeId.UINT64: (8, False),
+}
+
+_FLOAT_TYPE_ID_TO_SIZE: dict[DataTypeId, int] = {
+    DataTypeId.FLOAT8:  1,
+    DataTypeId.FLOAT16: 2,
+    DataTypeId.FLOAT32: 4,
+    DataTypeId.FLOAT64: 8,
+}
 
 
 @dataclass(frozen=True, repr=False)
@@ -411,6 +452,53 @@ class DataType(BaseChildrenFields, ABC):
         """
         return self.to_spark()
 
+    def as_polars(self) -> "DataType":
+        """Return a Polars-flavored :class:`DataType` for this type.
+
+        Same shape as :meth:`as_spark` — stays on the yggdrasil side
+        of the boundary and returns a :class:`DataType` whose
+        :meth:`to_polars` lands on a dtype Polars natively
+        represents. Defaults to ``self``; subclasses Polars can't
+        store at their declared width / precision override:
+
+        * ``Float8Type`` and ``Float16Type`` widen to ``Float32Type``
+          (Polars has no sub-32-bit floats);
+        * ``TimestampType`` / ``DurationType`` with second-precision
+          (``unit="s"``) widen to ``unit="ms"`` (Polars supports
+          ``ms`` / ``us`` / ``ns`` only);
+        * nested types (``ArrayType`` / ``MapType`` / ``StructType``)
+          recurse via ``as_polars`` on their child fields.
+
+        :class:`Field` and :class:`Schema` expose a matching
+        ``as_polars`` that delegates to ``self.dtype.as_polars`` and
+        re-wraps so callers chain through Field-shaped APIs without
+        dropping back to a plain :class:`DataType`.
+        """
+        return self
+
+    def as_spark(self) -> "DataType":
+        """Return a Spark-flavored :class:`DataType` for this type.
+
+        ``as_spark`` lives on the yggdrasil side of the boundary: it
+        returns a :class:`DataType` that maps cleanly to a Spark dtype
+        (i.e. one ``self.to_spark()`` would round-trip without a
+        widening-time surprise). For types Spark already represents
+        natively (signed ints, ``Float32`` / ``Float64``, ``Date``,
+        ``String`` / ``Binary`` / ``Boolean``, decimal, naive / UTC
+        timestamps), the default is to return ``self`` unchanged.
+
+        Subclasses Spark cannot represent natively
+        (``IntegerType`` with ``signed=False``, ``Float16Type``,
+        ``DurationType``, ``TimeType``, non-UTC ``TimestampType``)
+        override this to return the closest Spark-compatible
+        yggdrasil dtype — usually a widened integer, a ``StringType``,
+        or a naive timestamp. Nested types (``ArrayType`` /
+        ``MapType`` / ``StructType``) recurse via ``as_spark`` on
+        their child fields so the whole tree comes back
+        Spark-compatible in one call.
+        """
+        return self
+
     # ==================================================================
     # Autotag — Databricks-friendly shape tags
     # ==================================================================
@@ -544,11 +632,17 @@ class DataType(BaseChildrenFields, ABC):
         if parsed.type_id == DataTypeId.BOOL:
             return BooleanType()
 
-        if parsed.type_id == DataTypeId.INTEGER:
-            return IntegerType(byte_size=parsed.byte_size or 8, signed=True)
+        if parsed.type_id.is_integer:
+            byte_size, signed = _INT_TYPE_ID_TO_PARAMS.get(
+                parsed.type_id, (parsed.byte_size or 8, True)
+            )
+            return IntegerType(byte_size=byte_size, signed=signed)
 
-        if parsed.type_id == DataTypeId.FLOAT:
-            return FloatingPointType(byte_size=parsed.byte_size or 8)
+        if parsed.type_id.is_floating_point:
+            byte_size = _FLOAT_TYPE_ID_TO_SIZE.get(
+                parsed.type_id, parsed.byte_size or 8
+            )
+            return FloatingPointType(byte_size=byte_size)
 
         if parsed.type_id == DataTypeId.DECIMAL:
             precision = meta.precision if meta.precision is not None else 38
@@ -1872,7 +1966,15 @@ from .primitive import (
     DateType,
     DecimalType,
     DurationType,
+    Float8Type,
+    Float16Type,
+    Float32Type,
+    Float64Type,
     FloatingPointType,
+    Int8Type,
+    Int16Type,
+    Int32Type,
+    Int64Type,
     IntegerType,
     NullType,
     NumericType,
@@ -1881,4 +1983,8 @@ from .primitive import (
     TemporalType,
     TimeType,
     TimestampType,
+    UInt8Type,
+    UInt16Type,
+    UInt32Type,
+    UInt64Type,
 )

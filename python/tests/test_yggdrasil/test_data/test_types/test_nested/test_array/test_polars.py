@@ -56,7 +56,7 @@ class TestPolarsDtype:
         rebuilt = ArrayType.from_polars_type(original.to_polars())
 
         assert isinstance(rebuilt, ArrayType)
-        assert rebuilt.item_field.dtype.type_id == DataTypeId.INTEGER
+        assert rebuilt.item_field.dtype.type_id == DataTypeId.INT64
 
     def test_from_polars_rejects_non_list(self) -> None:
         with pytest.raises(TypeError, match="Unsupported Polars data type"):

@@ -2147,6 +2147,51 @@ class Field(BaseMetadata, BaseChildrenFields):
             return self.to_spark_schema()
         return self.to_pyspark_field()
 
+    def as_spark(self) -> "Field":
+        """Return a Field whose ``dtype`` is Spark-compatible.
+
+        Stays on the yggdrasil side of the boundary — the result is
+        still a :class:`Field`, just with :attr:`dtype` swapped for
+        whatever ``self.dtype.as_spark()`` produced (an unsigned int
+        widens to signed, a non-UTC timestamp drops to naive,
+        ``TimeType`` becomes ``StringType``, …). When the dtype is
+        already Spark-compatible the same instance is returned, so
+        the call is cheap to make defensively.
+
+        Use :meth:`to_pyspark_field` when you need an actual
+        ``pyspark.sql.types.StructField``.
+        """
+        spark_dtype = self.dtype.as_spark()
+        if spark_dtype is self.dtype:
+            return self
+        return Field(
+            name=self.name,
+            dtype=spark_dtype,
+            nullable=self.nullable,
+            metadata=self.metadata,
+        )
+
+    def as_polars(self) -> "Field":
+        """Return a Field whose ``dtype`` is Polars-compatible.
+
+        Mirrors :meth:`as_spark` for Polars — :attr:`dtype` is
+        swapped for ``self.dtype.as_polars()`` (sub-32-bit floats
+        widen to ``Float32Type``, second-precision timestamps /
+        durations widen to milliseconds, nested types recurse).
+        Already-Polars-compatible fields return ``self`` so the call
+        is cheap to make defensively. Use :meth:`to_polars_field`
+        when you need a real ``pl.Field``.
+        """
+        polars_dtype = self.dtype.as_polars()
+        if polars_dtype is self.dtype:
+            return self
+        return Field(
+            name=self.name,
+            dtype=polars_dtype,
+            nullable=self.nullable,
+            metadata=self.metadata,
+        )
+
     def to_schema(
         self,
         metadata: dict[str, Any] | None = None,
@@ -2174,17 +2219,17 @@ class Field(BaseMetadata, BaseChildrenFields):
     def to_databricks_ddl(
         self,
         *,
-        put_name: bool = True,
-        put_not_null: bool = True,
-        put_comment: bool = True,
+        with_name: bool = True,
+        with_nullable: bool = True,
+        with_comment: bool = True,
     ) -> str:
         from yggdrasil.databricks.sql.sql_utils import escape_sql_string, quote_ident
 
-        name_str = f"{quote_ident(self.name)} " if put_name else ""
-        nullable_str = " NOT NULL" if put_not_null and not self.nullable else ""
+        name_str = f"{quote_ident(self.name)} " if with_name else ""
+        nullable_str = " NOT NULL" if with_nullable and not self.nullable else ""
 
         comment_str = ""
-        if put_comment and self.metadata and b"comment" in self.metadata:
+        if with_comment and self.metadata and b"comment" in self.metadata:
             comment = (self.metadata[b"comment"] or b"").decode("utf-8")
             comment_str = f" COMMENT '{escape_sql_string(comment)}'"
 
@@ -2206,8 +2251,8 @@ class Field(BaseMetadata, BaseChildrenFields):
             # MERGE go through.
             struct_body = ", ".join(
                 Field.from_arrow(child).to_databricks_ddl(
-                    put_comment=False,
-                    put_not_null=False,
+                    with_comment=False,
+                    with_nullable=False,
                 )
                 for child in self.arrow_type
             )
@@ -2216,23 +2261,23 @@ class Field(BaseMetadata, BaseChildrenFields):
         if pa.types.is_map(self.arrow_type):
             map_type: pa.MapType = self.arrow_type
             key_type = Field.from_arrow(map_type.key_field).to_databricks_ddl(
-                put_name=False,
-                put_comment=False,
-                put_not_null=False,
+                with_name=False,
+                with_comment=False,
+                with_nullable=False,
             )
             val_type = Field.from_arrow(map_type.item_field).to_databricks_ddl(
-                put_name=False,
-                put_comment=False,
-                put_not_null=False,
+                with_name=False,
+                with_comment=False,
+                with_nullable=False,
             )
             return f"{name_str}MAP<{key_type}, {val_type}>{nullable_str}{comment_str}"
 
         if pa.types.is_list(self.arrow_type) or pa.types.is_large_list(self.arrow_type):
             list_type: pa.ListType = self.arrow_type
             elem_type = Field.from_arrow(list_type.value_field).to_databricks_ddl(
-                put_name=False,
-                put_comment=False,
-                put_not_null=False,
+                with_name=False,
+                with_comment=False,
+                with_nullable=False,
             )
             return f"{name_str}ARRAY<{elem_type}>{nullable_str}{comment_str}"
 

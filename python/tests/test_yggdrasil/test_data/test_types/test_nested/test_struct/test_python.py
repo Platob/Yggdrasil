@@ -254,7 +254,7 @@ class TestWithFields:
 
         assert len(dtype.fields) == 1
         assert dtype.fields[0].name == "a"
-        assert dtype.fields[0].dtype.type_id == DataTypeId.INTEGER
+        assert dtype.fields[0].dtype.type_id == DataTypeId.INT64
 
 
 # ---------------------------------------------------------------------------

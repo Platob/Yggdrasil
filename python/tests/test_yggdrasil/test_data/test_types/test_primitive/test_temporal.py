@@ -720,10 +720,15 @@ class TestMerge:
         assert merged.tz in {"UTC", "Europe/Paris"}
 
     def test_tz_unification_conflict_downcast_drops(self) -> None:
+        from yggdrasil.data.enums.timezone import Timezone
+
         merged = TimestampType(tz="UTC")._merge_with_same_id(
             TimestampType(tz="Europe/Paris"), downcast=True
         )
-        assert merged.tz is None
+        # Conflicting tzs collapse to the naive sentinel rather than
+        # ``None`` — the field is now ``Timezone`` (non-optional).
+        assert merged.tz == Timezone.NAIVE
+        assert merged.tz.is_naive()
 
     def test_cross_class_merge_raises(self) -> None:
         with pytest.raises(TypeError):

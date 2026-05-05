@@ -41,9 +41,11 @@ class TestParserAliases:
     @pytest.mark.parametrize(
         "name,expected_id",
         [
-            ("int", DataTypeId.INTEGER),
-            ("bigint", DataTypeId.INTEGER),
-            ("double precision", DataTypeId.FLOAT),
+            # Sized aliases route to the specialized type ids — generic
+            # ``INTEGER`` / ``FLOAT`` are reserved for unknown widths.
+            ("int", DataTypeId.INT32),
+            ("bigint", DataTypeId.INT64),
+            ("double precision", DataTypeId.FLOAT64),
             ("bytea", DataTypeId.BINARY),
             ("json", DataTypeId.JSON),
             ("timestamp_ntz", DataTypeId.TIMESTAMP),
@@ -53,44 +55,50 @@ class TestParserAliases:
         assert ParsedDataType.parse_type_id(name) is expected_id
 
     @pytest.mark.parametrize(
-        "expr,byte_size",
+        "expr,expected_id,byte_size",
         [
-            ("int8", 1),
-            ("int16", 2),
-            ("int32", 4),
-            ("int64", 8),
-            ("uint8", 1),
-            ("uint16", 2),
-            ("uint32", 4),
-            ("uint64", 8),
-            ("INT64", 8),
+            ("int8",   DataTypeId.INT8,   1),
+            ("int16",  DataTypeId.INT16,  2),
+            ("int32",  DataTypeId.INT32,  4),
+            ("int64",  DataTypeId.INT64,  8),
+            ("uint8",  DataTypeId.UINT8,  1),
+            ("uint16", DataTypeId.UINT16, 2),
+            ("uint32", DataTypeId.UINT32, 4),
+            ("uint64", DataTypeId.UINT64, 8),
+            ("INT64",  DataTypeId.INT64,  8),
         ],
     )
-    def test_sized_int_aliases(self, expr: str, byte_size: int) -> None:
+    def test_sized_int_aliases(
+        self, expr: str, expected_id: DataTypeId, byte_size: int
+    ) -> None:
         assert parse_data_type(expr) == ParsedDataType(
-            DataTypeId.INTEGER, DataTypeMetadata(byte_size=byte_size)
+            expected_id, DataTypeMetadata(byte_size=byte_size)
         )
 
     @pytest.mark.parametrize(
-        "expr,byte_size",
+        "expr,expected_id,byte_size",
         [
-            ("float16", 2),
-            ("float32", 4),
-            ("float64", 8),
-            ("FLOAT64", 8),
+            ("float16", DataTypeId.FLOAT16, 2),
+            ("float32", DataTypeId.FLOAT32, 4),
+            ("float64", DataTypeId.FLOAT64, 8),
+            ("FLOAT64", DataTypeId.FLOAT64, 8),
         ],
     )
-    def test_sized_float_aliases(self, expr: str, byte_size: int) -> None:
+    def test_sized_float_aliases(
+        self, expr: str, expected_id: DataTypeId, byte_size: int
+    ) -> None:
         assert parse_data_type(expr) == ParsedDataType(
-            DataTypeId.FLOAT, DataTypeMetadata(byte_size=byte_size)
+            expected_id, DataTypeMetadata(byte_size=byte_size)
         )
 
     @pytest.mark.parametrize(
         "expr", ["bfloat16", "bf16", "BFLOAT16"]
     )
     def test_bfloat16_aliases(self, expr: str) -> None:
+        # ``bfloat16`` shares storage width with IEEE half-precision and
+        # routes to the ``FLOAT16`` specialized id.
         assert parse_data_type(expr) == ParsedDataType(
-            DataTypeId.FLOAT, DataTypeMetadata(byte_size=2)
+            DataTypeId.FLOAT16, DataTypeMetadata(byte_size=2)
         )
 
     @pytest.mark.parametrize(
@@ -119,7 +127,7 @@ class TestParserAliases:
             DataTypeId.ARRAY,
             DataTypeMetadata(),
             children=(
-                ParsedDataType(DataTypeId.INTEGER, DataTypeMetadata(byte_size=8)),
+                ParsedDataType(DataTypeId.INT64, DataTypeMetadata(byte_size=8)),
             ),
         )
 
@@ -244,7 +252,7 @@ class TestParserTemporalFastPaths:
 
     def test_parse_data_type_function_delegates(self) -> None:
         assert parse_data_type("int") == ParsedDataType(
-            DataTypeId.INTEGER, DataTypeMetadata(byte_size=4)
+            DataTypeId.INT32, DataTypeMetadata(byte_size=4)
         )
 
     def test_variant_normalizes_to_object(self) -> None:
@@ -265,7 +273,7 @@ class TestParserPythonSyntax:
             DataTypeId.ARRAY,
             DataTypeMetadata(),
             children=(
-                ParsedDataType(DataTypeId.INTEGER, DataTypeMetadata(byte_size=4)),
+                ParsedDataType(DataTypeId.INT32, DataTypeMetadata(byte_size=4)),
             ),
         )
 
@@ -275,7 +283,7 @@ class TestParserPythonSyntax:
             DataTypeMetadata(),
             children=(
                 ParsedDataType(DataTypeId.STRING, DataTypeMetadata()),
-                ParsedDataType(DataTypeId.INTEGER, DataTypeMetadata(byte_size=4)),
+                ParsedDataType(DataTypeId.INT32, DataTypeMetadata(byte_size=4)),
             ),
         )
 
@@ -285,7 +293,7 @@ class TestParserPythonSyntax:
             DataTypeMetadata(ordered=True, extras={"container": "tuple"}),
             children=(
                 ParsedDataType(
-                    DataTypeId.INTEGER,
+                    DataTypeId.INT32,
                     DataTypeMetadata(byte_size=4),
                     name="f0",
                 ),
@@ -304,13 +312,13 @@ class TestParserPythonSyntax:
 
     def test_optional_marks_inner_nullable(self) -> None:
         assert ParsedDataType.parse("Optional[int]") == ParsedDataType(
-            DataTypeId.INTEGER,
+            DataTypeId.INT32,
             DataTypeMetadata(nullable=True, byte_size=4),
         )
 
     def test_pipe_union_with_none_marks_nullable(self) -> None:
         assert ParsedDataType.parse("int | None") == ParsedDataType(
-            DataTypeId.INTEGER,
+            DataTypeId.INT32,
             DataTypeMetadata(nullable=True, byte_size=4),
         )
 
@@ -319,7 +327,7 @@ class TestParserPythonSyntax:
             DataTypeId.UNION,
             DataTypeMetadata(nullable=True),
             children=(
-                ParsedDataType(DataTypeId.INTEGER, DataTypeMetadata(byte_size=4)),
+                ParsedDataType(DataTypeId.INT32, DataTypeMetadata(byte_size=4)),
                 ParsedDataType(DataTypeId.STRING, DataTypeMetadata()),
             ),
         )
@@ -329,7 +337,7 @@ class TestParserPythonSyntax:
             DataTypeId.UNION,
             DataTypeMetadata(),
             children=(
-                ParsedDataType(DataTypeId.INTEGER, DataTypeMetadata(byte_size=4)),
+                ParsedDataType(DataTypeId.INT32, DataTypeMetadata(byte_size=4)),
                 ParsedDataType(DataTypeId.STRING, DataTypeMetadata()),
             ),
         )
@@ -436,7 +444,7 @@ class TestParserSQLSyntax:
             DataTypeMetadata(),
             children=(
                 ParsedDataType(DataTypeId.STRING, DataTypeMetadata()),
-                ParsedDataType(DataTypeId.INTEGER, DataTypeMetadata(byte_size=4)),
+                ParsedDataType(DataTypeId.INT32, DataTypeMetadata(byte_size=4)),
             ),
         )
 
@@ -446,7 +454,7 @@ class TestParserSQLSyntax:
             DataTypeMetadata(),
             children=(
                 ParsedDataType(
-                    DataTypeId.INTEGER,
+                    DataTypeId.INT32,
                     DataTypeMetadata(byte_size=4),
                     name="a",
                 ),
@@ -520,7 +528,7 @@ class TestParserSQLSyntax:
                             DataTypeMetadata(),
                             children=(
                                 ParsedDataType(
-                                    DataTypeId.INTEGER,
+                                    DataTypeId.INT32,
                                     DataTypeMetadata(byte_size=4),
                                     name="a",
                                 ),
@@ -548,7 +556,7 @@ class TestParserSQLSyntax:
             DataTypeId.DICTIONARY,
             DataTypeMetadata(ordered=True),
             children=(
-                ParsedDataType(DataTypeId.INTEGER, DataTypeMetadata(byte_size=4)),
+                ParsedDataType(DataTypeId.INT32, DataTypeMetadata(byte_size=4)),
                 ParsedDataType(DataTypeId.STRING, DataTypeMetadata()),
             ),
         )
@@ -558,7 +566,7 @@ class TestParserSQLSyntax:
             DataTypeId.DICTIONARY,
             DataTypeMetadata(),
             children=(
-                ParsedDataType(DataTypeId.INTEGER, DataTypeMetadata(byte_size=4)),
+                ParsedDataType(DataTypeId.INT32, DataTypeMetadata(byte_size=4)),
                 ParsedDataType(DataTypeId.STRING, DataTypeMetadata()),
             ),
         )
@@ -721,8 +729,9 @@ class TestParserTypeIdMatrix:
         "expr,expected_id",
         [
             ("bool", DataTypeId.BOOL),
-            ("integer", DataTypeId.INTEGER),
-            ("float", DataTypeId.FLOAT),
+            # Sized aliases now resolve to specialized ids.
+            ("integer", DataTypeId.INT32),
+            ("float", DataTypeId.FLOAT32),
             ("date", DataTypeId.DATE),
             ("time", DataTypeId.TIME),
             ("timestamp", DataTypeId.TIMESTAMP),
@@ -785,7 +794,7 @@ class TestParserTreeAccess:
         assert book.children[0].name == "book_id"
         assert book.children[0].type_id is DataTypeId.STRING
         assert book.children[1].name == "version"
-        assert book.children[1].type_id is DataTypeId.INTEGER
+        assert book.children[1].type_id is DataTypeId.INT32
         assert book.children[1].byte_size == 4
 
         tags = parsed.children[1]
