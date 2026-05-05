@@ -317,6 +317,48 @@ class LocalPath(Path):
     # ``BytesIO(path=self, ...)``).
 
     # ==================================================================
+    # Open context — long-lived fd
+    # ==================================================================
+
+    def open_context(self, mode: str = "rb", **kwargs: Any):
+        """Local-path open context: a single long-lived ``os.open`` fd.
+
+        Subsequent ``ctx.pread`` / ``ctx.pwrite`` / ``ctx.truncate``
+        calls reuse that fd via :func:`os.pread` / :func:`os.pwrite` /
+        :func:`os.ftruncate`. ``ctx.fileno()`` exposes the fd for
+        consumers that want it directly (mmap, pyarrow ``OSFile``).
+
+        Tests sometimes spoof :attr:`is_local` to ``False`` to drive
+        the remote-buffered codepath against a real local file. When
+        that happens, fall back to the base buffer context so the
+        spoof actually exercises remote semantics.
+        """
+        if not self.is_local:
+            return super().open_context(mode, **kwargs)
+
+        from yggdrasil.io.fs._open_context import _FdOpenContext
+
+        os_path = self._os_path()
+        flags = _flags_for_mode(mode)
+        # Match ``BytesIO``'s create-on-write behaviour for path-bound
+        # opens — ``wb`` / ``ab`` / ``xb`` / ``rb+`` should bring the
+        # parent into existence rather than failing on a missing
+        # directory.
+        if (
+            "w" in mode
+            or "a" in mode
+            or "x" in mode
+            or ("r" in mode and "+" in mode)
+        ):
+            parent_str = os.path.dirname(os_path)
+            if parent_str:
+                os.makedirs(parent_str, exist_ok=True)
+            flags |= os.O_CREAT
+
+        fd = os.open(os_path, flags, 0o644)
+        return _FdOpenContext(self, mode, fd=fd)
+
+    # ==================================================================
     # Abstract hooks — whole-file primitives
     # ==================================================================
     #

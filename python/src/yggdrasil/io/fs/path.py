@@ -97,6 +97,9 @@ from yggdrasil.disposable import Disposable
 from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.enums import MediaType
+
+if False:  # TYPE_CHECKING fence — avoid circular import at runtime
+    from yggdrasil.io.fs._open_context import OpenContext
 from yggdrasil.io.path_stat import PathKind, PathStats
 from yggdrasil.io.url import URL
 from yggdrasil.lazy_imports import local_path_class, tabular_io_class, PATH_SCHEME_FACTORY
@@ -870,6 +873,42 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         )
 
         return io
+
+    # ==================================================================
+    # Open context — fd for local, scratch buffer for remote
+    # ==================================================================
+
+    def open_context(
+        self,
+        mode: str = "rb",
+        *,
+        spill_bytes: int = 128 * 1024 * 1024,
+        spill_ttl: int = 86400,
+    ) -> "OpenContext":
+        """Open a per-IO context bound to this path.
+
+        For local paths the returned context wraps a single long-lived
+        ``os.open`` fd; positional reads/writes route through
+        :func:`os.pread` / :func:`os.pwrite`. For remote paths the
+        context holds a scratch :class:`BytesIO` filled via
+        :meth:`_pread`; reads/writes hit the scratch and are committed
+        back via :meth:`_pwrite` on flush.
+
+        :class:`yggdrasil.io.buffer.BytesIO` calls this on its own
+        ``_acquire`` and forwards every primitive (``pread``,
+        ``pwrite``, ``truncate``, …) through the returned context.
+        Backends that want a custom backing (e.g. an S3 path that
+        streams a multipart upload directly without buffering in
+        memory) override this method to return a custom
+        :class:`OpenContext`.
+        """
+        from yggdrasil.io.fs._open_context import _BufferOpenContext
+        return _BufferOpenContext(
+            self,
+            mode,
+            spill_bytes=spill_bytes,
+            spill_ttl=spill_ttl,
+        )
 
     # ==================================================================
     # URL-delegated pure-path API
