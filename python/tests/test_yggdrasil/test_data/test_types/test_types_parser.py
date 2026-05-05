@@ -27,6 +27,7 @@ from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.parser import (
     DataTypeMetadata,
     ParsedDataType,
+    _parse_cached,
     parse_data_type,
 )
 
@@ -808,3 +809,230 @@ class TestParserTreeAccess:
         assert attrs.key.type_id is DataTypeId.STRING
         assert attrs.value is not None
         assert attrs.value.type_id is DataTypeId.STRING
+
+
+# ---------------------------------------------------------------------------
+# Postfix `[]` array notation (PostgreSQL / Hive style)
+# ---------------------------------------------------------------------------
+
+
+class TestParserPostfixArray:
+
+    def test_int_postfix_becomes_array(self) -> None:
+        assert parse_data_type("int[]") == ParsedDataType(
+            DataTypeId.ARRAY,
+            DataTypeMetadata(),
+            children=(
+                ParsedDataType(DataTypeId.INT32, DataTypeMetadata(byte_size=4)),
+            ),
+        )
+
+    def test_text_postfix_becomes_array(self) -> None:
+        assert parse_data_type("text[]") == ParsedDataType(
+            DataTypeId.ARRAY,
+            DataTypeMetadata(),
+            children=(ParsedDataType(DataTypeId.STRING, DataTypeMetadata()),),
+        )
+
+    def test_string_postfix_does_not_collide_with_metadata(self) -> None:
+        # `string[]` is array-of-string, NOT string with empty metadata.
+        assert parse_data_type("string[]") == ParsedDataType(
+            DataTypeId.ARRAY,
+            DataTypeMetadata(),
+            children=(ParsedDataType(DataTypeId.STRING, DataTypeMetadata()),),
+        )
+
+    def test_postfix_chained_for_multi_dim(self) -> None:
+        assert parse_data_type("int[][]") == ParsedDataType(
+            DataTypeId.ARRAY,
+            DataTypeMetadata(),
+            children=(
+                ParsedDataType(
+                    DataTypeId.ARRAY,
+                    DataTypeMetadata(),
+                    children=(
+                        ParsedDataType(
+                            DataTypeId.INT32, DataTypeMetadata(byte_size=4)
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+    def test_postfix_after_parameterized_type(self) -> None:
+        assert parse_data_type("varchar(10)[]") == ParsedDataType(
+            DataTypeId.ARRAY,
+            DataTypeMetadata(),
+            children=(
+                ParsedDataType(
+                    DataTypeId.STRING,
+                    DataTypeMetadata(length=10, args=(10,)),
+                ),
+            ),
+        )
+
+    def test_postfix_after_struct(self) -> None:
+        parsed = parse_data_type("struct<a:int, b:string>[]")
+        assert parsed.type_id is DataTypeId.ARRAY
+        assert parsed.item is not None
+        assert parsed.item.type_id is DataTypeId.STRUCT
+        assert [c.name for c in parsed.item.children] == ["a", "b"]
+
+    def test_postfix_inside_union_with_none(self) -> None:
+        assert parse_data_type("int[] | None") == ParsedDataType(
+            DataTypeId.ARRAY,
+            DataTypeMetadata(nullable=True),
+            children=(
+                ParsedDataType(DataTypeId.INT32, DataTypeMetadata(byte_size=4)),
+            ),
+        )
+
+    def test_postfix_inside_map_value(self) -> None:
+        parsed = parse_data_type("map<string, int[]>")
+        assert parsed.type_id is DataTypeId.MAP
+        assert parsed.value is not None
+        assert parsed.value.type_id is DataTypeId.ARRAY
+        assert parsed.value.item is not None
+        assert parsed.value.item.type_id is DataTypeId.INT32
+
+    def test_metadata_brackets_still_work(self) -> None:
+        # `[encoding=...]` is still metadata, NOT a postfix array.
+        assert parse_data_type("string[encoding='utf8']") == ParsedDataType(
+            DataTypeId.STRING, DataTypeMetadata(encoding="utf8")
+        )
+
+
+# ---------------------------------------------------------------------------
+# Hive / BigQuery space-separated struct fields
+# ---------------------------------------------------------------------------
+
+
+class TestParserStructFieldSpaceSeparator:
+
+    def test_struct_with_space_separated_fields(self) -> None:
+        # Hive / BigQuery DDL style — no `:` between field name and type.
+        assert parse_data_type("struct<a int, b string>") == ParsedDataType(
+            DataTypeId.STRUCT,
+            DataTypeMetadata(),
+            children=(
+                ParsedDataType(
+                    DataTypeId.INT32,
+                    DataTypeMetadata(byte_size=4),
+                    name="a",
+                ),
+                ParsedDataType(
+                    DataTypeId.STRING, DataTypeMetadata(), name="b"
+                ),
+            ),
+        )
+
+    def test_bigquery_uppercase_struct_no_colon(self) -> None:
+        parsed = parse_data_type(
+            "STRUCT<scheme STRING NOT NULL, port INT, host STRING>"
+        )
+        assert parsed.type_id is DataTypeId.STRUCT
+        assert [(c.name, c.type_id, c.metadata.nullable) for c in parsed.children] == [
+            ("scheme", DataTypeId.STRING, False),
+            ("port", DataTypeId.INT32, None),
+            ("host", DataTypeId.STRING, None),
+        ]
+
+    def test_space_separator_with_nested_type(self) -> None:
+        parsed = parse_data_type(
+            "struct<id bigint, tags array<string>, meta map<string, string>>"
+        )
+        assert parsed.type_id is DataTypeId.STRUCT
+        names_and_ids = [(c.name, c.type_id) for c in parsed.children]
+        assert names_and_ids == [
+            ("id", DataTypeId.INT64),
+            ("tags", DataTypeId.ARRAY),
+            ("meta", DataTypeId.MAP),
+        ]
+
+    def test_colon_and_space_separators_mix(self) -> None:
+        # Real-world DDL is sometimes irregular — both forms in one struct.
+        parsed = parse_data_type("struct<a:int, b string>")
+        assert [(c.name, c.type_id) for c in parsed.children] == [
+            ("a", DataTypeId.INT32),
+            ("b", DataTypeId.STRING),
+        ]
+
+    def test_missing_separator_and_no_type_still_errors(self) -> None:
+        with pytest.raises(ValueError):
+            parse_data_type("struct<a , b: int>")
+
+
+# ---------------------------------------------------------------------------
+# Trailing commas in nested type lists
+# ---------------------------------------------------------------------------
+
+
+class TestParserTrailingCommas:
+
+    def test_trailing_comma_in_array(self) -> None:
+        assert parse_data_type("array<int,>") == parse_data_type("array<int>")
+
+    def test_trailing_comma_in_map(self) -> None:
+        assert parse_data_type("map<string, int,>") == parse_data_type(
+            "map<string, int>"
+        )
+
+    def test_trailing_comma_in_struct(self) -> None:
+        assert parse_data_type("struct<a:int, b:string,>") == parse_data_type(
+            "struct<a:int, b:string>"
+        )
+
+    def test_trailing_comma_in_decimal(self) -> None:
+        assert parse_data_type("decimal(18, 4,)") == parse_data_type(
+            "decimal(18, 4)"
+        )
+
+    def test_trailing_comma_in_enum(self) -> None:
+        assert parse_data_type("enum('a', 'b',)") == parse_data_type(
+            "enum('a', 'b')"
+        )
+
+    def test_trailing_comma_in_metadata(self) -> None:
+        assert parse_data_type("timestamp[unit=ms, tz=UTC,]") == parse_data_type(
+            "timestamp[unit=ms, tz=UTC]"
+        )
+
+
+# ---------------------------------------------------------------------------
+# LRU cache behaviour for the parser front door
+# ---------------------------------------------------------------------------
+
+
+class TestParserCache:
+
+    def test_cache_returns_identical_object(self) -> None:
+        # Frozen-dataclass identity means callers that hash a parsed
+        # type get cache reuse for free.
+        _parse_cached.cache_clear()
+        first = parse_data_type("array<map<string, struct<a:int, b:bigint>>>")
+        second = parse_data_type("array<map<string, struct<a:int, b:bigint>>>")
+        assert first is second
+
+    def test_cache_records_hits(self) -> None:
+        _parse_cached.cache_clear()
+        parse_data_type("decimal(18, 4)")
+        parse_data_type("decimal(18, 4)")
+        parse_data_type("decimal(18, 4)")
+        info = _parse_cached.cache_info()
+        assert info.hits >= 2
+        assert info.misses >= 1
+
+    def test_cache_does_not_swallow_errors(self) -> None:
+        _parse_cached.cache_clear()
+        with pytest.raises(ValueError):
+            parse_data_type("map<string>")
+        # A second call still re-raises rather than returning a stale entry.
+        with pytest.raises(ValueError):
+            parse_data_type("map<string>")
+        # And a fix to the input still parses normally.
+        assert parse_data_type("map<string, int>").type_id is DataTypeId.MAP
+
+    def test_cache_eviction_is_bounded(self) -> None:
+        # Cap is finite — we don't grow without bound on adversarial input.
+        info = _parse_cached.cache_info()
+        assert info.maxsize is not None and info.maxsize > 0

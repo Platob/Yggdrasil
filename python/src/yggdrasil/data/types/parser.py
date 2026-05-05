@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from typing import Any
 
 from .id import DataTypeId
@@ -163,11 +164,14 @@ class ParsedDataType:
           treat it as opaque" type. Strings used to land here too;
           OBJECT keeps the value untouched whereas STRING would have
           coerced through ``str()`` on cast.
-        """
-        parser = _Parser(value, default=default)
 
+        Successful parses are memoized via :func:`_parse_cached` so a
+        schema that mentions ``map<string, struct<...>>`` a million
+        times only walks the AST once. Failures are not cached — each
+        call re-raises so a fix in the input doesn't get masked.
+        """
         try:
-            return parser.parse()
+            return _parse_cached(value)
         except ValueError as e:
             if default is ...:
                 raise ValueError(
@@ -624,7 +628,7 @@ class _Parser:
         return result
 
     def parse_type(self) -> ParsedDataType:
-        left = self.parse_primary()
+        left = self._apply_postfix_array(self.parse_primary())
 
         variants = [left]
         saw_pipe = False
@@ -632,7 +636,7 @@ class _Parser:
         while self._peek_punct("|"):
             saw_pipe = True
             self._advance()
-            variants.append(self.parse_primary())
+            variants.append(self._apply_postfix_array(self.parse_primary()))
 
         if not saw_pipe:
             return left
@@ -854,7 +858,10 @@ class _Parser:
             DataTypeId.TIMESTAMP,
             DataTypeId.DURATION,
         }:
-            if self._peek_any_generic_open():
+            if (
+                self._peek_any_generic_open()
+                and not self._peek_postfix_empty_array()
+            ):
                 open_tok = self._advance()
                 close_char = _matching_close(open_tok.value)
                 metadata = self._parse_metadata(close_char)
@@ -862,7 +869,10 @@ class _Parser:
             return ParsedDataType(type_id=dtype)
 
         if dtype is DataTypeId.DICTIONARY:
-            if self._peek_any_generic_open():
+            if (
+                self._peek_any_generic_open()
+                and not self._peek_postfix_empty_array()
+            ):
                 open_tok = self._advance()
                 close_char = _matching_close(open_tok.value)
                 metadata, children = self._parse_dictionary_payload(close_char)
@@ -877,7 +887,10 @@ class _Parser:
             # Unknown identifier (e.g. a dataclass forward-ref string like
             # "dt.datetime"). Treat as opaque OBJECT and keep the original
             # name on the parsed metadata so callers can still see it.
-            if self._peek_any_generic_open():
+            if (
+                self._peek_any_generic_open()
+                and not self._peek_postfix_empty_array()
+            ):
                 open_tok = self._advance()
                 close_char = _matching_close(open_tok.value)
                 # Drain the bracketed payload so the outer tokenstream stays
@@ -896,7 +909,11 @@ class _Parser:
         # generic `[...]` form of a wider type.
         base_metadata = self._default_metadata_for(dtype, canonical)
 
-        if dtype in _BRACKET_METADATA_TYPE_IDS and self._peek_any_generic_open():
+        if (
+            dtype in _BRACKET_METADATA_TYPE_IDS
+            and self._peek_any_generic_open()
+            and not self._peek_postfix_empty_array()
+        ):
             open_tok = self._advance()
             close_char = _matching_close(open_tok.value)
             payload = self._parse_metadata(close_char)
@@ -926,6 +943,8 @@ class _Parser:
             items.append(self._parse_metadata_item())
             if self._peek_punct(","):
                 self._advance()
+                if self._peek_punct(close_char):
+                    break
                 continue
             break
         self._expect_punct(close_char)
@@ -964,6 +983,8 @@ class _Parser:
             items.append(self._parse_metadata_item())
             if self._peek_punct(","):
                 self._advance()
+                if self._peek_punct(close_char):
+                    break
                 continue
             break
         self._expect_punct(close_char)
@@ -1065,6 +1086,10 @@ class _Parser:
             items.append(self.parse_type())
             if self._peek_punct(","):
                 self._advance()
+                # Trailing comma — `array<int,>` / `map<k, v,>` — is
+                # accepted to match formatted SQL DDL output.
+                if self._peek_punct(close_char):
+                    break
                 continue
             break
 
@@ -1087,6 +1112,8 @@ class _Parser:
             items.append(self._parse_mixed_value())
             if self._peek_punct(","):
                 self._advance()
+                if self._peek_punct(close_char):
+                    break
                 continue
             break
 
@@ -1104,6 +1131,8 @@ class _Parser:
             items.append(self._parse_scalar_or_symbol())
             if self._peek_punct(","):
                 self._advance()
+                if self._peek_punct(close_char):
+                    break
                 continue
             break
 
@@ -1176,6 +1205,8 @@ class _Parser:
             items.append((key, value))
             if self._peek_punct(","):
                 self._advance()
+                if self._peek_punct(close_char):
+                    break
                 continue
             break
 
@@ -1201,6 +1232,8 @@ class _Parser:
             items.append((key, value))
             if self._peek_punct(","):
                 self._advance()
+                if self._peek_punct(close_char):
+                    break
                 continue
             break
 
@@ -1307,6 +1340,8 @@ class _Parser:
             fields.append(self._parse_struct_field())
             if self._peek_punct(","):
                 self._advance()
+                if self._peek_punct(close_char):
+                    break
                 continue
             break
 
@@ -1334,7 +1369,26 @@ class _Parser:
             self._advance()
             nullable = False
 
-        self._expect_any_punct(":", "=")
+        # Accept three field-name/type separators:
+        #   * `:`  — Spark / Databricks / Polars (`a: int`)
+        #   * `=`  — Python-typing style (`a = int`)
+        #   * (none) — Hive / BigQuery DDL (`a int`, `a STRING`)
+        # The space-separated form falls through whenever the next
+        # token can start a type (an identifier, quoted name, number,
+        # or a `(`-grouped expression). That matches what users
+        # actually paste from `SHOW CREATE TABLE` output.
+        sep = self._current()
+        if sep is not None and sep.kind == "punct" and sep.value in {":", "="}:
+            self._advance()
+        elif sep is None or not (
+            sep.kind in {"ident", "string", "number"}
+            or (sep.kind == "punct" and sep.value == "(")
+        ):
+            return self._fail(
+                f"Struct field {name!r} expected ':' / '=' or a type, "
+                f"got {sep.value!r}" if sep is not None
+                else f"Struct field {name!r} expected ':' / '=' or a type"
+            )
         field_type = self.parse_type()
 
         if self._match_ident_phrase("not", "null") or self._match_ident_phrase(
@@ -1386,6 +1440,35 @@ class _Parser:
     def _peek_any_generic_open(self) -> bool:
         tok = self._current()
         return tok is not None and tok.kind == "punct" and tok.value in {"(", "[", "<"}
+
+    def _peek_postfix_empty_array(self) -> bool:
+        """True iff the next two tokens are ``[`` then ``]``.
+
+        That bracket pair is the PostgreSQL / Hive postfix-array marker
+        (``int[]`` → ``array<int>``) and must NOT be consumed by the
+        bracketed-metadata branches in :meth:`parse_primary`.
+        """
+        if not self._peek_punct("["):
+            return False
+        nxt = self._peek_token(1)
+        return nxt is not None and nxt.kind == "punct" and nxt.value == "]"
+
+    def _apply_postfix_array(self, parsed: ParsedDataType) -> ParsedDataType:
+        """Wrap ``parsed`` in ``array<...>`` for each trailing ``[]`` pair.
+
+        Handles the PostgreSQL postfix syntax — ``int[]``, ``text[][]``,
+        ``struct<a:int>[]`` — by greedily consuming empty bracket pairs.
+        Non-empty brackets (``int[nullable=true]``) are NOT touched here;
+        they belong to :meth:`parse_primary`'s metadata path.
+        """
+        while self._peek_postfix_empty_array():
+            self._advance()  # consume '['
+            self._advance()  # consume ']'
+            parsed = ParsedDataType(
+                type_id=DataTypeId.ARRAY,
+                children=(parsed,),
+            )
+        return parsed
 
     def _expect_any_generic_open(self) -> Token:
         tok = self._current()
@@ -1574,6 +1657,37 @@ def _canonical_name(name: str) -> tuple[str, DataTypeId | None]:
     """
     low = name.strip().lower().replace(" ", "_").replace("-", "_")
     return _NAME_ALIASES.get(low, (low, None))
+
+
+# ---------------------------------------------------------------------
+# Parse cache.
+#
+# Schemas in the wild repeat the same handful of type strings across
+# many fields and many rows — `string`, `bigint`, `timestamp_ntz`,
+# `array<struct<...>>`, ... Memoizing the lex+parse step turns the hot
+# call into a dict lookup. The cap is sized to comfortably hold a few
+# realistic schemas without unbounded growth from pathological inputs
+# (e.g. machine-generated DDL with embedded ids).
+#
+# Only successful parses are cached — :class:`functools.lru_cache`
+# never stores raised exceptions, which is exactly what we want: a
+# typo in the input keeps re-raising rather than getting frozen into
+# the cache.
+# ---------------------------------------------------------------------
+
+_PARSE_CACHE_SIZE = 1024
+
+
+@lru_cache(maxsize=_PARSE_CACHE_SIZE)
+def _parse_cached(value: str) -> ParsedDataType:
+    """Parse ``value`` into a :class:`ParsedDataType`, with memoization.
+
+    Returned :class:`ParsedDataType` instances are immutable (frozen
+    dataclass with slots), so sharing them across callers is safe.
+    The one mutable corner — :attr:`DataTypeMetadata.extras` — must
+    not be mutated in place by downstream code; treat it as read-only.
+    """
+    return _Parser(value).parse()
 
 
 def parse_data_type(
