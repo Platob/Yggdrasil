@@ -71,6 +71,13 @@ class TestPrimitiveAsSpark(unittest.TestCase):
                 max_unsigned = (1 << (size * 8)) - 1
                 self.assertEqual(unsigned.reinterpret_pyobj(-1), max_unsigned)
 
+    def test_float8_widens_to_float32(self) -> None:
+        # Spark has no sub-32-bit float — ``Float8Type`` widens to
+        # ``Float32Type`` so the cast lands on ``FloatType``.
+        spark = FloatingPointType(byte_size=1).as_spark()
+        self.assertIsInstance(spark, FloatingPointType)
+        self.assertEqual(spark.byte_size, 4)
+
     def test_float16_widens_to_float32(self) -> None:
         spark = FloatingPointType(byte_size=2).as_spark()
         self.assertIsInstance(spark, FloatingPointType)
@@ -336,15 +343,80 @@ class TestIntegerTypeNewAlwaysRedirects(unittest.TestCase):
 
     def test_floating_point_redirect_same_shape(self) -> None:
         from yggdrasil.data.types.primitive.numeric import (
-            Float16Type, Float32Type, Float64Type,
+            Float8Type, Float16Type, Float32Type, Float64Type,
         )
-        # Abstract → fixed.
+        # Abstract → fixed across every registered width.
+        self.assertIs(type(FloatingPointType(byte_size=1)), Float8Type)
         self.assertIs(type(FloatingPointType(byte_size=2)), Float16Type)
         self.assertIs(type(FloatingPointType(byte_size=4)), Float32Type)
         self.assertIs(type(FloatingPointType(byte_size=8)), Float64Type)
         # Mismatched specialized → canonical.
         self.assertIs(type(Float32Type(byte_size=8)), Float64Type)
         self.assertIs(type(Float64Type(byte_size=2)), Float16Type)
+        self.assertIs(type(Float8Type(byte_size=8)), Float64Type)
         # No-args specialized stays on its default.
+        self.assertIs(type(Float8Type()), Float8Type)
+        self.assertEqual(Float8Type().byte_size, 1)
         self.assertIs(type(Float64Type()), Float64Type)
         self.assertEqual(Float64Type().byte_size, 8)
+
+
+class TestFloat8Type(unittest.TestCase):
+    """``Float8Type`` — the 1-byte FP8 storage tag.
+
+    No native Arrow / Polars / Spark equivalent — the type is a
+    yggdrasil-side label that widens to a 32-bit float at every
+    engine boundary.
+    """
+
+    def test_construction_and_default_byte_size(self) -> None:
+        from yggdrasil.data.types.primitive.numeric import Float8Type
+
+        self.assertEqual(Float8Type().byte_size, 1)
+        self.assertEqual(str(Float8Type()), "float8")
+
+    def test_class_type_id_is_float8(self) -> None:
+        from yggdrasil.data.types.id import DataTypeId
+        from yggdrasil.data.types.primitive.numeric import Float8Type
+
+        self.assertIs(Float8Type.class_type_id(), DataTypeId.FLOAT8)
+        self.assertTrue(DataTypeId.FLOAT8.is_floating_point)
+        self.assertTrue(DataTypeId.FLOAT8.is_numeric)
+
+    def test_dict_round_trip_via_specialized_id(self) -> None:
+        from yggdrasil.data.types.base import DataType
+        from yggdrasil.data.types.id import DataTypeId
+        from yggdrasil.data.types.primitive.numeric import Float8Type
+
+        original = Float8Type()
+        d = original.to_dict()
+        self.assertEqual(d["id"], int(DataTypeId.FLOAT8))
+        self.assertEqual(d["byte_size"], 1)
+
+        restored = DataType.from_dict(d)
+        self.assertIs(type(restored), Float8Type)
+
+    def test_dict_round_trip_via_abstract_id_and_byte_size(self) -> None:
+        from yggdrasil.data.types.base import DataType
+        from yggdrasil.data.types.id import DataTypeId
+        from yggdrasil.data.types.primitive.numeric import Float8Type
+
+        # Old-format payload carrying ``FLOAT`` + ``byte_size`` still
+        # resolves to ``Float8Type`` via the ``__new__`` redirect.
+        d = {"id": int(DataTypeId.FLOAT), "byte_size": 1}
+        self.assertIs(type(DataType.from_dict(d)), Float8Type)
+
+    def test_parser_aliases(self) -> None:
+        from yggdrasil.data.types.base import DataType
+        from yggdrasil.data.types.primitive.numeric import Float8Type
+
+        for alias in ("f8", "fp8", "float8", "e4m3", "e5m2"):
+            with self.subTest(alias=alias):
+                self.assertIs(type(DataType.from_str(alias)), Float8Type)
+
+    def test_as_spark_widens_to_float32(self) -> None:
+        from yggdrasil.data.types.primitive.numeric import Float8Type
+
+        spark = Float8Type().as_spark()
+        self.assertIsInstance(spark, FloatingPointType)
+        self.assertEqual(spark.byte_size, 4)

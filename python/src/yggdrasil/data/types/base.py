@@ -69,6 +69,7 @@ __all__ = [
     "UInt32Type",
     "UInt64Type",
     "FloatingPointType",
+    "Float8Type",
     "Float16Type",
     "Float32Type",
     "Float64Type",
@@ -188,6 +189,7 @@ _INT_TYPE_ID_TO_PARAMS: dict[DataTypeId, tuple[int, bool]] = {
 }
 
 _FLOAT_TYPE_ID_TO_SIZE: dict[DataTypeId, int] = {
+    DataTypeId.FLOAT8:  1,
     DataTypeId.FLOAT16: 2,
     DataTypeId.FLOAT32: 4,
     DataTypeId.FLOAT64: 8,
@@ -1940,6 +1942,7 @@ from .primitive import (
     DateType,
     DecimalType,
     DurationType,
+    Float8Type,
     Float16Type,
     Float32Type,
     Float64Type,

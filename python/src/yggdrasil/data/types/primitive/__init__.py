@@ -23,6 +23,7 @@ from .boolean import BooleanType
 from .null import NullType
 from .numeric import (
     DecimalType,
+    Float8Type,
     Float16Type,
     Float32Type,
     Float64Type,
@@ -61,6 +62,7 @@ __all__ = [
     "UInt32Type",
     "UInt64Type",
     "FloatingPointType",
+    "Float8Type",
     "Float16Type",
     "Float32Type",
     "Float64Type",

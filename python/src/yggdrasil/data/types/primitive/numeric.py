@@ -40,6 +40,7 @@ __all__ = [
     "UInt32Type",
     "UInt64Type",
     "FloatingPointType",
+    "Float8Type",
     "Float16Type",
     "Float32Type",
     "Float64Type",
@@ -779,7 +780,15 @@ class FloatingPointType(NumericType):
     @classmethod
     def from_dict(cls, value: dict[str, Any], default: Any = ...) -> "FloatingPointType":
         try:
-            return cls(byte_size=value.get("byte_size", 8))
+            # Use the subclass's declared default so a payload that
+            # only carries ``id`` (e.g. ``{"id": FLOAT16}``) lands on
+            # the matching class — the abstract ``byte_size=8`` would
+            # send ``Float8Type.from_dict({...})`` straight to
+            # ``Float64Type`` via the ``__new__`` redirect.
+            byte_size_default = cls.__dataclass_fields__["byte_size"].default
+            if byte_size_default is None:
+                byte_size_default = 8
+            return cls(byte_size=value.get("byte_size", byte_size_default))
         except Exception as e:
             if default is ...:
                 raise ValueError(
@@ -810,8 +819,9 @@ class FloatingPointType(NumericType):
 
     def as_spark(self) -> "FloatingPointType":
         # Spark has ``FloatType`` (32-bit) and ``DoubleType`` (64-bit)
-        # but no native half-precision float — widen 16-bit to 32-bit.
-        if self._size == 2:
+        # but no native sub-32-bit floats — widen ``Float8Type`` and
+        # ``Float16Type`` up to 32-bit.
+        if self._size in (1, 2):
             return FloatingPointType(byte_size=4)
         return self
 
@@ -951,6 +961,25 @@ class UInt64Type(IntegerType):
 
 
 @dataclass(frozen=True, repr=False)
+class Float8Type(FloatingPointType):
+    """1-byte FP8 — the storage tag for ML-framework Float8 variants.
+
+    No native Arrow / Polars / Spark equivalent: ``to_arrow`` and
+    ``to_polars`` widen to 32-bit, ``to_spark`` produces ``FloatType``,
+    and :meth:`FloatingPointType.as_spark` collapses to
+    ``Float32Type`` so downstream Spark pipelines see a width Spark
+    can actually represent. Carry the tag through schemas / round-
+    trips at the yggdrasil layer; convert at the boundary.
+    """
+
+    byte_size: int | None = 1
+
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
+        return DataTypeId.FLOAT8
+
+
+@dataclass(frozen=True, repr=False)
 class Float16Type(FloatingPointType):
     byte_size: int | None = 2
 
@@ -989,6 +1018,7 @@ _SPECIALIZED_INTEGER_TYPES: dict[tuple[int | None, bool], type[IntegerType]] = {
 }
 
 _SPECIALIZED_FLOAT_TYPES: dict[int | None, type[FloatingPointType]] = {
+    1: Float8Type,
     2: Float16Type,
     4: Float32Type,
     8: Float64Type,

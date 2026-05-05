@@ -33,6 +33,7 @@ _INTEGER_BYTE_SIZES: dict[str, int] = {
 
 
 _FLOAT_BYTE_SIZES: dict[str, int] = {
+    "f8": 1, "float8": 1, "fp8": 1, "e4m3": 1, "e5m2": 1,
     "f16": 2, "float16": 2, "half": 2,
     "bfloat16": 2, "bf16": 2,
     "f32": 4, "float32": 4, "float": 4, "real": 4,
@@ -351,6 +352,11 @@ _NAME_ALIASES: dict[str, tuple[str, DataTypeId | None]] = {
     "double":       ("double",  DataTypeId.FLOAT64),
     "double_precision": ("double_precision", DataTypeId.FLOAT64),
     "real":         ("real",    DataTypeId.FLOAT32),
+    "f8":           ("f8",      DataTypeId.FLOAT8),
+    "fp8":          ("fp8",     DataTypeId.FLOAT8),
+    "float8":       ("float8",  DataTypeId.FLOAT8),
+    "e4m3":         ("e4m3",    DataTypeId.FLOAT8),
+    "e5m2":         ("e5m2",    DataTypeId.FLOAT8),
     "f16":          ("f16",     DataTypeId.FLOAT16),
     "f32":          ("f32",     DataTypeId.FLOAT32),
     "f64":          ("f64",     DataTypeId.FLOAT64),
@@ -488,7 +494,8 @@ _BRACKET_METADATA_TYPE_IDS = frozenset({
     DataTypeId.INT8, DataTypeId.INT16, DataTypeId.INT32, DataTypeId.INT64,
     DataTypeId.UINT8, DataTypeId.UINT16, DataTypeId.UINT32, DataTypeId.UINT64,
     DataTypeId.FLOAT,
-    DataTypeId.FLOAT16, DataTypeId.FLOAT32, DataTypeId.FLOAT64,
+    DataTypeId.FLOAT8, DataTypeId.FLOAT16,
+    DataTypeId.FLOAT32, DataTypeId.FLOAT64,
     DataTypeId.DATE,
     DataTypeId.NULL,
     DataTypeId.OBJECT,

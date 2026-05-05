@@ -57,10 +57,15 @@ class DataTypeId(IntEnum):
     UINT64 = 29
 
     # ── Floating-point family ────────────────────────────────────────────
+    # Abstract first, then sized widths ascending. ``FLOAT8`` is the
+    # 1-byte tag used by ML frameworks (E4M3 / E5M2 FP8 variants);
+    # we don't model the format choice here — the storage width is
+    # what threads through Arrow / Polars / Spark.
     FLOAT = 40
-    FLOAT16 = 41
-    FLOAT32 = 42
-    FLOAT64 = 43
+    FLOAT8 = 41
+    FLOAT16 = 42
+    FLOAT32 = 43
+    FLOAT64 = 44
 
     # ── Decimal ──────────────────────────────────────────────────────────
     DECIMAL = 50
