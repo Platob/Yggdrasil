@@ -41,6 +41,7 @@ from ._errors import (
     ALREADY_EXISTS_ERRORS,
     SDK_ERRORS,
     coerce_mtime,
+    retry_sdk_call,
 )
 from .path import DatabricksPath
 from .path_kind import DatabricksPathKind
@@ -259,21 +260,46 @@ class VolumePath(DatabricksPath):
     # SDK hooks
     # ==================================================================
 
-    def _remote_download(self, allow_not_found: bool = False) -> bytes:
-        """Pull the full object via ``sdk.files.download``."""
+    def _remote_download(self, allow_not_found: bool = False) -> BytesIO:
+        """Pull the full object via ``sdk.files.download``.
+
+        Drains the SDK response into a project :class:`BytesIO`
+        (spill-capable) so multi-GB volume objects don't blow out
+        RAM. Transient transport flakes are retried by the base
+        ``read_bytes`` wrapper (the whole ``_remote_download`` is
+        replayed on failure).
+        """
         from ._errors import NOT_FOUND_ERRORS, SDK_ERRORS
         sdk = self._sdk()
+        out = BytesIO()
         try:
             resp = sdk.files.download(self.full_path())
         except NOT_FOUND_ERRORS:
             if allow_not_found:
-                return b""
+                out.seek(0)
+                return out
             raise FileNotFoundError(self.full_path())
         except SDK_ERRORS:
             if allow_not_found:
-                return b""
+                out.seek(0)
+                return out
             raise
-        return resp.contents.read()
+
+        try:
+            stream = resp.contents
+            while True:
+                chunk = stream.read(4 * 1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+        except NOT_FOUND_ERRORS:
+            if allow_not_found:
+                out.seek(0)
+                return out
+            raise FileNotFoundError(self.full_path())
+
+        out.seek(0)
+        return out
 
     def write_stream(
         self,
@@ -282,18 +308,46 @@ class VolumePath(DatabricksPath):
         batch_size: int = 4 * 1024 * 1024,
         parents: bool = True,
     ) -> int:
-        """Push the full payload via ``sdk.files.upload``."""
+        """Push the full payload via ``sdk.files.upload``.
+
+        Retries on both Files API errors (``SDK_ERRORS`` —
+        ``NotFound`` / ``BadRequest`` / ``InternalError``, with a
+        one-shot parent-mkdir on the first failure) and transport
+        flakes (``TRANSIENT_ERRORS`` — ``requests.ReadTimeout``,
+        ``ConnectionError``, 5xx/429/503/504). The loop runs up to
+        five attempts with a 1/2/4/8/16s backoff and seeks the
+        payload back to its original position before each retry so
+        the next attempt replays the same bytes.
+        """
+        from ._errors import TRANSIENT_ERRORS
+
         sdk = self._sdk()
         full_path = self.full_path()
 
-        LOGGER.debug("Uploading %r bytes to %s", src, self)
+        bio = BytesIO.from_(src)
+        try:
+            start_pos = bio.tell()
+        except Exception:
+            start_pos = 0
+
+        LOGGER.debug("Uploading %r bytes to %s", bio, self)
 
         checked_parent = False
         last_exc: Exception | None = None
+        retryable = SDK_ERRORS + TRANSIENT_ERRORS
+        max_tries = 5
 
-        for itry in range(4):
+        for itry in range(max_tries):
+            if itry > 0:
+                try:
+                    bio.seek(start_pos)
+                except Exception:
+                    LOGGER.debug(
+                        "Could not seek payload back to %s before retry %d "
+                        "(buffer may not be seekable); continuing.",
+                        start_pos, itry,
+                    )
             try:
-                bio = BytesIO.from_(src)
                 sdk.files.upload(
                     full_path,
                     bio,
@@ -303,18 +357,29 @@ class VolumePath(DatabricksPath):
                     parallelism=self._UPLOAD_PARALLELISM,
                 )
                 break
-            except SDK_ERRORS as exc:
+            except retryable as exc:
                 last_exc = exc
-                if parents and not checked_parent:
+                if (
+                    isinstance(exc, SDK_ERRORS)
+                    and parents
+                    and not checked_parent
+                ):
                     self.parent.mkdir(parents=True, exist_ok=True)
                     checked_parent = True
-                elif itry == 3:
-                    raise FileNotFoundError(full_path) from exc
-                time.sleep(itry + 1)
+                elif itry == max_tries - 1:
+                    if isinstance(exc, SDK_ERRORS):
+                        raise FileNotFoundError(full_path) from exc
+                    raise
+                LOGGER.info(
+                    "Volume upload to %s failed (attempt %d/%d): %r — "
+                    "retrying",
+                    full_path, itry + 1, max_tries, exc,
+                )
+                time.sleep(min(2 ** itry, 16))
         else:
             raise FileNotFoundError(full_path) from last_exc
 
-        LOGGER.info("Wrote %r bytes to %s", src, self)
+        LOGGER.info("Wrote %r bytes to %s", bio, self)
 
     def _remote_upload(self, payload: BytesIO) -> None:
         return self.write_stream(src=payload, parents=True)

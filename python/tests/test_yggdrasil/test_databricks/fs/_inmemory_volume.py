@@ -45,13 +45,19 @@ class InMemoryVolumePath(VolumePath):
         cls.download_count = 0
 
     # -- SDK transport ----------------------------------------------------
-    def _remote_download(self, allow_not_found: bool = False) -> bytes:
+    def _remote_download(self, allow_not_found: bool = False):
+        from yggdrasil.io.buffer.bytes_io import BytesIO as _YBytesIO
+
         type(self).download_count += 1
         key = self.full_path()
+        out = _YBytesIO()
         if key in self._STORE:
-            return self._STORE[key]
+            out.write(self._STORE[key])
+            out.seek(0)
+            return out
         if allow_not_found:
-            return b""
+            out.seek(0)
+            return out
         raise FileNotFoundError(key)
 
     def _remote_upload(self, payload) -> None:

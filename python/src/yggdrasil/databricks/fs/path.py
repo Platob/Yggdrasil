@@ -82,6 +82,7 @@ from typing import IO, TYPE_CHECKING, Any, ClassVar, Optional, Tuple, Union
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.fs.path import Path, _select_path_class
 from yggdrasil.io.url import URL
+from ._errors import retry_sdk_call
 from .path_kind import DatabricksPathKind
 from ...lazy_imports import databricks_client_class
 
@@ -525,9 +526,23 @@ class DatabricksPath(Path):
     # SDK transport.
 
     def read_bytes(self, *, raise_error: bool = True) -> bytes:
-        """Whole-file download via :meth:`_remote_download`."""
+        """Whole-file download via :meth:`_remote_download`.
+
+        Wrapped in :func:`retry_sdk_call` so transient transport
+        flakes (``requests.ReadTimeout``, 5xx, 429, 503/504) get a
+        few attempts before surfacing. Semantic errors —
+        ``FileNotFoundError`` / ``NotFound`` / ``BadRequest`` —
+        propagate on the first attempt.
+
+        Subclasses return a :class:`BytesIO` (the optimized,
+        spill-capable buffer) so large downloads don't have to live
+        in RAM; if a legacy override returns ``bytes`` we fall back
+        to that path transparently.
+        """
         try:
-            content = self._remote_download(allow_not_found=False)
+            content = retry_sdk_call(
+                self._remote_download, allow_not_found=False,
+            )
 
             if isinstance(content, BytesIO):
                 return content.to_bytes()
@@ -539,24 +554,45 @@ class DatabricksPath(Path):
 
     def write_bytes(
         self,
-        data: Union[bytes, bytearray, memoryview],
+        data: Union[bytes, bytearray, memoryview, BytesIO],
         *,
         mode: str = "wb",
         parents: bool = True,
     ) -> int:
-        """Whole-file upload via :meth:`_remote_upload`."""
+        """Whole-file upload via :meth:`_remote_upload`.
+
+        Coerces ``data`` to a :class:`BytesIO` (the project's
+        spill-capable buffer) so subclasses can stream it without
+        loading everything into RAM. The retry wrapper seeks the
+        buffer back to its original position before each retry so
+        a partial transport failure replays the exact same bytes.
+        """
         del mode  # always overwrite at this layer
-        payload = bytes(data)
+
+        bio = BytesIO.from_(data)
+        start = bio.tell()
+        size = bio.size if hasattr(bio, "size") else len(data)
+
+        def _seek_back(_attempt: int, _exc: BaseException) -> None:
+            try:
+                bio.seek(start)
+            except Exception:
+                LOGGER.debug(
+                    "Could not seek payload back to %s before retry "
+                    "(buffer may not be seekable); continuing.",
+                    start,
+                )
 
         try:
-            self._remote_upload(payload)
+            retry_sdk_call(self._remote_upload, bio, on_retry=_seek_back)
         except FileNotFoundError:
             if not parents:
                 raise
             self.parent.mkdir(parents=True, exist_ok=True)
-            self._remote_upload(payload)
+            bio.seek(start)
+            retry_sdk_call(self._remote_upload, bio, on_retry=_seek_back)
         self.invalidate_mirror()
-        return len(payload)
+        return int(size)
 
     # ==================================================================
     # Positional IO — required by the abstract Path
@@ -585,7 +621,9 @@ class DatabricksPath(Path):
             return b""
 
         try:
-            data = self._remote_download(allow_not_found=False)
+            data = retry_sdk_call(
+                self._remote_download, allow_not_found=False,
+            )
         except FileNotFoundError:
             if default is ...:
                 raise
@@ -594,6 +632,11 @@ class DatabricksPath(Path):
             if default is ...:
                 raise
             return default
+
+        # Subclasses return BytesIO; legacy overrides may still
+        # return raw bytes — handle both.
+        if isinstance(data, BytesIO):
+            data = data.to_bytes()
 
         if n < 0:
             return data[pos:]
@@ -651,16 +694,29 @@ class DatabricksPath(Path):
 
     @abstractmethod
     def _remote_download(self, allow_not_found: bool = False) -> BytesIO:
-        """Whole-object GET. Returns ``bytes``.
+        """Whole-object GET. Returns the project's :class:`BytesIO`.
 
-        Raises :class:`FileNotFoundError` on missing object when
-        ``allow_not_found=False``; returns ``b""`` when True.
-        Other backend errors propagate.
+        Implementations must drain the SDK response into a
+        :class:`yggdrasil.io.buffer.bytes_io.BytesIO` so large
+        downloads can spill to disk transparently rather than
+        balloon in memory. The buffer is left positioned at the
+        start so callers can ``read()`` / ``to_bytes()`` directly.
+
+        Raises :class:`FileNotFoundError` on a missing object when
+        ``allow_not_found=False``; returns an empty buffer when
+        True. Other backend errors propagate.
         """
 
     @abstractmethod
     def _remote_upload(self, payload: BytesIO) -> None:
-        """Whole-object PUT. Takes ``bytes``.
+        """Whole-object PUT. Takes the project's :class:`BytesIO`.
+
+        Implementations should ``seek(0)`` (or honour the buffer's
+        current position) and stream the contents to the SDK so
+        spill-backed payloads upload without a full in-memory
+        copy. The base ``write_bytes`` resets the position to its
+        original value before each retry so a transport flake
+        replays the same bytes.
 
         Implementations should overwrite if the object already
         exists. ``FileNotFoundError`` on a missing parent directory
