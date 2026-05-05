@@ -2147,6 +2147,18 @@ class Field(BaseMetadata, BaseChildrenFields):
             return self.to_spark_schema()
         return self.to_pyspark_field()
 
+    def as_spark(self) -> "pst.DataType":
+        """Spark-native counterpart for this field's *dtype*.
+
+        Delegates to :meth:`DataType.as_spark` on :attr:`dtype` —
+        ``Field`` itself doesn't have a Spark counterpart (Spark's
+        ``StructField`` is a metadata wrapper, not a field-shape
+        equivalent), so ``as_spark`` returns the Spark dtype instead.
+        Use :meth:`to_pyspark_field` when you actually need a
+        ``StructField``.
+        """
+        return self.dtype.as_spark()
+
     def to_schema(
         self,
         metadata: dict[str, Any] | None = None,
@@ -2174,17 +2186,30 @@ class Field(BaseMetadata, BaseChildrenFields):
     def to_databricks_ddl(
         self,
         *,
-        put_name: bool = True,
-        put_not_null: bool = True,
-        put_comment: bool = True,
+        with_name: bool = True,
+        with_nullable: bool = True,
+        with_comment: bool = True,
+        # Legacy aliases — older callers passed ``put_name`` /
+        # ``put_not_null`` / ``put_comment``. Keep them working so
+        # downstream code that hasn't moved over yet keeps compiling.
+        put_name: bool | None = None,
+        put_not_null: bool | None = None,
+        put_comment: bool | None = None,
     ) -> str:
         from yggdrasil.databricks.sql.sql_utils import escape_sql_string, quote_ident
 
-        name_str = f"{quote_ident(self.name)} " if put_name else ""
-        nullable_str = " NOT NULL" if put_not_null and not self.nullable else ""
+        if put_name is not None:
+            with_name = put_name
+        if put_not_null is not None:
+            with_nullable = put_not_null
+        if put_comment is not None:
+            with_comment = put_comment
+
+        name_str = f"{quote_ident(self.name)} " if with_name else ""
+        nullable_str = " NOT NULL" if with_nullable and not self.nullable else ""
 
         comment_str = ""
-        if put_comment and self.metadata and b"comment" in self.metadata:
+        if with_comment and self.metadata and b"comment" in self.metadata:
             comment = (self.metadata[b"comment"] or b"").decode("utf-8")
             comment_str = f" COMMENT '{escape_sql_string(comment)}'"
 
@@ -2206,8 +2231,8 @@ class Field(BaseMetadata, BaseChildrenFields):
             # MERGE go through.
             struct_body = ", ".join(
                 Field.from_arrow(child).to_databricks_ddl(
-                    put_comment=False,
-                    put_not_null=False,
+                    with_comment=False,
+                    with_nullable=False,
                 )
                 for child in self.arrow_type
             )
@@ -2216,23 +2241,23 @@ class Field(BaseMetadata, BaseChildrenFields):
         if pa.types.is_map(self.arrow_type):
             map_type: pa.MapType = self.arrow_type
             key_type = Field.from_arrow(map_type.key_field).to_databricks_ddl(
-                put_name=False,
-                put_comment=False,
-                put_not_null=False,
+                with_name=False,
+                with_comment=False,
+                with_nullable=False,
             )
             val_type = Field.from_arrow(map_type.item_field).to_databricks_ddl(
-                put_name=False,
-                put_comment=False,
-                put_not_null=False,
+                with_name=False,
+                with_comment=False,
+                with_nullable=False,
             )
             return f"{name_str}MAP<{key_type}, {val_type}>{nullable_str}{comment_str}"
 
         if pa.types.is_list(self.arrow_type) or pa.types.is_large_list(self.arrow_type):
             list_type: pa.ListType = self.arrow_type
             elem_type = Field.from_arrow(list_type.value_field).to_databricks_ddl(
-                put_name=False,
-                put_comment=False,
-                put_not_null=False,
+                with_name=False,
+                with_comment=False,
+                with_nullable=False,
             )
             return f"{name_str}ARRAY<{elem_type}>{nullable_str}{comment_str}"
 

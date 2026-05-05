@@ -170,6 +170,14 @@ class Schema(Field):
             metadata=self.metadata,
         )
 
+    def as_spark(self):
+        """Spark-native counterpart for this schema — a ``StructType``.
+
+        :attr:`dtype` is always a :class:`StructType` here, so its
+        ``as_spark`` already produces the right Spark shape.
+        """
+        return self.dtype.as_spark()
+
 
 @register_converter(Any, Schema)
 def any_to_schema(obj: Any, _: Any):

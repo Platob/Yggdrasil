@@ -455,10 +455,13 @@ class MapType(NestedType):
         )
 
     def to_spark(self) -> Any:
+        return self.as_spark()
+
+    def as_spark(self) -> Any:
         spark = get_spark_sql()
         return spark.types.MapType(
-            keyType=self.key_field.dtype.to_spark(),
-            valueType=self.value_field.dtype.to_spark(),
+            keyType=self.key_field.dtype.as_spark(),
+            valueType=self.value_field.dtype.as_spark(),
             valueContainsNull=self.value_field.nullable,
         )
 

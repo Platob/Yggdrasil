@@ -450,6 +450,20 @@ class DataType(BaseChildrenFields, ABC):
         """
         return self.to_spark()
 
+    def as_spark(self) -> "pst.DataType":
+        """Spark-native counterpart for this dtype.
+
+        Returns a :class:`pyspark.sql.types.DataType`. Nested types
+        (``ArrayType`` / ``MapType`` / ``StructType``) override this
+        to recurse via ``as_spark`` on their children, so one call
+        assembles the full Spark type tree without each call site
+        reaching into ``to_spark`` / ``to_pyspark_field`` directly.
+        :class:`Field` and :class:`Schema` expose the same method —
+        both delegate to ``self.dtype.as_spark`` so callers get the
+        Spark dtype regardless of which yggdrasil object they hold.
+        """
+        return self.to_spark()
+
     # ==================================================================
     # Autotag — Databricks-friendly shape tags
     # ==================================================================
