@@ -116,12 +116,24 @@ class TestViewsSetitem:
 # ---------------------------------------------------------------------------
 
 
+def _fake_column(name: str, dtype):
+    """Stand-in for :class:`Column` exposing only ``name`` and ``field.dtype``."""
+    col = MagicMock()
+    col.name = name
+    col.field = MagicMock()
+    col.field.dtype = dtype
+    return col
+
+
 def _fake_table(
     table_name: str,
     catalog_name: str = "main",
     schema_name: str = "sales",
+    columns=None,
 ):
-    """Minimal stand-in for :class:`Table` — only ``full_name`` + fields used."""
+    """Minimal stand-in for :class:`Table` — ``full_name`` + ``columns`` only."""
+    from yggdrasil.data.types import IntegerType, StringType
+
     tbl = MagicMock()
     tbl.catalog_name = catalog_name
     tbl.schema_name = schema_name
@@ -131,6 +143,12 @@ def _fake_table(
         if safe
         else f"{catalog_name}.{schema_name}.{table_name}"
     )
+    if columns is None:
+        columns = [
+            _fake_column("id", IntegerType(byte_size=8)),
+            _fake_column("name", StringType()),
+        ]
+    tbl.columns = columns
     return tbl
 
 
@@ -156,7 +174,7 @@ class TestCommonTableNameRoot:
 
 
 class TestConcatTables:
-    def test_builds_union_all_by_name_view_using_common_prefix(
+    def test_builds_smart_cast_union_using_common_prefix(
         self, views, mock_client
     ):
         mock_engine = MagicMock()
@@ -179,22 +197,45 @@ class TestConcatTables:
         stmt = mock_engine.execute.call_args[0][0]
         assert "CREATE OR REPLACE VIEW" in stmt
         assert "`main`.`sales`.`sales`" in stmt
-        assert "UNION ALL BY NAME" in stmt
+        assert "UNION ALL" in stmt
+        # Smart-cast emits explicit per-column CAST + plain UNION ALL.
+        assert "UNION ALL BY NAME" not in stmt
+        assert "CAST(`id` AS BIGINT) AS `id`" in stmt
+        assert "CAST(`name` AS STRING) AS `name`" in stmt
         for name in ("sales_jan", "sales_feb", "sales_mar"):
-            assert f"SELECT * FROM `main`.`sales`.`{name}`" in stmt
+            assert f"FROM `main`.`sales`.`{name}`" in stmt
 
-    def test_by_name_false_uses_plain_union_all(self, views, mock_client):
+    def test_cast_false_with_by_name_emits_union_all_by_name(
+        self, views, mock_client
+    ):
         mock_engine = MagicMock()
         mock_client.sql.return_value = mock_engine
 
         views.concat_tables(
             [_fake_table("sales_jan"), _fake_table("sales_feb")],
+            cast=False,
+        )
+
+        stmt = mock_engine.execute.call_args[0][0]
+        assert "UNION ALL BY NAME" in stmt
+        assert "SELECT * FROM `main`.`sales`.`sales_jan`" in stmt
+
+    def test_cast_false_by_name_false_uses_plain_union_all(
+        self, views, mock_client,
+    ):
+        mock_engine = MagicMock()
+        mock_client.sql.return_value = mock_engine
+
+        views.concat_tables(
+            [_fake_table("sales_jan"), _fake_table("sales_feb")],
+            cast=False,
             by_name=False,
         )
 
         stmt = mock_engine.execute.call_args[0][0]
         assert "UNION ALL BY NAME" not in stmt
         assert "UNION ALL" in stmt
+        assert "SELECT * FROM `main`.`sales`.`sales_jan`" in stmt
 
     def test_explicit_view_name_overrides_prefix_detection(
         self, views, mock_client
@@ -266,3 +307,91 @@ class TestConcatTables:
 
         stmt = mock_engine.execute.call_args[0][0]
         assert "COMMENT 'Monthly sales roll-up'" in stmt
+
+
+class TestConcatTablesSmartCast:
+    """Smart-cast behavior: type promotion + missing-column padding."""
+
+    def test_promotes_numeric_widths_across_inputs(self, views, mock_client):
+        from yggdrasil.data.types import IntegerType
+
+        mock_engine = MagicMock()
+        mock_client.sql.return_value = mock_engine
+
+        narrow = _fake_table(
+            "sales_jan",
+            columns=[_fake_column("amount", IntegerType(byte_size=4))],
+        )
+        wide = _fake_table(
+            "sales_feb",
+            columns=[_fake_column("amount", IntegerType(byte_size=8))],
+        )
+
+        views.concat_tables([narrow, wide])
+
+        stmt = mock_engine.execute.call_args[0][0]
+        # BIGINT (8-byte) wins for both inputs.
+        assert stmt.count("CAST(`amount` AS BIGINT) AS `amount`") == 2
+        assert "CAST(`amount` AS INT)" not in stmt
+
+    def test_pads_missing_columns_with_null_cast(self, views, mock_client):
+        from yggdrasil.data.types import IntegerType, StringType
+
+        mock_engine = MagicMock()
+        mock_client.sql.return_value = mock_engine
+
+        a = _fake_table(
+            "sales_jan",
+            columns=[
+                _fake_column("id", IntegerType(byte_size=8)),
+                _fake_column("name", StringType()),
+            ],
+        )
+        b = _fake_table(
+            "sales_feb",
+            columns=[
+                _fake_column("id", IntegerType(byte_size=8)),
+                _fake_column("region", StringType()),
+            ],
+        )
+
+        views.concat_tables([a, b])
+
+        stmt = mock_engine.execute.call_args[0][0]
+        # Unified projection: id, name, region (first-seen order).
+        assert "CAST(`id` AS BIGINT) AS `id`" in stmt
+        assert "CAST(`name` AS STRING) AS `name`" in stmt
+        assert "CAST(`region` AS STRING) AS `region`" in stmt
+        # Missing column => CAST(NULL AS <ddl>).
+        assert "CAST(NULL AS STRING) AS `region`" in stmt
+        assert "CAST(NULL AS STRING) AS `name`" in stmt
+
+    def test_view_concat_tables_returns_self(self, mock_client):
+        from yggdrasil.databricks.sql.views import Views
+
+        mock_engine = MagicMock()
+        mock_client.sql.return_value = mock_engine
+
+        svc = Views(client=mock_client, catalog_name="main", schema_name="sales")
+        target = svc.view(view_name="combined")
+
+        result = target.concat_tables(
+            [_fake_table("sales_jan"), _fake_table("sales_feb")]
+        )
+
+        assert result is target
+        stmt = mock_engine.execute.call_args[0][0]
+        assert "`main`.`sales`.`combined`" in stmt
+        assert "UNION ALL" in stmt
+
+    def test_no_columns_raises(self, mock_client):
+        from yggdrasil.databricks.sql.views import Views
+
+        svc = Views(client=mock_client, catalog_name="main", schema_name="sales")
+        target = svc.view(view_name="empty_union")
+
+        empty_a = _fake_table("a_2024", columns=[])
+        empty_b = _fake_table("a_2025", columns=[])
+
+        with pytest.raises(ValueError, match="no columns to union"):
+            target.concat_tables([empty_a, empty_b])

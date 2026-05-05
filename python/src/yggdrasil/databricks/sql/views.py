@@ -553,16 +553,22 @@ class Views(DatabricksService):
         catalog_name: str | None = None,
         schema_name: str | None = None,
         by_name: bool = True,
+        cast: bool = True,
         comment: str | None = None,
         mode: ModeLike = Mode.OVERWRITE,
     ) -> View:
         """Create or update a view that concatenates *tables* with ``UNION ALL``.
 
+        Resolves the view name + parent (deriving from the inputs' shared
+        prefix and the first input's catalog/schema when not given) and
+        delegates the actual DDL to :meth:`View.concat_tables` — which does
+        the smart by-name + type-promotion projection when ``cast`` is
+        ``True``.
+
         Args:
             tables:
-                Iterable of :class:`Table` objects to union.  Each table
-                contributes ``SELECT * FROM <table.full_name>`` to the view
-                definition.
+                Iterable of :class:`Table` or :class:`View` instances to
+                union.  At least one input is required.
             view_name:
                 Unqualified view name.  When omitted, the longest shared
                 prefix of the input table names (trimmed of trailing
@@ -572,11 +578,12 @@ class Views(DatabricksService):
                 Override the view location.  Fall back to the service
                 defaults, then to the first input table's catalog/schema.
             by_name:
-                When ``True`` (default), emit ``UNION ALL BY NAME`` so
-                columns are aligned by name and missing columns are padded
-                with ``NULL`` — useful when tables have slightly different
-                schemas.  When ``False``, emit plain ``UNION ALL`` (columns
-                aligned by position).
+                Forwarded to :meth:`View.concat_tables`.  Only consulted
+                when ``cast`` is ``False``.
+            cast:
+                Forwarded to :meth:`View.concat_tables` — enables smart
+                column-name alignment + type promotion via explicit
+                ``CAST(... AS <ddl>)``.  Default ``True``.
             comment:
                 Optional ``COMMENT`` on the view.
             mode:
@@ -607,15 +614,15 @@ class Views(DatabricksService):
         catalog_name = catalog_name or self.catalog_name or first.catalog_name
         schema_name = schema_name or self.schema_name or first.schema_name
 
-        separator = "\nUNION ALL BY NAME\n" if by_name else "\nUNION ALL\n"
-        query = separator.join(
-            f"SELECT * FROM {t.full_name(safe=True)}"
-            for t in tables_list
-        )
-
         view = self.view(
             catalog_name=catalog_name,
             schema_name=schema_name,
             view_name=view_name,
         )
-        return view.create(query, mode=mode, comment=comment)
+        return view.concat_tables(
+            tables_list,
+            by_name=by_name,
+            cast=cast,
+            comment=comment,
+            mode=mode,
+        )
