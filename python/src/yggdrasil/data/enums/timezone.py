@@ -3,14 +3,22 @@
 The :class:`Timezone` dataclass wraps an IANA timezone identifier (e.g.
 ``"Europe/Paris"``, ``"UTC"``) and provides:
 
-* **Parsing** from strings — IANA names, common abbreviations (``CET``,
-  ``EST``, …), and fixed UTC offsets (``+01:00``, ``UTC-05``).
-* **Conversion helpers** — ``localize`` naive datetimes, ``convert`` between
-  zones, extract ``utc_offset`` at a given instant.
-* **Polars integration** — ``from_polars_type`` to extract the tz from a
-  ``pl.Datetime``, ``polars_normalize`` to map a Series/Expr of timezone
+* **Coercion** from any common Python timezone shape — strings (IANA
+  names, abbreviations like ``CET`` / ``EST``, fixed offsets like
+  ``+01:00`` / ``UTC-05``), ``ZoneInfo``, ``datetime.tzinfo``,
+  ``datetime`` instances with a tzinfo attached, or other Timezone
+  objects.
+* **Conversion helpers** — ``localize`` naive datetimes, ``convert``
+  between zones, extract ``utc_offset`` at a given instant.
+* **Polars integration** — ``from_polars_type`` extracts the tz from a
+  ``pl.Datetime``, ``polars_normalize`` maps a Series/Expr of timezone
   strings to canonical IANA names.
-* **Pre-built constants** — ``Timezone.UTC``, ``Timezone.CET``, etc.
+* **Pre-built constants** — :attr:`Timezone.UTC`, :attr:`Timezone.CET`,
+  :attr:`Timezone.NAIVE`, etc.
+
+The single coercion entry point is :meth:`Timezone.from_`. There is no
+``parse`` / ``parse_str`` API anymore — every call site routes through
+``from_`` so the same input rules apply everywhere.
 """
 from __future__ import annotations
 
@@ -61,27 +69,92 @@ _TIMEZONE_ALIASES: dict[str, str] = {
 
 _OFFSET_RE = re.compile(r"^([+-])(\d{2}):?(\d{2})$")
 
+# Sentinel iana value for the naive Timezone — empty string keeps
+# ``str(Timezone.NAIVE)`` invisible in pretty-printed output and makes
+# ``bool(Timezone.NAIVE)`` falsy. Internal-only — callers should use
+# :attr:`Timezone.NAIVE` rather than ``Timezone("")``.
+_NAIVE_IANA = ""
+
 
 @lru_cache(maxsize=1)
 def _available_timezones_cached() -> frozenset[str]:
     return frozenset(available_timezones())
 
 
+def _parse_timezone_string(s: str) -> str:
+    """Resolve a timezone string to its canonical IANA name.
+
+    Resolution order:
+
+    1. Exact IANA name (``"Europe/Paris"``).
+    2. Known alias (``"CET"`` → ``Europe/Paris``).
+    3. UTC offset (``"+01:00"``, ``"UTC-05"``, ``"-0530"``).
+
+    Pure helper — kept private; the public surface is
+    :meth:`Timezone.from_`.
+
+    Raises:
+        ValueError: when the string can't be resolved.
+    """
+    raw = s.strip()
+    if not raw:
+        raise ValueError("Timezone string cannot be empty")
+
+    if raw in _available_timezones_cached():
+        return raw
+
+    upper = raw.upper()
+    if upper in _TIMEZONE_ALIASES:
+        return _TIMEZONE_ALIASES[upper]
+
+    offset_part = raw
+    if upper.startswith("UTC") and len(raw) > 3:
+        offset_part = raw[3:].strip()
+
+    m = _OFFSET_RE.match(offset_part)
+    if m:
+        sign, hh, mm = m.groups()
+        hours = int(hh)
+        minutes = int(mm)
+
+        if minutes != 0:
+            raise ValueError(
+                f"Cannot normalize non-hour-aligned UTC offset to IANA timezone: {s!r}"
+            )
+
+        if hours == 0:
+            return "UTC"
+
+        # IANA Etc/GMT sign convention is reversed.
+        etc_sign = "-" if sign == "+" else "+"
+        return f"Etc/GMT{etc_sign}{hours}"
+
+    raise ValueError(f"Unknown timezone: {s!r}")
+
+
 @dataclass(slots=True, frozen=True)
 class Timezone:
     """An immutable wrapper around an IANA timezone identifier.
 
-    Instances are created via :meth:`parse` (accepts strings, ``ZoneInfo``,
-    other ``Timezone`` objects, or ``None`` → UTC) or directly::
+    Instances are created via :meth:`from_` (accepts strings,
+    ``ZoneInfo``, ``datetime.tzinfo``, other ``Timezone`` objects, or
+    ``None`` → UTC) or directly::
 
         tz = Timezone("Europe/Paris")
-        tz = Timezone.parse("CET")      # → Timezone("Europe/Paris")
-        tz = Timezone.parse("+01:00")   # → Timezone("Etc/GMT-1")
+        tz = Timezone.from_("CET")        # → Timezone("Europe/Paris")
+        tz = Timezone.from_("+01:00")     # → Timezone("Etc/GMT-1")
+        tz = Timezone.from_(ZoneInfo("Europe/Paris"))
+
+    The naive case is represented by :attr:`Timezone.NAIVE` — a
+    sentinel instance whose ``iana`` is the empty string and whose
+    ``__bool__`` is ``False``. Use it instead of ``None`` so a
+    ``tz: Timezone`` field type can stay non-optional.
     """
 
     iana: str
 
     # ── Pre-built constants (set after class body) ───────────────────────────
+    NAIVE: ClassVar["Timezone"]        # tz-less sentinel
     UTC: ClassVar["Timezone"]
     CET: ClassVar["Timezone"]          # Europe/Paris (CET/CEST)
     WET: ClassVar["Timezone"]          # Europe/Lisbon
@@ -99,7 +172,14 @@ class Timezone:
         return self.iana
 
     def __repr__(self) -> str:
+        if self.iana == _NAIVE_IANA:
+            return "Timezone.NAIVE"
         return f"Timezone({self.iana!r})"
+
+    def __bool__(self) -> bool:
+        # ``Timezone.NAIVE`` is falsy so callers can ``if self.tz:``
+        # to mean "is timezone-aware".
+        return bool(self.iana)
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, Timezone):
@@ -111,94 +191,104 @@ class Timezone:
     def __hash__(self) -> int:
         return hash(self.iana)
 
-    # ── Parsing ──────────────────────────────────────────────────────────────
+    # ── Coercion ────────────────────────────────────────────────────────────
 
     @classmethod
-    def parse(cls, obj: Any) -> "Timezone":
-        """Parse *obj* into a :class:`Timezone`.
+    def from_(cls, obj: Any, *, default: Any = ...) -> "Timezone":
+        """Coerce any Python value into a :class:`Timezone`.
 
-        Accepted types:
+        Accepts:
 
-        * ``Timezone`` — returned as-is.
-        * ``str`` — delegates to :meth:`parse_str`.
-        * ``ZoneInfo`` — extracts the ``key`` attribute.
-        * ``None`` — returns :attr:`UTC`.
+        * :class:`Timezone` (returned as-is — including ``Timezone.NAIVE``);
+        * :class:`zoneinfo.ZoneInfo` (extracts ``key``);
+        * a string — IANA name, alias (``CET`` / ``EST`` / ``Z`` / ``GMT``
+          / ``Etc/UTC`` / ``+00:00`` / …), or fixed offset
+          (``"+01:00"``, ``"UTC-05"``, ``"-0530"``);
+        * ``datetime.tzinfo`` instance (``ZoneInfo``,
+          ``datetime.timezone``, third-party zones) — the ``key`` /
+          ``zone`` attribute is preferred; otherwise falls back to the
+          fixed UTC offset;
+        * timezone-aware ``datetime`` / ``time`` (extracts ``tzinfo``);
+        * objects exposing a ``tz`` / ``time_zone`` / ``timezone`` /
+          ``iana`` attribute (PyArrow ``TimestampType``, Polars
+          ``Datetime``, foreign Timezone classes); the attribute is
+          re-funneled through ``from_``;
+        * ``None`` — returns :attr:`UTC` for backward compatibility
+          unless ``default`` is supplied.
 
-        Raises:
-            TypeError: For unsupported types.
+        ``default`` swallows unknown / unparseable input. Without it,
+        bad input raises :class:`ValueError` (string parse failure) or
+        :class:`TypeError` (unsupported value type).
         """
         if isinstance(obj, cls):
             return obj
+
         if obj is None:
+            if default is not ...:
+                return default
             return cls.UTC
+
         if isinstance(obj, ZoneInfo):
             return cls(obj.key)
+
+        if isinstance(obj, _dt.datetime):
+            return cls.from_(obj.tzinfo, default=default)
+        if isinstance(obj, _dt.time):
+            return cls.from_(obj.tzinfo, default=default)
+
+        if isinstance(obj, _dt.tzinfo):
+            for attr in ("key", "zone"):
+                inner = getattr(obj, attr, None)
+                if isinstance(inner, str) and inner:
+                    return cls._from_str(inner, default=default)
+            offset = obj.utcoffset(_dt.datetime.now(_dt.timezone.utc))
+            if offset is None:
+                if default is not ...:
+                    return default
+                raise ValueError(
+                    f"Cannot derive Timezone from tzinfo without offset: {obj!r}"
+                )
+            total = int(offset.total_seconds())
+            sign = "+" if total >= 0 else "-"
+            hours, remainder = divmod(abs(total), 3600)
+            minutes = remainder // 60
+            return cls._from_str(f"{sign}{hours:02d}:{minutes:02d}", default=default)
+
         if isinstance(obj, str):
-            return cls.parse_str(obj)
-        raise TypeError(f"Cannot parse {type(obj).__name__} as {cls.__name__}")
+            return cls._from_str(obj, default=default)
+
+        # Engine dtypes — Arrow ``TimestampType.tz``, Polars
+        # ``Datetime.time_zone``, foreign Timezone classes with
+        # ``iana`` / ``zone`` / ``timezone`` attribute.
+        for attr in ("tz", "time_zone", "timezone", "iana"):
+            inner = getattr(obj, attr, None)
+            if inner is not None and inner is not obj:
+                return cls.from_(inner, default=default)
+
+        if default is not ...:
+            return default
+        raise TypeError(f"Cannot derive Timezone from {type(obj).__name__}: {obj!r}")
 
     @classmethod
-    def parse_str(cls, s: str) -> "Timezone":
-        """Parse a timezone string.
-
-        Resolution order:
-
-        1. Exact IANA name (``"Europe/Paris"``).
-        2. Known alias (``"CET"`` → ``Europe/Paris``).
-        3. UTC offset (``"+01:00"``, ``"UTC-05"``, ``"-0530"``).
-
-        Raises:
-            TypeError: If *s* is not a ``str``.
-            ValueError: If the string cannot be resolved.
-        """
-        if not isinstance(s, str):
-            raise TypeError(f"Expected str, got {type(s).__name__}")
-
-        raw = s.strip()
-        if not raw:
-            raise ValueError("Timezone string cannot be empty")
-
-        # Exact IANA timezone
-        if raw in _available_timezones_cached():
-            return cls(raw)
-
-        upper = raw.upper()
-
-        # Known aliases
-        if upper in _TIMEZONE_ALIASES:
-            return cls(_TIMEZONE_ALIASES[upper])
-
-        # Normalize "UTC+01:00" / "UTC-0500"
-        offset_part = raw
-        if upper.startswith("UTC") and len(raw) > 3:
-            offset_part = raw[3:].strip()
-
-        # Normalize "+01:00" / "-0500" to IANA Etc/GMT±X where possible
-        m = _OFFSET_RE.match(offset_part)
-        if m:
-            sign, hh, mm = m.groups()
-            hours = int(hh)
-            minutes = int(mm)
-
-            if minutes != 0:
-                raise ValueError(
-                    f"Cannot normalize non-hour-aligned UTC offset to IANA timezone: {s!r}"
-                )
-
-            if hours == 0:
-                return cls("UTC")
-
-            # IANA Etc/GMT sign convention is reversed
-            etc_sign = "-" if sign == "+" else "+"
-            return cls(f"Etc/GMT{etc_sign}{hours}")
-
-        raise ValueError(f"Unknown timezone: {s!r}")
+    def _from_str(cls, s: str, *, default: Any = ...) -> "Timezone":
+        try:
+            return cls(_parse_timezone_string(s))
+        except (TypeError, ValueError):
+            if default is not ...:
+                return default
+            raise
 
     # ── ZoneInfo interop ─────────────────────────────────────────────────────
 
     @lru_cache(maxsize=64)
     def to_zoneinfo(self) -> ZoneInfo:
-        """Return the ``zoneinfo.ZoneInfo`` for this timezone."""
+        """Return the ``zoneinfo.ZoneInfo`` for this timezone.
+
+        Raises :class:`ValueError` for :attr:`Timezone.NAIVE` since
+        there is no concrete zone to materialize.
+        """
+        if self.is_naive():
+            raise ValueError("Timezone.NAIVE has no ZoneInfo")
         return ZoneInfo(self.iana)
 
     @property
@@ -216,6 +306,8 @@ class Timezone:
         >>> Timezone("Europe/Paris").utc_offset(datetime(2024, 7, 1))
         datetime.timedelta(seconds=7200)  # +02:00 (CEST)
         """
+        if self.is_naive():
+            raise ValueError("Timezone.NAIVE has no UTC offset")
         if at is None:
             at = _dt.datetime.now(_dt.timezone.utc)
         elif at.tzinfo is None:
@@ -230,12 +322,18 @@ class Timezone:
         """
         return self.utc_offset(at).total_seconds() / 3600
 
+    def is_naive(self) -> bool:
+        """Return ``True`` for :attr:`Timezone.NAIVE` — the tz-less sentinel."""
+        return self.iana == _NAIVE_IANA
+
     def is_utc(self) -> bool:
         """Return ``True`` if this timezone is UTC (or an equivalent)."""
         return self.iana in ("UTC", "Etc/UTC", "Etc/GMT", "Etc/GMT+0", "Etc/GMT-0", "GMT")
 
     def is_fixed_offset(self) -> bool:
         """Return ``True`` if this timezone has a fixed UTC offset (no DST)."""
+        if self.is_naive():
+            return False
         return self.iana.startswith("Etc/") or self.is_utc()
 
     def is_dst(self, at: _dt.datetime | None = None) -> bool:
@@ -246,6 +344,8 @@ class Timezone:
         >>> Timezone("Europe/Paris").is_dst(datetime(2024, 1, 1))
         False
         """
+        if self.is_naive():
+            return False
         if at is None:
             at = _dt.datetime.now(_dt.timezone.utc)
         elif at.tzinfo is None:
@@ -258,8 +358,10 @@ class Timezone:
         """Return the DST adjustment at instant *at*.
 
         Returns ``timedelta(0)`` when DST is not active or for fixed-offset
-        timezones.
+        timezones, and for :attr:`Timezone.NAIVE`.
         """
+        if self.is_naive():
+            return _dt.timedelta(0)
         if at is None:
             at = _dt.datetime.now(_dt.timezone.utc)
         elif at.tzinfo is None:
@@ -275,6 +377,8 @@ class Timezone:
         >>> Timezone("Europe/Paris").abbreviation(datetime(2024, 1, 1))
         'CET'
         """
+        if self.is_naive():
+            return ""
         if at is None:
             at = _dt.datetime.now(_dt.timezone.utc)
         elif at.tzinfo is None:
@@ -315,8 +419,11 @@ class Timezone:
         """Stamp a naive datetime with this timezone (no conversion).
 
         Raises:
-            ValueError: If *naive* is already timezone-aware.
+            ValueError: If *naive* is already timezone-aware, or if
+                this is :attr:`Timezone.NAIVE`.
         """
+        if self.is_naive():
+            raise ValueError("Cannot localize against Timezone.NAIVE")
         if naive.tzinfo is not None:
             raise ValueError(
                 f"Cannot localize a timezone-aware datetime "
@@ -328,8 +435,11 @@ class Timezone:
         """Convert a timezone-aware datetime to this timezone.
 
         Raises:
-            ValueError: If *aware* is naive.
+            ValueError: If *aware* is naive, or if this is
+                :attr:`Timezone.NAIVE`.
         """
+        if self.is_naive():
+            raise ValueError("Cannot convert into Timezone.NAIVE")
         if aware.tzinfo is None:
             raise ValueError(
                 "Cannot convert a naive datetime; use localize() first"
@@ -356,7 +466,7 @@ class Timezone:
         import polars as pl
 
         if isinstance(dtype, pl.Datetime) and dtype.time_zone:
-            return cls.parse(dtype.time_zone)
+            return cls.from_(dtype.time_zone)
         return None
 
     @classmethod
@@ -396,7 +506,7 @@ class Timezone:
         """
         tz = getattr(dtype, "tz", None)
         if tz:
-            return cls.parse(tz)
+            return cls.from_(tz)
         return None
 
     def arrow_timestamp_type(self, unit: str = "us") -> Any:
@@ -406,6 +516,8 @@ class Timezone:
         TimestampType(timestamp[ns, tz=Europe/Paris])
         """
         import pyarrow as pa
+        if self.is_naive():
+            return pa.timestamp(unit)
         return pa.timestamp(unit, tz=self.iana)
 
     # ── Enumeration ──────────────────────────────────────────────────────────
@@ -417,6 +529,7 @@ class Timezone:
 
 
 # ── Class-level constants (can't be set inside a frozen dataclass body) ──────
+Timezone.NAIVE = Timezone(_NAIVE_IANA)
 Timezone.UTC = Timezone("UTC")
 Timezone.CET = Timezone("Europe/Paris")
 Timezone.WET = Timezone("Europe/Lisbon")

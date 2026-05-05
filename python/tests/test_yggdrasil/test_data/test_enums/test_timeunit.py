@@ -6,7 +6,7 @@ in the codebase (``DateType`` / ``TimeType`` / ``TimestampType`` /
 
 * members carry the canonical short string (``s``, ``ms``, ``us``,
   ``ns``, ``d``, ``year_month``, ``day_time``, ``month_day_nano``);
-* :meth:`TimeUnit.parse` accepts any common spelling — long names,
+* :meth:`TimeUnit.from_` accepts any common spelling — long names,
   plurals, ``TimeUnit`` instances — and raises on unknowns;
 * :class:`TimeUnit` ``IS`` :class:`str`, so it slots into existing
   ``unit: str`` declarations without coercion at the boundary.
@@ -45,7 +45,7 @@ class TestCanonicalMembers:
         assert TimeUnit.D is TimeUnit.DAY
 
 
-class TestParse:
+class TestFrom:
 
     @pytest.mark.parametrize(
         "value,expected",
@@ -74,31 +74,31 @@ class TestParse:
         ],
     )
     def test_accepts_known_aliases(self, value: str, expected: TimeUnit) -> None:
-        assert TimeUnit.parse(value) is expected
+        assert TimeUnit.from_(value) is expected
 
     def test_returns_timeunit_unchanged(self) -> None:
-        assert TimeUnit.parse(TimeUnit.NANOSECOND) is TimeUnit.NANOSECOND
+        assert TimeUnit.from_(TimeUnit.NANOSECOND) is TimeUnit.NANOSECOND
 
     def test_rejects_unknown_string(self) -> None:
         with pytest.raises(ValueError, match="Unknown time unit"):
-            TimeUnit.parse("fortnight")
+            TimeUnit.from_("fortnight")
 
     def test_rejects_non_string(self) -> None:
         with pytest.raises(TypeError):
-            TimeUnit.parse(42)
+            TimeUnit.from_(42)
 
     def test_default_returned_on_unknown(self) -> None:
-        assert TimeUnit.parse("xyz", default=None) is None
-        assert TimeUnit.parse(None, default=TimeUnit.SECOND) is TimeUnit.SECOND
+        assert TimeUnit.from_("xyz", default=None) is None
+        assert TimeUnit.from_(None, default=TimeUnit.SECOND) is TimeUnit.SECOND
 
     def test_none_without_default_raises(self) -> None:
         with pytest.raises(ValueError):
-            TimeUnit.parse(None)
+            TimeUnit.from_(None)
 
     def test_empty_string_rejected(self) -> None:
         with pytest.raises(ValueError):
-            TimeUnit.parse("")
-        assert TimeUnit.parse("   ", default=TimeUnit.MICROSECOND) is TimeUnit.MICROSECOND
+            TimeUnit.from_("")
+        assert TimeUnit.from_("   ", default=TimeUnit.MICROSECOND) is TimeUnit.MICROSECOND
 
 
 class TestIsValid:

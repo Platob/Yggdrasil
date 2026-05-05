@@ -61,35 +61,14 @@ __all__ = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Shared constants — sourced from :class:`TimeUnit` so every temporal
-# class agrees on what the canonical tokens are. The legacy dict names
-# are kept as thin views for the existing call sites; new code should
-# reach for :class:`TimeUnit` properties directly.
-# ---------------------------------------------------------------------------
-
-# Seconds per one unit. Used for scalar epoch math.
-_TEMPORAL_UNIT_SECONDS: dict[str, float] = {
-    TimeUnit.SECOND.value:      TimeUnit.SECOND.seconds,
-    TimeUnit.MILLISECOND.value: TimeUnit.MILLISECOND.seconds,
-    TimeUnit.MICROSECOND.value: TimeUnit.MICROSECOND.seconds,
-    TimeUnit.NANOSECOND.value:  TimeUnit.NANOSECOND.seconds,
-}
-
-# Unit precision rank — higher = finer precision. Used by merge to pick the
-# "widest" unit when combining two temporal types.
-_TEMPORAL_UNIT_ORDER: dict[str, int] = {
-    TimeUnit.SECOND.value:      TimeUnit.SECOND.order,
-    TimeUnit.MILLISECOND.value: TimeUnit.MILLISECOND.order,
-    TimeUnit.MICROSECOND.value: TimeUnit.MICROSECOND.order,
-    TimeUnit.NANOSECOND.value:  TimeUnit.NANOSECOND.order,
-}
-
-# Polars only supports ms/us/ns units for Datetime/Duration natively.
+# Polars only supports ms/us/ns units natively for Datetime/Duration —
+# the membership test runs in tight cast-fast-path code. Members are
+# :class:`TimeUnit` instances and subclass ``str``, so the set works
+# for both ``TimeUnit.MICROSECOND`` and the bare ``"us"`` token.
 _POLARS_UNITS = frozenset({
-    TimeUnit.MILLISECOND.value,
-    TimeUnit.MICROSECOND.value,
-    TimeUnit.NANOSECOND.value,
+    TimeUnit.MILLISECOND,
+    TimeUnit.MICROSECOND,
+    TimeUnit.NANOSECOND,
 })
 
 # ---------------------------------------------------------------------------
@@ -504,18 +483,18 @@ class TemporalType(PrimitiveType, ABC):
     methods, and ``to_arrow`` / ``to_polars`` / ``to_spark`` / ``to_databricks_ddl``.
     """
 
-    unit: str = "us"
+    unit: TimeUnit = TimeUnit.MICROSECOND
     tz: str | None = None
 
     def __post_init__(self):
-        if self.unit is not None:
-            # Funnel any spelling — short token, plural, ``TimeUnit``
-            # member, etc. — through the enum so downstream code can
-            # rely on the canonical string token. Subclasses with extra
-            # __post_init__ logic call ``super().__post_init__()`` first.
-            normalized = TimeUnit.parse(self.unit, default=None)
-            if normalized is not None and normalized.value != self.unit:
-                object.__setattr__(self, "unit", normalized.value)
+        # Funnel ``unit`` through :class:`TimeUnit` so any spelling —
+        # short token, plural, long form, ``TimeUnit`` member — collapses
+        # to a canonical enum instance. Subclasses with extra
+        # __post_init__ logic call ``super().__post_init__()`` first.
+        if self.unit is not None and not isinstance(self.unit, TimeUnit):
+            normalized = TimeUnit.from_(self.unit, default=None)
+            if normalized is not None:
+                object.__setattr__(self, "unit", normalized)
         if self.tz and self.tz in UTC_ALIAS_TIMEZONES:
             object.__setattr__(self, "tz", "UTC")
 
@@ -711,14 +690,22 @@ class TemporalType(PrimitiveType, ABC):
     ) -> "TemporalType":
         base = super()._merge_with_same_id(other, mode, downcast, upcast)
 
-        left_rank = _TEMPORAL_UNIT_ORDER.get(self.unit, 3)
-        right_rank = _TEMPORAL_UNIT_ORDER.get(other.unit, 3)
+        # Use :attr:`TimeUnit.order` directly — the rank table moved to
+        # the enum so every temporal type agrees on the precedence.
+        left = TimeUnit.from_(self.unit, default=TimeUnit.NANOSECOND)
+        right = TimeUnit.from_(other.unit, default=TimeUnit.NANOSECOND)
+        left_rank = left.order
+        right_rank = right.order
 
         if downcast:
             unit = self.unit if left_rank <= right_rank else other.unit
+            # Naive on either side collapses to naive — the conservative
+            # downcast keeps the wall-clock rather than picking a side.
             tz = self.tz if self.tz == other.tz else None
         else:
             unit = self.unit if left_rank >= right_rank else other.unit
+            # ``__bool__`` on Timezone is True for non-NAIVE — pick the
+            # aware side when one of the two is naive.
             tz = self.tz if self.tz == other.tz else (self.tz or other.tz)
 
         return self.__class__(byte_size=base.byte_size, unit=unit, tz=tz)
@@ -729,15 +716,18 @@ class TemporalType(PrimitiveType, ABC):
 
     def to_dict(self) -> dict[str, Any]:
         base = super().to_dict()
+        # ``self.unit`` is a :class:`TimeUnit` (str subclass) and
         # ``self.tz`` is ``str`` on most temporal types but
-        # :class:`Timezone` on :class:`TimestampType`; ``str(...)``
-        # collapses both to the canonical IANA token for serialization.
-        return {**base, "unit": self.unit, "tz": str(self.tz) if self.tz else None}
+        # :class:`Timezone` on :class:`TimestampType`. ``str(...)``
+        # collapses both to the canonical token for serialization.
+        unit_value = str(self.unit) if self.unit else None
+        tz_value = str(self.tz) if self.tz else None
+        return {**base, "unit": unit_value, "tz": tz_value}
 
     def autotag(self) -> dict[bytes, bytes]:
         tags = super().autotag()
         if self.unit:
-            tags[b"unit"] = self.unit.encode("utf-8")
+            tags[b"unit"] = str(self.unit).encode("utf-8")
         if self.tz:
             tags[b"tz"] = str(self.tz).encode("utf-8")
         return tags
@@ -946,25 +936,24 @@ class TimeType(TemporalType):
 
 @dataclass(frozen=True, repr=False)
 class TimestampType(TemporalType):
-    unit: str = "us"
-    # Stored as :class:`Timezone` (or ``None``) so consumers can call
-    # ``self.tz.is_utc()`` / ``.utc_offset(...)`` without parsing the
-    # IANA token on every access. The constructor still accepts plain
-    # strings — :meth:`__post_init__` parses them to a Timezone, so
-    # ``TimestampType(tz="UTC")`` and existing dict / Arrow / Polars
-    # paths keep working unchanged.
-    tz: "Timezone | None" = None
+    unit: TimeUnit = TimeUnit.MICROSECOND
+    # Always a :class:`Timezone` instance — naive timestamps use the
+    # :attr:`Timezone.NAIVE` sentinel rather than ``None`` so the field
+    # type stays non-optional and call sites can ``if self.tz:`` to
+    # mean "is timezone-aware". Constructor accepts plain IANA strings
+    # / ``ZoneInfo`` / ``datetime.tzinfo`` / ``None`` and routes them
+    # through :meth:`Timezone.from_` in ``__post_init__``.
+    tz: Timezone = Timezone.NAIVE
 
     def __post_init__(self):
-        # Skip parent's UTC-alias coercion — :meth:`Timezone.parse_str`
-        # already canonicalizes UTC equivalents (``Etc/UTC``, ``GMT``,
-        # ``+00:00``) to the ``UTC`` IANA name.
-        if self.unit is not None:
-            normalized = TimeUnit.parse(self.unit, default=None)
-            if normalized is not None and normalized.value != self.unit:
-                object.__setattr__(self, "unit", normalized.value)
-        if self.tz is not None and not isinstance(self.tz, Timezone):
-            object.__setattr__(self, "tz", Timezone.parse_str(self.tz))
+        if self.unit is not None and not isinstance(self.unit, TimeUnit):
+            normalized = TimeUnit.from_(self.unit, default=None)
+            if normalized is not None:
+                object.__setattr__(self, "unit", normalized)
+        if self.tz is None:
+            object.__setattr__(self, "tz", Timezone.NAIVE)
+        elif not isinstance(self.tz, Timezone):
+            object.__setattr__(self, "tz", Timezone.from_(self.tz))
         object.__setattr__(self, "byte_size", 8)
 
     @classmethod
@@ -1028,7 +1017,7 @@ class TimestampType(TemporalType):
         directly — it carries :class:`Timezone` helpers like
         ``is_utc()`` and ``utc_offset()``.
         """
-        return self.tz.iana if self.tz is not None else None
+        return None if self.tz.is_naive() else self.tz.iana
 
     def to_arrow(self) -> "pa.DataType":
         return pa.timestamp(unit=self.unit, tz=self.tz_iana)
@@ -1039,7 +1028,7 @@ class TimestampType(TemporalType):
 
     def to_spark(self) -> Any:
         spark = get_spark_sql()
-        if self.tz is None and hasattr(spark.types, "TimestampNTZType"):
+        if self.tz.is_naive() and hasattr(spark.types, "TimestampNTZType"):
             return spark.types.TimestampNTZType()
         return spark.types.TimestampType()
 
@@ -1048,13 +1037,15 @@ class TimestampType(TemporalType):
         # UTC-equivalent. Anything else (naive or a real non-UTC zone like
         # ``Europe/Paris``) drops to ``TIMESTAMP_NTZ`` so the wall-clock value
         # round-trips without a silent shift.
-        if self.tz is None:
+        if self.tz.is_naive():
             return "TIMESTAMP_NTZ"
         return "TIMESTAMP" if self.tz.is_utc() else "TIMESTAMP_NTZ"
 
     def default_pyobj(self, nullable: bool) -> Any:
         if nullable:
             return None
+        # ``Timezone.NAIVE`` is falsy via ``__bool__`` so ``if self.tz``
+        # cleanly distinguishes naive from aware here.
         if self.tz:
             return dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
         return dt.datetime(1970, 1, 1)
@@ -1071,7 +1062,7 @@ class TimestampType(TemporalType):
             parsed = self._parse_iso_scalar_string(text, "timestamp", safe)
             return None if parsed is None else self._apply_tz(parsed)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
-            factor = _TEMPORAL_UNIT_SECONDS.get(self.unit, 1e-6)
+            factor = TimeUnit.from_(self.unit, default=TimeUnit.MICROSECOND).seconds
             try:
                 seconds = float(value) * factor
                 ts = dt.datetime.fromtimestamp(seconds, tz=dt.timezone.utc)
@@ -1082,7 +1073,7 @@ class TimestampType(TemporalType):
                         f"for {type(self).__name__}."
                     )
                 return None
-            if self.tz is None:
+            if self.tz.is_naive():
                 return ts.replace(tzinfo=None)
             return self._apply_tz(ts)
         if safe:
@@ -1095,7 +1086,7 @@ class TimestampType(TemporalType):
     def _apply_tz(self, value: "dt.datetime") -> "dt.datetime":
         # Naive-target: strip tz. Aware-target: attach UTC when given a naive value,
         # otherwise preserve; downstream Arrow cast normalizes to ``self.tz``.
-        if self.tz is None:
+        if self.tz.is_naive():
             if value.tzinfo is None:
                 return value
             return value.astimezone(dt.timezone.utc).replace(tzinfo=None)
@@ -1226,5 +1217,5 @@ class DurationType(TemporalType):
         return None
 
     def _timedelta_from_numeric(self, value: float) -> "dt.timedelta":
-        factor = _TEMPORAL_UNIT_SECONDS.get(self.unit, 1e-6)
+        factor = TimeUnit.from_(self.unit, default=TimeUnit.MICROSECOND).seconds
         return dt.timedelta(seconds=value * factor)

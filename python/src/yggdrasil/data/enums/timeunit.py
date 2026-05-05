@@ -106,35 +106,54 @@ class TimeUnit(str, Enum):
     NS: ClassVar["TimeUnit"]
     D: ClassVar["TimeUnit"]
 
-    # ── Parsing ─────────────────────────────────────────────────────────────
+    # ── Coercion ────────────────────────────────────────────────────────────
 
     @classmethod
-    def parse(cls, value: Any, *, default: Any = ...) -> "TimeUnit":
-        """Normalize *value* to a :class:`TimeUnit`.
+    def from_(cls, value: Any, *, default: Any = ...) -> "TimeUnit":
+        """Coerce any Python value into a :class:`TimeUnit`.
 
-        Accepts ``TimeUnit`` (returned as-is), strings (matched case-
-        insensitively against the alias table or any canonical member
-        value), and ``None`` — passing ``None`` returns *default* if
-        provided, otherwise raises :class:`ValueError`.
+        Accepts:
 
-        Raises:
-            TypeError: when *value* is neither a string nor a
-                ``TimeUnit``.
-            ValueError: when the string can't be resolved to any
-                canonical unit and no *default* is supplied.
+        * :class:`TimeUnit` (returned as-is);
+        * any string the alias table or canonical member values know —
+          ``s`` / ``ms`` / ``us`` / ``ns`` / ``d`` / interval forms,
+          plurals (``microseconds``), long forms (``millisecond``),
+          mixed case, ``µs``, hyphens / spaces;
+        * objects exposing a ``time_unit`` / ``unit`` attribute (Polars
+          ``Datetime`` / ``Duration``, PyArrow ``TimestampType`` /
+          ``DurationType`` / ``Time32Type`` / ``Time64Type``); the
+          attribute is re-funneled through ``from_``;
+        * ``None`` — returns *default* if supplied, else raises.
+
+        ``default`` swallows unknown / unparseable input. Without it,
+        unknown tokens raise :class:`ValueError` and unsupported types
+        raise :class:`TypeError`.
         """
         if isinstance(value, cls):
             return value
+
         if value is None:
             if default is not ...:
                 return default
-            raise ValueError("TimeUnit cannot be parsed from None")
-        if not isinstance(value, str):
-            raise TypeError(
-                f"Cannot parse {type(value).__name__} as TimeUnit; "
-                f"expected str or TimeUnit, got {value!r}"
-            )
+            raise ValueError("TimeUnit cannot be derived from None")
 
+        if isinstance(value, str):
+            return cls._from_str(value, default=default)
+
+        # Engine dtypes — pull out ``time_unit`` / ``unit`` and recurse.
+        for attr in ("time_unit", "unit"):
+            inner = getattr(value, attr, None)
+            if inner is not None and inner is not value:
+                return cls.from_(inner, default=default)
+
+        if default is not ...:
+            return default
+        raise TypeError(
+            f"Cannot derive TimeUnit from {type(value).__name__}: {value!r}"
+        )
+
+    @classmethod
+    def _from_str(cls, value: str, *, default: Any = ...) -> "TimeUnit":
         token = value.strip().lower().replace("-", "_").replace(" ", "_")
         if not token:
             if default is not ...:
@@ -145,9 +164,6 @@ class TimeUnit(str, Enum):
         if canonical is not None:
             return cls(canonical)
 
-        # Allow exact value match for safety (e.g. ``TimeUnit("us")``
-        # already routes here from member lookup but ``parse("US")``
-        # benefits from the case-insensitive fallthrough).
         try:
             return cls(token)
         except ValueError:
@@ -162,9 +178,9 @@ class TimeUnit(str, Enum):
 
     @classmethod
     def is_valid(cls, value: Any) -> bool:
-        """Return ``True`` when :meth:`parse` would succeed for *value*."""
+        """Return ``True`` when :meth:`from_` would succeed for *value*."""
         try:
-            cls.parse(value)
+            cls.from_(value)
             return True
         except (TypeError, ValueError):
             return False
