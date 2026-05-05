@@ -2201,21 +2201,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         with_name: bool = True,
         with_nullable: bool = True,
         with_comment: bool = True,
-        # Legacy aliases — older callers passed ``put_name`` /
-        # ``put_not_null`` / ``put_comment``. Keep them working so
-        # downstream code that hasn't moved over yet keeps compiling.
-        put_name: bool | None = None,
-        put_not_null: bool | None = None,
-        put_comment: bool | None = None,
     ) -> str:
         from yggdrasil.databricks.sql.sql_utils import escape_sql_string, quote_ident
-
-        if put_name is not None:
-            with_name = put_name
-        if put_not_null is not None:
-            with_nullable = put_not_null
-        if put_comment is not None:
-            with_comment = put_comment
 
         name_str = f"{quote_ident(self.name)} " if with_name else ""
         nullable_str = " NOT NULL" if with_nullable and not self.nullable else ""

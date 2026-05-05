@@ -2337,7 +2337,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         cast_projection = ", ".join(
             (
                 f"CAST({quote_ident(f.name)} AS "
-                f"{f.to_databricks_ddl(put_name=False, put_not_null=False, put_comment=False)})"
+                f"{f.to_databricks_ddl(with_name=False, with_nullable=False, with_comment=False)})"
                 f" AS {quote_ident(f.name)}"
             )
             for f in existing_schema.fields
@@ -2422,7 +2422,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
                 extra_cast_proj = ", ".join(
                     (
                         f"CAST({quote_ident(f.name)} AS "
-                        f"{f.to_databricks_ddl(put_name=False, put_not_null=False, put_comment=False)})"
+                        f"{f.to_databricks_ddl(with_name=False, with_nullable=False, with_comment=False)})"
                         f" AS {quote_ident(f.name)}"
                     )
                     for f in extra_schema.fields
@@ -2843,7 +2843,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         cast_projection = ", ".join(
             (
                 f"CAST(raw_src.{quote_ident(f.name)} AS "
-                f"{f.to_databricks_ddl(put_name=False, put_not_null=False, put_comment=False)})"
+                f"{f.to_databricks_ddl(with_name=False, with_nullable=False, with_comment=False)})"
                 f" AS {quote_ident(f.name)}"
             )
             for f in fields
@@ -2944,7 +2944,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
                 extra_cast_proj = ", ".join(
                     (
                         f"CAST(raw_src.{quote_ident(f.name)} AS "
-                        f"{f.to_databricks_ddl(put_name=False, put_not_null=False, put_comment=False)})"
+                        f"{f.to_databricks_ddl(with_name=False, with_nullable=False, with_comment=False)})"
                         f" AS {quote_ident(f.name)}"
                     )
                     for f in extra_fields

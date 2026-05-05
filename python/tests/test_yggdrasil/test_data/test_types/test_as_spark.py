@@ -200,3 +200,69 @@ class TestFieldAndSchemaAsSpark(unittest.TestCase):
             Field("y", StringType()),
         ])
         self.assertIs(s.as_spark(), s)
+
+
+class TestSignFlipCastEngine(unittest.TestCase):
+    """The cast engine round-trips ``as_spark`` rewrites lossless.
+
+    ``IntegerType.as_spark`` flips ``signed`` on unsigned types
+    while keeping the byte width. Pinning the cast engine here so
+    the bit-reinterpret semantics stay tied to the type-side rewrite
+    — if either drifts, these tests fail loudly rather than silently
+    overflowing on round-trip.
+    """
+
+    def test_arrow_array_cast_uint64_to_int64_wraps_negative(self) -> None:
+        import pyarrow as pa
+
+        src = Field("x", IntegerType(byte_size=8, signed=False))
+        tgt = Field("x", IntegerType(byte_size=8, signed=True))
+        arr = pa.array([(1 << 64) - 1, 0, 100], type=pa.uint64())
+
+        casted = tgt.cast_arrow_array(arr, source_field=src)
+
+        self.assertEqual(casted.type, pa.int64())
+        self.assertEqual(casted.to_pylist(), [-1, 0, 100])
+
+    def test_arrow_array_cast_int64_to_uint64_wraps_to_max(self) -> None:
+        import pyarrow as pa
+
+        src = Field("x", IntegerType(byte_size=8, signed=True))
+        tgt = Field("x", IntegerType(byte_size=8, signed=False))
+        arr = pa.array([-1, 0, 100], type=pa.int64())
+
+        casted = tgt.cast_arrow_array(arr, source_field=src)
+
+        self.assertEqual(casted.type, pa.uint64())
+        self.assertEqual(casted.to_pylist(), [(1 << 64) - 1, 0, 100])
+
+    def test_arrow_tabular_cast_applies_per_column(self) -> None:
+        import pyarrow as pa
+
+        table = pa.table({
+            "big": pa.array([(1 << 64) - 1, 0, 100], type=pa.uint64()),
+            "small": pa.array([255, 0, 100], type=pa.uint8()),
+        })
+        s = Schema(inner_fields=[
+            Field("big", IntegerType(byte_size=8, signed=True)),
+            Field("small", IntegerType(byte_size=1, signed=True)),
+        ])
+
+        casted = s.cast_arrow_tabular(table)
+
+        self.assertEqual(casted.column("big").type, pa.int64())
+        self.assertEqual(casted.column("big").to_pylist(), [-1, 0, 100])
+        self.assertEqual(casted.column("small").type, pa.int8())
+        self.assertEqual(casted.column("small").to_pylist(), [-1, 0, 100])
+
+    def test_polars_series_cast_uint64_to_int64_wraps_negative(self) -> None:
+        import polars as pl
+
+        src = Field("x", IntegerType(byte_size=8, signed=False))
+        tgt = Field("x", IntegerType(byte_size=8, signed=True))
+        series = pl.Series("x", [(1 << 64) - 1, 0, 100], dtype=pl.UInt64)
+
+        casted = tgt.cast_polars_series(series, source_field=src)
+
+        self.assertEqual(casted.dtype, pl.Int64)
+        self.assertEqual(casted.to_list(), [-1, 0, 100])
