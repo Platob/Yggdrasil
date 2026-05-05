@@ -2171,6 +2171,27 @@ class Field(BaseMetadata, BaseChildrenFields):
             metadata=self.metadata,
         )
 
+    def as_polars(self) -> "Field":
+        """Return a Field whose ``dtype`` is Polars-compatible.
+
+        Mirrors :meth:`as_spark` for Polars — :attr:`dtype` is
+        swapped for ``self.dtype.as_polars()`` (sub-32-bit floats
+        widen to ``Float32Type``, second-precision timestamps /
+        durations widen to milliseconds, nested types recurse).
+        Already-Polars-compatible fields return ``self`` so the call
+        is cheap to make defensively. Use :meth:`to_polars_field`
+        when you need a real ``pl.Field``.
+        """
+        polars_dtype = self.dtype.as_polars()
+        if polars_dtype is self.dtype:
+            return self
+        return Field(
+            name=self.name,
+            dtype=polars_dtype,
+            nullable=self.nullable,
+            metadata=self.metadata,
+        )
+
     def to_schema(
         self,
         metadata: dict[str, Any] | None = None,

@@ -202,6 +202,13 @@ class FloatingPointType(NumericType):
             return FloatingPointType(byte_size=4)
         return self
 
+    def as_polars(self) -> "FloatingPointType":
+        # Polars has ``Float32`` (32-bit) and ``Float64`` (64-bit)
+        # only — same widening rule as :meth:`as_spark`.
+        if self._size in (1, 2):
+            return FloatingPointType(byte_size=4)
+        return self
+
     def to_databricks_ddl(self) -> str:
         return "DOUBLE" if self._size == 8 else "FLOAT"
 

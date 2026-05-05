@@ -420,3 +420,128 @@ class TestFloat8Type(unittest.TestCase):
         spark = Float8Type().as_spark()
         self.assertIsInstance(spark, FloatingPointType)
         self.assertEqual(spark.byte_size, 4)
+
+
+class TestAsPolars(unittest.TestCase):
+    """``as_polars`` mirrors ``as_spark`` for the Polars target.
+
+    Polars natively supports every signed / unsigned integer width
+    and ``Float32`` / ``Float64`` only. ``Datetime`` / ``Duration``
+    are limited to ``ms`` / ``us`` / ``ns``. The yggdrasil-side
+    rewrite widens whatever doesn't fit.
+    """
+
+    def test_float8_and_float16_widen_to_float32(self) -> None:
+        from yggdrasil.data.types.primitive.numeric import (
+            Float8Type, Float16Type,
+        )
+        for t in (Float8Type(), Float16Type()):
+            with self.subTest(t=t):
+                polars = t.as_polars()
+                self.assertIsInstance(polars, FloatingPointType)
+                self.assertEqual(polars.byte_size, 4)
+
+    def test_float32_and_float64_unchanged(self) -> None:
+        for size in (4, 8):
+            with self.subTest(size=size):
+                t = FloatingPointType(byte_size=size)
+                self.assertIs(t.as_polars(), t)
+
+    def test_signed_and_unsigned_integers_unchanged(self) -> None:
+        for size in (1, 2, 4, 8):
+            for signed in (True, False):
+                with self.subTest(size=size, signed=signed):
+                    t = IntegerType(byte_size=size, signed=signed)
+                    self.assertIs(t.as_polars(), t)
+
+    def test_timestamp_seconds_widens_to_ms(self) -> None:
+        # ``Datetime`` in polars only supports ms/us/ns.
+        t = TimestampType(unit="s", tz="UTC")
+        polars = t.as_polars()
+        self.assertEqual(str(polars.unit), "ms")
+        self.assertEqual(polars.tz.iana, "UTC")
+
+    def test_timestamp_us_unchanged(self) -> None:
+        for unit in ("ms", "us", "ns"):
+            with self.subTest(unit=unit):
+                t = TimestampType(unit=unit)
+                self.assertIs(t.as_polars(), t)
+
+    def test_duration_seconds_widens_to_ms(self) -> None:
+        t = DurationType(unit="s")
+        polars = t.as_polars()
+        self.assertEqual(str(polars.unit), "ms")
+
+    def test_duration_us_unchanged(self) -> None:
+        for unit in ("ms", "us", "ns"):
+            with self.subTest(unit=unit):
+                t = DurationType(unit=unit)
+                self.assertIs(t.as_polars(), t)
+
+    def test_pass_through_types(self) -> None:
+        from yggdrasil.data.types.primitive.numeric import DecimalType
+
+        for t in (
+            BooleanType(),
+            StringType(),
+            BinaryType(),
+            DateType(),
+            TimeType(),
+            DecimalType(precision=10, scale=2),
+        ):
+            with self.subTest(t=t):
+                self.assertIs(t.as_polars(), t)
+
+    def test_array_recurses_via_field_as_polars(self) -> None:
+        from yggdrasil.data.types.primitive.numeric import Float8Type
+
+        arr = ArrayType.from_item(Field("item", Float8Type()))
+        polars = arr.as_polars()
+        self.assertIsInstance(polars, ArrayType)
+        self.assertEqual(polars.item_field.dtype.byte_size, 4)
+
+    def test_struct_recurses_via_each_field(self) -> None:
+        from yggdrasil.data.types.primitive.numeric import Float16Type
+
+        st = StructType(fields=[
+            Field("a", Float16Type()),
+            Field("b", TimestampType(unit="s", tz="UTC")),
+        ])
+        polars = st.as_polars()
+        self.assertEqual(polars.fields[0].dtype.byte_size, 4)
+        self.assertEqual(str(polars.fields[1].dtype.unit), "ms")
+
+    def test_field_returns_field_with_polars_dtype(self) -> None:
+        from yggdrasil.data.types.primitive.numeric import Float8Type
+
+        f = Field("x", Float8Type())
+        polars = f.as_polars()
+        self.assertIsInstance(polars, Field)
+        self.assertEqual(polars.name, "x")
+        self.assertEqual(polars.dtype.byte_size, 4)
+
+    def test_field_already_polars_returns_self(self) -> None:
+        f = Field("x", IntegerType(byte_size=4, signed=True))
+        self.assertIs(f.as_polars(), f)
+
+    def test_schema_returns_schema_with_polars_dtypes(self) -> None:
+        from yggdrasil.data.types.primitive.numeric import Float8Type
+        from yggdrasil.data.schema import Schema
+
+        s = Schema(inner_fields=[
+            Field("x", Float8Type()),
+            Field("y", TimestampType(unit="s", tz="UTC")),
+        ])
+        polars = s.as_polars()
+        self.assertIsInstance(polars, Schema)
+        self.assertEqual(polars["x"].dtype.byte_size, 4)
+        self.assertEqual(str(polars["y"].dtype.unit), "ms")
+
+    def test_schema_already_polars_returns_self(self) -> None:
+        from yggdrasil.data.schema import Schema
+
+        s = Schema(inner_fields=[
+            Field("x", IntegerType(byte_size=4, signed=True)),
+            Field("y", StringType()),
+        ])
+        self.assertIs(s.as_polars(), s)

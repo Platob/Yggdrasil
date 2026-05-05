@@ -473,6 +473,17 @@ class MapType(NestedType):
             keys_sorted=self.keys_sorted,
         )
 
+    def as_polars(self) -> "MapType":
+        polars_key = self.key_field.as_polars()
+        polars_value = self.value_field.as_polars()
+        if polars_key is self.key_field and polars_value is self.value_field:
+            return self
+        return MapType.from_key_value(
+            key_field=polars_key,
+            value_field=polars_value,
+            keys_sorted=self.keys_sorted,
+        )
+
     def to_databricks_ddl(self) -> str:
         return f"MAP<{self.key_field.dtype.to_databricks_ddl()}, {self.value_field.dtype.to_databricks_ddl()}>"
 

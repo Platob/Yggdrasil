@@ -391,6 +391,44 @@ class TestOffset:
         assert Timezone.EASTERN.utc_offset_hours(at) == -4.0
 
 
+class TestUtcSecondsOffset:
+    """``utc_seconds_offset`` returns the fixed offset in seconds.
+
+    DST zones and :attr:`Timezone.NAIVE` return ``None``. Etc/GMT
+    follows IANA's reversed sign convention — ``Etc/GMT-3`` means
+    UTC+3, so the property reports ``+10800``.
+    """
+
+    def test_utc_returns_zero(self):
+        assert Timezone.UTC.utc_seconds_offset == 0
+        assert Timezone("Etc/UTC").utc_seconds_offset == 0
+        assert Timezone("GMT").utc_seconds_offset == 0
+        assert Timezone("Etc/GMT+0").utc_seconds_offset == 0
+
+    def test_etc_gmt_negative_means_east_of_utc(self):
+        assert Timezone("Etc/GMT-1").utc_seconds_offset == 3600
+        assert Timezone("Etc/GMT-3").utc_seconds_offset == 10800
+        assert Timezone("Etc/GMT-12").utc_seconds_offset == 12 * 3600
+
+    def test_etc_gmt_positive_means_west_of_utc(self):
+        assert Timezone("Etc/GMT+5").utc_seconds_offset == -5 * 3600
+        assert Timezone("Etc/GMT+8").utc_seconds_offset == -8 * 3600
+
+    def test_dst_zones_return_none(self):
+        # ``utc_offset(at)`` is the call to use for DST-aware values.
+        assert Timezone("Europe/Paris").utc_seconds_offset is None
+        assert Timezone.EASTERN.utc_seconds_offset is None
+        assert Timezone("Asia/Tokyo").utc_seconds_offset is None
+
+    def test_naive_returns_none(self):
+        assert Timezone.NAIVE.utc_seconds_offset is None
+
+    def test_offset_strings_round_trip(self):
+        assert Timezone.from_("+01:00").utc_seconds_offset == 3600
+        assert Timezone.from_("-05:00").utc_seconds_offset == -5 * 3600
+        assert Timezone.from_("+00:00").utc_seconds_offset == 0
+
+
 class TestIntrospection:
 
     def test_is_utc_true(self):

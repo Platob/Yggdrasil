@@ -452,6 +452,30 @@ class DataType(BaseChildrenFields, ABC):
         """
         return self.to_spark()
 
+    def as_polars(self) -> "DataType":
+        """Return a Polars-flavored :class:`DataType` for this type.
+
+        Same shape as :meth:`as_spark` — stays on the yggdrasil side
+        of the boundary and returns a :class:`DataType` whose
+        :meth:`to_polars` lands on a dtype Polars natively
+        represents. Defaults to ``self``; subclasses Polars can't
+        store at their declared width / precision override:
+
+        * ``Float8Type`` and ``Float16Type`` widen to ``Float32Type``
+          (Polars has no sub-32-bit floats);
+        * ``TimestampType`` / ``DurationType`` with second-precision
+          (``unit="s"``) widen to ``unit="ms"`` (Polars supports
+          ``ms`` / ``us`` / ``ns`` only);
+        * nested types (``ArrayType`` / ``MapType`` / ``StructType``)
+          recurse via ``as_polars`` on their child fields.
+
+        :class:`Field` and :class:`Schema` expose a matching
+        ``as_polars`` that delegates to ``self.dtype.as_polars`` and
+        re-wraps so callers chain through Field-shaped APIs without
+        dropping back to a plain :class:`DataType`.
+        """
+        return self
+
     def as_spark(self) -> "DataType":
         """Return a Spark-flavored :class:`DataType` for this type.
 

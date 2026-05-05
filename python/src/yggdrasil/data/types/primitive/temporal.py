@@ -1049,6 +1049,14 @@ class TimestampType(TemporalType):
             return self
         return TimestampType(unit=self.unit, tz=Timezone.NAIVE)
 
+    def as_polars(self) -> "TimestampType":
+        # Polars ``Datetime`` only supports ``ms`` / ``us`` / ``ns``;
+        # second-precision timestamps widen to ms so the
+        # ``to_polars()`` produces a dtype Polars actually stores.
+        if str(self.unit) == "s":
+            return TimestampType(unit=TimeUnit.MILLISECOND, tz=self.tz)
+        return self
+
     def to_databricks_ddl(self) -> str:
         # Databricks ``TIMESTAMP`` is UTC-anchored — only emit it when the tz is
         # UTC-equivalent. Anything else (naive or a real non-UTC zone like
@@ -1185,6 +1193,14 @@ class DurationType(TemporalType):
         from .numeric import IntegerType
 
         return IntegerType(byte_size=8, signed=True)
+
+    def as_polars(self) -> "DurationType":
+        # Polars ``Duration`` only supports ``ms`` / ``us`` / ``ns``;
+        # second-precision durations widen to ms so ``to_polars()``
+        # produces a dtype Polars actually stores.
+        if str(self.unit) == "s":
+            return DurationType(unit=TimeUnit.MILLISECOND)
+        return self
 
     def to_databricks_ddl(self) -> str:
         return "BIGINT"

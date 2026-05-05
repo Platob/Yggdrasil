@@ -233,6 +233,12 @@ class StructType(NestedType):
             return self
         return StructType(fields=spark_fields)
 
+    def as_polars(self) -> "StructType":
+        polars_fields = tuple(f.as_polars() for f in self.fields)
+        if all(a is b for a, b in zip(polars_fields, self.fields)):
+            return self
+        return StructType(fields=polars_fields)
+
     def to_databricks_ddl(self) -> str:
         fields_ddl = ", ".join(
             # Double any embedded backticks so Databricks/Spark parses the

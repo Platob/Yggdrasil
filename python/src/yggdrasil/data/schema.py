@@ -180,11 +180,21 @@ class Schema(Field):
         returned. Use :meth:`to_spark_schema` when you need an actual
         ``pyspark.sql.types.StructType``.
         """
-        spark_dtype = self.dtype.as_spark()
-        if spark_dtype is self.dtype:
+        return self._rewrap_with_dtype(self.dtype.as_spark())
+
+    def as_polars(self) -> "Schema":
+        """Return a :class:`Schema` whose dtype is Polars-compatible.
+
+        Same shape as :meth:`as_spark`, just delegating to
+        :meth:`DataType.as_polars` on the inner dtype.
+        """
+        return self._rewrap_with_dtype(self.dtype.as_polars())
+
+    def _rewrap_with_dtype(self, dtype) -> "Schema":
+        if dtype is self.dtype:
             return self
         return Schema(
-            inner_fields=tuple(spark_dtype.fields),
+            inner_fields=tuple(dtype.fields),
             metadata=self.metadata,
             name=self.name,
             nullable=self.nullable,

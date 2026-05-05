@@ -322,6 +322,28 @@ class Timezone:
         """
         return self.utc_offset(at).total_seconds() / 3600
 
+    @property
+    def utc_seconds_offset(self) -> int | None:
+        """Fixed UTC offset in seconds, or ``None`` for non-fixed zones.
+
+        Returns ``0`` for UTC and its equivalents (``Etc/UTC``,
+        ``GMT``, ``Etc/GMT+0``, …), the parsed offset for
+        ``Etc/GMT±N`` (note IANA's sign-flip — ``Etc/GMT-3`` means
+        UTC+3, so the property reports ``+10800`` not ``-10800``),
+        and ``None`` for any zone whose offset depends on DST or for
+        :attr:`Timezone.NAIVE`. Use :meth:`utc_offset` instead when
+        you need a DST-aware offset for a specific instant.
+
+        Naming follows the "type-suffix unit" convention so
+        ``utc_seconds_offset`` makes the unit explicit at the call
+        site — ``utc_offset`` returns a :class:`datetime.timedelta`,
+        ``utc_offset_hours`` returns fractional hours, and this
+        property returns whole seconds (or ``None``).
+        """
+        if not self.is_fixed_offset():
+            return None
+        return int(self.utc_offset().total_seconds())
+
     def is_naive(self) -> bool:
         """Return ``True`` for :attr:`Timezone.NAIVE` — the tz-less sentinel."""
         return self.iana == _NAIVE_IANA

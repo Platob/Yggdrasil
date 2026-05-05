@@ -373,6 +373,12 @@ class ArrayType(NestedType):
             return self
         return ArrayType.from_item(spark_item)
 
+    def as_polars(self) -> "ArrayType":
+        polars_item = self.item_field.as_polars()
+        if polars_item is self.item_field:
+            return self
+        return ArrayType.from_item(polars_item)
+
     def to_databricks_ddl(self) -> str:
         return f"ARRAY<{self.item_field.dtype.to_databricks_ddl()}>"
 
