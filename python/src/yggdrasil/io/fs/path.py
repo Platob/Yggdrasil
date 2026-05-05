@@ -575,43 +575,6 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         return False
 
     # ==================================================================
-    # Concurrency — sidecar locks
-    # ==================================================================
-
-    def lock_path(self, *, read: bool = False, write: bool = True) -> str:
-        from yggdrasil.io.buffer._concurrency import lock_path_for
-        return lock_path_for(self.full_path(), read=read, write=write)
-
-    def lock(
-        self,
-        *,
-        read: bool = False,
-        write: bool = True,
-        wait: Any = None,
-        stale_after_seconds: Any = None,
-    ) -> "Any":
-        """Build (but don't acquire) a cross-process lock for this path."""
-        from yggdrasil.io.buffer._concurrency import AtomicLock, FileLock
-
-        suffix_path_str = self.lock_path(read=read, write=write)
-        if self.is_local:
-            return FileLock(
-                suffix_path_str,
-                shared=(read and not write),
-                wait=wait,
-            )
-        try:
-            sidecar = type(self).from_(suffix_path_str)
-        except Exception:
-            sidecar = Path.from_(suffix_path_str)
-        return AtomicLock(
-            sidecar,
-            shared=(read and not write),
-            wait=wait,
-            stale_after_seconds=stale_after_seconds,
-        )
-
-    # ==================================================================
     # Coercion entry points
     # ==================================================================
 

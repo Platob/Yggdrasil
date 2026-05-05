@@ -248,8 +248,7 @@ class TestStreamingFolderIO:
         errors: list[Exception] = []
 
         def writer():
-            with YGGFolderIO(path=str(tmp_path), concurrent=True,
-                          lock_wait=10.0) as w:
+            with YGGFolderIO(path=str(tmp_path)) as w:
                 for i in range(1, n_batches):
                     w.write_arrow_table(
                         _make_table(i * rows_per_batch, rows_per_batch),
@@ -759,44 +758,3 @@ class TestYggOptimize:
         )
         assert result is folder
 
-    def test_read_does_not_block_on_root_lock(self, tmp_path):
-        """Reads run lock-free by default — the caller opts into locking
-        via ``concurrent=True`` on the underlying :class:`Path`, not the
-        folder type. A holder of the root ``.rw.lock`` must not stall
-        an ordinary :meth:`read_arrow_table` call.
-        """
-        if _IS_WINDOWS:
-            pytest.skip("Locking semantics on Windows differ enough to skip.")
-
-        folder = YGGFolderIO(path=str(tmp_path))
-        self._write_n_small(folder, 6)
-
-        ready = threading.Event()
-        release = threading.Event()
-        observed: list[float] = []
-
-        def _writer():
-            with folder.path.lock(read=True, write=True, wait=10):
-                ready.set()
-                release.wait(timeout=10)
-
-        def _reader():
-            ready.wait(timeout=5)
-            t0 = time.monotonic()
-            folder.read_arrow_table()
-            observed.append(time.monotonic() - t0)
-
-        wt = threading.Thread(target=_writer)
-        rt = threading.Thread(target=_reader)
-        wt.start()
-        rt.start()
-        time.sleep(0.3)
-        try:
-            assert observed, "reader didn't finish before lock release"
-            # Reader should have completed promptly without waiting
-            # on the writer's lock.
-            assert observed[0] < 0.2
-        finally:
-            release.set()
-            wt.join(timeout=10)
-            rt.join(timeout=10)

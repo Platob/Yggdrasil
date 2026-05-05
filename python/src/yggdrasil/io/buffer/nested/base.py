@@ -215,8 +215,6 @@ class NestedIO(TabularIO[O], ABC):
         media_type: Any = None,
         parent: "NestedIO | None" = None,
         auto_open: bool = False,
-        concurrent: bool = False,
-        lock_wait: Any = None,
         **kwargs: Any,
     ) -> None:
         """Initialize from a folder path.
@@ -232,25 +230,11 @@ class NestedIO(TabularIO[O], ABC):
         first ``with`` entry or explicit :meth:`open`. This matches
         the no-surprises rule callers rely on: building a handle
         should not start probing storage.
-
-        ``concurrent=True`` enables cross-process serialisation: an
-        ``.rw.lock`` sidecar against the folder root is acquired on
-        :meth:`_acquire` and released on :meth:`_release`. The lock
-        is conservative — exclusive across reads and writes — because
-        a folder doesn't carry a single mode the way :class:`BytesIO`
-        does. Callers that need finer granularity should split read
-        and write blocks with their own
-        ``self.path.lock(read=...)`` / ``write=...)`` calls.
-
-        ``lock_wait`` follows :class:`WaitingConfig` conventions
-        (``None`` = wait forever, ``N`` = ``N`` seconds with backoff,
-        ``WaitingConfig(...)`` for full control). Raises
-        :class:`TimeoutError` once the deadline elapses.
         """
         # Common TabularIO state (cache slots, _media_type, spill
         # placeholders) — NestedIO subclasses don't use _spill_path
         # but the consistent default is harmless.
-        TabularIO.__init__(self, media_type=media_type, concurrent=concurrent)
+        TabularIO.__init__(self, media_type=media_type)
         self.parent: "NestedIO | None" = parent
 
         raw = path if path is not None else data
@@ -264,14 +248,6 @@ class NestedIO(TabularIO[O], ABC):
         else:
             self.path = path_class().from_(raw)
 
-        # Concurrency: lock the folder root for the IO's lifetime when
-        # ``concurrent=True``. Inherited from :class:`TabularIO`, but
-        # the actual lock object lives here because it's keyed off
-        # :attr:`path`. ``lock_wait`` is a :class:`WaitingConfig`
-        # argument — see ``Path.lock``.
-        self._lock_wait: Any = lock_wait
-        self._path_lock = None
-
         if auto_open:
             Disposable.open(self)
 
@@ -282,32 +258,9 @@ class NestedIO(TabularIO[O], ABC):
     def _acquire(self) -> None:
         if not self.path.opened:
             self.path.open()
-        if self.concurrent and self._path_lock is None:
-            try:
-                lock = self.path.lock(
-                    read=True, write=True,
-                    wait=self._lock_wait,
-                )
-            except Exception:
-                lock = None
-            if lock is not None:
-                try:
-                    lock.acquire()
-                except TimeoutError:
-                    raise
-                except Exception:
-                    lock = None
-            self._path_lock = lock
 
     def _release(self) -> None:
         self.unpersist()
-        lock = self._path_lock
-        self._path_lock = None
-        if lock is not None:
-            try:
-                lock.release()
-            except Exception:
-                pass
 
     # ``cached`` / ``persist`` / ``unpersist`` come from
     # :class:`TabularIO` — they drive the shared ``_persisted_data``

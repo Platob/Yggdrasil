@@ -526,10 +526,8 @@ class LocalPath(Path):
         rely on this override to keep their JSON-line invariants.
 
         ``mode="xb"`` rides ``O_EXCL`` so the create-and-write is
-        atomic — used by the AtomicLock sidecar dance, where two
-        concurrent acquirers must not both succeed. The base
-        implementation does an ``exists()`` check first and is
-        therefore racy.
+        atomic. The base implementation does an ``exists()`` check
+        first and is therefore racy under concurrent writers.
 
         Other modes fall through to the base implementation (which
         funnels through :meth:`_pwrite`).
