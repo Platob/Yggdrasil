@@ -53,13 +53,17 @@ class TestArrowFieldRoundTrip:
         assert b"type_json" in out.metadata
 
     def test_from_arrow_field_strips_type_json_metadata(self) -> None:
+        from yggdrasil.data.types.id import DataTypeId
+
         arrow_field = pa.field(
             "value",
             pa.int64(),
             nullable=True,
             metadata={
                 b"comment": b"hello",
-                b"type_json": b'{"id":3}',
+                # Use the live ``INTEGER`` id rather than a hard-coded
+                # int so the test survives further enum reorganization.
+                b"type_json": f'{{"id":{int(DataTypeId.INTEGER)}}}'.encode(),
             },
         )
 

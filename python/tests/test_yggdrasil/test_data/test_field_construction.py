@@ -134,8 +134,13 @@ class TestFromStr:
         assert out.nullable is False
 
     def test_json_payload(self) -> None:
+        from yggdrasil.data.types.id import DataTypeId
+
+        # Hand-built JSON payload — the abstract ``INTEGER`` id resolves
+        # through the size + signed metadata back to ``Int32Type``.
         out = Field.from_str(
-            '{"name":"qty","dtype":{"id":3,"byte_size":4,"signed":true},'
+            '{"name":"qty","dtype":'
+            f'{{"id":{int(DataTypeId.INTEGER)},"byte_size":4,"signed":true}},'
             '"nullable":false}'
         )
 
@@ -186,10 +191,12 @@ class TestFromDataclass:
 class TestFromDictAndJson:
 
     def test_from_dict_builds_field_with_metadata(self) -> None:
+        from yggdrasil.data.types.id import DataTypeId
+
         out = Field.from_dict(
             {
                 "name": "value",
-                "dtype": {"id": 11},
+                "dtype": {"id": int(DataTypeId.STRING)},
                 "nullable": True,
                 "metadata": {"comment": "hello"},
             }
