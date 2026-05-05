@@ -314,12 +314,21 @@ class TestSeek:
         buf = BytesIO(SMALL)
         assert buf.seek(0, _stdio.SEEK_END) == len(SMALL)
 
-    def test_seek_negative_set_counts_from_end(self):
-        # Yggdrasil extension: SEEK_SET with a negative offset is
-        # measured from the end (size + offset + 1).
+    def test_seek_minus_one_is_end_sentinel(self):
+        # Yggdrasil extension: seek(-1) on SEEK_SET maps to end, to
+        # mirror the read(-1) "read all" sentinel. Other negative
+        # SEEK_SET offsets raise like stdlib io.BytesIO.
         buf = BytesIO(b"helloworld")
         assert buf.seek(-1) == 10
-        assert buf.seek(-2) == 9
+        assert buf.tell() == 10
+
+    def test_seek_other_negative_set_raises(self):
+        buf = BytesIO(b"helloworld")
+        for bad in (-2, -5, -100):
+            with pytest.raises(ValueError):
+                buf.seek(bad)
+        # cursor unchanged after the failed seeks
+        assert buf.tell() == 0
 
     def test_seek_invalid_whence_raises(self):
         with pytest.raises(ValueError):
@@ -1189,13 +1198,14 @@ class TestBytesIOView:
         with pytest.raises(ValueError):
             v.truncate(-1)
 
-    def test_seek_set_negative_counts_from_end(self):
-        # BytesIO's seek extends SEEK_SET to support negative offsets
-        # as "count back from end". A view inherits that semantics
-        # since it is a BytesIO.
+    def test_seek_minus_one_is_end_sentinel(self):
+        # BytesIO maps seek(-1) to end as a "go to end" sentinel.
+        # A view inherits that semantics since it is a BytesIO.
         v = BytesIO(b"abc").view(pos=0, size=3)
-        # -1 from a 3-byte view → 3 + -1 + 1 = 3 (one past last byte).
         assert v.seek(-1, _stdio.SEEK_SET) == 3
+        # Other negative SEEK_SET offsets raise on a view too.
+        with pytest.raises(ValueError):
+            v.seek(-2, _stdio.SEEK_SET)
 
     def test_seek_cur_clamps_to_zero(self):
         v = BytesIO(b"abc").view(pos=0, size=3)

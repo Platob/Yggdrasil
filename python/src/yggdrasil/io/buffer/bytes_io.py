@@ -492,7 +492,21 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             self._init_from(data, copy=copy)
 
         if auto_open is None:
-            auto_open = self._spill_path is not None and not self._owns_spill_path
+            # Default policy:
+            #
+            # * Caller-owned path-bound buffers stay closed — the
+            #   caller drives the lifecycle via ``with`` so we don't
+            #   prematurely truncate someone else's file.
+            # * Everything else (memory-only and self-owned spill
+            #   paths) auto-opens. Memory-only buffers must report
+            #   ``closed=False`` from construction so external
+            #   writers (pyarrow ``NativeFile``, gzip, zipfile, ...)
+            #   accept the handle. Their ``_acquire`` is a cheap
+            #   no-op for the memory-only case.
+            caller_owned_path = (
+                self._spill_path is not None and not self._owns_spill_path
+            )
+            auto_open = caller_owned_path or self._spill_path is None
 
         if auto_open and not self._acquired:
             self.open()
@@ -2378,18 +2392,31 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     
     @check_transaction()
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
-        """Seek. Yggdrasil extension: SEEK_SET with negative offset
-        counts from end."""
+        """Seek to ``offset`` measured by ``whence``.
+
+        Mirrors :meth:`io.IOBase.seek` so external writers (pandas,
+        pyarrow, zipfile, gzip, ...) get the semantics they expect.
+        Two intentional deviations from stdlib for ergonomics:
+
+        * ``seek(-1, SEEK_SET)`` is a "go to end" sentinel mirroring
+          the ``read(-1)`` / "read all" convention used elsewhere on
+          this object. Any other negative ``SEEK_SET`` offset raises
+          ``ValueError`` like ``io.BytesIO``.
+        * ``SEEK_CUR`` / ``SEEK_END`` with an offset that would land
+          before byte 0 clamps to 0 instead of raising — matches what
+          most file-like consumers in this repo already rely on.
+        """
         offset = int(offset)
         size = self.size
         if whence == io.SEEK_SET:
-            if offset < 0:
-                new_pos = size + offset + 1
-                if new_pos < 0:
-                    raise ValueError(
-                        f"Negative SEEK_SET offset {offset!r} is past the "
-                        f"start of a {size}-byte buffer"
-                    )
+            if offset == -1:
+                new_pos = size
+            elif offset < 0:
+                raise ValueError(
+                    f"Negative SEEK_SET offset {offset!r} is invalid; "
+                    f"only -1 is accepted as a 'seek to end' sentinel. "
+                    f"Use seek({offset}, SEEK_END) to count from the end."
+                )
             else:
                 new_pos = offset
         elif whence == io.SEEK_CUR:
