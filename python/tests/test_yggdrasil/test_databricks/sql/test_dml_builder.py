@@ -569,3 +569,41 @@ class TestResolveDispatchTargets:
                 {123: col("x") == 1}, primary=primary,
             )
         assert "Table or str" in str(exc.value)
+
+    def test_string_predicate_is_lifted_via_predicate_from_(self):
+        from yggdrasil.data.expr.nodes import Predicate
+        primary = _make_table("cat", "sch", "primary")
+        extra = _make_table("cat", "sch", "extra")
+
+        # Raw SQL on the value side — Predicate.from_ routes str to
+        # from_sql, so callers don't have to build expr trees by hand
+        # for the simple "filter rows where ..." case.
+        out = _resolve_dispatch_targets(
+            {extra: "region = 'eu' AND tier = 'gold'"},
+            primary=primary,
+        )
+
+        assert len(out) == 1
+        target, predicate = out[0]
+        assert target is extra
+        # Coercion lands a real Predicate AST — downstream rendering
+        # (``_render_source_predicate``) doesn't need to special-case
+        # strings.
+        assert isinstance(predicate, Predicate)
+
+        rendered = _render_source_predicate(predicate)
+        assert "`region`" in rendered
+        assert "`tier`" in rendered
+        assert "AND" in rendered
+
+    def test_existing_predicate_passes_through_unchanged(self):
+        from yggdrasil.data.expr import col
+        primary = _make_table("cat", "sch", "primary")
+        extra = _make_table("cat", "sch", "extra")
+        pred = col("region") == "eu"
+
+        out = _resolve_dispatch_targets({extra: pred}, primary=primary)
+
+        # Already-a-Predicate skips the lift entirely — same object
+        # comes back so callers can rely on identity for caching keys.
+        assert out[0][1] is pred

@@ -487,7 +487,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         prune_by: list[str] | str | None = None,
         prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
-        table_dispatch: Mapping["Table | str", Predicate] | None = None,
+        table_dispatch: Mapping["Table | str", "Predicate | str"] | None = None,
     ) -> None:
         """Resolve the target :class:`Table` and call :meth:`Table.insert_into`.
 
@@ -544,7 +544,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         prune_by: list[str] | str | None = None,
         prune_values: Mapping[str, list[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
-        table_dispatch: Mapping["Table | str", Predicate] | None = None,
+        table_dispatch: Mapping["Table | str", "Predicate | str"] | None = None,
     ) -> None:
         """Resolve target and forward to :meth:`Table.arrow_insert`."""
         target = self._resolve_target(
@@ -597,7 +597,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         prune_values: dict[str, tuple[Any, ...]] | None = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         retry: Optional[WaitingConfigArg] = None,
-        table_dispatch: Mapping["Table | str", Predicate] | None = None,
+        table_dispatch: Mapping["Table | str", "Predicate | str"] | None = None,
     ) -> None:
         """Resolve target and forward to :meth:`Table.spark_insert`."""
         target = self._resolve_target(
@@ -648,7 +648,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         prune_by: list[str] | str | None = None,
         prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
-        table_dispatch: Mapping["Table | str", Predicate] | None = None,
+        table_dispatch: Mapping["Table | str", "Predicate | str"] | None = None,
     ) -> None:
         """Resolve target and forward to :meth:`Table.sql_insert`."""
         target = self._resolve_target(

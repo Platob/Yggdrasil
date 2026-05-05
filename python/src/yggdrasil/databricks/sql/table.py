@@ -443,13 +443,13 @@ def _resolve_prune_by(
 # source rows into additional Delta tables, with each target getting its own
 # row-level :class:`Predicate` applied to the source as a ``WHERE`` filter.
 # Resolution accepts either a built :class:`Table` or a dotted location
-# string so callers can stay loose ("cat.sch.tbl") without pre-building
-# handles.
+# string for keys, and a :class:`Predicate`, raw SQL string, or any other
+# engine expression :meth:`Predicate.from_` knows how to lift for values.
 # ---------------------------------------------------------------------------
 
 
 def _resolve_dispatch_targets(
-    dispatch: "Mapping[Table | str, Predicate] | None",
+    dispatch: "Mapping[Table | str, Predicate | str] | None",
     *,
     primary: "Table",
 ) -> list[tuple["Table", Predicate]]:
@@ -457,10 +457,13 @@ def _resolve_dispatch_targets(
 
     String keys go through :meth:`Table.from_` against the primary's
     own ``Tables`` service so callers can pass either a fully-built
-    handle or a dotted location like ``"cat.sch.name"``. A self-dispatch
-    (an entry that resolves to the primary itself) raises — the primary
-    insert already covers that target and silently double-inserting
-    would surprise everyone.
+    handle or a dotted location like ``"cat.sch.name"``. String values
+    (or anything else :meth:`Predicate.from_` can lift — Polars / Arrow /
+    Spark expressions) are coerced to a yggdrasil :class:`Predicate`
+    here so the rendering path always sees the canonical AST.
+    A self-dispatch (an entry that resolves to the primary itself)
+    raises — the primary insert already covers that target and
+    silently double-inserting would surprise everyone.
     """
     if not dispatch:
         return []
@@ -487,6 +490,13 @@ def _resolve_dispatch_targets(
                 f"target {primary_loc!r}; the primary insert already "
                 f"covers it. Drop the entry or point it at a different table."
             )
+        # Coerce SQL strings and engine-native expressions into the
+        # canonical Predicate AST. ``Predicate.from_`` is forgiving on
+        # input: existing Predicate passes through, str → from_sql,
+        # polars/pyarrow/pyspark → matching from_*. Anything it can't
+        # lift surfaces with a clear "give me one of: …" error.
+        if not isinstance(predicate, Predicate):
+            predicate = Predicate.from_(predicate)
         out.append((target, predicate))
     return out
 
@@ -2085,7 +2095,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         raise_error: bool = True,
         spark_session: Optional["SparkSession"] = None,
         return_data: bool = False,
-        table_dispatch: "Mapping[Table | str, Predicate] | None" = None,
+        table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
         **kwargs
     ) -> "TabularIO | None":
         """Insert *data* into this table — thin wrapper over :meth:`insert_into`."""
@@ -2132,7 +2142,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
-        table_dispatch: "Mapping[Table | str, Predicate] | None" = None,
+        table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
     ) -> "TabularIO | None":
         """Insert *data* into this table using the most appropriate backend.
 
@@ -2231,7 +2241,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         prune_values: Mapping[str, list[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
-        table_dispatch: "Mapping[Table | str, Predicate] | None" = None,
+        table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
     ) -> "TabularIO | None":
         """Insert through the warehouse SQL path with staged Parquet.
 
@@ -2482,7 +2492,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
-        table_dispatch: "Mapping[Table | str, Predicate] | None" = None,
+        table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
     ) -> "TabularIO | None":
         """Insert into this table using Spark.
 
@@ -2719,7 +2729,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
-        table_dispatch: "Mapping[Table | str, Predicate] | None" = None,
+        table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
     ) -> "TabularIO | None":
         """Insert into this table from a SQL source query.
 
@@ -2803,7 +2813,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         prune_by: list[str] | str | None,
         prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
-        table_dispatch: "Mapping[Table | str, Predicate] | None" = None,
+        table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
     ) -> None:
         """Warehouse fallback for :meth:`sql_insert`."""
         from yggdrasil.databricks.warehouse import WarehousePreparedStatement
