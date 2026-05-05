@@ -1,0 +1,202 @@
+"""``DataType.as_spark`` / ``Field.as_spark`` / ``Schema.as_spark``.
+
+The contract:
+
+* the result is a :class:`DataType` / :class:`Field` / :class:`Schema`
+  on the yggdrasil side — never a pyspark object;
+* it's a Spark-compatible *yggdrasil* shape, i.e. one whose
+  ``to_spark()`` round-trips without a widening surprise;
+* unsigned integers stay the same width and flip to signed (Spark has
+  no native unsigned types — values reinterpret two's-complement so
+  ``max(uint64) → -1`` as ``int64``);
+* ``Float16`` widens to ``Float32`` (no native half-precision in
+  Spark);
+* ``TimeType`` becomes ``StringType``; ``DurationType`` becomes a
+  64-bit signed int; non-UTC ``TimestampType`` drops to naive;
+* nested types recurse via their child fields' ``as_spark``;
+* types that are already Spark-compatible return ``self`` so the
+  call is cheap to make defensively.
+"""
+from __future__ import annotations
+
+import unittest
+
+from yggdrasil.data.data_field import Field
+from yggdrasil.data.enums.timezone import Timezone
+from yggdrasil.data.schema import Schema
+from yggdrasil.data.types.nested import ArrayType, MapType, StructType
+from yggdrasil.data.types.primitive import (
+    BinaryType,
+    BooleanType,
+    DateType,
+    DecimalType,
+    DurationType,
+    FloatingPointType,
+    IntegerType,
+    StringType,
+    TimestampType,
+    TimeType,
+)
+
+
+class TestPrimitiveAsSpark(unittest.TestCase):
+
+    def test_signed_integer_returns_self(self) -> None:
+        for size in (1, 2, 4, 8):
+            with self.subTest(size=size):
+                t = IntegerType(byte_size=size, signed=True)
+                self.assertIs(t.as_spark(), t)
+
+    def test_unsigned_integer_flips_signed_keeps_width(self) -> None:
+        for size in (1, 2, 4, 8):
+            with self.subTest(size=size):
+                t = IntegerType(byte_size=size, signed=False)
+                spark = t.as_spark()
+                self.assertEqual(spark.byte_size, size)
+                self.assertTrue(spark.signed)
+
+    def test_unsigned_reinterpret_max_to_negative_one(self) -> None:
+        # ``max(uintN)`` reinterprets as ``-1`` in the matching signed
+        # width — two's-complement bit pattern.
+        for size in (1, 2, 4, 8):
+            with self.subTest(size=size):
+                signed = IntegerType(byte_size=size, signed=True)
+                max_unsigned = (1 << (size * 8)) - 1
+                self.assertEqual(signed.reinterpret_pyobj(max_unsigned), -1)
+
+    def test_signed_reinterpret_negative_one_to_max(self) -> None:
+        for size in (1, 2, 4, 8):
+            with self.subTest(size=size):
+                unsigned = IntegerType(byte_size=size, signed=False)
+                max_unsigned = (1 << (size * 8)) - 1
+                self.assertEqual(unsigned.reinterpret_pyobj(-1), max_unsigned)
+
+    def test_float16_widens_to_float32(self) -> None:
+        spark = FloatingPointType(byte_size=2).as_spark()
+        self.assertIsInstance(spark, FloatingPointType)
+        self.assertEqual(spark.byte_size, 4)
+
+    def test_float32_and_float64_unchanged(self) -> None:
+        for size in (4, 8):
+            with self.subTest(size=size):
+                t = FloatingPointType(byte_size=size)
+                self.assertIs(t.as_spark(), t)
+
+    def test_time_widens_to_string(self) -> None:
+        self.assertIsInstance(TimeType().as_spark(), StringType)
+
+    def test_duration_widens_to_int64(self) -> None:
+        spark = DurationType().as_spark()
+        self.assertIsInstance(spark, IntegerType)
+        self.assertEqual(spark.byte_size, 8)
+        self.assertTrue(spark.signed)
+
+    def test_timestamp_naive_unchanged(self) -> None:
+        t = TimestampType()
+        self.assertIs(t.as_spark(), t)
+
+    def test_timestamp_utc_unchanged(self) -> None:
+        t = TimestampType(tz="UTC")
+        self.assertIs(t.as_spark(), t)
+
+    def test_timestamp_non_utc_drops_to_naive(self) -> None:
+        t = TimestampType(tz="Europe/Paris")
+        spark = t.as_spark()
+        self.assertIsInstance(spark, TimestampType)
+        self.assertTrue(spark.tz.is_naive())
+        self.assertEqual(spark.unit, t.unit)
+
+    def test_pass_through_types_return_self(self) -> None:
+        # Spark already represents these natively.
+        for t in (
+            BooleanType(),
+            StringType(),
+            BinaryType(),
+            DateType(),
+            DecimalType(precision=10, scale=2),
+        ):
+            with self.subTest(t=t):
+                self.assertIs(t.as_spark(), t)
+
+
+class TestNestedAsSpark(unittest.TestCase):
+
+    def test_array_recurses_via_field_as_spark(self) -> None:
+        arr = ArrayType.from_item(Field("item", TimeType()))
+        spark = arr.as_spark()
+        self.assertIsInstance(spark, ArrayType)
+        self.assertIsInstance(spark.item_field.dtype, StringType)
+
+    def test_array_already_spark_returns_self(self) -> None:
+        arr = ArrayType.from_item(Field("item", IntegerType(byte_size=4, signed=True)))
+        self.assertIs(arr.as_spark(), arr)
+
+    def test_map_recurses_via_key_and_value_fields(self) -> None:
+        map_type = MapType.from_key_value(
+            key_field=Field("key", IntegerType(byte_size=4, signed=False)),
+            value_field=Field("value", DurationType()),
+        )
+        spark = map_type.as_spark()
+        self.assertIsInstance(spark, MapType)
+        # Unsigned key flips to signed (same width).
+        self.assertTrue(spark.key_field.dtype.signed)
+        self.assertEqual(spark.key_field.dtype.byte_size, 4)
+        # Duration becomes Int64.
+        self.assertIsInstance(spark.value_field.dtype, IntegerType)
+        self.assertEqual(spark.value_field.dtype.byte_size, 8)
+
+    def test_struct_recurses_via_each_field(self) -> None:
+        st = StructType(fields=[
+            Field("a", IntegerType(byte_size=2, signed=False)),
+            Field("b", TimestampType(tz="Asia/Tokyo")),
+            Field("c", DateType()),
+        ])
+        spark = st.as_spark()
+        self.assertIsInstance(spark, StructType)
+        # uint16 → int16
+        self.assertEqual(spark.fields[0].dtype.byte_size, 2)
+        self.assertTrue(spark.fields[0].dtype.signed)
+        # Asia/Tokyo → naive
+        self.assertTrue(spark.fields[1].dtype.tz.is_naive())
+        # date untouched
+        self.assertIs(spark.fields[2].dtype, st.fields[2].dtype)
+
+    def test_struct_already_spark_returns_self(self) -> None:
+        st = StructType(fields=[
+            Field("a", IntegerType(byte_size=4, signed=True)),
+            Field("b", DateType()),
+        ])
+        self.assertIs(st.as_spark(), st)
+
+
+class TestFieldAndSchemaAsSpark(unittest.TestCase):
+
+    def test_field_returns_field_with_spark_dtype(self) -> None:
+        f = Field("x", IntegerType(byte_size=2, signed=False))
+        spark = f.as_spark()
+        self.assertIsInstance(spark, Field)
+        self.assertEqual(spark.name, "x")
+        self.assertEqual(spark.nullable, f.nullable)
+        self.assertTrue(spark.dtype.signed)
+        self.assertEqual(spark.dtype.byte_size, 2)
+
+    def test_field_already_spark_returns_self(self) -> None:
+        f = Field("x", IntegerType(byte_size=4, signed=True))
+        self.assertIs(f.as_spark(), f)
+
+    def test_schema_returns_schema_with_spark_dtypes(self) -> None:
+        s = Schema(inner_fields=[
+            Field("x", IntegerType(byte_size=4, signed=False)),
+            Field("y", TimeType()),
+        ])
+        spark = s.as_spark()
+        self.assertIsInstance(spark, Schema)
+        self.assertTrue(spark["x"].dtype.signed)
+        self.assertIsInstance(spark["y"].dtype, StringType)
+
+    def test_schema_already_spark_returns_self(self) -> None:
+        s = Schema(inner_fields=[
+            Field("x", IntegerType(byte_size=4, signed=True)),
+            Field("y", StringType()),
+        ])
+        self.assertIs(s.as_spark(), s)

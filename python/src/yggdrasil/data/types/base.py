@@ -450,19 +450,28 @@ class DataType(BaseChildrenFields, ABC):
         """
         return self.to_spark()
 
-    def as_spark(self) -> "pst.DataType":
-        """Spark-native counterpart for this dtype.
+    def as_spark(self) -> "DataType":
+        """Return a Spark-flavored :class:`DataType` for this type.
 
-        Returns a :class:`pyspark.sql.types.DataType`. Nested types
-        (``ArrayType`` / ``MapType`` / ``StructType``) override this
-        to recurse via ``as_spark`` on their children, so one call
-        assembles the full Spark type tree without each call site
-        reaching into ``to_spark`` / ``to_pyspark_field`` directly.
-        :class:`Field` and :class:`Schema` expose the same method —
-        both delegate to ``self.dtype.as_spark`` so callers get the
-        Spark dtype regardless of which yggdrasil object they hold.
+        ``as_spark`` lives on the yggdrasil side of the boundary: it
+        returns a :class:`DataType` that maps cleanly to a Spark dtype
+        (i.e. one ``self.to_spark()`` would round-trip without a
+        widening-time surprise). For types Spark already represents
+        natively (signed ints, ``Float32`` / ``Float64``, ``Date``,
+        ``String`` / ``Binary`` / ``Boolean``, decimal, naive / UTC
+        timestamps), the default is to return ``self`` unchanged.
+
+        Subclasses Spark cannot represent natively
+        (``IntegerType`` with ``signed=False``, ``Float16Type``,
+        ``DurationType``, ``TimeType``, non-UTC ``TimestampType``)
+        override this to return the closest Spark-compatible
+        yggdrasil dtype — usually a widened integer, a ``StringType``,
+        or a naive timestamp. Nested types (``ArrayType`` /
+        ``MapType`` / ``StructType``) recurse via ``as_spark`` on
+        their child fields so the whole tree comes back
+        Spark-compatible in one call.
         """
-        return self.to_spark()
+        return self
 
     # ==================================================================
     # Autotag — Databricks-friendly shape tags

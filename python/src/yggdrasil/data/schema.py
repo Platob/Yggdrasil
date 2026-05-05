@@ -170,13 +170,25 @@ class Schema(Field):
             metadata=self.metadata,
         )
 
-    def as_spark(self):
-        """Spark-native counterpart for this schema — a ``StructType``.
+    def as_spark(self) -> "Schema":
+        """Return a :class:`Schema` whose dtype is Spark-compatible.
 
-        :attr:`dtype` is always a :class:`StructType` here, so its
-        ``as_spark`` already produces the right Spark shape.
+        Like :meth:`Field.as_spark`, but the result is wrapped back
+        into a :class:`Schema` so callers chain through schema-shaped
+        APIs without dropping to a plain :class:`Field`. When every
+        child is already Spark-compatible the same instance is
+        returned. Use :meth:`to_spark_schema` when you need an actual
+        ``pyspark.sql.types.StructType``.
         """
-        return self.dtype.as_spark()
+        spark_dtype = self.dtype.as_spark()
+        if spark_dtype is self.dtype:
+            return self
+        return Schema(
+            inner_fields=tuple(spark_dtype.fields),
+            metadata=self.metadata,
+            name=self.name,
+            nullable=self.nullable,
+        )
 
 
 @register_converter(Any, Schema)

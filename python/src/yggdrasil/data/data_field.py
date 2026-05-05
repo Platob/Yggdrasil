@@ -2147,17 +2147,29 @@ class Field(BaseMetadata, BaseChildrenFields):
             return self.to_spark_schema()
         return self.to_pyspark_field()
 
-    def as_spark(self) -> "pst.DataType":
-        """Spark-native counterpart for this field's *dtype*.
+    def as_spark(self) -> "Field":
+        """Return a Field whose ``dtype`` is Spark-compatible.
 
-        Delegates to :meth:`DataType.as_spark` on :attr:`dtype` —
-        ``Field`` itself doesn't have a Spark counterpart (Spark's
-        ``StructField`` is a metadata wrapper, not a field-shape
-        equivalent), so ``as_spark`` returns the Spark dtype instead.
-        Use :meth:`to_pyspark_field` when you actually need a
-        ``StructField``.
+        Stays on the yggdrasil side of the boundary — the result is
+        still a :class:`Field`, just with :attr:`dtype` swapped for
+        whatever ``self.dtype.as_spark()`` produced (an unsigned int
+        widens to signed, a non-UTC timestamp drops to naive,
+        ``TimeType`` becomes ``StringType``, …). When the dtype is
+        already Spark-compatible the same instance is returned, so
+        the call is cheap to make defensively.
+
+        Use :meth:`to_pyspark_field` when you need an actual
+        ``pyspark.sql.types.StructField``.
         """
-        return self.dtype.as_spark()
+        spark_dtype = self.dtype.as_spark()
+        if spark_dtype is self.dtype:
+            return self
+        return Field(
+            name=self.name,
+            dtype=spark_dtype,
+            nullable=self.nullable,
+            metadata=self.metadata,
+        )
 
     def to_schema(
         self,

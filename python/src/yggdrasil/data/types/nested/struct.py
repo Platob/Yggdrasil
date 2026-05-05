@@ -221,15 +221,17 @@ class StructType(NestedType):
         return pl.Struct([f.to_polars_field() for f in self.fields])
 
     def to_spark(self) -> Any:
-        return self.as_spark()
-
-    def as_spark(self) -> Any:
-        # ``Field.as_spark`` returns a fully-formed ``StructField`` with
-        # metadata and nullability — recurse through it so nested
-        # struct trees keep their per-field metadata in the Spark
-        # round-trip.
         spark = get_spark_sql()
-        return spark.types.StructType([f.as_spark() for f in self.fields])
+        return spark.types.StructType([f.to_pyspark_field() for f in self.fields])
+
+    def as_spark(self) -> "StructType":
+        # Recurse via the field-level :meth:`Field.as_spark` so each
+        # child's metadata + nullability survive alongside its
+        # Spark-flavored dtype.
+        spark_fields = tuple(f.as_spark() for f in self.fields)
+        if all(a is b for a, b in zip(spark_fields, self.fields)):
+            return self
+        return StructType(fields=spark_fields)
 
     def to_databricks_ddl(self) -> str:
         fields_ddl = ", ".join(

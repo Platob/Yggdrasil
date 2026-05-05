@@ -358,16 +358,20 @@ class ArrayType(NestedType):
         return pl.List(self.item_field.dtype.to_polars())
 
     def to_spark(self) -> Any:
-        return self.as_spark()
-
-    def as_spark(self) -> Any:
-        # Drive the nested element type through ``as_spark`` so the
-        # whole tree round-trips through one polymorphic entry point.
         spark = get_spark_sql()
         return spark.types.ArrayType(
-            self.item_field.dtype.as_spark(),
+            self.item_field.dtype.to_spark(),
             containsNull=self.item_field.nullable,
         )
+
+    def as_spark(self) -> "ArrayType":
+        # Recurse via the field-level :meth:`Field.as_spark` so the
+        # element's metadata + nullability survive alongside its
+        # Spark-flavored dtype.
+        spark_item = self.item_field.as_spark()
+        if spark_item is self.item_field:
+            return self
+        return ArrayType.from_item(spark_item)
 
     def to_databricks_ddl(self) -> str:
         return f"ARRAY<{self.item_field.dtype.to_databricks_ddl()}>"

@@ -905,6 +905,13 @@ class TimeType(TemporalType):
         spark = get_spark_sql()
         return spark.types.StringType()
 
+    def as_spark(self):
+        # Spark has no native ``TimeType`` — widen to ``StringType`` so
+        # ``self.to_spark()`` round-trips through ISO-8601 text.
+        from .string import StringType
+
+        return StringType()
+
     def to_databricks_ddl(self) -> str:
         return "STRING"
 
@@ -1031,6 +1038,16 @@ class TimestampType(TemporalType):
         if self.tz.is_naive() and hasattr(spark.types, "TimestampNTZType"):
             return spark.types.TimestampNTZType()
         return spark.types.TimestampType()
+
+    def as_spark(self) -> "TimestampType":
+        # Spark only has UTC-anchored ``TimestampType`` and naive
+        # ``TimestampNTZType`` — non-UTC zones (``Europe/Paris``,
+        # ``America/New_York`` …) lose their offset on round-trip.
+        # Drop them to ``Timezone.NAIVE`` so the wall-clock survives
+        # rather than silently shifting to UTC at write time.
+        if self.tz.is_naive() or self.tz.is_utc():
+            return self
+        return TimestampType(unit=self.unit, tz=Timezone.NAIVE)
 
     def to_databricks_ddl(self) -> str:
         # Databricks ``TIMESTAMP`` is UTC-anchored — only emit it when the tz is
@@ -1161,6 +1178,13 @@ class DurationType(TemporalType):
     def to_spark(self) -> Any:
         spark = get_spark_sql()
         return spark.types.LongType()
+
+    def as_spark(self):
+        # Spark has no native interval type — widen to a 64-bit signed
+        # integer to mirror :meth:`to_spark` (``LongType``).
+        from .numeric import IntegerType
+
+        return IntegerType(byte_size=8, signed=True)
 
     def to_databricks_ddl(self) -> str:
         return "BIGINT"

@@ -579,6 +579,35 @@ class IntegerType(NumericType):
         tags[b"signed"] = b"true" if self.signed else b"false"
         return tags
 
+    def as_spark(self) -> "IntegerType":
+        # Spark has no native unsigned integers — flip ``signed`` while
+        # keeping the same byte width. The cast goes through Arrow /
+        # Polars / pyspark with two's-complement reinterpretation
+        # (``safe=False``), so values that exceed the signed range wrap
+        # negative: ``max(uint64) → -1`` as ``int64`` and vice versa.
+        # Same width keeps storage cheap and the round-trip lossless
+        # at the bit level.
+        if self.signed:
+            return self
+        return IntegerType(byte_size=self._size, signed=True)
+
+    def reinterpret_pyobj(self, value: int) -> int:
+        """Reinterpret *value* as this type's two's-complement form.
+
+        Mirrors what ``pyarrow.compute.cast(..., safe=False)`` does for
+        signed↔unsigned casts at the Arrow level — values are masked
+        to ``byte_size * 8`` bits and read back with this type's
+        signedness. ``max(uint64)`` becomes ``-1`` when reinterpreted
+        as ``int64``; ``-1`` becomes ``max(uint64)`` reinterpreted the
+        other way.
+        """
+        bits = self._size * 8
+        mask = (1 << bits) - 1
+        raw = value & mask
+        if self.signed and raw & (1 << (bits - 1)):
+            return raw - (1 << bits)
+        return raw
+
     def _merge_with_same_id(
         self,
         other: "DataType",
@@ -767,6 +796,13 @@ class FloatingPointType(NumericType):
     def to_spark(self) -> Any:
         t = get_spark_sql().types
         return t.DoubleType() if self._size == 8 else t.FloatType()
+
+    def as_spark(self) -> "FloatingPointType":
+        # Spark has ``FloatType`` (32-bit) and ``DoubleType`` (64-bit)
+        # but no native half-precision float — widen 16-bit to 32-bit.
+        if self._size == 2:
+            return FloatingPointType(byte_size=4)
+        return self
 
     def to_databricks_ddl(self) -> str:
         return "DOUBLE" if self._size == 8 else "FLOAT"
