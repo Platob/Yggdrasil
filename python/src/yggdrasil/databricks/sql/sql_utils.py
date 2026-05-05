@@ -33,27 +33,74 @@ __all__ = [
 MAX_TABLE_NAME_LEN = 255
 
 
+# Names commonly use space, underscore, or dash to glue tokens together
+# (medallion layer + entity + role + version, etc.). We split on these
+# when truncating so we keep whole tokens — qualifier prefixes like
+# ``raw``, ``brz``, ``curated``, ``dim`` end up at the front naturally.
+_TABLE_NAME_SEP_RE = re.compile(r"[ _\-]+")
+
+
 def safe_table_name(name: str | None, *, limit: int = MAX_TABLE_NAME_LEN) -> str | None:
     """Return *name* unchanged if it fits, otherwise truncate + hash.
 
     Databricks Unity Catalog caps identifiers at 255 chars. When a caller
-    hands in something longer, keep a deterministic prefix and append a
-    BLAKE2b digest of the full name. The result fits the limit, stays
-    stable for the same input, and uses only identifier-safe hex chars.
+    hands in something longer, split *name* on common separators (space,
+    underscore, dash), keep as many leading tokens as fit alongside a
+    BLAKE2b digest of the overflow tail, and join the result with ``_``.
+    Tokens are kept whole — no chopping in the middle of a word — so
+    layer/role qualifiers (``raw``, ``brz``, ``curated``, ``dim``, …)
+    stay readable at the front of the truncated name.
 
-    ``None`` and empty strings pass through unchanged so this stays safe to
-    call before defaults have been resolved.
+    The result fits the limit, stays stable for the same input, and uses
+    only identifier-safe ASCII. ``None`` and empty strings pass through
+    unchanged so this stays safe to call before defaults have been
+    resolved.
     """
     if not name or len(name) <= limit:
         return name
 
-    # 16-byte digest → 32 hex chars. Collision-safe for practical table-name
-    # workloads, and leaves plenty of room for a recognizable prefix.
-    digest = hashlib.blake2b(name.encode("utf-8"), digest_size=16).hexdigest()
-    keep = limit - len(digest) - 1  # 1 for the underscore separator
-    if keep <= 0:
-        return digest[:limit]
-    return f"{name[:keep]}_{digest}"
+    # 16-byte digest → 32 hex chars. Collision-safe for practical
+    # table-name workloads.
+    digest_size = 16
+    digest_chars = digest_size * 2
+    reserved = 1 + digest_chars  # "_<digest>" trailer
+
+    tokens = [t for t in _TABLE_NAME_SEP_RE.split(name) if t]
+
+    kept: list[str] = []
+    cursor = 0  # length of "_".join(kept) so far
+    for tok in tokens:
+        candidate_len = cursor + (1 if kept else 0) + len(tok)
+        if candidate_len + reserved <= limit:
+            kept.append(tok)
+            cursor = candidate_len
+        else:
+            break
+
+    if not kept:
+        # Single token (or first token alone) is too long alongside the
+        # digest — fall back to a raw truncate-and-hash on the full name
+        # so something deterministic still fits.
+        full_digest = hashlib.blake2b(
+            name.encode("utf-8"), digest_size=digest_size
+        ).hexdigest()
+        keep = limit - reserved
+        if keep <= 0:
+            return full_digest[:limit]
+        return f"{name[:keep]}_{full_digest}"
+
+    overflow_tokens = tokens[len(kept):]
+    if not overflow_tokens:
+        # Separator collapse alone shrank the name enough to fit.
+        return "_".join(kept)[:limit]
+
+    # Hash only the overflow tail: distinct overflows still produce
+    # distinct digests, and the kept head reads naturally in logs/SQL.
+    overflow = "_".join(overflow_tokens)
+    digest = hashlib.blake2b(
+        overflow.encode("utf-8"), digest_size=digest_size
+    ).hexdigest()
+    return f"{'_'.join(kept)}_{digest}"
 
 
 def is_glob_pattern(value: Any) -> bool:

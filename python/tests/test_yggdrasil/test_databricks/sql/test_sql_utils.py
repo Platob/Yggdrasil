@@ -105,3 +105,64 @@ def test_safe_table_name_falls_back_to_pure_hash_for_tiny_limits():
     out = safe_table_name("orders_archive_2026", limit=8)
     assert out is not None and len(out) == 8
     assert all(ch in "0123456789abcdef" for ch in out)
+
+
+def test_safe_table_name_keeps_leading_token_when_overflow_is_huge():
+    # "brz" stays whole at the front; the giant tail token is replaced
+    # by a 32-hex digest.
+    long = "brz_" + "x" * 400
+    out = safe_table_name(long)
+    assert out is not None
+    assert len(out) <= MAX_TABLE_NAME_LEN
+    assert out.startswith("brz_")
+    assert out[-33] == "_"
+    assert all(ch in "0123456789abcdef" for ch in out[-32:])
+
+
+def test_safe_table_name_keeps_multiple_leading_tokens():
+    long = "raw_orders_archive_" + "y" * 400
+    out = safe_table_name(long)
+    assert out is not None and len(out) <= MAX_TABLE_NAME_LEN
+    assert out.startswith("raw_orders_archive_")
+    assert out[-33] == "_"
+    assert all(ch in "0123456789abcdef" for ch in out[-32:])
+
+
+def test_safe_table_name_distinguishes_overflows_sharing_a_prefix():
+    a = safe_table_name("raw_orders_archive_" + "a" * 400)
+    b = safe_table_name("raw_orders_archive_" + "b" * 400)
+    assert a is not None and b is not None and a != b
+    assert a.startswith("raw_orders_archive_")
+    assert b.startswith("raw_orders_archive_")
+
+
+def test_safe_table_name_normalizes_dash_and_space_separators():
+    long = "raw orders-archive_" + "z" * 400
+    out = safe_table_name(long)
+    assert out is not None and out.startswith("raw_orders_archive_")
+
+
+def test_safe_table_name_falls_back_when_first_token_is_too_long():
+    # Single token longer than (limit - 33) → falls back to mid-token
+    # truncate + hash of the full name. We just check the result fits
+    # the limit and ends with the underscore-separated digest.
+    long = "x" * 100 + "_short"
+    out = safe_table_name(long, limit=64)
+    assert out is not None and len(out) == 64
+    assert out[-33] == "_"
+    assert all(ch in "0123456789abcdef" for ch in out[-32:])
+
+
+def test_safe_table_name_keeps_token_boundary_in_normal_truncation():
+    # With many short tokens, truncation lands on a token boundary so
+    # the kept head reads cleanly.
+    name = "_".join(["raw", "orders", "archive", "v2"] + ["seg"] * 60)
+    out = safe_table_name(name)
+    assert out is not None and len(out) <= MAX_TABLE_NAME_LEN
+    assert out.startswith("raw_orders_archive_v2_")
+    # Whatever's kept must be a series of whole tokens — no partial token
+    # immediately before the trailing "_<digest>".
+    head = out[:-33]
+    assert not head.endswith("_")
+    for tok in head.split("_"):
+        assert tok in {"raw", "orders", "archive", "v2", "seg"}
