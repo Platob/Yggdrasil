@@ -18,9 +18,12 @@ from yggdrasil.dataclasses.dataclass import get_from_dict
 from .buffer import BytesIO
 from .enums import Codec, MediaType, MimeTypes
 from .headers import normalize_headers
+from yggdrasil.environ.userinfo import USERINFO_STRUCT, UserInfo
 from .request import (
     PreparedRequest,
     REQUEST_SCHEMA,
+    _coerce_userinfo,
+    _default_sender,
     _map_as_str_dict,
     _string_dict,
 )
@@ -236,6 +239,17 @@ def _parse_received_at(obj: Mapping[str, Any]) -> dt.datetime:
     return any_to_datetime(value)
 
 
+def _parse_receiver(obj: Mapping[str, Any]) -> UserInfo | None:
+    value = get_from_dict(obj, keys=("receiver",), prefix=None)
+    if value is MISSING or value in (None, ""):
+        return _default_sender()
+    if isinstance(value, UserInfo):
+        return value
+    if isinstance(value, Mapping):
+        return UserInfo.from_struct_dict(value)
+    return _default_sender()
+
+
 # ---------------------------------------------------------------------------
 # Hop-by-hop header names
 # ---------------------------------------------------------------------------
@@ -337,6 +351,17 @@ for _req_field_name in _REQUEST_FIELD_NAMES_FOR_UNNEST:
         nullable=_src_field.nullable,
         metadata=_src_meta_clean,
     ).autotag()
+
+RESPONSE_SCHEMA["receiver"] = schema_field(
+    "receiver",
+    USERINFO_STRUCT,
+    nullable=True,
+    metadata={
+        "comment": "Snapshot of :class:`~yggdrasil.environ.UserInfo` for the receiver "
+                   "— defaults to ``UserInfo.current()``. Carries identity (key, "
+                   "email, hostname, url, git_url, product) plus a stable ``hash``.",
+    },
+).autotag()
 
 RESPONSE_SCHEMA["hash"] = schema_field(
     "hash",
@@ -486,6 +511,7 @@ class Response:
         "tags",
         "buffer",
         "received_at",
+        "_receiver",
         "_id_cache",
         "_session",
     )
@@ -498,6 +524,7 @@ class Response:
         tags: MutableMapping[str, str],
         buffer: BytesIO,
         received_at: dt.datetime,
+        receiver: Optional[UserInfo] = None,
     ) -> None:
         self.request = request
         self.status_code = int(status_code)
@@ -505,11 +532,33 @@ class Response:
         self.tags = _string_dict(tags)
         self.received_at = any_to_datetime(received_at)
         self.buffer = buffer if isinstance(buffer, BytesIO) else BytesIO(buffer, copy=False)
+        self._receiver: UserInfo | None = (
+            _coerce_userinfo(receiver) if receiver is not None else _default_sender()
+        )
 
         _ensure_media_headers(self.headers, self.buffer)
 
         self._id_cache: int | None = None
         self._session: "Session | None" = None
+
+    @property
+    def receiver(self) -> UserInfo | None:
+        """:class:`UserInfo` snapshot for the side that received this response.
+
+        Defaults to ``UserInfo.current()`` at construction time. Use
+        :meth:`with_receiver` to swap it.
+        """
+        return self._receiver
+
+    def with_receiver(self, receiver: UserInfo | Mapping[str, Any] | None) -> "Response":
+        """Mutate :attr:`receiver` in place and return ``self``.
+
+        Mirrors :meth:`update_headers` / :meth:`update_tags` — the
+        response is mutable in this codebase, so this is a fluent
+        in-place setter rather than a clone.
+        """
+        self._receiver = _coerce_userinfo(receiver)
+        return self
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}<r={self.request} s={self.status_code} b={self.body!r}>"
@@ -594,6 +643,7 @@ class Response:
         buffer = _parse_response_buffer(obj, media_type=pre_media)
         received_at = _parse_received_at(obj)
         tags = _parse_response_tags(obj)
+        receiver = _parse_receiver(obj)
 
         if normalize:
             headers = normalize_headers(headers, body=buffer, is_request=False)
@@ -611,6 +661,7 @@ class Response:
                     tags=tags,
                     buffer=buffer,
                     received_at=received_at,
+                    receiver=receiver,
                 )
 
         return cls(
@@ -620,6 +671,7 @@ class Response:
             tags=tags,
             buffer=buffer,
             received_at=received_at,
+            receiver=receiver,
         )
 
     # ------------------------------------------------------------------
@@ -859,6 +911,7 @@ class Response:
 
         return {
             **flat_request,
+            "receiver":      self._receiver.to_struct_dict() if self._receiver is not None else None,
             "hash":          self.hash,
             "public_hash":   self.public_hash,
             "status_code":   self.status_code,
@@ -956,6 +1009,7 @@ class Response:
             tags=self.tags,
             buffer=self.buffer,
             received_at=self.received_at,
+            receiver=self._receiver,
         )
 
     # ------------------------------------------------------------------
@@ -1195,6 +1249,9 @@ class Response:
             from .http_ import HTTPResponse
             out_class = HTTPResponse
 
+        receiver_value = get("receiver")
+        receiver = _coerce_userinfo(receiver_value) if receiver_value is not None else None
+
         return out_class(
             request=request,
             status_code=get("status_code") or 0,
@@ -1202,6 +1259,7 @@ class Response:
             tags=_map_as_str_dict(get("tags")),
             buffer=buffer,
             received_at=get("received_at") or 0,
+            receiver=receiver,
         )
 
     # ------------------------------------------------------------------
