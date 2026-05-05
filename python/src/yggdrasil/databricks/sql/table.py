@@ -3068,7 +3068,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         def _refresh() -> AwsCredentials:
             creds = self.temporary_credentials(operation=operation)
             aws = creds.aws_temp_credentials
-            expiration = getattr(creds, "expiration_time", None)
+            expiration = getattr(creds, "expiration_time", None) / 1000
             return AwsCredentials(
                 access_key_id=aws.access_key_id,
                 secret_access_key=aws.secret_access_key,
