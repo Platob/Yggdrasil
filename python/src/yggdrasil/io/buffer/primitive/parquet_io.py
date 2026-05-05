@@ -24,14 +24,10 @@ import pyarrow.parquet as pq
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.io.enums import MimeTypes, Mode
-from yggdrasil.lazy_imports import (
-    polars_module,
-    pyarrow_dataset_module,
-)
+from yggdrasil.lazy_imports import pyarrow_dataset_module
 from yggdrasil.io.buffer.bytes_io import BytesIO
 
 if TYPE_CHECKING:
-    import polars as pl
     import pyarrow.dataset as pds
 
 
@@ -376,29 +372,3 @@ class ParquetIO(BytesIO):
             source = v.arrow_io(mode="rb")
             table = pq.read_table(source)
         return pds.dataset(table)
-
-    def _scan_polars_frame(self, options: ParquetOptions) -> "pl.LazyFrame":
-        if not self._can_use_native_scanner(options):
-            return super()._scan_polars_frame(options)
-
-        pl = polars_module()
-        if self.path is not None and self.path.is_local:
-            return pl.scan_parquet(self.path.__fspath__())
-
-        # ``pl.scan_parquet`` accepts a file-like and pulls the
-        # bytes it needs at scan time (footer + planning), so the
-        # view can be closed once the LazyFrame exists. The view's
-        # cursor isolates the scan from ``self._pos``.
-        with self.view(pos=0) as v:
-            return pl.scan_parquet(v)
-
-    def _read_polars_frame(self, options: ParquetOptions) -> "pl.DataFrame":
-        if not self._can_use_native_scanner(options):
-            return super()._read_polars_frame(options)
-
-        pl = polars_module()
-        if self.path is not None and self.path.is_local:
-            return pl.read_parquet(self.path.__fspath__(), use_pyarrow=False)
-
-        with self.view(pos=0) as v:
-            return pl.read_parquet(v, use_pyarrow=False)
