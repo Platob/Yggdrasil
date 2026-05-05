@@ -13,11 +13,12 @@ from yggdrasil.data.cast import any_to_datetime
 from yggdrasil.data.data_field import field as schema_field
 from yggdrasil.data.schema import schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
+from yggdrasil.environ.userinfo import USERINFO_STRUCT, UserInfo
 from yggdrasil.io.enums import MediaType, MimeTypes
 from .buffer import BytesIO
 from .enums import GZIP, Codec, MimeType
 from .headers import normalize_headers
-from .url import URL
+from .url import URL, URL_STRUCT
 
 if TYPE_CHECKING:
     from .response import Response
@@ -40,18 +41,13 @@ _REQUEST_SCHEMA_JSON_TAGS: dict[str, str] = {
 }
 
 
-# Nested URL struct — parsed components for joins / replay. The full
-# string isn't kept here; ``private_url_hash`` covers exact identity
-# and ``URL.from_(struct)`` reassembles the URL from its parts.
-REQUEST_URL_STRUCT = pa.struct([
-    pa.field("scheme",   pa.string(), nullable=False),
-    pa.field("userinfo", pa.string(), nullable=True),
-    pa.field("host",     pa.string(), nullable=False),
-    pa.field("port",     pa.int32(),  nullable=True),
-    pa.field("path",     pa.string(), nullable=False),
-    pa.field("query",    pa.string(), nullable=True),
-    pa.field("fragment", pa.string(), nullable=True),
-])
+# Nested URL struct — re-exported from :mod:`yggdrasil.io.url` so the
+# request schema and every downstream consumer share a single source
+# of truth for column ordering, types, and nullability flags. The
+# full string isn't kept here; ``private_url_hash`` covers exact
+# identity and ``URL.from_(struct)`` reassembles the URL from its
+# parts.
+REQUEST_URL_STRUCT = URL_STRUCT
 
 
 REQUEST_SCHEMA = schema(
@@ -114,6 +110,17 @@ REQUEST_SCHEMA["url"] = schema_field(
     REQUEST_URL_STRUCT,
     nullable=False,
     metadata={"comment": "Parsed URL components with full string for replay"},
+).autotag()
+
+REQUEST_SCHEMA["sender"] = schema_field(
+    "sender",
+    USERINFO_STRUCT,
+    nullable=True,
+    metadata={
+        "comment": "Snapshot of :class:`~yggdrasil.environ.UserInfo` for the sender "
+                   "— defaults to ``UserInfo.current()``. Carries identity (key, "
+                   "email, hostname, url, git_url, product) plus a stable ``hash``.",
+    },
 ).autotag()
 
 REQUEST_SCHEMA["private_url_hash"] = schema_field(
@@ -259,16 +266,27 @@ def _xxh3_int64_str(text: str) -> int:
 
 
 def _build_url_struct(url: URL) -> dict[str, Any]:
-    """Build the URL struct value (matches REQUEST_URL_STRUCT)."""
-    return {
-        "scheme":   url.scheme or "",
-        "userinfo": url.userinfo,
-        "host":     url.host or "",
-        "port":     url.port if url.port not in (None, 0) else None,
-        "path":     url.path or "",
-        "query":    url.query,
-        "fragment": url.fragment,
-    }
+    """Build the URL struct value (matches :data:`URL_STRUCT`)."""
+    return url.to_struct_dict()
+
+
+def _default_sender() -> UserInfo | None:
+    """Resolve :class:`UserInfo` for the current process — never raises."""
+    try:
+        return UserInfo.current()
+    except Exception:
+        return None
+
+
+def _coerce_userinfo(value: Any) -> UserInfo | None:
+    """Best-effort cast of ``value`` to :class:`UserInfo`."""
+    if value is None:
+        return None
+    if isinstance(value, UserInfo):
+        return value
+    if isinstance(value, Mapping):
+        return UserInfo.from_struct_dict(value)
+    return None
 
 
 class PreparedRequest:
@@ -292,6 +310,7 @@ class PreparedRequest:
         sent_at: Optional[dt.datetime],
         local_cache_config: Optional["CacheConfig"] = None,
         remote_cache_config: Optional["CacheConfig"] = None,
+        sender: Optional[UserInfo] = None,
     ) -> None:
         self.method = method or "GET"
         self.url = URL.from_(url)
@@ -308,7 +327,29 @@ class PreparedRequest:
         )
         self.local_cache_config = local_cache_config
         self.remote_cache_config = remote_cache_config
+        self._sender: UserInfo | None = (
+            _coerce_userinfo(sender) if sender is not None else _default_sender()
+        )
         self._session: "Session | None" = None
+
+    @property
+    def sender(self) -> UserInfo | None:
+        """:class:`UserInfo` snapshot for the side issuing this request.
+
+        Defaults to ``UserInfo.current()`` at construction time. Use
+        :meth:`with_sender` to swap it for a different snapshot
+        (returns a new request — :class:`PreparedRequest` is
+        immutable-ish, so the underlying field is read-only).
+        """
+        return self._sender
+
+    def with_sender(self, sender: UserInfo | Mapping[str, Any] | None) -> "PreparedRequest":
+        """Return a copy of this request with :attr:`sender` replaced.
+
+        Accepts a :class:`UserInfo`, a struct-shaped mapping (matching
+        :data:`USERINFO_STRUCT`), or ``None`` to clear the snapshot.
+        """
+        return self.copy(sender=sender)
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}<{self.method} {self.url.to_string()!r}>"
@@ -398,6 +439,7 @@ class PreparedRequest:
         tags = cls._parse_tags(obj)
         buffer = cls._parse_buffer(obj)
         sent_at = cls._parse_sent_at_timestamp(obj)
+        sender = cls._parse_sender(obj, normalize=normalize)
 
         if cls is PreparedRequest:
             if url.is_http:
@@ -410,6 +452,7 @@ class PreparedRequest:
                     tags=tags,
                     buffer=buffer,
                     sent_at=sent_at,
+                    sender=sender,
                 )
 
         return cls(
@@ -419,6 +462,7 @@ class PreparedRequest:
             tags=tags,
             buffer=buffer,
             sent_at=sent_at,
+            sender=sender,
         )
 
     @staticmethod
@@ -469,6 +513,24 @@ class PreparedRequest:
         return _map_as_str_dict(headers)
 
     @staticmethod
+    def _parse_sender(
+        obj: Mapping[str, Any],
+        *,
+        normalize: bool,
+    ) -> UserInfo | None:
+        # Accept a pre-built UserInfo, a struct dict matching
+        # :data:`USERINFO_STRUCT`, or nothing — falling back to
+        # ``UserInfo.current()`` when the caller didn't supply one.
+        value = get_from_dict(obj, keys=("sender",), prefix=None)
+        if value is MISSING or value in (None, ""):
+            return _default_sender()
+        if isinstance(value, UserInfo):
+            return value
+        if isinstance(value, Mapping):
+            return UserInfo.from_struct_dict(value)
+        return _default_sender()
+
+    @staticmethod
     def _parse_tags(obj: Mapping[str, Any]) -> dict[str, str]:
         tags = get_from_dict(obj, keys=("tags",), prefix=None)
         return _string_dict(tags if isinstance(tags, Mapping) else None)
@@ -502,6 +564,7 @@ class PreparedRequest:
         normalize: bool = True,
         compress_threshold: Optional[int] = 4 * 1024 * 1024,
         compress_codec: Optional[Codec] = GZIP,
+        sender: Optional[UserInfo | Mapping[str, Any]] = None,
     ) -> "PreparedRequest":
         parsed_url = URL.from_(url, normalize=normalize)
         out_headers: dict[str, str] = _string_dict(headers)
@@ -537,6 +600,7 @@ class PreparedRequest:
             sent_at=0,
             local_cache_config=local_cache_config,
             remote_cache_config=remote_cache_config,
+            sender=_coerce_userinfo(sender),
         )
 
     def copy(
@@ -550,6 +614,7 @@ class PreparedRequest:
         sent_at: int | None = None,
         local_cache_config: Optional["CacheConfig"] = ...,
         remote_cache_config: Optional["CacheConfig"] = ...,
+        sender: Optional[UserInfo] = ...,
         normalize: bool = True,
         copy_buffer: bool = False,
     ) -> "PreparedRequest":
@@ -564,6 +629,7 @@ class PreparedRequest:
             new_buffer = buffer
 
         new_tags = dict(self.tags) if tags is None else _string_dict(tags)
+        new_sender = self.sender if sender is ... else _coerce_userinfo(sender)
 
         return self.__class__(
             method=self.method if method is None else str(method),
@@ -574,6 +640,7 @@ class PreparedRequest:
             sent_at=self.sent_at if sent_at is None else any_to_datetime(sent_at),
             local_cache_config=self.local_cache_config if local_cache_config is ... else local_cache_config,
             remote_cache_config=self.remote_cache_config if remote_cache_config is ... else remote_cache_config,
+            sender=new_sender,
         )
 
     def prepare_to_send(
@@ -762,6 +829,7 @@ class PreparedRequest:
             "public_hash":      self.public_hash,
             "method":           self.method,
             "url":              _build_url_struct(self.url),
+            "sender":           self.sender.to_struct_dict() if self.sender is not None else None,
             "private_url_hash": self.private_url_hash,
             "public_url_hash":  self.public_url_hash,
             "headers":          _string_dict(self.headers),
@@ -997,6 +1065,7 @@ class PreparedRequest:
             {
                 "method":   get("method") or "GET",
                 "url":      url_value,
+                "sender":   get("sender"),
                 "headers":  _map_as_str_dict(headers_value),
                 "tags":     _map_as_str_dict(get("tags")),
                 "buffer":   get("body"),

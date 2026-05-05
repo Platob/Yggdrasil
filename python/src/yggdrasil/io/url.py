@@ -47,6 +47,8 @@ from urllib.parse import (
     urlunsplit,
 )
 
+import pyarrow as pa
+
 from yggdrasil.io.parameters import anonymize_parameters
 from yggdrasil.lazy_imports import (
     bytes_io_class,
@@ -54,7 +56,12 @@ from yggdrasil.lazy_imports import (
     mime_type_class,
 )
 
-__all__ = ["URL", "resolve_memory_address"]
+__all__ = [
+    "URL",
+    "URL_SCHEMA",
+    "URL_STRUCT",
+    "resolve_memory_address",
+]
 
 _DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
 
@@ -314,6 +321,33 @@ def _normalize_components(
     fragment_n = fragment.lstrip("#")
 
     return scheme_n, host_n, port_n, path_n, query_n, fragment_n
+
+
+# ---------------------------------------------------------------------------
+# Arrow schema — single source of truth for the URL struct shape used by
+# request / response / userinfo serializers. Defined here next to the
+# :class:`URL` class so every consumer references the same column
+# ordering, types, and nullability flags.
+#
+# Kept as raw pyarrow types (rather than wrapped in
+# :class:`yggdrasil.data.schema.Schema`) because ``data.data_field``
+# transitively imports ``io.enums.media_type``, which imports back into
+# this module — wrapping URL_SCHEMA here would create an import cycle.
+# Engines that need the richer wrapper rebuild it on top of these
+# columns.
+# ---------------------------------------------------------------------------
+
+URL_SCHEMA: pa.Schema = pa.schema([
+    pa.field("scheme",   pa.string(), nullable=False),
+    pa.field("userinfo", pa.string(), nullable=True),
+    pa.field("host",     pa.string(), nullable=False),
+    pa.field("port",     pa.int32(),  nullable=True),
+    pa.field("path",     pa.string(), nullable=False),
+    pa.field("query",    pa.string(), nullable=True),
+    pa.field("fragment", pa.string(), nullable=True),
+])
+
+URL_STRUCT: pa.StructType = pa.struct(list(URL_SCHEMA))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1175,6 +1209,23 @@ class URL(os.PathLike):
             authority = f"{self.userinfo}@{authority}"
 
         return authority
+
+    def to_struct_dict(self) -> dict[str, Any]:
+        """Flatten into the dict shape that matches :data:`URL_STRUCT`.
+
+        Used by request / response / userinfo serializers to populate a
+        nested URL struct column without each module re-implementing the
+        same field-by-field mapping.
+        """
+        return {
+            "scheme":   self.scheme or "",
+            "userinfo": self.userinfo,
+            "host":     self.host or "",
+            "port":     self.port if self.port not in (None, 0) else None,
+            "path":     self.path or "",
+            "query":    self.query,
+            "fragment": self.fragment,
+        }
 
     def to_pathlib(self, *, strict: bool = True) -> Path:
         """Convert this URL to a ``pathlib.Path``.

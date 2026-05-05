@@ -5,13 +5,18 @@ import os
 import re
 import socket
 import subprocess
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Literal, Mapping, Optional, Sequence
+from typing import Any, Literal, Mapping, Optional, Sequence
 
-from yggdrasil.io.url import URL
+import pyarrow as pa
+
+from yggdrasil.io.url import URL, URL_STRUCT
 
 __all__ = [
     "UserInfo",
+    "USERINFO_SCHEMA",
+    "USERINFO_STRUCT",
     "get_user_info",
     "normalize_abs_path_for_url",
     "parse_name_from_email",
@@ -40,175 +45,96 @@ _LASTNAME_PARTICLES = {
 }
 
 
+# ── arrow schema ──────────────────────────────────────────────────────────────
+
+
+# Single source of truth for the UserInfo struct shape used by request /
+# response serializers. Defined as raw pyarrow (rather than wrapped in
+# :class:`yggdrasil.data.schema.Schema`) because ``yggdrasil.data`` is
+# imported from inside ``yggdrasil.environ``'s init path, so reaching
+# back into ``data.data_field`` here would create an import cycle.
+USERINFO_SCHEMA: pa.Schema = pa.schema([
+    pa.field("hash",            pa.int64(),  nullable=False),
+    pa.field("key",             pa.string(), nullable=False),
+    pa.field("cwd",             pa.string(), nullable=False),
+    pa.field("hostname",        pa.string(), nullable=False),
+    pa.field("email",           pa.string(), nullable=True),
+    pa.field("first_name",      pa.string(), nullable=True),
+    pa.field("last_name",       pa.string(), nullable=True),
+    pa.field("url",             URL_STRUCT,  nullable=True),
+    pa.field("git_url",         URL_STRUCT,  nullable=True),
+    pa.field("product",         pa.string(), nullable=True),
+    pa.field("product_version", pa.string(), nullable=True),
+])
+
+USERINFO_STRUCT: pa.StructType = pa.struct(list(USERINFO_SCHEMA))
+
+
 # ── class ─────────────────────────────────────────────────────────────────────
 
 
+@dataclass(frozen=True, slots=True)
 class UserInfo:
-    __slots__ = (
-        "_key",
-        "_cwd",
-        "_hostname",
-        "_email",
-        "_email_loaded",
-        "_url",
-        "_url_loaded",
-        "_git_info_cache",
-        "_git_info_loaded",
-        "_git_url",
-        "_git_url_loaded",
-        "_project_cache",
-        "_project_loaded",
-        "_name_parts_cache",
-        "_name_parts_loaded",
-    )
-
-    def __init__(self, *, key: str, cwd: str) -> None:
-        self._key = key
-        self._cwd = cwd
-
-        self._hostname: str | None = None
-
-        self._email: str | None = None
-        self._email_loaded = False
-
-        self._url: URL | None = None
-        self._url_loaded = False
-
-        self._git_info_cache: dict[str, str] | None = None
-        self._git_info_loaded = False
-
-        self._git_url: URL | None = None
-        self._git_url_loaded = False
-
-        self._project_cache: tuple[str | None, str | None] | None = None
-        self._project_loaded = False
-
-        self._name_parts_cache: tuple[str | None, str | None] | None = None
-        self._name_parts_loaded = False
+    key: str = ""
+    cwd: str = ""
+    hostname: str = ""
+    email: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
+    url: URL | None = None
+    git_url: URL | None = None
+    product: str | None = None
+    product_version: str | None = None
 
     @classmethod
     def current(cls) -> "UserInfo":
         return get_user_info()
 
+    @property
+    def hash(self) -> int:
+        """xxh3_64 digest over (key, hostname, email, url, git_url) — int64."""
+        return _userinfo_hash(self)
+
     def with_email(self, email: str | None) -> "UserInfo":
-        clone = UserInfo(key=self.key, cwd=self.cwd)
-        clone._hostname = self._hostname
-
-        clone._email = email
-        clone._email_loaded = True
-
-        clone._url = self._url
-        clone._url_loaded = self._url_loaded
-
-        clone._git_info_cache = self._git_info_cache
-        clone._git_info_loaded = self._git_info_loaded
-
-        clone._git_url = self._git_url
-        clone._git_url_loaded = self._git_url_loaded
-
-        clone._project_cache = self._project_cache
-        clone._project_loaded = self._project_loaded
-
-        clone._name_parts_cache = None
-        clone._name_parts_loaded = False
-        return clone
-
-    def __repr__(self) -> str:
-        return (
-            f"UserInfo("
-            f"email={self.email!r}, "
-            f"first_name={self.first_name!r}, "
-            f"last_name={self.last_name!r}, "
-            f"key={self.key!r}, "
-            f"hostname={self.hostname!r}, "
-            f"url={self.url!r}, "
-            f"git_url={self.git_url!r}, "
-            f"product={self.product!r}, "
-            f"product_version={self.product_version!r}"
-            f")"
+        first_name, last_name = _names_from_email(email)
+        return replace(
+            self,
+            email=email,
+            first_name=first_name,
+            last_name=last_name,
         )
 
-    @property
-    def key(self) -> str:
-        return self._key
+    def to_struct_dict(self) -> dict[str, Any]:
+        """Flatten into the dict shape that matches :data:`USERINFO_STRUCT`."""
+        return {
+            "hash":            self.hash,
+            "key":             self.key,
+            "cwd":             self.cwd,
+            "hostname":        self.hostname,
+            "email":           self.email,
+            "first_name":      self.first_name,
+            "last_name":       self.last_name,
+            "url":             _url_to_struct(self.url),
+            "git_url":         _url_to_struct(self.git_url),
+            "product":         self.product,
+            "product_version": self.product_version,
+        }
 
-    @property
-    def cwd(self) -> str:
-        return self._cwd
-
-    @property
-    def hostname(self) -> str:
-        value = self._hostname
-        if value is None:
-            value = socket.gethostname()
-            self._hostname = value
-        return value
-
-    @property
-    def email(self) -> str | None:
-        if not self._email_loaded:
-            self._email = _get_upn_email() or _guess_email_from_env()
-            self._email_loaded = True
-        return self._email
-
-    @property
-    def first_name(self) -> str | None:
-        return self._name_parts[0]
-
-    @property
-    def last_name(self) -> str | None:
-        return self._name_parts[1]
-
-    @property
-    def url(self) -> URL | None:
-        if not self._url_loaded:
-            self._url = _current_compute_url(hostname=self.hostname, cwd=self.cwd)
-            self._url_loaded = True
-        return self._url
-
-    @property
-    def git_url(self) -> URL | None:
-        if not self._git_url_loaded:
-            self._git_url = _git_url_from_info(self._git_info)
-            self._git_url_loaded = True
-        return self._git_url
-
-    @property
-    def product(self) -> str | None:
-        return self._project_info[0]
-
-    @property
-    def product_version(self) -> str | None:
-        return self._project_info[1]
-
-    @property
-    def _git_info(self) -> dict[str, str] | None:
-        if not self._git_info_loaded:
-            self._git_info_cache = _git_info(self.cwd)
-            self._git_info_loaded = True
-        return self._git_info_cache
-
-    @property
-    def _project_info(self) -> tuple[str | None, str | None]:
-        if not self._project_loaded:
-            self._project_cache = _infer_project(self.cwd)
-            self._project_loaded = True
-        return self._project_cache or (None, None)
-
-    @property
-    def _name_parts(self) -> tuple[str | None, str | None]:
-        if not self._name_parts_loaded:
-            first_name: str | None = None
-            last_name: str | None = None
-
-            parsed = parse_name_from_email(self.email or "")
-            if parsed is not None:
-                first_name, last_name, _domain = parsed
-
-            self._name_parts_cache = (first_name, last_name)
-            self._name_parts_loaded = True
-
-        return self._name_parts_cache or (None, None)
+    @classmethod
+    def from_struct_dict(cls, value: Mapping[str, Any]) -> "UserInfo":
+        """Inverse of :meth:`to_struct_dict` — drops the derived ``hash``."""
+        return cls(
+            key=str(value.get("key") or ""),
+            cwd=str(value.get("cwd") or ""),
+            hostname=str(value.get("hostname") or ""),
+            email=_or_none(value.get("email")),
+            first_name=_or_none(value.get("first_name")),
+            last_name=_or_none(value.get("last_name")),
+            url=_url_from_struct(value.get("url")),
+            git_url=_url_from_struct(value.get("git_url")),
+            product=_or_none(value.get("product")),
+            product_version=_or_none(value.get("product_version")),
+        )
 
 
 # ── public API ────────────────────────────────────────────────────────────────
@@ -221,9 +147,26 @@ def get_user_info(*, refresh: bool = False) -> UserInfo:
     if _CURRENT_CACHE is not None and not refresh:
         return _CURRENT_CACHE
 
+    cwd = _safe_getcwd()
+    hostname = socket.gethostname()
+    email = _get_upn_email() or _guess_email_from_env()
+    first_name, last_name = _names_from_email(email)
+    url = _current_compute_url(hostname=hostname, cwd=cwd)
+    git_data = _git_info(cwd)
+    git_url = _git_url_from_info(git_data)
+    product, product_version = _infer_project(cwd)
+
     info = UserInfo(
         key=_get_key(),
-        cwd=_safe_getcwd(),
+        cwd=cwd,
+        hostname=hostname,
+        email=email,
+        first_name=first_name,
+        last_name=last_name,
+        url=url,
+        git_url=git_url,
+        product=product,
+        product_version=product_version,
     )
     _CURRENT_CACHE = info
     return info
@@ -232,6 +175,70 @@ def get_user_info(*, refresh: bool = False) -> UserInfo:
 def _clear_cache() -> None:
     global _CURRENT_CACHE
     _CURRENT_CACHE = None
+
+
+# ── struct / hash helpers ─────────────────────────────────────────────────────
+
+
+def _names_from_email(email: str | None) -> tuple[str | None, str | None]:
+    parsed = parse_name_from_email(email or "")
+    if parsed is None:
+        return None, None
+    first, last, _ = parsed
+    return first, last
+
+
+def _url_to_struct(url: URL | None) -> dict[str, Any] | None:
+    if url is None:
+        return None
+    return {
+        "scheme":   url.scheme or "",
+        "userinfo": url.userinfo,
+        "host":     url.host or "",
+        "port":     url.port if url.port not in (None, 0) else None,
+        "path":     url.path or "",
+        "query":    url.query,
+        "fragment": url.fragment,
+    }
+
+
+def _url_from_struct(value: Any) -> URL | None:
+    if value is None:
+        return None
+    if isinstance(value, URL):
+        return value
+    if isinstance(value, str):
+        return URL.from_str(value) if value else None
+    if isinstance(value, Mapping):
+        if not any(value.get(k) for k in ("scheme", "host", "path")):
+            return None
+        return URL.from_dict(dict(value))
+    return None
+
+
+def _or_none(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    return str(value)
+
+
+def _userinfo_hash(info: "UserInfo") -> int:
+    """Stable signed-int64 xxh3_64 over identity-defining fields."""
+    try:
+        import xxhash
+    except ImportError:
+        return 0
+
+    parts = [
+        info.key or "",
+        info.hostname or "",
+        info.email or "",
+        info.url.to_string() if info.url is not None else "",
+        info.git_url.to_string() if info.git_url is not None else "",
+    ]
+    payload = "\x00".join(parts).encode("utf-8")
+    u = xxhash.xxh3_64(payload).intdigest()
+    return u if u < 2**63 else u - 2**64
 
 
 # ── URL helpers ───────────────────────────────────────────────────────────────
