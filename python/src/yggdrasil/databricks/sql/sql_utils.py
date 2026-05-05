@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import re
 from fnmatch import fnmatchcase
 from typing import Any, Callable, Optional
 
 __all__ = [
     "DEFAULT_TAG_COLLATION",
+    "MAX_TABLE_NAME_LEN",
     "_qualify_fk_ref",
     "databricks_tag_literal",
     "is_glob_pattern",
     "name_matcher",
     "normalize_databricks_collation",
+    "safe_table_name",
     "_safe_str",
     "_sql_str",
     "escape_sql_string",
@@ -22,6 +25,35 @@ __all__ = [
     "quote_principal",
     "sql_literal",
 ]
+
+
+# Unity Catalog rejects identifiers longer than 255 chars. Generated table
+# names (e.g. derived from user input or composed keys) can blow past that,
+# so any path that builds a name needs a length-safe normalizer.
+MAX_TABLE_NAME_LEN = 255
+
+
+def safe_table_name(name: str | None, *, limit: int = MAX_TABLE_NAME_LEN) -> str | None:
+    """Return *name* unchanged if it fits, otherwise truncate + hash.
+
+    Databricks Unity Catalog caps identifiers at 255 chars. When a caller
+    hands in something longer, keep a deterministic prefix and append a
+    BLAKE2b digest of the full name. The result fits the limit, stays
+    stable for the same input, and uses only identifier-safe hex chars.
+
+    ``None`` and empty strings pass through unchanged so this stays safe to
+    call before defaults have been resolved.
+    """
+    if not name or len(name) <= limit:
+        return name
+
+    # 16-byte digest → 32 hex chars. Collision-safe for practical table-name
+    # workloads, and leaves plenty of room for a recognizable prefix.
+    digest = hashlib.blake2b(name.encode("utf-8"), digest_size=16).hexdigest()
+    keep = limit - len(digest) - 1  # 1 for the underscore separator
+    if keep <= 0:
+        return digest[:limit]
+    return f"{name[:keep]}_{digest}"
 
 
 def is_glob_pattern(value: Any) -> bool:

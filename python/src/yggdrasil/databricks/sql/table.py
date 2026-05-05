@@ -60,6 +60,7 @@ from .column import Column
 from .sql_utils import (
     quote_ident,
     quote_qualified_ident,
+    safe_table_name,
     sql_literal, escape_sql_string,
 )
 from ..fs import VolumePath
@@ -895,7 +896,9 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         super().__init__(service=service)
         self.catalog_name = catalog_name
         self.schema_name = schema_name
-        self.table_name = table_name
+        # Unity Catalog caps identifiers at 255 chars. Normalize once at the
+        # boundary so every downstream SQL/URL/cache key sees the safe form.
+        self.table_name = safe_table_name(table_name)
         self._infos = infos
         self._infos_fetched_at = infos_fetched_at
         self._columns = columns
