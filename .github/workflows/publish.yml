@@ -4,6 +4,12 @@
 # Builds and publishes the `ygg` pure-Python package to PyPI.
 # Versioned from the single source of truth: python/pyproject.toml.
 #
+# Pairs with publish-native.yml (which builds the `yggrs` Rust wheels at
+# the same version). Both workflows trigger on the same events and run
+# in parallel; `ygg` declares `yggrs==X.Y.Z` as a hard dependency, so a
+# release isn't usable until both have landed on PyPI. Order doesn't
+# matter — pip resolves the dep at install time.
+#
 # Jobs
 # ----
 #   detect         → reads version, checks ygg on PyPI, decides
@@ -30,6 +36,7 @@ on:
       - "python/pyproject.toml"
       - "python/README.md"
       - "python/LICENSE"
+      - "rust/**"
       - ".github/workflows/publish.yml"
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
