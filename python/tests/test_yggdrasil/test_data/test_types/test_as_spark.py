@@ -266,3 +266,85 @@ class TestSignFlipCastEngine(unittest.TestCase):
 
         self.assertEqual(casted.dtype, pl.Int64)
         self.assertEqual(casted.to_list(), [-1, 0, 100])
+
+
+class TestIntegerTypeNewAlwaysRedirects(unittest.TestCase):
+    """``__new__`` redirects to the registered specialized class.
+
+    The redirect fires regardless of which class the constructor was
+    invoked through — ``IntegerType(byte_size=8, signed=True)``,
+    ``Int8Type(byte_size=8)``, and ``UInt32Type(byte_size=8,
+    signed=True)`` all collapse to ``Int64Type``. A specialized
+    class can't quietly leave its declared width / signedness behind.
+    """
+
+    def test_abstract_redirects_to_fixed_per_byte_size_and_signed(self) -> None:
+        from yggdrasil.data.types.primitive.numeric import (
+            Int8Type, Int16Type, Int32Type, Int64Type,
+            UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+        )
+        cases = [
+            (1, True, Int8Type), (2, True, Int16Type),
+            (4, True, Int32Type), (8, True, Int64Type),
+            (1, False, UInt8Type), (2, False, UInt16Type),
+            (4, False, UInt32Type), (8, False, UInt64Type),
+        ]
+        for size, signed, expected in cases:
+            with self.subTest(size=size, signed=signed):
+                t = IntegerType(byte_size=size, signed=signed)
+                self.assertIs(type(t), expected)
+
+    def test_specialized_with_mismatched_args_redirects_to_canonical(self) -> None:
+        from yggdrasil.data.types.primitive.numeric import (
+            Int8Type, Int64Type, UInt64Type,
+        )
+        # Asking for an Int8Type with a wider byte_size lands on the
+        # right specialized class instead of producing a malformed
+        # ``Int8Type(byte_size=8)``.
+        self.assertIs(type(Int8Type(byte_size=8)), Int64Type)
+        self.assertIs(type(Int8Type(byte_size=8, signed=False)), UInt64Type)
+
+    def test_specialized_no_args_uses_class_default(self) -> None:
+        # ``Int8Type()`` with no args still produces ``Int8Type`` —
+        # the class default ``byte_size=1`` lands during ``__init__``,
+        # and ``__new__`` saw ``byte_size=None`` so the redirect
+        # registry missed (no entry for ``(None, True)``).
+        from yggdrasil.data.types.primitive.numeric import Int8Type, Int64Type
+
+        self.assertIs(type(Int8Type()), Int8Type)
+        self.assertEqual(Int8Type().byte_size, 1)
+        self.assertIs(type(Int64Type()), Int64Type)
+        self.assertEqual(Int64Type().byte_size, 8)
+
+    def test_unknown_width_falls_through_to_abstract(self) -> None:
+        # 16-byte / hugeint has no registered specialized class — the
+        # call lands on plain ``IntegerType`` rather than crashing.
+        t = IntegerType(byte_size=16, signed=True)
+        self.assertIs(type(t), IntegerType)
+        self.assertEqual(t.byte_size, 16)
+
+    def test_pickle_round_trips_specialized_class(self) -> None:
+        from yggdrasil.data.types.primitive.numeric import Int64Type, UInt32Type
+        import pickle
+
+        for original in (Int64Type(), UInt32Type()):
+            with self.subTest(t=original):
+                restored = pickle.loads(pickle.dumps(original))
+                self.assertIs(type(restored), type(original))
+                self.assertEqual(restored.byte_size, original.byte_size)
+                self.assertEqual(restored.signed, original.signed)
+
+    def test_floating_point_redirect_same_shape(self) -> None:
+        from yggdrasil.data.types.primitive.numeric import (
+            Float16Type, Float32Type, Float64Type,
+        )
+        # Abstract → fixed.
+        self.assertIs(type(FloatingPointType(byte_size=2)), Float16Type)
+        self.assertIs(type(FloatingPointType(byte_size=4)), Float32Type)
+        self.assertIs(type(FloatingPointType(byte_size=8)), Float64Type)
+        # Mismatched specialized → canonical.
+        self.assertIs(type(Float32Type(byte_size=8)), Float64Type)
+        self.assertIs(type(Float64Type(byte_size=2)), Float16Type)
+        # No-args specialized stays on its default.
+        self.assertIs(type(Float64Type()), Float64Type)
+        self.assertEqual(Float64Type().byte_size, 8)

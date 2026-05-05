@@ -251,18 +251,27 @@ class IntegerType(NumericType):
     signed: bool = True
 
     def __new__(cls, byte_size: int | None = None, signed: bool = True, **kwargs):
-        # When called on the abstract base, redirect to the registered
-        # specialized subclass for ``(byte_size, signed)``. ``Int32Type`` /
-        # ``UInt8Type`` / ... carry their own ``DataTypeId`` so they
-        # round-trip through ``to_dict`` / ``from_dict`` without losing
-        # signedness or width. Unusual sizes (16-byte hugeint, ``None``)
-        # fall through to a plain ``IntegerType`` instance — the dynamic
-        # fallback. Subclasses skip the redirect: ``Int32Type(...)`` is
-        # always an ``Int32Type``.
-        if cls is IntegerType:
-            target = _SPECIALIZED_INTEGER_TYPES.get((byte_size, bool(signed)))
-            if target is not None:
-                return object.__new__(target)
+        # Always redirect to the registered specialized subclass for
+        # ``(byte_size, signed)`` — ``Int8Type`` / ``Int32Type`` /
+        # ``UInt64Type`` / ... carry their own ``DataTypeId``. Two
+        # branches collapse the cases:
+        #
+        # * ``IntegerType(byte_size=4, signed=True)`` redirects to
+        #   ``Int32Type`` (the abstract → fixed promotion).
+        # * ``Int8Type(byte_size=8, signed=True)`` *also* redirects, to
+        #   ``Int64Type`` — a malformed specialized construction can't
+        #   silently leave its declared width behind.
+        #
+        # Unusual sizes (16-byte hugeint, ``byte_size=None``) have no
+        # registered specialized class, so the lookup misses and the
+        # call lands on whichever ``cls`` the caller asked for —
+        # typically the abstract :class:`IntegerType` for the dynamic
+        # fallback, or a specialized class via ``Int64Type()`` (whose
+        # dataclass default fills in ``byte_size=8`` during ``__init__``
+        # after ``__new__`` returns).
+        target = _SPECIALIZED_INTEGER_TYPES.get((byte_size, bool(signed)))
+        if target is not None and target is not cls:
+            return object.__new__(target)
         return object.__new__(cls)
 
     def pretty_format(self, indent: int = 2, level: int = 0) -> str:
@@ -667,10 +676,12 @@ class FloatingPointType(NumericType):
         # See :meth:`IntegerType.__new__` — same dispatch, keyed on
         # ``byte_size`` only. ``bfloat16`` rides the same Float16Type as
         # IEEE half-precision; we don't model BF separately here.
-        if cls is FloatingPointType:
-            target = _SPECIALIZED_FLOAT_TYPES.get(byte_size)
-            if target is not None:
-                return object.__new__(target)
+        # Always redirect when a specialized class is registered, so
+        # ``Float32Type(byte_size=8)`` lands on ``Float64Type`` rather
+        # than carrying a malformed width.
+        target = _SPECIALIZED_FLOAT_TYPES.get(byte_size)
+        if target is not None and target is not cls:
+            return object.__new__(target)
         return object.__new__(cls)
 
     def pretty_format(self, indent: int = 2, level: int = 0) -> str:
