@@ -28,11 +28,17 @@ from __future__ import annotations
 import pyarrow as pa
 import pytest
 
+from unittest.mock import MagicMock
+
+from yggdrasil.databricks.client import DatabricksClient
+from yggdrasil.databricks.sql import Table, Tables
 from yggdrasil.databricks.sql.table import (
     _build_delete_insert_statements,
     _build_dml_statements,
     _build_merge_fallback_statements,
     _collect_prune_values_polars,
+    _render_source_predicate,
+    _resolve_dispatch_targets,
     _resolve_prune_by,
 )
 from yggdrasil.io.buffer.primitive import ParquetIO
@@ -446,3 +452,120 @@ class TestCollectPruneValuesPolars:
             assert set(out["region"]) == {"eu", "us", None}
         finally:
             buf.clear()
+
+
+# ---------------------------------------------------------------------------
+# table_dispatch helpers — multi-target insert fan-out
+# ---------------------------------------------------------------------------
+
+
+def _make_table(catalog: str, schema: str, name: str) -> Table:
+    """Build a :class:`Table` bound to a stub :class:`Tables` service.
+
+    The mock client/service combo lets us exercise the dispatch
+    resolver and predicate renderer without any Databricks round trip.
+    """
+    client = MagicMock(spec=DatabricksClient)
+    service = MagicMock(spec=Tables)
+    service.client = client
+    service.catalog_name = catalog
+    service.schema_name = schema
+
+    def _from_(obj, *, service, **_kw):
+        loc = str(obj)
+        parts = loc.split(".")
+        if len(parts) == 3:
+            cat, sch, tbl = parts
+        else:
+            cat, sch, tbl = catalog, schema, parts[-1]
+        return Table(
+            service=service,
+            catalog_name=cat,
+            schema_name=sch,
+            table_name=tbl,
+        )
+
+    # ``Table.from_`` is bound at the class level — the resolver hits it
+    # for str keys, so we route it through the same stubbed service.
+    service.parse_check_location_params.side_effect = (
+        lambda location=None, catalog_name=None, schema_name=None, table_name=None, **kw: (
+            location or f"{catalog_name}.{schema_name}.{table_name}",
+            catalog_name, schema_name, table_name,
+        )
+    )
+
+    return Table(
+        service=service,
+        catalog_name=catalog,
+        schema_name=schema,
+        table_name=name,
+    )
+
+
+class TestRenderSourcePredicate:
+    def test_none_returns_empty(self):
+        assert _render_source_predicate(None) == ""
+
+    def test_simple_predicate_renders_unaliased(self):
+        from yggdrasil.data.expr import col
+        sql = _render_source_predicate(col("region") == "eu")
+        # Source-side fragment must NOT carry an ``T.`` / ``S.`` alias —
+        # callers compose it onto whatever projection they built.
+        assert "T." not in sql and "S." not in sql
+        assert "`region`" in sql
+        assert "'eu'" in sql
+
+    def test_compound_predicate_is_parenthesized(self):
+        from yggdrasil.data.expr import col
+        pred = (col("region") == "eu") & (col("tier") == "gold")
+        sql = _render_source_predicate(pred)
+        # Compound forms must be parenthesized so AND/OR nesting stays
+        # explicit when the fragment is concatenated onto a WHERE clause.
+        assert sql.startswith("(") and sql.endswith(")")
+        assert " AND " in sql
+
+
+class TestResolveDispatchTargets:
+    def test_none_returns_empty_list(self):
+        primary = _make_table("cat", "sch", "primary")
+        assert _resolve_dispatch_targets(None, primary=primary) == []
+
+    def test_empty_mapping_returns_empty_list(self):
+        primary = _make_table("cat", "sch", "primary")
+        assert _resolve_dispatch_targets({}, primary=primary) == []
+
+    def test_table_keys_pass_through(self):
+        from yggdrasil.data.expr import col
+        primary = _make_table("cat", "sch", "primary")
+        extra = _make_table("cat", "sch", "extra")
+        pred = col("region") == "eu"
+
+        out = _resolve_dispatch_targets({extra: pred}, primary=primary)
+
+        assert len(out) == 1
+        assert out[0][0] is extra
+        assert out[0][1] is pred
+
+    def test_self_dispatch_raises_with_actionable_message(self):
+        from yggdrasil.data.expr import col
+        primary = _make_table("cat", "sch", "primary")
+
+        with pytest.raises(ValueError) as exc:
+            _resolve_dispatch_targets(
+                {primary: col("x") == 1}, primary=primary,
+            )
+        msg = str(exc.value)
+        # Helpful-error contract from AGENTS.md: name what failed and
+        # what to do next.
+        assert "primary" in msg
+        assert "Drop the entry" in msg or "different table" in msg
+
+    def test_unsupported_key_type_raises_typeerror(self):
+        from yggdrasil.data.expr import col
+        primary = _make_table("cat", "sch", "primary")
+
+        with pytest.raises(TypeError) as exc:
+            _resolve_dispatch_targets(
+                {123: col("x") == 1}, primary=primary,
+            )
+        assert "Table or str" in str(exc.value)
