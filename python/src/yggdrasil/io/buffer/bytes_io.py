@@ -1072,6 +1072,30 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
         return b""
 
+    def _flag_dirty_for_commit(self) -> None:
+        """Mark the buffer dirty when ``_commit`` would do real work.
+
+        Hand-rolled instead of routing through :meth:`mark_dirty`
+        because writes are valid against unacquired (autonomous,
+        memory-mode) buffers, and ``mark_dirty`` raises in that
+        state. The set mirrors the conditions in :meth:`_commit`:
+        view buffers (parent flush needed) and non-local path
+        buffers (transaction buffer must commit) are the only
+        shapes that have anything durable to push on close.
+        Local-path and pure-memory buffers stay clean — there's
+        nothing for ``flush`` / context-exit commit to do.
+        """
+        if not self._acquired:
+            return
+        if self.is_view:
+            self._dirty = True
+            return
+        if self._spill_path is None:
+            return
+        if self._spill_path.is_local:
+            return
+        self._dirty = True
+
     @_under_thread_lock
     def _write_at(self, data: memoryview, pos: int) -> int:
         """Write *mv* at *pos*. Grows backing, auto-spills on threshold.
@@ -1089,6 +1113,11 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         Critical fix vs. previous version: if a memory-mode write
         crosses ``spill_bytes`` and triggers ``_spill()``, the same
         call falls through to the spill-fd write branch.
+
+        Flips the dirty bit on a successful non-zero write so that
+        context-manager exit (or an explicit :meth:`flush`) commits
+        the change to remote backings without callers having to
+        call :meth:`mark_dirty` by hand.
         """
         if pos < 0:
             raise ValueError("write position must be >= 0")
@@ -1111,6 +1140,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             written = self.parent.pwrite(data, self._view_offset + pos)
             if pos + written > self._size:
                 self._size = pos + written
+            if written:
+                self._flag_dirty_for_commit()
             return written
 
         # Auto-spill check fires only for autonomous (no-path) memory
@@ -1134,6 +1165,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         if self._transaction_buffer is not None:
             written = self._transaction_buffer._write_at(data, pos)
             self._size = max(self._size, pos + written)
+            if written:
+                self._flag_dirty_for_commit()
             return written
 
         # Pure memory: splice into _buf.
@@ -1170,6 +1203,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             if self._view_max_size is not None:
                 n = min(n, self._view_max_size)
             self.parent._set_size(self._view_offset + n)
+            if n != self._size:
+                self._flag_dirty_for_commit()
             self._size = n
             if self._pos > n:
                 self._pos = n
@@ -1187,6 +1222,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # Non-local path: delegate to the transaction buffer.
         if self._transaction_buffer is not None:
             self._transaction_buffer._set_size(n)
+            if n != self._size:
+                self._flag_dirty_for_commit()
             self._size = n
             if self._pos > n:
                 self._pos = n
@@ -1529,6 +1566,10 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 self._transaction_buffer._set_size(0)
                 self._size = 0
                 self._pos = 0
+                # Truncate-only on a non-local backing is a real
+                # mutation — flag so close/flush actually pushes the
+                # zero-byte file to the remote.
+                self._flag_dirty_for_commit()
 
             if payload is None:
                 # Empty buffer; flush on close will push zero bytes
