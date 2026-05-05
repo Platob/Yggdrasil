@@ -21,7 +21,23 @@ from .base import PrimitiveType
 from .binary import BinaryType
 from .boolean import BooleanType
 from .null import NullType
-from .numeric import DecimalType, FloatingPointType, IntegerType, NumericType
+from .numeric import (
+    DecimalType,
+    Float16Type,
+    Float32Type,
+    Float64Type,
+    FloatingPointType,
+    Int8Type,
+    Int16Type,
+    Int32Type,
+    Int64Type,
+    IntegerType,
+    NumericType,
+    UInt8Type,
+    UInt16Type,
+    UInt32Type,
+    UInt64Type,
+)
 from .object import ObjectType
 from .string import StringType
 from .temporal import DateType, DurationType, TemporalType, TimestampType, TimeType
@@ -36,7 +52,18 @@ __all__ = [
     "BooleanType",
     "NumericType",
     "IntegerType",
+    "Int8Type",
+    "Int16Type",
+    "Int32Type",
+    "Int64Type",
+    "UInt8Type",
+    "UInt16Type",
+    "UInt32Type",
+    "UInt64Type",
     "FloatingPointType",
+    "Float16Type",
+    "Float32Type",
+    "Float64Type",
     "DecimalType",
     "TemporalType",
     "DateType",

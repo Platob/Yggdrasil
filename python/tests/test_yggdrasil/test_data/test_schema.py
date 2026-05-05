@@ -528,7 +528,7 @@ class TestAutotag:
         out = s.autotag(tags={"layer": "silver"})
 
         id_tags = out["user_id"].tags or {}
-        assert id_tags[b"type_name"] == b"integer"
+        assert id_tags[b"type_name"] == b"int64"
         assert id_tags[b"signed"] == b"true"
         assert id_tags[b"nullable"] == b"false"
         assert id_tags[b"primary_key"] == b"true"

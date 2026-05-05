@@ -304,58 +304,62 @@ _NAME_ALIASES: dict[str, tuple[str, DataTypeId | None]] = {
     "bit":          ("bool",    DataTypeId.BOOL),
 
     # integers — Python / Arrow / Spark / Databricks / SQL
-    "int":          ("int",     DataTypeId.INTEGER),
-    "integer":      ("integer", DataTypeId.INTEGER),
-    "bigint":       ("bigint",  DataTypeId.INTEGER),
-    "smallint":     ("smallint", DataTypeId.INTEGER),
-    "tinyint":      ("tinyint", DataTypeId.INTEGER),
-    "byte":         ("byte",    DataTypeId.INTEGER),
-    "short":        ("short",   DataTypeId.INTEGER),
-    "long":         ("long",    DataTypeId.INTEGER),
+    # Sized aliases route to specialized type ids so the parsed result
+    # carries signedness + width without leaning on metadata. Names with
+    # no canonical width ("int128", "hugeint") stay on the generic
+    # INTEGER id and rely on byte_size metadata.
+    "int":          ("int",     DataTypeId.INT32),
+    "integer":      ("integer", DataTypeId.INT32),
+    "bigint":       ("bigint",  DataTypeId.INT64),
+    "smallint":     ("smallint", DataTypeId.INT16),
+    "tinyint":      ("tinyint", DataTypeId.INT8),
+    "byte":         ("byte",    DataTypeId.INT8),
+    "short":        ("short",   DataTypeId.INT16),
+    "long":         ("long",    DataTypeId.INT64),
     # Rust / Arrow shorthand
-    "i8":           ("i8",      DataTypeId.INTEGER),
-    "i16":          ("i16",     DataTypeId.INTEGER),
-    "i32":          ("i32",     DataTypeId.INTEGER),
-    "i64":          ("i64",     DataTypeId.INTEGER),
+    "i8":           ("i8",      DataTypeId.INT8),
+    "i16":          ("i16",     DataTypeId.INT16),
+    "i32":          ("i32",     DataTypeId.INT32),
+    "i64":          ("i64",     DataTypeId.INT64),
     "i128":         ("i128",    DataTypeId.INTEGER),
-    "u8":           ("u8",      DataTypeId.INTEGER),
-    "u16":          ("u16",     DataTypeId.INTEGER),
-    "u32":          ("u32",     DataTypeId.INTEGER),
-    "u64":          ("u64",     DataTypeId.INTEGER),
+    "u8":           ("u8",      DataTypeId.UINT8),
+    "u16":          ("u16",     DataTypeId.UINT16),
+    "u32":          ("u32",     DataTypeId.UINT32),
+    "u64":          ("u64",     DataTypeId.UINT64),
     "u128":         ("u128",    DataTypeId.INTEGER),
     # Polars / NumPy spelling
-    "int8":         ("int8",    DataTypeId.INTEGER),
-    "int16":        ("int16",   DataTypeId.INTEGER),
-    "int32":        ("int32",   DataTypeId.INTEGER),
-    "int64":        ("int64",   DataTypeId.INTEGER),
+    "int8":         ("int8",    DataTypeId.INT8),
+    "int16":        ("int16",   DataTypeId.INT16),
+    "int32":        ("int32",   DataTypeId.INT32),
+    "int64":        ("int64",   DataTypeId.INT64),
     "int128":       ("int128",  DataTypeId.INTEGER),
-    "uint8":        ("uint8",   DataTypeId.INTEGER),
-    "uint16":       ("uint16",  DataTypeId.INTEGER),
-    "uint32":       ("uint32",  DataTypeId.INTEGER),
-    "uint64":       ("uint64",  DataTypeId.INTEGER),
+    "uint8":        ("uint8",   DataTypeId.UINT8),
+    "uint16":       ("uint16",  DataTypeId.UINT16),
+    "uint32":       ("uint32",  DataTypeId.UINT32),
+    "uint64":       ("uint64",  DataTypeId.UINT64),
     "uint128":      ("uint128", DataTypeId.INTEGER),
     # DuckDB wide / unsigned
-    "utinyint":     ("utinyint", DataTypeId.INTEGER),
-    "usmallint":    ("usmallint", DataTypeId.INTEGER),
-    "uinteger":     ("uinteger", DataTypeId.INTEGER),
-    "ubigint":      ("ubigint", DataTypeId.INTEGER),
+    "utinyint":     ("utinyint", DataTypeId.UINT8),
+    "usmallint":    ("usmallint", DataTypeId.UINT16),
+    "uinteger":     ("uinteger", DataTypeId.UINT32),
+    "ubigint":      ("ubigint", DataTypeId.UINT64),
     "hugeint":      ("hugeint", DataTypeId.INTEGER),
     "uhugeint":     ("uhugeint", DataTypeId.INTEGER),
 
     # floats
-    "float":        ("float",   DataTypeId.FLOAT),
-    "double":       ("double",  DataTypeId.FLOAT),
-    "double_precision": ("double_precision", DataTypeId.FLOAT),
-    "real":         ("real",    DataTypeId.FLOAT),
-    "f16":          ("f16",     DataTypeId.FLOAT),
-    "f32":          ("f32",     DataTypeId.FLOAT),
-    "f64":          ("f64",     DataTypeId.FLOAT),
-    "float16":      ("float16", DataTypeId.FLOAT),
-    "float32":      ("float32", DataTypeId.FLOAT),
-    "float64":      ("float64", DataTypeId.FLOAT),
-    "half":         ("half",    DataTypeId.FLOAT),
-    "bfloat16":     ("bfloat16", DataTypeId.FLOAT),
-    "bf16":         ("bfloat16", DataTypeId.FLOAT),
+    "float":        ("float",   DataTypeId.FLOAT32),
+    "double":       ("double",  DataTypeId.FLOAT64),
+    "double_precision": ("double_precision", DataTypeId.FLOAT64),
+    "real":         ("real",    DataTypeId.FLOAT32),
+    "f16":          ("f16",     DataTypeId.FLOAT16),
+    "f32":          ("f32",     DataTypeId.FLOAT32),
+    "f64":          ("f64",     DataTypeId.FLOAT64),
+    "float16":      ("float16", DataTypeId.FLOAT16),
+    "float32":      ("float32", DataTypeId.FLOAT32),
+    "float64":      ("float64", DataTypeId.FLOAT64),
+    "half":         ("half",    DataTypeId.FLOAT16),
+    "bfloat16":     ("bfloat16", DataTypeId.FLOAT16),
+    "bf16":         ("bfloat16", DataTypeId.FLOAT16),
 
     # decimals
     "decimal":      ("decimal", DataTypeId.DECIMAL),
@@ -481,7 +485,10 @@ _NAME_ALIASES: dict[str, tuple[str, DataTypeId | None]] = {
 _BRACKET_METADATA_TYPE_IDS = frozenset({
     DataTypeId.BOOL,
     DataTypeId.INTEGER,
+    DataTypeId.INT8, DataTypeId.INT16, DataTypeId.INT32, DataTypeId.INT64,
+    DataTypeId.UINT8, DataTypeId.UINT16, DataTypeId.UINT32, DataTypeId.UINT64,
     DataTypeId.FLOAT,
+    DataTypeId.FLOAT16, DataTypeId.FLOAT32, DataTypeId.FLOAT64,
     DataTypeId.DATE,
     DataTypeId.NULL,
     DataTypeId.OBJECT,
@@ -972,9 +979,9 @@ class _Parser:
         canonical: str,
     ) -> DataTypeMetadata:
         """Default metadata for a plain-token type (no brackets seen yet)."""
-        if dtype is DataTypeId.INTEGER:
+        if dtype is not None and dtype.is_integer:
             return DataTypeMetadata(byte_size=_default_integer_byte_size(canonical))
-        if dtype is DataTypeId.FLOAT:
+        if dtype is not None and dtype.is_floating_point:
             return DataTypeMetadata(byte_size=_default_float_byte_size(canonical))
         return DataTypeMetadata()
 

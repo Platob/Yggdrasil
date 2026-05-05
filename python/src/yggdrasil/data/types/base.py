@@ -60,7 +60,18 @@ __all__ = [
     "BooleanType",
     "NumericType",
     "IntegerType",
+    "Int8Type",
+    "Int16Type",
+    "Int32Type",
+    "Int64Type",
+    "UInt8Type",
+    "UInt16Type",
+    "UInt32Type",
+    "UInt64Type",
     "FloatingPointType",
+    "Float16Type",
+    "Float32Type",
+    "Float64Type",
     "DecimalType",
     "TemporalType",
     "DateType",
@@ -153,6 +164,34 @@ def _literal_values_to_hint(values: tuple[object, ...]) -> object:
 
 
 DATA_TYPE_CLASSES: dict[int, type["DataType"]] = {}
+
+
+# ---------------------------------------------------------------------
+# Specialized fixed-width integer / float type-id tables.
+#
+# Mirrors :data:`yggdrasil.data.types.primitive.numeric._SPECIALIZED_INTEGER_TYPES`
+# but keyed by ``DataTypeId`` so ``from_parsed`` can recover ``(byte_size,
+# signed)`` from a specialized id without re-scanning the canonical
+# alias name. Generic ``INTEGER`` / ``FLOAT`` ids fall through to the
+# byte_size hint already on the parsed metadata.
+# ---------------------------------------------------------------------
+
+_INT_TYPE_ID_TO_PARAMS: dict[DataTypeId, tuple[int, bool]] = {
+    DataTypeId.INT8:   (1, True),
+    DataTypeId.INT16:  (2, True),
+    DataTypeId.INT32:  (4, True),
+    DataTypeId.INT64:  (8, True),
+    DataTypeId.UINT8:  (1, False),
+    DataTypeId.UINT16: (2, False),
+    DataTypeId.UINT32: (4, False),
+    DataTypeId.UINT64: (8, False),
+}
+
+_FLOAT_TYPE_ID_TO_SIZE: dict[DataTypeId, int] = {
+    DataTypeId.FLOAT16: 2,
+    DataTypeId.FLOAT32: 4,
+    DataTypeId.FLOAT64: 8,
+}
 
 
 @dataclass(frozen=True, repr=False)
@@ -544,11 +583,17 @@ class DataType(BaseChildrenFields, ABC):
         if parsed.type_id == DataTypeId.BOOL:
             return BooleanType()
 
-        if parsed.type_id == DataTypeId.INTEGER:
-            return IntegerType(byte_size=parsed.byte_size or 8, signed=True)
+        if parsed.type_id.is_integer:
+            byte_size, signed = _INT_TYPE_ID_TO_PARAMS.get(
+                parsed.type_id, (parsed.byte_size or 8, True)
+            )
+            return IntegerType(byte_size=byte_size, signed=signed)
 
-        if parsed.type_id == DataTypeId.FLOAT:
-            return FloatingPointType(byte_size=parsed.byte_size or 8)
+        if parsed.type_id.is_floating_point:
+            byte_size = _FLOAT_TYPE_ID_TO_SIZE.get(
+                parsed.type_id, parsed.byte_size or 8
+            )
+            return FloatingPointType(byte_size=byte_size)
 
         if parsed.type_id == DataTypeId.DECIMAL:
             precision = meta.precision if meta.precision is not None else 38
@@ -1872,7 +1917,14 @@ from .primitive import (
     DateType,
     DecimalType,
     DurationType,
+    Float16Type,
+    Float32Type,
+    Float64Type,
     FloatingPointType,
+    Int8Type,
+    Int16Type,
+    Int32Type,
+    Int64Type,
     IntegerType,
     NullType,
     NumericType,
@@ -1881,4 +1933,8 @@ from .primitive import (
     TemporalType,
     TimeType,
     TimestampType,
+    UInt8Type,
+    UInt16Type,
+    UInt32Type,
+    UInt64Type,
 )

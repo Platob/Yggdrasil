@@ -31,7 +31,18 @@ if TYPE_CHECKING:
 __all__ = [
     "NumericType",
     "IntegerType",
+    "Int8Type",
+    "Int16Type",
+    "Int32Type",
+    "Int64Type",
+    "UInt8Type",
+    "UInt16Type",
+    "UInt32Type",
+    "UInt64Type",
     "FloatingPointType",
+    "Float16Type",
+    "Float32Type",
+    "Float64Type",
     "DecimalType",
 ]
 
@@ -68,6 +79,36 @@ class NumericType(PrimitiveType, ABC):
     def _source_type_id(options: "CastOptions") -> DataTypeId | None:
         sf = options.source_field
         return sf.dtype.type_id if sf is not None else None
+
+    def merge_with(
+        self,
+        other: "DataType",
+        mode: Mode | None = None,
+        downcast: bool = False,
+        upcast: bool = False,
+    ):
+        # Specialized fixed-width subclasses (``Int32Type``, ``UInt8Type``,
+        # ``Float64Type``, ...) carry distinct ``type_id`` values, but
+        # they still merge as one kind: any two integers collapse via
+        # ``_merge_with_same_id`` regardless of width / signedness, and
+        # likewise for floats. Decimals stay strict — they have their
+        # own ``DECIMAL`` id and don't bridge to ints / floats here.
+        mode = Mode.from_(mode, Mode.UPSERT)
+        if mode is Mode.IGNORE:
+            return self
+
+        same_kind = (
+            self.type_id == other.type_id
+            or (self.type_id.is_integer and other.type_id.is_integer)
+            or (self.type_id.is_floating_point and other.type_id.is_floating_point)
+        )
+        if same_kind:
+            return self._merge_with_same_id(
+                other=other, mode=mode, downcast=downcast, upcast=upcast
+            )
+        return self._merge_with_different_id(
+            other=other, mode=mode, downcast=downcast, upcast=upcast
+        )
 
     # ------------------------------------------------------------------
     # Arrow
@@ -208,6 +249,21 @@ def _polars_is_signed_int(dtype: Any) -> bool:
 @dataclass(frozen=True, repr=False)
 class IntegerType(NumericType):
     signed: bool = True
+
+    def __new__(cls, byte_size: int | None = None, signed: bool = True, **kwargs):
+        # When called on the abstract base, redirect to the registered
+        # specialized subclass for ``(byte_size, signed)``. ``Int32Type`` /
+        # ``UInt8Type`` / ... carry their own ``DataTypeId`` so they
+        # round-trip through ``to_dict`` / ``from_dict`` without losing
+        # signedness or width. Unusual sizes (16-byte hugeint, ``None``)
+        # fall through to a plain ``IntegerType`` instance — the dynamic
+        # fallback. Subclasses skip the redirect: ``Int32Type(...)`` is
+        # always an ``Int32Type``.
+        if cls is IntegerType:
+            target = _SPECIALIZED_INTEGER_TYPES.get((byte_size, bool(signed)))
+            if target is not None:
+                return object.__new__(target)
+        return object.__new__(cls)
 
     def pretty_format(self, indent: int = 2, level: int = 0) -> str:
         pad = " " * (indent * level)
@@ -386,14 +442,22 @@ class IntegerType(NumericType):
 
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
-        return cls._matches_dict(value, DataTypeId.INTEGER)
+        return cls._matches_dict(value, cls.class_type_id())
 
     @classmethod
     def from_dict(cls, value: dict[str, Any], default: Any = ...) -> "IntegerType":
         try:
+            # Pull defaults from the class itself so specialized subclasses
+            # (``UInt8Type``, ``Int64Type``, ...) recover the correct
+            # signedness even when the serialized dict omits it.
+            byte_size_default = cls.__dataclass_fields__["byte_size"].default
+            if byte_size_default is None:
+                byte_size_default = 8
+            signed_default = cls.__dataclass_fields__["signed"].default
+
             return cls(
-                byte_size=value.get("byte_size", 8),
-                signed=bool(value.get("signed", True)),
+                byte_size=value.get("byte_size", byte_size_default),
+                signed=bool(value.get("signed", signed_default)),
             )
         except Exception as e:
             if default is ...:
@@ -401,6 +465,11 @@ class IntegerType(NumericType):
                     f"Could not parse IntegerType from dict: {value!r}."
                 ) from e
             return default
+
+    def to_dict(self) -> dict[str, Any]:
+        base = super().to_dict()
+        base["signed"] = self.signed
+        return base
 
     # ------------------------------------------------------------------
     # Exporters
@@ -510,6 +579,53 @@ class IntegerType(NumericType):
         tags[b"signed"] = b"true" if self.signed else b"false"
         return tags
 
+    def _merge_with_same_id(
+        self,
+        other: "DataType",
+        mode: Mode | None = None,
+        downcast: bool = False,
+        upcast: bool = False,
+    ) -> "IntegerType":
+        # Accept any IntegerType subclass — the specialized fixed-width
+        # subclasses (``Int8Type``, ``UInt32Type``, ...) are siblings,
+        # not parent/child, so the default ``isinstance(other,
+        # self.__class__)`` check from :class:`PrimitiveType` would
+        # spuriously reject ``Int32Type.merge_with(Int64Type(...))``.
+        if not isinstance(other, IntegerType):
+            raise TypeError(
+                f"Cannot merge {self.__class__.__name__} with {other.__class__.__name__}"
+            )
+
+        if mode is Mode.IGNORE:
+            return self
+        if mode is Mode.OVERWRITE:
+            return other
+
+        # Funnel construction back through the abstract base so the
+        # ``__new__`` redirect picks the correct specialized class for
+        # the resolved width / signedness.
+        if mode is Mode.AUTO:
+            byte_size = self.byte_size or other.byte_size
+            signed = self.signed or other.signed
+            if byte_size == self.byte_size and signed == self.signed:
+                return self
+            return IntegerType(byte_size=byte_size, signed=signed)
+
+        if downcast == upcast:
+            return self
+
+        left = self.byte_size
+        right = other.byte_size
+        signed = self.signed or other.signed
+
+        if left is None:
+            return other if right is not None else self
+        if right is None:
+            return self
+        if downcast:
+            return IntegerType(byte_size=min(left, right), signed=signed)
+        return IntegerType(byte_size=max(left, right), signed=signed)
+
 
 # ======================================================================
 # FloatingPointType
@@ -517,6 +633,16 @@ class IntegerType(NumericType):
 
 @dataclass(frozen=True, repr=False)
 class FloatingPointType(NumericType):
+
+    def __new__(cls, byte_size: int | None = None, **kwargs):
+        # See :meth:`IntegerType.__new__` — same dispatch, keyed on
+        # ``byte_size`` only. ``bfloat16`` rides the same Float16Type as
+        # IEEE half-precision; we don't model BF separately here.
+        if cls is FloatingPointType:
+            target = _SPECIALIZED_FLOAT_TYPES.get(byte_size)
+            if target is not None:
+                return object.__new__(target)
+        return object.__new__(cls)
 
     def pretty_format(self, indent: int = 2, level: int = 0) -> str:
         pad = " " * indent * level
@@ -538,13 +664,27 @@ class FloatingPointType(NumericType):
             raise TypeError(
                 f"Cannot merge FloatingPointType with {other.__class__.__name__}"
             )
+
+        if mode is Mode.IGNORE:
+            return self
+        if mode is Mode.OVERWRITE:
+            return other
+
+        if mode is Mode.AUTO:
+            byte_size = self.byte_size or other.byte_size
+            if byte_size == self.byte_size:
+                return self
+            return FloatingPointType(byte_size=byte_size)
+
         if downcast == upcast:
             return self
 
         left_size = self.byte_size or 8
         right_size = other.byte_size or 8
         byte_size = min(left_size, right_size) if downcast else max(left_size, right_size)
-        return self.__class__(byte_size=byte_size)
+        # Build through the abstract base so the ``__new__`` redirect
+        # selects the right ``FloatXX`` specialized class.
+        return FloatingPointType(byte_size=byte_size)
 
     # ------------------------------------------------------------------
     # Engine probes / constructors
@@ -594,7 +734,7 @@ class FloatingPointType(NumericType):
 
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
-        return cls._matches_dict(value, DataTypeId.FLOAT)
+        return cls._matches_dict(value, cls.class_type_id())
 
     @classmethod
     def from_dict(cls, value: dict[str, Any], default: Any = ...) -> "FloatingPointType":
@@ -668,6 +808,144 @@ class FloatingPointType(NumericType):
                 f"for {type(self).__name__}: {value!r}."
             )
         return None
+
+
+# ======================================================================
+# Specialized fixed-width integer / float subclasses
+#
+# Each one carries its own ``DataTypeId`` so ``to_dict`` / ``from_dict`` /
+# ``autotag`` / ``pretty_format`` reflect the concrete width without
+# having to read ``byte_size`` and ``signed`` out of metadata. The
+# ``__new__`` redirect on the abstract bases (``IntegerType`` /
+# ``FloatingPointType``) is what lifts a generic
+# ``IntegerType(byte_size=4, signed=True)`` call into ``Int32Type`` —
+# the registry below is the single source of truth for the mapping.
+# ======================================================================
+
+
+@dataclass(frozen=True, repr=False)
+class Int8Type(IntegerType):
+    byte_size: int | None = 1
+    signed: bool = True
+
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
+        return DataTypeId.INT8
+
+
+@dataclass(frozen=True, repr=False)
+class Int16Type(IntegerType):
+    byte_size: int | None = 2
+    signed: bool = True
+
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
+        return DataTypeId.INT16
+
+
+@dataclass(frozen=True, repr=False)
+class Int32Type(IntegerType):
+    byte_size: int | None = 4
+    signed: bool = True
+
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
+        return DataTypeId.INT32
+
+
+@dataclass(frozen=True, repr=False)
+class Int64Type(IntegerType):
+    byte_size: int | None = 8
+    signed: bool = True
+
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
+        return DataTypeId.INT64
+
+
+@dataclass(frozen=True, repr=False)
+class UInt8Type(IntegerType):
+    byte_size: int | None = 1
+    signed: bool = False
+
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
+        return DataTypeId.UINT8
+
+
+@dataclass(frozen=True, repr=False)
+class UInt16Type(IntegerType):
+    byte_size: int | None = 2
+    signed: bool = False
+
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
+        return DataTypeId.UINT16
+
+
+@dataclass(frozen=True, repr=False)
+class UInt32Type(IntegerType):
+    byte_size: int | None = 4
+    signed: bool = False
+
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
+        return DataTypeId.UINT32
+
+
+@dataclass(frozen=True, repr=False)
+class UInt64Type(IntegerType):
+    byte_size: int | None = 8
+    signed: bool = False
+
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
+        return DataTypeId.UINT64
+
+
+@dataclass(frozen=True, repr=False)
+class Float16Type(FloatingPointType):
+    byte_size: int | None = 2
+
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
+        return DataTypeId.FLOAT16
+
+
+@dataclass(frozen=True, repr=False)
+class Float32Type(FloatingPointType):
+    byte_size: int | None = 4
+
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
+        return DataTypeId.FLOAT32
+
+
+@dataclass(frozen=True, repr=False)
+class Float64Type(FloatingPointType):
+    byte_size: int | None = 8
+
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
+        return DataTypeId.FLOAT64
+
+
+_SPECIALIZED_INTEGER_TYPES: dict[tuple[int | None, bool], type[IntegerType]] = {
+    (1, True):  Int8Type,
+    (2, True):  Int16Type,
+    (4, True):  Int32Type,
+    (8, True):  Int64Type,
+    (1, False): UInt8Type,
+    (2, False): UInt16Type,
+    (4, False): UInt32Type,
+    (8, False): UInt64Type,
+}
+
+_SPECIALIZED_FLOAT_TYPES: dict[int | None, type[FloatingPointType]] = {
+    2: Float16Type,
+    4: Float32Type,
+    8: Float64Type,
+}
 
 
 # ======================================================================

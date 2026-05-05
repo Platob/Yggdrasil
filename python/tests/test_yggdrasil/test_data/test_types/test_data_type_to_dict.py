@@ -34,7 +34,10 @@ class TestPrimitiveDictRoundTrip(unittest.TestCase):
         d = original.to_dict()
         restored = DataType.from_dict(d)
 
-        self.assertEqual(d["id"], int(DataTypeId.INTEGER))
+        # ``IntegerType(byte_size=8, signed=True)`` redirects to the
+        # specialized ``Int64Type`` via ``__new__``; the dict id reflects
+        # the concrete subclass rather than the abstract ``INTEGER``.
+        self.assertEqual(d["id"], int(DataTypeId.INT64))
         self.assertIsInstance(restored, IntegerType)
         self.assertEqual(restored.byte_size, 8)
         self.assertTrue(restored.signed)
