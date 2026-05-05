@@ -160,13 +160,20 @@ def _ensure_media_headers(
     declared_type = _parse_content_type(headers)
     declared_encoding = _parse_content_encoding(headers)
 
+    # Treat placeholder Content-Type (octet-stream, unknown/unknown,
+    # blank) as "missing" for the sniff: otherwise a placeholder we
+    # stamped during ``__init__`` (when the buffer was still empty)
+    # would mask the real media after the body lands.
+    type_is_placeholder = _is_probably_placeholder_content_type(declared_type)
+    sniff_type = None if type_is_placeholder else declared_type
+
     media = _sniff_media_from_body(
         body,
-        content_type=declared_type,
+        content_type=sniff_type,
         content_encoding=declared_encoding,
     )
 
-    if _is_probably_placeholder_content_type(declared_type):
+    if type_is_placeholder:
         headers["Content-Type"] = media.mime_type.value
 
     if not declared_encoding and media.codec is not None:

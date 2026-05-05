@@ -188,6 +188,35 @@ class TestHashing:
         req = PreparedRequest.prepare(method="GET", url="https://example.com/")
         assert isinstance(req.xxh3_b64(), str)
 
+    def test_url_hashes_distinguish_method(self):
+        # GET /x and POST /x must hash to different cache keys —
+        # otherwise a POST response would be served for a GET (and vice
+        # versa) when ``public_url_hash`` is used as the match key.
+        pytest.importorskip("xxhash")
+        get_req = PreparedRequest.prepare(method="GET", url="https://example.com/x")
+        post_req = PreparedRequest.prepare(method="POST", url="https://example.com/x")
+
+        assert get_req.private_url_hash != post_req.private_url_hash
+        assert get_req.public_url_hash != post_req.public_url_hash
+
+    def test_url_hashes_stable_across_method_equal_calls(self):
+        pytest.importorskip("xxhash")
+        a = PreparedRequest.prepare(method="GET", url="https://example.com/x")
+        b = PreparedRequest.prepare(method="GET", url="https://example.com/x")
+        assert a.private_url_hash == b.private_url_hash
+        assert a.public_url_hash == b.public_url_hash
+
+    def test_public_url_hash_drops_userinfo(self):
+        # Regression — the public hash still anonymizes userinfo even
+        # though method is now mixed in.
+        pytest.importorskip("xxhash")
+        plain = PreparedRequest.prepare(method="GET", url="https://example.com/x")
+        with_user = PreparedRequest.prepare(
+            method="GET", url="https://alice:pw@example.com/x"
+        )
+        assert plain.public_url_hash == with_user.public_url_hash
+        assert plain.private_url_hash != with_user.private_url_hash
+
 
 # ---------------------------------------------------------------------------
 # Anonymize
@@ -311,3 +340,39 @@ class TestRepr:
         text = repr(req)
         assert "GET" in text
         assert "example.com" in text
+
+
+# ---------------------------------------------------------------------------
+# Schema partition tags
+# ---------------------------------------------------------------------------
+
+
+class TestRequestSchemaPartitions:
+    def test_method_is_partition_field(self):
+        from yggdrasil.io.request import REQUEST_SCHEMA
+
+        assert REQUEST_SCHEMA["method"]._tag_flag(b"partition_by") is True
+
+    def test_partition_key_remains_partition_field(self):
+        from yggdrasil.io.request import REQUEST_SCHEMA
+
+        assert REQUEST_SCHEMA["partition_key"]._tag_flag(b"partition_by") is True
+
+    def test_other_fields_are_not_partition_fields(self):
+        from yggdrasil.io.request import REQUEST_SCHEMA
+
+        for name in ("url", "headers", "body", "body_size", "hash"):
+            assert (
+                REQUEST_SCHEMA[name]._tag_flag(b"partition_by") is False
+            ), f"{name} should not be tagged partition_by"
+
+    def test_response_request_method_is_not_partition_field(self):
+        # Unnested ``request_method`` on the response side must NOT
+        # inherit the request schema's partition_by flag — the response
+        # has its own partitioning strategy.
+        from yggdrasil.io.response import RESPONSE_SCHEMA
+
+        assert (
+            RESPONSE_SCHEMA["request_method"]._tag_flag(b"partition_by")
+            is False
+        )

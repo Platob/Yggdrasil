@@ -62,10 +62,13 @@ REQUEST_SCHEMA = schema(
         # Schema-level identity / partitioning hints — ``autotag`` at
         # the bottom of this block propagates them to the matching
         # children. The primary key is composite ``(hash, body_size)``;
-        # ``partition_key`` (the only ``partition_by`` column) is
-        # derived from :meth:`PreparedRequest.partition_values`.
+        # ``partition_by`` lists every column that gets a Hive-style
+        # partition leaf — ``method`` keeps each verb on its own
+        # branch (cheap predicate pushdown for "all GETs"), while
+        # ``partition_key`` (the xxh3 of :meth:`PreparedRequest.partition_values`)
+        # buckets the rest by endpoint.
         "primary_key": ["hash", "body_size"],
-        "partition_by": ["partition_key"],
+        "partition_by": ["method", "partition_key"],
     },
     tags=_REQUEST_SCHEMA_JSON_TAGS,
 )
@@ -99,7 +102,11 @@ REQUEST_SCHEMA["method"] = schema_field(
     "method",
     pa.string(),
     nullable=False,
-    metadata={"comment": "HTTP method (GET, POST, etc.)"},
+    metadata={
+        "comment": "HTTP method (GET, POST, etc.). One of the schema's "
+                   "``partition_by`` columns — each verb lands in its own "
+                   "Hive partition leaf.",
+    },
 ).autotag()
 
 REQUEST_SCHEMA["url"] = schema_field(
@@ -114,8 +121,9 @@ REQUEST_SCHEMA["private_url_hash"] = schema_field(
     pa.int64(),
     nullable=False,
     metadata={
-        "comment": "xxh3_64 digest of the full URL string (scheme, userinfo, host, port, "
-                   "path, query, fragment) — matches the URL exactly as captured.",
+        "comment": "xxh3_64 digest of (method, full URL string) — scheme, userinfo, host, "
+                   "port, path, query, fragment exactly as captured. Method is mixed in "
+                   "so ``GET /x`` and ``POST /x`` don't collide.",
         "algorithm": "xxh3_64",
     },
 ).autotag()
@@ -125,9 +133,10 @@ REQUEST_SCHEMA["public_url_hash"] = schema_field(
     pa.int64(),
     nullable=False,
     metadata={
-        "comment": "xxh3_64 digest of ``url.anonymize('remove').to_string()`` — drops "
-                   "userinfo and sensitive query params so this hash is stable across "
-                   "anonymization. The default cache match key.",
+        "comment": "xxh3_64 digest of (method, ``url.anonymize('remove').to_string()``) — "
+                   "userinfo and sensitive query params dropped, method mixed in so verbs "
+                   "stay distinct. Stable across anonymization and the default cache match "
+                   "key.",
         "algorithm": "xxh3_64",
     },
 ).autotag()
@@ -678,15 +687,17 @@ class PreparedRequest:
 
     @property
     def private_url_hash(self) -> int:
-        """xxh3_64 of the URL exactly as captured (userinfo + full query)."""
-        return _xxh3_int64_str(self.url.to_string())
+        """xxh3_64 of (method, URL) exactly as captured (userinfo + full query)."""
+        return _xxh3_int64_str(f"{self.method}\x00{self.url.to_string()}")
 
     @property
     def public_url_hash(self) -> int:
-        """xxh3_64 of the URL after ``anonymize('remove')`` — userinfo and
+        """xxh3_64 of (method, URL) after ``anonymize('remove')`` — userinfo and
         sensitive query params dropped, so this hash is stable across the
-        cache's anonymize step."""
-        return _xxh3_int64_str(self.url.anonymize(mode="remove").to_string())
+        cache's anonymize step. Method is mixed in so verbs don't collide."""
+        return _xxh3_int64_str(
+            f"{self.method}\x00{self.url.anonymize(mode='remove').to_string()}"
+        )
 
     @property
     def hash(self) -> int:
