@@ -59,8 +59,26 @@ class TestPrimitiveDDL(unittest.TestCase):
     def test_timestamp_naive_renders_as_ntz(self) -> None:
         self.assertEqual(TimestampType(tz=None).to_databricks_ddl(), "TIMESTAMP_NTZ")
 
-    def test_timestamp_zoned_renders_as_timestamp(self) -> None:
-        self.assertEqual(TimestampType(tz="UTC").to_databricks_ddl(), "TIMESTAMP")
+    def test_timestamp_utc_renders_as_timestamp(self) -> None:
+        # All UTC-equivalent spellings collapse to ``TIMESTAMP`` — Databricks
+        # stores it UTC-anchored regardless.
+        for tz in ("UTC", "Etc/UTC", "GMT", "Z", "+00:00", "-00:00"):
+            with self.subTest(tz=tz):
+                self.assertEqual(TimestampType(tz=tz).to_databricks_ddl(), "TIMESTAMP")
+
+    def test_timestamp_non_utc_zone_renders_as_ntz(self) -> None:
+        # Databricks ``TIMESTAMP`` would silently shift wall-clock values for
+        # non-UTC zones; render naive instead so digits round-trip.
+        for tz in ("Europe/Paris", "America/New_York", "Asia/Tokyo", "Etc/GMT+5"):
+            with self.subTest(tz=tz):
+                self.assertEqual(TimestampType(tz=tz).to_databricks_ddl(), "TIMESTAMP_NTZ")
+
+    def test_timestamp_unknown_zone_falls_back_to_ntz(self) -> None:
+        # Unparseable tz strings can't be proven UTC — fall back to naive.
+        self.assertEqual(
+            TimestampType(tz="Not/AZone").to_databricks_ddl(),
+            "TIMESTAMP_NTZ",
+        )
 
     def test_duration_widens_to_bigint(self) -> None:
         # Duration has no native Databricks counterpart; carry as int64.

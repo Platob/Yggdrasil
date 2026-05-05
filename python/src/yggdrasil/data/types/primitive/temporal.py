@@ -991,7 +991,18 @@ class TimestampType(TemporalType):
         return spark.types.TimestampType()
 
     def to_databricks_ddl(self) -> str:
-        return "TIMESTAMP_NTZ" if self.tz is None else "TIMESTAMP"
+        # Databricks ``TIMESTAMP`` is UTC-anchored — only emit it when the tz is
+        # UTC-equivalent. Anything else (naive or a real non-UTC zone like
+        # ``Europe/Paris``) drops to ``TIMESTAMP_NTZ`` so the wall-clock value
+        # round-trips without a silent shift.
+        if self.tz is None:
+            return "TIMESTAMP_NTZ"
+        from yggdrasil.data.enums.timezone import Timezone
+
+        try:
+            return "TIMESTAMP" if Timezone.parse_str(self.tz).is_utc() else "TIMESTAMP_NTZ"
+        except (TypeError, ValueError):
+            return "TIMESTAMP_NTZ"
 
     def default_pyobj(self, nullable: bool) -> Any:
         if nullable:
