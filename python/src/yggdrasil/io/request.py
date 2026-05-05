@@ -62,10 +62,13 @@ REQUEST_SCHEMA = schema(
         # Schema-level identity / partitioning hints — ``autotag`` at
         # the bottom of this block propagates them to the matching
         # children. The primary key is composite ``(hash, body_size)``;
-        # ``partition_key`` (the only ``partition_by`` column) is
-        # derived from :meth:`PreparedRequest.partition_values`.
+        # ``partition_by`` lists every column that gets a Hive-style
+        # partition leaf — ``method`` keeps each verb on its own
+        # branch (cheap predicate pushdown for "all GETs"), while
+        # ``partition_key`` (the xxh3 of :meth:`PreparedRequest.partition_values`)
+        # buckets the rest by endpoint.
         "primary_key": ["hash", "body_size"],
-        "partition_by": ["partition_key"],
+        "partition_by": ["method", "partition_key"],
     },
     tags=_REQUEST_SCHEMA_JSON_TAGS,
 )
@@ -99,7 +102,11 @@ REQUEST_SCHEMA["method"] = schema_field(
     "method",
     pa.string(),
     nullable=False,
-    metadata={"comment": "HTTP method (GET, POST, etc.)"},
+    metadata={
+        "comment": "HTTP method (GET, POST, etc.). One of the schema's "
+                   "``partition_by`` columns — each verb lands in its own "
+                   "Hive partition leaf.",
+    },
 ).autotag()
 
 REQUEST_SCHEMA["url"] = schema_field(

@@ -311,3 +311,39 @@ class TestRepr:
         text = repr(req)
         assert "GET" in text
         assert "example.com" in text
+
+
+# ---------------------------------------------------------------------------
+# Schema partition tags
+# ---------------------------------------------------------------------------
+
+
+class TestRequestSchemaPartitions:
+    def test_method_is_partition_field(self):
+        from yggdrasil.io.request import REQUEST_SCHEMA
+
+        assert REQUEST_SCHEMA["method"]._tag_flag(b"partition_by") is True
+
+    def test_partition_key_remains_partition_field(self):
+        from yggdrasil.io.request import REQUEST_SCHEMA
+
+        assert REQUEST_SCHEMA["partition_key"]._tag_flag(b"partition_by") is True
+
+    def test_other_fields_are_not_partition_fields(self):
+        from yggdrasil.io.request import REQUEST_SCHEMA
+
+        for name in ("url", "headers", "body", "body_size", "hash"):
+            assert (
+                REQUEST_SCHEMA[name]._tag_flag(b"partition_by") is False
+            ), f"{name} should not be tagged partition_by"
+
+    def test_response_request_method_is_not_partition_field(self):
+        # Unnested ``request_method`` on the response side must NOT
+        # inherit the request schema's partition_by flag — the response
+        # has its own partitioning strategy.
+        from yggdrasil.io.response import RESPONSE_SCHEMA
+
+        assert (
+            RESPONSE_SCHEMA["request_method"]._tag_flag(b"partition_by")
+            is False
+        )
