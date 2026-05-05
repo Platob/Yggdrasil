@@ -21,12 +21,14 @@ from databricks.sdk.service.workspace import (
     ObjectType,
 )
 
+from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.path_stat import PathKind, PathStats
 from yggdrasil.io.url import URL
 from ._errors import (
     ALREADY_EXISTS_ERRORS,
     NOT_FOUND_ERRORS,
     SDK_ERRORS,
+    retry_sdk_call,
 )
 from .path import DatabricksPath
 from .path_kind import DatabricksPathKind
@@ -59,9 +61,17 @@ class WorkspacePath(DatabricksPath):
     # SDK transport
     # ==================================================================
 
-    def _remote_download(self, allow_not_found: bool = False) -> bytes:
-        """Pull the full object via ``sdk.workspace.download``."""
+    def _remote_download(self, allow_not_found: bool = False) -> BytesIO:
+        """Pull the full object via ``sdk.workspace.download``.
+
+        Drains the SDK response into a project :class:`BytesIO`
+        (spill-capable) so large notebooks/artifacts don't have to
+        live entirely in RAM. The base ``read_bytes`` /
+        ``retry_sdk_call`` wrapper handles transient transport
+        flakes around the call.
+        """
         sdk = self._sdk()
+        out = BytesIO()
         try:
             result = sdk.workspace.download(
                 path=self.full_path(),
@@ -69,24 +79,48 @@ class WorkspacePath(DatabricksPath):
             )
         except NOT_FOUND_ERRORS:
             if allow_not_found:
-                return b""
+                out.seek(0)
+                return out
             raise FileNotFoundError(self.full_path())
         except SDK_ERRORS:
             if allow_not_found:
-                return b""
+                out.seek(0)
+                return out
             raise
 
         if result is None:
-            return b""
-        return result.read()
+            out.seek(0)
+            return out
 
-    def _remote_upload(self, payload: bytes) -> None:
-        """Push the full payload via ``sdk.workspace.upload``."""
+        try:
+            while True:
+                chunk = result.read(1 * 1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+        except NOT_FOUND_ERRORS:
+            if allow_not_found:
+                out.seek(0)
+                return out
+            raise FileNotFoundError(self.full_path())
+
+        out.seek(0)
+        return out
+
+    def _remote_upload(self, payload: BytesIO) -> None:
+        """Push the full payload via ``sdk.workspace.upload``.
+
+        ``payload`` is the project :class:`BytesIO`. The Workspace
+        SDK ``upload`` accepts a file-like object, so we hand the
+        buffer through directly (it satisfies ``read``/``seek``).
+        Resetting before each retry is handled by the base via
+        ``on_retry`` in :meth:`DatabricksPath.write_bytes`.
+        """
         sdk = self._sdk()
         full_path = self.full_path()
-        size = len(payload)
+        size = getattr(payload, "size", None)
 
-        LOGGER.debug("Uploading %s bytes to %s", size, self)
+        LOGGER.debug("Uploading %r bytes to %s", size, self)
         try:
             sdk.workspace.upload(
                 full_path, payload,
@@ -96,7 +130,7 @@ class WorkspacePath(DatabricksPath):
             # Surface as FileNotFoundError so the base class's
             # write_bytes can do its parent-dir-and-retry dance.
             raise FileNotFoundError(full_path)
-        LOGGER.info("Wrote %s bytes to %s", size, self)
+        LOGGER.info("Wrote %r bytes to %s", size, self)
 
     # ==================================================================
     # SDK hooks — stat / ls / mkdir / remove
@@ -104,7 +138,9 @@ class WorkspacePath(DatabricksPath):
 
     def _stat(self) -> PathStats:
         try:
-            info = self._sdk().workspace.get_status(self.full_path())
+            info = retry_sdk_call(
+                self._sdk().workspace.get_status, self.full_path(),
+            )
         except SDK_ERRORS:
             found = next(self._ls(recursive=False, allow_not_found=True), None)
             if found is None:
@@ -145,7 +181,7 @@ class WorkspacePath(DatabricksPath):
 
     def _mkdir(self, parents=True, exist_ok=True):
         try:
-            self._sdk().workspace.mkdirs(self.full_path())
+            retry_sdk_call(self._sdk().workspace.mkdirs, self.full_path())
         except ALREADY_EXISTS_ERRORS:
             if not exist_ok:
                 raise
@@ -155,7 +191,10 @@ class WorkspacePath(DatabricksPath):
         # notebook files (legacy quirk — notebooks-with-revisions
         # are tree-shaped on the API side).
         try:
-            self._sdk().workspace.delete(self.full_path(), recursive=True)
+            retry_sdk_call(
+                self._sdk().workspace.delete,
+                self.full_path(), recursive=True,
+            )
         except SDK_ERRORS:
             if not allow_not_found:
                 raise
@@ -163,9 +202,11 @@ class WorkspacePath(DatabricksPath):
     def _remove_dir(self, recursive=True, allow_not_found=True, with_root=True):
         path = self.full_path()
         try:
-            self._sdk().workspace.delete(path, recursive=recursive)
+            retry_sdk_call(
+                self._sdk().workspace.delete, path, recursive=recursive,
+            )
             if not with_root:
-                self._sdk().workspace.mkdirs(path)
+                retry_sdk_call(self._sdk().workspace.mkdirs, path)
         except SDK_ERRORS:
             if not allow_not_found:
                 raise

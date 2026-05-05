@@ -23,6 +23,7 @@ import logging
 import os
 from typing import ClassVar, Optional, Union
 
+from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.path_stat import PathKind, PathStats
 from yggdrasil.io.url import URL
 
@@ -30,6 +31,7 @@ from ._errors import (
     ALREADY_EXISTS_ERRORS,
     NOT_FOUND_ERRORS,
     SDK_ERRORS,
+    retry_sdk_call,
 )
 from .path import DatabricksPath
 from .path_kind import DatabricksPathKind
@@ -238,11 +240,13 @@ class DBFSPath(DatabricksPath):
     # SDK transport
     # ==================================================================
 
-    def _remote_download(self, allow_not_found: bool = False) -> bytes:
+    def _remote_download(self, allow_not_found: bool = False) -> BytesIO:
         """Drain the full object via base64-chunked ``dbfs.read``.
 
         Hits the 1 MiB cap per call. Stops when content_length is
         reached (if known) or when a short page signals EOF.
+        Streams into a project :class:`BytesIO` so very large
+        objects spill to disk instead of accumulating in RAM.
         """
         try:
             size = self.size
@@ -251,7 +255,7 @@ class DBFSPath(DatabricksPath):
 
         sdk = self._sdk()
         full_path = self.full_path()
-        result = bytearray()
+        out = BytesIO()
         pos = 0
         target = size if size > 0 else None
 
@@ -263,7 +267,8 @@ class DBFSPath(DatabricksPath):
                     if remaining <= 0:
                         break
                     chunk_size = min(_DBFS_CHUNK, remaining)
-                resp = sdk.dbfs.read(
+                resp = retry_sdk_call(
+                    sdk.dbfs.read,
                     path=full_path, offset=pos, length=chunk_size,
                 )
                 if not resp.data:
@@ -271,20 +276,23 @@ class DBFSPath(DatabricksPath):
                 decoded = base64.b64decode(resp.data)
                 if not decoded:
                     break
-                result.extend(decoded)
+                out.write(decoded)
                 pos += len(decoded)
                 if target is None and len(decoded) < chunk_size:
                     break
         except NOT_FOUND_ERRORS:
             if allow_not_found:
-                return bytes(result)
+                out.seek(0)
+                return out
             raise FileNotFoundError(self.full_path())
         except SDK_ERRORS:
             if allow_not_found:
-                return bytes(result)
+                out.seek(0)
+                return out
             raise
 
-        return bytes(result)
+        out.seek(0)
+        return out
 
     def _sdk_chunked_read(self, n: int, pos: int, *, default) -> bytes:
         """Range read via DBFS' chunked REST. Used by non-FUSE pread.
@@ -321,7 +329,8 @@ class DBFSPath(DatabricksPath):
                     if remaining <= 0:
                         break
                     chunk_size = min(_DBFS_CHUNK, remaining)
-                resp = sdk.dbfs.read(
+                resp = retry_sdk_call(
+                    sdk.dbfs.read,
                     path=full_path, offset=offset, length=chunk_size,
                 )
                 if not resp.data:
@@ -347,20 +356,34 @@ class DBFSPath(DatabricksPath):
 
         return bytes(result)
 
-    def _remote_upload(self, payload: bytes) -> None:
-        """Push the full payload via streaming ``sdk.dbfs.open(write=True)``."""
+    def _remote_upload(self, payload: BytesIO) -> None:
+        """Push the full payload via streaming ``sdk.dbfs.open(write=True)``.
+
+        ``payload`` is the project :class:`BytesIO`. The base
+        ``write_bytes`` records its position on entry and seeks it
+        back before each retry, so we just stream from the current
+        cursor here. The DBFS SDK's chunked writer doesn't expose
+        per-chunk retries; the outer :func:`retry_sdk_call` replays
+        the whole upload on transport failure.
+        """
         sdk = self._sdk()
         full_path = self.full_path()
 
-        LOGGER.debug("Uploading %s bytes to %s", len(payload), self)
+        size_hint = getattr(payload, "size", None)
+        LOGGER.debug("Uploading %r bytes to %s", size_hint, self)
+
         try:
             with sdk.dbfs.open(
                 path=full_path, read=False, write=True, overwrite=True,
             ) as f:
-                f.write(payload)
+                while True:
+                    chunk = payload.read(_DBFS_CHUNK)
+                    if not chunk:
+                        break
+                    f.write(chunk)
         except NOT_FOUND_ERRORS:
             raise FileNotFoundError(full_path)
-        LOGGER.info("Wrote %s bytes to %s", len(payload), self)
+        LOGGER.info("Wrote %r bytes to %s", size_hint, self)
 
     # ==================================================================
     # SDK hooks — stat / ls / mkdir / remove
@@ -368,7 +391,9 @@ class DBFSPath(DatabricksPath):
 
     def _stat(self) -> PathStats:
         try:
-            info = self._sdk().dbfs.get_status(self.full_path())
+            info = retry_sdk_call(
+                self._sdk().dbfs.get_status, self.full_path(),
+            )
         except NOT_FOUND_ERRORS:
             # Probe via list — bare prefixes don't have stat entries.
             found = next(self._ls(recursive=False, allow_not_found=True), None)
@@ -412,14 +437,16 @@ class DBFSPath(DatabricksPath):
 
     def _mkdir(self, parents=True, exist_ok=True):
         try:
-            self._sdk().dbfs.mkdirs(self.full_path())
+            retry_sdk_call(self._sdk().dbfs.mkdirs, self.full_path())
         except ALREADY_EXISTS_ERRORS:
             if not exist_ok:
                 raise
 
     def _remove_file(self, allow_not_found=True):
         try:
-            self._sdk().dbfs.delete(self.full_path(), recursive=False)
+            retry_sdk_call(
+                self._sdk().dbfs.delete, self.full_path(), recursive=False,
+            )
         except SDK_ERRORS:
             if not allow_not_found:
                 raise
@@ -427,9 +454,9 @@ class DBFSPath(DatabricksPath):
     def _remove_dir(self, recursive=True, allow_not_found=True, with_root=True):
         path = self.full_path()
         try:
-            self._sdk().dbfs.delete(path, recursive=recursive)
+            retry_sdk_call(self._sdk().dbfs.delete, path, recursive=recursive)
             if not with_root:
-                self._sdk().dbfs.mkdirs(path)
+                retry_sdk_call(self._sdk().dbfs.mkdirs, path)
         except SDK_ERRORS:
             if not allow_not_found:
                 raise

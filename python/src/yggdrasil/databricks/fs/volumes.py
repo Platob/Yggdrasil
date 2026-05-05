@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import time
 from email.utils import parsedate_to_datetime
 from typing import Tuple, Optional
 
@@ -10,8 +9,9 @@ from databricks.sdk import WorkspaceClient
 from databricks.sdk.errors.platform import (
     NotFound,
     ResourceDoesNotExist,
-    InternalError,
 )
+
+from ._errors import TRANSIENT_ERRORS, retry_sdk_call
 
 __all__ = [
     "get_volume_status",
@@ -19,17 +19,20 @@ __all__ = [
 ]
 
 _NOT_FOUND = (NotFound, ResourceDoesNotExist)
-_RETRY = (InternalError, ConnectionError, TimeoutError)
+# Transient retry set: builtin TimeoutError/ConnectionError plus
+# requests.ReadTimeout, urllib3 ReadTimeoutError, SDK 5xx/429/503/504.
 # BadRequest and PermissionDenied always raise — never caught.
+_RETRY = TRANSIENT_ERRORS
 
 
 def _call(fn, *args, **kwargs):
-    """One retry on transient errors; fatal errors propagate immediately."""
-    try:
-        return fn(*args, **kwargs)
-    except _RETRY:
-        time.sleep(0.25)
-        return fn(*args, **kwargs)
+    """Retry transient errors with exponential backoff; fatal errors propagate."""
+    return retry_sdk_call(
+        fn, *args,
+        tries=5, delay=0.25, backoff=2.0, max_delay=8.0,
+        transient=_RETRY,
+        **kwargs,
+    )
 
 
 def get_volume_status(
