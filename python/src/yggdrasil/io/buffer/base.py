@@ -889,6 +889,24 @@ class TabularIO(Disposable, ABC, Generic[O]):
     ) -> None:
         """Consume Arrow record batches and persist them."""
 
+    def optimize(self) -> "TabularIO":
+        """Compact / re-pack the underlying storage in place.
+
+        Default implementation is a no-op — the abstract contract
+        is "best-effort layout fix; callers can run it at any time
+        without changing the data". Concrete backends override:
+
+        - :class:`yggdrasil.io.buffer.nested.YGGFolderIO` re-packs
+          small leaf files into ``~128 MiB`` targets when a folder
+          carries more than five children.
+        - Future backends (Delta optimize, Iceberg compaction,
+          warehouse VACUUM) plug in here.
+
+        Returns ``self`` so callers can chain
+        ``io.optimize().read_arrow_table()``.
+        """
+        return self
+
     def _iter_children(self, options: O) -> "Iterator[TabularIO]":
         """Yield this IO's direct children, each as a :class:`TabularIO`.
 

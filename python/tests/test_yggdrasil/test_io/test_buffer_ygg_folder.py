@@ -97,6 +97,7 @@ class TestYggSidecar:
         assert recs[0]["rows_seen"] == 128
         assert recs[0]["source"] == "ingest-job-7"
 
+
     def test_checkpoint_records_compute_owner_url(self, tmp_path):
         """Each checkpoint stamps a compute-identifier URL so a
         downstream replay can attribute it to a specific machine /
@@ -591,3 +592,125 @@ class TestTimeSortableStaging:
         time.sleep(1.05)
         path_b = _mint_spill_path("bin", 60)
         assert path_a.name < path_b.name
+
+
+# ---------------------------------------------------------------------------
+# optimize — small-file compaction
+# ---------------------------------------------------------------------------
+
+
+class TestTabularIOOptimizeDefault:
+    def test_default_optimize_is_noop(self, tmp_path):
+        from yggdrasil.io.buffer.primitive import ParquetIO
+
+        ParquetIO(path=str(tmp_path / "a.parquet")).write_arrow_table(_make_table(0))
+        io = ParquetIO(path=str(tmp_path / "a.parquet"))
+        assert io.optimize() is io
+
+
+class TestYggOptimize:
+    def _write_n_small(self, folder: YGGFolderIO, n: int) -> None:
+        # Stride by 2 so each batch's id range doesn't overlap the
+        # next — keeps post-optimize integrity checks unambiguous.
+        for i in range(n):
+            folder.write_arrow_table(_make_table(i * 2, n=2), mode=Mode.APPEND)
+
+    def _data_files(self, root: pathlib.Path) -> list[pathlib.Path]:
+        return sorted(
+            p for p in root.iterdir()
+            if p.is_file() and not p.name.startswith(".") and not p.name.startswith("tmp-")
+        )
+
+    def test_optimize_skips_below_threshold(self, tmp_path):
+        folder = YGGFolderIO(path=str(tmp_path))
+        self._write_n_small(folder, 4)
+        before = self._data_files(tmp_path)
+        folder.optimize(target_bytes=1024 * 1024, min_files=5)
+        after = self._data_files(tmp_path)
+        assert {p.name for p in before} == {p.name for p in after}
+
+    def test_optimize_compacts_when_above_threshold(self, tmp_path):
+        folder = YGGFolderIO(path=str(tmp_path))
+        self._write_n_small(folder, 8)
+        before = self._data_files(tmp_path)
+        assert len(before) == 8
+
+        folder.optimize(target_bytes=1024 * 1024, min_files=3)
+        after = self._data_files(tmp_path)
+        assert len(after) < len(before)
+
+        out = folder.read_arrow_table().sort_by([("id", "ascending")])
+        assert out.column("id").to_pylist() == list(range(16))
+
+    def test_optimize_preserves_large_files(self, tmp_path):
+        folder = YGGFolderIO(path=str(tmp_path))
+        self._write_n_small(folder, 8)
+        # Tiny target — every file already exceeds it.
+        folder.optimize(target_bytes=1, min_files=2)
+        after = self._data_files(tmp_path)
+        assert len(after) == 8
+
+    def test_optimize_compacts_partition_subfolders(self, tmp_path):
+        folder = YGGFolderIO(
+            path=str(tmp_path), partition_columns=["year"],
+        )
+        for i in range(6):
+            folder.write_arrow_table(
+                pa.table({
+                    "id": [i, i + 100],
+                    "year": ["2024", "2024"],
+                    "tag": [f"a-{i}", f"b-{i}"],
+                }),
+                mode=Mode.APPEND,
+            )
+        partition_root = tmp_path / "year=2024"
+        assert partition_root.exists()
+        before = sorted(p.name for p in partition_root.iterdir() if not p.name.startswith("."))
+        assert len(before) == 6
+
+        folder.optimize(target_bytes=1024 * 1024, min_files=3)
+        after = sorted(p.name for p in partition_root.iterdir() if not p.name.startswith("."))
+        assert len(after) < len(before)
+
+        out = folder.read_arrow_table()
+        assert out.num_rows == 12
+
+    def test_optimize_returns_self_for_chaining(self, tmp_path):
+        folder = YGGFolderIO(path=str(tmp_path))
+        self._write_n_small(folder, 6)
+        assert folder.optimize(target_bytes=1024 * 1024, min_files=3) is folder
+
+    def test_read_acquires_shared_lock(self, tmp_path):
+        """Concurrent reader waits on a write-locked optimize."""
+        if _IS_WINDOWS:
+            pytest.skip("Locking semantics on Windows differ enough to skip.")
+
+        folder = YGGFolderIO(path=str(tmp_path))
+        self._write_n_small(folder, 6)
+
+        ready = threading.Event()
+        release = threading.Event()
+        observed: list[float] = []
+
+        def _writer():
+            with folder.path.lock(read=True, write=True, wait=10):
+                ready.set()
+                release.wait(timeout=10)
+
+        def _reader():
+            ready.wait(timeout=5)
+            t0 = time.monotonic()
+            folder.read_arrow_table()
+            observed.append(time.monotonic() - t0)
+
+        wt = threading.Thread(target=_writer)
+        rt = threading.Thread(target=_reader)
+        wt.start()
+        rt.start()
+        time.sleep(0.3)
+        release.set()
+        wt.join(timeout=10)
+        rt.join(timeout=10)
+
+        assert observed, "reader didn't finish"
+        assert observed[0] >= 0.2
