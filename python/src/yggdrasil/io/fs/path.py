@@ -52,6 +52,7 @@ from yggdrasil.disposable import Disposable
 from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.enums import MediaType
+from yggdrasil.io.holder import Holder
 from yggdrasil.io.path_stat import PathKind, PathStats
 from yggdrasil.io.url import URL
 from yggdrasil.lazy_imports import local_path_class, tabular_io_class, PATH_SCHEME_FACTORY
@@ -123,7 +124,7 @@ _STAGING_TMP_RE: re.Pattern = re.compile(r"-(\d+)-(\d+)-[0-9a-f]+(?:\.[^/]+)?$")
 # ---------------------------------------------------------------------------
 
 
-class Path(TabularIO[CastOptions], os.PathLike, ABC):
+class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
     """Abstract filesystem path with :class:`pathlib.Path`-like behaviour.
 
     Acquire-driven I/O state. ``_acquire`` opens the path: local paths
@@ -1233,6 +1234,37 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
             return n
         finally:
             bio.close()
+
+    # ==================================================================
+    # Holder primitives — read_mv / write_mv / reserve
+    # ==================================================================
+
+    def read_mv(self, n: int, pos: int) -> memoryview:
+        """:class:`Holder` primitive: memoryview slice at ``pos``."""
+        if pos < 0:
+            raise ValueError(f"read_mv pos must be >= 0, got {pos!r}")
+        # Materialize via pread; fd-mode and transaction-buffer-mode
+        # both copy the bytes out. The returned view backs onto the
+        # produced bytes object so the caller owns it.
+        data = self.pread(n, pos, default=b"")
+        return memoryview(data)
+
+    def write_mv(self, data: memoryview, pos: int) -> int:
+        """:class:`Holder` primitive: splice memoryview at ``pos``."""
+        if data.format != "B" or data.ndim != 1 or data.itemsize != 1:
+            data = data.cast("B")
+        if not data.c_contiguous:
+            data = memoryview(bytes(data))
+        return self.pwrite(data, pos)
+
+    def reserve(self, n: int) -> None:
+        """:class:`Holder` primitive: pre-grow capacity.
+
+        Files have no separate "capacity" knob — :func:`posix_fallocate`
+        isn't portable, and remote backends don't have the concept.
+        Default no-op; backends with a meaningful pre-grow override.
+        """
+        del n
 
     def fileno(self) -> int:
         """Return the underlying fd, opening one if needed.

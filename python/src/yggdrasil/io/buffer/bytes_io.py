@@ -1,13 +1,25 @@
-"""Spill-to-disk byte buffer — pure stdlib, ctx-backed, fully self-contained.
+"""Spill-to-disk byte buffer with cursor and tabular dispatch.
+
+A :class:`BytesIO` is a cursor + format dispatcher layered on top of
+a :class:`yggdrasil.io.holder.Holder` backing. The two concrete
+holders it composes with are:
+
+- :class:`yggdrasil.io.memory.Memory` (in-memory backed by
+  :class:`bytearray`) — fast for small/medium payloads, used when
+  there's no path bound and the payload fits under ``spill_bytes``.
+- :class:`yggdrasil.io.fs.Path` (path-bound) — the path's
+  ``acquire_io`` sets up its own fd (local) or transaction
+  :class:`BytesIO` (remote); the buffer forwards every positional op
+  (``pread`` / ``pwrite`` / ``truncate``) straight to the path.
 
 Shape
 -----
 
 A :class:`BytesIO` has one of two backings at any moment:
 
-- **memory** — a :class:`bytearray`. Fast for small/medium payloads.
-  Used when there's no path bound and the payload fits under
-  ``spill_bytes``.
+- **memory** — a :class:`bytearray` managed inline (effectively a
+  :class:`Memory` holder); the buffer auto-spills to a self-owned
+  temp file once the payload crosses ``spill_bytes``.
 - **path-bound** — a :class:`Path` whose ``acquire_io`` set up its
   own fd (local) or transaction :class:`BytesIO` (remote). The
   buffer forwards every positional op (``pread`` / ``pwrite`` /
