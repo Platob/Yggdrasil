@@ -202,7 +202,7 @@ class TestRequestBodyHashFilter:
 
     def test_filter_keeps_matching_and_nulls(self):
         pa = pytest.importorskip("pyarrow")
-        from yggdrasil.io.session import _request_body_hash_filter
+        from yggdrasil.io.session import _request_body_hash_predicate
 
         post = self._prep(b"aaa")
         get_ = self._prep(None)
@@ -214,19 +214,21 @@ class TestRequestBodyHashFilter:
             "value": [1, 2, 3],
         })
 
-        expr = _request_body_hash_filter(table.column_names, [post, get_])
-        kept = table.filter(expr)
+        predicate = _request_body_hash_predicate([post, get_])
+        kept = table.filter(predicate.to_arrow())
         assert kept.column("value").to_pylist() == [1, 3]
 
-    def test_filter_skips_when_column_absent(self):
-        from yggdrasil.io.session import _request_body_hash_filter
+    def test_filter_skips_when_no_body_hashes(self):
+        from yggdrasil.io.session import _request_body_hash_predicate
 
-        post = self._prep(b"aaa")
-        assert _request_body_hash_filter(["a", "b"], [post]) is None
+        # Build a request whose body_hash raises (synthetic edge case
+        # — match_value path fails). Use an empty request list to
+        # exercise the "no usable values" branch.
+        assert _request_body_hash_predicate([]) is None
 
     def test_filter_only_non_null(self):
         pa = pytest.importorskip("pyarrow")
-        from yggdrasil.io.session import _request_body_hash_filter
+        from yggdrasil.io.session import _request_body_hash_predicate
 
         post = self._prep(b"aaa")
         table = pa.table({
@@ -234,8 +236,8 @@ class TestRequestBodyHashFilter:
                 [post.body_hash, post.body_hash + 1, None], type=pa.int64(),
             ),
         })
-        expr = _request_body_hash_filter(table.column_names, [post])
-        kept = table.filter(expr)
+        predicate = _request_body_hash_predicate([post])
+        kept = table.filter(predicate.to_arrow())
         assert kept.column("request_body_hash").to_pylist() == [post.body_hash]
 
     def test_lookup_distinguishes_post_bodies(self, tmp_path):
@@ -287,6 +289,56 @@ class TestRequestBodyHashFilter:
         key = (req_aaa.public_url_hash, req_aaa.body_hash)
         assert key in looked
         assert looked[key].request.body_hash == req_aaa.body_hash
+
+
+class TestLocalCacheUsesYGGFolder:
+    """Local-cache builder lazily produces a :class:`YGGFolderIO`."""
+
+    def test_default_builder_returns_ygg_folder(self, tmp_path):
+        from yggdrasil.io.buffer.nested.ygg_folder_io import YGGFolderIO
+        from yggdrasil.io.send_config import _folderio_for_local_cache
+
+        folder = _folderio_for_local_cache(tmp_path)
+        assert isinstance(folder, YGGFolderIO)
+
+    def test_local_cache_lazy_builds_ygg_folder(self, tmp_path):
+        from yggdrasil.io.buffer.nested.ygg_folder_io import YGGFolderIO
+
+        cfg = CacheConfig.check_arg(tmp_path, received_from="2020-01-01T00:00:00Z")
+        assert isinstance(cfg.local_cache(), YGGFolderIO)
+        assert cfg.is_local_tabular is True
+
+
+class TestLookupPushdownPredicate:
+    """``_lookup_local_responses`` builds a single composed predicate."""
+
+    def test_combined_predicate_includes_partition_and_body(self):
+        from yggdrasil.io.send_config import _folderio_for_local_cache
+        from yggdrasil.io.session import (
+            _combine_predicates,
+            _request_body_hash_predicate,
+            _request_partition_predicate,
+        )
+
+        # A bare request, no body — partition predicate covers
+        # ``partition_key`` (driven by RESPONSE_SCHEMA's
+        # ``partition_by``) and the body-hash branch falls into
+        # ``is_null``.
+        req = PreparedRequest.prepare(
+            method="GET", url="https://example.com/x",
+            headers={}, body=None,
+        )
+        import tempfile, pathlib
+        with tempfile.TemporaryDirectory() as d:
+            cache = _folderio_for_local_cache(pathlib.Path(d))
+            partition = _request_partition_predicate(cache, [req])
+            body_hash = _request_body_hash_predicate([req])
+            combined = _combine_predicates(partition, body_hash)
+
+        assert combined is not None
+        rendered = repr(combined)
+        assert "partition_key" in rendered
+        assert "request_body_hash" in rendered
 
 
 class TestMirrorLocalToRemote:

@@ -157,11 +157,19 @@ def _is_tabular_io(arg: Any) -> bool:
 
 
 def _folderio_for_local_cache(path: Path) -> "FolderIO":
-    """Wrap a local filesystem :class:`Path` into a schema-tagged FolderIO."""
-    from yggdrasil.io.buffer.nested.folder_io import FolderIO
+    """Wrap a local filesystem :class:`Path` into a schema-tagged folder.
+
+    Returns a :class:`YGGFolderIO` rather than a plain
+    :class:`FolderIO` so the local cache can lean on the
+    ``.ygg/`` sidecar (stats, checkpoints, kv metadata) without a
+    second wrapper. The data layout is identical — any other
+    reader still sees a plain Hive-partitioned tree — so callers
+    that point a FolderIO at the same path still work.
+    """
+    from yggdrasil.io.buffer.nested.ygg_folder_io import YGGFolderIO
     from yggdrasil.io.fs import LocalPath
 
-    return FolderIO(path=LocalPath(path), schema=RESPONSE_SCHEMA)
+    return YGGFolderIO(path=LocalPath(path), schema=RESPONSE_SCHEMA)
 
 
 def _coerce_optional_datetime(value: Any) -> Optional[dt.datetime]:
@@ -501,26 +509,22 @@ class CacheConfig(_ConfigBase):
         return Path.home() / ".yggdrasil" / "cache" / "response"
 
     def local_cache(self) -> "FolderIO":
-        """Return the local-cache :class:`FolderIO`.
+        """Return the local-cache folder.
 
         Returns ``self.tabular`` when it's already a FolderIO,
-        otherwise lazy-builds a default one rooted at
+        otherwise lazy-builds a :class:`YGGFolderIO` rooted at
         :meth:`local_cache_folder` (and caches it back into
         ``tabular`` so subsequent calls return the same instance).
         The schema is :data:`RESPONSE_SCHEMA` — its
         ``partition_by``-tagged ``partition_key`` column drives the
-        Hive layout automatically.
+        Hive layout automatically; the ``.ygg/`` sidecar lets the
+        cache attach stats / checkpoints without a separate
+        wrapper.
         """
-        from yggdrasil.io.buffer.nested.folder_io import FolderIO
-        from yggdrasil.io.fs import LocalPath
-
         if self.is_local_tabular:
             return self.tabular  # type: ignore[return-value]
 
-        folder = FolderIO(
-            path=LocalPath(self.local_cache_folder()),
-            schema=RESPONSE_SCHEMA,
-        )
+        folder = _folderio_for_local_cache(self.local_cache_folder())
         # Cache the lazy-built FolderIO so repeated send_many()
         # calls don't keep re-instantiating it. Frozen-dataclass
         # safe via ``object.__setattr__``.

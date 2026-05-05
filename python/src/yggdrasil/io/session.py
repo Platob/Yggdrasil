@@ -8,10 +8,9 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional
 
 import pyarrow as pa
-import pyarrow.compute as pc
 
 from yggdrasil.arrow.cast import rechunk_arrow_batches_by_byte_size
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
@@ -81,23 +80,26 @@ def _store_local_arrow_batch(
     )
 
 
-def _request_partition_filter(
+def _request_partition_predicate(
     cache: "FolderIO",
     requests: "list[PreparedRequest]",
-) -> "pc.Expression | None":
-    """Build a pyarrow predicate pruning to the partitions in ``requests``.
+) -> "Any | None":
+    """Build a universal predicate pruning to the partitions in ``requests``.
 
     Walks every request, projects its values for the cache's
-    partition columns, and AND-s an ``isin`` filter per column.
-    Used by the lookup path to skip partitions no incoming request
-    actually touches before the row-level match-by filter runs.
-    Returns ``None`` when the cache isn't partitioned or the
-    request list yields no usable values.
+    partition columns, and AND-s a per-column ``is_in`` term.
+    Returned as a :mod:`yggdrasil.data.expr` :class:`Predicate`
+    so the caller can hand it to ``options.predicate`` and get
+    Hive-partition + row-group pruning at the leaf parquet
+    reader. Returns ``None`` when the cache isn't partitioned or
+    no usable values come out.
     """
+    from yggdrasil.data.expr import col
+
     parts = cache._resolve_partition_columns()
     if not parts:
         return None
-    expr: "pc.Expression | None" = None
+    expr: "Any | None" = None
     for f in parts:
         try:
             values = sorted(
@@ -108,33 +110,32 @@ def _request_partition_filter(
             continue
         if not values:
             continue
-        term = pc.is_in(pc.field(f.name), value_set=pa.array(values))
+        term = col(f.name).is_in(values)
         expr = term if expr is None else (expr & term)
     return expr
 
 
-def _request_body_hash_filter(
-    column_names: "Sequence[str]",
+def _request_body_hash_predicate(
     requests: "list[PreparedRequest]",
-) -> "pc.Expression | None":
-    """Narrow a cache scan to rows whose ``request_body_hash`` matches.
+) -> "Any | None":
+    """Universal predicate keeping rows whose ``request_body_hash`` matches.
 
     Two requests with the same URL / method / public_url_hash but
     different POST bodies hash to distinct ``body_hash`` values, so
     a cache keyed only by URL would let one alias the other. The
     flattened ``request_body_hash`` column on the response cache
     holds the request side's body digest verbatim — this helper
-    builds an Arrow predicate keeping only rows whose digest
-    matches one of the incoming bodies, plus rows where the column
-    is null (empty-body GETs cached alongside their POST siblings).
+    keeps rows whose digest matches one of the incoming bodies,
+    plus rows where the column is null (empty-body GETs cached
+    alongside their POST siblings).
 
-    Returns ``None`` when the cache's table doesn't carry the
-    column (older schema, custom cache layouts) or when no useful
-    value can be derived from the request set — both cases fall
-    back to the caller's existing row-level match-by walk.
+    Returned as a :mod:`yggdrasil.data.expr` :class:`Predicate`
+    so the call site can compose it with the partition predicate
+    and pass a single ``options.predicate`` down to the parquet
+    reader. Returns ``None`` when no useful value can be derived
+    from the request set.
     """
-    if "request_body_hash" not in column_names:
-        return None
+    from yggdrasil.data.expr import col
 
     hashes: set[Any] = set()
     for r in requests:
@@ -145,19 +146,32 @@ def _request_body_hash_filter(
     if not hashes:
         return None
 
-    non_null = sorted(h for h in hashes if h is not None)
     has_null = None in hashes
+    non_null = sorted(h for h in hashes if h is not None)
 
-    expr: "pc.Expression | None" = None
+    if non_null and has_null:
+        # ``is_in`` already mixes the null branch when ``includes_null``
+        # is set on the underlying InList — but the builder strips
+        # nulls out of the value list, so reattach the null term
+        # explicitly. ``OR`` is what the previous pyarrow expression
+        # produced, kept identical here so behaviour doesn't drift.
+        column = col("request_body_hash")
+        return column.is_in(non_null) | column.is_null()
     if non_null:
-        expr = pc.is_in(
-            pc.field("request_body_hash"),
-            value_set=pa.array(non_null, type=pa.int64()),
-        )
+        return col("request_body_hash").is_in(non_null)
     if has_null:
-        null_term = pc.is_null(pc.field("request_body_hash"))
-        expr = null_term if expr is None else (expr | null_term)
-    return expr
+        return col("request_body_hash").is_null()
+    return None
+
+
+def _combine_predicates(*exprs: "Any") -> "Any | None":
+    """``AND`` together any number of optional :class:`Predicate`s."""
+    out: "Any | None" = None
+    for expr in exprs:
+        if expr is None:
+            continue
+        out = expr if out is None else (out & expr)
+    return out
 
 
 def _lookup_local_responses(
@@ -184,9 +198,30 @@ def _lookup_local_responses(
     if not cache.path.exists():
         return {}
 
+    from yggdrasil.data.expr import col
+    from yggdrasil.data.options import CastOptions
+
+    # Push the partition / body-hash / received-window prune as a
+    # single :class:`Predicate` so the parquet reader's
+    # row-group / Hive-partition pruning skips the matching files
+    # before any bytes hit the driver. Anything we can't express
+    # (corrupt expr, unsupported backend) collapses to a None
+    # predicate and the unfiltered read still runs — the universal
+    # ``apply_predicate`` step at the TabularIO layer is the
+    # backstop that re-applies the filter on the materialised
+    # batches.
+    predicate = _combine_predicates(
+        _request_partition_predicate(cache, requests),
+        _request_body_hash_predicate(requests),
+        col("received_at") >= received_from if received_from is not None else None,
+        col("received_at") < received_to if received_to is not None else None,
+    )
+
+    options = CastOptions(predicate=predicate) if predicate is not None else None
+
     try:
         with cache:
-            table = cache.read_arrow_table()
+            table = cache.read_arrow_table(options=options)
     except Exception:
         # Corrupt leaf, race with a concurrent write, schema drift
         # — fall through to "nothing matches" so callers progress
@@ -196,63 +231,6 @@ def _lookup_local_responses(
             cache.path, exc_info=True,
         )
         return {}
-
-    if table.num_rows == 0:
-        return {}
-
-    # Partition prune: keep only rows whose ``partition_key`` matches
-    # one of the incoming requests' endpoint buckets. With the
-    # endpoint-derived partition_key (xxh3_64 of host+path), a typical
-    # send_many burst against a handful of endpoints prunes the
-    # post-read table down by orders of magnitude before the per-row
-    # match-by walk.
-    partition_filter = _request_partition_filter(cache, requests)
-    if partition_filter is not None:
-        try:
-            table = table.filter(partition_filter)
-        except Exception:
-            LOGGER.debug(
-                "Partition filter against local cache %s failed; "
-                "falling back to full-table scan",
-                cache.path, exc_info=True,
-            )
-
-    # Body-hash prune: with POST traffic the same endpoint bucket
-    # will hold many siblings that differ only on body, so without
-    # this filter the post-partition row walk re-decodes every
-    # body just to discard it. ``request_body_hash`` is the
-    # int64 xxh3_64 of the request body — matching it against the
-    # incoming body-hash set narrows the table down to the rows
-    # whose request body actually corresponds to one of the
-    # callers, before any Response object is materialized.
-    body_hash_filter = _request_body_hash_filter(
-        table.column_names, requests,
-    )
-    if body_hash_filter is not None:
-        try:
-            table = table.filter(body_hash_filter)
-        except Exception:
-            LOGGER.debug(
-                "request_body_hash filter against local cache %s failed; "
-                "falling back to full-table scan",
-                cache.path, exc_info=True,
-            )
-
-    if "received_at" in table.column_names:
-        if received_from is not None:
-            table = table.filter(
-                pc.greater_equal(
-                    table["received_at"],
-                    pa.scalar(received_from),
-                )
-            )
-        if received_to is not None:
-            table = table.filter(
-                pc.less(
-                    table["received_at"],
-                    pa.scalar(received_to),
-                )
-            )
 
     if table.num_rows == 0:
         return {}
