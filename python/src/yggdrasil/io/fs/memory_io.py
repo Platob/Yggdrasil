@@ -707,9 +707,42 @@ class MemoryPath(Path):
         return MemoryIO(self, buf, mode=mode, auto_open=auto_open)
 
     # ------------------------------------------------------------------
-    # Random-access primitives — Path declares pread/pwrite abstract;
-    # delegate to the registry buffer directly so the abstraction is
-    # satisfied without re-routing through the IO layer.
+    # Whole-file primitives — required by :class:`Path`.
+    # ------------------------------------------------------------------
+
+    def _pread(self) -> BytesIO:
+        existing = REGISTRY.get(self.url, None)
+        if existing is None or existing.closed:
+            raise FileNotFoundError(self.full_path())
+        # Return a fresh BytesIO carrying the registry contents. We
+        # copy the bytes rather than aliasing so callers can edit
+        # without mutating the registry-backed shared buffer.
+        bio = BytesIO()
+        bio.open()
+        size = existing.size
+        if size:
+            bio.write(existing.pread(size, 0))
+            bio.seek(0)
+        return bio
+
+    def _pwrite(self, data: BytesIO) -> int:
+        if not data.opened:
+            data.open()
+        buf = REGISTRY.get(self.url, None)
+        if buf is None or buf.closed:
+            buf = BytesIO()
+            REGISTRY[self.url] = buf
+        # Wholesale replace: drop existing content, splice in new bytes.
+        buf.truncate(0)
+        size = data.size
+        if size:
+            payload = data.pread(size, 0)
+            buf.pwrite(payload, 0)
+        return size
+
+    # ------------------------------------------------------------------
+    # Random-access primitives — direct splice into the registry buffer
+    # so the in-memory case stays cheap.
     # ------------------------------------------------------------------
 
     def pread(self, n: int, pos: int, *, default: Any = ...) -> bytes:

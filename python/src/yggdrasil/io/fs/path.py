@@ -193,20 +193,23 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
     - :meth:`_mkdir`        — create directory.
     - :meth:`_remove_file`  — delete file.
     - :meth:`_remove_dir`   — delete directory.
-    - :meth:`_open`         — open file, return :class:`PathIO`.
-    - :meth:`pread`         — positional read.
-    - :meth:`pwrite`        — positional write.
+    - :meth:`_pread`        — whole-file read → :class:`BytesIO`.
+    - :meth:`_pwrite`       — whole-file write from :class:`BytesIO`.
 
-    For backends without a native random-access primitive, the
-    :meth:`pread` / :meth:`pwrite` overrides can delegate to the
-    concrete helpers :meth:`_pread_via_io` (open + read) and
-    :meth:`_pwrite_via_rmw` (read-modify-write). Those helpers are
-    correct but slow; subclasses with a real positional API
-    (``os.pread``, HTTP range requests) should implement their
-    own. Making these abstract — rather than providing the slow
-    helpers as defaults — forces every backend to think about
-    whether it has a fast path, instead of silently inheriting an
-    O(file size) write.
+    :meth:`_open` is concrete by default — it returns
+    ``BytesIO(path=self, **options)``, which leans on
+    :meth:`_pread` / :meth:`_pwrite` for transport. Backends with
+    extra setup (lazy SDK connect, mode normalisation) override it
+    and ``super()._open(...)`` through.
+
+    Whole-file primitives are intentionally minimal: every backend
+    can express "give me the bytes" / "replace the bytes" cheaply.
+    Random-access reads (:meth:`pread`) and positional writes
+    (:meth:`pwrite`) have default implementations on top, so a
+    backend without native range support gets correct (if O(file
+    size)) behaviour for free. Backends with a real positional API
+    (``os.pread``, HTTP ``Range:`` requests) override
+    :meth:`pread` / :meth:`pwrite` for the fast path.
     """
 
     scheme: ClassVar[str] = ""
@@ -775,7 +778,6 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         with_root: bool = True,
     ) -> None: ...
 
-    @abstractmethod
     def _open(
         self,
         mode: str = "rb",
@@ -786,7 +788,60 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         auto_open: bool = True,
         touch: bool = False,
     ) -> BytesIO:
-        """Open the underlying file, return a :class:`BytesIO` (or subclass)."""
+        """Default open: bind a :class:`BytesIO` to *self*.
+
+        Concrete now — every backend's I/O goes through the same
+        path-bound :class:`BytesIO`. Acquire pulls bytes via
+        :meth:`_pread`, commit pushes via :meth:`_pwrite`. Backends
+        only have to teach those two whole-file primitives; the
+        buffer takes care of cursors, spill, transactions, and mode
+        semantics.
+
+        ``encoding`` / ``errors`` / ``newline`` are accepted for
+        signature parity with :func:`builtins.open`; this layer is
+        binary-only. ``touch`` honors the "create on read of a
+        missing file" ergonomic by promoting through :meth:`touch`
+        when the caller asks for it.
+        """
+        del encoding, errors, newline  # binary-only at this layer
+
+        if touch and "r" in mode and "+" not in mode and not self.exists():
+            self.touch(exist_ok=True, parents=True)
+
+        return BytesIO(path=self, mode=mode, auto_open=auto_open)
+
+    @abstractmethod
+    def _pread(self) -> BytesIO:
+        """Whole-file read primitive — return a fresh :class:`BytesIO`.
+
+        Backends materialise the file's current bytes into the
+        returned buffer. The buffer is the caller's; it should be
+        treated as ephemeral (close after use). Missing files raise
+        :class:`FileNotFoundError`.
+
+        This is THE read primitive every other read operation
+        (:meth:`pread`, :meth:`read_bytes`, :meth:`pwrite`'s RMW
+        leg, :meth:`truncate`'s shrink leg) is built on top of.
+        Backends with a native range-read (POSIX ``os.pread``, S3
+        ``GetObject Range:``) should also override :meth:`pread` so
+        partial reads don't pay the whole-file download.
+        """
+
+    @abstractmethod
+    def _pwrite(self, data: BytesIO) -> int:
+        """Whole-file write primitive — replace *self* with *data*'s bytes.
+
+        Implementations should overwrite (not splice) — *data*'s
+        full content from cursor 0 becomes the new file content,
+        truncating any prior tail. Returns the number of bytes
+        written.
+
+        Receives a :class:`BytesIO` so backends with a streaming
+        upload (multipart) can avoid materialising the whole payload
+        in memory. ``parents`` semantics — auto-create missing
+        parent directories — are the implementation's responsibility
+        and should be honored when the backend has the concept.
+        """
 
     # ==================================================================
     # I/O entry point — distinct from the lifecycle Disposable.open()
@@ -1233,90 +1288,99 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
     # Bytes / text I/O
     # ==================================================================
 
-    @abstractmethod
     def pread(
         self,
         n: int,
         pos: int,
         *,
         default: Any = ...,
-    ) -> bytes: ...
+    ) -> bytes:
+        """Positional read derived from :meth:`_pread`.
 
-    @abstractmethod
+        Default implementation downloads the whole file via
+        :meth:`_pread` and slices in memory. Backends with a native
+        range read (``os.pread``, ``GetObject Range:``) should
+        override to avoid the whole-file fetch on partial reads.
+
+        ``n < 0`` reads from *pos* to end of file.
+        """
+        if pos < 0:
+            raise ValueError("pread position must be >= 0")
+        if n == 0:
+            return b""
+
+        try:
+            bio = self._pread()
+        except (OSError, ValueError):
+            if default is ...:
+                raise
+            return default
+
+        try:
+            size = bio.size
+            if pos >= size:
+                return b""
+            want = (size - pos) if n < 0 else min(n, size - pos)
+            if want <= 0:
+                return b""
+            return bio.pread(want, pos)
+        finally:
+            bio.close()
+
     def pwrite(
         self,
         data: Union[bytes, bytearray, memoryview],
         pos: int,
         *,
         parents: bool = True,
-    ) -> int: ...
-
-    def _pread_via_io(
-        self,
-        n: int,
-        pos: int,
-        *,
-        default: Any = ...,
-    ) -> bytes:
-        if pos < 0:
-            raise ValueError("pread position must be >= 0")
-        if n == 0:
-            return b""
-        try:
-            with self.open_io("rb") as src:
-                if n < 0:
-                    src.seek(pos)
-                    return src.read()
-                return src.pread(n=n, pos=pos)
-        except (OSError, ValueError):
-            if default is ...:
-                raise
-            return default
-
-    def _pwrite_via_rmw(
-        self,
-        data: Union[bytes, bytearray, memoryview],
-        pos: int,
-        *,
-        parents: bool = True,
     ) -> int:
+        """Positional write derived from :meth:`_pread` + :meth:`_pwrite`.
+
+        Read–modify–write: pull the existing object, splice *data*
+        in at *pos* (zero-padding past EOF as POSIX pwrite would),
+        push it back. Backends with a native positional write
+        (``os.pwrite``) should override to skip the read leg.
+
+        ``parents`` is forwarded — :meth:`_pwrite` is responsible
+        for honoring it on backends that can create directories.
+        """
+        del parents  # consumed by _pwrite implementations
         mv = memoryview(data)
         if not mv.c_contiguous:
             mv = memoryview(bytes(mv))
+        if mv.format != "B" or mv.ndim != 1 or mv.itemsize != 1:
+            mv = mv.cast("B")
         n = len(mv)
         if n == 0:
             return 0
         if pos < 0:
             raise ValueError("pwrite position must be >= 0")
 
-        # EAFP: read directly. ``read_bytes(raise_error=False)``
-        # returns ``b""`` when the file is missing, saving the extra
-        # ``exists()`` round-trip on remote backends.
-        existing = self.read_bytes(raise_error=False)
-        end = pos + n
-
-        if end <= len(existing):
-            buf = bytearray(existing)
-            buf[pos:end] = mv
-            out = bytes(buf)
-        else:
-            buf = bytearray(end)
-            if existing:
-                buf[: len(existing)] = existing
-            buf[pos:end] = mv
-            out = bytes(buf)
-
-        self.write_bytes(out, parents=parents)
-        return n
+        try:
+            bio = self._pread()
+        except FileNotFoundError:
+            bio = BytesIO()
+            bio.open()
+        try:
+            bio.pwrite(mv, pos)
+            bio.seek(0)
+            self._pwrite(bio)
+            return n
+        finally:
+            bio.close()
 
     def read_bytes(self, *, raise_error: bool = True) -> bytes:
+        """Whole-file read via :meth:`_pread`."""
         try:
-            with self.open_io("rb") as fh:
-                return fh.read()
+            bio = self._pread()
         except (OSError, ValueError):
             if raise_error:
                 raise
             return b""
+        try:
+            return bio.to_bytes()
+        finally:
+            bio.close()
 
     def write_bytes(
         self,
@@ -1325,19 +1389,65 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         mode: str = "wb",
         parents: bool = True,
     ) -> int:
-        def _write() -> int:
-            with self.open_io(mode) as fh:
-                return fh.write(bytes(data))
+        """Whole-file write via :meth:`_pwrite`.
 
+        Modes:
+        - ``wb`` (default): replace the whole file with *data*.
+        - ``xb``: same, but raise :class:`FileExistsError` if the
+          file already exists.
+        - ``ab``: append *data* at end of file.
+
+        ``parents`` is forwarded to :meth:`_pwrite`.
+        """
+        del parents  # consumed by _pwrite implementations
+        if mode not in ("wb", "xb", "ab"):
+            raise ValueError(
+                f"write_bytes mode must be one of 'wb', 'xb', 'ab'; got {mode!r}"
+            )
+
+        mv = memoryview(data)
+        if not mv.c_contiguous:
+            mv = memoryview(bytes(mv))
+        if mv.format != "B" or mv.ndim != 1 or mv.itemsize != 1:
+            mv = mv.cast("B")
+        n = len(mv)
+
+        if mode == "xb" and self.exists():
+            raise FileExistsError(
+                f"Path already exists: {self.full_path()!r}"
+            )
+
+        if mode == "ab":
+            # Append: load existing, seek-to-end, write, push back.
+            try:
+                bio = self._pread()
+            except FileNotFoundError:
+                bio = BytesIO()
+                bio.open()
+            try:
+                bio.seek(bio.size)
+                if n > 0:
+                    bio.write(bytes(mv))
+                bio.seek(0)
+                self._pwrite(bio)
+                return n
+            finally:
+                bio.close()
+
+        # wb / xb: replace whole file.
+        bio = BytesIO()
+        bio.open()
         try:
-            return _write()
-        except (OSError, ValueError):
-            if not parents:
-                raise
-            self.parent.mkdir(parents=True, exist_ok=True)
-            return _write()
+            if n > 0:
+                bio.write(bytes(mv))
+            bio.seek(0)
+            self._pwrite(bio)
+            return n
+        finally:
+            bio.close()
 
     def truncate(self, n: int, *, parents: bool = True) -> int:
+        del parents  # consumed by _pwrite implementations
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
 
@@ -1355,30 +1465,18 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         current = int(stat.size)
         if n == current:
             return n
-        if n == 0:
-            self.write_bytes(b"", parents=parents)
-            return 0
 
-        if n < current:
-            prefix = self.pread(n=n, pos=0)
-            if len(prefix) != n:
-                raise OSError(
-                    f"Short pread during truncate: requested {n} bytes, "
-                    f"got {len(prefix)}"
-                )
-            self.write_bytes(prefix, parents=parents)
+        # Pull, resize the in-memory buffer (truncate or zero-extend),
+        # push back. POSIX-equivalent semantics fall out of BytesIO's
+        # ``truncate``.
+        bio = self._pread()
+        try:
+            bio.truncate(n)
+            bio.seek(0)
+            self._pwrite(bio)
             return n
-
-        existing = self.read_bytes()
-        if len(existing) != current:
-            raise OSError(
-                f"Stat/read mismatch during truncate: stat={current}, "
-                f"read={len(existing)}"
-            )
-        buf = bytearray(n)
-        buf[:current] = existing
-        self.write_bytes(bytes(buf), parents=parents)
-        return n
+        finally:
+            bio.close()
 
     def read_text(
         self,
@@ -1420,18 +1518,32 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         batch_size: int = 1024 * 1024,
         parents: bool = True
     ):
+        """Drain *buffer* into *self* via :meth:`_pwrite`.
+
+        Two fast paths kept:
+
+        - **src local-spilled, dst local** — :func:`shutil.copyfile`,
+          which routes through ``sendfile`` / ``fcopyfile`` /
+          ``CopyFileEx`` for kernel-side zero-copy.
+        - **src memory-mode, dst local with no path-bound buffer
+          machinery in between** — implicit via the same primitive.
+
+        Otherwise, we hand the whole buffer to :meth:`_pwrite`. The
+        backend decides how to drive the upload (multipart, single
+        PUT, fd splice). ``batch_size`` is forwarded for backends
+        that stream their upload; the in-process splice path
+        ignores it.
+        """
+        del batch_size  # reserved for backend-driven streaming uploads
         buffer = BytesIO.from_(buffer)
         if not buffer.opened:
             buffer.open()
-
             try:
-                return self.write_bytes_io(
-                    buffer, batch_size=batch_size, parents=parents
-                )
+                return self._write_bytes_io(buffer, parents=parents)
             finally:
                 buffer.close()
 
-        # src local-spilled + self local → kernel copy.
+        # Local-spilled src + local dst → kernel-side zero-copy.
         if (
             buffer.spilled
             and buffer.is_local
@@ -1446,19 +1558,18 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
                 pass
             return buffer.size
 
-        if buffer.spilled and buffer.is_local:
-            mv = buffer.memoryview()
+        # General path: rewind and hand to _pwrite. The backend chooses
+        # the upload shape (multipart, single PUT, fd splice).
+        prev_pos = buffer.tell()
+        buffer.seek(0)
+        try:
+            self._pwrite(buffer)
+        finally:
             try:
-                self.write_bytes(mv, parents=parents)
-                return len(mv)
-            finally:
-                del mv
-
-        if not buffer.spilled:
-            with self.open_io("wb", auto_open=False) as fh:
-                fh.write_bytes_io(buffer, batch_size=batch_size)
-
-        return 0
+                buffer.seek(prev_pos)
+            except Exception:
+                pass
+        return buffer.size
 
 
     # ==================================================================

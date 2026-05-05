@@ -263,6 +263,29 @@ class MirrorPath(Path):
             force_refresh=force_refresh,
         )
 
+    def _pread(self):
+        """Whole-file read through the local mirror.
+
+        Refreshes the mirror first so callers see the upstream state
+        as of the TTL window. Returns the mirror's BytesIO so reads
+        ride the local-fd fast path.
+        """
+        return self._ensure_mirror()._pread()
+
+    def _pwrite(self, data) -> int:
+        """Whole-file write to the local mirror, queuing an async upload.
+
+        Drops the verdict/sidecar so the next read after a remote
+        round-trip notices the local change.
+        """
+        local = self.mirror_local
+        local.parent.mkdir(parents=True, exist_ok=True)
+        n = local._pwrite(data)
+        payload = local.read_bytes()
+        self._remote.invalidate_mirror()
+        self._enqueue_upload(payload=payload)
+        return n
+
     def read_bytes(self, *, raise_error: bool = True) -> bytes:
         try:
             return self._ensure_mirror().read_bytes(raise_error=raise_error)

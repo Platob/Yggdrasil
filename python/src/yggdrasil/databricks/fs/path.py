@@ -440,15 +440,12 @@ class DatabricksPath(Path):
         auto_open: bool = True,
         touch: bool = False,
     ) -> BytesIO:
-        """Construct a path-bound :class:`BytesIO`.
+        """Path-bound :class:`BytesIO`, with lazy SDK connect.
 
-        Binary-mode only at this layer; text wrapping is the caller's
-        job (or use the ``open()`` shim below for builtin-open
-        ergonomics). The BytesIO machinery handles the buffer
-        lifecycle, mode-driven download/upload, and commit-on-close.
+        Same shape as :meth:`Path._open` (the new concrete default)
+        but ensures the SDK client is connected and normalises text
+        modes to binary at the buffer layer.
         """
-        del errors, newline, encoding  # binary-only at this layer
-
         # Bind the client lazily on first IO if it isn't connected.
         if self._client is not None and not self.connected:
             self.connect()
@@ -459,12 +456,13 @@ class DatabricksPath(Path):
             if "b" not in mode:
                 mode += "b"
 
-        del touch  # honored at the SDK layer per-subclass if useful
-
-        return BytesIO(
-            path=self,
+        return super()._open(
             mode=mode,
+            encoding=encoding,
+            errors=errors,
+            newline=newline,
             auto_open=auto_open,
+            touch=touch,
         )
 
     def open(
@@ -517,65 +515,60 @@ class DatabricksPath(Path):
         )
 
     # ==================================================================
-    # Bytes I/O — direct SDK calls, NOT through open_io
+    # Whole-file primitives — direct SDK transport
     # ==================================================================
     #
-    # Override the base's read_bytes/write_bytes (which go through
-    # open_io → BytesIO → path.pread → infinite recursion). The
-    # subclass-supplied _remote_download / _remote_upload are the
-    # SDK transport.
+    # :class:`Path` requires :meth:`_pread` (download → BytesIO) and
+    # :meth:`_pwrite` (upload from BytesIO).  Wired straight onto the
+    # subclass-supplied ``_remote_download`` / ``_remote_upload``
+    # SDK calls, with retry on the transport flakes.  All other
+    # I/O (read_bytes, write_bytes, pread, pwrite, truncate, …)
+    # falls out of the base implementations on top.
 
-    def read_bytes(self, *, raise_error: bool = True) -> bytes:
+    def _pread(self) -> BytesIO:
         """Whole-file download via :meth:`_remote_download`.
 
-        Wrapped in :func:`retry_sdk_call` so transient transport
-        flakes (``requests.ReadTimeout``, 5xx, 429, 503/504) get a
-        few attempts before surfacing. Semantic errors —
-        ``FileNotFoundError`` / ``NotFound`` / ``BadRequest`` —
-        propagate on the first attempt.
-
-        Subclasses return a :class:`BytesIO` (the optimized,
-        spill-capable buffer) so large downloads don't have to live
-        in RAM; if a legacy override returns ``bytes`` we fall back
-        to that path transparently.
+        Retried on transient transport errors; semantic errors
+        (``FileNotFoundError`` / ``NotFound`` / ``BadRequest``)
+        propagate on the first attempt. Returns the project's
+        spill-capable :class:`BytesIO` so large downloads stream to
+        local temp rather than hogging RAM.
         """
-        try:
-            content = retry_sdk_call(
-                self._remote_download, allow_not_found=False,
-            )
+        content = retry_sdk_call(
+            self._remote_download, allow_not_found=False,
+        )
 
-            if isinstance(content, BytesIO):
-                return content.to_bytes()
+        if isinstance(content, BytesIO):
+            if not content.opened:
+                content.open()
+            content.seek(0)
             return content
-        except (OSError, ValueError):
-            if raise_error:
-                raise
-            return b""
 
-    def write_bytes(
-        self,
-        data: Union[bytes, bytearray, memoryview, BytesIO],
-        *,
-        mode: str = "wb",
-        parents: bool = True,
-    ) -> int:
+        bio = BytesIO()
+        bio.open()
+        if content:
+            bio.write(content)
+            bio.seek(0)
+        return bio
+
+    def _pwrite(self, data: BytesIO) -> int:
         """Whole-file upload via :meth:`_remote_upload`.
 
-        Coerces ``data`` to a :class:`BytesIO` (the project's
-        spill-capable buffer) so subclasses can stream it without
-        loading everything into RAM. The retry wrapper seeks the
-        buffer back to its original position before each retry so
-        a partial transport failure replays the exact same bytes.
+        Most Databricks SDKs don't expose positional writes — the
+        streaming upload truncates the destination. Auto-creates
+        parent directories on :class:`FileNotFoundError`.  The
+        retry wrapper seeks the buffer back to its starting offset
+        before each replay so partial transport failures upload the
+        exact same bytes.
         """
-        del mode  # always overwrite at this layer
-
-        bio = BytesIO.from_(data)
-        start = bio.tell()
-        size = bio.size if hasattr(bio, "size") else len(data)
+        if not data.opened:
+            data.open()
+        start = data.tell()
+        size = data.size
 
         def _seek_back(_attempt: int, _exc: BaseException) -> None:
             try:
-                bio.seek(start)
+                data.seek(start)
             except Exception:
                 LOGGER.debug(
                     "Could not seek payload back to %s before retry "
@@ -584,109 +577,13 @@ class DatabricksPath(Path):
                 )
 
         try:
-            retry_sdk_call(self._remote_upload, bio, on_retry=_seek_back)
+            retry_sdk_call(self._remote_upload, data, on_retry=_seek_back)
         except FileNotFoundError:
-            if not parents:
-                raise
             self.parent.mkdir(parents=True, exist_ok=True)
-            bio.seek(start)
-            retry_sdk_call(self._remote_upload, bio, on_retry=_seek_back)
+            data.seek(start)
+            retry_sdk_call(self._remote_upload, data, on_retry=_seek_back)
         self.invalidate_mirror()
         return int(size)
-
-    # ==================================================================
-    # Positional IO — required by the abstract Path
-    # ==================================================================
-
-    def pread(
-        self,
-        n: int,
-        pos: int,
-        *,
-        default: Any = ...,
-    ) -> bytes:
-        """Positional read via download-and-slice.
-
-        SDK Databricks paths don't generally expose range reads
-        (DBFS FUSE is the exception, handled by :class:`DBFSPath`'s
-        override). The naive implementation downloads the whole
-        object and slices locally — correct, single round-trip per
-        ``pread`` call, fine for occasional use; if pread becomes a
-        hot loop the caller should ``read_bytes`` once and slice
-        themselves.
-        """
-        if pos < 0:
-            raise ValueError("pread position must be >= 0")
-        if n == 0:
-            return b""
-
-        try:
-            data = retry_sdk_call(
-                self._remote_download, allow_not_found=False,
-            )
-        except FileNotFoundError:
-            if default is ...:
-                raise
-            return default
-        except OSError:
-            if default is ...:
-                raise
-            return default
-
-        # Subclasses return BytesIO; legacy overrides may still
-        # return raw bytes — handle both.
-        if isinstance(data, BytesIO):
-            data = data.to_bytes()
-
-        if n < 0:
-            return data[pos:]
-        return data[pos:pos + n]
-
-    def pwrite(
-        self,
-        data: Union[bytes, bytearray, memoryview],
-        pos: int,
-        *,
-        parents: bool = True,
-    ) -> int:
-        """Positional write via read-modify-write.
-
-        Most Databricks SDKs don't support partial writes — even
-        DBFS' streaming upload truncates the destination. This
-        implementation downloads the existing object (if any),
-        splices the new bytes at ``pos``, uploads the result.
-
-        Window-inside-existing patches in place; extending past EOF
-        zero-pads to match POSIX. Same shape as
-        :meth:`Path._pwrite_via_rmw` but using our SDK-direct
-        ``read_bytes`` / ``write_bytes`` to avoid the
-        ``open_io`` recursion.
-        """
-        mv = memoryview(data)
-        if not mv.c_contiguous:
-            mv = memoryview(bytes(mv))
-        n = len(mv)
-        if n == 0:
-            return 0
-        if pos < 0:
-            raise ValueError("pwrite position must be >= 0")
-
-        existing = self.read_bytes(raise_error=False) if self.exists() else b""
-        end = pos + n
-
-        if end <= len(existing):
-            buf = bytearray(existing)
-            buf[pos:end] = mv
-            out = bytes(buf)
-        else:
-            buf = bytearray(end)
-            if existing:
-                buf[: len(existing)] = existing
-            buf[pos:end] = mv
-            out = bytes(buf)
-
-        self.write_bytes(out, parents=parents)
-        return n
 
     # ==================================================================
     # SDK transport — abstract, subclasses fill in
