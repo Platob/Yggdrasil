@@ -179,13 +179,6 @@ class MemoryPath(Path):
         # the transaction-buffer reference and clear the dirty flag.
         self._transaction_buffer = None
         self._dirty = False
-        if self._fd >= 0:
-            import os
-            fd, self._fd = self._fd, -1
-            try:
-                os.close(fd)
-            except OSError:
-                pass
 
     # ------------------------------------------------------------------
     # Abstract hooks

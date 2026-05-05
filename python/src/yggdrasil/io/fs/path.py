@@ -1,23 +1,20 @@
 """Abstract filesystem path — ``pathlib.Path``-like API over :class:`URL`.
 
-Path is the I/O resource. ``_acquire`` opens it: a long-lived
-``os.open`` fd for local paths, an in-memory transaction
-:class:`BytesIO` for remote ones (downloaded via :meth:`_pread`,
-committed via :meth:`_pwrite` on flush/close). All positional ops
-(:meth:`pread`, :meth:`pwrite`, :meth:`truncate`, :meth:`fileno`,
-:meth:`memoryview`) read or splice that single backing — no extra
-context object, no scratch buffer in between.
+Path is a backend-agnostic byte holder. By default, ``acquire_io``
+sets up a transaction :class:`BytesIO` (downloaded via
+:meth:`_pread`, committed via :meth:`_pwrite` on flush/close).
+All positional ops (:meth:`pread` / :meth:`pwrite` / :meth:`truncate`
+/ :meth:`memoryview`) read or splice that buffer when active, or
+fall through to single-shot whole-file primitives otherwise.
 
-Backings are lazy. Constructing a path doesn't open anything;
-the first I/O op (or an explicit :meth:`acquire_io`) sets up the
-fd/transaction-buffer. The path's :class:`Disposable` ``_release``
-flushes and closes whatever's open.
+The fd-driven fast path lives entirely in
+:class:`yggdrasil.io.fs.local_path.LocalPath` — the only backend
+that holds a kernel file descriptor. Other backends (S3, Databricks,
+in-memory) inherit the default transaction-buffer behavior.
 
 Subclasses implement seven hooks: :meth:`full_path`, :meth:`_stat`,
 :meth:`_ls`, :meth:`_mkdir`, :meth:`_remove_file`, :meth:`_remove_dir`,
-:meth:`_pread`, :meth:`_pwrite`. Local backends override
-:meth:`_open_fd` to plug in their own fd opener; remote backends
-inherit the default transaction-buffer behavior.
+:meth:`_pread`, :meth:`_pwrite`.
 """
 
 from __future__ import annotations
@@ -25,7 +22,6 @@ from __future__ import annotations
 import contextlib
 import io
 import logging
-import mmap
 import os
 import pathlib
 import re
@@ -61,10 +57,6 @@ from yggdrasil.lazy_imports import local_path_class, tabular_io_class, PATH_SCHE
 __all__ = ["Path", "register_path_class"]
 
 LOGGER = logging.getLogger(__name__)
-
-
-_HAS_PREAD = hasattr(os, "pread")
-_HAS_PWRITE = hasattr(os, "pwrite")
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +137,6 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         "url",
         "temporary",
         "_mode",
-        "_fd",
         "_transaction_buffer",
         "_dirty",
     )
@@ -198,7 +189,6 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         self.url = resolved
         self.temporary = bool(temporary)
         self._mode = mode
-        self._fd = -1
         self._transaction_buffer: "BytesIO | None" = None
         self._dirty = False
 
@@ -237,13 +227,8 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
 
     @property
     def io_open(self) -> bool:
-        """True when an fd or a transaction buffer is currently bound."""
-        return self._fd >= 0 or self._transaction_buffer is not None
-
-    @property
-    def fd(self) -> int:
-        """The currently-bound fd, or ``-1`` if none."""
-        return self._fd
+        """True when an I/O backing (transaction buffer / subclass-specific) is active."""
+        return self._transaction_buffer is not None
 
     @property
     def transaction_buffer(self) -> "BytesIO | None":
@@ -288,7 +273,11 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         return self
 
     def close_io(self) -> None:
-        """Close the fd / commit and close the transaction buffer."""
+        """Commit and close the transaction buffer.
+
+        Subclasses with extra per-open resources (fd for
+        :class:`LocalPath`) override and ``super().close_io()``.
+        """
         buf = self._transaction_buffer
         self._transaction_buffer = None
         if buf is not None:
@@ -302,12 +291,6 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
                         buf.close()
                 except Exception:
                     pass
-        if self._fd >= 0:
-            fd, self._fd = self._fd, -1
-            try:
-                os.close(fd)
-            except OSError:
-                pass
         self._dirty = False
 
     @contextlib.contextmanager
@@ -325,24 +308,16 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
                 self._mode = prev_mode
 
     def _ensure_io(self) -> None:
-        """Open the fd or transaction_buffer if it isn't already."""
+        """Open the I/O backing if it isn't already.
+
+        Default: bring up a transaction :class:`BytesIO` from the
+        path's whole-file ``_pread`` / ``_pwrite`` primitives.
+        :class:`LocalPath` overrides to open a real ``os.open`` fd
+        instead.
+        """
         if self.io_open:
             return
-        if self.is_local:
-            self._open_fd(self._mode)
-        else:
-            self._open_transaction_buffer(self._mode)
-
-    def _open_fd(self, mode: str) -> None:
-        """Local backend hook: bind ``self._fd`` to a fresh fd.
-
-        Default raises — :class:`LocalPath` overrides. Backends that
-        report :attr:`is_local` ``True`` must implement this.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} reports is_local=True but does not "
-            "override _open_fd."
-        )
+        self._open_transaction_buffer(self._mode)
 
     def _open_transaction_buffer(self, mode: str) -> None:
         """Default remote backend behavior: download into a transaction buffer.
@@ -913,22 +888,12 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
 
     @property
     def size(self) -> int:
-        if self._fd >= 0:
-            try:
-                return int(os.fstat(self._fd).st_size)
-            except OSError:
-                pass
         if self._transaction_buffer is not None:
             return int(self._transaction_buffer.size)
         return int(self._stat().size)
 
     @property
     def mtime(self) -> float:
-        if self._fd >= 0:
-            try:
-                return float(os.fstat(self._fd).st_mtime)
-            except OSError:
-                return 0.0
         if self._transaction_buffer is not None:
             try:
                 return float(self._transaction_buffer.mtime)
@@ -942,21 +907,11 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
     def stats(self) -> IOStats:
         """One backend round-trip → ``IOStats`` (size + mtime + media_type).
 
-        Active backings short-circuit to ``fstat`` (local fd) or
-        the in-memory transaction buffer; otherwise a single
-        :meth:`_stat` round-trip fills size and mtime. ``media_type``
-        comes from the URL extension — best effort, may be ``None``.
+        Active transaction buffer short-circuits to its in-memory
+        size/mtime; otherwise a single :meth:`_stat` round-trip fills
+        them. ``media_type`` comes from the URL extension — best
+        effort, may be ``None``.
         """
-        if self._fd >= 0:
-            try:
-                raw = os.fstat(self._fd)
-                return IOStats(
-                    size=int(raw.st_size),
-                    mtime=float(raw.st_mtime),
-                    media_type=self.media_type,
-                )
-            except OSError:
-                pass
         if self._transaction_buffer is not None:
             buf = self._transaction_buffer
             return IOStats(
@@ -1147,17 +1102,14 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
     ) -> bytes:
         """Positional read.
 
-        If the path has an active fd or transaction buffer, reads from
-        it. Otherwise does a single-shot :meth:`_pread` + slice. ``n <
-        0`` reads from *pos* to EOF.
+        Uses the transaction buffer when active, else does a single-shot
+        :meth:`_pread` + slice. ``n < 0`` reads from *pos* to EOF.
+        :class:`LocalPath` overrides to use its long-lived fd.
         """
         if pos < 0:
             raise ValueError("pread position must be >= 0")
         if n == 0:
             return b""
-
-        if self._fd >= 0:
-            return _fd_pread(self._fd, n, pos)
 
         if self._transaction_buffer is not None:
             buf = self._transaction_buffer
@@ -1192,9 +1144,10 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
     ) -> int:
         """Positional write.
 
-        Active fd: single :func:`os.pwrite`. Active transaction buffer:
-        splice in place, mark dirty (commit on flush/close). Otherwise
-        single-shot RMW via :meth:`_pread` + :meth:`_pwrite`.
+        Active transaction buffer: splice in place, mark dirty (commit
+        on flush/close). Otherwise single-shot RMW via :meth:`_pread`
+        + :meth:`_pwrite`. :class:`LocalPath` overrides with its
+        long-lived fd.
         """
         del parents
         mv = memoryview(data)
@@ -1207,9 +1160,6 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
             return 0
         if pos < 0:
             raise ValueError("pwrite position must be >= 0")
-
-        if self._fd >= 0:
-            return _fd_pwrite(self._fd, mv, pos)
 
         if self._transaction_buffer is not None:
             written = self._transaction_buffer.pwrite(mv, pos)
@@ -1235,10 +1185,6 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         del parents
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
-
-        if self._fd >= 0:
-            os.ftruncate(self._fd, n)
-            return n
 
         if self._transaction_buffer is not None:
             if int(self._transaction_buffer.size) != n:
@@ -1302,34 +1248,13 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         del n
 
     def fileno(self) -> int:
-        """Return the underlying fd, opening one if needed.
-
-        Local backends produce a real fd. Remote backends raise
-        :class:`OSError` — they have no kernel-side fd to expose.
-        """
-        if self._fd >= 0:
-            return self._fd
-        if self.is_local:
-            self._ensure_io()
-            if self._fd >= 0:
-                return self._fd
+        """Backends with a real fd override; the default has none."""
         raise OSError(
             f"{type(self).__name__} has no underlying file descriptor"
         )
 
     def read_bytes(self, *, raise_error: bool = True) -> bytes:
         """Whole-file read."""
-        if self._fd >= 0:
-            try:
-                size = int(os.fstat(self._fd).st_size)
-            except OSError:
-                if raise_error:
-                    raise
-                return b""
-            if size == 0:
-                return b""
-            return _fd_pread(self._fd, size, 0)
-
         if self._transaction_buffer is not None:
             return self._transaction_buffer.to_bytes()
 
@@ -1643,79 +1568,6 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         if exc_type is not None:
             self._dirty = False
         self.close()
-
-
-# ---------------------------------------------------------------------------
-# fd helpers — POSIX pread/pwrite with portable fallbacks
-# ---------------------------------------------------------------------------
-
-
-def _fd_pread(fd: int, n: int, pos: int) -> bytes:
-    if n <= 0:
-        return b""
-    if _HAS_PREAD:
-        chunks: list[bytes] = []
-        remaining = n
-        offset = pos
-        while remaining > 0:
-            chunk = os.pread(fd, remaining, offset)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            got = len(chunk)
-            remaining -= got
-            offset += got
-        return b"".join(chunks)
-    saved = os.lseek(fd, 0, os.SEEK_CUR)
-    try:
-        os.lseek(fd, pos, os.SEEK_SET)
-        chunks: list[bytes] = []
-        remaining = n
-        while remaining > 0:
-            chunk = os.read(fd, remaining)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
-    finally:
-        try:
-            os.lseek(fd, saved, os.SEEK_SET)
-        except OSError:
-            pass
-
-
-def _fd_pwrite(fd: int, mv: memoryview, pos: int) -> int:
-    if mv.format != "B" or mv.ndim != 1 or mv.itemsize != 1:
-        mv = mv.cast("B")
-    if not mv.c_contiguous:
-        mv = memoryview(bytes(mv))
-    n = len(mv)
-    if n == 0:
-        return 0
-    if _HAS_PWRITE:
-        total = 0
-        while total < n:
-            written = os.pwrite(fd, bytes(mv[total:]), pos + total)
-            if written == 0:
-                raise io.BlockingIOError(f"Short write at offset {pos + total}")
-            total += written
-        return total
-    saved = os.lseek(fd, 0, os.SEEK_CUR)
-    try:
-        os.lseek(fd, pos, os.SEEK_SET)
-        total = 0
-        while total < n:
-            written = os.write(fd, bytes(mv[total:]))
-            if written == 0:
-                raise io.BlockingIOError(f"Short write at offset {pos + total}")
-            total += written
-        return total
-    finally:
-        try:
-            os.lseek(fd, saved, os.SEEK_SET)
-        except OSError:
-            pass
 
 
 # ---------------------------------------------------------------------------

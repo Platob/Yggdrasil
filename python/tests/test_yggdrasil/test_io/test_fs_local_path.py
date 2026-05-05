@@ -222,3 +222,70 @@ class TestPathProperties:
     def test_fspath_protocol(self, tmp_path):
         path = LocalPath.from_(tmp_path)
         assert os.fspath(path).startswith("/")
+
+
+# ---------------------------------------------------------------------------
+# fd lifecycle — the user-visible contract
+# ---------------------------------------------------------------------------
+
+
+class TestFdLifecycle:
+    def test_fileno_returns_open_fd_for_existing_file(self, tmp_path):
+        target = tmp_path / "x.bin"
+        target.write_bytes(b"hi")
+        path = LocalPath.from_pathlib(target)
+        try:
+            fd = path.fileno()
+            assert fd >= 0
+            # Fd is real — fstat round-trips.
+            assert os.fstat(fd).st_size == 2
+        finally:
+            path.close()
+
+    def test_fileno_raises_after_close(self, tmp_path):
+        target = tmp_path / "x.bin"
+        target.write_bytes(b"hi")
+        path = LocalPath.from_pathlib(target)
+        path.fileno()  # open succeeds
+        path.close()
+        with pytest.raises(OSError):
+            path.fileno()
+
+    def test_construction_does_not_create_missing_file(self, tmp_path):
+        target = tmp_path / "ghost.bin"
+        # Default mode "rb+"; auto_open=True.
+        path = LocalPath.from_pathlib(target)
+        try:
+            # Construction-time acquire is best-effort: missing target
+            # leaves fd closed, fileno raises, file is NOT created.
+            assert not target.exists()
+            with pytest.raises(OSError):
+                path.fileno()
+        finally:
+            path.close()
+
+    def test_acquire_io_with_write_mode_opens_and_creates(self, tmp_path):
+        target = tmp_path / "fresh.bin"
+        path = LocalPath.from_pathlib(target)
+        try:
+            path.acquire_io("wb+")
+            fd = path.fileno()
+            assert fd >= 0
+            assert target.exists()
+        finally:
+            path.close()
+
+    def test_close_io_closes_fd_but_keeps_path_alive(self, tmp_path):
+        target = tmp_path / "x.bin"
+        target.write_bytes(b"hello")
+        path = LocalPath.from_pathlib(target)
+        try:
+            path.fileno()  # open
+            path.close_io()
+            with pytest.raises(OSError):
+                path.fileno()
+            # Re-acquire works — path object is still alive.
+            path.acquire_io("rb")
+            assert path.fileno() >= 0
+        finally:
+            path.close()

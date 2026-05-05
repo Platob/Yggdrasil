@@ -130,10 +130,6 @@ BufferLike = Union[
 _HEAD_DEFAULT = 128
 _PICKLE_COMPRESS_THRESHOLD_DEFAULT = 1 * 1024 * 1024
 _COPY_CHUNK_SIZE = 4 * 1024 * 1024
-_HAS_PWRITE = hasattr(os, "pwrite")
-_HAS_PREAD = hasattr(os, "pread")
-
-
 def _as_contiguous_mv(mv: memoryview) -> memoryview:
     """Return a C-contiguous memoryview.
 
@@ -164,59 +160,6 @@ def _under_thread_lock(func):
             return func(self, *args, **kwargs)
 
     return wrapper
-
-
-# ---------------------------------------------------------------------------
-# Mode → os.O_* flags
-# ---------------------------------------------------------------------------
-
-
-def _flags_for_mode(mode: str) -> int:
-    """Translate a stdlib-style mode string into ``os.open`` flags.
-
-    Binary subset only — text-mode bits (``t``, ``U``, encoding) are
-    handled at any wrapper layer above us. Raises :class:`ValueError`
-    for nonsensical modes ("rw", "", multiple primaries) so the
-    caller surfaces a clear error rather than an opaque ``OSError``.
-
-    Adds ``O_BINARY`` on Windows and ``O_CLOEXEC`` where available.
-    """
-    has_r = "r" in mode
-    has_w = "w" in mode
-    has_a = "a" in mode
-    has_x = "x" in mode
-    has_plus = "+" in mode
-
-    primary_count = sum((has_r, has_w, has_a, has_x))
-    if primary_count != 1:
-        raise ValueError(
-            f"Invalid open mode {mode!r}: must contain exactly one of "
-            "'r', 'w', 'a', 'x'."
-        )
-
-    if has_r and not has_plus:
-        flags = os.O_RDONLY
-    elif has_r and has_plus:
-        flags = os.O_RDWR
-    elif has_w and not has_plus:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    elif has_w and has_plus:
-        flags = os.O_RDWR | os.O_CREAT | os.O_TRUNC
-    elif has_a and not has_plus:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-    elif has_a and has_plus:
-        flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
-    elif has_x and not has_plus:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    else:
-        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
-
-    if hasattr(os, "O_BINARY"):
-        flags |= os.O_BINARY  # Windows
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-
-    return flags
 
 
 # ===========================================================================
@@ -2760,55 +2703,6 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 # ===========================================================================
 # Module-level helpers
 # ===========================================================================
-
-
-def _pread_bounded(fd: int, n: int, pos: int) -> bytes:
-    """:func:`os.pread` with a Windows fallback.
-
-    ``os.pread`` is POSIX-only and not exposed on the Windows build
-    of CPython. Falls back to lseek + read, restoring the cursor
-    afterward so concurrent positional ops on the same fd don't
-    fight. Not thread-safe in the fallback path.
-    """
-    if _HAS_PREAD:
-        return os.pread(fd, n, pos)
-    # Fallback: lseek + read. Preserves cursor so concurrent ops on
-    # the same fd don't fight, but is NOT thread-safe.
-    saved = os.lseek(fd, 0, os.SEEK_CUR)
-    try:
-        os.lseek(fd, pos, os.SEEK_SET)
-        return os.read(fd, n)
-    finally:
-        try:
-            os.lseek(fd, saved, os.SEEK_SET)
-        except OSError:
-            pass
-
-
-def _pwrite_bounded(fd: int, data, pos: int) -> int:
-    """:func:`os.pwrite` with a Windows fallback.
-
-    Symmetric to :func:`_pread_bounded`. ``os.pwrite`` is POSIX-only;
-    on Windows we ``lseek`` + ``write`` and restore the cursor.
-    Coerces *data* to a contiguous :class:`memoryview` here so call
-    sites can pass any buffer-protocol input without pre-coercion.
-
-    Not thread-safe in the fallback path — concurrent positional
-    writes on the same fd race for the cursor.
-    """
-    mv = _as_contiguous_mv(memoryview(data))
-    if _HAS_PWRITE:
-        return os.pwrite(fd, mv, pos)
-    # Fallback for Windows et al.
-    saved = os.lseek(fd, 0, os.SEEK_CUR)
-    try:
-        os.lseek(fd, pos, os.SEEK_SET)
-        return os.write(fd, mv)
-    finally:
-        try:
-            os.lseek(fd, saved, os.SEEK_SET)
-        except OSError:
-            pass
 
 
 def _mint_spill_path(ext: str, ttl_seconds: int) -> "Path":
