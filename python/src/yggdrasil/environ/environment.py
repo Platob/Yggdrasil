@@ -765,7 +765,7 @@ class PyEnv:
                 from pyspark.sql import SparkSession
 
                 active = SparkSession.getActiveSession()
-            except ImportError:
+            except Exception:
                 pass
 
             if active is not None:

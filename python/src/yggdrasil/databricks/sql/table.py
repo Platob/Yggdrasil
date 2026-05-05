@@ -1522,7 +1522,6 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         definition: Union[pa.Schema, Any],
         *,
         mode: Mode | str | None = None,
-        partition_by: Optional[list[str]] = None,
         storage_location: str | None = None,
         comment: str | None = None,
         properties: Optional[dict[str, str]] = None,
@@ -1548,6 +1547,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
                 definition,
                 comment=comment,
                 if_not_exists=if_not_exists,
+                properties=properties,
             )
         else:
             if table_type == TableType.EXTERNAL and not storage_location:
