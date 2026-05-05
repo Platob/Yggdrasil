@@ -53,6 +53,7 @@ from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.enums import MediaType
 from yggdrasil.io.holder import Holder
+from yggdrasil.io.io_stats import IOStats
 from yggdrasil.io.path_stat import PathKind, PathStats
 from yggdrasil.io.url import URL
 from yggdrasil.lazy_imports import local_path_class, tabular_io_class, PATH_SCHEME_FACTORY
@@ -922,21 +923,55 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         return int(self._stat().size)
 
     @property
-    def mtime(self) -> Optional[float]:
+    def mtime(self) -> float:
         if self._fd >= 0:
             try:
                 return float(os.fstat(self._fd).st_mtime)
             except OSError:
-                return None
+                return 0.0
         if self._transaction_buffer is not None:
             try:
                 return float(self._transaction_buffer.mtime)
             except Exception:
-                return None
+                return 0.0
         s = self._stat()
         if s.kind == PathKind.MISSING:
-            return None
-        return s.mtime
+            return 0.0
+        return float(s.mtime or 0.0)
+
+    def stats(self) -> IOStats:
+        """One backend round-trip → ``IOStats`` (size + mtime + media_type).
+
+        Active backings short-circuit to ``fstat`` (local fd) or
+        the in-memory transaction buffer; otherwise a single
+        :meth:`_stat` round-trip fills size and mtime. ``media_type``
+        comes from the URL extension — best effort, may be ``None``.
+        """
+        if self._fd >= 0:
+            try:
+                raw = os.fstat(self._fd)
+                return IOStats(
+                    size=int(raw.st_size),
+                    mtime=float(raw.st_mtime),
+                    media_type=self.media_type,
+                )
+            except OSError:
+                pass
+        if self._transaction_buffer is not None:
+            buf = self._transaction_buffer
+            return IOStats(
+                size=int(buf.size),
+                mtime=float(buf.mtime or 0.0),
+                media_type=self.media_type,
+            )
+        s = self._stat()
+        if s.kind == PathKind.MISSING:
+            return IOStats(size=0, mtime=0.0, media_type=self.media_type)
+        return IOStats(
+            size=int(s.size),
+            mtime=float(s.mtime or 0.0),
+            media_type=self.media_type,
+        )
 
     # ==================================================================
     # Listing / walking

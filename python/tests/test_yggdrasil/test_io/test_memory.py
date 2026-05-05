@@ -7,7 +7,7 @@ import pathlib
 
 import pytest
 
-from yggdrasil.io import Holder, Memory
+from yggdrasil.io import Holder, IOStats, Memory
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +204,30 @@ class TestMemoryLocalPathBridge:
         assert n == 5
         assert bytes(m) == b"hello world"
 
+    def test_read_local_path_n_caps_length(self, tmp_path):
+        src = tmp_path / "in.bin"
+        src.write_bytes(b"abcdefghij")
+        m = Memory()
+        n = m.read_local_path(src, n=4)
+        assert n == 4
+        assert bytes(m) == b"abcd"
+
+    def test_read_local_path_n_zero_reads_nothing(self, tmp_path):
+        src = tmp_path / "in.bin"
+        src.write_bytes(b"abcd")
+        m = Memory()
+        n = m.read_local_path(src, n=0)
+        assert n == 0
+        assert bytes(m) == b""
+
+    def test_read_local_path_n_at_pos(self, tmp_path):
+        src = tmp_path / "in.bin"
+        src.write_bytes(b"abcdef")
+        m = Memory(b"_")  # 1 byte
+        n = m.read_local_path(src, pos=1, n=3)
+        assert n == 3
+        assert bytes(m) == b"_abc"
+
     def test_read_local_path_accepts_str(self, tmp_path):
         src = tmp_path / "in.bin"
         src.write_bytes(b"abc")
@@ -252,6 +276,55 @@ class TestMemoryLocalPathBridge:
 # ---------------------------------------------------------------------------
 # Equality / hashing / dunder
 # ---------------------------------------------------------------------------
+
+
+class TestMemoryStats:
+    def test_stats_returns_iostats(self):
+        m = Memory(b"hello")
+        s = m.stats()
+        assert isinstance(s, IOStats)
+        assert s.size == 5
+        assert s.mtime > 0
+        assert s.media_type is None
+
+    def test_stats_after_write_bumps_mtime(self):
+        import time as _time
+        m = Memory()
+        before = m.stats().mtime
+        _time.sleep(0.01)
+        m.write_bytes(b"x")
+        after = m.stats().mtime
+        assert after > before
+
+    def test_stats_carries_media_type(self):
+        from yggdrasil.io.enums import MediaTypes
+        m = Memory(b"abc", media_type=MediaTypes.JSON)
+        s = m.stats()
+        assert s.media_type is MediaTypes.JSON
+        assert s.has_media_type
+
+    def test_iostats_with_copy(self):
+        s = IOStats(size=10, mtime=1.0, media_type=None)
+        s2 = s.with_(size=20, copy=True)
+        assert s.size == 10
+        assert s2.size == 20
+
+    def test_iostats_with_inplace(self):
+        s = IOStats(size=10, mtime=1.0, media_type=None)
+        s.with_(size=20)
+        assert s.size == 20
+
+    def test_iostats_clear_media_type(self):
+        from yggdrasil.io.enums import MediaTypes
+        s = IOStats(size=1, mtime=0.0, media_type=MediaTypes.JSON)
+        s.with_(media_type=None)
+        assert s.media_type is None
+        assert not s.has_media_type
+
+    def test_iostats_iterable(self):
+        s = IOStats(size=10, mtime=2.5, media_type=None)
+        size, mtime, mt = s
+        assert (size, mtime, mt) == (10, 2.5, None)
 
 
 class TestMemoryDunder:

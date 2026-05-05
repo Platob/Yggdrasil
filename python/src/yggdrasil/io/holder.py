@@ -26,6 +26,8 @@ import pathlib
 from abc import ABC, abstractmethod
 from typing import Union
 
+from .io_stats import IOStats
+
 
 __all__ = ["Holder"]
 
@@ -99,6 +101,33 @@ class Holder(ABC):
         """Current visible size in bytes."""
 
     # ------------------------------------------------------------------
+    # IOStats — size / mtime / media_type triple
+    # ------------------------------------------------------------------
+
+    @property
+    def mtime(self) -> float:
+        """Last modification time. ``0.0`` when no meaningful mtime is available."""
+        return 0.0
+
+    @property
+    def media_type(self):
+        """:class:`MediaType` for this holder, or ``None`` if unknown."""
+        return None
+
+    def stats(self) -> IOStats:
+        """Snapshot ``size`` / ``mtime`` / ``media_type`` as an :class:`IOStats`.
+
+        Default impl reads :attr:`size` / :attr:`mtime` / :attr:`media_type`.
+        Backends with cheaper batched probes (e.g. one ``stat`` call
+        for both size and mtime) can override.
+        """
+        return IOStats(
+            size=int(self.size),
+            mtime=float(self.mtime),
+            media_type=self.media_type,
+        )
+
+    # ------------------------------------------------------------------
     # Bytes / text convenience surface — built on the abstract primitives
     # ------------------------------------------------------------------
 
@@ -157,22 +186,30 @@ class Holder(ABC):
         path: PathLike,
         *,
         pos: int = 0,
+        n: int = -1,
         chunk_size: int = _COPY_CHUNK,
     ) -> int:
         """Load ``path``'s bytes into this holder at ``pos``.
 
-        Returns the number of bytes spliced in. Streams the source
-        file in ``chunk_size`` slices so a large file doesn't
-        materialize into memory.
+        ``n < 0`` reads the whole file; ``n >= 0`` caps the number of
+        bytes pulled from the source at *n*. Streams the source file
+        in ``chunk_size`` slices so a large file doesn't materialize
+        into memory. Returns the number of bytes spliced in.
         """
         if pos < 0:
             raise ValueError("read_local_path pos must be >= 0")
         os_path = os.fspath(path)
         total = 0
         cursor = pos
+        remaining = n if n >= 0 else None
         with open(os_path, "rb") as fh:
             while True:
-                chunk = fh.read(chunk_size)
+                want = chunk_size
+                if remaining is not None:
+                    if remaining <= 0:
+                        break
+                    want = min(want, remaining)
+                chunk = fh.read(want)
                 if not chunk:
                     break
                 written = self.write_mv(memoryview(chunk), cursor)
@@ -180,6 +217,8 @@ class Holder(ABC):
                     break
                 cursor += written
                 total += written
+                if remaining is not None:
+                    remaining -= written
         return total
 
     def write_local_path(

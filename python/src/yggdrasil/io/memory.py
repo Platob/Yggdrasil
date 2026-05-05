@@ -12,6 +12,7 @@ TabularIO read/write surface.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Optional, Union
 
 from .holder import Holder
@@ -42,7 +43,7 @@ class Memory(Holder):
     zero-padding on extend up to capacity.
     """
 
-    __slots__ = ("_buf", "_size")
+    __slots__ = ("_buf", "_size", "_mtime", "_media_type")
 
     def __init__(
         self,
@@ -53,7 +54,12 @@ class Memory(Holder):
             memoryview,
             "Memory",
         ]] = None,
+        *,
+        media_type: Any = None,
     ) -> None:
+        self._mtime: float = time.time()
+        self._media_type: Any = media_type
+
         if data is None:
             self._buf: bytearray = bytearray()
             self._size: int = 0
@@ -62,6 +68,8 @@ class Memory(Holder):
         if isinstance(data, Memory):
             self._buf = bytearray(memoryview(data._buf)[: data._size])
             self._size = data._size
+            if media_type is None:
+                self._media_type = data._media_type
             return
 
         if isinstance(data, int):
@@ -93,6 +101,14 @@ class Memory(Holder):
     @property
     def size(self) -> int:
         return self._size
+
+    @property
+    def mtime(self) -> float:
+        return self._mtime
+
+    @property
+    def media_type(self):
+        return self._media_type
 
     @property
     def capacity(self) -> int:
@@ -128,6 +144,7 @@ class Memory(Holder):
         memoryview(self._buf)[pos:need] = data
         if need > self._size:
             self._size = need
+        self._mtime = time.time()
         return n
 
     def reserve(self, n: int) -> None:
@@ -144,6 +161,8 @@ class Memory(Holder):
     def truncate(self, n: int) -> int:
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
+        if n != self._size:
+            self._mtime = time.time()
         if n < self._size:
             self._size = n
             return n
@@ -169,6 +188,7 @@ class Memory(Holder):
         """Drop all bytes; reset capacity AND size to zero."""
         self._buf = bytearray()
         self._size = 0
+        self._mtime = time.time()
 
     # ------------------------------------------------------------------
     # Dunder
