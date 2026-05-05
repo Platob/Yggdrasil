@@ -136,6 +136,27 @@ class YGGFolderIO(FolderIO):
     def default_mime_type(cls) -> "MimeType | None":
         return MimeTypes.YGG_FOLDER
 
+    def _default_child_media_type(self) -> Any:
+        """Arrow IPC is the canonical YGG-folder leaf format.
+
+        Plain :class:`FolderIO` defaults to Parquet — fine when
+        cross-tool readability matters more than write speed, but a
+        ``.ygg/`` cache is intentionally an internal layout: the
+        sidecar advertises "this folder is owned by yggdrasil." We
+        trade Parquet's compression + column pruning for Arrow IPC's
+        zero-copy reads, much faster small-file writes (no encoder
+        setup, no row-group machinery), and a stable on-disk
+        representation that maps 1:1 to the in-memory
+        :class:`pa.RecordBatch`. The compactor still bin-packs small
+        files into ``OPTIMIZE_TARGET_BYTES`` chunks, so storage stays
+        comparable; the win is on the hot append path.
+
+        Callers who want Parquet anyway can pass ``child_media_type``
+        on :class:`FolderOptions` — same override hook the base class
+        documents.
+        """
+        return MimeTypes.ARROW_IPC
+
     #: Hidden subfolder used for metadata. Starts with ``.`` so the
     #: default :meth:`_is_ignored_path` rule already hides it from
     #: data enumeration.
@@ -750,16 +771,15 @@ class YGGFolderIO(FolderIO):
 
         media_type = self._default_child_media_type()
 
-        # ``read=True, write=True`` selects the ``.rw.lock`` sidecar
-        # so a concurrent ``_read_arrow_batches`` (which acquires
-        # the same lock) actually blocks. The ``.w.lock`` /
-        # ``.r.lock`` variants live in separate files and don't
-        # serialise across read/write directions.
-        with leaf.lock(read=True, write=True, wait=wait):
-            for bucket in buckets:
-                self._write_compact_bucket(
-                    leaf, bucket, media_type=media_type,
-                )
+        # No leaf-folder lock: a destructive op only locks the
+        # specific source files it's about to read+remove, leaving
+        # untouched siblings in the same leaf free to read/write
+        # concurrently. The merged file is staged + renamed under a
+        # fresh name, so it never collides with the locked sources.
+        for bucket in buckets:
+            self._write_compact_bucket(
+                leaf, bucket, media_type=media_type, wait=wait,
+            )
 
     def _write_compact_bucket(
         self,
@@ -767,6 +787,7 @@ class YGGFolderIO(FolderIO):
         sources: "list[Path]",
         *,
         media_type: Any,
+        wait: Any,
     ) -> None:
         """Read every file in ``sources`` and write one merged file.
 
@@ -775,60 +796,151 @@ class YGGFolderIO(FolderIO):
         merge. The merged write goes through :meth:`Path.make_staging`
         so a crashed compactor leaves a recognisable ``tmp-…``
         sidecar that the next read enumeration ignores.
+
+        Locking is per-source: each input file is held under its
+        own ``.rw.lock`` for the read+remove window, and the lock
+        is released only after the source is unlinked. A concurrent
+        reader that asks for the same file waits on the same
+        sidecar (cf. :meth:`_read_child_batches`) and then either
+        sees the file (we hadn't gotten there yet) or treats it
+        as missing (we already removed it). Either outcome is safe
+        — the row contents live on in the merged file we wrote
+        before touching the sources.
         """
         from yggdrasil.io.buffer.base import TabularIO
 
-        tables: list[pa.Table] = []
-        for source in sources:
-            try:
-                source_io = TabularIO.from_path(source)
-            except Exception:
-                return
-            with source_io:
+        # Acquire all per-source locks up front, in name order.
+        # Same ordering across compactors → no deadlock under
+        # contention; same ordering as the reader's listing →
+        # waiters block on the first file we hold and pick the
+        # rest up incrementally as we release.
+        ordered_sources = sorted(sources, key=lambda p: p.name)
+        held: list[Any] = []
+        try:
+            for source in ordered_sources:
+                lock = source.lock(read=True, write=True, wait=wait)
+                lock.__enter__()
+                held.append(lock)
+
+            tables: list[pa.Table] = []
+            for source in ordered_sources:
                 try:
-                    tables.append(source_io.read_arrow_table())
+                    source_io = TabularIO.from_path(source)
                 except Exception:
                     return
+                with source_io:
+                    try:
+                        tables.append(source_io.read_arrow_table())
+                    except Exception:
+                        return
 
-        if not tables:
+            if not tables:
+                return
+
+            merged = pa.concat_tables(tables, promote_options="default")
+            if merged.num_rows == 0:
+                return
+
+            staging = leaf.make_staging(media_type=media_type)
+            try:
+                target_io = TabularIO.from_path(staging, media_type=media_type)
+                with target_io:
+                    target_io.write_arrow_table(merged)
+            except Exception:
+                try:
+                    staging.remove(allow_not_found=True)
+                except Exception:
+                    pass
+                return
+
+            final_name = self._next_child_name_in(leaf, media_type=media_type)
+            final_path = leaf / final_name
+            try:
+                staging.rename(final_path)
+            except Exception:
+                try:
+                    staging.remove(allow_not_found=True)
+                except Exception:
+                    pass
+                return
+
+            # Sources are dropped last and still under their per-file
+            # locks. A reader that listed the leaf before the rename
+            # but waited on a source lock now sees the file removed
+            # (skip path); a reader that listed after the rename and
+            # before the unlink reads the merged file plus any
+            # not-yet-removed sources — duplicate rows are tolerated
+            # by the response cache's match-by deduplication on read.
+            for source in ordered_sources:
+                try:
+                    source.remove(allow_not_found=True)
+                except Exception:
+                    pass
+        finally:
+            # Release in reverse to mirror nested context-manager
+            # exit ordering.
+            for lock in reversed(held):
+                try:
+                    lock.__exit__(None, None, None)
+                except Exception:
+                    pass
+
+    def _read_child_batches(
+        self,
+        child: Any,
+        options: Any,
+    ) -> "Iterator[pa.RecordBatch]":
+        """Wait on a per-child ``.rw.lock`` before draining a file's batches.
+
+        :meth:`_compact_leaf_folder` holds an exclusive ``.rw.lock``
+        on each source file while it reads + removes it. Mirroring
+        that on the read side gives readers a per-file rendezvous —
+        if a compactor is in flight the reader blocks at the
+        contended file (and only that file) instead of the whole
+        leaf folder. Sub-folder children (further :class:`NestedIO`
+        layers) defer to the inherited path; the lock only matters
+        for actual data files where the compactor can race us.
+        """
+        from yggdrasil.io.buffer.base import TabularIO
+        from .base import NestedIO
+
+        if isinstance(child, NestedIO):
+            yield from super()._read_child_batches(child, options)
             return
 
-        merged = pa.concat_tables(tables, promote_options="default")
-        if merged.num_rows == 0:
+        if not isinstance(child, TabularIO):
+            # Pure :class:`BytesIO` children with no tabular surface
+            # — nothing to lock against, nothing to read.
             return
 
-        staging = leaf.make_staging(media_type=media_type)
+        child_path = getattr(child, "path", None)
+        if child_path is None:
+            yield from super()._read_child_batches(child, options)
+            return
+
+        # ``read=True, write=True`` matches the compactor's sidecar
+        # selection so the two sides actually serialise on the same
+        # ``.rw.lock`` file. The lock is dropped as soon as we
+        # finish draining the child's batches — this is a per-file
+        # rendezvous, not a folder-wide barrier.
         try:
-            target_io = TabularIO.from_path(staging, media_type=media_type)
-            with target_io:
-                target_io.write_arrow_table(merged)
+            file_lock = child_path.lock(read=True, write=True)
         except Exception:
-            try:
-                staging.remove(allow_not_found=True)
-            except Exception:
-                pass
+            yield from super()._read_child_batches(child, options)
             return
 
-        final_name = self._next_child_name_in(leaf, media_type=media_type)
-        final_path = leaf / final_name
-        try:
-            staging.rename(final_path)
-        except Exception:
+        with file_lock:
+            # The compactor unlinks sources while still holding
+            # their locks; a reader that waited on the lock and
+            # then finds the file gone treats it as a clean skip
+            # (the rows live on in the merged file the compactor
+            # wrote before touching the sources).
             try:
-                staging.remove(allow_not_found=True)
+                if not child_path.exists():
+                    return
             except Exception:
                 pass
-            return
-
-        # Sources are dropped last so a reader who acquired the
-        # shared lock right before us sees the old files in full;
-        # a reader who arrived during our write waits on the lock
-        # until we're done, then sees only the compacted result.
-        for source in sources:
-            try:
-                source.remove(allow_not_found=True)
-            except Exception:
-                pass
+            yield from super()._read_child_batches(child, options)
 
     # ==================================================================
     # Spark — Arrow → Spark via the dedicated connector

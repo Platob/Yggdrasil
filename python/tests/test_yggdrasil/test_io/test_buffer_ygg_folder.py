@@ -183,8 +183,9 @@ class TestYggSidecar:
             children = list(io.iter_children())
             names = [c.path.name for c in children]
         assert ".ygg" not in names
-        # The data file still appears.
-        assert any(n.endswith(".parquet") for n in names)
+        # The data file still appears. YGGFolderIO defaults to Arrow IPC
+        # for child files (``.ipc``).
+        assert any(n.endswith(".ipc") for n in names)
 
     def test_read_arrow_table_ignores_ygg(self, tmp_path):
         with YGGFolderIO(path=str(tmp_path)) as io:
