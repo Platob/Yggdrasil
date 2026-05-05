@@ -8,6 +8,7 @@ from databricks.sdk.service.catalog import CatalogInfo, SchemaInfo, TableInfo
 
 from yggdrasil.databricks.client import DatabricksClient
 from yggdrasil.databricks.sql import Tables
+from yggdrasil.databricks.sql.sql_utils import MAX_TABLE_NAME_LEN, safe_table_name
 from yggdrasil.databricks.sql.table import Table
 
 
@@ -252,4 +253,24 @@ class TestTablesSetitem:
         assert "ALTER TABLE" in stmt
         assert "`main`.`sales`.`orders`" in stmt
         assert "RENAME TO `orders_v2`" in stmt
+
+
+class TestTableNameLengthCap:
+    def test_short_name_passes_through(self, tables):
+        t = Table(service=tables, catalog_name="main", schema_name="sales", table_name="orders")
+        assert t.table_name == "orders"
+
+    def test_overlong_name_is_hashed_to_fit(self, tables):
+        long = "x" * 400
+        t = Table(service=tables, catalog_name="main", schema_name="sales", table_name=long)
+
+        assert t.table_name is not None
+        assert len(t.table_name) == MAX_TABLE_NAME_LEN
+        assert t.table_name == safe_table_name(long)
+        # Full-name SQL stays valid because it sees the normalized form.
+        assert t.full_name() == f"main.sales.{t.table_name}"
+
+    def test_none_table_name_is_preserved(self, tables):
+        t = Table(service=tables, catalog_name="main", schema_name="sales", table_name=None)
+        assert t.table_name is None
 
