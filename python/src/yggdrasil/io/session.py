@@ -1176,6 +1176,106 @@ class Session(ABC):
             )
             with cache:
                 cache.write_arrow_table(table, options=options)
+            self._optimize_cache_partitions(cache, eff, ok_responses)
+
+    def _optimize_cache_partitions(
+        self,
+        cache: "FolderIO",
+        cfg: CacheConfig,
+        responses: "list[Response]",
+    ) -> None:
+        """Compact only the partitions a write actually touched.
+
+        The local cache writes one new file per ``partition_key=…``
+        leaf per write call, so a fresh batch can land dozens of
+        small files in a few partitions while the rest of the tree
+        stays cold. Compacting leaf-by-leaf — and only for the
+        leaves we wrote into — keeps the small-file count bounded
+        without paying for a full-tree walk.
+
+        ``cfg.optimize_on_write`` gates the call: an externally
+        managed cache (e.g. one a scheduled OPTIMIZE job already
+        owns) can opt out without disabling the cache itself. The
+        optimize call is best-effort — a failure to compact must
+        never break a successful write — so any exception is logged
+        and swallowed.
+        """
+        if not getattr(cfg, "optimize_on_write", True):
+            return
+        if not responses:
+            return
+        # Optimize is a YGGFolderIO concern; remote / non-folder
+        # caches don't expose a leaf layout to compact against.
+        optimize = getattr(cache, "optimize", None)
+        if not callable(optimize):
+            return
+
+        partition_keys: list[Any] = []
+        seen: set[Any] = set()
+        for response in responses:
+            try:
+                key = response.partition_key
+            except Exception:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            partition_keys.append(key)
+        if not partition_keys:
+            return
+
+        try:
+            with cache:
+                optimize(partitions={"partition_key": partition_keys})
+        except Exception as exc:
+            # Compaction is best-effort; a failed optimize leaves the
+            # newly-written small files in place — readers still see
+            # the right data, just less efficiently.
+            LOGGER.debug(
+                "Local cache optimize skipped for %s: %s",
+                getattr(cache, "path", cache), exc,
+            )
+
+    def _optimize_local_after_misses(
+        self,
+        responses: "list[Response]",
+        url_to_local_cfg: Mapping[str, CacheConfig],
+        session_local_cfg: CacheConfig,
+    ) -> None:
+        """Compact the local cache for partitions stage 3 just wrote.
+
+        Stage 3's per-worker ``_send`` writes responses one at a
+        time, so a batch of N misses fanning out to M partitions
+        leaves up to N small files spread across those M leaves.
+        Group the responses by their effective local cache, then
+        run a single :meth:`_optimize_cache_partitions` per cache
+        — that bounds the post-batch small-file count without
+        pretending the writes themselves were bulk.
+        """
+        if not responses:
+            return
+
+        groups: dict[str, tuple["FolderIO", CacheConfig, list[Response]]] = {}
+        for response in responses:
+            if not response.ok:
+                continue
+            url_key = str(response.request.url) if response.request else None
+            eff = url_to_local_cfg.get(url_key) if url_key else None
+            if eff is None:
+                eff = session_local_cfg
+            if not eff.local_cache_enabled:
+                continue
+            if not getattr(eff, "optimize_on_write", True):
+                continue
+            pkey = str(eff.local_cache_folder())
+            slot = groups.get(pkey)
+            if slot is None:
+                groups[pkey] = (eff.local_cache(), eff, [response])
+            else:
+                slot[2].append(response)
+
+        for cache, eff, group_responses in groups.values():
+            self._optimize_cache_partitions(cache, eff, group_responses)
 
     def _persist_remote(
         self,
@@ -1608,6 +1708,17 @@ class Session(ABC):
                 if new_hits:
                     self._persist_remote(
                         new_hits, url_to_remote_cfg, session_remote_cfg,
+                    )
+                # Compact only the partitions stage 3 actually
+                # wrote. Stage 3 fans out per-worker writes that each
+                # land one new small file per touched partition;
+                # without this call a high-miss batch would steadily
+                # fragment the local cache. The pruned optimize is
+                # bounded by ``len(distinct partition_keys)`` and
+                # never visits cold partitions.
+                if isinstance(new_hits, list) and new_hits:
+                    self._optimize_local_after_misses(
+                        new_hits, url_to_local_cfg, session_local_cfg,
                     )
 
             yield ResponseBatch(

@@ -45,6 +45,7 @@ _CACHE_CONFIG_FIELDS: frozenset[str] = frozenset(
         "received_to",
         "wait",
         "mirror_local_to_remote",
+        "optimize_on_write",
     }
 )
 
@@ -280,6 +281,18 @@ class CacheConfig(_ConfigBase):
     # write per group instead of waiting for a fresh network call to
     # repopulate remote. Default False keeps the legacy behavior.
     mirror_local_to_remote: bool = False
+    # When True (default), each :meth:`Session.send_many` batch
+    # invokes :meth:`YGGFolderIO.optimize` on the local cache once
+    # the batch's writes have settled — but scoped to the partition
+    # tuples that batch actually touched. A typical batch spreads its
+    # writes across a handful of ``partition_key=…`` directories;
+    # compacting only those leaves means we never pay for a full-tree
+    # walk just because a few new small files landed. Remote caches
+    # ignore this flag (compaction is the warehouse's job). Set False
+    # to opt out — useful when an external process already runs
+    # OPTIMIZE on a schedule, or for very write-heavy bursts where
+    # the per-batch fsync is unwelcome.
+    optimize_on_write: bool = True
 
     @staticmethod
     def _check_mapping(values: MutableMapping[str, Any]):
@@ -328,6 +341,7 @@ class CacheConfig(_ConfigBase):
             "received_to": self.received_to,
             "received_ttl": self.received_ttl,
             "mirror_local_to_remote": self.mirror_local_to_remote,
+            "optimize_on_write": self.optimize_on_write,
         }
 
     def __setstate__(self, state):
@@ -348,6 +362,10 @@ class CacheConfig(_ConfigBase):
         object.__setattr__(
             self, "mirror_local_to_remote",
             state.get("mirror_local_to_remote", False),
+        )
+        object.__setattr__(
+            self, "optimize_on_write",
+            state.get("optimize_on_write", True),
         )
 
     @classmethod

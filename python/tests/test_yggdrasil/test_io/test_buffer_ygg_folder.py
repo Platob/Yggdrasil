@@ -183,8 +183,9 @@ class TestYggSidecar:
             children = list(io.iter_children())
             names = [c.path.name for c in children]
         assert ".ygg" not in names
-        # The data file still appears.
-        assert any(n.endswith(".parquet") for n in names)
+        # The data file still appears. YGGFolderIO defaults to Arrow IPC
+        # for child files (``.ipc``).
+        assert any(n.endswith(".ipc") for n in names)
 
     def test_read_arrow_table_ignores_ygg(self, tmp_path):
         with YGGFolderIO(path=str(tmp_path)) as io:
@@ -680,8 +681,90 @@ class TestYggOptimize:
         self._write_n_small(folder, 6)
         assert folder.optimize(target_bytes=1024 * 1024, min_files=3) is folder
 
-    def test_read_acquires_shared_lock(self, tmp_path):
-        """Concurrent reader waits on a write-locked optimize."""
+    def test_optimize_partitions_only_touches_named_leaves(self, tmp_path):
+        """Pruned optimize compacts named partitions and skips others."""
+        folder = YGGFolderIO(
+            path=str(tmp_path), partition_columns=["year"],
+        )
+        for year in ("2024", "2025"):
+            for i in range(6):
+                folder.write_arrow_table(
+                    pa.table({
+                        "id": [i, i + 100],
+                        "year": [year, year],
+                        "tag": [f"a-{year}-{i}", f"b-{year}-{i}"],
+                    }),
+                    mode=Mode.APPEND,
+                )
+
+        leaf_2024 = tmp_path / "year=2024"
+        leaf_2025 = tmp_path / "year=2025"
+
+        def _data_count(leaf: pathlib.Path) -> int:
+            return sum(
+                1 for p in leaf.iterdir()
+                if p.is_file() and not p.name.startswith(".") and not p.name.startswith("tmp-")
+            )
+
+        before_2024 = _data_count(leaf_2024)
+        before_2025 = _data_count(leaf_2025)
+        assert before_2024 == 6
+        assert before_2025 == 6
+
+        folder.optimize(
+            target_bytes=1024 * 1024,
+            min_files=3,
+            partitions={"year": ["2024"]},
+        )
+
+        # 2024 was compacted; 2025 was left alone.
+        assert _data_count(leaf_2024) < before_2024
+        assert _data_count(leaf_2025) == before_2025
+
+        # Row count is preserved across the entire folder.
+        assert folder.read_arrow_table().num_rows == 24
+
+    def test_optimize_partitions_unknown_column_raises(self, tmp_path):
+        """Typos in the partition spec must fail loudly."""
+        folder = YGGFolderIO(
+            path=str(tmp_path), partition_columns=["year"],
+        )
+        folder.write_arrow_table(
+            pa.table({"id": [1], "year": ["2024"], "tag": ["a"]}),
+            mode=Mode.APPEND,
+        )
+
+        with pytest.raises(ValueError, match="Unknown partition column"):
+            folder.optimize(
+                target_bytes=1024 * 1024,
+                min_files=3,
+                partitions={"month": ["01"]},
+            )
+
+    def test_optimize_partitions_missing_leaf_is_noop(self, tmp_path):
+        """A partition with no leaf on disk silently skips."""
+        folder = YGGFolderIO(
+            path=str(tmp_path), partition_columns=["year"],
+        )
+        folder.write_arrow_table(
+            pa.table({"id": [1], "year": ["2024"], "tag": ["a"]}),
+            mode=Mode.APPEND,
+        )
+
+        # No leaf for 2099 yet — optimize must not fail.
+        result = folder.optimize(
+            target_bytes=1024 * 1024,
+            min_files=3,
+            partitions={"year": ["2099"]},
+        )
+        assert result is folder
+
+    def test_read_does_not_block_on_root_lock(self, tmp_path):
+        """Reads run lock-free by default — the caller opts into locking
+        via ``concurrent=True`` on the underlying :class:`Path`, not the
+        folder type. A holder of the root ``.rw.lock`` must not stall
+        an ordinary :meth:`read_arrow_table` call.
+        """
         if _IS_WINDOWS:
             pytest.skip("Locking semantics on Windows differ enough to skip.")
 
@@ -708,9 +791,12 @@ class TestYggOptimize:
         wt.start()
         rt.start()
         time.sleep(0.3)
-        release.set()
-        wt.join(timeout=10)
-        rt.join(timeout=10)
-
-        assert observed, "reader didn't finish"
-        assert observed[0] >= 0.2
+        try:
+            assert observed, "reader didn't finish before lock release"
+            # Reader should have completed promptly without waiting
+            # on the writer's lock.
+            assert observed[0] < 0.2
+        finally:
+            release.set()
+            wt.join(timeout=10)
+            rt.join(timeout=10)
