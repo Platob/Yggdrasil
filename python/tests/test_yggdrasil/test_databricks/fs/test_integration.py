@@ -507,25 +507,22 @@ class TestVolumeIntegration(unittest.TestCase):
     def test_bytes_io_against_volume_path(self) -> None:
         """Drive a BytesIO directly against a VolumePath.
 
-        Pins the new contract: opening with ``mode='wb'`` constructs
-        a transaction buffer (empty), writes hit the buffer, flush
-        commits via ``path.write_bytes``. Reading back via a fresh
+        Pins the contract: opening with ``mode='wb'`` truncates the
+        path; writes route through ``ctx.pwrite`` which delegates
+        to :meth:`Path.pwrite`; reading back via a fresh
         ``mode='rb'`` open verifies the upload landed.
         """
         f = self.vol_base / "bytesio_direct.bin"
 
+        payload = b"hello from BytesIO ctx passthrough"
         bio = BytesIO(path=f, mode="wb")
         try:
-            self.assertIsNotNone(bio._transaction_buffer)
-            bio.write(b"hello from BytesIO transaction buffer")
-            self.assertEqual(bio.size, len(b"hello from BytesIO transaction buffer"))
+            bio.write(payload)
+            self.assertEqual(bio.size, len(payload))
         finally:
             bio.close()
 
-        self.assertEqual(
-            f.read_bytes(),
-            b"hello from BytesIO transaction buffer",
-        )
+        self.assertEqual(f.read_bytes(), payload)
 
 
 # ---------------------------------------------------------------------------
@@ -621,21 +618,19 @@ class TestFileSystemServiceIntegration(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# BytesIO transaction-buffer contract — pin the new acquire/flush flow
+# BytesIO direct passthrough against a DatabricksPath
 # ---------------------------------------------------------------------------
 
 
 @_skip_if_no_client()
-class TestBytesIOTransactionBuffer(unittest.TestCase):
+class TestBytesIOAgainstDatabricksPath(unittest.TestCase):
     """Direct BytesIO-against-DatabricksPath tests.
 
-    These exist because the IO removal moved buffer plumbing from
-    the (deleted) DatabricksIO subclasses into BytesIO itself. The
-    user-facing surface is unchanged but the internal contract is
-    different — these tests pin the new shape so a regression in
-    ``BytesIO._acquire_transaction_buffer`` / ``BytesIO.flush``
-    fails here loud, before downstream tests start looking like
-    SDK problems.
+    BytesIO opens a per-I/O context against the path; for non-local
+    paths the default :class:`_PathOpenContext` is a thin passthrough
+    that forwards every primitive to the path's own
+    :meth:`pread` / :meth:`pwrite` / :meth:`truncate`. There is no
+    transaction buffer.
     """
 
     dbfs_base: DBFSPath
@@ -656,40 +651,36 @@ class TestBytesIOTransactionBuffer(unittest.TestCase):
         except Exception:
             pass
 
-    def test_wb_starts_empty_even_if_remote_exists(self) -> None:
-        """``mode='wb'`` truncates: the transaction buffer is empty
-        after acquire, regardless of any existing remote file."""
+    def test_wb_truncates_existing_remote(self) -> None:
+        """``mode='wb'`` calls :meth:`Path.truncate(0)` on acquire,
+        so any pre-existing remote bytes are gone before the caller
+        writes."""
         f = self.dbfs_base / "wb_truncate.bin"
         f.write_bytes(b"old content")
 
         bio = BytesIO(path=f, mode="wb")
         try:
             self.assertEqual(bio.size, 0)
-            self.assertIsNotNone(bio._transaction_buffer)
-            self.assertEqual(bio._transaction_buffer.size, 0)
         finally:
             bio.close()
 
-        # Nothing was written, so the existing content stays on the
-        # remote? Actually no — close → flush → write_bytes(b"") which
-        # truncates. Verify both behaviors:
         self.assertEqual(f.read_bytes(), b"")
 
-    def test_rb_downloads_into_transaction_buffer(self) -> None:
+    def test_rb_reads_existing_remote(self) -> None:
         f = self.dbfs_base / "rb_download.bin"
-        f.write_bytes(b"hello transaction buffer")
+        payload = b"hello passthrough"
+        f.write_bytes(payload)
 
         bio = BytesIO(path=f, mode="rb")
         try:
-            self.assertIsNotNone(bio._transaction_buffer)
-            self.assertEqual(bio.size, len(b"hello transaction buffer"))
+            self.assertEqual(bio.size, len(payload))
             bio.seek(0)
-            self.assertEqual(bio.read(), b"hello transaction buffer")
+            self.assertEqual(bio.read(), payload)
         finally:
             bio.close()
 
-        # Read-only flush is a no-op — remote unchanged.
-        self.assertEqual(f.read_bytes(), b"hello transaction buffer")
+        # Read-only is non-mutating.
+        self.assertEqual(f.read_bytes(), payload)
 
     def test_rb_plus_against_missing_starts_empty(self) -> None:
         """``rb+`` is tolerant of missing files (matches the legacy
@@ -705,14 +696,9 @@ class TestBytesIOTransactionBuffer(unittest.TestCase):
 
         self.assertEqual(f.read_bytes(), b"created via rb+")
 
-    def test_flush_uses_write_bytes_single_round_trip(self) -> None:
-        """The new flush path is one ``path.write_bytes(payload)``
-        call — the previous ``pwrite + truncate`` would have done
-        two SDK round-trips (RMW for pwrite, RMW for truncate).
-
-        We can't directly observe the round-trip count without
-        instrumenting the SDK, but we can verify that a write +
-        close lands the right bytes on the remote in a known shape."""
+    def test_writes_land_on_remote(self) -> None:
+        """A sequence of writes against a ``mode='wb'`` BytesIO ends
+        up on the remote as the concatenated payload."""
         f = self.dbfs_base / "flush_shape.bin"
 
         bio = BytesIO(path=f, mode="wb")
@@ -723,7 +709,6 @@ class TestBytesIOTransactionBuffer(unittest.TestCase):
         finally:
             bio.close()
 
-        # After close, the remote has the full concatenated payload.
         self.assertEqual(f.read_bytes(), b"first then more")
 
 

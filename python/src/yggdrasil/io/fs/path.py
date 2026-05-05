@@ -97,6 +97,9 @@ from yggdrasil.disposable import Disposable
 from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.enums import MediaType
+
+if False:  # TYPE_CHECKING fence — avoid circular import at runtime
+    from yggdrasil.io.fs._open_context import OpenContext
 from yggdrasil.io.path_stat import PathKind, PathStats
 from yggdrasil.io.url import URL
 from yggdrasil.lazy_imports import local_path_class, tabular_io_class, PATH_SCHEME_FACTORY
@@ -870,6 +873,36 @@ class Path(TabularIO[CastOptions], os.PathLike, ABC):
         )
 
         return io
+
+    # ==================================================================
+    # Open context — fd for local, scratch buffer for remote
+    # ==================================================================
+
+    def open_context(
+        self,
+        mode: str = "rb",
+        **kwargs: Any,
+    ) -> "OpenContext":
+        """Open a per-I/O context bound to this path.
+
+        For local paths the returned context wraps a single long-lived
+        ``os.open`` fd; positional reads/writes route through
+        :func:`os.pread` / :func:`os.pwrite`. For every other path
+        the default returned context is a thin passthrough — every
+        ``ctx.pread`` / ``ctx.pwrite`` / ``ctx.truncate`` lands on
+        the path's own method, no scratch buffer in between. There
+        is no transaction buffer.
+
+        :class:`yggdrasil.io.buffer.BytesIO` calls this on its own
+        ``_acquire`` and forwards every primitive through the
+        returned context. Backends that want batched I/O (S3
+        multipart, paginated APIs, persistent connections) override
+        this method to return a custom :class:`OpenContext`. The
+        default carries no hidden allocation.
+        """
+        del kwargs  # accepted for forward compat with custom backends
+        from yggdrasil.io.fs._open_context import _PathOpenContext
+        return _PathOpenContext(self, mode)
 
     # ==================================================================
     # URL-delegated pure-path API

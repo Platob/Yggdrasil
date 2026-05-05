@@ -184,9 +184,9 @@ REQUEST_SCHEMA["body_size"] = schema_field(
 REQUEST_SCHEMA["body_hash"] = schema_field(
     "body_hash",
     pa.int64(),
-    nullable=True,
+    nullable=False,
     metadata={
-        "comment": "xxh3_64 digest of body bytes; null when body is absent",
+        "comment": "xxh3_64 digest of body bytes; 0 when body is absent",
         "algorithm": "xxh3_64",
     },
 ).autotag()
@@ -746,13 +746,18 @@ class PreparedRequest:
         return self.buffer.size if self.buffer is not None else 0
 
     @property
-    def body_hash(self) -> Optional[int]:
+    def body_hash(self) -> int:
+        """xxh3_64 digest of the body bytes; 0 when body is absent.
+
+        Non-nullable in the schema — callers that need a "missing"
+        signal should branch on :attr:`buffer` or :attr:`body_size`.
+        """
         if self.buffer is None:
-            return None
+            return 0
         try:
             return self.buffer.xxh3_int64()
         except ImportError:
-            return None
+            return 0
 
     @property
     def private_url_hash(self) -> int:

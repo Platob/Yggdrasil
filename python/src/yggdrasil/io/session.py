@@ -137,7 +137,7 @@ def _request_body_hash_predicate(
     """
     from yggdrasil.data.expr import col
 
-    hashes: set[Any] = set()
+    hashes: set[int] = set()
     for r in requests:
         try:
             hashes.add(r.body_hash)
@@ -146,22 +146,17 @@ def _request_body_hash_predicate(
     if not hashes:
         return None
 
-    has_null = None in hashes
-    non_null = sorted(h for h in hashes if h is not None)
+    column = col("request_body_hash")
+    values = sorted(hashes)
 
-    if non_null and has_null:
-        # ``is_in`` already mixes the null branch when ``includes_null``
-        # is set on the underlying InList — but the builder strips
-        # nulls out of the value list, so reattach the null term
-        # explicitly. ``OR`` is what the previous pyarrow expression
-        # produced, kept identical here so behaviour doesn't drift.
-        column = col("request_body_hash")
-        return column.is_in(non_null) | column.is_null()
-    if non_null:
-        return col("request_body_hash").is_in(non_null)
-    if has_null:
-        return col("request_body_hash").is_null()
-    return None
+    # ``body_hash`` is non-null on writes since the schema flipped to
+    # ``nullable=False`` (0 for empty bodies). Older cached rows can
+    # still carry a literal NULL for empty bodies, though, so when the
+    # incoming set includes 0 also keep null rows so legacy hits don't
+    # silently disappear.
+    if 0 in hashes:
+        return column.is_in(values) | column.is_null()
+    return column.is_in(values)
 
 
 def _combine_predicates(*exprs: "Any") -> "Any | None":

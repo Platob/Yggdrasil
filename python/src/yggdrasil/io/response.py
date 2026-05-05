@@ -428,9 +428,9 @@ RESPONSE_SCHEMA["body_size"] = schema_field(
 RESPONSE_SCHEMA["body_hash"] = schema_field(
     "body_hash",
     pa.int64(),
-    nullable=True,
+    nullable=False,
     metadata={
-        "comment": "xxh3_64 digest of body bytes; null when body is absent",
+        "comment": "xxh3_64 digest of body bytes; 0 when body is absent",
         "algorithm": "xxh3_64",
     },
 ).autotag()
@@ -852,13 +852,18 @@ class Response:
         return self.buffer.size if self.buffer is not None else 0
 
     @property
-    def body_hash(self) -> Optional[int]:
+    def body_hash(self) -> int:
+        """xxh3_64 digest of the body bytes; 0 when body is absent.
+
+        Non-nullable in the schema — callers that need a "missing"
+        signal should branch on :attr:`buffer` or :attr:`body_size`.
+        """
         if self.buffer is None:
-            return None
+            return 0
         try:
             return self.buffer.xxh3_int64()
         except ImportError:
-            return None
+            return 0
 
     @property
     def hash(self) -> int:
@@ -893,16 +898,16 @@ class Response:
     @property
     def arrow_values(self) -> dict[str, Any]:
         body_bytes: bytes | None
-        body_hash: int | None
+        body_hash: int
         if self.buffer is not None:
             body_bytes = self.buffer.to_bytes()
             try:
                 body_hash = self.buffer.xxh3_int64()
             except ImportError:
-                body_hash = None
+                body_hash = 0
         else:
             body_bytes = None
-            body_hash = None
+            body_hash = 0
 
         request_values = self.request.arrow_values
         flat_request: dict[str, Any] = {
