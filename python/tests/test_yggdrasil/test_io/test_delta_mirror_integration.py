@@ -150,6 +150,12 @@ class FakeRemote(Path):
     def _open(self, mode: str = "rb", **kwargs):
         return self._backing._open(mode=mode, **kwargs)
 
+    def _pread(self):
+        return self._backing._pread()
+
+    def _pwrite(self, data):
+        return self._backing._pwrite(data)
+
     def read_bytes(self, *, raise_error: bool = True):
         return self._backing.read_bytes(raise_error=raise_error)
 

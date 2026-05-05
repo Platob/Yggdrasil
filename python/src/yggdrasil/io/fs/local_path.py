@@ -313,34 +313,162 @@ class LocalPath(Path):
             if not allow_not_found:
                 raise
 
-    def _open(
-        self,
-        mode: str = "rb",
-        *,
-        encoding: Optional[str] = None,
-        errors: Optional[str] = None,
-        newline: Optional[str] = None,
-        auto_open: bool = True,
-        touch: bool = False,
-    ) -> BytesIO:
-        if touch and "r" in mode and "+" not in mode and not self.exists():
-            self.touch(exist_ok=True, parents=True)
-
-        return BytesIO(
-            self,
-            mode=mode,
-            auto_open=auto_open,
-        )
+    # ``_open`` falls through to :meth:`Path._open` (default — returns
+    # ``BytesIO(path=self, ...)``).
 
     # ==================================================================
-    # Abstract hooks — random-access I/O
+    # Abstract hooks — whole-file primitives
     # ==================================================================
     #
-    # The base :class:`Path` declares :meth:`pread` and :meth:`pwrite`
-    # as ``@abstractmethod``. LocalPath implements them with single
-    # syscalls per call; remote backends would either use range-
-    # requests or call :meth:`_pread_via_io` / :meth:`_pwrite_via_rmw`
-    # from their overrides.
+    # :class:`Path` requires :meth:`_pread` (download → BytesIO) and
+    # :meth:`_pwrite` (upload from BytesIO). For a local file these
+    # are trivially "read every byte" / "write every byte" against
+    # the inode. The :meth:`pread` / :meth:`pwrite` overrides below
+    # then short-circuit the whole-file load when only a slice is
+    # needed.
+
+    def _pread(self) -> BytesIO:
+        """Whole-file read into an autonomous in-memory :class:`BytesIO`.
+
+        The buffer is detached from the file (subsequent edits don't
+        propagate) — :meth:`Path._pwrite` is what carries changes
+        back. Missing path raises :class:`FileNotFoundError`.
+        """
+        # Open explicitly so a missing path surfaces as
+        # FileNotFoundError — :meth:`pread` collapses missing-on-EOF
+        # to ``b""`` for the slice path, which is the wrong shape
+        # here.
+        fd = os.open(self._os_path(), os.O_RDONLY)
+        try:
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(fd, _COPY_CHUNK)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        finally:
+            os.close(fd)
+
+        bio = BytesIO()
+        bio.open()
+        for c in chunks:
+            bio.write(c)
+        bio.seek(0)
+        return bio
+
+    def write_bytes(
+        self,
+        data: Union[bytes, bytearray, memoryview],
+        *,
+        mode: str = "wb",
+        parents: bool = True,
+    ) -> int:
+        """Local-fast write_bytes — :func:`os.open` + the right flags.
+
+        ``mode="ab"`` rides ``O_APPEND`` so a single write is atomic
+        within ``PIPE_BUF`` (POSIX's atomic-append guarantee for
+        local files). The base class's read-modify-write append
+        path defeats that guarantee — two concurrent appenders race
+        and one wins — so callers like the streaming-folder log
+        rely on this override to keep their JSON-line invariants.
+
+        Other modes fall through to the base implementation (which
+        funnels through :meth:`_pwrite`).
+        """
+        if mode != "ab":
+            return super().write_bytes(data, mode=mode, parents=parents)
+
+        mv = memoryview(data)
+        if not mv.c_contiguous:
+            mv = memoryview(bytes(mv))
+        if mv.format != "B" or mv.ndim != 1 or mv.itemsize != 1:
+            mv = mv.cast("B")
+        n = len(mv)
+        if n == 0:
+            return 0
+
+        os_path = self._os_path()
+        if parents:
+            parent = os.path.dirname(os_path)
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent, exist_ok=True)
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_BINARY"):
+            flags |= os.O_BINARY
+
+        fd = os.open(os_path, flags, 0o644)
+        try:
+            view = mv
+            total = 0
+            while view:
+                written = os.write(fd, view)
+                if written == 0:
+                    raise io.BlockingIOError(
+                        f"Short append at offset {total}"
+                    )
+                view = view[written:]
+                total += written
+            return total
+        finally:
+            os.close(fd)
+
+    def _pwrite(self, data: BytesIO) -> int:
+        """Replace the local file's content with *data*'s bytes.
+
+        Streams ``data`` chunk-wise via ``os.write`` so a multi-GiB
+        spilled buffer doesn't have to be materialised into memory.
+        Truncates first via ``O_TRUNC`` so any pre-existing tail past
+        the new payload is dropped.
+        """
+        if not data.opened:
+            data.open()
+
+        os_path = self._os_path()
+        parent = os.path.dirname(os_path)
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent, exist_ok=True)
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+
+        fd = os.open(os_path, flags, 0o644)
+        try:
+            total = 0
+            size = data.size
+            chunk = 1024 * 1024
+            pos = 0
+            while pos < size:
+                want = min(chunk, size - pos)
+                buf = data.pread(want, pos)
+                if not buf:
+                    break
+                view = memoryview(buf)
+                while view:
+                    written = os.write(fd, view)
+                    if written == 0:
+                        raise io.BlockingIOError(
+                            f"Short write at offset {pos + total}"
+                        )
+                    view = view[written:]
+                    total += written
+                pos += len(buf)
+            return total
+        finally:
+            os.close(fd)
+
+    # ==================================================================
+    # Native positional-IO overrides — bypass the whole-file load
+    # ==================================================================
+    #
+    # The base :class:`Path` provides default :meth:`pread` /
+    # :meth:`pwrite` derived from :meth:`_pread` / :meth:`_pwrite`.
+    # LocalPath overrides both with single ``os.pread`` /
+    # ``os.pwrite`` syscalls so a partial read or splice doesn't
+    # materialise the entire file.
 
     def pread(
         self,

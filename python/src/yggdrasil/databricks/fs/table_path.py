@@ -113,6 +113,18 @@ class TablePath(DatabricksPath):
             "byte-streams. Use the SQL APIs."
         )
 
+    def _pread(self):
+        raise OSError(
+            f"Cannot _pread {self!r} — UC tables are not byte-streams. "
+            "Use the SQL APIs."
+        )
+
+    def _pwrite(self, data) -> int:
+        raise OSError(
+            f"Cannot _pwrite {self!r} — UC tables are not byte-streams. "
+            "Use the SQL APIs."
+        )
+
     # The base class has concrete pread/pwrite that go through
     # download+slice / read-modify-write. Override to fail fast with
     # the same SQL-pointer message rather than letting the base try

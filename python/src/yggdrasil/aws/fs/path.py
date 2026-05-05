@@ -485,49 +485,41 @@ class S3Path(Path):
             )
 
     # ==================================================================
-    # Open — return a BytesIO bound to this path
+    # Whole-file primitives — _pread / _pwrite
     # ==================================================================
+    #
+    # ``_open`` falls through to :meth:`Path._open` (returns
+    # ``BytesIO(path=self)``).  The buffer's transaction machinery
+    # downloads via :meth:`_pread` on acquire and uploads via
+    # :meth:`_pwrite` on commit.
 
-    def _open(
-        self,
-        mode: str = "rb",
-        *,
-        encoding: Optional[str] = None,
-        errors: Optional[str] = None,
-        newline: Optional[str] = None,
-        auto_open: bool = True,
-        touch: bool = False,
-    ) -> BytesIO:
-        """Return a :class:`BytesIO` bound to this S3 path.
+    def _pread(self) -> BytesIO:
+        """Whole-object download → autonomous :class:`BytesIO`.
 
-        The :class:`BytesIO`'s acquire flow:
-
-        1. Recognize ``self`` as non-local (``is_local=False``).
-        2. Build an internal transaction buffer (a regular BytesIO
-           with local-spill).
-        3. Call ``self.pread(n=-1, pos=0)`` once to download the
-           object into the transaction buffer.
-
-        On flush:
-
-        4. ``self.write_stream(transaction_buffer)`` uploads via
-           ``upload_fileobj``.
-
-        ``touch`` is honored for ``"r"`` modes (verifies presence)
-        and ignored for ``"w"`` / ``"a"`` / ``"x"`` (the file is
-        about to be created anyway).
+        One GetObject; missing key surfaces as
+        :class:`FileNotFoundError`. The buffer is detached (in-memory
+        / local-spill); subsequent edits travel back via
+        :meth:`_pwrite`.
         """
-        del encoding, errors, newline  # Binary I/O only at this layer.
+        data = self.pread(-1, 0)
+        bio = BytesIO()
+        bio.open()
+        if data:
+            bio.write(data)
+            bio.seek(0)
+        return bio
 
-        if touch and "r" in mode and "+" not in mode:
-            if not self.exists():
-                raise FileNotFoundError(self.full_path())
+    def _pwrite(self, data: BytesIO) -> int:
+        """Upload *data* to this S3 key, replacing any existing object.
 
-        return BytesIO(
-            path=self,
-            mode=mode,
-            auto_open=auto_open,
-        )
+        Routes through :meth:`write_stream` so the multipart
+        threshold and adaptor logic (handles ``BytesIO``, raw bytes,
+        and stream sources) stays in one place.
+        """
+        if not data.opened:
+            data.open()
+        data.seek(0)
+        return self.write_stream(data)
 
     # ==================================================================
     # pread — Range-based GetObject
@@ -588,25 +580,11 @@ class S3Path(Path):
                 close()
         return data
 
-    def pwrite(
-        self,
-        data: Union[bytes, bytearray, memoryview],
-        pos: int,
-        *,
-        parents: bool = True,
-    ) -> int:
-        """Positional write via read-modify-write.
-
-        S3 has no positional write primitive. We delegate to the
-        inherited helper which reads the full object, splices, and
-        writes back — slow but correct.
-
-        Most callers don't hit this: a :class:`BytesIO` bound to
-        an S3 path absorbs positional writes into its local
-        transaction buffer and flushes once on close via
-        :meth:`write_stream`.
-        """
-        return self._pwrite_via_rmw(data, pos, parents=parents)
+    # ``pwrite`` falls through to :meth:`Path.pwrite` (default —
+    # read-modify-write via :meth:`_pread` + :meth:`_pwrite`).  Most
+    # callers don't hit it directly: a :class:`BytesIO` bound to an
+    # S3 path absorbs positional writes into its local transaction
+    # buffer and flushes once on close.
 
     # ==================================================================
     # write_stream — multipart-aware upload

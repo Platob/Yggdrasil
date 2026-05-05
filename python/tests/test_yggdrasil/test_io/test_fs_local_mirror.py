@@ -71,6 +71,27 @@ class FakeRemote(Path):
     def _open(self, mode="rb", **kwargs):
         return BytesIO(self, mode=mode)
 
+    def _pread(self):
+        FAKE_COUNTERS["pread"] = FAKE_COUNTERS.get("pread", 0) + 1
+        entry = FAKE_STORE.get(self.full_path())
+        if entry is None:
+            raise FileNotFoundError(self.full_path())
+        data, _ = entry
+        bio = BytesIO()
+        bio.open()
+        if data:
+            bio.write(data)
+            bio.seek(0)
+        return bio
+
+    def _pwrite(self, data):
+        if not data.opened:
+            data.open()
+        size = data.size
+        payload = data.pread(size, 0) if size else b""
+        FAKE_STORE[self.full_path()] = (bytes(payload), time.time())
+        return len(payload)
+
     def pread(self, n, pos, *, default=...):
         FAKE_COUNTERS["pread"] = FAKE_COUNTERS.get("pread", 0) + 1
         entry = FAKE_STORE.get(self.full_path())
@@ -82,9 +103,6 @@ class FakeRemote(Path):
         if n < 0:
             return data[pos:]
         return data[pos:pos + n]
-
-    def pwrite(self, data, pos, *, parents=True):
-        return self._pwrite_via_rmw(data, pos, parents=parents)
 
     def read_bytes(self, *, raise_error=True):
         FAKE_COUNTERS["read_bytes"] = FAKE_COUNTERS.get("read_bytes", 0) + 1
