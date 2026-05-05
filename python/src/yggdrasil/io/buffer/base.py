@@ -469,11 +469,6 @@ class TabularIO(Disposable, ABC, Generic[O]):
         if not issubclass(target, cls) and target is not cls:
             target = cls
 
-        if target.default_mime_type() != media_type.mime_type:
-            raise ValueError(
-                f"Cannot build {target} with given media type {media_type}"
-            )
-
         return object.__new__(target)
 
     def __init__(
