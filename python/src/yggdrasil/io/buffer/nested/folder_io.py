@@ -1329,9 +1329,24 @@ def _has_marker(path_like: Any, marker: str) -> bool:
     trip, swallowing every transient error. Both probes treat
     "couldn't decide" as "no" so a stat hiccup never upgrades a
     plain folder to a typed subclass it shouldn't be.
+
+    Local string / :class:`os.PathLike` inputs take a direct
+    :func:`os.path.isdir` fast path: no Path coercion, no URL
+    parsing — :meth:`FolderIO.__new__` runs this probe twice per
+    construction so the savings compound on hot loops.
     """
     try:
-        if isinstance(path_like, Path):
+        if isinstance(path_like, str):
+            if path_like and "://" not in path_like:
+                return os.path.isdir(os.path.join(path_like, marker))
+            probe = Path.from_(path_like, default=None)
+        elif isinstance(path_like, os.PathLike) and not isinstance(path_like, Path):
+            return os.path.isdir(os.path.join(os.fspath(path_like), marker))
+        elif isinstance(path_like, Path):
+            if path_like.is_local:
+                return os.path.isdir(
+                    os.path.join(path_like.full_path(), marker)
+                )
             probe = path_like
         else:
             probe = Path.from_(path_like, default=None)

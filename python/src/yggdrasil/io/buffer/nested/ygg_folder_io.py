@@ -48,6 +48,7 @@ import yggdrasil.pickle.json as json_module
 from yggdrasil.io.enums import MimeType, MimeTypes
 from yggdrasil.io.fs import Path
 from yggdrasil.io.stats import Stats, STATS_FILENAME
+from .base import _run_in_threads
 from .folder_io import FolderIO
 
 
@@ -86,21 +87,63 @@ def _validate_metadata_key(key: str) -> str:
     return key
 
 
+def _parse_checkpoint_lines(blob: bytes) -> list[dict[str, Any]]:
+    """Decode a JSONL checkpoint blob, skipping torn / non-dict lines.
+
+    Shared between :meth:`YGGFolderIO.list_checkpoints` and the
+    fallback path of :meth:`YGGFolderIO._read_last_checkpoint_record`.
+    Splits on ``b"\\n"`` instead of ``splitlines`` so an embedded
+    ``\\r`` in a (mistakenly) Windows-encoded payload doesn't get
+    treated as a record boundary.
+    """
+    out: list[dict[str, Any]] = []
+    for raw in blob.split(b"\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json_module.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            out.append(obj)
+    return out
+
+
 def is_ygg_folder(path: "Path | str | os.PathLike") -> bool:
     """Probe ``<path>/.ygg/`` to classify a folder.
 
     Returns ``True`` when the directory exists and has a ``.ygg``
-    subdirectory; ``False`` for plain folders or missing paths. The
-    probe is a single backend round-trip (``Path.exists``), kept
-    cheap because :meth:`FolderIO.__new__` calls it on every folder
-    construction.
+    subdirectory; ``False`` for plain folders or missing paths.
+
+    Local paths take a fast path through :func:`os.path.isdir` —
+    one direct ``stat`` syscall, no Path / URL allocation, no
+    backend round-trip. :meth:`FolderIO.__new__` calls this probe
+    on every folder construction, so the saved allocations add up
+    quickly when a hot loop repeatedly opens the same folder.
     """
+    if isinstance(path, str):
+        # Fast path for the most common caller shape (string path).
+        if path and "://" not in path:
+            try:
+                return os.path.isdir(os.path.join(path, YGGFolderIO.YGG_DIR_NAME))
+            except (OSError, ValueError):
+                return False
+    if isinstance(path, os.PathLike) and not isinstance(path, Path):
+        try:
+            return os.path.isdir(os.path.join(os.fspath(path), YGGFolderIO.YGG_DIR_NAME))
+        except (OSError, ValueError):
+            return False
     if not isinstance(path, Path):
         try:
             path = Path.from_(path)
         except Exception:
             return False
     try:
+        if path.is_local:
+            return os.path.isdir(
+                os.path.join(path.full_path(), YGGFolderIO.YGG_DIR_NAME)
+            )
         return (path / YGGFolderIO.YGG_DIR_NAME).exists()
     except Exception:
         return False
@@ -176,29 +219,90 @@ class YGGFolderIO(FolderIO):
     STATS_FILENAME: ClassVar[str] = STATS_FILENAME
 
     # ==================================================================
-    # Sidecar paths
+    # Sidecar paths — memoised on first access
     # ==================================================================
+    #
+    # Each property used to rebuild a fresh :class:`Path` per call
+    # via ``self.path / NAME``. On hot loops (e.g. a thousand
+    # ``checkpoint()`` calls in a streaming pipeline) that's a
+    # thousand redundant Path allocations. Cache the four sidecar
+    # paths on the instance and reuse them.
 
     @property
     def ygg_path(self) -> Path:
         """Hidden ``.ygg/`` subfolder used for out-of-band metadata."""
-        return self.path / self.YGG_DIR_NAME
+        cached = self.__dict__.get("_ygg_path_cache")
+        if cached is None:
+            cached = self.path / self.YGG_DIR_NAME
+            self.__dict__["_ygg_path_cache"] = cached
+        return cached
 
     @property
     def _ygg_checkpoint_log(self) -> Path:
-        return self.ygg_path / self.CHECKPOINT_LOG_NAME
+        cached = self.__dict__.get("_ygg_log_cache")
+        if cached is None:
+            cached = self.ygg_path / self.CHECKPOINT_LOG_NAME
+            self.__dict__["_ygg_log_cache"] = cached
+        return cached
 
     @property
     def _ygg_metadata_dir(self) -> Path:
-        return self.ygg_path / self.METADATA_DIR_NAME
+        cached = self.__dict__.get("_ygg_meta_dir_cache")
+        if cached is None:
+            cached = self.ygg_path / self.METADATA_DIR_NAME
+            self.__dict__["_ygg_meta_dir_cache"] = cached
+        return cached
 
     @property
     def _ygg_stats_path(self) -> Path:
-        return self.ygg_path / self.STATS_FILENAME
+        cached = self.__dict__.get("_ygg_stats_cache")
+        if cached is None:
+            cached = self.ygg_path / self.STATS_FILENAME
+            self.__dict__["_ygg_stats_cache"] = cached
+        return cached
+
+    def _ensure_ygg_dir(self) -> None:
+        """``mkdir(parents=True, exist_ok=True)`` — at most once per instance.
+
+        ``exist_ok=True`` makes the syscall idempotent, but it's not
+        free: every call still pays a stat (and on remote backends, a
+        round-trip). The dir lives for the entire lifetime of the
+        folder once created, so a per-instance "I've already mkdir'd
+        this" flag is correct and trivial to maintain.
+        """
+        if self.__dict__.get("_ygg_dir_ensured"):
+            return
+        self.ygg_path.mkdir(parents=True, exist_ok=True)
+        self.__dict__["_ygg_dir_ensured"] = True
+
+    def _ensure_metadata_dir(self) -> None:
+        if self.__dict__.get("_ygg_meta_dir_ensured"):
+            return
+        self._ygg_metadata_dir.mkdir(parents=True, exist_ok=True)
+        self.__dict__["_ygg_meta_dir_ensured"] = True
+        # The metadata dir lives under .ygg/, so creating it implies
+        # the parent — mark it so future ``_ensure_ygg_dir`` calls
+        # short-circuit too.
+        self.__dict__["_ygg_dir_ensured"] = True
 
     # ==================================================================
     # Checkpoints
     # ==================================================================
+
+    #: Tail window (bytes) used by :meth:`latest_checkpoint` to skip
+    #: re-parsing the entire log when only the most recent record is
+    #: needed. 8 KiB comfortably fits dozens of typical records (a
+    #: ``checkpoint`` JSON line is ~200 B with a handful of files
+    #: listed); on the rare case the last record overflows this we
+    #: fall back to a full read.
+    _CHECKPOINT_TAIL_WINDOW: ClassVar[int] = 8192
+
+    #: Upper bound on payload size for the lockless append fast-path
+    #: in :meth:`checkpoint`. POSIX guarantees ``write()`` atomicity
+    #: only up to ``PIPE_BUF`` (typically 4 KiB on Linux, 512 B on
+    #: macOS); we play it safe at 512 B so an interleaved concurrent
+    #: append from another process never tears a JSON line.
+    _APPEND_ATOMIC_LIMIT: ClassVar[int] = 512
 
     def checkpoint(
         self,
@@ -214,7 +318,9 @@ class YGGFolderIO(FolderIO):
         to *this point* a coherent unit, with optional caller-supplied
         ``message`` and arbitrary ``**extra`` fields. Concurrent
         ``checkpoint()`` callers serialise on a transient ``.w.lock``
-        against the log file so JSON lines never tear.
+        against the log file so JSON lines never tear; the lock is
+        held only for the append, not for the (much more expensive)
+        record assembly.
 
         ``owner`` is a compute-identifier URL (see
         :func:`yggdrasil.io.buffer._concurrency.compute_identifier_url`
@@ -228,6 +334,9 @@ class YGGFolderIO(FolderIO):
         if owner is None:
             owner = compute_identifier_url()
 
+        # Build the record outside the write lock — id discovery
+        # (tail-read) and file listing both touch the filesystem and
+        # would be wasted contention if held inside ``.w.lock``.
         record: dict[str, Any] = {
             "id": self._next_checkpoint_id(),
             "ts": time.time(),
@@ -247,11 +356,30 @@ class YGGFolderIO(FolderIO):
             json_module.dumps(record, to_bytes=False).encode("utf-8") + b"\n"
         )
 
-        self.ygg_path.mkdir(parents=True, exist_ok=True)
+        self._ensure_ygg_dir()
         log = self._ygg_checkpoint_log
+
+        # Local files: rely on POSIX / Windows ``O_APPEND`` atomicity
+        # for writes smaller than ``PIPE_BUF`` (typically 4 KiB on
+        # Linux, 512 B on macOS). A checkpoint line is on the order
+        # of 200–800 B even with a hundred files listed, so the
+        # append is atomic and the ``.w.lock`` sidecar is unneeded —
+        # cuts the lock-file clutter and the per-call sidecar
+        # round-trip on the hot path. Remote backends (where atomic
+        # append is not guaranteed) still serialise on the lock.
+        if log.is_local and len(line) <= self._APPEND_ATOMIC_LIMIT:
+            try:
+                log.write_bytes(line, mode="ab")
+                # Bump the in-memory id counter on success so the
+                # next call skips the tail read entirely.
+                self.__dict__["_cached_next_id"] = record["id"] + 1
+                return record
+            except OSError:
+                pass
 
         with log.lock(write=True, wait=30):
             log.write_bytes(line, mode="ab")
+        self.__dict__["_cached_next_id"] = record["id"] + 1
         return record
 
     def list_checkpoints(self) -> list[dict[str, Any]]:
@@ -269,8 +397,54 @@ class YGGFolderIO(FolderIO):
             return []
         if not blob:
             return []
-        out: list[dict[str, Any]] = []
-        for raw in blob.decode("utf-8", errors="replace").splitlines():
+        return _parse_checkpoint_lines(blob)
+
+    def latest_checkpoint(self) -> "dict[str, Any] | None":
+        """The most recent checkpoint record, or ``None`` if none.
+
+        Tail-reads the log via :meth:`Path.pread` so a million-record
+        history doesn't pay a full scan + JSON parse to surface the
+        last commit. Falls back to a full read in the (rare) case
+        where the last record straddles the tail window.
+        """
+        return self._read_last_checkpoint_record()
+
+    def _read_last_checkpoint_record(self) -> "dict[str, Any] | None":
+        log = self._ygg_checkpoint_log
+        try:
+            size = log.size
+        except (OSError, FileNotFoundError):
+            return None
+        if not size:
+            return None
+
+        window = self._CHECKPOINT_TAIL_WINDOW
+        pos = max(0, size - window)
+        try:
+            blob = log.pread(n=size - pos, pos=pos, default=b"")
+        except (OSError, ValueError):
+            blob = b""
+
+        if blob and pos > 0:
+            # Drop the leading partial record; its newline boundary
+            # is the first ``\n`` in the window.
+            nl = blob.find(b"\n")
+            if nl < 0:
+                # Last record longer than the window — fall back to a
+                # full read (vanishingly rare in practice).
+                blob = b""
+            else:
+                blob = blob[nl + 1:]
+
+        if not blob:
+            try:
+                blob = log.read_bytes(raise_error=False)
+            except OSError:
+                return None
+            if not blob:
+                return None
+
+        for raw in reversed(blob.split(b"\n")):
             line = raw.strip()
             if not line:
                 continue
@@ -279,22 +453,32 @@ class YGGFolderIO(FolderIO):
             except Exception:
                 continue
             if isinstance(obj, dict):
-                out.append(obj)
-        return out
-
-    def latest_checkpoint(self) -> "dict[str, Any] | None":
-        """The most recent checkpoint record, or ``None`` if none."""
-        records = self.list_checkpoints()
-        return records[-1] if records else None
+                return obj
+        return None
 
     def _next_checkpoint_id(self) -> int:
-        prev = self.latest_checkpoint()
+        """In-memory counter, seeded once from the on-disk tail.
+
+        After the first call, subsequent ``checkpoint()``s skip the
+        ``stat`` + ``pread`` entirely — the writer instance owns its
+        own monotonic id stream. Concurrent writers from different
+        processes can still race here exactly as they always have:
+        the on-disk log tolerates duplicate ids and ``list_checkpoints``
+        returns them in append order.
+        """
+        cached = self.__dict__.get("_cached_next_id")
+        if cached is not None:
+            return cached
+        prev = self._read_last_checkpoint_record()
         if prev is None:
-            return 1
-        try:
-            return int(prev.get("id", 0)) + 1
-        except (TypeError, ValueError):
-            return 1
+            seeded = 1
+        else:
+            try:
+                seeded = int(prev.get("id", 0)) + 1
+            except (TypeError, ValueError):
+                seeded = 1
+        self.__dict__["_cached_next_id"] = seeded
+        return seeded
 
     def _current_child_filenames(self) -> list[str]:
         """Names of the *direct* tabular children at this moment.
@@ -303,16 +487,14 @@ class YGGFolderIO(FolderIO):
         the checkpoint was taken, so a reader replaying the log can
         reconstruct the folder's state at each commit point. Hidden
         / sidecar entries are filtered via :meth:`_is_ignored_path`.
+        Single ``iterdir`` round-trip — no per-entry stat calls.
         """
         try:
             entries = self.path.iterdir()
         except (OSError, FileNotFoundError):
             return []
-        names: list[str] = []
-        for entry in entries:
-            if self._is_ignored_path(entry):
-                continue
-            names.append(entry.name)
+        is_ignored = self._is_ignored_path
+        names = [e.name for e in entries if not is_ignored(e)]
         names.sort()
         return names
 
@@ -330,7 +512,7 @@ class YGGFolderIO(FolderIO):
         partial write.
         """
         slug = _validate_metadata_key(key)
-        self._ygg_metadata_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_metadata_dir()
         target = self._ygg_metadata_dir / f"{slug}.json"
         payload = json_module.dumps(value)
         try:
@@ -402,17 +584,28 @@ class YGGFolderIO(FolderIO):
                 distinct=distinct,
             )
 
-        per_child: list[Stats] = []
-        for child in self.iter_children(options=options):
+        # Per-child stats are independent — compute concurrently when
+        # the caller passed a thread budget on ``options``. Each child
+        # opens its own IO so there's no shared state to fight over.
+        children = list(self.iter_children(options=options))
+        max_workers = getattr(options, "max_workers", 0) or 0
+
+        def _compute_child(child: Any) -> "Stats | None":
             try:
-                child_stats = Stats.compute(
+                return Stats.compute(
                     child.read_arrow_table(options=options),
                     name=child.path.name,
                     distinct=distinct,
                 )
             except Exception:
-                continue
-            per_child.append(child_stats)
+                return None
+
+        per_child: list[Stats] = [
+            s for s in _run_in_threads(
+                children, _compute_child, max_workers=max_workers,
+            )
+            if s is not None
+        ]
 
         if not per_child:
             # Empty folder — return a zero-row Stats with the
@@ -446,7 +639,7 @@ class YGGFolderIO(FolderIO):
         """
         if stats is None:
             stats = self.collect_stats(distinct=distinct, per_file=per_file)
-        self.ygg_path.mkdir(parents=True, exist_ok=True)
+        self._ensure_ygg_dir()
         payload = stats.to_ipc()
         target = self._ygg_stats_path
         try:
@@ -493,6 +686,12 @@ class YGGFolderIO(FolderIO):
     #: the rewrite — the win on a 3-file folder isn't worth a fsync.
     OPTIMIZE_MIN_FILES: ClassVar[int] = 5
 
+    #: Default thread budget for :meth:`optimize`'s per-leaf fan-out.
+    #: Compaction is I/O-bound (read sources, write merged, unlink
+    #: sources) so a small pool dramatically shortens wall time on a
+    #: tree of dozens of leaves without saturating the FS.
+    OPTIMIZE_MAX_WORKERS: ClassVar[int] = 8
+
     def optimize(
         self,
         *,
@@ -500,6 +699,7 @@ class YGGFolderIO(FolderIO):
         min_files: "int | None" = None,
         wait: Any = None,
         partitions: "Mapping[str, Iterable[Any]] | None" = None,
+        max_workers: "int | None" = None,
     ) -> "YGGFolderIO":
         """Compact small leaf files into ``~target_bytes`` chunks.
 
@@ -517,30 +717,36 @@ class YGGFolderIO(FolderIO):
         partition tuples — a mapping from partition column name to
         the values to touch (e.g. ``{"partition_key": [123, 456]}``).
         Only the leaf folders matching the cartesian product of those
-        values are visited; the rest of the tree is left alone. This
-        is the smart-optimize path used after a partition-routed
-        write (cf. :meth:`Session._send_many`): a batch only touches
-        a handful of partitions, and we don't want a full-tree walk
-        to amortise compaction across the whole cache. When
-        ``partitions`` is ``None`` (default), every leaf is walked.
+        values are visited; the rest of the tree is left alone.
 
-        Concurrency:
+        ``max_workers`` controls the per-leaf fan-out. Defaults to
+        :attr:`OPTIMIZE_MAX_WORKERS`; pass ``1`` for sequential
+        compaction.
 
-        - Each leaf-folder rewrite holds an exclusive ``.w.lock``
-          on the leaf so a parallel optimizer can't fight us for
-          the same files.
-        - :meth:`_read_arrow_batches` takes a shared ``.r.lock``
-          on the same leaf during reads, so a caller iterating
-          batches while an optimize is running waits at the leaf
-          boundary instead of seeing half-deleted files.
+        Concurrency model — *lock-free*. The compactor relies on
+        write-then-unlink ordering for correctness: each merged
+        file is staged + atomically renamed before any source is
+        removed, so a concurrent reader sees one of three
+        consistent shapes — ``{old sources}``, ``{old sources +
+        merged}``, or ``{merged}``. The middle window briefly
+        produces duplicate rows; the response cache's ``match_by``
+        de-duplication on read absorbs them. Trading the
+        per-source ``.rw.lock`` sidecars for this small duplicate
+        window is a deliberate choice: lock files were the single
+        biggest source of clutter and FS-stat traffic in the
+        original design.
 
-        ``wait`` (default ``None`` = wait forever) follows the
-        :class:`WaitingConfig` convention used by
-        :meth:`Path.lock`. Returns ``self`` so call sites can
-        chain ``cache.optimize().read_arrow_table()``.
+        ``wait`` is accepted for API parity but unused in the
+        lock-free path. Returns ``self`` so call sites can chain
+        ``cache.optimize().read_arrow_table()``.
         """
+        del wait
+
         target = int(target_bytes if target_bytes is not None else self.OPTIMIZE_TARGET_BYTES)
         threshold = int(min_files if min_files is not None else self.OPTIMIZE_MIN_FILES)
+        workers = int(
+            max_workers if max_workers is not None else self.OPTIMIZE_MAX_WORKERS
+        )
 
         if target <= 0 or threshold <= 0:
             return self
@@ -548,17 +754,21 @@ class YGGFolderIO(FolderIO):
             return self
 
         if partitions:
-            leaves = self._partition_leaves(partitions)
+            leaves = list(self._partition_leaves(partitions))
         else:
-            leaves = self._walk_optimize_leaves(self.path)
+            leaves = list(self._walk_optimize_leaves(self.path))
 
-        for leaf_folder in leaves:
+        if not leaves:
+            return self
+
+        def _compact_one(leaf_folder: Path) -> None:
             self._compact_leaf_folder(
                 leaf_folder,
                 target_bytes=target,
                 min_files=threshold,
-                wait=wait,
             )
+
+        _run_in_threads(leaves, _compact_one, max_workers=workers)
         return self
 
     def _partition_leaves(
@@ -707,7 +917,6 @@ class YGGFolderIO(FolderIO):
         *,
         target_bytes: int,
         min_files: int,
-        wait: Any,
     ) -> None:
         """Bin-pack the small files in ``leaf`` into ``~target_bytes`` chunks.
 
@@ -717,8 +926,9 @@ class YGGFolderIO(FolderIO):
         carrying a single file are dropped (no compaction needed).
         Each surviving bucket is written to one staging file, then
         atomically renamed; the consumed sources are removed last
-        so a reader holding the shared lock sees either the old
-        layout or the new one.
+        so a reader sees either the old layout, the merged-plus-old
+        intermediate (duplicate rows, deduped on read), or the new
+        layout — never a half-deleted folder.
 
         ``min_files`` is checked against the *small file* count, not
         the total — an otherwise-fine folder with one stray small
@@ -764,21 +974,16 @@ class YGGFolderIO(FolderIO):
 
         # A bucket of size 1 is a no-op (renaming a single file to
         # itself doesn't help), so drop those before paying for the
-        # lock.
+        # rewrite.
         buckets = [b for b in buckets if len(b) > 1]
         if not buckets:
             return
 
         media_type = self._default_child_media_type()
 
-        # No leaf-folder lock: a destructive op only locks the
-        # specific source files it's about to read+remove, leaving
-        # untouched siblings in the same leaf free to read/write
-        # concurrently. The merged file is staged + renamed under a
-        # fresh name, so it never collides with the locked sources.
         for bucket in buckets:
             self._write_compact_bucket(
-                leaf, bucket, media_type=media_type, wait=wait,
+                leaf, bucket, media_type=media_type,
             )
 
     def _write_compact_bucket(
@@ -787,160 +992,82 @@ class YGGFolderIO(FolderIO):
         sources: "list[Path]",
         *,
         media_type: Any,
-        wait: Any,
     ) -> None:
         """Read every file in ``sources`` and write one merged file.
 
-        Per-source read failures abort the bucket — better to
-        leave the small files in place than land an incomplete
-        merge. The merged write goes through :meth:`Path.make_staging`
-        so a crashed compactor leaves a recognisable ``tmp-…``
-        sidecar that the next read enumeration ignores.
+        Lock-free. The ordering guarantee is the only correctness
+        primitive: stage + atomic rename of the merged file *first*,
+        then unlink the sources. A reader that catches us mid-
+        compaction sees ``{merged + sources}`` until the unlinks
+        complete — duplicate rows that the response cache dedupes
+        on read. A reader that opens a source while we're unlinking
+        either succeeds (the open holds an fd through the unlink on
+        POSIX) or treats it as a missing-file skip.
 
-        Locking is per-source: each input file is held under its
-        own ``.rw.lock`` for the read+remove window, and the lock
-        is released only after the source is unlinked. A concurrent
-        reader that asks for the same file waits on the same
-        sidecar (cf. :meth:`_read_child_batches`) and then either
-        sees the file (we hadn't gotten there yet) or treats it
-        as missing (we already removed it). Either outcome is safe
-        — the row contents live on in the merged file we wrote
-        before touching the sources.
+        Per-source read failures abort the bucket — better to leave
+        the small files in place than land an incomplete merge.
         """
         from yggdrasil.io.buffer.base import TabularIO
 
-        # Acquire all per-source locks up front, in name order.
-        # Same ordering across compactors → no deadlock under
-        # contention; same ordering as the reader's listing →
-        # waiters block on the first file we hold and pick the
-        # rest up incrementally as we release.
         ordered_sources = sorted(sources, key=lambda p: p.name)
-        held: list[Any] = []
-        try:
-            for source in ordered_sources:
-                lock = source.lock(read=True, write=True, wait=wait)
-                lock.__enter__()
-                held.append(lock)
 
-            tables: list[pa.Table] = []
-            for source in ordered_sources:
+        tables: list[pa.Table] = []
+        for source in ordered_sources:
+            try:
+                source_io = TabularIO.from_path(source)
+            except Exception:
+                return
+            with source_io:
                 try:
-                    source_io = TabularIO.from_path(source)
+                    tables.append(source_io.read_arrow_table())
                 except Exception:
                     return
-                with source_io:
-                    try:
-                        tables.append(source_io.read_arrow_table())
-                    except Exception:
-                        return
 
-            if not tables:
-                return
-
-            merged = pa.concat_tables(tables, promote_options="default")
-            if merged.num_rows == 0:
-                return
-
-            staging = leaf.make_staging(media_type=media_type)
-            try:
-                target_io = TabularIO.from_path(staging, media_type=media_type)
-                with target_io:
-                    target_io.write_arrow_table(merged)
-            except Exception:
-                try:
-                    staging.remove(allow_not_found=True)
-                except Exception:
-                    pass
-                return
-
-            final_name = self._next_child_name_in(leaf, media_type=media_type)
-            final_path = leaf / final_name
-            try:
-                staging.rename(final_path)
-            except Exception:
-                try:
-                    staging.remove(allow_not_found=True)
-                except Exception:
-                    pass
-                return
-
-            # Sources are dropped last and still under their per-file
-            # locks. A reader that listed the leaf before the rename
-            # but waited on a source lock now sees the file removed
-            # (skip path); a reader that listed after the rename and
-            # before the unlink reads the merged file plus any
-            # not-yet-removed sources — duplicate rows are tolerated
-            # by the response cache's match-by deduplication on read.
-            for source in ordered_sources:
-                try:
-                    source.remove(allow_not_found=True)
-                except Exception:
-                    pass
-        finally:
-            # Release in reverse to mirror nested context-manager
-            # exit ordering.
-            for lock in reversed(held):
-                try:
-                    lock.__exit__(None, None, None)
-                except Exception:
-                    pass
-
-    def _read_child_batches(
-        self,
-        child: Any,
-        options: Any,
-    ) -> "Iterator[pa.RecordBatch]":
-        """Wait on a per-child ``.rw.lock`` before draining a file's batches.
-
-        :meth:`_compact_leaf_folder` holds an exclusive ``.rw.lock``
-        on each source file while it reads + removes it. Mirroring
-        that on the read side gives readers a per-file rendezvous —
-        if a compactor is in flight the reader blocks at the
-        contended file (and only that file) instead of the whole
-        leaf folder. Sub-folder children (further :class:`NestedIO`
-        layers) defer to the inherited path; the lock only matters
-        for actual data files where the compactor can race us.
-        """
-        from yggdrasil.io.buffer.base import TabularIO
-        from .base import NestedIO
-
-        if isinstance(child, NestedIO):
-            yield from super()._read_child_batches(child, options)
+        if not tables:
             return
 
-        if not isinstance(child, TabularIO):
-            # Pure :class:`BytesIO` children with no tabular surface
-            # — nothing to lock against, nothing to read.
+        merged = pa.concat_tables(tables, promote_options="default")
+        if merged.num_rows == 0:
             return
 
-        child_path = getattr(child, "path", None)
-        if child_path is None:
-            yield from super()._read_child_batches(child, options)
-            return
-
-        # ``read=True, write=True`` matches the compactor's sidecar
-        # selection so the two sides actually serialise on the same
-        # ``.rw.lock`` file. The lock is dropped as soon as we
-        # finish draining the child's batches — this is a per-file
-        # rendezvous, not a folder-wide barrier.
+        staging = leaf.make_staging(media_type=media_type)
         try:
-            file_lock = child_path.lock(read=True, write=True)
+            target_io = TabularIO.from_path(staging, media_type=media_type)
+            with target_io:
+                target_io.write_arrow_table(merged)
         except Exception:
-            yield from super()._read_child_batches(child, options)
-            return
-
-        with file_lock:
-            # The compactor unlinks sources while still holding
-            # their locks; a reader that waited on the lock and
-            # then finds the file gone treats it as a clean skip
-            # (the rows live on in the merged file the compactor
-            # wrote before touching the sources).
             try:
-                if not child_path.exists():
-                    return
+                staging.remove(allow_not_found=True)
             except Exception:
                 pass
-            yield from super()._read_child_batches(child, options)
+            return
+
+        final_name = self._next_child_name_in(leaf, media_type=media_type)
+        final_path = leaf / final_name
+        try:
+            staging.rename(final_path)
+        except Exception:
+            try:
+                staging.remove(allow_not_found=True)
+            except Exception:
+                pass
+            return
+
+        # Sources are dropped last (post-rename) so a reader has
+        # already-published merged rows to fall back on. Best-effort
+        # — a missing source is a no-op (someone else won the race).
+        for source in ordered_sources:
+            try:
+                source.remove(allow_not_found=True)
+            except Exception:
+                pass
+
+    # ``_read_child_batches`` is intentionally NOT overridden. The
+    # base implementation reads each child without holding a lock,
+    # which is exactly what we want for ``permissive on read/write
+    # locks``. The compactor's stage-rename-then-unlink discipline
+    # keeps reads correct without per-file ``.rw.lock`` sidecars
+    # cluttering the data directory and burning a stat per child.
 
     # ==================================================================
     # Spark — Arrow → Spark via the dedicated connector
