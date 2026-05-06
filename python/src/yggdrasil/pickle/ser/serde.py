@@ -62,7 +62,11 @@ def _dump(
 ) -> None:
     dumped = Serialized.from_python_object(obj, metadata=metadata, codec=codec)
     fp.write(MAGIC)
-    fp.write(dumped.data.parent.to_bytes())
+    # ``write_to`` rebuilds the full wire frame (header + payload).
+    # The previous shape (``data.parent.to_bytes()``) leaned on the
+    # bounded view's parent back-pointer; that's gone with the new
+    # snapshot-on-bound-view semantics.
+    fp.write(dumped.write_to().to_bytes())
 
 
 def _dump_path(

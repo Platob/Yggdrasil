@@ -365,12 +365,13 @@ def normalize_headers(
 
             if not has_content_type:
                 media_type = media_type or body.media_type
-                out["Content-Type"] = media_type.full_mime_type(concat_codec=False).value
+                if media_type is not None:
+                    out["Content-Type"] = media_type.full_mime_type(concat_codec=False).value
 
-                if not has_content_encoding:
-                    codec: Optional[Codec] = media_type.codec
-                    if codec is not None:
-                        out["Content-Encoding"] = codec.name
+                    if not has_content_encoding:
+                        codec: Optional[Codec] = media_type.codec
+                        if codec is not None:
+                            out["Content-Encoding"] = codec.name
 
             if not has_content_length:
                 out["Content-Length"] = str(body.size)

@@ -135,7 +135,10 @@ def _sniff_media_from_body(
             mime_types=[content_type, content_encoding],
             default=MediaType.from_mime(MimeTypes.OCTET_STREAM)
         )
-    return body.media_type
+    declared = body.media_type
+    if declared is not None:
+        return declared
+    return MediaType.from_mime(MimeTypes.OCTET_STREAM)
 
 
 def _media_type_from_headers(
@@ -184,7 +187,7 @@ def _ensure_media_headers(
 
     headers["Content-Length"] = str(body.size)
 
-    if body._stats.media_type is None and not media.mime_type.is_any_bytes:
+    if body.media_type is None and not media.mime_type.is_any_bytes:
         try:
             body.with_media_type(media, copy=False)
         except Exception:
@@ -216,7 +219,7 @@ def _parse_response_buffer(
     if body is MISSING or body is None:
         return BytesIO(media_type=media_type) if media_type is not None else BytesIO()
     if isinstance(body, BytesIO):
-        if media_type is not None and body._stats.media_type is None:
+        if media_type is not None and body.media_type is None:
             try:
                 body.with_media_type(media_type, copy=False)
             except Exception:

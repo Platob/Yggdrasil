@@ -149,6 +149,45 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         "_scratch",
     )
 
+    def __new__(
+        cls,
+        data: Any = None,
+        *,
+        holder: "Holder | None" = None,
+        owns_holder: bool = False,
+        mode: str = "rb+",
+        media_type: Any = None,
+        **kwargs: Any,
+    ):
+        """Dispatch to a registered Tabular leaf when *media_type*
+        identifies one.
+
+        Lets ``BytesIO(data, media_type=MediaTypes.PARQUET)`` land on
+        :class:`ParquetIO` directly, which is what the pickle ser
+        layer relies on for round-tripping a typed buffer through
+        ``BytesIO(payload, media_type=...)`` — same shape as the
+        scheme dispatch on :class:`Holder`. Subclass calls
+        (``ParquetIO(...)``) skip the dispatch and stay on the
+        concrete class.
+        """
+        if cls is BytesIO and media_type is not None:
+            from yggdrasil.io.tabular.base import Tabular
+            from yggdrasil.data.enums.media_type import MediaType
+            mt = MediaType.from_(media_type, default=None)
+            if mt is not None:
+                target = Tabular.class_for_media_type(mt, default=None)
+                if target is not None and issubclass(target, BytesIO) and target is not cls:
+                    return target.__new__(
+                        target,
+                        data=data,
+                        holder=holder,
+                        owns_holder=owns_holder,
+                        mode=mode,
+                        media_type=media_type,
+                        **kwargs,
+                    )
+        return super().__new__(cls)
+
     def __init__(
         self,
         data: Any = None,
@@ -156,6 +195,7 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         holder: "Holder | None" = None,
         owns_holder: bool = False,
         mode: str = "rb+",
+        media_type: Any = None,
         **kwargs: Any,
     ) -> None:
         """Construct a cursor over a :class:`Holder`. Does NOT open.
@@ -202,6 +242,18 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         # :meth:`_release`. ``None`` when the BytesIO is closed; in
         # that state, ops route directly to ``self._holder``.
         self._scratch: "Holder | None" = None
+
+        # Stamp media type onto the holder's IOStats — gives the
+        # codec auto-handling path something to inspect, and makes
+        # the buffer self-describing for downstream serializers.
+        if media_type is not None:
+            try:
+                from yggdrasil.data.enums.media_type import MediaType
+                mt = MediaType.from_(media_type, default=None)
+                if mt is not None:
+                    self._holder.stat().media_type = mt
+            except Exception:
+                pass
 
     # ==================================================================
     # Construction routing
@@ -478,6 +530,10 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
     def __bool__(self) -> bool:
         return True
 
+    def __bytes__(self) -> bytes:
+        """Snapshot the active payload as :class:`bytes`."""
+        return self.to_bytes()
+
     def __repr__(self) -> str:
         state = "open" if self._acquired else "closed"
         own = "owns" if self._owns_holder else "borrows"
@@ -529,6 +585,35 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
     @property
     def name(self) -> str:
         return str(self._holder.url)
+
+    @property
+    def media_type(self):
+        """The buffer's :class:`MediaType`, or ``None``.
+
+        Convenience over ``self._holder.stat().media_type`` — same
+        thing the codec auto-handling reads.
+        """
+        try:
+            return self._holder.stat().media_type
+        except Exception:
+            return None
+
+    def with_media_type(self, media_type: Any, *, copy: bool = False) -> "BytesIO":
+        """Stamp *media_type* onto the holder's :class:`IOStats`.
+
+        With ``copy=False`` (the default), mutates ``self`` and
+        returns it. ``copy=True`` allocates a fresh holder over the
+        same bytes and returns a new BytesIO over it.
+        """
+        from yggdrasil.data.enums.media_type import MediaType
+        mt = MediaType.from_(media_type, default=None) if media_type is not None else None
+        if copy:
+            payload = self.to_bytes()
+            new_io = BytesIO(payload, media_type=mt)
+            return new_io
+        if mt is not None:
+            self._holder.stat().media_type = mt
+        return self
 
     @property
     def closed(self) -> bool:
@@ -857,6 +942,63 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
 
     def write_str_u32(self, s: str, encoding: str = "utf-8") -> int:
         return self.write_bytes_u32(s.encode(encoding))
+
+    # ==================================================================
+    # Hashing convenience — duck-typed for callers that do
+    # ``buffer.xxh3_int64()`` for fingerprinting / dedup
+    # ==================================================================
+
+    def xxh3_64(self):
+        """Return an :class:`xxhash.xxh3_64` instance over the payload.
+
+        Mirrors the legacy buffer surface a couple of HTTP layer
+        consumers expect (:func:`response._compute_response_identity_hash`
+        calls ``buffer.xxh3_64().digest()``). Falls back to a
+        ``hashlib`` shim when ``xxhash`` isn't installed; the shim
+        exposes ``digest`` / ``intdigest`` so the caller doesn't
+        notice.
+        """
+        payload = self.to_bytes()
+        try:
+            import xxhash as _xx
+            return _xx.xxh3_64(payload)
+        except Exception:
+            import hashlib
+
+            class _Fallback:
+                def __init__(self, p: bytes) -> None:
+                    self._d = hashlib.blake2b(p, digest_size=8).digest()
+
+                def digest(self) -> bytes:
+                    return self._d
+
+                def hexdigest(self) -> str:
+                    return self._d.hex()
+
+                def intdigest(self) -> int:
+                    return int.from_bytes(self._d, "big", signed=False)
+
+            return _Fallback(payload)
+
+    def xxh3_int64(self) -> int:
+        """64-bit xxh3 hash of the buffer's payload as a signed int64.
+
+        ``xxh3_64`` itself produces an unsigned 64-bit value;
+        downstream Arrow schemas pin the field as ``int64``, so we
+        wrap into signed range ``[-2**63, 2**63)`` here. Falls back
+        to ``blake2b`` when ``xxhash`` isn't installed.
+        """
+        payload = self.to_bytes()
+        try:
+            import xxhash as _xx
+            v = _xx.xxh3_64(payload).intdigest()
+        except Exception:
+            import hashlib
+            digest = hashlib.blake2b(payload, digest_size=8).digest()
+            v = int.from_bytes(digest, "big", signed=False)
+        if v >= 2 ** 63:
+            v -= 2 ** 64
+        return v
 
 
 # ===========================================================================
