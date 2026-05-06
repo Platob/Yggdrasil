@@ -16,6 +16,7 @@ class TestModeMembers:
         names = {m.name for m in Mode}
         assert names == {
             "AUTO",
+            "READ_ONLY",
             "OVERWRITE",
             "APPEND",
             "IGNORE",
@@ -64,9 +65,9 @@ class TestModeFromOSStrings:
     @pytest.mark.parametrize(
         ("os_mode", "expected"),
         [
-            ("r", Mode.AUTO),
-            ("rb", Mode.AUTO),
-            ("rt", Mode.AUTO),
+            ("r", Mode.READ_ONLY),
+            ("rb", Mode.READ_ONLY),
+            ("rt", Mode.READ_ONLY),
             ("rb+", Mode.AUTO),
             ("r+b", Mode.AUTO),
             ("w", Mode.OVERWRITE),

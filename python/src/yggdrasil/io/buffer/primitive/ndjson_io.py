@@ -145,7 +145,7 @@ class NDJsonIO(BytesIO):
     # ==================================================================
 
     @classmethod
-    def default_mime_type(cls):
+    def default_media_type(cls):
         return MimeTypes.NDJSON
 
     @classmethod

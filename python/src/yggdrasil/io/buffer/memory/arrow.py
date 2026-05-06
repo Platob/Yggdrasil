@@ -136,7 +136,7 @@ class MemoryArrowIO(TabularIO[CastOptions]):
     _FINAL_TABULAR_IO: ClassVar[bool] = True
 
     @classmethod
-    def default_mime_type(cls) -> Optional[MimeType]:
+    def default_media_type(cls) -> Optional[MimeType]:
         # In-memory containers don't claim a wire format; returning
         # None keeps them out of the media-type registry so they never
         # win factory dispatch by accident.

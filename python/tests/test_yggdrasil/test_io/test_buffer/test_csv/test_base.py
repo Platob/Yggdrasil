@@ -12,8 +12,8 @@ from .._helpers import sample_table
 
 
 class TestCsvBase:
-    def test_default_mime_type(self):
-        assert CsvIO.default_mime_type() == MimeTypes.CSV
+    def test_default_media_type(self):
+        assert CsvIO.default_media_type() == MimeTypes.CSV
 
     def test_options_class(self):
         assert CsvIO.options_class() is CsvOptions

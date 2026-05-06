@@ -11,8 +11,8 @@ from yggdrasil.io.enums import MimeTypes
 
 
 class TestXlsxBase:
-    def test_default_mime_type(self):
-        assert XlsxIO.default_mime_type() == MimeTypes.XLSX
+    def test_default_media_type(self):
+        assert XlsxIO.default_media_type() == MimeTypes.XLSX
 
     def test_options_class(self):
         assert XlsxIO.options_class() is XlsxOptions

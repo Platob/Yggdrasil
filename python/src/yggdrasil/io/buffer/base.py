@@ -407,7 +407,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
     # ------------------------------------------------------------------
 
     @classmethod
-    def default_mime_type(cls) -> "MimeType | None":
+    def default_media_type(cls) -> "MimeType | None":
         """Canonical :class:`MimeType` this subclass handles.
 
         Concrete subclasses override; intermediates (``PrimitiveIO``,
@@ -420,7 +420,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         """Auto-register concrete subclasses against their mime type."""
         super().__init_subclass__(**kwargs)
         try:
-            mime = cls.default_mime_type()
+            mime = cls.default_media_type()
         except Exception:
             return
         key = _normalize_media_key(mime)
@@ -485,19 +485,17 @@ class TabularIO(Disposable, ABC, Generic[O]):
         * Disposable lifecycle (``opened`` / ``closed`` flags).
         * ``_media_type`` — the format identity. ``None`` for opaque
           buffers; concrete leaves (ParquetIO, CsvIO, …) fill it from
-          their ``default_mime_type`` on construction.
+          their ``default_media_type`` on construction.
         * ``_persisted_data`` — a single :class:`TabularIO` slot
           holding the materialised cache. :meth:`persist` populates
           it (with a :class:`MemorySparkIO` when an active Spark
           session is reachable, otherwise a :class:`MemoryArrowIO`);
           :meth:`unpersist` clears it. Read paths short-circuit
           through it before touching the source.
-        * Spill-path slots — ``_spill_path`` / ``_owns_spill_path``
-          used by :class:`BytesIO` (and any byte-buffer-backed
-          subclass) to track durable storage. They live on
-          :class:`TabularIO` so non-buffer subclasses inherit
-          consistent ``None`` defaults without each writing the
-          same boilerplate.
+        Backing storage lives on :class:`BytesIO` (and any byte-buffer-
+        backed subclass) under the single ``_holder: Holder`` slot,
+        not on :class:`TabularIO` — non-byte TabularIOs (StatementResult,
+        NestedIO trees, …) carry no backing.
 
         Subclasses with extra state extend via ``super().__init__()``
         rather than re-zeroing the same slots; ``__init_subclass__``
@@ -514,7 +512,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         )
         # Format identity (stored on _stats.media_type).
         if media_type is None:
-            cls_mime = type(self).default_mime_type()
+            cls_mime = type(self).default_media_type()
             if cls_mime is not None and not getattr(cls_mime, "is_any_bytes", False):
                 self._stats.media_type = MediaType(cls_mime)
         else:
@@ -523,9 +521,12 @@ class TabularIO(Disposable, ABC, Generic[O]):
         # cache (MemorySparkIO when Spark is reachable, MemoryArrowIO
         # otherwise). Read paths delegate through it when set.
         self._persisted_data: "TabularIO | None" = None
-        # Buffer-backing slots — concrete byte buffers fill these in;
-        # non-byte TabularIOs (StatementResult, NestedIO trees, …)
-        # leave them at None.
+        # Spill-path slots used by non-byte buffer-backed TabularIOs
+        # (e.g. :class:`MemoryArrowIO`) to track durable storage.
+        # :class:`BytesIO` does not consult these — it stores its
+        # backing on the single ``_holder`` slot — but leaving the
+        # defaults here keeps the contract uniform for callers that
+        # introspect either kind of buffer.
         self._spill_path = None
         self._owns_spill_path = True
         # Lazy spill directory used by :meth:`scan_spark_frame`'s
@@ -553,7 +554,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         if self._FINAL_TABULAR_IO:
             if media_type is None:
                 return self
-            if media_type.is_octet or media_type.mime_type == self.default_mime_type():
+            if media_type.is_octet or media_type.mime_type == self.default_media_type():
                 return self
             target = self.media_type_class(media_type=media_type)
             return target(self, media_type=media_type)

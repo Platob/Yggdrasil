@@ -13,10 +13,16 @@ position." Two concrete shapes:
 
 The four abstract primitives are :meth:`read_mv`, :meth:`write_mv`,
 :meth:`reserve`, :meth:`truncate` and the :attr:`size` property.
-Everything else (:meth:`read_bytes` / :meth:`write_bytes` /
-:meth:`read_text` / :meth:`write_text` / :meth:`read_local_path` /
-:meth:`write_local_path`) builds on those, so a new backend gets
-the full convenience surface for free.
+Everything else (:meth:`pread` / :meth:`pwrite` / :meth:`read_bytes` /
+:meth:`write_bytes` / :meth:`read_text` / :meth:`write_text` /
+:meth:`read_local_path` / :meth:`write_local_path`) builds on those,
+so a new backend gets the full convenience surface for free.
+
+:class:`yggdrasil.io.buffer.BytesIO` keeps a single ``_holder: Holder``
+slot and routes every cursorless I/O op straight through
+:meth:`pread` / :meth:`pwrite` / :meth:`truncate` / :attr:`size` —
+the holder mutates from :class:`Memory` to :class:`Path` on spill
+without any change to the call sites.
 """
 
 from __future__ import annotations
@@ -24,11 +30,15 @@ from __future__ import annotations
 import os
 import pathlib
 from abc import abstractmethod
-from typing import Union
+from typing import TYPE_CHECKING, Optional, Union
 
 from yggdrasil.disposable import Disposable
 
 from .io_stats import IOStats
+
+
+if TYPE_CHECKING:
+    from yggdrasil.io.enums import Mode
 
 
 __all__ = ["Holder"]
@@ -38,6 +48,34 @@ PathLike = Union[str, "os.PathLike[str]", pathlib.PurePath]
 
 
 _COPY_CHUNK = 4 * 1024 * 1024
+
+
+# Stdlib ``open()`` mode-string lookup for the standard
+# :class:`Mode` values that have an OS-mode counterpart. Used by
+# :meth:`Holder.open` to translate a :class:`Mode` argument into a
+# string ``acquire_io`` understands.
+_MODE_TO_OS_MODE = {
+    "auto": "rb+",
+    "read_only": "rb",
+    "overwrite": "wb+",
+    "append": "ab+",
+    "truncate": "wb+",
+    "error_if_exists": "xb+",
+}
+
+
+def _resolve_mode_string(mode: "Mode | str | None") -> str:
+    """Translate *mode* (Mode enum, alias, or os-style string) → os-mode str."""
+    if mode is None:
+        return "rb+"
+    if isinstance(mode, str) and mode and not _MODE_TO_OS_MODE.get(mode.lower()):
+        # Already looks like an OS-mode string (e.g. "rb+", "wb").
+        # Don't re-normalize — preserve flag combinations.
+        if all(c in "rwaxbt+" for c in mode):
+            return mode
+    from yggdrasil.io.enums import Mode  # avoid import cycle
+    parsed = Mode.from_(mode)
+    return _MODE_TO_OS_MODE.get(parsed.value, "rb+")
 
 
 class Holder(Disposable):
@@ -140,6 +178,97 @@ class Holder(Disposable):
     def media_type(self):
         """Convenience accessor — same as ``self.stat().media_type``."""
         return self.stat().media_type
+
+    # ------------------------------------------------------------------
+    # Per-open lifecycle — Path overrides; Memory and other always-live
+    # holders inherit no-ops so :class:`BytesIO` can call them blind.
+    # ------------------------------------------------------------------
+
+    def open(self, mode: "Mode | str | None" = None) -> "Holder":
+        """Open the holder for IO at *mode*; returns ``self``.
+
+        Wrapper that drives :class:`Disposable` open + :meth:`acquire_io`
+        in one call. ``mode`` accepts a :class:`yggdrasil.io.enums.Mode`,
+        a stdlib :func:`open` mode string (``"rb"``, ``"rb+"``,
+        ``"wb"``, …), or ``None`` for the default ``"rb+"``. Memory
+        holders ignore the mode (no separate IO state); :class:`Path`
+        holders translate it into the fd / transaction-buffer
+        acquire.
+        """
+        if not self._acquired:
+            Disposable.open(self)
+        os_mode = _resolve_mode_string(mode)
+        self.acquire_io(os_mode)
+        return self
+
+    def acquire_io(self, mode: "str | None" = None) -> "Holder":
+        """Open per-open IO state. Default no-op; returns ``self``.
+
+        :class:`yggdrasil.io.fs.Path` overrides to mint a transaction
+        buffer (remote) or :func:`os.open` an fd (local). Memory-style
+        holders have no separate per-open state, so this is a no-op.
+        """
+        del mode
+        return self
+
+    def close_io(self) -> None:
+        """Release per-open IO state. Default no-op.
+
+        Mirrors :meth:`acquire_io`: subclasses with per-open state
+        flush + tear it down here.
+        """
+
+    def flush(self) -> None:
+        """Push buffered writes to the durable backing. Default no-op."""
+
+    @property
+    def dirty(self) -> bool:
+        """True when there are uncommitted writes. Default ``False``."""
+        return False
+
+    @property
+    def is_local(self) -> bool:
+        """True for in-process / local-fs holders. Default ``True``."""
+        return True
+
+    # ------------------------------------------------------------------
+    # Cursorless I/O — the canonical surface :class:`BytesIO` consumes
+    # ------------------------------------------------------------------
+
+    def pread(self, n: int, pos: int) -> bytes:
+        """Positional read. Returns at most ``n`` bytes at *pos*.
+
+        ``n < 0`` reads to end of holder. Returns a fresh
+        :class:`bytes` so callers can hold onto it past further I/O
+        against the holder. Default impl wraps :meth:`read_mv`.
+        """
+        return bytes(self.read_mv(n, pos))
+
+    def pwrite(
+        self,
+        data: Union[bytes, bytearray, memoryview],
+        pos: int,
+    ) -> int:
+        """Positional write. Returns bytes actually written.
+
+        Default impl normalises bytes-like ``data`` to a 1-D unsigned-
+        byte memoryview and forwards to :meth:`write_mv`.
+        """
+        mv = memoryview(data)
+        if mv.format != "B" or mv.ndim != 1 or mv.itemsize != 1:
+            mv = mv.cast("B")
+        if not mv.c_contiguous:
+            mv = memoryview(bytes(mv))
+        return self.write_mv(mv, pos)
+
+    def memoryview(self) -> memoryview:
+        """View over the holder's visible bytes.
+
+        Default impl materialises via :meth:`read_mv` so every backend
+        gets a consistent shape; engines with cheaper paths (mmap on
+        local fd, alias of an in-memory bytearray) override.
+        """
+        return self.read_mv(-1, 0)
 
     # ------------------------------------------------------------------
     # Bytes / text convenience surface — built on the abstract primitives

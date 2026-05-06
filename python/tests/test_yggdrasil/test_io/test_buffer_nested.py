@@ -77,11 +77,11 @@ class TestNestedIOBase:
         io = FolderIO(str(tmp_path), path=str(sub))
         assert str(io.path).endswith("sub")
 
-    def test_default_mime_type_base_is_none(self):
-        assert NestedIO.default_mime_type() is None
+    def test_default_media_type_base_is_none(self):
+        assert NestedIO.default_media_type() is None
 
-    def test_folder_default_mime_type(self):
-        assert FolderIO.default_mime_type() == MimeTypes.FOLDER
+    def test_folder_default_media_type(self):
+        assert FolderIO.default_media_type() == MimeTypes.FOLDER
 
     def test_options_class_default(self):
         assert NestedIO.options_class() is CastOptions

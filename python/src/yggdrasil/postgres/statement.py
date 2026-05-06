@@ -220,7 +220,7 @@ class PostgresStatementResult(StatementResult[PostgresPreparedStatement]):
         self._row_count: int = -1
 
     @classmethod
-    def default_mime_type(cls) -> "MimeType | None":
+    def default_media_type(cls) -> "MimeType | None":
         return POSTGRES_STATEMENT_MIME
 
     # ------------------------------------------------------------------

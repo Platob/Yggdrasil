@@ -164,7 +164,7 @@ class DeltaIO(FolderIO):
         return DeltaOptions
 
     @classmethod
-    def default_mime_type(cls) -> MimeType:
+    def default_media_type(cls) -> MimeType:
         return MimeTypes.DELTA_FOLDER
 
     def _default_child_media_type(self) -> Any:

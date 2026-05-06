@@ -12,8 +12,8 @@ from .._helpers import sample_table
 
 
 class TestParquetIOBase:
-    def test_default_mime_type(self):
-        assert ParquetIO.default_mime_type() == MimeTypes.PARQUET
+    def test_default_media_type(self):
+        assert ParquetIO.default_media_type() == MimeTypes.PARQUET
 
     def test_options_class(self):
         assert ParquetIO.options_class() is ParquetOptions

@@ -63,18 +63,18 @@ def tmpdir_path(tmp_path: Path) -> Path:
 
 
 class TestPrimitiveIOBase:
-    def test_default_mime_type_is_none_on_base(self):
+    def test_default_media_type_is_none_on_base(self):
         # The base layer must not register against OCTET_STREAM or it
         # would shadow BytesIO as the fallback.
-        assert BytesIO.default_mime_type() is None
+        assert BytesIO.default_media_type() is None
 
     def test_concrete_leaves_have_mime_types(self):
-        assert ParquetIO.default_mime_type() == MimeTypes.PARQUET
-        assert CsvIO.default_mime_type() == MimeTypes.CSV
-        assert JsonIO.default_mime_type() == MimeTypes.JSON
+        assert ParquetIO.default_media_type() == MimeTypes.PARQUET
+        assert CsvIO.default_media_type() == MimeTypes.CSV
+        assert JsonIO.default_media_type() == MimeTypes.JSON
         # Arrow IPC, NDJSON also register; just sanity-check non-None.
         for cls in (ArrowIPCIO, NDJsonIO, XlsxIO, ZipIO):
-            assert cls.default_mime_type() is not None
+            assert cls.default_media_type() is not None
 
     def test_dispatch_via_path_extension(self, tmpdir_path: Path):
         # BytesIO(path=...) routes to the right leaf via the

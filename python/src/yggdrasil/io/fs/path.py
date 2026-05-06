@@ -147,7 +147,7 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
     # ==================================================================
 
     @classmethod
-    def default_mime_type(cls):
+    def default_media_type(cls):
         """Path is format-agnostic — never auto-register against a mime type."""
         return None
 

@@ -12,9 +12,9 @@ from yggdrasil.io.buffer.memory import MemorySparkIO
 
 
 class TestMemorySparkIOBasics:
-    def test_default_mime_type_is_none_so_not_registered(self):
+    def test_default_media_type_is_none_so_not_registered(self):
         # In-memory holders never want to win factory dispatch.
-        assert MemorySparkIO.default_mime_type() is None
+        assert MemorySparkIO.default_media_type() is None
 
     def test_is_a_tabular_io(self):
         assert isinstance(MemorySparkIO(), TabularIO)

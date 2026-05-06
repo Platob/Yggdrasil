@@ -131,7 +131,7 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
         return self._cached_schema
 
     @classmethod
-    def default_mime_type(cls) -> "MimeType | None":
+    def default_media_type(cls) -> "MimeType | None":
         return MimeTypes.SPARK_SQL_STATEMENT
 
     # -------------------------------------------------------------------------

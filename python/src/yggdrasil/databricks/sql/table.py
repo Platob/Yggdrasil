@@ -928,7 +928,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
     # ------------------------------------
 
     @classmethod
-    def default_mime_type(cls) -> MimeType:
+    def default_media_type(cls) -> MimeType:
         return MimeTypes.DATABRICKS_UNITY_CATALOG_TABLE
 
     @property

@@ -12,8 +12,8 @@ from .._helpers import sample_table
 
 
 class TestNDJsonBase:
-    def test_default_mime_type(self):
-        assert NDJsonIO.default_mime_type() == MimeTypes.NDJSON
+    def test_default_media_type(self):
+        assert NDJsonIO.default_media_type() == MimeTypes.NDJSON
 
     def test_options_class(self):
         assert NDJsonIO.options_class() is NDJsonOptions

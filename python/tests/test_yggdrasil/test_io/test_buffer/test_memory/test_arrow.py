@@ -16,10 +16,10 @@ from .._helpers import sample_table
 
 
 class TestMemoryArrowIOBasics:
-    def test_default_mime_type_is_none_so_not_registered(self):
+    def test_default_media_type_is_none_so_not_registered(self):
         # Returning None keeps the class out of the media-type
         # registry — in-memory holders never want factory dispatch.
-        assert MemoryArrowIO.default_mime_type() is None
+        assert MemoryArrowIO.default_media_type() is None
 
     def test_is_a_tabular_io(self):
         assert isinstance(MemoryArrowIO(), TabularIO)

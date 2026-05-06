@@ -42,7 +42,7 @@ class MemorySparkIO(TabularIO[CastOptions]):
     _FINAL_TABULAR_IO: ClassVar[bool] = True
 
     @classmethod
-    def default_mime_type(cls) -> Optional[MimeType]:
+    def default_media_type(cls) -> Optional[MimeType]:
         return None  # not registered, see MemoryArrowIO for the rationale
 
     def __init__(

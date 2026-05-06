@@ -183,7 +183,7 @@ class ZipIO(BytesIO):
     _FINAL_TABULAR_IO: ClassVar[bool] = True
 
     @classmethod
-    def default_mime_type(cls):
+    def default_media_type(cls):
         return MimeTypes.ZIP
 
     @classmethod
@@ -926,7 +926,7 @@ class ZipEntryIO(BytesIO):
     # ------------------------------------------------------------------
 
     @classmethod
-    def default_mime_type(cls):
+    def default_media_type(cls):
         # Per-instance default is overridden in __init__ from the
         # entry's filename. The class-level default just claims the
         # ZIP_ENTRY mime so the registry can hand back ZipEntryIO
@@ -1082,7 +1082,7 @@ class ZipEntryFolderIO(TabularIO[ZipOptions]):
     _FINAL_TABULAR_IO: ClassVar[bool] = True
 
     @classmethod
-    def default_mime_type(cls):
+    def default_media_type(cls):
         # No public mime — this is a structural view, not a wire format.
         return None
 

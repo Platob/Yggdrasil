@@ -147,7 +147,7 @@ class NestedIO(TabularIO[O], ABC):
     # ------------------------------------------------------------------
 
     @classmethod
-    def default_mime_type(cls) -> "MimeType | None":
+    def default_media_type(cls) -> "MimeType | None":
         """Don't claim any mime type at the abstract layer."""
         return None
 

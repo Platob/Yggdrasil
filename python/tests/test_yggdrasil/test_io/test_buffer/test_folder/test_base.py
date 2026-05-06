@@ -11,8 +11,8 @@ from .._helpers import sample_table
 
 
 class TestFolderBase:
-    def test_default_mime_type(self):
-        assert FolderIO.default_mime_type() == MimeTypes.FOLDER
+    def test_default_media_type(self):
+        assert FolderIO.default_media_type() == MimeTypes.FOLDER
 
     def test_options_class(self):
         assert FolderIO.options_class() is FolderOptions

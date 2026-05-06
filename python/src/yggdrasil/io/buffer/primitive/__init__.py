@@ -6,7 +6,7 @@ Each concrete subclass under this package implements one file format
 ``PrimitiveIO`` layer is gone — every concrete leaf is just a
 :class:`BytesIO` with format-specific ``_read_arrow_batches`` /
 ``_write_arrow_batches`` hooks and a registered
-``default_mime_type``.
+``default_media_type``.
 
 Importing this package as a whole forces every leaf module to load,
 which auto-registers them in :data:`TabularIO._DATAIO_REGISTRY` via

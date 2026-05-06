@@ -170,7 +170,7 @@ class SqlStatementResult(StatementResult[SqlPreparedStatement]):
     _PREPARED_STATEMENT_CLASS: ClassVar[type[SqlPreparedStatement]] = SqlPreparedStatement
 
     @classmethod
-    def default_mime_type(cls) -> "MimeType | None":
+    def default_media_type(cls) -> "MimeType | None":
         # In-process SQL results don't claim a wire mime type — we
         # don't want to override the base StatementResult registration
         # in the IO factory dispatch table. Returning None keeps us
