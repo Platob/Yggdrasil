@@ -176,6 +176,11 @@ class CastOptions:
     schema_mode: Mode = Mode.IGNORE
     row_size: int | None = None
     byte_size: int | None = None
+    #: Allow format readers / writers to use a thread pool when the
+    #: backend supports it. Universally honored across CSV, Parquet,
+    #: Arrow IPC, and NDJSON; format-specific options can override
+    #: the default by re-declaring the field.
+    use_threads: bool = True
     recursive: bool = False
     match_by_names: list[str] | None = None
     with_io: bool = True

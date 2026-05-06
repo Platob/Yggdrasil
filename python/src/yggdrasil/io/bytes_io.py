@@ -380,19 +380,86 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         """The underlying :class:`Holder`."""
         return self._holder
 
-    def view(self, *, pos: int = 0, mode: str = "rb") -> "BytesIO":
-        """Return a fresh, non-owning :class:`BytesIO` over the same holder.
+    def view(
+        self,
+        *,
+        pos: int = 0,
+        size: Optional[int] = None,
+        mode: str = "rb",
+    ) -> "BytesIO":
+        """Return a fresh, non-owning :class:`BytesIO` over the buffer.
 
-        Useful when a caller needs to read from the buffer without
-        disturbing the original cursor — Parquet footer probes, zip
-        directory walks, magic-byte sniffs. The returned cursor is
-        seeded at *pos* and never closes the durable holder, so
-        ``with self.view(pos=0) as v: ...`` is safe to nest inside an
-        outer transaction over the same buffer.
+        With *size* unset the view shares the same holder as ``self``
+        — zero copy, cursor seeded at *pos*. Useful for Parquet
+        footer probes, zip directory walks, magic-byte sniffs.
+
+        With *size* set, the view holds an in-memory copy of bytes
+        ``[pos, pos+size)``. That's the right shape for a *bounded*
+        sub-view that should not race with later mutations of the
+        parent buffer (the pickle ser layer slices a header's
+        payload section out of a packed wire format like this).
         """
-        v = BytesIO(holder=self._holder, owns_holder=False, mode=mode)
-        v._pos = int(pos)
-        return v
+        if size is None:
+            v = BytesIO(holder=self._holder, owns_holder=False, mode=mode)
+            v._pos = int(pos)
+            return v
+        if size < 0:
+            raise ValueError(f"view size must be >= 0, got {size!r}")
+        # Bounded view: snapshot the requested range.
+        payload = self.pread(int(size), int(pos))
+        return BytesIO(payload)
+
+    # ==================================================================
+    # Codec auto-handling — peeks at the holder's MediaType
+    # ==================================================================
+
+    def _codec(self):
+        """The codec on this buffer's :class:`MediaType`, or ``None``.
+
+        Path-bound holders learn their media type from the URL
+        suffix at construction (``data.csv.gz`` → CSV + GZIP);
+        callers that build a :class:`Memory` holder by hand can
+        seed ``stat().media_type`` to opt the buffer into codec
+        round-tripping.
+        """
+        holder = self._holder
+        if holder is None:
+            return None
+        try:
+            mt = holder.stat().media_type
+        except Exception:
+            return None
+        return getattr(mt, "codec", None) if mt is not None else None
+
+    def _format_view(self) -> "BytesIO":
+        """A read-only :class:`BytesIO` over the *format* bytes.
+
+        When the holder is uncompressed (no codec on the media type),
+        returns a non-owning :meth:`view` of ``self``. When a codec
+        is present, returns a fresh in-memory :class:`BytesIO` whose
+        bytes are the decompressed payload — leaf readers parse the
+        format directly from it without knowing the wire was
+        compressed.
+
+        The returned buffer is the caller's to close.
+        """
+        codec = self._codec()
+        if codec is None:
+            return self.view(pos=0)
+        # ``codec.decompress`` accepts the source BytesIO and returns
+        # a freshly-allocated decompressed BytesIO; caller closes.
+        return codec.decompress(self)
+
+    def _format_buffer(self) -> "_FormatBufferContext":
+        """Context manager yielding a buffer to write raw format bytes into.
+
+        For an uncompressed holder, the yielded buffer is ``self``,
+        already truncated to zero so the writer starts clean.
+        For a codec-tagged holder, the yielded buffer is a fresh
+        in-memory :class:`BytesIO`; on exit the bytes are compressed
+        and committed to ``self``.
+        """
+        return _FormatBufferContext(self)
 
     @property
     def owns_holder(self) -> bool:
@@ -790,3 +857,60 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
 
     def write_str_u32(self, s: str, encoding: str = "utf-8") -> int:
         return self.write_bytes_u32(s.encode(encoding))
+
+
+# ===========================================================================
+# Codec writer context manager
+# ===========================================================================
+
+
+class _FormatBufferContext:
+    """Writer-side of :meth:`BytesIO._format_buffer`.
+
+    Caller does ``with bio._format_buffer() as buf: writer(buf)``;
+    the yielded ``buf`` accepts raw format bytes. On exit:
+
+    * No codec → ``buf is bio``; we just leave the bytes in place.
+      (We pre-truncate so the writer sees an empty target.)
+    * Codec set → ``buf`` is a fresh in-memory BytesIO; on exit the
+      bytes are compressed and committed to ``bio``.
+    """
+
+    def __init__(self, parent: "BytesIO") -> None:
+        self._parent = parent
+        self._buf: "BytesIO | None" = None
+        self._codec = parent._codec()
+
+    def __enter__(self) -> "BytesIO":
+        if self._codec is None:
+            # Direct write path: pre-truncate so the leaf writer
+            # opens onto an empty target.
+            self._parent.seek(0)
+            self._parent.truncate(0)
+            self._buf = self._parent
+            return self._parent
+        # Codec path: scratch buffer; we compress on exit.
+        self._buf = BytesIO()
+        return self._buf
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._buf is None or exc_type is not None:
+            return
+        if self._codec is None:
+            return
+        # Compress scratch into the durable buffer.
+        compressed = self._codec.compress(self._buf)
+        try:
+            payload = compressed.to_bytes()
+        finally:
+            try:
+                compressed.close()
+            except Exception:
+                pass
+        try:
+            self._buf.close()
+        except Exception:
+            pass
+        self._parent.seek(0)
+        self._parent.truncate(0)
+        self._parent.write(payload)

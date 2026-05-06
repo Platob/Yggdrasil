@@ -80,7 +80,7 @@ class NDJsonIO(BytesIO):
     def _collect_schema(self, options: NDJsonOptions) -> Schema:
         if self.size == 0:
             return Schema.empty()
-        with self.view(pos=0) as v:
+        with self._format_view() as v:
             reader = pa_json.open_json(
                 v,
                 read_options=options.to_read_options(),
@@ -101,7 +101,7 @@ class NDJsonIO(BytesIO):
     ) -> Iterator[pa.RecordBatch]:
         if self.size == 0:
             return
-        with self.view(pos=0) as v:
+        with self._format_view() as v:
             reader = pa_json.open_json(
                 v,
                 read_options=options.to_read_options(),
@@ -144,28 +144,47 @@ class NDJsonIO(BytesIO):
                 )
             action = Mode.OVERWRITE
 
-        is_append = action is Mode.APPEND and self.size > 0
-        if is_append:
-            self.seek(0, 2)  # SEEK_END
-            # NDJSON requires every line to end with the terminator;
-            # paper over a missing trailing newline before appending.
-            if self.pread(1, self.size - 1) != b"\n":
-                self.write(options.line_ending.encode(options.encoding))
-        else:
-            self.seek(0)
-            self.truncate(0)
+        codec = self._codec()
+        is_append_uncompressed = (
+            action is Mode.APPEND and self.size > 0 and codec is None
+        )
+        is_append_compressed = (
+            action is Mode.APPEND and self.size > 0 and codec is not None
+        )
+
+        if is_append_compressed:
+            # Codec'd buffer — read existing batches, chain new ones,
+            # rewrite via OVERWRITE so the gzip frame is produced
+            # whole.
+            existing = list(self._read_arrow_batches(options))
+            chained = iter([*existing, *batches])
+            return self._write_arrow_batches(
+                chained, dataclasses.replace(options, mode=Mode.OVERWRITE),
+            )
 
         line_term = options.line_ending.encode(options.encoding)
-        for batch in batches:
-            for row in batch.to_pylist():
-                line = json.dumps(
-                    row,
-                    ensure_ascii=options.ensure_ascii,
-                    sort_keys=options.sort_keys,
-                    default=str,
-                ).encode(options.encoding)
-                self.write(line)
+
+        def _emit(buf):
+            for batch in batches:
+                for row in batch.to_pylist():
+                    line = json.dumps(
+                        row,
+                        ensure_ascii=options.ensure_ascii,
+                        sort_keys=options.sort_keys,
+                        default=str,
+                    ).encode(options.encoding)
+                    buf.write(line)
+                    buf.write(line_term)
+
+        if is_append_uncompressed:
+            self.seek(0, 2)  # SEEK_END
+            if self.pread(1, self.size - 1) != b"\n":
                 self.write(line_term)
+            _emit(self)
+            return
+
+        with self._format_buffer() as buf:
+            _emit(buf)
 
     def _resolve_action(self, mode: Mode) -> Mode:
         if mode is Mode.AUTO or mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:

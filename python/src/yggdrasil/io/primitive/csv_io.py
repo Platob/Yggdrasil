@@ -102,7 +102,7 @@ class CsvIO(BytesIO):
     def _collect_schema(self, options: CsvOptions) -> Schema:
         if self.size == 0:
             return Schema.empty()
-        with self.view(pos=0) as v:
+        with self._format_view() as v:
             reader = pa_csv.open_csv(
                 v,
                 read_options=options.to_read_options(),
@@ -124,7 +124,7 @@ class CsvIO(BytesIO):
     ) -> Iterator[pa.RecordBatch]:
         if self.size == 0:
             return
-        with self.view(pos=0) as v:
+        with self._format_view() as v:
             reader = pa_csv.open_csv(
                 v,
                 read_options=options.to_read_options(),
@@ -185,27 +185,53 @@ class CsvIO(BytesIO):
         if first is None:
             return
 
-        is_append = action is Mode.APPEND and self.size > 0
-        if is_append:
+        codec = self._codec()
+        is_append_uncompressed = (
+            action is Mode.APPEND and self.size > 0 and codec is None
+        )
+        is_append_compressed = (
+            action is Mode.APPEND and self.size > 0 and codec is not None
+        )
+
+        if is_append_compressed:
+            # Codec'd buffer can't be appended to byte-wise; fall
+            # back to read-modify-rewrite via OVERWRITE chained with
+            # the existing batches.
+            existing = list(self._read_arrow_batches(options))
+            chained = iter([*existing, first, *iterator])
+            return self._write_arrow_batches(
+                chained, dataclasses.replace(options, mode=Mode.OVERWRITE),
+            )
+
+        schema = first.schema
+
+        if is_append_uncompressed:
             write_options = pa_csv.WriteOptions(
                 include_header=False, delimiter=options.delimiter,
             )
             self.seek(0, _stdlib_io.SEEK_END)
-        else:
-            write_options = options.to_write_options()
-            self.seek(0)
-            self.truncate(0)
+            with contextlib.ExitStack() as stack:
+                writer = pa_csv.CSVWriter(
+                    self, schema, write_options=write_options,
+                )
+                stack.callback(writer.close)
+                if first.num_rows > 0:
+                    writer.write_batch(first)
+                for batch in iterator:
+                    if batch.num_rows > 0:
+                        writer.write_batch(batch)
+            return
 
-        schema = first.schema
-
-        with contextlib.ExitStack() as stack:
-            writer = pa_csv.CSVWriter(self, schema, write_options=write_options)
-            stack.callback(writer.close)
-            if first.num_rows > 0:
-                writer.write_batch(first)
-            for batch in iterator:
-                if batch.num_rows > 0:
-                    writer.write_batch(batch)
+        write_options = options.to_write_options()
+        with self._format_buffer() as buf:
+            with contextlib.ExitStack() as stack:
+                writer = pa_csv.CSVWriter(buf, schema, write_options=write_options)
+                stack.callback(writer.close)
+                if first.num_rows > 0:
+                    writer.write_batch(first)
+                for batch in iterator:
+                    if batch.num_rows > 0:
+                        writer.write_batch(batch)
 
     def _resolve_action(self, mode: Mode) -> Mode:
         if mode is Mode.AUTO or mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:

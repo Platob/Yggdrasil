@@ -101,7 +101,7 @@ class ArrowIPCIO(BytesIO):
         if self.size == 0:
             return
 
-        with self.view(pos=0) as v:
+        with self._format_view() as v:
             reader = ipc.RecordBatchFileReader(v)
             for i in range(reader.num_record_batches):
                 yield reader.get_batch(i)
@@ -110,11 +110,12 @@ class ArrowIPCIO(BytesIO):
         """Read the schema straight from the IPC footer.
 
         Empty buffer short-circuits to :meth:`Schema.empty`. Routes
-        through :meth:`view` so the parent cursor isn't disturbed.
+        through :meth:`_format_view` so a codec'd holder is
+        transparently decompressed before the footer probe.
         """
         if self.size == 0:
             return Schema.empty()
-        with self.view(pos=0) as v:
+        with self._format_view() as v:
             return Schema.from_arrow(ipc.RecordBatchFileReader(v).schema)
 
     # ==================================================================
@@ -182,21 +183,20 @@ class ArrowIPCIO(BytesIO):
                 chained, dataclasses.replace(options, mode=Mode.OVERWRITE),
             )
 
-        # OVERWRITE path — single writer session.
+        # OVERWRITE path — single writer session, codec-aware buffer.
         schema = first.schema
-        self.seek(0)
-        self.truncate(0)
 
-        with contextlib.ExitStack() as stack:
-            writer = ipc.RecordBatchFileWriter(
-                self, schema, options=options.to_writer_options(),
-            )
-            stack.callback(writer.close)
-            if first.num_rows > 0:
-                writer.write_batch(first)
-            for batch in iterator:
-                if batch.num_rows > 0:
-                    writer.write_batch(batch)
+        with self._format_buffer() as buf:
+            with contextlib.ExitStack() as stack:
+                writer = ipc.RecordBatchFileWriter(
+                    buf, schema, options=options.to_writer_options(),
+                )
+                stack.callback(writer.close)
+                if first.num_rows > 0:
+                    writer.write_batch(first)
+                for batch in iterator:
+                    if batch.num_rows > 0:
+                        writer.write_batch(batch)
 
     # ==================================================================
     # Helpers

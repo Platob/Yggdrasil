@@ -1,59 +1,57 @@
 """S3-backed :class:`Path` implementation.
 
-Reads and writes go through an :class:`S3Service` (one per path
-instance, shared across joinpath / parent / etc.) so every path
-under one bucket reuses the same boto3 session and credential
-refresh. The service holds a reference to the :class:`AWSClient`,
-which owns the actual session.
+:class:`S3Path` is a :class:`RemotePath` over the ``s3://`` URL
+scheme, talking to a boto3-shaped S3 client. The client is injected
+at construction (``client=`` kwarg) — concrete production code uses
+the :class:`yggdrasil.aws.fs.service.S3Service` factory, tests pass
+a :class:`unittest.mock.Mock` that stubs the boto methods.
 
-Path mechanics
---------------
+Holder primitives
+-----------------
 
-S3 has no real directories, only key prefixes. We model:
+The new :class:`Path` substrate exposes positional reads / writes
+through five hooks; :class:`S3Path` overrides three of them with
+S3-native equivalents:
 
-- ``s3://bucket/`` → the bucket root. ``ls`` lists objects with no
-  prefix.
-- ``s3://bucket/key/with/slashes`` → either an object (``is_file``)
-  or a directory marker (``is_dir`` — empty key with trailing slash,
-  or any key prefix that's a parent of other keys). The
-  classification is done on demand via :meth:`_stat`.
-- Reading non-existent keys raises :class:`FileNotFoundError` from
-  the underlying boto error (``NoSuchKey``).
+* :meth:`_read_mv` — range-based ``GetObject`` with
+  ``Range: bytes={pos}-{pos+n-1}``. ``n=0`` short-circuits to an
+  empty :class:`memoryview`. A miss surfaces as
+  :class:`FileNotFoundError`; an EOF range yields an empty buffer
+  to match file semantics.
+* :meth:`_write_mv` — read existing object (if any), splice the
+  incoming bytes at ``pos``, and ``PutObject`` the result. S3 has
+  no native partial-write API, so this is a read-modify-write at
+  the object granularity.
+* :meth:`truncate` — ``PutObject`` of the head N bytes.
+* :meth:`_clear` — ``DeleteObject`` (idempotent).
 
-We accept ``s3://``, ``s3a://``, and ``s3n://`` as inputs (Hadoop
-variants are common in Spark contexts) but always normalize the
-URL's scheme to ``s3``. Output paths render as ``s3://``.
+Reads of the whole object pass through the inherited ``read_bytes``
+which calls ``_read_mv(-1, 0)`` once, so a parquet footer probe
+costs one S3 request.
 
-I/O patterns
-------------
+Filesystem surface
+------------------
 
-:meth:`pread` issues ``GetObject`` with a ``Range`` header. This is
-the right primitive for the BytesIO transaction-buffer pattern
-(one ``pread(n=-1, pos=0)`` per open) AND for parquet footer reads
-(``pread(n=8, pos=size-8)``). Both are one S3 round-trip.
-
-:meth:`write_stream` is overridden to use boto3's
-``upload_fileobj``, which auto-multiparts above 8 MiB. This is the
-flush path used by every BytesIO bound to an S3Path.
-
-:meth:`pwrite` falls back to the inherited read-modify-write
-helper from :class:`Path`. S3 has no positional write; this is the
-honest answer. Most callers don't hit it because the BytesIO
-transaction-buffer absorbs positional writes locally, then flushes
-the whole object via ``write_stream``.
+* :meth:`_stat_uncached` — ``HeadObject`` for the file shape;
+  ``ListObjectsV2(MaxKeys=1, Delimiter='/')`` to disambiguate
+  directory prefixes from missing keys.
+* :meth:`_ls` — ``ListObjectsV2`` paginator, treats common-prefixes
+  as sub-directories. Children inherit the same client.
+* :meth:`_mkdir` — no-op (S3 has no directory concept; prefixes
+  come into existence the moment a child object lands).
+* :meth:`_remove_file` — ``DeleteObject``.
+* :meth:`_remove_dir` — paginated bulk ``DeleteObjects`` (1000 keys
+  per call). Idempotent under ``missing_ok=True``.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, ClassVar, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterator, Optional
 
-from yggdrasil.aws.fs.service import S3Service
-from yggdrasil.io.bytes_io import BytesIO
-from yggdrasil.data.enums import Mode
-from yggdrasil.io.path import Path, RemotePath
+from yggdrasil.io.path import RemotePath
+from yggdrasil.io.path._retry import retry_sdk_call
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
-from yggdrasil.lazy_imports import botocore_module
 
 if TYPE_CHECKING:
     from botocore.client import BaseClient  # type: ignore[import-untyped]
@@ -62,112 +60,123 @@ if TYPE_CHECKING:
 __all__ = ["S3Path"]
 
 
-#: Above this size, write_stream uses upload_fileobj (which internally
-#: multiparts). Below, we use a single PutObject. boto3's default
-#: multipart threshold is 8 MiB; matching it keeps behaviour predictable.
-_MULTIPART_THRESHOLD: int = 8 * 1024 * 1024
-
-
 # ---------------------------------------------------------------------------
 # S3Path
 # ---------------------------------------------------------------------------
 
 
 class S3Path(RemotePath):
-    """Path subclass over an S3 bucket via boto3.
+    """:class:`Path` over an S3 bucket via a boto3-shaped client.
 
-    Construction:
+    Construction shapes::
 
-        >>> p = S3Path("s3://my-bucket/data/file.parquet")
-        >>> p.read_bytes()  # via pread → one GetObject
+        S3Path("s3://bucket/key.parquet")                # uses default service
+        S3Path("s3://bucket/", client=my_boto_client)    # explicit client
+        S3Path(url=URL("s3://bucket/key"), client=mock)  # tests inject mocks
 
-        >>> # With explicit creds:
-        >>> from yggdrasil.aws import AWSClient, AWSConfig
-        >>> client = AWSClient(AWSConfig(role_arn="arn:aws:iam::1234:role/Reader"))
-        >>> p = S3Path("s3://my-bucket/data/", service=client.s3)
-
-    The ``service`` kwarg holds the :class:`S3Service`. Derived
-    paths (``parent``, ``joinpath``) inherit the same service so a
-    single set of credentials covers a whole tree.
+    The ``client`` kwarg accepts any object that quacks like the
+    boto3 S3 client surface — ``head_object``, ``get_object``,
+    ``put_object``, ``delete_object``, ``delete_objects``,
+    ``list_objects_v2``, ``get_paginator``. Tests use
+    :class:`unittest.mock.Mock`; production code passes the boto
+    client owned by :class:`S3Service`.
     """
 
-    __slots__ = ("_service",)
+    __slots__ = ("_client", "_retry_sleep")
 
     scheme: ClassVar[str] = "s3"
 
-    #: URL schemes we accept on input. Always normalized to ``s3``.
+    #: URL schemes accepted on input; always normalized to ``s3``.
     _ACCEPTED_SCHEMES: ClassVar[frozenset[str]] = frozenset({"s3", "s3a", "s3n"})
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # Construction
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     def __init__(
         self,
-        obj: Any = None,
+        data: Any = None,
         *,
         url: URL | None = None,
+        client: "BaseClient | Any | None" = None,
         temporary: bool = False,
-        auto_open: bool = True,
-        service: Optional[S3Service] = None,
+        retry_sleep: Optional[Callable[[float], None]] = None,
+        **kwargs: Any,
     ) -> None:
-        # Normalize the URL scheme so ``s3a://...`` round-trips as
-        # ``s3://...``. We do this before super().__init__ stamps
-        # the URL on self.
+        if url is None and isinstance(data, str):
+            url = URL.from_(data)
+            data = None
+        if url is None and isinstance(data, URL):
+            url = data
+            data = None
         if url is not None:
             url = self._normalize_scheme(URL.from_(url))
-        elif isinstance(obj, S3Path):
-            url = obj.url
-            if service is None:
-                service = obj._service
-        elif obj is not None and not isinstance(obj, Path):
-            url = self._normalize_scheme(URL.from_(obj))
 
-        super().__init__(
-            url=url,
-            temporary=temporary,
-            auto_open=auto_open,
-        )
-        self._service: S3Service = (
-            service if service is not None else S3Service.current()
-        )
+        super().__init__(data=data, url=url, temporary=temporary, **kwargs)
+
+        self._client = client
+        # Injection point for tests — replace ``time.sleep`` with a
+        # spy / no-op so retry behavior is observable without burning
+        # wall-clock seconds.
+        self._retry_sleep: Optional[Callable[[float], None]] = retry_sleep
 
     @classmethod
     def _normalize_scheme(cls, url: URL) -> URL:
-        """Coerce ``s3a://`` / ``s3n://`` to ``s3://``."""
+        """Coerce ``s3a://`` / ``s3n://`` to ``s3://``.
+
+        Both Hadoop variants are common in Spark contexts; the
+        canonical form on disk and in logs is ``s3://``, so we
+        normalize at construction time and round-trip clean.
+        """
         if url.scheme in cls._ACCEPTED_SCHEMES and url.scheme != cls.scheme:
             return url.with_scheme(cls.scheme)
         return url
 
-    @classmethod
-    def handles(cls, obj: Any) -> bool:
-        """Accept any of the three S3 URI schemes."""
-        if isinstance(obj, URL):
-            return obj.scheme in cls._ACCEPTED_SCHEMES
-        if isinstance(obj, str):
-            return any(
-                obj.startswith(f"{s}:/") for s in cls._ACCEPTED_SCHEMES
-            )
-        try:
-            return URL.from_(obj).scheme in cls._ACCEPTED_SCHEMES
-        except (ValueError, TypeError):
-            return False
-
-    # ------------------------------------------------------------------
-    # Service / client access
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # Client access
+    # ==================================================================
 
     @property
-    def service(self) -> S3Service:
-        return self._service
+    def client(self) -> Any:
+        """The boto-shaped S3 client.
 
-    @property
-    def client(self) -> "BaseClient":
-        return self._service.boto_client
+        Lazily builds a real boto3 client via :class:`S3Service`
+        when none was passed. Tests that inject a :class:`Mock` at
+        construction never trigger this branch.
+        """
+        if self._client is None:
+            from yggdrasil.aws.fs.service import S3Service
+            self._client = S3Service.current().boto_client
+        return self._client
 
-    # ------------------------------------------------------------------
+    def with_client(self, client: Any) -> "S3Path":
+        """Return *self* with *client* installed.
+
+        Mutating in place — same identity, new transport. Useful
+        for swapping a stubbed client onto an existing path tree
+        (e.g. wiring a test mock onto paths that came from a real
+        URL parse).
+        """
+        self._client = client
+        return self
+
+    def _call(self, func, *args, **kwargs):
+        """Invoke *func(*args, **kwargs)* under the standard retry policy.
+
+        Transient errors (5xx, 429, BadRequest, throttling, transport
+        timeouts) get up to 4 retries with 1 / 2 / 4 / 8 s sleeps.
+        Permission errors (403, AccessDenied, expired token) get
+        exactly one retry — usually enough to dodge a credential
+        refresh race. Anything else (404 / NoSuchKey / InvalidRange)
+        is deterministic and propagates.
+        """
+        if self._retry_sleep is not None:
+            return retry_sdk_call(func, *args, sleep=self._retry_sleep, **kwargs)
+        return retry_sdk_call(func, *args, **kwargs)
+
+    # ==================================================================
     # URL parts → bucket / key
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     @property
     def bucket(self) -> str:
@@ -178,61 +187,43 @@ class S3Path(RemotePath):
 
     @property
     def key(self) -> str:
-        """The S3 key — path part with leading slash stripped."""
         path = self.url.path or ""
         return path.lstrip("/")
 
     def full_path(self) -> str:
-        """Render as ``s3://bucket/key``. Always uses ``s3://``."""
+        """Render as ``s3://bucket/key``."""
         key = self.key
-        if key:
-            return f"s3://{self.bucket}/{key}"
-        return f"s3://{self.bucket}/"
+        return f"s3://{self.bucket}/{key}" if key else f"s3://{self.bucket}/"
+
+    @property
+    def size(self) -> int:
+        """Object size from a (cached) ``HeadObject``. ``0`` when missing."""
+        return int(self._stat().size)
 
     def _from_url(self, url: URL) -> "S3Path":
-        """Override base — preserve the service across URL-derived paths."""
-        return type(self)(url=url, service=self._service)
+        """Sibling :class:`S3Path` with the same client."""
+        return S3Path(url=url, client=self._client)
 
     # ==================================================================
-    # Cache key helpers
-    # ==================================================================
-
-    def _stat_cache_key(self) -> str:
-        """Override :class:`RemotePath`'s default with the canonical
-        S3 form ``bucket/key`` — same answer for ``s3://``,
-        ``s3a://``, ``s3n://`` against the same object."""
-        return f"{self.bucket}/{self.key}"
-
-    def _ls_cache_key(self, recursive: bool) -> str:
-        """Cache key for a listing: ``bucket/prefix/`` + mode suffix."""
-        prefix = self.key
-        if prefix and not prefix.endswith("/"):
-            prefix += "/"
-        mode = "r" if recursive else "f"
-        return f"{self.bucket}/{prefix}:{mode}"
-
-    # ==================================================================
-    # Stat — uncached probe; caching lives on :class:`RemotePath`
+    # Stat — uncached probe
     # ==================================================================
 
     def _stat_uncached(self) -> IOStats:
-        """One HeadObject call; falls through to a list-objects probe
-        for prefixes that are pure directories (no object at the key).
-        """
+        """One ``HeadObject``; falls through to a list probe for prefixes."""
         if not self.key:
             return IOStats(size=0, mtime=0.0, kind=IOKind.DIRECTORY, mode=0)
 
-        botocore = botocore_module()
         try:
-            response = self.client.head_object(
+            response = self._call(
+                self.client.head_object,
                 Bucket=self.bucket, Key=self.key,
             )
-        except botocore.exceptions.ClientError as exc:
-            code = exc.response.get("Error", {}).get("Code", "")
-            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-            if code not in ("404", "NoSuchKey", "NotFound") and status != 404:
+        except Exception as exc:
+            if not _is_not_found(exc):
                 raise
-        else:
+            response = None
+
+        if response is not None:
             return IOStats(
                 size=int(response.get("ContentLength", 0)),
                 mtime=_mtime_from_response(response),
@@ -240,11 +231,13 @@ class S3Path(RemotePath):
                 mode=0,
             )
 
+        # No object at the exact key — probe whether it's a prefix.
         prefix = self.key
         if not prefix.endswith("/"):
             prefix = prefix + "/"
         try:
-            response = self.client.list_objects_v2(
+            response = self._call(
+                self.client.list_objects_v2,
                 Bucket=self.bucket,
                 Prefix=prefix,
                 MaxKeys=1,
@@ -255,41 +248,14 @@ class S3Path(RemotePath):
 
         if response.get("KeyCount", 0) > 0 or response.get("CommonPrefixes"):
             return IOStats(size=0, mtime=0.0, kind=IOKind.DIRECTORY, mode=0)
-
         return IOStats(size=0, mtime=0.0, kind=IOKind.MISSING, mode=0)
 
     # ==================================================================
     # Listing
     # ==================================================================
 
-    def _ls(
-        self,
-        recursive: bool = False,
-        allow_not_found: bool = True,
-    ) -> Iterator["S3Path"]:
-        """List children. Non-recursive uses ``Delimiter="/"`` to get
-        common-prefixes (directory analogues) plus immediate keys.
-
-        Results are cached on the service's ls_cache so repeated
-        ``iterdir()`` / ``ls()`` on the same prefix within the TTL
-        window reuse the same listing. The cache stores lightweight
-        tuples of (key, is_prefix) pairs — no S3Path objects kept
-        alive beyond iteration.
-        """
-        ls_cache = self._service.ls_cache
-        ck = self._ls_cache_key(recursive)
-        cached = ls_cache.get(ck)
-        if cached is not None:
-            # Replay cached child keys. Also warm the stat cache for
-            # file entries we saw during the original listing.
-            for child_key, child_size, child_mtime in cached:
-                child = self._make_child(child_key)
-                yield child
-            return
-
-        # Miss — run the real listing and cache the results.
-        entries: list[tuple[str, int | None, float | None]] = []
-
+    def _ls(self, recursive: bool = False) -> Iterator["S3Path"]:
+        """List direct (or recursive) children under this prefix."""
         prefix = self.key
         if prefix and not prefix.endswith("/"):
             prefix = prefix + "/"
@@ -299,118 +265,78 @@ class S3Path(RemotePath):
             kwargs["Delimiter"] = "/"
 
         paginator = self.client.get_paginator("list_objects_v2")
-
         try:
             pages = paginator.paginate(**kwargs)
-            for page in pages:
-                for cp in page.get("CommonPrefixes") or ():
-                    sub_prefix = cp.get("Prefix")
-                    if not sub_prefix:
-                        continue
-                    entries.append((sub_prefix, None, None))
-                    # Warm RemotePath's stat cache — this prefix is a directory.
-                    self._make_child(sub_prefix.rstrip("/"))._seed_stat_cache(
-                        IOStats(
-                            size=0, mtime=0.0,
-                            kind=IOKind.DIRECTORY, mode=0,
-                        )
-                    )
-                for obj in page.get("Contents") or ():
-                    key = obj.get("Key")
-                    if not key:
-                        continue
-                    if not recursive and key.endswith("/") and obj.get("Size", 0) == 0:
-                        continue
-                    obj_size = int(obj.get("Size", 0))
-                    obj_mtime = _mtime_from_response(obj)
-                    entries.append((key, obj_size, obj_mtime))
-                    # Warm RemotePath's stat cache — we already know size + mtime.
-                    self._make_child(key)._seed_stat_cache(
-                        IOStats(
-                            size=obj_size, mtime=obj_mtime,
-                            kind=IOKind.FILE, mode=0,
-                        )
-                    )
         except Exception:
-            if allow_not_found:
-                return
-            raise
+            return
 
-        ls_cache.set(ck, tuple(entries))
-
-        for child_key, _, _ in entries:
-            yield self._make_child(child_key)
+        for page in pages:
+            for cp in page.get("CommonPrefixes") or ():
+                sub_prefix = cp.get("Prefix")
+                if sub_prefix:
+                    yield self._make_child(sub_prefix)
+            for obj in page.get("Contents") or ():
+                key = obj.get("Key")
+                if not key:
+                    continue
+                if not recursive and key.endswith("/") and obj.get("Size", 0) == 0:
+                    # Listing leaks placeholder objects (zero-byte
+                    # keys ending in '/') under non-recursive mode;
+                    # treat them as directories that will surface as
+                    # CommonPrefixes on a directory walk.
+                    continue
+                yield self._make_child(key)
 
     def _make_child(self, key: str) -> "S3Path":
-        """Build a child :class:`S3Path` from an absolute key string."""
-        # key might end in "/" for prefixes; URL.from_str preserves
-        # that and our `key` property strips the leading slash.
-        url = URL.from_str(f"s3://{self.bucket}/{key.lstrip('/')}")
+        url = URL.from_(f"s3://{self.bucket}/{key.lstrip('/')}")
         return self._from_url(url)
 
     # ==================================================================
-    # Mkdir
+    # Mutators — mkdir / remove
     # ==================================================================
 
     def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
-        """Directory creation in S3 is mostly a no-op.
+        """No-op — S3 has no directory concept.
 
-        Pure-prefix directories (``s3://bucket/data/`` with no
-        ``data/`` object) come into existence the moment any child
-        is written — listing the prefix returns them as common
-        prefixes. We don't write a placeholder object; that would
-        create cleanup work later.
-
-        ``parents=True`` and ``exist_ok=True`` are vacuously
-        satisfied. ``exist_ok=False`` against an existing prefix
-        would normally raise — we don't enforce that for S3 because
-        "exists" of a prefix is racy by nature.
+        Pure-prefix directories materialize when a child object
+        lands under them. Writing a placeholder zero-byte key would
+        just create cleanup work later.
         """
         del parents, exist_ok
 
-    # ==================================================================
-    # Remove
-    # ==================================================================
-
-    def _remove_file(self, allow_not_found: bool = True) -> None:
-        """Single DeleteObject call. Idempotent."""
+    def _remove_file(self, missing_ok: bool = True) -> None:
         try:
-            self.client.delete_object(Bucket=self.bucket, Key=self.key)
+            self._call(
+                self.client.delete_object,
+                Bucket=self.bucket, Key=self.key,
+            )
         except Exception:
-            if allow_not_found:
-                return
-            raise
+            if not missing_ok:
+                raise
+            return
         self._invalidate_stat_cache()
-        self._service.invalidate_ls_cache(self.bucket, self.key)
 
     def _remove_dir(
-        self,
-        recursive: bool = True,
-        allow_not_found: bool = True,
-        with_root: bool = True,
+        self, recursive: bool = True, missing_ok: bool = True,
     ) -> None:
         """Bulk-delete every object under the prefix.
 
-        S3's batch DeleteObjects accepts up to 1000 keys per call.
-        We page through the prefix listing, batch-deleting up to
-        1000 at a time. ``with_root`` is informational on S3 (no
-        directory placeholder unless one was explicitly written;
-        the "root" of the prefix has no object identity).
+        Pages through ``ListObjectsV2`` and batches up to 1000 keys
+        per ``DeleteObjects`` call. Errors per-key are aggregated by
+        boto into the response; we surface a single :class:`OSError`
+        when any keys fail unless ``missing_ok=True`` swallows them.
         """
-        del with_root  # No directory inode to remove on S3.
-
         if not recursive:
-            # Non-recursive remove of an "empty directory" — the
-            # placeholder object case. Try delete_object on the
-            # prefix-with-trailing-slash key; succeeds whether or
-            # not it exists.
             placeholder = self.key
             if placeholder and not placeholder.endswith("/"):
                 placeholder = placeholder + "/"
             try:
-                self.client.delete_object(Bucket=self.bucket, Key=placeholder)
+                self._call(
+                    self.client.delete_object,
+                    Bucket=self.bucket, Key=placeholder,
+                )
             except Exception:
-                if allow_not_found:
+                if missing_ok:
                     return
                 raise
             return
@@ -420,10 +346,9 @@ class S3Path(RemotePath):
             prefix = prefix + "/"
 
         paginator = self.client.get_paginator("list_objects_v2")
+        batch: list[dict[str, str]] = []
         try:
-            pages = paginator.paginate(Bucket=self.bucket, Prefix=prefix)
-            batch: list[dict[str, str]] = []
-            for page in pages:
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
                 for obj in page.get("Contents") or ():
                     key = obj.get("Key")
                     if not key:
@@ -435,27 +360,23 @@ class S3Path(RemotePath):
             if batch:
                 self._delete_batch(batch)
         except Exception:
-            if allow_not_found:
+            if missing_ok:
                 return
             raise
+        self._invalidate_stat_cache()
 
-    def _delete_batch(self, batch: List[dict]) -> None:
-        """One DeleteObjects call. Errors per-key are aggregated by
-        boto into the response; we surface as a single error if any
-        keys failed.
-        """
+    def _delete_batch(self, batch: list[dict]) -> None:
         if not batch:
             return
-        response = self.client.delete_objects(
+        response = self._call(
+            self.client.delete_objects,
             Bucket=self.bucket,
             Delete={"Objects": batch, "Quiet": True},
         )
         errors = response.get("Errors") or []
         if errors:
-            # Build a compact summary; full per-key detail is in errors.
             sample = ", ".join(
-                f"{e.get('Key')!r}={e.get('Code')}"
-                for e in errors[:3]
+                f"{e.get('Key')!r}={e.get('Code')}" for e in errors[:3]
             )
             more = f" (+{len(errors) - 3} more)" if len(errors) > 3 else ""
             raise OSError(
@@ -464,50 +385,30 @@ class S3Path(RemotePath):
             )
 
     # ==================================================================
-    # Whole-file primitives — _pread / _pwrite
+    # Holder I/O — _read_mv / _write_mv / truncate / _clear
     # ==================================================================
-    #
-    # ``_open`` falls through to :meth:`Path._open` (returns
-    # ``BytesIO(path=self)``).  The buffer's transaction machinery
-    # downloads via :meth:`_pread` on acquire and uploads via
-    # :meth:`_pwrite` on commit.
 
-    def _bread(self, n: int, pos: int, mode: "Mode") -> BytesIO:
-        """Range-based GetObject → autonomous :class:`BytesIO`.
+    def _read_mv(self, n: int, pos: int) -> memoryview:
+        """Range-based ``GetObject`` → :class:`memoryview` over bytes.
 
-        ``n=-1`` reads from *pos* to end of object — a single
-        GetObject with ``Range: bytes={pos}-`` (or no Range header
-        if pos=0, which is slightly cheaper on some endpoints).
-        Missing key surfaces as :class:`FileNotFoundError`; a
-        416 (Range not satisfiable) yields an empty buffer to
-        mirror file semantics.
+        :class:`Holder.read_mv` already normalized ``(n, pos)`` to a
+        non-negative range that fits within :attr:`size`, so the
+        ``Range`` header always covers a valid window.
         """
-        del mode  # S3 reads are mode-agnostic
-        bio = BytesIO()
-        bio.open()
         if n == 0:
-            return bio
+            return memoryview(b"")
 
-        botocore = botocore_module()
         kwargs: dict[str, Any] = {"Bucket": self.bucket, "Key": self.key}
-        if n > 0:
-            kwargs["Range"] = f"bytes={pos}-{pos + n - 1}"
-        elif pos > 0:
-            kwargs["Range"] = f"bytes={pos}-"
-        # n=-1 and pos=0 → no Range; full-object download.
+        # Closed range — boto wants inclusive end byte.
+        kwargs["Range"] = f"bytes={pos}-{pos + n - 1}"
 
         try:
-            response = self.client.get_object(**kwargs)
-        except botocore.exceptions.ClientError as exc:
-            code = exc.response.get("Error", {}).get("Code", "")
-            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-            if code in ("NoSuchKey", "404", "NotFound") or status == 404:
-                bio.close()
+            response = self._call(self.client.get_object, **kwargs)
+        except Exception as exc:
+            if _is_not_found(exc):
                 raise FileNotFoundError(self.full_path()) from exc
-            if code == "InvalidRange" or status == 416:
-                # Past-EOF range; mirror file semantics — empty result.
-                return bio
-            bio.close()
+            if _is_invalid_range(exc):
+                return memoryview(b"")
             raise
 
         body = response.get("Body")
@@ -516,163 +417,138 @@ class S3Path(RemotePath):
         finally:
             close = getattr(body, "close", None)
             if callable(close):
-                close()
-        if data:
-            bio.write(data)
-            bio.seek(0)
-        return bio
+                try:
+                    close()
+                except Exception:
+                    pass
+        return memoryview(data or b"")
 
-    def _bwrite(self, data: BytesIO, pos: int, mode: "Mode") -> int:
-        """Upload *data* to this S3 key.
+    def _write_mv(self, data: memoryview, pos: int) -> int:
+        """Splice *data* at *pos* via read-modify-write ``PutObject``.
 
-        ``pos == 0`` with :class:`Mode.OVERWRITE` is a single
-        PutObject (or auto-multipart via ``upload_fileobj`` past
-        :data:`_MULTIPART_THRESHOLD`). Any other (pos, mode)
-        combination does a download → splice → upload RMW so a
-        positional splice survives even though S3 has no native
-        partial-write API.
+        S3 has no positional write; the only honest answer at the
+        object level is to download the existing payload, splice
+        the new bytes in at *pos*, and re-upload. Most callers don't
+        actually hit this hot path because :class:`BytesIO`'s
+        scratch transaction absorbs positional writes locally and
+        commits the whole object once on close.
         """
-        if not data.opened:
-            data.open()
-        data.seek(0)
+        n = len(data)
+        if n == 0:
+            return 0
 
-        if not (pos == 0 and mode is Mode.OVERWRITE):
-            # Read-modify-write — pull, splice, recurse via OVERWRITE.
-            try:
-                existing_bio = self._bread(-1, 0, Mode.READ_ONLY)
-                existing = existing_bio.to_bytes()
-                existing_bio.close()
-            except FileNotFoundError:
-                existing = b""
-            scratch = BytesIO(existing)
-            try:
-                scratch.pwrite(data.pread(data.size, 0), pos)
-                scratch.seek(0)
-                return self._bwrite(scratch, 0, Mode.OVERWRITE)
-            finally:
-                scratch.close()
-
-        # Whole-file upload — single PutObject under the threshold,
-        # auto-multipart above it.
-        size = self._probe_src_size(data)
-        client = self.client
-
-        if size is not None and size <= _MULTIPART_THRESHOLD:
-            payload = self._materialize_small(data, size)
-            client.put_object(
-                Bucket=self.bucket,
-                Key=self.key,
-                Body=payload,
-            )
-            self._invalidate_stat_cache()
-            self._service.invalidate_ls_cache(self.bucket, self.key)
-            return len(payload)
-
-        fileobj, total = self._adapt_for_upload(data)
         try:
-            client.upload_fileobj(
-                Fileobj=fileobj,
-                Bucket=self.bucket,
-                Key=self.key,
-            )
-        finally:
-            close = getattr(fileobj, "close", None)
-            if total is not None and callable(close) and fileobj is not data:
-                close()
+            existing = bytes(self._read_mv(self._existing_size_or_zero(), 0))
+        except FileNotFoundError:
+            existing = b""
 
+        # Pad up to pos with zeros if the splice lands past EOF —
+        # mirrors local-fd behavior under O_RDWR.
+        if pos > len(existing):
+            existing = existing + b"\x00" * (pos - len(existing))
+
+        head = existing[:pos]
+        tail = existing[pos + n:]
+        payload = head + bytes(data) + tail
+
+        self._call(
+            self.client.put_object,
+            Bucket=self.bucket, Key=self.key, Body=payload,
+        )
         self._invalidate_stat_cache()
-        self._service.invalidate_ls_cache(self.bucket, self.key)
+        return n
 
-        if total is not None:
-            return total
+    def _existing_size_or_zero(self) -> int:
+        """Read-side size probe used by RMW; tolerates a missing object."""
         try:
-            return int(self.size)
+            return int(self._stat().size)
         except Exception:
             return 0
 
-    # ``pread`` / ``pwrite`` / ``write_stream`` / ``write_bytes`` all
-    # inherit from :class:`Path`, which routes through :meth:`_bread`
-    # and :meth:`_bwrite` above. The Range GetObject and multipart
-    # PutObject logic lives there now — subclasses only override
-    # the byte-IO primitives.
+    def truncate(self, n: int) -> int:
+        """Re-upload the head *n* bytes (zero-padded if extending)."""
+        if n < 0:
+            raise ValueError(f"truncate size must be >= 0, got {n!r}")
 
-    @staticmethod
-    def _probe_src_size(src: Any) -> Optional[int]:
-        """Return *src*'s byte size if cheaply known, else None."""
-        if isinstance(src, (bytes, bytearray, memoryview)):
-            return len(src)
-        if isinstance(src, BytesIO):
-            try:
-                return src.size
-            except Exception:
-                return None
-        # Stdlib io.BytesIO has getbuffer(); use that for the size.
-        getbuffer = getattr(src, "getbuffer", None)
-        if callable(getbuffer):
-            try:
-                return len(getbuffer())
-            except Exception:
-                return None
-        return None
+        current = 0
+        try:
+            existing = bytes(self._read_mv(self._existing_size_or_zero(), 0))
+            current = len(existing)
+        except FileNotFoundError:
+            existing = b""
 
-    @staticmethod
-    def _materialize_small(src: Any, size: int) -> bytes:
-        """Coerce *src* to a bytes payload for a single PutObject."""
-        if isinstance(src, bytes):
-            return src
-        if isinstance(src, (bytearray, memoryview)):
-            return bytes(src)
-        if isinstance(src, BytesIO):
-            # Use to_bytes — for memory-mode this is a single copy
-            # of the bytearray; for spilled it's an mmap copy.
-            return src.to_bytes()
-        # File-like fallback: read everything.
-        return src.read(size)
+        if n == current and current > 0:
+            return n
 
-    @staticmethod
-    def _adapt_for_upload(src: Any) -> Tuple[Any, Optional[int]]:
-        """Return a (file-like, total_or_None) pair suitable for
-        :meth:`upload_fileobj`.
+        if n == 0:
+            payload = b""
+        elif n <= len(existing):
+            payload = existing[:n]
+        else:
+            payload = existing + b"\x00" * (n - len(existing))
 
-        - bytes-like → wrap in stdlib io.BytesIO; total = len.
-        - yggdrasil BytesIO → already a file-like; total = src.size
-          if cheaply known.
-        - anything with .read() → pass through; total = None.
-        """
-        import io as _io
-
-        if isinstance(src, (bytes, bytearray, memoryview)):
-            data = bytes(src)
-            return _io.BytesIO(data), len(data)
-
-        if isinstance(src, BytesIO):
-            # Make sure we're at offset 0 so upload_fileobj reads
-            # the whole thing.
-            try:
-                src.seek(0)
-            except Exception:
-                pass
-            try:
-                return src, src.size
-            except Exception:
-                return src, None
-
-        if hasattr(src, "read"):
-            return src, None
-
-        raise TypeError(
-            f"S3Path.write_stream: cannot adapt source of type "
-            f"{type(src).__name__} for upload."
+        self._call(
+            self.client.put_object,
+            Bucket=self.bucket, Key=self.key, Body=payload,
         )
+        self._invalidate_stat_cache()
+        return n
+
+    def reserve(self, n: int) -> None:
+        """No-op — S3 has no capacity-vs-size distinction."""
+        if n < 0:
+            raise ValueError(f"reserve size must be >= 0, got {n!r}")
+
+    def _clear(self) -> None:
+        """``DeleteObject``. Idempotent."""
+        self._remove_file(missing_ok=True)
+
+    # ==================================================================
+    # _bread / _bwrite — fallbacks the base class declares abstract
+    # ==================================================================
+
+    def _bread(self, n: int, pos: int, mode):  # noqa: D401
+        """Fallback whole-file read into a fresh :class:`BytesIO`.
+
+        Used by callers that explicitly want a buffer instead of a
+        :class:`memoryview`; the hot path goes through :meth:`_read_mv`
+        directly.
+        """
+        from yggdrasil.io.bytes_io import BytesIO
+        del mode
+        size = n if n >= 0 else max(0, self._existing_size_or_zero() - pos)
+        if size <= 0:
+            return BytesIO()
+        try:
+            data = bytes(self._read_mv(size, pos))
+        except FileNotFoundError:
+            data = b""
+        return BytesIO(data)
+
+    def _bwrite(self, data, pos: int, mode) -> int:
+        """Fallback whole-file write from a :class:`BytesIO`."""
+        del mode
+        if hasattr(data, "to_bytes"):
+            payload = data.to_bytes()
+        elif hasattr(data, "read"):
+            payload = data.read()
+        else:
+            payload = bytes(data)
+        if pos == 0:
+            self.client.put_object(
+                Bucket=self.bucket, Key=self.key, Body=payload,
+            )
+            self._invalidate_stat_cache()
+            return len(payload)
+        return self._write_mv(memoryview(payload), pos)
 
     # ==================================================================
     # Repr
     # ==================================================================
 
     def __repr__(self) -> str:
-        if self.temporary:
-            return f"S3Path({self.full_path()!r}, temporary=True)"
-        return f"S3Path({self.full_path()!r})"
+        marker = ", temporary=True" if self.temporary else ""
+        return f"S3Path({self.full_path()!r}{marker})"
 
 
 # ---------------------------------------------------------------------------
@@ -680,8 +556,41 @@ class S3Path(RemotePath):
 # ---------------------------------------------------------------------------
 
 
+def _is_not_found(exc: BaseException) -> bool:
+    """True when *exc* looks like a ``404`` / ``NoSuchKey``.
+
+    Doesn't import botocore — checks duck-typed attributes so the
+    helper works with both real boto exceptions and the simpler
+    shapes a test mock may raise.
+    """
+    code = ""
+    status = None
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        code = response.get("Error", {}).get("Code", "") or ""
+        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    if isinstance(exc, FileNotFoundError):
+        return True
+    if status == 404:
+        return True
+    if code in ("404", "NoSuchKey", "NotFound"):
+        return True
+    name = type(exc).__name__
+    return name in ("NoSuchKey", "NotFound", "404")
+
+
+def _is_invalid_range(exc: BaseException) -> bool:
+    """True when *exc* looks like a ``416`` Range Not Satisfiable."""
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        code = response.get("Error", {}).get("Code", "")
+        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if code == "InvalidRange" or status == 416:
+            return True
+    return False
+
+
 def _mtime_from_response(response: Any) -> float:
-    """Extract LastModified as epoch-seconds from a HeadObject response."""
     last_modified = response.get("LastModified")
     if last_modified is None:
         return 0.0
