@@ -87,7 +87,7 @@ from yggdrasil.disposable import Disposable
 from yggdrasil.io.enums import MimeType, Mode
 from yggdrasil.io.fs import Path
 from yggdrasil.data.options import CastOptions
-from yggdrasil.io.buffer.base import TabularIO
+from yggdrasil.io.buffer.base import TabularIO, inject_static_values_into_batch as _inject_static_batch
 from yggdrasil.lazy_imports import path_class
 
 if TYPE_CHECKING:
@@ -301,10 +301,56 @@ class NestedIO(TabularIO[O], ABC):
         derived ``_read_arrow_batches`` loop) opens them inside a
         ``with`` block.
 
-        Public callers should use :meth:`iter_children` (inherited
-        from :class:`TabularIO`) which runs :meth:`check_options`
-        first.
+        Public callers should use :meth:`iter_children` (which
+        runs :meth:`check_options` first).
         """
+
+    def iter_children(
+        self,
+        predicate: Any = None,
+        *,
+        options: "O | Mapping[str, Any] | None" = None,
+        **kwargs: Any,
+    ) -> "Iterator[TabularIO | BytesIO]":
+        """Public wrapper around :meth:`_iter_children`.
+
+        ``predicate`` is the canonical knob for filtering discovered
+        children — it's evaluated against the metadata mapping
+        ``{name, path, is_dir, is_private}`` per candidate. ``None``
+        (default) means "yield everything." When provided, the
+        predicate replaces ``options.children_predicate`` for this
+        call.
+
+        ``options`` is the lower-level escape hatch (callers who
+        want to drive partition / row-size / mode knobs for the
+        eventual read or who already have an options object in
+        hand). Extra kwargs merge into the resolved options.
+        """
+        resolved = self.check_options(options, overrides=locals())
+        if predicate is not None:
+            resolved = resolved.copy(children_predicate=predicate)
+        return self._iter_children(resolved)
+
+    def iter_children_or_self(
+        self,
+        predicate: Any = None,
+        *,
+        options: "O | Mapping[str, Any] | None" = None,
+        **kwargs: Any,
+    ) -> "Iterator[TabularIO | BytesIO]":
+        if self.has_children():
+            yield from self.iter_children(
+                predicate, options=options, **kwargs,
+            )
+        else:
+            yield self
+
+    def has_children(self) -> bool:
+        """Return ``True`` iff this folder exposes at least one child."""
+        try:
+            return next(iter(self._iter_children(self._default_options())), None) is not None
+        except (FileNotFoundError, StopIteration):
+            return False
 
     # ==================================================================
     # Child IO factory — primary write API
@@ -472,21 +518,29 @@ class NestedIO(TabularIO[O], ABC):
         child: Any,
         options: O,
     ) -> Iterator[pa.RecordBatch]:
-        """Drain one child's batches.
+        """Drain one child's batches with per-child static-value injection.
 
         Pulled out so subclasses (PartitionedFolderIO, DeltaIO) can
-        wrap each child's batch stream (e.g. to inject partition
-        columns or apply a deletion vector) without re-implementing
-        the dispatch on child type.
+        wrap each child's batch stream (e.g. to apply a deletion
+        vector) without re-implementing the dispatch on child type.
+
+        :class:`TabularIO` no longer auto-injects ``static_values`` on
+        the read path; nested IOs that stamp partition columns onto
+        a child via ``child.static_values = ...`` rely on this method
+        to do the injection on their behalf.
         """
+        static = getattr(child, "static_values", None)
+
         if isinstance(child, NestedIO):
             with child:
-                yield from child._read_arrow_batches(options)
+                for batch in child._read_arrow_batches(options):
+                    yield _inject_static_batch(batch, static) if static else batch
             return
 
         if isinstance(child, TabularIO):
             with child:
-                yield from child.read_arrow_batches(options=options)
+                for batch in child.read_arrow_batches(options=options):
+                    yield _inject_static_batch(batch, static) if static else batch
             return
 
         # BytesIO without a tabular surface: not readable as arrow.

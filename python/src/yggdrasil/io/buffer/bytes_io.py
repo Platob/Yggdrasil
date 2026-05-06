@@ -1352,14 +1352,6 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             "or pass media_type= to dispatch through the registry."
         )
 
-    def _iter_children(self, options: CastOptions) -> "Iterator[TabularIO]":
-        """Single-buffer leaves have no children — yields nothing.
-
-        Folder-shaped IOs override this; for a raw byte buffer the
-        answer is always "this IS the leaf, walk no further."
-        """
-        return iter(())
-
     # ==================================================================
     # Mode resolution — used by every single-buffer write path
     # ==================================================================

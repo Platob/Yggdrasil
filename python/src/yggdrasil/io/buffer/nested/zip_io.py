@@ -422,6 +422,33 @@ class ZipIO(BytesIO):
         except (zipfile.BadZipFile, FileNotFoundError):
             return False
 
+    def iter_children(
+        self,
+        predicate: Any = None,
+        *,
+        options: "ZipOptions | Mapping[str, Any] | None" = None,
+        **kwargs: Any,
+    ) -> "Iterator[ZipEntryIO]":
+        """Public wrapper around :meth:`_iter_children`."""
+        resolved = self.check_options(options, overrides=locals())
+        if predicate is not None:
+            resolved = resolved.copy(children_predicate=predicate)
+        return self._iter_children(resolved)
+
+    def iter_children_or_self(
+        self,
+        predicate: Any = None,
+        *,
+        options: "ZipOptions | Mapping[str, Any] | None" = None,
+        **kwargs: Any,
+    ) -> "Iterator[ZipEntryIO | ZipIO]":
+        if self.has_children():
+            yield from self.iter_children(
+                predicate, options=options, **kwargs,
+            )
+        else:
+            yield self
+
     # ==================================================================
     # Empty / clear (children-flavored — overrides BytesIO's byte view)
     # ==================================================================
@@ -1162,6 +1189,33 @@ class ZipEntryFolderIO(TabularIO[ZipOptions]):
 
     def has_children(self) -> bool:
         return next(self._direct_children_names(), None) is not None
+
+    def iter_children(
+        self,
+        predicate: Any = None,
+        *,
+        options: "ZipOptions | Mapping[str, Any] | None" = None,
+        **kwargs: Any,
+    ) -> "Iterator[TabularIO]":
+        """Public wrapper around :meth:`_iter_children`."""
+        resolved = self.check_options(options, overrides=locals())
+        if predicate is not None:
+            resolved = resolved.copy(children_predicate=predicate)
+        return self._iter_children(resolved)
+
+    def iter_children_or_self(
+        self,
+        predicate: Any = None,
+        *,
+        options: "ZipOptions | Mapping[str, Any] | None" = None,
+        **kwargs: Any,
+    ) -> "Iterator[TabularIO]":
+        if self.has_children():
+            yield from self.iter_children(
+                predicate, options=options, **kwargs,
+            )
+        else:
+            yield self
 
     def list_entries(self, *, recursive: bool = True) -> list[str]:
         """List entry names under this folder.
