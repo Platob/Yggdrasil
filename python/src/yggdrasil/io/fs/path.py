@@ -1,20 +1,22 @@
 """Abstract filesystem path — ``pathlib.Path``-like API over :class:`URL`.
 
-Path is a backend-agnostic byte holder. By default, ``acquire_io``
-sets up a transaction :class:`BytesIO` (downloaded via
-:meth:`_pread`, committed via :meth:`_pwrite` on flush/close).
-All positional ops (:meth:`pread` / :meth:`pwrite` / :meth:`truncate`
-/ :meth:`memoryview`) read or splice that buffer when active, or
-fall through to single-shot whole-file primitives otherwise.
+Path is a backend-agnostic byte holder. Positional ops
+(:meth:`pread` / :meth:`pwrite` / :meth:`truncate`) route directly
+through the subclass's :meth:`_bread` / :meth:`_bwrite` whole-file
+primitives — there is no internal buffering at this layer. Callers
+that want to coalesce writes wrap the path in a
+:class:`yggdrasil.io.buffer.bytes_io.BytesIO`, which carries its
+own :class:`Memory`/:class:`Path` holder and only commits on flush.
 
 The fd-driven fast path lives entirely in
 :class:`yggdrasil.io.fs.local_path.LocalPath` — the only backend
 that holds a kernel file descriptor. Other backends (S3, Databricks,
-in-memory) inherit the default transaction-buffer behavior.
+in-memory) implement :meth:`_bread` / :meth:`_bwrite` directly
+against their SDK and pay the whole-file cost on every call.
 
 Subclasses implement seven hooks: :meth:`full_path`, :meth:`_stat`,
 :meth:`_ls`, :meth:`_mkdir`, :meth:`_remove_file`, :meth:`_remove_dir`,
-:meth:`_pread`, :meth:`_pwrite`.
+:meth:`_bread`, :meth:`_bwrite`.
 """
 
 from __future__ import annotations
@@ -119,16 +121,17 @@ _STAGING_TMP_RE: re.Pattern = re.compile(r"-(\d+)-(\d+)-[0-9a-f]+(?:\.[^/]+)?$")
 class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
     """Abstract filesystem path with :class:`pathlib.Path`-like behaviour.
 
-    Acquire-driven I/O state. ``_acquire`` opens the path: local paths
-    get an :func:`os.open` fd, remote paths get a transaction
-    :class:`BytesIO`. Positional ops (:meth:`pread`, :meth:`pwrite`,
-    :meth:`truncate`) flow through whichever backing is active.
-    ``_release`` commits the buffer (if dirty) and closes the fd.
+    Stateless I/O surface. Positional ops (:meth:`pread`, :meth:`pwrite`,
+    :meth:`truncate`) route straight through the subclass's
+    :meth:`_bread` / :meth:`_bwrite` whole-file primitives — no
+    internal buffering. :class:`LocalPath` adds an fd fast path on
+    top via :meth:`acquire_io`; remote backends pay one round-trip
+    per call (callers coalesce by wrapping in :class:`BytesIO`).
 
     Concrete backends override the seven abstract hooks
     (:meth:`full_path`, :meth:`_stat`, :meth:`_ls`, :meth:`_mkdir`,
-    :meth:`_remove_file`, :meth:`_remove_dir`, :meth:`_pread`,
-    :meth:`_pwrite`) plus :meth:`_open_fd` for local-fd backends.
+    :meth:`_remove_file`, :meth:`_remove_dir`, :meth:`_bread`,
+    :meth:`_bwrite`) plus :meth:`_open_fd` for local-fd backends.
     """
 
     scheme: ClassVar[str] = ""
@@ -136,8 +139,6 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         "url",
         "temporary",
         "_mode",
-        "_transaction_buffer",
-        "_dirty",
     )
 
     _STAGING_SWEEP_INTERVAL: ClassVar[float] = _STAGING_SWEEP_INTERVAL_S
@@ -188,20 +189,17 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         self.url = resolved
         self.temporary = bool(temporary)
         self._mode = mode
-        self._transaction_buffer: "BytesIO | None" = None
-        self._dirty = False
 
         if auto_open:
             Disposable.open(self)
 
     # ==================================================================
-    # Disposable hooks — lifecycle is cheap; I/O backings are lazy
+    # Disposable hooks — lifecycle is cheap; subclasses add per-open IO
     # ==================================================================
 
     def _acquire(self) -> None:
-        # Lifecycle marker only. The fd / transaction_buffer is opened
-        # lazily by ``_ensure_io`` on the first positional op so naked
-        # construction stays cheap.
+        # Stateless at the base. :class:`LocalPath` overrides to open
+        # a long-lived fd; everything else has nothing to acquire.
         return
 
     def _release(self) -> None:
@@ -221,18 +219,17 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
             pass
 
     # ==================================================================
-    # I/O acquire — fd (local) or transaction_buffer:BytesIO (remote)
+    # I/O acquire — subclass-specific (fd for local, no-op otherwise)
     # ==================================================================
 
     @property
     def io_open(self) -> bool:
-        """True when an I/O backing (transaction buffer / subclass-specific) is active."""
-        return self._transaction_buffer is not None
+        """True when a per-open IO backing (subclass-specific) is active.
 
-    @property
-    def transaction_buffer(self) -> "BytesIO | None":
-        """The currently-bound transaction buffer, or ``None``."""
-        return self._transaction_buffer
+        Default: ``False`` — the base path holds no per-open state.
+        :class:`LocalPath` overrides to track its fd.
+        """
+        return False
 
     @property
     def mode(self) -> str:
@@ -249,48 +246,30 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         self._mode = value
 
     @property
-    def dirty(self) -> bool:
-        """True when the transaction buffer has uncommitted writes."""
-        return self._dirty
-
-    @property
     def is_writing(self) -> bool:
         """True when the active mode includes any write semantics."""
         return any(c in self._mode for c in "wax+")
 
     def acquire_io(self, mode: Optional[str] = None) -> "Path":
-        """Open the fd (local) or transaction buffer (remote) explicitly.
+        """Open the per-open IO backing (subclass-specific) explicitly.
 
         Idempotent for the same mode. If a different mode was already
-        open, closes and reopens. Returns ``self`` so the call chains.
+        open, closes and reopens. Default base impl just records the
+        new mode; :class:`LocalPath` overrides to manage its fd.
+        Returns ``self`` so the call chains.
         """
         if mode is not None and mode != self._mode:
             if self.io_open:
                 self.close_io()
             self._mode = mode
-        self._ensure_io()
         return self
 
     def close_io(self) -> None:
-        """Commit and close the transaction buffer.
+        """Release per-open IO state. Default no-op.
 
         Subclasses with extra per-open resources (fd for
-        :class:`LocalPath`) override and ``super().close_io()``.
+        :class:`LocalPath`) override.
         """
-        buf = self._transaction_buffer
-        self._transaction_buffer = None
-        if buf is not None:
-            try:
-                if self._dirty:
-                    buf.seek(0)
-                    self._bwrite(buf, 0, Mode.from_(self._mode, default=Mode.OVERWRITE))
-            finally:
-                try:
-                    if buf.opened:
-                        buf.close()
-                except Exception:
-                    pass
-        self._dirty = False
 
     @contextlib.contextmanager
     def opened(self, mode: str = "rb+") -> "Iterator[Path]":
@@ -306,78 +285,13 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
             if not was_open:
                 self._mode = prev_mode
 
-    def _ensure_io(self) -> None:
-        """Open the I/O backing if it isn't already.
-
-        Default: bring up a transaction :class:`BytesIO` from the
-        path's whole-file ``_pread`` / ``_pwrite`` primitives.
-        :class:`LocalPath` overrides to open a real ``os.open`` fd
-        instead.
-        """
-        if self.io_open:
-            return
-        self._open_transaction_buffer(self._mode)
-
-    def _open_transaction_buffer(self, mode: str) -> None:
-        """Default remote backend behavior: download into a transaction buffer.
-
-        Pulls the path's current bytes via :meth:`_pread` and splices
-        them into a fresh :class:`BytesIO`. A missing target leaves
-        the buffer empty — reads against a non-existent path yield
-        zero bytes, matching the tabular "no batches → empty table"
-        contract :meth:`TabularIO._read_arrow_table` relies on.
-        Subsequent :meth:`pwrite` / :meth:`truncate` mutate the
-        buffer; :meth:`flush` / :meth:`close_io` commits via
-        :meth:`_pwrite`.
-
-        Mode-specific policy: ``"w"`` truncates the seeded buffer
-        before any writes; ``"x"`` fails if the seed found existing
-        bytes.
-        """
-        buf = BytesIO()
-        buf.open()
-
-        existing_loaded = False
-        try:
-            src = self._bread(-1, 0, Mode.READ_ONLY)
-        except FileNotFoundError:
-            src = None
-        if src is not None:
-            try:
-                payload = src.to_bytes()
-                if payload:
-                    buf.write(payload)
-                    existing_loaded = True
-            finally:
-                src.close()
-
-        if "x" in mode and existing_loaded:
-            buf.close()
-            raise FileExistsError(
-                f"Cannot exclusively create {self.full_path()!r}: file exists."
-            )
-        if "w" in mode:
-            buf.truncate(0)
-
-        buf.seek(0)
-        self._transaction_buffer = buf
-        # Don't flag dirty for the initial download — only writes flag it.
-
     def flush(self) -> None:
-        """Commit the transaction buffer to the path (no-op for fd / clean)."""
-        if not self._dirty or self._transaction_buffer is None:
-            return
-        buf = self._transaction_buffer
-        prev_pos = buf.tell()
-        buf.seek(0)
-        try:
-            self._bwrite(buf, 0, Mode.from_(self._mode, default=Mode.OVERWRITE))
-        finally:
-            try:
-                buf.seek(prev_pos)
-            except Exception:
-                pass
-        self._dirty = False
+        """No-op at the base — every :meth:`pwrite` already committed.
+
+        :class:`LocalPath`'s fd writes hit the kernel via :func:`os.pwrite`;
+        remote :meth:`_bwrite` calls already issued the upload. There's
+        nothing buffered between :class:`Path` and the durable backing.
+        """
 
     # ==================================================================
     # TabularIO hooks — open the path, dispatch to its BytesIO
@@ -571,17 +485,14 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
 
     @property
     def is_memory(self) -> bool:
-        """Paths are never raw memory holders. :class:`MemoryPath` is
-        still a path — its bytes happen to live in process memory but
-        the addressing is path-shaped, not :class:`Memory`-shaped."""
+        """Paths are never raw memory holders — :class:`Memory` is the
+        in-process bytearray shape, not anything reached via path
+        addressing."""
         return False
 
     @property
     def is_remote_path(self) -> bool:
-        """Default: every path that isn't a local-fs path is remote.
-        Concrete subclasses override only when they need finer-grained
-        dispatch (e.g. an in-process :class:`MemoryPath` overrides to
-        ``False`` since it isn't reachable over a network)."""
+        """Default: every path that isn't a local-fs path is remote."""
         return not self.is_local_path
 
     # ==================================================================
@@ -911,38 +822,17 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
 
     @property
     def size(self) -> int:
-        if self._transaction_buffer is not None:
-            return int(self._transaction_buffer.size)
         return int(self._stat().size)
 
     @property
     def mtime(self) -> float:
-        if self._transaction_buffer is not None:
-            try:
-                return float(self._transaction_buffer.mtime)
-            except Exception:
-                return 0.0
         s = self._stat()
         if s.kind == IOKind.MISSING:
             return 0.0
         return float(s.mtime or 0.0)
 
     def stat(self) -> IOStats:
-        """One backend round-trip → ``IOStats`` (kind + size + mtime + mode + media_type).
-
-        Active transaction buffer short-circuits to its in-memory
-        size/mtime; otherwise a single :meth:`_stat` round-trip fills
-        the stat quad. ``media_type`` comes from the URL extension —
-        best effort, may be ``None``.
-        """
-        if self._transaction_buffer is not None:
-            buf = self._transaction_buffer
-            return IOStats(
-                size=int(buf.size),
-                mtime=float(buf.mtime or 0.0),
-                kind=IOKind.FILE,
-                media_type=self.media_type,
-            )
+        """One backend round-trip → ``IOStats`` (kind + size + mtime + mode + media_type)."""
         s = self._stat()
         s.media_type = self.media_type
         return s
@@ -1122,21 +1012,14 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         """Positional read.
 
         Resolves negative *pos* against :attr:`size` (so ``-1`` reads
-        the last byte, ``-n`` reads from N bytes before EOF). Uses
-        the transaction buffer when active, else routes through the
-        :meth:`_bread` positional primitive and unwraps its
-        :class:`BytesIO` into a fresh :class:`bytes`.
+        the last byte, ``-n`` reads from N bytes before EOF). Routes
+        through the :meth:`_bread` whole-file primitive and unwraps
+        its :class:`BytesIO` into a fresh :class:`bytes`.
         """
         if pos < 0:
             pos = max(0, int(self.size) + pos)
         if n == 0:
             return b""
-
-        if self._transaction_buffer is not None:
-            buf = self._transaction_buffer
-            if n < 0:
-                n = max(0, buf.size - pos)
-            return buf.pread(n, pos) if n else b""
 
         try:
             bio = self._bread(
@@ -1162,11 +1045,9 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
 
         Resolves negative *pos* against :attr:`size` (``-1`` splices
         before the last byte; ``-n`` splices N bytes before EOF).
-        Active transaction buffer splices in place and flags dirty
-        (commit on flush/close). Otherwise wraps ``data`` in a
-        :class:`BytesIO` and routes through the :meth:`_bwrite`
-        positional primitive — whole-file backends absorb the
-        read-modify-write cost internally.
+        Wraps ``data`` in a :class:`BytesIO` and routes through the
+        :meth:`_bwrite` positional primitive — whole-file backends
+        absorb the read-modify-write cost internally.
         """
         del parents
         mv = memoryview(data)
@@ -1180,12 +1061,6 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         if pos < 0:
             pos = max(0, int(self.size) + pos)
 
-        if self._transaction_buffer is not None:
-            written = self._transaction_buffer.pwrite(mv, pos)
-            if written:
-                self._dirty = True
-            return written
-
         scratch = BytesIO(bytes(mv))
         try:
             return self._bwrite(
@@ -1198,12 +1073,6 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         del parents
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
-
-        if self._transaction_buffer is not None:
-            if int(self._transaction_buffer.size) != n:
-                self._dirty = True
-            self._transaction_buffer.truncate(n)
-            return n
 
         stat = self._stat()
         if stat.kind == IOKind.MISSING:
@@ -1233,17 +1102,8 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         """:class:`Holder` primitive: drop the backing file entirely.
 
         Unlinks via :meth:`unlink` with ``missing_ok=True`` so a
-        missing target is a no-op. Any active transaction buffer is
-        torn down too — its bytes are scratch, the durable backing
-        is what we just removed.
+        missing target is a no-op.
         """
-        if self._transaction_buffer is not None:
-            try:
-                self._transaction_buffer.close()
-            except Exception:
-                pass
-            self._transaction_buffer = None
-            self._dirty = False
         self.unlink(missing_ok=True)
 
     # ==================================================================
@@ -1285,9 +1145,6 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
 
     def read_bytes(self, *, raise_error: bool = True) -> bytes:
         """Whole-file read."""
-        if self._transaction_buffer is not None:
-            return self._transaction_buffer.to_bytes()
-
         try:
             bio = self._bread(-1, 0, Mode.READ_ONLY)
         except (OSError, ValueError):
@@ -1579,8 +1436,6 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
             self._depth -= 1
         if self._depth > 0:
             return
-        if exc_type is not None:
-            self._dirty = False
         self.close()
 
 
