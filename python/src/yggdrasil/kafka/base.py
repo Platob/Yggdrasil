@@ -141,7 +141,7 @@ class KafkaIO(TabularIO[CastOptions]):
     _FINAL_TABULAR_IO = True
 
     @classmethod
-    def default_mime_type(cls) -> MimeType:
+    def default_media_type(cls) -> MimeType:
         return MimeTypes.KAFKA_TOPIC
 
     @classmethod

@@ -110,7 +110,7 @@ class ArrowIPCIO(BytesIO):
     # ==================================================================
 
     @classmethod
-    def default_mime_type(cls):
+    def default_media_type(cls):
         """Canonical :class:`MimeType` — :data:`MimeTypes.ARROW_IPC`."""
         return MimeTypes.ARROW_IPC
 

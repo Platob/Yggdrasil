@@ -147,7 +147,7 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
     # ==================================================================
 
     @classmethod
-    def default_mime_type(cls):
+    def default_media_type(cls):
         """Path is format-agnostic — never auto-register against a mime type."""
         return None
 
@@ -570,8 +570,19 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
             return False
 
     @property
-    def is_local(self) -> bool:
+    def is_memory(self) -> bool:
+        """Paths are never raw memory holders. :class:`MemoryPath` is
+        still a path — its bytes happen to live in process memory but
+        the addressing is path-shaped, not :class:`Memory`-shaped."""
         return False
+
+    @property
+    def is_remote_path(self) -> bool:
+        """Default: every path that isn't a local-fs path is remote.
+        Concrete subclasses override only when they need finer-grained
+        dispatch (e.g. an in-process :class:`MemoryPath` overrides to
+        ``False`` since it isn't reachable over a network)."""
+        return not self.is_local_path
 
     # ==================================================================
     # Coercion entry points
@@ -1170,6 +1181,23 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
             return n
         finally:
             bio.close()
+
+    def clear(self) -> None:
+        """:class:`Holder` primitive: drop the backing file entirely.
+
+        Unlinks via :meth:`unlink` with ``missing_ok=True`` so a
+        missing target is a no-op. Any active transaction buffer is
+        torn down too — its bytes are scratch, the durable backing
+        is what we just removed.
+        """
+        if self._transaction_buffer is not None:
+            try:
+                self._transaction_buffer.close()
+            except Exception:
+                pass
+            self._transaction_buffer = None
+            self._dirty = False
+        self.unlink(missing_ok=True)
 
     # ==================================================================
     # Holder primitives — read_mv / write_mv / reserve

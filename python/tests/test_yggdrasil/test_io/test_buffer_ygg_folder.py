@@ -56,9 +56,9 @@ class TestYggSidecar:
         assert YGGFolderIO.METADATA_DIR_NAME == "metadata"
         assert YGGFolderIO.STATS_FILENAME == "stats.arrow"
 
-    def test_default_mime_type(self):
-        assert YGGFolderIO.default_mime_type() is MimeTypes.YGG_FOLDER
-        assert FolderIO.default_mime_type() is MimeTypes.FOLDER
+    def test_default_media_type(self):
+        assert YGGFolderIO.default_media_type() is MimeTypes.YGG_FOLDER
+        assert FolderIO.default_media_type() is MimeTypes.FOLDER
 
     def test_list_checkpoints_empty_when_no_log(self, tmp_path):
         with YGGFolderIO(path=str(tmp_path)) as io:

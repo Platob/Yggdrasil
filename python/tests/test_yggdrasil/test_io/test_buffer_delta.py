@@ -131,8 +131,8 @@ def _seed_commit_zero(
 
 
 class TestDeltaIOSurface:
-    def test_default_mime_type(self):
-        assert DeltaIO.default_mime_type() == MimeTypes.DELTA_FOLDER
+    def test_default_media_type(self):
+        assert DeltaIO.default_media_type() == MimeTypes.DELTA_FOLDER
 
     def test_options_defaults(self):
         opts = DeltaOptions()

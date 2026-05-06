@@ -27,8 +27,8 @@ _io_BytesIO = _io_module.BytesIO
 
 
 class TestZipIOBase:
-    def test_default_mime_type(self):
-        assert ZipIO.default_mime_type() == MimeTypes.ZIP
+    def test_default_media_type(self):
+        assert ZipIO.default_media_type() == MimeTypes.ZIP
 
     def test_options_class(self):
         assert ZipIO.options_class() is ZipOptions

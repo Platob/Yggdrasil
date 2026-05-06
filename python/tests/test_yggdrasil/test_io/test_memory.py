@@ -303,21 +303,21 @@ class TestMemoryStats:
         assert s.media_type is MediaTypes.JSON
         assert s.has_media_type
 
-    def test_iostats_with_copy(self):
+    def test_iostats_with_default_copies(self):
         s = IOStats(size=10, mtime=1.0, media_type=None)
-        s2 = s.with_(size=20, copy=True)
+        s2 = s.with_(size=20)
         assert s.size == 10
         assert s2.size == 20
 
     def test_iostats_with_inplace(self):
         s = IOStats(size=10, mtime=1.0, media_type=None)
-        s.with_(size=20)
+        s.with_(size=20, inplace=True)
         assert s.size == 20
 
     def test_iostats_clear_media_type(self):
         from yggdrasil.io.enums import MediaTypes
         s = IOStats(size=1, mtime=0.0, media_type=MediaTypes.JSON)
-        s.with_(media_type=None)
+        s.with_(media_type=None, inplace=True)
         assert s.media_type is None
         assert not s.has_media_type
 

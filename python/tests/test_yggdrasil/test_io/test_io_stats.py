@@ -61,11 +61,12 @@ class TestIOStatsKindHelpers:
 
 
 class TestIOStatsWith:
-    def test_with_copy_returns_new_instance(self):
+    def test_with_default_returns_new_instance(self):
         original = IOStats(
             size=1, mtime=1.0, kind=IOKind.FILE, mode=0o644,
         )
-        updated = original.with_(size=99, copy=True)
+        updated = original.with_(size=99)
+        assert updated is not original
         assert original.size == 1
         assert updated.size == 99
         # Other fields preserved.
@@ -75,23 +76,40 @@ class TestIOStatsWith:
 
     def test_with_inplace_mutates_self(self):
         s = IOStats()
-        result = s.with_(size=10, kind=IOKind.FILE, mode=0o755)
+        result = s.with_(size=10, kind=IOKind.FILE, mode=0o755, inplace=True)
         assert result is s
         assert s.size == 10
         assert s.kind is IOKind.FILE
         assert s.mode == 0o755
 
-    def test_with_none_does_not_overwrite_quad(self):
+    def test_with_omitted_fields_carry_over(self):
         s = IOStats(size=5)
-        s.with_(size=None)
-        assert s.size == 5
+        out = s.with_()
+        assert out is not s
+        assert out.size == 5
 
     def test_with_clears_media_type_explicitly(self):
         from yggdrasil.io.enums import MediaTypes
 
         s = IOStats(media_type=MediaTypes.JSON)
-        s.with_(media_type=None)
+        s.with_(media_type=None, inplace=True)
         assert s.media_type is None
+
+    def test_copy_returns_independent_instance(self):
+        original = IOStats(size=4, kind=IOKind.FILE)
+        copy = original.copy()
+        assert copy is not original
+        assert (copy.size, copy.kind) == (4, IOKind.FILE)
+        copy.size = 99
+        assert original.size == 4
+
+    def test_copy_overrides_only_named_fields(self):
+        original = IOStats(size=4, mtime=1.5, mode=0o600)
+        copy = original.copy(size=99, media_type=None)
+        assert copy.size == 99
+        assert copy.mtime == 1.5
+        assert copy.mode == 0o600
+        assert copy.media_type is None
 
 
 class TestIOStatsIteration:

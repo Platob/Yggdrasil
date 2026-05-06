@@ -12,8 +12,8 @@ from .._helpers import sample_table
 
 
 class TestArrowIPCIOBase:
-    def test_default_mime_type(self):
-        assert ArrowIPCIO.default_mime_type() == MimeTypes.ARROW_IPC
+    def test_default_media_type(self):
+        assert ArrowIPCIO.default_media_type() == MimeTypes.ARROW_IPC
 
     def test_options_class(self):
         assert ArrowIPCIO.options_class() is ArrowIPCOptions

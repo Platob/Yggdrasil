@@ -136,7 +136,7 @@ class MemoryArrowIO(TabularIO[CastOptions]):
     _FINAL_TABULAR_IO: ClassVar[bool] = True
 
     @classmethod
-    def default_mime_type(cls) -> Optional[MimeType]:
+    def default_media_type(cls) -> Optional[MimeType]:
         # In-memory containers don't claim a wire format; returning
         # None keeps them out of the media-type registry so they never
         # win factory dispatch by accident.
@@ -177,6 +177,8 @@ class MemoryArrowIO(TabularIO[CastOptions]):
         # Caller-supplied spill path acts like the BytesIO "external"
         # branch — we honor it as the spill destination but don't
         # unlink on close. Otherwise minted on demand.
+        self._spill_path = None
+        self._owns_spill_path = True
         if spill_path is not None:
             from yggdrasil.io.fs.path import Path  # local import — Path optional in some envs.
 

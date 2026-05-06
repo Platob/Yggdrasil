@@ -12,8 +12,8 @@ from .._helpers import sample_table
 
 
 class TestJsonBase:
-    def test_default_mime_type(self):
-        assert JsonIO.default_mime_type() == MimeTypes.JSON
+    def test_default_media_type(self):
+        assert JsonIO.default_media_type() == MimeTypes.JSON
 
     def test_options_class(self):
         assert JsonIO.options_class() is JsonOptions

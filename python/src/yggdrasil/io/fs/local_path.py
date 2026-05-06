@@ -197,7 +197,7 @@ class LocalPath(Path):
         )
 
     @property
-    def is_local(self) -> bool:
+    def is_local_path(self) -> bool:
         return True
 
     @property

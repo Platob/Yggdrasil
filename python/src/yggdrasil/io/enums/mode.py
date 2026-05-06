@@ -44,6 +44,7 @@ ModeLike = Union["Mode", str]
 
 class Mode(str, Enum):
     AUTO = "auto"
+    READ_ONLY = "read_only"
     OVERWRITE = "overwrite"
     APPEND = "append"
     IGNORE = "ignore"
@@ -51,6 +52,16 @@ class Mode(str, Enum):
     MERGE = "merge"
     TRUNCATE = "truncate"
     ERROR_IF_EXISTS = "error_if_exists"
+
+    @property
+    def is_read_only(self) -> bool:
+        """True for read-only modes — i.e. no write disposition."""
+        return self is Mode.READ_ONLY
+
+    @property
+    def allows_write(self) -> bool:
+        """True when the mode admits any write disposition."""
+        return self is not Mode.READ_ONLY
 
     @classmethod
     def from_(
@@ -188,10 +199,14 @@ def _parse_os_mode(s: str) -> Optional[Mode]:
 
     primary = primaries[0]
     if primary == "r":
-        # 'r', 'rb', 'rt', 'r+', 'rb+', 'rt+' — no write disposition
-        # (or in-place edit for '+'). Both collapse to AUTO at this
-        # layer; the caller's write semantics happen elsewhere.
-        return Mode.AUTO
+        # 'r', 'rb', 'rt' — read-only. '+' variants ('r+', 'rb+',
+        # 'rt+') admit in-place writes and resolve to AUTO so a
+        # write-side caller can pick a disposition. Pure-read forms
+        # surface as Mode.READ_ONLY so callers can refuse writes
+        # explicitly without parsing the mode string themselves.
+        if "+" in s:
+            return Mode.AUTO
+        return Mode.READ_ONLY
     if primary == "w":
         return Mode.OVERWRITE
     if primary == "a":
@@ -215,9 +230,9 @@ def _parse_os_mode(s: str) -> Optional[Mode]:
 
 STR_MAPPING = {
     # OS modes — simple primary forms (parser handles the rest).
-    "r": Mode.AUTO,
-    "rb": Mode.AUTO,
-    "rt": Mode.AUTO,
+    "r": Mode.READ_ONLY,
+    "rb": Mode.READ_ONLY,
+    "rt": Mode.READ_ONLY,
     "w": Mode.OVERWRITE,
     "wb": Mode.OVERWRITE,
     "wt": Mode.OVERWRITE,
@@ -240,6 +255,12 @@ STR_MAPPING = {
     "i": Mode.IGNORE,
     "ignore": Mode.IGNORE,
     "skip": Mode.IGNORE,
+
+    # Read-only — no write disposition admitted.
+    "ro": Mode.READ_ONLY,
+    "read": Mode.READ_ONLY,
+    "readonly": Mode.READ_ONLY,
+    "read_only": Mode.READ_ONLY,
 
     "up": Mode.UPSERT,
     "update": Mode.UPSERT,

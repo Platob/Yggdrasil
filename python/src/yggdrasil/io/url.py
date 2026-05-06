@@ -169,6 +169,36 @@ def _format_memory_address(address: int) -> str:
     return f"0x{address:0{_MEMORY_HEX_WIDTH}x}"
 
 
+# Cached host component for ``mem://<host>/<addr>`` URLs. Looked up
+# once via :func:`socket.gethostname` (or :func:`platform.node` as a
+# fallback) and lower-cased so the rendered URL matches the casing of
+# every other URL component. Falls back to ``"localhost"`` if the
+# system has no usable hostname configured.
+_LOCAL_HOSTNAME: "str | None" = None
+
+
+def _local_hostname() -> str:
+    """Return the local machine's hostname, lower-cased and cached.
+
+    Used as the host component for memory URLs so two ``mem://`` URLs
+    from different hosts never collide on a shared cache key. The
+    lookup runs once per process; subsequent calls return the cached
+    value.
+    """
+    global _LOCAL_HOSTNAME
+    if _LOCAL_HOSTNAME is None:
+        import socket
+        try:
+            name = socket.gethostname()
+        except OSError:
+            name = ""
+        if not name:
+            import platform
+            name = platform.node() or "localhost"
+        _LOCAL_HOSTNAME = name.strip().lower() or "localhost"
+    return _LOCAL_HOSTNAME
+
+
 def _parse_memory_address(text: str) -> int:
     """Parse the path portion of a ``mem://`` URL back into an integer.
 
@@ -684,14 +714,17 @@ class URL(os.PathLike):
 
     @classmethod
     def from_memory_address(cls, obj: object) -> "URL":
-        """Build a ``mem://<hex_addr>`` URL pointing at ``obj``.
+        """Build a ``mem://<hostname>/<hex_addr>`` URL pointing at ``obj``.
 
         Encodes ``id(obj)`` so the URL can round-trip through code
         paths that expect a string or :class:`URL` (cache keys,
         MediaIO dispatch, pipeline configs). The returned URL is a
         *handle*, not a persistent reference: it is valid only within
         this process and only while the caller holds a strong
-        reference to ``obj``.
+        reference to ``obj``. The host component is the local machine's
+        hostname (cached process-wide) so two memory URLs minted on
+        different hosts never alias even when ``id()`` happens to
+        collide across machines.
 
         Lifetime contract:
 
@@ -718,6 +751,7 @@ class URL(os.PathLike):
         address = id(obj)
         return cls(
             scheme=_MEMORY_SCHEME,
+            host=_local_hostname(),
             path="/" + _format_memory_address(address),
         )
 

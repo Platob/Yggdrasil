@@ -147,7 +147,7 @@ class FolderIO(NestedIO[FolderOptions]):
     _FINAL_TABULAR_IO: ClassVar[bool] = True
 
     @classmethod
-    def default_mime_type(cls) -> "MimeType | None":
+    def default_media_type(cls) -> "MimeType | None":
         return MimeTypes.FOLDER
 
     @classmethod

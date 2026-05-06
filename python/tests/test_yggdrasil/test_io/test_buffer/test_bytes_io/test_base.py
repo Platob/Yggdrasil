@@ -46,10 +46,10 @@ class TestBytesIOConstruction:
         assert bio.read() == b"PAYLOAD"
         bio.close()
 
-    def test_default_mime_type_is_none(self):
+    def test_default_media_type_is_none(self):
         # BytesIO opts out of the TabularIO registry — the buffer
         # has no single mime to claim.
-        assert BytesIO.default_mime_type() is None
+        assert BytesIO.default_media_type() is None
 
 
 class TestBytesIOReadWrite:

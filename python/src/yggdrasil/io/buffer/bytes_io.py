@@ -1,35 +1,39 @@
 """Spill-to-disk byte buffer with cursor and tabular dispatch.
 
 A :class:`BytesIO` is a cursor + format dispatcher layered on top of
-a :class:`yggdrasil.io.holder.Holder` backing. The two concrete
-holders it composes with are:
+a single :class:`yggdrasil.io.holder.Holder` backing. The buffer
+keeps **one** ``_holder`` slot that mutates between two shapes:
 
 - :class:`yggdrasil.io.memory.Memory` (in-memory backed by
   :class:`bytearray`) — fast for small/medium payloads, used when
   there's no path bound and the payload fits under ``spill_bytes``.
 - :class:`yggdrasil.io.fs.Path` (path-bound) — the path's
-  ``acquire_io`` sets up its own fd (local) or transaction
+  :meth:`Path.acquire_io` sets up its own fd (local) or transaction
   :class:`BytesIO` (remote); the buffer forwards every positional op
-  (``pread`` / ``pwrite`` / ``truncate``) straight to the path.
+  (``pread`` / ``pwrite`` / ``truncate``) straight to the holder.
+
+The buffer never branches on ``isinstance(_holder, Memory|Path)`` for
+I/O — every cursorless op funnels through ``_holder.pread`` /
+``_holder.pwrite`` / ``_holder.truncate`` / ``_holder.size``. The
+spill swap rebinds ``_holder`` in place; call sites stay unchanged.
 
 Shape
 -----
 
 A :class:`BytesIO` has one of two backings at any moment:
 
-- **memory** — a :class:`bytearray` managed inline (effectively a
-  :class:`Memory` holder); the buffer auto-spills to a self-owned
-  temp file once the payload crosses ``spill_bytes``.
-- **path-bound** — a :class:`Path` whose ``acquire_io`` set up its
-  own fd (local) or transaction :class:`BytesIO` (remote). The
-  buffer forwards every positional op (``pread`` / ``pwrite`` /
-  ``truncate``) straight to the path; the path is the I/O state.
+- **memory** — ``_holder`` is a :class:`Memory`; the buffer
+  auto-spills to a self-owned temp file once the payload crosses
+  ``spill_bytes``.
+- **path-bound** — ``_holder`` is a :class:`Path` whose
+  :meth:`Path.acquire_io` sets up its own fd (local) or transaction
+  :class:`BytesIO` (remote). The path IS the I/O state.
 
 The path-bound file is either:
 
-- **owned** (``_owns_spill_path = True``) — minted by us in
+- **owned** (``_owns_holder = True``) — minted by us in
   :func:`tempfile.gettempdir`. Unlinked on close.
-- **external** (``_owns_spill_path = False``) — supplied by the
+- **external** (``_owns_holder = False``) — supplied by the
   caller via the ``path=`` constructor kwarg. Never unlinked.
 
 Lifecycle
@@ -39,14 +43,15 @@ Inherits :class:`Disposable`. Constructed in the open state by
 default (``open`` runs from ``__init__``), so callers who never
 enter a ``with`` block still see :meth:`close` do the right thing.
 
-- :meth:`_acquire` opens the open context for path-bound buffers:
-  * memory mode → no-op.
-  * path-bound → :meth:`Path.acquire_io` with the buffer's mode.
-- :meth:`flush` calls ``ctx.flush()`` — a no-op for fd-backed
-  contexts (writes already in the kernel via :func:`os.pwrite`)
-  and a path commit for buffer-backed contexts.
-- :meth:`_release` flushes, closes the context, unlinks the spill
-  file (only if owned).
+- :meth:`_acquire` opens the holder's per-open IO state via
+  :meth:`Holder.acquire_io` — a no-op for :class:`Memory`, and for
+  :class:`Path` it brings up the fd (local) or transaction buffer
+  (remote).
+- :meth:`flush` calls ``_holder.flush()`` — a no-op for memory and
+  fd-backed contexts (writes already in the kernel via
+  :func:`os.pwrite`) and a path commit for buffer-backed contexts.
+- :meth:`_release` flushes, releases per-open state via
+  :meth:`Holder.close_io`, unlinks the spill file (only if owned).
 - ``with bio:`` uses single-shot semantics — the outermost
   ``__exit__`` always closes.
 
@@ -59,10 +64,10 @@ Every public op composes from three internals:
 - :meth:`_write_at` — write N bytes at position, growing/spilling
 - :meth:`_set_size` — extend or shrink
 
-Each routes through the context for path-bound buffers, falls
-through to the in-memory bytearray for memory mode. Memory-mode
-auto-spills on threshold; path-bound buffers never auto-spill at
-this layer (the path is the durable backing).
+Each routes through ``_holder.pread`` / ``_holder.pwrite`` /
+``_holder.truncate``. Memory-mode auto-spills on threshold; path-bound
+buffers never auto-spill at this layer (the path is the durable
+backing).
 
 Modes
 -----
@@ -157,7 +162,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     Mechanically identical otherwise: same fd-backed positional I/O,
     same primitive set. The only behavioural difference is the
     cleanup decision in :meth:`_release`, gated on
-    :attr:`_owns_spill_path`.
+    :attr:`_owns_holder`.
 
     A :class:`BytesIO` IS-A :class:`TabularIO`. Without a tabular
     media type set, the tabular hooks (``_read_arrow_batches`` /
@@ -173,7 +178,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     # a real cost.
 
     @classmethod
-    def default_mime_type(cls) -> "MimeType | None":
+    def default_media_type(cls) -> "MimeType | None":
         """Don't auto-register against any mime type.
 
         :class:`TabularIO.__init_subclass__` registers concrete
@@ -289,39 +294,34 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # below mutates that single shared instance.
         TabularIO.__init__(self, media_type=media_type)
 
-        # Buffer-specific per-instance state.
-        self._buf: bytearray | None = bytearray()
+        # Single backing slot. Memory-mode buffers carry a
+        # :class:`Memory` here; the same slot is mutated to a
+        # :class:`Path` on spill or path-bind. ``None`` only for view
+        # buffers that forward to ``parent`` instead.
+        from yggdrasil.io.memory import Memory  # avoid import cycle
+        self._holder: "Holder | None" = Memory(auto_open=True)
+        self._owns_holder = True
         self._pos: int = 0
-        # Per-open IO state. When acquired, points at ``self._spill_path``
-        # — the path itself owns the active fd or transaction buffer.
-        # ``None`` for memory-mode buffers and pre-acquire path-bound
-        # buffers.
-        self._ctx: "Path | None" = None
         self._mode: str = mode or "rb+"
         self._spill_bytes: int = int(spill_bytes)
         self._spill_ttl: int = int(spill_ttl)
         self._metadata = metadata or {}
         # View state — populated by :meth:`_make_view` only. When
-        # ``parent`` is set AND no own backing is bound (no ``_buf``,
-        # no ``_spill_path``, no ``_ctx``), this BytesIO is a window
-        # over the parent: reads/writes route through ``parent.pread``
-        # / ``parent.pwrite`` at ``_view_offset + pos``, bounded by
-        # ``_view_max_size`` if set. ZipEntryIO and other subclasses
-        # that set ``parent`` for navigation always have own backing,
-        # so :attr:`is_view` stays False.
+        # ``parent`` is set AND ``_holder`` is ``None``, this BytesIO
+        # is a window over the parent: reads/writes route through
+        # ``parent.pread`` / ``parent.pwrite`` at
+        # ``_view_offset + pos``, bounded by ``_view_max_size`` if
+        # set. ZipEntryIO and other subclasses that set ``parent``
+        # for navigation always have own backing, so :attr:`is_view`
+        # stays False.
         self.parent: "BytesIO | None" = None
         self._view_offset: int = 0
         self._view_max_size: int | None = None
 
         if path is not None:
             # Path-bound. Caller owns the path; we don't unlink on close.
-            self._spill_path = path_class().from_(path)
-            self._owns_spill_path = False
-            # Path-bound buffers don't keep an in-memory bytearray —
-            # everything goes through the fd.
-            self._buf = None
-        # ``_spill_path = None`` / ``_owns_spill_path = True`` were
-        # already set by TabularIO.__init__ for the autonomous case.
+            self._holder = path_class().from_(path)
+            self._owns_holder = False
 
         if data is not None:
             self._init_from(data, copy=copy)
@@ -339,9 +339,9 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             #   accept the handle. Their ``_acquire`` is a cheap
             #   no-op for the memory-only case.
             caller_owned_path = (
-                self._spill_path is not None and not self._owns_spill_path
+                self._is_path_holder() and not self._owns_holder
             )
-            auto_open = caller_owned_path or self._spill_path is None
+            auto_open = caller_owned_path or not self._is_path_holder()
 
         if auto_open and not self._acquired:
             self.open()
@@ -349,6 +349,33 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     # ------------------------------------------------------------------
     # Input dispatch
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Holder helpers — single source of truth for the active backing
+    # ------------------------------------------------------------------
+
+    def _is_path_holder(self) -> bool:
+        """True when ``_holder`` is path-bound (spilled or external)."""
+        return isinstance(self._holder, path_class())
+
+    def _is_memory_holder(self) -> bool:
+        """True when ``_holder`` is the in-memory :class:`Memory` shape."""
+        from yggdrasil.io.memory import Memory  # avoid import cycle
+        return isinstance(self._holder, Memory)
+
+    def _path_holder(self) -> "Path | None":
+        """Return ``_holder`` if path-bound, else ``None``."""
+        return self._holder if self._is_path_holder() else None
+
+    def _memory_holder(self):
+        """Return ``_holder`` if memory-backed, else ``None``."""
+        return self._holder if self._is_memory_holder() else None
+
+    def _set_memory(self, source=None) -> None:
+        """Replace ``_holder`` with a :class:`Memory` seeded from *source*."""
+        from yggdrasil.io.memory import Memory  # avoid import cycle
+        self._holder = Memory(source, auto_open=True)
+        self._owns_holder = True
 
     def _init_from(self, data: Any, *, copy: bool) -> None:
         """Memory-mode dispatcher. May immediately spill if input crosses threshold."""
@@ -368,9 +395,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # is equivalent to passing ``path=data`` as a kwarg.
         p = path_class()
         if p.is_pathish(data):
-            self._spill_path = p.from_(data)
-            self._owns_spill_path = False
-            self._buf = None
+            self._holder = p.from_(data)
+            self._owns_holder = False
             return
 
         if hasattr(data, "read"):
@@ -393,13 +419,12 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             # buffer just supplies the payload.
             path = _mint_spill_path(self._ext_hint(), self._spill_ttl)
             path.write_bytes(src)
-            self._buf = None
+            self._holder = path
+            self._owns_holder = True
             self._stats.size = n
-            self._spill_path = path
-            self._owns_spill_path = True
-            # ctx opens lazily in _acquire / _ensure_ctx.
+            # Holder's per-open IO state opens lazily in _acquire.
         else:
-            self._buf = bytearray(src)
+            self._set_memory(bytes(src))
             self._stats.size = n
         self._pos = 0
 
@@ -414,16 +439,15 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             src = src.copy()
 
         super()._init_from_disposable(src)
-        self._buf = src._buf
+        # Share the holder reference — each :class:`Disposable` instance
+        # opens its own per-open state on _acquire, so two BytesIO
+        # views over the same path get independent fds / transactions.
+        self._holder = src._holder
         self._stats.size = src._stats.size
-        self._spill_path = src._spill_path
-        self._owns_spill_path = src._owns_spill_path
+        self._owns_holder = src._owns_holder
         self._pos = src._pos
         self._stats.media_type = src._stats.media_type
         self._metadata = src._metadata
-        # Don't share the open context — each instance opens its own
-        # against the path on _acquire.
-        self._ctx = None
         self._mode = src._mode
         self._spill_bytes = src._spill_bytes
         self._spill_ttl = src._spill_ttl
@@ -457,10 +481,9 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 path.flush()
             finally:
                 path.close_io()
-            self._buf = None
+            self._holder = path
+            self._owns_holder = True
             self._stats.size = total
-            self._spill_path = path
-            self._owns_spill_path = True
             self._pos = 0
             return
 
@@ -487,13 +510,12 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
-            self._buf = bytearray(payload)
+            self._set_memory(payload)
             self._stats.size = len(payload)
         else:
-            self._buf = None
+            self._holder = path
+            self._owns_holder = True
             self._stats.size = total
-            self._spill_path = path
-            self._owns_spill_path = True
         self._pos = 0
 
     # ------------------------------------------------------------------
@@ -550,12 +572,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     @property
     def spilled(self) -> bool:
         """True when backed by a spill file (owned or external)."""
-        return self._spill_path is not None
-
-    @property
-    def ctx(self) -> "Path | None":
-        """The path acting as our active I/O context, or ``None``."""
-        return self._ctx
+        return self._is_path_holder()
 
     @property
     def _owner(self) -> "Holder | None":
@@ -564,45 +581,40 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         - **Spilled / path-bound** → the bound :class:`Path` (already
           a :class:`Holder`). Mutates through the path's
           :meth:`acquire_io` flow.
-        - **Memory mode** → a :class:`Memory` aliasing the same
-          ``bytearray`` the buffer mutates internally
-          (:meth:`Memory.view`, zero-copy). Read/write operations
-          through the Holder interface land on the same bytes the
-          buffer's primitives do; spill swaps the property over to
-          the path without changing the call surface.
+        - **Memory mode** → the :class:`Memory` instance that owns
+          the in-memory bytearray. Read/write operations through the
+          Holder interface land on the same bytes the buffer's
+          primitives do; spill swaps the slot over to the path
+          without changing the call surface.
         - **View mode** (window over a parent buffer) → ``None``.
           Views forward to ``self.parent`` directly.
         """
-        from yggdrasil.io.memory import Memory  # avoid import cycle
-        if self._spill_path is not None:
-            return self._spill_path
-        if self._buf is not None:
-            return Memory.view(self._buf, self._stats.size)
-        return None
+        return self._holder
 
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
 
     # ------------------------------------------------------------------
-    # Disposable hooks — open context against the bound path
+    # Disposable hooks — open per-open IO state on the holder
     # ------------------------------------------------------------------
 
     def _acquire(self) -> None:
-        """Acquire the bound path's I/O state (fd or transaction buffer)."""
-        if self._spill_path is None:
-            return
-        if self._ctx is not None:
+        """Acquire the holder's per-open IO state.
+
+        Memory holders are no-ops; :class:`Path` holders bring up an
+        fd (local) or transaction buffer (remote) keyed by the
+        buffer's mode. Always calls :meth:`Path.acquire_io` so a
+        caller-supplied path opened in a different mode at
+        construction is reopened in the buffer's mode.
+        """
+        path = self._path_holder()
+        if path is None:
             return
 
-        self._spill_path.acquire_io(self._mode)
-        self._ctx = self._spill_path
-
-        # Path-bound buffers don't keep an in-memory bytearray — the
-        # path owns the working bytes.
-        self._buf = None
-        self._stats.size = int(self._spill_path.size)
-        mt = self._spill_path.mtime
+        path.acquire_io(self._mode)
+        self._stats.size = int(path.size)
+        mt = path.mtime
         self._stats.mtime = float(mt) if mt is not None else 0.0
 
         if "a" in self._mode:
@@ -611,50 +623,60 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             self._pos = 0
 
     def _release(self) -> None:
-        """Close the open context, unlink owned spill files."""
+        """Close the holder's per-open IO state, unlink owned spill files."""
         # Tabular cache: clear first so a re-open after close starts cold.
         self.unpersist()
 
-        # Drop the path's I/O state — close_io flushes the transaction
-        # buffer (remote) or closes the fd (local).
-        if self._ctx is not None:
+        # Views share their holder with a parent — never touch the
+        # holder's per-open state or unlink it on close.
+        if self.is_view:
+            return
+
+        path = self._path_holder()
+        if path is not None:
+            # Drop the path's I/O state — close_io flushes the
+            # transaction buffer (remote) or closes the fd (local).
             try:
-                self._ctx.close_io()
+                path.close_io()
             except Exception:
                 pass
-            self._ctx = None
 
-        # Unlink the file only if we minted it. Caller-owned paths
-        # are left alone.
-        if self._spill_path is not None and self._owns_spill_path:
-            try:
-                self._spill_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            self._spill_path = None
+            # Unlink the file only if we minted it. Caller-owned paths
+            # are left alone.
+            if self._owns_holder:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                # Drop the holder so later code observes "no path bound."
+                self._holder = None
 
-    def _ensure_ctx(self) -> "Path":
-        """Lazily acquire the bound path's I/O state; return the path."""
-        if self._ctx is not None:
-            return self._ctx
-        if self._spill_path is None:
+    def _ensure_holder_open(self) -> "Holder":
+        """Lazily acquire the holder's per-open IO state; return the holder.
+
+        Memory holders are no-ops; :class:`Path` holders open their fd
+        / transaction buffer keyed by the buffer's mode.
+        """
+        holder = self._holder
+        if holder is None:
             raise RuntimeError(
-                "BytesIO has no spill path to open a context against"
+                f"{type(self).__name__} has no holder to open"
             )
-        self._spill_path.acquire_io(self._mode)
-        self._ctx = self._spill_path
-        return self._ctx
+        if isinstance(holder, path_class()) and not holder.io_open:
+            holder.acquire_io(self._mode)
+        return holder
 
     # ------------------------------------------------------------------
-    # Three core primitives — only branch sites for memory vs spilled
+    # Three core primitives — single dispatch through ``_holder.pread`` /
+    # ``_holder.pwrite`` / ``_holder.truncate``.
     # ------------------------------------------------------------------
     def _slice(self, pos: int, n: int) -> bytes:
-        """Read *n* bytes at *pos*. Two backings:
+        """Read *n* bytes at *pos*.
 
-        - Path-bound → forward to the open context's ``pread``, which
-          uses ``os.pread`` for local paths and ``Path.pread`` for
-          remote.
-        - Memory mode → slice from ``_buf``.
+        - Path-bound → ``_holder.pread`` (uses ``os.pread`` for local
+          paths and the transaction buffer for remote).
+        - Memory mode → ``_holder.pread`` against the :class:`Memory`
+          backing.
         - View → ``parent.pread`` at ``_view_offset + pos``, bounded
           by the view's tracked size.
         """
@@ -663,26 +685,19 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         if pos < 0:
             raise ValueError("slice position must be >= 0")
 
-        # View mode: forward to the parent, bounded by our tracked size.
+        # View mode: forward through the shared holder at the view's
+        # window offset, bounded by the view's tracked size.
         if self.is_view:
             if pos >= self._stats.size:
                 return b""
             n = min(n, self._stats.size - pos)
-            return self.parent.pread(n, self._view_offset + pos)
+            return self._ensure_holder_open().pread(n, self._view_offset + pos)
 
-        # Path-bound: route through the context (fd-backed for local,
-        # buffer-backed for remote).
-        if self._spill_path is not None:
-            return self._ensure_ctx().pread(n, pos)
+        holder = self._holder
+        if holder is None:
+            return b""
 
-        # Pure memory: read from _buf.
-        if self._buf is not None:
-            end = min(pos + n, self._stats.size)
-            if pos >= end:
-                return b""
-            return bytes(memoryview(self._buf)[pos:end])
-
-        return b""
+        return self._ensure_holder_open().pread(n, pos)
 
     def _flag_dirty_for_commit(self) -> None:
         """Mark the buffer dirty when ``_commit`` would do real work.
@@ -693,7 +708,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         state. The set mirrors the conditions in :meth:`_commit`:
         view buffers (parent flush needed) are the only shape with
         anything durable to push. Path-bound contexts already
-        commit each ``ctx.pwrite`` straight to the path's
+        commit each ``_holder.pwrite`` straight to the path's
         :meth:`pwrite`, so there's nothing held back to flush;
         memory-mode buffers have nowhere to flush to.
         """
@@ -702,26 +717,19 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         if self.is_view:
             self._dirty = True
             return
-        ctx = self._ctx
-        if ctx is None:
-            return
-        if ctx.dirty:
+        if self._is_path_holder() and self._holder.dirty:
             self._dirty = True
 
     def _write_at(self, data: memoryview, pos: int) -> int:
         """Write *mv* at *pos*. Grows backing, auto-spills on threshold.
 
-        Two dispatch shapes:
-
-        - **Path-bound** → forward to the open context's ``pwrite``.
-          The context handles fd writes (local) or scratch-buffer
-          splicing (remote); the buffer doesn't care which.
-        - **No path** → write into ``_buf``; auto-spill if the
-          projected size crosses ``spill_bytes``.
-
-        Critical fix vs. previous version: if a memory-mode write
-        crosses ``spill_bytes`` and triggers ``_spill()``, the same
-        call falls through to the path-bound write branch.
+        Single dispatch through ``_holder.pwrite`` regardless of
+        backing. Memory holders splice into their :class:`bytearray`;
+        path holders forward to fd writes (local) or scratch-buffer
+        splicing (remote). Auto-spill swaps ``_holder`` from
+        :class:`Memory` to :class:`Path` when the projected size
+        crosses ``spill_bytes`` — the same call then falls through
+        to the path branch transparently.
 
         Flips the dirty bit on a successful non-zero write so that
         context-manager exit (or an explicit :meth:`flush`) commits
@@ -735,9 +743,10 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         if n == 0:
             return 0
 
-        # View mode: forward to parent, capped by ``_view_max_size``.
-        # The view's tracked size grows up to the cap; the parent's
-        # cursor stays put (pwrite is cursorless).
+        # View mode: forward through the shared holder at the view's
+        # window offset, capped by ``_view_max_size``. The view's
+        # tracked size grows up to the cap; the holder's bytes past
+        # ``_view_offset + size`` are left intact for the parent.
         if self.is_view:
             if self._view_max_size is not None:
                 allowed = self._view_max_size - pos
@@ -746,7 +755,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 if n > allowed:
                     data = data[:allowed]
                     n = len(data)
-            written = self.parent.pwrite(data, self._view_offset + pos)
+            holder = self._ensure_holder_open()
+            written = holder.pwrite(data, self._view_offset + pos)
             if pos + written > self._stats.size:
                 self._stats.size = pos + written
             if written:
@@ -754,47 +764,35 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 self._touch_mtime()
             return written
 
-        # Auto-spill check fires only for autonomous (no-path) memory
-        # buffers. A buffer already bound to a path never spills at
-        # this layer — the path IS the durable backing.
-        if self._buf is not None and self._spill_path is None:
+        # Auto-spill check fires only for memory holders. A buffer
+        # already bound to a path never spills at this layer — the
+        # path IS the durable backing.
+        if self._is_memory_holder():
             projected = max(self._stats.size, pos + n)
             if projected > self._spill_bytes:
                 self._spill()
 
-        # Path-bound: route through the open context.
-        if self._spill_path is not None:
-            ctx = self._ensure_ctx()
-            written = ctx.pwrite(data, pos)
-            self._stats.size = max(self._stats.size, pos + written)
-            if written and ctx.dirty:
+        if self._holder is None:
+            raise RuntimeError(f"Cannot write to {self!r}: no backing")
+
+        holder = self._ensure_holder_open()
+        written = holder.pwrite(data, pos)
+        self._stats.size = max(self._stats.size, pos + written)
+        if written:
+            if self._is_path_holder() and holder.dirty:
                 self._flag_dirty_for_commit()
-                self._touch_mtime()
-            return written
-
-        # Pure memory: splice into _buf.
-        if self._buf is not None:
-            need = pos + n
-            if need > len(self._buf):
-                new_cap = max(need, int(len(self._buf) * 1.5) + 1)
-                self._buf.extend(b"\x00" * (new_cap - len(self._buf)))
-            memoryview(self._buf)[pos:need] = _as_contiguous_mv(data)
-            self._stats.size = max(self._stats.size, need)
             self._touch_mtime()
-            return n
-
-        raise RuntimeError(f"Cannot write to {self!r}: no backing")
+        return written
 
     def _set_size(self, n: int) -> int:
         """Truncate or extend backing to exactly *n* bytes.
 
-        - **Path-bound** → ``ctx.truncate(n)``. Local fd-backed
-          contexts call ``os.ftruncate``; remote contexts forward
-          to :meth:`Path.truncate`.
-        - **No path** → resize ``_buf``.
-        - **View** → resize the parent so its bytes past
-          ``_view_offset + n`` are dropped (or zero-extended on grow),
-          then update the view's tracked size.
+        Single dispatch through ``_holder.truncate``. Local fd-backed
+        path holders call ``os.ftruncate``; remote path holders
+        forward to :meth:`Path.truncate`; memory holders resize the
+        :class:`bytearray`. Views resize the parent so its bytes past
+        ``_view_offset + n`` are dropped (or zero-extended on grow),
+        then update the view's tracked size.
 
         Spill is one-way — truncate on a spilled buffer truncates
         the file, never demotes back to memory.
@@ -805,7 +803,10 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         if self.is_view:
             if self._view_max_size is not None:
                 n = min(n, self._view_max_size)
-            self.parent._set_size(self._view_offset + n)
+            # Resize the shared holder so bytes past
+            # ``_view_offset + n`` are dropped (or zero-extended on
+            # grow). Other views over the same holder see the change.
+            self._ensure_holder_open().truncate(self._view_offset + n)
             if n != self._stats.size:
                 self._flag_dirty_for_commit()
             self._stats.size = n
@@ -813,71 +814,58 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 self._pos = n
             return n
 
-        # Path-bound: route through the open context.
-        if self._spill_path is not None:
-            ctx = self._ensure_ctx()
-            ctx.truncate(n)
-            if n != self._stats.size and ctx.dirty:
-                self._flag_dirty_for_commit()
+        if self._holder is None:
+            # Defensive — synthesize a memory backing of n zero bytes.
+            # Reachable only after a botched reset.
+            self._set_memory(b"\x00" * n)
             self._stats.size = n
-            if self._pos > n:
-                self._pos = n
+            self._pos = min(self._pos, n)
             return n
 
-        # Pure memory: resize _buf.
-        if self._buf is not None:
-            if n < self._stats.size:
-                self._stats.size = n
-            else:
-                if n > len(self._buf):
-                    self._buf.extend(b"\x00" * (n - len(self._buf)))
-                self._stats.size = n
-            if self._pos > n:
-                self._pos = n
-            return n
-
-        # Neither backing — synthesize a memory backing of n zero
-        # bytes. Reachable only after a botched reset; defensive.
-        self._buf = bytearray(b"\x00" * n)
+        prev_size = self._stats.size
+        holder = self._ensure_holder_open()
+        holder.truncate(n)
         self._stats.size = n
-        self._pos = min(self._pos, n)
+        if self._is_path_holder() and n != prev_size and holder.dirty:
+            self._flag_dirty_for_commit()
+        if self._pos > n:
+            self._pos = n
         return n
 
     # ------------------------------------------------------------------
-    # Spill helper — also opens the fd so post-spill writes work
+    # Spill helper — mutates ``_holder`` from Memory to Path in place
     # ------------------------------------------------------------------
 
     def _spill(self) -> None:
-        """Move the in-memory payload to a fresh owned temp file.
-
-        After this returns, ``_buf`` is None, ``_spill_path`` is set,
-        ``_ctx`` is opened. The caller can immediately use positional
-        ops via ``_ctx.pread`` / ``_ctx.pwrite`` without a second open.
+        """Swap ``_holder`` from :class:`Memory` to :class:`Path`.
 
         The path owns the syscall side: we hand the payload to the
-        path's ``write_bytes`` and immediately open a context against
-        it. There is no buffer-side fd handling.
+        path's :meth:`write_bytes` and acquire its IO state so post-
+        spill positional ops continue to work without any additional
+        bookkeeping at the BytesIO layer.
+
+        After this returns, ``_holder`` is a path-bound :class:`Path`
+        with its IO state already open in ``rb+`` mode.
         """
-        if self._buf is None:
+        memory = self._memory_holder()
+        if memory is None:
             return  # Already spilled, or no backing.
 
         path = _mint_spill_path(self._ext_hint(), self._spill_ttl)
-        if self._stats.size:
-            path.write_bytes(memoryview(self._buf)[: self._stats.size])
+        size = self._stats.size
+        if size:
+            path.write_bytes(bytes(memory.read_mv(size, 0)))
         else:
             # write_bytes on b"" creates a zero-byte file — same shape
             # as the one we'd build via ``open(path, "wb")`` and close.
             path.write_bytes(b"")
 
-        self._buf = None
-        self._spill_path = path
-        self._owns_spill_path = True
-
         # Acquire the new path's IO state. ``rb+`` so subsequent reads
         # AND writes work regardless of the original mode — the spill
         # is internal scratch we own.
         path.acquire_io("rb+")
-        self._ctx = path
+        self._holder = path
+        self._owns_holder = True
 
     def _ext_hint(self) -> str:
         """File extension suggestion for spill files."""
@@ -896,18 +884,16 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     def size(self) -> int:
         """Current size in bytes — the **buffer's** working size.
 
-        Two shapes:
-
-        - **Path-bound** → ``ctx.size``. For local fd contexts this
-          is a live ``os.fstat``; for remote passthrough contexts
-          it's a live ``Path.stat`` round-trip.
-        - **Memory-mode** → ``_stats.size``.
+        Live-reads from the active path holder (fstat for local fd
+        contexts, Path.stat for remote passthrough); for memory
+        holders this returns the in-memory bytearray's size.
 
         For "what's on the remote right now", use :meth:`stat`,
         which is always live.
         """
-        if self._ctx is not None:
-            self._stats.size = self._ctx.size
+        path = self._path_holder()
+        if path is not None and path.io_open:
+            self._stats.size = path.size
         return self._stats.size
 
     def is_empty(self):
@@ -925,20 +911,27 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         remote file's mtime is exposed via :meth:`stat` if the
         caller wants it).
         """
-        if self._ctx is not None:
-            return self._ctx.mtime or time.time()
+        path = self._path_holder()
+        if path is not None and path.io_open:
+            return path.mtime or time.time()
         return self._stats.mtime or time.time()
 
     @property
     def path(self) -> "Path | None":
         """Spill file path, or ``None`` when in memory."""
-        return self._spill_path
+        return self._path_holder()
 
     @property
     def url(self) -> URL:
-        """URL of the buffer's working backing."""
-        if self._spill_path is not None:
-            return self._spill_path.url
+        """URL of the buffer's working backing.
+
+        Forwards to ``_holder.url``: ``file://`` / ``s3://`` / … for
+        path holders, ``mem://<addr>`` for memory holders. Falls back
+        to a buffer-keyed memory URL only when there's no holder yet
+        (views before the parent populates a backing).
+        """
+        if self._holder is not None:
+            return self._holder.url
         return URL.from_memory_address(self)
 
     @property
@@ -948,14 +941,16 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
     @property
     def name(self) -> str:
-        if self._spill_path is not None:
-            return self._spill_path.full_path()
+        path = self._path_holder()
+        if path is not None:
+            return path.full_path()
         return "<memory>"
 
     @property
     def is_local(self) -> bool:
-        if self._spill_path is not None:
-            return self._spill_path.is_local
+        path = self._path_holder()
+        if path is not None:
+            return path.is_local
         return True
 
     @property
@@ -971,27 +966,26 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         return size >= self._spill_bytes
 
     # ------------------------------------------------------------------
-    # View mode — bounded window over a parent BytesIO
+    # View mode — bounded window sharing the parent's :class:`Holder`
     # ------------------------------------------------------------------
 
     @property
     def is_view(self) -> bool:
         """True iff this buffer is a window over :attr:`parent`.
 
-        A view has no own backing — no ``_buf``, no ``_spill_path``,
-        no ``_ctx`` — and ``parent`` is set. Reads and writes are
-        forwarded to the parent's ``pread`` / ``pwrite`` at
-        ``_view_offset + cursor``, leaving the parent's cursor
-        untouched. Subclasses (e.g. :class:`ZipEntryIO`) that set
-        ``parent`` for navigation but allocate their own backing
-        report ``False``.
+        A view shares ``parent._holder`` rather than owning its own
+        backing — every read / write routes through the same
+        :class:`Holder`, just at ``_view_offset + cursor``. Views
+        never unlink the underlying spill on close
+        (``_owns_holder is False``). Subclasses (e.g.
+        :class:`ZipEntryIO`) that set ``parent`` for navigation but
+        allocate their own backing report ``False``.
         """
-        return (
-            self.parent is not None
-            and self._buf is None
-            and self._spill_path is None
-            and self._ctx is None
-        )
+        parent = self.parent
+        if parent is None or self._owns_holder:
+            return False
+        parent_holder = getattr(parent, "_holder", None)
+        return parent_holder is not None and self._holder is parent_holder
 
     @property
     def start(self) -> int:
@@ -1025,6 +1019,12 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     ) -> "BytesIO":
         """Construct a view-mode :class:`BytesIO` over *parent*.
 
+        The view shares ``parent._holder`` directly — every read /
+        write reaches the same backing :class:`Holder`. The view
+        owns nothing: closing the view does not touch the holder or
+        unlink any spill file. ``offset`` / ``size`` / ``max_size``
+        bound the visible window over the shared bytes.
+
         Bypasses :meth:`__new__`'s registry dispatch — a view is always
         a plain BytesIO regardless of the parent's concrete subclass.
         """
@@ -1041,13 +1041,13 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
         view = object.__new__(BytesIO)
         TabularIO.__init__(view, media_type=parent._stats.media_type)
-        view._buf = None
+        # Share the parent's holder directly. The view never owns it,
+        # so close-time unlinking is gated on ``_owns_holder``.
+        view._holder = parent._holder
+        view._owns_holder = False
         view._stats.size = int(size)
         view._stats.mtime = 0.0
         view._pos = int(pos)
-        view._ctx = None
-        view._spill_path = None
-        view._owns_spill_path = False
         view._mode = parent._mode
         view._spill_bytes = 0
         view._spill_ttl = 0
@@ -1081,7 +1081,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     def replace_with_payload(self, payload: Any) -> None:
         """Replace this buffer's content with *payload*, consuming it.
 
-        Two-mode behaviour driven by ``_owns_spill_path``:
+        Two-mode behaviour driven by ``_owns_holder``:
 
         - **Owned spill (or memory)** — tear down the old backing
           (close fd, unlink owned spill, drop bytearray), reset
@@ -1089,7 +1089,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         - **External path binding** (path-bound buffer) — keep the
           binding. Truncate the bound file to zero, write the new
           payload's bytes through the fd, leave ``_spill_path`` /
-          ``_owns_spill_path`` intact.
+          ``_owns_holder`` intact.
 
         Cursor resets to 0. ``_stats.media_type`` is intentionally NOT
         modified — callers that need to update it (compress /
@@ -1107,13 +1107,12 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # ------------------------------------------------------------------
         # External path binding — preserve binding, write through it.
         # ------------------------------------------------------------------
-        if self._spill_path is not None and not self._owns_spill_path:
-            ctx = self._ensure_ctx()
-            ctx.truncate(0)
+        if self._is_path_holder() and not self._owns_holder:
+            holder = self._ensure_holder_open()
+            holder.truncate(0)
             self._stats.size = 0
             self._pos = 0
-            self._buf = None
-            if ctx.dirty:
+            if holder.dirty:
                 # Truncate on a remote-buffered context is a real
                 # mutation — flag so close/flush actually pushes the
                 # zero-byte file to the remote.
@@ -1138,30 +1137,28 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # ------------------------------------------------------------------
         # Owned scratch — full teardown + reinit.
         # ------------------------------------------------------------------
-        if self._ctx is not None:
+        path = self._path_holder()
+        if path is not None:
             try:
-                self._ctx.close_io()
+                path.close_io()
             except Exception:
                 pass
-            self._ctx = None
-        if self._spill_path is not None:
             try:
-                self._spill_path.unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
             except OSError:
                 pass
-            self._spill_path = None
 
-        self._buf = bytearray()
+        self._set_memory()
         self._stats.size = 0
         self._stats.mtime = 0
         self._pos = 0
-        self._owns_spill_path = True
 
         if payload is None:
             return
         self._init_from(payload, copy=False)
-        # If _init_from spilled, the fd is open already. If it stayed
-        # in memory, no fd to open. Either way, consistent state.
+        # If _init_from spilled, the holder swap happened in place. If
+        # it stayed in memory, no IO state to open. Either way,
+        # consistent state.
 
     # ------------------------------------------------------------------
     # Media type
@@ -1170,8 +1167,9 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     @property
     def media_type(self) -> MediaType:
         if self._stats.media_type is None:
-            if self._spill_path is not None:
-                parsed = MediaType.from_path(self._spill_path, default=None)
+            path = self._path_holder()
+            if path is not None:
+                parsed = MediaType.from_path(path, default=None)
                 if parsed is not None and not parsed.mime_type.is_any_bytes:
                     self._stats.media_type = parsed
                     return self._stats.media_type
@@ -1246,12 +1244,12 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         ``Path.stat`` round-trip) before returning so a stale
         in-memory copy never lies about what's on disk.
         """
-        if self._spill_path is not None:
-            ctx = self._ctx
-            if ctx is not None and self._spill_path.is_local:
-                # Local fd: fstat through the ctx is the cheap path.
+        path = self._path_holder()
+        if path is not None:
+            if path.io_open and path.is_local:
+                # Local fd: fstat through the holder is the cheap path.
                 try:
-                    raw = os.fstat(ctx.fileno())
+                    raw = os.fstat(path.fileno())
                     self._stats.size = raw.st_size
                     self._stats.mtime = raw.st_mtime
                     self._stats.kind = IOKind.FILE
@@ -1261,7 +1259,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                     pass
             # Local without an open fd, or remote — go through the
             # path's stat. Live every call.
-            backing = self._spill_path.stat()
+            backing = path.stat()
             self._stats.size = backing.size
             self._stats.mtime = backing.mtime
             self._stats.kind = backing.kind
@@ -1392,7 +1390,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     def _make_uncompressed_sibling(self) -> "BytesIO":
         """Build an uncompressed sibling carrying self's bytes decompressed.
 
-        Same concrete class as ``self`` with ``default_mime_type()``
+        Same concrete class as ``self`` with ``default_media_type()``
         (no codec) as media — a downstream lookup of ``codec`` on the
         sibling returns ``None``, terminating recursion through the
         codec branch.
@@ -1407,7 +1405,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         decompressed_buf = codec.decompress(self, copy=True)
         return type(self)(
             decompressed_buf,
-            media_type=type(self).default_mime_type(),
+            media_type=type(self).default_media_type(),
         )
 
     def _make_empty_sibling(self) -> "BytesIO":
@@ -1420,7 +1418,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         target are either empty or the previous compressed version
         we're about to overwrite.
         """
-        return type(self)(media_type=type(self).default_mime_type())
+        return type(self)(media_type=type(self).default_media_type())
 
     # ==================================================================
     # Lifecycle context managers — open/seek/codec
@@ -1552,7 +1550,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
         Backing-aware behaviour:
 
-        - **External path binding** (``_owns_spill_path=False``) — pass
+        - **External path binding** (``_owns_holder=False``) — pass
           the path through to the new instance. Neither side owns the
           file, so sharing the binding is safe; both will pread/pwrite
           against the same durable backing, which is exactly the
@@ -1576,9 +1574,9 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         if target_class is None:
             target_class = type(self)
 
-        if self._spill_path is not None and not self._owns_spill_path:
+        if self._is_path_holder() and not self._owns_holder:
             return target_class(
-                path=self._spill_path,
+                path=self._holder,
                 mode=self._mode,
                 media_type=self._stats.media_type,
                 spill_bytes=self._spill_bytes,
@@ -1600,19 +1598,17 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             new_instance._pos = 0
             return new_instance
 
-        # Memory mode: clone the bytearray. Spill if it crosses the new
-        # instance's threshold.
-        if self._buf is not None:
+        memory = self._memory_holder()
+        if memory is not None:
+            payload = bytes(memory.read_mv(size, 0))
             if size > new_instance._spill_bytes:
                 path = _mint_spill_path(new_instance._ext_hint(), new_instance._spill_ttl)
-                with open(path.full_path(), "wb") as fh:
-                    fh.write(memoryview(self._buf)[:size])
-                new_instance._buf = None
-                new_instance._spill_path = path
-                new_instance._owns_spill_path = True
+                path.write_bytes(payload)
+                new_instance._holder = path
+                new_instance._owns_holder = True
                 new_instance._stats.size = size
             else:
-                new_instance._buf = bytearray(memoryview(self._buf)[:size])
+                new_instance._set_memory(payload)
                 new_instance._stats.size = size
             new_instance._pos = self._pos
             return new_instance
@@ -1620,14 +1616,14 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # Owned spilled: copy the spill file via chunked pread→pwrite
         # against the source's acquired path and a fresh acquire on
         # the new path.
-        src_ctx = self._ensure_ctx()
+        src_holder = self._ensure_holder_open()
         new_path = _mint_spill_path(new_instance._ext_hint(), new_instance._spill_ttl)
         new_path.acquire_io("rb+")
         try:
             pos = 0
             while pos < size:
                 want = min(_COPY_CHUNK_SIZE, size - pos)
-                chunk = src_ctx.pread(want, pos)
+                chunk = src_holder.pread(want, pos)
                 if not chunk:
                     break
                 written = new_path.pwrite(chunk, pos)
@@ -1638,9 +1634,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         finally:
             new_path.close_io()
 
-        new_instance._buf = None
-        new_instance._spill_path = new_path
-        new_instance._owns_spill_path = True
+        new_instance._holder = new_path
+        new_instance._owns_holder = True
         new_instance._stats.size = size
         new_instance._pos = self._pos
         return new_instance
@@ -1670,13 +1665,14 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     def __repr__(self) -> str:
         target_class = type(self)
         opened = "opened" if self.opened else "closed"
-        internal = "internal" if self._owns_spill_path else "external"
+        internal = "internal" if self._owns_holder else "external"
         spilled = "spilled" if self.spilled else "memory"
         mt = f" media={self._stats.media_type.__repr__()}" if self._stats.media_type else ""
-        if self._buf is not None:
-            owner = str(id(self._buf))
-        elif self._spill_path is not None:
-            owner = self._spill_path.url.to_string(encode=False)
+        path = self._path_holder()
+        if path is not None:
+            owner = path.url.to_string(encode=False)
+        elif self._holder is not None:
+            owner = str(id(self._holder))
         else:
             owner = "<not allocated>"
         return (
@@ -1694,7 +1690,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
           moment any other writer touched it.
         """
         self.flush()
-        if not self._owns_spill_path and self._spill_path is not None:
+        path = self._path_holder()
+        if not self._owns_holder and path is not None:
             # Pickle the path as a STRING, not the Path object. Path
             # subclasses inherit from Disposable, which holds a
             # WeakSet whose internal _remove callback is a closure
@@ -1703,7 +1700,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             # via path_class().from_().
             return {
                 "kind": "path",
-                "path": self._spill_path.url.to_string(),
+                "path": path.url.to_string(),
                 "mode": self._mode,
                 "media_type": self._stats.media_type,
             }
@@ -1762,29 +1759,28 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             self.parent.flush()
             return
 
-        ctx = self._ctx
-        if ctx is None:
-            return  # Memory-mode — nothing durable to flush to.
+        path = self._path_holder()
+        if path is None or not path.io_open:
+            return  # Memory-mode (or unopened) — nothing durable to flush to.
 
-        # Local fd contexts: writes already in the kernel — flush is
-        # a no-op. Remote contexts: commit dirty bytes via path._pwrite.
-        ctx.flush()
-        self._stats.size = ctx.size
-        self._stats.mtime = ctx.mtime
+        # Local fd holders: writes already in the kernel — flush is
+        # a no-op. Remote holders: commit dirty bytes via path._pwrite.
+        path.flush()
+        self._stats.size = path.size
+        self._stats.mtime = path.mtime
         self.clear_dirty()
 
     def flush(self) -> None:
         """Push buffered writes to the backing.
 
-        Forwards to the open context's ``flush``:
+        Forwards to the holder's :meth:`Holder.flush`:
 
-        - **Memory mode / view**: no ctx — nothing durable to flush
-          to. (Views' flush propagates to the parent in
-          :meth:`_commit`.)
-        - **Local fd context**: no-op. Writes already hit the kernel
+        - **Memory mode / view**: nothing durable to flush. (Views'
+          flush propagates to the holder in :meth:`_commit`.)
+        - **Local fd holder**: no-op. Writes already hit the kernel
           via :func:`os.pwrite`.
-        - **Remote passthrough context**: also a no-op. Every
-          ``ctx.pwrite`` already issued a :meth:`Path.pwrite`
+        - **Remote passthrough holder**: also a no-op. Every
+          ``holder.pwrite`` already issued a :meth:`Path.pwrite`
           syscall, so there's nothing buffered between the buffer
           and the path.
         """
@@ -1794,10 +1790,13 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         return False
 
     def fileno(self) -> int:
-        """Underlying fd. Raises if the context has no fd to expose."""
-        if self._spill_path is None:
+        """Underlying fd. Raises if no holder has an fd to expose."""
+        path = self._path_holder()
+        if path is None:
             raise OSError("BytesIO has no underlying file descriptor")
-        return self._ensure_ctx().fileno()
+        if not path.io_open:
+            path.acquire_io(self._mode)
+        return path.fileno()
 
     def readline(self, limit: int = -1) -> bytes:
         """Read one line up to the next ``\\n`` inclusive."""
@@ -1995,9 +1994,13 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     ) -> int:
         """Drain *buffer* into self at the current cursor.
 
-        Dispatches on the (source, destination) backing pair to one
-        of four helpers. Returns bytes written. Advances ``self._pos``
-        only; ``buffer._pos`` is untouched. ``buffer is self`` raises.
+        Single chunked pread → :meth:`_write_at` loop — every backing
+        (memory and path) exposes the same :meth:`Holder.pread`
+        contract, so there's no reason to dispatch on src/dst shape.
+        :meth:`_write_at` handles auto-spill on the dst side when the
+        projected size crosses ``spill_bytes``. Returns bytes written.
+        Advances ``self._pos`` only; ``buffer._pos`` is untouched.
+        ``buffer is self`` raises.
         """
         if buffer is self:
             raise ValueError("Cannot _write_bytes_io a BytesIO into itself")
@@ -2010,55 +2013,11 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         if src_size == 0:
             return 0
 
-        src_in_memory = buffer._buf is not None
-        dst_in_memory = self._buf is not None
-
-        # Pre-flight spill: a memory dst whose projected size crosses
-        # threshold spills BEFORE the copy so helpers stay on a stable
-        # backing throughout.
-        if dst_in_memory:
-            projected = max(self._stats.size, self._pos + src_size)
-            if projected > self._spill_bytes:
-                self._spill()
-                dst_in_memory = False
-
-        if src_in_memory and dst_in_memory:
-            return self._copy_mem_to_mem(buffer)
-        if src_in_memory and not dst_in_memory:
-            return self._copy_mem_to_spilled(buffer)
-        if not src_in_memory and dst_in_memory:
-            return self._copy_spilled_to_mem(buffer, batch_size=batch_size)
-        return self._copy_spilled_to_spilled(buffer, batch_size=batch_size)
-
-    def _copy_mem_to_mem(self, buffer: "BytesIO") -> int:
-        src_size = buffer._stats.size
-        if src_size == 0:
-            return 0
-        mv = memoryview(buffer._buf)[:src_size]
-        n = self._write_at(mv, self._pos)
-        self._pos += n
-        return n
-
-    def _copy_mem_to_spilled(self, buffer: "BytesIO") -> int:
-        src_size = buffer._stats.size
-        if src_size == 0:
-            return 0
-        mv = memoryview(buffer._buf)[:src_size]
-        n = self._write_at(mv, self._pos)
-        self._pos += n
-        return n
-
-    def _copy_spilled_to_mem(self, buffer: "BytesIO", *, batch_size: int) -> int:
-        src_size = buffer.size
-        if src_size == 0:
-            return 0
-        src_ctx = buffer._ensure_ctx()
-
         total = 0
         src_pos = 0
         while src_pos < src_size:
             want = min(batch_size, src_size - src_pos)
-            chunk = src_ctx.pread(want, src_pos)
+            chunk = buffer.pread(want, src_pos)
             if not chunk:
                 break
             written = self._write_at(memoryview(chunk), self._pos)
@@ -2067,31 +2026,6 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             self._pos += written
             total += written
             src_pos += written
-        return total
-
-    def _copy_spilled_to_spilled(self, buffer: "BytesIO", *, batch_size: int) -> int:
-        src_size = buffer.size
-        if src_size == 0:
-            return 0
-        src_ctx = buffer._ensure_ctx()
-        dst_ctx = self._ensure_ctx()
-
-        total = 0
-        src_pos = 0
-        while src_pos < src_size:
-            want = min(batch_size, src_size - src_pos)
-            chunk = src_ctx.pread(want, src_pos)
-            if not chunk:
-                break
-            written = dst_ctx.pwrite(chunk, self._pos)
-            if written == 0:
-                break
-            self._stats.size = max(self._stats.size, self._pos + written)
-            self._pos += written
-            total += written
-            src_pos += written
-        if total and dst_ctx.dirty:
-            self._flag_dirty_for_commit()
         return total
 
     def write_str(self, s: str, encoding: str = "utf-8") -> int:
@@ -2256,14 +2190,14 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
         # Local-path fast path: update_mmap reads the file via mmap
         # directly, no Python-level copy. Works whether or not the
-        # ctx is currently open.
+        # holder is currently open.
+        path = self._path_holder()
         if (
-            self._spill_path is not None
-            and self._spill_path.is_local
-            and self._buf is None
+            path is not None
+            and path.is_local
             and self._stats.size
         ):
-            h.update_mmap(self._spill_path.full_path())
+            h.update_mmap(path.full_path())
             return h
 
         # Path-bound (remote) or memory: hash whatever the
@@ -2323,29 +2257,38 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     def memoryview(self):
         """Return a ``memoryview`` over this buffer's bytes.
 
-        - Memory mode (no path) → direct bytearray view.
-        - Path-bound → forward to ``ctx.memoryview()``. Local fd
-          contexts return an mmap-backed view; remote passthrough
-          contexts round-trip a ``Path.pread`` of the whole payload
-          and wrap it.
-        - Empty → empty memoryview.
+        Forwards to the active :class:`Holder.memoryview`. For an
+        in-memory holder this is a zero-copy bytearray view; for a
+        local fd-backed path it's an mmap; for a remote path it
+        round-trips a fresh ``Path.pread`` of the whole payload.
+
+        Views over a parent return a sized slice of the parent's
+        memoryview at the view's offset.
 
         For local-spilled mode, the returned mmap-backed view's
         lifetime is tied to the GC of the underlying mmap object.
         Release the view before closing the BytesIO if your platform
         is strict about closing mapped files.
         """
-        if self._buf is not None:
-            return memoryview(self._buf)[: self._stats.size]
-
-        if self._spill_path is not None:
-            return self._ensure_ctx().memoryview()
-
-        return memoryview(b"")
+        if self._holder is None:
+            return memoryview(b"")
+        if self.is_view:
+            size = self._stats.size
+            if size == 0:
+                return memoryview(b"")
+            return memoryview(self._slice(0, size))
+        memory = self._memory_holder()
+        if memory is not None:
+            return memory.memoryview()
+        return self._ensure_holder_open().memoryview()
 
     def to_bytes(self) -> bytes:
-        if self._buf is not None:
-            return bytes(memoryview(self._buf)[: self._stats.size])
+        if self.is_view:
+            size = self._stats.size
+            return b"" if size == 0 else self._slice(0, size)
+        memory = self._memory_holder()
+        if memory is not None:
+            return memory.to_bytes()
         size = self.size
         if size == 0:
             return b""
@@ -2445,42 +2388,36 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         if n <= self.size:
             return self  # Already have at least n bytes of capacity.
 
-        # Path-bound: nothing to pre-grow. The context grows lazily
-        # on pwrite — no portable fallocate, remote backends would
-        # have no use for it either.
-        if self._spill_path is not None:
+        # Path-bound: nothing to pre-grow. The path grows lazily on
+        # pwrite — no portable fallocate, remote backends would have
+        # no use for it either.
+        if self._is_path_holder():
             return self
 
         # Memory mode. If the target capacity crosses the spill
-        # threshold, spill first and bail — the path-side context
+        # threshold, spill first and bail — the path-side holder
         # needs no pre-growth.
         if n > self._spill_bytes:
             self._spill()
             return self
 
-        # Pre-grow the bytearray to length n with the same 1.5×
-        # amortization _write_at uses, so back-to-back allocate +
-        # streaming writes don't fight each other.
-        if self._buf is None:
-            # Defensive — autonomous memory-mode buffer with no _buf
+        # Pre-grow the underlying :class:`Memory` holder. The Holder
+        # primitive owns the 1.5× amortization so back-to-back
+        # allocate + streaming writes don't fight each other.
+        if self._memory_holder() is None:
+            # Defensive — autonomous memory-mode buffer with no holder
             # shouldn't happen post-init, but synthesize one rather
             # than raise.
-            self._buf = bytearray()
-        cur = len(self._buf)
-        if n > cur:
-            new_cap = max(n, int(cur * 1.5) + 1)
-            self._buf.extend(b"\x00" * (new_cap - cur))
+            self._set_memory()
+        self._holder.reserve(n)
         return self
 
     def arrow_io(self, mode: str = "rb", size: int | None = None):
-        if (
-            self.spilled
-            and self._spill_path is not None
-            and self._spill_path.is_local
-        ):
+        path = self._path_holder()
+        if path is not None and path.is_local:
             if size is not None:
-                return pa.create_memory_map(self._spill_path.full_path(), size)
-            return pa.OSFile(self._spill_path.full_path(), mode)
+                return pa.create_memory_map(path.full_path(), size)
+            return pa.OSFile(path.full_path(), mode)
 
         if mode in {"a", "ab"}:
             self.seek(0, io.SEEK_END)
@@ -2490,17 +2427,16 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     def clear(self):
         self.close(force=True)
 
-        if self._ctx is not None:
+        path = self._path_holder()
+        if path is not None:
             try:
-                self._ctx.close_io()
+                path.close_io()
             except Exception:
                 pass
-            self._ctx = None
 
-        self._buf = bytearray()
+        self._set_memory()
         self._stats.size = 0
         self._pos = 0
-        self._spill_path = None
         self._stats.media_type = None
 
 
