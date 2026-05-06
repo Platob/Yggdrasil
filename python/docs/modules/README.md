@@ -1,18 +1,34 @@
-# Module docs
+# Module pages
 
-Focused module pages (updated for current implementation):
+Hand-written, copy-paste-friendly pages for the most-used surfaces. The auto-generated pages live under [API Reference](../api/index.md).
 
-- [arrow](arrow/README.md)
-- [data.cast](types/README.md)
-- [engine cast helpers](types/cast/README.md)
-- [dataclasses](dataclasses/README.md)
-- [io](io/README.md)
-- [io.http_](io/http_/README.md)
-- [requests](requests/README.md)
-- [pyutils](pyutils/README.md)
-- [concurrent](concurrent/README.md)
-- [databricks](databricks/README.md)
-- [optional libs and extensions](libs/README.md), [extensions](libs/extensions/README.md)
+## Core
 
-Notes:
-- The `deltalake` page is retained only as a status note because `yggdrasil.deltalake` is not part of the current package tree.
+- [arrow](arrow/README.md) — Arrow type inference and casting helpers.
+- [data.cast](types/README.md) — `convert`, `register_converter`, `CastOptions`.
+- [engine cast helpers](types/cast/README.md) — `cast_arrow_tabular`, `cast_polars_dataframe`, `cast_pandas_dataframe`, `cast_spark_dataframe`.
+- [dataclasses](dataclasses/README.md) — `dataclass_to_arrow_field`, `WaitingConfig`, `Expiring`.
+
+## IO and HTTP
+
+- [io](io/README.md) — `BytesIO`, `URL`, `SendConfig`/`SendManyConfig`.
+- [io.http_](io/http_/README.md) — `HTTPSession`, prepared requests, batch dispatch.
+- [requests](requests/README.md) — legacy `YGGSession` and MSAL variant.
+
+## Databricks
+
+- [databricks](databricks/README.md) — `DatabricksClient` overview.
+- [databricks/sql](databricks/sql/README.md) — SQL execution + Unity Catalog.
+- [databricks/compute](databricks/compute/README.md) and [compute/remote](databricks/compute/remote/README.md).
+- [databricks/workspaces](databricks/workspaces/README.md), [databricks/fs](databricks/fs/README.md).
+- [databricks/secrets](databricks/secrets/README.md), [databricks/iam](databricks/iam/README.md).
+- [databricks/jobs](databricks/jobs/README.md), [databricks/account](databricks/account/README.md).
+- [databricks/ai/genie](databricks/ai/genie/README.md).
+
+## Utilities
+
+- [pyutils](pyutils/README.md) — `retry`, `parallelize`.
+- [concurrent](concurrent/README.md) — `Job`, `JobPoolExecutor`.
+- [optional libs](libs/README.md) and [extension helpers](libs/extensions/README.md).
+
+> The `deltalake` page is retained only as a [status note](deltalake/README.md) — `yggdrasil.deltalake` is not part of the current package tree.

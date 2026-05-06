@@ -1,119 +1,119 @@
-# Rust acceleration (experimental)
+# `yggrs` — Rust acceleration for Yggdrasil
 
-This folder contains optional Rust extensions for hot-path operations used by
-`yggdrasil`.
+Optional native kernels for `yggdrasil`. Built with **PyO3 + maturin** on the **`abi3-py310`** stable ABI — one wheel per OS/arch covers Python 3.10, 3.11, 3.12, 3.13.
 
-## Why
+- **PyPI:** [`yggrs`](https://pypi.org/project/yggrs/)
+- **Crate root:** [`rust/`](.) · **Bridge:** [`python/src/yggdrasil/rs.py`](../python/src/yggdrasil/rs.py)
+- Pulled in automatically by `pip install ygg`.
 
-- Keep Python APIs stable while accelerating tight loops.
-- Reuse Arrow-compatible memory ideas for future schema and metadata kernels.
-- Allow graceful fallback to pure Python when native builds are unavailable.
+---
 
-## Module layout
+## Design rules
 
-Rust source files mirror the Python package hierarchy so every kernel is easy
-to locate.  Add new kernels to the matching submodule, then register them in
-`lib.rs`.
+1. **Python is canonical.** Rust must match Python behavior, not diverge.
+2. **Pure-Python fallback always works.** The `ygg` test suite must pass with and without `yggrs` installed.
+3. **`yggdrasil/rs.py` is the only bridge.** Feature code never imports from `yggdrasil.rust.*` directly.
+4. **Add Rust only to a hot, semantically stable path.**
 
-The compiled extension is placed at `yggdrasil/rust.abi3.so` (or `.pyd` on
-Windows), extending the `yggdrasil` namespace directly.  No top-level package
-collision — `yggrs` (PyPI) slots into the existing `yggdrasil` namespace:
+---
 
-| Rust file              | Python package           | Exposed as                  |
-|------------------------|--------------------------|-----------------------------|
-| `rust/src/data.rs`     | `yggdrasil/data/`        | `yggdrasil.rust.data`       |
-| `rust/src/io.rs`       | `yggdrasil/io/`          | `yggdrasil.rust.io` (future)|
-| `rust/src/arrow.rs`    | `yggdrasil/arrow/`       | `yggdrasil.rust.arrow` (future) |
-
-Current kernels:
-
-- `yggdrasil.rust.data.utf8_len(values)` — Unicode character counts for string batches.
-
-## Build locally
-
-`rust/pyproject.toml` uses **maturin** as the PEP 517 build backend, so the
-Rust extension is compiled automatically whenever you build or install the
-package.
-
-```bash
-# Full editable install (compiles Rust extension):
-cd rust
-maturin develop --extras dev      # recommended during Rust development
-# or from the repo root:
-pip install -e rust/              # also works via PEP 517
-
-# Release wheel for the current platform (output → rust/dist/):
-cd rust
-maturin build --release
-```
-
-### Platform prerequisites
-
-`maturin` shells out to `cargo`, which needs a working C linker for the host
-target.
-
-- **Linux**: `gcc` + `pkg-config` (e.g. `apt install build-essential pkg-config`).
-- **macOS**: Xcode Command Line Tools (`xcode-select --install`).
-- **Windows**: install [Build Tools for Visual Studio 2022](https://visualstudio.microsoft.com/downloads/?q=build+tools)
-  with the **"Desktop development with C++"** workload — that ships `link.exe`,
-  which the default `x86_64-pc-windows-msvc` target requires. Without it,
-  `maturin develop` fails with:
-
-  ```
-  error: linker `link.exe` not found
-  note: the msvc targets depend on the msvc linker but `link.exe` was not found
-  ```
-
-  The published Windows wheel on PyPI is MSVC-built, so MSVC is the supported
-  local toolchain. If you cannot install it, you can fall back to the GNU
-  toolchain for development only — install `mingw-w64` (`gcc` on PATH) and run:
-
-  ```bash
-  rustup target add x86_64-pc-windows-gnu
-  maturin develop --extras dev --target x86_64-pc-windows-gnu
-  ```
-
-  GNU-built artifacts are fine for local iteration but won't be ABI-identical
-  to the released MSVC wheels.
-
-### abi3-py310 stable ABI
-
-`Cargo.toml` enables `pyo3/abi3-py310`.  This means maturin emits a
-`cp310-abi3` wheel that is **compatible with Python 3.10, 3.11, 3.12, and
-3.13** — one wheel per OS/arch, not per Python version.
-
-### CI / release wheels
-
-The GitHub workflow (`.github/workflows/publish-native.yml`) builds five
-platform wheels in parallel using `PyO3/maturin-action@v1` with
-`working-directory: rust`:
-
-| Artifact name           | Target triple                  | Runner           |
-|-------------------------|--------------------------------|------------------|
-| `linux-x86_64`          | `x86_64-unknown-linux-gnu`     | ubuntu-latest    |
-| `linux-aarch64`         | `aarch64-unknown-linux-gnu`    | ubuntu-latest + QEMU |
-| `windows-x86_64`        | `x86_64-pc-windows-msvc`       | windows-latest   |
-| `macos-arm64`           | `aarch64-apple-darwin`         | macos-latest     |
-| `macos-x86_64`          | `x86_64-apple-darwin`          | macos-13         |
-
-All five wheels plus the sdist are merged and uploaded to PyPI in a single
-`publish` job.  The GitHub Release receives all of them as downloadable assets.
-
-
-
-## Python bridge
-
-`yggdrasil/rs.py` is the single entry point.  It imports from the matching
-`yggdrasil.rust.<submodule>` and falls back to pure Python when the native
-wheel is absent.  Import it as:
+## Use it from Python
 
 ```python
 from yggdrasil.rs import HAS_RS, utf8_len
+
+print(HAS_RS)                    # True if yggrs is installed
+print(utf8_len(["héllo", "🦀"])) # uses Rust if available, falls back otherwise
 ```
 
-Under the hood, when `yggrs` is installed, `rs.py` uses:
+Under the hood, when `yggrs` is installed:
 
 ```python
-from yggdrasil.rust.data import utf8_len  # fast path
+from yggdrasil.rust.data import utf8_len   # fast path
 ```
 
+---
+
+## Module map
+
+Rust source files mirror the Python package hierarchy. The compiled extension installs as `_yggrs` and is rebound under `yggdrasil.rust.<submodule>` by `yggdrasil/rs.py`.
+
+| Rust file | Python namespace | Status |
+|---|---|---|
+| `rust/src/data.rs` | `yggdrasil.rust.data` | `utf8_len` shipped |
+| `rust/src/io.rs`   | `yggdrasil.rust.io`   | reserved |
+| `rust/src/arrow.rs`| `yggdrasil.rust.arrow`| reserved |
+
+Add new kernels in the matching submodule, register them in `lib.rs`, and expose them through `yggdrasil/rs.py` with a Python fallback.
+
+> Why a top-level `_yggrs` import name? `ygg` already ships `yggdrasil/__init__.py` as a regular package, so two wheels can't both own the directory. Shipping the extension as `_yggrs` and rebinding through `yggdrasil/rs.py` keeps both wheels installable side by side.
+
+---
+
+## Build locally
+
+```bash
+cd rust
+maturin develop --release          # editable build into the active venv
+# or compile a release wheel for this platform:
+maturin build --release             # → rust/dist/
+```
+
+`maturin develop` rebuilds the cdylib, packages it as a wheel, and installs it as `yggrs` in the current venv. The compiled module lands at `_yggrs.abi3.so` (Linux/macOS) or `_yggrs.pyd` (Windows).
+
+`importlib.reload` does **not** swap a compiled extension — restart the interpreter after `maturin develop`.
+
+### Daily loop
+
+| Editing… | Command |
+|---|---|
+| Python only (`python/src/**`) | nothing — editable install picks up changes on next `import` |
+| Rust (`rust/src/**`) | `maturin develop --release` (then restart the interpreter) |
+| Cargo deps | `cargo update`, then `maturin develop --release` |
+
+### Toolchain prerequisites
+
+`maturin` shells out to `cargo`, which needs a working C linker for the host target.
+
+- **Linux**: `gcc` + `pkg-config` (`apt install build-essential pkg-config`).
+- **macOS**: Xcode Command Line Tools (`xcode-select --install`).
+- **Windows**: [Build Tools for Visual Studio 2022](https://visualstudio.microsoft.com/downloads/?q=build+tools) with the **"Desktop development with C++"** workload (provides `link.exe`). The published Windows wheel on PyPI is MSVC-built.
+
+  Fallback for development only — GNU toolchain:
+
+  ```bash
+  rustup target add x86_64-pc-windows-gnu
+  maturin develop --release --target x86_64-pc-windows-gnu
+  ```
+
+---
+
+## CI / release wheels
+
+[`.github/workflows/publish-native.yml`](../.github/workflows/publish-native.yml) builds five platform wheels in parallel using `PyO3/maturin-action@v1` with `working-directory: rust`:
+
+| Artifact | Target triple | Runner |
+|---|---|---|
+| `linux-x86_64`  | `x86_64-unknown-linux-gnu`  | `ubuntu-latest` |
+| `linux-aarch64` | `aarch64-unknown-linux-gnu` | `ubuntu-latest` + QEMU |
+| `windows-x86_64`| `x86_64-pc-windows-msvc`    | `windows-latest` |
+| `macos-arm64`   | `aarch64-apple-darwin`      | `macos-latest` |
+| `macos-x86_64`  | `x86_64-apple-darwin`       | `macos-13` |
+
+All five wheels plus the sdist are merged and uploaded to PyPI in a single `publish` job. The GitHub Release receives all of them as downloadable assets. The version is read from `python/pyproject.toml` and stamped into `rust/pyproject.toml` and `rust/Cargo.toml` before building.
+
+---
+
+## Adding a kernel — checklist
+
+1. Add the function in `rust/src/<module>.rs` and register it in `lib.rs`.
+2. Re-run `maturin develop --release`.
+3. Add a Python fallback in `python/src/yggdrasil/<module>/` and import it in `yggdrasil/rs.py`. Decide what the Rust path replaces.
+4. Add tests under `python/tests/test_yggdrasil/test_<module>/`. They must pass both with and without `yggrs` installed.
+5. Update the module map above.
+
+---
+
+## License
+
+[Apache-2.0](LICENSE).

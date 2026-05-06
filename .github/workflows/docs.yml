@@ -1,4 +1,16 @@
-name: 📚 Publish Python docs
+# ============================================================================
+# docs.yml
+#
+# Builds the MkDocs Material site from `python/docs/` and deploys it to
+# GitHub Pages at https://platob.github.io/Yggdrasil/.
+#
+# - Pull requests build the site as a verification step (no deploy).
+# - Push to `main` (or manual dispatch) builds and deploys.
+# - Build is strict: any MkDocs warning fails the job.
+# - Artifact is available as `docs-site` for inspection on every run.
+# ============================================================================
+
+name: 📚 Docs (MkDocs → GitHub Pages)
 
 on:
   push:
@@ -9,8 +21,25 @@ on:
       - "python/src/**"
       - "python/mkdocs.yml"
       - "python/pyproject.toml"
+      - "README.md"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "python/docs/**"
+      - "python/src/**"
+      - "python/mkdocs.yml"
+      - "python/pyproject.toml"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
+    inputs:
+      deploy:
+        description: "Deploy to GitHub Pages even on manual run"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 permissions:
   contents: read
@@ -21,42 +50,138 @@ concurrency:
   group: pages
   cancel-in-progress: false
 
+env:
+  PYTHON_VERSION: "3.12"
+  UV_SYSTEM_PYTHON: "1"
+
 jobs:
+  # --------------------------------------------------------------------------
+  # build — strict MkDocs build, uploaded as both an artifact and a Pages tarball
+  # --------------------------------------------------------------------------
   build:
+    name: Build site (strict)
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: python
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # for git-revision-date-localized if added later
 
-      - name: Set up Python
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+          enable-cache: true
+          cache-dependency-glob: "python/pyproject.toml"
 
       - name: Install package with docs dependencies
         run: uv pip install --system -e .[dev]
 
-      - name: Build docs
-        run: mkdocs build
+      - name: Show MkDocs configuration
+        run: mkdocs --version
 
-      - name: Upload Pages artifact
+      - name: Build docs
+        id: build
+        run: |
+          set -o pipefail
+          mkdocs build --site-dir site 2>&1 | tee mkdocs-build.log
+          warnings=$(grep -c '^WARNING' mkdocs-build.log || true)
+          errors=$(grep -c '^ERROR' mkdocs-build.log || true)
+          echo "warnings=${warnings}" >> "$GITHUB_OUTPUT"
+          echo "errors=${errors}" >> "$GITHUB_OUTPUT"
+          if [ "${errors}" -gt 0 ]; then
+            echo "::error::MkDocs reported ${errors} error(s); see log."
+            exit 1
+          fi
+
+      - name: Validate critical pages
+        run: |
+          for f in site/index.html site/getting-started/index.html \
+                   site/guides/architecture/index.html \
+                   site/guides/databricks/index.html \
+                   site/api/index.html; do
+            if [ ! -s "$f" ]; then
+              echo "::error::Missing or empty: $f"
+              exit 1
+            fi
+          done
+          echo "All critical pages present."
+
+      - name: List output (head)
+        run: |
+          echo "Top-level files:"
+          ls -la site | head -40
+          echo
+          echo "Total pages:"
+          find site -name '*.html' | wc -l
+
+      - name: Upload site artifact (always available for inspection)
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-site
+          path: python/site
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload Pages artifact (deploy input)
+        if: |
+          github.event_name == 'push' ||
+          (github.event_name == 'workflow_dispatch' && inputs.deploy == 'true')
         uses: actions/upload-pages-artifact@v3
         with:
           path: python/site
 
+      - name: Build summary
+        run: |
+          pages=$(find site -name '*.html' | wc -l)
+          size=$(du -sh site | awk '{print $1}')
+          {
+            echo "## 📚 MkDocs build"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Pages built | ${pages} |"
+            echo "| Site size   | ${size} |"
+            echo "| Warnings    | ${{ steps.build.outputs.warnings }} |"
+            echo "| Errors      | ${{ steps.build.outputs.errors }} |"
+            echo "| Artifact    | \`docs-site\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------------------
+  # deploy — only on push to main or explicit workflow_dispatch with deploy=true
+  # --------------------------------------------------------------------------
   deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.deploy == 'true')
+
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
-    needs: build
+
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+      - name: Deploy summary
+        run: |
+          {
+            echo "## 🌍 Deployed to GitHub Pages"
+            echo ""
+            echo "🔗 ${{ steps.deployment.outputs.page_url }}"
+            echo ""
+            echo "Source: ${{ github.sha }}"
+          } >> "$GITHUB_STEP_SUMMARY"
