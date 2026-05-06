@@ -5,7 +5,8 @@ from typing import Mapping, Optional
 
 from urllib3 import BaseHTTPResponse
 
-from ..buffer import BytesIO, Tabular
+from ..bytes_io import BytesIO
+from ..tabular import Tabular
 from ..request import PreparedRequest
 from ..response import Response, _ensure_media_headers, _media_type_from_headers
 

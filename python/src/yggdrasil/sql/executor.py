@@ -18,7 +18,7 @@ Two backends, picked at runtime by what's installed:
   gets a single-line fix.
 
 Both backends materialize the result into a :class:`Tabular`
-holder (:class:`MemoryArrowIO` by default, :class:`ParquetIO`
+holder (:class:`ArrowTabular` by default, :class:`ParquetIO`
 folder when :attr:`SqlPreparedStatement.persist == "path"`) and
 return it alongside the row count. The :class:`SqlStatementResult`
 hangs the holder off ``_persisted_data`` so subsequent reads short-
@@ -42,7 +42,7 @@ from yggdrasil.data.expr import (
 )
 from yggdrasil.data.executor import StatementExecutor
 from yggdrasil.io.tabular import Tabular
-from yggdrasil.io.tabular import MemoryArrowIO
+from yggdrasil.io.tabular import ArrowTabular
 
 from .catalog import SqlContext, default_context
 from .lib import has_polars, sqlglot_expressions
@@ -179,7 +179,7 @@ class SqlExecutor(StatementExecutor, ABC):
     ) -> Tabular:
         """Materialize *table* into the requested persistence target.
 
-        ``persist == "memory"`` → :class:`MemoryArrowIO` (zero copy
+        ``persist == "memory"`` → :class:`ArrowTabular` (zero copy
         — the holder just keeps a reference to the batches).
         ``persist == "path"`` → spill to a parquet file/folder under
         ``statement.path`` and return the :class:`ParquetIO`
@@ -189,7 +189,7 @@ class SqlExecutor(StatementExecutor, ABC):
         """
         target = statement.persist or "memory"
         if target == "memory":
-            return MemoryArrowIO(table)
+            return ArrowTabular(table)
         if target == "path":
             if not statement.path:
                 raise ValueError(

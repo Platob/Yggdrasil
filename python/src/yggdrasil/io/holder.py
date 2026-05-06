@@ -103,14 +103,25 @@ def _resolve_subclass(
         return existing
 
     if path is not None:
-        from .path.path import Path
-        return Path
+        # Resolve the path's URL scheme via the registry (file:// →
+        # LocalPath, s3:// → S3Path, …). The abstract :class:`Path`
+        # itself isn't instantiable, so a missing scheme falls back to
+        # LocalPath — that's the only path-shaped backend that's
+        # always available.
+        from .path.local_path import LocalPath
+        url_obj = URL.from_(path)
+        scheme_from_path = url_obj.scheme
+        if scheme_from_path:
+            existing = _HOLDER_SCHEMES.get(scheme_from_path)
+            if existing is not None:
+                return existing
+        return LocalPath
 
     if isinstance(data, Holder):
         return type(data)
 
     # binary, str, pathlib.Path, None, bytes-like — all default to memory
-    from .tabular import Memory
+    from .memory import Memory
     return Memory
 
 
@@ -249,11 +260,17 @@ class Holder(Disposable):
         """
         super().__init__(**kwargs)
 
-        self._url: URL | None = url
+        self._url: URL | None = None
+        if url is not None:
+            self.url = url
         self._cached_stat: IOStats = IOStats() if stat is None else stat
         self.temporary: bool = bool(temporary)
 
-        for prio in (url, binary, path, data):
+        # ``url=`` only fixes identity; payload-bearing seeds
+        # (binary / path / data) are still routed below. Skip ``data``
+        # if it duplicates an explicit binary/path seed — caller already
+        # picked their lane.
+        for prio in (binary, path, data):
             if prio is not None:
                 self._init_from(prio)
                 break
@@ -276,11 +293,10 @@ class Holder(Disposable):
             )
 
     def _init_from_holder(self, holder: Holder) -> None:
-        url = holder.url
         if not self._url:
-            self.url = url
+            self.url = holder.url
 
-        if self.url != url:
+        if not self._url_matches(holder.url):
             self.write_bytes(holder.read_bytes())
 
     def _init_from_bytes(self, data: bytes | bytearray | memoryview) -> None:
@@ -291,16 +307,16 @@ class Holder(Disposable):
         if not self._url:
             self.url = url
 
-        if self.url != url:
-            self.write_local_path(path)
+        # Path-shaped seed on a path-shaped holder is identity only —
+        # there's nothing to copy, and the file may not exist yet.
+        # The cross-backend case (Memory seeded from a local file)
+        # still routes through write_local_path.
+        if self._url_matches(url):
+            return
+        self.write_local_path(path)
 
     def _init_from_pathlib(self, path: pathlib.PurePath) -> None:
-        url = URL.from_(path)
-        if not self._url:
-            self.url = url
-
-        if self.url != url:
-            self.write_local_path(os.fspath(path))
+        self._init_from_local_path(os.fspath(path))
 
     def _init_from_str(self, value: str) -> None:
         if URL.is_urlish(value):
@@ -316,11 +332,26 @@ class Holder(Disposable):
         if not self._url:
             self.url = url
 
-        if self._url == url:
+        if self._url_matches(url):
             return
 
-        local_path = url.__fspath__()
-        self._init_from_local_path(local_path)
+        self._init_from_local_path(url.__fspath__())
+
+    def _url_matches(self, candidate: URL) -> bool:
+        """True when *candidate* points at the same place as :attr:`_url`.
+
+        Compares both the canonical URL and the local fspath so the
+        check survives a setter that adds/strips a scheme. Returns
+        ``False`` when no URL is bound yet.
+        """
+        if self._url is None:
+            return False
+        if self._url == candidate:
+            return True
+        try:
+            return self._url.__fspath__() == candidate.__fspath__()
+        except Exception:
+            return False
 
     def _init_from_file_like(self, data: IO[bytes]) -> None:
         pos = 0

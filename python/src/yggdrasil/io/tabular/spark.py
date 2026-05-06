@@ -26,10 +26,10 @@ if TYPE_CHECKING:
     from pyspark.sql import DataFrame as SparkDataFrame, SparkSession
 
 
-__all__ = ["MemorySparkIO"]
+__all__ = ["SparkTabular"]
 
 
-class MemorySparkIO(Tabular[CastOptions]):
+class SparkTabular(Tabular[CastOptions]):
     """:class:`Tabular` whose backing store is a single Spark DataFrame.
 
     The frame is the holder's only state; reads of
@@ -43,7 +43,7 @@ class MemorySparkIO(Tabular[CastOptions]):
 
     @classmethod
     def default_media_type(cls) -> Optional[MimeType]:
-        return None  # not registered, see MemoryArrowIO for the rationale
+        return None  # not registered, see ArrowTabular for the rationale
 
     def __init__(
         self,
@@ -61,8 +61,8 @@ class MemorySparkIO(Tabular[CastOptions]):
 
     def __repr__(self) -> str:
         if self._frame is None:
-            return "MemorySparkIO(frame=None)"
-        return f"MemorySparkIO(frame={self._frame!r})"
+            return "SparkTabular(frame=None)"
+        return f"SparkTabular(frame={self._frame!r})"
 
     # ------------------------------------------------------------------
     # Public accessors

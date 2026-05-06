@@ -647,41 +647,50 @@ class LocalPath(Path):
     # ==================================================================
 
     def _read_mv(self, n: int, pos: int) -> memoryview:
-        """Positional read, fd-direct.
+        """Positional read, fd-direct (transient open when un-acquired).
 
         :class:`Holder.read_mv` has already normalized ``(n, pos)``:
-        ``0 <= pos <= size`` and ``0 <= n <= size - pos``. We read
-        ``n`` bytes at ``pos`` via :func:`_fd_pread` — :func:`os.pread`
-        on POSIX, lseek+read on Windows.
+        ``0 <= pos <= size`` and ``0 <= n <= size - pos``. Hot path
+        is the long-lived fd opened by :meth:`_acquire`; if no fd is
+        bound (``read_bytes`` / ``pread`` on a closed holder) we open
+        an O_RDONLY fd just for this call so casual reads "just work".
         """
         if n == 0:
             return memoryview(b"")
-        if self._fd < 0:
-            raise OSError(
-                f"LocalPath {self.os_path!r} is closed; open it before "
-                f"reading."
-            )
+        if self._fd >= 0:
+            return memoryview(_fd_pread(self._fd, n, pos))
 
-        return memoryview(_fd_pread(self._fd, n, pos))
+        flags = os.O_RDONLY
+        if hasattr(os, "O_BINARY"):
+            flags |= os.O_BINARY
+        fd = os.open(self.os_path, flags)
+        try:
+            return memoryview(_fd_pread(fd, n, pos))
+        finally:
+            os.close(fd)
 
     def _write_mv(self, data: memoryview, pos: int) -> int:
-        """Positional write, fd-direct.
+        """Positional write, fd-direct (transient open when un-acquired).
 
-        :class:`Holder.write_mv` has already pre-grown the visible
-        size via :meth:`resize` → :meth:`truncate`, so the file is
-        already at least ``pos + len(data)`` bytes long. The
-        portable :func:`_fd_pwrite` does the actual splice.
+        :class:`Holder.write_mv` has pre-grown the visible size via
+        :meth:`resize` → :meth:`truncate`, so the file is already at
+        least ``pos + len(data)`` bytes long when an fd is bound.
+        Without an fd, we open one for this call (creating the file
+        if needed); :meth:`truncate` is a no-op on the closed-holder
+        path, but :func:`_fd_pwrite` extends the file naturally as
+        bytes land past EOF.
         """
         n = len(data)
         if n == 0:
             return 0
-        if self._fd < 0:
-            raise OSError(
-                f"LocalPath {self.os_path!r} is closed; open it before "
-                f"writing."
-            )
+        if self._fd >= 0:
+            return _fd_pwrite(self._fd, data, pos)
 
-        return _fd_pwrite(self._fd, data, pos)
+        fd = _open_with_mkdir_retry(self.os_path, _default_open_flags())
+        try:
+            return _fd_pwrite(fd, data, pos)
+        finally:
+            os.close(fd)
 
     def reserve(self, n: int) -> None:
         """No-op — local filesystems have no useful capacity-vs-size
@@ -696,17 +705,20 @@ class LocalPath(Path):
 
         Shrinks drop the tail; extends zero-pad. Overrides the
         :class:`Path` default (read-truncate-rewrite via _bread/_bwrite)
-        with the direct syscall.
+        with the direct syscall. Transient fd when the holder isn't
+        acquired so ``truncate`` is usable on a fresh path.
         """
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
-        if self._fd < 0:
-            raise OSError(
-                f"LocalPath {self.os_path!r} is closed; open it before "
-                f"truncating."
-            )
+        if self._fd >= 0:
+            os.ftruncate(self._fd, n)
+            return n
 
-        os.ftruncate(self._fd, n)
+        fd = _open_with_mkdir_retry(self.os_path, _default_open_flags())
+        try:
+            os.ftruncate(fd, n)
+        finally:
+            os.close(fd)
         return n
 
     def _clear(self) -> None:

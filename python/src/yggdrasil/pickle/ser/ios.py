@@ -196,11 +196,17 @@ def _metadata_text(
 
 def _encode_media_type(obj: io.IOBase) -> bytes | None:
     """Return compact ``b"MIME_NAME"`` or ``b"MIME_NAME+codec"`` for the media type, or *None*."""
-    # yggdrasil :class:`BytesIO` carries its media type on
-    # ``_stats.media_type``; fall back to the stdlib-style ``_media_type``
-    # slot for any external file-likes that adopted the older pattern.
-    stats = getattr(obj, "_stats", None)
-    mt = getattr(stats, "media_type", None) if stats is not None else None
+    # yggdrasil :class:`BytesIO` carries its media type on the
+    # holder's :class:`IOStats` — go through ``stat()`` (rather than
+    # touching a private slot) so the lookup survives future
+    # holder refactors.
+    mt = None
+    holder = getattr(obj, "_holder", None)
+    if holder is not None:
+        try:
+            mt = holder.stat().media_type
+        except Exception:
+            mt = None
     if mt is None:
         mt = getattr(obj, "_media_type", None)
     if mt is None:

@@ -80,8 +80,9 @@ class Path(Holder, os.PathLike, ABC):
 
         When called on the abstract :class:`Path`, dispatches via the
         :class:`Holder` scheme registry to the subclass registered for
-        the URL's scheme. When called on a concrete subclass, returns
-        an instance of that subclass.
+        the URL's scheme; defaults to :class:`LocalPath` for path-shaped
+        URLs without an explicit scheme. When called on a concrete
+        subclass, returns an instance of that subclass.
         """
         if isinstance(obj, Path):
             if cls is Path or isinstance(obj, cls):
@@ -90,8 +91,21 @@ class Path(Holder, os.PathLike, ABC):
 
         url = URL.from_(obj)
         if cls is Path:
-            # Holder.__new__ dispatches on url.scheme via _HOLDER_SCHEMES.
-            return Holder(url=url, **kwargs)
+            # Holder.__new__ dispatches on scheme; force LocalPath for
+            # the no-scheme path case so callers don't accidentally
+            # land on :class:`Memory`.
+            from yggdrasil.io.holder import _HOLDER_SCHEMES
+            scheme = url.scheme
+            if scheme:
+                target = _HOLDER_SCHEMES.get(scheme)
+                if target is None:
+                    raise ValueError(
+                        f"Unknown scheme {scheme!r} for Path.from_({obj!r}). "
+                        f"Registered: {sorted(_HOLDER_SCHEMES)}."
+                    )
+                return target(url=url, **kwargs)
+            from yggdrasil.io.path.local_path import LocalPath
+            return LocalPath(url=url, **kwargs)
         return cls(url=url, **kwargs)
 
     def _from_url(self, url: URL) -> "Path":
@@ -206,7 +220,7 @@ class Path(Holder, os.PathLike, ABC):
         finally:
             bio.close()
 
-    def clear(self) -> None:
+    def _clear(self) -> None:
         """:class:`Holder` primitive: drop the backing entirely (idempotent)."""
         self._remove_file(missing_ok=True)
 
@@ -262,22 +276,44 @@ class Path(Holder, os.PathLike, ABC):
 
     def touch(self) -> "Path":
         if not self.exists():
-            self.write_bytes(b"")
+            # An empty ``write_bytes`` short-circuits without creating
+            # the backing — open() is what materializes the file.
+            with self.open("ab"):
+                pass
         return self
+
+    def as_media(self) -> "Any":
+        """Wrap this path in the :class:`Tabular` leaf for its media type.
+
+        Resolution: peek the holder's :class:`MediaType` (path
+        extension first, magic-byte sniff second) → look up the
+        registered :class:`Tabular` subclass → instantiate it bound
+        to this path. Useful as a one-liner for callers that just
+        want "give me the parquet view of this path".
+
+        Raises :class:`KeyError` when the path's media type isn't
+        registered as a tabular format.
+        """
+        # Side-effect import: every primitive leaf registers its
+        # mime_type on import.
+        import yggdrasil.io.primitive  # noqa: F401
+        from yggdrasil.io.tabular.base import Tabular
+        return Tabular.for_holder(self)
 
     # ==================================================================
     # open(mode) — returns a BytesIO bound to self
     # ==================================================================
 
-    def open(self, mode: "Mode | str | None" = None) -> "BytesIO | Path":
-        """Two shapes:
+    def open(self, mode: "Mode | str | None" = None) -> "BytesIO":
+        """Acquire the path and return a :class:`BytesIO` bound to it.
 
-        - ``path.open()``       → lifecycle acquire; returns ``self``.
-        - ``path.open("rb")``   → :class:`BytesIO` bound to ``self``.
+        ``mode`` accepts a :class:`Mode` member, an alias string,
+        or a stdlib ``open()`` mode string. ``None`` falls through
+        to :meth:`Holder.open` which uses ``"rb+"``.
         """
         if mode is None:
             return Holder.open(self)
-        return BytesIO(path=self, mode=Mode.from_(mode).os_mode)
+        return Holder.open(self, mode=Mode.from_(mode).os_mode)
 
     # ==================================================================
     # Pure-path API — all delegated to URL

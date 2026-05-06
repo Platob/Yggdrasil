@@ -26,14 +26,14 @@ from abc import abstractmethod
 from typing import ClassVar
 
 from yggdrasil.dataclasses.expiring import ExpiringDict
-from yggdrasil.io.holder import Holder
 from yggdrasil.io.io_stats import IOStats
+from yggdrasil.io.path.path import Path
 
 
 __all__ = ["RemotePath"]
 
 
-class RemotePath(Holder):
+class RemotePath(Path):
     """Abstract :class:`Holder` for network-backed backends.
 
     Subclasses pick a ``scheme`` (``s3``, ``dbfs``, …), implement the
@@ -97,6 +97,24 @@ class RemotePath(Holder):
     def _invalidate_stat_cache(self) -> None:
         """Drop this path's cached entry. Call after writes / deletes."""
         self._STAT_CACHE.pop(str(self.url), None)
+
+    # ------------------------------------------------------------------
+    # Resize is a no-op on remote backends — the upload IS the resize
+    # ------------------------------------------------------------------
+
+    def resize(self, n: int) -> int:
+        """No-op for remote-backend paths.
+
+        :class:`Holder.resize` would call :meth:`truncate` to pre-grow
+        a holder before a positional write. On remote backends every
+        ``truncate`` is a full-object upload, so the pre-grow would
+        double the network traffic for every write. The upload that
+        :meth:`write_mv` runs next will materialize the right size on
+        its own.
+        """
+        if n < 0:
+            raise ValueError(f"resize size must be >= 0, got {n!r}")
+        return n
 
     def _seed_stat_cache(self, stats: IOStats) -> None:
         """Pre-populate the cache with a known :class:`IOStats`.

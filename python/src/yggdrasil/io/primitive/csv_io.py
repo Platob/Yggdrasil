@@ -1,34 +1,18 @@
-"""CSV I/O for :class:`PrimitiveIO`.
+"""CSV Tabular leaf over the new :class:`BytesIO` substrate.
 
-:class:`CsvIO` is the concrete leaf for CSV files. Unlike the
-footer-indexed formats (Parquet, Arrow IPC), CSV is a pure stream:
-no random access, no metadata, no cheap schema. Reads parse from
-byte zero every time; schema collection is "read the first batch."
-
-This makes CSV the simplest leaf and also the slowest for repeated
-queries — the format pays for its human-readability with everything
-else. The native engine overrides help (``pds.dataset(format="csv")``
-and ``pl.scan_csv`` will at least skip columns at parse time) but
-the underlying parser still touches every byte.
-
-Save modes
-----------
-
-CSV supports honest append: concatenate the new bytes to the
-existing file, optionally skipping the header row on the second-
-and-later sessions. APPEND is implemented at the leaf level
-(unlike Parquet / IPC where it's a NestedIO concern) because the
-format itself supports it without footer rewrites.
-
-Lifecycle, codec, and Mode resolution all live on
-:class:`DataIO` / :class:`PrimitiveIO`. This leaf only owns the
-format-specific options and the read/write bodies.
+CSV is a pure stream — no footer, no random access, no cheap
+schema. Schema collection reads the first batch; reads parse from
+byte zero every call. APPEND is implemented honestly at the leaf
+level (concat new bytes; suppress header on the second-and-later
+session) since the format itself supports it without a footer
+rewrite.
 """
 
 from __future__ import annotations
 
 import contextlib
 import dataclasses
+import io as _stdlib_io
 from typing import TYPE_CHECKING, ClassVar, Iterable, Iterator
 
 import pyarrow as pa
@@ -37,10 +21,7 @@ import pyarrow.csv as pa_csv
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MimeTypes, Mode
-from yggdrasil.lazy_imports import (
-    polars_module,
-    pyarrow_dataset_module,
-)
+from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
 from yggdrasil.io.bytes_io import BytesIO
 
 if TYPE_CHECKING:
@@ -51,16 +32,10 @@ if TYPE_CHECKING:
 __all__ = ["CsvIO", "CsvOptions"]
 
 
-# ---------------------------------------------------------------------------
-# CsvOptions
-# ---------------------------------------------------------------------------
-
-
 @dataclasses.dataclass(frozen=True, slots=True)
 class CsvOptions(CastOptions):
     """:class:`CastOptions` extended with CSV-specific knobs."""
 
-    # Reader knobs
     delimiter: str = ","
     quote_char: str = '"'
     escape_char: "str | None" = None
@@ -69,7 +44,6 @@ class CsvOptions(CastOptions):
     null_values: "tuple[str, ...]" = ("", "N/A", "n/a", "NULL", "null", "None")
     encoding: str = "utf-8"
 
-    # Writer knobs
     write_header: bool = True
     line_ending: str = "\n"
 
@@ -101,46 +75,36 @@ class CsvOptions(CastOptions):
         )
 
 
-# ---------------------------------------------------------------------------
-# CsvIO
-# ---------------------------------------------------------------------------
-
-
 class CsvIO(BytesIO):
-    """:class:`PrimitiveIO` for CSV files."""
+    """:class:`Tabular` leaf for CSV files."""
 
-    # No cached reader — CSV has no footer to amortize.
-    _FINAL_TABULAR_IO: ClassVar[bool] = True
-
-    @classmethod
-    def default_media_type(cls):
-        return MimeTypes.CSV
+    mime_type: ClassVar[MimeTypes] = MimeTypes.CSV
 
     @classmethod
     def options_class(cls):
         return CsvOptions
 
-    _SUPPORTED_APPEND: ClassVar[bool] = True
-    _SUPPORTED_UPSERT: ClassVar[bool] = True
-    _NATIVE_SCANNER_OK: ClassVar[bool] = True
+    # ==================================================================
+    # Helpers
+    # ==================================================================
+
+    def _local_path_str(self) -> "str | None":
+        holder = self._holder
+        if holder is None or not getattr(holder, "is_local_path", False):
+            return None
+        full_path = getattr(holder, "full_path", None)
+        return full_path() if full_path is not None else None
 
     # ==================================================================
     # Schema — read the first batch
     # ==================================================================
 
     def _collect_schema(self, options: CsvOptions) -> Schema:
-        """Read the schema from the first batch.
-
-        CSV has no metadata; the parser must read at least one row
-        of data to type-infer.
-        """
-        if self.is_empty():
+        if self.size == 0:
             return Schema.empty()
-
-        with self._reading_context(options) as io:
-            source = io.arrow_io(mode="rb")
+        with self._format_view() as v:
             reader = pa_csv.open_csv(
-                source,
+                v,
                 read_options=options.to_read_options(),
                 parse_options=options.to_parse_options(),
                 convert_options=options.to_convert_options(),
@@ -158,21 +122,18 @@ class CsvIO(BytesIO):
         self,
         options: CsvOptions,
     ) -> Iterator[pa.RecordBatch]:
-        """Yield Arrow record batches from a streaming CSV parse."""
-        if self.is_empty():
+        if self.size == 0:
             return
-
-        with self._reading_context(options) as io:
-            source = io.arrow_io(mode="rb")
+        with self._format_view() as v:
             reader = pa_csv.open_csv(
-                source,
+                v,
                 read_options=options.to_read_options(),
                 parse_options=options.to_parse_options(),
                 convert_options=options.to_convert_options(),
             )
             try:
                 for batch in reader:
-                    yield options.cast_arrow_tabular(batch)
+                    yield batch
             finally:
                 reader.close()
 
@@ -185,117 +146,137 @@ class CsvIO(BytesIO):
         batches: Iterable[pa.RecordBatch],
         options: CsvOptions,
     ) -> None:
-        """Persist Arrow record batches as a CSV file.
+        """Persist Arrow record batches as CSV.
 
-        OVERWRITE goes through one writer session over a truncated
-        buffer. APPEND seeks to end and writes without a header
-        (unless the existing buffer is empty, which collapses to
-        OVERWRITE-with-header semantics). UPSERT goes through the
-        generic read-modify-write helper on :class:`DataIO`.
+        Mode dispatch:
+
+        - **OVERWRITE / AUTO / TRUNCATE** — single
+          :class:`pa_csv.CSVWriter` over the truncated buffer with the
+          configured header behavior.
+        - **APPEND** — seek to EOF, write **without** a header
+          (unless the buffer was empty, in which case collapse to
+          OVERWRITE-with-header semantics).
+        - **IGNORE** — skip when non-empty.
+        - **ERROR_IF_EXISTS** — raise when non-empty.
+        - **UPSERT / MERGE** — degrade to APPEND. CSV has no key
+          model worth honoring at this layer.
         """
-        action = self._resolve_save_mode(options.mode)
+        action = self._resolve_action(options.mode)
+
         if action is Mode.IGNORE:
-            return
-        if action is Mode.UPSERT:
-            return self._arrow_upsert_via_rewrite(batches, options)
-        if action not in (Mode.OVERWRITE, Mode.APPEND):
-            raise NotImplementedError(
-                f"{type(self).__name__}._write_arrow_batches handles "
-                f"OVERWRITE / APPEND / UPSERT; got resolved action "
-                f"{action!r}."
-            )
+            if self.size > 0:
+                return
+            action = Mode.OVERWRITE
+        elif action is Mode.ERROR_IF_EXISTS:
+            if self.size > 0:
+                raise FileExistsError(
+                    f"{type(self).__name__} buffer is non-empty "
+                    f"({self.size} bytes); refusing to overwrite under "
+                    f"mode={options.mode!r}."
+                )
+            action = Mode.OVERWRITE
 
         iterator = iter(batches)
         first = next(iterator, None)
+        if first is None and action is Mode.OVERWRITE:
+            self.seek(0)
+            self.truncate(0)
+            return
         if first is None:
             return
 
-        first = options.cast_arrow_tabular(first)
-        schema = options.check_source(first).check_target(first).merged_schema.to_arrow_schema()
-
-        # Decide append-vs-overwrite at the byte level. APPEND on an
-        # empty buffer is overwrite-with-header.
-        is_append = action is Mode.APPEND and not self.is_empty()
-
-        if is_append:
-            write_options = pa_csv.WriteOptions(
-                include_header=False,
-                delimiter=options.delimiter,
-            )
-            sink_mode = "ab"
-        else:
-            write_options = options.to_write_options()
-            sink_mode = "wb"
-
-        lifecycle = options.copy(
-            truncate_before_write=not is_append,
-            write_seek=-1 if is_append else options.write_seek,
+        codec = self._codec()
+        is_append_uncompressed = (
+            action is Mode.APPEND and self.size > 0 and codec is None
+        )
+        is_append_compressed = (
+            action is Mode.APPEND and self.size > 0 and codec is not None
         )
 
-        with self._writing_context(lifecycle) as io:
+        if is_append_compressed:
+            # Codec'd buffer can't be appended to byte-wise; fall
+            # back to read-modify-rewrite via OVERWRITE chained with
+            # the existing batches.
+            existing = list(self._read_arrow_batches(options))
+            chained = iter([*existing, first, *iterator])
+            return self._write_arrow_batches(
+                chained, dataclasses.replace(options, mode=Mode.OVERWRITE),
+            )
+
+        schema = first.schema
+
+        if is_append_uncompressed:
+            write_options = pa_csv.WriteOptions(
+                include_header=False, delimiter=options.delimiter,
+            )
+            self.seek(0, _stdlib_io.SEEK_END)
             with contextlib.ExitStack() as stack:
-                sink = io.arrow_io(mode=sink_mode)
-                stack.callback(sink.close)
-                writer = pa_csv.CSVWriter(sink, schema, write_options=write_options)
+                writer = pa_csv.CSVWriter(
+                    self, schema, write_options=write_options,
+                )
                 stack.callback(writer.close)
-
-                try:
+                if first.num_rows > 0:
                     writer.write_batch(first)
-                    for batch in iterator:
-                        batch = options.cast_arrow_tabular(batch)
+                for batch in iterator:
+                    if batch.num_rows > 0:
                         writer.write_batch(batch)
-                finally:
-                    writer.close()
+            return
 
-        return None
+        write_options = options.to_write_options()
+        with self._format_buffer() as buf:
+            with contextlib.ExitStack() as stack:
+                writer = pa_csv.CSVWriter(buf, schema, write_options=write_options)
+                stack.callback(writer.close)
+                if first.num_rows > 0:
+                    writer.write_batch(first)
+                for batch in iterator:
+                    if batch.num_rows > 0:
+                        writer.write_batch(batch)
+
+    def _resolve_action(self, mode: Mode) -> Mode:
+        if mode is Mode.AUTO or mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:
+            return Mode.OVERWRITE
+        if mode is Mode.APPEND:
+            return Mode.APPEND
+        if mode is Mode.IGNORE:
+            return Mode.IGNORE
+        if mode is Mode.ERROR_IF_EXISTS:
+            return Mode.ERROR_IF_EXISTS
+        if mode is Mode.UPSERT or mode is Mode.MERGE:
+            return Mode.APPEND
+        return Mode.OVERWRITE
 
     # ==================================================================
     # Native engine overrides
     # ==================================================================
 
-    def _can_use_native_scanner(self, options: CsvOptions) -> bool:
-        """True iff the native CSV scanners can serve *options*."""
-        if not type(self)._NATIVE_SCANNER_OK:
-            return False
-        if self.is_empty():
-            return False
-        if options.target_field is not None:
-            return False
-        if self.codec is not None:
-            return False
-        if self.path is None:
-            return False
-        if not self.path.is_local:
-            return False
-        return True
-
     def _read_arrow_dataset(self, options: CsvOptions) -> "pds.Dataset":
-        if not self._can_use_native_scanner(options):
-            return super()._read_arrow_dataset(options)
-
         pds = pyarrow_dataset_module()
-        return pds.dataset(self.path.__fspath__(), format="csv")
+        path = self._local_path_str()
+        if path is not None:
+            return pds.dataset(path, format="csv")
+        return super()._read_arrow_dataset(options)
 
     def _scan_polars_frame(self, options: CsvOptions) -> "pl.LazyFrame":
-        if not self._can_use_native_scanner(options):
-            return super()._scan_polars_frame(options)
-
         pl = polars_module()
-        return pl.scan_csv(
-            self.path.__fspath__(),
-            separator=options.delimiter,
-            has_header=options.has_header,
-            quote_char=options.quote_char,
-        )
+        path = self._local_path_str()
+        if path is not None:
+            return pl.scan_csv(
+                path,
+                separator=options.delimiter,
+                has_header=options.has_header,
+                quote_char=options.quote_char,
+            )
+        return super()._scan_polars_frame(options)
 
     def _read_polars_frame(self, options: CsvOptions) -> "pl.DataFrame":
-        if not self._can_use_native_scanner(options):
-            return super()._read_polars_frame(options)
-
         pl = polars_module()
-        return pl.read_csv(
-            self.path.__fspath__(),
-            separator=options.delimiter,
-            has_header=options.has_header,
-            quote_char=options.quote_char,
-        )
+        path = self._local_path_str()
+        if path is not None:
+            return pl.read_csv(
+                path,
+                separator=options.delimiter,
+                has_header=options.has_header,
+                quote_char=options.quote_char,
+            )
+        return super()._read_polars_frame(options)

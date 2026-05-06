@@ -1,215 +1,234 @@
 """:class:`WorkspacePath` — ``/Workspace/...`` via the Workspace API.
 
-Always SDK-mediated; no FUSE counterpart. Thinner than
-:class:`DBFSPath` because the only access path is the Workspace
-REST API: list / get_status / mkdirs / delete / download / upload.
+Workspace objects (notebooks, files, directories) are managed
+through ``workspace.workspace.*``. There's no FUSE counterpart;
+every read / write is SDK-mediated.
 
-The buffered-IO machinery lives in :class:`BytesIO`; this class
-just plugs in the SDK download/upload calls via the
-:meth:`_remote_download` / :meth:`_remote_upload` hooks declared
-on :class:`DatabricksPath`.
+The Workspace API has a single download / upload pair (no range
+reads, no positional writes), so the byte primitives map onto a
+read-modify-rewrite scheme.
 """
 
 from __future__ import annotations
 
-import logging
-from typing import ClassVar
+import io as _stdio
+from typing import ClassVar, Iterator
 
-from databricks.sdk.service.workspace import (
-    ExportFormat,
-    ImportFormat,
-    ObjectType,
-)
-
-from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
-from ._errors import (
-    ALREADY_EXISTS_ERRORS,
-    NOT_FOUND_ERRORS,
-    SDK_ERRORS,
-    retry_sdk_call,
-)
+
 from .path import DatabricksPath
-from .path_kind import DatabricksPathKind
+
 
 __all__ = ["WorkspacePath"]
-
-
-LOGGER = logging.getLogger(__name__)
 
 
 class WorkspacePath(DatabricksPath):
     """Path under ``/Workspace/...`` via the Workspace API."""
 
-    scheme: ClassVar[str] = "dbfs+workspace"
-    _NAMESPACE_PREFIX: ClassVar[str] = "/Workspace/"
-
-    @property
-    def kind(self) -> DatabricksPathKind:
-        return DatabricksPathKind.WORKSPACE
+    scheme: ClassVar[str] = "workspace"
+    namespace_prefix: ClassVar[str] = "/Workspace/"
 
     # ==================================================================
     # Path rendering
     # ==================================================================
 
     def full_path(self) -> str:
-        p = self.url.path.lstrip("/")
+        p = (self.url.path or "").lstrip("/")
         return "/Workspace/" + p if p else "/Workspace"
 
-    # ==================================================================
-    # SDK transport
-    # ==================================================================
-
-    def _remote_download(self, allow_not_found: bool = False) -> BytesIO:
-        """Pull the full object via ``sdk.workspace.download``.
-
-        Drains the SDK response into a project :class:`BytesIO`
-        (spill-capable) so large notebooks/artifacts don't have to
-        live entirely in RAM. The base ``read_bytes`` /
-        ``retry_sdk_call`` wrapper handles transient transport
-        flakes around the call.
-        """
-        sdk = self._sdk()
-        out = BytesIO()
-        try:
-            result = sdk.workspace.download(
-                path=self.full_path(),
-                format=ExportFormat.AUTO,
-            )
-        except NOT_FOUND_ERRORS:
-            if allow_not_found:
-                out.seek(0)
-                return out
-            raise FileNotFoundError(self.full_path())
-        except SDK_ERRORS:
-            if allow_not_found:
-                out.seek(0)
-                return out
-            raise
-
-        if result is None:
-            out.seek(0)
-            return out
-
-        try:
-            while True:
-                chunk = result.read(1 * 1024 * 1024)
-                if not chunk:
-                    break
-                out.write(chunk)
-        except NOT_FOUND_ERRORS:
-            if allow_not_found:
-                out.seek(0)
-                return out
-            raise FileNotFoundError(self.full_path())
-
-        out.seek(0)
-        return out
-
-    def _remote_upload(self, payload: BytesIO) -> None:
-        """Push the full payload via ``sdk.workspace.upload``.
-
-        ``payload`` is the project :class:`BytesIO`. The Workspace
-        SDK ``upload`` accepts a file-like object, so we hand the
-        buffer through directly (it satisfies ``read``/``seek``).
-        Resetting before each retry is handled by the base via
-        ``on_retry`` in :meth:`DatabricksPath.write_bytes`.
-        """
-        sdk = self._sdk()
-        full_path = self.full_path()
-        size = getattr(payload, "size", None)
-
-        LOGGER.debug("Uploading %r bytes to %s", size, self)
-        try:
-            sdk.workspace.upload(
-                full_path, payload,
-                format=ImportFormat.AUTO, overwrite=True,
-            )
-        except NOT_FOUND_ERRORS:
-            # Surface as FileNotFoundError so the base class's
-            # write_bytes can do its parent-dir-and-retry dance.
-            raise FileNotFoundError(full_path)
-        LOGGER.info("Wrote %r bytes to %s", size, self)
+    @property
+    def api_path(self) -> str:
+        return self.full_path()
 
     # ==================================================================
-    # SDK hooks — stat / ls / mkdir / remove
+    # Stat
     # ==================================================================
 
     def _stat_uncached(self) -> IOStats:
         try:
-            info = retry_sdk_call(
-                self._sdk().workspace.get_status, self.full_path(),
+            info = self._call(
+                self.workspace.workspace.get_status, self.api_path,
             )
-        except SDK_ERRORS:
-            found = next(self._ls(recursive=False, allow_not_found=True), None)
-            if found is None:
-                return IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
-            return IOStats(
-                kind=IOKind.DIRECTORY, size=0,
-                mtime=float(found.mtime or 0.0),
-            )
+        except Exception:
+            return IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
 
-        is_dir = info.object_type in (ObjectType.DIRECTORY, ObjectType.REPO)
+        ot = getattr(info, "object_type", None)
+        is_dir = (
+            getattr(ot, "name", None) == "DIRECTORY"
+            or str(ot).upper().endswith("DIRECTORY")
+        )
+        size = int(getattr(info, "size", 0) or 0)
+        mtime_ms = getattr(info, "modified_at", None) or 0
         return IOStats(
             kind=IOKind.DIRECTORY if is_dir else IOKind.FILE,
-            size=int(info.size or 0),
-            mtime=(
-                float(info.modified_at) / 1000.0
-                if info.modified_at else 0.0
-            ),
+            size=size,
+            mtime=float(mtime_ms) / 1000.0 if mtime_ms else 0.0,
         )
 
-    def _ls(self, recursive=False, allow_not_found=True):
-        try:
-            for info in self._sdk().workspace.list(
-                self.full_path(), recursive=recursive,
-            ):
-                api_path = info.path
-                url_path = (
-                    api_path[len("/Workspace"):]
-                    if api_path.startswith("/Workspace")
-                    else api_path
-                )
-                child = WorkspacePath(
-                    url=URL(scheme="workspace", host=self.url.host, path=url_path),
-                    client=self._client,
-                )
-                yield child
-        except SDK_ERRORS:
-            if not allow_not_found:
-                raise
+    @property
+    def size(self) -> int:
+        return int(self._stat().size)
 
-    def _mkdir(self, parents=True, exist_ok=True):
-        try:
-            retry_sdk_call(self._sdk().workspace.mkdirs, self.full_path())
-        except ALREADY_EXISTS_ERRORS:
-            if not exist_ok:
-                raise
+    # ==================================================================
+    # Listing
+    # ==================================================================
 
-    def _remove_file(self, allow_not_found=True):
-        # Workspace ``delete`` requires recursive=True for
-        # notebook files (legacy quirk — notebooks-with-revisions
-        # are tree-shaped on the API side).
+    def _ls(self, recursive: bool = False) -> Iterator["WorkspacePath"]:
         try:
-            retry_sdk_call(
-                self._sdk().workspace.delete,
-                self.full_path(), recursive=True,
+            entries = list(
+                self._call(self.workspace.workspace.list, self.api_path)
             )
-        except SDK_ERRORS:
-            if not allow_not_found:
+        except Exception:
+            return
+        for info in entries:
+            child_path = getattr(info, "path", None)
+            if not child_path:
+                continue
+            # Workspace.list returns paths under ``/Workspace/...``;
+            # the URL path is the namespace-stripped suffix.
+            url_path = child_path
+            if url_path.startswith("/Workspace/"):
+                url_path = url_path[len("/Workspace"):]
+            elif url_path.startswith("/Workspace"):
+                url_path = url_path[len("/Workspace"):] or "/"
+            child = type(self)(
+                url=URL(scheme=self.scheme, path=url_path),
+                workspace=self._workspace,
+            )
+            yield child
+            ot = getattr(info, "object_type", None)
+            is_dir = (
+                getattr(ot, "name", None) == "DIRECTORY"
+                or str(ot).upper().endswith("DIRECTORY")
+            )
+            if recursive and is_dir:
+                yield from child._ls(recursive=True)
+
+    # ==================================================================
+    # Mutators
+    # ==================================================================
+
+    def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
+        try:
+            self._call(self.workspace.workspace.mkdirs, self.api_path)
+        except Exception as exc:
+            if not exist_ok and _looks_like_already_exists(exc):
+                raise
+
+    def _remove_file(self, missing_ok: bool = True) -> None:
+        try:
+            self._call(
+                self.workspace.workspace.delete,
+                self.api_path, recursive=False,
+            )
+        except Exception:
+            if not missing_ok:
                 raise
         self._invalidate_stat_cache()
 
-    def _remove_dir(self, recursive=True, allow_not_found=True, with_root=True):
-        path = self.full_path()
+    def _remove_dir(
+        self, recursive: bool = True, missing_ok: bool = True,
+    ) -> None:
         try:
-            retry_sdk_call(
-                self._sdk().workspace.delete, path, recursive=recursive,
+            self._call(
+                self.workspace.workspace.delete,
+                self.api_path, recursive=recursive,
             )
-            if not with_root:
-                retry_sdk_call(self._sdk().workspace.mkdirs, path)
-        except SDK_ERRORS:
-            if not allow_not_found:
+        except Exception:
+            if not missing_ok:
                 raise
         self._invalidate_stat_cache()
+
+    # ==================================================================
+    # Holder I/O — download / upload
+    # ==================================================================
+
+    def _read_mv(self, n: int, pos: int) -> memoryview:
+        if n == 0:
+            return memoryview(b"")
+        try:
+            response = self._call(
+                self.workspace.workspace.download, self.api_path,
+            )
+        except Exception as exc:
+            if _looks_like_not_found(exc):
+                raise FileNotFoundError(self.full_path()) from exc
+            raise
+        body = getattr(response, "contents", None) or response
+        try:
+            data = body.read()
+        except AttributeError:
+            data = bytes(body)
+        if pos:
+            data = data[pos:]
+        if n > 0:
+            data = data[:n]
+        return memoryview(data)
+
+    def _write_mv(self, data: memoryview, pos: int) -> int:
+        n = len(data)
+        if n == 0:
+            return 0
+        if pos == 0:
+            payload = bytes(data)
+        else:
+            try:
+                existing_size = int(self._stat().size)
+            except Exception:
+                existing_size = 0
+            existing = (
+                bytes(self._read_mv(existing_size, 0)) if existing_size else b""
+            )
+            if pos > len(existing):
+                existing = existing + b"\x00" * (pos - len(existing))
+            payload = existing[:pos] + bytes(data) + existing[pos + n:]
+        self._upload(payload)
+        return n
+
+    def _upload(self, payload: bytes) -> None:
+        self._call(
+            self.workspace.workspace.upload,
+            path=self.api_path,
+            content=_stdio.BytesIO(payload),
+            overwrite=True,
+        )
+        self._invalidate_stat_cache()
+
+    def truncate(self, n: int) -> int:
+        if n < 0:
+            raise ValueError(f"truncate size must be >= 0, got {n!r}")
+        try:
+            existing_size = int(self._stat().size)
+        except Exception:
+            existing_size = 0
+        if n == 0:
+            self._upload(b"")
+            return 0
+        if n <= existing_size:
+            head = bytes(self._read_mv(n, 0))
+        else:
+            existing = bytes(self._read_mv(existing_size, 0)) if existing_size else b""
+            head = existing + b"\x00" * (n - existing_size)
+        self._upload(head)
+        return n
+
+    def _clear(self) -> None:
+        self._remove_file(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _looks_like_not_found(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    return name in (
+        "NotFound", "ResourceDoesNotExist", "FileNotFoundError",
+    ) or isinstance(exc, FileNotFoundError)
+
+
+def _looks_like_already_exists(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    return name in ("AlreadyExists", "ResourceAlreadyExists", "FileExistsError")

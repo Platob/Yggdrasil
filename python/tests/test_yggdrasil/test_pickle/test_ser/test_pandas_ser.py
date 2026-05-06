@@ -91,6 +91,12 @@ def test_pandas_timestamp_roundtrip() -> None:
 
 
 def test_pandas_timestamp_timezone_roundtrip() -> None:
+    try:
+        import zoneinfo
+        zoneinfo.ZoneInfo("US/Eastern")
+    except Exception:
+        import pytest
+        pytest.skip("tzdata / system zoneinfo not available")
     ts = pd.Timestamp("2020-01-01 07:34:56.123456789", tz="US/Eastern")
 
     ser, out = _roundtrip(ts)

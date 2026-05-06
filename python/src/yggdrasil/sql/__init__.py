@@ -35,7 +35,7 @@ A thin SQL surface that:
   ``read_spark_frame`` / ``to_records`` / …).
 - Persists the materialized result through
   :attr:`Tabular._persisted_data` so repeat reads are cache
-  hits. Default holder is :class:`MemoryArrowIO`; pass
+  hits. Default holder is :class:`ArrowTabular`; pass
   ``persist='path', path='...'`` to spill to a parquet file or
   folder instead.
 
@@ -56,7 +56,7 @@ them together:
   selectors / columns to apply on the way out.
 - :class:`yggdrasil.data.statement.StatementResult` is the
   lifecycle + Arrow-IO base.
-- :class:`yggdrasil.io.buffer.memory.MemoryArrowIO` is the
+- :class:`yggdrasil.io.buffer.memory.ArrowTabular` is the
   zero-copy in-memory holder. ParquetIO handles the on-disk
   spill case.
 
@@ -189,7 +189,7 @@ def sql(
         the way out without touching the SQL text.
     persist
         Where to land the materialized result. ``"memory"`` (the
-        default) keeps it as :class:`MemoryArrowIO`. ``"path"``
+        default) keeps it as :class:`ArrowTabular`. ``"path"``
         spills to a parquet file/folder under ``path``. ``None``
         skips persistence — re-reads will re-execute the engine,
         which is only what you want for one-shot consumption.

@@ -15,8 +15,8 @@ from yggdrasil.data.schema import schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
 from yggdrasil.environ.userinfo import USERINFO_STRUCT, UserInfo
 from yggdrasil.data.enums import MediaType, MimeTypes
-from .buffer import BytesIO
-from .enums import GZIP, Codec, MimeType
+from .bytes_io import BytesIO
+from yggdrasil.data.enums import GZIP, Codec, MimeType
 from .headers import normalize_headers
 from .url import URL, URL_STRUCT
 

@@ -176,6 +176,11 @@ class CastOptions:
     schema_mode: Mode = Mode.IGNORE
     row_size: int | None = None
     byte_size: int | None = None
+    #: Allow format readers / writers to use a thread pool when the
+    #: backend supports it. Universally honored across CSV, Parquet,
+    #: Arrow IPC, and NDJSON; format-specific options can override
+    #: the default by re-declaring the field.
+    use_threads: bool = True
     recursive: bool = False
     match_by_names: list[str] | None = None
     with_io: bool = True
@@ -244,13 +249,26 @@ class CastOptions:
     # --- Capture inserted rows as a return value -----------------------
     # When True, mutating tabular operations (table inserts, MERGE-style
     # writes, …) hand back the rows they actually wrote as a
-    # :class:`Tabular` — typically a :class:`MemoryArrowIO` or a
-    # :class:`MemorySparkIO` depending on the engine that ran the write.
+    # :class:`Tabular` — typically a :class:`ArrowTabular` or a
+    # :class:`SparkTabular` depending on the engine that ran the write.
     # Default ``False`` keeps the historical "fire-and-forget" return
     # contract; flip it on when downstream code wants to chain on the
     # newly-appended payload (logging, follow-up tasks, downstream
     # writes) without re-querying the target.
     return_data: bool = False
+
+    # --- Keyed-write strategy toggle ------------------------------------
+    # When False (the default), keyed inserts use the engine's native
+    # ``MERGE INTO`` statement — Databricks / Delta plans the dedup
+    # once. When True, the table layer sidesteps MERGE entirely:
+    # ``Mode.APPEND`` becomes ``INSERT ... WHERE NOT EXISTS`` (or a
+    # Spark DataFrame anti-join, when a session is reachable);
+    # ``Mode.UPSERT`` / ``Mode.MERGE`` become a keyed ``DELETE``
+    # followed by ``INSERT``. Useful for backends without native
+    # MERGE, for callers that want explicit dedup semantics, or for
+    # the Spark fast path where pre-filtering the DataFrame is much
+    # cheaper than the SQL ``NOT EXISTS`` plan.
+    safe_merge: bool = False
 
     # --- Memoization slots ---------------------------------------------
     # ``merged_field`` and ``merged_schema`` are read repeatedly by every

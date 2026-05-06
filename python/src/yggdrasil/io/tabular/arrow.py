@@ -62,7 +62,7 @@ from yggdrasil.data.enums import MimeType, Mode
 logger = logging.getLogger(__name__)
 
 
-__all__ = ["MemoryArrowIO"]
+__all__ = ["ArrowTabular"]
 
 
 # Anything we know how to ingest into the internal batch list.
@@ -81,7 +81,7 @@ ArrowSource = Union[
 
 # Default spill threshold — matches BytesIO so the two layers behave
 # identically on big payloads. Override per-instance via
-# ``spill_bytes=`` or per-call via ``MemoryArrowIO.spill_bytes = N``.
+# ``spill_bytes=`` or per-call via ``ArrowTabular.spill_bytes = N``.
 _DEFAULT_SPILL_BYTES = 128 * 1024 * 1024
 _DEFAULT_SPILL_TTL = 86400
 
@@ -109,7 +109,7 @@ def _deep_copy_table(table: pa.Table) -> pa.Table:
     return table.combine_chunks()
 
 
-class MemoryArrowIO(Tabular[CastOptions]):
+class ArrowTabular(Tabular[CastOptions]):
     """In-memory Arrow batch holder with auto-spill to local IPC.
 
     Schema is tracked separately so an empty buffer still answers
@@ -188,20 +188,16 @@ class MemoryArrowIO(Tabular[CastOptions]):
         if data is not None:
             self._ingest(data)
 
-        # Disposable's ``close`` only fires teardown when the resource
-        # is in the open state. We're always "live" once constructed —
-        # no separate acquire phase like BytesIO has — so flip the flag
-        # eagerly so :meth:`close` runs :meth:`_release` and unlinks
-        # the spill file.
-        if not self._acquired:
-            self.open()
+        # Tabular leaves are stateless w.r.t. Disposable — there is
+        # no separate acquire phase to wait for, so just leave the
+        # instance live as soon as construction returns.
 
     def __repr__(self) -> str:
         spill = ""
         if self._spilled_table is not None and self._spill_path is not None:
             spill = f", spill={self._spill_path!s}"
         return (
-            f"MemoryArrowIO(num_batches={self._total_batches()}, "
+            f"ArrowTabular(num_batches={self._total_batches()}, "
             f"num_rows={self.num_rows}"
             f"{spill})"
         )
@@ -388,7 +384,7 @@ class MemoryArrowIO(Tabular[CastOptions]):
             self._consolidate_spill()
         except Exception:
             logger.exception(
-                "MemoryArrowIO: spill to local IPC failed; staying "
+                "ArrowTabular: spill to local IPC failed; staying "
                 "in-memory. The next write attempt will retry.",
             )
 
@@ -538,7 +534,7 @@ class MemoryArrowIO(Tabular[CastOptions]):
                 pass
             except Exception:
                 logger.debug(
-                    "MemoryArrowIO: failed to unlink spill file %r — "
+                    "ArrowTabular: failed to unlink spill file %r — "
                     "leaving it for the cross-process janitor.",
                     str(path),
                 )
@@ -643,7 +639,7 @@ class MemoryArrowIO(Tabular[CastOptions]):
             iterator = iter(source)
         except TypeError as exc:
             raise TypeError(
-                f"MemoryArrowIO can't ingest "
+                f"ArrowTabular can't ingest "
                 f"{type(source).__module__}.{type(source).__name__}: "
                 f"{source!r}. Accepted: pyarrow Table/RecordBatch, polars "
                 "DataFrame/LazyFrame, pandas DataFrame, pyspark DataFrame, "

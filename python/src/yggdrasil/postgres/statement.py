@@ -47,7 +47,7 @@ from yggdrasil.data.statement import (
     StatementResult,
 )
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
-from yggdrasil.io.buffer.base import O
+from yggdrasil.io.tabular.base import O
 from yggdrasil.data.enums import MimeType
 
 if TYPE_CHECKING:
@@ -182,7 +182,7 @@ class PostgresStatementResult(StatementResult[PostgresPreparedStatement]):
     (cursor-based streaming is opt-in via ``fetch_size``, and even
     then the executor materializes batch-by-batch eagerly).
 
-    The materialized payload is held as a :class:`MemoryArrowIO` on
+    The materialized payload is held as a :class:`ArrowTabular` on
     ``_persisted_data`` so the inherited :class:`Tabular` read
     methods (``read_arrow_batches``, ``read_polars_frame``,
     ``read_pandas_frame``, …) work out of the box.
@@ -298,8 +298,8 @@ class PostgresStatementResult(StatementResult[PostgresPreparedStatement]):
                 raise
             return self
 
-        from yggdrasil.io.tabular import MemoryArrowIO
-        self._persisted_data = MemoryArrowIO(table)
+        from yggdrasil.io.tabular import ArrowTabular
+        self._persisted_data = ArrowTabular(table)
         self._row_count = row_count
         self._started = True
         return self

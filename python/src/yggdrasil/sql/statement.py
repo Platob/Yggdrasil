@@ -46,7 +46,7 @@ __all__ = [
 PersistTarget = Optional[str]
 """Where to land the result.
 
-``"memory"`` (default) → :class:`MemoryArrowIO`. ``"path"`` →
+``"memory"`` (default) → :class:`ArrowTabular`. ``"path"`` →
 spill to a parquet folder under ``path``. ``None`` → don't persist
 (the result is consumed once on read; subsequent reads re-execute
 the underlying engine, so callers who plan to drain the result
@@ -154,7 +154,7 @@ class SqlStatementResult(StatementResult[SqlPreparedStatement]):
 
     Lifecycle is synchronous: :meth:`start` runs the executor and
     stashes the materialized payload on ``_persisted_data`` (a
-    :class:`MemoryArrowIO` for ``persist="memory"``, a
+    :class:`ArrowTabular` for ``persist="memory"``, a
     :class:`ParquetIO` folder for ``persist="path"``). Once
     started, every :class:`Tabular` read method on this object
     serves from the cache — ``read_arrow_table`` /
@@ -317,7 +317,7 @@ class SqlStatementResult(StatementResult[SqlPreparedStatement]):
         raise NotImplementedError(
             "SqlStatementResult is read-only — it represents the output "
             "of a SQL query, not a writable target. Build a Tabular "
-            "(MemoryArrowIO, ParquetIO, ...) and pipe the result into "
+            "(ArrowTabular, ParquetIO, ...) and pipe the result into "
             "it via `result.read_arrow_batches()` if you need to land "
             "it somewhere new."
         )

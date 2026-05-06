@@ -107,7 +107,7 @@ class MediaType:
             return cls.from_magic(obj, default=default)
         if hasattr(obj, "read") and hasattr(obj, "seek"):
             return cls.from_io(obj, default=default)
-        if path_class().is_pathish(obj):
+        if URL.is_pathish(obj):
             parsed = cls.from_path(obj, default=None)
             if parsed is not None:
                 return parsed
@@ -248,8 +248,22 @@ class MediaType:
         if fast_parsed is not None:
             return fast_parsed
 
-        if path.is_dir_sink():
-            return MediaType(MimeTypes.FOLDER)
+        # Backend-aware "is this a directory sink?" probe — older
+        # paths exposed ``is_dir_sink``; the new substrate uses
+        # ``is_dir``. Fall through gracefully if neither is present
+        # (a string-shaped pseudo-path) so we just attempt the
+        # IO sniff next.
+        is_dir_sink = getattr(path, "is_dir_sink", None)
+        try:
+            if callable(is_dir_sink) and is_dir_sink():
+                return MediaType(MimeTypes.FOLDER)
+        except Exception:
+            pass
+        try:
+            if path.is_dir():
+                return MediaType(MimeTypes.FOLDER)
+        except Exception:
+            pass
 
         try:
             with path.open(mode="rb") as f:

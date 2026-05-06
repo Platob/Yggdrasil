@@ -1011,6 +1011,171 @@ class Field(BaseMetadata, BaseChildrenFields):
         )
         return inst
 
+    # ==================================================================
+    # Children mutators — append / replace / merge a child Field
+    # ==================================================================
+
+    def with_field(
+        self,
+        field: "Field | pa.Field | str",
+        *,
+        mode: "Mode | str | None" = None,
+        inplace: bool = True,
+        **kwargs: Any,
+    ) -> "Field":
+        """Return *self* with *field* appended or merged in.
+
+        ``mode`` controls collision behavior when a child with the
+        same name already exists. Accepts a :class:`Mode` member or
+        any alias :meth:`Mode.from_` understands.
+
+        - :data:`Mode.AUTO` / :data:`Mode.OVERWRITE` — replace the
+          existing child verbatim with *field*.
+        - :data:`Mode.APPEND` — append a fresh child even if the
+          name collides (struct semantics: last-write-wins for
+          duplicate names; both entries survive in the children
+          tuple).
+        - :data:`Mode.IGNORE` — keep the existing child; drop the
+          incoming.
+        - :data:`Mode.ERROR_IF_EXISTS` — raise :class:`ValueError`
+          on collision.
+        - :data:`Mode.UPSERT` / :data:`Mode.MERGE` — :meth:`merge_with`
+          the existing child against the incoming one (dtype, nullability,
+          metadata), keeping the existing child's identity.
+
+        Auto-promotion to struct: when ``self`` isn't a struct
+        (a primitive Field, a list/map, …) the call returns a fresh
+        struct Field whose first child is the previous ``self``
+        (renamed to its current ``name`` so it's addressable) and
+        whose second child is *field*. The promoted struct keeps
+        ``self``'s name, nullability, and metadata — only the dtype
+        changes.
+
+        Bare-string shorthand: ``self.with_field("price")`` reads as
+        "make sure a child named 'price' exists." That call goes
+        through :meth:`Field.from_any` which infers a sensible
+        default dtype.
+
+        ``inplace=True`` (the default) mutates ``self`` and returns
+        it. ``inplace=False`` returns a fresh copy.
+        """
+        if isinstance(field, Field):
+            new_field = field
+        elif isinstance(field, str):
+            # Bare-string shorthand: ``with_field("price")`` reads as
+            # "make sure a child named 'price' exists." The dtype
+            # defaults to :class:`ObjectType` so the column is typed
+            # but un-pinned; callers that care can pass a Field /
+            # ``pa.Field`` instead.
+            new_field = Field.make_default_field(name=field, **kwargs)
+        else:
+            new_field = Field.from_any(field, **kwargs)
+
+        if not isinstance(self.dtype, StructType):
+            return self._promote_to_struct_with(new_field, inplace=inplace)
+
+        action = Mode.from_(mode, default=Mode.AUTO)
+        target = self if inplace else self.copy()
+
+        existing_idx: "int | None" = None
+        for i, c in enumerate(target.children_fields):
+            if c.name == new_field.name:
+                existing_idx = i
+                break
+
+        if existing_idx is None:
+            # No collision — APPEND-style, IGNORE/ERROR are no-ops here.
+            new_children = list(target.children_fields)
+            new_children.append(new_field)
+            target._set_dtype_fields(new_children)
+            return target
+
+        if action is Mode.IGNORE:
+            return target
+        if action is Mode.ERROR_IF_EXISTS:
+            raise ValueError(
+                f"{type(self).__name__}.with_field: child {new_field.name!r} "
+                f"already exists; mode=ERROR_IF_EXISTS refuses overwrite. "
+                f"Pass mode='overwrite', 'merge', or 'append' to control "
+                f"the collision behavior."
+            )
+        if action is Mode.APPEND:
+            # Honest append: keep the existing child, add a new one
+            # with the same name. Struct lookups by name will hit the
+            # first match (preserves the existing entry's identity);
+            # downstream consumers that care can dedupe.
+            new_children = list(target.children_fields)
+            new_children.append(new_field)
+            target._set_dtype_fields(new_children)
+            return target
+        if action is Mode.UPSERT or action is Mode.MERGE:
+            existing = target.children_fields[existing_idx]
+            merged = existing.merge_with(new_field, inplace=False)
+            new_children = list(target.children_fields)
+            new_children[existing_idx] = merged
+            target._set_dtype_fields(new_children)
+            return target
+
+        # AUTO / OVERWRITE / TRUNCATE → replace.
+        new_children = list(target.children_fields)
+        new_children[existing_idx] = new_field
+        target._set_dtype_fields(new_children)
+        return target
+
+    def with_fields(
+        self,
+        fields: "Iterable[Field | pa.Field | str]",
+        *,
+        mode: "Mode | str | None" = None,
+        inplace: bool = True,
+    ) -> "Field":
+        """Apply :meth:`with_field` for every entry in *fields*.
+
+        Same mode semantics as :meth:`with_field`; the loop short-
+        circuits :data:`Mode.IGNORE` once any one collision keeps the
+        existing child (no global "first one wins, drop the rest"
+        gymnastics — collisions are evaluated per name).
+
+        Auto-promotes ``self`` to a struct on the first call when
+        needed; subsequent fields land on that struct.
+        """
+        target = self if inplace else self.copy()
+        for f in fields:
+            target = target.with_field(f, mode=mode, inplace=True)
+        return target
+
+    def _promote_to_struct_with(
+        self, new_field: "Field", *, inplace: bool,
+    ) -> "Field":
+        """Rebuild ``self`` as a struct whose first child is its
+        previous self.
+
+        The previous content keeps its name (so ``parent["x"]``
+        still resolves to the original), its dtype, its nullability,
+        and its metadata. The wrapper inherits ``self``'s name and
+        becomes the addressable struct.
+
+        Used by :meth:`with_field` when ``self`` isn't already a
+        struct — the call site reads as "stamp a child onto this
+        field," and the field auto-grows children-shape semantics
+        without the caller having to call :meth:`empty` or
+        :meth:`copy(fields=...)` first.
+        """
+        previous = Field(
+            name=self.name or DEFAULT_FIELD_NAME,
+            dtype=self.dtype,
+            nullable=self.nullable,
+            metadata=self.metadata,
+        )
+        new_dtype = StructType(fields=(previous, new_field))
+
+        if inplace:
+            object.__setattr__(self, "dtype", new_dtype)
+            self._invalidate_cache()
+            self._adopt_children()
+            return self
+        return self.copy(dtype=new_dtype)
+
     def merge_with(
         self,
         other: "Field",
@@ -1323,12 +1488,13 @@ class Field(BaseMetadata, BaseChildrenFields):
             return cls.from_spark(obj)
 
         # Path-like check — only for inputs that could *plausibly* be paths.
-        # Resolving ``path_class()`` pulls in the io.fs subtree, so we don't
-        # want unrelated objects (random user classes) reaching it.
-        if isinstance(obj, (str, pathlib.PurePath, os.PathLike)):
-            pc = path_class()
-            if pc.is_pathish(obj):
+        # Routes through ``URL.is_pathish`` (the cross-cutting check) so
+        # ``Field.from_any`` doesn't have to know about every Path subtype.
+        if isinstance(obj, (pathlib.PurePath, os.PathLike)):
+            from yggdrasil.io.url import URL
+            if URL.is_pathish(obj):
                 try:
+                    pc = path_class()
                     return pc.from_(obj).as_media().collect_schema().to_field()
                 except Exception:
                     pass

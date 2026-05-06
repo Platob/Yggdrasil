@@ -52,7 +52,7 @@ import pyarrow as pa
 
 from yggdrasil.data import Schema as DataSchema
 from yggdrasil.data.options import CastOptions
-from yggdrasil.io.buffer.base import O, Tabular
+from yggdrasil.io.tabular.base import O, Tabular
 from yggdrasil.data.enums import MimeType, MimeTypes, Mode
 
 from .column import Column

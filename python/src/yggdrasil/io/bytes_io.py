@@ -149,6 +149,45 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         "_scratch",
     )
 
+    def __new__(
+        cls,
+        data: Any = None,
+        *,
+        holder: "Holder | None" = None,
+        owns_holder: bool = False,
+        mode: str = "rb+",
+        media_type: Any = None,
+        **kwargs: Any,
+    ):
+        """Dispatch to a registered Tabular leaf when *media_type*
+        identifies one.
+
+        Lets ``BytesIO(data, media_type=MediaTypes.PARQUET)`` land on
+        :class:`ParquetIO` directly, which is what the pickle ser
+        layer relies on for round-tripping a typed buffer through
+        ``BytesIO(payload, media_type=...)`` — same shape as the
+        scheme dispatch on :class:`Holder`. Subclass calls
+        (``ParquetIO(...)``) skip the dispatch and stay on the
+        concrete class.
+        """
+        if cls is BytesIO and media_type is not None:
+            from yggdrasil.io.tabular.base import Tabular
+            from yggdrasil.data.enums.media_type import MediaType
+            mt = MediaType.from_(media_type, default=None)
+            if mt is not None:
+                target = Tabular.class_for_media_type(mt, default=None)
+                if target is not None and issubclass(target, BytesIO) and target is not cls:
+                    return target.__new__(
+                        target,
+                        data=data,
+                        holder=holder,
+                        owns_holder=owns_holder,
+                        mode=mode,
+                        media_type=media_type,
+                        **kwargs,
+                    )
+        return super().__new__(cls)
+
     def __init__(
         self,
         data: Any = None,
@@ -156,6 +195,7 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         holder: "Holder | None" = None,
         owns_holder: bool = False,
         mode: str = "rb+",
+        media_type: Any = None,
         **kwargs: Any,
     ) -> None:
         """Construct a cursor over a :class:`Holder`. Does NOT open.
@@ -180,7 +220,6 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         if holder is None:
             if data is None:
                 # Empty memory holder — equivalent to stdlib io.BytesIO().
-                from yggdrasil.io.tabular import Memory
                 holder = Memory()
                 owns_holder = True
             else:
@@ -203,6 +242,18 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         # :meth:`_release`. ``None`` when the BytesIO is closed; in
         # that state, ops route directly to ``self._holder``.
         self._scratch: "Holder | None" = None
+
+        # Stamp media type onto the holder's IOStats — gives the
+        # codec auto-handling path something to inspect, and makes
+        # the buffer self-describing for downstream serializers.
+        if media_type is not None:
+            try:
+                from yggdrasil.data.enums.media_type import MediaType
+                mt = MediaType.from_(media_type, default=None)
+                if mt is not None:
+                    self._holder.stat().media_type = mt
+            except Exception:
+                pass
 
     # ==================================================================
     # Construction routing
@@ -312,25 +363,34 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         self._scratch = scratch
         self._pos = scratch.size if "a" in self._mode else 0
 
-    def _release(self) -> None:
-        """Commit the scratch buffer (if dirty) and close the holder
-        if owned.
+    def _commit(self) -> None:
+        """Push the scratch buffer's bytes onto the durable holder.
 
-        On ``temporary=True`` the scratch is discarded without commit
-        — :class:`Disposable.close` clears the dirty bit before this
-        runs in that case.
+        :class:`Disposable._close` calls :meth:`commit` (which routes
+        here when :attr:`_dirty`) before :meth:`_release`, so by the
+        time :meth:`_release` runs the durable holder already has the
+        new bytes. ``temporary`` holders skip this — :meth:`_release`
+        on the holder side drops the payload.
+        """
+        scratch = self._scratch
+        if scratch is None:
+            return
+        if getattr(self._holder, "temporary", False):
+            return
+        self._commit_scratch(scratch)
+
+    def _release(self) -> None:
+        """Tear down scratch and release the durable holder if owned.
+
+        Commit is :meth:`_commit`'s job — this method is pure cleanup.
         """
         scratch = self._scratch
         if scratch is not None:
             try:
-                if self._dirty:
-                    self._commit_scratch(scratch)
-            finally:
-                try:
-                    scratch.close()
-                except Exception:
-                    pass
-                self._scratch = None
+                scratch.close()
+            except Exception:
+                pass
+            self._scratch = None
 
         if self._owns_holder:
             try:
@@ -372,6 +432,87 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         """The underlying :class:`Holder`."""
         return self._holder
 
+    def view(
+        self,
+        *,
+        pos: int = 0,
+        size: Optional[int] = None,
+        mode: str = "rb",
+    ) -> "BytesIO":
+        """Return a fresh, non-owning :class:`BytesIO` over the buffer.
+
+        With *size* unset the view shares the same holder as ``self``
+        — zero copy, cursor seeded at *pos*. Useful for Parquet
+        footer probes, zip directory walks, magic-byte sniffs.
+
+        With *size* set, the view holds an in-memory copy of bytes
+        ``[pos, pos+size)``. That's the right shape for a *bounded*
+        sub-view that should not race with later mutations of the
+        parent buffer (the pickle ser layer slices a header's
+        payload section out of a packed wire format like this).
+        """
+        if size is None:
+            v = BytesIO(holder=self._holder, owns_holder=False, mode=mode)
+            v._pos = int(pos)
+            return v
+        if size < 0:
+            raise ValueError(f"view size must be >= 0, got {size!r}")
+        # Bounded view: snapshot the requested range.
+        payload = self.pread(int(size), int(pos))
+        return BytesIO(payload)
+
+    # ==================================================================
+    # Codec auto-handling — peeks at the holder's MediaType
+    # ==================================================================
+
+    def _codec(self):
+        """The codec on this buffer's :class:`MediaType`, or ``None``.
+
+        Path-bound holders learn their media type from the URL
+        suffix at construction (``data.csv.gz`` → CSV + GZIP);
+        callers that build a :class:`Memory` holder by hand can
+        seed ``stat().media_type`` to opt the buffer into codec
+        round-tripping.
+        """
+        holder = self._holder
+        if holder is None:
+            return None
+        try:
+            mt = holder.stat().media_type
+        except Exception:
+            return None
+        return getattr(mt, "codec", None) if mt is not None else None
+
+    def _format_view(self) -> "BytesIO":
+        """A read-only :class:`BytesIO` over the *format* bytes.
+
+        When the holder is uncompressed (no codec on the media type),
+        returns a non-owning :meth:`view` of ``self``. When a codec
+        is present, returns a fresh in-memory :class:`BytesIO` whose
+        bytes are the decompressed payload — leaf readers parse the
+        format directly from it without knowing the wire was
+        compressed.
+
+        The returned buffer is the caller's to close.
+        """
+        codec = self._codec()
+        if codec is None:
+            return self.view(pos=0)
+        # ``codec.decompress`` accepts the source BytesIO and returns
+        # a freshly-allocated decompressed BytesIO; caller closes.
+        return codec.decompress(self)
+
+    def _format_buffer(self) -> "_FormatBufferContext":
+        """Context manager yielding a buffer to write raw format bytes into.
+
+        For an uncompressed holder, the yielded buffer is ``self``,
+        already truncated to zero so the writer starts clean.
+        For a codec-tagged holder, the yielded buffer is a fresh
+        in-memory :class:`BytesIO`; on exit the bytes are compressed
+        and committed to ``self``.
+        """
+        return _FormatBufferContext(self)
+
     @property
     def owns_holder(self) -> bool:
         """Whether closing self also closes the holder."""
@@ -388,6 +529,10 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
 
     def __bool__(self) -> bool:
         return True
+
+    def __bytes__(self) -> bytes:
+        """Snapshot the active payload as :class:`bytes`."""
+        return self.to_bytes()
 
     def __repr__(self) -> str:
         state = "open" if self._acquired else "closed"
@@ -440,6 +585,53 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
     @property
     def name(self) -> str:
         return str(self._holder.url)
+
+    @property
+    def media_type(self):
+        """The buffer's :class:`MediaType`, or ``None``.
+
+        Convenience over ``self._holder.stat().media_type`` — same
+        thing the codec auto-handling reads.
+        """
+        try:
+            return self._holder.stat().media_type
+        except Exception:
+            return None
+
+    def with_media_type(self, media_type: Any, *, copy: bool = False) -> "BytesIO":
+        """Stamp *media_type* onto the holder's :class:`IOStats`.
+
+        With ``copy=False`` (the default), mutates ``self`` and
+        returns it. ``copy=True`` allocates a fresh holder over the
+        same bytes and returns a new BytesIO over it.
+        """
+        from yggdrasil.data.enums.media_type import MediaType
+        mt = MediaType.from_(media_type, default=None) if media_type is not None else None
+        if copy:
+            payload = self.to_bytes()
+            new_io = BytesIO(payload, media_type=mt)
+            return new_io
+        if mt is not None:
+            self._holder.stat().media_type = mt
+        return self
+
+    @property
+    def closed(self) -> bool:
+        """Stdlib ``IO[bytes]`` parity — ``False`` while the durable
+        holder is reachable.
+
+        Stdlib semantics: ``closed`` means "file unusable for I/O."
+        Our holders are reachable in both the closed-Disposable
+        (direct synchronous commit) and open-Disposable (scratch
+        transaction) states, so the property only flips when a
+        ``close(force=True)`` has actually run teardown. This matters
+        for pyarrow / pandas / polars / zipfile, which guard every
+        op with an ``assert not closed`` and would otherwise refuse
+        to write into a fresh, never-explicitly-opened ``BytesIO``.
+        """
+        # Holder cleared its scratch and we own it but have nothing
+        # to fall back onto — that's the only honestly-closed state.
+        return self._holder is None
 
     def readable(self) -> bool:
         return "r" in self._mode or "+" in self._mode
@@ -530,8 +722,14 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
     # ==================================================================
 
     def read(self, size: int = -1) -> bytes:
+        remaining = max(0, self.size - self._pos)
         if size is None or size < 0:
-            size = max(0, self.size - self._pos)
+            size = remaining
+        else:
+            # Cap to remaining bytes — stdlib ``IOBase.read`` returns
+            # fewer than *size* when EOF is reached, so we do the same
+            # rather than asking the holder for an out-of-range slice.
+            size = min(size, remaining)
         if size == 0:
             return b""
         out = self._active().pread(size, self._pos)
@@ -744,3 +942,166 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
 
     def write_str_u32(self, s: str, encoding: str = "utf-8") -> int:
         return self.write_bytes_u32(s.encode(encoding))
+
+    # ==================================================================
+    # Hashing convenience — duck-typed for callers that do
+    # ``buffer.xxh3_int64()`` for fingerprinting / dedup
+    # ==================================================================
+
+    # ==================================================================
+    # Convenience: parse / decompress
+    # ==================================================================
+
+    def json_load(self, *, media_type: Any = None, orient: Any = None) -> Any:
+        """Parse the buffer as JSON and return the Python object.
+
+        ``media_type`` and ``orient`` are accepted for compatibility
+        with the response layer — when ``orient`` is set the buffer
+        is treated as a pandas-shaped JSON document. The default
+        path is the stdlib ``json.loads`` over the decoded bytes.
+        """
+        import json as _json
+        text = self.to_bytes().decode("utf-8", errors="replace")
+        if not text.strip():
+            return None
+        if orient is not None:
+            try:
+                import pandas as pd
+                return pd.read_json(text, orient=orient)
+            except Exception:
+                # Fall through to plain json on any pandas snag.
+                pass
+        return _json.loads(text)
+
+    def decompress(self, *, codec: Any = None, copy: bool = True) -> "BytesIO":
+        """Return a new :class:`BytesIO` over the decompressed payload.
+
+        ``codec`` may be a :class:`Codec`, a codec name (``"gzip"``,
+        ``"zstd"``, …), or a :class:`MediaType`-shaped object whose
+        ``codec`` attribute is read. Returns the original buffer
+        when no codec is set / supplied.
+        """
+        if codec is None:
+            codec_obj = self._codec()
+        else:
+            inner = getattr(codec, "codec", None)
+            if inner is not None:
+                codec_obj = inner
+            else:
+                from yggdrasil.data.enums.codec import Codec
+                codec_obj = Codec.from_(codec, default=None)
+        if codec_obj is None:
+            if copy:
+                return BytesIO(self.to_bytes())
+            return self
+        out = codec_obj.decompress(self)
+        return out
+
+    def xxh3_64(self):
+        """Return an :class:`xxhash.xxh3_64` instance over the payload.
+
+        Mirrors the legacy buffer surface a couple of HTTP layer
+        consumers expect (:func:`response._compute_response_identity_hash`
+        calls ``buffer.xxh3_64().digest()``). Falls back to a
+        ``hashlib`` shim when ``xxhash`` isn't installed; the shim
+        exposes ``digest`` / ``intdigest`` so the caller doesn't
+        notice.
+        """
+        payload = self.to_bytes()
+        try:
+            import xxhash as _xx
+            return _xx.xxh3_64(payload)
+        except Exception:
+            import hashlib
+
+            class _Fallback:
+                def __init__(self, p: bytes) -> None:
+                    self._d = hashlib.blake2b(p, digest_size=8).digest()
+
+                def digest(self) -> bytes:
+                    return self._d
+
+                def hexdigest(self) -> str:
+                    return self._d.hex()
+
+                def intdigest(self) -> int:
+                    return int.from_bytes(self._d, "big", signed=False)
+
+            return _Fallback(payload)
+
+    def xxh3_int64(self) -> int:
+        """64-bit xxh3 hash of the buffer's payload as a signed int64.
+
+        ``xxh3_64`` itself produces an unsigned 64-bit value;
+        downstream Arrow schemas pin the field as ``int64``, so we
+        wrap into signed range ``[-2**63, 2**63)`` here. Falls back
+        to ``blake2b`` when ``xxhash`` isn't installed.
+        """
+        payload = self.to_bytes()
+        try:
+            import xxhash as _xx
+            v = _xx.xxh3_64(payload).intdigest()
+        except Exception:
+            import hashlib
+            digest = hashlib.blake2b(payload, digest_size=8).digest()
+            v = int.from_bytes(digest, "big", signed=False)
+        if v >= 2 ** 63:
+            v -= 2 ** 64
+        return v
+
+
+# ===========================================================================
+# Codec writer context manager
+# ===========================================================================
+
+
+class _FormatBufferContext:
+    """Writer-side of :meth:`BytesIO._format_buffer`.
+
+    Caller does ``with bio._format_buffer() as buf: writer(buf)``;
+    the yielded ``buf`` accepts raw format bytes. On exit:
+
+    * No codec → ``buf is bio``; we just leave the bytes in place.
+      (We pre-truncate so the writer sees an empty target.)
+    * Codec set → ``buf`` is a fresh in-memory BytesIO; on exit the
+      bytes are compressed and committed to ``bio``.
+    """
+
+    def __init__(self, parent: "BytesIO") -> None:
+        self._parent = parent
+        self._buf: "BytesIO | None" = None
+        self._codec = parent._codec()
+
+    def __enter__(self) -> "BytesIO":
+        if self._codec is None:
+            # Direct write path: pre-truncate so the leaf writer
+            # opens onto an empty target.
+            self._parent.seek(0)
+            self._parent.truncate(0)
+            self._buf = self._parent
+            return self._parent
+        # Codec path: scratch buffer; we compress on exit.
+        self._buf = BytesIO()
+        return self._buf
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._buf is None or exc_type is not None:
+            return
+        if self._codec is None:
+            return
+        # Compress scratch into the durable buffer.
+        compressed = self._codec.compress(self._buf)
+        try:
+            payload = compressed.to_bytes()
+        finally:
+            try:
+                compressed.close()
+            except Exception:
+                pass
+        try:
+            self._buf.close()
+        except Exception:
+            pass
+        self._parent.seek(0)
+        self._parent.truncate(0)
+        self._parent.write(payload)
