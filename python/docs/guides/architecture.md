@@ -1,27 +1,110 @@
-# Architecture Guide
+# Architecture
 
-Yggdrasil revolves around a converter registry in `yggdrasil.data.cast.registry`.
+Yggdrasil is built around a **single conversion registry** that every engine plugs into.
 
-## Dispatch flow
+## The cast registry
 
-Converter lookup follows this strategy:
+Source: [`python/src/yggdrasil/data/cast/registry.py`](https://github.com/Platob/Yggdrasil/blob/main/python/src/yggdrasil/data/cast/registry.py).
 
-1. Exact source/target type match.
-2. Identity conversion.
-3. Any-wildcard converters.
-4. MRO fallback.
-5. One-hop converter composition.
+Register converters with `@register_converter(from_hint, to_hint)`; dispatch them via `convert(value, target)`. Dispatch order:
 
-## Cast options
+1. **Exact match** — registered `(from, to)` pair.
+2. **Identity** — value already matches the target type.
+3. **`Any` wildcards** — fall back to converters registered with `Any`.
+4. **MRO fallback** — walk the source type's MRO to find a registered ancestor.
+5. **One-hop composition** — `from → mid → to` if a single intermediate exists.
 
-`CastOptions` is threaded through conversion paths and is the canonical way to control:
+Engine modules register their converters **on import**:
 
-- target schema/field,
-- strictness,
-- coercion behavior.
+```python
+import yggdrasil.arrow.cast      # noqa: F401
+import yggdrasil.polars.cast     # noqa: F401  (needs polars installed)
+import yggdrasil.pandas.cast     # noqa: F401  (needs pandas installed)
+import yggdrasil.spark.cast      # noqa: F401  (needs pyspark installed)
+```
 
-Use `CastOptions.check_arg()` in custom helpers to normalize user input.
+If a conversion you expect isn't firing, check whether the engine module has actually been imported.
 
-## Optional dependencies
+### Register your own
 
-All optional libraries should be imported through each module's `lib.py` guard pattern to keep base installs functional.
+```python
+from decimal import Decimal
+from yggdrasil.data.cast.registry import convert, register_converter
+
+@register_converter(str, Decimal)
+def _str_to_decimal(value: str, options=None) -> Decimal:
+    return Decimal(value.replace(",", "."))
+
+convert("19,95", Decimal)   # Decimal('19.95')
+```
+
+## `CastOptions`
+
+Source: [`python/src/yggdrasil/data/cast/options.py`](https://github.com/Platob/Yggdrasil/blob/main/python/src/yggdrasil/data/cast/options.py).
+
+`CastOptions` is the **single normalized options carrier**. It threads through every cast helper and holds source hints, target field/schema, safety/memory/nullability behavior, and strictness flags.
+
+```python
+import yggdrasil.arrow as pa
+from yggdrasil.data.cast.options import CastOptions
+
+opts = CastOptions(
+    target_field=pa.schema([pa.field("id", pa.int64(), nullable=False)]),
+    strict_match_names=True,
+)
+```
+
+In your own helpers, normalize input through `CastOptions.check`:
+
+```python
+def normalize_options(options=None, *, target_field=None) -> CastOptions:
+    return CastOptions.check(options, target_field=target_field, strict_match_names=True)
+```
+
+Don't invent parallel per-call option objects — extend `CastOptions` or pass it through.
+
+## `yggdrasil.data` is the canonical surface
+
+Reach for `yggdrasil.data` before raw engine APIs:
+
+- `Field` / `Schema` for describing columns (names, nullability, metadata, nested structure).
+- `DataType` / `DataTypeId` for type hints (don't hand-roll `pa.int64()` / `pl.Int64` / `"bigint"` strings).
+- `DataTable` / `StatementResult` for "execute a query, then move rows somewhere".
+- `convert(value, target, options=...)` for value conversion.
+- `yggdrasil.data.enums` for normalized currency / geozone / timezone values.
+
+Only drop down to `polars` / `pandas` / `pyspark` / `pyarrow` when you actually need something the abstraction doesn't cover. When you do, register the new behavior back into `yggdrasil.data` so the next caller gets it for free.
+
+## Optional dependencies — the `lib.py` pattern
+
+Subsystems that depend on optional packages expose a `lib.py` guard that does the import once and raises a helpful "install extra X" error on failure.
+
+```python
+from yggdrasil.polars.lib import polars   # correct
+import polars                             # wrong — breaks base installs
+```
+
+Same applies to `yggdrasil.pandas.lib`, `yggdrasil.spark.lib`, and Databricks-related modules.
+
+The only **hard** runtime deps are `pyarrow>=20`, `polars>=1.3`, and `yggrs`. Base installs must keep working without anything else.
+
+## Rust fast path, Python canonical
+
+`yggdrasil/rs.py` is the **only** place that imports from `yggdrasil.rust.*`. It exposes `HAS_RS` plus the fallback-capable entry points (e.g. `utf8_len`).
+
+Rules:
+
+- Python behavior is the source of truth; Rust must match it, not diverge.
+- Pure-Python fallback must stay correct on its own — tests pass with and without `yggrs` installed.
+- Add Rust only to a path that is actually hot and semantically stable.
+
+```python
+from yggdrasil.rs import HAS_RS, utf8_len
+
+print(HAS_RS)                 # True if yggrs is installed
+print(utf8_len(["héllo"]))    # native if HAS_RS, else pure Python
+```
+
+## Schema intent across boundaries
+
+Names, order, nullability, metadata, nested structure, precision/scale, and timezone intent are **part of the user contract**. Don't drop them unless the API documents the loss. The cast registry preserves them by default; engine bridges round-trip through Arrow rather than each engine's native parser to avoid silent drift.

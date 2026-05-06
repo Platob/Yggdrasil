@@ -1,43 +1,54 @@
 # Yggdrasil Power Query Connector
 
-Power Query connector for **Excel** and **Power BI** that connects to the
-Yggdrasil FastAPI service (`yggdrasil.fastapi.routers.excel`).
+Connect **Excel** and **Power BI** to the Yggdrasil FastAPI service (`yggdrasil.fastapi.routers.excel`). Run Python on the server, get a typed Power Query table back. Includes a server-side cache for repeated refreshes.
 
-Two variants are provided:
-
-| File | For | How |
+| File | For | How to use |
 |---|---|---|
-| `YggdrasilExcel.pq` | **Excel** | Paste into the Advanced Editor (no install) |
-| `Yggdrasil.mez` | **Power BI Desktop** | Custom connector via Get Data dialog |
+| `YggdrasilExcel.pq` | Excel | Paste into Advanced Editor — no install |
+| `Yggdrasil.mez`     | Power BI Desktop | Custom connector via Get Data |
 
-## Features
+---
 
-| Function | Description |
+## Functions exposed
+
+| Function | What it does |
 |---|---|
-| `Yggdrasil.Execute` | Run Python code and return a DataFrame as a Power Query table |
-| `Yggdrasil.Prepare` | Run Python code with server-side caching (parquet) |
-| `Yggdrasil.DatabricksSQL` | Execute SQL on Databricks and return the result as a table (server-side cached) |
+| `Yggdrasil.Execute` | Run Python code, return a DataFrame as a Power Query table |
+| `Yggdrasil.Prepare` | Run Python code with server-side parquet caching |
+| `Yggdrasil.DatabricksSQL` | Execute SQL on Databricks, return a typed table (server-side cached) |
 | `Yggdrasil.Health` | Check service health |
 | `Yggdrasil.Contents` | Navigation table entry point (Power BI only) |
 
-## Prerequisites
+---
 
-1. The Yggdrasil FastAPI service must be running:
+## Step 0 — start the FastAPI service
 
-   ```bash
-   python -m yggdrasil.fastapi.main
-   ```
+```bash
+pip install "ygg[api]"
+python -m yggdrasil.fastapi.main     # or: ygg-api
+```
 
-   By default it listens on `http://127.0.0.1:8000`.
+By default the service listens on `http://127.0.0.1:8000`. Override with the env vars below.
 
-2. Excel 2016+ or Power BI Desktop.
+| Env var | Default | Description |
+|---|---|---|
+| `YGG_FASTAPI_HOST`         | `127.0.0.1`   | API host |
+| `YGG_FASTAPI_PORT`         | `8000`        | API port |
+| `YGG_FASTAPI_API_PREFIX`   | `/api`        | API route prefix |
+| `YGG_FASTAPI_PYTHON_PREFIX`| `/python`     | Python router prefix |
+| `YGG_FASTAPI_EXCEL_PREFIX` | `/excel`      | Excel router prefix |
+| `YGG_FASTAPI_DATABRICKS_CACHE_MAX_SIZE`    | `128` | Max cached Databricks SQL results |
+| `YGG_FASTAPI_DATABRICKS_CACHE_DEFAULT_TTL` | `300` | Default TTL (seconds) |
 
-## Excel Usage (no install required)
+---
 
-1. Open Excel, go to **Data > Get Data > From Other Sources > Blank Query**.
-2. Click **Advanced Editor**.
-3. Paste the contents of `YggdrasilExcel.pq`.
-4. Replace the final `in Yggdrasil` with your query, for example:
+## Excel — no install
+
+1. **Data > Get Data > From Other Sources > Blank Query**
+2. **Advanced Editor**, paste `YggdrasilExcel.pq`
+3. Replace the trailing `in Yggdrasil` with one of the patterns below.
+
+### Run a Python snippet
 
 ```powerquery-m
 in Yggdrasil[Execute](
@@ -46,12 +57,13 @@ in Yggdrasil[Execute](
 )
 ```
 
-Or use it as a reusable query: save the module as a query named `Yggdrasil`,
-then reference it from other queries:
+### Reuse Yggdrasil as a saved query
+
+Save the module as a query named `Yggdrasil`, then reference it:
 
 ```powerquery-m
 let
-    Ygg    = Yggdrasil,  // reference the saved query
+    Ygg    = Yggdrasil,
     Result = Ygg[Execute](
         "import pyarrow as pa#(lf)df = pa.table({'x': list(range(100))})",
         [Packages = {"pyarrow"}, MaxRows = 10]
@@ -60,10 +72,22 @@ in
     Result
 ```
 
+### Cached snippet (`Prepare`)
+
+```powerquery-m
+let
+    Ygg    = Yggdrasil,
+    Source = Ygg[Prepare](
+        "import polars as pl#(lf)df = pl.DataFrame({'a': [1,2,3]})",
+        [Packages = {"polars"}, ForceRefresh = false]
+    )
+in
+    Source
+```
+
 ### Databricks SQL from Excel
 
-Query Databricks directly — results are cached server-side so repeated
-refreshes don't flood your warehouse:
+Server-side cached so refreshing your sheet doesn't re-hit your warehouse:
 
 ```powerquery-m
 in Yggdrasil[DatabricksSQL](
@@ -71,7 +95,7 @@ in Yggdrasil[DatabricksSQL](
 )
 ```
 
-With connection and cache options:
+With explicit connection + cache options:
 
 ```powerquery-m
 let
@@ -104,15 +128,17 @@ in
 | `CacheTtl` | number | `null` | Cache lifetime in seconds (`null` → server default 300 s) |
 | `ForceRefresh` | logical | `false` | Bypass the cache and re-execute |
 
-## Power BI Installation (.mez)
+---
 
-### Quick install (PowerShell)
+## Power BI Desktop — install the `.mez`
+
+### One-line install (PowerShell)
 
 ```powershell
 # From a local clone
 .\install.ps1 -Target PowerBI
 
-# Or install directly from GitHub (no clone needed)
+# Or directly from GitHub (no clone needed)
 .\install.ps1 -Source GitHub -Target PowerBI
 ```
 
@@ -120,21 +146,21 @@ in
 |---|---|---|---|
 | `-Source` | `Local`, `GitHub` | `Local` | Where to get the connector sources |
 | `-Target` | `PowerBI`, `Excel`, `Both` | `Both` | Which app to install for |
-| `-Branch` | any branch name | `main` | GitHub branch (only with `-Source GitHub`) |
-| `-Repo` | `owner/repo` | `Platob/Yggdrasil` | GitHub repo (only with `-Source GitHub`) |
+| `-Branch` | any branch | `main` | GitHub branch (only with `-Source GitHub`) |
+| `-Repo`   | `owner/repo` | `Platob/Yggdrasil` | GitHub repo (only with `-Source GitHub`) |
 
 ### Manual install
 
-1. Build: `.\build.ps1`
-2. Copy `Yggdrasil.mez` to `%USERPROFILE%\Documents\Power BI Desktop\Custom Connectors\`
-3. In Power BI: *File > Options > Security > Data Extensions* >
-   **Allow any extension to load without validation or warning**.
-4. Restart. The connector appears under *Get Data > Other > Yggdrasil (Beta)*.
+1. `.\build.ps1` to produce `Yggdrasil.mez`.
+2. Copy to `%USERPROFILE%\Documents\Power BI Desktop\Custom Connectors\`.
+3. **File > Options > Security > Data Extensions** → *Allow any extension to load without validation or warning*.
+4. Restart Power BI. Connector appears under **Get Data > Other > Yggdrasil (Beta)**.
 
 ### Power BI M usage
 
+Run a Python snippet:
+
 ```powerquery-m
-// Execute - returns a typed table
 let
     Source = Yggdrasil.Execute(
         "import pyarrow as pa#(lf)df = pa.table({'x': [1,2,3], 'y': ['a','b','c']})",
@@ -142,8 +168,11 @@ let
     )
 in
     Source
+```
 
-// Prepare (cached) - returns a manifest record
+Cached snippet (returns a manifest record):
+
+```powerquery-m
 let
     Source = Yggdrasil.Prepare(
         "import pyarrow as pa#(lf)df = pa.table({'x': [1,2,3]})",
@@ -151,8 +180,11 @@ let
     )
 in
     Source
+```
 
-// Databricks SQL - query Databricks and return a typed table (server-side cached)
+Databricks SQL → typed table (server-side cached):
+
+```powerquery-m
 let
     Source = Yggdrasil.DatabricksSQL(
         "SELECT id, name, amount FROM main.analytics.transactions LIMIT 100",
@@ -169,22 +201,17 @@ in
     Source
 ```
 
-## Configuration
+---
 
-| Environment Variable | Default | Description |
-|---|---|---|
-| `YGG_FASTAPI_HOST` | `127.0.0.1` | API host |
-| `YGG_FASTAPI_PORT` | `8000` | API port |
-| `YGG_FASTAPI_API_PREFIX` | `/api` | API route prefix |
-| `YGG_FASTAPI_PYTHON_PREFIX` | `/python` | Python router prefix |
-| `YGG_FASTAPI_EXCEL_PREFIX` | `/excel` | Excel router prefix |
-| `YGG_FASTAPI_DATABRICKS_CACHE_MAX_SIZE` | `128` | Max cached Databricks SQL results in memory |
-| `YGG_FASTAPI_DATABRICKS_CACHE_DEFAULT_TTL` | `300` | Default TTL (seconds) for Databricks SQL cache |
+## Troubleshooting
 
-The connector defaults to `http://127.0.0.1:8000`. Pass a different base URL to
-any function to override.
+- **Refresh hangs / 503**: confirm the FastAPI service is running on the expected port (`Yggdrasil.Health(...)` returns the build info).
+- **`No module named 'pyarrow'`**: list every package you import in the `Packages = {...}` option so the server installs them lazily.
+- **Databricks 401/403**: ensure `Host` + `Token` are set (option, env, or `~/.databrickscfg` profile) and the warehouse exists.
+- **Stale results in Power BI**: pass `ForceRefresh = true` on the next refresh, or shorten `CacheTtl`.
+
+---
 
 ## License
 
-Same as the parent Yggdrasil repository — see `../LICENSE`.
-
+Same as the parent Yggdrasil repository — see [`../LICENSE`](../LICENSE).

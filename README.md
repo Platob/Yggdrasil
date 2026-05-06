@@ -1,57 +1,68 @@
 # Yggdrasil
 
-Yggdrasil is a schema-aware data interchange library for Python teams that are tired of writing one-off conversion glue.
+**Schema-aware data interchange for Python.** One conversion registry that moves values cleanly between Python types, dataclasses, Arrow, Polars, pandas, Spark, Databricks, and the wire — without losing schema, nullability, or metadata along the way.
 
-It helps you move cleanly between Python types, dataclasses, Apache Arrow, Polars, pandas, Spark, and Databricks without losing control of schema, nullability, or metadata.
+| Package | What it is | Where it lives |
+|---|---|---|
+| `ygg` (PyPI) / `yggdrasil` (import) | Pure-Python core: cast registry, Arrow schema, engine bridges, IO/HTTP, Databricks, FastAPI | [`python/`](python/) |
+| `yggrs` (PyPI) | Optional Rust acceleration kernels (PyO3, `abi3-py310`) | [`rust/`](rust/) |
+| Power Query connector | Excel `.pq` and Power BI `.mez` connectors that call the FastAPI service | [`powerquery/`](powerquery/) |
 
-The main package lives in [`python/`](python/), is published on PyPI as `ygg`, and is imported as `yggdrasil`. The Rust acceleration kernels live in [`rust/`](rust/) and ship as `yggrs`; `ygg` declares `yggrs` as a hard dependency, so installing one pulls the other.
+`pip install ygg` pulls both `ygg` and the matching `yggrs` wheel for your platform.
 
-## Why people adopt it
+📚 **Docs site:** https://platob.github.io/Yggdrasil/
 
-- Stop hand-writing brittle casting code between app models, dataframes, and warehouse-facing schemas.
-- Keep Arrow schema as the contract surface instead of letting every tool infer something different.
-- Use one conversion registry instead of separate ad hoc utilities for Python, Polars, pandas, Spark, and Databricks.
-- Install only what you need beyond the core. Most integrations are optional extras.
+---
 
-## What Yggdrasil gives you
-
-- Registry-driven conversion across Python values, dataclasses, Arrow, Polars, pandas, Spark, and Databricks workflows.
-- Arrow schema inference from Python type hints.
-- Schema-aware casting with `CastOptions` for explicit, repeatable behavior.
-- Databricks helpers for SQL, workspaces, jobs, compute, IAM, and secrets.
-- IO and HTTP utilities for buffers, sessions, URLs, retries, batching, and concurrency.
-- Native acceleration for hot paths (URL parsing, percent-encoding, query normalization) via `yggrs`.
-
-## Quick start
-
-Install from PyPI — `pip` will pull both `ygg` and the matching `yggrs` wheel for your platform:
+## Install
 
 ```bash
-pip install ygg
+pip install ygg                   # core
+pip install "ygg[data]"           # + pandas, numpy, sqlglot
+pip install "ygg[bigdata]"        # + pyspark, delta-spark
+pip install "ygg[databricks]"     # + databricks-sdk
+pip install "ygg[api]"            # + fastapi, uvicorn, pydantic
+pip install "ygg[http]"           # + urllib3, xxhash
+pip install "ygg[pickle]"         # + cloudpickle, dill, zstandard, blake3
+pip install "ygg[mongo]"          # + mongoengine
+pip install "ygg[postgres]"       # + psycopg, adbc-driver-postgresql
+pip install "ygg[kafka]"          # + confluent-kafka
+pip install "ygg[delta]"          # + deltalake
 ```
 
-A first sample:
+The only hard runtime deps are `pyarrow>=20`, `polars>=1.3`, and the matching `yggrs` wheel. Everything else is opt-in.
+
+---
+
+## 60-second tour
+
+### Cast anything into anything
+
+```python
+from yggdrasil.data.cast.registry import convert
+
+convert("42", int)              # 42
+convert("true", bool)           # True
+convert("2024-01-15", "date")   # datetime.date(2024, 1, 15)
+```
+
+### Dict → typed dataclass (forgiving on input, strict on meaning)
 
 ```python
 from dataclasses import dataclass
 from yggdrasil.data.cast.registry import convert
 
-
 @dataclass
-class User:
+class Order:
     id: int
-    email: str
-    active: bool = True
+    amount: float
+    paid: bool = False
 
-
-payload = {"id": "7", "email": "ada@example.com", "active": "false"}
-user = convert(payload, User)
-
-print(user)
-# User(id=7, email='ada@example.com', active=False)
+convert({"id": "7", "amount": "99.50", "paid": "yes"}, Order)
+# Order(id=7, amount=99.5, paid=True)
 ```
 
-And making Arrow schema explicit before data moves downstream:
+### Arrow schema as the contract surface
 
 ```python
 import yggdrasil.arrow as pa
@@ -60,7 +71,7 @@ from yggdrasil.data.cast.options import CastOptions
 
 raw = pa.table({"id": ["1", "2"], "score": ["9.1", "8.7"]})
 target = pa.schema([
-    pa.field("id", pa.int64(), nullable=False),
+    pa.field("id",    pa.int64(),   nullable=False),
     pa.field("score", pa.float64(), nullable=False),
 ])
 
@@ -68,127 +79,105 @@ out = cast_arrow_tabular(raw, CastOptions(target_field=target))
 print(out.schema)
 ```
 
-## Common use cases
+### Cross-engine in one move
 
-- Normalize API payloads into typed Python models.
-- Convert application schemas into Arrow for storage or transport.
-- Bridge Arrow, Polars, pandas, and Spark in mixed analytics stacks.
-- Build Databricks-facing workflows that keep schema handling explicit.
-- Reuse one set of casting rules across local development and production pipelines.
+```python
+from yggdrasil.databricks import DatabricksClient
 
-## Why it is different
+stmt = DatabricksClient().sql.execute("SELECT * FROM main.default.orders LIMIT 100")
 
-Most libraries solve one layer of the stack. Yggdrasil is designed to connect them.
+stmt.to_arrow_table()   # pyarrow.Table
+stmt.to_pandas()        # pandas.DataFrame
+stmt.to_polars()        # polars.DataFrame
+stmt.to_spark()         # pyspark.sql.DataFrame
+stmt.to_pylist()        # list[dict]
+```
 
-Instead of treating Python objects, dataframe engines, and warehouse tooling as separate worlds, it uses a central converter registry so the same casting model can apply across all of them. That reduces duplicate logic, reduces silent schema drift, and makes data movement easier to reason about.
+---
+
+## What you get
+
+- **One conversion registry.** Register a converter once, dispatch from anywhere. Order: exact match → identity → `Any` wildcard → MRO fallback → one-hop composition.
+- **Arrow schema as the contract.** Field names, order, nullability, metadata, nested structure, timezone intent are preserved across boundaries.
+- **Engines bridge into Arrow.** Polars, pandas, Spark each register on import — `from yggdrasil.polars.cast import cast_polars_dataframe` etc.
+- **Production HTTP stack.** `HTTPSession`, prepared requests, batch dispatch, typed response → Arrow/pandas/Polars/Spark.
+- **Databricks toolkit.** `DatabricksClient` covers SQL, Unity Catalog, Compute, DBFS/Volumes, Secrets, IAM, Genie, Spark Connect.
+- **Optional dep guards.** Base installs stay light. `from yggdrasil.polars.lib import polars` is the safe import.
+- **Rust fast path, Python canonical.** `yggdrasil.rs` exposes accelerated functions; tests pass with and without `yggrs` installed.
+
+---
+
+## Use cases at a glance
+
+| You want to… | Reach for |
+|---|---|
+| Normalize dicts/JSON into typed dataclasses | `convert(payload, MyDataclass)` |
+| Pin a downstream Arrow schema | `cast_arrow_tabular(t, CastOptions(target_field=schema))` |
+| Convert Polars ↔ Arrow ↔ pandas ↔ Spark | `yggdrasil.{polars,pandas,spark}.cast` |
+| Fan out HTTP requests with retries | `HTTPSession().send_many(reqs, SendManyConfig(...))` |
+| Run SQL on Databricks and get a DataFrame | `DatabricksClient().sql.execute(q).to_polars()` |
+| Read/write DBFS or Volume files | `DatabricksClient().dbfs_path("...").write_text(...)` |
+| Type-check job widget params | `MyConfig.from_environment()` (subclass `NotebookConfig`) |
+| Talk to Databricks from Excel/Power BI | Power Query connector via FastAPI service |
+
+---
 
 ## Repository guide
 
-- [`python/`](python/) — `ygg` source, tests, and MkDocs site.
-  - [`python/README.md`](python/README.md) — package-level guide and richer examples.
-  - [`python/docs/README.md`](python/docs/README.md) — progressive documentation.
-  - [`python/docs/modules.md`](python/docs/modules.md) — module index.
-- [`rust/`](rust/) — `yggrs` Rust acceleration crate (PyO3 + maturin, `abi3-py310`).
-- [`powerquery/`](powerquery/) — Power Query / Power BI connectors over the FastAPI service.
-- [`AGENTS.md`](AGENTS.md) — house style: tone, error messages, comment voice, API ergonomics.
-- [`CLAUDE.md`](CLAUDE.md) — agent-facing notes that mirror this layout.
+- [`python/`](python/) — `ygg` source, tests, MkDocs site.
+  - [`python/README.md`](python/README.md) — package guide with progressive examples (scalars → schema → engines → HTTP → Databricks).
+  - [`python/docs/`](python/docs/) — published documentation source (https://platob.github.io/Yggdrasil/).
+- [`rust/`](rust/) — `yggrs` crate (maturin + PyO3, `abi3-py310`).
+- [`powerquery/`](powerquery/) — Excel `.pq` and Power BI `.mez` connectors over the FastAPI service.
+- [`AGENTS.md`](AGENTS.md) — house style, error-message tone, comment voice, API ergonomics.
+- [`CLAUDE.md`](CLAUDE.md) — agent-facing notes for AI contributors.
 
-## Development
+---
 
-The dev loop is two installs in one venv: `ygg` editable from `python/`, and `yggrs` editable from `rust/` via `maturin develop`. The Python side imports the compiled module via the `yggdrasil/rs.py` bridge, so the editable install lets you iterate on either side without reinstalling.
-
-### Prerequisites
-
-- **Python 3.10+** (`abi3-py310` is the floor — Rust wheels work on every newer 3.x without a rebuild).
-- **Rust toolchain** via [`rustup`](https://rustup.rs).
-- **`uv`** (recommended) or `pip` for the Python venv.
-- **`maturin>=1.7`** for compiling the Rust extension. Installed automatically by `pip install -e .[dev]`.
-
-Linux only: building the manylinux-style wheels in CI uses QEMU for `aarch64`. Local builds compile for the host arch only.
-
-### One-time setup
+## Develop locally
 
 ```bash
 git clone https://github.com/Platob/Yggdrasil.git
-cd Yggdrasil
+cd Yggdrasil/python
 
-# 1. Python venv + editable ygg install (with dev tooling)
-cd python
-uv venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-uv pip install -e .[dev]
+uv venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
+uv pip install -e .[dev]                       # core + dev tooling
 
-# 2. Rust extension, editable, into the same venv
-cd ../rust
-maturin develop --release          # use --release; debug builds are very slow
+# Optional: native acceleration (editable, into the same venv)
+cd ../rust && maturin develop --release
 ```
 
-`maturin develop` compiles the cdylib, packages it as a wheel, and installs it as `yggrs` in the active venv. The compiled module lands at `_yggrs.abi3.so` (Linux/macOS) or `_yggrs.pyd` (Windows). `yggdrasil.rs` is the Python bridge that re-publishes its submodules under the `yggdrasil.rust.<name>` namespace, so call sites can keep writing `from yggdrasil.rust.io import url`.
-
-> Why a top-level `_yggrs` instead of `yggdrasil.rust`? Two wheels can't both own the `yggdrasil/` package directory — `ygg` already ships `yggdrasil/__init__.py` as a regular package. Shipping the extension as `_yggrs` and rebinding it through `yggdrasil/rs.py` keeps both wheels installable side by side.
-
-### Daily loop
-
-| Editing… | Command |
-|---|---|
-| Python only (`python/src/**`) | nothing — editable install picks up changes on next `import` |
-| Rust (`rust/src/**`) | `cd rust && maturin develop --release` (re-imports pick it up after Python restart) |
-| Cargo dependencies | `cd rust && cargo update`, then `maturin develop --release` |
-| Switching Python versions | rebuild once: `maturin develop --release` (the `abi3-py310` wheel works across 3.10+, but the editable install path is per-venv) |
-
-Inside a Python REPL, `importlib.reload` does **not** swap a compiled extension — restart the interpreter after `maturin develop`.
-
-### Tests
-
-```bash
-# Python tests (always available, work without yggrs as a fallback)
-cd python
-pytest                                          # full suite
-pytest tests/test_yggdrasil/test_io/test_url.py # single file
-
-# Rust unit tests (none today; add under rust/src/<mod>/tests when needed)
-cd ../rust
-cargo test
-```
-
-Rust delegation is verified end-to-end through the Python tests — `yggdrasil.io.url.URL.from_str` calls into `_yggrs.io.url.parse_url`, and the URL test suite exercises that path.
-
-### Optional dependencies
-
-The package keeps `pyarrow` and `yggrs` as the only hard runtime deps. Pull integrations in as needed:
-
-```bash
-uv pip install -e .[data]         # pandas + numpy + sqlglot
-uv pip install -e .[bigdata]      # pyspark + delta-spark
-uv pip install -e .[databricks]   # databricks-sdk
-uv pip install -e .[api]          # fastapi + uvicorn + pydantic
-uv pip install -e .[pickle]       # cloudpickle/dill/zstandard/xxhash/blake3
-uv pip install -e .[http]         # urllib3 + xxhash
-uv pip install -e .[mongo]        # mongoengine
-```
-
-The Databricks live-integration tests are gated by the `integration` marker and skipped unless `DATABRICKS_HOST` is set.
-
-### Lint, format, docs
+`yggdrasil/rs.py` is the only place that imports from `yggdrasil.rust.*`. With `yggrs` installed it dispatches to native; without it, the pure-Python fallback runs. Tests must pass either way.
 
 ```bash
 cd python
+pytest                          # full suite
+pytest tests/test_yggdrasil/test_io/test_url.py   # one file
 ruff check
 black .
-mkdocs serve         # docs at http://127.0.0.1:8000
+mkdocs serve                    # docs at http://127.0.0.1:8000
 ```
 
-### Releasing
+Databricks live-integration tests are gated by the `integration` marker and skipped unless `DATABRICKS_HOST` is set.
+
+---
+
+## Release pipeline
 
 The version in [`python/pyproject.toml`](python/pyproject.toml) is the single source of truth.
 
-- [`.github/workflows/publish.yml`](.github/workflows/publish.yml) builds and publishes the pure-Python `ygg` wheel + sdist.
-- [`.github/workflows/publish-native.yml`](.github/workflows/publish-native.yml) builds and publishes `yggrs` wheels for `linux-{x86_64,aarch64}`, `windows-x86_64`, `macos-{x86_64,arm64}` plus an sdist, stamping the same version into `rust/pyproject.toml` and `rust/Cargo.toml` before building.
+| Workflow | Builds | Triggers |
+|---|---|---|
+| [`publish.yml`](.github/workflows/publish.yml) | `ygg` sdist + pure-Python wheel → PyPI, then tags `vX.Y.Z` and cuts a GitHub Release | push to `main` touching `python/src/**`, `pyproject.toml`, README, LICENSE, `rust/**`, or workflow itself |
+| [`publish-native.yml`](.github/workflows/publish-native.yml) | `yggrs` wheels for `linux-{x86_64,aarch64}`, `windows-x86_64`, `macos-{x86_64,arm64}` + sdist → PyPI | same triggers |
+| [`docs.yml`](.github/workflows/docs.yml) | MkDocs Material site → GitHub Pages (https://platob.github.io/Yggdrasil/) | push to `main` touching `python/docs/**`, `python/src/**`, `mkdocs.yml`, or workflow itself |
 
-Both workflows trigger on the same events (push to `main` touching `python/src/**`, `rust/**`, the workflows, or any `v*` tag). They run in parallel; `ygg` declares `yggrs==X.Y.Z` so a release is only fully usable once both have landed.
+`ygg` declares `yggrs==X.Y.Z` so a release is fully usable once both PyPI uploads land.
 
 Do not push to `main` from an agent session — develop on a branch and open a PR.
 
+---
+
 ## License
 
-See [LICENSE](LICENSE).
+[Apache-2.0](LICENSE).
