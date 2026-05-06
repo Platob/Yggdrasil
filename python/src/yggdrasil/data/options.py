@@ -228,20 +228,12 @@ class CastOptions:
     overwrite_schema: bool | None = None
     spark_options: dict[str, Any] | None = None
 
-    # --- Folder-write knobs ---------------------------------------------
-    # Used by folder-shaped writers (FolderIO, ZipIO, DeltaIO):
-    # ``child_media_type`` is the :class:`MediaType` to mint child files
-    # as on write. ``None`` lets the IO infer from its child convention.
-    # ``child_row_size`` / ``child_byte_size`` cap the per-child size so
-    # the writer rolls over to a new staging file when a threshold is
-    # hit (row threshold wins if both set; ``0`` disables). ``max_workers``
-    # is the thread-pool size for naturally-parallel folder operations
-    # (clearing children, per-child schema collection, per-leaf reads
-    # behind partition merges, per-partition writes); ``0`` / ``1`` keeps
-    # the single-threaded path.
-    child_media_type: Any = None
-    child_row_size: int = 0
-    child_byte_size: int = 0
+    # --- Folder-write knob ----------------------------------------------
+    # Used by folder-shaped writers (FolderIO, ZipIO, DeltaIO).
+    # ``max_workers`` is the thread-pool size for naturally-parallel
+    # folder operations (clearing children, per-child schema collection,
+    # per-leaf reads behind partition merges, per-partition writes);
+    # ``0`` / ``1`` keeps the single-threaded path.
     max_workers: int = 0
 
     # --- Statement-level retry ------------------------------------------

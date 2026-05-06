@@ -211,10 +211,6 @@ class YGGFolderIO(FolderIO):
         :class:`pa.RecordBatch`. The compactor still bin-packs small
         files into ``OPTIMIZE_TARGET_BYTES`` chunks, so storage stays
         comparable; the win is on the hot append path.
-
-        Callers who want Parquet anyway can pass ``child_media_type``
-        on :class:`FolderOptions` — same override hook the base class
-        documents.
         """
         return MimeTypes.ARROW_IPC
 

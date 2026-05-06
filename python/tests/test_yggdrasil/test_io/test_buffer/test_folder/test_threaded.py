@@ -142,13 +142,18 @@ class TestThreadedPartitionedWrites:
 
 class TestThreadedSchemaCollection:
     def test_collect_schema_matches_serial(self, tmp_path):
+        from yggdrasil.io.enums import Mode
+
         folder = FolderIO(path=str(tmp_path))
-        folder.write_arrow_table(
-            pa.Table.from_pylist(
-                [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}, {"a": 3, "b": "z"}]
-            ),
-            options=FolderOptions(child_row_size=1),
-        )
+        for row in (
+            {"a": 1, "b": "x"},
+            {"a": 2, "b": "y"},
+            {"a": 3, "b": "z"},
+        ):
+            folder.write_arrow_table(
+                pa.Table.from_pylist([row]),
+                options=FolderOptions(mode=Mode.APPEND),
+            )
 
         serial = FolderIO(path=str(tmp_path)).collect_schema()
         threaded = FolderIO(path=str(tmp_path)).collect_schema(

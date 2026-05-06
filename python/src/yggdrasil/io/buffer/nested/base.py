@@ -110,10 +110,9 @@ _STAGING_TMP_RE: "re.Pattern[str]" = re.compile(
 # Type alias
 # ---------------------------------------------------------------------------
 
-# Folder/zip/delta writers consume :class:`CastOptions` directly — the
-# folder-write knobs (``child_media_type``, ``child_row_size``,
-# ``child_byte_size``, ``max_workers``) live there. Subclasses can
-# narrow the bound when they introduce extra fields (e.g. ``ZipOptions``).
+# Folder/zip/delta writers consume :class:`CastOptions` directly.
+# Subclasses can narrow the bound when they introduce extra fields
+# (e.g. partition routing on :class:`FolderOptions`).
 O = TypeVar("O", bound=CastOptions)
 
 
@@ -558,13 +557,12 @@ class NestedIO(TabularIO[O], ABC):
         batches: Iterable[pa.RecordBatch],
         options: O,
     ) -> None:
-        """Dispatch a batch iterable into one or more child files.
+        """Dispatch a batch iterable into a single child file.
 
         Resolves save mode first (so OVERWRITE can clear before any
-        bytes hit disk), then streams batches into staging children
-        per :attr:`CastOptions.child_row_size` /
-        ``child_byte_size``. On a successful drain, staging files
-        are renamed to their final names.
+        bytes hit disk), then drains the iterable into one staging
+        child of :meth:`_default_child_media_type`. On a successful
+        drain, the staging file is renamed to its final name.
         """
         mode = self._resolve_save_mode(options.mode)
 
@@ -585,34 +583,17 @@ class NestedIO(TabularIO[O], ABC):
         batches: Iterable[pa.RecordBatch],
         options: O,
     ) -> None:
-        """Drain *batches* into one or more child files."""
+        """Drain *batches* into a single child file."""
         batch_iter = iter(batches)
         first = next(batch_iter, None)
         if first is None:
             return
 
-        media_type = options.child_media_type or self._default_child_media_type()
-        row_threshold = options.child_row_size or 0
-        byte_threshold = options.child_byte_size or 0
-
-        if row_threshold <= 0 and byte_threshold <= 0:
-            self._write_one_child(
-                _chain_first(first, batch_iter),
-                media_type=media_type,
-                options=options,
-            )
-            return
-
-        for chunk in _split_batches(
+        self._write_one_child(
             _chain_first(first, batch_iter),
-            row_threshold=row_threshold,
-            byte_threshold=byte_threshold,
-        ):
-            self._write_one_child(
-                chunk,
-                media_type=media_type,
-                options=options,
-            )
+            media_type=self._default_child_media_type(),
+            options=options,
+        )
 
     def _write_one_child(
         self,
@@ -766,61 +747,3 @@ def _chain_first(
     """Yield *first*, then every batch from *rest*."""
     yield first
     yield from rest
-
-
-def _split_batches(
-    batches: Iterator[pa.RecordBatch],
-    *,
-    row_threshold: int,
-    byte_threshold: int,
-) -> Iterator[Iterator[pa.RecordBatch]]:
-    """Split a batch iterator into chunks by row / byte threshold.
-
-    ``row_threshold`` wins when both are set. With a row threshold,
-    incoming batches are sliced so each emitted chunk holds exactly
-    ``row_threshold`` rows (the final chunk may be shorter). Without
-    a row threshold, byte accounting accumulates whole batches.
-    """
-
-    def _size_bytes(batch: pa.RecordBatch) -> int:
-        try:
-            return int(batch.nbytes)
-        except Exception:
-            return 0
-
-    if row_threshold > 0:
-        pending: list[pa.RecordBatch] = []
-        pending_rows = 0
-        for batch in batches:
-            offset = 0
-            remaining = batch.num_rows
-            while remaining > 0:
-                take = min(remaining, row_threshold - pending_rows)
-                slice_ = batch.slice(offset, take)
-                pending.append(slice_)
-                pending_rows += take
-                offset += take
-                remaining -= take
-                if pending_rows >= row_threshold:
-                    yield iter(pending)
-                    pending = []
-                    pending_rows = 0
-        if pending:
-            yield iter(pending)
-        return
-
-    pending = []
-    nbytes = 0
-
-    for batch in batches:
-        pending.append(batch)
-        if byte_threshold > 0:
-            nbytes += _size_bytes(batch)
-
-        if 0 < byte_threshold <= nbytes:
-            yield iter(pending)
-            pending = []
-            nbytes = 0
-
-    if pending:
-        yield iter(pending)

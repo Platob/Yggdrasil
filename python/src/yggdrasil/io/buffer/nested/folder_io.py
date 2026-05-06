@@ -190,8 +190,7 @@ class FolderIO(NestedIO[FolderOptions]):
         """Parquet is the canonical folder-of-tables payload.
 
         Subclasses with a fixed format (Delta = parquet, IcebergV1
-        = avro) override; callers that want IPC/CSV/... pass
-        ``options.child_media_type`` explicitly.
+        = avro) override.
         """
         return MimeTypes.PARQUET
 
@@ -1172,7 +1171,7 @@ class FolderIO(NestedIO[FolderOptions]):
         }
         relative_dir = _partition_path_segment(partition_values)
 
-        media_type = options.child_media_type or self._default_child_media_type()
+        media_type = self._default_child_media_type()
 
         partition_root = (
             self.path.joinpath(*relative_dir.split("/"))

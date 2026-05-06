@@ -15,16 +15,6 @@ class TestFolderArrow:
         assert out.num_rows == 3
         assert out.column_names == ["a", "b"]
 
-    def test_child_row_size_splits(self, tmp_path):
-        FolderIO(path=str(tmp_path)).write_arrow_table(
-            sample_table(),
-            options=FolderOptions(child_row_size=1),
-        )
-        # Three rows, one per file → at least three children.
-        files = list(tmp_path.iterdir())
-        data_files = [f for f in files if f.is_file() and not f.name.startswith(".")]
-        assert len(data_files) >= 3
-
     def test_partitioned_round_trip(self, tmp_path):
         import pyarrow as pa
 

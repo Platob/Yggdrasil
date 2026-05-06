@@ -144,13 +144,7 @@ _ENTRY_NAME = "batch-{:06d}.arrow"
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class ZipOptions(CastOptions):
-    """:class:`CastOptions` extended with zip-archive framing knobs.
-
-    Reuses the child-routing fields (``child_media_type``,
-    ``child_row_size``, ``child_byte_size``, ``max_workers``) that
-    live on :class:`CastOptions` and adds the archive's framing
-    knobs.
-    """
+    """:class:`CastOptions` extended with zip-archive framing knobs."""
 
     compression: int = zipfile.ZIP_STORED
     compresslevel: "int | None" = None
@@ -182,9 +176,8 @@ class ZipIO(BytesIO):
     (file) or :class:`ZipEntryFolderIO` (virtual folder).
 
     Reading drains every entry's Arrow IPC stream into one batch
-    iterator; writing splits the input into one or more entries
-    according to :attr:`CastOptions.child_row_size` /
-    ``child_byte_size`` (default: one entry per write call).
+    iterator; writing puts every batch iterable into a single fresh
+    entry.
     """
 
     _FINAL_TABULAR_IO: ClassVar[bool] = True
@@ -220,8 +213,7 @@ class ZipIO(BytesIO):
 
     def _default_child_media_type(self) -> Any:
         # Arrow IPC stream is the canonical entry payload for tabular
-        # writes. Callers that want a different format pass
-        # ``options.child_media_type`` explicitly.
+        # writes. Subclasses override for a different default.
         return MimeTypes.ARROW_IPC
 
     @contextlib.contextmanager
@@ -576,34 +568,17 @@ class ZipIO(BytesIO):
         batches: Iterable[pa.RecordBatch],
         options: ZipOptions,
     ) -> None:
-        """Drain *batches* into one or more child entries."""
+        """Drain *batches* into a single zip entry."""
         batch_iter = iter(batches)
         first = next(batch_iter, None)
         if first is None:
             return
 
-        media_type = options.child_media_type or self._default_child_media_type()
-        row_threshold = options.child_row_size or 0
-        byte_threshold = options.child_byte_size or 0
-
-        if row_threshold <= 0 and byte_threshold <= 0:
-            self._write_one_child(
-                _chain_first(first, batch_iter),
-                media_type=media_type,
-                options=options,
-            )
-            return
-
-        for chunk in _split_batches(
+        self._write_one_child(
             _chain_first(first, batch_iter),
-            row_threshold=row_threshold,
-            byte_threshold=byte_threshold,
-        ):
-            self._write_one_child(
-                chunk,
-                media_type=media_type,
-                options=options,
-            )
+            media_type=self._default_child_media_type(),
+            options=options,
+        )
 
     def _write_one_child(
         self,
@@ -1287,41 +1262,29 @@ class ZipEntryFolderIO(TabularIO[ZipOptions]):
         batches: Iterable[pa.RecordBatch],
         options: ZipOptions,
     ) -> None:
-        """Drain *batches* into one or more entries under prefix."""
+        """Drain *batches* into a single entry under prefix."""
         batch_iter = iter(batches)
         first = next(batch_iter, None)
         if first is None:
             return
 
-        media_type = options.child_media_type or MimeTypes.ARROW_IPC
-        row_threshold = options.child_row_size or 0
-        byte_threshold = options.child_byte_size or 0
-
-        chunks: Iterable[Iterable[pa.RecordBatch]]
-        if row_threshold <= 0 and byte_threshold <= 0:
-            chunks = [_chain_first(first, batch_iter)]
-        else:
-            chunks = _split_batches(
-                _chain_first(first, batch_iter),
-                row_threshold=row_threshold,
-                byte_threshold=byte_threshold,
-            )
-
-        for chunk in chunks:
-            name = self.parent._next_child_name(
-                media_type=media_type, options=options
-            )
-            full = name if name.startswith(self._prefix) else self._prefix + name
-            child = self.parent.make_child(full, media_type=media_type)
+        media_type = MimeTypes.ARROW_IPC
+        name = self.parent._next_child_name(
+            media_type=media_type, options=options
+        )
+        full = name if name.startswith(self._prefix) else self._prefix + name
+        child = self.parent.make_child(full, media_type=media_type)
+        try:
+            with child:
+                child.write_arrow_batches(
+                    _chain_first(first, batch_iter), options=options,
+                )
+        except Exception:
             try:
-                with child:
-                    child.write_arrow_batches(chunk, options=options)
+                self.parent._delete_entry(full)
             except Exception:
-                try:
-                    self.parent._delete_entry(full)
-                except Exception:
-                    pass
-                raise
+                pass
+            raise
 
     def is_empty(self) -> bool:
         return not self.has_children()
@@ -1356,60 +1319,6 @@ def _chain_first(
     """Yield *first*, then every batch from *rest*."""
     yield first
     yield from rest
-
-
-def _split_batches(
-    batches: "Iterator[pa.RecordBatch]",
-    *,
-    row_threshold: int,
-    byte_threshold: int,
-) -> "Iterator[Iterator[pa.RecordBatch]]":
-    """Split a batch iterator into chunks by row / byte threshold.
-
-    ``row_threshold`` wins when both are set. With a row threshold,
-    incoming batches are sliced so each emitted chunk holds exactly
-    ``row_threshold`` rows (the final chunk may be shorter).
-    """
-
-    def _size_bytes(batch: pa.RecordBatch) -> int:
-        try:
-            return int(batch.nbytes)
-        except Exception:
-            return 0
-
-    if row_threshold > 0:
-        pending: list[pa.RecordBatch] = []
-        pending_rows = 0
-        for batch in batches:
-            offset = 0
-            remaining = batch.num_rows
-            while remaining > 0:
-                take = min(remaining, row_threshold - pending_rows)
-                slice_ = batch.slice(offset, take)
-                pending.append(slice_)
-                pending_rows += take
-                offset += take
-                remaining -= take
-                if pending_rows >= row_threshold:
-                    yield iter(pending)
-                    pending = []
-                    pending_rows = 0
-        if pending:
-            yield iter(pending)
-        return
-
-    pending = []
-    nbytes = 0
-    for batch in batches:
-        pending.append(batch)
-        if byte_threshold > 0:
-            nbytes += _size_bytes(batch)
-        if 0 < byte_threshold <= nbytes:
-            yield iter(pending)
-            pending = []
-            nbytes = 0
-    if pending:
-        yield iter(pending)
 
 
 def _zipinfo_mtime(info: zipfile.ZipInfo, *, fallback: float) -> float:

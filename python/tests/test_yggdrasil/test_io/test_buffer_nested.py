@@ -106,15 +106,6 @@ class TestFolderIOFlat:
         assert files
         assert all(f.endswith(".parquet") for f in files)
 
-    def test_child_media_type_override(self, tmp_path: Path):
-        FolderIO(path=str(tmp_path)).write_arrow_table(
-            _flat_table(),
-            child_media_type=MimeTypes.CSV,
-        )
-        files = sorted(os.listdir(str(tmp_path)))
-        assert files
-        assert all(f.endswith(".csv") for f in files)
-
     def test_is_empty_on_missing_folder(self, tmp_path: Path):
         io = FolderIO(path=str(tmp_path / "missing"))
         assert io.is_empty()
@@ -581,9 +572,6 @@ class TestCoercePartitionColumn:
 class TestFolderWriteOptions:
     def test_default_values(self):
         opts = CastOptions()
-        assert opts.child_media_type is None
-        assert opts.child_row_size == 0
-        assert opts.child_byte_size == 0
         assert opts.max_workers == 0
 
     def test_folder_options_partition_defaults(self):
