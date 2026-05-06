@@ -245,7 +245,7 @@ class Scan(PlanNode):
 
     def _execute_arrow(self, ctx: "DynamicCatalog") -> pa.Table:
         source = ctx.resolve(self.name)
-        options = CastOptions(predicate=self.predicate)
+        options = self._build_options(source, ctx)
         table = source.read_arrow_table(options=options)
         # Pushdown is a hint — the source may or may not honour it.
         # Re-apply both filter and projection so the output of Scan
@@ -259,6 +259,45 @@ class Scan(PlanNode):
         if self.limit is not None and table.num_rows > self.limit:
             table = table.slice(0, self.limit)
         return table
+
+    def _build_options(self, source: Tabular, ctx: "DynamicCatalog") -> CastOptions:
+        """Build :class:`CastOptions` carrying the predicate + projection.
+
+        For a column projection to push into a SQL-backed source
+        (Databricks :class:`Table`, parquet readers that respect
+        ``column_names``), ``CastOptions`` needs a ``target_field``
+        whose children are the projected columns. We synthesize that
+        from the source's :class:`Schema` so dtypes round-trip
+        cleanly — the source already has the typed view; we just
+        narrow it.
+
+        The narrowed schema must include every column the predicate
+        references too — otherwise the source filters the projection
+        first (dropping ``qty``) and the post-read predicate eval has
+        nothing to compare. ``_execute_arrow`` does a final
+        ``.select`` after filtering so the predicate-only columns
+        don't leak into the Scan's output.
+        """
+        if not self.projection:
+            return CastOptions(predicate=self.predicate)
+        try:
+            full = ctx.schema_of(self.name)
+        except Exception:
+            return CastOptions(predicate=self.predicate)
+
+        cols: set[str] = set(self.projection)
+        if self.predicate is not None:
+            cols |= _columns_referenced(self.predicate)
+
+        # Preserve schema declaration order for the narrowed projection.
+        ordered = [name for name in (f.name for f in full.fields) if name in cols]
+        try:
+            narrowed = _narrow_schema(full, ordered)
+        except Exception:
+            return CastOptions(predicate=self.predicate)
+        if narrowed is None:
+            return CastOptions(predicate=self.predicate)
+        return CastOptions(predicate=self.predicate, target_field=narrowed)
 
 
 # ---------------------------------------------------------------------------
@@ -656,3 +695,45 @@ def _as_chunked(arr: Any) -> pa.ChunkedArray:
     if isinstance(arr, pa.Array):
         return pa.chunked_array([arr])
     return pa.chunked_array([pa.array(arr)])
+
+
+def _narrow_schema(full: Any, projection: "Sequence[str]") -> Any:
+    """Return a child :class:`Schema` keeping only *projection* columns.
+
+    Lazy import of :class:`Schema` keeps the cold path on this module
+    cheap. Used by :meth:`Scan._build_options` to thread per-Scan
+    column projection through :class:`CastOptions.target_field`.
+    """
+    from yggdrasil.data.schema import Schema
+
+    if not isinstance(full, Schema):
+        return None
+    keep_set = set(projection)
+    keep = [f for f in full.fields if f.name in keep_set]
+    if not keep:
+        return None
+    return Schema(inner_fields=keep)
+
+
+def _columns_referenced(expr: Any) -> "set[str]":
+    """Walk *expr*'s subtree and collect every :class:`Column` name."""
+    from yggdrasil.data.expr import Column, Expression
+
+    out: set[str] = set()
+    stack: list[Any] = [expr]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, Column):
+            if cur.name:
+                out.add(cur.name)
+            continue
+        if isinstance(cur, Expression):
+            for fld in dataclasses.fields(cur):
+                v = getattr(cur, fld.name, None)
+                if isinstance(v, Expression):
+                    stack.append(v)
+                elif isinstance(v, (list, tuple)):
+                    for item in v:
+                        if isinstance(item, Expression):
+                            stack.append(item)
+    return out

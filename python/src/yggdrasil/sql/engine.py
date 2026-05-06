@@ -228,27 +228,66 @@ class Engine:
         where: "Expression | str | None" = None,
         persist: PersistTarget = "memory",
         path: "str | None" = None,
-    ) -> SqlStatementResult:
-        """Compile + run *query*, return the live :class:`SqlStatementResult`.
+        pushdown: bool = True,
+    ) -> "SqlStatementResult | Any":
+        """Compile + run *query*, return the live result handle.
 
-        The result is already a :class:`Tabular` — every read method
-        (``read_arrow_table`` / ``read_polars_frame`` / ``read_pandas_frame``
-        / ``read_spark_frame`` / ``read_pylist`` / ``read_records``)
-        works against the cached payload. Pass ``persist="path"``
-        with ``path="..."`` to spill to a parquet folder instead of
-        keeping the result in memory.
+        The returned object is always a :class:`Tabular` so every read
+        method (``read_arrow_table`` / ``read_polars_frame`` /
+        ``read_pandas_frame`` / ``read_spark_frame`` / ``read_pylist``
+        / ``read_records``) works against the materialized payload.
+
+        Pushdown
+        --------
+
+        When ``pushdown=True`` (the default), and *query* is a SQL
+        string, the engine first tries to push the *whole* query down
+        to a remote SQL engine when every referenced source supports
+        it. Currently the only adapter shipped in-tree is
+        :mod:`yggdrasil.sql.databricks_pushdown` — when every name in
+        the SQL resolves to a
+        :class:`yggdrasil.databricks.sql.table.Table` on one shared
+        client, the engine rewrites the FROM names to the fully-
+        qualified ``catalog.schema.table`` form and submits to that
+        client's :class:`SQLEngine`. The returned
+        :class:`WarehouseStatementResult` *is* a :class:`Tabular` —
+        the call site doesn't see a difference except for the join /
+        aggregate / filter actually running on the warehouse.
+
+        When the pushdown adapter says "not applicable" (mixed
+        sources, unknown name, etc.), execution falls through to the
+        in-process planner. Pass ``pushdown=False`` to force the
+        Arrow path even when pushdown would have applied (useful for
+        debugging / benchmarking).
+
+        ``persist="path"`` with ``path="..."`` spills the materialized
+        result to a parquet folder instead of keeping it in memory.
         """
         if isinstance(query, EnginePlan):
-            engine_plan = query
-        else:
-            engine_plan = self.prepare(
+            return self.run_plan(query)
+
+        # Whole-query pushdown — only attempted on raw SQL input.
+        if pushdown:
+            ctx = self.catalog if not sources else self.catalog.child(sources)
+            from yggdrasil.sql.databricks_pushdown import try_databricks_pushdown
+
+            pushed = try_databricks_pushdown(
                 query,
-                dialect=dialect,
-                sources=sources,
+                dialect=dialect or self.dialect,
+                catalog=ctx,
                 where=where,
-                persist=persist,
-                path=path,
             )
+            if pushed is not None:
+                return pushed
+
+        engine_plan = self.prepare(
+            query,
+            dialect=dialect,
+            sources=sources,
+            where=where,
+            persist=persist,
+            path=path,
+        )
         return self.run_plan(engine_plan)
 
     # ==================================================================
