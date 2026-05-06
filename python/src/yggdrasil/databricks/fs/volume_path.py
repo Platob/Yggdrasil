@@ -33,7 +33,7 @@ from databricks.sdk.errors.platform import (
 )
 from databricks.sdk.service.catalog import PathOperation, VolumeInfo, VolumeType
 
-from yggdrasil.io.buffer import BytesIO
+from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.data.enums import MediaType, MediaTypes
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL

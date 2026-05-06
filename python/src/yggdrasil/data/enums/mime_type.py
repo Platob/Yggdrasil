@@ -7,7 +7,7 @@ from typing import Any, Callable, ClassVar, IO, Mapping, Union, Iterable, Iterat
 __all__ = ["MimeType", "MimeTypes"]
 from yggdrasil.io import URL
 
-from yggdrasil.lazy_imports import path_class, bytes_io_class
+from yggdrasil.lazy_imports import bytes_io_class
 
 MagicMatcher = Callable[[bytes], bool]
 
@@ -287,16 +287,12 @@ class MimeType:
         if isinstance(obj, cls):
             return obj
 
-        _Path = path_class()
-        if _Path.is_pathish(obj):
-            # ``Path.infer_media_type`` returns a MediaType (never None
-            # — it has its own default-handling), but its ``default``
-            # kwarg expects a MediaType or None, not our sentinel. Map
-            # the sentinel to None for the forwarded call, then check
-            # the result and route through _miss when it falls back to
-            # a default-ish value.
-            mt = _Path.from_(obj).infer_media_type(default=None)
-
+        # Path-shaped inputs short-circuit through URL: extension and
+        # scheme tell us the mime without even constructing a Path
+        # holder. Maps the sentinel to ``None`` for the forwarded call
+        # so URL's own default handling stays consistent.
+        if URL.is_pathish(obj):
+            mt = URL.from_(obj).infer_media_type(default=None)
             if mt is not None:
                 return mt.mime_type
 
@@ -328,10 +324,24 @@ class MimeType:
             BytesIO = bytes_io_class()
 
             if isinstance(magic, BytesIO):
-                magic = bytes(magic.head(64))
+                magic = bytes(magic.pread(64, 0))
+            elif hasattr(magic, "read") and hasattr(magic, "seek"):
+                # Stdlib-style file-like — read head, restore cursor so
+                # the caller's IO comes out exactly as it went in.
+                fh = magic
+                saved = fh.tell()
+                try:
+                    fh.seek(0)
+                    magic = fh.read(64)
+                finally:
+                    fh.seek(saved)
             else:
-                with BytesIO(magic, copy=False).view(pos=0) as b:
-                    magic = bytes(b.read(64))
+                bio = BytesIO(magic)
+                bio.acquire()
+                try:
+                    magic = bytes(bio.pread(64, 0))
+                finally:
+                    bio.close()
 
         for mt in cls._MAGIC_ORDER:
             for matcher in mt.magics:

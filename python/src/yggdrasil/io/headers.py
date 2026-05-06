@@ -10,8 +10,8 @@ from typing import ClassVar, Literal, Mapping, MutableMapping, Optional, Union
 from yggdrasil.data.enums import MimeTypes
 from yggdrasil.version import __version_info__, __version__
 
-from .buffer import BytesIO
-from .enums import Codec, MediaType
+from .bytes_io import BytesIO
+from yggdrasil.data.enums import Codec, MediaType
 
 __all__ = [
     "HeaderValue",

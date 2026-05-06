@@ -28,7 +28,7 @@ from yggdrasil.data.statement import (
 )
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.environ import PyEnv
-from yggdrasil.io.buffer.base import O
+from yggdrasil.io.tabular.base import O
 from yggdrasil.data.enums import MimeType, MimeTypes
 
 if TYPE_CHECKING:

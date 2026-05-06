@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from random import Random
 from dataclasses import dataclass
-from typing import Optional
 
 
 __all__ = [

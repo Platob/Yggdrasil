@@ -107,7 +107,7 @@ class MediaType:
             return cls.from_magic(obj, default=default)
         if hasattr(obj, "read") and hasattr(obj, "seek"):
             return cls.from_io(obj, default=default)
-        if path_class().is_pathish(obj):
+        if URL.is_pathish(obj):
             parsed = cls.from_path(obj, default=None)
             if parsed is not None:
                 return parsed

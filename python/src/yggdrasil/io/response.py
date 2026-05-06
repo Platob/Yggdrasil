@@ -15,8 +15,8 @@ from yggdrasil.data.cast import any_to_datetime
 from yggdrasil.data.data_field import field as schema_field
 from yggdrasil.data.schema import schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
-from .buffer import BytesIO
-from .enums import Codec, MediaType, MimeTypes
+from .bytes_io import BytesIO
+from yggdrasil.data.enums import Codec, MediaType, MimeTypes
 from .headers import normalize_headers
 from yggdrasil.environ.userinfo import USERINFO_STRUCT, UserInfo
 from .request import (

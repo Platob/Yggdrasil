@@ -190,7 +190,7 @@ class Memory(Holder):
         stats.mtime = time.time()
         return n
 
-    def clear(self) -> None:
+    def _clear(self) -> None:
         """Drop all bytes; reset capacity AND size to zero."""
         self._buf = bytearray()
         stats = self.stat()

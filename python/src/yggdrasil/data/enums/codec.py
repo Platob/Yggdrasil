@@ -45,7 +45,7 @@ from typing import IO, Any, TYPE_CHECKING
 from yggdrasil.lazy_imports import mime_type_class, bytes_io_class
 
 if TYPE_CHECKING:
-    from ..buffer import BytesIO
+    from yggdrasil.io.bytes_io import BytesIO
     from yggdrasil.data.enums.mime_type import MimeType
 
 __all__ = [
@@ -238,15 +238,14 @@ class Codec(abc.ABC):
         bio = bytes_io_class()
 
         fh = bio.from_(src)
+        out = bio()
         saved = fh.tell()
         try:
             fh.seek(0)
-            out = bio()
 
             if _compress:
                 writer = self._open_compress_writer(out)
                 if writer is None:
-                    # Non-streaming codec — fall back to full-in-memory.
                     out.write(self.compress_bytes(fh.read()))
                 else:
                     with writer:
@@ -258,7 +257,6 @@ class Codec(abc.ABC):
             else:
                 reader = self._open_decompress_reader(fh)
                 if reader is None:
-                    # Non-streaming codec — fall back to full-in-memory.
                     out.write(self.decompress_bytes(fh.read()))
                 else:
                     with reader:
@@ -269,10 +267,6 @@ class Codec(abc.ABC):
                             out.write(chunk)
 
             out.seek(0)
-
-            if fh._stats.media_type is not None:
-                out._stats.media_type = fh._stats.media_type.with_codec(self)
-
             return out
         finally:
             try:
@@ -306,7 +300,7 @@ class Codec(abc.ABC):
         to a full :meth:`decompress_bytes` call, which materializes
         the whole uncompressed payload in memory.
         """
-        from ..buffer import BytesIO
+        from yggdrasil.io.bytes_io import BytesIO
 
         if n_start < 0 or n_end < 0:
             raise ValueError("n_start and n_end must be >= 0")
@@ -315,23 +309,24 @@ class Codec(abc.ABC):
         if n_start == 0 and n_end == 0:
             return b"", b""
 
-        fh = BytesIO(src, copy=False).view(pos=0)
-        saved = fh.tell()
-        try:
-            fh.seek(0)
-
-            reader = self._open_decompress_reader(fh)
-            if reader is None:
-                data = self.decompress_bytes(_drain(fh))
-                return data[:n_start], (data[-n_end:] if n_end else b"")
-
-            with reader:
-                return self._collect_head_tail(reader, n_start, n_end, chunk_size)
-        finally:
+        fh = BytesIO.from_(src)
+        with fh:
+            saved = fh.tell()
             try:
-                fh.seek(saved)
-            except Exception:
-                pass
+                fh.seek(0)
+
+                reader = self._open_decompress_reader(fh)
+                if reader is None:
+                    data = self.decompress_bytes(_drain(fh))
+                    return data[:n_start], (data[-n_end:] if n_end else b"")
+
+                with reader:
+                    return self._collect_head_tail(reader, n_start, n_end, chunk_size)
+            finally:
+                try:
+                    fh.seek(saved)
+                except Exception:
+                    pass
 
     @staticmethod
     def _collect_head_tail(

@@ -180,7 +180,6 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         if holder is None:
             if data is None:
                 # Empty memory holder — equivalent to stdlib io.BytesIO().
-                from yggdrasil.io.tabular import Memory
                 holder = Memory()
                 owns_holder = True
             else:
@@ -312,25 +311,34 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         self._scratch = scratch
         self._pos = scratch.size if "a" in self._mode else 0
 
-    def _release(self) -> None:
-        """Commit the scratch buffer (if dirty) and close the holder
-        if owned.
+    def _commit(self) -> None:
+        """Push the scratch buffer's bytes onto the durable holder.
 
-        On ``temporary=True`` the scratch is discarded without commit
-        — :class:`Disposable.close` clears the dirty bit before this
-        runs in that case.
+        :class:`Disposable._close` calls :meth:`commit` (which routes
+        here when :attr:`_dirty`) before :meth:`_release`, so by the
+        time :meth:`_release` runs the durable holder already has the
+        new bytes. ``temporary`` holders skip this — :meth:`_release`
+        on the holder side drops the payload.
+        """
+        scratch = self._scratch
+        if scratch is None:
+            return
+        if getattr(self._holder, "temporary", False):
+            return
+        self._commit_scratch(scratch)
+
+    def _release(self) -> None:
+        """Tear down scratch and release the durable holder if owned.
+
+        Commit is :meth:`_commit`'s job — this method is pure cleanup.
         """
         scratch = self._scratch
         if scratch is not None:
             try:
-                if self._dirty:
-                    self._commit_scratch(scratch)
-            finally:
-                try:
-                    scratch.close()
-                except Exception:
-                    pass
-                self._scratch = None
+                scratch.close()
+            except Exception:
+                pass
+            self._scratch = None
 
         if self._owns_holder:
             try:
@@ -371,6 +379,20 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
     def holder(self) -> "Holder":
         """The underlying :class:`Holder`."""
         return self._holder
+
+    def view(self, *, pos: int = 0, mode: str = "rb") -> "BytesIO":
+        """Return a fresh, non-owning :class:`BytesIO` over the same holder.
+
+        Useful when a caller needs to read from the buffer without
+        disturbing the original cursor — Parquet footer probes, zip
+        directory walks, magic-byte sniffs. The returned cursor is
+        seeded at *pos* and never closes the durable holder, so
+        ``with self.view(pos=0) as v: ...`` is safe to nest inside an
+        outer transaction over the same buffer.
+        """
+        v = BytesIO(holder=self._holder, owns_holder=False, mode=mode)
+        v._pos = int(pos)
+        return v
 
     @property
     def owns_holder(self) -> bool:
@@ -530,8 +552,14 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
     # ==================================================================
 
     def read(self, size: int = -1) -> bytes:
+        remaining = max(0, self.size - self._pos)
         if size is None or size < 0:
-            size = max(0, self.size - self._pos)
+            size = remaining
+        else:
+            # Cap to remaining bytes — stdlib ``IOBase.read`` returns
+            # fewer than *size* when EOF is reached, so we do the same
+            # rather than asking the holder for an out-of-range slice.
+            size = min(size, remaining)
         if size == 0:
             return b""
         out = self._active().pread(size, self._pos)

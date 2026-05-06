@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
 from typing import Any, Mapping
 
 from yggdrasil.io.http_ import HTTPSession

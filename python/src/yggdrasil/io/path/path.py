@@ -206,7 +206,7 @@ class Path(Holder, os.PathLike, ABC):
         finally:
             bio.close()
 
-    def clear(self) -> None:
+    def _clear(self) -> None:
         """:class:`Holder` primitive: drop the backing entirely (idempotent)."""
         self._remove_file(missing_ok=True)
 
@@ -262,22 +262,26 @@ class Path(Holder, os.PathLike, ABC):
 
     def touch(self) -> "Path":
         if not self.exists():
-            self.write_bytes(b"")
+            # An empty ``write_bytes`` short-circuits without creating
+            # the backing — open() is what materializes the file.
+            with self.open("ab"):
+                pass
         return self
 
     # ==================================================================
     # open(mode) — returns a BytesIO bound to self
     # ==================================================================
 
-    def open(self, mode: "Mode | str | None" = None) -> "BytesIO | Path":
-        """Two shapes:
+    def open(self, mode: "Mode | str | None" = None) -> "BytesIO":
+        """Acquire the path and return a :class:`BytesIO` bound to it.
 
-        - ``path.open()``       → lifecycle acquire; returns ``self``.
-        - ``path.open("rb")``   → :class:`BytesIO` bound to ``self``.
+        ``mode`` accepts a :class:`Mode` member, an alias string,
+        or a stdlib ``open()`` mode string. ``None`` falls through
+        to :meth:`Holder.open` which uses ``"rb+"``.
         """
         if mode is None:
             return Holder.open(self)
-        return BytesIO(path=self, mode=Mode.from_(mode).os_mode)
+        return Holder.open(self, mode=Mode.from_(mode).os_mode)
 
     # ==================================================================
     # Pure-path API — all delegated to URL

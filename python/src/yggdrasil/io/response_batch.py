@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Iterator, Mapping, Optional, Union
 
-from .buffer.base import Tabular
+from .tabular.base import Tabular
 from yggdrasil.io.tabular import MemoryArrowIO, MemorySparkIO
 from .response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA, Response
 
@@ -521,7 +521,7 @@ class ResponseBatch:
         return self
 
     def _merge_simple_holder(self, attr: str, theirs: Tabular) -> None:
-        from .enums import Mode
+        from yggdrasil.data.enums import Mode
 
         mine: Tabular = getattr(self, attr)
         if isinstance(theirs, MemorySparkIO) and theirs.frame is not None:
@@ -539,7 +539,7 @@ class ResponseBatch:
         mine: dict[str, Tabular],
         theirs: dict[str, Tabular],
     ) -> dict[str, Tabular]:
-        from .enums import Mode
+        from yggdrasil.data.enums import Mode
 
         # Drop the placeholder empty default as soon as the incoming
         # side brings in any real (non-default) key — keeps the

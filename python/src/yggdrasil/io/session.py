@@ -20,7 +20,7 @@ from yggdrasil.dataclasses.waiting import (
     WaitingConfigArg,
 )
 from yggdrasil.data.enums import Mode
-from .buffer import BytesIO
+from .bytes_io import BytesIO
 from yggdrasil.io.nested import FolderIO, FolderOptions
 from .request import PreparedRequest
 from .response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
