@@ -431,6 +431,21 @@ class URL(os.PathLike):
         if self.port == 0:
             object.__setattr__(self, "port", None)
 
+    @classmethod
+    def is_urlish(cls, value: Any) -> bool:
+        """True iff the value is a string or URL-like object."""
+        if isinstance(value, cls):
+            return True
+
+        if isinstance(value, str):
+            if len(value) > 256 * 1024:
+                return False
+
+            if "://" in value or "/":
+                return True
+
+        return isinstance(value, os.PathLike)
+
     @property
     def parts(self):
         if not self.path or self.path == "/":

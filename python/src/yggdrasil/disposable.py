@@ -7,7 +7,18 @@ class Disposable(ABC):
     """Transactional resource with binary open/close, with-stack
     nesting, and an owned-children graph."""
 
-    def __init__(self) -> None:
+    __slots__ = (
+        '_acquired',
+        '_dirty',
+        '_depth',
+        '_ctx_owns_close',
+    )
+
+    def __init__(
+        self,
+        *args,
+        **kwargs
+    ) -> None:
         self._acquired: bool = False
         self._dirty: bool = False
         self._depth: int = 0
@@ -152,17 +163,11 @@ class Disposable(ABC):
         finally:
             self._release()
 
-    @property
-    def dirty(self):
-        return self._dirty
-
     def is_dirty(self):
         return self._dirty
 
     def mark_dirty(self) -> None:
         """Signal pending mutations — commit on next clean :meth:`close`."""
-        if not self._acquired:
-            raise RuntimeError("mark_dirty() called on a closed Disposable")
         self._dirty = True
 
     def clear_dirty(self) -> None:
@@ -243,10 +248,6 @@ class Disposable(ABC):
         # GC — data integrity depends on explicit close.
         try:
             if self.opened:
-                self.clear_dirty()
-                # Use force=True to bypass the claim deferral; if we
-                # made it to __del__ with _acquired=True, no parent
-                # is reachable to ever come back and unclaim us.
                 self.close(force=True)
         except Exception:
             pass

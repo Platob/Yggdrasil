@@ -517,15 +517,6 @@ class TabularIO(Disposable, ABC, Generic[O]):
                 self._stats.media_type = MediaType(cls_mime)
         else:
             self._stats.media_type = MediaType.from_(media_type)
-        # Persist cache slot — a sub-TabularIO holding the materialised
-        # cache (MemorySparkIO when Spark is reachable, MemoryArrowIO
-        # otherwise). Read paths delegate through it when set.
-        self._persisted_data: "TabularIO | None" = None
-        # Lazy spill directory used by :meth:`scan_spark_frame`'s
-        # default fallback. Populated on first scan, cleaned up by
-        # :meth:`_release`.
-        self._spark_scan_spill: "str | None" = None
-        self._spark_scan_cleanup = None
 
     # ==================================================================
     # Tabular view shortcut — at TabularIO so every subclass shares it

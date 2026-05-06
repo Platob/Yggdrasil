@@ -57,13 +57,7 @@ class Memory(Holder):
 
     def __init__(
         self,
-        data: Optional[Union[
-            int,
-            bytes,
-            bytearray,
-            memoryview,
-            "Memory",
-        ]] = None,
+        data: Any = None,
         *,
         media_type: Any = None,
         auto_open: bool = True,

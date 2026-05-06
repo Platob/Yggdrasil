@@ -118,7 +118,7 @@ _STAGING_TMP_RE: re.Pattern = re.compile(r"-(\d+)-(\d+)-[0-9a-f]+(?:\.[^/]+)?$")
 # ---------------------------------------------------------------------------
 
 
-class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
+class Path(Holder, os.PathLike, ABC):
     """Abstract filesystem path with :class:`pathlib.Path`-like behaviour.
 
     Stateless I/O surface. Positional ops (:meth:`pread`, :meth:`pwrite`,
@@ -134,186 +134,21 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
     :meth:`_bwrite`) plus :meth:`_open_fd` for local-fd backends.
     """
 
-    scheme: ClassVar[str] = ""
     __slots__ = (
-        "url",
         "temporary",
-        "_mode",
     )
 
     _STAGING_SWEEP_INTERVAL: ClassVar[float] = _STAGING_SWEEP_INTERVAL_S
 
-    # ==================================================================
-    # Construction / dispatch
-    # ==================================================================
-
-    @classmethod
-    def default_media_type(cls):
-        """Path is format-agnostic — never auto-register against a mime type."""
-        return None
-
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        try:
-            super().__init_subclass__(**kwargs)
-        except TypeError:
-            pass
-        register_path_class(cls)
-
-    def __new__(cls, obj: Any = None, *args: Any, **kwargs: Any) -> "Path":
-        del args, kwargs
-        if cls is Path:
-            target = _select_path_class(obj)
-            return target.__new__(target, obj)
-        return object.__new__(cls)
-
     def __init__(
         self,
-        obj: Any = None,
+        data: Any = None,
         *,
-        url: URL | None = None,
         temporary: bool = False,
-        mode: str = "rb+",
-        auto_open: bool = True,
-    ) -> None:
-        TabularIO.__init__(self, media_type=None)
-
-        if url is not None:
-            resolved = URL.from_(url)
-        elif obj is None:
-            resolved = URL.empty()
-        elif isinstance(obj, Path):
-            resolved = obj.url
-        else:
-            resolved = URL.from_(obj)
-
-        self.url = resolved
-        self.temporary = bool(temporary)
-        self._mode = mode
-
-        if auto_open:
-            Disposable.open(self)
-
-    # ==================================================================
-    # Disposable hooks — lifecycle is cheap; subclasses add per-open IO
-    # ==================================================================
-
-    def _acquire(self) -> None:
-        # Stateless at the base. :class:`LocalPath` overrides to open
-        # a long-lived fd; everything else has nothing to acquire.
-        return
-
-    def _release(self) -> None:
-        try:
-            self.unpersist()
-        except Exception:
-            pass
-        try:
-            self.close_io()
-        except Exception:
-            pass
-        if not self.temporary:
-            return
-        try:
-            self.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    # ==================================================================
-    # I/O acquire — subclass-specific (fd for local, no-op otherwise)
-    # ==================================================================
-
-    @property
-    def io_open(self) -> bool:
-        """True when a per-open IO backing (subclass-specific) is active.
-
-        Default: ``False`` — the base path holds no per-open state.
-        :class:`LocalPath` overrides to track its fd.
-        """
-        return False
-
-    @property
-    def mode(self) -> str:
-        """The mode used for the next acquire (or already-open backing)."""
-        return self._mode
-
-    @mode.setter
-    def mode(self, value: str) -> None:
-        if self.io_open and value != self._mode:
-            raise RuntimeError(
-                f"Cannot change mode while {self!r} is open. "
-                "Call close_io() first."
-            )
-        self._mode = value
-
-    @property
-    def is_writing(self) -> bool:
-        """True when the active mode includes any write semantics."""
-        return any(c in self._mode for c in "wax+")
-
-    def acquire_io(self, mode: Optional[str] = None) -> "Path":
-        """Open the per-open IO backing (subclass-specific) explicitly.
-
-        Idempotent for the same mode. If a different mode was already
-        open, closes and reopens. Default base impl just records the
-        new mode; :class:`LocalPath` overrides to manage its fd.
-        Returns ``self`` so the call chains.
-        """
-        if mode is not None and mode != self._mode:
-            if self.io_open:
-                self.close_io()
-            self._mode = mode
-        return self
-
-    def close_io(self) -> None:
-        """Release per-open IO state. Default no-op.
-
-        Subclasses with extra per-open resources (fd for
-        :class:`LocalPath`) override.
-        """
-
-    @contextlib.contextmanager
-    def opened(self, mode: str = "rb+") -> "Iterator[Path]":
-        """Context manager: acquire I/O backing, release on exit."""
-        prev_mode = self._mode
-        was_open = self.io_open
-        self.acquire_io(mode)
-        try:
-            yield self
-        finally:
-            if not was_open:
-                self.close_io()
-            if not was_open:
-                self._mode = prev_mode
-
-    def flush(self) -> None:
-        """No-op at the base — every :meth:`pwrite` already committed.
-
-        :class:`LocalPath`'s fd writes hit the kernel via :func:`os.pwrite`;
-        remote :meth:`_bwrite` calls already issued the upload. There's
-        nothing buffered between :class:`Path` and the durable backing.
-        """
-
-    # ==================================================================
-    # TabularIO hooks — open the path, dispatch to its BytesIO
-    # ==================================================================
-
-    def _read_arrow_batches(self, options: CastOptions) -> Iterator["pa.RecordBatch"]:
-        buf = self.open("rb")
-        try:
-            yield from buf.read_arrow_batches(options=options)
-        finally:
-            buf.close()
-
-    def _write_arrow_batches(
-        self,
-        batches: Iterable["pa.RecordBatch"],
-        options: CastOptions,
-    ) -> None:
-        buf = self.open("wb")
-        try:
-            buf.write_arrow_batches(batches, options=options)
-        finally:
-            buf.close()
+        **kwargs,
+    ):
+        super().__init__(data, **kwargs)
+        self.temporary = temporary
 
     # ==================================================================
     # Temporary-flag builders
@@ -337,7 +172,7 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         temporary: bool = True,
     ) -> "Path":
         """Mint a unique sibling/child path with a TTL-encoded name."""
-        seed = os.urandom(8).hex()
+        seed = os.urandom(4).hex()
         prefix = prefix or ""
         suffix = suffix or ""
 

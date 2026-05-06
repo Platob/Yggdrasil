@@ -30,17 +30,13 @@ from __future__ import annotations
 import os
 import pathlib
 from abc import abstractmethod
-from typing import TYPE_CHECKING, Optional, Union
+from typing import Union, Any, ClassVar, IO
 
 from yggdrasil.disposable import Disposable
 
+from .enums import Mode
 from .io_stats import IOStats
-
-
-if TYPE_CHECKING:
-    from yggdrasil.io.enums import Mode
-    from yggdrasil.io.url import URL
-
+from .url import URL
 
 __all__ = ["Holder"]
 
@@ -48,35 +44,8 @@ __all__ = ["Holder"]
 PathLike = Union[str, "os.PathLike[str]", pathlib.PurePath]
 
 
-_COPY_CHUNK = 4 * 1024 * 1024
-
-
-# Stdlib ``open()`` mode-string lookup for the standard
-# :class:`Mode` values that have an OS-mode counterpart. Used by
-# :meth:`Holder.open` to translate a :class:`Mode` argument into a
-# string ``acquire_io`` understands.
-_MODE_TO_OS_MODE = {
-    "auto": "rb+",
-    "read_only": "rb",
-    "overwrite": "wb+",
-    "append": "ab+",
-    "truncate": "wb+",
-    "error_if_exists": "xb+",
-}
-
-
-def _resolve_mode_string(mode: "Mode | str | None") -> str:
-    """Translate *mode* (Mode enum, alias, or os-style string) → os-mode str."""
-    if mode is None:
-        return "rb+"
-    if isinstance(mode, str) and mode and not _MODE_TO_OS_MODE.get(mode.lower()):
-        # Already looks like an OS-mode string (e.g. "rb+", "wb").
-        # Don't re-normalize — preserve flag combinations.
-        if all(c in "rwaxbt+" for c in mode):
-            return mode
-    from yggdrasil.io.enums import Mode  # avoid import cycle
-    parsed = Mode.from_(mode)
-    return _MODE_TO_OS_MODE.get(parsed.value, "rb+")
+_COPY_CHUNK = 1024 * 1024
+_HOLDER_SCHEMES: dict[str, type[Holder]] = {}
 
 
 class Holder(Disposable):
@@ -103,12 +72,193 @@ class Holder(Disposable):
     - :attr:`size` — current visible size in bytes.
     """
 
+    scheme: ClassVar[str] = ""
+
+    __slots__ = (
+        "_url",
+    )
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        try:
+            super().__init_subclass__(**kwargs)
+        except TypeError:
+            pass
+
+        scheme = cls.scheme
+
+        if scheme:
+            if scheme in _HOLDER_SCHEMES:
+                raise RuntimeError(f"Duplicate scheme '{scheme}' for {cls.__name__}")
+            _HOLDER_SCHEMES[scheme] = cls
+
+    def __new__(
+        cls,
+        data: Any = None,
+        *,
+        scheme: str | None = None,
+        url: URL | None = None,
+        binary: bytes | bytearray | memoryview | None = None,
+        path: PathLike | None = None,
+    ):
+        """Create a new holder."""
+        if url is not None:
+            url = URL.from_(url)
+            scheme = url.scheme or cls.scheme
+
+        if scheme is not None:
+            existing = _HOLDER_SCHEMES.get(scheme)
+            if existing is not None:
+                return existing.__new__(existing)
+
+            raise ValueError(f"Unknown scheme '{scheme}'")
+
+        if binary is not None:
+            from .memory import Memory
+            return Memory
+        elif path is not None:
+            from .fs.path import Path
+            return Path.__new__(Path, path=path)
+
+        if data is None:
+            from .memory import Memory
+            return Memory
+
+        if isinstance(data, Holder):
+            return type(data)
+
+        from .memory import Memory
+        return Memory
+
+    def __init__(
+        self,
+        data: Any = None,
+        *,
+        url: URL | None = None,
+        binary: bytes | bytearray | memoryview | None = None,
+        path: PathLike | None = None,
+        **kwargs
+    ):
+        """Initialize the holder."""
+        super().__init__(**kwargs)
+
+        self._url: URL | None = None
+
+        if url is not None:
+            self.url = url
+        elif binary is not None:
+            self._init_from_bytes(binary)
+        elif path is not None:
+            self._init_from_local_path(path)
+        elif data is not None:
+            if isinstance(data, Holder):
+                self._init_from_holder(data)
+            if isinstance(data, (bytes, bytearray, memoryview)):
+                self._init_from_bytes(data)
+            elif isinstance(data, str):
+                self._init_from_str(data)
+            elif isinstance(data, pathlib.Path):
+                self._init_from_pathlib(data)
+            else:
+                raise ValueError(
+                    f"Cannot initialize {self.__class__.__name__} with object of type {type(data).__name__}: {data}"
+                )
+
+    def _init_from_holder(self, holder: Holder):
+        self.url = holder.url
+
+        if self.is_memory:
+            self.write_bytes(holder.read_bytes())
+
+    def _init_from_bytes(self, data: bytes | bytearray | memoryview):
+        self.write_bytes(data)
+
+    def _init_from_local_path(self, path: PathLike):
+        self.url = URL.from_(path)
+
+        if self.is_memory:
+            self.write_local_path(path)
+
+    def _init_from_pathlib(self, path: pathlib.Path):
+        self.url = URL.from_(path)
+
+        if self.is_memory:
+            self.write_bytes(path.read_bytes())
+
+    def _init_from_str(self, value: str):
+        if URL.is_urlish(value):
+            self._init_from_url(URL.from_(value))
+            return None
+
+        raise ValueError(f"Cannot initialize {self.__class__.__name__} with string '{value}'")
+
+    def _init_from_url(self, url: URL):
+        self.url = url
+
+        if self.is_memory:
+            local_path = self.url.__fspath__()
+
+            if os.path.exists(local_path):
+                self._init_from_local_path(local_path)
+            else:
+                raise ValueError(f"URL '{url}' does not exist as a local path; cannot initialize {self.__class__.__name__}")
+
+    def _init_from_file_like(self, data: IO[bytes]):
+        pos = 0
+        while True:
+            chunk = data.read(_COPY_CHUNK)
+            if not chunk:
+                break
+
+            self.write_bytes(chunk, pos=pos)
+            pos += len(chunk)
+
+    # ------------------------------------------------------------------
+    # Constructors
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_(
+        cls,
+        obj: Any,
+        *,
+        url: URL | None = None,
+        **kwargs
+    ):
+        if isinstance(obj, cls):
+            return obj
+
+        return cls(data=obj, url=url, **kwargs)
+
+    @classmethod
+    def from_url(cls, url: URL, **kwargs) -> Holder:
+        """Create a new holder from a URL."""
+        return cls(url=url, **kwargs)
+
+    @classmethod
+    def from_bytes(cls, data: bytes, **kwargs) -> Holder:
+        """Create a new holder from bytes."""
+        return cls(binary=data, **kwargs)
+
     # ------------------------------------------------------------------
     # Abstract primitives
     # ------------------------------------------------------------------
 
-    @abstractmethod
     def read_mv(self, n: int, pos: int) -> memoryview:
+        if pos < 0:
+            pos = self.size + pos
+        if pos < 0:
+            raise ValueError(f"Position {pos} is out of bounds for {self.__class__.__name__} of size {self.size}")
+        if n < 0:
+            n = self.size - pos
+        if n < 0:
+            raise ValueError(f"Length {n} is out of bounds for {self.__class__.__name__} of size {self.size}")
+        if pos + n > self.size:
+            raise ValueError(f"Position {pos} + length {n} is out of bounds for {self.__class__.__name__} of size {self.size}")
+
+        return self._read_mv(n, pos)
+
+    @abstractmethod
+    def _read_mv(self, n: int, pos: int) -> memoryview:
         """Return a memoryview over ``n`` bytes starting at ``pos``.
 
         ``n < 0`` is interpreted as "from ``pos`` to end of holder."
@@ -119,8 +269,20 @@ class Holder(Disposable):
         view before any other I/O against the holder.
         """
 
-    @abstractmethod
     def write_mv(self, data: memoryview, pos: int) -> int:
+        """Default impl normalizes to bytes and forwards to :meth:`write_bytes`."""
+        if pos < 0:
+            pos = self.size + pos
+        if pos < 0:
+            raise ValueError(f"Position {pos} is out of bounds for {self.__class__.__name__} of size {self.size}")
+
+        written = self._write_mv(data, pos)
+        if written > 0:
+            self.mark_dirty()
+        return written
+
+    @abstractmethod
+    def _write_mv(self, data: memoryview, pos: int) -> int:
         """Splice ``data`` at ``pos``. Returns bytes actually written.
 
         Grows the holder when ``pos + len(data) > size``. The caller
@@ -210,34 +372,12 @@ class Holder(Disposable):
         """
         if not self._acquired:
             Disposable.open(self)
-        os_mode = _resolve_mode_string(mode)
-        self.acquire_io(os_mode)
+
         return self
-
-    def acquire_io(self, mode: "str | None" = None) -> "Holder":
-        """Open per-open IO state. Default no-op; returns ``self``.
-
-        :class:`yggdrasil.io.fs.Path` overrides to mint a transaction
-        buffer (remote) or :func:`os.open` an fd (local). Memory-style
-        holders have no separate per-open state, so this is a no-op.
-        """
-        del mode
-        return self
-
-    def close_io(self) -> None:
-        """Release per-open IO state. Default no-op.
-
-        Mirrors :meth:`acquire_io`: subclasses with per-open state
-        flush + tear it down here.
-        """
 
     def flush(self) -> None:
         """Push buffered writes to the durable backing. Default no-op."""
-
-    @property
-    def dirty(self) -> bool:
-        """True when there are uncommitted writes. Default ``False``."""
-        return False
+        return self.commit()
 
     # ------------------------------------------------------------------
     # Identity — every holder is addressable by a :class:`URL`. Memory
@@ -248,9 +388,16 @@ class Holder(Disposable):
     # ------------------------------------------------------------------
 
     @property
-    @abstractmethod
     def url(self) -> "URL":
         """Canonical URL identifying this holder. Required."""
+        if self._url is None:
+            return URL.from_memory_address(self)
+        return self._url
+
+    @url.setter
+    def url(self, value: "URL") -> None:
+        """Set the holder's URL. Required."""
+        self._url = URL.from_(value).with_scheme(self.scheme)
 
     # ------------------------------------------------------------------
     # Backing-shape predicates — every subclass answers exactly one as
@@ -305,10 +452,10 @@ class Holder(Disposable):
         data: Union[bytes, bytearray, memoryview],
         pos: int,
     ) -> int:
-        """Positional write. Returns bytes actually written.
+        """Positionally write. Returns bytes actually written.
 
         Default impl normalises bytes-like ``data`` to a 1-D unsigned-
-        byte memoryview and forwards to :meth:`write_mv`.
+        byte memory and forwards to :meth:`write_mv`.
         """
         mv = memoryview(data)
         if mv.format != "B" or mv.ndim != 1 or mv.itemsize != 1:
@@ -345,7 +492,15 @@ class Holder(Disposable):
         pos: int = 0,
     ) -> int:
         """Splice bytes-like ``data`` at ``pos``. Returns bytes written."""
-        mv = memoryview(data)
+        try:
+            mv = memoryview(data)
+        except Exception:
+            if isinstance(data, str):
+                data = data.encode()
+            else:
+                raise
+            mv = memoryview(data)
+
         if mv.format != "B" or mv.ndim != 1 or mv.itemsize != 1:
             mv = mv.cast("B")
         if not mv.c_contiguous:
