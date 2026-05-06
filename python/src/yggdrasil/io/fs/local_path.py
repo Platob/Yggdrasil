@@ -516,85 +516,52 @@ class LocalPath(Path):
             bio.seek(0)
         return bio
 
-    def write_bytes(
-        self,
-        data: Union[bytes, bytearray, memoryview],
-        *,
-        mode: str = "wb",
-        parents: bool = True,
-    ) -> int:
-        """Local-fast write_bytes — :func:`os.open` + the right flags.
-
-        ``mode="ab"`` rides ``O_APPEND`` so a single write is atomic
-        within ``PIPE_BUF`` (POSIX's atomic-append guarantee for
-        local files). The base class's read-modify-write append
-        path defeats that guarantee — two concurrent appenders race
-        and one wins — so callers like the streaming-folder log
-        rely on this override to keep their JSON-line invariants.
-
-        ``mode="xb"`` rides ``O_EXCL`` so the create-and-write is
-        atomic. The base implementation does an ``exists()`` check
-        first and is therefore racy under concurrent writers.
-
-        Other modes fall through to the base implementation (which
-        funnels through :meth:`_bwrite`).
-        """
-        if mode not in ("ab", "xb"):
-            return super().write_bytes(data, mode=mode, parents=parents)
-
-        mv = memoryview(data)
-        if not mv.c_contiguous:
-            mv = memoryview(bytes(mv))
-        if mv.format != "B" or mv.ndim != 1 or mv.itemsize != 1:
-            mv = mv.cast("B")
-        n = len(mv)
-
-        os_path = self._os_path()
-        if parents:
-            parent = os.path.dirname(os_path)
-            if parent and not os.path.isdir(parent):
-                os.makedirs(parent, exist_ok=True)
-
-        if mode == "ab":
-            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-        else:  # xb
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
-        if hasattr(os, "O_BINARY"):
-            flags |= os.O_BINARY
-
-        fd = os.open(os_path, flags, 0o644)
-        try:
-            if n == 0:
-                return 0
-            view = mv
-            total = 0
-            while view:
-                written = os.write(fd, view)
-                if written == 0:
-                    raise io.BlockingIOError(
-                        f"Short write at offset {total}"
-                    )
-                view = view[written:]
-                total += written
-            return total
-        finally:
-            os.close(fd)
-
     def _bwrite(self, data: BytesIO, pos: int, mode: "Mode") -> int:
         """Native positional write — splice ``data`` at ``pos``.
 
-        ``pos == 0`` with :class:`Mode.OVERWRITE` (the legacy
-        whole-file shape) opens with ``O_TRUNC`` so any pre-existing
-        tail past the new payload is dropped. Other (pos, mode)
-        combinations open without ``O_TRUNC`` and rely on
-        :func:`os.pwrite` to splice in place. Streams ``data``
-        chunk-wise so a multi-GiB spilled buffer doesn't materialise
-        into memory.
+        Mode dispatch:
+
+        - :class:`Mode.OVERWRITE` (legacy whole-file shape, ``pos==0``)
+          opens with ``O_TRUNC`` so any pre-existing tail past the
+          new payload is dropped.
+        - :class:`Mode.APPEND` rides ``O_APPEND`` for atomic-within-
+          ``PIPE_BUF`` concurrent appends — two writers can race
+          without truncating each other (POSIX guarantee).
+        - :class:`Mode.ERROR_IF_EXISTS` rides ``O_EXCL`` so the
+          create-and-write is race-free; a pre-existing file
+          surfaces as :class:`FileExistsError`.
+        - Other modes (``AUTO`` / positional in-place) open without
+          ``O_TRUNC`` and rely on :func:`os.pwrite` to splice.
+
+        Streams ``data`` chunk-wise so a multi-GiB spilled buffer
+        doesn't materialise into memory.
         """
         if not data.opened:
             data.open()
+
+        # Atomic-append always opens its own ``O_APPEND`` fd — using
+        # a long-lived fd opened in another mode would defeat the
+        # POSIX atomic-append guarantee that concurrent writers rely
+        # on. Same for atomic-create (``O_EXCL``).
+        if mode is Mode.APPEND or mode is Mode.ERROR_IF_EXISTS:
+            os_path = self._os_path()
+            parent = os.path.dirname(os_path)
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent, exist_ok=True)
+            flags = os.O_WRONLY | os.O_CREAT
+            if mode is Mode.APPEND:
+                flags |= os.O_APPEND
+            else:
+                flags |= os.O_EXCL
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            fd = os.open(os_path, flags, 0o644)
+            try:
+                if mode is Mode.APPEND:
+                    return self._append_to_fd(data, fd)
+                return self._bwrite_to_fd(data, pos, fd)
+            finally:
+                os.close(fd)
 
         if self._fd >= 0:
             return self._bwrite_to_fd(data, pos, self._fd)
@@ -607,8 +574,6 @@ class LocalPath(Path):
         flags = os.O_WRONLY | os.O_CREAT
         if pos == 0 and mode is Mode.OVERWRITE:
             flags |= os.O_TRUNC
-        if mode is Mode.ERROR_IF_EXISTS:
-            flags |= os.O_EXCL
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
 
@@ -633,122 +598,29 @@ class LocalPath(Path):
             src_pos += len(buf)
         return src_pos
 
-    # ==================================================================
-    # Native positional-IO overrides — bypass the whole-file load
-    # ==================================================================
-    #
-    # The base :class:`Path` provides default :meth:`pread` /
-    # :meth:`pwrite` derived from :meth:`_pread` / :meth:`_pwrite`.
-    # LocalPath overrides both with single ``os.pread`` /
-    # ``os.pwrite`` syscalls so a partial read or splice doesn't
-    # materialise the entire file.
-
-    # ==================================================================
-    # Positional I/O — live fd when open, transient fd otherwise
-    # ==================================================================
-    #
-    # The base :class:`Path` provides default ``pread`` / ``pwrite`` that
-    # round-trip through ``_pread`` / ``_pwrite`` — way too expensive for
-    # a local file. LocalPath always uses a single-syscall ``os.pread`` /
-    # ``os.pwrite`` against either the live :attr:`_fd` (path open) or a
-    # transient one (path closed).
-
-    def pread(
-        self,
-        n: int,
-        pos: int,
-        *,
-        default: Any = ...,
-    ) -> bytes:
-        if pos < 0:
-            raise ValueError("pread position must be >= 0")
-        if n == 0:
-            return b""
-
-        if self._fd >= 0:
-            if n < 0:
-                try:
-                    n = max(0, int(os.fstat(self._fd).st_size) - pos)
-                except OSError:
-                    return b""
-                if n == 0:
-                    return b""
-            return _fd_pread_loop(self._fd, n, pos)
-
-        # Spoofed-non-local fixture or any setup that engaged the
-        # transaction-buffer flow on this LocalPath: defer to the
-        # base path's reader.
-        if self._transaction_buffer is not None:
-            return Path.pread(self, n, pos, default=default)
-
-        # Transient fd fallback.
-        if n < 0:
-            try:
-                n = max(0, int(self._stat().size) - pos)
-            except OSError:
-                if default is ...:
-                    raise
-                return default
-            if n == 0:
-                return b""
-
-        try:
-            fd = os.open(self._os_path(), os.O_RDONLY)
-        except OSError:
-            if default is ...:
-                raise
-            return default
-
-        try:
-            return _fd_pread_loop(fd, n, pos)
-        finally:
-            os.close(fd)
-
-    def pwrite(
-        self,
-        data: Union[bytes, bytearray, memoryview],
-        pos: int,
-        *,
-        parents: bool = True,
-    ) -> int:
-        mv = memoryview(data)
-        if not mv.c_contiguous:
-            mv = memoryview(bytes(mv))
-        if mv.format != "B" or mv.ndim != 1 or mv.itemsize != 1:
-            mv = mv.cast("B")
-        n = len(mv)
-        if n == 0:
-            return 0
-        if pos < 0:
-            raise ValueError("pwrite position must be >= 0")
-
-        if self._fd >= 0:
-            return _fd_pwrite_loop(self._fd, mv, pos)
-
-        # Spoofed-non-local fixture or any setup that engaged the
-        # transaction-buffer flow on this LocalPath: splice into the
-        # buffer and let close_io's flush ride through.
-        if self._transaction_buffer is not None:
-            return Path.pwrite(self, mv, pos, parents=parents)
-
-        # Transient fd: ``O_CREAT`` so a fresh path grows from a
-        # positional write without a separate touch step. No ``O_TRUNC``
-        # — we patch in place.
-        flags = os.O_WRONLY | os.O_CREAT
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
-
-        os_path = self._os_path()
-        if parents:
-            parent = os.path.dirname(os_path)
-            if parent and not os.path.isdir(parent):
-                os.makedirs(parent, exist_ok=True)
-
-        fd = os.open(os_path, flags, 0o644)
-        try:
-            return _fd_pwrite_loop(fd, mv, pos)
-        finally:
-            os.close(fd)
+    @staticmethod
+    def _append_to_fd(data: BytesIO, fd: int) -> int:
+        """``O_APPEND`` write — let the kernel position every chunk."""
+        size = data.size
+        chunk = 1024 * 1024
+        src_pos = 0
+        total = 0
+        while src_pos < size:
+            want = min(chunk, size - src_pos)
+            buf = data.pread(want, src_pos)
+            if not buf:
+                break
+            view = memoryview(buf)
+            while view:
+                written = os.write(fd, view)
+                if written == 0:
+                    raise io.BlockingIOError(
+                        f"Short append write at offset {total}"
+                    )
+                view = view[written:]
+                total += written
+            src_pos += len(buf)
+        return total
 
     # ==================================================================
     # Filesystem mutators — local-cheap overrides

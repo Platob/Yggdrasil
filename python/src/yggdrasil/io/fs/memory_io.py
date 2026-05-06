@@ -187,6 +187,12 @@ class MemoryPath(Path):
         self._transaction_buffer = None
         self._dirty = False
 
+    def flush(self) -> None:
+        # Transaction buffer IS the inner buffer — every write
+        # already landed durably; flushing through ``_bwrite`` would
+        # try to splice the buffer into itself and corrupt it.
+        self._dirty = False
+
     # ------------------------------------------------------------------
     # Abstract hooks
     # ------------------------------------------------------------------
@@ -277,27 +283,6 @@ class MemoryPath(Path):
         if size:
             buf.pwrite(data.pread(size, 0), pos)
         return size
-
-    def pread(self, n: int, pos: int, *, default: Any = ...) -> bytes:
-        del default
-        if pos < 0:
-            raise ValueError("pread position must be >= 0")
-        buf = self._ensure_buffer()
-        if n < 0:
-            n = max(0, buf.size - pos)
-        return buf.pread(n, pos)
-
-    def pwrite(
-        self,
-        data: Union[bytes, bytearray, memoryview],
-        pos: int,
-        *,
-        parents: bool = True,
-    ) -> int:
-        del parents
-        if pos < 0:
-            raise ValueError("pwrite position must be >= 0")
-        return self._ensure_buffer().pwrite(data, pos)
 
     def truncate(self, n: int, *, parents: bool = True) -> int:
         del parents

@@ -1303,20 +1303,26 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         self,
         data: Union[bytes, bytearray, memoryview],
         *,
-        mode: str = "wb",
+        mode: "Mode | str" = "wb",
         parents: bool = True,
     ) -> int:
-        """Whole-file write. Modes: ``wb`` / ``xb`` / ``ab``.
+        """Whole-file write. Routes through :meth:`_bwrite` with the
+        :class:`Mode` derived from *mode* (``wb`` → ``OVERWRITE``,
+        ``ab`` → ``APPEND``, ``xb`` → ``ERROR_IF_EXISTS``).
 
-        ``xb`` is best-effort atomic at the base layer (``exists()``
-        check then write). Backends with a real exclusive-create
-        primitive (POSIX ``O_EXCL``, S3 conditional PUT) override
-        this to make ``xb`` race-free.
+        Subclasses with native atomic-append (``O_APPEND``) or
+        atomic-create (``O_EXCL``) honour the disposition inside
+        :meth:`_bwrite`; backends without those primitives fall back
+        to whole-file RMW with a best-effort ``exists()`` guard for
+        ``xb``.
         """
         del parents
-        if mode not in ("wb", "xb", "ab"):
+
+        parsed = Mode.from_(mode, default=Mode.OVERWRITE)
+        if parsed not in (Mode.OVERWRITE, Mode.APPEND, Mode.ERROR_IF_EXISTS):
             raise ValueError(
-                f"write_bytes mode must be one of 'wb', 'xb', 'ab'; got {mode!r}"
+                f"write_bytes mode must resolve to OVERWRITE, APPEND, or "
+                f"ERROR_IF_EXISTS; got {mode!r} → {parsed.name}"
             )
 
         mv = memoryview(data)
@@ -1326,35 +1332,13 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
             mv = mv.cast("B")
         n = len(mv)
 
-        if mode == "xb" and self.exists():
-            raise FileExistsError(
-                f"Path already exists: {self.full_path()!r}"
-            )
-
-        if mode == "ab":
-            try:
-                bio = self._bread(-1, 0, Mode.READ_ONLY)
-            except FileNotFoundError:
-                bio = BytesIO()
-                bio.open()
-            try:
-                bio.seek(bio.size)
-                if n > 0:
-                    bio.write(bytes(mv))
-                bio.seek(0)
-                self._bwrite(bio, 0, Mode.APPEND)
-                return n
-            finally:
-                bio.close()
-
         bio = BytesIO()
         bio.open()
         try:
             if n > 0:
                 bio.write(bytes(mv))
             bio.seek(0)
-            self._bwrite(bio, 0, Mode.OVERWRITE)
-            return n
+            return self._bwrite(bio, 0, parsed)
         finally:
             bio.close()
 

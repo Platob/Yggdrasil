@@ -475,79 +475,20 @@ class S3Path(RemotePath):
     def _bread(self, n: int, pos: int, mode: "Mode") -> BytesIO:
         """Range-based GetObject → autonomous :class:`BytesIO`.
 
-        Forwards to the public :meth:`pread` (which already handles
-        Range headers, full-object downloads, and missing-key →
-        :class:`FileNotFoundError` mapping). The returned buffer is
-        detached; subsequent edits travel back via :meth:`_bwrite`
-        only via an explicit upload.
-        """
-        del mode  # S3 reads are mode-agnostic
-        data = self.pread(n, pos)
-        bio = BytesIO()
-        bio.open()
-        if data:
-            bio.write(data)
-            bio.seek(0)
-        return bio
-
-    def _bwrite(self, data: BytesIO, pos: int, mode: "Mode") -> int:
-        """Upload *data* to this S3 key.
-
-        ``pos == 0`` with :class:`Mode.OVERWRITE` (the legacy
-        whole-file shape) uploads ``data`` straight via
-        :meth:`write_stream` — multipart threshold and stream
-        handling live there. Any other (pos, mode) combination does
-        a download → splice → upload RMW so a positional splice
-        survives even though S3 has no native partial-write API.
-        """
-        if not data.opened:
-            data.open()
-        data.seek(0)
-
-        if pos == 0 and mode is Mode.OVERWRITE:
-            return self.write_stream(data)
-
-        # Read-modify-write: pull current object, splice ``data`` at
-        # ``pos``, push back. ``pread(-1, 0, default=b"")`` so a
-        # missing key behaves like an empty object (the splice grows
-        # the file from scratch).
-        existing = self.pread(-1, 0, default=b"")
-        scratch = BytesIO(existing)
-        try:
-            scratch.pwrite(data.pread(data.size, 0), pos)
-            scratch.seek(0)
-            return self.write_stream(scratch)
-        finally:
-            scratch.close()
-
-    # ==================================================================
-    # pread — Range-based GetObject
-    # ==================================================================
-
-    def pread(
-        self,
-        n: int,
-        pos: int,
-        *,
-        default: Any = ...,
-    ) -> bytes:
-        """Read *n* bytes at offset *pos* via GetObject Range header.
-
         ``n=-1`` reads from *pos* to end of object — a single
         GetObject with ``Range: bytes={pos}-`` (or no Range header
         if pos=0, which is slightly cheaper on some endpoints).
-
-        Failure handling: 404 / NoSuchKey returns *default* if
-        provided, else raises :class:`FileNotFoundError`. Any other
-        boto error propagates.
+        Missing key surfaces as :class:`FileNotFoundError`; a
+        416 (Range not satisfiable) yields an empty buffer to
+        mirror file semantics.
         """
-        if pos < 0:
-            raise ValueError("pread position must be >= 0")
+        del mode  # S3 reads are mode-agnostic
+        bio = BytesIO()
+        bio.open()
         if n == 0:
-            return b""
+            return bio
 
         botocore = botocore_module()
-
         kwargs: dict[str, Any] = {"Bucket": self.bucket, "Key": self.key}
         if n > 0:
             kwargs["Range"] = f"bytes={pos}-{pos + n - 1}"
@@ -561,13 +502,12 @@ class S3Path(RemotePath):
             code = exc.response.get("Error", {}).get("Code", "")
             status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
             if code in ("NoSuchKey", "404", "NotFound") or status == 404:
-                if default is ...:
-                    raise FileNotFoundError(self.full_path()) from exc
-                return default
-            # 416 = Range not satisfiable (pos >= object size).
-            # Mirror file semantics: return empty bytes rather than raise.
+                bio.close()
+                raise FileNotFoundError(self.full_path()) from exc
             if code == "InvalidRange" or status == 416:
-                return b""
+                # Past-EOF range; mirror file semantics — empty result.
+                return bio
+            bio.close()
             raise
 
         body = response.get("Body")
@@ -577,44 +517,48 @@ class S3Path(RemotePath):
             close = getattr(body, "close", None)
             if callable(close):
                 close()
-        return data
+        if data:
+            bio.write(data)
+            bio.seek(0)
+        return bio
 
-    # ``pwrite`` falls through to :meth:`Path.pwrite` (default —
-    # read-modify-write via :meth:`_pread` + :meth:`_pwrite`).  Most
-    # callers don't hit it directly: a :class:`BytesIO` bound to an
-    # S3 path absorbs positional writes into its local transaction
-    # buffer and flushes once on close.
+    def _bwrite(self, data: BytesIO, pos: int, mode: "Mode") -> int:
+        """Upload *data* to this S3 key.
 
-    # ==================================================================
-    # write_stream — multipart-aware upload
-    # ==================================================================
-
-    def write_stream(
-        self,
-        src,
-        *,
-        batch_size: int = 4 * 1024 * 1024,
-        parents: bool = True,
-    ) -> int:
-        """Upload *src* to this S3 key.
-
-        Above :data:`_MULTIPART_THRESHOLD`, we use boto3's
-        ``upload_fileobj`` which auto-multiparts and parallelizes.
-        Below, single PutObject — one round-trip, lower overhead.
-
-        The size probe is best-effort: we look at ``src.size`` for
-        yggdrasil :class:`BytesIO`, or ``len()`` for bytes-likes,
-        and fall back to multipart for anything else (safer
-        default; multipart handles arbitrary streams).
+        ``pos == 0`` with :class:`Mode.OVERWRITE` is a single
+        PutObject (or auto-multipart via ``upload_fileobj`` past
+        :data:`_MULTIPART_THRESHOLD`). Any other (pos, mode)
+        combination does a download → splice → upload RMW so a
+        positional splice survives even though S3 has no native
+        partial-write API.
         """
-        del parents, batch_size  # S3 has no parents; multipart owns chunking.
+        if not data.opened:
+            data.open()
+        data.seek(0)
 
-        size = self._probe_src_size(src)
+        if not (pos == 0 and mode is Mode.OVERWRITE):
+            # Read-modify-write — pull, splice, recurse via OVERWRITE.
+            try:
+                existing_bio = self._bread(-1, 0, Mode.READ_ONLY)
+                existing = existing_bio.to_bytes()
+                existing_bio.close()
+            except FileNotFoundError:
+                existing = b""
+            scratch = BytesIO(existing)
+            try:
+                scratch.pwrite(data.pread(data.size, 0), pos)
+                scratch.seek(0)
+                return self._bwrite(scratch, 0, Mode.OVERWRITE)
+            finally:
+                scratch.close()
+
+        # Whole-file upload — single PutObject under the threshold,
+        # auto-multipart above it.
+        size = self._probe_src_size(data)
         client = self.client
 
         if size is not None and size <= _MULTIPART_THRESHOLD:
-            # Single PutObject. Materialize bytes if we have to.
-            payload = self._materialize_small(src, size)
+            payload = self._materialize_small(data, size)
             client.put_object(
                 Bucket=self.bucket,
                 Key=self.key,
@@ -624,10 +568,7 @@ class S3Path(RemotePath):
             self._service.invalidate_ls_cache(self.bucket, self.key)
             return len(payload)
 
-        # Multipart via upload_fileobj. boto3 needs a file-like with
-        # .read(). yggdrasil BytesIO satisfies that; raw bytes need a
-        # quick BytesIO wrap.
-        fileobj, total = self._adapt_for_upload(src)
+        fileobj, total = self._adapt_for_upload(data)
         try:
             client.upload_fileobj(
                 Fileobj=fileobj,
@@ -636,23 +577,24 @@ class S3Path(RemotePath):
             )
         finally:
             close = getattr(fileobj, "close", None)
-            # Only close adapter wrappers we created ourselves —
-            # don't close the caller's file-like.
-            if total is not None and callable(close) and fileobj is not src:
+            if total is not None and callable(close) and fileobj is not data:
                 close()
 
         self._invalidate_stat_cache()
         self._service.invalidate_ls_cache(self.bucket, self.key)
 
-        # ``total`` is None when we couldn't size the source up front;
-        # post-upload we don't have a cheap byte count without a HEAD.
-        # Best-effort: stat the result.
         if total is not None:
             return total
         try:
             return int(self.size)
         except Exception:
             return 0
+
+    # ``pread`` / ``pwrite`` / ``write_stream`` / ``write_bytes`` all
+    # inherit from :class:`Path`, which routes through :meth:`_bread`
+    # and :meth:`_bwrite` above. The Range GetObject and multipart
+    # PutObject logic lives there now — subclasses only override
+    # the byte-IO primitives.
 
     @staticmethod
     def _probe_src_size(src: Any) -> Optional[int]:
