@@ -5,7 +5,7 @@ from typing import Mapping, Optional
 
 from urllib3 import BaseHTTPResponse
 
-from ..buffer import BytesIO, TabularIO
+from ..buffer import BytesIO, Tabular
 from ..request import PreparedRequest
 from ..response import Response, _ensure_media_headers, _media_type_from_headers
 
@@ -35,7 +35,7 @@ class HTTPResponse(Response):
         # tabular-ready buffer without an extra as_media() hop.
         headers = dict(response.headers)
         pre_media = _media_type_from_headers(headers)
-        buffer_class = TabularIO.media_type_class(pre_media, default=BytesIO)
+        buffer_class = Tabular.media_type_class(pre_media, default=BytesIO)
         buffer = (
             buffer_class(media_type=pre_media)
             if pre_media is not None

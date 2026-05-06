@@ -34,7 +34,7 @@ import pyarrow.compute as pc
 
 from yggdrasil.data.enums.timeunit import TimeUnit
 from yggdrasil.data.enums.timezone import Timezone
-from yggdrasil.io.enums import Mode
+from yggdrasil.data.enums import Mode
 
 from .base import PrimitiveType
 from ..id import DataTypeId

@@ -74,7 +74,7 @@ from yggdrasil.data.expr import Predicate
 
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
-from yggdrasil.io.enums import Mode
+from yggdrasil.data.enums import Mode
 from yggdrasil.lazy_imports import field_class, schema_class
 
 if TYPE_CHECKING:
@@ -244,7 +244,7 @@ class CastOptions:
     # --- Capture inserted rows as a return value -----------------------
     # When True, mutating tabular operations (table inserts, MERGE-style
     # writes, …) hand back the rows they actually wrote as a
-    # :class:`TabularIO` — typically a :class:`MemoryArrowIO` or a
+    # :class:`Tabular` — typically a :class:`MemoryArrowIO` or a
     # :class:`MemorySparkIO` depending on the engine that ran the write.
     # Default ``False`` keeps the historical "fire-and-forget" return
     # contract; flip it on when downstream code wants to chain on the

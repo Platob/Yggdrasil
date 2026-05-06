@@ -3,9 +3,9 @@ from __future__ import annotations
 import io
 
 from yggdrasil.io import BytesIO
-from yggdrasil.io.enums.codec import GZIP
-from yggdrasil.io.enums.media_type import MediaType
-from yggdrasil.io.enums.mime_type import MimeTypes
+from yggdrasil.data.enums.codec import GZIP
+from yggdrasil.data.enums.media_type import MediaType
+from yggdrasil.data.enums.mime_type import MimeTypes
 from yggdrasil.pickle.ser.ios import IOSerialized
 from yggdrasil.pickle.ser.serialized import Serialized
 from yggdrasil.pickle.ser.tags import Tags
@@ -107,7 +107,7 @@ def test_ygg_bytesio_media_type_promotes_subclass() -> None:
     ``ParquetIO``, …). Pass media_type to the constructor so
     ``BytesIO.__new__`` dispatches.
     """
-    from yggdrasil.io.buffer.primitive.json_io import JsonIO
+    from yggdrasil.io.primitive import JsonIO
 
     src = BytesIO(b'{"a":1}', media_type=MediaType(MimeTypes.JSON))
     assert isinstance(src, JsonIO)

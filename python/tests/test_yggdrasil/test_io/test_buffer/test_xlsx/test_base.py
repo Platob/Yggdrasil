@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.io.buffer.primitive import XlsxIO
+from yggdrasil.io.primitive import XlsxIO
 from yggdrasil.io.buffer import BytesIO
-from yggdrasil.io.buffer.primitive.xlsx_io import XlsxOptions
-from yggdrasil.io.enums import MimeTypes
+from yggdrasil.io.primitive import XlsxOptions
+from yggdrasil.data.enums import MimeTypes
 
 
 class TestXlsxBase:

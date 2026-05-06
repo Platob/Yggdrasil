@@ -10,14 +10,14 @@ from typing import Any, ClassVar, Iterable, Literal, Mapping, MutableMapping, Op
 from yggdrasil.data.cast import any_to_datetime, any_to_timedelta
 from yggdrasil.dataclasses import DEFAULT_WAITING_CONFIG
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
-from yggdrasil.io.enums import Mode
+from yggdrasil.data.enums import Mode
 from yggdrasil.io.request import REQUEST_ARROW_SCHEMA, PreparedRequest
 from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
-    from yggdrasil.io.buffer.base import TabularIO
-    from yggdrasil.io.buffer.nested.folder_io import FolderIO
+    from yggdrasil.io.tabular import Tabular
+    from yggdrasil.io.nested.folder_io import FolderIO
     from yggdrasil.io.response import Response
 
 
@@ -142,10 +142,10 @@ def _validate_response_by(
 
 
 def _is_tabular_io(arg: Any) -> bool:
-    """Duck-test ``arg`` for a :class:`TabularIO`-shaped object.
+    """Duck-test ``arg`` for a :class:`Tabular`-shaped object.
 
     Used by :meth:`CacheConfig.check_arg` so the test doesn't pull
-    in :class:`TabularIO` (and its transitive ``yggdrasil.io.buffer``
+    in :class:`Tabular` (and its transitive ``yggdrasil.io.buffer``
     imports) at config-construction time. Anything that exposes
     both ``read_arrow_batches`` and ``write_arrow_batches`` qualifies
     — covers :class:`FolderIO`, :class:`Table`, and any third-party
@@ -167,8 +167,8 @@ def _folderio_for_local_cache(path: Path) -> "FolderIO":
     reader still sees a plain Hive-partitioned tree — so callers
     that point a FolderIO at the same path still work.
     """
-    from yggdrasil.io.buffer.nested.ygg_folder_io import YGGFolderIO
-    from yggdrasil.io.fs import LocalPath
+    from yggdrasil.io.nested.ygg_folder_io import YGGFolderIO
+    from yggdrasil.io.path import LocalPath
 
     return YGGFolderIO(path=LocalPath(path), schema=RESPONSE_SCHEMA)
 
@@ -257,14 +257,14 @@ class _ConfigBase:
 class CacheConfig(_ConfigBase):
     _FIELD_NAMES: ClassVar[frozenset[str]] = _CACHE_CONFIG_FIELDS
 
-    # Unified backend slot — accepts any :class:`TabularIO` subclass:
+    # Unified backend slot — accepts any :class:`Tabular` subclass:
     # :class:`FolderIO` for an on-disk cache, :class:`Table` (Databricks)
     # for a remote cache, or any other registered tabular adapter.
     # Both backends share the same partitioning / primary-key /
     # match-by rules driven from RESPONSE_SCHEMA, so the cache flow
     # in Session is the same regardless of where the rows actually
     # land.
-    tabular: Optional["TabularIO"] = field(default=None, hash=False, compare=False)
+    tabular: Optional["Tabular"] = field(default=None, hash=False, compare=False)
     request_by: Optional[list[str]] = field(default=None, hash=False, compare=False)
     response_by: Optional[list[str]] = field(default=None, hash=False, compare=False)
     mode: Mode = Mode.APPEND
@@ -419,7 +419,7 @@ class CacheConfig(_ConfigBase):
         Databricks-Table write semantics (``insert(..., match_by=...,
         prune_by=...)``) inside :class:`Session`.
         """
-        from yggdrasil.io.buffer.nested.folder_io import FolderIO
+        from yggdrasil.io.nested.folder_io import FolderIO
         return isinstance(self.tabular, FolderIO)
 
     @property

@@ -34,7 +34,7 @@ from yggdrasil.data.types.parser import (
     ParsedDataType,
     parse_data_type,
 )
-from yggdrasil.io.enums.mode import Mode
+from yggdrasil.data.enums.mode import Mode
 from yggdrasil.lazy_imports import field_class, polars_module, pandas_module
 from yggdrasil.pickle.serde import ObjectSerde
 from .support import get_pandas, get_polars, get_spark_sql

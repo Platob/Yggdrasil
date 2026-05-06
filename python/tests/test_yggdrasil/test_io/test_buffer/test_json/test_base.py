@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import pytest
-
-from yggdrasil.io.buffer.primitive import JsonIO
+from yggdrasil.io.primitive import JsonIO
 from yggdrasil.io.buffer import BytesIO
-from yggdrasil.io.buffer.primitive.json_io import JsonOptions
-from yggdrasil.io.enums import MimeTypes
+from yggdrasil.io.primitive import JsonOptions
+from yggdrasil.data.enums import MimeTypes
 from .._helpers import sample_table
 
 

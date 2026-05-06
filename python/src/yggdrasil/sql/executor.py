@@ -17,7 +17,7 @@ Two backends, picked at runtime by what's installed:
   that surface raises a clean "install polars" error so the user
   gets a single-line fix.
 
-Both backends materialize the result into a :class:`TabularIO`
+Both backends materialize the result into a :class:`Tabular`
 holder (:class:`MemoryArrowIO` by default, :class:`ParquetIO`
 folder when :attr:`SqlPreparedStatement.persist == "path"`) and
 return it alongside the row count. The :class:`SqlStatementResult`
@@ -41,8 +41,8 @@ from yggdrasil.data.expr import (
     Selector,
 )
 from yggdrasil.data.executor import StatementExecutor
-from yggdrasil.io.buffer.base import TabularIO
-from yggdrasil.io.buffer.memory import MemoryArrowIO
+from yggdrasil.io.tabular import Tabular
+from yggdrasil.io.tabular import MemoryArrowIO
 
 from .catalog import SqlContext, default_context
 from .lib import has_polars, sqlglot_expressions
@@ -116,7 +116,7 @@ class SqlExecutor(StatementExecutor, ABC):
         statement: SqlPreparedStatement,
         *,
         context: "SqlContext | None" = None,
-    ) -> "tuple[TabularIO, int]":
+    ) -> "tuple[Tabular, int]":
         """Execute *statement* and return ``(holder, row_count)``."""
 
     # ------------------------------------------------------------------
@@ -127,8 +127,8 @@ class SqlExecutor(StatementExecutor, ABC):
         self,
         statement: SqlPreparedStatement,
         context: "SqlContext | None",
-    ) -> "dict[str, TabularIO]":
-        """Return ``{name: TabularIO}`` for every base table the SQL touches.
+    ) -> "dict[str, Tabular]":
+        """Return ``{name: Tabular}`` for every base table the SQL touches.
 
         Statement-bound sources win (they were snapshotted at
         prepare time) over the live context — that mirrors the
@@ -149,7 +149,7 @@ class SqlExecutor(StatementExecutor, ABC):
             )
 
         bound = dict(statement.sources)
-        sources: "dict[str, TabularIO]" = {}
+        sources: "dict[str, Tabular]" = {}
         for name in extract_sources(root):
             if name in bound:
                 sources[name] = bound[name]
@@ -176,7 +176,7 @@ class SqlExecutor(StatementExecutor, ABC):
         self,
         statement: SqlPreparedStatement,
         table: pa.Table,
-    ) -> TabularIO:
+    ) -> Tabular:
         """Materialize *table* into the requested persistence target.
 
         ``persist == "memory"`` → :class:`MemoryArrowIO` (zero copy
@@ -203,8 +203,8 @@ class SqlExecutor(StatementExecutor, ABC):
         )
 
 
-def _spill_to_path(table: pa.Table, path: str) -> TabularIO:
-    """Write *table* to a parquet target and return a :class:`TabularIO`.
+def _spill_to_path(table: pa.Table, path: str) -> Tabular:
+    """Write *table* to a parquet target and return a :class:`Tabular`.
 
     A path ending in ``.parquet`` writes a single file; anything
     else is treated as a folder (created on demand) so multi-batch
@@ -227,7 +227,7 @@ def _spill_to_path(table: pa.Table, path: str) -> TabularIO:
                 pa.Table.from_batches([batch]),
                 os.path.join(path, f"part-{index:08d}.parquet"),
             )
-    return TabularIO.from_path(path)
+    return Tabular.from_path(path)
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +258,7 @@ class PolarsSqlExecutor(SqlExecutor):
         statement: SqlPreparedStatement,
         *,
         context: "SqlContext | None" = None,
-    ) -> "tuple[TabularIO, int]":
+    ) -> "tuple[Tabular, int]":
         import polars as pl
 
         sources = self._resolve_sources(statement, context)
@@ -358,7 +358,7 @@ class ArrowSqlExecutor(SqlExecutor):
         statement: SqlPreparedStatement,
         *,
         context: "SqlContext | None" = None,
-    ) -> "tuple[TabularIO, int]":
+    ) -> "tuple[Tabular, int]":
         sources = self._resolve_sources(statement, context)
 
         sge = sqlglot_expressions()

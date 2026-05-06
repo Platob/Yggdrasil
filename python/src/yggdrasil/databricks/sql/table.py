@@ -50,10 +50,10 @@ from yggdrasil.dataclasses.expiring import Expiring, RefreshResult
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io import URL
-from yggdrasil.io.buffer.base import TabularIO, O
-from yggdrasil.io.buffer.primitive import ParquetIO
-from yggdrasil.io.enums import MimeTypes, MimeType, MediaType
-from yggdrasil.io.enums.mode import ModeLike, Mode
+from yggdrasil.io.tabular import Tabular, O
+from yggdrasil.io.primitive import ParquetIO
+from yggdrasil.data.enums import MimeTypes, MimeType, MediaType
+from yggdrasil.data.enums.mode import ModeLike, Mode
 from yggdrasil.lazy_imports import aws_config_class
 
 from .column import Column
@@ -78,8 +78,8 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.sql.schema import Schema as UCSchema
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.warehouse import WarehousePreparedStatement
-    from yggdrasil.io.buffer.nested.delta import DeltaIO
-    from yggdrasil.io.fs import Path
+    from yggdrasil.io.nested import DeltaIO
+    from yggdrasil.io.path import Path
 
 
 # Modes that only need read credentials. Anything outside this set
@@ -871,7 +871,7 @@ def _column_type_name_from_ddl(ddl: str) -> ColumnTypeName:
 # Table — per-table resource
 # ===========================================================================
 
-class Table(DatabricksResource, TabularIO[CastOptions]):
+class Table(DatabricksResource, Tabular[CastOptions]):
     """A single Unity Catalog table — DDL, DML, schema, storage helpers."""
 
     @classmethod
@@ -924,7 +924,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         super().__setstate__(state)
 
     # ------------------------------------
-    # TabularIO
+    # Tabular
     # ------------------------------------
 
     @classmethod
@@ -939,7 +939,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         pass
 
     def persist(self, engine: Literal["arrow", "polars", "spark", "auto"] = "auto", *,
-                data: Any | None = None) -> "TabularIO":
+                data: Any | None = None) -> "Tabular":
         return self
 
     def stat(self):
@@ -2103,7 +2103,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         return_data: bool = False,
         table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
         **kwargs
-    ) -> "TabularIO | None":
+    ) -> "Tabular | None":
         """Insert *data* into this table — thin wrapper over :meth:`insert_into`."""
         return self.insert_into(
             data,
@@ -2149,7 +2149,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
-    ) -> "TabularIO | None":
+    ) -> "Tabular | None":
         """Insert *data* into this table using the most appropriate backend.
 
         Routing:
@@ -2162,7 +2162,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
 
         Returns ``None`` by default. With ``return_data=True`` the
         backend that ran the write hands back its source payload as a
-        :class:`TabularIO` — :class:`MemoryArrowIO` from
+        :class:`Tabular` — :class:`MemoryArrowIO` from
         :meth:`arrow_insert`, :class:`MemorySparkIO` from
         :meth:`spark_insert`, the input :class:`StatementResult` from
         :meth:`sql_insert` — for downstream chaining without
@@ -2248,7 +2248,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
-    ) -> "TabularIO | None":
+    ) -> "Tabular | None":
         """Insert through the warehouse SQL path with staged Parquet.
 
         With ``return_data=True``, returns a :class:`MemoryArrowIO`
@@ -2306,7 +2306,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         )
 
         prune_values = prune_values or {}
-        output_data: "TabularIO | None" = None
+        output_data: "Tabular | None" = None
         with ParquetIO() as buffer:
             buffer.write_table(data, cast_options)
             buffer.seek(0)
@@ -2323,7 +2323,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
             # Parquet so the holder shares the same row chunking the
             # warehouse will see.
             if return_data:
-                from yggdrasil.io.buffer.memory.arrow import MemoryArrowIO
+                from yggdrasil.io.tabular import MemoryArrowIO
                 buffer.seek(0)
                 output_data = MemoryArrowIO(buffer.read_arrow_table())
 
@@ -2499,7 +2499,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
-    ) -> "TabularIO | None":
+    ) -> "Tabular | None":
         """Insert into this table using Spark.
 
         ``retry`` is applied to DML statements (INSERT/MERGE/DELETE/UPDATE)
@@ -2709,7 +2709,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
                     logger.debug("Failed to unpersist cached source; continuing.", exc_info=True)
 
         if return_data:
-            from yggdrasil.io.buffer.memory.spark import MemorySparkIO
+            from yggdrasil.io.tabular.spark import MemorySparkIO
             return MemorySparkIO(data_df)
         return None
 
@@ -2736,7 +2736,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
-    ) -> "TabularIO | None":
+    ) -> "Tabular | None":
         """Insert into this table from a SQL source query.
 
         Smart dispatch:
@@ -2798,7 +2798,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         if return_data and isinstance(statement, StatementResult):
             # The warehouse path doesn't materialise rows on its own,
             # but the caller's :class:`StatementResult` is already a
-            # :class:`TabularIO` over the same source query — hand it
+            # :class:`Tabular` over the same source query — hand it
             # back so ``return_data=True`` stays consistent across paths.
             return statement
         return None
@@ -3052,7 +3052,7 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
         auto-refreshing credentials from :meth:`aws`, so reads survive
         STS token rotation without caller-side re-binding.
         """
-        from yggdrasil.io.buffer.nested.delta import DeltaIO
+        from yggdrasil.io.nested import DeltaIO
 
         return DeltaIO.from_path(self.storage_location(operation=operation))
 

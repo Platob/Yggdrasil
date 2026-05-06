@@ -1,4 +1,4 @@
-"""TabularIO record streaming surface, exercised on `MemoryArrowIO`.
+"""Tabular record streaming surface, exercised on `MemoryArrowIO`.
 
 The base-class default impl of `_read_records` and `_write_records`
 shouldn't depend on a specific concrete leaf — verify on the
@@ -13,14 +13,14 @@ import pyarrow as pa
 
 from yggdrasil.data.record import Record
 from yggdrasil.data.schema import Schema
-from yggdrasil.io.buffer.memory import MemoryArrowIO
+from yggdrasil.io.tabular import MemoryArrowIO
 
 
 def _table() -> pa.Table:
     return pa.table({"a": [1, 2, 3], "b": ["x", "y", "z"]})
 
 
-class TestTabularIOReadRecords:
+class TestTabularReadRecords:
     def test_read_records_yields_record_objects(self):
         io = MemoryArrowIO(_table())
         records = list(io.read_records())
@@ -42,7 +42,7 @@ class TestTabularIOReadRecords:
         ]
 
 
-class TestTabularIOWriteRecords:
+class TestTabularWriteRecords:
     def test_write_records_round_trips(self):
         # Build records by hand against a known schema, write them
         # into a fresh MemoryArrowIO, read them back as records.

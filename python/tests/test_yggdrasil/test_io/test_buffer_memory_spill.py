@@ -18,8 +18,8 @@ import unittest
 import pyarrow as pa
 
 from yggdrasil.data.options import CastOptions
-from yggdrasil.io.buffer.memory import MemoryArrowIO
-from yggdrasil.io.enums import Mode
+from yggdrasil.io.tabular import MemoryArrowIO
+from yggdrasil.data.enums import Mode
 
 
 def _wide_table(rows: int, *, value: int = 1) -> pa.Table:
@@ -170,7 +170,7 @@ class TestCleanupContract(unittest.TestCase):
 
 
 class TestReadEngineSurfaces(unittest.TestCase):
-    """Spilled holders still serve every TabularIO read path."""
+    """Spilled holders still serve every Tabular read path."""
 
     def test_read_polars_frame_after_spill(self) -> None:
         try:

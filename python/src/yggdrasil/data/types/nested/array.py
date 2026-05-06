@@ -10,7 +10,7 @@ import pyarrow.types as pat
 
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.support import get_pandas, get_polars, get_spark_sql
-from yggdrasil.io.enums import Mode
+from yggdrasil.data.enums import Mode
 from yggdrasil.lazy_imports import field_class
 from ._cast_json import (
     cast_arrow_json_string_array,

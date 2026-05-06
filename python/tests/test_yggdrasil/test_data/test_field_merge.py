@@ -18,7 +18,7 @@ import pyarrow as pa
 import pytest
 
 from yggdrasil.data.data_field import Field, field
-from yggdrasil.io.enums import Mode
+from yggdrasil.data.enums import Mode
 
 
 class TestSelfMerge:

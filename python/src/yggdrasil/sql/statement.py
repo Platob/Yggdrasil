@@ -9,7 +9,7 @@ Two value types backing :func:`yggdrasil.sql.sql`:
   with the parsed ``WHERE`` via AND), and the persistence target
   (``"memory"``, ``"path"``, or ``None`` to skip persistence).
 - :class:`SqlStatementResult` — the live :class:`StatementResult`
-  the executor returns. Inherits the full :class:`TabularIO`
+  the executor returns. Inherits the full :class:`Tabular`
   surface (``read_arrow_table`` / ``read_polars_frame`` /
   ``read_pandas_frame`` / ``write_*``) from
   :class:`yggdrasil.data.statement.StatementResult`, persists the
@@ -26,8 +26,8 @@ import pyarrow as pa
 from yggdrasil.data.expr import Expression
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.statement import PreparedStatement, StatementResult
-from yggdrasil.io.enums import MimeType
-from yggdrasil.io.buffer.base import TabularIO
+from yggdrasil.data.enums import MimeType
+from yggdrasil.io.tabular import Tabular
 
 from .catalog import SqlContext, default_context
 from .dialect import Dialect, resolve_dialect
@@ -78,7 +78,7 @@ class SqlPreparedStatement(PreparedStatement):
         text: str = "",
         *,
         dialect: "Dialect | str | None" = None,
-        sources: "Mapping[str, TabularIO] | None" = None,
+        sources: "Mapping[str, Tabular] | None" = None,
         predicate: "Expression | None" = None,
         select: "Iterable[Any] | None" = None,
         persist: PersistTarget = "memory",
@@ -88,7 +88,7 @@ class SqlPreparedStatement(PreparedStatement):
     ) -> None:
         super().__init__(text=text, key=key, **kwargs)
         self.dialect: Dialect = resolve_dialect(dialect)
-        self.sources: "dict[str, TabularIO]" = dict(sources) if sources else {}
+        self.sources: "dict[str, Tabular]" = dict(sources) if sources else {}
         self.predicate: "Expression | None" = predicate
         self.select: "tuple[Any, ...] | None" = (
             tuple(select) if select is not None else None
@@ -156,7 +156,7 @@ class SqlStatementResult(StatementResult[SqlPreparedStatement]):
     stashes the materialized payload on ``_persisted_data`` (a
     :class:`MemoryArrowIO` for ``persist="memory"``, a
     :class:`ParquetIO` folder for ``persist="path"``). Once
-    started, every :class:`TabularIO` read method on this object
+    started, every :class:`Tabular` read method on this object
     serves from the cache — ``read_arrow_table`` /
     ``read_polars_frame`` / ``read_pandas_frame`` /
     ``read_spark_frame`` / ``read_pylist`` / ``to_records`` all
@@ -164,7 +164,7 @@ class SqlStatementResult(StatementResult[SqlPreparedStatement]):
 
     Call :meth:`unpersist` to drop the cache and force the next
     read to re-execute. Useful when the underlying source
-    :class:`TabularIO` has been mutated and you want a fresh view.
+    :class:`Tabular` has been mutated and you want a fresh view.
     """
 
     _PREPARED_STATEMENT_CLASS: ClassVar[type[SqlPreparedStatement]] = SqlPreparedStatement
@@ -174,7 +174,7 @@ class SqlStatementResult(StatementResult[SqlPreparedStatement]):
         # In-process SQL results don't claim a wire mime type — we
         # don't want to override the base StatementResult registration
         # in the IO factory dispatch table. Returning None keeps us
-        # out of the registry while the inherited TabularIO surface
+        # out of the registry while the inherited Tabular surface
         # still works fine.
         return None
 
@@ -287,7 +287,7 @@ class SqlStatementResult(StatementResult[SqlPreparedStatement]):
         return self
 
     # ------------------------------------------------------------------
-    # TabularIO hooks — delegate through the cache
+    # Tabular hooks — delegate through the cache
     # ------------------------------------------------------------------
 
     def _read_arrow_batches(
@@ -316,7 +316,7 @@ class SqlStatementResult(StatementResult[SqlPreparedStatement]):
     ) -> None:
         raise NotImplementedError(
             "SqlStatementResult is read-only — it represents the output "
-            "of a SQL query, not a writable target. Build a TabularIO "
+            "of a SQL query, not a writable target. Build a Tabular "
             "(MemoryArrowIO, ParquetIO, ...) and pipe the result into "
             "it via `result.read_arrow_batches()` if you need to land "
             "it somewhere new."

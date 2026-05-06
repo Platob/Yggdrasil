@@ -16,6 +16,7 @@ selection, format inference, content-negotiation.
 """
 
 from __future__ import annotations
+import datetime
 
 import time
 from dataclasses import dataclass
@@ -23,7 +24,7 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
-    from yggdrasil.io.enums import MediaType
+    from yggdrasil.data.enums import MediaType
 
 
 __all__ = ["IOStats", "IOKind"]
@@ -37,6 +38,7 @@ class IOKind(IntEnum):
     """
 
     MISSING = 0
+    MEMORY = 0
     FILE = 1
     DIRECTORY = 2
     SYMLINK = 3
@@ -46,7 +48,7 @@ class IOKind(IntEnum):
     BLOCK_DEVICE = 7
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, repr=False, eq=False)
 class IOStats:
     """Stat-like quad (``size`` / ``mtime`` / ``kind`` / ``mode``) + ``media_type``.
 
@@ -82,6 +84,13 @@ class IOStats:
     # ------------------------------------------------------------------
     # ``os.stat_result`` compatibility — drop-in for legacy callers
     # ------------------------------------------------------------------
+
+    def __repr__(self):
+        dt = datetime.datetime.fromtimestamp(self.mtime, datetime.timezone.utc).isoformat()
+        return f"<IOStats size={self.size} mtime={dt!r} kind={self.kind.name} mode={self.mode} media_type={self.media_type!r}>"
+
+    def __str__(self):
+        return repr(self)
 
     def __getitem__(self, idx: int) -> Any:
         # Mirrors the positional layout of ``os.stat_result``:

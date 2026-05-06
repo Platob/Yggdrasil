@@ -408,7 +408,7 @@ URL_SCHEMA: pa.Schema = pa.schema([
 URL_STRUCT: pa.StructType = pa.struct(list(URL_SCHEMA))
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, unsafe_hash=False, repr=False)
 class URL(os.PathLike):
     scheme: str = ""
     userinfo: str | None = None
@@ -422,6 +422,22 @@ class URL(os.PathLike):
     _str_raw: str | None = field(default=None, init=False, repr=False, compare=False)
     _anonymized: bool | None = field(default=None, init=False, repr=False, compare=False)
 
+    def __hash__(self):
+        return hash(self.to_string())
+
+    def __str__(self):
+        return self.to_string(encode=True)
+
+    def __repr__(self):
+        return self.to_string(encode=False)
+
+    def __eq__(self, other):
+        if isinstance(other, URL):
+            return self.__hash__() == other.__hash__()
+        if isinstance(other, str):
+            return self.to_string() == other
+        return False
+
     def __post_init__(self) -> None:
         # Centrally normalize the port=0 sentinel to None. Without this,
         # two URLs that render identically can compare unequal because
@@ -430,6 +446,21 @@ class URL(os.PathLike):
         # use object.__setattr__.
         if self.port == 0:
             object.__setattr__(self, "port", None)
+
+    @classmethod
+    def is_urlish(cls, value: Any) -> bool:
+        """True iff the value is a string or URL-like object."""
+        if isinstance(value, cls):
+            return True
+
+        if isinstance(value, str):
+            if len(value) > 256 * 1024:
+                return False
+
+            if "://" in value or "/":
+                return True
+
+        return isinstance(value, os.PathLike)
 
     @property
     def parts(self):
@@ -1229,6 +1260,12 @@ class URL(os.PathLike):
     @property
     def is_absolute(self) -> bool:
         return bool(self.scheme) and bool(self.host)
+
+    @property
+    def is_dir_sink(self):
+        if not self.path:
+            return True
+        return self.path.endswith("/") or self.path.endswith("\\")
 
     @property
     def is_http(self):

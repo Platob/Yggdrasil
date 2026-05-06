@@ -35,7 +35,7 @@ from yggdrasil.concurrent.threading import Job
 from yggdrasil.databricks.client import DatabricksResource
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io import URL
-from yggdrasil.io.enums.mode import ModeLike
+from yggdrasil.data.enums.mode import ModeLike
 
 from .sql_utils import DEFAULT_TAG_COLLATION, databricks_tag_literal
 

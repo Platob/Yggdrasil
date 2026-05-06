@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import pytest
-
-from yggdrasil.io.buffer.primitive import ParquetIO
+from yggdrasil.io.primitive import ParquetIO
 from .._helpers import sample_batches, sample_table
 
 

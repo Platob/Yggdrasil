@@ -26,7 +26,7 @@ import pyarrow.compute as pc
 from yggdrasil.data import DataType, DataTypeId
 from yggdrasil.data.types import PrimitiveType, StringType
 from yggdrasil.data.types.support import get_spark_sql, get_polars
-from yggdrasil.io.enums import Mode
+from yggdrasil.data.enums import Mode
 
 
 if TYPE_CHECKING:

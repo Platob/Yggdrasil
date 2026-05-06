@@ -48,7 +48,7 @@ from yggdrasil.data.statement import (
 )
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io.buffer.base import O
-from yggdrasil.io.enums import MimeType, MimeTypes
+from yggdrasil.data.enums import MimeType
 
 if TYPE_CHECKING:
     from .connection import PostgresConnection
@@ -63,7 +63,7 @@ __all__ = [
 ]
 
 
-# Postgres assigns unique mime types so :class:`TabularIO`'s
+# Postgres assigns unique mime types so :class:`Tabular`'s
 # auto-registry can dispatch on the result's identity. Defined here
 # rather than in ``yggdrasil.io.enums.mime_type`` to keep the
 # Postgres backend optional — importing ``yggdrasil.postgres`` is
@@ -183,7 +183,7 @@ class PostgresStatementResult(StatementResult[PostgresPreparedStatement]):
     then the executor materializes batch-by-batch eagerly).
 
     The materialized payload is held as a :class:`MemoryArrowIO` on
-    ``_persisted_data`` so the inherited :class:`TabularIO` read
+    ``_persisted_data`` so the inherited :class:`Tabular` read
     methods (``read_arrow_batches``, ``read_polars_frame``,
     ``read_pandas_frame``, …) work out of the box.
     """
@@ -298,7 +298,7 @@ class PostgresStatementResult(StatementResult[PostgresPreparedStatement]):
                 raise
             return self
 
-        from yggdrasil.io.buffer.memory import MemoryArrowIO
+        from yggdrasil.io.tabular import MemoryArrowIO
         self._persisted_data = MemoryArrowIO(table)
         self._row_count = row_count
         self._started = True
@@ -316,7 +316,7 @@ class PostgresStatementResult(StatementResult[PostgresPreparedStatement]):
         return self
 
     # ------------------------------------------------------------------
-    # Read hooks — the inherited TabularIO surface delegates here.
+    # Read hooks — the inherited Tabular surface delegates here.
     # ------------------------------------------------------------------
 
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:

@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import pytest
-
-from yggdrasil.io.buffer.primitive import NDJsonIO
+from yggdrasil.io.primitive import NDJsonIO
 from .._helpers import sample_table
 
 

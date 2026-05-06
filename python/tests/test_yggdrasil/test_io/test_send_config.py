@@ -6,10 +6,10 @@ import datetime as dt
 
 import pytest
 
-from yggdrasil.io.enums import Mode
+from yggdrasil.data.enums import Mode
 from yggdrasil.io.send_config import CacheConfig, SendConfig, SendManyConfig
 
-from ._helpers import make_request, make_response
+from ._helpers import make_request
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +60,7 @@ class TestCacheConfigCheckArgPolymorphism:
         assert cfg.received_from == when
 
     def test_path_arg(self, tmp_path):
-        from yggdrasil.io.buffer.nested.folder_io import FolderIO
+        from yggdrasil.io.nested.folder_io import FolderIO
 
         cfg = CacheConfig.check_arg(tmp_path)
         assert isinstance(cfg.tabular, FolderIO)

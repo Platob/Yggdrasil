@@ -6,7 +6,7 @@ predicate pushdown, partition pruning, and rowcount-only queries
 are all blind once the data lands in those formats.
 
 This module is the single canonical place for columnar stats across
-every :class:`yggdrasil.io.buffer.TabularIO` leaf and folder. The
+every :class:`yggdrasil.io.buffer.Tabular` leaf and folder. The
 on-disk encoding is **Arrow IPC** (file format): self-describing,
 fast to mmap, schema-rich, supports nested types and per-column
 metadata. One IPC file can carry stats for an entire folder
@@ -17,7 +17,7 @@ Three entry points
 ------------------
 
 - :meth:`Stats.compute` — scan an Arrow source (Table, batch
-  iterable, or :class:`TabularIO`) and emit a :class:`Stats`.
+  iterable, or :class:`Tabular`) and emit a :class:`Stats`.
 - :meth:`Stats.merge` — combine multiple :class:`Stats` instances.
   Min/max collapse via Arrow ``min_max`` semantics; counts add;
   distinct counts go to ``None`` when any input was unset (a sum
@@ -75,9 +75,8 @@ from yggdrasil.io.types import BytesLike  # noqa: F401  (re-export hook)
 
 
 if TYPE_CHECKING:
-    from yggdrasil.io.buffer.base import TabularIO
-    from yggdrasil.io.buffer.bytes_io import BytesIO
-    from yggdrasil.io.fs import Path
+    from yggdrasil.io.bytes_io import BytesIO
+    from yggdrasil.io.path import Path
 
 
 __all__ = [
@@ -220,7 +219,7 @@ class Stats:
       ``(source, column)`` pair *plus* an aggregate per column at
       ``source=None``.
 
-    Build via :meth:`compute` (scan a TabularIO / Table / batches),
+    Build via :meth:`compute` (scan a Tabular / Table / batches),
     :meth:`merge` (combine several existing :class:`Stats`), or
     :meth:`read` (load an Arrow IPC sidecar).
     """
@@ -248,7 +247,7 @@ class Stats:
 
         :param source: a :class:`pyarrow.Table`, :class:`pyarrow.RecordBatch`,
             an iterable of record batches, or anything
-            :class:`TabularIO`-shaped (something with
+            :class:`Tabular`-shaped (something with
             ``read_arrow_table``).
         :param name: identifier stored as ``source`` in the encoded
             row(s). ``None`` (default) marks the row as the aggregate.
@@ -538,8 +537,8 @@ class Stats:
         the underlying ``write_bytes`` (folder writes go through
         stage+rename; raw paths get a single write).
         """
-        from yggdrasil.io.fs import Path as _Path  # local — avoid cycle
-        from yggdrasil.io.buffer.bytes_io import BytesIO as _BytesIO
+        from yggdrasil.io.path import Path as _Path  # local — avoid cycle
+        from yggdrasil.io.bytes_io import BytesIO as _BytesIO
 
         payload = self.to_ipc()
         if isinstance(target, _BytesIO):
@@ -558,8 +557,8 @@ class Stats:
     ) -> "Stats":
         """Inverse of :meth:`write`. EAFP — missing files raise
         :class:`FileNotFoundError`."""
-        from yggdrasil.io.fs import Path as _Path
-        from yggdrasil.io.buffer.bytes_io import BytesIO as _BytesIO
+        from yggdrasil.io.path import Path as _Path
+        from yggdrasil.io.bytes_io import BytesIO as _BytesIO
 
         if isinstance(source, (bytes, bytearray, memoryview)):
             return cls.from_ipc(source)
@@ -583,7 +582,7 @@ def _coerce_to_arrow_table(source: Any) -> pa.Table:
 
     Accepts: ``pa.Table``, ``pa.RecordBatch``, an iterable of
     batches/tables, anything with a ``read_arrow_table()`` method
-    (every :class:`TabularIO`).
+    (every :class:`Tabular`).
     """
     if isinstance(source, pa.Table):
         return source
@@ -616,7 +615,7 @@ def _coerce_to_arrow_table(source: Any) -> pa.Table:
     raise TypeError(
         f"Stats.compute: source type {type(source)!r} not supported. "
         "Expected pa.Table, pa.RecordBatch, batch iterable, or any "
-        "TabularIO-shaped object with read_arrow_table()."
+        "Tabular-shaped object with read_arrow_table()."
     )
 
 

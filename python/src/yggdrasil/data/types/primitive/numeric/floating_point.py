@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
-from yggdrasil.io.enums import Mode
+from yggdrasil.data.enums import Mode
 
 from .._helpers import _coerce_str
 from ...id import DataTypeId

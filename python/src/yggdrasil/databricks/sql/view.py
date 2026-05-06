@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import  field
 from typing import Any, Iterable, Mapping, Optional, TYPE_CHECKING
 
 from databricks.sdk.errors import DatabricksError, NotFound
@@ -34,7 +34,7 @@ from yggdrasil.concurrent.threading import Job
 from yggdrasil.databricks.client import DatabricksResource
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io import URL
-from yggdrasil.io.enums.mode import ModeLike, Mode
+from yggdrasil.data.enums.mode import ModeLike, Mode
 from .column import Column
 from .sql_utils import (
     DEFAULT_TAG_COLLATION,
@@ -634,7 +634,7 @@ class View(DatabricksResource):
         True)``), then projects each input to that schema — substituting
         ``CAST(NULL AS <ddl>)`` for absent columns.
         """
-        from yggdrasil.io.enums.mode import Mode as _Mode
+        from yggdrasil.data.enums.mode import Mode as _Mode
 
         column_order: list[str] = []
         unified: dict[str, "DataType"] = {}

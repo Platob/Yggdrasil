@@ -29,7 +29,7 @@ from yggdrasil.data.statement import (
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.buffer.base import O
-from yggdrasil.io.enums import MimeType, MimeTypes
+from yggdrasil.data.enums import MimeType, MimeTypes
 
 if TYPE_CHECKING:
     from yggdrasil.spark.executor import SparkStatementExecutor
@@ -225,10 +225,10 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
     # Persisted DataFrame
     # -------------------------------------------------------------------------
     #
-    # ``cached`` / ``unpersist`` come from :class:`TabularIO` —
+    # ``cached`` / ``unpersist`` come from :class:`Tabular` —
     # ``_persisted_data`` (a :class:`MemorySparkIO` wrapper) is the
     # single source of truth for "was this statement materialised".
-    # The :class:`TabularIO` read paths delegate to it before the
+    # The :class:`Tabular` read paths delegate to it before the
     # private ``_read_*`` hooks fire, so we only need to fill in
     # ``persist`` and the convenience ``spark_dataframe`` accessor.
 
@@ -251,7 +251,7 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
         (Spark caches lazily on the frame itself, not on this handle).
         """
         if data is not None:
-            from yggdrasil.io.buffer.memory import MemorySparkIO
+            from yggdrasil.io.tabular import MemorySparkIO
             from yggdrasil.spark.cast import any_to_spark_dataframe
 
             self._persisted_data = MemorySparkIO(any_to_spark_dataframe(data))

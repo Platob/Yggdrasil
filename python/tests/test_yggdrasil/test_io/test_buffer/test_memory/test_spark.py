@@ -7,8 +7,8 @@ surface (registration, empty state) without the optional dep.
 
 from __future__ import annotations
 
-from yggdrasil.io.buffer.base import TabularIO
-from yggdrasil.io.buffer.memory import MemorySparkIO
+from yggdrasil.io.tabular import Tabular
+from yggdrasil.io.tabular import MemorySparkIO
 
 
 class TestMemorySparkIOBasics:
@@ -17,7 +17,7 @@ class TestMemorySparkIOBasics:
         assert MemorySparkIO.default_media_type() is None
 
     def test_is_a_tabular_io(self):
-        assert isinstance(MemorySparkIO(), TabularIO)
+        assert isinstance(MemorySparkIO(), Tabular)
 
     def test_empty_construction(self):
         io = MemorySparkIO()

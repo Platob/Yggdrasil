@@ -10,9 +10,7 @@ from __future__ import annotations
 
 import zipfile
 
-import pytest
-
-from yggdrasil.io.buffer.nested import ZipIO, ZipOptions
+from yggdrasil.io.nested import ZipIO
 from .._helpers import sample_batches, sample_table
 
 

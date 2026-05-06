@@ -4,7 +4,7 @@ Subclass of :class:`yggdrasil.databricks.fs.volume_path.VolumePath` whose
 SDK transport hooks read/write a class-level dict instead of calling the
 Databricks Files API. Lets us exercise the path machinery —
 ``open``, transaction buffer, format-leaf dispatch by extension,
-``TabularIO`` surface — without a live workspace.
+``Tabular`` surface — without a live workspace.
 
 Lives under ``_helpers`` (leading underscore) so pytest doesn't try to
 collect it as a test module.
@@ -46,7 +46,7 @@ class InMemoryVolumePath(VolumePath):
 
     # -- SDK transport ----------------------------------------------------
     def _remote_download(self, allow_not_found: bool = False):
-        from yggdrasil.io.buffer.bytes_io import BytesIO as _YBytesIO
+        from yggdrasil.io.bytes_io import BytesIO as _YBytesIO
 
         type(self).download_count += 1
         key = self.full_path()

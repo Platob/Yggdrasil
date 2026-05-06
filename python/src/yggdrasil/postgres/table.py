@@ -1,10 +1,10 @@
 """Per-table resource: DDL, DML, schema introspection, and Arrow I/O.
 
 The :class:`Table` is both a navigation object (rename / drop /
-list columns) **and** a :class:`TabularIO` — it implements the two
+list columns) **and** a :class:`Tabular` — it implements the two
 hooks (:meth:`_read_arrow_batches` / :meth:`_write_arrow_batches`)
 that drive every Arrow / Polars / pandas conversion in
-:class:`yggdrasil.io.buffer.base.TabularIO`. That means a caller can
+:class:`yggdrasil.io.buffer.base.Tabular`. That means a caller can
 treat a :class:`Table` like any other tabular IO::
 
     tbl = engine.table("public.users")
@@ -52,8 +52,8 @@ import pyarrow as pa
 
 from yggdrasil.data import Schema as DataSchema
 from yggdrasil.data.options import CastOptions
-from yggdrasil.io.buffer.base import O, TabularIO
-from yggdrasil.io.enums import MimeType, MimeTypes, Mode
+from yggdrasil.io.buffer.base import O, Tabular
+from yggdrasil.data.enums import MimeType, MimeTypes, Mode
 
 from .column import Column
 from .sql_utils import (
@@ -95,7 +95,7 @@ _ADBC_MODE_MAP: dict[Mode, str] = {
 }
 
 
-class Table(TabularIO):
+class Table(Tabular):
     """A single Postgres table — DDL, DML, and Arrow IO."""
 
     _FINAL_TABULAR_IO: ClassVar[bool] = True
@@ -115,7 +115,7 @@ class Table(TabularIO):
         connection: Optional["PostgresConnection"] = None,
         **kwargs: Any,
     ):
-        # TabularIO.__init__ wires the persist cache slot, the
+        # Tabular.__init__ wires the persist cache slot, the
         # ``_media_type``, and other shared bookkeeping.
         super().__init__(**kwargs)
         if executor is None and service is not None:
@@ -425,7 +425,7 @@ class Table(TabularIO):
         return self._cached_schema
 
     # ------------------------------------------------------------------
-    # TabularIO — read
+    # Tabular — read
     # ------------------------------------------------------------------
 
     def _select_text(

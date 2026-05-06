@@ -16,8 +16,8 @@ import time
 import pyarrow as pa
 import pytest
 
-from yggdrasil.io.buffer.nested import FolderIO, FolderOptions
-from yggdrasil.io.buffer.nested.base import _run_in_threads
+from yggdrasil.io.nested import FolderIO, FolderOptions
+from yggdrasil.io.nested.base import _run_in_threads
 
 
 class TestRunInThreads:
@@ -142,7 +142,7 @@ class TestThreadedPartitionedWrites:
 
 class TestThreadedSchemaCollection:
     def test_collect_schema_matches_serial(self, tmp_path):
-        from yggdrasil.io.enums import Mode
+        from yggdrasil.data.enums import Mode
 
         folder = FolderIO(path=str(tmp_path))
         for row in (
@@ -164,7 +164,7 @@ class TestThreadedSchemaCollection:
 
 class TestThreadedUpsert:
     def test_partitioned_upsert_threaded(self, tmp_path):
-        from yggdrasil.io.enums import Mode
+        from yggdrasil.data.enums import Mode
 
         folder = FolderIO(
             path=str(tmp_path),

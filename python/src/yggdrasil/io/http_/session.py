@@ -9,10 +9,10 @@ import urllib3
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io import BytesIO
-from yggdrasil.io.enums import MediaTypes
+from yggdrasil.data.enums import MediaTypes
 
 from .response import HTTPResponse
-from ..buffer.primitive import ArrowIPCIO
+from yggdrasil.io.primitive import ArrowIPCIO
 from ..request import PreparedRequest
 from ..send_config import SendConfig
 from ..session import Session

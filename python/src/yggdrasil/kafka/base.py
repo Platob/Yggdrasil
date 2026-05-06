@@ -1,8 +1,8 @@
-"""Apache Kafka :class:`TabularIO` — publish and read records.
+"""Apache Kafka :class:`Tabular` — publish and read records.
 
 :class:`KafkaIO` is the canonical Kafka transport surface in
 yggdrasil. A single instance is bound to a topic on a cluster and
-satisfies the :class:`TabularIO` contract, so a Kafka topic can be
+satisfies the :class:`Tabular` contract, so a Kafka topic can be
 consumed and produced through the same Arrow / Polars / Pandas /
 Spark surface that every other tabular source exposes.
 
@@ -31,8 +31,8 @@ import pyarrow as pa
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.environ import PyEnv
-from yggdrasil.io.buffer.base import TabularIO
-from yggdrasil.io.enums import MimeType, MimeTypes
+from yggdrasil.io.tabular import Tabular
+from yggdrasil.data.enums import MimeType, MimeTypes
 
 if TYPE_CHECKING:
     from confluent_kafka import Consumer, Producer
@@ -95,8 +95,8 @@ def _default_key_serializer(key: Any) -> "bytes | None":
 # ---------------------------------------------------------------------------
 
 
-class KafkaIO(TabularIO[CastOptions]):
-    """A single Kafka topic, exposed as a :class:`TabularIO`.
+class KafkaIO(Tabular[CastOptions]):
+    """A single Kafka topic, exposed as a :class:`Tabular`.
 
     Parameters
     ----------
@@ -243,7 +243,7 @@ class KafkaIO(TabularIO[CastOptions]):
         return consumer
 
     # ------------------------------------------------------------------
-    # TabularIO contract
+    # Tabular contract
     # ------------------------------------------------------------------
 
     def stat(self):
@@ -302,7 +302,7 @@ class KafkaIO(TabularIO[CastOptions]):
     def _scan_spark_frame(self, options: CastOptions) -> "SparkDataFrame":
         """Native Spark Structured Streaming source for Kafka.
 
-        Skips the parquet-spill fallback in :class:`TabularIO` and
+        Skips the parquet-spill fallback in :class:`Tabular` and
         wires straight into Spark's built-in ``kafka`` source —
         ``spark.readStream.format("kafka")`` — so ``isStreaming`` is
         ``True`` and the consumer keeps tailing the topic for the
@@ -334,7 +334,7 @@ class KafkaIO(TabularIO[CastOptions]):
     def _records_to_batch(self, records: list[dict[str, Any]]) -> pa.RecordBatch:
         """Build a :class:`pa.RecordBatch` from a list of decoded rows.
 
-        Falls through :meth:`TabularIO._normalize_records` so rows
+        Falls through :meth:`Tabular._normalize_records` so rows
         with diverging keys are backfilled to a uniform schema before
         Arrow type inference runs.
         """
@@ -342,7 +342,7 @@ class KafkaIO(TabularIO[CastOptions]):
         return pa.RecordBatch.from_pylist(normalized)
 
     # ------------------------------------------------------------------
-    # TabularIO write path
+    # Tabular write path
     # ------------------------------------------------------------------
 
     def _write_arrow_batches(

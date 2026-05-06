@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.io.buffer.base import TabularIO
-from yggdrasil.io.buffer.memory import MemoryArrowIO
-from yggdrasil.io.enums import Mode
+from yggdrasil.io.tabular import Tabular
+from yggdrasil.io.tabular import MemoryArrowIO
+from yggdrasil.data.enums import Mode
 from .._helpers import sample_table
 
 
@@ -22,7 +22,7 @@ class TestMemoryArrowIOBasics:
         assert MemoryArrowIO.default_media_type() is None
 
     def test_is_a_tabular_io(self):
-        assert isinstance(MemoryArrowIO(), TabularIO)
+        assert isinstance(MemoryArrowIO(), Tabular)
 
     def test_empty_construction(self):
         io = MemoryArrowIO()

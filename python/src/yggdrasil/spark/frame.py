@@ -13,7 +13,7 @@ __all__ = [
     "is_dynamic_schema",
 ]
 
-from yggdrasil.io.enums import Mode
+from yggdrasil.data.enums import Mode
 from yggdrasil.lazy_imports import polars_module
 
 PICKLE_COLUMN_NAME = "_pickle"

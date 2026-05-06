@@ -6,7 +6,7 @@ row — the caller can't tell whether a response came from the local
 on-disk cache, the remote SQL cache, or a fresh network fetch.
 
 :class:`ResponseBatch` keeps that split visible. The local and remote
-buckets are both ``dict[str, TabularIO]`` so the per-config split
+buckets are both ``dict[str, Tabular]`` so the per-config split
 survives all the way to the consumer: local hits keyed by local-cache
 folder path, remote hits keyed by remote-cache table full name. The
 new-hits bucket stays single-holder — network fetches don't carry a
@@ -24,8 +24,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Iterator, Mapping, Optional, Union
 
-from .buffer.base import TabularIO
-from .buffer.memory import MemoryArrowIO, MemorySparkIO
+from .buffer.base import Tabular
+from yggdrasil.io.tabular import MemoryArrowIO, MemorySparkIO
 from .response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA, Response
 
 if TYPE_CHECKING:
@@ -63,12 +63,12 @@ DEFAULT_LOCAL_PATH_KEY = DEFAULT_BUCKET_KEY
 # What the public constructor accepts per simple bucket. ``None`` is
 # coerced to a schema-bearing empty holder so every bucket carries
 # :data:`RESPONSE_SCHEMA` — Spark when the batch was built with a
-# session, Arrow otherwise. ``TabularIO`` is taken as-is; lists and
+# session, Arrow otherwise. ``Tabular`` is taken as-is; lists and
 # Spark DataFrames are funnelled through :func:`responses_to_tabular`
 # / :func:`spark_to_tabular`.
 BucketInput = Union[
     list[Response],
-    "TabularIO",
+    "Tabular",
     "SparkDataFrame",
     None,
 ]
@@ -111,7 +111,7 @@ def empty_spark_holder(spark: "SparkSession") -> MemorySparkIO:
 
 
 # ---------------------------------------------------------------------------
-# Coercion helpers — one shape in, one TabularIO out
+# Coercion helpers — one shape in, one Tabular out
 # ---------------------------------------------------------------------------
 
 def responses_to_tabular(responses: list[Response]) -> MemoryArrowIO:
@@ -137,8 +137,8 @@ def spark_to_tabular(df: "SparkDataFrame") -> MemorySparkIO:
     """Wrap a Spark DataFrame in a :class:`MemorySparkIO` (no collect).
 
     The DataFrame lives on the holder's mutable ``frame`` slot, so
-    :meth:`TabularIO.read_spark_frame` returns it untouched. A
-    subsequent :meth:`TabularIO.read_arrow_batches` would force
+    :meth:`Tabular.read_spark_frame` returns it untouched. A
+    subsequent :meth:`Tabular.read_arrow_batches` would force
     ``df.toArrow()`` — fine for small frames, but Spark-mode iteration
     on the :class:`ResponseBatch` is disallowed precisely so callers
     don't trip over that collect by accident.
@@ -150,21 +150,21 @@ def _coerce_bucket(
     value: BucketInput,
     *,
     spark: Optional["SparkSession"] = None,
-) -> TabularIO:
-    """Funnel any accepted simple bucket input down to a ``TabularIO``.
+) -> Tabular:
+    """Funnel any accepted simple bucket input down to a ``Tabular``.
 
     Strict on meaning: an unknown shape raises rather than silently
     being treated as Spark. ``None`` is coerced to an empty
     schema-bearing holder — Spark when ``spark`` is passed (so the
     bucket aligns with the rest of a Spark batch), Arrow otherwise.
     Lists land in :func:`responses_to_tabular`, Spark DataFrames in
-    :func:`spark_to_tabular`, ``TabularIO`` passes through.
+    :func:`spark_to_tabular`, ``Tabular`` passes through.
     """
     if value is None:
         if spark is not None:
             return empty_spark_holder(spark)
         return empty_arrow_holder()
-    if isinstance(value, TabularIO):
+    if isinstance(value, Tabular):
         return value
     if isinstance(value, list):
         return responses_to_tabular(value)
@@ -176,7 +176,7 @@ def _coerce_bucket(
         return spark_to_tabular(value)
     raise TypeError(
         f"Unsupported bucket input: {type(value).__name__}. "
-        "Expected list[Response], TabularIO, Spark DataFrame, or None."
+        "Expected list[Response], Tabular, Spark DataFrame, or None."
     )
 
 
@@ -184,7 +184,7 @@ def _coerce_keyed_bucket(
     value: KeyedBucketInput,
     *,
     spark: Optional["SparkSession"] = None,
-) -> dict[str, TabularIO]:
+) -> dict[str, Tabular]:
     """Funnel any accepted per-key bucket input down to a keyed dict.
 
     Always returns at least one entry so the bucket can answer schema
@@ -216,21 +216,21 @@ class ResponseBatch:
     Three buckets, in pipeline order:
 
     - ``local_hits``  — served from the on-disk pickle cache, split by
-      local-cache folder path (``dict[str, TabularIO]``) so callers can
+      local-cache folder path (``dict[str, Tabular]``) so callers can
       see which configured cache root answered which subset.
     - ``remote_hits`` — served from the remote SQL cache, split by
-      cache-table full name (``dict[str, TabularIO]``) so callers can
+      cache-table full name (``dict[str, Tabular]``) so callers can
       see which configured table answered which subset of the batch.
     - ``new_hits``    — fetched from the network this run.
 
     The local and remote buckets live on insertion-ordered ``dict``
     holders (``_local_responses`` / ``_remote_responses``) so the
     per-config split survives. The new bucket stays a single private
-    :class:`TabularIO` (``_new_response``) — fresh network fetches
+    :class:`Tabular` (``_new_response``) — fresh network fetches
     haven't been bucketed by destination at this stage of the
     pipeline. Constructor inputs go through coercion so callers can
     hand in a ``list[Response]``, a Spark DataFrame, an existing
-    ``TabularIO``, ``None``, or — for ``local_hits`` / ``remote_hits``
+    ``Tabular``, ``None``, or — for ``local_hits`` / ``remote_hits``
     — a mapping from key (path or table name) to any of those.
     ``None`` and empty inputs become schema-bearing empty holders so
     every bucket advertises :data:`RESPONSE_SCHEMA`.
@@ -258,13 +258,13 @@ class ResponseBatch:
         spark: Optional["SparkSession"] = None,
     ) -> None:
         self.spark: Optional["SparkSession"] = spark
-        self._local_responses: dict[str, TabularIO] = _coerce_keyed_bucket(
+        self._local_responses: dict[str, Tabular] = _coerce_keyed_bucket(
             local_hits, spark=spark,
         )
-        self._remote_responses: dict[str, TabularIO] = _coerce_keyed_bucket(
+        self._remote_responses: dict[str, Tabular] = _coerce_keyed_bucket(
             remote_hits, spark=spark,
         )
-        self._new_response: TabularIO = _coerce_bucket(new_hits, spark=spark)
+        self._new_response: Tabular = _coerce_bucket(new_hits, spark=spark)
 
     def __repr__(self) -> str:
         return (
@@ -278,7 +278,7 @@ class ResponseBatch:
     # ------------------------------------------------------------------
 
     @property
-    def local_hits(self) -> dict[str, TabularIO]:
+    def local_hits(self) -> dict[str, Tabular]:
         """Per-path local-cache holders, keyed by local-cache folder.
 
         Always returns at least one entry — :data:`DEFAULT_LOCAL_PATH_KEY`
@@ -303,7 +303,7 @@ class ResponseBatch:
         return [k for k in self._local_responses if k != DEFAULT_LOCAL_PATH_KEY]
 
     @property
-    def remote_hits(self) -> dict[str, TabularIO]:
+    def remote_hits(self) -> dict[str, Tabular]:
         """Per-table remote-cache holders, keyed by cache-table full name.
 
         Always returns at least one entry — :data:`DEFAULT_REMOTE_TABLE_KEY`
@@ -328,7 +328,7 @@ class ResponseBatch:
         return [k for k in self._remote_responses if k != DEFAULT_REMOTE_TABLE_KEY]
 
     @property
-    def new_hits(self) -> TabularIO:
+    def new_hits(self) -> Tabular:
         return self._new_response
 
     @new_hits.setter
@@ -343,7 +343,7 @@ class ResponseBatch:
     # Shape helpers
     # ------------------------------------------------------------------
 
-    def _holders(self) -> list[TabularIO]:
+    def _holders(self) -> list[Tabular]:
         return [
             *self._local_responses.values(),
             *self._remote_responses.values(),
@@ -351,11 +351,11 @@ class ResponseBatch:
         ]
 
     @staticmethod
-    def _is_spark_holder(holder: TabularIO) -> bool:
+    def _is_spark_holder(holder: Tabular) -> bool:
         return isinstance(holder, MemorySparkIO) and holder.frame is not None
 
     @staticmethod
-    def _holder_count(holder: TabularIO) -> int:
+    def _holder_count(holder: Tabular) -> int:
         if isinstance(holder, MemorySparkIO):
             return holder.frame.count() if holder.frame is not None else 0
         if isinstance(holder, MemoryArrowIO):
@@ -367,7 +367,7 @@ class ResponseBatch:
         """True if any holder carries a Spark DataFrame."""
         return any(self._is_spark_holder(h) for h in self._holders())
 
-    def parts(self) -> list[TabularIO]:
+    def parts(self) -> list[Tabular]:
         """All bucket holders in pipeline order: locals…, remotes…, new.
 
         Every bucket is schema-bearing, including empty ones. Per-key
@@ -421,7 +421,7 @@ class ResponseBatch:
 
     def _keyed_counts(
         self,
-        holders: dict[str, TabularIO],
+        holders: dict[str, Tabular],
         default_key: str,
     ) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -520,10 +520,10 @@ class ResponseBatch:
         self._merge_simple_holder("_new_response", other._new_response)
         return self
 
-    def _merge_simple_holder(self, attr: str, theirs: TabularIO) -> None:
+    def _merge_simple_holder(self, attr: str, theirs: Tabular) -> None:
         from .enums import Mode
 
-        mine: TabularIO = getattr(self, attr)
+        mine: Tabular = getattr(self, attr)
         if isinstance(theirs, MemorySparkIO) and theirs.frame is not None:
             if isinstance(mine, MemorySparkIO) and mine.frame is not None:
                 mine.frame = mine.frame.unionByName(
@@ -536,9 +536,9 @@ class ResponseBatch:
 
     def _merge_keyed(
         self,
-        mine: dict[str, TabularIO],
-        theirs: dict[str, TabularIO],
-    ) -> dict[str, TabularIO]:
+        mine: dict[str, Tabular],
+        theirs: dict[str, Tabular],
+    ) -> dict[str, Tabular]:
         from .enums import Mode
 
         # Drop the placeholder empty default as soon as the incoming
@@ -567,7 +567,7 @@ class ResponseBatch:
             )
         return mine
 
-    def _is_placeholder(self, holders: dict[str, TabularIO]) -> bool:
+    def _is_placeholder(self, holders: dict[str, Tabular]) -> bool:
         """True when ``holders`` contains only the empty default entry."""
         if list(holders) != [DEFAULT_BUCKET_KEY]:
             return False
@@ -585,7 +585,7 @@ class ResponseBatch:
 
         Works in both modes: Spark-backed holders return their cached
         frame directly (no collect), Arrow-IPC holders go through
-        :meth:`TabularIO.read_spark_frame` which materializes on the
+        :meth:`Tabular.read_spark_frame` which materializes on the
         driver and lifts to Spark. Buckets are unioned in pipeline
         order — every per-path local holder, then every per-table
         remote holder, then new — with ``allowMissingColumns=True``

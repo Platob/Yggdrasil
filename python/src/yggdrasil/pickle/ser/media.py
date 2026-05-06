@@ -17,9 +17,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar, Mapping
 
-from yggdrasil.io.enums.codec import Codec
-from yggdrasil.io.enums.media_type import MediaType
-from yggdrasil.io.enums.mime_type import MimeType
+from yggdrasil.data.enums.codec import Codec
+from yggdrasil.data.enums.media_type import MediaType
+from yggdrasil.data.enums.mime_type import MimeType
 from yggdrasil.pickle.ser.serialized import Serialized
 from yggdrasil.pickle.ser.tags import Tags
 

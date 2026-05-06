@@ -23,7 +23,7 @@ import logging
 import os
 from typing import ClassVar, Optional, Union
 
-from yggdrasil.io.buffer.bytes_io import BytesIO
+from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 

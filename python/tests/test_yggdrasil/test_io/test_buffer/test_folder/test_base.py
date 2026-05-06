@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.io.buffer.nested import FolderIO, FolderOptions
-from yggdrasil.io.buffer.primitive import ParquetIO
-from yggdrasil.io.enums import MimeTypes
+from yggdrasil.io.nested import FolderIO, FolderOptions
+from yggdrasil.io.primitive import ParquetIO
+from yggdrasil.data.enums import MimeTypes
 from .._helpers import sample_table
 
 

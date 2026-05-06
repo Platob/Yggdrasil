@@ -25,15 +25,15 @@ imports across modules.
 import pyarrow as pa
 
 from yggdrasil.aws.fs.path import S3Path
-from yggdrasil.io.buffer.nested.delta import DeltaIO
-from yggdrasil.io.buffer.nested.delta.deletion_vector import (
+from yggdrasil.io.nested import DeltaIO
+from yggdrasil.io.nested import (
     DeletionVectorDescriptor,
 )
-from yggdrasil.io.buffer.nested.delta.replay import (
+from yggdrasil.io.nested import (
     latest_commit_version,
     read_last_checkpoint,
 )
-from yggdrasil.io.fs import Path
+from yggdrasil.io.path import Path
 from .._base import DatabricksCase
 
 
@@ -170,7 +170,7 @@ class ManagedTableIntegrationCase(DatabricksCase):
 
     def _replay(self) -> "object":
         """Replay the table's log through the public replay function."""
-        from yggdrasil.io.buffer.nested.delta.replay import replay_log
+        from yggdrasil.io.nested import replay_log
 
         return replay_log(self._log_dir())
 
@@ -193,7 +193,7 @@ class ManagedTableIntegrationCase(DatabricksCase):
     ) -> None:
         """Resolve a DV descriptor end-to-end and verify the bitmap."""
         if descriptor.is_inline:
-            from yggdrasil.io.buffer.nested.delta.deletion_vector import (
+            from yggdrasil.io.nested import (
                 decode_inline_descriptor,
             )
             bitmap = decode_inline_descriptor(descriptor)
@@ -538,7 +538,7 @@ class ManagedTableIntegrationCase(DatabricksCase):
         self.table.insert([{"a": 1, "s": "log_test"}])
 
         log_dir = self._log_dir()
-        from yggdrasil.io.buffer.nested.delta.constants import COMMIT_FILE_RE
+        from yggdrasil.io.nested import COMMIT_FILE_RE
 
         commit_files: list[tuple[int, S3Path]] = []
         for child in log_dir.ls(recursive=False, allow_not_found=False):

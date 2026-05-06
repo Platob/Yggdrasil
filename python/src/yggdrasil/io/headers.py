@@ -7,7 +7,7 @@ import socket
 from dataclasses import dataclass, field
 from typing import ClassVar, Literal, Mapping, MutableMapping, Optional, Union
 
-from yggdrasil.io.enums import MimeTypes
+from yggdrasil.data.enums import MimeTypes
 from yggdrasil.version import __version_info__, __version__
 
 from .buffer import BytesIO

@@ -45,12 +45,12 @@ the whole object via ``write_stream``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, ClassVar, Iterator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Iterator, List, Optional, Tuple
 
 from yggdrasil.aws.fs.service import S3Service
-from yggdrasil.io.buffer.bytes_io import BytesIO
-from yggdrasil.io.enums import Mode
-from yggdrasil.io.fs import Path, RemotePath
+from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.data.enums import Mode
+from yggdrasil.io.path import Path, RemotePath
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 from yggdrasil.lazy_imports import botocore_module

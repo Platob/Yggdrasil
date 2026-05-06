@@ -7,10 +7,10 @@ Three concrete types, each with a clear single responsibility:
 - :class:`StatementResult` — a handle to a statement *being or having
   been* executed by some backend.  Carries the per-execution state
   (statement_id, response, materialized data) and exposes Arrow I/O via
-  :class:`TabularIO`.  Lifecycle hooks: ``start``, ``cancel``,
+  :class:`Tabular`.  Lifecycle hooks: ``start``, ``cancel``,
   ``refresh_status``, ``done``, ``failed``.
 - :class:`StatementBatch` — a collection of pending statements + their
-  in-flight / completed results.  *Not* a TabularIO: the batch as a whole
+  in-flight / completed results.  *Not* a Tabular: the batch as a whole
   has no rows, only its individual results do.  Convenience for
   add-then-wait flows; parallelism is opt-in.
 
@@ -44,8 +44,8 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.disposable import Disposable
-from yggdrasil.io.enums import MimeType, MimeTypes
-from yggdrasil.io.buffer.base import TabularIO
+from yggdrasil.data.enums import MimeType, MimeTypes
+from yggdrasil.io.tabular import Tabular
 
 if TYPE_CHECKING:
     from yggdrasil.data.executor import StatementExecutor
@@ -234,7 +234,7 @@ def _new_key() -> str:
 # ---------------------------------------------------------------------------
 
 
-class StatementResult(TabularIO, Generic[PS]):
+class StatementResult(Tabular, Generic[PS]):
     """Backend-agnostic handle to a running or completed statement.
 
     Subclasses fill in lifecycle hooks (``done``, ``failed``,
@@ -291,8 +291,8 @@ class StatementResult(TabularIO, Generic[PS]):
         self._cached_schema: Optional[Schema] = None
         self.num_try = num_try or 0
         self._auto_retry_promoted = False
-        # ``_persisted_data`` (Optional[TabularIO]) is initialised by
-        # the :class:`TabularIO` base ``__init__``; subclasses populate
+        # ``_persisted_data`` (Optional[Tabular]) is initialised by
+        # the :class:`Tabular` base ``__init__``; subclasses populate
         # it via :meth:`persist` to expose the materialised result
         # through the standard cache path.
         super().__init__(**kwargs)
@@ -611,7 +611,7 @@ SR = TypeVar("SR", bound="StatementResult")
 class StatementBatch(Generic[PS, SR]):
     """A pending queue of statements plus a map of in-flight / completed results.
 
-    *Not* a :class:`TabularIO` — a batch as a whole has no rows, only its
+    *Not* a :class:`Tabular` — a batch as a whole has no rows, only its
     individual results do.  Iterate via :meth:`materialized` (or just walk
     ``self.results``) to drain results into Arrow, polars, etc.
 

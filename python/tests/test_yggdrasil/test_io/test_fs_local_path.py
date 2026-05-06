@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from yggdrasil.io.fs import LocalPath, Path
+from yggdrasil.io.path import LocalPath, Path
 from yggdrasil.io.io_stats import IOKind
 
 

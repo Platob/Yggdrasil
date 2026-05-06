@@ -7,11 +7,20 @@ class Disposable(ABC):
     """Transactional resource with binary open/close, with-stack
     nesting, and an owned-children graph."""
 
-    def __init__(self) -> None:
+    __slots__ = (
+        '_acquired',
+        '_dirty',
+        '_depth',
+    )
+
+    def __init__(
+        self,
+        *args,
+        **kwargs
+    ) -> None:
         self._acquired: bool = False
         self._dirty: bool = False
         self._depth: int = 0
-        self._ctx_owns_close: bool = False
 
     # ------------------------------------------------------------------
     # State predicates
@@ -21,7 +30,6 @@ class Disposable(ABC):
         self._acquired = obj._acquired
         self._dirty = obj._dirty
         self._depth = obj._depth
-        self._ctx_owns_close = obj._ctx_owns_close
 
     @property
     def opened(self) -> bool:
@@ -151,18 +159,13 @@ class Disposable(ABC):
             self._before_release()
         finally:
             self._release()
-
-    @property
-    def dirty(self):
-        return self._dirty
+            self._depth = 0
 
     def is_dirty(self):
         return self._dirty
 
     def mark_dirty(self) -> None:
         """Signal pending mutations — commit on next clean :meth:`close`."""
-        if not self._acquired:
-            raise RuntimeError("mark_dirty() called on a closed Disposable")
         self._dirty = True
 
     def clear_dirty(self) -> None:
@@ -176,15 +179,11 @@ class Disposable(ABC):
         """Enter a context. Opens the resource only if not already open.
 
         The first ``__enter__`` that finds the resource closed flips
-        :attr:`_ctx_owns_close` — that frame's matching ``__exit__``
         is the one that closes. Nested ``__enter__``s see the resource
         already open and leave the flag alone.
         """
         if not self._acquired:
             self.open()
-            self._ctx_owns_close = True
-        elif self._depth == 0:
-            self._ctx_owns_close = True
         self._depth += 1
         return self
 
@@ -200,9 +199,7 @@ class Disposable(ABC):
         self._depth -= 1
         if self._depth > 0:
             return
-        if not self._ctx_owns_close:
-            return
-        self._ctx_owns_close = False
+
         if exc_type is not None:
             self._dirty = False
         self.close()
@@ -243,10 +240,6 @@ class Disposable(ABC):
         # GC — data integrity depends on explicit close.
         try:
             if self.opened:
-                self.clear_dirty()
-                # Use force=True to bypass the claim deferral; if we
-                # made it to __del__ with _acquired=True, no parent
-                # is reachable to ever come back and unclaim us.
                 self.close(force=True)
         except Exception:
             pass

@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import pytest
-
-from yggdrasil.io.buffer.primitive import CsvIO
+from yggdrasil.io.primitive import CsvIO
 from yggdrasil.io.buffer import BytesIO
-from yggdrasil.io.buffer.primitive.csv_io import CsvOptions
-from yggdrasil.io.enums import Mode, MimeTypes
+from yggdrasil.io.primitive import CsvOptions
+from yggdrasil.data.enums import Mode, MimeTypes
 from .._helpers import sample_table
 
 

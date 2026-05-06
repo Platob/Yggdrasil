@@ -67,8 +67,8 @@ from yggdrasil.databricks.fs import (
     WorkspacePath,
 )
 from yggdrasil.databricks.fs.service import FileSystem
-from yggdrasil.io.buffer.bytes_io import BytesIO
-from yggdrasil.io.buffer.primitive import ParquetIO
+from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.io.primitive import ParquetIO
 
 # ---------------------------------------------------------------------------
 # Configuration

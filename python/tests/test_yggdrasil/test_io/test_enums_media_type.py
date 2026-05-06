@@ -7,9 +7,9 @@ import io
 
 import pytest
 
-from yggdrasil.io.enums.codec import GZIP, ZSTD
-from yggdrasil.io.enums.media_type import MediaType, MediaTypes
-from yggdrasil.io.enums.mime_type import MimeTypes
+from yggdrasil.data.enums.codec import GZIP, ZSTD
+from yggdrasil.data.enums.media_type import MediaType, MediaTypes
+from yggdrasil.data.enums.mime_type import MimeTypes
 
 
 # ---------------------------------------------------------------------------

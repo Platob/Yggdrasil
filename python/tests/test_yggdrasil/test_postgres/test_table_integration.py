@@ -7,7 +7,7 @@ from decimal import Decimal
 
 import pytest
 
-from yggdrasil.io.enums import Mode
+from yggdrasil.data.enums import Mode
 from yggdrasil.postgres.tests import PostgresTestCase
 
 pytestmark = pytest.mark.postgres_integration

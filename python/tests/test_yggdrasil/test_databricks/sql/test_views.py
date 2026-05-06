@@ -282,7 +282,7 @@ class TestConcatTables:
         assert "`prod`.`fin`.`sales`" in stmt
 
     def test_custom_mode_maps_to_view_create(self, views, mock_client):
-        from yggdrasil.io.enums.mode import Mode
+        from yggdrasil.data.enums.mode import Mode
 
         mock_engine = MagicMock()
         mock_client.sql.return_value = mock_engine

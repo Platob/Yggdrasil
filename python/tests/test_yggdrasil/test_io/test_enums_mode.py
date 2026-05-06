@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.io.enums.mode import STR_MAPPING, Mode
+from yggdrasil.data.enums.mode import STR_MAPPING, Mode
 
 
 class TestModeMembers:

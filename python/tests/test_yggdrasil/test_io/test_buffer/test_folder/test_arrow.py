@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import pytest
-
-from yggdrasil.io.buffer.nested import FolderIO, FolderOptions
+from yggdrasil.io.nested import FolderIO
 from .._helpers import sample_table
 
 

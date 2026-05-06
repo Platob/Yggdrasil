@@ -297,7 +297,7 @@ class TestMemoryStats:
         assert after > before
 
     def test_stats_carries_media_type(self):
-        from yggdrasil.io.enums import MediaTypes
+        from yggdrasil.data.enums import MediaTypes
         m = Memory(b"abc", media_type=MediaTypes.JSON)
         s = m.stat()
         assert s.media_type is MediaTypes.JSON
@@ -315,7 +315,7 @@ class TestMemoryStats:
         assert s.size == 20
 
     def test_iostats_clear_media_type(self):
-        from yggdrasil.io.enums import MediaTypes
+        from yggdrasil.data.enums import MediaTypes
         s = IOStats(size=1, mtime=0.0, media_type=MediaTypes.JSON)
         s.with_(media_type=None, inplace=True)
         assert s.media_type is None

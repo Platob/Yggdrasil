@@ -24,7 +24,7 @@ from yggdrasil.data.base_meta import (
 from yggdrasil.data.constants import DEFAULT_VALUE_KEY, DEFAULT_FIELD_NAME
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.parser import ParsedDataType
-from yggdrasil.io.enums import Mode
+from yggdrasil.data.enums import Mode
 from yggdrasil.lazy_imports import path_class, schema_class, pandas_module
 from yggdrasil.pickle.serde import ObjectSerde
 from .cast.registry import register_converter

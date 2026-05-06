@@ -17,8 +17,8 @@ import tempfile
 import time
 import unittest
 
-from yggdrasil.io.buffer.nested.folder_io import FolderIO
-from yggdrasil.io.enums import MimeTypes
+from yggdrasil.io.nested.folder_io import FolderIO
+from yggdrasil.data.enums import MimeTypes
 
 
 _PART_NAME_RE = re.compile(
