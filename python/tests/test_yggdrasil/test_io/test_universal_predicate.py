@@ -136,23 +136,10 @@ class TestFolderPredicate:
 # ---------------------------------------------------------------------------
 
 
-class TestIterChildrenPredicate:
-    def test_iter_children_predicate_filters_by_name(self, tmp_path):
-        # Two parquet files; iterate with a predicate that filters
-        # by the discovered child's basename.
-        a = tmp_path / "a.parquet"
-        b = tmp_path / "b.parquet"
-        with ParquetIO(path=str(a), mode="wb+") as w:
-            w.write_arrow_table(_TABLE)
-        with ParquetIO(path=str(b), mode="wb+") as w:
-            w.write_arrow_table(_TABLE)
-
-        with FolderIO(path=str(tmp_path)) as io:
-            kept = list(io.iter_children(col("name") == "a.parquet"))
-        names = sorted(c.path.name for c in kept)
-        assert names == ["a.parquet"]
-
-    def test_iter_children_no_predicate_yields_everything(self, tmp_path):
+class TestIterChildren:
+    def test_iter_children_yields_everything(self, tmp_path):
+        # Folder iteration is unfiltered — every entry on disk is
+        # yielded. Callers that want to filter do so on the iterator.
         for name in ("x.parquet", "y.parquet"):
             with ParquetIO(path=str(tmp_path / name), mode="wb+") as w:
                 w.write_arrow_table(_TABLE)

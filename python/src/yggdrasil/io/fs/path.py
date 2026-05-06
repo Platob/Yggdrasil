@@ -322,35 +322,35 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
     def _open_transaction_buffer(self, mode: str) -> None:
         """Default remote backend behavior: download into a transaction buffer.
 
-        Pulls the path's current bytes via :meth:`_pread`, splices into
-        a fresh :class:`BytesIO`, applies mode-specific policy
-        (truncate for ``w``, fail-if-exists for ``x``, fail-if-missing
-        for ``r`` without ``+``). Subsequent :meth:`pwrite` /
-        :meth:`truncate` mutate the buffer; :meth:`flush` /
-        :meth:`close_io` commits via :meth:`_pwrite`.
+        Pulls the path's current bytes via :meth:`_pread` and splices
+        them into a fresh :class:`BytesIO`. A missing target leaves
+        the buffer empty — reads against a non-existent path yield
+        zero bytes, matching the tabular "no batches → empty table"
+        contract :meth:`TabularIO._read_arrow_table` relies on.
+        Subsequent :meth:`pwrite` / :meth:`truncate` mutate the
+        buffer; :meth:`flush` / :meth:`close_io` commits via
+        :meth:`_pwrite`.
+
+        Mode-specific policy: ``"w"`` truncates the seeded buffer
+        before any writes; ``"x"`` fails if the seed found existing
+        bytes.
         """
         buf = BytesIO()
         buf.open()
 
-        wants_existing = (
-            "r" in mode or "+" in mode or "a" in mode or "x" in mode
-        )
         existing_loaded = False
-        if wants_existing:
+        try:
+            src = self._pread()
+        except FileNotFoundError:
+            src = None
+        if src is not None:
             try:
-                src = self._pread()
-            except FileNotFoundError:
-                if "r" in mode and "+" not in mode:
-                    buf.close()
-                    raise
-            else:
-                try:
-                    payload = src.to_bytes()
-                    if payload:
-                        buf.write(payload)
-                        existing_loaded = True
-                finally:
-                    src.close()
+                payload = src.to_bytes()
+                if payload:
+                    buf.write(payload)
+                    existing_loaded = True
+            finally:
+                src.close()
 
         if "x" in mode and existing_loaded:
             buf.close()

@@ -217,9 +217,9 @@ class YGGFolderIO(FolderIO):
         """
         return MimeTypes.ARROW_IPC
 
-    #: Hidden subfolder used for metadata. Starts with ``.`` so the
-    #: default :meth:`_is_ignored_path` rule already hides it from
-    #: data enumeration.
+    #: Hidden subfolder used for metadata. The
+    #: :meth:`_iter_children` override below skips it so data
+    #: enumeration doesn't dive into the sidecar tree.
     YGG_DIR_NAME: ClassVar[str] = ".ygg"
 
     #: File under :attr:`YGG_DIR_NAME` that holds the append-only
@@ -253,6 +253,26 @@ class YGGFolderIO(FolderIO):
             cached = self.path / self.YGG_DIR_NAME
             self.__dict__["_ygg_path_cache"] = cached
         return cached
+
+    # ------------------------------------------------------------------
+    # Children — skip the .ygg/ sidecar so data enumeration stays clean
+    # ------------------------------------------------------------------
+
+    def _iter_children(
+        self,
+        options: Any,
+    ) -> "Iterator[Any]":
+        """Yield direct children of :attr:`path`, skipping ``.ygg/``."""
+        ygg_name = self.YGG_DIR_NAME
+        for child in super()._iter_children(options):
+            try:
+                name = child.path.name
+            except Exception:
+                yield child
+                continue
+            if name == ygg_name:
+                continue
+            yield child
 
     @property
     def _ygg_checkpoint_log(self) -> Path:

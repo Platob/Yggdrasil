@@ -77,7 +77,17 @@ from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.enums import MimeType, MimeTypes, Mode
 from yggdrasil.io.fs import Path
 from yggdrasil.io.buffer.base import TabularIO
-from .base import NestedIO, NestedOptions, _run_in_threads
+from .base import NestedIO, NestedOptions, _STAGING_TMP_RE, _run_in_threads
+
+
+def _is_staging_in_flight(name: str) -> bool:
+    """True for in-flight staging filenames produced by :meth:`Path.with_tmp_name`.
+
+    Yielding these mid-write races with the writer (rename to the
+    final ``part-NNNN.<ext>`` name happens after the bytes land), so
+    folder iteration filters them out unconditionally.
+    """
+    return name.startswith("tmp-") and _STAGING_TMP_RE.search(name) is not None
 
 if TYPE_CHECKING:
     pass
@@ -339,42 +349,40 @@ class FolderIO(NestedIO[FolderOptions]):
         self,
         options: FolderOptions,
     ) -> "Iterator[TabularIO | BytesIO]":
-        """Yield one IO per direct child of :attr:`path`.
+        """Yield every direct child of :attr:`path`.
 
         Sub-directories are returned as fresh :class:`FolderIO`
         instances (sharing this folder's partition declaration and
         accumulating any ``key=value`` segment from the directory
-        name into ``partition_values``). Files are returned as
-        :class:`PrimitiveIO` when their extension maps to a
-        registered tabular format; opaque files are returned as
-        :class:`BytesIO` so callers can still pull bytes from them.
-        Unknown / un-readable entries are silently skipped.
+        name into ``partition_values``). Files go through
+        :class:`BytesIO`'s registry dispatch so registered tabular
+        extensions (``.parquet`` / ``.csv`` / ``.arrow`` / …) land
+        on their concrete leaf class; opaque files come back as a
+        plain :class:`BytesIO` so callers can still pull bytes
+        from them.
 
-        ``options.children_predicate`` is honoured via the shared
-        :func:`yggdrasil.io.buffer.base.matches_children_predicate`
-        helper. Combined with backend-specific ignores (the default
-        :meth:`_is_ignored_path` hides dot-prefixed entries; Delta
-        adds ``_delta_log/``), this is the canonical filter point —
-        no glob-pattern fallbacks. To exclude files by extension
-        write the predicate explicitly:
-        ``children_predicate=~col("name").like("%.tmp")``.
+        The only filter: in-flight staging files
+        (``tmp-<start>-<end>-<seed>.<ext>``) — they're mid-write
+        transients that vanish on rename, so yielding them races
+        with the writer. Subclasses that need extra hides
+        (Delta's ``_delta_log/``, YGG's ``.ygg/``) override
+        :meth:`_iter_children` themselves.
 
         Each child's ``parent`` attribute is stamped to ``self``.
-        Children are returned closed (un-acquired); caller opens
+        Children are returned closed (un-acquired); the caller opens
         them inside a ``with`` block.
 
         Missing folder is treated as empty: no children yielded,
         no error raised.
         """
-        from yggdrasil.io.buffer.base import matches_children_predicate
-
+        del options
         if not self.path.exists():
             return
 
         recursive = self._recursive
 
         for entry in self.path.iterdir():
-            if self._is_ignored_path(entry):
+            if _is_staging_in_flight(entry.name):
                 continue
 
             try:
@@ -383,12 +391,6 @@ class FolderIO(NestedIO[FolderOptions]):
                 # Stat failure on a child mid-listing — skip rather
                 # than abort. Listings on remote stores can race
                 # with deletes.
-                continue
-
-            if not matches_children_predicate(
-                options, entry.name,
-                path=str(entry), is_dir=is_dir,
-            ):
                 continue
 
             if is_dir:
@@ -444,42 +446,25 @@ class FolderIO(NestedIO[FolderOptions]):
     ) -> "TabularIO | BytesIO | None":
         """Build an IO for a file leaf.
 
-        Tries :meth:`TabularIO.from_path` first; falls back to
-        :class:`BytesIO` for files with no registered tabular
-        format. Returns ``None`` if neither can bind (rare —
-        usually means the entry vanished mid-listing).
-
-        When the enclosing folder carries
-        :attr:`partition_values`, the leaf's
-        :attr:`TabularIO.static_values` is stamped with the
-        Arrow-typed equivalent so its read path automatically
-        injects the partition columns — no per-batch wrapping
-        needed at the folder level.
+        ``BytesIO(path=...)`` already dispatches via its registry
+        lookup: registered tabular extensions land on the concrete
+        leaf class (ParquetIO, CsvIO, IPCIO, …); opaque files come
+        back as a plain :class:`BytesIO`. When the enclosing folder
+        carries :attr:`partition_values`, the leaf is stamped with
+        the Arrow-typed equivalent on ``static_values`` so
+        :meth:`NestedIO._read_child_batches` injects the partition
+        columns at read time.
         """
         try:
-            io = TabularIO.from_path(file_path)
-        except Exception:
-            io = None
-
-        # A registered tabular leaf is a :class:`BytesIO` subclass
-        # with a format-specific class (so ``type(io) is BytesIO``
-        # would be false). Stamp the typed partition values onto
-        # ``static_values`` so the inherited
-        # :meth:`TabularIO.read_arrow_batches` injection picks
-        # them up — no folder-side per-batch wrapping needed.
-        if isinstance(io, BytesIO) and type(io) is not BytesIO:
-            if self.partition_values:
-                io.static_values = self._typed_partition_static(
-                    self.partition_values,
-                )
-            return io
-
-        # No tabular registration — fall back to a raw BytesIO so
-        # callers can still reach the bytes via iter_children.
-        try:
-            return BytesIO(path=file_path, auto_open=False)
+            io = BytesIO(path=file_path, auto_open=False)
         except Exception:
             return None
+
+        if self.partition_values:
+            io.static_values = self._typed_partition_static(
+                self.partition_values,
+            )
+        return io
 
     def _typed_partition_static(
         self,

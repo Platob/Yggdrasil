@@ -538,13 +538,22 @@ class NestedIO(TabularIO[O], ABC):
             return
 
         if isinstance(child, TabularIO):
+            # Plain :class:`BytesIO` (no tabular media type) has no
+            # arrow surface — skip it. Sidecar files (``.schema``,
+            # ``.ygmirror.json``, …) get yielded by :meth:`iter_children`
+            # so callers can still pull bytes from them, but they
+            # don't participate in the read stream.
+            mt = getattr(child, "_media_type", None)
+            if mt is None or getattr(mt, "is_octet", False):
+                if type(child).__name__ == "BytesIO":
+                    return
             with child:
                 for batch in child.read_arrow_batches(options=options):
                     yield _inject_static_batch(batch, static) if static else batch
             return
 
-        # BytesIO without a tabular surface: not readable as arrow.
-        # Skip — the caller can still reach it via iter_children.
+        # Non-TabularIO child: not readable as arrow. Skip — the
+        # caller can still reach it via iter_children.
 
     def _collect_schema(self, options: O) -> Schema:
         """Merge per-child schemas into a single folder schema.
