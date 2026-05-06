@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import pytest
-
-from yggdrasil.io.buffer.nested import ZipIO
+from yggdrasil.io.nested import ZipIO
 from .._helpers import require_polars, sample_polars_frame
 
 

@@ -60,7 +60,7 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.data.statement import PreparedStatement, StatementResult, StatementBatch
 from yggdrasil.databricks.sql.exceptions import SQLError
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
-from yggdrasil.io.enums import MimeType, MimeTypes, MediaTypes
+from yggdrasil.data.enums import MimeType, MimeTypes, MediaTypes
 from ..fs import VolumePath, DatabricksPath
 from ..sql.types import parse_databricks_field
 

@@ -14,9 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-import pytest
-
-from yggdrasil.io import BytesIO, URL
+from yggdrasil.io import BytesIO
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
 from yggdrasil.pickle.ser import dumps, loads
@@ -427,9 +425,9 @@ class TestResponseRoundTrip:
         media type post-hoc, so the buffer class wasn't promoted to
         the registered leaf (``JsonIO``, ``ParquetIO``, …).
         """
-        from yggdrasil.io.buffer.primitive.json_io import JsonIO
-        from yggdrasil.io.enums.media_type import MediaType
-        from yggdrasil.io.enums.mime_type import MimeTypes
+        from yggdrasil.io.primitive import JsonIO
+        from yggdrasil.data.enums.media_type import MediaType
+        from yggdrasil.data.enums.mime_type import MimeTypes
 
         req = _make_request()
         buf = BytesIO(b'{"x":1}', media_type=MediaType(MimeTypes.JSON))

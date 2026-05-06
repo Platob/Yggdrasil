@@ -11,7 +11,6 @@ class Disposable(ABC):
         '_acquired',
         '_dirty',
         '_depth',
-        '_ctx_owns_close',
     )
 
     def __init__(
@@ -22,7 +21,6 @@ class Disposable(ABC):
         self._acquired: bool = False
         self._dirty: bool = False
         self._depth: int = 0
-        self._ctx_owns_close: bool = False
 
     # ------------------------------------------------------------------
     # State predicates
@@ -32,7 +30,6 @@ class Disposable(ABC):
         self._acquired = obj._acquired
         self._dirty = obj._dirty
         self._depth = obj._depth
-        self._ctx_owns_close = obj._ctx_owns_close
 
     @property
     def opened(self) -> bool:
@@ -162,6 +159,7 @@ class Disposable(ABC):
             self._before_release()
         finally:
             self._release()
+            self._depth = 0
 
     def is_dirty(self):
         return self._dirty
@@ -181,15 +179,11 @@ class Disposable(ABC):
         """Enter a context. Opens the resource only if not already open.
 
         The first ``__enter__`` that finds the resource closed flips
-        :attr:`_ctx_owns_close` — that frame's matching ``__exit__``
         is the one that closes. Nested ``__enter__``s see the resource
         already open and leave the flag alone.
         """
         if not self._acquired:
             self.open()
-            self._ctx_owns_close = True
-        elif self._depth == 0:
-            self._ctx_owns_close = True
         self._depth += 1
         return self
 
@@ -205,9 +199,7 @@ class Disposable(ABC):
         self._depth -= 1
         if self._depth > 0:
             return
-        if not self._ctx_owns_close:
-            return
-        self._ctx_owns_close = False
+
         if exc_type is not None:
             self._dirty = False
         self.close()

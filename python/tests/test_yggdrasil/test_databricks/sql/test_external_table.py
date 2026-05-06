@@ -30,16 +30,16 @@ imports across modules.
 import pyarrow as pa
 
 from yggdrasil.aws.fs.path import S3Path
-from yggdrasil.io.buffer.nested.delta import DeltaIO, DeltaOptions
-from yggdrasil.io.buffer.nested.delta.deletion_vector import (
+from yggdrasil.io.nested import DeltaIO, DeltaOptions
+from yggdrasil.io.nested import (
     DeletionVectorDescriptor,
 )
-from yggdrasil.io.buffer.nested.delta.replay import (
+from yggdrasil.io.nested import (
     latest_commit_version,
     read_last_checkpoint,
 )
-from yggdrasil.io.enums import Mode
-from yggdrasil.io.fs import Path
+from yggdrasil.data.enums import Mode
+from yggdrasil.io.path import Path
 from yggdrasil.io.url import URL
 from .._base import DatabricksCase
 
@@ -181,7 +181,7 @@ class ExternalTableIntegrationCase(DatabricksCase):
         return files
 
     def _replay(self) -> "object":
-        from yggdrasil.io.buffer.nested.delta.replay import replay_log
+        from yggdrasil.io.nested import replay_log
 
         return replay_log(self._log_dir())
 
@@ -202,7 +202,7 @@ class ExternalTableIntegrationCase(DatabricksCase):
         descriptor: DeletionVectorDescriptor,
     ) -> None:
         if descriptor.is_inline:
-            from yggdrasil.io.buffer.nested.delta.deletion_vector import (
+            from yggdrasil.io.nested import (
                 decode_inline_descriptor,
             )
             bitmap = decode_inline_descriptor(descriptor)
@@ -636,7 +636,7 @@ class ExternalTableIntegrationCase(DatabricksCase):
         self.table.insert([{"a": 1, "s": "log_test"}])
 
         log_dir = self._log_dir()
-        from yggdrasil.io.buffer.nested.delta.constants import COMMIT_FILE_RE
+        from yggdrasil.io.nested import COMMIT_FILE_RE
 
         commit_files: list[tuple[int, S3Path]] = []
         for child in log_dir.ls(recursive=False, allow_not_found=False):

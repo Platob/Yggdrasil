@@ -20,19 +20,19 @@ import pytest
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Field
-from yggdrasil.io.buffer.nested import (
+from yggdrasil.io.nested import (
     FolderIO,
     FolderOptions,
     NestedIO,
 )
-from yggdrasil.io.buffer.nested.folder_io import (
+from yggdrasil.io.nested.folder_io import (
     _coerce_partition_column,
     _parse_kv_segment,
     _partition_path_segment,
 )
 from yggdrasil.io.buffer import BytesIO
-from yggdrasil.io.buffer.primitive import ParquetIO, CsvIO
-from yggdrasil.io.enums import MimeTypes, Mode
+from yggdrasil.io.primitive import ParquetIO, CsvIO
+from yggdrasil.data.enums import MimeTypes, Mode
 
 
 # ---------------------------------------------------------------------------

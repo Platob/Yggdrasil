@@ -248,11 +248,11 @@ class TestPolarsBackend(SqlPolarsTestCase):
 
 class TestStatementResult(SqlPolarsTestCase):
     def test_result_is_tabular_io(self) -> None:
-        from yggdrasil.io.buffer.base import TabularIO
+        from yggdrasil.io.tabular import Tabular
 
         self.register("t", self.table({"a": [1, 2]}))
         result = self.sql("SELECT * FROM t")
-        self.assertIsInstance(result, TabularIO)
+        self.assertIsInstance(result, Tabular)
 
     def test_collect_schema(self) -> None:
         self.register("t", self.table({"a": [1, 2], "b": ["x", "y"]}))

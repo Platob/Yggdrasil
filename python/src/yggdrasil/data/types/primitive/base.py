@@ -4,7 +4,7 @@ from abc import ABC
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from yggdrasil.io.enums import Mode
+from yggdrasil.data.enums import Mode
 
 from ..base import DataType
 

@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import pytest
-
-from yggdrasil.io.buffer.primitive import ParquetIO
+from yggdrasil.io.primitive import ParquetIO
 from yggdrasil.io.buffer import BytesIO
-from yggdrasil.io.buffer.primitive.parquet_io import ParquetOptions
-from yggdrasil.io.enums import Mode, MimeTypes
+from yggdrasil.io.primitive import ParquetOptions
+from yggdrasil.data.enums import Mode, MimeTypes
 from .._helpers import sample_table
 
 

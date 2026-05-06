@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.io.enums.codec import (
+from yggdrasil.data.enums.codec import (
     BROTLI,
     BZIP2,
     GZIP,
@@ -17,7 +17,7 @@ from yggdrasil.io.enums.codec import (
     Codec,
     Codecs,
 )
-from yggdrasil.io.enums.mime_type import MimeTypes
+from yggdrasil.data.enums.mime_type import MimeTypes
 
 
 PAYLOAD = b"Brent ICE front-month settle " * 200

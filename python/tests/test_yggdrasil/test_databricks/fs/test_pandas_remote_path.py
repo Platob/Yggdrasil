@@ -50,7 +50,7 @@ class TestPandasRemotePath(PandasTestCase):
     written to with ``write_pandas_frame`` and round-tripped with
     ``read_pandas_frame`` (the same shape the deleted ``DatabricksIO``
     classes used to expose). Regression here would surface to every
-    caller using the path's ``TabularIO`` surface for tabular IO.
+    caller using the path's ``Tabular`` surface for tabular IO.
     """
 
     def setUp(self) -> None:
@@ -98,7 +98,7 @@ class TestPandasRemotePath(PandasTestCase):
     def test_read_pandas_frame_missing_path(self) -> None:
         """Reading a path that was never written produces an empty
         DataFrame (the framework's standard "no batches → empty table"
-        contract from :meth:`TabularIO._read_arrow_table`)."""
+        contract from :meth:`Tabular._read_arrow_table`)."""
         p = self._path("never_written.parquet")
         got = p.read_pandas_frame()
         self.assertEqual(len(got), 0)

@@ -22,9 +22,9 @@ import struct
 import pytest
 
 from yggdrasil.io.buffer import BytesIO
-from yggdrasil.io.enums.codec import GZIP, ZSTD
-from yggdrasil.io.enums.media_type import MediaType
-from yggdrasil.io.enums.mime_type import MimeTypes
+from yggdrasil.data.enums.codec import GZIP, ZSTD
+from yggdrasil.data.enums.media_type import MediaType
+from yggdrasil.data.enums.mime_type import MimeTypes
 
 
 SMALL = b"Henry Hub prompt settle"

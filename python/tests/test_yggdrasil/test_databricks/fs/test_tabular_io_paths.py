@@ -1,6 +1,6 @@
-"""TabularIO integration tests against a local path and a mocked remote.
+"""Tabular integration tests against a local path and a mocked remote.
 
-Pins the same surface — :class:`yggdrasil.io.buffer.base.TabularIO`
+Pins the same surface — :class:`yggdrasil.io.buffer.base.Tabular`
 operations (``read_pandas_frame`` / ``write_arrow_table`` /
 ``read_polars_frame`` / ``write_pylist`` / …) — across two backends:
 
@@ -15,7 +15,7 @@ operations (``read_pandas_frame`` / ``write_arrow_table`` /
   needing a Databricks workspace. Lets the same assertions exercise
   the remote-write contract from a unit test.
 
-Test methods live on :class:`_TabularIOPathMixin` so both backends
+Test methods live on :class:`_TabularPathMixin` so both backends
 run them. The remote class wraps every ``test_write_*`` /
 ``test_*_round_trip`` with :func:`unittest.expectedFailure` because
 the format-leaf write currently bypasses ``BytesIO.write`` and leaves
@@ -42,16 +42,16 @@ import pyarrow.parquet as pq
 # very first import of the test module deadlocks the buffer ↔ fs cycle.
 from ._inmemory_volume import InMemoryVolumePath  # noqa: I001
 
-from yggdrasil.io.fs import LocalPath
+from yggdrasil.io.path import LocalPath
 from yggdrasil.pandas.tests import PandasTestCase
 from yggdrasil.polars.lib import polars as pl
 
 # ---------------------------------------------------------------------------
-# Mixin — backend-agnostic TabularIO assertions
+# Mixin — backend-agnostic Tabular assertions
 # ---------------------------------------------------------------------------
 
-class _TabularIOPathMixin:
-    """Shared TabularIO round-trip suite.
+class _TabularPathMixin:
+    """Shared Tabular round-trip suite.
 
     Subclasses provide :meth:`_make_path` (and may override
     :meth:`_seed_parquet` if direct seeding is needed for read tests
@@ -234,8 +234,8 @@ class _TabularIOPathMixin:
 # LocalPath — real files in a tmpdir
 # ---------------------------------------------------------------------------
 
-class TestTabularIOLocalPath(_TabularIOPathMixin, PandasTestCase):
-    """Run the TabularIO suite against a real local-FS path.
+class TestTabularLocalPath(_TabularPathMixin, PandasTestCase):
+    """Run the Tabular suite against a real local-FS path.
 
     Local paths are the "happy path" for the buffer machinery: writes
     go straight to the file via ``os.pwrite`` and ``BytesIO._commit``
@@ -245,7 +245,7 @@ class TestTabularIOLocalPath(_TabularIOPathMixin, PandasTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self._tabularto_tmp = tempfile.mkdtemp(prefix="ygg-tabulario-local-")
+        self._tabularto_tmp = tempfile.mkdtemp(prefix="ygg-Tabular-local-")
 
     def tearDown(self) -> None:
         shutil.rmtree(self._tabularto_tmp, ignore_errors=True)
@@ -286,8 +286,8 @@ def _xfail_inherited(*method_names: str):
         return cls
     return deco
 
-class TestTabularIORemoteMock(_TabularIOPathMixin, PandasTestCase):
-    """Run the TabularIO suite against a mocked managed remote path.
+class TestTabularRemoteMock(_TabularPathMixin, PandasTestCase):
+    """Run the Tabular suite against a mocked managed remote path.
 
     Same assertions as the local class, but routed through the
     non-local path machinery (``open`` → BytesIO transaction buffer

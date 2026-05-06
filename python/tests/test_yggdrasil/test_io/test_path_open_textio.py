@@ -29,7 +29,7 @@ import json
 
 import pytest
 
-from yggdrasil.io.fs import Path
+from yggdrasil.io.path import Path
 
 
 # ---------------------------------------------------------------------------

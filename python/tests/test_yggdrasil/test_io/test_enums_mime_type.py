@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.io.enums.mime_type import MimeType, MimeTypes
+from yggdrasil.data.enums.mime_type import MimeType, MimeTypes
 
 
 # ---------------------------------------------------------------------------

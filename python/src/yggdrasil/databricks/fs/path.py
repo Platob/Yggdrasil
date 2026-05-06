@@ -77,12 +77,12 @@ import logging
 import threading
 from abc import abstractmethod
 from dataclasses import replace as _dc_replace
-from typing import IO, TYPE_CHECKING, Any, ClassVar, Optional, Tuple, Union
+from typing import IO, TYPE_CHECKING, Any, ClassVar, Optional, Tuple
 
-from yggdrasil.io.buffer.bytes_io import BytesIO
-from yggdrasil.io.enums import Mode
-from yggdrasil.io.fs.path import Path, _select_path_class
-from yggdrasil.io.fs.remote_path import RemotePath
+from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.data.enums import Mode
+from yggdrasil.io.path.path import Path, _select_path_class
+from yggdrasil.io.path.remote_path import RemotePath
 from yggdrasil.io.url import URL
 from ._errors import retry_sdk_call
 from .path_kind import DatabricksPathKind

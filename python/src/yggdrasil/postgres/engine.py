@@ -27,7 +27,7 @@ import pyarrow as pa
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.statement import StatementResult
-from yggdrasil.io.enums import Mode
+from yggdrasil.data.enums import Mode
 
 from .connection import PostgresConnection
 from .executor import PostgresExecutor

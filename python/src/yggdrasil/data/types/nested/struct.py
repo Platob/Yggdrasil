@@ -24,12 +24,11 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping
 
 import pyarrow as pa
-
+from yggdrasil.data.enums import Mode
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.nested import NestedType
-from yggdrasil.data.types.support import get_pandas, get_polars, get_spark_sql
+from yggdrasil.data.types.support import get_polars, get_spark_sql
 from yggdrasil.environ.importlib import cached_from_import
-from yggdrasil.io.enums import Mode
 from yggdrasil.lazy_imports import field_class
 
 if TYPE_CHECKING:
@@ -524,8 +523,6 @@ from .struct_polars import (  # noqa: E402
     cast_polars_struct_expr,
     cast_polars_map_expr,
     cast_polars_list_expr,
-    cast_polars_struct_series,
-    cast_polars_list_series,
     cast_polars_tabular,
 )
 from .struct_pandas import (  # noqa: E402

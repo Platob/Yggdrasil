@@ -1,7 +1,7 @@
 """Tests for the universal :class:`CastOptions.predicate` filter.
 
 Every IO that yields tabular rows funnels through
-:meth:`TabularIO._iter_public_batches`, which applies the
+:meth:`Tabular._iter_public_batches`, which applies the
 predicate before the rows leave the read pipeline. The same
 mechanism enforces the "missing column → accept everything"
 contract so a heterogeneous-source folder doesn't silently drop
@@ -35,7 +35,7 @@ from yggdrasil.io.buffer.primitive.csv_io import CsvIO
 from yggdrasil.io.buffer.primitive.json_io import JsonIO
 from yggdrasil.io.buffer.primitive.ndjson_io import NDJsonIO
 from yggdrasil.io.buffer.primitive.parquet_io import ParquetIO
-from yggdrasil.io.enums import Mode
+from yggdrasil.data.enums import Mode
 
 
 _IS_WINDOWS = sys.platform.startswith("win")
@@ -216,7 +216,7 @@ class TestParquetPushdown:
     The pushdown path uses the parquet footer's per-row-group min/max
     stats to skip whole row groups before any data is decompressed —
     a different code path from the universal per-batch filter at the
-    TabularIO layer. We can't easily probe ``pa.dataset`` internals
+    Tabular layer. We can't easily probe ``pa.dataset`` internals
     from here, but we can observe the contract: the result is the
     same as the universal-filter path, AND the pushdown helper is
     chosen when the predicate compiles cleanly.

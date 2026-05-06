@@ -226,9 +226,9 @@ def _decode_media_type(metadata: Mapping[bytes, bytes] | None):
     raw = metadata.get(_M_MT)
     if raw is None:
         return None
-    from yggdrasil.io.enums.codec import Codec
-    from yggdrasil.io.enums.media_type import MediaType
-    from yggdrasil.io.enums.mime_type import MimeType
+    from yggdrasil.data.enums.codec import Codec
+    from yggdrasil.data.enums.media_type import MediaType
+    from yggdrasil.data.enums.mime_type import MimeType
 
     text = raw.decode("utf-8")
     if "+" in text:
@@ -295,7 +295,7 @@ class IOSerialized(Serialized[object]):
     ) -> Serialized[object] | None:
         # order matters: most specific first.
         # yggdrasil BytesIO does NOT inherit ``io.IOBase`` (it's a
-        # TabularIO under :mod:`yggdrasil.io.buffer`), so the stdlib
+        # Tabular under :mod:`yggdrasil.io.buffer`), so the stdlib
         # checks below would miss it. Match it first and route through
         # the binary path, which already preserves ``_media_type`` via
         # :func:`_encode_media_type`.

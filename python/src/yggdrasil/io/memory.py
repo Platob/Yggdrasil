@@ -7,20 +7,19 @@ spill file, no transaction layer. Capacity grows with the standard
 
 Composes with :class:`yggdrasil.io.buffer.BytesIO`: a memory-mode
 ``BytesIO`` is conceptually a Memory holder plus a cursor and the
-TabularIO read/write surface.
+Tabular read/write surface.
 
 Metadata model
 --------------
 All IO metadata (visible size, mtime, media-type) lives on a single
-mutable :class:`IOStats` instance — :attr:`stats`. Writes mutate it
-in place; readers are free to call :meth:`stats` and pin the same
-object (it's never replaced for the holder's lifetime).
+mutable :class:`IOStats` instance — :meth:`stat`. Writes mutate it
+in place via :meth:`Holder._touch_stat`.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.io_stats import IOKind, IOStats
@@ -31,78 +30,55 @@ from .holder import Holder
 __all__ = ["Memory"]
 
 
-# ---------------------------------------------------------------------------
-# Memory
-# ---------------------------------------------------------------------------
-
-
 class Memory(Holder):
     """Fully memory-resident byte holder.
 
-    Construction shapes:
+    Construction shapes (in addition to those inherited from
+    :class:`Holder`):
 
-    - ``Memory()`` — empty, zero capacity.
-    - ``Memory(int n)`` — empty, capacity ``n`` reserved.
-    - ``Memory(bytes_like)`` — seeded with the given bytes; visible
-      size is ``len(bytes_like)``.
-    - ``Memory(other_memory)`` — deep copy.
+    - ``Memory()``          — empty, zero capacity.
+    - ``Memory(int n)``     — empty, capacity ``n`` reserved.
+    - ``Memory(other_mem)`` — deep copy of another Memory.
 
-    The visible :attr:`size` and the underlying ``bytearray`` capacity
-    are tracked separately. ``reserve(n)`` grows capacity without
-    moving :attr:`size`; :meth:`truncate` moves :attr:`size`,
-    zero-padding on extend up to capacity.
+    Visible :attr:`size` and underlying ``bytearray`` capacity are
+    tracked separately. ``reserve(n)`` grows capacity without moving
+    :attr:`size`; :meth:`truncate` moves :attr:`size`, zero-padding
+    on extend.
+
+    Implements the five :class:`Holder` primitives — :meth:`_read_mv`,
+    :meth:`_write_mv`, :meth:`reserve`, :meth:`truncate`, :meth:`clear`
+    — plus :attr:`size` and the lazy :meth:`stat`. Everything else
+    (positional normalization, bounds checking, pre-grow via
+    :meth:`resize`, ``mark_dirty``, bytes/text convenience,
+    append-at-end ``pos = -1`` semantics) comes from the base class.
     """
 
-    __slots__ = ("_buf", "_stats", "_url")
+    __slots__ = ("_buf",)
 
     def __init__(
         self,
         data: Any = None,
-        *,
-        media_type: Any = None,
-        auto_open: bool = True,
+        **kwargs,
     ) -> None:
-        Disposable.__init__(self)
-        # Lazy ``mem://<addr>`` URL handle — minted on first access.
-        self._url = None
-        self._stats: IOStats = IOStats(
-            mtime=time.time(),
-            kind=IOKind.SOCKET,
-            media_type=media_type,
-        )
+        self._buf: bytearray = bytearray()
 
-        if data is None:
-            self._buf: bytearray = bytearray()
-        elif isinstance(data, Memory):
-            self._buf = bytearray(memoryview(data._buf)[: data._stats.size])
-            self._stats.size = data._stats.size
-            if media_type is None:
-                self._stats.media_type = data._stats.media_type
-        elif isinstance(data, int):
+        # ``int`` is Memory-specific (reserve capacity, no payload);
+        # everything else routes through Holder's _init_from_* dispatch.
+        if isinstance(data, int) and not isinstance(data, bool):
             if data < 0:
                 raise ValueError(
                     f"Memory(int) capacity must be >= 0, got {data!r}"
                 )
             self._buf = bytearray(data)
-        elif isinstance(data, (bytes, bytearray, memoryview)):
-            mv = memoryview(data)
-            if mv.format != "B" or mv.ndim != 1 or mv.itemsize != 1:
-                mv = mv.cast("B")
-            self._buf = bytearray(mv if mv.c_contiguous else bytes(mv))
-            self._stats.size = len(self._buf)
-        else:
-            raise TypeError(
-                f"Memory does not accept data of type {type(data).__name__!r}. "
-                "Pass bytes / bytearray / memoryview / int (capacity) / Memory."
-            )
+            data = None
 
-        if auto_open:
-            self.open()
+        super().__init__(data, **kwargs)
 
-    # ``_acquire`` / ``_release`` are inherited as no-ops from
-    # :class:`Disposable`. Memory's bytes survive a ``close()`` —
-    # the bytearray is owned by Python and freed on GC. Use
-    # :meth:`clear` to drop the payload explicitly.
+
+
+    # ``_acquire`` / ``_release`` inherited as no-ops from Disposable.
+    # Memory's bytes survive a close() — the bytearray is owned by
+    # Python and freed on GC. Use clear() to drop the payload.
 
     @classmethod
     def view(
@@ -117,12 +93,7 @@ class Memory(Holder):
         Zero-copy: ``buf`` is shared with the returned Memory.
         Mutations through :meth:`write_mv` / :meth:`truncate` /
         :meth:`reserve` propagate to ``buf`` directly. Closing the
-        returned Memory does not free ``buf`` — the bytearray's
-        lifetime is the caller's.
-
-        ``size`` defaults to ``len(buf)``; pass an explicit size when
-        the visible payload is shorter than the underlying capacity
-        (e.g. when the caller pre-allocated extra bytes).
+        returned Memory does not free ``buf``.
 
         Used by :class:`BytesIO` as the in-memory ``_owner``: the
         same bytearray BytesIO mutates directly is exposed through
@@ -131,18 +102,19 @@ class Memory(Holder):
         m = cls.__new__(cls)
         Disposable.__init__(m)
         m._url = None
+        m.temporary = False
         m._buf = buf
-        m._stats = IOStats(
+        m._stat = IOStats(
             size=len(buf) if size is None else int(size),
             mtime=time.time(),
-            kind=IOKind.SOCKET,
+            kind=IOKind.MEMORY,
             media_type=media_type,
         )
         m._acquired = True
         return m
 
     # ------------------------------------------------------------------
-    # Holder primitives
+    # Backing-shape predicates
     # ------------------------------------------------------------------
 
     @property
@@ -157,77 +129,40 @@ class Memory(Holder):
     def is_remote_path(self) -> bool:
         return False
 
-    @property
-    def url(self):
-        """``mem://<hex_addr>`` URL minted from this holder's id.
-
-        Built lazily on first access so naked construction stays
-        cheap; cached on ``_url`` for stable identity across
-        repeated reads (cache keys, dispatch discriminators).
-        """
-        u = self._url
-        if u is None:
-            from yggdrasil.io.url import URL  # avoid import cycle
-            u = URL.from_memory_address(self)
-            self._url = u
-        return u
+    # ------------------------------------------------------------------
+    # Holder primitives
+    # ------------------------------------------------------------------
 
     @property
     def size(self) -> int:
-        return self._stats.size
-
-    @property
-    def mtime(self) -> float:
-        return self._stats.mtime
-
-    @property
-    def media_type(self):
-        return self._stats.media_type
-
-    def stat(self) -> IOStats:
-        """The mutable :class:`IOStats` carrying this holder's metadata.
-
-        Always returns the same instance for the holder's lifetime —
-        callers can pin it to observe live size/mtime updates.
-        """
-        return self._stats
+        return self.stat().size
 
     @property
     def capacity(self) -> int:
         """Current allocated capacity (``len(bytearray)``)."""
         return len(self._buf)
 
-    def read_mv(self, n: int, pos: int) -> memoryview:
-        if pos < 0:
-            raise ValueError(f"read_mv pos must be >= 0, got {pos!r}")
-        size = self._stats.size
-        if pos >= size:
-            return memoryview(b"")
-        if n < 0:
-            n = size - pos
-        end = min(pos + max(0, n), size)
-        if end <= pos:
-            return memoryview(b"")
-        return memoryview(self._buf)[pos:end]
+    def _read_mv(self, n: int, pos: int) -> memoryview:
+        # Holder.read_mv has already normalized pos and bounded n;
+        # 0 <= pos <= size and 0 <= n <= size - pos.
+        return memoryview(self._buf)[pos : pos + n]
 
-    def write_mv(self, data: memoryview, pos: int) -> int:
-        if pos < 0:
-            raise ValueError(f"write_mv pos must be >= 0, got {pos!r}")
-        if data.format != "B" or data.ndim != 1 or data.itemsize != 1:
-            data = data.cast("B")
-        if not data.c_contiguous:
-            data = memoryview(bytes(data))
+    def _write_mv(self, data: memoryview, pos: int) -> int:
+        """Splice bytes at ``pos`` — size already grown by :meth:`write_mv`.
+
+        :class:`Holder.write_mv` has pre-grown the visible size via
+        :meth:`resize` (which delegates to :meth:`truncate` here),
+        which in turn called :meth:`reserve` to grow the underlying
+        bytearray. So at this point ``len(self._buf)`` is already
+        guaranteed ≥ ``pos + len(data)`` and we just lay bytes down.
+
+        Stat-cache mutation (size / mtime) lives in :meth:`write_mv`
+        via :meth:`_touch_stat`, so this method does pure splice.
+        """
         n = len(data)
         if n == 0:
             return 0
-        need = pos + n
-        if need > len(self._buf):
-            self.reserve(need)
-        memoryview(self._buf)[pos:need] = data
-        stats = self._stats
-        if need > stats.size:
-            stats.size = need
-        stats.mtime = time.time()
+        memoryview(self._buf)[pos : pos + n] = data
         return n
 
     def reserve(self, n: int) -> None:
@@ -244,54 +179,35 @@ class Memory(Holder):
     def truncate(self, n: int) -> int:
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
-        stats = self._stats
-        if n != stats.size:
-            stats.mtime = time.time()
-        if n < stats.size:
-            stats.size = n
+        stats = self.stat()
+        if n == stats.size:
             return n
-        if n > stats.size:
+        if n > len(self._buf):
+            # bytearray.extend(b"\x00"*…) gives zero-padding for free,
+            # so reserve() does both the capacity grow and the zero-fill.
             self.reserve(n)
-            # The reserved tail is already zero — bytearray.extend(b"\x00")
-            # gives us zero-padding for free.
-            stats.size = n
+        stats.size = n
+        stats.mtime = time.time()
         return n
-
-    # ------------------------------------------------------------------
-    # Direct bytearray accessors — for callers that want zero-copy
-    # ------------------------------------------------------------------
-
-    def memoryview(self) -> memoryview:
-        """Memoryview over the visible payload (size-bounded)."""
-        return memoryview(self._buf)[: self._stats.size]
-
-    def to_bytes(self) -> bytes:
-        return bytes(self.memoryview())
 
     def clear(self) -> None:
         """Drop all bytes; reset capacity AND size to zero."""
         self._buf = bytearray()
-        self._stats.size = 0
-        self._stats.mtime = time.time()
+        stats = self.stat()
+        stats.size = 0
+        stats.mtime = time.time()
 
     # ------------------------------------------------------------------
-    # Dunder
+    # Memory-specific zero-copy accessors
     # ------------------------------------------------------------------
 
-    def __eq__(self, other: Any) -> bool:
-        if isinstance(other, Memory):
-            return (
-                self._stats.size == other._stats.size
-                and self.memoryview() == other.memoryview()
-            )
-        if isinstance(other, (bytes, bytearray, memoryview)):
-            return self.memoryview() == memoryview(other)
-        return NotImplemented
+    def memoryview(self) -> memoryview:
+        """Memoryview over the visible payload (size-bounded).
 
-    def __hash__(self) -> int:
-        # Equality is value-based; hash by content. Mutable, so use
-        # the bytes form (immutable snapshot) for the hash.
-        return hash(self.to_bytes())
+        Override of :meth:`Holder.memoryview` that aliases the
+        bytearray directly — no copy, no per-byte dispatch.
+        """
+        return memoryview(self._buf)[: self.stat().size]
 
-    def __repr__(self) -> str:
-        return f"Memory(size={self._stats.size}, capacity={len(self._buf)})"
+    def to_bytes(self) -> bytes:
+        return bytes(self.memoryview())

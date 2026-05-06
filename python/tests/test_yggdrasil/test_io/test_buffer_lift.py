@@ -1,6 +1,6 @@
-"""Tests for the frame-shaped lift on :class:`TabularIO`.
+"""Tests for the frame-shaped lift on :class:`Tabular`.
 
-``TabularIO(...)`` and ``TabularIO.from_(...)`` accept the shapes a
+``Tabular(...)`` and ``Tabular.from_(...)`` accept the shapes a
 real caller has on hand — pyarrow Table / RecordBatch, polars
 DataFrame / LazyFrame, pandas DataFrame, ``list[dict]`` rows,
 ``dict[str, list]`` columns, and any iterable of those — and lift
@@ -14,31 +14,31 @@ import unittest
 
 import pyarrow as pa
 
-from yggdrasil.io.buffer.base import TabularIO
-from yggdrasil.io.buffer.memory import MemoryArrowIO
+from yggdrasil.io.tabular import Tabular
+from yggdrasil.io.tabular import MemoryArrowIO
 
 
 class TestConstructorLift(unittest.TestCase):
     def test_pyarrow_table(self) -> None:
-        io = TabularIO(pa.table({"a": [1, 2, 3]}))
+        io = Tabular(pa.table({"a": [1, 2, 3]}))
         self.assertIsInstance(io, MemoryArrowIO)
         self.assertEqual(io.read_arrow_table().num_rows, 3)
 
     def test_pyarrow_record_batch(self) -> None:
         batch = pa.record_batch([pa.array([1, 2])], names=["a"])
-        io = TabularIO(batch)
+        io = Tabular(batch)
         self.assertIsInstance(io, MemoryArrowIO)
         self.assertEqual(io.read_arrow_table().num_rows, 2)
 
     def test_list_of_dicts(self) -> None:
-        io = TabularIO([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}])
+        io = Tabular([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}])
         self.assertIsInstance(io, MemoryArrowIO)
         out = io.read_arrow_table()
         self.assertEqual(out.column_names, ["a", "b"])
         self.assertEqual(out.num_rows, 2)
 
     def test_dict_of_columns(self) -> None:
-        io = TabularIO({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+        io = Tabular({"a": [1, 2, 3], "b": ["x", "y", "z"]})
         self.assertIsInstance(io, MemoryArrowIO)
         self.assertEqual(io.read_arrow_table().num_rows, 3)
 
@@ -47,7 +47,7 @@ class TestConstructorLift(unittest.TestCase):
             import polars as pl
         except ImportError:
             self.skipTest("polars not installed")
-        io = TabularIO(pl.DataFrame({"a": [1, 2, 3]}))
+        io = Tabular(pl.DataFrame({"a": [1, 2, 3]}))
         self.assertIsInstance(io, MemoryArrowIO)
         self.assertEqual(io.read_arrow_table().num_rows, 3)
 
@@ -56,7 +56,7 @@ class TestConstructorLift(unittest.TestCase):
             import polars as pl
         except ImportError:
             self.skipTest("polars not installed")
-        io = TabularIO(pl.LazyFrame({"a": [1, 2, 3, 4]}))
+        io = Tabular(pl.LazyFrame({"a": [1, 2, 3, 4]}))
         self.assertIsInstance(io, MemoryArrowIO)
         self.assertEqual(io.read_arrow_table().num_rows, 4)
 
@@ -65,20 +65,20 @@ class TestConstructorLift(unittest.TestCase):
             import pandas as pd
         except ImportError:
             self.skipTest("pandas not installed")
-        io = TabularIO(pd.DataFrame({"a": [1, 2]}))
+        io = Tabular(pd.DataFrame({"a": [1, 2]}))
         self.assertIsInstance(io, MemoryArrowIO)
         self.assertEqual(io.read_arrow_table().num_rows, 2)
 
 
 class TestFromLift(unittest.TestCase):
     def test_from_pyarrow_table(self) -> None:
-        io = TabularIO.from_(pa.table({"a": [1, 2]}))
+        io = Tabular.from_(pa.table({"a": [1, 2]}))
         self.assertIsInstance(io, MemoryArrowIO)
         self.assertEqual(io.read_arrow_table().num_rows, 2)
 
     def test_from_already_tabular_io_passes_through(self) -> None:
         original = MemoryArrowIO(pa.table({"a": [1]}))
-        same = TabularIO.from_(original)
+        same = Tabular.from_(original)
         self.assertIs(same, original)
 
     def test_from_unsupported_raises_with_helpful_message(self) -> None:
@@ -86,7 +86,7 @@ class TestFromLift(unittest.TestCase):
             pass
 
         with self.assertRaises(RuntimeError) as cx:
-            TabularIO.from_(Mystery())
+            Tabular.from_(Mystery())
         msg = str(cx.exception)
         self.assertIn("pyarrow", msg.lower())
         self.assertIn("polars", msg.lower())
@@ -96,7 +96,7 @@ class TestFromLift(unittest.TestCase):
             import polars as pl
         except ImportError:
             self.skipTest("polars not installed")
-        io = TabularIO.from_(pl.DataFrame({"a": [1, 2, 3]}))
+        io = Tabular.from_(pl.DataFrame({"a": [1, 2, 3]}))
         self.assertIsInstance(io, MemoryArrowIO)
         self.assertEqual(io.read_arrow_table().num_rows, 3)
 

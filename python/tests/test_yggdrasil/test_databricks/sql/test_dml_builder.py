@@ -41,8 +41,8 @@ from yggdrasil.databricks.sql.table import (
     _resolve_dispatch_targets,
     _resolve_prune_by,
 )
-from yggdrasil.io.buffer.primitive import ParquetIO
-from yggdrasil.io.enums import Mode
+from yggdrasil.io.primitive import ParquetIO
+from yggdrasil.data.enums import Mode
 
 
 TARGET = "`cat`.`sch`.`tbl`"

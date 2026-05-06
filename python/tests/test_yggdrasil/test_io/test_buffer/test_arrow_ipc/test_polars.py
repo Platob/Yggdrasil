@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import pytest
-
-from yggdrasil.io.buffer.primitive import ArrowIPCIO
+from yggdrasil.io.primitive import ArrowIPCIO
 from .._helpers import require_polars, sample_polars_frame
 
 

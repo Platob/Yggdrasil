@@ -15,7 +15,7 @@ from databricks.sdk.config import Config
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.dataclasses import WaitingConfigArg, WaitingConfig, ExpiringDict
 from yggdrasil.io.buffer import BytesIO
-from yggdrasil.io.enums import MimeTypes
+from yggdrasil.data.enums import MimeTypes
 from yggdrasil.io.url import URL
 from yggdrasil.version import __version__ as ygg_version
 

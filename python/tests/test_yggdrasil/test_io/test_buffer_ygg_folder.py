@@ -20,7 +20,6 @@ files, no schema drift.
 
 from __future__ import annotations
 
-import os
 import pathlib
 import sys
 import threading
@@ -29,8 +28,8 @@ import time
 import pyarrow as pa
 import pytest
 
-from yggdrasil.io.buffer.nested import FolderIO, YGGFolderIO, is_ygg_folder
-from yggdrasil.io.enums import Mode, MimeTypes
+from yggdrasil.io.nested import FolderIO, YGGFolderIO, is_ygg_folder
+from yggdrasil.data.enums import Mode, MimeTypes
 from yggdrasil.io.stats import Stats
 
 
@@ -527,11 +526,11 @@ class TestStatsAcrossFormats:
         ],
     )
     def test_stats_compute_for_format(self, tmp_path, io_cls, filename):
-        from yggdrasil.io.buffer.primitive.parquet_io import ParquetIO
-        from yggdrasil.io.buffer.primitive.arrow_ipc_io import ArrowIPCIO
-        from yggdrasil.io.buffer.primitive.csv_io import CsvIO
-        from yggdrasil.io.buffer.primitive.json_io import JsonIO
-        from yggdrasil.io.buffer.primitive.ndjson_io import NDJsonIO
+        from yggdrasil.io.primitive import ParquetIO
+        from yggdrasil.io.primitive import ArrowIPCIO
+        from yggdrasil.io.primitive import CsvIO
+        from yggdrasil.io.primitive import JsonIO
+        from yggdrasil.io.primitive import NDJsonIO
 
         cls_map = {
             "ParquetIO": ParquetIO,
@@ -563,7 +562,7 @@ class TestStatsAcrossFormats:
 
 class TestTimeSortableStaging:
     def test_with_tmp_name_sorts_chronologically(self, tmp_path):
-        from yggdrasil.io.fs import LocalPath
+        from yggdrasil.io.path import LocalPath
 
         base = LocalPath.from_pathlib(pathlib.Path(str(tmp_path)))
         names: list[str] = []
@@ -586,7 +585,7 @@ class TestTimeSortableStaging:
             )
 
     def test_spill_filename_lexical_order_matches_epoch(self):
-        from yggdrasil.io.buffer.bytes_io import _mint_spill_path
+        from yggdrasil.io.bytes_io import _mint_spill_path
 
         path_a = _mint_spill_path("bin", 60)
         time.sleep(1.05)
@@ -599,9 +598,9 @@ class TestTimeSortableStaging:
 # ---------------------------------------------------------------------------
 
 
-class TestTabularIOOptimizeDefault:
+class TestTabularOptimizeDefault:
     def test_default_optimize_is_noop(self, tmp_path):
-        from yggdrasil.io.buffer.primitive import ParquetIO
+        from yggdrasil.io.primitive import ParquetIO
 
         ParquetIO(path=str(tmp_path / "a.parquet")).write_arrow_table(_make_table(0))
         io = ParquetIO(path=str(tmp_path / "a.parquet"))

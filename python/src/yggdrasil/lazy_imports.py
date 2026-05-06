@@ -3,43 +3,43 @@ from functools import lru_cache
 
 @lru_cache(maxsize=1)
 def bytes_io_class():
-    from yggdrasil.io.buffer.bytes_io import BytesIO
+    from yggdrasil.io.bytes_io import BytesIO
     return BytesIO
 
 
 @lru_cache(maxsize=1)
 def media_type_class():
-    from yggdrasil.io.enums import MediaType
+    from yggdrasil.data.enums import MediaType
     return MediaType
 
 
 @lru_cache(maxsize=1)
 def media_types_class():
-    from yggdrasil.io.enums import MediaTypes
+    from yggdrasil.data.enums import MediaTypes
     return MediaTypes
 
 
 @lru_cache(maxsize=1)
 def mime_type_class():
-    from yggdrasil.io.enums import MimeType
+    from yggdrasil.data.enums import MimeType
     return MimeType
 
 
 @lru_cache(maxsize=1)
 def mime_types_class():
-    from yggdrasil.io.enums import MimeTypes
+    from yggdrasil.data.enums import MimeTypes
     return MimeTypes
 
 
 @lru_cache(maxsize=1)
 def path_class():
-    from yggdrasil.io.fs.path import Path
+    from yggdrasil.io.path.path import Path
     return Path
 
 
 @lru_cache(maxsize=1)
 def local_path_class():
-    from yggdrasil.io.fs.local_path import LocalPath
+    from yggdrasil.io.path.local_path import LocalPath
     return LocalPath
 
 
@@ -105,8 +105,8 @@ def spark_sql_module():
 
 @lru_cache(maxsize=1)
 def tabular_io_class():
-    from yggdrasil.io.buffer.base import TabularIO
-    return TabularIO
+    from yggdrasil.io.tabular import Tabular
+    return Tabular
 
 
 @lru_cache(maxsize=1)

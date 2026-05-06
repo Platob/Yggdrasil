@@ -19,9 +19,8 @@ import zipfile
 import pytest
 
 from yggdrasil.io.buffer import BytesIO
-from yggdrasil.io.buffer.nested import ZipEntryIO, ZipIO, ZipOptions
-from yggdrasil.io.enums import MimeTypes
-from .._helpers import sample_table
+from yggdrasil.io.nested import ZipEntryIO, ZipIO, ZipOptions
+from yggdrasil.data.enums import MimeTypes
 
 _io_BytesIO = _io_module.BytesIO
 

@@ -49,7 +49,7 @@ def _wait_for_cache(tmp_path: Path, expected: int = 1, timeout: float = 10.0) ->
     Hive parser would hand them back as strings and a multi-leaf
     read would fail to concat).
     """
-    from yggdrasil.io.buffer.nested.folder_io import FolderIO
+    from yggdrasil.io.nested.folder_io import FolderIO
     from yggdrasil.io.response import RESPONSE_SCHEMA
 
     cache_root = tmp_path
@@ -332,7 +332,7 @@ class TestHttpSessionSendManyLocalCache:
     def test_send_many_batches_first_pass_all_new_hits(
         self, http_server: _Server, tmp_path
     ):
-        from yggdrasil.io.buffer.base import TabularIO
+        from yggdrasil.io.tabular import Tabular
         from yggdrasil.io.session import ResponseBatch
 
         pytest.importorskip("xxhash")
@@ -354,10 +354,10 @@ class TestHttpSessionSendManyLocalCache:
         # the default-placeholder schema-bearing empty holder so the
         # batch can still answer schema questions.
         assert isinstance(batch.local_hits, dict)
-        assert all(isinstance(h, TabularIO) for h in batch.local_hits.values())
+        assert all(isinstance(h, Tabular) for h in batch.local_hits.values())
         assert isinstance(batch.remote_hits, dict)
-        assert all(isinstance(h, TabularIO) for h in batch.remote_hits.values())
-        assert isinstance(batch.new_hits, TabularIO)
+        assert all(isinstance(h, Tabular) for h in batch.remote_hits.values())
+        assert isinstance(batch.new_hits, Tabular)
         # No per-key hits — only the default placeholders are present,
         # so both breakdowns elide the empty defaults and read empty.
         assert batch.local_counts == {}

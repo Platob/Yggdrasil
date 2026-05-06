@@ -18,7 +18,7 @@ Public surface
 The engine is a :class:`yggdrasil.data.executor.StatementExecutor`
 that composes the resource hierarchy with an ADBC-fast Arrow
 read/write path. :class:`Table` implements
-:class:`yggdrasil.io.buffer.base.TabularIO`, so every cross-engine
+:class:`yggdrasil.io.buffer.base.Tabular`, so every cross-engine
 conversion (Arrow / Polars / pandas / Spark / records) lights up
 out-of-the-box.
 

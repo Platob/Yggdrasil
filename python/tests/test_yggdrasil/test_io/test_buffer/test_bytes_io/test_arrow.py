@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from yggdrasil.io.buffer import BytesIO
-from yggdrasil.io.enums import MimeTypes
+from yggdrasil.data.enums import MimeTypes
 from .._helpers import sample_table
 
 

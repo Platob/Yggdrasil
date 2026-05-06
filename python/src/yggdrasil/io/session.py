@@ -8,7 +8,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional
+from typing import TYPE_CHECKING, Any,  Iterator, Mapping, Optional
 
 import pyarrow as pa
 
@@ -19,9 +19,9 @@ from yggdrasil.dataclasses.waiting import (
     WaitingConfig,
     WaitingConfigArg,
 )
-from yggdrasil.io.enums import Mode
+from yggdrasil.data.enums import Mode
 from .buffer import BytesIO
-from .buffer.nested.folder_io import FolderIO, FolderOptions
+from yggdrasil.io.nested import FolderIO, FolderOptions
 from .request import PreparedRequest
 from .response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
 from .response_batch import ResponseBatch
@@ -202,7 +202,7 @@ def _lookup_local_responses(
     # before any bytes hit the driver. Anything we can't express
     # (corrupt expr, unsupported backend) collapses to a None
     # predicate and the unfiltered read still runs — the universal
-    # ``apply_predicate`` step at the TabularIO layer is the
+    # ``apply_predicate`` step at the Tabular layer is the
     # backstop that re-applies the filter on the materialised
     # batches.
     predicate = _combine_predicates(
@@ -674,7 +674,7 @@ class Session(ABC):
         """Stream responses one at a time, in both Python and Spark modes.
 
         Spark-backed buckets are drained via the holder's
-        :meth:`TabularIO.read_records`, which for :class:`MemorySparkIO`
+        :meth:`Tabular.read_records`, which for :class:`MemorySparkIO`
         uses ``df.toLocalIterator()`` — rows stream from the executors
         one at a time, so the driver memory footprint stays bounded
         even for large network-fetch batches. Callers that want a
@@ -1405,7 +1405,7 @@ class Session(ABC):
         instead.
 
         Works in both Python and Spark modes. Spark-backed buckets are
-        drained via the holder's :meth:`TabularIO.read_records`, which
+        drained via the holder's :meth:`Tabular.read_records`, which
         for :class:`MemorySparkIO` uses ``df.toLocalIterator()`` — rows
         stream from the executors one at a time, so the driver memory
         footprint stays bounded even for large network-fetch batches.

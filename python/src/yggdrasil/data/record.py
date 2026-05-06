@@ -8,8 +8,8 @@ That keeps row materialization cheap when the same schema repeats
 across millions of rows (the only real use case).
 
 :class:`Record` is the natural unit returned by
-:meth:`TabularIO.read_records` and consumed by
-:meth:`TabularIO.write_records`. Subclasses with a richer row shape
+:meth:`Tabular.read_records` and consumed by
+:meth:`Tabular.write_records`. Subclasses with a richer row shape
 (SQL row, Spark Row, etc.) should still satisfy the Mapping contract
 so callers don't need to know the concrete origin.
 """

@@ -14,7 +14,7 @@ from yggdrasil.data.data_field import field as schema_field
 from yggdrasil.data.schema import schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
 from yggdrasil.environ.userinfo import USERINFO_STRUCT, UserInfo
-from yggdrasil.io.enums import MediaType, MimeTypes
+from yggdrasil.data.enums import MediaType, MimeTypes
 from .buffer import BytesIO
 from .enums import GZIP, Codec, MimeType
 from .headers import normalize_headers

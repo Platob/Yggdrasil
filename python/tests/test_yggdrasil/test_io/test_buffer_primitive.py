@@ -12,14 +12,13 @@ Optional-dependency leaves (XLSX needs ``openpyxl``) are gated by
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 import pyarrow as pa
 import pytest
 
 from yggdrasil.io.buffer import BytesIO
-from yggdrasil.io.buffer.primitive import (
+from yggdrasil.io.primitive import (
     ArrowIPCIO,
     CsvIO,
     JsonIO,
@@ -27,14 +26,14 @@ from yggdrasil.io.buffer.primitive import (
     ParquetIO,
     XlsxIO,
 )
-from yggdrasil.io.buffer.nested import ZipIO, ZipOptions
-from yggdrasil.io.buffer.primitive.parquet_io import ParquetOptions
-from yggdrasil.io.buffer.primitive.csv_io import CsvOptions
-from yggdrasil.io.buffer.primitive.json_io import JsonOptions
-from yggdrasil.io.buffer.primitive.ndjson_io import NDJsonOptions
-from yggdrasil.io.buffer.primitive.arrow_ipc_io import ArrowIPCOptions
-from yggdrasil.io.buffer.primitive.xlsx_io import XlsxOptions
-from yggdrasil.io.enums import MimeTypes, MediaType, Mode
+from yggdrasil.io.nested import ZipIO, ZipOptions
+from yggdrasil.io.primitive import ParquetOptions
+from yggdrasil.io.primitive import CsvOptions
+from yggdrasil.io.primitive import JsonOptions
+from yggdrasil.io.primitive import NDJsonOptions
+from yggdrasil.io.primitive import ArrowIPCOptions
+from yggdrasil.io.primitive import XlsxOptions
+from yggdrasil.data.enums import MimeTypes, MediaType, Mode
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +457,7 @@ class TestPersist:
         assert not io.cached
 
     def test_persist_idempotent(self, tmpdir_path: Path):
-        from yggdrasil.io.buffer.memory import MemoryArrowIO
+        from yggdrasil.io.tabular import MemoryArrowIO
 
         path = tmpdir_path / "a.parquet"
         ParquetIO(path=str(path)).write_arrow_table(_sample_table())
@@ -471,7 +470,7 @@ class TestPersist:
         assert io._persisted_data is first
 
     def test_persist_with_explicit_data(self):
-        from yggdrasil.io.buffer.memory import MemoryArrowIO
+        from yggdrasil.io.tabular import MemoryArrowIO
 
         io = ParquetIO()
         table = _sample_table()

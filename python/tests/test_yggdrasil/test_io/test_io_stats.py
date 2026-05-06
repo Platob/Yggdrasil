@@ -89,7 +89,7 @@ class TestIOStatsWith:
         assert out.size == 5
 
     def test_with_clears_media_type_explicitly(self):
-        from yggdrasil.io.enums import MediaTypes
+        from yggdrasil.data.enums import MediaTypes
 
         s = IOStats(media_type=MediaTypes.JSON)
         s.with_(media_type=None, inplace=True)

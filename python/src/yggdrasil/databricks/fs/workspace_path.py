@@ -21,7 +21,7 @@ from databricks.sdk.service.workspace import (
     ObjectType,
 )
 
-from yggdrasil.io.buffer.bytes_io import BytesIO
+from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 from ._errors import (

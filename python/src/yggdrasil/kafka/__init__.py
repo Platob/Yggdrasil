@@ -1,6 +1,6 @@
 """yggdrasil Kafka integration.
 
-Surfaces an Apache Kafka topic as a :class:`TabularIO`, so the same
+Surfaces an Apache Kafka topic as a :class:`Tabular`, so the same
 Arrow / Polars / Pandas / Spark conversion stack used everywhere
 else in yggdrasil also covers Kafka publish / consume. The runtime
 client (``confluent-kafka``) is loaded through

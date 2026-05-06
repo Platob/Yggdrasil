@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.io.errors import BadRequest, NotFoundError
+from yggdrasil.io.errors import BadRequest
 from yggdrasil.io.request import PreparedRequest
-from yggdrasil.io.send_config import CacheConfig, SendConfig
+from yggdrasil.io.send_config import CacheConfig
 from yggdrasil.io.session import Session
 from yggdrasil.io.url import URL
 
@@ -250,8 +250,8 @@ class TestRequestBodyHashFilter:
         pytest.importorskip("pyarrow")
         pytest.importorskip("xxhash")
 
-        from yggdrasil.io.buffer.nested import FolderOptions
-        from yggdrasil.io.enums import Mode
+        from yggdrasil.io.nested import FolderOptions
+        from yggdrasil.data.enums import Mode
         from yggdrasil.io.response import Response
         from yggdrasil.io.session import _lookup_local_responses
         from yggdrasil.io.send_config import _folderio_for_local_cache
@@ -295,14 +295,14 @@ class TestLocalCacheUsesYGGFolder:
     """Local-cache builder lazily produces a :class:`YGGFolderIO`."""
 
     def test_default_builder_returns_ygg_folder(self, tmp_path):
-        from yggdrasil.io.buffer.nested.ygg_folder_io import YGGFolderIO
+        from yggdrasil.io.nested.ygg_folder_io import YGGFolderIO
         from yggdrasil.io.send_config import _folderio_for_local_cache
 
         folder = _folderio_for_local_cache(tmp_path)
         assert isinstance(folder, YGGFolderIO)
 
     def test_local_cache_lazy_builds_ygg_folder(self, tmp_path):
-        from yggdrasil.io.buffer.nested.ygg_folder_io import YGGFolderIO
+        from yggdrasil.io.nested.ygg_folder_io import YGGFolderIO
 
         cfg = CacheConfig.check_arg(tmp_path, received_from="2020-01-01T00:00:00Z")
         assert isinstance(cfg.local_cache(), YGGFolderIO)
@@ -410,7 +410,7 @@ class TestMirrorLocalToRemote:
             received_at=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
         )
 
-        # Stand in for a TabularIO with the surface ``remote_cache_enabled``
+        # Stand in for a Tabular with the surface ``remote_cache_enabled``
         # consults — has both read and write callables, plus
         # ``full_name``. The mirror should call _persist_remote with the
         # local hit; we capture the call instead of letting it actually

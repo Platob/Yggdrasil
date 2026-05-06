@@ -162,7 +162,7 @@ def is_query(node: Any) -> bool:
 
     Used by the executor to refuse to run side-effecting DDL/DML
     against the in-process catalog — those wouldn't make sense on
-    a :class:`TabularIO` source anyway.
+    a :class:`Tabular` source anyway.
     """
     sge = sqlglot_expressions()
     return isinstance(

@@ -34,7 +34,7 @@ from databricks.sdk.service.catalog import TableInfo, TableType
 from yggdrasil.databricks.client import DatabricksService
 from yggdrasil.databricks.sql.sql_utils import is_glob_pattern, name_matcher, quote_ident
 from yggdrasil.dataclasses.expiring import ExpiringDict
-from yggdrasil.io.enums.mode import Mode, ModeLike
+from yggdrasil.data.enums.mode import Mode, ModeLike
 
 from .view import View
 

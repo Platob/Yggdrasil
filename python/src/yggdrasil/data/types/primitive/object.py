@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
-from yggdrasil.io.enums import Mode
+from yggdrasil.data.enums import Mode
 
 from ..base import DataType
 from ..id import DataTypeId

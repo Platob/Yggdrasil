@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import pytest
-
-from yggdrasil.io.buffer.primitive import CsvIO
+from yggdrasil.io.primitive import CsvIO
 from .._helpers import sample_table
 
 

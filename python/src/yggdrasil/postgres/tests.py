@@ -8,7 +8,7 @@ Two orientations:
   dependency skips for the optional ``psycopg`` / ``adbc`` modules.
 
 * **Integration tests** — exercise the catalog / schema / table /
-  TabularIO surface against a live Postgres. Skipped automatically
+  Tabular surface against a live Postgres. Skipped automatically
   when ``POSTGRES_URI`` is unset *or* either driver is missing.
   Decorate the test class with the ``integration`` pytest marker
   (matches the existing Databricks pattern in the repo) so the

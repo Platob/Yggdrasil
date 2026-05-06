@@ -56,7 +56,7 @@ from databricks.sdk.service.catalog import (
 )
 
 from yggdrasil.dataclasses.expiring import ExpiringDict
-from yggdrasil.io.enums.mode import Mode, ModeLike
+from yggdrasil.data.enums.mode import Mode, ModeLike
 from ..client import DatabricksService
 
 __all__ = ["EntityTags", "RetryPolicy"]

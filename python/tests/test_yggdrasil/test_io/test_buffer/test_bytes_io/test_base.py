@@ -12,7 +12,7 @@ import io as stdio
 import pytest
 
 from yggdrasil.io.buffer import BytesIO
-from yggdrasil.io.enums import MimeTypes
+from yggdrasil.data.enums import MimeTypes
 
 
 class TestBytesIOConstruction:
@@ -47,7 +47,7 @@ class TestBytesIOConstruction:
         bio.close()
 
     def test_default_media_type_is_none(self):
-        # BytesIO opts out of the TabularIO registry — the buffer
+        # BytesIO opts out of the Tabular registry — the buffer
         # has no single mime to claim.
         assert BytesIO.default_media_type() is None
 
@@ -114,7 +114,7 @@ class TestBytesIOLifecycle:
         assert bio.closed
 
     def test_cached_default_false(self):
-        # TabularIO contract is implemented on BytesIO; without a
+        # Tabular contract is implemented on BytesIO; without a
         # tabular view, persist() must fail rather than silently
         # cache nothing.
         bio = BytesIO()

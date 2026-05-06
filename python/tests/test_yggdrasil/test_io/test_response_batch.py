@@ -12,7 +12,7 @@ import datetime as dt
 import pytest
 
 from yggdrasil.io.buffer import BytesIO
-from yggdrasil.io.buffer.base import TabularIO
+from yggdrasil.io.tabular import Tabular
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, Response
 from yggdrasil.io.response_batch import (
@@ -61,7 +61,7 @@ class TestResponseBatchPython:
         # three holders (one default placeholder per keyed bucket).
         assert len(batch.parts()) == 3
         for holder in batch.parts():
-            assert isinstance(holder, TabularIO)
+            assert isinstance(holder, Tabular)
             # Schema is preserved — RESPONSE_ARROW_SCHEMA — so callers
             # can introspect column names without ever fetching rows.
             assert holder.schema == RESPONSE_ARROW_SCHEMA
@@ -73,7 +73,7 @@ class TestResponseBatchPython:
         assert DEFAULT_LOCAL_PATH_KEY == DEFAULT_REMOTE_TABLE_KEY == DEFAULT_BUCKET_KEY
 
     def test_lists_are_coerced_to_tabular_holders(self):
-        # The constructor lifts list[Response] into TabularIO holders so
+        # The constructor lifts list[Response] into Tabular holders so
         # all three buckets share one read contract. A bare list passed
         # for local_hits / remote_hits is treated as a single untagged
         # bucket and stored under the default placeholder key.
@@ -86,13 +86,13 @@ class TestResponseBatchPython:
         )
         assert isinstance(batch.local_hits, dict)
         assert list(batch.local_hits) == [DEFAULT_LOCAL_PATH_KEY]
-        assert isinstance(batch.local_hits[DEFAULT_LOCAL_PATH_KEY], TabularIO)
+        assert isinstance(batch.local_hits[DEFAULT_LOCAL_PATH_KEY], Tabular)
         assert isinstance(batch.remote_hits, dict)
         assert list(batch.remote_hits) == [DEFAULT_REMOTE_TABLE_KEY]
-        assert isinstance(batch.remote_hits[DEFAULT_REMOTE_TABLE_KEY], TabularIO)
+        assert isinstance(batch.remote_hits[DEFAULT_REMOTE_TABLE_KEY], Tabular)
         # The unsupplied bucket gets a schema-bearing empty holder
         # rather than ``None`` so empty results still expose a schema.
-        assert isinstance(batch.new_hits, TabularIO)
+        assert isinstance(batch.new_hits, Tabular)
         assert batch.new_hits.schema == RESPONSE_ARROW_SCHEMA
 
     def test_local_hits_dict_input_preserves_per_path_split(self):

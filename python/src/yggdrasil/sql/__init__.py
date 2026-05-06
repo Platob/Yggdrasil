@@ -1,10 +1,10 @@
-"""In-process SQL on top of :class:`yggdrasil.io.buffer.TabularIO`.
+"""In-process SQL on top of :class:`yggdrasil.io.buffer.Tabular`.
 
 The single line you'll write 95% of the time::
 
     import yggdrasil.sql as ysql
 
-    ysql.register("trades", trades_io)              # name → TabularIO
+    ysql.register("trades", trades_io)              # name → Tabular
     result = ysql.sql("SELECT symbol, SUM(qty) AS total "
                        "FROM trades GROUP BY symbol "
                        "ORDER BY total DESC LIMIT 10")
@@ -21,7 +21,7 @@ A thin SQL surface that:
   SELECT shape). ``dialect='postgres'`` / ``'sqlite'`` / ``'mysql'``
   / ``'ansi'`` switch flavors when you need them.
 - Resolves table references against a :class:`SqlContext` — a dict
-  of ``name → TabularIO`` (or anything :func:`coerce_source`
+  of ``name → Tabular`` (or anything :func:`coerce_source`
   knows how to lift: pyarrow Table/Batch, polars / pandas / Spark
   DataFrame, ``list[dict]``, path string).
 - Executes through :class:`polars.SQLContext` when polars is
@@ -30,11 +30,11 @@ A thin SQL surface that:
   ``SELECT cols FROM src [WHERE] [LIMIT]`` shape on base installs.
 - Returns a :class:`SqlStatementResult` — a real
   :class:`yggdrasil.data.statement.StatementResult` (so it's a
-  full :class:`TabularIO` with ``read_arrow_table`` /
+  full :class:`Tabular` with ``read_arrow_table`` /
   ``read_polars_frame`` / ``read_pandas_frame`` /
   ``read_spark_frame`` / ``to_records`` / …).
 - Persists the materialized result through
-  :attr:`TabularIO._persisted_data` so repeat reads are cache
+  :attr:`Tabular._persisted_data` so repeat reads are cache
   hits. Default holder is :class:`MemoryArrowIO`; pass
   ``persist='path', path='...'`` to spill to a parquet file or
   folder instead.
@@ -45,7 +45,7 @@ Why this shape
 Existing pieces in the repo do most of the work — we just stitch
 them together:
 
-- :class:`yggdrasil.io.buffer.TabularIO` is the universal source
+- :class:`yggdrasil.io.buffer.Tabular` is the universal source
   surface. Anything that yields Arrow batches plugs in.
 - :class:`yggdrasil.data.expr.Expression` is the cross-engine
   predicate AST. The ``where=`` kwarg accepts one and composes
@@ -105,7 +105,7 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
-    from yggdrasil.io.buffer.base import TabularIO
+    pass
 
 
 __all__ = [
@@ -168,10 +168,10 @@ def sql(
         ``dialect='postgres'`` etc. to switch.
     sources
         Optional ``{name: source}`` overrides scoped to this
-        execution. Each value is lifted to a :class:`TabularIO`
+        execution. Each value is lifted to a :class:`Tabular`
         via :func:`coerce_source` (accepts pyarrow / polars /
         pandas / Spark frames, ``list[dict]``, path strings, or
-        an existing :class:`TabularIO`). Wins over the
+        an existing :class:`Tabular`). Wins over the
         :class:`SqlContext` for the duration of the call.
     context
         :class:`SqlContext` to resolve unbound names against.
@@ -209,7 +209,7 @@ def sql(
     Returns
     -------
     SqlStatementResult
-        Lifecycle handle and a full :class:`TabularIO` over the
+        Lifecycle handle and a full :class:`Tabular` over the
         materialized result. Read via :meth:`read_arrow_table`,
         :meth:`read_polars_frame`, :meth:`read_pandas_frame`,
         :meth:`read_spark_frame`, :meth:`to_records`, etc.
