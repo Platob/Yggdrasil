@@ -11,8 +11,8 @@ survives all the way to the consumer: local hits keyed by local-cache
 folder path, remote hits keyed by remote-cache table full name. The
 new-hits bucket stays single-holder — network fetches don't carry a
 meaningful per-config split before they're persisted. All holders are
-the same type — Python (:class:`MemoryArrowIO`) and Spark
-(:class:`MemorySparkIO`) share one contract — and empty buckets keep
+the same type — Python (:class:`ArrowTabular`) and Spark
+(:class:`SparkTabular`) share one contract — and empty buckets keep
 their :data:`RESPONSE_SCHEMA` so a batch with no responses still answers
 schema questions correctly. Iteration walks each holder's Arrow batches
 and rebuilds :class:`Response` objects via
@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Iterator, Mapping, Optional, Union
 
 from .tabular.base import Tabular
-from yggdrasil.io.tabular import MemoryArrowIO, MemorySparkIO
+from yggdrasil.io.tabular import ArrowTabular, SparkTabular
 from .response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA, Response
 
 if TYPE_CHECKING:
@@ -90,35 +90,35 @@ KeyedBucketInput = Union[
 # ---------------------------------------------------------------------------
 
 
-def empty_arrow_holder() -> MemoryArrowIO:
-    """Empty :class:`MemoryArrowIO` keyed to :data:`RESPONSE_ARROW_SCHEMA`.
+def empty_arrow_holder() -> ArrowTabular:
+    """Empty :class:`ArrowTabular` keyed to :data:`RESPONSE_ARROW_SCHEMA`.
 
     Use as the default bucket in Python mode so consumers can read
     ``holder.schema`` even when no responses landed in this origin.
     """
-    return MemoryArrowIO(schema=RESPONSE_ARROW_SCHEMA)
+    return ArrowTabular(schema=RESPONSE_ARROW_SCHEMA)
 
 
-def empty_spark_holder(spark: "SparkSession") -> MemorySparkIO:
-    """Empty :class:`MemorySparkIO` keyed to the Spark response schema.
+def empty_spark_holder(spark: "SparkSession") -> SparkTabular:
+    """Empty :class:`SparkTabular` keyed to the Spark response schema.
 
     The held frame is built with ``spark.createDataFrame([], schema=...)``
     so the holder advertises :data:`RESPONSE_SCHEMA` (Spark form) without
     materialising any rows.
     """
     df = spark.createDataFrame([], schema=RESPONSE_SCHEMA.to_spark_schema())
-    return MemorySparkIO(df, spark=spark)
+    return SparkTabular(df, spark=spark)
 
 
 # ---------------------------------------------------------------------------
 # Coercion helpers — one shape in, one Tabular out
 # ---------------------------------------------------------------------------
 
-def responses_to_tabular(responses: list[Response]) -> MemoryArrowIO:
-    """Wrap a list of :class:`Response` in a :class:`MemoryArrowIO`.
+def responses_to_tabular(responses: list[Response]) -> ArrowTabular:
+    """Wrap a list of :class:`Response` in a :class:`ArrowTabular`.
 
     Always returns a schema-bearing holder — an empty list yields an
-    empty :class:`MemoryArrowIO` whose ``.schema`` is
+    empty :class:`ArrowTabular` whose ``.schema`` is
     :data:`RESPONSE_ARROW_SCHEMA`, so a batch with zero rows still
     answers schema questions correctly. Each response is serialized via
     ``to_arrow_batch(parse=False)`` (one row per batch) and held in
@@ -127,14 +127,14 @@ def responses_to_tabular(responses: list[Response]) -> MemoryArrowIO:
     """
     if not responses:
         return empty_arrow_holder()
-    return MemoryArrowIO(
+    return ArrowTabular(
         (r.to_arrow_batch(parse=False) for r in responses),
         schema=RESPONSE_ARROW_SCHEMA,
     )
 
 
-def spark_to_tabular(df: "SparkDataFrame") -> MemorySparkIO:
-    """Wrap a Spark DataFrame in a :class:`MemorySparkIO` (no collect).
+def spark_to_tabular(df: "SparkDataFrame") -> SparkTabular:
+    """Wrap a Spark DataFrame in a :class:`SparkTabular` (no collect).
 
     The DataFrame lives on the holder's mutable ``frame`` slot, so
     :meth:`Tabular.read_spark_frame` returns it untouched. A
@@ -143,7 +143,7 @@ def spark_to_tabular(df: "SparkDataFrame") -> MemorySparkIO:
     on the :class:`ResponseBatch` is disallowed precisely so callers
     don't trip over that collect by accident.
     """
-    return MemorySparkIO(df)
+    return SparkTabular(df)
 
 
 def _coerce_bucket(
@@ -352,13 +352,13 @@ class ResponseBatch:
 
     @staticmethod
     def _is_spark_holder(holder: Tabular) -> bool:
-        return isinstance(holder, MemorySparkIO) and holder.frame is not None
+        return isinstance(holder, SparkTabular) and holder.frame is not None
 
     @staticmethod
     def _holder_count(holder: Tabular) -> int:
-        if isinstance(holder, MemorySparkIO):
+        if isinstance(holder, SparkTabular):
             return holder.frame.count() if holder.frame is not None else 0
-        if isinstance(holder, MemoryArrowIO):
+        if isinstance(holder, ArrowTabular):
             return holder.num_rows
         return holder.read_arrow_table().num_rows
 
@@ -384,8 +384,8 @@ class ResponseBatch:
         ``local`` and ``remote`` are totals summed across every
         contributing key — use :attr:`local_counts` and
         :attr:`remote_counts` for the per-key breakdowns. For
-        :class:`MemorySparkIO` this triggers ``df.count()``; for
-        :class:`MemoryArrowIO` it sums ``num_rows`` across the
+        :class:`SparkTabular` this triggers ``df.count()``; for
+        :class:`ArrowTabular` it sums ``num_rows`` across the
         in-memory batches — fine for debugging or small assertions,
         not for hot paths.
         """
@@ -458,10 +458,10 @@ class ResponseBatch:
         # makes the batch truthy regardless of contents — use
         # :attr:`counts` when you need the precise size.
         for holder in self._holders():
-            if isinstance(holder, MemorySparkIO):
+            if isinstance(holder, SparkTabular):
                 if holder.frame is not None:
                     return True
-            elif isinstance(holder, MemoryArrowIO):
+            elif isinstance(holder, ArrowTabular):
                 if holder.num_rows > 0:
                     return True
             else:
@@ -524,8 +524,8 @@ class ResponseBatch:
         from yggdrasil.data.enums import Mode
 
         mine: Tabular = getattr(self, attr)
-        if isinstance(theirs, MemorySparkIO) and theirs.frame is not None:
-            if isinstance(mine, MemorySparkIO) and mine.frame is not None:
+        if isinstance(theirs, SparkTabular) and theirs.frame is not None:
+            if isinstance(mine, SparkTabular) and mine.frame is not None:
                 mine.frame = mine.frame.unionByName(
                     theirs.frame, allowMissingColumns=True,
                 )
@@ -554,8 +554,8 @@ class ResponseBatch:
             if existing is None:
                 mine[key] = their_holder
                 continue
-            if isinstance(their_holder, MemorySparkIO) and their_holder.frame is not None:
-                if isinstance(existing, MemorySparkIO) and existing.frame is not None:
+            if isinstance(their_holder, SparkTabular) and their_holder.frame is not None:
+                if isinstance(existing, SparkTabular) and existing.frame is not None:
                     existing.frame = existing.frame.unionByName(
                         their_holder.frame, allowMissingColumns=True,
                     )
@@ -603,7 +603,7 @@ class ResponseBatch:
 
         frames: list["SparkDataFrame"] = []
         for holder in self._holders():
-            if isinstance(holder, MemorySparkIO) and holder.frame is not None:
+            if isinstance(holder, SparkTabular) and holder.frame is not None:
                 frames.append(holder.frame)
             else:
                 frames.append(holder.read_spark_frame())

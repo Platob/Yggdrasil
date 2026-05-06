@@ -249,8 +249,8 @@ class CastOptions:
     # --- Capture inserted rows as a return value -----------------------
     # When True, mutating tabular operations (table inserts, MERGE-style
     # writes, …) hand back the rows they actually wrote as a
-    # :class:`Tabular` — typically a :class:`MemoryArrowIO` or a
-    # :class:`MemorySparkIO` depending on the engine that ran the write.
+    # :class:`Tabular` — typically a :class:`ArrowTabular` or a
+    # :class:`SparkTabular` depending on the engine that ran the write.
     # Default ``False`` keeps the historical "fire-and-forget" return
     # contract; flip it on when downstream code wants to chain on the
     # newly-appended payload (logging, follow-up tasks, downstream

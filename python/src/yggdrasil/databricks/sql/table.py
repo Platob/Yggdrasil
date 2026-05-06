@@ -2162,8 +2162,8 @@ class Table(DatabricksResource, Tabular[CastOptions]):
 
         Returns ``None`` by default. With ``return_data=True`` the
         backend that ran the write hands back its source payload as a
-        :class:`Tabular` — :class:`MemoryArrowIO` from
-        :meth:`arrow_insert`, :class:`MemorySparkIO` from
+        :class:`Tabular` — :class:`ArrowTabular` from
+        :meth:`arrow_insert`, :class:`SparkTabular` from
         :meth:`spark_insert`, the input :class:`StatementResult` from
         :meth:`sql_insert` — for downstream chaining without
         re-querying the target.
@@ -2251,7 +2251,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
     ) -> "Tabular | None":
         """Insert through the warehouse SQL path with staged Parquet.
 
-        With ``return_data=True``, returns a :class:`MemoryArrowIO`
+        With ``return_data=True``, returns a :class:`ArrowTabular`
         wrapping the staged source rows so callers can chain on the
         payload without re-reading from the target.
 
@@ -2318,14 +2318,14 @@ class Table(DatabricksResource, Tabular[CastOptions]):
                 )
             buffer.seek(0)
             staging.write_stream(buffer)
-            # Capture the staged payload as a MemoryArrowIO before
+            # Capture the staged payload as a ArrowTabular before
             # the buffer is cleared.  Read straight off the spilled
             # Parquet so the holder shares the same row chunking the
             # warehouse will see.
             if return_data:
-                from yggdrasil.io.tabular import MemoryArrowIO
+                from yggdrasil.io.tabular import ArrowTabular
                 buffer.seek(0)
-                output_data = MemoryArrowIO(buffer.read_arrow_table())
+                output_data = ArrowTabular(buffer.read_arrow_table())
 
         buffer.clear()
         prune_predicates = _build_prune_predicates(prune_values, target_alias="T") if prune_values else []
@@ -2509,7 +2509,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
         passing ``retry=True`` (or any :class:`WaitingConfig` arg) makes
         the policy explicit instead of relying on auto-promote.
 
-        With ``return_data=True``, returns a :class:`MemorySparkIO`
+        With ``return_data=True``, returns a :class:`SparkTabular`
         wrapping the materialised source DataFrame — handy for
         chaining downstream transforms without re-querying the
         target.
@@ -2700,7 +2700,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
                 logger.debug("Failed to drop temp view %r; continuing.", view_name, exc_info=True)
             if prune_by and not return_data:
                 # Keep the cached source alive when the caller asked
-                # for it back — :class:`MemorySparkIO` is the consumer
+                # for it back — :class:`SparkTabular` is the consumer
                 # and unpersisting here would force a re-execution
                 # downstream.
                 try:
@@ -2709,8 +2709,8 @@ class Table(DatabricksResource, Tabular[CastOptions]):
                     logger.debug("Failed to unpersist cached source; continuing.", exc_info=True)
 
         if return_data:
-            from yggdrasil.io.tabular.spark import MemorySparkIO
-            return MemorySparkIO(data_df)
+            from yggdrasil.io.tabular.spark import SparkTabular
+            return SparkTabular(data_df)
         return None
 
     # =========================================================================

@@ -226,7 +226,7 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
     # -------------------------------------------------------------------------
     #
     # ``cached`` / ``unpersist`` come from :class:`Tabular` —
-    # ``_persisted_data`` (a :class:`MemorySparkIO` wrapper) is the
+    # ``_persisted_data`` (a :class:`SparkTabular` wrapper) is the
     # single source of truth for "was this statement materialised".
     # The :class:`Tabular` read paths delegate to it before the
     # private ``_read_*`` hooks fire, so we only need to fill in
@@ -245,20 +245,20 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
         *,
         data: Any | None = None,
     ) -> "SparkStatementResult":
-        """Stash a materialised frame on this result as a :class:`MemorySparkIO`.
+        """Stash a materialised frame on this result as a :class:`SparkTabular`.
 
         ``data`` overrides the persisted frame; otherwise this is a no-op
         (Spark caches lazily on the frame itself, not on this handle).
         """
         if data is not None:
-            from yggdrasil.io.tabular import MemorySparkIO
+            from yggdrasil.io.tabular import SparkTabular
             from yggdrasil.spark.cast import any_to_spark_dataframe
 
-            self._persisted_data = MemorySparkIO(any_to_spark_dataframe(data))
+            self._persisted_data = SparkTabular(any_to_spark_dataframe(data))
         return self
 
     # -------------------------------------------------------------------------
-    # Read hooks — forward to the held MemorySparkIO when set so callers
+    # Read hooks — forward to the held SparkTabular when set so callers
     # that bypass the public API (or hit ``_read_records`` through the
     # base default) still see the materialised frame.
     # -------------------------------------------------------------------------
