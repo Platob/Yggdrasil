@@ -257,6 +257,19 @@ class CastOptions:
     # writes) without re-querying the target.
     return_data: bool = False
 
+    # --- Keyed-write strategy toggle ------------------------------------
+    # When False (the default), keyed inserts use the engine's native
+    # ``MERGE INTO`` statement — Databricks / Delta plans the dedup
+    # once. When True, the table layer sidesteps MERGE entirely:
+    # ``Mode.APPEND`` becomes ``INSERT ... WHERE NOT EXISTS`` (or a
+    # Spark DataFrame anti-join, when a session is reachable);
+    # ``Mode.UPSERT`` / ``Mode.MERGE`` become a keyed ``DELETE``
+    # followed by ``INSERT``. Useful for backends without native
+    # MERGE, for callers that want explicit dedup semantics, or for
+    # the Spark fast path where pre-filtering the DataFrame is much
+    # cheaper than the SQL ``NOT EXISTS`` plan.
+    safe_merge: bool = False
+
     # --- Memoization slots ---------------------------------------------
     # ``merged_field`` and ``merged_schema`` are read repeatedly by every
     # cast / fill / alias entry point on this class — once per dispatch

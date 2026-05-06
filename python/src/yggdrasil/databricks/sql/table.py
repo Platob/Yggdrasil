@@ -537,6 +537,66 @@ def _build_delete_insert_statements(
     ]
 
 
+def _build_merge_statement(
+    *,
+    target_location: str,
+    source_sql: str,
+    columns: list[str],
+    match_by: list[str],
+    update_column_names: Optional[list[str]],
+    prune_predicates: list[str],
+    insert_only: bool = False,
+) -> str:
+    """Render a single ``MERGE INTO ...`` statement.
+
+    Used by :func:`_build_dml_statements` when ``safe_merge=False``
+    (the default) — Databricks / Delta supports MERGE natively and
+    plans the keyed dedup once instead of twice (one delete + one
+    insert) the way the safe path does.
+
+    ``insert_only=True`` emits a MERGE with only the ``WHEN NOT
+    MATCHED THEN INSERT`` clause — the keyed-APPEND shape. Without
+    it, the full update-and-insert MERGE runs.
+    """
+    cols_quoted = ", ".join(quote_ident(c) for c in columns)
+    on_condition = _build_match_condition(
+        match_by, left_alias="T", right_alias="S",
+        null_safe=True, extra_predicates=prune_predicates,
+    )
+    insert_clause = (
+        f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
+        f"VALUES ({', '.join(f'S.{quote_ident(c)}' for c in columns)})"
+    )
+    if insert_only:
+        return (
+            f"MERGE INTO {target_location} AS T\n"
+            f"USING (\n{source_sql}\n) AS S\n"
+            f"ON {on_condition}\n"
+            f"{insert_clause}"
+        )
+
+    update_column_names_effective = (
+        update_column_names
+        if update_column_names is not None
+        else [c for c in columns if c not in match_by]
+    )
+    update_clause = ""
+    if update_column_names_effective:
+        update_set = ", ".join(
+            f"T.{quote_ident(c)} = S.{quote_ident(c)}"
+            for c in update_column_names_effective
+        )
+        update_clause = f"WHEN MATCHED THEN UPDATE SET {update_set}\n"
+
+    return (
+        f"MERGE INTO {target_location} AS T\n"
+        f"USING (\n{source_sql}\n) AS S\n"
+        f"ON {on_condition}\n"
+        f"{update_clause}"
+        f"{insert_clause}"
+    )
+
+
 def _spark_filter_existing_keys(
     *,
     session: Any,
@@ -648,33 +708,36 @@ def _build_dml_statements(
     zorder_by: Optional[list[str]] = None,
     optimize_after_merge: bool = False,
     vacuum_hours: Optional[int] = None,
+    safe_merge: bool = False,
 ) -> list[str]:
-    """Generate INSERT / DELETE / OPTIMIZE / VACUUM SQL — no MERGE.
+    """Generate INSERT / MERGE / DELETE / OPTIMIZE / VACUUM SQL.
 
     Mode dispatch when ``match_by`` is set:
 
-    * :attr:`Mode.APPEND` / :attr:`Mode.AUTO` → single
-      ``INSERT ... WHERE NOT EXISTS`` against the target. Rows whose
-      keys already exist in the target get filtered out at INSERT
-      time; the engine still does the keyed lookup but never has to
-      rewrite an existing row.
-    * :attr:`Mode.UPSERT` / :attr:`Mode.MERGE` → keyed ``DELETE`` of
-      conflicting rows followed by a plain ``INSERT``. Honest
-      "incoming wins on overlap" without leaning on engine-specific
-      MERGE syntax.
-    * :attr:`Mode.TRUNCATE` with ``match_by`` → same DELETE + INSERT
-      shape (truncate-by-key).
+    * **safe_merge=False (default)** — emit a single ``MERGE INTO``
+      statement. Databricks / Delta plans the keyed dedup once;
+      :attr:`Mode.UPSERT` / :attr:`Mode.MERGE` get the full
+      update-and-insert MERGE, :attr:`Mode.APPEND` /
+      :attr:`Mode.AUTO` get the insert-only variant.
+    * **safe_merge=True** — sidestep MERGE entirely.
+      :attr:`Mode.UPSERT` / :attr:`Mode.MERGE` run a keyed ``DELETE``
+      followed by ``INSERT`` (incoming wins on overlap).
+      :attr:`Mode.APPEND` / :attr:`Mode.AUTO` run
+      ``INSERT ... WHERE NOT EXISTS (...)`` so existing rows are
+      filtered at INSERT time. Useful for backends without native
+      MERGE, for callers that want "do exactly the dedup you wrote
+      down" semantics, or for the Spark fast-path
+      (:func:`_spark_filter_existing_keys`) which pre-filters the
+      DataFrame before submission and downgrades to plain INSERT.
+
+    Mode without keys:
+
+    * :attr:`Mode.TRUNCATE` with ``match_by`` → DELETE + INSERT
+      (truncate-by-key).
     * :attr:`Mode.TRUNCATE` no keys → ``TRUNCATE TABLE`` + INSERT.
     * :attr:`Mode.OVERWRITE` → plain INSERT (the caller already
-      ``DELETE``\\ d the target up front).
-
-    No MERGE / fallback / retry-on-MERGE-failure machinery — the
-    delete-then-insert path is the single source of truth for
-    update semantics, and Spark's anti-join optimization for the
-    APPEND case lives one layer up in :meth:`spark_insert`.
+      cleared the target up front).
     """
-    del update_column_names  # incoming wins; ``UPDATE SET`` no longer used.
-
     cols_quoted = ", ".join(quote_ident(c) for c in columns)
     statements: list[str] = []
 
@@ -697,7 +760,25 @@ def _build_dml_statements(
                 f"INSERT INTO {target_location} ({cols_quoted})\n{source_sql}"
             )
 
+    elif match_by and not safe_merge:
+        # Native MERGE INTO — Databricks / Delta plans the dedup
+        # once. Insert-only for APPEND/AUTO; full update + insert
+        # for UPSERT/MERGE.
+        statements.append(_build_merge_statement(
+            target_location=target_location,
+            source_sql=source_sql,
+            columns=columns,
+            match_by=match_by,
+            update_column_names=update_column_names,
+            prune_predicates=prune_predicates,
+            insert_only=mode in (Mode.APPEND, Mode.AUTO),
+        ))
+
     elif match_by and mode in (Mode.UPSERT, Mode.MERGE):
+        # safe_merge=True + UPSERT — keyed DELETE then INSERT.
+        # Same outcome as MERGE but without the engine-specific
+        # syntax; the staged source reads twice, which is the trade
+        # the caller opted into.
         statements.extend(_build_delete_insert_statements(
             target_location=target_location,
             source_sql=source_sql,
@@ -707,8 +788,10 @@ def _build_dml_statements(
         ))
 
     elif match_by:
-        # AUTO / APPEND with keys — drop incoming rows that already
-        # exist on the target side (keyed dedup) and INSERT the rest.
+        # safe_merge=True + AUTO/APPEND — INSERT NOT EXISTS so
+        # existing rows are filtered at INSERT time. The Spark
+        # fast path replaces this with a DataFrame anti-join one
+        # layer up in :meth:`Table.spark_insert`.
         statements.extend(_build_anti_join_insert(
             target_location=target_location,
             source_sql=source_sql,
@@ -906,6 +989,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
             prune_values=options.prune_values,
             retry=options.retry,
             return_data=options.return_data,
+            safe_merge=options.safe_merge,
         )
 
     def _read_spark_frame(self, options: O) -> "SparkDataFrame":
@@ -924,6 +1008,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
             match_by=options.match_by_names,
             wait=options.wait,
             return_data=options.return_data,
+            safe_merge=options.safe_merge,
         )
 
     # Properties
@@ -2062,6 +2147,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
         prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
+        safe_merge: bool = False,
         table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
     ) -> "Tabular | None":
         """Insert *data* into this table using the most appropriate backend.
@@ -2108,6 +2194,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
             prune_values=prune_values,
             retry=retry,
             return_data=return_data,
+            safe_merge=safe_merge,
             table_dispatch=table_dispatch,
         )
 
@@ -2161,11 +2248,23 @@ class Table(DatabricksResource, Tabular[CastOptions]):
         prune_values: Mapping[str, list[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
+        safe_merge: bool = False,
         table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
     ) -> "Tabular | None":
         """Insert through the warehouse SQL path with staged Parquet.
 
-        With ``return_data=True``, returns a :class:`ArrowTabular`
+        ``safe_merge`` controls keyed-write strategy:
+
+        * ``safe_merge=False`` (default) — emits a single ``MERGE
+          INTO`` statement. Databricks / Delta plans the keyed dedup
+          once.
+        * ``safe_merge=True`` — sidesteps MERGE: keyed APPEND becomes
+          ``INSERT ... WHERE NOT EXISTS (...)``, keyed UPSERT becomes
+          ``DELETE`` matching keys then ``INSERT``. Useful for
+          backends without native MERGE or callers that want explicit
+          dedup semantics.
+
+        With ``return_data=True``, returns an :class:`ArrowTabular`
         wrapping the staged source rows so callers can chain on the
         payload without re-reading from the target.
 
@@ -2275,6 +2374,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
             zorder_by=zorder_by,
             optimize_after_merge=optimize_after_merge,
             vacuum_hours=vacuum_hours,
+            safe_merge=safe_merge,
         )
 
         retry_active = retry is not None
@@ -2388,6 +2488,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
+        safe_merge: bool = False,
         table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
     ) -> "Tabular | None":
         """Insert into this table using Spark.
@@ -2466,13 +2567,18 @@ class Table(DatabricksResource, Tabular[CastOptions]):
         if where is not None:
             prune_predicates.append(_wrap_user_predicate(where, target_alias="T"))
 
-        # Spark fast path for keyed APPEND — see
-        # :func:`_spark_filter_existing_keys`. Catalyst's anti-join
-        # is dramatically cheaper than the SQL NOT EXISTS shape used
-        # on the warehouse path because it only reads the target's
-        # key columns from disk.
+        # Spark fast path for keyed APPEND under ``safe_merge=True``
+        # (see :func:`_spark_filter_existing_keys`). Catalyst's
+        # anti-join only reads the target's key columns from disk,
+        # so this is dramatically cheaper than the SQL NOT EXISTS
+        # shape used on the warehouse path. ``safe_merge=False``
+        # leaves the work to a native MERGE INTO statement.
         anti_join_handled = False
-        if match_by and mode_enum in (Mode.APPEND, Mode.AUTO):
+        if (
+            safe_merge
+            and match_by
+            and mode_enum in (Mode.APPEND, Mode.AUTO)
+        ):
             data_df, anti_join_handled = _spark_filter_existing_keys(
                 session=session,
                 data_df=data_df,
@@ -2519,6 +2625,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
                 zorder_by=zorder_by,
                 optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
+                safe_merge=safe_merge,
             )
 
         retry_cfg = _resolve_retry(retry)
@@ -2637,6 +2744,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
         prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
+        safe_merge: bool = False,
         table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
     ) -> "Tabular | None":
         """Insert into this table from a SQL source query.
@@ -2780,6 +2888,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
             zorder_by=zorder_by,
             optimize_after_merge=optimize_after_merge,
             vacuum_hours=vacuum_hours,
+            safe_merge=safe_merge,
         )
 
         retry_active = retry is not None

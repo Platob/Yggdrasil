@@ -1,24 +1,31 @@
 """Tests for the Databricks :class:`Table` insert SQL generation.
 
-The legacy code used :sql:`MERGE INTO` for keyed inserts and a
-DELETE+INSERT fallback wrapped in a multi-stage retry. The
-rewritten path is simpler:
+Two strategies live side-by-side, picked by the ``safe_merge``
+flag (``CastOptions.safe_merge`` / ``insert(..., safe_merge=...)``):
 
-* **APPEND / AUTO with keys** → single
-  ``INSERT INTO ... SELECT ... WHERE NOT EXISTS (...)`` against
-  the target. Existing rows are filtered out by the ``EXISTS``
-  subquery; the engine never has to touch (let alone rewrite)
-  rows that already match.
-* **UPSERT / MERGE with keys** → ``DELETE`` matching keys, then
-  plain ``INSERT``. Incoming wins on overlap. Same shape as the
-  legacy fallback, now the only path.
-* **OVERWRITE** → caller pre-deletes; we just ``INSERT``.
+* **safe_merge=False (default)** — single ``MERGE INTO`` statement.
+  Databricks / Delta plans the keyed dedup once;
+  :attr:`Mode.UPSERT` / :attr:`Mode.MERGE` get the full
+  update-and-insert MERGE, :attr:`Mode.APPEND` /
+  :attr:`Mode.AUTO` get the insert-only variant.
+* **safe_merge=True** — sidesteps MERGE entirely. UPSERT becomes
+  keyed ``DELETE`` + plain ``INSERT``; APPEND becomes
+  ``INSERT ... WHERE NOT EXISTS (...)``. Useful for backends
+  without native MERGE, for callers that want explicit dedup
+  semantics, or for the Spark fast path where the DataFrame
+  anti-join one layer up turns the SQL submission into a plain
+  ``INSERT``.
+
+Mode dispatch (independent of ``safe_merge``):
+
+* **OVERWRITE** → caller pre-deletes; plain ``INSERT``.
 * **TRUNCATE** with keys → keyed DELETE + INSERT.
 * **TRUNCATE** without keys → ``TRUNCATE TABLE`` + INSERT.
 * **No keys, plain INSERT** → unchanged.
 
-These tests pin the SQL output shape so a future change can't
-silently regress the keyed-dedup behavior.
+These tests pin the SQL output for both branches so a future
+change can't silently regress the keyed-dedup behavior on either
+side.
 """
 from __future__ import annotations
 
@@ -121,9 +128,10 @@ class TestAntiJoinInsert:
 # ---------------------------------------------------------------------------
 
 
-class TestDMLDispatch:
+class TestNativeMerge:
+    """``safe_merge=False`` (the default) → engine MERGE INTO."""
 
-    def test_append_with_keys_uses_anti_join_insert(self) -> None:
+    def test_append_with_keys_uses_insert_only_merge(self) -> None:
         stmts = _build_dml_statements(
             target_location="cat.sch.t",
             source_sql="SELECT id, v FROM staging",
@@ -134,14 +142,63 @@ class TestDMLDispatch:
             prune_predicates=[],
         )
         sql = _normalize_ws(stmts[0])
-        # Single INSERT with NOT EXISTS — no MERGE, no DELETE.
+        assert sql.startswith("MERGE INTO cat.sch.t AS T")
+        # Insert-only — no UPDATE branch when mode is APPEND/AUTO.
+        assert "WHEN NOT MATCHED THEN INSERT" in sql
+        assert "WHEN MATCHED" not in sql
+
+    def test_upsert_with_keys_uses_full_merge(self) -> None:
+        stmts = _build_dml_statements(
+            target_location="cat.sch.t",
+            source_sql="SELECT id, v FROM staging",
+            columns=["id", "v"],
+            mode=Mode.UPSERT,
+            match_by=["id"],
+            update_column_names=None,
+            prune_predicates=[],
+        )
+        sql = _normalize_ws(stmts[0])
+        assert sql.startswith("MERGE INTO cat.sch.t AS T")
+        # Full merge — both branches present.
+        assert "WHEN MATCHED THEN UPDATE SET" in sql
+        assert "WHEN NOT MATCHED THEN INSERT" in sql
+
+    def test_update_column_names_narrows_update_set(self) -> None:
+        stmts = _build_dml_statements(
+            target_location="cat.sch.t",
+            source_sql="SELECT id, v, ts FROM staging",
+            columns=["id", "v", "ts"],
+            mode=Mode.UPSERT,
+            match_by=["id"],
+            update_column_names=["v"],  # only update v, not ts
+            prune_predicates=[],
+        )
+        sql = _normalize_ws(stmts[0])
+        assert "UPDATE SET T.`v` = S.`v`" in sql
+        assert "T.`ts` = S.`ts`" not in sql
+
+
+class TestSafeMerge:
+    """``safe_merge=True`` → DELETE+INSERT or NOT EXISTS INSERT, no MERGE."""
+
+    def test_append_with_keys_uses_anti_join_insert(self) -> None:
+        stmts = _build_dml_statements(
+            target_location="cat.sch.t",
+            source_sql="SELECT id, v FROM staging",
+            columns=["id", "v"],
+            mode=Mode.APPEND,
+            match_by=["id"],
+            update_column_names=None,
+            prune_predicates=[],
+            safe_merge=True,
+        )
+        sql = _normalize_ws(stmts[0])
         assert sql.startswith("INSERT INTO cat.sch.t")
         assert "NOT EXISTS" in sql
         assert "MERGE" not in sql
         assert all("DELETE" not in _normalize_ws(s) for s in stmts)
 
     def test_auto_with_keys_uses_anti_join_insert(self) -> None:
-        # AUTO defaults to "append only new keys" when match_by is set.
         stmts = _build_dml_statements(
             target_location="cat.sch.t",
             source_sql="SELECT id, v FROM staging",
@@ -150,6 +207,7 @@ class TestDMLDispatch:
             match_by=["id"],
             update_column_names=None,
             prune_predicates=[],
+            safe_merge=True,
         )
         assert "NOT EXISTS" in _normalize_ws(stmts[0])
 
@@ -162,16 +220,14 @@ class TestDMLDispatch:
             match_by=["id"],
             update_column_names=None,
             prune_predicates=[],
+            safe_merge=True,
         )
-        # Two statements: DELETE then INSERT.
         assert len(stmts) >= 2
         assert _normalize_ws(stmts[0]).startswith("DELETE FROM")
         assert _normalize_ws(stmts[1]).startswith("INSERT INTO")
-        # No MERGE anywhere.
         assert all("MERGE" not in _normalize_ws(s) for s in stmts)
 
-    def test_merge_mode_aliases_to_delete_insert(self) -> None:
-        # ``Mode.MERGE`` no longer triggers a real MERGE statement.
+    def test_merge_mode_uses_delete_insert(self) -> None:
         stmts = _build_dml_statements(
             target_location="cat.sch.t",
             source_sql="SELECT id FROM staging",
@@ -180,9 +236,14 @@ class TestDMLDispatch:
             match_by=["id"],
             update_column_names=None,
             prune_predicates=[],
+            safe_merge=True,
         )
         assert _normalize_ws(stmts[0]).startswith("DELETE FROM")
         assert _normalize_ws(stmts[1]).startswith("INSERT INTO")
+
+
+class TestDMLDispatch:
+    """Mode dispatch behavior that's independent of ``safe_merge``."""
 
     def test_overwrite_emits_plain_insert(self) -> None:
         stmts = _build_dml_statements(
@@ -240,8 +301,9 @@ class TestDMLDispatch:
         assert "NOT EXISTS" not in sql
         assert "DELETE" not in sql
 
-    def test_update_column_names_is_ignored_now(self) -> None:
-        """Legacy ``update_column_names`` is dropped — incoming wins on UPSERT."""
+    def test_safe_merge_ignores_update_column_names(self) -> None:
+        """``safe_merge=True`` discards ``update_column_names`` —
+        the DELETE+INSERT pair always lets incoming win on overlap."""
         stmts_default = _build_dml_statements(
             target_location="cat.sch.t",
             source_sql="SELECT id, v FROM staging",
@@ -250,6 +312,7 @@ class TestDMLDispatch:
             match_by=["id"],
             update_column_names=None,
             prune_predicates=[],
+            safe_merge=True,
         )
         stmts_explicit = _build_dml_statements(
             target_location="cat.sch.t",
@@ -259,8 +322,8 @@ class TestDMLDispatch:
             match_by=["id"],
             update_column_names=["v"],
             prune_predicates=[],
+            safe_merge=True,
         )
-        # Both produce the same DELETE+INSERT — no UPDATE branch.
         assert _texts(stmts_default) == _texts(stmts_explicit)
 
 
@@ -368,7 +431,8 @@ class TestDeleteInsertShape:
 
 
 class TestNoMergeFallbackMachinery:
-    """The legacy retry / fallback funnel is gone; assert no shadows."""
+    """The legacy retry / fallback funnel is gone; the simple
+    helpers (MERGE template, anti-join, _execute_dml) remain."""
 
     def test_no_drain_helper(self) -> None:
         from yggdrasil.databricks.sql import table as _t
@@ -378,8 +442,28 @@ class TestNoMergeFallbackMachinery:
         from yggdrasil.databricks.sql import table as _t
         assert not hasattr(_t, "_execute_with_merge_fallback")
         assert not hasattr(_t, "_build_merge_fallback_statements")
-        assert not hasattr(_t, "_build_merge_statement")
 
-    def test_execute_dml_helper_present(self) -> None:
+    def test_helpers_present(self) -> None:
         from yggdrasil.databricks.sql import table as _t
+        # MERGE template back, anti-join INSERT alongside, and the
+        # simplified executor instead of the fallback funnel.
+        assert hasattr(_t, "_build_merge_statement")
+        assert hasattr(_t, "_build_anti_join_insert")
         assert hasattr(_t, "_execute_dml")
+        assert hasattr(_t, "_spark_filter_existing_keys")
+
+
+# ---------------------------------------------------------------------------
+# CastOptions.safe_merge
+# ---------------------------------------------------------------------------
+
+
+class TestCastOptionsSafeMerge:
+
+    def test_default_is_false(self) -> None:
+        from yggdrasil.data.options import CastOptions
+        assert CastOptions().safe_merge is False
+
+    def test_set_via_constructor(self) -> None:
+        from yggdrasil.data.options import CastOptions
+        assert CastOptions(safe_merge=True).safe_merge is True
