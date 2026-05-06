@@ -37,30 +37,18 @@ __all__ = [
 def coerce_source(obj: Any) -> Tabular:
     """Lift *obj* into a :class:`Tabular`.
 
-    Thin shim around :meth:`Tabular.from_` plus a path-string
-    fast path. The bulk of the type-handling (pyarrow Table /
-    RecordBatch, polars DF / LazyFrame, pandas DF, pyspark DF,
-    ``list[dict]``, ``dict[str, list]``) lives on :meth:`Tabular.from_`
-    so anywhere else in yggdrasil that wants to lift "anything"
-    into a :class:`Tabular` gets the same shape support without
-    re-implementing the ladder.
-
-    The path-string branch stays here because :func:`Tabular.from_`
-    treats unknown strings as bytes-buffer fodder; for SQL
-    registration we want path strings to open via
-    :meth:`Tabular.from_path` so a parquet file or folder lands
-    as the right subclass.
+    Delegates to :func:`yggdrasil.sql.dynamic_catalog.coerce_to_tabular`,
+    which handles every shape the registry accepts (existing
+    :class:`Tabular`, pyarrow Table / RecordBatch, polars / pandas
+    frames, ``list[dict]`` / ``dict[str, list]``, path-likes). Kept
+    as a separate function in this module so legacy call sites that
+    import ``coerce_source`` from the legacy catalog module still
+    work — the canonical helper now lives next to the
+    :class:`DynamicCatalog`.
     """
-    if isinstance(obj, Tabular):
-        return obj
+    from yggdrasil.sql.dynamic_catalog import coerce_to_tabular
 
-    if isinstance(obj, (str, bytes)) or hasattr(obj, "__fspath__"):
-        # Path-like: open as the right registered media leaf so a
-        # parquet file / folder / CSV registers as itself rather
-        # than as a generic byte buffer.
-        return Tabular.from_path(obj)  # type: ignore[arg-type]
-
-    return Tabular.from_(obj)
+    return coerce_to_tabular(obj)
 
 
 class SqlContext:

@@ -79,6 +79,8 @@ from .catalog import (
     registered,
 )
 from .dialect import DEFAULT_DIALECT, Dialect, resolve_dialect
+from .dynamic_catalog import DynamicCatalog
+from .engine import Engine, EnginePlan
 from .executor import (
     ArrowSqlExecutor,
     PolarsSqlExecutor,
@@ -94,7 +96,24 @@ from .parser import (
     parse_many,
     parse_predicate,
 )
+from .plan import (
+    Aggregate,
+    AggregateSpec,
+    Filter,
+    Join,
+    JoinKind,
+    Limit,
+    PlanNode,
+    Project,
+    ProjectionItem,
+    Scan,
+    Sort,
+    SortKey,
+)
+from .planner import PlanError, Planner, plan
 from .statement import PersistTarget, SqlPreparedStatement, SqlStatementResult
+from . import system_catalog
+from .system_catalog import SYSTEM_CATALOG
 from .utils import (
     is_valid_identifier,
     parse_dotted_name,
@@ -115,6 +134,26 @@ __all__ = [
     "registered",
     "default_context",
     "SqlContext",
+    "DynamicCatalog",
+    "SYSTEM_CATALOG",
+    "system_catalog",
+    "Engine",
+    "EnginePlan",
+    "Planner",
+    "PlanError",
+    "plan",
+    "PlanNode",
+    "Scan",
+    "Filter",
+    "Project",
+    "ProjectionItem",
+    "Aggregate",
+    "AggregateSpec",
+    "Sort",
+    "SortKey",
+    "Limit",
+    "Join",
+    "JoinKind",
     "SqlExecutor",
     "PolarsSqlExecutor",
     "ArrowSqlExecutor",
