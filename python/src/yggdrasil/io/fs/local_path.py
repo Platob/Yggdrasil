@@ -208,7 +208,7 @@ class LocalPath(Path):
 
     @property
     def io_open(self) -> bool:
-        return self._fd >= 0 or super().io_open
+        return self._fd >= 0
 
     # ==================================================================
     # Classification
@@ -391,30 +391,24 @@ class LocalPath(Path):
         except (FileNotFoundError, IsADirectoryError, NotADirectoryError, PermissionError):
             self._fd = -1
 
-    def _ensure_io(self) -> None:
-        """Open the fd actively; create per the mode's create rule.
-
-        Test fixtures sometimes spoof :attr:`is_local` to ``False`` to
-        drive the remote-buffered codepath against a real local file.
-        Honour that here by deferring to the base path's transaction-
-        buffer flow when the spoof is in effect.
-        """
-        if self.io_open:
-            return
-        if self.is_local:
+    def acquire_io(self, mode: Optional[str] = None) -> "Path":
+        """Open the long-lived fd at *mode* (or refresh on mode change)."""
+        if mode is not None and mode != self._mode:
+            if self._fd >= 0:
+                self.close_io()
+            self._mode = mode
+        if self._fd < 0:
             self._open_fd(self._mode)
-        else:
-            super()._ensure_io()
+        return self
 
     def close_io(self) -> None:
-        """Close the live fd; flush + close the transaction buffer (if any)."""
+        """Close the live fd."""
         if self._fd >= 0:
             fd, self._fd = self._fd, -1
             try:
                 os.close(fd)
             except OSError:
                 pass
-        super().close_io()
 
     def _release(self) -> None:
         # Drop the fd before the base ``_release`` runs the temporary-
@@ -638,9 +632,6 @@ class LocalPath(Path):
         if self._fd >= 0:
             os.ftruncate(self._fd, n)
             return n
-
-        if self._transaction_buffer is not None:
-            return Path.truncate(self, n)
 
         os.truncate(self._os_path(), n)
         return n

@@ -739,129 +739,34 @@ class TestPathBound:
 
 
 # ---------------------------------------------------------------------------
-# Remote-path context-exit auto-flush
+# Path-bound BytesIO end-to-end durability
 #
-# When a BytesIO is bound to a non-local path, writes go through an
-# in-memory transaction buffer that has to be committed to the backing
-# on close. Earlier the dirty bit was only set by a tiny set of
-# internal codepaths, so callers that just did the obvious thing —
-#   ``with BytesIO(path=remote, mode="wb+") as f: f.write(payload)``
-# — saw the file unchanged and had to add ``f.mark_dirty(); f.flush()``
-# manually. These tests pin down that writes alone are now enough.
+# Path positional ops route straight through ``_bread`` / ``_bwrite`` —
+# there's no internal buffer at the Path layer, so every pwrite lands
+# on the durable backing immediately. These tests pin down the
+# end-result on disk for the common BytesIO-bound shapes.
 # ---------------------------------------------------------------------------
 
 
-def _spoof_non_local(monkeypatch, path) -> None:
-    """Make a LocalPath behave like a remote backend for dispatch.
-
-    Real non-local backends (S3, Volumes, …) override
-    :meth:`write_stream` / :meth:`write_bytes` to push bytes natively.
-    The base :class:`Path` implementation, by contrast, falls back to
-    opening another path-bound :class:`BytesIO` — which, for a path
-    whose ``is_local`` we've spoofed to ``False``, would recurse
-    forever through the transaction-buffer commit path.
-
-    To exercise the BytesIO non-local branches without that
-    contrivance, we override both:
-
-    * ``is_local`` → ``False`` so dispatch picks the transaction
-      buffer.
-    * ``write_stream`` / ``write_bytes`` → write straight to the
-      underlying local file, the same role a remote backend's
-      override would play.
-    """
-    monkeypatch.setattr(type(path), "is_local", property(lambda self: False))
-
-    def _write_bytes(self, data, *, mode="wb", parents=True):
-        import os as _os
-        with open(self.full_path(), mode) as fh:
-            return fh.write(bytes(data))
-
-    def _write_stream(self, src, *, batch_size=1 << 20, parents=True):
-        # Read whatever the source has; mirrors the no-recursion shape
-        # a real backend's streaming upload would have.
-        if hasattr(src, "seek"):
-            src.seek(0)
-        data = src.read() if hasattr(src, "read") else bytes(src)
-        return _write_bytes(self, data, parents=parents)
-
-    monkeypatch.setattr(type(path), "write_bytes", _write_bytes)
-    monkeypatch.setattr(type(path), "write_stream", _write_stream)
-
-
-class TestRemotePathAutoFlush:
-    def test_write_marks_buffer_dirty_for_non_local_path(self, tmp_path, monkeypatch):
-        from yggdrasil.io.fs.local_path import LocalPath
-        import pathlib
-
-        target = pathlib.Path(str(tmp_path / "remote.dat"))
-        target.write_bytes(b"")
-        path = LocalPath.from_pathlib(target)
-        _spoof_non_local(monkeypatch, path)
-
-        with BytesIO(path=path, mode="wb+") as buf:
-            buf.write(b"hello remote")
-            assert buf.is_dirty(), (
-                "writes against a non-local backing must flag dirty so "
-                "context-exit commits without a manual mark_dirty()"
-            )
-
-    def test_context_exit_flushes_writes_to_remote_path(self, tmp_path, monkeypatch):
-        from yggdrasil.io.fs.local_path import LocalPath
-        import pathlib
-
-        target = pathlib.Path(str(tmp_path / "remote.dat"))
-        target.write_bytes(b"")
-        path = LocalPath.from_pathlib(target)
-        _spoof_non_local(monkeypatch, path)
-
-        with BytesIO(path=path, mode="wb+") as buf:
+class TestPathBoundDurability:
+    def test_context_exit_flushes_writes_to_path(self, tmp_path):
+        target = tmp_path / "out.dat"
+        with BytesIO(path=str(target), mode="wb+") as buf:
             buf.write(b"durable payload")
-
-        # No manual mark_dirty()/flush() — the context manager handled it.
         assert target.read_bytes() == b"durable payload"
 
-    def test_explicit_flush_still_works(self, tmp_path, monkeypatch):
-        from yggdrasil.io.fs.local_path import LocalPath
-        import pathlib
-
-        target = pathlib.Path(str(tmp_path / "remote.dat"))
-        target.write_bytes(b"")
-        path = LocalPath.from_pathlib(target)
-        _spoof_non_local(monkeypatch, path)
-
-        with BytesIO(path=path, mode="wb+") as buf:
-            buf.write(b"flush mid-context")
-            buf.flush()
-            assert not buf.is_dirty()
-            assert target.read_bytes() == b"flush mid-context"
-
-    def test_truncate_alone_marks_dirty(self, tmp_path, monkeypatch):
-        from yggdrasil.io.fs.local_path import LocalPath
-        import pathlib
-
-        target = pathlib.Path(str(tmp_path / "remote.dat"))
+    def test_truncate_lands_on_disk(self, tmp_path):
+        target = tmp_path / "trunc.dat"
         target.write_bytes(b"existing-content")
-        path = LocalPath.from_pathlib(target)
-        _spoof_non_local(monkeypatch, path)
-
-        with BytesIO(path=path, mode="rb+") as buf:
+        with BytesIO(path=str(target), mode="rb+") as buf:
             buf.truncate(4)
-
         assert target.read_bytes() == b"exis"
 
-    def test_replace_with_payload_none_flushes_zero_bytes(self, tmp_path, monkeypatch):
-        from yggdrasil.io.fs.local_path import LocalPath
-        import pathlib
-
-        target = pathlib.Path(str(tmp_path / "remote.dat"))
+    def test_replace_with_payload_none_clears(self, tmp_path):
+        target = tmp_path / "clear.dat"
         target.write_bytes(b"existing-content")
-        path = LocalPath.from_pathlib(target)
-        _spoof_non_local(monkeypatch, path)
-
-        with BytesIO(path=path, mode="rb+") as buf:
+        with BytesIO(path=str(target), mode="rb+") as buf:
             buf.replace_with_payload(None)
-
         assert target.read_bytes() == b""
 
     def test_local_path_writes_do_not_set_dirty(self, tmp_path):
