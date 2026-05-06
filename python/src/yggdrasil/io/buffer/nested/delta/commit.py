@@ -38,12 +38,14 @@ commit itself fails — that lives in ``io.py``, not here.
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from yggdrasil.io.enums import MediaTypes
-from yggdrasil.io.fs import Path
 
 from .actions import serialize_action
+
+if TYPE_CHECKING:
+    from yggdrasil.io.fs import Path
 
 
 __all__ = [

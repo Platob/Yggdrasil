@@ -47,7 +47,7 @@ def test_ygg_bytesio_media_type_roundtrip() -> None:
     """Media type on yggdrasil BytesIO is preserved through serialization."""
     mt = MediaType(MimeTypes.JSON)
     src = BytesIO(b'{"a":1}')
-    src._media_type = mt
+    src._stats.media_type = mt
 
     ser = Serialized.from_python_object(src)
     assert ser is not None
@@ -57,9 +57,9 @@ def test_ygg_bytesio_media_type_roundtrip() -> None:
 
     out = ser.as_python()
     assert isinstance(out, BytesIO)
-    assert out._media_type is not None
-    assert out._media_type.mime_type is MimeTypes.JSON
-    assert out._media_type.codec is None
+    assert out._stats.media_type is not None
+    assert out._stats.media_type.mime_type is MimeTypes.JSON
+    assert out._stats.media_type.codec is None
     assert bytes(out) == b'{"a":1}'
 
 
@@ -67,7 +67,7 @@ def test_ygg_bytesio_media_type_with_codec_roundtrip() -> None:
     """Media type with codec on yggdrasil BytesIO is preserved."""
     mt = MediaType(MimeTypes.PARQUET, codec=GZIP)
     src = BytesIO(b"compressed-payload")
-    src._media_type = mt
+    src._stats.media_type = mt
 
     ser = Serialized.from_python_object(src)
     assert ser is not None
@@ -77,10 +77,10 @@ def test_ygg_bytesio_media_type_with_codec_roundtrip() -> None:
 
     out = ser.as_python()
     assert isinstance(out, BytesIO)
-    assert out._media_type is not None
-    assert out._media_type.mime_type is MimeTypes.PARQUET
-    assert out._media_type.codec is not None
-    assert out._media_type.codec.name == "gzip"
+    assert out._stats.media_type is not None
+    assert out._stats.media_type.mime_type is MimeTypes.PARQUET
+    assert out._stats.media_type.codec is not None
+    assert out._stats.media_type.codec.name == "gzip"
 
 
 def test_ygg_bytesio_no_media_type_no_metadata() -> None:
@@ -95,7 +95,7 @@ def test_ygg_bytesio_no_media_type_no_metadata() -> None:
 
     out = ser.as_python()
     assert isinstance(out, BytesIO)
-    assert out._media_type is None
+    assert out._stats.media_type is None
 
 
 def test_ygg_bytesio_media_type_promotes_subclass() -> None:
@@ -117,5 +117,5 @@ def test_ygg_bytesio_media_type_promotes_subclass() -> None:
     out = ser.as_python()
 
     assert isinstance(out, JsonIO)
-    assert out._media_type is not None
-    assert out._media_type.mime_type is MimeTypes.JSON
+    assert out._stats.media_type is not None
+    assert out._stats.media_type.mime_type is MimeTypes.JSON

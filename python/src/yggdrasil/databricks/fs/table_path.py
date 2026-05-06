@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import ClassVar, Optional, Tuple, Union
 
-from yggdrasil.io.path_stat import PathKind, PathStats
+from yggdrasil.io.io_stats import IOStats, IOKind
 
 from .path import DatabricksPath
 from .path_kind import DatabricksPathKind
@@ -61,12 +61,12 @@ class TablePath(DatabricksPath):
     # SDK hooks — all stubs
     # ==================================================================
 
-    def _stat(self) -> PathStats:
+    def _stat_uncached(self) -> IOStats:
         # Treat as an extant directory — SQL helpers are the only
         # meaningful operations and they don't go through FS.
         # Reporting MISSING here would surprise SQL callers that
         # probe ``exists()`` before issuing DML.
-        return PathStats(kind=PathKind.DIRECTORY, size=0, mtime=None)
+        return IOStats(kind=IOKind.DIRECTORY, size=0, mtime=0.0)
 
     def _ls(self, recursive=False, allow_not_found=True):
         return iter([])

@@ -49,8 +49,7 @@ from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.enums import MediaType
 from yggdrasil.io.holder import Holder
-from yggdrasil.io.io_stats import IOStats
-from yggdrasil.io.path_stat import PathKind, PathStats
+from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 from yggdrasil.lazy_imports import local_path_class, tabular_io_class, PATH_SCHEME_FACTORY
 
@@ -647,7 +646,7 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
     def full_path(self) -> str: ...
 
     @abstractmethod
-    def _stat(self) -> PathStats: ...
+    def _stat(self) -> IOStats: ...
 
     @abstractmethod
     def _ls(
@@ -828,18 +827,15 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
     # Stat — uncached, every call hits the backend
     # ==================================================================
 
-    def stat(self) -> PathStats:
-        return self._stat()
-
     def exists(self, *, follow_symlinks: bool = True) -> bool:
         del follow_symlinks
-        return self._stat().kind != PathKind.MISSING
+        return self._stat().kind != IOKind.MISSING
 
     def is_file(self) -> bool:
-        return self._stat().kind == PathKind.FILE
+        return self._stat().kind == IOKind.FILE
 
     def is_dir(self) -> bool:
-        return self._stat().kind == PathKind.DIRECTORY
+        return self._stat().kind == IOKind.DIRECTORY
 
     def is_symlink(self) -> bool:
         return False
@@ -863,33 +859,29 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
             except Exception:
                 return 0.0
         s = self._stat()
-        if s.kind == PathKind.MISSING:
+        if s.kind == IOKind.MISSING:
             return 0.0
         return float(s.mtime or 0.0)
 
-    def stats(self) -> IOStats:
-        """One backend round-trip → ``IOStats`` (size + mtime + media_type).
+    def stat(self) -> IOStats:
+        """One backend round-trip → ``IOStats`` (kind + size + mtime + mode + media_type).
 
         Active transaction buffer short-circuits to its in-memory
         size/mtime; otherwise a single :meth:`_stat` round-trip fills
-        them. ``media_type`` comes from the URL extension — best
-        effort, may be ``None``.
+        the stat quad. ``media_type`` comes from the URL extension —
+        best effort, may be ``None``.
         """
         if self._transaction_buffer is not None:
             buf = self._transaction_buffer
             return IOStats(
                 size=int(buf.size),
                 mtime=float(buf.mtime or 0.0),
+                kind=IOKind.FILE,
                 media_type=self.media_type,
             )
         s = self._stat()
-        if s.kind == PathKind.MISSING:
-            return IOStats(size=0, mtime=0.0, media_type=self.media_type)
-        return IOStats(
-            size=int(s.size),
-            mtime=float(s.mtime or 0.0),
-            media_type=self.media_type,
-        )
+        s.media_type = self.media_type
+        return s
 
     # ==================================================================
     # Listing / walking
@@ -992,11 +984,11 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
 
     def unlink(self, missing_ok: bool = True) -> None:
         kind = self._stat().kind
-        if kind == PathKind.MISSING:
+        if kind == IOKind.MISSING:
             if missing_ok:
                 return
             raise FileNotFoundError(f"{self.full_path()!r} does not exist")
-        if kind == PathKind.DIRECTORY:
+        if kind == IOKind.DIRECTORY:
             raise IsADirectoryError(
                 f"Cannot unlink directory {self.full_path()!r}; "
                 "use rmdir() or remove() for trees."
@@ -1009,15 +1001,15 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         allow_not_found: bool = True,
     ) -> "Path":
         kind = self._stat().kind
-        if kind == PathKind.FILE:
+        if kind == IOKind.FILE:
             self._remove_file(allow_not_found=allow_not_found)
-        elif kind == PathKind.DIRECTORY:
+        elif kind == IOKind.DIRECTORY:
             self._remove_dir(
                 recursive=recursive,
                 allow_not_found=allow_not_found,
                 with_root=True,
             )
-        elif kind == PathKind.MISSING:
+        elif kind == IOKind.MISSING:
             if not allow_not_found:
                 raise FileNotFoundError(f"{self!r} does not exist")
         return self
@@ -1156,12 +1148,12 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
             return n
 
         stat = self._stat()
-        if stat.kind == PathKind.MISSING:
+        if stat.kind == IOKind.MISSING:
             raise FileNotFoundError(
                 f"Cannot truncate non-existent path {self.full_path()!r}. "
                 "Call touch() first if you want create-or-resize semantics."
             )
-        if stat.kind == PathKind.DIRECTORY:
+        if stat.kind == IOKind.DIRECTORY:
             raise IsADirectoryError(
                 f"Cannot truncate directory {self.full_path()!r}"
             )

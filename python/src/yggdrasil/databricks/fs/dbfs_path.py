@@ -24,7 +24,7 @@ import os
 from typing import ClassVar, Optional, Union
 
 from yggdrasil.io.buffer.bytes_io import BytesIO
-from yggdrasil.io.path_stat import PathKind, PathStats
+from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 
 from ._errors import (
@@ -389,7 +389,7 @@ class DBFSPath(DatabricksPath):
     # SDK hooks — stat / ls / mkdir / remove
     # ==================================================================
 
-    def _stat(self) -> PathStats:
+    def _stat_uncached(self) -> IOStats:
         try:
             info = retry_sdk_call(
                 self._sdk().dbfs.get_status, self.full_path(),
@@ -398,17 +398,18 @@ class DBFSPath(DatabricksPath):
             # Probe via list — bare prefixes don't have stat entries.
             found = next(self._ls(recursive=False, allow_not_found=True), None)
             if found is None:
-                return PathStats(kind=PathKind.MISSING, size=0, mtime=None)
-            return PathStats(
-                kind=PathKind.DIRECTORY, size=0, mtime=found.mtime,
+                return IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
+            return IOStats(
+                kind=IOKind.DIRECTORY, size=0,
+                mtime=float(found.mtime or 0.0),
             )
 
-        return PathStats(
-            kind=PathKind.DIRECTORY if info.is_dir else PathKind.FILE,
+        return IOStats(
+            kind=IOKind.DIRECTORY if info.is_dir else IOKind.FILE,
             size=int(info.file_size or 0),
             mtime=(
                 info.modification_time / 1000.0
-                if info.modification_time else None
+                if info.modification_time else 0.0
             ),
         )
 
@@ -450,6 +451,7 @@ class DBFSPath(DatabricksPath):
         except SDK_ERRORS:
             if not allow_not_found:
                 raise
+        self._invalidate_stat_cache()
 
     def _remove_dir(self, recursive=True, allow_not_found=True, with_root=True):
         path = self.full_path()
@@ -460,3 +462,4 @@ class DBFSPath(DatabricksPath):
         except SDK_ERRORS:
             if not allow_not_found:
                 raise
+        self._invalidate_stat_cache()

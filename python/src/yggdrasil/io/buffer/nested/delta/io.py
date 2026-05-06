@@ -61,7 +61,6 @@ from yggdrasil.arrow.cast import any_to_arrow_table
 from yggdrasil.data.schema import Field, Schema
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.enums import MediaTypes, Mode, MimeType, MimeTypes
-from yggdrasil.io.fs import Path
 from yggdrasil.io.buffer.base import TabularIO
 from .actions import (
     AddFile,
@@ -98,6 +97,7 @@ from ..folder_io import (
 
 if TYPE_CHECKING:
     from pyroaring import BitMap64  # type: ignore[import-untyped]
+    from yggdrasil.io.fs import Path
 
 __all__ = ["DeltaIO", "DeltaOptions"]
 
@@ -659,7 +659,6 @@ class DeltaIO(FolderIO):
         before_files = self._scan_data_files()
         write_options = options.copy(
             mode=Mode.OVERWRITE if mode is Mode.OVERWRITE else Mode.APPEND,
-            child_media_type=MediaTypes.PARQUET,
         )
 
         # Probe iterator emptiness so empty writes still produce a
@@ -853,7 +852,6 @@ class DeltaIO(FolderIO):
         # Write the incoming rows as new parquet files.
         write_options = options.copy(
             mode=Mode.APPEND,
-            child_media_type=MediaTypes.PARQUET,
         )
         try:
             super()._write_arrow_batches(

@@ -11,8 +11,7 @@ A "fat" filesystem service (`list_buckets`, `head_object`,
 operations are addressable on :class:`S3Path` itself (you walk to
 the path you care about and call ``stat()`` / ``ls()`` /
 ``copy_to()`` / etc., which all go through the boto client this
-service exposes). When something genuinely cross-cutting comes up
-(e.g. a parallel sync between two prefixes), it can land here.
+service exposes).
 
 What :class:`S3Service` *does* expose:
 
@@ -22,10 +21,9 @@ What :class:`S3Service` *does* expose:
   ``service.client.head_object(...)`` reads well from S3Path.
 - :meth:`path` — convenience constructor for :class:`S3Path`
   bound to this service.
-- :attr:`stat_cache` / :attr:`ls_cache` — short-lived caches for
-  ``HeadObject`` and ``ListObjectsV2`` results. Shared across all
-  S3Paths bound to this service, so a DeltaIO replay that hits
-  the same keys repeatedly pays one round-trip instead of N.
+- :attr:`ls_cache` — short-lived ``ListObjectsV2`` cache shared
+  across every :class:`S3Path` bound to this service. Stat caching
+  lives on :class:`yggdrasil.io.fs.RemotePath`, not here.
 
 Construction
 ------------
@@ -54,19 +52,10 @@ if TYPE_CHECKING:
 
 __all__ = ["S3Service"]
 
-#: Default TTL for stat cache entries (seconds). Short enough to not
-#: cause stale reads in typical workflows, long enough to collapse the
-#: 10+ HeadObject calls a single DeltaIO replay makes on the same keys.
-_STAT_CACHE_TTL: float = 30.0
-
 #: Default TTL for listing cache entries (seconds). Listings are more
-#: expensive (paginated ListObjectsV2) so the TTL is the same; callers
-#: that need a fresh listing can bypass via ``invalidate_cache``.
+#: expensive than stats (paginated ListObjectsV2); callers that need
+#: a fresh listing can bypass via :meth:`S3Service.invalidate_ls_cache`.
 _LS_CACHE_TTL: float = 15.0
-
-#: Maximum number of cached stat entries per service. Keeps memory
-#: bounded even when walking very large prefixes.
-_STAT_CACHE_MAX: int = 4096
 
 #: Maximum cached listing results per service.
 _LS_CACHE_MAX: int = 256
@@ -80,17 +69,13 @@ class S3Service(AWSService):
     that's S3-specific here is :attr:`service_name` (= ``"s3"``)
     and the convenience :meth:`path` factory.
 
-    The stat and listing caches are keyed on ``(bucket, key)`` tuples.
-    Both use short TTLs so callers see fresh data within seconds, but
-    hot loops (like DeltaIO replay) that hit the same keys 5–10 times
-    within one operation pay only one S3 round-trip per key.
+    The :attr:`ls_cache` is keyed on ``(bucket, prefix)`` tuples
+    with a short TTL, so a DeltaIO replay that hits the same prefix
+    5–10 times pays one ListObjectsV2 instead of N.
     """
 
-    # ExpiringDict fields — not part of the dataclass __init__; lazily
+    # ExpiringDict field — not part of the dataclass __init__; lazily
     # created on first access so default S3Service() is cheap.
-    _stat_cache: ExpiringDict | None = dataclasses.field(
-        default=None, init=False, repr=False,
-    )
     _ls_cache: ExpiringDict | None = dataclasses.field(
         default=None, init=False, repr=False,
     )
@@ -100,18 +85,8 @@ class S3Service(AWSService):
         return "s3"
 
     # ------------------------------------------------------------------
-    # Caches — lazy init, one per service instance
+    # ls cache — lazy init, one per service instance
     # ------------------------------------------------------------------
-
-    @property
-    def stat_cache(self) -> ExpiringDict:
-        """Per-key ``PathStats`` cache. Keys are ``"bucket/key"`` strings."""
-        if self._stat_cache is None:
-            self._stat_cache = ExpiringDict(
-                default_ttl=_STAT_CACHE_TTL,
-                max_size=_STAT_CACHE_MAX,
-            )
-        return self._stat_cache
 
     @property
     def ls_cache(self) -> ExpiringDict:
@@ -129,36 +104,28 @@ class S3Service(AWSService):
             )
         return self._ls_cache
 
-    def invalidate_cache(
+    def invalidate_ls_cache(
         self,
         bucket: str | None = None,
         key: str | None = None,
     ) -> None:
-        """Drop cached entries. Call after writes / deletes.
+        """Drop cached listings whose prefix could contain ``bucket/key``.
 
-        With no args, drops everything. With ``bucket`` + ``key``,
-        drops the exact stat entry and any listing whose prefix is
-        a parent of the key.
+        With no args, drops every listing. Stat caching is mutualized
+        on :class:`RemotePath`; call
+        :meth:`RemotePath._invalidate_stat_cache` for that.
         """
+        if self._ls_cache is None:
+            return
+
         if bucket is None:
-            if self._stat_cache is not None:
-                self._stat_cache.clear()
-            if self._ls_cache is not None:
-                self._ls_cache.clear()
+            self._ls_cache.clear()
             return
 
         full = f"{bucket}/{key}" if key else bucket
-        if self._stat_cache is not None:
-            self._stat_cache.pop(full, None)
-
-        # Invalidate any listing prefix that could contain this key.
-        if self._ls_cache is not None:
-            to_drop = [
-                k for k in self._ls_cache
-                if full.startswith(str(k))
-            ]
-            for k in to_drop:
-                self._ls_cache.pop(k, None)
+        to_drop = [k for k in self._ls_cache if full.startswith(str(k))]
+        for k in to_drop:
+            self._ls_cache.pop(k, None)
 
     # ------------------------------------------------------------------
     # Ergonomic alias — `service.client` reads better than

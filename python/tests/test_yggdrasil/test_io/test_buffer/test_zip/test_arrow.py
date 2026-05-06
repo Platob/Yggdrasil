@@ -45,12 +45,3 @@ class TestZipIOArrow:
         schema = ZipIO(path=str(path)).collect_schema()
         assert list(schema.field_names()) == ["a", "b"]
 
-    def test_child_row_size_splits_into_multiple_entries(self, tmp_path):
-        path = tmp_path / "d.zip"
-        # Ask for one row per child file → three entries.
-        ZipIO(path=str(path)).write_arrow_table(
-            sample_table(),
-            options=ZipOptions(child_row_size=1),
-        )
-        with zipfile.ZipFile(str(path)) as zf:
-            assert len(zf.namelist()) >= 3

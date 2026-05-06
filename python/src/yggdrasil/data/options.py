@@ -228,6 +228,14 @@ class CastOptions:
     overwrite_schema: bool | None = None
     spark_options: dict[str, Any] | None = None
 
+    # --- Folder-write knob ----------------------------------------------
+    # Used by folder-shaped writers (FolderIO, ZipIO, DeltaIO).
+    # ``max_workers`` is the thread-pool size for naturally-parallel
+    # folder operations (clearing children, per-child schema collection,
+    # per-leaf reads behind partition merges, per-partition writes);
+    # ``0`` / ``1`` keeps the single-threaded path.
+    max_workers: int = 0
+
     # --- Statement-level retry ------------------------------------------
     # Threaded onto each DML WarehousePreparedStatement on the warehouse
     # path; ignored on Spark (driver-side retry handles it there).

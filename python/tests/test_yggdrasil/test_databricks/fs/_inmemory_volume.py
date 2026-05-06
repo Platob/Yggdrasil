@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import ClassVar, Dict, Iterator
 
 from yggdrasil.databricks.fs.volume_path import VolumePath
-from yggdrasil.io.path_stat import PathKind, PathStats
+from yggdrasil.io.io_stats import IOStats, IOKind
 
 
 __all__ = ["InMemoryVolumePath"]
@@ -91,18 +91,18 @@ class InMemoryVolumePath(VolumePath):
     def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
         return
 
-    def _stat(self) -> PathStats:
+    def _stat_uncached(self) -> IOStats:
         key = self.full_path()
         if key in self._STORE:
-            return PathStats(
-                kind=PathKind.FILE,
+            return IOStats(
+                kind=IOKind.FILE,
                 size=len(self._STORE[key]),
-                mtime=None,
+                mtime=0.0,
             )
         prefix = key.rstrip("/") + "/"
         if any(k.startswith(prefix) for k in self._STORE):
-            return PathStats(kind=PathKind.DIRECTORY, size=0, mtime=None)
-        return PathStats(kind=PathKind.MISSING, size=0, mtime=None)
+            return IOStats(kind=IOKind.DIRECTORY, size=0, mtime=0.0)
+        return IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
 
     def _ls(
         self,

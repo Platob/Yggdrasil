@@ -75,9 +75,10 @@ import pyarrow.compute as pc
 from yggdrasil.data.schema import Field, Schema
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.enums import MimeType, MimeTypes, Mode
-from yggdrasil.io.fs import Path
 from yggdrasil.io.buffer.base import TabularIO
-from .base import NestedIO, NestedOptions, _STAGING_TMP_RE, _run_in_threads
+from yggdrasil.lazy_imports import path_class
+from yggdrasil.data.options import CastOptions
+from .base import NestedIO, _STAGING_TMP_RE, _run_in_threads
 
 
 def _is_staging_in_flight(name: str) -> bool:
@@ -90,15 +91,15 @@ def _is_staging_in_flight(name: str) -> bool:
     return name.startswith("tmp-") and _STAGING_TMP_RE.search(name) is not None
 
 if TYPE_CHECKING:
-    pass
+    from yggdrasil.io.fs import Path
 
 
 __all__ = ["FolderIO", "FolderOptions"]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class FolderOptions(NestedOptions):
-    """:class:`NestedOptions` extended with partition-routing knobs.
+class FolderOptions(CastOptions):
+    """:class:`CastOptions` extended with partition-routing knobs.
 
     :param partition_columns: explicit list of partition columns as
         :class:`Field` instances (or anything :meth:`Field.from_any`
@@ -189,8 +190,7 @@ class FolderIO(NestedIO[FolderOptions]):
         """Parquet is the canonical folder-of-tables payload.
 
         Subclasses with a fixed format (Delta = parquet, IcebergV1
-        = avro) override; callers that want IPC/CSV/... pass
-        ``options.child_media_type`` explicitly.
+        = avro) override.
         """
         return MimeTypes.PARQUET
 
@@ -1171,7 +1171,7 @@ class FolderIO(NestedIO[FolderOptions]):
         }
         relative_dir = _partition_path_segment(partition_values)
 
-        media_type = options.child_media_type or self._default_child_media_type()
+        media_type = self._default_child_media_type()
 
         partition_root = (
             self.path.joinpath(*relative_dir.split("/"))
@@ -1287,6 +1287,7 @@ def _has_marker(path_like: Any, marker: str) -> bool:
     parsing — :meth:`FolderIO.__new__` runs this probe twice per
     construction so the savings compound on hot loops.
     """
+    Path = path_class()
     try:
         if isinstance(path_like, str):
             if path_like and "://" not in path_like:

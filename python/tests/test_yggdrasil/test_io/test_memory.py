@@ -281,7 +281,7 @@ class TestMemoryLocalPathBridge:
 class TestMemoryStats:
     def test_stats_returns_iostats(self):
         m = Memory(b"hello")
-        s = m.stats()
+        s = m.stat()
         assert isinstance(s, IOStats)
         assert s.size == 5
         assert s.mtime > 0
@@ -290,16 +290,16 @@ class TestMemoryStats:
     def test_stats_after_write_bumps_mtime(self):
         import time as _time
         m = Memory()
-        before = m.stats().mtime
+        before = m.stat().mtime
         _time.sleep(0.01)
         m.write_bytes(b"x")
-        after = m.stats().mtime
+        after = m.stat().mtime
         assert after > before
 
     def test_stats_carries_media_type(self):
         from yggdrasil.io.enums import MediaTypes
         m = Memory(b"abc", media_type=MediaTypes.JSON)
-        s = m.stats()
+        s = m.stat()
         assert s.media_type is MediaTypes.JSON
         assert s.has_media_type
 
@@ -323,8 +323,8 @@ class TestMemoryStats:
 
     def test_iostats_iterable(self):
         s = IOStats(size=10, mtime=2.5, media_type=None)
-        size, mtime, mt = s
-        assert (size, mtime, mt) == (10, 2.5, None)
+        size, mtime, kind, mode, mt = s
+        assert (size, mtime, mode, mt) == (10, 2.5, 0, None)
 
 
 class TestMemoryDunder:

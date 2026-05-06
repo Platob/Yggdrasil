@@ -149,6 +149,9 @@ class MemorySparkIO(TabularIO[CastOptions]):
     # Arrow read / write — collects on read, builds Spark on write
     # ------------------------------------------------------------------
 
+    def stat(self):
+        return self._stats
+
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
         # Forces a driver-side collect via ``df.toArrow()``. Loud
         # rather than silent — the call site is the one asking for

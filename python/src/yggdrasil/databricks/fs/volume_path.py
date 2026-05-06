@@ -35,7 +35,7 @@ from databricks.sdk.service.catalog import PathOperation, VolumeInfo, VolumeType
 
 from yggdrasil.io.buffer import BytesIO
 from yggdrasil.io.enums import MediaType, MediaTypes
-from yggdrasil.io.path_stat import PathKind, PathStats
+from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 from ._errors import (
     ALREADY_EXISTS_ERRORS,
@@ -388,7 +388,7 @@ class VolumePath(DatabricksPath):
     # Filesystem metadata
     # ------------------------------------------------------------------
 
-    def _stat(self) -> PathStats:
+    def _stat_uncached(self) -> IOStats:
         is_file, is_dir, size, mtime = get_volume_status(
             sdk=self._sdk(),
             full_path=self.full_path(),
@@ -396,11 +396,11 @@ class VolumePath(DatabricksPath):
             raise_error=False,
         )
         if is_file is None and is_dir is None:
-            return PathStats(kind=PathKind.MISSING, size=0, mtime=None)
-        return PathStats(
-            kind=PathKind.FILE if is_file else PathKind.DIRECTORY,
+            return IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
+        return IOStats(
+            kind=IOKind.FILE if is_file else IOKind.DIRECTORY,
             size=int(size or 0),
-            mtime=coerce_mtime(mtime),
+            mtime=float(coerce_mtime(mtime) or 0.0),
         )
 
     def _ls(self, recursive=False, allow_not_found=True):
@@ -615,6 +615,7 @@ class VolumePath(DatabricksPath):
         except SDK_ERRORS:
             if not allow_not_found:
                 raise
+        self._invalidate_stat_cache()
 
     def _remove_dir(self, recursive=True, allow_not_found=True, with_root=True):
         cat, sch, vol, rel = self.sql_volume_or_table_parts()
@@ -647,4 +648,4 @@ class VolumePath(DatabricksPath):
                     if not allow_not_found:
                         raise
         finally:
-            pass
+            self._invalidate_stat_cache()

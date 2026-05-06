@@ -50,7 +50,6 @@ from typing import TYPE_CHECKING, Any, Iterator, Mapping, Sequence
 import pyarrow as pa
 
 from yggdrasil.io.enums import MediaTypes
-from yggdrasil.io.fs import Path
 
 from .actions import (
     AddFile,
@@ -78,6 +77,7 @@ from .constants import (
 
 if TYPE_CHECKING:
     from yggdrasil.io.buffer.bytes_io import BytesIO
+    from yggdrasil.io.fs import Path
 
 
 __all__ = [

@@ -243,8 +243,11 @@ class KafkaIO(TabularIO[CastOptions]):
         return consumer
 
     # ------------------------------------------------------------------
-    # TabularIO read path
+    # TabularIO contract
     # ------------------------------------------------------------------
+
+    def stat(self):
+        return self._stats
 
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
         """Drain the topic into Arrow record batches.

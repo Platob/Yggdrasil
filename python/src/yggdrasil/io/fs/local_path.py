@@ -51,7 +51,7 @@ from typing import Any, ClassVar, Iterator, Optional, Union
 
 from yggdrasil.io.buffer import BytesIO
 from yggdrasil.io.fs.path import Path, register_path_class
-from yggdrasil.io.path_stat import PathKind, PathStats
+from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 
 __all__ = ["LocalPath"]
@@ -249,24 +249,24 @@ class LocalPath(Path):
         """
         return _to_long_path(self.full_path())
 
-    def _stat(self) -> PathStats:
+    def _stat(self) -> IOStats:
         path = self._os_path()
         try:
             st = os.stat(path)
         except FileNotFoundError:
-            return PathStats(kind=PathKind.MISSING)
+            return IOStats(kind=IOKind.MISSING)
         except NotADirectoryError:
-            return PathStats(kind=PathKind.MISSING)
+            return IOStats(kind=IOKind.MISSING)
 
         mode = st.st_mode
         if stat_module.S_ISDIR(mode):
-            kind = PathKind.DIRECTORY
+            kind = IOKind.DIRECTORY
         elif stat_module.S_ISREG(mode):
-            kind = PathKind.FILE
+            kind = IOKind.FILE
         else:
-            kind = PathKind.FILE
+            kind = IOKind.FILE
 
-        return PathStats(
+        return IOStats(
             kind=kind,
             size=int(st.st_size),
             mtime=float(st.st_mtime),

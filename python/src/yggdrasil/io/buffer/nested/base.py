@@ -30,8 +30,8 @@ The contract
 
 A subclass implements:
 
-- :meth:`options_class`     — :class:`NestedOptions` subtype it
-                              consumes. Default :class:`NestedOptions`.
+- :meth:`options_class`     — :class:`CastOptions` subtype it
+                              consumes. Default :class:`CastOptions`.
 - :meth:`iter_children`     — yield direct children. Each yielded
                               child is a :class:`TabularIO`
                               (typically :class:`PrimitiveIO` for
@@ -85,16 +85,16 @@ from yggdrasil.arrow.cast import any_to_arrow_table
 from yggdrasil.data.schema import Schema
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.enums import MimeType, Mode
-from yggdrasil.io.fs import Path
 from yggdrasil.data.options import CastOptions
 from yggdrasil.io.buffer.base import TabularIO, inject_static_values_into_batch as _inject_static_batch
 from yggdrasil.lazy_imports import path_class
 
 if TYPE_CHECKING:
     from yggdrasil.io.buffer.bytes_io import BytesIO
+    from yggdrasil.io.fs import Path
 
 
-__all__ = ["NestedIO", "NestedOptions"]
+__all__ = ["NestedIO"]
 
 
 # Time-sortable staging layout: ``<prefix>-<start>-<end>-<seed>(.ext)*``.
@@ -107,57 +107,13 @@ _STAGING_TMP_RE: "re.Pattern[str]" = re.compile(
 
 
 # ---------------------------------------------------------------------------
-# Options
-# ---------------------------------------------------------------------------
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class NestedOptions(CastOptions):
-    """Cast options extended with folder-write knobs.
-
-    Inherits everything from :class:`CastOptions` (mode, row_size,
-    byte_size, schema-cast hooks, ``recursive``,
-    ``children_predicate``).  ``NestedOptions`` adds only knobs the
-    folder writer needs — sub-IO discovery is filtered uniformly
-    via :attr:`CastOptions.children_predicate` plus the shared
-    :func:`yggdrasil.io.buffer.base.matches_children_predicate`
-    helper.
-
-    :param child_media_type: the :class:`MediaType` to mint child
-        files as on write. ``None`` (default) means "infer from the
-        folder's child convention" — the concrete subclass decides
-        (e.g. :class:`FolderIO` falls back to a class-level default).
-    :param child_row_size: row count per child file on write. ``0``
-        or ``None`` means "one child file per write call" — the
-        whole batch iterator is drained into a single staging
-        file. Positive values cause the writer to roll over to a
-        new staging file every ``child_row_size`` rows.
-    :param child_byte_size: same as ``child_row_size`` but in
-        approximate bytes. Mutually exclusive with
-        ``child_row_size`` (row threshold wins if both set).
-    :param max_workers: thread-pool size for naturally-parallel
-        folder operations: clearing children before an OVERWRITE,
-        per-child schema collection, per-leaf reads behind a
-        partition merge, and per-partition writes/upserts. ``0``
-        or ``1`` (default) keeps the legacy single-threaded path
-        — no executor is created. Higher values fan the work out
-        across a :class:`concurrent.futures.ThreadPoolExecutor`;
-        the work is I/O-bound (path stat, leaf bytes, Arrow C++
-        decoders that drop the GIL) so threads scale well on
-        local SSDs and remote object stores alike.
-    """
-
-    child_media_type: Any = None
-    child_row_size: int = 0
-    child_byte_size: int = 0
-    max_workers: int = 0
-
-
-# ---------------------------------------------------------------------------
 # Type alias
 # ---------------------------------------------------------------------------
 
-O = TypeVar("O", bound=NestedOptions)
+# Folder/zip/delta writers consume :class:`CastOptions` directly.
+# Subclasses can narrow the bound when they introduce extra fields
+# (e.g. partition routing on :class:`FolderOptions`).
+O = TypeVar("O", bound=CastOptions)
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +199,7 @@ class NestedIO(TabularIO[O], ABC):
                 f"{type(self).__name__} requires a path; got None. "
                 "Pass path=... or a path-ish positional."
             )
-        if isinstance(raw, Path):
+        if isinstance(raw, path_class()):
             self.path = raw
         else:
             self.path = path_class().from_(raw)
@@ -272,7 +228,7 @@ class NestedIO(TabularIO[O], ABC):
 
     @classmethod
     def options_class(cls) -> type[O]:
-        return NestedOptions  # type: ignore[return-value]
+        return CastOptions  # type: ignore[return-value]
 
     # ==================================================================
     # Children surface — primary read API
@@ -444,7 +400,7 @@ class NestedIO(TabularIO[O], ABC):
         Used by OVERWRITE. Does not remove the folder itself —
         concurrent readers may hold the directory handle.
 
-        ``max_workers`` mirrors :attr:`NestedOptions.max_workers`:
+        ``max_workers`` mirrors :attr:`CastOptions.max_workers`:
         ``0`` / ``1`` removes serially, higher values fan the
         per-child ``remove`` calls across a thread pool. Removal
         is independent across siblings — order doesn't matter,
@@ -492,6 +448,13 @@ class NestedIO(TabularIO[O], ABC):
         if name.startswith("tmp-") and _STAGING_TMP_RE.search(name):
             return True
         return False
+
+    # ==================================================================
+    # IOStats — folders surface the inherited mutable holder
+    # ==================================================================
+
+    def stat(self):
+        return self._stats
 
     # ==================================================================
     # Read derivation — chain children directly
@@ -601,13 +564,12 @@ class NestedIO(TabularIO[O], ABC):
         batches: Iterable[pa.RecordBatch],
         options: O,
     ) -> None:
-        """Dispatch a batch iterable into one or more child files.
+        """Dispatch a batch iterable into a single child file.
 
         Resolves save mode first (so OVERWRITE can clear before any
-        bytes hit disk), then streams batches into staging children
-        per :attr:`NestedOptions.child_row_size` /
-        ``child_byte_size``. On a successful drain, staging files
-        are renamed to their final names.
+        bytes hit disk), then drains the iterable into one staging
+        child of :meth:`_default_child_media_type`. On a successful
+        drain, the staging file is renamed to its final name.
         """
         mode = self._resolve_save_mode(options.mode)
 
@@ -628,34 +590,17 @@ class NestedIO(TabularIO[O], ABC):
         batches: Iterable[pa.RecordBatch],
         options: O,
     ) -> None:
-        """Drain *batches* into one or more child files."""
+        """Drain *batches* into a single child file."""
         batch_iter = iter(batches)
         first = next(batch_iter, None)
         if first is None:
             return
 
-        media_type = options.child_media_type or self._default_child_media_type()
-        row_threshold = options.child_row_size or 0
-        byte_threshold = options.child_byte_size or 0
-
-        if row_threshold <= 0 and byte_threshold <= 0:
-            self._write_one_child(
-                _chain_first(first, batch_iter),
-                media_type=media_type,
-                options=options,
-            )
-            return
-
-        for chunk in _split_batches(
+        self._write_one_child(
             _chain_first(first, batch_iter),
-            row_threshold=row_threshold,
-            byte_threshold=byte_threshold,
-        ):
-            self._write_one_child(
-                chunk,
-                media_type=media_type,
-                options=options,
-            )
+            media_type=self._default_child_media_type(),
+            options=options,
+        )
 
     def _write_one_child(
         self,
@@ -719,7 +664,7 @@ class NestedIO(TabularIO[O], ABC):
         return f"{prefix}{next_idx:05d}{suffix}"
 
     def _extension_for(self, media_type: Any) -> str:
-        return Path._staging_extension(media_type)
+        return path_class()._staging_extension(media_type)
 
     def _default_child_media_type(self) -> Any:
         """Media type for new children when not specified.
@@ -809,61 +754,3 @@ def _chain_first(
     """Yield *first*, then every batch from *rest*."""
     yield first
     yield from rest
-
-
-def _split_batches(
-    batches: Iterator[pa.RecordBatch],
-    *,
-    row_threshold: int,
-    byte_threshold: int,
-) -> Iterator[Iterator[pa.RecordBatch]]:
-    """Split a batch iterator into chunks by row / byte threshold.
-
-    ``row_threshold`` wins when both are set. With a row threshold,
-    incoming batches are sliced so each emitted chunk holds exactly
-    ``row_threshold`` rows (the final chunk may be shorter). Without
-    a row threshold, byte accounting accumulates whole batches.
-    """
-
-    def _size_bytes(batch: pa.RecordBatch) -> int:
-        try:
-            return int(batch.nbytes)
-        except Exception:
-            return 0
-
-    if row_threshold > 0:
-        pending: list[pa.RecordBatch] = []
-        pending_rows = 0
-        for batch in batches:
-            offset = 0
-            remaining = batch.num_rows
-            while remaining > 0:
-                take = min(remaining, row_threshold - pending_rows)
-                slice_ = batch.slice(offset, take)
-                pending.append(slice_)
-                pending_rows += take
-                offset += take
-                remaining -= take
-                if pending_rows >= row_threshold:
-                    yield iter(pending)
-                    pending = []
-                    pending_rows = 0
-        if pending:
-            yield iter(pending)
-        return
-
-    pending = []
-    nbytes = 0
-
-    for batch in batches:
-        pending.append(batch)
-        if byte_threshold > 0:
-            nbytes += _size_bytes(batch)
-
-        if 0 < byte_threshold <= nbytes:
-            yield iter(pending)
-            pending = []
-            nbytes = 0
-
-    if pending:
-        yield iter(pending)

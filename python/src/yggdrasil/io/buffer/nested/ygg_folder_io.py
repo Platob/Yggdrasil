@@ -47,14 +47,14 @@ import pyarrow as pa
 
 import yggdrasil.pickle.json as json_module
 from yggdrasil.io.enums import MimeType, MimeTypes
-from yggdrasil.io.fs import Path
 from yggdrasil.io.stats import Stats, STATS_FILENAME
+from yggdrasil.lazy_imports import path_class
 from .base import _run_in_threads
 from .folder_io import FolderIO
 
 
 if TYPE_CHECKING:
-    pass
+    from yggdrasil.io.fs import Path
 
 
 __all__ = ["YGGFolderIO", "is_ygg_folder"]
@@ -139,6 +139,7 @@ def is_ygg_folder(path: "Path | str | os.PathLike") -> bool:
     on every folder construction, so the saved allocations add up
     quickly when a hot loop repeatedly opens the same folder.
     """
+    Path = path_class()
     if isinstance(path, str):
         # Fast path for the most common caller shape (string path).
         if path and "://" not in path:
@@ -210,10 +211,6 @@ class YGGFolderIO(FolderIO):
         :class:`pa.RecordBatch`. The compactor still bin-packs small
         files into ``OPTIMIZE_TARGET_BYTES`` chunks, so storage stays
         comparable; the win is on the hot append path.
-
-        Callers who want Parquet anyway can pass ``child_media_type``
-        on :class:`FolderOptions` — same override hook the base class
-        documents.
         """
         return MimeTypes.ARROW_IPC
 

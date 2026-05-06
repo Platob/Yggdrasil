@@ -111,31 +111,35 @@ class Holder(Disposable):
         """Current visible size in bytes."""
 
     # ------------------------------------------------------------------
-    # IOStats — size / mtime / media_type triple
+    # IOStats — the canonical metadata holder
     # ------------------------------------------------------------------
+    #
+    # Every concrete :class:`Holder` keeps a single mutable
+    # :class:`IOStats` instance. Writes mutate it in place
+    # (``stats.size = new_size``, ``stats.mtime = time.time()``);
+    # readers either pin :meth:`stats` and observe the live values, or
+    # use the convenience properties below which read straight off the
+    # same object. ``size`` / ``mtime`` / ``media_type`` are no longer
+    # stored on separate slots — :class:`IOStats` is the holder.
+
+    @abstractmethod
+    def stat(self) -> IOStats:
+        """The mutable :class:`IOStats` carrying this holder's metadata.
+
+        Concrete holders return the *same* instance for the holder's
+        lifetime; callers can pin it to observe live size / mtime /
+        media_type updates as writes land.
+        """
 
     @property
     def mtime(self) -> float:
-        """Last modification time. ``0.0`` when no meaningful mtime is available."""
-        return 0.0
+        """Convenience accessor — same as ``self.stat().mtime``."""
+        return self.stat().mtime
 
     @property
     def media_type(self):
-        """:class:`MediaType` for this holder, or ``None`` if unknown."""
-        return None
-
-    def stats(self) -> IOStats:
-        """Snapshot ``size`` / ``mtime`` / ``media_type`` as an :class:`IOStats`.
-
-        Default impl reads :attr:`size` / :attr:`mtime` / :attr:`media_type`.
-        Backends with cheaper batched probes (e.g. one ``stat`` call
-        for both size and mtime) can override.
-        """
-        return IOStats(
-            size=int(self.size),
-            mtime=float(self.mtime),
-            media_type=self.media_type,
-        )
+        """Convenience accessor — same as ``self.stat().media_type``."""
+        return self.stat().media_type
 
     # ------------------------------------------------------------------
     # Bytes / text convenience surface — built on the abstract primitives
