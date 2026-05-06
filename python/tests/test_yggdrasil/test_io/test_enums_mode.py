@@ -8,9 +8,10 @@ from yggdrasil.io.enums.mode import STR_MAPPING, Mode
 
 
 class TestModeMembers:
-    def test_str_subclass(self):
-        assert isinstance(Mode.OVERWRITE, str)
-        assert Mode.OVERWRITE == "overwrite"
+    def test_int_subclass(self):
+        assert isinstance(Mode.OVERWRITE, int)
+        # Members are stable codes; Mode.from_ accepts the int.
+        assert Mode.from_(Mode.OVERWRITE.value) is Mode.OVERWRITE
 
     def test_all_expected_members(self):
         names = {m.name for m in Mode}
@@ -25,6 +26,13 @@ class TestModeMembers:
             "TRUNCATE",
             "ERROR_IF_EXISTS",
         }
+
+    def test_os_mode_lookup(self):
+        assert Mode.READ_ONLY.os_mode == "rb"
+        assert Mode.OVERWRITE.os_mode == "wb+"
+        assert Mode.APPEND.os_mode == "ab+"
+        assert Mode.ERROR_IF_EXISTS.os_mode == "xb+"
+        assert Mode.AUTO.os_mode == "rb+"
 
 
 class TestModeFromIdentity:
@@ -98,9 +106,13 @@ class TestModeFromInvalid:
         with pytest.raises(ValueError):
             Mode.from_("not-a-mode")
 
-    def test_non_string_raises(self):
+    def test_unknown_int_raises(self):
+        with pytest.raises(ValueError):
+            Mode.from_(99999)
+
+    def test_non_string_non_int_raises(self):
         with pytest.raises(TypeError):
-            Mode.from_(42)  # type: ignore[arg-type]
+            Mode.from_(3.14)  # type: ignore[arg-type]
 
 
 class TestStrMapping:
