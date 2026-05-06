@@ -1182,6 +1182,23 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         finally:
             bio.close()
 
+    def clear(self) -> None:
+        """:class:`Holder` primitive: drop the backing file entirely.
+
+        Unlinks via :meth:`unlink` with ``missing_ok=True`` so a
+        missing target is a no-op. Any active transaction buffer is
+        torn down too — its bytes are scratch, the durable backing
+        is what we just removed.
+        """
+        if self._transaction_buffer is not None:
+            try:
+                self._transaction_buffer.close()
+            except Exception:
+                pass
+            self._transaction_buffer = None
+            self._dirty = False
+        self.unlink(missing_ok=True)
+
     # ==================================================================
     # Holder primitives — read_mv / write_mv / reserve
     # ==================================================================

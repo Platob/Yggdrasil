@@ -144,6 +144,18 @@ class Holder(Disposable):
         Shrinks drop the tail; extends zero-pad. Returns ``n``.
         """
 
+    @abstractmethod
+    def clear(self) -> None:
+        """Drop the holder's payload entirely.
+
+        :class:`Memory` resets the underlying ``bytearray`` to zero
+        bytes (capacity drops too). :class:`yggdrasil.io.fs.Path`
+        unlinks the backing file with ``missing_ok=True`` so the
+        operation is idempotent. After :meth:`clear`, :attr:`size`
+        reads ``0`` and the holder is still usable — subsequent
+        writes grow it from scratch.
+        """
+
     @property
     @abstractmethod
     def size(self) -> int:
