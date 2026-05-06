@@ -889,11 +889,9 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
                 mtime=float(buf.mtime or 0.0),
                 kind=IOKind.FILE,
                 media_type=self.media_type,
-                url=self.url,
             )
         s = self._stat()
         s.media_type = self.media_type
-        s.url = self.url
         return s
 
     # ==================================================================

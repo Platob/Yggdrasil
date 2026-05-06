@@ -53,7 +53,7 @@ class Memory(Holder):
     zero-padding on extend up to capacity.
     """
 
-    __slots__ = ("_buf", "_stats")
+    __slots__ = ("_buf", "_stats", "_url")
 
     def __init__(
         self,
@@ -69,6 +69,8 @@ class Memory(Holder):
         auto_open: bool = True,
     ) -> None:
         Disposable.__init__(self)
+        # Lazy ``mem://<addr>`` URL handle — minted on first access.
+        self._url = None
         self._stats: IOStats = IOStats(
             mtime=time.time(),
             kind=IOKind.SOCKET,
@@ -134,6 +136,7 @@ class Memory(Holder):
         """
         m = cls.__new__(cls)
         Disposable.__init__(m)
+        m._url = None
         m._buf = buf
         m._stats = IOStats(
             size=len(buf) if size is None else int(size),
@@ -159,6 +162,21 @@ class Memory(Holder):
     @property
     def is_remote_path(self) -> bool:
         return False
+
+    @property
+    def url(self):
+        """``mem://<hex_addr>`` URL minted from this holder's id.
+
+        Built lazily on first access so naked construction stays
+        cheap; cached on ``_url`` for stable identity across
+        repeated reads (cache keys, dispatch discriminators).
+        """
+        u = self._url
+        if u is None:
+            from yggdrasil.io.url import URL  # avoid import cycle
+            u = URL.from_memory_address(self)
+            self._url = u
+        return u
 
     @property
     def size(self) -> int:

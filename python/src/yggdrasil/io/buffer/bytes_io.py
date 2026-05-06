@@ -923,10 +923,15 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
     @property
     def url(self) -> URL:
-        """URL of the buffer's working backing."""
-        path = self._path_holder()
-        if path is not None:
-            return path.url
+        """URL of the buffer's working backing.
+
+        Forwards to ``_holder.url``: ``file://`` / ``s3://`` / … for
+        path holders, ``mem://<addr>`` for memory holders. Falls back
+        to a buffer-keyed memory URL only when there's no holder yet
+        (views before the parent populates a backing).
+        """
+        if self._holder is not None:
+            return self._holder.url
         return URL.from_memory_address(self)
 
     @property
@@ -1241,7 +1246,6 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         """
         path = self._path_holder()
         if path is not None:
-            self._stats.url = path.url
             if path.io_open and path.is_local:
                 # Local fd: fstat through the holder is the cheap path.
                 try:

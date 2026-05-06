@@ -24,7 +24,6 @@ from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from yggdrasil.io.enums import MediaType
-    from yggdrasil.io.url import URL
 
 
 __all__ = ["IOStats", "IOKind"]
@@ -69,11 +68,6 @@ class IOStats:
       bytes). ``None`` when no honest answer is available; never
       guess :class:`MimeTypes.OCTET_STREAM` here — let the caller
       decide.
-    - ``url`` — :class:`URL` identifying the backing (``file://`` for
-      local paths, ``s3://`` / ``dbfs://`` / … for remote, ``mem://``
-      for memory holders). ``None`` when the holder has no canonical
-      URL — callers needing a stable identity should fall back to
-      :func:`URL.from_memory_address` against the holder.
 
     Backends with richer metadata (ETag, content-type, owner…) should
     subclass and extend rather than cram extras into ``mode``.
@@ -84,7 +78,6 @@ class IOStats:
     kind: IOKind = IOKind.MISSING
     mode: int = 0
     media_type: "Optional[MediaType]" = None
-    url: "Optional[URL]" = None
 
     # ------------------------------------------------------------------
     # ``os.stat_result`` compatibility — drop-in for legacy callers
@@ -141,14 +134,12 @@ class IOStats:
         kind: Optional[IOKind] = None,
         mode: Optional[int] = None,
         media_type: Any = ...,
-        url: Any = ...,
         copy: bool = False,
     ) -> "IOStats":
         """Mutate in place (default) or return a copy with the given fields set.
 
-        ``media_type`` and ``url`` use the ``...`` sentinel so callers
-        can explicitly clear them by passing ``media_type=None`` /
-        ``url=None``.
+        ``media_type`` uses the ``...`` sentinel so callers can
+        explicitly clear it by passing ``media_type=None``.
         """
         if copy:
             return IOStats(
@@ -159,7 +150,6 @@ class IOStats:
                 media_type=(
                     self.media_type if media_type is ... else media_type
                 ),
-                url=self.url if url is ... else url,
             )
         if size is not None:
             self.size = size
@@ -171,8 +161,6 @@ class IOStats:
             self.mode = mode
         if media_type is not ...:
             self.media_type = media_type
-        if url is not ...:
-            self.url = url
         return self
 
     # ------------------------------------------------------------------
@@ -185,14 +173,12 @@ class IOStats:
         yield self.kind
         yield self.mode
         yield self.media_type
-        yield self.url
 
     def __repr__(self) -> str:
         mt = self.media_type
         mt_repr = repr(mt) if mt is not None else "None"
-        url_repr = repr(self.url) if self.url is not None else "None"
         return (
             f"IOStats(size={self.size}, mtime={self.mtime!r}, "
             f"kind={self.kind.name}, mode={self.mode!r}, "
-            f"media_type={mt_repr}, url={url_repr})"
+            f"media_type={mt_repr})"
         )

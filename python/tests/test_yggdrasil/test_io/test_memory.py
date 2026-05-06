@@ -323,8 +323,8 @@ class TestMemoryStats:
 
     def test_iostats_iterable(self):
         s = IOStats(size=10, mtime=2.5, media_type=None)
-        size, mtime, kind, mode, mt, url = s
-        assert (size, mtime, mode, mt, url) == (10, 2.5, 0, None, None)
+        size, mtime, kind, mode, mt = s
+        assert (size, mtime, mode, mt) == (10, 2.5, 0, None)
 
 
 class TestMemoryDunder:

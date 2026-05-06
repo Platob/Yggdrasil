@@ -39,6 +39,7 @@ from .io_stats import IOStats
 
 if TYPE_CHECKING:
     from yggdrasil.io.enums import Mode
+    from yggdrasil.io.url import URL
 
 
 __all__ = ["Holder"]
@@ -225,6 +226,19 @@ class Holder(Disposable):
     def dirty(self) -> bool:
         """True when there are uncommitted writes. Default ``False``."""
         return False
+
+    # ------------------------------------------------------------------
+    # Identity — every holder is addressable by a :class:`URL`. Memory
+    # holders synthesize a ``mem://<addr>`` URL; path holders return
+    # their path's URL. The slot doubles as a cache key, a routing
+    # discriminator (``mem://`` vs ``file://`` vs ``s3://`` …), and a
+    # debug-friendly handle.
+    # ------------------------------------------------------------------
+
+    @property
+    @abstractmethod
+    def url(self) -> "URL":
+        """Canonical URL identifying this holder. Required."""
 
     # ------------------------------------------------------------------
     # Backing-shape predicates — every subclass answers exactly one as
