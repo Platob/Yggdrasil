@@ -31,9 +31,9 @@ A :class:`BytesIO` has one of two backings at any moment:
 
 The path-bound file is either:
 
-- **owned** (``_owns_spill_path = True``) — minted by us in
+- **owned** (``_owns_holder = True``) — minted by us in
   :func:`tempfile.gettempdir`. Unlinked on close.
-- **external** (``_owns_spill_path = False``) — supplied by the
+- **external** (``_owns_holder = False``) — supplied by the
   caller via the ``path=`` constructor kwarg. Never unlinked.
 
 Lifecycle
@@ -162,7 +162,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     Mechanically identical otherwise: same fd-backed positional I/O,
     same primitive set. The only behavioural difference is the
     cleanup decision in :meth:`_release`, gated on
-    :attr:`_owns_spill_path`.
+    :attr:`_owns_holder`.
 
     A :class:`BytesIO` IS-A :class:`TabularIO`. Without a tabular
     media type set, the tabular hooks (``_read_arrow_batches`` /
@@ -300,7 +300,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # buffers that forward to ``parent`` instead.
         from yggdrasil.io.memory import Memory  # avoid import cycle
         self._holder: "Holder | None" = Memory(auto_open=True)
-        self._owns_spill_path = True
+        self._owns_holder = True
         self._pos: int = 0
         self._mode: str = mode or "rb+"
         self._spill_bytes: int = int(spill_bytes)
@@ -321,7 +321,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         if path is not None:
             # Path-bound. Caller owns the path; we don't unlink on close.
             self._holder = path_class().from_(path)
-            self._owns_spill_path = False
+            self._owns_holder = False
 
         if data is not None:
             self._init_from(data, copy=copy)
@@ -339,7 +339,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             #   accept the handle. Their ``_acquire`` is a cheap
             #   no-op for the memory-only case.
             caller_owned_path = (
-                self._is_path_holder() and not self._owns_spill_path
+                self._is_path_holder() and not self._owns_holder
             )
             auto_open = caller_owned_path or not self._is_path_holder()
 
@@ -375,7 +375,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         """Replace ``_holder`` with a :class:`Memory` seeded from *source*."""
         from yggdrasil.io.memory import Memory  # avoid import cycle
         self._holder = Memory(source, auto_open=True)
-        self._owns_spill_path = True
+        self._owns_holder = True
 
     def _init_from(self, data: Any, *, copy: bool) -> None:
         """Memory-mode dispatcher. May immediately spill if input crosses threshold."""
@@ -396,7 +396,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         p = path_class()
         if p.is_pathish(data):
             self._holder = p.from_(data)
-            self._owns_spill_path = False
+            self._owns_holder = False
             return
 
         if hasattr(data, "read"):
@@ -420,7 +420,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             path = _mint_spill_path(self._ext_hint(), self._spill_ttl)
             path.write_bytes(src)
             self._holder = path
-            self._owns_spill_path = True
+            self._owns_holder = True
             self._stats.size = n
             # Holder's per-open IO state opens lazily in _acquire.
         else:
@@ -444,7 +444,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # views over the same path get independent fds / transactions.
         self._holder = src._holder
         self._stats.size = src._stats.size
-        self._owns_spill_path = src._owns_spill_path
+        self._owns_holder = src._owns_holder
         self._pos = src._pos
         self._stats.media_type = src._stats.media_type
         self._metadata = src._metadata
@@ -482,7 +482,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             finally:
                 path.close_io()
             self._holder = path
-            self._owns_spill_path = True
+            self._owns_holder = True
             self._stats.size = total
             self._pos = 0
             return
@@ -514,7 +514,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             self._stats.size = len(payload)
         else:
             self._holder = path
-            self._owns_spill_path = True
+            self._owns_holder = True
             self._stats.size = total
         self._pos = 0
 
@@ -643,7 +643,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
             # Unlink the file only if we minted it. Caller-owned paths
             # are left alone.
-            if self._owns_spill_path:
+            if self._owns_holder:
                 try:
                     path.unlink(missing_ok=True)
                 except OSError:
@@ -865,7 +865,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # is internal scratch we own.
         path.acquire_io("rb+")
         self._holder = path
-        self._owns_spill_path = True
+        self._owns_holder = True
 
     def _ext_hint(self) -> str:
         """File extension suggestion for spill files."""
@@ -972,12 +972,12 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         backing — every read / write routes through the same
         :class:`Holder`, just at ``_view_offset + cursor``. Views
         never unlink the underlying spill on close
-        (``_owns_spill_path is False``). Subclasses (e.g.
+        (``_owns_holder is False``). Subclasses (e.g.
         :class:`ZipEntryIO`) that set ``parent`` for navigation but
         allocate their own backing report ``False``.
         """
         parent = self.parent
-        if parent is None or self._owns_spill_path:
+        if parent is None or self._owns_holder:
             return False
         parent_holder = getattr(parent, "_holder", None)
         return parent_holder is not None and self._holder is parent_holder
@@ -1037,9 +1037,9 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         view = object.__new__(BytesIO)
         TabularIO.__init__(view, media_type=parent._stats.media_type)
         # Share the parent's holder directly. The view never owns it,
-        # so close-time unlinking is gated on ``_owns_spill_path``.
+        # so close-time unlinking is gated on ``_owns_holder``.
         view._holder = parent._holder
-        view._owns_spill_path = False
+        view._owns_holder = False
         view._stats.size = int(size)
         view._stats.mtime = 0.0
         view._pos = int(pos)
@@ -1076,7 +1076,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     def replace_with_payload(self, payload: Any) -> None:
         """Replace this buffer's content with *payload*, consuming it.
 
-        Two-mode behaviour driven by ``_owns_spill_path``:
+        Two-mode behaviour driven by ``_owns_holder``:
 
         - **Owned spill (or memory)** — tear down the old backing
           (close fd, unlink owned spill, drop bytearray), reset
@@ -1084,7 +1084,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         - **External path binding** (path-bound buffer) — keep the
           binding. Truncate the bound file to zero, write the new
           payload's bytes through the fd, leave ``_spill_path`` /
-          ``_owns_spill_path`` intact.
+          ``_owns_holder`` intact.
 
         Cursor resets to 0. ``_stats.media_type`` is intentionally NOT
         modified — callers that need to update it (compress /
@@ -1102,7 +1102,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # ------------------------------------------------------------------
         # External path binding — preserve binding, write through it.
         # ------------------------------------------------------------------
-        if self._is_path_holder() and not self._owns_spill_path:
+        if self._is_path_holder() and not self._owns_holder:
             holder = self._ensure_holder_open()
             holder.truncate(0)
             self._stats.size = 0
@@ -1545,7 +1545,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
         Backing-aware behaviour:
 
-        - **External path binding** (``_owns_spill_path=False``) — pass
+        - **External path binding** (``_owns_holder=False``) — pass
           the path through to the new instance. Neither side owns the
           file, so sharing the binding is safe; both will pread/pwrite
           against the same durable backing, which is exactly the
@@ -1569,7 +1569,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         if target_class is None:
             target_class = type(self)
 
-        if self._is_path_holder() and not self._owns_spill_path:
+        if self._is_path_holder() and not self._owns_holder:
             return target_class(
                 path=self._holder,
                 mode=self._mode,
@@ -1600,7 +1600,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 path = _mint_spill_path(new_instance._ext_hint(), new_instance._spill_ttl)
                 path.write_bytes(payload)
                 new_instance._holder = path
-                new_instance._owns_spill_path = True
+                new_instance._owns_holder = True
                 new_instance._stats.size = size
             else:
                 new_instance._set_memory(payload)
@@ -1630,7 +1630,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             new_path.close_io()
 
         new_instance._holder = new_path
-        new_instance._owns_spill_path = True
+        new_instance._owns_holder = True
         new_instance._stats.size = size
         new_instance._pos = self._pos
         return new_instance
@@ -1660,7 +1660,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     def __repr__(self) -> str:
         target_class = type(self)
         opened = "opened" if self.opened else "closed"
-        internal = "internal" if self._owns_spill_path else "external"
+        internal = "internal" if self._owns_holder else "external"
         spilled = "spilled" if self.spilled else "memory"
         mt = f" media={self._stats.media_type.__repr__()}" if self._stats.media_type else ""
         path = self._path_holder()
@@ -1686,7 +1686,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         """
         self.flush()
         path = self._path_holder()
-        if not self._owns_spill_path and path is not None:
+        if not self._owns_holder and path is not None:
             # Pickle the path as a STRING, not the Path object. Path
             # subclasses inherit from Disposable, which holds a
             # WeakSet whose internal _remove callback is a closure

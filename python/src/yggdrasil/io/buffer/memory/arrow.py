@@ -177,6 +177,8 @@ class MemoryArrowIO(TabularIO[CastOptions]):
         # Caller-supplied spill path acts like the BytesIO "external"
         # branch — we honor it as the spill destination but don't
         # unlink on close. Otherwise minted on demand.
+        self._spill_path = None
+        self._owns_spill_path = True
         if spill_path is not None:
             from yggdrasil.io.fs.path import Path  # local import — Path optional in some envs.
 

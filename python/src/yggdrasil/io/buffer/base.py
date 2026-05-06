@@ -521,14 +521,6 @@ class TabularIO(Disposable, ABC, Generic[O]):
         # cache (MemorySparkIO when Spark is reachable, MemoryArrowIO
         # otherwise). Read paths delegate through it when set.
         self._persisted_data: "TabularIO | None" = None
-        # Spill-path slots used by non-byte buffer-backed TabularIOs
-        # (e.g. :class:`MemoryArrowIO`) to track durable storage.
-        # :class:`BytesIO` does not consult these — it stores its
-        # backing on the single ``_holder`` slot — but leaving the
-        # defaults here keeps the contract uniform for callers that
-        # introspect either kind of buffer.
-        self._spill_path = None
-        self._owns_spill_path = True
         # Lazy spill directory used by :meth:`scan_spark_frame`'s
         # default fallback. Populated on first scan, cleaned up by
         # :meth:`_release`.
