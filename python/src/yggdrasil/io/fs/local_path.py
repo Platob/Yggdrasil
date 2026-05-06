@@ -50,6 +50,7 @@ from pathlib import PurePath
 from typing import Any, ClassVar, Iterator, Optional, Union
 
 from yggdrasil.io.buffer import BytesIO
+from yggdrasil.io.enums import Mode
 from yggdrasil.io.fs.path import Path, register_path_class
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
@@ -470,43 +471,49 @@ class LocalPath(Path):
         return super().mtime
 
     # ==================================================================
-    # Abstract hooks — whole-file primitives
+    # Holder primitives — native positional IO via os.pread / os.pwrite
     # ==================================================================
     #
-    # :class:`Path` requires :meth:`_pread` (download → BytesIO) and
-    # :meth:`_pwrite` (upload from BytesIO). For a local file these
-    # are trivially "read every byte" / "write every byte" against
-    # the inode. The :meth:`pread` / :meth:`pwrite` overrides below
-    # then short-circuit the whole-file load when only a slice is
-    # needed.
+    # :class:`Path` requires :meth:`_bread` (positional read → BytesIO)
+    # and :meth:`_bwrite` (positional write taking BytesIO). LocalPath
+    # implements both natively against the inode — partial reads /
+    # splices avoid the round-trip through a whole-file BytesIO that
+    # remote backends pay.
 
-    def _pread(self) -> BytesIO:
-        """Whole-file read into an autonomous in-memory :class:`BytesIO`.
+    def _bread(self, n: int, pos: int, mode: "Mode") -> BytesIO:
+        """Native positional read.
 
-        The buffer is detached from the file (subsequent edits don't
-        propagate) — :meth:`Path._pwrite` is what carries changes
-        back. Missing path raises :class:`FileNotFoundError`.
+        Uses the live :attr:`_fd` when the path is open; otherwise
+        opens a transient ``O_RDONLY`` fd, reads, closes. ``n < 0``
+        reads to EOF. Missing path raises :class:`FileNotFoundError`
+        — empty-on-missing is the public :meth:`pread`'s job, not
+        the primitive's.
         """
-        # Open explicitly so a missing path surfaces as
-        # FileNotFoundError — :meth:`pread` collapses missing-on-EOF
-        # to ``b""`` for the slice path, which is the wrong shape
-        # here.
-        fd = os.open(self._os_path(), os.O_RDONLY)
-        try:
-            chunks: list[bytes] = []
-            while True:
-                chunk = os.read(fd, _COPY_CHUNK)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-        finally:
-            os.close(fd)
-
+        del mode  # local fd reads are mode-agnostic
+        if self._fd >= 0:
+            if n < 0:
+                try:
+                    n = max(0, int(os.fstat(self._fd).st_size) - pos)
+                except OSError:
+                    n = 0
+            data = _fd_pread_loop(self._fd, n, pos) if n else b""
+        else:
+            os_path = self._os_path()
+            fd = os.open(os_path, os.O_RDONLY)
+            try:
+                if n < 0:
+                    try:
+                        n = max(0, int(os.fstat(fd).st_size) - pos)
+                    except OSError:
+                        n = 0
+                data = _fd_pread_loop(fd, n, pos) if n else b""
+            finally:
+                os.close(fd)
         bio = BytesIO()
         bio.open()
-        for c in chunks:
-            bio.write(c)
-        bio.seek(0)
+        if data:
+            bio.write(data)
+            bio.seek(0)
         return bio
 
     def write_bytes(
@@ -530,7 +537,7 @@ class LocalPath(Path):
         first and is therefore racy under concurrent writers.
 
         Other modes fall through to the base implementation (which
-        funnels through :meth:`_pwrite`).
+        funnels through :meth:`_bwrite`).
         """
         if mode not in ("ab", "xb"):
             return super().write_bytes(data, mode=mode, parents=parents)
@@ -575,50 +582,56 @@ class LocalPath(Path):
         finally:
             os.close(fd)
 
-    def _pwrite(self, data: BytesIO) -> int:
-        """Replace the local file's content with *data*'s bytes.
+    def _bwrite(self, data: BytesIO, pos: int, mode: "Mode") -> int:
+        """Native positional write — splice ``data`` at ``pos``.
 
-        Streams ``data`` chunk-wise via ``os.write`` so a multi-GiB
-        spilled buffer doesn't have to be materialised into memory.
-        Truncates first via ``O_TRUNC`` so any pre-existing tail past
-        the new payload is dropped.
+        ``pos == 0`` with :class:`Mode.OVERWRITE` (the legacy
+        whole-file shape) opens with ``O_TRUNC`` so any pre-existing
+        tail past the new payload is dropped. Other (pos, mode)
+        combinations open without ``O_TRUNC`` and rely on
+        :func:`os.pwrite` to splice in place. Streams ``data``
+        chunk-wise so a multi-GiB spilled buffer doesn't materialise
+        into memory.
         """
         if not data.opened:
             data.open()
+
+        if self._fd >= 0:
+            return self._bwrite_to_fd(data, pos, self._fd)
 
         os_path = self._os_path()
         parent = os.path.dirname(os_path)
         if parent and not os.path.isdir(parent):
             os.makedirs(parent, exist_ok=True)
 
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        flags = os.O_WRONLY | os.O_CREAT
+        if pos == 0 and mode is Mode.OVERWRITE:
+            flags |= os.O_TRUNC
+        if mode is Mode.ERROR_IF_EXISTS:
+            flags |= os.O_EXCL
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
 
         fd = os.open(os_path, flags, 0o644)
         try:
-            total = 0
-            size = data.size
-            chunk = 1024 * 1024
-            pos = 0
-            while pos < size:
-                want = min(chunk, size - pos)
-                buf = data.pread(want, pos)
-                if not buf:
-                    break
-                view = memoryview(buf)
-                while view:
-                    written = os.write(fd, view)
-                    if written == 0:
-                        raise io.BlockingIOError(
-                            f"Short write at offset {pos + total}"
-                        )
-                    view = view[written:]
-                    total += written
-                pos += len(buf)
-            return total
+            return self._bwrite_to_fd(data, pos, fd)
         finally:
             os.close(fd)
+
+    @staticmethod
+    def _bwrite_to_fd(data: BytesIO, pos: int, fd: int) -> int:
+        """Stream *data* chunk-wise into *fd* starting at *pos*."""
+        size = data.size
+        chunk = 1024 * 1024
+        src_pos = 0
+        while src_pos < size:
+            want = min(chunk, size - src_pos)
+            buf = data.pread(want, src_pos)
+            if not buf:
+                break
+            _fd_pwrite_loop(fd, memoryview(buf), pos + src_pos)
+            src_pos += len(buf)
+        return src_pos
 
     # ==================================================================
     # Native positional-IO overrides — bypass the whole-file load

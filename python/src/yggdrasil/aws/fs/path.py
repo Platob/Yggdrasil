@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Iterator, List, Optional, Tuple
 
 from yggdrasil.aws.fs.service import S3Service
 from yggdrasil.io.buffer.bytes_io import BytesIO
+from yggdrasil.io.enums import Mode
 from yggdrasil.io.fs import Path, RemotePath
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
@@ -471,15 +472,17 @@ class S3Path(RemotePath):
     # downloads via :meth:`_pread` on acquire and uploads via
     # :meth:`_pwrite` on commit.
 
-    def _pread(self) -> BytesIO:
-        """Whole-object download → autonomous :class:`BytesIO`.
+    def _bread(self, n: int, pos: int, mode: "Mode") -> BytesIO:
+        """Range-based GetObject → autonomous :class:`BytesIO`.
 
-        One GetObject; missing key surfaces as
-        :class:`FileNotFoundError`. The buffer is detached (in-memory
-        / local-spill); subsequent edits travel back via
-        :meth:`_pwrite`.
+        Forwards to the public :meth:`pread` (which already handles
+        Range headers, full-object downloads, and missing-key →
+        :class:`FileNotFoundError` mapping). The returned buffer is
+        detached; subsequent edits travel back via :meth:`_bwrite`
+        only via an explicit upload.
         """
-        data = self.pread(-1, 0)
+        del mode  # S3 reads are mode-agnostic
+        data = self.pread(n, pos)
         bio = BytesIO()
         bio.open()
         if data:
@@ -487,17 +490,35 @@ class S3Path(RemotePath):
             bio.seek(0)
         return bio
 
-    def _pwrite(self, data: BytesIO) -> int:
-        """Upload *data* to this S3 key, replacing any existing object.
+    def _bwrite(self, data: BytesIO, pos: int, mode: "Mode") -> int:
+        """Upload *data* to this S3 key.
 
-        Routes through :meth:`write_stream` so the multipart
-        threshold and adaptor logic (handles ``BytesIO``, raw bytes,
-        and stream sources) stays in one place.
+        ``pos == 0`` with :class:`Mode.OVERWRITE` (the legacy
+        whole-file shape) uploads ``data`` straight via
+        :meth:`write_stream` — multipart threshold and stream
+        handling live there. Any other (pos, mode) combination does
+        a download → splice → upload RMW so a positional splice
+        survives even though S3 has no native partial-write API.
         """
         if not data.opened:
             data.open()
         data.seek(0)
-        return self.write_stream(data)
+
+        if pos == 0 and mode is Mode.OVERWRITE:
+            return self.write_stream(data)
+
+        # Read-modify-write: pull current object, splice ``data`` at
+        # ``pos``, push back. ``pread(-1, 0, default=b"")`` so a
+        # missing key behaves like an empty object (the splice grows
+        # the file from scratch).
+        existing = self.pread(-1, 0, default=b"")
+        scratch = BytesIO(existing)
+        try:
+            scratch.pwrite(data.pread(data.size, 0), pos)
+            scratch.seek(0)
+            return self.write_stream(scratch)
+        finally:
+            scratch.close()
 
     # ==================================================================
     # pread — Range-based GetObject

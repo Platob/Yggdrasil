@@ -113,15 +113,15 @@ class TablePath(DatabricksPath):
             "byte-streams. Use the SQL APIs."
         )
 
-    def _pread(self):
+    def _bread(self, n, pos, mode):
         raise OSError(
-            f"Cannot _pread {self!r} — UC tables are not byte-streams. "
+            f"Cannot _bread {self!r} — UC tables are not byte-streams. "
             "Use the SQL APIs."
         )
 
-    def _pwrite(self, data) -> int:
+    def _bwrite(self, data, pos, mode) -> int:
         raise OSError(
-            f"Cannot _pwrite {self!r} — UC tables are not byte-streams. "
+            f"Cannot _bwrite {self!r} — UC tables are not byte-streams. "
             "Use the SQL APIs."
         )
 
