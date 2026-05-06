@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     from pyspark.sql import DataFrame as SparkDataFrame
     from yggdrasil.io.buffer.bytes_io import BytesIO
     from yggdrasil.io.fs import Path
+    from yggdrasil.io.io_stats import IOStats
 
 
 __all__ = [
@@ -443,7 +444,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
 
         if data is not None:
             if isinstance(data, bytes_io_class()):
-                media_type = media_type or data._media_type
+                media_type = media_type or data._stats.media_type
                 path = path or data.path
             elif media_type is None and path is None and _is_frame_shaped(data):
                 # No bytes, no path, no media-type pin, but the data
@@ -503,15 +504,21 @@ class TabularIO(Disposable, ABC, Generic[O]):
         is reserved for the registry hook.
         """
         Disposable.__init__(self)
-        # Format identity
+        # Canonical metadata holder. ``size`` / ``mtime`` /
+        # ``media_type`` all live on this single mutable IOStats —
+        # writes mutate it in place, readers can pin the same instance
+        # across the holder's lifetime.
+        from yggdrasil.io.io_stats import IOKind, IOStats
+        self._stats: IOStats = IOStats(
+            kind=IOKind.SOCKET,
+        )
+        # Format identity (stored on _stats.media_type).
         if media_type is None:
             cls_mime = type(self).default_mime_type()
             if cls_mime is not None and not getattr(cls_mime, "is_any_bytes", False):
-                self._media_type = MediaType(cls_mime)
-            else:
-                self._media_type = None
+                self._stats.media_type = MediaType(cls_mime)
         else:
-            self._media_type = MediaType.from_(media_type)
+            self._stats.media_type = MediaType.from_(media_type)
         # Persist cache slot — a sub-TabularIO holding the materialised
         # cache (MemorySparkIO when Spark is reachable, MemoryArrowIO
         # otherwise). Read paths delegate through it when set.
@@ -839,6 +846,36 @@ class TabularIO(Disposable, ABC, Generic[O]):
             kwargs.update(kwargs.pop("kwargs", {}))
 
         return cls.options_class().check(options, **kwargs)
+
+    # ==================================================================
+    # IOStats — every TabularIO must surface its metadata holder
+    # ==================================================================
+
+    @abstractmethod
+    def stat(self) -> "IOStats":
+        """The mutable :class:`IOStats` for this IO.
+
+        Every concrete :class:`TabularIO` is required to surface a
+        single :class:`IOStats` instance it mutates in place — that
+        instance IS the canonical home for ``size`` / ``mtime`` /
+        ``media_type``. Returning a fresh dataclass per call is wrong
+        (callers can't pin live updates); reuse the same instance.
+
+        Most subclasses can satisfy this with the one-liner
+        ``return self._stats`` — the slot is seeded in
+        :meth:`TabularIO.__init__`.
+        """
+
+    def stat(self) -> "IOStats":
+        """Live snapshot of the **backing's** state.
+
+        Default falls back to :meth:`stats` (same answer for
+        memory-only IOs). :class:`BytesIO` and :class:`Path` override
+        with a fresh ``os.fstat`` / ``Path.stat()`` probe — useful
+        when the durable backing can drift away from the buffer's
+        working copy between commits.
+        """
+        return self.stats()
 
     @abstractmethod
     def _read_arrow_batches(self, options: O) -> Iterator[pa.RecordBatch]:

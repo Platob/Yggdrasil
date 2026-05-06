@@ -827,9 +827,6 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
     # Stat — uncached, every call hits the backend
     # ==================================================================
 
-    def stat(self) -> IOStats:
-        return self._stat()
-
     def exists(self, *, follow_symlinks: bool = True) -> bool:
         del follow_symlinks
         return self._stat().kind != IOKind.MISSING
@@ -866,7 +863,7 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
             return 0.0
         return float(s.mtime or 0.0)
 
-    def stats(self) -> IOStats:
+    def stat(self) -> IOStats:
         """One backend round-trip → ``IOStats`` (kind + size + mtime + mode + media_type).
 
         Active transaction buffer short-circuits to its in-memory

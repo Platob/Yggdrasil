@@ -942,6 +942,9 @@ class Table(DatabricksResource, TabularIO[CastOptions]):
                 data: Any | None = None) -> "TabularIO":
         return self
 
+    def stat(self):
+        return self._stats
+
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
         options = options.with_source(source=self.collect_schema())
         safe_char = "`"

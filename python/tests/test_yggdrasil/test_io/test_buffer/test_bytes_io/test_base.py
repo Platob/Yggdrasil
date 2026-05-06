@@ -19,7 +19,7 @@ class TestBytesIOConstruction:
     def test_empty_construction(self):
         bio = BytesIO()
         assert bio.size == 0
-        assert bio._media_type is None
+        assert bio._stats.media_type is None
 
     def test_from_bytes(self):
         bio = BytesIO(b"hello")

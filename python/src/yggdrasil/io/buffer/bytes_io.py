@@ -239,7 +239,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                         path = parsed_path
                         media_type = parsed_path.url.media_type
                 elif isinstance(data, BytesIO):
-                    media_type = data._media_type
+                    media_type = data._stats.media_type
 
             if media_type is None and path is not None:
                 path = P.from_(path)
@@ -281,15 +281,16 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         metadata: dict | None = None,
         **kwargs
     ) -> None:
-        # Funnel cache slots, _media_type, and the spill-path
-        # placeholders through the TabularIO base. We then refine
-        # the spill bindings below for the buffer-specific cases.
+        # Funnel cache slots and the spill-path placeholders through
+        # the TabularIO base. We then refine the spill bindings below
+        # for the buffer-specific cases. Note that TabularIO seeds
+        # ``self._stats`` (the canonical IOStats holder) — every
+        # ``self._stats.size`` / ``mtime`` / ``media_type`` reference
+        # below mutates that single shared instance.
         TabularIO.__init__(self, media_type=media_type)
 
         # Buffer-specific per-instance state.
         self._buf: bytearray | None = bytearray()
-        self._size: int = 0
-        self._mtime: float = 0
         self._pos: int = 0
         # Per-open IO state. When acquired, points at ``self._spill_path``
         # — the path itself owns the active fd or transaction buffer.
@@ -393,13 +394,13 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             path = _mint_spill_path(self._ext_hint(), self._spill_ttl)
             path.write_bytes(src)
             self._buf = None
-            self._size = n
+            self._stats.size = n
             self._spill_path = path
             self._owns_spill_path = True
             # ctx opens lazily in _acquire / _ensure_ctx.
         else:
             self._buf = bytearray(src)
-            self._size = n
+            self._stats.size = n
         self._pos = 0
 
     def _init_from_bytesio(
@@ -414,11 +415,11 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
         super()._init_from_disposable(src)
         self._buf = src._buf
-        self._size = src._size
+        self._stats.size = src._stats.size
         self._spill_path = src._spill_path
         self._owns_spill_path = src._owns_spill_path
         self._pos = src._pos
-        self._media_type = src._media_type
+        self._stats.media_type = src._stats.media_type
         self._metadata = src._metadata
         # Don't share the open context — each instance opens its own
         # against the path on _acquire.
@@ -457,7 +458,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             finally:
                 path.close_io()
             self._buf = None
-            self._size = total
+            self._stats.size = total
             self._spill_path = path
             self._owns_spill_path = True
             self._pos = 0
@@ -487,10 +488,10 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             except OSError:
                 pass
             self._buf = bytearray(payload)
-            self._size = len(payload)
+            self._stats.size = len(payload)
         else:
             self._buf = None
-            self._size = total
+            self._stats.size = total
             self._spill_path = path
             self._owns_spill_path = True
         self._pos = 0
@@ -576,7 +577,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         if self._spill_path is not None:
             return self._spill_path
         if self._buf is not None:
-            return Memory.view(self._buf, self._size)
+            return Memory.view(self._buf, self._stats.size)
         return None
 
     @property
@@ -600,12 +601,12 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # Path-bound buffers don't keep an in-memory bytearray — the
         # path owns the working bytes.
         self._buf = None
-        self._size = int(self._spill_path.size)
+        self._stats.size = int(self._spill_path.size)
         mt = self._spill_path.mtime
-        self._mtime = float(mt) if mt is not None else 0.0
+        self._stats.mtime = float(mt) if mt is not None else 0.0
 
         if "a" in self._mode:
-            self._pos = self._size
+            self._pos = self._stats.size
         else:
             self._pos = 0
 
@@ -664,9 +665,9 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
         # View mode: forward to the parent, bounded by our tracked size.
         if self.is_view:
-            if pos >= self._size:
+            if pos >= self._stats.size:
                 return b""
-            n = min(n, self._size - pos)
+            n = min(n, self._stats.size - pos)
             return self.parent.pread(n, self._view_offset + pos)
 
         # Path-bound: route through the context (fd-backed for local,
@@ -676,7 +677,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
         # Pure memory: read from _buf.
         if self._buf is not None:
-            end = min(pos + n, self._size)
+            end = min(pos + n, self._stats.size)
             if pos >= end:
                 return b""
             return bytes(memoryview(self._buf)[pos:end])
@@ -746,17 +747,18 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                     data = data[:allowed]
                     n = len(data)
             written = self.parent.pwrite(data, self._view_offset + pos)
-            if pos + written > self._size:
-                self._size = pos + written
+            if pos + written > self._stats.size:
+                self._stats.size = pos + written
             if written:
                 self._flag_dirty_for_commit()
+                self._touch_mtime()
             return written
 
         # Auto-spill check fires only for autonomous (no-path) memory
         # buffers. A buffer already bound to a path never spills at
         # this layer — the path IS the durable backing.
         if self._buf is not None and self._spill_path is None:
-            projected = max(self._size, pos + n)
+            projected = max(self._stats.size, pos + n)
             if projected > self._spill_bytes:
                 self._spill()
 
@@ -764,9 +766,10 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         if self._spill_path is not None:
             ctx = self._ensure_ctx()
             written = ctx.pwrite(data, pos)
-            self._size = max(self._size, pos + written)
+            self._stats.size = max(self._stats.size, pos + written)
             if written and ctx.dirty:
                 self._flag_dirty_for_commit()
+                self._touch_mtime()
             return written
 
         # Pure memory: splice into _buf.
@@ -776,7 +779,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 new_cap = max(need, int(len(self._buf) * 1.5) + 1)
                 self._buf.extend(b"\x00" * (new_cap - len(self._buf)))
             memoryview(self._buf)[pos:need] = _as_contiguous_mv(data)
-            self._size = max(self._size, need)
+            self._stats.size = max(self._stats.size, need)
+            self._touch_mtime()
             return n
 
         raise RuntimeError(f"Cannot write to {self!r}: no backing")
@@ -802,9 +806,9 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             if self._view_max_size is not None:
                 n = min(n, self._view_max_size)
             self.parent._set_size(self._view_offset + n)
-            if n != self._size:
+            if n != self._stats.size:
                 self._flag_dirty_for_commit()
-            self._size = n
+            self._stats.size = n
             if self._pos > n:
                 self._pos = n
             return n
@@ -813,21 +817,21 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         if self._spill_path is not None:
             ctx = self._ensure_ctx()
             ctx.truncate(n)
-            if n != self._size and ctx.dirty:
+            if n != self._stats.size and ctx.dirty:
                 self._flag_dirty_for_commit()
-            self._size = n
+            self._stats.size = n
             if self._pos > n:
                 self._pos = n
             return n
 
         # Pure memory: resize _buf.
         if self._buf is not None:
-            if n < self._size:
-                self._size = n
+            if n < self._stats.size:
+                self._stats.size = n
             else:
                 if n > len(self._buf):
                     self._buf.extend(b"\x00" * (n - len(self._buf)))
-                self._size = n
+                self._stats.size = n
             if self._pos > n:
                 self._pos = n
             return n
@@ -835,7 +839,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # Neither backing — synthesize a memory backing of n zero
         # bytes. Reachable only after a botched reset; defensive.
         self._buf = bytearray(b"\x00" * n)
-        self._size = n
+        self._stats.size = n
         self._pos = min(self._pos, n)
         return n
 
@@ -858,8 +862,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             return  # Already spilled, or no backing.
 
         path = _mint_spill_path(self._ext_hint(), self._spill_ttl)
-        if self._size:
-            path.write_bytes(memoryview(self._buf)[: self._size])
+        if self._stats.size:
+            path.write_bytes(memoryview(self._buf)[: self._stats.size])
         else:
             # write_bytes on b"" creates a zero-byte file — same shape
             # as the one we'd build via ``open(path, "wb")`` and close.
@@ -877,7 +881,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
     def _ext_hint(self) -> str:
         """File extension suggestion for spill files."""
-        mt = self._media_type
+        mt = self._stats.media_type
         if mt is not None:
             ext = mt.full_extension
             if ext:
@@ -897,14 +901,14 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         - **Path-bound** → ``ctx.size``. For local fd contexts this
           is a live ``os.fstat``; for remote passthrough contexts
           it's a live ``Path.stat`` round-trip.
-        - **Memory-mode** → ``_size``.
+        - **Memory-mode** → ``_stats.size``.
 
         For "what's on the remote right now", use :meth:`stat`,
         which is always live.
         """
         if self._ctx is not None:
-            self._size = self._ctx.size
-        return self._size
+            self._stats.size = self._ctx.size
+        return self._stats.size
 
     def is_empty(self):
         return self.size == 0
@@ -923,7 +927,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         """
         if self._ctx is not None:
             return self._ctx.mtime or time.time()
-        return self._mtime or time.time()
+        return self._stats.mtime or time.time()
 
     @property
     def path(self) -> "Path | None":
@@ -1036,10 +1040,10 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             raise ValueError("view size cannot exceed max_size")
 
         view = object.__new__(BytesIO)
-        TabularIO.__init__(view, media_type=parent._media_type)
+        TabularIO.__init__(view, media_type=parent._stats.media_type)
         view._buf = None
-        view._size = int(size)
-        view._mtime = 0.0
+        view._stats.size = int(size)
+        view._stats.mtime = 0.0
         view._pos = int(pos)
         view._ctx = None
         view._spill_path = None
@@ -1087,7 +1091,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
           payload's bytes through the fd, leave ``_spill_path`` /
           ``_owns_spill_path`` intact.
 
-        Cursor resets to 0. ``_media_type`` is intentionally NOT
+        Cursor resets to 0. ``_stats.media_type`` is intentionally NOT
         modified — callers that need to update it (compress /
         decompress) do so explicitly.
 
@@ -1106,7 +1110,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         if self._spill_path is not None and not self._owns_spill_path:
             ctx = self._ensure_ctx()
             ctx.truncate(0)
-            self._size = 0
+            self._stats.size = 0
             self._pos = 0
             self._buf = None
             if ctx.dirty:
@@ -1148,8 +1152,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             self._spill_path = None
 
         self._buf = bytearray()
-        self._size = 0
-        self._mtime = 0
+        self._stats.size = 0
+        self._stats.mtime = 0
         self._pos = 0
         self._owns_spill_path = True
 
@@ -1165,23 +1169,23 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
     @property
     def media_type(self) -> MediaType:
-        if self._media_type is None:
+        if self._stats.media_type is None:
             if self._spill_path is not None:
                 parsed = MediaType.from_path(self._spill_path, default=None)
                 if parsed is not None and not parsed.mime_type.is_any_bytes:
-                    self._media_type = parsed
-                    return self._media_type
+                    self._stats.media_type = parsed
+                    return self._stats.media_type
 
             parsed = MediaType.from_io(self, default=None)
             if parsed is not None and not parsed.mime_type.is_any_bytes:
-                self._media_type = parsed
-                return self._media_type
+                self._stats.media_type = parsed
+                return self._stats.media_type
 
             return MediaType(MimeTypes.OCTET_STREAM)
-        elif self._media_type.mime_type.is_any_bytes:
-            self._media_type = None
+        elif self._stats.media_type.mime_type.is_any_bytes:
+            self._stats.media_type = None
             return self.media_type
-        return self._media_type
+        return self._stats.media_type
 
     @media_type.setter
     def media_type(self, value: "MediaType") -> None:
@@ -1207,14 +1211,14 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             duplicate.with_media_type(parsed, copy=False)
             return duplicate
 
-        current = self._media_type
+        current = self._stats.media_type
         if current is None or self.size == 0:
-            self._media_type = parsed
+            self._stats.media_type = parsed
             return self
         if current == parsed:
             return self
         if current.mime_type == parsed.mime_type:
-            self._media_type = parsed
+            self._stats.media_type = parsed
             return self
 
         raise ValueError(
@@ -1226,32 +1230,21 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         )
 
     def with_mime_type(self, mime_type: MimeType, *, copy: bool = False):
-        if self._media_type is None:
+        if self._stats.media_type is None:
             media_type = MediaType.from_mime(mime_type)
         else:
-            media_type = self._media_type.with_mime_type(mime_type)
+            media_type = self._stats.media_type.with_mime_type(mime_type)
         return self.with_media_type(media_type, copy=copy)
 
     def stat(self) -> IOStats:
-        """Live snapshot of the **backing's** state.
+        """The mutable :class:`IOStats` carrying the buffer's metadata.
 
-        Always re-fetches; never cached. Distinct from :attr:`size`
-        / :attr:`mtime`, which reflect the **buffer's** working
-        state — for path-bound buffers the two converge by
-        construction (every ``ctx.pwrite`` already lands on the
-        path), but the call still issues a fresh ``Path.stat`` for
-        remote backings.
-
-        Three shapes:
-
-        - **Local fd-mode** → fresh ``os.fstat`` on the ctx fd.
-          Equivalent to a ``stat()`` syscall against the path, but
-          cheaper (no path resolution).
-        - **Remote-buffered** → live ``self._spill_path.stat()`` —
-          one round-trip to the remote per call. May report
-          ``MISSING`` if the remote file hasn't been flushed yet.
-        - **Memory-mode** → synthesize a SOCKET-kind :class:`IOStats`
-          from the buffer's own ``_size``/``_mtime``.
+        Same instance for the buffer's lifetime — pin it once and
+        observe live size / mtime / media_type updates as writes land.
+        Path-bound buffers refresh ``size`` / ``mtime`` / ``kind`` /
+        ``mode`` from the durable backing (open ctx fd, otherwise a
+        ``Path.stat`` round-trip) before returning so a stale
+        in-memory copy never lies about what's on disk.
         """
         if self._spill_path is not None:
             ctx = self._ctx
@@ -1259,25 +1252,25 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 # Local fd: fstat through the ctx is the cheap path.
                 try:
                     raw = os.fstat(ctx.fileno())
-                    return IOStats(
-                        size=raw.st_size,
-                        mtime=raw.st_mtime,
-                        kind=IOKind.FILE,
-                        mode=raw.st_mode,
-                    )
+                    self._stats.size = raw.st_size
+                    self._stats.mtime = raw.st_mtime
+                    self._stats.kind = IOKind.FILE
+                    self._stats.mode = raw.st_mode
+                    return self._stats
                 except OSError:
                     pass
             # Local without an open fd, or remote — go through the
             # path's stat. Live every call.
-            return self._spill_path.stat()
+            backing = self._spill_path.stat()
+            self._stats.size = backing.size
+            self._stats.mtime = backing.mtime
+            self._stats.kind = backing.kind
+            self._stats.mode = backing.mode
+        return self._stats
 
-        # Memory-mode — synthesize.
-        return IOStats(
-            size=self._size,
-            mtime=self._mtime or time.time(),
-            kind=IOKind.SOCKET,
-            mode=0,
-        )
+    def _touch_mtime(self) -> None:
+        """Stamp ``stats.mtime`` to now. Called by every mutator."""
+        self._stats.mtime = time.time()
 
     # ``as_media`` lives on :class:`TabularIO` — it's the same logic
     # for every TabularIO subclass (final-leaf short-circuit, fall
@@ -1315,8 +1308,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         if view is not None:
             # Sync the leaf's size to ours BEFORE the read — the leaf
             # was constructed without seeing self's payload size
-            # (init copies _buf reference, not _size).
-            view._size = self._size
+            # (init copies _buf reference, not _stats.size).
+            view._stats.size = self._stats.size
             yield from view._read_arrow_batches(view.check_options(options))
             return
         raise NotImplementedError(
@@ -1338,12 +1331,12 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         """
         view = self._tabular_leaf_view()
         if view is not None:
-            view._size = self._size
+            view._stats.size = self._stats.size
             view._pos = self._pos
             view._write_arrow_batches(batches, view.check_options(options))
             # Sync the leaf's tracking back — it appended into our
             # shared bytearray but has its own size/pos cursors.
-            self._size = view._size
+            self._stats.size = view._stats.size
             self._pos = view._pos
             return
         raise NotImplementedError(
@@ -1587,7 +1580,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             return target_class(
                 path=self._spill_path,
                 mode=self._mode,
-                media_type=self._media_type,
+                media_type=self._stats.media_type,
                 spill_bytes=self._spill_bytes,
                 spill_ttl=self._spill_ttl,
                 metadata=dict(self._metadata) if self._metadata else None,
@@ -1597,7 +1590,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             spill_bytes=self._spill_bytes,
             spill_ttl=self._spill_ttl,
             mode=self._mode,
-            media_type=self._media_type,
+            media_type=self._stats.media_type,
             metadata=dict(self._metadata) if self._metadata else None,
             auto_open=False,
         )
@@ -1617,10 +1610,10 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 new_instance._buf = None
                 new_instance._spill_path = path
                 new_instance._owns_spill_path = True
-                new_instance._size = size
+                new_instance._stats.size = size
             else:
                 new_instance._buf = bytearray(memoryview(self._buf)[:size])
-                new_instance._size = size
+                new_instance._stats.size = size
             new_instance._pos = self._pos
             return new_instance
 
@@ -1648,7 +1641,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         new_instance._buf = None
         new_instance._spill_path = new_path
         new_instance._owns_spill_path = True
-        new_instance._size = size
+        new_instance._stats.size = size
         new_instance._pos = self._pos
         return new_instance
 
@@ -1679,7 +1672,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         opened = "opened" if self.opened else "closed"
         internal = "internal" if self._owns_spill_path else "external"
         spilled = "spilled" if self.spilled else "memory"
-        mt = f" media={self._media_type.__repr__()}" if self._media_type else ""
+        mt = f" media={self._stats.media_type.__repr__()}" if self._stats.media_type else ""
         if self._buf is not None:
             owner = str(id(self._buf))
         elif self._spill_path is not None:
@@ -1712,7 +1705,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 "kind": "path",
                 "path": self._spill_path.url.to_string(),
                 "mode": self._mode,
-                "media_type": self._media_type,
+                "media_type": self._stats.media_type,
             }
 
         if self.size > _PICKLE_COMPRESS_THRESHOLD_DEFAULT:
@@ -1725,7 +1718,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             "kind": "bytes",
             "data": blob,
             "codec": codec,
-            "media_type": self._media_type,
+            "media_type": self._stats.media_type,
         }
 
     def __setstate__(self, state):
@@ -1776,8 +1769,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # Local fd contexts: writes already in the kernel — flush is
         # a no-op. Remote contexts: commit dirty bytes via path._pwrite.
         ctx.flush()
-        self._size = ctx.size
-        self._mtime = ctx.mtime
+        self._stats.size = ctx.size
+        self._stats.mtime = ctx.mtime
         self.clear_dirty()
 
     def flush(self) -> None:
@@ -2024,7 +2017,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # threshold spills BEFORE the copy so helpers stay on a stable
         # backing throughout.
         if dst_in_memory:
-            projected = max(self._size, self._pos + src_size)
+            projected = max(self._stats.size, self._pos + src_size)
             if projected > self._spill_bytes:
                 self._spill()
                 dst_in_memory = False
@@ -2038,7 +2031,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         return self._copy_spilled_to_spilled(buffer, batch_size=batch_size)
 
     def _copy_mem_to_mem(self, buffer: "BytesIO") -> int:
-        src_size = buffer._size
+        src_size = buffer._stats.size
         if src_size == 0:
             return 0
         mv = memoryview(buffer._buf)[:src_size]
@@ -2047,7 +2040,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         return n
 
     def _copy_mem_to_spilled(self, buffer: "BytesIO") -> int:
-        src_size = buffer._size
+        src_size = buffer._stats.size
         if src_size == 0:
             return 0
         mv = memoryview(buffer._buf)[:src_size]
@@ -2093,7 +2086,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             written = dst_ctx.pwrite(chunk, self._pos)
             if written == 0:
                 break
-            self._size = max(self._size, self._pos + written)
+            self._stats.size = max(self._stats.size, self._pos + written)
             self._pos += written
             total += written
             src_pos += written
@@ -2268,7 +2261,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             self._spill_path is not None
             and self._spill_path.is_local
             and self._buf is None
-            and self._size
+            and self._stats.size
         ):
             h.update_mmap(self._spill_path.full_path())
             return h
@@ -2343,7 +2336,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         is strict about closing mapped files.
         """
         if self._buf is not None:
-            return memoryview(self._buf)[: self._size]
+            return memoryview(self._buf)[: self._stats.size]
 
         if self._spill_path is not None:
             return self._ensure_ctx().memoryview()
@@ -2352,7 +2345,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
     def to_bytes(self) -> bytes:
         if self._buf is not None:
-            return bytes(memoryview(self._buf)[: self._size])
+            return bytes(memoryview(self._buf)[: self._stats.size])
         size = self.size
         if size == 0:
             return b""
@@ -2372,13 +2365,13 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         c = Codec.from_(codec)
         if c is None:
             raise ValueError(f"Unknown codec: {codec!r}")
-        target_mt = self.media_type.with_codec(c) if self._media_type else None
+        target_mt = self.media_type.with_codec(c) if self._stats.media_type else None
         payload = c.compress(self)
         if copy:
-            payload._media_type = target_mt
+            payload._stats.media_type = target_mt
             return payload
         self.replace_with_payload(payload)
-        self._media_type = target_mt
+        self._stats.media_type = target_mt
         return self
 
     def decompress(
@@ -2397,7 +2390,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         if copy:
             return payload
         self.replace_with_payload(payload)
-        self._media_type = payload._media_type
+        self._stats.media_type = payload._stats.media_type
         return self
 
     # ------------------------------------------------------------------
@@ -2426,7 +2419,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
     def reserve(self, n: int) -> "BytesIO":
         """Reserve capacity for a total size of *n* bytes.
 
-        Capacity-reservation only — does NOT change ``_size`` or
+        Capacity-reservation only — does NOT change ``_stats.size`` or
         ``_pos``. Use :meth:`truncate` if you want the visible size
         to change. Idempotent: if ``self.size >= n`` already, this
         is a no-op.
@@ -2437,7 +2430,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
           fall through to the path-bound branch. Otherwise grow the
           underlying ``bytearray`` to length ``n`` using the same
           1.5× amortized pattern as :meth:`_write_at`, leaving
-          ``_size`` untouched. Subsequent writes up to *n* bytes
+          ``_stats.size`` untouched. Subsequent writes up to *n* bytes
           incur no further reallocation.
         - **Path-bound** — no-op. The path-side context grows lazily
           on positional write; ``posix_fallocate`` isn't portably
@@ -2505,10 +2498,10 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             self._ctx = None
 
         self._buf = bytearray()
-        self._size = 0
+        self._stats.size = 0
         self._pos = 0
         self._spill_path = None
-        self._media_type = None
+        self._stats.media_type = None
 
 
 # ===========================================================================

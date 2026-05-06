@@ -184,7 +184,7 @@ def _ensure_media_headers(
 
     headers["Content-Length"] = str(body.size)
 
-    if body._media_type is None and not media.mime_type.is_any_bytes:
+    if body._stats.media_type is None and not media.mime_type.is_any_bytes:
         try:
             body.with_media_type(media, copy=False)
         except Exception:
@@ -216,7 +216,7 @@ def _parse_response_buffer(
     if body is MISSING or body is None:
         return BytesIO(media_type=media_type) if media_type is not None else BytesIO()
     if isinstance(body, BytesIO):
-        if media_type is not None and body._media_type is None:
+        if media_type is not None and body._stats.media_type is None:
             try:
                 body.with_media_type(media_type, copy=False)
             except Exception:

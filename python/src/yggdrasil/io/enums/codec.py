@@ -270,8 +270,8 @@ class Codec(abc.ABC):
 
             out.seek(0)
 
-            if fh._media_type is not None:
-                out._media_type = fh._media_type.with_codec(self)
+            if fh._stats.media_type is not None:
+                out._stats.media_type = fh._stats.media_type.with_codec(self)
 
             return out
         finally:

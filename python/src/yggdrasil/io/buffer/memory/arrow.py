@@ -319,6 +319,9 @@ class MemoryArrowIO(TabularIO[CastOptions]):
     # TabularIO contract — read / write hooks
     # ------------------------------------------------------------------
 
+    def stat(self):
+        return self._stats
+
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
         # Spilled chunk first — those batches are zero-copy views into
         # the mmap. The in-memory tail follows in append order.

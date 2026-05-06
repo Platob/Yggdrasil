@@ -8,6 +8,13 @@ spill file, no transaction layer. Capacity grows with the standard
 Composes with :class:`yggdrasil.io.buffer.BytesIO`: a memory-mode
 ``BytesIO`` is conceptually a Memory holder plus a cursor and the
 TabularIO read/write surface.
+
+Metadata model
+--------------
+All IO metadata (visible size, mtime, media-type) lives on a single
+mutable :class:`IOStats` instance — :attr:`stats`. Writes mutate it
+in place; readers are free to call :meth:`stats` and pin the same
+object (it's never replaced for the holder's lifetime).
 """
 
 from __future__ import annotations
@@ -16,6 +23,7 @@ import time
 from typing import Any, Optional, Union
 
 from yggdrasil.disposable import Disposable
+from yggdrasil.io.io_stats import IOKind, IOStats
 
 from .holder import Holder
 
@@ -45,7 +53,7 @@ class Memory(Holder):
     zero-padding on extend up to capacity.
     """
 
-    __slots__ = ("_buf", "_size", "_mtime", "_media_type")
+    __slots__ = ("_buf", "_stats")
 
     def __init__(
         self,
@@ -61,30 +69,31 @@ class Memory(Holder):
         auto_open: bool = True,
     ) -> None:
         Disposable.__init__(self)
-        self._mtime: float = time.time()
-        self._media_type: Any = media_type
+        self._stats: IOStats = IOStats(
+            mtime=time.time(),
+            kind=IOKind.SOCKET,
+            media_type=media_type,
+        )
 
         if data is None:
             self._buf: bytearray = bytearray()
-            self._size: int = 0
         elif isinstance(data, Memory):
-            self._buf = bytearray(memoryview(data._buf)[: data._size])
-            self._size = data._size
+            self._buf = bytearray(memoryview(data._buf)[: data._stats.size])
+            self._stats.size = data._stats.size
             if media_type is None:
-                self._media_type = data._media_type
+                self._stats.media_type = data._stats.media_type
         elif isinstance(data, int):
             if data < 0:
                 raise ValueError(
                     f"Memory(int) capacity must be >= 0, got {data!r}"
                 )
             self._buf = bytearray(data)
-            self._size = 0
         elif isinstance(data, (bytes, bytearray, memoryview)):
             mv = memoryview(data)
             if mv.format != "B" or mv.ndim != 1 or mv.itemsize != 1:
                 mv = mv.cast("B")
             self._buf = bytearray(mv if mv.c_contiguous else bytes(mv))
-            self._size = len(self._buf)
+            self._stats.size = len(self._buf)
         else:
             raise TypeError(
                 f"Memory does not accept data of type {type(data).__name__!r}. "
@@ -126,9 +135,12 @@ class Memory(Holder):
         m = cls.__new__(cls)
         Disposable.__init__(m)
         m._buf = buf
-        m._size = len(buf) if size is None else int(size)
-        m._mtime = time.time()
-        m._media_type = media_type
+        m._stats = IOStats(
+            size=len(buf) if size is None else int(size),
+            mtime=time.time(),
+            kind=IOKind.SOCKET,
+            media_type=media_type,
+        )
         m._acquired = True
         return m
 
@@ -138,15 +150,23 @@ class Memory(Holder):
 
     @property
     def size(self) -> int:
-        return self._size
+        return self._stats.size
 
     @property
     def mtime(self) -> float:
-        return self._mtime
+        return self._stats.mtime
 
     @property
     def media_type(self):
-        return self._media_type
+        return self._stats.media_type
+
+    def stat(self) -> IOStats:
+        """The mutable :class:`IOStats` carrying this holder's metadata.
+
+        Always returns the same instance for the holder's lifetime —
+        callers can pin it to observe live size/mtime updates.
+        """
+        return self._stats
 
     @property
     def capacity(self) -> int:
@@ -156,7 +176,7 @@ class Memory(Holder):
     def read_mv(self, n: int, pos: int) -> memoryview:
         if pos < 0:
             raise ValueError(f"read_mv pos must be >= 0, got {pos!r}")
-        size = self._size
+        size = self._stats.size
         if pos >= size:
             return memoryview(b"")
         if n < 0:
@@ -180,9 +200,10 @@ class Memory(Holder):
         if need > len(self._buf):
             self.reserve(need)
         memoryview(self._buf)[pos:need] = data
-        if need > self._size:
-            self._size = need
-        self._mtime = time.time()
+        stats = self._stats
+        if need > stats.size:
+            stats.size = need
+        stats.mtime = time.time()
         return n
 
     def reserve(self, n: int) -> None:
@@ -199,16 +220,17 @@ class Memory(Holder):
     def truncate(self, n: int) -> int:
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
-        if n != self._size:
-            self._mtime = time.time()
-        if n < self._size:
-            self._size = n
+        stats = self._stats
+        if n != stats.size:
+            stats.mtime = time.time()
+        if n < stats.size:
+            stats.size = n
             return n
-        if n > self._size:
+        if n > stats.size:
             self.reserve(n)
             # The reserved tail is already zero — bytearray.extend(b"\x00")
             # gives us zero-padding for free.
-            self._size = n
+            stats.size = n
         return n
 
     # ------------------------------------------------------------------
@@ -217,7 +239,7 @@ class Memory(Holder):
 
     def memoryview(self) -> memoryview:
         """Memoryview over the visible payload (size-bounded)."""
-        return memoryview(self._buf)[: self._size]
+        return memoryview(self._buf)[: self._stats.size]
 
     def to_bytes(self) -> bytes:
         return bytes(self.memoryview())
@@ -225,8 +247,8 @@ class Memory(Holder):
     def clear(self) -> None:
         """Drop all bytes; reset capacity AND size to zero."""
         self._buf = bytearray()
-        self._size = 0
-        self._mtime = time.time()
+        self._stats.size = 0
+        self._stats.mtime = time.time()
 
     # ------------------------------------------------------------------
     # Dunder
@@ -235,7 +257,7 @@ class Memory(Holder):
     def __eq__(self, other: Any) -> bool:
         if isinstance(other, Memory):
             return (
-                self._size == other._size
+                self._stats.size == other._stats.size
                 and self.memoryview() == other.memoryview()
             )
         if isinstance(other, (bytes, bytearray, memoryview)):
@@ -248,4 +270,4 @@ class Memory(Holder):
         return hash(self.to_bytes())
 
     def __repr__(self) -> str:
-        return f"Memory(size={self._size}, capacity={len(self._buf)})"
+        return f"Memory(size={self._stats.size}, capacity={len(self._buf)})"

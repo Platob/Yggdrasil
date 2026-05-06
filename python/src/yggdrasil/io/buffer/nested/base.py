@@ -450,6 +450,13 @@ class NestedIO(TabularIO[O], ABC):
         return False
 
     # ==================================================================
+    # IOStats — folders surface the inherited mutable holder
+    # ==================================================================
+
+    def stat(self):
+        return self._stats
+
+    # ==================================================================
     # Read derivation — chain children directly
     # ==================================================================
 

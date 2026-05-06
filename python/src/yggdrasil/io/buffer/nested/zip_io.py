@@ -235,7 +235,7 @@ class ZipIO(BytesIO):
         finally:
             # Re-clamp in case the archive shrank under us (in-memory
             # rewrite to fewer bytes); a cursor past EOF is nonsense.
-            self._pos = min(saved, self._size)
+            self._pos = min(saved, self._stats.size)
 
     # ------------------------------------------------------------------
     # Archive backing — path or in-memory bytes, behind one interface
@@ -251,7 +251,7 @@ class ZipIO(BytesIO):
         """
         if self.path is not None:
             return self.path.exists()
-        return self._size > 0
+        return self._stats.size > 0
 
     @contextlib.contextmanager
     def _open_archive_reader(self) -> "Iterator[zipfile.ZipFile]":
@@ -270,7 +270,7 @@ class ZipIO(BytesIO):
             with zipfile.ZipFile(self.path.full_path(), mode="r") as zf:
                 yield zf
             return
-        if self._size == 0:
+        if self._stats.size == 0:
             # Empty in-memory archive — surface the same "missing"
             # signal as a non-existent path file.
             raise FileNotFoundError("in-memory ZipIO is empty")
@@ -963,7 +963,7 @@ class ZipEntryIO(BytesIO):
         return n
 
     def _set_size(self, n: int) -> int:
-        before = self._size
+        before = self._stats.size
         result = super()._set_size(n)
         if result != before:
             self._dirty = True
@@ -1241,6 +1241,13 @@ class ZipEntryFolderIO(TabularIO[ZipOptions]):
         if not normalized.startswith(self._prefix):
             normalized = self._prefix + normalized
         return ZipEntryFolderIO(parent=self.parent, prefix=normalized)
+
+    # ------------------------------------------------------------------
+    # IOStats
+    # ------------------------------------------------------------------
+
+    def stat(self):
+        return self._stats
 
     # ------------------------------------------------------------------
     # Read/write — chain children
