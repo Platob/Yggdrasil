@@ -80,8 +80,9 @@ class Path(Holder, os.PathLike, ABC):
 
         When called on the abstract :class:`Path`, dispatches via the
         :class:`Holder` scheme registry to the subclass registered for
-        the URL's scheme. When called on a concrete subclass, returns
-        an instance of that subclass.
+        the URL's scheme; defaults to :class:`LocalPath` for path-shaped
+        URLs without an explicit scheme. When called on a concrete
+        subclass, returns an instance of that subclass.
         """
         if isinstance(obj, Path):
             if cls is Path or isinstance(obj, cls):
@@ -90,8 +91,21 @@ class Path(Holder, os.PathLike, ABC):
 
         url = URL.from_(obj)
         if cls is Path:
-            # Holder.__new__ dispatches on url.scheme via _HOLDER_SCHEMES.
-            return Holder(url=url, **kwargs)
+            # Holder.__new__ dispatches on scheme; force LocalPath for
+            # the no-scheme path case so callers don't accidentally
+            # land on :class:`Memory`.
+            from yggdrasil.io.holder import _HOLDER_SCHEMES
+            scheme = url.scheme
+            if scheme:
+                target = _HOLDER_SCHEMES.get(scheme)
+                if target is None:
+                    raise ValueError(
+                        f"Unknown scheme {scheme!r} for Path.from_({obj!r}). "
+                        f"Registered: {sorted(_HOLDER_SCHEMES)}."
+                    )
+                return target(url=url, **kwargs)
+            from yggdrasil.io.path.local_path import LocalPath
+            return LocalPath(url=url, **kwargs)
         return cls(url=url, **kwargs)
 
     def _from_url(self, url: URL) -> "Path":

@@ -1,37 +1,37 @@
-"""JSON I/O for :class:`PrimitiveIO`.
+"""JSON Tabular leaf over the new :class:`BytesIO` substrate.
 
-:class:`JsonIO` reads and writes newline-delimited JSON (NDJSON /
-JSONL) — one JSON object per line. This is the only JSON shape
-that's natively streamable and appendable.
+:class:`JsonIO` writes a single JSON document — either an array of
+objects (``[{...}, {...}, …]``) or a single object — and reads
+either shape back. For the streamable line-per-record format use
+:class:`NDJsonIO`.
 
-Pretty-printed JSON arrays of objects (the ``[{...}, {...}]``
-shape) are out of scope at the leaf level; transform upstream
-or use a different leaf.
+Reads accept three on-disk shapes:
 
-Save modes
-----------
+1. NDJSON-flavored input (newline at EOF) routes through
+   :func:`pyarrow.json.open_json` — fast, threaded, type-inferred.
+2. JSON array of objects — parsed with ``json.loads`` and emitted
+   as a single :class:`pa.RecordBatch` from the python list.
+3. JSON object — wrapped into a single-row batch.
 
-OVERWRITE truncates and writes fresh. APPEND seeks to end and
-writes — JSONL's line-per-record framing means concatenation is
-a valid append. UPSERT goes through the generic rewrite helper.
+Writes emit a JSON array under the OVERWRITE / AUTO mode.
+APPEND / UPSERT / MERGE round-trip through OVERWRITE since a
+top-level array can't be appended to without rewriting the closing
+bracket.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import json
 from typing import TYPE_CHECKING, ClassVar, Iterable, Iterator
 
 import pyarrow as pa
 import pyarrow.json as pa_json
-import yggdrasil.pickle.json as json_module
-from yggdrasil.arrow.cast import any_to_arrow_batch_iterator
+
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MimeTypes, Mode
-from yggdrasil.lazy_imports import (
-    pyarrow_dataset_module,
-)
-
+from yggdrasil.lazy_imports import pyarrow_dataset_module
 from yggdrasil.io.bytes_io import BytesIO
 
 if TYPE_CHECKING:
@@ -41,19 +41,15 @@ if TYPE_CHECKING:
 __all__ = ["JsonIO", "JsonOptions"]
 
 
-# ---------------------------------------------------------------------------
-# JsonOptions
-# ---------------------------------------------------------------------------
-
-
 @dataclasses.dataclass(frozen=True, slots=True)
 class JsonOptions(CastOptions):
     """:class:`CastOptions` extended with JSON-specific knobs."""
 
     encoding: str = "utf-8"
     use_threads: bool = True
-    line_ending: str = "\n"
-    indent: int | None = None
+    indent: "int | None" = None
+    ensure_ascii: bool = False
+    sort_keys: bool = False
 
     def to_read_options(self) -> "pa_json.ReadOptions":
         return pa_json.ReadOptions(use_threads=self.use_threads)
@@ -62,43 +58,27 @@ class JsonOptions(CastOptions):
         return pa_json.ParseOptions()
 
 
-# ---------------------------------------------------------------------------
-# JsonIO
-# ---------------------------------------------------------------------------
-
-
 class JsonIO(BytesIO):
-    """:class:`PrimitiveIO` for newline-delimited JSON."""
+    """:class:`Tabular` leaf for JSON documents."""
 
-    _FINAL_TABULAR_IO: ClassVar[bool] = True
-
-    @classmethod
-    def default_media_type(cls):
-        return MimeTypes.JSON
+    mime_type: ClassVar[MimeTypes] = MimeTypes.JSON
 
     @classmethod
     def options_class(cls):
         return JsonOptions
 
     # ==================================================================
-    # Schema
+    # Schema — first-batch inference (or empty on empty buffer)
     # ==================================================================
 
     def _collect_schema(self, options: JsonOptions) -> Schema:
-        if self.is_empty():
+        if self.size == 0:
             return Schema.empty()
 
-        with self._reading_context(options) as io:
-            source = io.arrow_io(mode="rb")
-            reader = pa_json.open_json(
-                source,
-                read_options=options.to_read_options(),
-                parse_options=options.to_parse_options(),
-            )
-            try:
-                return Schema.from_arrow(reader.schema)
-            finally:
-                reader.close()
+        first = next(iter(self._read_arrow_batches(options)), None)
+        if first is None:
+            return Schema.empty()
+        return Schema.from_arrow(first.schema)
 
     # ==================================================================
     # Read path
@@ -108,43 +88,41 @@ class JsonIO(BytesIO):
         self,
         options: JsonOptions,
     ) -> Iterator[pa.RecordBatch]:
-        with self._reading_context(options) as io:
-            if io.remaining_bytes() == 0:
-                return
+        if self.size == 0:
+            return
 
-            tail = io.tail(5)
-            line_defined = tail.endswith(b"\n")
-
-            if line_defined:
-                source = io.arrow_io(mode="rb")
-
-                try:
-                    reader = pa_json.open_json(
-                        source,
-                        read_options=options.to_read_options(),
-                        parse_options=options.to_parse_options(),
-                    )
-                except Exception as e:
-                    raise ValueError(
-                        f"Cannot parse JSON {io}:\n{io.synthetic_content()}"
-                    ) from e
-
-                try:
-                    for batch in reader:
-                        yield options.cast_arrow_tabular(batch)
-                finally:
-                    reader.close()
-            else:
-                parsed = json_module.load(io)
-
-                if isinstance(parsed, list):
+        # Sniff the buffer shape: NDJSON-ish (line-terminated) goes
+        # through pyarrow's streaming reader; everything else through
+        # the standard library JSON parser.
+        head = self.pread(1, 0)
+        is_array = head.lstrip().startswith(b"[")
+        if is_array or not self.pread(1, max(0, self.size - 1)).endswith(b"\n"):
+            data = self.to_bytes()
+            parsed = json.loads(data.decode(options.encoding))
+            if isinstance(parsed, list):
+                if parsed:
                     yield pa.RecordBatch.from_pylist(parsed)
-                elif isinstance(parsed, dict):
-                    yield pa.RecordBatch.from_pylist([parsed])
-                else:
-                    raise ValueError(
-                        f"Cannot parse JSON {io} as list or dict: {io.synthetic_content()}"
-                    )
+                return
+            if isinstance(parsed, dict):
+                yield pa.RecordBatch.from_pylist([parsed])
+                return
+            raise ValueError(
+                f"{type(self).__name__}: expected a JSON array of objects "
+                f"or a single object; got {type(parsed).__name__}."
+            )
+
+        # Newline-terminated → NDJSON-shaped. Stream via pyarrow.
+        with self.view(pos=0) as v:
+            reader = pa_json.open_json(
+                v,
+                read_options=options.to_read_options(),
+                parse_options=options.to_parse_options(),
+            )
+            try:
+                for batch in reader:
+                    yield batch
+            finally:
+                reader.close()
 
     # ==================================================================
     # Write path
@@ -155,69 +133,82 @@ class JsonIO(BytesIO):
         batches: Iterable[pa.RecordBatch],
         options: JsonOptions,
     ) -> None:
-        """Persist batches as one JSON object per line.
+        """Persist as a JSON array of objects.
 
-        pyarrow has no ``open_json_writer`` analogue; we emit lines
-        manually via ``Table.to_pylist`` plus ``json.dumps``. For
-        large writes prefer Parquet or IPC.
+        APPEND / UPSERT / MERGE collapse to a read-modify-rewrite
+        because a top-level JSON array can't be honestly appended
+        to without rewriting the closing bracket.
         """
-        action = self._resolve_save_mode(options.mode)
+        action = self._resolve_action(options.mode)
+
         if action is Mode.IGNORE:
-            return
-        if action is Mode.APPEND:
-            return self._arrow_append_via_rewrite(batches, options)
-        if action is Mode.UPSERT:
-            return self._arrow_upsert_via_rewrite(batches, options)
-        if action not in (Mode.OVERWRITE, Mode.APPEND):
-            raise NotImplementedError(
-                f"{type(self).__name__}._write_arrow_batches handles "
-                f"OVERWRITE / APPEND / UPSERT; got resolved action "
-                f"{action!r}."
-            )
+            if self.size > 0:
+                return
+            action = Mode.OVERWRITE
+        elif action is Mode.ERROR_IF_EXISTS:
+            if self.size > 0:
+                raise FileExistsError(
+                    f"{type(self).__name__} buffer is non-empty "
+                    f"({self.size} bytes); refusing to overwrite under "
+                    f"mode={options.mode!r}."
+                )
+            action = Mode.OVERWRITE
 
         iterator = iter(batches)
         first = next(iterator, None)
+        if first is None and action is Mode.OVERWRITE:
+            self.seek(0)
+            self.truncate(0)
+            return
         if first is None:
             return
 
-        all_batches = [first] + list(any_to_arrow_batch_iterator(iterator))
-
-        collected = pa.concat_tables(
-            [pa.Table.from_batches([batch]) for batch in all_batches],
-            promote_options="permissive",
-            memory_pool=options.arrow_memory_pool,
-        ).to_pylist(maps_as_pydicts=True)
-
-        with self._writing_context(options) as io:
-            io.write_bytes(
-                json_module.dumps(collected, indent=options.indent)
+        if action is Mode.APPEND and self.size > 0:
+            existing = list(self._read_arrow_batches(options))
+            chained = iter([*existing, first, *iterator])
+            return self._write_arrow_batches(
+                chained, dataclasses.replace(options, mode=Mode.OVERWRITE),
             )
 
-    # ==================================================================
-    # Native engine overrides
-    # ==================================================================
+        # Materialize all batches into one pylist; it's a JSON array
+        # so the whole document goes out at once.
+        rows: list[dict] = list(first.to_pylist())
+        for batch in iterator:
+            rows.extend(batch.to_pylist())
 
-    def _can_use_native_scanner(self, options: JsonOptions) -> bool:
-        if self.is_empty():
-            return False
-        if options.target_field is not None:
-            return False
-        if self.codec is not None:
-            return False
-        if self.path is None:
-            return False
-        if not self.path.is_local:
-            return False
-        return True
+        text = json.dumps(
+            rows,
+            indent=options.indent,
+            ensure_ascii=options.ensure_ascii,
+            sort_keys=options.sort_keys,
+            default=str,
+        )
+        self.seek(0)
+        self.truncate(0)
+        self.write(text.encode(options.encoding))
+
+    def _resolve_action(self, mode: Mode) -> Mode:
+        if mode is Mode.AUTO or mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:
+            return Mode.OVERWRITE
+        if mode is Mode.APPEND:
+            return Mode.APPEND
+        if mode is Mode.IGNORE:
+            return Mode.IGNORE
+        if mode is Mode.ERROR_IF_EXISTS:
+            return Mode.ERROR_IF_EXISTS
+        if mode is Mode.UPSERT or mode is Mode.MERGE:
+            return Mode.APPEND
+        return Mode.OVERWRITE
+
+    # ==================================================================
+    # Native engine override — pyarrow.dataset(format="json")
+    # ==================================================================
 
     def _read_arrow_dataset(self, options: JsonOptions) -> "pds.Dataset":
-        if not self._can_use_native_scanner(options):
-            return super()._read_arrow_dataset(options)
-
         pds = pyarrow_dataset_module()
-        return pds.dataset(self.path.__fspath__(), format="json")
-
-    # No native polars JSON scanner — we serialize as a JSON array
-    # and polars' scan_ndjson / read_ndjson expect newline-delimited
-    # objects. Fall through to the base path (pyarrow JSON reader →
-    # pl.from_arrow), which handles both shapes correctly.
+        holder = self._holder
+        if holder is not None and getattr(holder, "is_local_path", False):
+            full_path = getattr(holder, "full_path", None)
+            if full_path is not None:
+                return pds.dataset(full_path(), format="json")
+        return super()._read_arrow_dataset(options)

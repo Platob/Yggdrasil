@@ -158,19 +158,16 @@ def _is_tabular_io(arg: Any) -> bool:
 
 
 def _folderio_for_local_cache(path: Path) -> "FolderIO":
-    """Wrap a local filesystem :class:`Path` into a schema-tagged folder.
+    """Wrap a local filesystem :class:`Path` into a tabular folder.
 
-    Returns a :class:`YGGFolderIO` rather than a plain
-    :class:`FolderIO` so the local cache can lean on the
-    ``.ygg/`` sidecar (stats, checkpoints, kv metadata) without a
-    second wrapper. The data layout is identical — any other
-    reader still sees a plain Hive-partitioned tree — so callers
-    that point a FolderIO at the same path still work.
+    Plain :class:`FolderIO` for now — the ``.ygg/`` sidecar layer
+    that used to live on top is intentionally on the way out as
+    part of the IO rework.
     """
-    from yggdrasil.io.nested.ygg_folder_io import YGGFolderIO
+    from yggdrasil.io.nested.folder_io import FolderIO
     from yggdrasil.io.path import LocalPath
 
-    return YGGFolderIO(path=LocalPath(path), schema=RESPONSE_SCHEMA)
+    return FolderIO(path=LocalPath(path))
 
 
 def _coerce_optional_datetime(value: Any) -> Optional[dt.datetime]:

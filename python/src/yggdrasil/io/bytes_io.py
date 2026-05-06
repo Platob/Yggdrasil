@@ -463,6 +463,24 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
     def name(self) -> str:
         return str(self._holder.url)
 
+    @property
+    def closed(self) -> bool:
+        """Stdlib ``IO[bytes]`` parity — ``False`` while the durable
+        holder is reachable.
+
+        Stdlib semantics: ``closed`` means "file unusable for I/O."
+        Our holders are reachable in both the closed-Disposable
+        (direct synchronous commit) and open-Disposable (scratch
+        transaction) states, so the property only flips when a
+        ``close(force=True)`` has actually run teardown. This matters
+        for pyarrow / pandas / polars / zipfile, which guard every
+        op with an ``assert not closed`` and would otherwise refuse
+        to write into a fresh, never-explicitly-opened ``BytesIO``.
+        """
+        # Holder cleared its scratch and we own it but have nothing
+        # to fall back onto — that's the only honestly-closed state.
+        return self._holder is None
+
     def readable(self) -> bool:
         return "r" in self._mode or "+" in self._mode
 

@@ -1,26 +1,12 @@
-from yggdrasil.io.nested.base import NestedIO
+"""Nested-Tabular leaves — directories and zip archives."""
+
 from yggdrasil.io.nested.folder_io import FolderIO, FolderOptions
-from yggdrasil.io.nested.ygg_folder_io import YGGFolderIO, is_ygg_folder
-from yggdrasil.io.nested.ygg_folder_spark import YGGFolderSparkConnector, register_datasource
-from yggdrasil.io.nested.zip_io import (
-    ZipEntryFolderIO,
-    ZipEntryIO,
-    ZipEntryOptions,
-    ZipIO,
-    ZipOptions,
-)
+from yggdrasil.io.nested.zip_io import ZipEntryIO, ZipIO, ZipOptions
 
 __all__ = [
-    "NestedIO",
     "FolderIO",
     "FolderOptions",
-    "YGGFolderIO",
-    "YGGFolderSparkConnector",
-    "is_ygg_folder",
-    "register_datasource",
     "ZipIO",
     "ZipOptions",
     "ZipEntryIO",
-    "ZipEntryFolderIO",
-    "ZipEntryOptions",
 ]

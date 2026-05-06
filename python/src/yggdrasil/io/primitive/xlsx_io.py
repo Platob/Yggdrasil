@@ -1,4 +1,4 @@
-"""XLSX I/O for :class:`PrimitiveIO`.
+"""XLSX Tabular leaf over the new :class:`BytesIO` substrate.
 
 :class:`XlsxIO` handles a single-sheet xlsx workbook. Multi-sheet
 workbooks are out of scope at the leaf level — they belong to a
@@ -6,7 +6,8 @@ folder/nested IO that maps each sheet onto a child fragment.
 
 Reads use :func:`openpyxl.load_workbook(read_only=True)`; writes
 use :func:`openpyxl.Workbook(write_only=True)`. Both modes are
-streaming. Save modes: OVERWRITE only.
+streaming. Save modes: OVERWRITE only — a workbook is one ZIP
+archive, so APPEND would defeat the streaming write path.
 """
 
 from __future__ import annotations
@@ -15,18 +16,13 @@ import dataclasses
 from typing import ClassVar, Iterable, Iterator
 
 import pyarrow as pa
+
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MimeTypes, Mode
-
 from yggdrasil.io.bytes_io import BytesIO
 
 __all__ = ["XlsxIO", "XlsxOptions"]
-
-
-# ---------------------------------------------------------------------------
-# XlsxOptions
-# ---------------------------------------------------------------------------
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -37,19 +33,10 @@ class XlsxOptions(CastOptions):
     has_header: bool = True
 
 
-# ---------------------------------------------------------------------------
-# XlsxIO
-# ---------------------------------------------------------------------------
-
-
 class XlsxIO(BytesIO):
-    """:class:`PrimitiveIO` for single-sheet xlsx workbooks."""
+    """:class:`Tabular` leaf for single-sheet xlsx workbooks."""
 
-    _FINAL_TABULAR_IO: ClassVar[bool] = True
-
-    @classmethod
-    def default_media_type(cls):
-        return MimeTypes.XLSX
+    mime_type: ClassVar[MimeTypes] = MimeTypes.XLSX
 
     @classmethod
     def options_class(cls):
@@ -62,7 +49,6 @@ class XlsxIO(BytesIO):
         "to add new xlsx files alongside, or convert to a streamable "
         "format (parquet, jsonl) for incremental ingest."
     )
-    _NATIVE_SCANNER_OK: ClassVar[bool] = False
 
     # ==================================================================
     # Lazy openpyxl import
@@ -71,12 +57,11 @@ class XlsxIO(BytesIO):
     @staticmethod
     def _openpyxl():
         try:
-            import openpyxl  # noqa: F401
+            import openpyxl
         except ImportError as e:  # pragma: no cover
             raise ImportError(
                 "XlsxIO requires openpyxl. Install with: pip install openpyxl"
             ) from e
-        import openpyxl
         return openpyxl
 
     # ==================================================================
@@ -84,7 +69,7 @@ class XlsxIO(BytesIO):
     # ==================================================================
 
     def _collect_schema(self, options: XlsxOptions) -> Schema:
-        if self.is_empty():
+        if self.size == 0:
             return Schema.empty()
         first = next(iter(self._read_arrow_batches(options)), None)
         if first is None:
@@ -100,12 +85,12 @@ class XlsxIO(BytesIO):
         options: XlsxOptions,
     ) -> Iterator[pa.RecordBatch]:
         """Stream rows from the named sheet, batch them, yield."""
-        if self.is_empty():
+        if self.size == 0:
             return
 
-        with self._reading_context(options) as io:
-            openpyxl = self._openpyxl()
-            wb = openpyxl.load_workbook(io, read_only=True, data_only=True)
+        openpyxl = self._openpyxl()
+        with self.view(pos=0) as v:
+            wb = openpyxl.load_workbook(v, read_only=True, data_only=True)
             try:
                 ws = (
                     wb[options.sheet_name]
@@ -135,10 +120,10 @@ class XlsxIO(BytesIO):
                 for raw_row in row_iter:
                     rows.append(dict(zip(columns, raw_row)))
                     if len(rows) >= row_size:
-                        yield from self._rows_to_batches(rows, options)
+                        yield from self._rows_to_batches(rows)
                         rows = []
                 if rows:
-                    yield from self._rows_to_batches(rows, options)
+                    yield from self._rows_to_batches(rows)
             finally:
                 wb.close()
 
@@ -147,17 +132,12 @@ class XlsxIO(BytesIO):
         yield first
         yield from rest
 
-    def _rows_to_batches(
-        self,
-        rows: list[dict],
-        options: XlsxOptions,
-    ) -> Iterator[pa.RecordBatch]:
-        normalized = self._normalize_records(rows)
-        if not normalized:
+    @staticmethod
+    def _rows_to_batches(rows: list[dict]) -> Iterator[pa.RecordBatch]:
+        if not rows:
             return
-        table = pa.Table.from_pylist(normalized)
-        for batch in table.to_batches():
-            yield options.cast_arrow_tabular(batch)
+        table = pa.Table.from_pylist(rows)
+        yield from table.to_batches()
 
     # ==================================================================
     # Write path
@@ -172,11 +152,23 @@ class XlsxIO(BytesIO):
 
         openpyxl's ``write_only`` workbook can only ``save(file_like)``
         once — the workbook closes itself on save. We hand it the
-        yielded IO directly.
+        BytesIO directly.
         """
-        action = self._resolve_save_mode(options.mode)
+        action = self._resolve_action(options.mode)
+
         if action is Mode.IGNORE:
-            return
+            if self.size > 0:
+                return
+            action = Mode.OVERWRITE
+        elif action is Mode.ERROR_IF_EXISTS:
+            if self.size > 0:
+                raise FileExistsError(
+                    f"{type(self).__name__} buffer is non-empty "
+                    f"({self.size} bytes); refusing to overwrite under "
+                    f"mode={options.mode!r}."
+                )
+            action = Mode.OVERWRITE
+
         if action is not Mode.OVERWRITE:
             raise NotImplementedError(
                 f"{type(self).__name__}._write_arrow_batches only handles "
@@ -186,34 +178,40 @@ class XlsxIO(BytesIO):
         iterator = iter(batches)
         first = next(iterator, None)
         if first is None:
+            self.seek(0)
+            self.truncate(0)
             return
 
-        if options.target_field is not None:
-            first = options.cast_arrow_tabular(first)
+        openpyxl = self._openpyxl()
+        wb = openpyxl.Workbook(write_only=True)
+        try:
+            ws = wb.create_sheet(title=options.sheet_name)
+            column_names = first.schema.names
+            if options.has_header:
+                ws.append(column_names)
 
-        lifecycle = options.copy(truncate_before_write=True)
+            self._append_batch(ws, first, column_names)
+            for batch in iterator:
+                self._append_batch(ws, batch, column_names)
 
-        with self._writing_context(lifecycle) as io:
-            openpyxl = self._openpyxl()
-            wb = openpyxl.Workbook(write_only=True)
-            try:
-                ws = wb.create_sheet(title=options.sheet_name)
-                column_names = first.schema.names
-                if options.has_header:
-                    ws.append(column_names)
-
-                self._append_batch(ws, first, column_names)
-                for batch in iterator:
-                    if options.target_field is not None:
-                        batch = options.cast_arrow_tabular(batch)
-                    self._append_batch(ws, batch, column_names)
-
-                io.seek(0)
-                wb.save(io)
-            finally:
-                wb.close()
+            self.seek(0)
+            self.truncate(0)
+            wb.save(self)
+        finally:
+            wb.close()
 
     @staticmethod
     def _append_batch(ws, batch: pa.RecordBatch, column_names: list[str]) -> None:
         for row in batch.to_pylist():
             ws.append([row.get(c) for c in column_names])
+
+    def _resolve_action(self, mode: Mode) -> Mode:
+        if mode is Mode.AUTO or mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:
+            return Mode.OVERWRITE
+        if mode is Mode.IGNORE:
+            return Mode.IGNORE
+        if mode is Mode.ERROR_IF_EXISTS:
+            return Mode.ERROR_IF_EXISTS
+        # APPEND / UPSERT / MERGE all reject — XLSX has no streaming
+        # append story; raise loudly.
+        return mode

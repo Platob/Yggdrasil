@@ -1,15 +1,26 @@
-"""Parquet I/O for :class:`PrimitiveIO`.
+"""Parquet Tabular leaf over the new :class:`BytesIO` substrate.
 
-:class:`ParquetIO` is the concrete leaf for Parquet files. The
-format is footer-indexed — readers parse the metadata block at
-the end of the file once and use it to plan column reads. Writes
-buffer row groups and finalize the footer on close.
+:class:`ParquetIO` is a :class:`BytesIO` subclass that auto-registers
+under :data:`MimeTypes.PARQUET`. The Parquet file format is
+footer-indexed: readers parse the metadata block at the end of the
+file once and use it to plan column reads. Writes buffer row groups
+and finalize the footer on close.
 
-Reads benefit from caching the parsed metadata across calls;
-writes can't (the writer must own the file for the duration of
-the write). Lifecycle, codec, and Mode resolution all live on
-:class:`DataIO`. This leaf owns the cached metadata and the
-format-specific options.
+The reworked memory-management model lets us pass ``self`` (or a
+:meth:`view`) directly to :class:`pyarrow.parquet.ParquetWriter` and
+:class:`pyarrow.parquet.ParquetFile`, so reads and writes don't have
+to bounce through a :class:`pyarrow.BufferReader` /
+:class:`pyarrow.BufferOutputStream` adapter.
+
+Native engine dispatch
+----------------------
+
+When the holder is a local path, :meth:`_read_arrow_dataset` /
+:meth:`_scan_polars_frame` / :meth:`_read_polars_frame` short-circuit
+to the format-aware scanners (``pds.dataset(format="parquet")``,
+``pl.scan_parquet``, ``pl.read_parquet``) — those push projection
+and predicate filters into the Parquet reader at plan time, which
+the generic Arrow batch shim can't do.
 """
 
 from __future__ import annotations
@@ -24,10 +35,7 @@ import pyarrow.parquet as pq
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MimeTypes, Mode
-from yggdrasil.lazy_imports import (
-    polars_module,
-    pyarrow_dataset_module,
-)
+from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
 from yggdrasil.io.bytes_io import BytesIO
 
 if TYPE_CHECKING:
@@ -36,11 +44,6 @@ if TYPE_CHECKING:
 
 
 __all__ = ["ParquetIO", "ParquetOptions"]
-
-
-# ---------------------------------------------------------------------------
-# ParquetOptions
-# ---------------------------------------------------------------------------
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -55,36 +58,38 @@ class ParquetOptions(CastOptions):
     use_threads: bool = True
 
 
-# ---------------------------------------------------------------------------
-# ParquetIO
-# ---------------------------------------------------------------------------
-
-
 class ParquetIO(BytesIO):
-    """A :class:`BytesIO` for Parquet files."""
+    """:class:`Tabular` leaf for Apache Parquet."""
 
-    _FINAL_TABULAR_IO: ClassVar[bool] = True
-
-    @classmethod
-    def default_media_type(cls):
-        return MimeTypes.PARQUET
+    mime_type: ClassVar[MimeTypes] = MimeTypes.PARQUET
 
     @classmethod
     def options_class(cls):
         return ParquetOptions
 
-    _NATIVE_SCANNER_OK: ClassVar[bool] = True
+    # ==================================================================
+    # Helpers
+    # ==================================================================
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._parquet_metadata: "pq.FileMetaData | None" = None
+    def _local_path_str(self) -> "str | None":
+        """Backend-native path string when the holder is a local path,
+        else ``None``.
 
-    def _drop_metadata(self) -> None:
-        self._parquet_metadata = None
-
-    def _before_release(self) -> None:
-        self._drop_metadata()
-        super()._before_release()
+        The native pyarrow / polars Parquet readers are dramatically
+        faster than the file-like fallback when given a real path
+        (memory-mapped reads, native predicate pushdown). Returning
+        ``None`` opts out and the caller routes through the
+        file-like view path.
+        """
+        holder = self._holder
+        if holder is None:
+            return None
+        if not getattr(holder, "is_local_path", False):
+            return None
+        full_path = getattr(holder, "full_path", None)
+        if full_path is None:
+            return None
+        return full_path()
 
     # ==================================================================
     # Schema — cheap via footer
@@ -93,28 +98,15 @@ class ParquetIO(BytesIO):
     def _collect_schema(self, options: ParquetOptions) -> Schema:
         """Read the schema from the Parquet footer.
 
-        Footer probe — must not move the buffer's byte cursor (a
-        caller mid-stream over the same buffer would lose its place).
-        Routes through a :meth:`BytesIO.view`: the view has its own
-        cursor, so :class:`pq.ParquetFile`'s seeks land on the view
-        and leave ``self._pos`` untouched. Codec'd buffers fall back
-        to :meth:`_reading_context`, which materializes a
-        decompressed sibling and yields it (also isolated from
-        ``self``).
+        Routes through :meth:`view` so the parent cursor isn't moved
+        — :class:`pq.ParquetFile` seeks to the footer to parse it
+        and would otherwise leave ``self._pos`` pointing at the file
+        end.
         """
-        if self.is_empty():
+        if self.size == 0:
             return Schema.empty()
-
-        if self.codec is not None:
-            with self._reading_context(options) as io:
-                source = io.arrow_io(mode="rb")
-                pf = pq.ParquetFile(source)
-                return Schema.from_arrow(pf.schema_arrow)
-
         with self.view(pos=0) as v:
-            source = v.arrow_io(mode="rb")
-            pf = pq.ParquetFile(source)
-            return Schema.from_arrow(pf.schema_arrow)
+            return Schema.from_arrow(pq.ParquetFile(v).schema_arrow)
 
     # ==================================================================
     # Read path
@@ -126,120 +118,23 @@ class ParquetIO(BytesIO):
     ) -> Iterator[pa.RecordBatch]:
         """Yield Arrow record batches from the Parquet file.
 
-        ``options.predicate`` is pushed down to
-        :mod:`pyarrow.dataset` when possible — that path uses the
-        Parquet footer's per-row-group min/max stats to skip whole
-        row groups, then evaluates the residual filter row-wise.
-        Two failure modes fall back to the unfiltered ``iter_batches``
-        path, where the universal predicate filter at the Tabular
-        layer takes over instead:
-
-        - The predicate references a column the parquet file
-          doesn't have (Arrow raises on filter binding).
-        - ``predicate.to_arrow()`` doesn't know how to compile the
-          expression (rare for typed comparisons; possible for
-          exotic UDF-shaped nodes).
+        Empty buffer short-circuits to no batches. The reader runs
+        against a :meth:`view` so the parent cursor stays put, and
+        ``options.row_size`` (when set) becomes the Parquet
+        ``batch_size`` — otherwise pyarrow's default of 65536 rows
+        per batch.
         """
-        if self.remaining_bytes() == 0:
+        if self.size == 0:
             return
 
-        with self._reading_context(options) as io:
-            source = io.arrow_io(mode="rb")
-            source.seek(0)
-            with pq.ParquetFile(source) as pf:
-                read_options = options.check_source(pf.schema_arrow)
-                columns = read_options.select_source_column_names()
-                batch_size = read_options.row_size or 65536
-                predicate = getattr(read_options, "predicate", None)
-
-                if predicate is not None:
-                    pushed = self._iter_with_pushdown(
-                        source=source,
-                        schema=pf.schema_arrow,
-                        predicate=predicate,
-                        columns=columns,
-                        batch_size=batch_size,
-                        read_options=read_options,
-                    )
-                    if pushed is not None:
-                        yield from pushed
-                        return
-
-                # No predicate, or pushdown unavailable — fall back
-                # to the plain reader; the universal filter at the
-                # Tabular layer applies the predicate per batch
-                # if it's still on the options.
+        batch_size = int(options.row_size or 65536)
+        with self.view(pos=0) as v:
+            with pq.ParquetFile(v) as pf:
                 for batch in pf.iter_batches(
                     batch_size=batch_size,
-                    use_threads=read_options.use_threads,
-                    columns=columns,
+                    use_threads=options.use_threads,
                 ):
-                    yield read_options.cast_arrow_tabular(batch)
-
-    def _iter_with_pushdown(
-        self,
-        *,
-        source: "pa.NativeFile",
-        schema: "pa.Schema",
-        predicate: "object",
-        columns: "list[str] | None",
-        batch_size: int,
-        read_options: "ParquetOptions",
-    ) -> "Iterator[pa.RecordBatch] | None":
-        """Try the :mod:`pyarrow.dataset` path with predicate pushdown.
-
-        Returns an iterator on success, ``None`` when pushdown isn't
-        applicable (predicate references a missing column, fails to
-        compile to a :class:`pa.compute.Expression`, or the dataset
-        API isn't importable). The caller falls back to the
-        unfiltered path; the universal predicate filter then applies.
-        """
-        try:
-            arrow_expr = predicate.to_arrow()
-        except Exception:
-            return None
-
-        try:
-            from yggdrasil.data.expr.nodes import free_columns
-            cols = free_columns(predicate)
-        except Exception:
-            cols = ()
-        schema_names = set(schema.names)
-        if cols and not set(cols).issubset(schema_names):
-            # Universal "missing column → accept everything" rule —
-            # let the fallback path emit the data unfiltered.
-            return None
-
-        try:
-            pds = pyarrow_dataset_module()
-        except Exception:
-            return None
-
-        try:
-            scanner = pds.dataset(
-                source,
-                format="parquet",
-                schema=schema,
-            ).scanner(
-                filter=arrow_expr,
-                columns=columns,
-                batch_size=batch_size,
-                use_threads=read_options.use_threads,
-            )
-        except Exception:
-            return None
-
-        return self._wrap_pushdown_batches(scanner, read_options)
-
-    @staticmethod
-    def _wrap_pushdown_batches(
-        scanner: "pds.Scanner",
-        read_options: "ParquetOptions",
-    ) -> Iterator[pa.RecordBatch]:
-        for batch in scanner.to_batches():
-            if batch.num_rows == 0:
-                continue
-            yield read_options.cast_arrow_tabular(batch)
+                    yield batch
 
     # ==================================================================
     # Write path
@@ -252,153 +147,133 @@ class ParquetIO(BytesIO):
     ) -> None:
         """Persist Arrow record batches as a Parquet file.
 
-        Pre-reserves buffer capacity per batch using ``batch.nbytes`` as
-        an upper bound on output size. This forces the spill decision
-        upfront on sizable writes so the ParquetWriter sink is the
-        fast :class:`pa.OSFile` path (real fd) rather than the Python
-        shim, and avoids mid-write bytearray reallocation churn.
+        Mode dispatch:
 
-        ``batch.nbytes`` over-estimates final Parquet size after
-        compression / dictionary encoding, which is the safe direction:
-        we may spill slightly earlier than strictly necessary, but we
-        never under-reserve.
+        - **OVERWRITE / AUTO / TRUNCATE** — single
+          :class:`pq.ParquetWriter` session over the buffer
+          (truncated to zero before the writer opens).
+        - **APPEND / UPSERT / MERGE** — read existing batches, chain
+          incoming, recurse with OVERWRITE. Parquet's footer covers
+          every row group, so a partial append still requires a full
+          rewrite.
+        - **IGNORE** — skip when non-empty.
+        - **ERROR_IF_EXISTS** — raise when non-empty.
         """
-        action = self._resolve_save_mode(options.mode)
+        action = self._resolve_action(options.mode)
+
         if action is Mode.IGNORE:
-            return
-        if action is Mode.APPEND:
-            self.seek(0)
-            return self._arrow_append_via_rewrite(batches, options)
-        if action is Mode.UPSERT:
-            self.seek(0)
-            return self._arrow_upsert_via_rewrite(batches, options)
-        if action is not Mode.OVERWRITE:
-            raise NotImplementedError(
-                f"{type(self).__name__}._write_arrow_batches handles "
-                f"OVERWRITE / APPEND / UPSERT; got resolved action "
-                f"{action!r}."
-            )
+            if self.size > 0:
+                return
+            action = Mode.OVERWRITE
+        elif action is Mode.ERROR_IF_EXISTS:
+            if self.size > 0:
+                raise FileExistsError(
+                    f"{type(self).__name__} buffer is non-empty "
+                    f"({self.size} bytes); refusing to overwrite under "
+                    f"mode={options.mode!r}."
+                )
+            action = Mode.OVERWRITE
 
         iterator = iter(batches)
         first = next(iterator, None)
+        if first is None and action is Mode.OVERWRITE:
+            self.seek(0)
+            self.truncate(0)
+            return
         if first is None:
             return
 
-        options = (
-            options
-            .check_source(first)
-            .check_target(first)
-        )
-        schema = options.merged_schema.to_arrow_schema()
-        first = options.cast_arrow_tabular(first)
+        if action is Mode.APPEND and self.size > 0:
+            existing = list(self._read_arrow_batches(options))
+            chained = iter([*existing, first, *iterator])
+            return self._write_arrow_batches(
+                chained, dataclasses.replace(options, mode=Mode.OVERWRITE),
+            )
 
-        self._drop_metadata()
+        # OVERWRITE — fresh writer over the buffer.
+        schema = first.schema
+        self.seek(0)
+        self.truncate(0)
 
-        lifecycle = options.copy(truncate_before_write=True)
+        with contextlib.ExitStack() as stack:
+            writer = pq.ParquetWriter(
+                self,
+                schema,
+                compression=options.compression,
+                compression_level=options.compression_level,
+                use_dictionary=options.use_dictionary,
+                write_statistics=options.write_statistics,
+            )
+            stack.callback(writer.close)
 
-        # Cap reserve target at one byte past spill threshold. Past that
-        # point the buffer will be local-spilled and further reserves
-        # are no-ops; pre-growing the bytearray to gigabytes would just
-        # delay the spill we already know is coming.
-        spill_cap = self._spill_bytes + 1
-        cumulative = first.nbytes
-        self.reserve(min(cumulative, spill_cap))
+            if first.num_rows > 0:
+                writer.write_batch(first, row_group_size=options.row_group_size)
+            for batch in iterator:
+                if batch.num_rows > 0:
+                    writer.write_batch(batch, row_group_size=options.row_group_size)
 
-        with self._writing_context(lifecycle) as io:
-            sink = io.arrow_io(mode="wb")
-            with contextlib.ExitStack() as stack:
-                stack.callback(sink.close)
-                writer = pq.ParquetWriter(
-                    sink,
-                    schema,
-                    compression=options.compression,
-                    compression_level=options.compression_level,
-                    use_dictionary=options.use_dictionary,
-                    write_statistics=options.write_statistics,
-                )
+    def _resolve_action(self, mode: Mode) -> Mode:
+        """Pick the disposition for a write call.
 
-                try:
-                    if first.num_rows > 0:
-                        writer.write_batch(first)
-
-                    for batch in iterator:
-                        casting = options.check_source(batch)
-                        batch = casting.cast_arrow_tabular(batch)
-                        if batch.num_rows == 0:
-                            continue
-                        cumulative += batch.nbytes
-                        # Idempotent for n <= current capacity, so the
-                        # cost past the first crossing is ~free.
-                        self.reserve(min(cumulative, spill_cap))
-                        writer.write_batch(batch)
-                finally:
-                    writer.close()
-        return None
-
-    # ==================================================================
-    # Native engine overrides
-    # ==================================================================
-
-    def _can_use_native_scanner(self, options: ParquetOptions) -> bool:
-        """True iff parquet's native readers can be invoked directly.
-
-        Path-bound local: hand the path to the reader (fastest —
-        memory-mapped reads, native filter pushdown). Otherwise
-        (in-memory, non-local path) route through a
-        :meth:`BytesIO.view`: the reader sees a self-contained
-        file-like over the buffer's bytes and the parent cursor
-        stays untouched. Codec'd buffers and casting/filtering
-        options still fall back to the generic Arrow batch reader.
+        Parquet has no native append story (one footer per file),
+        so :data:`Mode.AUTO` resolves to :data:`Mode.OVERWRITE` and
+        :data:`Mode.UPSERT` / :data:`Mode.MERGE` degrade to
+        :data:`Mode.APPEND` (which still triggers a full rewrite).
         """
-        if not type(self)._NATIVE_SCANNER_OK:
-            return False
-        if self.is_empty():
-            return False
-        if options.target_field is not None:
-            return False
-        if self.codec is not None:
-            return False
-        return True
+        if mode is Mode.AUTO or mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:
+            return Mode.OVERWRITE
+        if mode is Mode.APPEND:
+            return Mode.APPEND
+        if mode is Mode.IGNORE:
+            return Mode.IGNORE
+        if mode is Mode.ERROR_IF_EXISTS:
+            return Mode.ERROR_IF_EXISTS
+        if mode is Mode.UPSERT or mode is Mode.MERGE:
+            return Mode.APPEND
+        return Mode.OVERWRITE
+
+    # ==================================================================
+    # Native engine overrides — push reads to format-aware scanners
+    # ==================================================================
 
     def _read_arrow_dataset(self, options: ParquetOptions) -> "pds.Dataset":
-        if not self._can_use_native_scanner(options):
-            return super()._read_arrow_dataset(options)
-
+        """Native :class:`pyarrow.dataset.Dataset` over the Parquet bytes."""
         pds = pyarrow_dataset_module()
-        if self.path is not None and self.path.is_local:
-            return pds.dataset(self.path.__fspath__(), format="parquet")
+        path = self._local_path_str()
+        if path is not None:
+            return pds.dataset(path, format="parquet")
 
-        # In-memory or non-local: ``pds.dataset`` doesn't accept
-        # file-likes, so parse the footer through a view and wrap
-        # the resulting table. The view's cursor isolates the read
-        # from any caller mid-stream over ``self``.
+        # In-memory / non-local — pyarrow.dataset doesn't accept a
+        # file-like, so read the table through a view and wrap it.
+        if self.size == 0:
+            return pds.dataset(
+                pa.table({}),
+            )
         with self.view(pos=0) as v:
-            source = v.arrow_io(mode="rb")
-            table = pq.read_table(source)
+            table = pq.read_table(v)
         return pds.dataset(table)
 
     def _scan_polars_frame(self, options: ParquetOptions) -> "pl.LazyFrame":
-        if not self._can_use_native_scanner(options):
-            return super()._scan_polars_frame(options)
+        """Native :func:`polars.scan_parquet` LazyFrame.
 
+        For a local-path holder, hand polars the path so the rust
+        scanner does its own predicate pushdown. Otherwise feed it a
+        :meth:`view` — polars pulls the footer + planning bytes
+        through the file-like at scan time and the view's cursor
+        keeps the parent cursor untouched.
+        """
         pl = polars_module()
-        if self.path is not None and self.path.is_local:
-            return pl.scan_parquet(self.path.__fspath__())
-
-        # ``pl.scan_parquet`` accepts a file-like and pulls the
-        # bytes it needs at scan time (footer + planning), so the
-        # view can be closed once the LazyFrame exists. The view's
-        # cursor isolates the scan from ``self._pos``.
+        path = self._local_path_str()
+        if path is not None:
+            return pl.scan_parquet(path)
         with self.view(pos=0) as v:
             return pl.scan_parquet(v)
 
     def _read_polars_frame(self, options: ParquetOptions) -> "pl.DataFrame":
-        if not self._can_use_native_scanner(options):
-            return super()._read_polars_frame(options)
-
+        """Native :func:`polars.read_parquet` eager frame."""
         pl = polars_module()
-        if self.path is not None and self.path.is_local:
-            return pl.read_parquet(self.path.__fspath__(), use_pyarrow=False)
-
+        path = self._local_path_str()
+        if path is not None:
+            return pl.read_parquet(path, use_pyarrow=False)
         with self.view(pos=0) as v:
             return pl.read_parquet(v, use_pyarrow=False)
