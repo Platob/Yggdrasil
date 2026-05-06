@@ -236,55 +236,28 @@ def _resolve_retry(retry: Optional[WaitingConfigArg]) -> Optional[WaitingConfig]
     return WaitingConfig.from_(retry)
 
 
-def _drain_batch_with_retry(
-    batch: "StatementBatch",
+def _execute_dml(
+    sql_engine: "SQLEngine",
     *,
+    statements: list,
     wait: WaitingConfigArg,
-    target_location: str,
-    label: str,
-) -> "StatementBatch":
-    """Retry a failed batch in place when at least one item is retryable.
+    raise_error: bool,
+    engine_name: Literal["api", "spark"],
+):
+    """Submit DML statements through *sql_engine* and surface failures.
 
-    The warehouse / Spark statement results auto-promote known-transient
-    failures (Delta concurrency, ``ConcurrentAppendException``, …) to
-    retryable on the first ``raise_for_status`` call.  ``execute_many``
-    only submits + waits, so without an explicit ``batch.retry()`` the
-    auto-promoted config never fires — the exception just propagates.
-
-    This helper closes that gap: it nudges every failed item through
-    ``raise_for_status`` (swallowing the exception) so auto-promote
-    installs a retry config, then runs ``batch.retry()`` if anything is
-    now retryable.  Idempotent on already-successful batches and on
-    batches whose failures aren't transient.
+    Replaces the legacy MERGE-fallback funnel: there's no fallback
+    factory, no per-batch retry shuffle, no auto-promote dance —
+    statement-level retry policies (set by the caller via
+    :class:`WaitingConfig`) still fire inside
+    :class:`SparkPreparedStatement` / :class:`WarehousePreparedStatement`,
+    but the table layer no longer second-guesses them.
     """
-    if not batch.failed:
-        return batch
-
-    for key, result in batch.results.items():
-        if not result.failed:
-            continue
-        try:
-            result.raise_for_status()
-        except Exception:
-            # raise_for_status auto-promotes transient failures *before*
-            # re-raising; we only need the side-effect.
-            pass
-
-    retryable = [r for r in batch.results.values() if r.failed and r.retryable]
-    if not retryable:
-        return batch
-
-    logger.info(
-        "Retrying %d transiently-failed statement(s) in %s batch -> %s.",
-        len(retryable), label, target_location,
+    batch = sql_engine.execute_many(
+        statements, wait=wait, raise_error=False, engine=engine_name,
     )
-    try:
-        batch.retry(wait=wait, raise_error=False)
-    except Exception:
-        logger.exception(
-            "batch.retry() raised on %s batch -> %s; surfacing original failure.",
-            label, target_location,
-        )
+    if raise_error:
+        batch.raise_for_status()
     return batch
 
 
@@ -564,54 +537,84 @@ def _build_delete_insert_statements(
     ]
 
 
-def _build_merge_statement(
+def _spark_filter_existing_keys(
+    *,
+    session: Any,
+    data_df: Any,
+    target_location: str,
+    match_by: list[str],
+):
+    """Drop rows from *data_df* whose ``match_by`` tuple already exists in target.
+
+    The Spark fast path for keyed APPEND. Reads only the
+    ``match_by`` columns from the target via
+    ``session.table(target_location).select(*match_by).distinct()``
+    and left-anti-joins them against the incoming DataFrame.
+    Catalyst pushes the join down to the Delta files, so the
+    target side reads only its key columns — much cheaper than
+    the SQL ``NOT EXISTS`` shape used on the warehouse path.
+
+    Returns a tuple ``(filtered_df, ok)``:
+
+    * ``ok=True`` — the anti-join succeeded; ``filtered_df`` is
+      the survivor DataFrame ready for a plain INSERT.
+    * ``ok=False`` — target doesn't exist yet (first write) or the
+      session can't see it; caller falls through to the SQL
+      ``NOT EXISTS`` path which handles empty / missing targets.
+    """
+    try:
+        target_df = session.table(target_location)
+        key_df = target_df.select(*match_by).distinct()
+        return data_df.join(key_df, list(match_by), "left_anti"), True
+    except Exception:
+        return data_df, False
+
+
+def _build_anti_join_insert(
     *,
     target_location: str,
     source_sql: str,
     columns: list[str],
     match_by: list[str],
-    update_column_names: Optional[list[str]],
     prune_predicates: list[str],
-    insert_only: bool = False,
-) -> str:
-    """Render a single ``MERGE INTO ...`` statement."""
+) -> list[str]:
+    """Build a keyed APPEND that filters out rows already in the target.
+
+    Renders one statement of the shape::
+
+        INSERT INTO target (cols)
+        SELECT cols FROM (source) AS S
+        WHERE NOT EXISTS (
+          SELECT 1 FROM target AS T
+          WHERE T.k1 <=> S.k1 AND ... [AND prune_predicates]
+        )
+
+    No ``MERGE``, no fallback, no retry — Databricks / Spark / any
+    SQL engine that supports correlated ``EXISTS`` runs this
+    natively. The ``<=>`` null-safe comparison matches the legacy
+    MERGE behavior so rows with NULL key columns line up.
+
+    ``prune_predicates`` (target-aliased) narrow the EXISTS scan
+    to the matching partitions, so the keyed dedup doesn't read
+    the whole target.
+    """
     cols_quoted = ", ".join(quote_ident(c) for c in columns)
-    on_condition = _build_match_condition(
-        match_by, left_alias="T", right_alias="S",
-        null_safe=True, extra_predicates=prune_predicates,
+    key_match = " AND ".join(
+        f"T.{quote_ident(k)} <=> S.{quote_ident(k)}"
+        for k in match_by
     )
-    insert_clause = (
-        f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
-        f"VALUES ({', '.join(f'S.{quote_ident(c)}' for c in columns)})"
+    exists_where = "\n    AND ".join([key_match, *prune_predicates])
+    exists_clause = (
+        f"NOT EXISTS (\n"
+        f"  SELECT 1 FROM {target_location} AS T\n"
+        f"  WHERE {exists_where}\n"
+        f")"
     )
-    if insert_only:
-        return (
-            f"MERGE INTO {target_location} AS T\n"
-            f"USING (\n{source_sql}\n) AS S\n"
-            f"ON {on_condition}\n"
-            f"{insert_clause}"
-        )
-
-    update_column_names_effective = (
-        update_column_names
-        if update_column_names is not None
-        else [c for c in columns if c not in match_by]
-    )
-    update_clause = ""
-    if update_column_names_effective:
-        update_set = ", ".join(
-            f"T.{quote_ident(c)} = S.{quote_ident(c)}"
-            for c in update_column_names_effective
-        )
-        update_clause = f"WHEN MATCHED THEN UPDATE SET {update_set}\n"
-
-    return (
-        f"MERGE INTO {target_location} AS T\n"
-        f"USING (\n{source_sql}\n) AS S\n"
-        f"ON {on_condition}\n"
-        f"{update_clause}"
-        f"{insert_clause}"
-    )
+    return [
+        f"INSERT INTO {target_location} ({cols_quoted})\n"
+        f"SELECT {cols_quoted} FROM (\n{source_sql}\n) AS S\n"
+        f"WHERE {exists_clause}"
+    ]
 
 
 def _append_maintenance_statements(
@@ -646,27 +649,32 @@ def _build_dml_statements(
     optimize_after_merge: bool = False,
     vacuum_hours: Optional[int] = None,
 ) -> list[str]:
-    """Generate INSERT / MERGE / DELETE / OPTIMIZE / VACUUM SQL.
-
-    Path-agnostic — feeds from any source-SQL fragment that names the
-    rows to merge.  ``prune_predicates`` are pre-rendered & parenthesized;
-    they get AND-stitched onto ``ON`` clauses but NOT plain INSERT.
+    """Generate INSERT / DELETE / OPTIMIZE / VACUUM SQL — no MERGE.
 
     Mode dispatch when ``match_by`` is set:
 
-    - :attr:`Mode.UPSERT` / :attr:`Mode.MERGE` → single ``MERGE INTO``
-      statement.  Callers that want fallback semantics on ``MERGE``
-      failure should also build delete-insert statements via
-      :func:`_build_delete_insert_statements` and submit them on
-      failure.  (UPSERT historically dispatched a keyed-DELETE +
-      INSERT pair; the call sites still emit that pair as the MERGE
-      fallback so backends without native MERGE keep working.)
-    - :attr:`Mode.APPEND` / :attr:`Mode.AUTO` → ``MERGE`` with
-      ``WHEN NOT MATCHED THEN INSERT`` only (no update of existing
-      rows).  AUTO with match keys means "append only the new keys" —
-      the engine probes target by match-by columns and skips matched
-      rows, so existing rows are never re-read or rewritten.
+    * :attr:`Mode.APPEND` / :attr:`Mode.AUTO` → single
+      ``INSERT ... WHERE NOT EXISTS`` against the target. Rows whose
+      keys already exist in the target get filtered out at INSERT
+      time; the engine still does the keyed lookup but never has to
+      rewrite an existing row.
+    * :attr:`Mode.UPSERT` / :attr:`Mode.MERGE` → keyed ``DELETE`` of
+      conflicting rows followed by a plain ``INSERT``. Honest
+      "incoming wins on overlap" without leaning on engine-specific
+      MERGE syntax.
+    * :attr:`Mode.TRUNCATE` with ``match_by`` → same DELETE + INSERT
+      shape (truncate-by-key).
+    * :attr:`Mode.TRUNCATE` no keys → ``TRUNCATE TABLE`` + INSERT.
+    * :attr:`Mode.OVERWRITE` → plain INSERT (the caller already
+      ``DELETE``\\ d the target up front).
+
+    No MERGE / fallback / retry-on-MERGE-failure machinery — the
+    delete-then-insert path is the single source of truth for
+    update semantics, and Spark's anti-join optimization for the
+    APPEND case lives one layer up in :meth:`spark_insert`.
     """
+    del update_column_names  # incoming wins; ``UPDATE SET`` no longer used.
+
     cols_quoted = ", ".join(quote_ident(c) for c in columns)
     statements: list[str] = []
 
@@ -689,21 +697,26 @@ def _build_dml_statements(
                 f"INSERT INTO {target_location} ({cols_quoted})\n{source_sql}"
             )
 
-    elif match_by:
-        statements.append(_build_merge_statement(
+    elif match_by and mode in (Mode.UPSERT, Mode.MERGE):
+        statements.extend(_build_delete_insert_statements(
             target_location=target_location,
             source_sql=source_sql,
             columns=columns,
             match_by=match_by,
-            update_column_names=update_column_names,
             prune_predicates=prune_predicates,
-            # AUTO/APPEND with match keys means "append only new keys":
-            # MERGE WHEN NOT MATCHED THEN INSERT, no update branch.
-            # UPSERT/MERGE want the full update-and-insert merge.  The
-            # delete-insert pair stays available as a fallback emitted
-            # at the call site for backends without native MERGE.
-            insert_only=mode in (Mode.APPEND, Mode.AUTO),
         ))
+
+    elif match_by:
+        # AUTO / APPEND with keys — drop incoming rows that already
+        # exist on the target side (keyed dedup) and INSERT the rest.
+        statements.extend(_build_anti_join_insert(
+            target_location=target_location,
+            source_sql=source_sql,
+            columns=columns,
+            match_by=match_by,
+            prune_predicates=prune_predicates,
+        ))
+
     else:
         statements.append(
             f"INSERT INTO {target_location} ({cols_quoted})\n{source_sql}"
@@ -718,105 +731,6 @@ def _build_dml_statements(
         vacuum_hours=vacuum_hours,
     )
     return statements
-
-
-def _build_merge_fallback_statements(
-    *,
-    target_location: str,
-    source_sql: str,
-    columns: list[str],
-    match_by: list[str],
-    prune_predicates: list[str],
-    zorder_by: Optional[list[str]] = None,
-    optimize_after_merge: bool = False,
-    vacuum_hours: Optional[int] = None,
-) -> list[str]:
-    """Build the DELETE+INSERT statements run after a MERGE failure.
-
-    Mirrors :attr:`Mode.UPSERT`: a keyed ``DELETE`` narrows the target to
-    rows whose match keys appear in the source, then a plain ``INSERT``
-    appends every row from ``source_sql``.  The same projection used by
-    the primary MERGE flows through unchanged — extra source columns are
-    filtered out by the SELECT projection (it only names target columns)
-    and any ``cast_options`` alignment performed upstream is preserved.
-    """
-    statements = _build_delete_insert_statements(
-        target_location=target_location,
-        source_sql=source_sql,
-        columns=columns,
-        match_by=match_by,
-        prune_predicates=prune_predicates,
-    )
-    _append_maintenance_statements(
-        statements,
-        target_location=target_location,
-        zorder_by=zorder_by,
-        optimize_after_merge=optimize_after_merge,
-        keyed=True,
-        vacuum_hours=vacuum_hours,
-    )
-    return statements
-
-
-def _execute_with_merge_fallback(
-    sql_engine: "SQLEngine",
-    *,
-    primary: list,
-    fallback_factory: Optional[Callable[[], list]],
-    wait: WaitingConfigArg,
-    raise_error: bool,
-    engine_name: Literal["api", "spark"],
-    target_location: str,
-):
-    """Submit *primary*; on failure, retry then build and run the fallback batch.
-
-    Used for :attr:`Mode.MERGE`: if any DML in the primary submission
-    fails after its own retry policy (or the auto-promoted retry policy
-    for transient Delta failures), the caller-supplied
-    ``fallback_factory`` produces a fresh list of prepared statements
-    (the keyed-DELETE + INSERT pair plus any maintenance) which is then
-    submitted — and itself retried — in a second batch.  The
-    ``raise_error`` contract is deferred to whichever batch runs last.
-
-    Both batches are drained through :func:`_drain_batch_with_retry` so
-    transient errors like ``ConcurrentAppendException`` retry instead of
-    surfacing immediately.
-    """
-    if fallback_factory is None:
-        batch = sql_engine.execute_many(
-            primary, wait=wait, raise_error=False, engine=engine_name,
-        )
-        _drain_batch_with_retry(
-            batch, wait=wait, target_location=target_location, label="primary",
-        )
-        if raise_error:
-            batch.raise_for_status()
-        return batch
-
-    batch = sql_engine.execute_many(
-        primary, wait=wait, raise_error=False, engine=engine_name,
-    )
-    _drain_batch_with_retry(
-        batch, wait=wait, target_location=target_location, label="primary",
-    )
-    if not batch.failed:
-        if raise_error:
-            batch.raise_for_status()
-        return batch
-
-    logger.warning(
-        "MERGE into %s failed after retry; running DELETE+INSERT fallback.",
-        target_location,
-    )
-    fb_batch = sql_engine.execute_many(
-        fallback_factory(), wait=wait, raise_error=False, engine=engine_name,
-    )
-    _drain_batch_with_retry(
-        fb_batch, wait=wait, target_location=target_location, label="fallback",
-    )
-    if raise_error:
-        fb_batch.raise_for_status()
-    return fb_batch
 
 
 def _delta_conf_for(
@@ -2386,36 +2300,18 @@ class Table(DatabricksResource, Tabular[CastOptions]):
 
         prepared = _prepare_batch(sql_texts)
 
-        fallback_factory: Optional[Callable[[], list[WarehousePreparedStatement]]] = None
-        if mode_enum in (Mode.MERGE, Mode.UPSERT) and match_by:
-            def _build_fallback() -> list[WarehousePreparedStatement]:
-                fb_texts = _build_merge_fallback_statements(
-                    target_location=target_location,
-                    source_sql=source_sql,
-                    columns=columns,
-                    match_by=match_by,
-                    prune_predicates=prune_predicates,
-                    zorder_by=zorder_by,
-                    optimize_after_merge=optimize_after_merge,
-                    vacuum_hours=vacuum_hours,
-                )
-                return _prepare_batch(fb_texts)
-            fallback_factory = _build_fallback
-
         logger.debug(
-            "Arrow insert -> %s | mode=%s match_by=%s prune_by=%s statements=%d retry=%s fallback=%s",
+            "Arrow insert -> %s | mode=%s match_by=%s prune_by=%s statements=%d retry=%s",
             target_location, mode_enum, match_by, prune_by, len(prepared),
-            retry_active, bool(fallback_factory),
+            retry_active,
         )
 
-        _execute_with_merge_fallback(
+        _execute_dml(
             self.sql,
-            primary=prepared,
-            fallback_factory=fallback_factory,
+            statements=prepared,
             wait=wait_cfg,
             raise_error=raise_error,
             engine_name="api",
-            target_location=target_location,
         )
 
         dispatch_entries = _resolve_dispatch_targets(table_dispatch, primary=target)
@@ -2460,12 +2356,6 @@ class Table(DatabricksResource, Tabular[CastOptions]):
                     raise_error=False,
                     engine="api",
                     parallel=max(1, len(dispatch_entries)),
-                )
-                _drain_batch_with_retry(
-                    extra_batch,
-                    wait=wait_cfg,
-                    target_location="<dispatch>",
-                    label="dispatch",
                 )
                 if raise_error:
                     extra_batch.raise_for_status()
@@ -2576,6 +2466,20 @@ class Table(DatabricksResource, Tabular[CastOptions]):
         if where is not None:
             prune_predicates.append(_wrap_user_predicate(where, target_alias="T"))
 
+        # Spark fast path for keyed APPEND — see
+        # :func:`_spark_filter_existing_keys`. Catalyst's anti-join
+        # is dramatically cheaper than the SQL NOT EXISTS shape used
+        # on the warehouse path because it only reads the target's
+        # key columns from disk.
+        anti_join_handled = False
+        if match_by and mode_enum in (Mode.APPEND, Mode.AUTO):
+            data_df, anti_join_handled = _spark_filter_existing_keys(
+                session=session,
+                data_df=data_df,
+                target_location=target_location,
+                match_by=list(match_by),
+            )
+
         view_name = f"_yg_src_{uuid.uuid4().hex}"
         data_df.createOrReplaceTempView(view_name)
 
@@ -2583,18 +2487,39 @@ class Table(DatabricksResource, Tabular[CastOptions]):
         cols_quoted = ", ".join(quote_ident(c) for c in columns)
         source_sql = f"SELECT {cols_quoted} FROM {quote_ident(view_name)}"
 
-        sql_texts = _build_dml_statements(
-            target_location=target_location,
-            source_sql=source_sql,
-            columns=columns,
-            mode=mode_enum,
-            match_by=match_by,
-            update_column_names=update_column_names,
-            prune_predicates=prune_predicates,
-            zorder_by=zorder_by,
-            optimize_after_merge=optimize_after_merge,
-            vacuum_hours=vacuum_hours,
+        # The DataFrame anti-join already dedup'd; emit a plain INSERT
+        # so we don't pay for the SQL-side NOT EXISTS twice.
+        effective_mode = (
+            Mode.OVERWRITE if anti_join_handled else mode_enum
         )
+        effective_match_by = None if anti_join_handled else match_by
+        # OVERWRITE-with-no-match_by would normally trigger a target
+        # delete up front; skip that — the fast path is *append*.
+        if anti_join_handled:
+            sql_texts = [
+                f"INSERT INTO {target_location} ({cols_quoted})\n{source_sql}"
+            ]
+            _append_maintenance_statements(
+                sql_texts,
+                target_location=target_location,
+                zorder_by=zorder_by,
+                optimize_after_merge=optimize_after_merge,
+                keyed=True,
+                vacuum_hours=vacuum_hours,
+            )
+        else:
+            sql_texts = _build_dml_statements(
+                target_location=target_location,
+                source_sql=source_sql,
+                columns=columns,
+                mode=effective_mode,
+                match_by=effective_match_by,
+                update_column_names=update_column_names,
+                prune_predicates=prune_predicates,
+                zorder_by=zorder_by,
+                optimize_after_merge=optimize_after_merge,
+                vacuum_hours=vacuum_hours,
+            )
 
         retry_cfg = _resolve_retry(retry)
 
@@ -2609,40 +2534,23 @@ class Table(DatabricksResource, Tabular[CastOptions]):
 
         prepared = _prepare_spark_batch(sql_texts)
 
-        fallback_factory: Optional[Callable[[], list[SparkPreparedStatement]]] = None
-        if mode_enum in (Mode.MERGE, Mode.UPSERT) and match_by:
-            def _build_fallback() -> list[SparkPreparedStatement]:
-                fb_texts = _build_merge_fallback_statements(
-                    target_location=target_location,
-                    source_sql=source_sql,
-                    columns=columns,
-                    match_by=match_by,
-                    prune_predicates=prune_predicates,
-                    zorder_by=zorder_by,
-                    optimize_after_merge=optimize_after_merge,
-                    vacuum_hours=vacuum_hours,
-                )
-                return _prepare_spark_batch(fb_texts)
-            fallback_factory = _build_fallback
-
         logger.info(
-            "Spark insert -> %s | mode=%s match_by=%s prune_by=%s statements=%d retry=%s fallback=%s",
+            "Spark insert -> %s | mode=%s match_by=%s prune_by=%s "
+            "statements=%d retry=%s anti_join=%s",
             target_location, mode_enum, match_by, prune_by, len(prepared),
-            retry_cfg is not None, bool(fallback_factory),
+            retry_cfg is not None, anti_join_handled,
         )
 
         applied_conf = _delta_conf_for(overwrite_schema, spark_options)
 
         try:
             with sql_engine.spark.scoped_spark_conf(session, applied_conf):
-                _execute_with_merge_fallback(
+                _execute_dml(
                     sql_engine,
-                    primary=prepared,
-                    fallback_factory=fallback_factory,
+                    statements=prepared,
                     wait=wait,
                     raise_error=raise_error,
                     engine_name="spark",
-                    target_location=target_location,
                 )
 
                 dispatch_entries = _resolve_dispatch_targets(
@@ -2684,12 +2592,6 @@ class Table(DatabricksResource, Tabular[CastOptions]):
                             raise_error=False,
                             engine="spark",
                             parallel=max(1, len(dispatch_entries)),
-                        )
-                        _drain_batch_with_retry(
-                            extra_batch,
-                            wait=wait,
-                            target_location="<dispatch>",
-                            label="dispatch",
                         )
                         if raise_error:
                             extra_batch.raise_for_status()
@@ -2899,37 +2801,18 @@ class Table(DatabricksResource, Tabular[CastOptions]):
 
         prepared = _prepare_batch(sql_texts)
 
-        fallback_factory: Optional[Callable[[], list[WarehousePreparedStatement]]] = None
-        if mode_enum in (Mode.MERGE, Mode.UPSERT) and match_by:
-            def _build_fallback() -> list[WarehousePreparedStatement]:
-                fb_texts = _build_merge_fallback_statements(
-                    target_location=target_location,
-                    source_sql=source_sql,
-                    columns=columns,
-                    match_by=match_by,
-                    prune_predicates=prune_predicates,
-                    zorder_by=zorder_by,
-                    optimize_after_merge=optimize_after_merge,
-                    vacuum_hours=vacuum_hours,
-                )
-                return _prepare_batch(fb_texts)
-            fallback_factory = _build_fallback
-
         logger.info(
-            "SQL insert -> %s | mode=%s match_by=%s statements=%d retry=%s fallback=%s",
+            "SQL insert -> %s | mode=%s match_by=%s statements=%d retry=%s",
             target_location, mode_enum, match_by, len(prepared), retry_active,
-            bool(fallback_factory),
         )
 
         if prepared:
-            _execute_with_merge_fallback(
+            _execute_dml(
                 self.sql,
-                primary=prepared,
-                fallback_factory=fallback_factory,
+                statements=prepared,
                 wait=wait,
                 raise_error=raise_error,
                 engine_name="api",
-                target_location=target_location,
             )
 
         dispatch_entries = _resolve_dispatch_targets(table_dispatch, primary=self)
@@ -2982,12 +2865,6 @@ class Table(DatabricksResource, Tabular[CastOptions]):
                     raise_error=False,
                     engine="api",
                     parallel=max(1, len(dispatch_entries)),
-                )
-                _drain_batch_with_retry(
-                    extra_batch,
-                    wait=wait,
-                    target_location="<dispatch>",
-                    label="dispatch",
                 )
                 if raise_error:
                     extra_batch.raise_for_status()

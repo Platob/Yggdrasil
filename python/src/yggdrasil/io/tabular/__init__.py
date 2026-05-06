@@ -12,8 +12,8 @@ mode. Use these when you want a :class:`Tabular` over data you
 already have in memory and don't want to round-trip through IPC bytes.
 """
 
-from .base import Tabular
+from .base import O, Tabular
 from yggdrasil.io.tabular.arrow import ArrowTabular
 from yggdrasil.io.tabular.spark import SparkTabular
 
-__all__ = ["Tabular", "ArrowTabular", "SparkTabular"]
+__all__ = ["O", "Tabular", "ArrowTabular", "SparkTabular"]
