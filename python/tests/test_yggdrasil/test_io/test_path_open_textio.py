@@ -1,4 +1,4 @@
-"""Regression tests for ``Path.open_io(mode='wb')`` wrapped in a
+"""Regression tests for ``Path.open(mode='wb')`` wrapped in a
 :class:`io.TextIOWrapper`.
 
 The screenshot pattern from the bug report::
@@ -45,7 +45,7 @@ def _open_text(path, mode: str = "wb", *, encoding: str = "utf-8",
     text writes pass straight through to the underlying buffer
     instead of sitting in the wrapper's own buffer until close.
     """
-    binary = path.open_io(mode=mode)
+    binary = path.open(mode=mode)
     return _stdio.TextIOWrapper(
         binary, encoding=encoding, write_through=write_through,
     )
@@ -229,7 +229,7 @@ class TestDatabricksOpenShape:
     def test_screenshot_pattern(self, tmp_path, payload):
         target = Path.from_(tmp_path / "screenshot.dat")
 
-        binary_handle = target.open_io(mode="wb")
+        binary_handle = target.open(mode="wb")
         f = _stdio.TextIOWrapper(
             binary_handle,
             encoding="utf-8",

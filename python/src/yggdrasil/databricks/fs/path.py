@@ -41,12 +41,12 @@ positional-IO contract that ``Path`` declares abstract:
 - :meth:`write_bytes` — full upload.
 
 The last two override the base ``Path``'s default implementations
-(which go through ``open_io``) to call the SDK directly. Otherwise
+(which go through ``open``) to call the SDK directly. Otherwise
 opening a path-bound BytesIO would recurse: BytesIO._acquire calls
-path.pread → which would call open_io → which would construct a
+path.pread → which would call open → which would construct a
 new BytesIO bound to the path → which would try to acquire …
 
-So Databricks paths bypass ``open_io`` for their own bytes I/O,
+So Databricks paths bypass ``open`` for their own bytes I/O,
 and ``_open`` returns a plain ``BytesIO(path=self, mode=mode)``
 with no special subclass — the BytesIO machinery handles
 everything.
@@ -488,7 +488,7 @@ class DatabricksPath(RemotePath):
         del buffering
 
         if "b" in mode:
-            return self.open_io(
+            return self.open(
                 mode=mode,
                 encoding=encoding,
                 auto_open=auto_open,
@@ -497,7 +497,7 @@ class DatabricksPath(RemotePath):
 
         binary_mode = mode.replace("t", "") + "b"
         binary_mode = binary_mode.replace("bb", "b")
-        binary_handle = self.open_io(
+        binary_handle = self.open(
             mode=binary_mode,
             encoding=None,
             auto_open=auto_open,

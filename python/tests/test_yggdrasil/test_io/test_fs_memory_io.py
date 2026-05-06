@@ -138,23 +138,23 @@ class TestIO:
 
     def test_open_io_returns_bytesio_path_bound(self):
         path = MemoryPath(b"xyz")
-        with path.open_io("rb") as fh:
+        with path.open("rb") as fh:
             assert fh.read() == b"xyz"
 
     def test_open_wb_truncates(self):
         path = MemoryPath(b"original")
-        with path.open_io("wb") as fh:
+        with path.open("wb") as fh:
             fh.write(b"new")
         assert path.read_bytes() == b"new"
 
     def test_open_xb_on_existing_raises(self):
         path = MemoryPath(b"data")
         with pytest.raises(FileExistsError):
-            path.open_io("xb")
+            path.open("xb")
 
     def test_open_ab_appends(self):
         path = MemoryPath(b"orig")
-        with path.open_io("ab") as fh:
+        with path.open("ab") as fh:
             fh.write(b"-more")
         assert path.read_bytes() == b"orig-more"
 
@@ -165,7 +165,7 @@ class TestIO:
         path = MemoryPath(b"abc")
         original_url = path.url
         path.close(force=True)
-        with path.open_io("rb") as fh:
+        with path.open("rb") as fh:
             assert fh.read() == b"abc"
         assert path.url == original_url
 
@@ -178,7 +178,7 @@ class TestIO:
 class TestSharedBuffer:
     def test_two_opens_share_bytes(self):
         path = MemoryPath(b"abc")
-        with path.open_io("rb+") as writer, path.open_io("rb") as reader:
+        with path.open("rb+") as writer, path.open("rb") as reader:
             writer.seek(0)
             writer.write(b"XYZ")
             reader.seek(0)
@@ -186,7 +186,7 @@ class TestSharedBuffer:
 
     def test_independent_cursors(self):
         path = MemoryPath(b"abcdef")
-        with path.open_io("rb") as fh1, path.open_io("rb") as fh2:
+        with path.open("rb") as fh1, path.open("rb") as fh2:
             fh1.read(3)
             assert fh2.tell() == 0
 

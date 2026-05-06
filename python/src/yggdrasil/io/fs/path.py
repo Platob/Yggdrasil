@@ -47,7 +47,7 @@ from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.buffer.bytes_io import BytesIO
-from yggdrasil.io.enums import MediaType
+from yggdrasil.io.enums import MediaType, Mode
 from yggdrasil.io.holder import Holder
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
@@ -384,7 +384,7 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
     # ==================================================================
 
     def _read_arrow_batches(self, options: CastOptions) -> Iterator["pa.RecordBatch"]:
-        buf = self.open_io("rb")
+        buf = self.open("rb")
         try:
             yield from buf.read_arrow_batches(options=options)
         finally:
@@ -395,7 +395,7 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         batches: Iterable["pa.RecordBatch"],
         options: CastOptions,
     ) -> None:
-        buf = self.open_io("wb")
+        buf = self.open("wb")
         try:
             buf.write_arrow_batches(batches, options=options)
         finally:
@@ -692,26 +692,51 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
     # I/O entry points
     # ==================================================================
 
-    def open_io(
+    def open(
         self,
-        mode: str = "rb",
+        mode: "Mode | str | None" = None,
         *,
         encoding: Optional[str] = None,
         errors: Optional[str] = None,
         newline: Optional[str] = None,
         auto_open: bool = True,
         touch: bool = False,
-    ) -> BytesIO:
-        """Open a :class:`BytesIO` bound to *self* with the given mode."""
+    ) -> "BytesIO | Path":
+        """Open the path — pathlike when *mode* is given, lifecycle otherwise.
+
+        Two shapes:
+
+        - ``path.open()`` (no mode) — runs the :class:`Disposable`
+          lifecycle ``open`` (sets ``_acquired``); returns ``self``.
+          Equivalent to the bare ``Disposable.open(self)`` call sites
+          relied on before, kept for ``with path:`` and other lifecycle
+          contexts.
+        - ``path.open(mode)`` — opens a binary file handle at *mode*
+          and returns a :class:`BytesIO` bound to *self*. Mirrors
+          :meth:`pathlib.Path.open` for byte-level I/O. ``mode``
+          accepts a :class:`Mode`, an OS-style mode string
+          (``"rb"`` / ``"wb"`` / ``"ab"`` / ``"rb+"`` / …), or any
+          alias :meth:`Mode.from_` understands. The text-IO knobs
+          (``encoding`` / ``errors`` / ``newline``) are accepted for
+          signature parity with :class:`pathlib.Path` but ignored —
+          this is a binary surface.
+        """
+        if mode is None:
+            del encoding, errors, newline, auto_open, touch
+            Disposable.open(self)
+            return self
+
         del encoding, errors, newline  # binary-only at this layer
 
         if not self.opened:
             Disposable.open(self)
 
-        if touch and "r" in mode and "+" not in mode and not self.exists():
+        parsed = Mode.from_(mode)
+        os_mode = parsed.os_mode if isinstance(mode, Mode) or not isinstance(mode, str) else mode
+        if touch and parsed is Mode.READ_ONLY and not self.exists():
             self.touch(exist_ok=True, parents=True)
 
-        return BytesIO(path=self, mode=mode, auto_open=auto_open)
+        return BytesIO(path=self, mode=os_mode, auto_open=auto_open)
 
     # ==================================================================
     # URL-delegated pure-path API
@@ -1424,7 +1449,7 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         batch_size: int,
     ) -> int:
         total = 0
-        with self.open_io("rb") as src, dest_path.open_io("wb") as dst:
+        with self.open("rb") as src, dest_path.open("wb") as dst:
             if (
                 isinstance(src, BytesIO)
                 and src.spilled
@@ -1462,7 +1487,7 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
             return len(payload)
 
         total = 0
-        with self.open_io("wb") as dst:
+        with self.open("wb") as dst:
             while True:
                 chunk = src.read(batch_size)
                 if not chunk:

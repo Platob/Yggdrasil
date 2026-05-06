@@ -9,7 +9,7 @@ Why we don't use ``DatabricksCase`` here
 The integration suite in :mod:`tests.test_yggdrasil.test_databricks.fs.test_integration`
 gates on ``DATABRICKS_HOST`` so it only runs against a live workspace.
 That's appropriate for end-to-end coverage, but the *path code itself*
-(``open_io`` → BytesIO transaction buffer → format dispatch by
+(``open`` → BytesIO transaction buffer → format dispatch by
 extension → flush via ``write_stream``) has no Databricks-specific
 behaviour beyond the SDK transport hooks. We exercise it offline by
 plugging an in-memory store into the SDK seam, so this file runs in

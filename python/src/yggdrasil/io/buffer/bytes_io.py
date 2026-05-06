@@ -2083,7 +2083,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             with self as opened:
                 return opened.write_into_path(p, batch_size=batch_size)
 
-        with p.open_io(mode="wb") as fh:
+        with p.open(mode="wb") as fh:
             while True:
                 chunk = self.read(batch_size)
                 if not chunk:
