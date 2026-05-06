@@ -1,4 +1,4 @@
-from .base import NestedIO, NestedOptions
+from .base import NestedIO
 from .folder_io import FolderIO, FolderOptions
 from .ygg_folder_io import YGGFolderIO, is_ygg_folder
 from .ygg_folder_spark import YGGFolderSparkConnector, register_datasource
@@ -12,7 +12,6 @@ from .zip_io import (
 
 __all__ = [
     "NestedIO",
-    "NestedOptions",
     "FolderIO",
     "FolderOptions",
     "YGGFolderIO",

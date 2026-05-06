@@ -97,7 +97,7 @@ import yggdrasil.pickle.json as json_module
 from yggdrasil.data.options import CastOptions
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.enums import Codec, MediaType, MimeType, MimeTypes, Mode, ZSTD
-from yggdrasil.io.path_stat import PathStats, PathKind
+from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.buffer._spill_cleanup import maybe_cleanup_stale_spill_files
 from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.types import BytesLike
@@ -1232,7 +1232,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             media_type = self._media_type.with_mime_type(mime_type)
         return self.with_media_type(media_type, copy=copy)
 
-    def stat(self) -> PathStats:
+    def stat(self) -> IOStats:
         """Live snapshot of the **backing's** state.
 
         Always re-fetches; never cached. Distinct from :attr:`size`
@@ -1250,8 +1250,8 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         - **Remote-buffered** → live ``self._spill_path.stat()`` —
           one round-trip to the remote per call. May report
           ``MISSING`` if the remote file hasn't been flushed yet.
-        - **Memory-mode** → synthesize a SOCKET-kind PathStats from
-          the buffer's own ``_size``/``_mtime``.
+        - **Memory-mode** → synthesize a SOCKET-kind :class:`IOStats`
+          from the buffer's own ``_size``/``_mtime``.
         """
         if self._spill_path is not None:
             ctx = self._ctx
@@ -1259,10 +1259,10 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 # Local fd: fstat through the ctx is the cheap path.
                 try:
                     raw = os.fstat(ctx.fileno())
-                    return PathStats(
+                    return IOStats(
                         size=raw.st_size,
                         mtime=raw.st_mtime,
-                        kind=PathKind.FILE,
+                        kind=IOKind.FILE,
                         mode=raw.st_mode,
                     )
                 except OSError:
@@ -1272,10 +1272,10 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             return self._spill_path.stat()
 
         # Memory-mode — synthesize.
-        return PathStats(
+        return IOStats(
             size=self._size,
             mtime=self._mtime or time.time(),
-            kind=PathKind.SOCKET,
+            kind=IOKind.SOCKET,
             mode=0,
         )
 

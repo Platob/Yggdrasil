@@ -943,7 +943,7 @@ class TestStat:
         buf = BytesIO(SMALL)
         s = buf.stat()
         assert s.size == len(SMALL)
-        # Memory mode synthesizes a SOCKET-kind PathStats.
+        # Memory mode synthesizes a SOCKET-kind IOStats.
         assert s.kind.name == "SOCKET"
 
     def test_stat_local_spilled(self):

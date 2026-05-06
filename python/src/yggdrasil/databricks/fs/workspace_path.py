@@ -22,7 +22,7 @@ from databricks.sdk.service.workspace import (
 )
 
 from yggdrasil.io.buffer.bytes_io import BytesIO
-from yggdrasil.io.path_stat import PathKind, PathStats
+from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 from ._errors import (
     ALREADY_EXISTS_ERRORS,
@@ -136,7 +136,7 @@ class WorkspacePath(DatabricksPath):
     # SDK hooks — stat / ls / mkdir / remove
     # ==================================================================
 
-    def _stat(self) -> PathStats:
+    def _stat(self) -> IOStats:
         try:
             info = retry_sdk_call(
                 self._sdk().workspace.get_status, self.full_path(),
@@ -144,18 +144,19 @@ class WorkspacePath(DatabricksPath):
         except SDK_ERRORS:
             found = next(self._ls(recursive=False, allow_not_found=True), None)
             if found is None:
-                return PathStats(kind=PathKind.MISSING, size=0, mtime=None)
-            return PathStats(
-                kind=PathKind.DIRECTORY, size=0, mtime=found.mtime,
+                return IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
+            return IOStats(
+                kind=IOKind.DIRECTORY, size=0,
+                mtime=float(found.mtime or 0.0),
             )
 
         is_dir = info.object_type in (ObjectType.DIRECTORY, ObjectType.REPO)
-        return PathStats(
-            kind=PathKind.DIRECTORY if is_dir else PathKind.FILE,
+        return IOStats(
+            kind=IOKind.DIRECTORY if is_dir else IOKind.FILE,
             size=int(info.size or 0),
             mtime=(
                 float(info.modified_at) / 1000.0
-                if info.modified_at else None
+                if info.modified_at else 0.0
             ),
         )
 

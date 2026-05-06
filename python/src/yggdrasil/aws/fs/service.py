@@ -105,7 +105,7 @@ class S3Service(AWSService):
 
     @property
     def stat_cache(self) -> ExpiringDict:
-        """Per-key ``PathStats`` cache. Keys are ``"bucket/key"`` strings."""
+        """Per-key :class:`IOStats` cache. Keys are ``"bucket/key"`` strings."""
         if self._stat_cache is None:
             self._stat_cache = ExpiringDict(
                 default_ttl=_STAT_CACHE_TTL,

@@ -47,14 +47,14 @@ import pyarrow as pa
 
 import yggdrasil.pickle.json as json_module
 from yggdrasil.io.enums import MimeType, MimeTypes
-from yggdrasil.io.fs import Path
 from yggdrasil.io.stats import Stats, STATS_FILENAME
+from yggdrasil.lazy_imports import path_class
 from .base import _run_in_threads
 from .folder_io import FolderIO
 
 
 if TYPE_CHECKING:
-    pass
+    from yggdrasil.io.fs import Path
 
 
 __all__ = ["YGGFolderIO", "is_ygg_folder"]
@@ -139,6 +139,7 @@ def is_ygg_folder(path: "Path | str | os.PathLike") -> bool:
     on every folder construction, so the saved allocations add up
     quickly when a hot loop repeatedly opens the same folder.
     """
+    Path = path_class()
     if isinstance(path, str):
         # Fast path for the most common caller shape (string path).
         if path and "://" not in path:

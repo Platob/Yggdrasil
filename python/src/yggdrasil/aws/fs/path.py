@@ -49,8 +49,8 @@ from typing import TYPE_CHECKING, Any, ClassVar, Iterator, List, Optional, Tuple
 
 from yggdrasil.aws.fs.service import S3Service
 from yggdrasil.io.buffer.bytes_io import BytesIO
-from yggdrasil.io.fs import Path
-from yggdrasil.io.path_stat import PathKind, PathStats
+from yggdrasil.io.fs import Path, RemotePath
+from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 from yggdrasil.lazy_imports import botocore_module
 
@@ -72,7 +72,7 @@ _MULTIPART_THRESHOLD: int = 8 * 1024 * 1024
 # ---------------------------------------------------------------------------
 
 
-class S3Path(Path):
+class S3Path(RemotePath):
     """Path subclass over an S3 bucket via boto3.
 
     Construction:
@@ -188,10 +188,6 @@ class S3Path(Path):
             return f"s3://{self.bucket}/{key}"
         return f"s3://{self.bucket}/"
 
-    @property
-    def is_local(self) -> bool:
-        return False
-
     def _from_url(self, url: URL) -> "S3Path":
         """Override base — preserve the service across URL-derived paths."""
         return type(self)(url=url, service=self._service)
@@ -216,7 +212,7 @@ class S3Path(Path):
     # Stat — cached through the service's ExpiringDict
     # ==================================================================
 
-    def _stat(self) -> PathStats:
+    def _stat(self) -> IOStats:
         """One HeadObject call; falls through to a list-objects probe
         for prefixes that are pure directories (no object at the key).
 
@@ -225,7 +221,7 @@ class S3Path(Path):
         only one round-trip per key.
         """
         if not self.key:
-            return PathStats(size=0, mtime=0.0, kind=PathKind.DIRECTORY, mode=0)
+            return IOStats(size=0, mtime=0.0, kind=IOKind.DIRECTORY, mode=0)
 
         cache = self._service.stat_cache
         ck = self._cache_key()
@@ -237,7 +233,7 @@ class S3Path(Path):
         cache.set(ck, result)
         return result
 
-    def _stat_uncached(self) -> PathStats:
+    def _stat_uncached(self) -> IOStats:
         """The real HeadObject + directory-probe logic, no cache."""
         botocore = botocore_module()
         try:
@@ -250,10 +246,10 @@ class S3Path(Path):
             if code not in ("404", "NoSuchKey", "NotFound") and status != 404:
                 raise
         else:
-            return PathStats(
+            return IOStats(
                 size=int(response.get("ContentLength", 0)),
                 mtime=_mtime_from_response(response),
-                kind=PathKind.FILE,
+                kind=IOKind.FILE,
                 mode=0,
             )
 
@@ -268,12 +264,12 @@ class S3Path(Path):
                 Delimiter="/",
             )
         except Exception:
-            return PathStats(size=0, mtime=0.0, kind=PathKind.MISSING, mode=0)
+            return IOStats(size=0, mtime=0.0, kind=IOKind.MISSING, mode=0)
 
         if response.get("KeyCount", 0) > 0 or response.get("CommonPrefixes"):
-            return PathStats(size=0, mtime=0.0, kind=PathKind.DIRECTORY, mode=0)
+            return IOStats(size=0, mtime=0.0, kind=IOKind.DIRECTORY, mode=0)
 
-        return PathStats(size=0, mtime=0.0, kind=PathKind.MISSING, mode=0)
+        return IOStats(size=0, mtime=0.0, kind=IOKind.MISSING, mode=0)
 
     # ==================================================================
     # Listing
@@ -330,7 +326,7 @@ class S3Path(Path):
                     dir_ck = f"{self.bucket}/{sub_prefix.rstrip('/')}"
                     stat_cache.set(
                         dir_ck,
-                        PathStats(size=0, mtime=0.0, kind=PathKind.DIRECTORY, mode=0),
+                        IOStats(size=0, mtime=0.0, kind=IOKind.DIRECTORY, mode=0),
                     )
                 for obj in page.get("Contents") or ():
                     key = obj.get("Key")
@@ -345,10 +341,10 @@ class S3Path(Path):
                     file_ck = f"{self.bucket}/{key}"
                     stat_cache.set(
                         file_ck,
-                        PathStats(
+                        IOStats(
                             size=obj_size,
                             mtime=obj_mtime,
-                            kind=PathKind.FILE,
+                            kind=IOKind.FILE,
                             mode=0,
                         ),
                     )

@@ -13,7 +13,7 @@ import pytest
 
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.fs.memory_io import MemoryPath
-from yggdrasil.io.path_stat import PathKind
+from yggdrasil.io.io_stats import IOKind
 from yggdrasil.io.url import URL
 
 
@@ -86,7 +86,7 @@ class TestConstruction:
 class TestStat:
     def test_stat_kind_file(self):
         path = MemoryPath()
-        assert path.stat().kind is PathKind.FILE
+        assert path.stat().kind is IOKind.FILE
 
     def test_stat_size_tracks_writes(self):
         path = MemoryPath()
@@ -99,7 +99,7 @@ class TestStat:
         # buffer transparently.
         path = MemoryPath(b"abc")
         path.close(force=True)
-        assert path.stat().kind is PathKind.FILE
+        assert path.stat().kind is IOKind.FILE
         assert path.stat().size == 3
 
     def test_full_path_renders_as_mem_url(self):

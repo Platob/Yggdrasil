@@ -7,7 +7,7 @@ import os
 import pytest
 
 from yggdrasil.io.fs import LocalPath, Path
-from yggdrasil.io.path_stat import PathKind
+from yggdrasil.io.io_stats import IOKind
 
 
 # ---------------------------------------------------------------------------
@@ -43,17 +43,17 @@ class TestDispatch:
 class TestStat:
     def test_missing_kind(self, tmp_path):
         path = LocalPath.from_(tmp_path / "ghost")
-        assert path.stat().kind is PathKind.MISSING
+        assert path.stat().kind is IOKind.MISSING
 
     def test_directory_kind(self, tmp_path):
         path = LocalPath.from_(tmp_path)
-        assert path.stat().kind is PathKind.DIRECTORY
+        assert path.stat().kind is IOKind.DIRECTORY
 
     def test_file_kind(self, tmp_path):
         target = tmp_path / "x.txt"
         target.write_bytes(b"hello")
         path = LocalPath.from_(target)
-        assert path.stat().kind is PathKind.FILE
+        assert path.stat().kind is IOKind.FILE
         assert path.stat().size == len(b"hello")
 
     def test_exists_true_for_directory(self, tmp_path):

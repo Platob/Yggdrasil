@@ -2,7 +2,7 @@
 
 Covers:
 
-- :class:`NestedIO` / :class:`NestedOptions` base contract.
+- :class:`NestedIO` base contract.
 - :class:`FolderIO` flat folders, recursive sub-folders, partition
   columns, save modes, child minting, name validation, and the
   module-private helpers (``_parse_kv_segment``,
@@ -18,12 +18,12 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Field
 from yggdrasil.io.buffer.nested import (
     FolderIO,
     FolderOptions,
     NestedIO,
-    NestedOptions,
 )
 from yggdrasil.io.buffer.nested.folder_io import (
     _coerce_partition_column,
@@ -84,7 +84,7 @@ class TestNestedIOBase:
         assert FolderIO.default_mime_type() == MimeTypes.FOLDER
 
     def test_options_class_default(self):
-        assert NestedIO.options_class() is NestedOptions
+        assert NestedIO.options_class() is CastOptions
         assert FolderIO.options_class() is FolderOptions
 
 # ---------------------------------------------------------------------------
@@ -574,16 +574,17 @@ class TestCoercePartitionColumn:
 
 
 # ---------------------------------------------------------------------------
-# NestedOptions: defaults
+# CastOptions folder-write defaults (formerly NestedOptions)
 # ---------------------------------------------------------------------------
 
 
-class TestNestedOptions:
+class TestFolderWriteOptions:
     def test_default_values(self):
-        opts = NestedOptions()
+        opts = CastOptions()
         assert opts.child_media_type is None
         assert opts.child_row_size == 0
         assert opts.child_byte_size == 0
+        assert opts.max_workers == 0
 
     def test_folder_options_partition_defaults(self):
         opts = FolderOptions()

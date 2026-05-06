@@ -81,6 +81,7 @@ from typing import IO, TYPE_CHECKING, Any, ClassVar, Optional, Tuple, Union
 
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.fs.path import Path, _select_path_class
+from yggdrasil.io.fs.remote_path import RemotePath
 from yggdrasil.io.url import URL
 from ._errors import retry_sdk_call
 from .path_kind import DatabricksPathKind
@@ -137,7 +138,7 @@ def _looks_like_legacy_databricks(s: str) -> bool:
 # ===========================================================================
 
 
-class DatabricksPath(Path):
+class DatabricksPath(RemotePath):
     """Abstract :class:`Path` for Databricks namespaces.
 
     Concrete subclasses (DBFSPath / WorkspacePath / VolumePath /
@@ -332,11 +333,9 @@ class DatabricksPath(Path):
 
         return super().from_url(resolved, default=default, temporary=temporary)
 
-    @property
-    def is_local(self) -> bool:
-        # Default False — subclasses (notably DBFSPath) override
-        # when a local-FS view exists (FUSE mount).
-        return False
+    # ``is_local`` inherits ``False`` from :class:`RemotePath`. Subclasses
+    # (notably :class:`DBFSPath`) override when a local-FS view exists
+    # (FUSE mount).
 
     def to_sql_string_location(self, file_format: str):
         return f"{file_format}.`{self.full_path()}`"

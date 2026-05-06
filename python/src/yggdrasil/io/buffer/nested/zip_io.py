@@ -123,7 +123,6 @@ from yggdrasil.data.schema import Schema
 from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.buffer.bytes_io import BytesIO
 from yggdrasil.io.enums import MediaType, MediaTypes, MimeTypes, Mode
-from .base import NestedOptions
 
 __all__ = [
     "ZipIO",
@@ -144,12 +143,13 @@ _ENTRY_NAME = "batch-{:06d}.arrow"
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class ZipOptions(NestedOptions):
-    """:class:`NestedOptions` extended with zip-archive knobs.
+class ZipOptions(CastOptions):
+    """:class:`CastOptions` extended with zip-archive framing knobs.
 
-    Inherits child-routing (``child_media_type``, ``child_row_size``,
-    ``child_byte_size``) from :class:`NestedOptions` and adds the
-    archive's framing knobs.
+    Reuses the child-routing fields (``child_media_type``,
+    ``child_row_size``, ``child_byte_size``, ``max_workers``) that
+    live on :class:`CastOptions` and adds the archive's framing
+    knobs.
     """
 
     compression: int = zipfile.ZIP_STORED
@@ -183,7 +183,7 @@ class ZipIO(BytesIO):
 
     Reading drains every entry's Arrow IPC stream into one batch
     iterator; writing splits the input into one or more entries
-    according to :attr:`NestedOptions.child_row_size` /
+    according to :attr:`CastOptions.child_row_size` /
     ``child_byte_size`` (default: one entry per write call).
     """
 

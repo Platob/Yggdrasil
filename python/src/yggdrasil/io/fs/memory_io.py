@@ -30,7 +30,7 @@ from __future__ import annotations
 from typing import Any, ClassVar, Iterator, Optional, Union
 
 from yggdrasil.io.buffer.bytes_io import BytesIO
-from yggdrasil.io.path_stat import PathKind, PathStats
+from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL, resolve_memory_address
 
 from .path import Path, register_path_class
@@ -187,14 +187,14 @@ class MemoryPath(Path):
     def full_path(self) -> str:
         return self.url.to_string()
 
-    def _stat(self) -> PathStats:
+    def _stat(self) -> IOStats:
         buf = self._buffer
         if buf is None:
-            return PathStats(kind=PathKind.MISSING)
-        return PathStats(
-            kind=PathKind.FILE,
+            return IOStats(kind=IOKind.MISSING)
+        return IOStats(
+            kind=IOKind.FILE,
             size=int(buf.size),
-            mtime=buf.mtime,
+            mtime=float(buf.mtime or 0.0),
         )
 
     def _ls(
