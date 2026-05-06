@@ -116,7 +116,15 @@ class DynamicCatalog:
         parents: "Iterable[SqlContext | DynamicCatalog] | None" = None,
     ) -> None:
         self._locals: dict[str, Tabular] = {}
-        self._parents: list[Any] = list(parents) if parents else [default_context]
+        # Default parent chain: the process-wide system catalog (which
+        # itself parents the legacy SqlContext-style default_context).
+        # Tests and one-off scopes can opt out by passing ``parents=[]``
+        # (or a custom chain). Lazy import — the system catalog module
+        # imports this class, so the top-level cycle would deadlock.
+        if parents is None:
+            parents = (_default_parent_chain(),)
+            parents = tuple(p for p in parents if p is not None)
+        self._parents: list[Any] = list(parents)
         self._schema_cache: "dict[str, Schema]" = {}
         self._lock = threading.RLock()
         if sources:
@@ -263,6 +271,22 @@ class DynamicCatalog:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _default_parent_chain() -> Any:
+    """Return the canonical default parent for a freshly-built catalog.
+
+    Lazy lookup so :mod:`yggdrasil.sql.system_catalog` (which imports
+    this module) doesn't form a cycle at module load. Returns ``None``
+    on the very first call from inside the system catalog's own
+    construction — :class:`DynamicCatalog` strips Nones from the
+    parent chain so a missing system catalog isn't fatal.
+    """
+    try:
+        from yggdrasil.sql.system_catalog import SYSTEM_CATALOG
+    except ImportError:
+        return None
+    return SYSTEM_CATALOG
 
 
 def _suggest(name: str, choices: "list[str]") -> "list[str]":

@@ -112,6 +112,8 @@ from .plan import (
 )
 from .planner import PlanError, Planner, plan
 from .statement import PersistTarget, SqlPreparedStatement, SqlStatementResult
+from . import system_catalog
+from .system_catalog import SYSTEM_CATALOG
 from .utils import (
     is_valid_identifier,
     parse_dotted_name,
@@ -133,6 +135,8 @@ __all__ = [
     "default_context",
     "SqlContext",
     "DynamicCatalog",
+    "SYSTEM_CATALOG",
+    "system_catalog",
     "Engine",
     "EnginePlan",
     "Planner",
