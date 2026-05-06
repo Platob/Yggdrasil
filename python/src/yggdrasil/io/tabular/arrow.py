@@ -188,13 +188,9 @@ class MemoryArrowIO(Tabular[CastOptions]):
         if data is not None:
             self._ingest(data)
 
-        # Disposable's ``close`` only fires teardown when the resource
-        # is in the open state. We're always "live" once constructed —
-        # no separate acquire phase like BytesIO has — so flip the flag
-        # eagerly so :meth:`close` runs :meth:`_release` and unlinks
-        # the spill file.
-        if not self._acquired:
-            self.open()
+        # Tabular leaves are stateless w.r.t. Disposable — there is
+        # no separate acquire phase to wait for, so just leave the
+        # instance live as soon as construction returns.
 
     def __repr__(self) -> str:
         spill = ""

@@ -158,16 +158,19 @@ def _is_tabular_io(arg: Any) -> bool:
 
 
 def _folderio_for_local_cache(path: Path) -> "FolderIO":
-    """Wrap a local filesystem :class:`Path` into a tabular folder.
+    """Wrap a local filesystem :class:`Path` into a partitioned cache folder.
 
-    Plain :class:`FolderIO` for now — the ``.ygg/`` sidecar layer
-    that used to live on top is intentionally on the way out as
-    part of the IO rework.
+    Returns a :class:`YGGFolderIO` rooted at *path* and bound to
+    :data:`RESPONSE_SCHEMA`. The schema's ``partition_by``-tagged
+    fields drive the Hive layout automatically; partition pruning
+    on read uses ``options.prune_values`` (which the cache flow
+    in :mod:`yggdrasil.io.session` populates from the request
+    batch's ``partition_key`` set).
     """
-    from yggdrasil.io.nested.folder_io import FolderIO
+    from yggdrasil.io.nested.ygg_folder_io import YGGFolderIO
     from yggdrasil.io.path import LocalPath
 
-    return FolderIO(path=LocalPath(path))
+    return YGGFolderIO(path=LocalPath(path), schema=RESPONSE_SCHEMA)
 
 
 def _coerce_optional_datetime(value: Any) -> Optional[dt.datetime]:

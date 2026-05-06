@@ -948,6 +948,55 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
     # ``buffer.xxh3_int64()`` for fingerprinting / dedup
     # ==================================================================
 
+    # ==================================================================
+    # Convenience: parse / decompress
+    # ==================================================================
+
+    def json_load(self, *, media_type: Any = None, orient: Any = None) -> Any:
+        """Parse the buffer as JSON and return the Python object.
+
+        ``media_type`` and ``orient`` are accepted for compatibility
+        with the response layer — when ``orient`` is set the buffer
+        is treated as a pandas-shaped JSON document. The default
+        path is the stdlib ``json.loads`` over the decoded bytes.
+        """
+        import json as _json
+        text = self.to_bytes().decode("utf-8", errors="replace")
+        if not text.strip():
+            return None
+        if orient is not None:
+            try:
+                import pandas as pd
+                return pd.read_json(text, orient=orient)
+            except Exception:
+                # Fall through to plain json on any pandas snag.
+                pass
+        return _json.loads(text)
+
+    def decompress(self, *, codec: Any = None, copy: bool = True) -> "BytesIO":
+        """Return a new :class:`BytesIO` over the decompressed payload.
+
+        ``codec`` may be a :class:`Codec`, a codec name (``"gzip"``,
+        ``"zstd"``, …), or a :class:`MediaType`-shaped object whose
+        ``codec`` attribute is read. Returns the original buffer
+        when no codec is set / supplied.
+        """
+        if codec is None:
+            codec_obj = self._codec()
+        else:
+            inner = getattr(codec, "codec", None)
+            if inner is not None:
+                codec_obj = inner
+            else:
+                from yggdrasil.data.enums.codec import Codec
+                codec_obj = Codec.from_(codec, default=None)
+        if codec_obj is None:
+            if copy:
+                return BytesIO(self.to_bytes())
+            return self
+        out = codec_obj.decompress(self)
+        return out
+
     def xxh3_64(self):
         """Return an :class:`xxhash.xxh3_64` instance over the payload.
 

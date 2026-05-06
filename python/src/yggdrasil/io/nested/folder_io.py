@@ -114,6 +114,19 @@ class FolderIO(Tabular[FolderOptions]):
         return f"{type(self).__name__}(path={self.path!r})"
 
     # ==================================================================
+    # Context-manager protocol — folder leaves are stateless w.r.t.
+    # open/close. Provide a no-op ``with`` block so call sites that
+    # do ``with cache:`` (e.g. the session lookup helper) work
+    # against either a BytesIO (real Disposable) or a folder.
+    # ==================================================================
+
+    def __enter__(self) -> "FolderIO":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    # ==================================================================
     # Children — read
     # ==================================================================
 
