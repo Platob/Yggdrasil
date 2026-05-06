@@ -150,8 +150,14 @@ class MemoryPath(Path):
         return buf
 
     @property
-    def is_local(self) -> bool:
+    def is_local_path(self) -> bool:
+        # In-process bytes are reachable without network IO; we count
+        # MemoryPath as local even though it has no real filesystem.
         return True
+
+    @property
+    def is_remote_path(self) -> bool:
+        return False
 
     # ------------------------------------------------------------------
     # Acquire — alias the path's transaction buffer to the inner BytesIO

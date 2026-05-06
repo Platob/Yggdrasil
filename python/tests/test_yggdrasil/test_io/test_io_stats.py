@@ -95,11 +95,11 @@ class TestIOStatsWith:
 
 
 class TestIOStatsIteration:
-    def test_iter_yields_full_quad_plus_media_type(self):
+    def test_iter_yields_full_quad_plus_media_type_and_url(self):
         s = IOStats(
             size=10, mtime=2.5, kind=IOKind.FILE, mode=0o600, media_type=None,
         )
-        size, mtime, kind, mode, media_type = s
-        assert (size, mtime, kind, mode, media_type) == (
-            10, 2.5, IOKind.FILE, 0o600, None,
+        size, mtime, kind, mode, media_type, url = s
+        assert (size, mtime, kind, mode, media_type, url) == (
+            10, 2.5, IOKind.FILE, 0o600, None, None,
         )

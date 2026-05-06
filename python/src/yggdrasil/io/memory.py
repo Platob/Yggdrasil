@@ -149,6 +149,18 @@ class Memory(Holder):
     # ------------------------------------------------------------------
 
     @property
+    def is_memory(self) -> bool:
+        return True
+
+    @property
+    def is_local_path(self) -> bool:
+        return False
+
+    @property
+    def is_remote_path(self) -> bool:
+        return False
+
+    @property
     def size(self) -> int:
         return self._stats.size
 

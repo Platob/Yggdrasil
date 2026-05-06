@@ -570,8 +570,19 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
             return False
 
     @property
-    def is_local(self) -> bool:
+    def is_memory(self) -> bool:
+        """Paths are never raw memory holders. :class:`MemoryPath` is
+        still a path — its bytes happen to live in process memory but
+        the addressing is path-shaped, not :class:`Memory`-shaped."""
         return False
+
+    @property
+    def is_remote_path(self) -> bool:
+        """Default: every path that isn't a local-fs path is remote.
+        Concrete subclasses override only when they need finer-grained
+        dispatch (e.g. an in-process :class:`MemoryPath` overrides to
+        ``False`` since it isn't reachable over a network)."""
+        return not self.is_local_path
 
     # ==================================================================
     # Coercion entry points
@@ -878,9 +889,11 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
                 mtime=float(buf.mtime or 0.0),
                 kind=IOKind.FILE,
                 media_type=self.media_type,
+                url=self.url,
             )
         s = self._stat()
         s.media_type = self.media_type
+        s.url = self.url
         return s
 
     # ==================================================================

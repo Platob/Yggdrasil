@@ -226,10 +226,40 @@ class Holder(Disposable):
         """True when there are uncommitted writes. Default ``False``."""
         return False
 
+    # ------------------------------------------------------------------
+    # Backing-shape predicates — every subclass answers exactly one as
+    # ``True``. :class:`BytesIO` and other holder consumers branch on
+    # these instead of ``isinstance(_holder, Memory|Path|RemotePath)``.
+    # ------------------------------------------------------------------
+
+    @property
+    @abstractmethod
+    def is_memory(self) -> bool:
+        """True when the holder lives entirely in process memory."""
+
+    @property
+    @abstractmethod
+    def is_local_path(self) -> bool:
+        """True when the holder is a path on the local filesystem."""
+
+    @property
+    @abstractmethod
+    def is_remote_path(self) -> bool:
+        """True when the holder is a path on a non-local backend (S3,
+        Databricks, …)."""
+
     @property
     def is_local(self) -> bool:
-        """True for in-process / local-fs holders. Default ``True``."""
-        return True
+        """True for memory and local-path holders. Composite of
+        :attr:`is_memory` and :attr:`is_local_path`; subclasses
+        override only when neither suffices.
+        """
+        return self.is_memory or self.is_local_path
+
+    @property
+    def is_remote(self) -> bool:
+        """True for remote-path holders. Mirror of :attr:`is_remote_path`."""
+        return self.is_remote_path
 
     # ------------------------------------------------------------------
     # Cursorless I/O — the canonical surface :class:`BytesIO` consumes

@@ -1241,6 +1241,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         """
         path = self._path_holder()
         if path is not None:
+            self._stats.url = path.url
             if path.io_open and path.is_local:
                 # Local fd: fstat through the holder is the cheap path.
                 try:
