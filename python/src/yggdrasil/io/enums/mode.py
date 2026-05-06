@@ -33,25 +33,25 @@ Note: there's no OS-mode counterpart to :data:`UPSERT` or
 are SQL/dataset-level concepts and have no `open(2)` analog.
 """
 
-from enum import Enum
+from enum import IntEnum
 from typing import Optional, Union
 
 __all__ = ["Mode", "ModeLike", "STR_MAPPING"]
 
 
-ModeLike = Union["Mode", str]
+ModeLike = Union["Mode", str, int]
 
 
-class Mode(str, Enum):
-    AUTO = "auto"
-    READ_ONLY = "read_only"
-    OVERWRITE = "overwrite"
-    APPEND = "append"
-    IGNORE = "ignore"
-    UPSERT = "upsert"
-    MERGE = "merge"
-    TRUNCATE = "truncate"
-    ERROR_IF_EXISTS = "error_if_exists"
+class Mode(IntEnum):
+    AUTO = 0
+    READ_ONLY = 1
+    OVERWRITE = 2
+    APPEND = 3
+    IGNORE = 4
+    UPSERT = 5
+    MERGE = 6
+    TRUNCATE = 7
+    ERROR_IF_EXISTS = 8
 
     @property
     def is_read_only(self) -> bool:
@@ -62,6 +62,19 @@ class Mode(str, Enum):
     def allows_write(self) -> bool:
         """True when the mode admits any write disposition."""
         return self is not Mode.READ_ONLY
+
+    @property
+    def os_mode(self) -> str:
+        """Stdlib :func:`open` mode string for this :class:`Mode`.
+
+        - :attr:`READ_ONLY` → ``"rb"``
+        - :attr:`OVERWRITE` / :attr:`TRUNCATE` → ``"wb+"``
+        - :attr:`APPEND`    → ``"ab+"``
+        - :attr:`ERROR_IF_EXISTS` → ``"xb+"``
+        - everything else (AUTO, IGNORE, UPSERT, MERGE) → ``"rb+"``
+          (in-place edit; the disposition is enforced higher up).
+        """
+        return _MODE_TO_OS.get(self, "rb+")
 
     @classmethod
     def from_(
@@ -95,6 +108,17 @@ class Mode(str, Enum):
         if value is None:
             return default if default is not None else cls.AUTO
 
+        # IntEnum members compare equal to ints; allow lookup by the
+        # integer value too so persisted Mode codes round-trip.
+        if isinstance(value, int) and not isinstance(value, bool):
+            try:
+                return cls(value)
+            except ValueError:
+                raise ValueError(
+                    f"Cannot parse {value!r} as a Mode. Accepted "
+                    f"integer codes: {sorted(int(m) for m in cls)}."
+                )
+
         if not isinstance(value, str):
             raise TypeError(
                 f"Mode.parse expected a string or Mode, got "
@@ -122,18 +146,46 @@ class Mode(str, Enum):
         if os_match is not None:
             return os_match
 
-        # Last resort: try the enum's own value lookup. Mode
-        # values are lower-snake-case, so "overwrite" / "append" /
-        # "error_if_exists" land here cleanly. Anything else raises
+        # Last resort: try the enum's name lookup. Mode names are
+        # upper-snake-case, so "OVERWRITE" / "APPEND" /
+        # "ERROR_IF_EXISTS" land here cleanly. Anything else raises
         # ValueError with a helpful message.
         try:
-            return cls(normalized)
-        except ValueError:
+            return cls[normalized.upper()]
+        except KeyError:
             raise ValueError(
                 f"Cannot parse {value!r} as a Mode. Accepted "
-                f"values: {sorted(m.value for m in cls)} or aliases "
+                f"values: {sorted(m.name for m in cls)} or aliases "
                 f"like {sorted(STR_MAPPING)}."
             )
+
+
+# ---------------------------------------------------------------------------
+# Mode → POSIX open() string lookup
+# ---------------------------------------------------------------------------
+#
+# Built once at import; consulted by :attr:`Mode.os_mode` and the
+# :class:`Holder.open(mode=...)` plumbing in ``yggdrasil.io.holder``.
+
+_MODE_TO_OS: dict["Mode", str] = {}
+
+
+def _seed_mode_to_os() -> None:
+    global _MODE_TO_OS
+    _MODE_TO_OS = {
+        Mode.READ_ONLY: "rb",
+        Mode.OVERWRITE: "wb+",
+        Mode.TRUNCATE: "wb+",
+        Mode.APPEND: "ab+",
+        Mode.ERROR_IF_EXISTS: "xb+",
+        Mode.AUTO: "rb+",
+        Mode.IGNORE: "rb+",
+        Mode.UPSERT: "rb+",
+        Mode.MERGE: "rb+",
+    }
+
+
+_seed_mode_to_os()
 
 
 # ---------------------------------------------------------------------------

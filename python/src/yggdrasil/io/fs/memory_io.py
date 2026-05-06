@@ -30,6 +30,7 @@ from __future__ import annotations
 from typing import Any, ClassVar, Iterator, Optional, Union
 
 from yggdrasil.io.buffer.bytes_io import BytesIO
+from yggdrasil.io.enums import Mode
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL, resolve_memory_address
 
@@ -186,6 +187,12 @@ class MemoryPath(Path):
         self._transaction_buffer = None
         self._dirty = False
 
+    def flush(self) -> None:
+        # Transaction buffer IS the inner buffer — every write
+        # already landed durably; flushing through ``_bwrite`` would
+        # try to splice the buffer into itself and corrupt it.
+        self._dirty = False
+
     # ------------------------------------------------------------------
     # Abstract hooks
     # ------------------------------------------------------------------
@@ -242,46 +249,40 @@ class MemoryPath(Path):
     # I/O surface — direct against the buffer
     # ------------------------------------------------------------------
 
-    def _pread(self) -> BytesIO:
+    def _bread(self, n: int, pos: int, mode: "Mode") -> BytesIO:
+        """Native positional read — slice the inner BytesIO directly."""
+        del mode
         src = self._ensure_buffer()
         bio = BytesIO()
         bio.open()
+        if n == 0:
+            return bio
         size = src.size
-        if size:
-            bio.pwrite(src.pread(size, 0), 0)
-            bio.seek(0)
+        if pos >= size:
+            return bio
+        want = (size - pos) if n < 0 else min(n, size - pos)
+        if want <= 0:
+            return bio
+        bio.pwrite(src.pread(want, pos), 0)
+        bio.seek(0)
         return bio
 
-    def _pwrite(self, data: BytesIO) -> int:
+    def _bwrite(self, data: BytesIO, pos: int, mode: "Mode") -> int:
+        """Native positional write — splice into the inner BytesIO.
+
+        ``pos == 0`` with :class:`Mode.OVERWRITE` truncates the
+        backing first to mirror legacy whole-file write semantics;
+        any other shape splices in place via :meth:`BytesIO.pwrite`.
+        """
         if not data.opened:
             data.open()
         buf = self._ensure_buffer()
-        buf.truncate(0)
+        if pos == 0 and mode is Mode.OVERWRITE:
+            buf.truncate(0)
         size = data.size
         if size:
-            buf.pwrite(data.pread(size, 0), 0)
+            buf.pwrite(data.pread(size, 0), pos)
         return size
-
-    def pread(self, n: int, pos: int, *, default: Any = ...) -> bytes:
-        del default
-        if pos < 0:
-            raise ValueError("pread position must be >= 0")
-        buf = self._ensure_buffer()
-        if n < 0:
-            n = max(0, buf.size - pos)
-        return buf.pread(n, pos)
-
-    def pwrite(
-        self,
-        data: Union[bytes, bytearray, memoryview],
-        pos: int,
-        *,
-        parents: bool = True,
-    ) -> int:
-        del parents
-        if pos < 0:
-            raise ValueError("pwrite position must be >= 0")
-        return self._ensure_buffer().pwrite(data, pos)
 
     def truncate(self, n: int, *, parents: bool = True) -> int:
         del parents

@@ -47,7 +47,7 @@ from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.buffer.bytes_io import BytesIO
-from yggdrasil.io.enums import MediaType
+from yggdrasil.io.enums import MediaType, Mode
 from yggdrasil.io.holder import Holder
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
@@ -283,7 +283,7 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
             try:
                 if self._dirty:
                     buf.seek(0)
-                    self._pwrite(buf)
+                    self._bwrite(buf, 0, Mode.from_(self._mode, default=Mode.OVERWRITE))
             finally:
                 try:
                     if buf.opened:
@@ -339,7 +339,7 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
 
         existing_loaded = False
         try:
-            src = self._pread()
+            src = self._bread(-1, 0, Mode.READ_ONLY)
         except FileNotFoundError:
             src = None
         if src is not None:
@@ -371,7 +371,7 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         prev_pos = buf.tell()
         buf.seek(0)
         try:
-            self._pwrite(buf)
+            self._bwrite(buf, 0, Mode.from_(self._mode, default=Mode.OVERWRITE))
         finally:
             try:
                 buf.seek(prev_pos)
@@ -384,7 +384,7 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
     # ==================================================================
 
     def _read_arrow_batches(self, options: CastOptions) -> Iterator["pa.RecordBatch"]:
-        buf = self.open_io("rb")
+        buf = self.open("rb")
         try:
             yield from buf.read_arrow_batches(options=options)
         finally:
@@ -395,7 +395,7 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         batches: Iterable["pa.RecordBatch"],
         options: CastOptions,
     ) -> None:
-        buf = self.open_io("wb")
+        buf = self.open("wb")
         try:
             buf.write_arrow_batches(batches, options=options)
         finally:
@@ -681,37 +681,90 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
     ) -> None: ...
 
     @abstractmethod
-    def _pread(self) -> BytesIO:
-        """Whole-file read primitive — return a fresh :class:`BytesIO`."""
+    def _bread(self, n: int, pos: int, mode: Mode) -> BytesIO:
+        """Positional read primitive — return up to ``n`` bytes at ``pos``
+        wrapped in a fresh :class:`BytesIO`.
+
+        ``n < 0`` reads from ``pos`` to EOF. ``mode`` is the
+        :class:`Mode` the caller is opening at; subclasses use it
+        when their backend differentiates read shapes (e.g.
+        :class:`Mode.READ_ONLY` may skip cache invalidation that an
+        in-place edit needs).
+
+        The returned :class:`BytesIO` is autonomous — the caller is
+        responsible for closing it. Whole-file backends (S3,
+        Databricks) implement this by downloading the full payload
+        and slicing into a fresh buffer; backends with native
+        positional IO (LocalPath via ``os.pread``) override directly.
+        """
 
     @abstractmethod
-    def _pwrite(self, data: BytesIO) -> int:
-        """Whole-file write primitive — replace *self* with *data*'s bytes."""
+    def _bwrite(self, data: BytesIO, pos: int, mode: Mode) -> int:
+        """Positional write primitive — splice ``data`` at ``pos``.
+
+        ``data`` is a :class:`BytesIO` carrying the bytes to splice;
+        the implementation reads from it (typically from offset 0)
+        and lays them down starting at ``pos`` on the backing.
+        Returns the number of bytes actually written. Grows the
+        backing if ``pos + data.size`` exceeds the current size.
+        ``mode`` carries the disposition (overwrite / append / …)
+        for backends that need it on every call; positional writes
+        otherwise honour the caller's intent regardless.
+
+        Whole-file backends implement via download → splice →
+        upload (read-modify-write); native-positional backends
+        (LocalPath via ``os.pwrite``) override directly.
+        """
 
     # ==================================================================
     # I/O entry points
     # ==================================================================
 
-    def open_io(
+    def open(
         self,
-        mode: str = "rb",
+        mode: "Mode | str | None" = None,
         *,
         encoding: Optional[str] = None,
         errors: Optional[str] = None,
         newline: Optional[str] = None,
         auto_open: bool = True,
         touch: bool = False,
-    ) -> BytesIO:
-        """Open a :class:`BytesIO` bound to *self* with the given mode."""
+    ) -> "BytesIO | Path":
+        """Open the path — pathlike when *mode* is given, lifecycle otherwise.
+
+        Two shapes:
+
+        - ``path.open()`` (no mode) — runs the :class:`Disposable`
+          lifecycle ``open`` (sets ``_acquired``); returns ``self``.
+          Equivalent to the bare ``Disposable.open(self)`` call sites
+          relied on before, kept for ``with path:`` and other lifecycle
+          contexts.
+        - ``path.open(mode)`` — opens a binary file handle at *mode*
+          and returns a :class:`BytesIO` bound to *self*. Mirrors
+          :meth:`pathlib.Path.open` for byte-level I/O. ``mode``
+          accepts a :class:`Mode`, an OS-style mode string
+          (``"rb"`` / ``"wb"`` / ``"ab"`` / ``"rb+"`` / …), or any
+          alias :meth:`Mode.from_` understands. The text-IO knobs
+          (``encoding`` / ``errors`` / ``newline``) are accepted for
+          signature parity with :class:`pathlib.Path` but ignored —
+          this is a binary surface.
+        """
+        if mode is None:
+            del encoding, errors, newline, auto_open, touch
+            Disposable.open(self)
+            return self
+
         del encoding, errors, newline  # binary-only at this layer
 
         if not self.opened:
             Disposable.open(self)
 
-        if touch and "r" in mode and "+" not in mode and not self.exists():
+        parsed = Mode.from_(mode)
+        os_mode = parsed.os_mode if isinstance(mode, Mode) or not isinstance(mode, str) else mode
+        if touch and parsed is Mode.READ_ONLY and not self.exists():
             self.touch(exist_ok=True, parents=True)
 
-        return BytesIO(path=self, mode=mode, auto_open=auto_open)
+        return BytesIO(path=self, mode=os_mode, auto_open=auto_open)
 
     # ==================================================================
     # URL-delegated pure-path API
@@ -1068,12 +1121,14 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
     ) -> bytes:
         """Positional read.
 
-        Uses the transaction buffer when active, else does a single-shot
-        :meth:`_pread` + slice. ``n < 0`` reads from *pos* to EOF.
-        :class:`LocalPath` overrides to use its long-lived fd.
+        Resolves negative *pos* against :attr:`size` (so ``-1`` reads
+        the last byte, ``-n`` reads from N bytes before EOF). Uses
+        the transaction buffer when active, else routes through the
+        :meth:`_bread` positional primitive and unwraps its
+        :class:`BytesIO` into a fresh :class:`bytes`.
         """
         if pos < 0:
-            raise ValueError("pread position must be >= 0")
+            pos = max(0, int(self.size) + pos)
         if n == 0:
             return b""
 
@@ -1084,20 +1139,15 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
             return buf.pread(n, pos) if n else b""
 
         try:
-            bio = self._pread()
+            bio = self._bread(
+                n, pos, Mode.from_(self._mode, default=Mode.READ_ONLY),
+            )
         except (OSError, ValueError):
             if default is ...:
                 raise
             return default
-
         try:
-            size = bio.size
-            if pos >= size:
-                return b""
-            want = (size - pos) if n < 0 else min(n, size - pos)
-            if want <= 0:
-                return b""
-            return bio.pread(want, pos)
+            return bio.to_bytes()
         finally:
             bio.close()
 
@@ -1110,10 +1160,13 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
     ) -> int:
         """Positional write.
 
-        Active transaction buffer: splice in place, mark dirty (commit
-        on flush/close). Otherwise single-shot RMW via :meth:`_pread`
-        + :meth:`_pwrite`. :class:`LocalPath` overrides with its
-        long-lived fd.
+        Resolves negative *pos* against :attr:`size` (``-1`` splices
+        before the last byte; ``-n`` splices N bytes before EOF).
+        Active transaction buffer splices in place and flags dirty
+        (commit on flush/close). Otherwise wraps ``data`` in a
+        :class:`BytesIO` and routes through the :meth:`_bwrite`
+        positional primitive — whole-file backends absorb the
+        read-modify-write cost internally.
         """
         del parents
         mv = memoryview(data)
@@ -1125,7 +1178,7 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         if n == 0:
             return 0
         if pos < 0:
-            raise ValueError("pwrite position must be >= 0")
+            pos = max(0, int(self.size) + pos)
 
         if self._transaction_buffer is not None:
             written = self._transaction_buffer.pwrite(mv, pos)
@@ -1133,19 +1186,13 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
                 self._dirty = True
             return written
 
-        # Single-shot RMW.
+        scratch = BytesIO(bytes(mv))
         try:
-            bio = self._pread()
-        except FileNotFoundError:
-            bio = BytesIO()
-            bio.open()
-        try:
-            bio.pwrite(mv, pos)
-            bio.seek(0)
-            self._pwrite(bio)
-            return n
+            return self._bwrite(
+                scratch, pos, Mode.from_(self._mode, default=Mode.AUTO),
+            )
         finally:
-            bio.close()
+            scratch.close()
 
     def truncate(self, n: int, *, parents: bool = True) -> int:
         del parents
@@ -1173,11 +1220,11 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         if n == current:
             return n
 
-        bio = self._pread()
+        bio = self._bread(-1, 0, Mode.READ_ONLY)
         try:
             bio.truncate(n)
             bio.seek(0)
-            self._pwrite(bio)
+            self._bwrite(bio, 0, Mode.OVERWRITE)
             return n
         finally:
             bio.close()
@@ -1242,7 +1289,7 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
             return self._transaction_buffer.to_bytes()
 
         try:
-            bio = self._pread()
+            bio = self._bread(-1, 0, Mode.READ_ONLY)
         except (OSError, ValueError):
             if raise_error:
                 raise
@@ -1256,20 +1303,26 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         self,
         data: Union[bytes, bytearray, memoryview],
         *,
-        mode: str = "wb",
+        mode: "Mode | str" = "wb",
         parents: bool = True,
     ) -> int:
-        """Whole-file write. Modes: ``wb`` / ``xb`` / ``ab``.
+        """Whole-file write. Routes through :meth:`_bwrite` with the
+        :class:`Mode` derived from *mode* (``wb`` → ``OVERWRITE``,
+        ``ab`` → ``APPEND``, ``xb`` → ``ERROR_IF_EXISTS``).
 
-        ``xb`` is best-effort atomic at the base layer (``exists()``
-        check then write). Backends with a real exclusive-create
-        primitive (POSIX ``O_EXCL``, S3 conditional PUT) override
-        this to make ``xb`` race-free.
+        Subclasses with native atomic-append (``O_APPEND``) or
+        atomic-create (``O_EXCL``) honour the disposition inside
+        :meth:`_bwrite`; backends without those primitives fall back
+        to whole-file RMW with a best-effort ``exists()`` guard for
+        ``xb``.
         """
         del parents
-        if mode not in ("wb", "xb", "ab"):
+
+        parsed = Mode.from_(mode, default=Mode.OVERWRITE)
+        if parsed not in (Mode.OVERWRITE, Mode.APPEND, Mode.ERROR_IF_EXISTS):
             raise ValueError(
-                f"write_bytes mode must be one of 'wb', 'xb', 'ab'; got {mode!r}"
+                f"write_bytes mode must resolve to OVERWRITE, APPEND, or "
+                f"ERROR_IF_EXISTS; got {mode!r} → {parsed.name}"
             )
 
         mv = memoryview(data)
@@ -1279,35 +1332,13 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
             mv = mv.cast("B")
         n = len(mv)
 
-        if mode == "xb" and self.exists():
-            raise FileExistsError(
-                f"Path already exists: {self.full_path()!r}"
-            )
-
-        if mode == "ab":
-            try:
-                bio = self._pread()
-            except FileNotFoundError:
-                bio = BytesIO()
-                bio.open()
-            try:
-                bio.seek(bio.size)
-                if n > 0:
-                    bio.write(bytes(mv))
-                bio.seek(0)
-                self._pwrite(bio)
-                return n
-            finally:
-                bio.close()
-
         bio = BytesIO()
         bio.open()
         try:
             if n > 0:
                 bio.write(bytes(mv))
             bio.seek(0)
-            self._pwrite(bio)
-            return n
+            return self._bwrite(bio, 0, parsed)
         finally:
             bio.close()
 
@@ -1377,7 +1408,7 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         prev_pos = buffer.tell()
         buffer.seek(0)
         try:
-            self._pwrite(buffer)
+            self._bwrite(buffer, 0, Mode.OVERWRITE)
         finally:
             try:
                 buffer.seek(prev_pos)
@@ -1424,7 +1455,7 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
         batch_size: int,
     ) -> int:
         total = 0
-        with self.open_io("rb") as src, dest_path.open_io("wb") as dst:
+        with self.open("rb") as src, dest_path.open("wb") as dst:
             if (
                 isinstance(src, BytesIO)
                 and src.spilled
@@ -1462,7 +1493,7 @@ class Path(TabularIO[CastOptions], Holder, os.PathLike, ABC):
             return len(payload)
 
         total = 0
-        with self.open_io("wb") as dst:
+        with self.open("wb") as dst:
             while True:
                 chunk = src.read(batch_size)
                 if not chunk:

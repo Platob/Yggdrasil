@@ -196,7 +196,13 @@ def _metadata_text(
 
 def _encode_media_type(obj: io.IOBase) -> bytes | None:
     """Return compact ``b"MIME_NAME"`` or ``b"MIME_NAME+codec"`` for the media type, or *None*."""
-    mt = getattr(obj, "_media_type", None)
+    # yggdrasil :class:`BytesIO` carries its media type on
+    # ``_stats.media_type``; fall back to the stdlib-style ``_media_type``
+    # slot for any external file-likes that adopted the older pattern.
+    stats = getattr(obj, "_stats", None)
+    mt = getattr(stats, "media_type", None) if stats is not None else None
+    if mt is None:
+        mt = getattr(obj, "_media_type", None)
     if mt is None:
         return None
     wire = mt.mime_type.name.encode("utf-8")

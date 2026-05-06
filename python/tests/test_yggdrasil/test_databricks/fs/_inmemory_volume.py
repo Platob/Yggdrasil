@@ -3,7 +3,7 @@
 Subclass of :class:`yggdrasil.databricks.fs.volume_path.VolumePath` whose
 SDK transport hooks read/write a class-level dict instead of calling the
 Databricks Files API. Lets us exercise the path machinery —
-``open_io``, transaction buffer, format-leaf dispatch by extension,
+``open``, transaction buffer, format-leaf dispatch by extension,
 ``TabularIO`` surface — without a live workspace.
 
 Lives under ``_helpers`` (leading underscore) so pytest doesn't try to
@@ -27,7 +27,7 @@ class InMemoryVolumePath(VolumePath):
     Overrides exactly the SDK seam (``_remote_download``,
     ``_remote_upload``, ``write_stream``) plus the filesystem metadata
     hooks (``_mkdir``, ``_stat``, ``_ls``) so the rest of the path
-    machinery — URL handling, ``open_io`` mode dispatch, the BytesIO
+    machinery — URL handling, ``open`` mode dispatch, the BytesIO
     transaction buffer, format-leaf dispatch by extension — runs
     unmodified.
     """

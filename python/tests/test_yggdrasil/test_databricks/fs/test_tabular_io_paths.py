@@ -290,7 +290,7 @@ class TestTabularIORemoteMock(_TabularIOPathMixin, PandasTestCase):
     """Run the TabularIO suite against a mocked managed remote path.
 
     Same assertions as the local class, but routed through the
-    non-local path machinery (``open_io`` → BytesIO transaction buffer
+    non-local path machinery (``open`` → BytesIO transaction buffer
     → ``write_stream`` on flush).
     """
 

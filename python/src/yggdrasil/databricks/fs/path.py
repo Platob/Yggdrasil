@@ -41,12 +41,12 @@ positional-IO contract that ``Path`` declares abstract:
 - :meth:`write_bytes` — full upload.
 
 The last two override the base ``Path``'s default implementations
-(which go through ``open_io``) to call the SDK directly. Otherwise
+(which go through ``open``) to call the SDK directly. Otherwise
 opening a path-bound BytesIO would recurse: BytesIO._acquire calls
-path.pread → which would call open_io → which would construct a
+path.pread → which would call open → which would construct a
 new BytesIO bound to the path → which would try to acquire …
 
-So Databricks paths bypass ``open_io`` for their own bytes I/O,
+So Databricks paths bypass ``open`` for their own bytes I/O,
 and ``_open`` returns a plain ``BytesIO(path=self, mode=mode)``
 with no special subclass — the BytesIO machinery handles
 everything.
@@ -80,6 +80,7 @@ from dataclasses import replace as _dc_replace
 from typing import IO, TYPE_CHECKING, Any, ClassVar, Optional, Tuple, Union
 
 from yggdrasil.io.buffer.bytes_io import BytesIO
+from yggdrasil.io.enums import Mode
 from yggdrasil.io.fs.path import Path, _select_path_class
 from yggdrasil.io.fs.remote_path import RemotePath
 from yggdrasil.io.url import URL
@@ -488,7 +489,7 @@ class DatabricksPath(RemotePath):
         del buffering
 
         if "b" in mode:
-            return self.open_io(
+            return self.open(
                 mode=mode,
                 encoding=encoding,
                 auto_open=auto_open,
@@ -497,7 +498,7 @@ class DatabricksPath(RemotePath):
 
         binary_mode = mode.replace("t", "") + "b"
         binary_mode = binary_mode.replace("bb", "b")
-        binary_handle = self.open_io(
+        binary_handle = self.open(
             mode=binary_mode,
             encoding=None,
             auto_open=auto_open,
@@ -524,15 +525,16 @@ class DatabricksPath(RemotePath):
     # I/O (read_bytes, write_bytes, pread, pwrite, truncate, …)
     # falls out of the base implementations on top.
 
-    def _pread(self) -> BytesIO:
-        """Whole-file download via :meth:`_remote_download`.
+    def _bread(self, n: int, pos: int, mode: "Mode") -> BytesIO:
+        """Positional read — download whole, slice [pos:pos+n].
 
-        Retried on transient transport errors; semantic errors
-        (``FileNotFoundError`` / ``NotFound`` / ``BadRequest``)
-        propagate on the first attempt. Returns the project's
-        spill-capable :class:`BytesIO` so large downloads stream to
-        local temp rather than hogging RAM.
+        Most Databricks SDKs don't expose Range reads; we pull the
+        whole object via :meth:`_remote_download` and slice client-
+        side. Callers wanting many partial reads of the same object
+        should funnel through a :class:`BytesIO(path=...)` so the
+        bytes cache locally instead of round-tripping per call.
         """
+        del mode  # downloads are mode-agnostic
         content = retry_sdk_call(
             self._remote_download, allow_not_found=False,
         )
@@ -541,27 +543,78 @@ class DatabricksPath(RemotePath):
             if not content.opened:
                 content.open()
             content.seek(0)
-            return content
+            full = content
+            close_full = True
+        else:
+            full = BytesIO()
+            full.open()
+            if content:
+                full.write(content)
+                full.seek(0)
+            close_full = True
 
-        bio = BytesIO()
-        bio.open()
-        if content:
-            bio.write(content)
-            bio.seek(0)
-        return bio
+        try:
+            size = full.size
+            if n == 0 or pos >= size:
+                bio = BytesIO()
+                bio.open()
+                return bio
+            want = (size - pos) if n < 0 else min(n, size - pos)
+            if want <= 0:
+                bio = BytesIO()
+                bio.open()
+                return bio
+            if pos == 0 and want == size:
+                # Whole-file shortcut — hand the downloaded buffer
+                # straight back without an extra copy.
+                close_full = False
+                return full
+            bio = BytesIO(full.pread(want, pos))
+            return bio
+        finally:
+            if close_full:
+                try:
+                    full.close()
+                except Exception:
+                    pass
 
-    def _pwrite(self, data: BytesIO) -> int:
-        """Whole-file upload via :meth:`_remote_upload`.
+    def _bwrite(self, data: BytesIO, pos: int, mode: "Mode") -> int:
+        """Positional write — whole-file upload (or RMW for splices).
 
-        Most Databricks SDKs don't expose positional writes — the
-        streaming upload truncates the destination. Auto-creates
-        parent directories on :class:`FileNotFoundError`.  The
-        retry wrapper seeks the buffer back to its starting offset
-        before each replay so partial transport failures upload the
-        exact same bytes.
+        ``pos == 0`` with :class:`Mode.OVERWRITE` is a direct upload
+        via :meth:`_remote_upload`. Any other (pos, mode) combination
+        does download → splice → upload so callers get positional
+        semantics even though the SDK only exposes whole-file PUT.
+        Auto-creates parent directories on
+        :class:`FileNotFoundError`. The retry wrapper seeks the buffer
+        back to its starting offset before each replay so partial
+        transport failures upload the exact same bytes.
         """
         if not data.opened:
             data.open()
+
+        if not (pos == 0 and mode is Mode.OVERWRITE):
+            existing = retry_sdk_call(
+                self._remote_download, allow_not_found=True,
+            )
+            if isinstance(existing, BytesIO):
+                if not existing.opened:
+                    existing.open()
+                existing.seek(0)
+                scratch = existing
+            else:
+                scratch = BytesIO()
+                scratch.open()
+                if existing:
+                    scratch.write(existing)
+                    scratch.seek(0)
+            try:
+                scratch.pwrite(data.pread(data.size, 0), pos)
+                scratch.seek(0)
+                return self._bwrite(scratch, 0, Mode.OVERWRITE)
+            finally:
+                scratch.close()
+
         start = data.tell()
         size = data.size
 
