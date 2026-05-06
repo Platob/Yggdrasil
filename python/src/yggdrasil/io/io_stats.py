@@ -126,38 +126,63 @@ class IOStats:
     def is_dir(self) -> bool:
         return self.kind == IOKind.DIRECTORY
 
+    def copy(
+        self,
+        *,
+        size: Any = ...,
+        mtime: Any = ...,
+        kind: Any = ...,
+        mode: Any = ...,
+        media_type: Any = ...,
+    ) -> "IOStats":
+        """Return a fresh :class:`IOStats` with selected fields overridden.
+
+        Each kwarg uses the ``...`` sentinel so the caller can pass
+        ``None`` (or any other value) to override without colliding
+        with "leave unchanged". Any field left at ``...`` carries the
+        value over from ``self``.
+        """
+        return IOStats(
+            size=self.size if size is ... else size,
+            mtime=self.mtime if mtime is ... else mtime,
+            kind=self.kind if kind is ... else kind,
+            mode=self.mode if mode is ... else mode,
+            media_type=self.media_type if media_type is ... else media_type,
+        )
+
     def with_(
         self,
         *,
-        size: Optional[int] = None,
-        mtime: Optional[float] = None,
-        kind: Optional[IOKind] = None,
-        mode: Optional[int] = None,
+        size: Any = ...,
+        mtime: Any = ...,
+        kind: Any = ...,
+        mode: Any = ...,
         media_type: Any = ...,
-        copy: bool = False,
+        inplace: bool = False,
     ) -> "IOStats":
-        """Mutate in place (default) or return a copy with the given fields set.
+        """Return a stats object with the given fields overridden.
 
-        ``media_type`` uses the ``...`` sentinel so callers can
-        explicitly clear it by passing ``media_type=None``.
+        ``inplace=False`` (default) returns a fresh :class:`IOStats`
+        via :meth:`copy`. ``inplace=True`` mutates ``self`` and
+        returns ``self`` for chaining. Each field kwarg uses the
+        ``...`` sentinel — pass any other value (including ``None``)
+        to override.
         """
-        if copy:
-            return IOStats(
-                size=self.size if size is None else size,
-                mtime=self.mtime if mtime is None else mtime,
-                kind=self.kind if kind is None else kind,
-                mode=self.mode if mode is None else mode,
-                media_type=(
-                    self.media_type if media_type is ... else media_type
-                ),
+        if not inplace:
+            return self.copy(
+                size=size,
+                mtime=mtime,
+                kind=kind,
+                mode=mode,
+                media_type=media_type,
             )
-        if size is not None:
+        if size is not ...:
             self.size = size
-        if mtime is not None:
+        if mtime is not ...:
             self.mtime = mtime
-        if kind is not None:
+        if kind is not ...:
             self.kind = kind
-        if mode is not None:
+        if mode is not ...:
             self.mode = mode
         if media_type is not ...:
             self.media_type = media_type
