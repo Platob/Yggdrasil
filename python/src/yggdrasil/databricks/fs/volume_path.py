@@ -388,7 +388,7 @@ class VolumePath(DatabricksPath):
     # Filesystem metadata
     # ------------------------------------------------------------------
 
-    def _stat(self) -> IOStats:
+    def _stat_uncached(self) -> IOStats:
         is_file, is_dir, size, mtime = get_volume_status(
             sdk=self._sdk(),
             full_path=self.full_path(),
@@ -615,6 +615,7 @@ class VolumePath(DatabricksPath):
         except SDK_ERRORS:
             if not allow_not_found:
                 raise
+        self._invalidate_stat_cache()
 
     def _remove_dir(self, recursive=True, allow_not_found=True, with_root=True):
         cat, sch, vol, rel = self.sql_volume_or_table_parts()
@@ -647,4 +648,4 @@ class VolumePath(DatabricksPath):
                     if not allow_not_found:
                         raise
         finally:
-            pass
+            self._invalidate_stat_cache()

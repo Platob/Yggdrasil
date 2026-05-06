@@ -61,7 +61,7 @@ class TablePath(DatabricksPath):
     # SDK hooks — all stubs
     # ==================================================================
 
-    def _stat(self) -> IOStats:
+    def _stat_uncached(self) -> IOStats:
         # Treat as an extant directory — SQL helpers are the only
         # meaningful operations and they don't go through FS.
         # Reporting MISSING here would surprise SQL callers that

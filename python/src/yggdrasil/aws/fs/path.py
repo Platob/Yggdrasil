@@ -196,8 +196,10 @@ class S3Path(RemotePath):
     # Cache key helpers
     # ==================================================================
 
-    def _cache_key(self) -> str:
-        """Stable cache key for this path: ``bucket/key``."""
+    def _stat_cache_key(self) -> str:
+        """Override :class:`RemotePath`'s default with the canonical
+        S3 form ``bucket/key`` — same answer for ``s3://``,
+        ``s3a://``, ``s3n://`` against the same object."""
         return f"{self.bucket}/{self.key}"
 
     def _ls_cache_key(self, recursive: bool) -> str:
@@ -209,32 +211,16 @@ class S3Path(RemotePath):
         return f"{self.bucket}/{prefix}:{mode}"
 
     # ==================================================================
-    # Stat — cached through the service's ExpiringDict
+    # Stat — uncached probe; caching lives on :class:`RemotePath`
     # ==================================================================
 
-    def _stat(self) -> IOStats:
+    def _stat_uncached(self) -> IOStats:
         """One HeadObject call; falls through to a list-objects probe
         for prefixes that are pure directories (no object at the key).
-
-        Results are cached on the service's stat_cache for a short TTL
-        so hot loops (DeltaIO replay, repeated exists() checks) pay
-        only one round-trip per key.
         """
         if not self.key:
             return IOStats(size=0, mtime=0.0, kind=IOKind.DIRECTORY, mode=0)
 
-        cache = self._service.stat_cache
-        ck = self._cache_key()
-        cached = cache.get(ck)
-        if cached is not None:
-            return cached
-
-        result = self._stat_uncached()
-        cache.set(ck, result)
-        return result
-
-    def _stat_uncached(self) -> IOStats:
-        """The real HeadObject + directory-probe logic, no cache."""
         botocore = botocore_module()
         try:
             response = self.client.head_object(
@@ -312,7 +298,6 @@ class S3Path(RemotePath):
             kwargs["Delimiter"] = "/"
 
         paginator = self.client.get_paginator("list_objects_v2")
-        stat_cache = self._service.stat_cache
 
         try:
             pages = paginator.paginate(**kwargs)
@@ -322,11 +307,12 @@ class S3Path(RemotePath):
                     if not sub_prefix:
                         continue
                     entries.append((sub_prefix, None, None))
-                    # Warm stat cache — this prefix is a directory.
-                    dir_ck = f"{self.bucket}/{sub_prefix.rstrip('/')}"
-                    stat_cache.set(
-                        dir_ck,
-                        IOStats(size=0, mtime=0.0, kind=IOKind.DIRECTORY, mode=0),
+                    # Warm RemotePath's stat cache — this prefix is a directory.
+                    self._make_child(sub_prefix.rstrip("/"))._seed_stat_cache(
+                        IOStats(
+                            size=0, mtime=0.0,
+                            kind=IOKind.DIRECTORY, mode=0,
+                        )
                     )
                 for obj in page.get("Contents") or ():
                     key = obj.get("Key")
@@ -337,16 +323,12 @@ class S3Path(RemotePath):
                     obj_size = int(obj.get("Size", 0))
                     obj_mtime = _mtime_from_response(obj)
                     entries.append((key, obj_size, obj_mtime))
-                    # Warm stat cache — we already know size + mtime.
-                    file_ck = f"{self.bucket}/{key}"
-                    stat_cache.set(
-                        file_ck,
+                    # Warm RemotePath's stat cache — we already know size + mtime.
+                    self._make_child(key)._seed_stat_cache(
                         IOStats(
-                            size=obj_size,
-                            mtime=obj_mtime,
-                            kind=IOKind.FILE,
-                            mode=0,
-                        ),
+                            size=obj_size, mtime=obj_mtime,
+                            kind=IOKind.FILE, mode=0,
+                        )
                     )
         except Exception:
             if allow_not_found:
@@ -397,7 +379,8 @@ class S3Path(RemotePath):
             if allow_not_found:
                 return
             raise
-        self._service.invalidate_cache(self.bucket, self.key)
+        self._invalidate_stat_cache()
+        self._service.invalidate_ls_cache(self.bucket, self.key)
 
     def _remove_dir(
         self,
@@ -616,7 +599,8 @@ class S3Path(RemotePath):
                 Key=self.key,
                 Body=payload,
             )
-            self._service.invalidate_cache(self.bucket, self.key)
+            self._invalidate_stat_cache()
+            self._service.invalidate_ls_cache(self.bucket, self.key)
             return len(payload)
 
         # Multipart via upload_fileobj. boto3 needs a file-like with
@@ -636,7 +620,8 @@ class S3Path(RemotePath):
             if total is not None and callable(close) and fileobj is not src:
                 close()
 
-        self._service.invalidate_cache(self.bucket, self.key)
+        self._invalidate_stat_cache()
+        self._service.invalidate_ls_cache(self.bucket, self.key)
 
         # ``total`` is None when we couldn't size the source up front;
         # post-upload we don't have a cheap byte count without a HEAD.

@@ -136,7 +136,7 @@ class WorkspacePath(DatabricksPath):
     # SDK hooks — stat / ls / mkdir / remove
     # ==================================================================
 
-    def _stat(self) -> IOStats:
+    def _stat_uncached(self) -> IOStats:
         try:
             info = retry_sdk_call(
                 self._sdk().workspace.get_status, self.full_path(),
@@ -199,6 +199,7 @@ class WorkspacePath(DatabricksPath):
         except SDK_ERRORS:
             if not allow_not_found:
                 raise
+        self._invalidate_stat_cache()
 
     def _remove_dir(self, recursive=True, allow_not_found=True, with_root=True):
         path = self.full_path()
@@ -211,3 +212,4 @@ class WorkspacePath(DatabricksPath):
         except SDK_ERRORS:
             if not allow_not_found:
                 raise
+        self._invalidate_stat_cache()

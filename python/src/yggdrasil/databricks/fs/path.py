@@ -581,6 +581,7 @@ class DatabricksPath(RemotePath):
             self.parent.mkdir(parents=True, exist_ok=True)
             data.seek(start)
             retry_sdk_call(self._remote_upload, data, on_retry=_seek_back)
+        self._invalidate_stat_cache()
         return int(size)
 
     # ==================================================================

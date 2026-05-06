@@ -91,7 +91,7 @@ class InMemoryVolumePath(VolumePath):
     def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
         return
 
-    def _stat(self) -> IOStats:
+    def _stat_uncached(self) -> IOStats:
         key = self.full_path()
         if key in self._STORE:
             return IOStats(
