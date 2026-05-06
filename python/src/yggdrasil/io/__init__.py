@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .holder import Holder
+from .io_stats import IOStats
+from .memory import Memory
 from .url import URL
 
 
@@ -26,4 +29,8 @@ def __getattr__(name: str):
 
 
 def __dir__():
-    return sorted(set(globals()) | _LAZY_BUFFER_NAMES | {"URL"})
+    return sorted(
+        set(globals())
+        | _LAZY_BUFFER_NAMES
+        | {"URL", "Holder", "IOStats", "Memory"}
+    )

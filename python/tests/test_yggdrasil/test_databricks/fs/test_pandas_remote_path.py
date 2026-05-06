@@ -105,26 +105,12 @@ class TestPandasRemotePath(PandasTestCase):
 
     # ---- write_pandas_frame --------------------------------------------
     #
-    # These tests are currently expected to FAIL: ``write_pandas_frame``
-    # against a non-local path goes through
-    # ``Path._write_arrow_batches`` → ``open_io("wb")`` → format-leaf
-    # ``_write_arrow_batches`` (e.g. :class:`ParquetIO`), and the format
-    # leaves write through a pyarrow sink that bypasses ``BytesIO.write``.
-    # That bypass means the buffer's dirty flag stays ``False``, so the
-    # transaction-buffer ``commit`` on close becomes a no-op and the
-    # upload silently drops on the floor — caller sees success but the
-    # remote stays empty. Read works because read populates the
-    # transaction buffer via the SDK download in ``_acquire``, where the
-    # dirty bit isn't on the critical path.
-    #
-    # The fix lives in ``BytesIO._writing_context`` /
-    # ``ParquetIO._write_arrow_batches`` (mark dirty when a writable
-    # sink is yielded against a non-local path). When that lands,
-    # remove the ``expectedFailure`` decorators below — the
-    # ``unexpectedSuccess`` will surface in CI as a hard fail and force
-    # a cleanup pass on these tests.
+    # The Path/Holder refactor wired ``Path.pwrite`` so writes against a
+    # non-local backing land in the transaction :class:`BytesIO`,
+    # whose ``dirty`` bit drives ``close`` → :meth:`Path._pwrite`
+    # commit. End-to-end round trips therefore work through the SDK
+    # seam without any per-format leaf glue.
 
-    @unittest.expectedFailure
     def test_write_pandas_frame_uploads(self) -> None:
         """``write_pandas_frame(df)`` must actually push bytes to the
         remote store. Regression test for a flush path that left the
@@ -149,7 +135,6 @@ class TestPandasRemotePath(PandasTestCase):
         self.assertEqual(payload[:4], b"PAR1", "expected parquet magic")
         self.assertGreaterEqual(_InMemoryVolumePath.upload_count, 1)
 
-    @unittest.expectedFailure
     def test_write_then_read_round_trip(self) -> None:
         """End-to-end: write_pandas_frame → read_pandas_frame returns
         the same frame, going through the live SDK seam each way."""
@@ -165,7 +150,6 @@ class TestPandasRemotePath(PandasTestCase):
 
         self.assertFrameEqual(got, df)
 
-    @unittest.expectedFailure
     def test_write_overwrites_existing(self) -> None:
         """A second ``write_pandas_frame`` replaces the prior payload —
         the contract is OVERWRITE, not APPEND."""

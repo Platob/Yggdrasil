@@ -626,11 +626,10 @@ class TestFileSystemServiceIntegration(unittest.TestCase):
 class TestBytesIOAgainstDatabricksPath(unittest.TestCase):
     """Direct BytesIO-against-DatabricksPath tests.
 
-    BytesIO opens a per-I/O context against the path; for non-local
-    paths the default :class:`_PathOpenContext` is a thin passthrough
-    that forwards every primitive to the path's own
-    :meth:`pread` / :meth:`pwrite` / :meth:`truncate`. There is no
-    transaction buffer.
+    BytesIO acquires the path's I/O state. For non-local paths the
+    path opens a transaction :class:`BytesIO` seeded from
+    :meth:`_pread`, mutates it through :meth:`pread` / :meth:`pwrite`
+    / :meth:`truncate`, and commits via :meth:`_pwrite` on close.
     """
 
     dbfs_base: DBFSPath

@@ -125,9 +125,6 @@ class InMemoryVolumePath(VolumePath):
     def _from_url(self, url):
         return type(self)(url=url)
 
-    def invalidate_mirror(self) -> None:
-        return  # No mirror in the fake store.
-
     @property
     def connected(self) -> bool:
         return True

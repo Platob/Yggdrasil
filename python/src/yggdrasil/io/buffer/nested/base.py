@@ -87,7 +87,7 @@ from yggdrasil.disposable import Disposable
 from yggdrasil.io.enums import MimeType, Mode
 from yggdrasil.io.fs import Path
 from yggdrasil.data.options import CastOptions
-from yggdrasil.io.buffer.base import TabularIO
+from yggdrasil.io.buffer.base import TabularIO, inject_static_values_into_batch as _inject_static_batch
 from yggdrasil.lazy_imports import path_class
 
 if TYPE_CHECKING:
@@ -215,8 +215,6 @@ class NestedIO(TabularIO[O], ABC):
         media_type: Any = None,
         parent: "NestedIO | None" = None,
         auto_open: bool = False,
-        concurrent: bool = False,
-        lock_wait: Any = None,
         **kwargs: Any,
     ) -> None:
         """Initialize from a folder path.
@@ -232,25 +230,11 @@ class NestedIO(TabularIO[O], ABC):
         first ``with`` entry or explicit :meth:`open`. This matches
         the no-surprises rule callers rely on: building a handle
         should not start probing storage.
-
-        ``concurrent=True`` enables cross-process serialisation: an
-        ``.rw.lock`` sidecar against the folder root is acquired on
-        :meth:`_acquire` and released on :meth:`_release`. The lock
-        is conservative — exclusive across reads and writes — because
-        a folder doesn't carry a single mode the way :class:`BytesIO`
-        does. Callers that need finer granularity should split read
-        and write blocks with their own
-        ``self.path.lock(read=...)`` / ``write=...)`` calls.
-
-        ``lock_wait`` follows :class:`WaitingConfig` conventions
-        (``None`` = wait forever, ``N`` = ``N`` seconds with backoff,
-        ``WaitingConfig(...)`` for full control). Raises
-        :class:`TimeoutError` once the deadline elapses.
         """
         # Common TabularIO state (cache slots, _media_type, spill
         # placeholders) — NestedIO subclasses don't use _spill_path
         # but the consistent default is harmless.
-        TabularIO.__init__(self, media_type=media_type, concurrent=concurrent)
+        TabularIO.__init__(self, media_type=media_type)
         self.parent: "NestedIO | None" = parent
 
         raw = path if path is not None else data
@@ -264,14 +248,6 @@ class NestedIO(TabularIO[O], ABC):
         else:
             self.path = path_class().from_(raw)
 
-        # Concurrency: lock the folder root for the IO's lifetime when
-        # ``concurrent=True``. Inherited from :class:`TabularIO`, but
-        # the actual lock object lives here because it's keyed off
-        # :attr:`path`. ``lock_wait`` is a :class:`WaitingConfig`
-        # argument — see ``Path.lock``.
-        self._lock_wait: Any = lock_wait
-        self._path_lock = None
-
         if auto_open:
             Disposable.open(self)
 
@@ -282,32 +258,9 @@ class NestedIO(TabularIO[O], ABC):
     def _acquire(self) -> None:
         if not self.path.opened:
             self.path.open()
-        if self.concurrent and self._path_lock is None:
-            try:
-                lock = self.path.lock(
-                    read=True, write=True,
-                    wait=self._lock_wait,
-                )
-            except Exception:
-                lock = None
-            if lock is not None:
-                try:
-                    lock.acquire()
-                except TimeoutError:
-                    raise
-                except Exception:
-                    lock = None
-            self._path_lock = lock
 
     def _release(self) -> None:
         self.unpersist()
-        lock = self._path_lock
-        self._path_lock = None
-        if lock is not None:
-            try:
-                lock.release()
-            except Exception:
-                pass
 
     # ``cached`` / ``persist`` / ``unpersist`` come from
     # :class:`TabularIO` — they drive the shared ``_persisted_data``
@@ -348,10 +301,56 @@ class NestedIO(TabularIO[O], ABC):
         derived ``_read_arrow_batches`` loop) opens them inside a
         ``with`` block.
 
-        Public callers should use :meth:`iter_children` (inherited
-        from :class:`TabularIO`) which runs :meth:`check_options`
-        first.
+        Public callers should use :meth:`iter_children` (which
+        runs :meth:`check_options` first).
         """
+
+    def iter_children(
+        self,
+        predicate: Any = None,
+        *,
+        options: "O | Mapping[str, Any] | None" = None,
+        **kwargs: Any,
+    ) -> "Iterator[TabularIO | BytesIO]":
+        """Public wrapper around :meth:`_iter_children`.
+
+        ``predicate`` is the canonical knob for filtering discovered
+        children — it's evaluated against the metadata mapping
+        ``{name, path, is_dir, is_private}`` per candidate. ``None``
+        (default) means "yield everything." When provided, the
+        predicate replaces ``options.children_predicate`` for this
+        call.
+
+        ``options`` is the lower-level escape hatch (callers who
+        want to drive partition / row-size / mode knobs for the
+        eventual read or who already have an options object in
+        hand). Extra kwargs merge into the resolved options.
+        """
+        resolved = self.check_options(options, overrides=locals())
+        if predicate is not None:
+            resolved = resolved.copy(children_predicate=predicate)
+        return self._iter_children(resolved)
+
+    def iter_children_or_self(
+        self,
+        predicate: Any = None,
+        *,
+        options: "O | Mapping[str, Any] | None" = None,
+        **kwargs: Any,
+    ) -> "Iterator[TabularIO | BytesIO]":
+        if self.has_children():
+            yield from self.iter_children(
+                predicate, options=options, **kwargs,
+            )
+        else:
+            yield self
+
+    def has_children(self) -> bool:
+        """Return ``True`` iff this folder exposes at least one child."""
+        try:
+            return next(iter(self._iter_children(self._default_options())), None) is not None
+        except (FileNotFoundError, StopIteration):
+            return False
 
     # ==================================================================
     # Child IO factory — primary write API
@@ -519,25 +518,42 @@ class NestedIO(TabularIO[O], ABC):
         child: Any,
         options: O,
     ) -> Iterator[pa.RecordBatch]:
-        """Drain one child's batches.
+        """Drain one child's batches with per-child static-value injection.
 
         Pulled out so subclasses (PartitionedFolderIO, DeltaIO) can
-        wrap each child's batch stream (e.g. to inject partition
-        columns or apply a deletion vector) without re-implementing
-        the dispatch on child type.
+        wrap each child's batch stream (e.g. to apply a deletion
+        vector) without re-implementing the dispatch on child type.
+
+        :class:`TabularIO` no longer auto-injects ``static_values`` on
+        the read path; nested IOs that stamp partition columns onto
+        a child via ``child.static_values = ...`` rely on this method
+        to do the injection on their behalf.
         """
+        static = getattr(child, "static_values", None)
+
         if isinstance(child, NestedIO):
             with child:
-                yield from child._read_arrow_batches(options)
+                for batch in child._read_arrow_batches(options):
+                    yield _inject_static_batch(batch, static) if static else batch
             return
 
         if isinstance(child, TabularIO):
+            # Plain :class:`BytesIO` (no tabular media type) has no
+            # arrow surface — skip it. Sidecar files (``.schema``,
+            # ``.ygmirror.json``, …) get yielded by :meth:`iter_children`
+            # so callers can still pull bytes from them, but they
+            # don't participate in the read stream.
+            mt = getattr(child, "_media_type", None)
+            if mt is None or getattr(mt, "is_octet", False):
+                if type(child).__name__ == "BytesIO":
+                    return
             with child:
-                yield from child.read_arrow_batches(options=options)
+                for batch in child.read_arrow_batches(options=options):
+                    yield _inject_static_batch(batch, static) if static else batch
             return
 
-        # BytesIO without a tabular surface: not readable as arrow.
-        # Skip — the caller can still reach it via iter_children.
+        # Non-TabularIO child: not readable as arrow. Skip — the
+        # caller can still reach it via iter_children.
 
     def _collect_schema(self, options: O) -> Schema:
         """Merge per-child schemas into a single folder schema.

@@ -475,8 +475,6 @@ class TabularIO(Disposable, ABC, Generic[O]):
         self,
         *args: Any,
         media_type: Any = None,
-        static_values: "Mapping[str, Any] | None" = None,
-        concurrent: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the state every :class:`TabularIO` carries.
@@ -493,13 +491,6 @@ class TabularIO(Disposable, ABC, Generic[O]):
           session is reachable, otherwise a :class:`MemoryArrowIO`);
           :meth:`unpersist` clears it. Read paths short-circuit
           through it before touching the source.
-        * ``static_values`` — optional ``{column: value}`` map of
-          constant columns to attach to every batch / table on
-          read. Useful for tagging batches with metadata the
-          source itself doesn't carry (partition values inferred
-          from a path, a ``source="cache"`` marker, ingestion
-          timestamps, etc.). Existing columns with the same name
-          are left untouched — the injection is additive.
         * Spill-path slots — ``_spill_path`` / ``_owns_spill_path``
           used by :class:`BytesIO` (and any byte-buffer-backed
           subclass) to track durable storage. They live on
@@ -525,14 +516,6 @@ class TabularIO(Disposable, ABC, Generic[O]):
         # cache (MemorySparkIO when Spark is reachable, MemoryArrowIO
         # otherwise). Read paths delegate through it when set.
         self._persisted_data: "TabularIO | None" = None
-        # Static value attachments — defensively copied into a plain
-        # ``dict`` so mutations on the caller's mapping after
-        # construction don't leak through. Empty mapping coerces
-        # to ``None`` so the read-path guard stays a single cheap
-        # ``is None`` check.
-        self.static_values: "dict[str, Any] | None" = (
-            dict(static_values) if static_values else None
-        )
         # Buffer-backing slots — concrete byte buffers fill these in;
         # non-byte TabularIOs (StatementResult, NestedIO trees, …)
         # leave them at None.
@@ -543,15 +526,6 @@ class TabularIO(Disposable, ABC, Generic[O]):
         # :meth:`_release`.
         self._spark_scan_spill: "str | None" = None
         self._spark_scan_cleanup = None
-        # Opt-in concurrency safety. When True, byte-buffer subclasses
-        # serialise public read/write operations against an in-process
-        # ``threading.RLock`` (memory mode) and acquire a sidecar
-        # ``FileLock`` against any caller-owned path. Off by default
-        # — yggdrasil's primary use is single-threaded driver code,
-        # and the lock overhead isn't worth paying every time. Flip to
-        # True from concurrency-aware callers (Spark task threads,
-        # ``ProcessPoolExecutor`` workers, …).
-        self.concurrent: bool = bool(concurrent)
 
     # ==================================================================
     # Tabular view shortcut — at TabularIO so every subclass shares it
@@ -902,112 +876,6 @@ class TabularIO(Disposable, ABC, Generic[O]):
         """
         return self
 
-    def _iter_children(self, options: O) -> "Iterator[TabularIO]":
-        """Yield this IO's direct children, each as a :class:`TabularIO`.
-
-        Single-buffer leaves (``PrimitiveIO``, ``BytesIO`` without a
-        tabular media type, ``StatementResult``, …) yield nothing —
-        they ARE the leaf and have no sub-IO surface. Folder/archive
-        aggregations (:class:`NestedIO` subclasses, :class:`ZipIO`)
-        override to yield one IO per data unit (file, entry,
-        partition leaf), each itself a :class:`TabularIO` openable
-        on its own.
-
-        :class:`Fragment` indirection is intentionally absent —
-        children are real IOs with their own ``parent`` back-pointer,
-        so callers can walk the tree and drain Arrow batches
-        uniformly.
-
-        ``options`` is the same :class:`CastOptions` flavour used
-        by reads — :attr:`recursive` controls whether sub-folders
-        are walked, :attr:`children_predicate` filters discovered
-        children by their metadata. The shared
-        :func:`matches_children_predicate` helper applies the
-        predicate uniformly across backends.
-
-        Default: yields nothing — the right answer for any
-        single-source TabularIO. :class:`NestedIO` re-declares this
-        abstract so folder-shaped subclasses can't accidentally
-        inherit the empty default.
-        """
-        return iter(())
-
-    def iter_children_or_self(
-        self,
-        predicate: "Predicate | None" = None,
-        *,
-        options: "O | Mapping[str, Any] | None" = None,
-        **kwargs: Any,
-    ) -> "Iterator[TabularIO]":
-        if self.has_children():
-            yield from self.iter_children(
-                predicate, options=options, **kwargs,
-            )
-        else:
-            yield self
-
-    def iter_children(
-        self,
-        predicate: "Predicate | None" = None,
-        *,
-        options: "O | Mapping[str, Any] | None" = None,
-        **kwargs: Any,
-    ) -> "Iterator[TabularIO]":
-        """Public wrapper around :meth:`_iter_children`.
-
-        ``predicate`` is the canonical knob for filtering discovered
-        children — it's evaluated against the metadata mapping
-        ``{name, path, is_dir, is_private}`` per candidate. ``None``
-        (default) means "yield everything." When provided, the
-        predicate replaces ``options.children_predicate`` for this
-        call.
-
-        ``options`` is still accepted as the lower-level escape hatch
-        (callers who want to drive partition / row-size / mode knobs
-        for the eventual read or who already have an options object
-        in hand). Extra kwargs merge into the resolved options.
-
-        Examples::
-
-            for child in folder.iter_children():
-                ...
-
-            for child in folder.iter_children(~col("name").like("_%")):
-                ...
-        """
-        resolved = self.check_options(options, overrides=locals())
-        if predicate is not None:
-            resolved = resolved.copy(children_predicate=predicate)
-        return self._iter_children(resolved)
-
-    def has_children(self) -> bool:
-        """Return ``True`` iff this IO exposes at least one child.
-
-        Default probes :meth:`_iter_children` with default options and
-        peeks the first element. Subclasses with cheaper introspection
-        (a directory-listing call, a central-directory scan, an
-        already-cached child set) should override.
-
-        Single-buffer leaves with no children surface return ``False``
-        via the inherited empty :meth:`_iter_children`. Folder-shaped
-        IOs (:class:`NestedIO`, :class:`ZipIO`,
-        :class:`ZipEntryFolderIO`) override or rely on the default
-        peek to answer "is this a leaf or a container?".
-        """
-        try:
-            return next(iter(self._iter_children(self._has_children_options())), None) is not None
-        except (FileNotFoundError, StopIteration):
-            return False
-
-    def _has_children_options(self) -> "O":
-        """Cheap default options for :meth:`has_children`'s peek.
-
-        Split out so subclasses with mandatory option fields can
-        provide a probe-friendly default without rebuilding
-        :meth:`has_children`.
-        """
-        return self.options_class()()
-
     # ==================================================================
     # Static helpers
     # ==================================================================
@@ -1092,10 +960,6 @@ class TabularIO(Disposable, ABC, Generic[O]):
     ) -> Iterator[pa.RecordBatch]:
         """Yield Arrow record batches. Primary streaming read path.
 
-        :attr:`static_values` (when set) is injected into every
-        batch as constant columns — additive, so a column that
-        already exists on the underlying source is left untouched.
-
         :attr:`CastOptions.predicate` (when set) is applied to every
         batch before yielding. Backends that pushed it down already
         (warehouse SQL, Delta) clear the option before reaching this
@@ -1110,24 +974,9 @@ class TabularIO(Disposable, ABC, Generic[O]):
             ):
                 yield batch
             return
-        yield from self._iter_public_batches(
-            self.check_options(options, overrides=locals())
-        )
-
-    def _iter_public_batches(self, options: O) -> Iterator[pa.RecordBatch]:
-        """Internal: drain ``_read_arrow_batches`` with static-values
-        injection and the universal predicate filter applied.
-
-        Every public read that ultimately serves bytes to a caller
-        funnels through here, so static columns and predicate
-        filtering happen once and only once regardless of which
-        engine surface (Arrow, Polars, Pandas, Spark, pylist) the
-        caller picked.
-        """
-        static = self.static_values
-        predicate = getattr(options, "predicate", None)
-        for batch in self._read_arrow_batches(options):
-            batch = _inject_static_batch(batch, static)
+        resolved = self.check_options(options, overrides=locals())
+        predicate = getattr(resolved, "predicate", None)
+        for batch in self._read_arrow_batches(resolved):
             batch = _apply_predicate_filter(batch, predicate)
             if batch is not None and batch.num_rows > 0:
                 yield batch
@@ -1146,10 +995,8 @@ class TabularIO(Disposable, ABC, Generic[O]):
     ) -> pa.Table:
         """Read everything into a single :class:`pyarrow.Table`.
 
-        :attr:`static_values` is injected at batch level via
-        :meth:`_iter_public_batches`, so the resulting table already
-        carries the static columns by the time it lands here. The
-        same path also applies :attr:`CastOptions.predicate`.
+        Routes through :meth:`read_arrow_batches`, so
+        :attr:`CastOptions.predicate` is applied uniformly.
         """
         if self._persisted_data is not None:
             return self._persisted_data.read_arrow_table(
@@ -1158,7 +1005,7 @@ class TabularIO(Disposable, ABC, Generic[O]):
         return self._read_arrow_table(self.check_options(options, overrides=locals()))
 
     def _read_arrow_table(self, options: O) -> pa.Table:
-        batches = list(self._iter_public_batches(options))
+        batches = list(self.read_arrow_batches(options=options))
         if not batches:
             schema = (
                 getattr(options, "target_schema", None)

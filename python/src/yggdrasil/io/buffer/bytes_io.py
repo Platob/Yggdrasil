@@ -1,20 +1,29 @@
-"""Spill-to-disk byte buffer — pure stdlib, ctx-backed, fully self-contained.
+"""Spill-to-disk byte buffer with cursor and tabular dispatch.
+
+A :class:`BytesIO` is a cursor + format dispatcher layered on top of
+a :class:`yggdrasil.io.holder.Holder` backing. The two concrete
+holders it composes with are:
+
+- :class:`yggdrasil.io.memory.Memory` (in-memory backed by
+  :class:`bytearray`) — fast for small/medium payloads, used when
+  there's no path bound and the payload fits under ``spill_bytes``.
+- :class:`yggdrasil.io.fs.Path` (path-bound) — the path's
+  ``acquire_io`` sets up its own fd (local) or transaction
+  :class:`BytesIO` (remote); the buffer forwards every positional op
+  (``pread`` / ``pwrite`` / ``truncate``) straight to the path.
 
 Shape
 -----
 
 A :class:`BytesIO` has one of two backings at any moment:
 
-- **memory** — a :class:`bytearray`. Fast for small/medium payloads.
-  Used when there's no path bound and the payload fits under
-  ``spill_bytes``.
-- **path-bound** — a :class:`Path` plus an :class:`OpenContext`
-  produced by :meth:`Path.open_context`. The context owns the live
-  state: a long-lived ``os.open`` fd for local paths, or a thin
-  passthrough whose ``pread`` / ``pwrite`` / ``truncate`` lands
-  straight on the path's own method for everything else. Buffers
-  forward every primitive to the context — there is no transaction
-  or scratch buffer in between.
+- **memory** — a :class:`bytearray` managed inline (effectively a
+  :class:`Memory` holder); the buffer auto-spills to a self-owned
+  temp file once the payload crosses ``spill_bytes``.
+- **path-bound** — a :class:`Path` whose ``acquire_io`` set up its
+  own fd (local) or transaction :class:`BytesIO` (remote). The
+  buffer forwards every positional op (``pread`` / ``pwrite`` /
+  ``truncate``) straight to the path; the path is the I/O state.
 
 The path-bound file is either:
 
@@ -22,24 +31,6 @@ The path-bound file is either:
   :func:`tempfile.gettempdir`. Unlinked on close.
 - **external** (``_owns_spill_path = False``) — supplied by the
   caller via the ``path=`` constructor kwarg. Never unlinked.
-
-Why the context lives on Path
------------------------------
-
-Earlier drafts kept a fd or a scratch "transaction buffer" inside
-the buffer itself, branching on ``path.is_local`` at every read
-and write. That branching duplicated state and meant the buffer
-carried backend-specific plumbing.
-
-Moving the live state to :class:`Path.open_context` collapses both
-shapes into one API. The buffer's three primitives forward to
-``ctx.pread`` / ``ctx.pwrite`` / ``ctx.truncate`` without caring
-which backing is underneath. Local paths return a fd-backed
-context; everything else gets a passthrough whose primitives land
-straight on the path's own method — no scratch buffer, no commit
-on flush. Backends that want batched I/O (S3 multipart, paginated
-APIs) override :meth:`Path.open_context` to return a custom
-context, but the default has no hidden allocation.
 
 Lifecycle
 ---------
@@ -50,7 +41,7 @@ enter a ``with`` block still see :meth:`close` do the right thing.
 
 - :meth:`_acquire` opens the open context for path-bound buffers:
   * memory mode → no-op.
-  * path-bound → :meth:`Path.open_context` with the buffer's mode.
+  * path-bound → :meth:`Path.acquire_io` with the buffer's mode.
 - :meth:`flush` calls ``ctx.flush()`` — a no-op for fd-backed
   contexts (writes already in the kernel via :func:`os.pwrite`)
   and a path commit for buffer-backed contexts.
@@ -91,14 +82,12 @@ from __future__ import annotations
 
 import base64
 import contextlib
-import functools
 import io
 import mmap
 import os
 import pathlib
 import struct
 import tempfile
-import threading
 import time
 from typing import IO, TYPE_CHECKING, Any, Optional, Union, Literal
 
@@ -109,10 +98,7 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.enums import Codec, MediaType, MimeType, MimeTypes, Mode, ZSTD
 from yggdrasil.io.path_stat import PathStats, PathKind
-from yggdrasil.io.buffer._concurrency import (
-    FileLock,
-    maybe_cleanup_stale_spill_files,
-)
+from yggdrasil.io.buffer._spill_cleanup import maybe_cleanup_stale_spill_files
 from yggdrasil.io.buffer.base import TabularIO
 from yggdrasil.io.types import BytesLike
 from yggdrasil.io.url import URL
@@ -123,7 +109,7 @@ if TYPE_CHECKING:
     import xxhash
     from collections.abc import Iterable, Iterator
     from yggdrasil.io.fs import Path
-    from yggdrasil.io.fs._open_context import OpenContext
+    from yggdrasil.io.holder import Holder
 
 
 __all__ = ["BytesIO", "BufferLike"]
@@ -140,10 +126,6 @@ BufferLike = Union[
 _HEAD_DEFAULT = 128
 _PICKLE_COMPRESS_THRESHOLD_DEFAULT = 1 * 1024 * 1024
 _COPY_CHUNK_SIZE = 4 * 1024 * 1024
-_HAS_PWRITE = hasattr(os, "pwrite")
-_HAS_PREAD = hasattr(os, "pread")
-
-
 def _as_contiguous_mv(mv: memoryview) -> memoryview:
     """Return a C-contiguous memoryview.
 
@@ -153,80 +135,6 @@ def _as_contiguous_mv(mv: memoryview) -> memoryview:
     fast path stays zero-copy.
     """
     return mv if mv.c_contiguous else memoryview(mv.tobytes())
-
-
-def _under_thread_lock(func):
-    """Acquire ``self._thread_lock`` for the duration of ``func``.
-
-    Zero-cost when concurrency is off — the early branch on
-    ``self._thread_lock is None`` skips the ``with`` machinery
-    entirely. Re-entrant: the lock is :class:`threading.RLock`, so
-    nested calls (e.g. a public method that calls another public
-    method) don't deadlock.
-    """
-
-    @functools.wraps(func)
-    def wrapper(self, *args, **kwargs):
-        lock = self._thread_lock
-        if lock is None:
-            return func(self, *args, **kwargs)
-        with lock:
-            return func(self, *args, **kwargs)
-
-    return wrapper
-
-
-# ---------------------------------------------------------------------------
-# Mode → os.O_* flags
-# ---------------------------------------------------------------------------
-
-
-def _flags_for_mode(mode: str) -> int:
-    """Translate a stdlib-style mode string into ``os.open`` flags.
-
-    Binary subset only — text-mode bits (``t``, ``U``, encoding) are
-    handled at any wrapper layer above us. Raises :class:`ValueError`
-    for nonsensical modes ("rw", "", multiple primaries) so the
-    caller surfaces a clear error rather than an opaque ``OSError``.
-
-    Adds ``O_BINARY`` on Windows and ``O_CLOEXEC`` where available.
-    """
-    has_r = "r" in mode
-    has_w = "w" in mode
-    has_a = "a" in mode
-    has_x = "x" in mode
-    has_plus = "+" in mode
-
-    primary_count = sum((has_r, has_w, has_a, has_x))
-    if primary_count != 1:
-        raise ValueError(
-            f"Invalid open mode {mode!r}: must contain exactly one of "
-            "'r', 'w', 'a', 'x'."
-        )
-
-    if has_r and not has_plus:
-        flags = os.O_RDONLY
-    elif has_r and has_plus:
-        flags = os.O_RDWR
-    elif has_w and not has_plus:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    elif has_w and has_plus:
-        flags = os.O_RDWR | os.O_CREAT | os.O_TRUNC
-    elif has_a and not has_plus:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-    elif has_a and has_plus:
-        flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
-    elif has_x and not has_plus:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    else:
-        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
-
-    if hasattr(os, "O_BINARY"):
-        flags |= os.O_BINARY  # Windows
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-
-    return flags
 
 
 # ===========================================================================
@@ -371,49 +279,27 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         auto_open: bool | None = None,
         mode: str = "rb+",
         metadata: dict | None = None,
-        concurrent: bool = False,
-        lock_wait: Any = None,
         **kwargs
     ) -> None:
         # Funnel cache slots, _media_type, and the spill-path
         # placeholders through the TabularIO base. We then refine
         # the spill bindings below for the buffer-specific cases.
-        TabularIO.__init__(self, media_type=media_type, concurrent=concurrent)
+        TabularIO.__init__(self, media_type=media_type)
 
         # Buffer-specific per-instance state.
         self._buf: bytearray | None = bytearray()
         self._size: int = 0
         self._mtime: float = 0
         self._pos: int = 0
-        # Per-open context — fd-backed for local paths, scratch
-        # buffer-backed for remote. None when the buffer is in
-        # memory mode (no path) or unacquired.
-        self._ctx: "OpenContext | None" = None
+        # Per-open IO state. When acquired, points at ``self._spill_path``
+        # — the path itself owns the active fd or transaction buffer.
+        # ``None`` for memory-mode buffers and pre-acquire path-bound
+        # buffers.
+        self._ctx: "Path | None" = None
         self._mode: str = mode or "rb+"
         self._spill_bytes: int = int(spill_bytes)
         self._spill_ttl: int = int(spill_ttl)
         self._metadata = metadata or {}
-        # Concurrency: when ``concurrent=True`` the buffer:
-        #
-        # - serialises in-process readers/writers via a
-        #   ``threading.RLock`` (memory-mode and local fd mode).
-        # - acquires a sidecar :class:`FileLock` against any
-        #   caller-owned path so concurrent processes don't tear each
-        #   other's writes.
-        #
-        # ``lock_wait`` follows :class:`WaitingConfig` conventions:
-        # ``None`` waits forever, a number is a timeout in seconds,
-        # a dict / WaitingConfig gives full backoff control. On
-        # contention the lock retries with exponential backoff and
-        # raises :class:`TimeoutError` once the deadline is hit.
-        #
-        # Self-owned spill files (random tempdir name) skip the file
-        # lock — their path is unique by construction.
-        self._lock_wait: Any = lock_wait
-        self._path_lock: "FileLock | None" = None
-        self._thread_lock: "threading.RLock | None" = (
-            threading.RLock() if self.concurrent else None
-        )
         # View state — populated by :meth:`_make_view` only. When
         # ``parent`` is set AND no own backing is bound (no ``_buf``,
         # no ``_spill_path``, no ``_ctx``), this BytesIO is a window
@@ -540,16 +426,6 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         self._mode = src._mode
         self._spill_bytes = src._spill_bytes
         self._spill_ttl = src._spill_ttl
-        # Lock state propagates so a copy of a path-bound buffer keeps
-        # the same concurrency posture; the locks themselves aren't
-        # shared — the copy mints its own on _acquire if needed, and
-        # gets its own RLock so cross-copy synchronisation isn't
-        # implied where the caller didn't ask for it.
-        self.concurrent = src.concurrent
-        self._lock_wait = src._lock_wait
-        self._thread_lock = (
-            threading.RLock() if src.concurrent else None
-        )
 
     def _init_from_filelike(self, src: Any) -> None:
         """Drain a file-like from current cursor to end."""
@@ -563,23 +439,23 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 self._init_from_bytes(memoryview(src.read()))
                 return
 
-            # Mint a spill path, stream the source through ``ctx.pwrite``
-            # at the path so the syscall side is the path's concern.
+            # Mint a spill path, stream the source through the path's
+            # own ``pwrite`` so the syscall side is the path's concern.
             path = _mint_spill_path(self._ext_hint(), self._spill_ttl)
-            ctx = path.open_context("wb+")
+            path.acquire_io("wb+")
             total = 0
             try:
                 while True:
                     chunk = src.read(_COPY_CHUNK_SIZE)
                     if not chunk:
                         break
-                    written = ctx.pwrite(chunk, total)
+                    written = path.pwrite(chunk, total)
                     if written == 0:
                         break
                     total += written
-                ctx.flush()
+                path.flush()
             finally:
-                ctx.close()
+                path.close_io()
             self._buf = None
             self._size = total
             self._spill_path = path
@@ -589,20 +465,20 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
         # No seek/tell — drain blind, decide spill vs memory after.
         path = _mint_spill_path(self._ext_hint(), self._spill_ttl)
-        ctx = path.open_context("wb+")
+        path.acquire_io("wb+")
         total = 0
         try:
             while True:
                 chunk = src.read(_COPY_CHUNK_SIZE)
                 if not chunk:
                     break
-                written = ctx.pwrite(chunk, total)
+                written = path.pwrite(chunk, total)
                 if written == 0:
                     break
                 total += written
-            ctx.flush()
+            path.flush()
         finally:
-            ctx.close()
+            path.close_io()
 
         if total <= self._spill_bytes:
             payload = path.read_bytes()
@@ -676,169 +552,73 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         return self._spill_path is not None
 
     @property
-    def ctx(self) -> "OpenContext | None":
-        """The active per-open context, or ``None`` for memory mode."""
+    def ctx(self) -> "Path | None":
+        """The path acting as our active I/O context, or ``None``."""
         return self._ctx
+
+    @property
+    def _owner(self) -> "Holder | None":
+        """The active byte holder behind this buffer.
+
+        - **Spilled / path-bound** → the bound :class:`Path` (already
+          a :class:`Holder`). Mutates through the path's
+          :meth:`acquire_io` flow.
+        - **Memory mode** → a :class:`Memory` aliasing the same
+          ``bytearray`` the buffer mutates internally
+          (:meth:`Memory.view`, zero-copy). Read/write operations
+          through the Holder interface land on the same bytes the
+          buffer's primitives do; spill swaps the property over to
+          the path without changing the call surface.
+        - **View mode** (window over a parent buffer) → ``None``.
+          Views forward to ``self.parent`` directly.
+        """
+        from yggdrasil.io.memory import Memory  # avoid import cycle
+        if self._spill_path is not None:
+            return self._spill_path
+        if self._buf is not None:
+            return Memory.view(self._buf, self._size)
+        return None
 
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
 
     # ------------------------------------------------------------------
-    # Disposable hooks — fd lifecycle
+    # Disposable hooks — open context against the bound path
     # ------------------------------------------------------------------
 
-    def _should_lock_path(self) -> bool:
-        """True when path-level concurrent-access protection should kick in.
-
-        Lock only when:
-
-        - the caller opted into concurrency safety
-          (``concurrent=True``),
-        - we have a real path bound (no point locking a memory
-          buffer),
-        - the path is *external* — caller-owned. Self-owned spills
-          live under a unique random name, so two processes can't
-          collide. Skipping the lock there avoids an extra fd per
-          buffer in the common case.
-
-        Read-only opens still take a *shared* lock — multiple
-        readers coexist, but a concurrent exclusive writer blocks
-        until they release. Mode-aware suffix
-        (``-r.lock`` / ``-w.lock`` / ``-rw.lock``) keeps each access
-        kind on its own lock file for visibility; readers and
-        writers therefore don't block each other across kinds, by
-        design.
-        """
-        if not self.concurrent:
-            return False
-        if self._spill_path is None:
-            return False
-        if self._owns_spill_path:
-            return False
-        return True
-
-    def _lock_modes(self) -> tuple[bool, bool]:
-        """Decompose :attr:`_mode` into ``(read, write)`` access intent."""
-        m = self._mode
-        write = any(c in m for c in "wax+")
-        # Pure 'wb' / 'ab' / 'xb' (no '+') don't read; tag as
-        # write-only. 'rb' is pure read; everything else is mixed.
-        if "+" in m:
-            read = True
-        else:
-            read = "r" in m
-        return read, write
-
-    def _acquire_path_lock(self) -> None:
-        """Take the mode-suffixed sidecar lock for the bound path.
-
-        Delegates to :meth:`Path.lock` so every backend can plug in a
-        backend-specific locking primitive (S3 conditional PUT, GCS
-        preconditions, …) by overriding the method on its
-        :class:`Path` subclass. The default :class:`FileLock`-backed
-        implementation lives in
-        :mod:`yggdrasil.io.buffer._concurrency` and works on any
-        local-mount-style filesystem.
-        """
-        if self._path_lock is not None:
-            return
-        if not self._should_lock_path():
-            return
-
-        read, write = self._lock_modes()
-        try:
-            lock = self._spill_path.lock(
-                read=read,
-                write=write,
-                wait=self._lock_wait,
-            )
-        except Exception:
-            # Backend doesn't support a Path.lock surface — skip
-            # rather than failing the operation outright.
-            return
-        try:
-            lock.acquire()
-        except TimeoutError:
-            raise
-        except Exception:
-            # Best-effort: a backend that exposes lock() but raises
-            # on acquire (transient backend error, missing perms)
-            # shouldn't block the caller's I/O.
-            return
-        self._path_lock = lock
-
-    def _release_path_lock(self) -> None:
-        lock = self._path_lock
-        self._path_lock = None
-        if lock is None:
-            return
-        try:
-            lock.release()
-        except Exception:
-            pass
-
     def _acquire(self) -> None:
-        """Open the per-open context against the bound path."""
+        """Acquire the bound path's I/O state (fd or transaction buffer)."""
         if self._spill_path is None:
             return
-
-        # Acquire the cross-process lock BEFORE any backend-specific
-        # opening work. If we raced and another writer holds it,
-        # blocking here means we don't truncate (``wb`` mode includes
-        # ``O_TRUNC``) the file while the holder is still writing.
-        # Hits both local and remote paths so backend-specific
-        # ``Path.lock`` overrides participate uniformly.
-        self._acquire_path_lock()
-
         if self._ctx is not None:
             return
 
-        try:
-            self._ctx = self._spill_path.open_context(self._mode)
-        except Exception:
-            # Open failed — drop the lock so the next acquirer can try.
-            self._release_path_lock()
-            raise
+        self._spill_path.acquire_io(self._mode)
+        self._ctx = self._spill_path
 
         # Path-bound buffers don't keep an in-memory bytearray — the
-        # context owns the working bytes.
+        # path owns the working bytes.
         self._buf = None
-        self._size = self._ctx.size
-        self._mtime = self._ctx.mtime
+        self._size = int(self._spill_path.size)
+        mt = self._spill_path.mtime
+        self._mtime = float(mt) if mt is not None else 0.0
 
-        # Append modes start the visible cursor at EOF.
         if "a" in self._mode:
             self._pos = self._size
         else:
             self._pos = 0
 
     def _release(self) -> None:
-        """Close the open context, unlink owned spill files.
-
-        Order matters:
-
-        1. **Drop tabular caches first** — pure Python state, can't
-           fail meaningfully, want them out before any byte ops.
-        2. **Close the context.** ``ctx.close()`` releases any
-           underlying fd. Path-bound writes already hit the path
-           via :meth:`Path.pwrite` on each ``ctx.pwrite``, so close
-           has nothing to commit beyond the bookkeeping.
-        3. **Unlink the spill file** if owned. Caller-owned paths
-           are left alone.
-        4. **Release the cross-process lock** so the next writer can
-           safely take over the target path.
-        """
-        # Tabular cache: clear first so a re-open after close starts
-        # cold. Pure-Python state — no failure modes worth handling.
+        """Close the open context, unlink owned spill files."""
+        # Tabular cache: clear first so a re-open after close starts cold.
         self.unpersist()
 
-        # Close the open context. It owns the live state — typically
-        # a long-lived fd for local paths — and resets any per-open
-        # bookkeeping when it dies.
+        # Drop the path's I/O state — close_io flushes the transaction
+        # buffer (remote) or closes the fd (local).
         if self._ctx is not None:
             try:
-                self._ctx.close()
+                self._ctx.close_io()
             except Exception:
                 pass
             self._ctx = None
@@ -852,39 +632,21 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 pass
             self._spill_path = None
 
-        # Release the cross-process lock last — once this returns,
-        # another writer can take over the same target path safely.
-        self._release_path_lock()
-
-    def _ensure_ctx(self) -> "OpenContext":
-        """Open the per-open context lazily; return it.
-
-        Raises if there's no path to open against. Memory-mode buffers
-        have no ctx — callers that need positional path I/O against a
-        memory-only buffer should spill first or rethink the call.
-        """
+    def _ensure_ctx(self) -> "Path":
+        """Lazily acquire the bound path's I/O state; return the path."""
         if self._ctx is not None:
             return self._ctx
         if self._spill_path is None:
             raise RuntimeError(
                 "BytesIO has no spill path to open a context against"
             )
-        # Take the path lock first if we're in a write mode against a
-        # caller-owned path — the lazy open path bypasses _acquire,
-        # so we'd otherwise miss the concurrency guard for callers
-        # that write before opening explicitly.
-        self._acquire_path_lock()
-        try:
-            self._ctx = self._spill_path.open_context(self._mode)
-        except Exception:
-            self._release_path_lock()
-            raise
+        self._spill_path.acquire_io(self._mode)
+        self._ctx = self._spill_path
         return self._ctx
 
     # ------------------------------------------------------------------
     # Three core primitives — only branch sites for memory vs spilled
     # ------------------------------------------------------------------
-    @_under_thread_lock
     def _slice(self, pos: int, n: int) -> bytes:
         """Read *n* bytes at *pos*. Two backings:
 
@@ -945,7 +707,6 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         if ctx.dirty:
             self._dirty = True
 
-    @_under_thread_lock
     def _write_at(self, data: memoryview, pos: int) -> int:
         """Write *mv* at *pos*. Grows backing, auto-spills on threshold.
 
@@ -1020,7 +781,6 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
         raise RuntimeError(f"Cannot write to {self!r}: no backing")
 
-    @_under_thread_lock
     def _set_size(self, n: int) -> int:
         """Truncate or extend backing to exactly *n* bytes.
 
@@ -1109,12 +869,11 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         self._spill_path = path
         self._owns_spill_path = True
 
-        # Open a context against the new path. ``rb+`` so subsequent
-        # reads AND writes work regardless of the original mode —
-        # the spill is internal scratch we own. Mode preservation
-        # matters only for the path-bound case, where the user
-        # picked the mode.
-        self._ctx = path.open_context("rb+")
+        # Acquire the new path's IO state. ``rb+`` so subsequent reads
+        # AND writes work regardless of the original mode — the spill
+        # is internal scratch we own.
+        path.acquire_io("rb+")
+        self._ctx = path
 
     def _ext_hint(self) -> str:
         """File extension suggestion for spill files."""
@@ -1289,15 +1048,6 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         view._spill_bytes = 0
         view._spill_ttl = 0
         view._metadata = {}
-        # Concurrency slots — view mirrors the parent's posture but
-        # owns its own RLock so cross-view nesting doesn't accidentally
-        # share state. Path lock is irrelevant: a view has no own path.
-        view.concurrent = parent.concurrent
-        view._lock_wait = None
-        view._path_lock = None
-        view._thread_lock = (
-            threading.RLock() if parent.concurrent else None
-        )
         view.parent = parent
         view._view_offset = int(offset)
         view._view_max_size = None if max_size is None else int(max_size)
@@ -1386,7 +1136,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
         # ------------------------------------------------------------------
         if self._ctx is not None:
             try:
-                self._ctx.close()
+                self._ctx.close_io()
             except Exception:
                 pass
             self._ctx = None
@@ -1601,14 +1351,6 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             "Construct via the format leaf (ParquetIO, CsvIO, …) "
             "or pass media_type= to dispatch through the registry."
         )
-
-    def _iter_children(self, options: CastOptions) -> "Iterator[TabularIO]":
-        """Single-buffer leaves have no children — yields nothing.
-
-        Folder-shaped IOs override this; for a raw byte buffer the
-        answer is always "this IS the leaf, walk no further."
-        """
-        return iter(())
 
     # ==================================================================
     # Mode resolution — used by every single-buffer write path
@@ -1883,11 +1625,11 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
             return new_instance
 
         # Owned spilled: copy the spill file via chunked pread→pwrite
-        # against the source's open context and a fresh context on the
-        # new path.
+        # against the source's acquired path and a fresh acquire on
+        # the new path.
         src_ctx = self._ensure_ctx()
         new_path = _mint_spill_path(new_instance._ext_hint(), new_instance._spill_ttl)
-        dst_ctx = new_path.open_context("rb+")
+        new_path.acquire_io("rb+")
         try:
             pos = 0
             while pos < size:
@@ -1895,13 +1637,13 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
                 chunk = src_ctx.pread(want, pos)
                 if not chunk:
                     break
-                written = dst_ctx.pwrite(chunk, pos)
+                written = new_path.pwrite(chunk, pos)
                 if written == 0:
                     break
                 pos += written
-            dst_ctx.flush()
+            new_path.flush()
         finally:
-            dst_ctx.close()
+            new_path.close_io()
 
         new_instance._buf = None
         new_instance._spill_path = new_path
@@ -2757,7 +2499,7 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 
         if self._ctx is not None:
             try:
-                self._ctx.close()
+                self._ctx.close_io()
             except Exception:
                 pass
             self._ctx = None
@@ -2772,55 +2514,6 @@ class BytesIO(TabularIO[CastOptions], IO[bytes]):
 # ===========================================================================
 # Module-level helpers
 # ===========================================================================
-
-
-def _pread_bounded(fd: int, n: int, pos: int) -> bytes:
-    """:func:`os.pread` with a Windows fallback.
-
-    ``os.pread`` is POSIX-only and not exposed on the Windows build
-    of CPython. Falls back to lseek + read, restoring the cursor
-    afterward so concurrent positional ops on the same fd don't
-    fight. Not thread-safe in the fallback path.
-    """
-    if _HAS_PREAD:
-        return os.pread(fd, n, pos)
-    # Fallback: lseek + read. Preserves cursor so concurrent ops on
-    # the same fd don't fight, but is NOT thread-safe.
-    saved = os.lseek(fd, 0, os.SEEK_CUR)
-    try:
-        os.lseek(fd, pos, os.SEEK_SET)
-        return os.read(fd, n)
-    finally:
-        try:
-            os.lseek(fd, saved, os.SEEK_SET)
-        except OSError:
-            pass
-
-
-def _pwrite_bounded(fd: int, data, pos: int) -> int:
-    """:func:`os.pwrite` with a Windows fallback.
-
-    Symmetric to :func:`_pread_bounded`. ``os.pwrite`` is POSIX-only;
-    on Windows we ``lseek`` + ``write`` and restore the cursor.
-    Coerces *data* to a contiguous :class:`memoryview` here so call
-    sites can pass any buffer-protocol input without pre-coercion.
-
-    Not thread-safe in the fallback path — concurrent positional
-    writes on the same fd race for the cursor.
-    """
-    mv = _as_contiguous_mv(memoryview(data))
-    if _HAS_PWRITE:
-        return os.pwrite(fd, mv, pos)
-    # Fallback for Windows et al.
-    saved = os.lseek(fd, 0, os.SEEK_CUR)
-    try:
-        os.lseek(fd, pos, os.SEEK_SET)
-        return os.write(fd, mv)
-    finally:
-        try:
-            os.lseek(fd, saved, os.SEEK_SET)
-        except OSError:
-            pass
 
 
 def _mint_spill_path(ext: str, ttl_seconds: int) -> "Path":

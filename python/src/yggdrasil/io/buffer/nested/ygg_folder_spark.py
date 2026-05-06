@@ -55,7 +55,7 @@ __all__ = [
 
 
 #: Spark conf key that carries the driver's
-#: :func:`yggdrasil.io.buffer._concurrency.compute_identifier_url`
+#: :func:`yggdrasil.io.buffer.nested.ygg_folder_io._local_owner_url`
 #: across to executor processes. Workers pick the same value back up
 #: when they read ``$YGG_OWNER_URL`` (Spark propagates ``executorEnv``
 #: bindings to executor processes at task start).
@@ -141,14 +141,14 @@ class YGGFolderSparkConnector:
         """Compute (or return the propagated) compute-identifier URL.
 
         Convenience accessor — equivalent to calling
-        :func:`yggdrasil.io.buffer._concurrency.compute_identifier_url`
-        directly. Useful when a caller wants to capture the URL
-        on the driver before invoking a Spark write so the same
-        value can be plumbed to executors.
+        :func:`yggdrasil.io.buffer.nested.ygg_folder_io._local_owner_url`.
+        Useful when a caller wants to capture the URL on the driver
+        before invoking a Spark write so the same value can be
+        plumbed to executors.
         """
-        from yggdrasil.io.buffer._concurrency import compute_identifier_url
+        from .ygg_folder_io import _local_owner_url
 
-        return compute_identifier_url()
+        return _local_owner_url()
 
     @classmethod
     def propagate_owner_url(
@@ -161,7 +161,7 @@ class YGGFolderSparkConnector:
         Captures the driver's URL (or the caller-supplied ``owner_url``)
         and pushes it onto the Spark conf so executor-side code that
         reads ``$YGG_OWNER_URL`` — including
-        :func:`compute_identifier_url` itself — returns the same
+        :func:`_local_owner_url` itself — returns the same
         value as the driver. That way any locks taken by worker tasks
         (and any checkpoints they happen to record) carry the driver's
         attribution: same job id, same task key, same overall identity.
@@ -288,7 +288,7 @@ class YGGFolderSparkConnector:
         the URL is also stamped onto the Spark conf via
         :meth:`propagate_owner_url` so any new executor processes
         — and any subsequent worker-side calls to
-        :func:`compute_identifier_url` — return the same value, in
+        :func:`_local_owner_url` — return the same value, in
         turn making any locks they take share the same id.
 
         ``extra`` flows through to the checkpoint record verbatim,

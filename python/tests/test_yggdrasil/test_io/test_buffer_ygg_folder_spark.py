@@ -287,28 +287,17 @@ class TestYGGFolderSparkStreamingIntegration(SparkTestCase):
             f"driver URL {driver_url!r} missing from {owners!r}"
         )
 
-    def test_worker_owner_url_env_matches_driver(self):
-        """When ``YGG_OWNER_URL`` is set in a worker env, the worker's
-        :func:`compute_identifier_url` returns the propagated value
-        verbatim — the override beats Databricks-env detection so a
-        coordinator can pin all workers to the driver's identity."""
-        import os as _os
-        from yggdrasil.io.buffer._concurrency import compute_identifier_url
-
+    def test_driver_owner_url_is_stable(self):
+        """:meth:`YGGFolderSparkConnector.driver_owner_url` returns a
+        stable ``host://<hostname>/pid/<pid>`` URL for the driver."""
         folder = self.tmp_path / "owner_env"
         folder.mkdir()
         connector = YGGFolderSparkConnector(YGGFolderIO(path=str(folder)))
-        driver_url = connector.driver_owner_url()
-
-        prev = _os.environ.get("YGG_OWNER_URL")
-        try:
-            _os.environ["YGG_OWNER_URL"] = driver_url
-            assert compute_identifier_url() == driver_url
-        finally:
-            if prev is None:
-                _os.environ.pop("YGG_OWNER_URL", None)
-            else:
-                _os.environ["YGG_OWNER_URL"] = prev
+        url = connector.driver_owner_url()
+        assert url.startswith("host://")
+        assert "/pid/" in url
+        # Idempotent within a process.
+        assert connector.driver_owner_url() == url
 
 
 # ---------------------------------------------------------------------------

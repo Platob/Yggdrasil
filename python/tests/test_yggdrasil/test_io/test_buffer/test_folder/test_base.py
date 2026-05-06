@@ -31,12 +31,19 @@ class TestFolderIterChildren:
         names = sorted(c.path.name for c in FolderIO(path=str(tmp_path))._iter_children(FolderOptions()))
         assert names == ["a.parquet", "b.parquet"]
 
-    def test_skips_hidden_files(self, tmp_path):
+    def test_yields_dot_prefixed_entries(self, tmp_path):
+        # Iteration is unfiltered — dot-prefixed files are yielded
+        # alongside everything else. Backends that need to hide
+        # specific names (Delta's ``_delta_log/``, YGG's ``.ygg/``)
+        # override ``_iter_children`` themselves.
         ParquetIO(path=str(tmp_path / "a.parquet")).write_arrow_table(sample_table())
         (tmp_path / ".hidden").touch()
 
-        names = [c.path.name for c in FolderIO(path=str(tmp_path))._iter_children(FolderOptions())]
-        assert names == ["a.parquet"]
+        names = sorted(
+            c.path.name
+            for c in FolderIO(path=str(tmp_path))._iter_children(FolderOptions())
+        )
+        assert names == [".hidden", "a.parquet"]
 
 
 class TestFolderMakeChild:

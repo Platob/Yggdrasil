@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import itertools
 import os
+import socket
 import time
 import urllib.parse
 from typing import Any, ClassVar, Iterable, Iterator, Mapping, TYPE_CHECKING
@@ -62,6 +63,22 @@ __all__ = ["YGGFolderIO", "is_ygg_folder"]
 _METADATA_KEY_VALID = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-."
 )
+
+
+def _local_owner_url() -> str:
+    """Default ``owner`` URL for a checkpoint record.
+
+    ``host://<hostname>/pid/<pid>`` — best-effort hostname (falls
+    back to ``"unknown"``), URL-quoted to keep odd characters out
+    of the JSON-line encoding. Override with the ``owner=``
+    argument on :meth:`YGGFolderIO.checkpoint` when committing
+    on behalf of a different process / driver.
+    """
+    try:
+        host = socket.gethostname() or "unknown"
+    except OSError:
+        host = "unknown"
+    return f"host://{urllib.parse.quote(host, safe='')}/pid/{os.getpid()}"
 
 
 def _validate_metadata_key(key: str) -> str:
@@ -168,9 +185,9 @@ class YGGFolderIO(FolderIO):
       ``.ygg/stats.arrow``), :meth:`read_stats` (load).
 
     Construction parity with :class:`FolderIO` — pass ``path=`` and
-    optionally ``schema=`` / ``partition_columns=`` /
-    ``concurrent=``. Reads via :meth:`read_arrow_batches` work
-    exactly the same; the sidecar is invisible to data enumeration.
+    optionally ``schema=`` / ``partition_columns=``. Reads via
+    :meth:`read_arrow_batches` work exactly the same; the sidecar
+    is invisible to data enumeration.
     """
 
     _FINAL_TABULAR_IO: ClassVar[bool] = True
@@ -200,9 +217,9 @@ class YGGFolderIO(FolderIO):
         """
         return MimeTypes.ARROW_IPC
 
-    #: Hidden subfolder used for metadata. Starts with ``.`` so the
-    #: default :meth:`_is_ignored_path` rule already hides it from
-    #: data enumeration.
+    #: Hidden subfolder used for metadata. The
+    #: :meth:`_iter_children` override below skips it so data
+    #: enumeration doesn't dive into the sidecar tree.
     YGG_DIR_NAME: ClassVar[str] = ".ygg"
 
     #: File under :attr:`YGG_DIR_NAME` that holds the append-only
@@ -236,6 +253,26 @@ class YGGFolderIO(FolderIO):
             cached = self.path / self.YGG_DIR_NAME
             self.__dict__["_ygg_path_cache"] = cached
         return cached
+
+    # ------------------------------------------------------------------
+    # Children — skip the .ygg/ sidecar so data enumeration stays clean
+    # ------------------------------------------------------------------
+
+    def _iter_children(
+        self,
+        options: Any,
+    ) -> "Iterator[Any]":
+        """Yield direct children of :attr:`path`, skipping ``.ygg/``."""
+        ygg_name = self.YGG_DIR_NAME
+        for child in super()._iter_children(options):
+            try:
+                name = child.path.name
+            except Exception:
+                yield child
+                continue
+            if name == ygg_name:
+                continue
+            yield child
 
     @property
     def _ygg_checkpoint_log(self) -> Path:
@@ -316,23 +353,18 @@ class YGGFolderIO(FolderIO):
         A checkpoint is the streaming-write equivalent of a commit:
         it records that the writer considers everything written up
         to *this point* a coherent unit, with optional caller-supplied
-        ``message`` and arbitrary ``**extra`` fields. Concurrent
-        ``checkpoint()`` callers serialise on a transient ``.w.lock``
-        against the log file so JSON lines never tear; the lock is
-        held only for the append, not for the (much more expensive)
-        record assembly.
+        ``message`` and arbitrary ``**extra`` fields. The append rides
+        ``write_bytes(mode="ab")`` which is atomic within ``PIPE_BUF``
+        on local filesystems — JSON lines never tear at that size.
 
-        ``owner`` is a compute-identifier URL (see
-        :func:`yggdrasil.io.buffer._concurrency.compute_identifier_url`
-        for the schemes). When omitted, the local process's URL is
-        used. Pass an explicit ``owner`` when committing on behalf of
-        another process — for example, a Spark driver recording that
-        a distributed write across workers belongs to its own job.
+        ``owner`` is a compute-identifier URL. When omitted, a
+        ``host://<hostname>/pid/<pid>`` URL identifies the local
+        process. Pass an explicit ``owner`` when committing on behalf
+        of another process — e.g. a Spark driver recording that a
+        distributed write across workers belongs to its own job.
         """
-        from yggdrasil.io.buffer._concurrency import compute_identifier_url
-
         if owner is None:
-            owner = compute_identifier_url()
+            owner = _local_owner_url()
 
         # Build the record outside the write lock — id discovery
         # (tail-read) and file listing both touch the filesystem and
@@ -367,18 +399,9 @@ class YGGFolderIO(FolderIO):
         # cuts the lock-file clutter and the per-call sidecar
         # round-trip on the hot path. Remote backends (where atomic
         # append is not guaranteed) still serialise on the lock.
-        if log.is_local and len(line) <= self._APPEND_ATOMIC_LIMIT:
-            try:
-                log.write_bytes(line, mode="ab")
-                # Bump the in-memory id counter on success so the
-                # next call skips the tail read entirely.
-                self.__dict__["_cached_next_id"] = record["id"] + 1
-                return record
-            except OSError:
-                pass
-
-        with log.lock(write=True, wait=30):
-            log.write_bytes(line, mode="ab")
+        log.write_bytes(line, mode="ab")
+        # Bump the in-memory id counter on success so the next call
+        # skips the tail read entirely.
         self.__dict__["_cached_next_id"] = record["id"] + 1
         return record
 

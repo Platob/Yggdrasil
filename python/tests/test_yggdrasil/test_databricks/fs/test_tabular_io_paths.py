@@ -286,23 +286,12 @@ def _xfail_inherited(*method_names: str):
         return cls
     return deco
 
-@_xfail_inherited(
-    "test_arrow_table_round_trip",
-    "test_arrow_batches_streaming",
-    "test_pandas_frame_round_trip",
-    "test_polars_frame_round_trip",
-    "test_pylist_round_trip",
-    "test_pydict_round_trip",
-)
 class TestTabularIORemoteMock(_TabularIOPathMixin, PandasTestCase):
     """Run the TabularIO suite against a mocked managed remote path.
 
     Same assertions as the local class, but routed through the
     non-local path machinery (``open_io`` → BytesIO transaction buffer
-    → ``write_stream`` on flush). The write tests are currently
-    expected to fail; the read tests pass because they seed the store
-    directly via :meth:`_seed_parquet` instead of going through the
-    broken write path.
+    → ``write_stream`` on flush).
     """
 
     def setUp(self) -> None:
