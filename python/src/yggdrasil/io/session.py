@@ -803,35 +803,12 @@ class Session(ABC):
         config: SendManyConfig | SendConfig | Mapping[str, Any] | None = None,
         *,
         schema: Schema | None = None,
-        wait: WaitingConfigArg = None,
-        raise_error: bool = True,
-        normalize: bool | None = None,
-        stream: bool = True,
-        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
-        local_cache: CacheConfig | Mapping[str, Any] | None = None,
-        batch_size: int | None = None,
-        ordered: bool = False,
-        max_in_flight: int | None = None,
-        spark_session: Optional["SparkSession"] = None,
-        **options,
+        **kwargs,
     ) -> "SparkDataFrame":
         from yggdrasil.spark.frame import DynamicFrame, PICKLE_COLUMN_NAME
         from pyspark.sql.types import BinaryType, StructField, StructType
 
-        cfg = SendManyConfig.check_arg(
-            config,
-            wait=wait,
-            raise_error=raise_error,
-            normalize=normalize,
-            stream=stream,
-            remote_cache=remote_cache,
-            local_cache=local_cache,
-            batch_size=batch_size,
-            ordered=ordered,
-            max_in_flight=max_in_flight,
-            spark_session=spark_session,
-            **options,
-        )
+        cfg = SendManyConfig.check_arg(config, **kwargs)
 
         # Resolve Spark session — prefer cfg.spark_session, fall back to auto-create.
         effective_spark = cfg.spark_session
