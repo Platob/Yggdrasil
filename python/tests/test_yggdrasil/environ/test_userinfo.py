@@ -25,8 +25,6 @@ from yggdrasil.environ.userinfo import (
     get_user_info,
 )
 
-_UNSET = userinfo_mod._UNSET
-
 
 @pytest.fixture(autouse=True)
 def _clear_userinfo_cache():
@@ -72,11 +70,11 @@ class TestLazyResolution:
 
         assert info.hostname == "host-x"
         assert calls == {"key": 0, "email": 0, "project": 0, "cwd": 0}
-        assert info._key is _UNSET
-        assert info._email is _UNSET
-        assert info._product is _UNSET
-        assert info._product_version is _UNSET
-        assert info._cwd_cache is _UNSET
+        assert info._key is ...
+        assert info._email is ...
+        assert info._product is ...
+        assert info._product_version is ...
+        assert info._cwd_cache is ...
 
     def test_singleton_is_returned_until_refresh(self, monkeypatch):
         monkeypatch.setattr(userinfo_mod.socket, "gethostname", lambda: "host-x")

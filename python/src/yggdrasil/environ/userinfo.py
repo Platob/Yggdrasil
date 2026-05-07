@@ -13,10 +13,12 @@ import pyarrow as pa
 
 from yggdrasil.io.url import URL
 
-# Sentinel for lazy field caches. ``None`` is a valid computed result
-# (no email, no detectable compute / repo, no project) so we can't
-# use ``None`` to mean "not yet resolved".
-_UNSET: Any = object()
+# Lazy field caches default to ``...`` (the ``Ellipsis`` singleton)
+# to mean "not yet resolved". ``None`` is a valid computed result
+# (no email, no detectable compute / repo, no project) and can't be
+# overloaded for that role; ``Ellipsis`` is a stable, importable
+# singleton so identity checks (``is ...``) are safe across pickling
+# and across worker boundaries without a private sentinel object.
 
 __all__ = [
     "UserInfo",
@@ -112,24 +114,24 @@ class UserInfo:
 
     hostname: str = ""
 
-    # Lazy identity caches. Defaulted to ``_UNSET`` so the property
+    # Lazy identity caches. Defaulted to ``...`` so the property
     # accessors can distinguish "not yet resolved" from "resolved to
     # ``None``" (a legal value for everything except ``key``). They
     # participate in :func:`dataclasses.replace` (init=True) so wire
     # round-trips and ``with_email`` don't need a custom builder.
-    _key: Any = field(default=_UNSET, repr=False)
-    _email: Any = field(default=_UNSET, repr=False)
-    _first_name: Any = field(default=_UNSET, repr=False)
-    _last_name: Any = field(default=_UNSET, repr=False)
-    _product: Any = field(default=_UNSET, repr=False)
-    _product_version: Any = field(default=_UNSET, repr=False)
+    _key: Any = field(default=..., repr=False)
+    _email: Any = field(default=..., repr=False)
+    _first_name: Any = field(default=..., repr=False)
+    _last_name: Any = field(default=..., repr=False)
+    _product: Any = field(default=..., repr=False)
+    _product_version: Any = field(default=..., repr=False)
 
     # Per-process derived caches. ``init=False`` because they
     # shouldn't travel across the wire — the receiver's filesystem
     # / runtime is the only context that can answer correctly.
-    _cwd_cache: Any = field(default=_UNSET, init=False, repr=False, compare=False)
-    _url_cache: Any = field(default=_UNSET, init=False, repr=False, compare=False)
-    _git_url_cache: Any = field(default=_UNSET, init=False, repr=False, compare=False)
+    _cwd_cache: Any = field(default=..., init=False, repr=False, compare=False)
+    _url_cache: Any = field(default=..., init=False, repr=False, compare=False)
+    _git_url_cache: Any = field(default=..., init=False, repr=False, compare=False)
 
     @classmethod
     def current(cls) -> "UserInfo":
@@ -143,7 +145,7 @@ class UserInfo:
     @property
     def key(self) -> str:
         cached = self._key
-        if cached is not _UNSET:
+        if cached is not ...:
             return cached
         result = _resolve_key()
         object.__setattr__(self, "_key", result)
@@ -152,7 +154,7 @@ class UserInfo:
     @property
     def email(self) -> str | None:
         cached = self._email
-        if cached is not _UNSET:
+        if cached is not ...:
             return cached
         result = _resolve_email()
         object.__setattr__(self, "_email", result)
@@ -161,7 +163,7 @@ class UserInfo:
     @property
     def first_name(self) -> str | None:
         cached = self._first_name
-        if cached is not _UNSET:
+        if cached is not ...:
             return cached
         # Names derive from email — resolving one resolves the pair,
         # so the second access skips the regex on the cache hit.
@@ -173,7 +175,7 @@ class UserInfo:
     @property
     def last_name(self) -> str | None:
         cached = self._last_name
-        if cached is not _UNSET:
+        if cached is not ...:
             return cached
         first, last = _names_from_email(self.email)
         object.__setattr__(self, "_first_name", first)
@@ -183,7 +185,7 @@ class UserInfo:
     @property
     def product(self) -> str | None:
         cached = self._product
-        if cached is not _UNSET:
+        if cached is not ...:
             return cached
         # Like the name pair, project name and version are resolved
         # from a single ``pyproject.toml`` parse — fill both slots.
@@ -195,7 +197,7 @@ class UserInfo:
     @property
     def product_version(self) -> str | None:
         cached = self._product_version
-        if cached is not _UNSET:
+        if cached is not ...:
             return cached
         product, version = _infer_project(self.cwd)
         object.__setattr__(self, "_product", product)
@@ -206,7 +208,7 @@ class UserInfo:
     def cwd(self) -> str:
         """Resolve the current working directory lazily (memoized)."""
         cached = self._cwd_cache
-        if cached is not _UNSET:
+        if cached is not ...:
             return cached
         result = _safe_getcwd()
         object.__setattr__(self, "_cwd_cache", result)
@@ -222,7 +224,7 @@ class UserInfo:
         request hot path.
         """
         cached = self._url_cache
-        if cached is not _UNSET:
+        if cached is not ...:
             return cached
         result = _current_compute_url(hostname=self.hostname, cwd=self.cwd)
         object.__setattr__(self, "_url_cache", result)
@@ -237,7 +239,7 @@ class UserInfo:
         sanitization paths.
         """
         cached = self._git_url_cache
-        if cached is not _UNSET:
+        if cached is not ...:
             return cached
         result = _git_url_from_info(_git_info(self.cwd))
         object.__setattr__(self, "_git_url_cache", result)
