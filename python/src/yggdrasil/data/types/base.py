@@ -56,6 +56,8 @@ __all__ = [
     "PrimitiveType",
     "NullType",
     "BinaryType",
+    "BJsonType",
+    "SJsonType",
     "StringType",
     "BooleanType",
     "NumericType",
@@ -611,6 +613,7 @@ class DataType(BaseChildrenFields, ABC):
         from .nested import ArrayType, MapType, StructType
         from .primitive import (
             BinaryType,
+            BJsonType,
             BooleanType,
             DateType,
             DecimalType,
@@ -618,6 +621,7 @@ class DataType(BaseChildrenFields, ABC):
             FloatingPointType,
             IntegerType,
             NullType,
+            SJsonType,
             StringType,
             TimeType,
             TimestampType,
@@ -740,8 +744,11 @@ class DataType(BaseChildrenFields, ABC):
                 return cls.from_parsed(parsed.value_type)
             return StringType()
 
-        if parsed.type_id == DataTypeId.JSON:
-            return StringType()
+        if parsed.type_id == DataTypeId.SJSON:
+            return SJsonType()
+
+        if parsed.type_id == DataTypeId.BJSON:
+            return BJsonType(byte_size=parsed.byte_size)
 
         if parsed.type_id == DataTypeId.OBJECT:
             from .primitive import ObjectType
@@ -1962,6 +1969,7 @@ class DataType(BaseChildrenFields, ABC):
 from .nested import ArrayType, MapType, NestedType, StructType
 from .primitive import (
     BinaryType,
+    BJsonType,
     BooleanType,
     DateType,
     DecimalType,
@@ -1979,6 +1987,7 @@ from .primitive import (
     NullType,
     NumericType,
     PrimitiveType,
+    SJsonType,
     StringType,
     TemporalType,
     TimeType,

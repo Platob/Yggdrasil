@@ -27,6 +27,12 @@ import pyarrow as pa
 from yggdrasil.data.enums import Mode
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.nested import NestedType
+from yggdrasil.data.types.nested._cast_json import (
+    cast_arrow_json_string_array,
+    cast_polars_json_string_expr,
+    cast_spark_json_string_column,
+    is_json_string_source,
+)
 from yggdrasil.data.types.support import get_polars, get_spark_sql
 from yggdrasil.environ.importlib import cached_from_import
 from yggdrasil.lazy_imports import field_class
@@ -353,6 +359,9 @@ class StructType(NestedType):
                 memory_pool=options.arrow_memory_pool,
             )
 
+        elif is_json_string_source(source_type_id):
+            return cast_arrow_json_string_array(array, options=options)
+
         elif source_type_id == DataTypeId.STRUCT:
             return cast_arrow_struct_array(array, options)
 
@@ -418,6 +427,9 @@ class StructType(NestedType):
         if source_type_id == DataTypeId.NULL:
             return options.target_field.default_polars_expr(alias=options.target_field.name)
 
+        elif is_json_string_source(source_type_id):
+            return cast_polars_json_string_expr(expr, options)
+
         elif source_type_id == DataTypeId.STRUCT:
             return cast_polars_struct_expr(expr, options)
 
@@ -454,6 +466,11 @@ class StructType(NestedType):
         if source_type_id == DataTypeId.NULL or series.isna().all():
             return options.target_field.default_pandas_series(size=len(series))
 
+        elif is_json_string_source(source_type_id):
+            from .array import _cast_pandas_via_arrow
+
+            return _cast_pandas_via_arrow(series, options, cast_arrow_json_string_array)
+
         elif source_type_id == DataTypeId.STRUCT:
             return cast_pandas_struct_series(series, options)
 
@@ -483,6 +500,9 @@ class StructType(NestedType):
 
         if source_type_id == DataTypeId.NULL:
             return options.target_field.default_spark_column()
+
+        elif is_json_string_source(source_type_id):
+            return cast_spark_json_string_column(column, options)
 
         elif source_type_id == DataTypeId.STRUCT:
             return cast_spark_struct_column(column, options)

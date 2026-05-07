@@ -30,8 +30,8 @@ class DataTypeId(IntEnum):
     * ``60–69``  — temporal (``DATE`` / ``TIME`` / ``TIMESTAMP`` /
       ``DURATION``).
     * ``70–79``  — bytes (``BINARY`` / ``STRING``).
-    * ``80–99``  — extensions (``DICTIONARY`` / ``JSON`` / ``ENUM`` /
-      ``UNION``).
+    * ``80–99``  — extensions (``DICTIONARY`` / ``ENUM`` / ``UNION`` /
+      ``SJSON`` / ``BJSON``).
     * ``100+``   — nested (``ARRAY`` / ``MAP`` / ``STRUCT``).
     """
 
@@ -85,9 +85,10 @@ class DataTypeId(IntEnum):
 
     # ── Extensions ───────────────────────────────────────────────────────
     DICTIONARY = 80
-    JSON = 81
     ENUM = 82
     UNION = 83
+    SJSON = 84  # JSON encoded as a UTF-8 string (text JSON)
+    BJSON = 85  # JSON encoded as bytes (binary / packed JSON)
 
     # ── Nested ───────────────────────────────────────────────────────────
     ARRAY = 100
@@ -141,6 +142,13 @@ class DataTypeId(IntEnum):
     @property
     def is_extension(self) -> bool:
         return 80 <= self.value < 100
+
+    @property
+    def is_json(self) -> bool:
+        # Storage-pinned JSON variants — used by the cross-engine cast
+        # paths to recognize a "JSON column" without caring whether the
+        # bytes are UTF-8 text or a binary packing.
+        return self.value in (84, 85)
 
     @property
     def is_nested(self) -> bool:
