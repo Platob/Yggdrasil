@@ -190,18 +190,38 @@ class TestYggProperties(unittest.TestCase):
             with self.subTest(format=fmt.value):
                 self.assertIs(_resolve_format_mime(fmt), expected)
 
-    def test_unknown_format_falls_back_to_uc_table_mime(self) -> None:
-        """Connector-style formats yggdrasil doesn't categorize land on the UC mime."""
-        for fmt in (
-            DataSourceFormat.UNITY_CATALOG,
-            DataSourceFormat.DELTASHARING,
-            DataSourceFormat.MYSQL_FORMAT,
-        ):
+    def test_databricks_connector_formats_resolve(self) -> None:
+        """Databricks-specific connector formats now have their own MimeType."""
+        cases = [
+            (DataSourceFormat.HIVE, MimeTypes.HIVE),
+            (DataSourceFormat.DELTASHARING, MimeTypes.DELTASHARING),
+            (DataSourceFormat.DELTA_UNIFORM_HUDI, MimeTypes.DELTA_UNIFORM_HUDI),
+            (DataSourceFormat.DELTA_UNIFORM_ICEBERG, MimeTypes.DELTA_UNIFORM_ICEBERG),
+            (DataSourceFormat.UNITY_CATALOG, MimeTypes.UNITY_CATALOG),
+            (DataSourceFormat.DATABRICKS_FORMAT, MimeTypes.DATABRICKS_FORMAT),
+            (DataSourceFormat.MYSQL_FORMAT, MimeTypes.MYSQL_FORMAT),
+            (DataSourceFormat.POSTGRESQL_FORMAT, MimeTypes.POSTGRESQL_FORMAT),
+            (DataSourceFormat.SNOWFLAKE_FORMAT, MimeTypes.SNOWFLAKE_FORMAT),
+            (DataSourceFormat.BIGQUERY_FORMAT, MimeTypes.BIGQUERY_FORMAT),
+            (DataSourceFormat.REDSHIFT_FORMAT, MimeTypes.REDSHIFT_FORMAT),
+            (DataSourceFormat.VECTOR_INDEX_FORMAT, MimeTypes.VECTOR_INDEX_FORMAT),
+        ]
+        for fmt, expected in cases:
             with self.subTest(format=fmt.value):
-                self.assertIs(
-                    _resolve_format_mime(fmt),
-                    MimeTypes.DATABRICKS_UNITY_CATALOG_TABLE,
-                )
+                self.assertIs(_resolve_format_mime(fmt), expected)
+
+    def test_every_data_source_format_resolves(self) -> None:
+        """Coverage guard: no ``DataSourceFormat`` value should silently fall back."""
+        uc_table = MimeTypes.DATABRICKS_UNITY_CATALOG_TABLE
+        unresolved: list[str] = []
+        for fmt in DataSourceFormat:
+            mime = _resolve_format_mime(fmt)
+            # UNITY_CATALOG is a real category (foreign UC view), not the
+            # default fallback, so the only legitimate hit on the UC-table
+            # mime would mean a new enum value yggdrasil hasn't catalogued.
+            if mime is uc_table and fmt is not DataSourceFormat.UNITY_CATALOG:
+                unresolved.append(fmt.value)
+        self.assertEqual(unresolved, [])
 
     def test_format_none_falls_back_to_uc_table_mime(self) -> None:
         self.assertIs(
