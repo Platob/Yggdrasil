@@ -129,6 +129,7 @@ stmt.to_pylist()        # list[dict]
   - [`python/docs/`](python/docs/) — published documentation source (https://platob.github.io/Yggdrasil/).
 - [`rust/`](rust/) — `yggrs` crate (maturin + PyO3, `abi3-py310`).
 - [`powerquery/`](powerquery/) — Excel `.pq` and Power BI `.mez` connectors over the FastAPI service.
+- [`vercel/`](vercel/) — Next.js frontends and Vercel-hosted apps. One subfolder per app, each with its own Vercel project.
 - [`AGENTS.md`](AGENTS.md) — house style, error-message tone, comment voice, API ergonomics.
 - [`CLAUDE.md`](CLAUDE.md) — agent-facing notes for AI contributors.
 
