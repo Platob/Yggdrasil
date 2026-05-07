@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Mapping
+import struct
+from typing import IO, Mapping
 
 from yggdrasil.io import BytesIO
 from yggdrasil.pickle.ser.constants import HEADER_SIZE
@@ -20,6 +21,13 @@ MAX_METADATA_ENTRIES = 10_000
 MAX_METADATA_KEY_SIZE = 64 * 1024
 MAX_METADATA_VALUE_SIZE = 16 * 1024 * 1024
 
+# Pre-compiled struct codecs.
+# Header layout: tag:u16, codec:u16, size:u32, meta_size:u32 — 12 bytes BE.
+_HEADER_STRUCT = struct.Struct(">HHII")
+assert _HEADER_STRUCT.size == HEADER_SIZE
+_U32_BE = struct.Struct(">I")
+
+
 def encode_metadata(metadata: Mapping[bytes, bytes] | None) -> bytes:
     """Encode metadata as length-prefixed key/value pairs.
 
@@ -29,18 +37,19 @@ def encode_metadata(metadata: Mapping[bytes, bytes] | None) -> bytes:
     if not metadata:
         return b""
 
-    out = bytearray()
+    parts: list[bytes] = []
+    pack_u32 = _U32_BE.pack
     for key, value in metadata.items():
         if not isinstance(key, bytes):
             raise TypeError(f"Metadata keys must be bytes, got {type(key)!r}")
         if not isinstance(value, bytes):
             raise TypeError(f"Metadata values must be bytes, got {type(value)!r}")
 
-        out += len(key).to_bytes(4, "big")
-        out += key
-        out += len(value).to_bytes(4, "big")
-        out += value
-    return bytes(out)
+        parts.append(pack_u32(len(key)))
+        parts.append(key)
+        parts.append(pack_u32(len(value)))
+        parts.append(value)
+    return b"".join(parts)
 
 
 def decode_metadata(blob: bytes) -> Metadata:
@@ -51,6 +60,7 @@ def decode_metadata(blob: bytes) -> Metadata:
     size = len(blob)
     out: dict[bytes, bytes] = {}
     entries = 0
+    unpack_u32 = _U32_BE.unpack_from
 
     while pos < size:
         entries += 1
@@ -59,7 +69,7 @@ def decode_metadata(blob: bytes) -> Metadata:
 
         if pos + 4 > size:
             raise MetadataDecodeError("Unexpected EOF while reading metadata key length")
-        k_len = int.from_bytes(blob[pos : pos + 4], "big")
+        (k_len,) = unpack_u32(blob, pos)
         pos += 4
 
         if k_len > MAX_METADATA_KEY_SIZE:
@@ -72,7 +82,7 @@ def decode_metadata(blob: bytes) -> Metadata:
 
         if pos + 4 > size:
             raise MetadataDecodeError("Unexpected EOF while reading metadata value length")
-        v_len = int.from_bytes(blob[pos : pos + 4], "big")
+        (v_len,) = unpack_u32(blob, pos)
         pos += 4
 
         if v_len > MAX_METADATA_VALUE_SIZE:
@@ -164,10 +174,8 @@ class Header:
                 f"Expected {HEADER_SIZE} header bytes at pos={pos}, got {len(fixed)}"
             )
 
-        tag = int.from_bytes(fixed[0:2], "big")
-        codec = int.from_bytes(fixed[2:4], "big")
-        size = int.from_bytes(fixed[4:8], "big")
-        meta_size = int.from_bytes(fixed[8:12], "big")
+        # One unpack instead of four int.from_bytes calls.
+        tag, codec, size, meta_size = _HEADER_STRUCT.unpack(fixed)
 
         if meta_size > MAX_META_SIZE:
             raise HeaderDecodeError(f"Metadata too large: {meta_size}")
@@ -202,9 +210,15 @@ class Header:
         self,
         data: bytes | bytearray | memoryview,
         *,
-        buffer: BytesIO | None = None,
-    ) -> BytesIO:
-        """Write header + payload into a buffer and return that buffer."""
+        buffer: "BytesIO | IO[bytes] | None" = None,
+    ) -> "BytesIO | IO[bytes]":
+        """Write header + payload into a buffer and return that buffer.
+
+        Streams via the universal :class:`IO[bytes].write` method so a
+        stdlib ``io.BytesIO`` or any open file handle works as a sink —
+        not just the yggdrasil :class:`BytesIO`. Avoids the extra
+        ``to_bytes()`` materialization that previous shapes incurred.
+        """
         if buffer is None:
             buffer = BytesIO()
 
@@ -221,14 +235,12 @@ class Header:
                 f"actual={len(metadata_blob)}"
             )
 
-        fixed = bytearray(HEADER_SIZE)
-        fixed[0:2] = self.tag.to_bytes(2, "big")
-        fixed[2:4] = self.codec.to_bytes(2, "big")
-        fixed[4:8] = self.size.to_bytes(4, "big")
-        fixed[8:12] = self.meta_size.to_bytes(4, "big")
+        # Single struct.pack for the fixed 12-byte header.
+        fixed = _HEADER_STRUCT.pack(self.tag, self.codec, self.size, self.meta_size)
 
-        buffer.write_bytes(fixed)
+        write = buffer.write
+        write(fixed)
         if metadata_blob:
-            buffer.write_bytes(metadata_blob)
-        buffer.write_bytes(payload)
+            write(metadata_blob)
+        write(payload)
         return buffer

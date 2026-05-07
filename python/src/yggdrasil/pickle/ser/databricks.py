@@ -140,16 +140,19 @@ def _canonicalize_client_kwargs(kwargs: Mapping[str, object]) -> dict[str, objec
 
 
 def _nested_serialized_bytes(obj: object) -> bytes:
-    nested = Serialized.from_python_object(obj)
-    with BytesIO() as buf:
-        nested.write_to(buf)
-        buf.seek(0)
-        return buf.read()
+    # ``write_to`` builds + returns its own ``BytesIO`` when called
+    # without a sink, so an explicit ``with``-managed buffer +
+    # ``seek(0); buf.read()`` was double-buffering through scratch and
+    # then re-reading it — ``to_bytes()`` snapshots the underlying
+    # holder directly.
+    return Serialized.from_python_object(obj).write_to().to_bytes()
 
 
 def _load_nested_serialized(data: bytes) -> object:
-    with BytesIO(data, copy=False) as buf:
-        return Serialized.read_from(buf, pos=0).as_python()
+    # Closed-state ``BytesIO(data)`` reads route straight through the
+    # Memory holder; the previous ``with``-managed scratch transaction
+    # was seeding a redundant copy of the whole payload.
+    return Serialized.read_from(BytesIO(data), pos=0).as_python()
 
 
 def _extract_config_kwargs(config: Config) -> dict[str, object]:

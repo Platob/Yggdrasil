@@ -62,11 +62,11 @@ def _dump(
 ) -> None:
     dumped = Serialized.from_python_object(obj, metadata=metadata, codec=codec)
     fp.write(MAGIC)
-    # ``write_to`` rebuilds the full wire frame (header + payload).
-    # The previous shape (``data.parent.to_bytes()``) leaned on the
-    # bounded view's parent back-pointer; that's gone with the new
-    # snapshot-on-bound-view semantics.
-    fp.write(dumped.write_to().to_bytes())
+    # Stream the wire frame straight into ``fp``: ``Header.write_to``
+    # accepts any IO[bytes] sink. Skips the intermediate
+    # ``BytesIO() -> to_bytes()`` materialization the previous shape
+    # paid on every dump.
+    dumped.write_to(buffer=fp)
 
 
 def _dump_path(
@@ -130,9 +130,13 @@ def dumps(
     b64: bool = False,
 ) -> bytes | str:
     """Serialise *obj* to ``bytes``, or to a URL-safe base-64 ``str`` when *b64* is ``True``."""
-    with BytesIO() as buffer:
-        dump(obj, buffer, metadata=metadata, codec=codec)
-        value = buffer.getvalue()
+    # Closed-state ``BytesIO`` writes route straight to its Memory holder
+    # — no scratch allocation, no commit-on-close copy. The ``with``
+    # block was double-buffering writes through scratch then committing
+    # back into the same in-memory holder for no benefit.
+    buffer = BytesIO()
+    _dump(obj, buffer, metadata=metadata, codec=codec)
+    value = buffer.getvalue()
 
     if not b64:
         return value
@@ -151,7 +155,7 @@ def load(
     default: Any = None,
 ) -> Any:
     """Read a serialised payload from *fp* and optionally unpickle it."""
-    buffer = BytesIO(fp, copy=False)
+    buffer = BytesIO(fp)
 
     mag = buffer.read(MAGIC_LENGTH)
     if not is_valid_magic(mag):
@@ -199,6 +203,8 @@ def loads(
                 f"Invalid base64-encoded string {label!r}"
             ) from e
 
-    with BytesIO(s, copy=False) as buffer:
-        return load(buffer, unpickle=unpickle)
+    # Read-only over a fresh in-memory buffer — closed state already
+    # routes ops directly through the Memory holder; the ``with`` block
+    # was seeding a redundant scratch copy of the entire payload.
+    return load(BytesIO(s), unpickle=unpickle)
 
