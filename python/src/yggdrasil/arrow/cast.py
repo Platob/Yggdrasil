@@ -151,6 +151,16 @@ def _is_arrow_dataset(obj: Any) -> bool:
     return isinstance(obj, ds.Dataset)
 
 
+def _is_yggdrasil_tabular(obj: Any) -> bool:
+    """Return ``True`` if *obj* is a :class:`yggdrasil.io.tabular.Tabular`.
+
+    Imported lazily to avoid pulling the io subpackage into the import
+    graph of every Arrow consumer.
+    """
+    from yggdrasil.io.tabular import Tabular
+    return isinstance(obj, Tabular)
+
+
 # ---------------------------------------------------------------------------
 # Streaming rechunker — pure pyarrow, used by every engine entry point that
 # needs ``byte_size`` / ``row_size`` sizing on the way out.
@@ -462,6 +472,15 @@ def any_to_arrow_table(
     elif isinstance(obj, pa.RecordBatchReader):
         options = _bind_source(options, obj.schema)
         table = _project(obj.read_all(), options)
+
+    elif _is_yggdrasil_tabular(obj):
+        # ``Tabular`` (Response, StatementResult, ParquetIO, …) owns
+        # its own engine fan-out — let it produce the table so format
+        # leaves use their native scanners (Parquet predicate pushdown,
+        # StatementResult's persisted-frame short-circuit) instead of
+        # the polars-wrap fallback further down.
+        table = obj.read_arrow_table(options)
+        options = _bind_source(options, table)
 
     elif _is_arrow_dataset(obj):
         # ``Dataset.to_table()`` runs the scanner with column projection

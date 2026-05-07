@@ -394,7 +394,7 @@ def _collect_prune_values_polars(
     buffer: ParquetIO,
     prune_by: list[str],
 ) -> dict[str, tuple[Any, ...]]:
-    df = buffer.scan_polars().select(*prune_by).unique().collect()
+    df = buffer.scan_polars_frame().select(*prune_by).unique().collect()
     return {col: tuple(df.get_column(col).to_list()) for col in prune_by}
 
 
