@@ -127,8 +127,12 @@ class Serialized(ABC, Generic[T]):
             object.__setattr__(self, "_cached_obj", cached)
         return cached
 
-    def write_to(self, buffer: BytesIO | None = None) -> BytesIO:
-        return self.head.write_to(self.to_bytes(), buffer=buffer)
+    def write_to(self, buffer: "BytesIO | None" = None) -> BytesIO:
+        # Hand the payload to ``Header.write_to`` as a memoryview so the
+        # write streams straight from the data buffer's holder into the
+        # output sink (zero-copy for Memory holders) — no intermediate
+        # ``bytes`` allocation.
+        return self.head.write_to(self.data.memoryview(), buffer=buffer)
 
     def __reduce_ex__(self, protocol: int):
         """
@@ -387,7 +391,13 @@ class Serialized(ABC, Generic[T]):
         codec: int | None = None,
         compress_threshold: int = COMPRESS_THRESHOLD,
     ) -> "Serialized[object]":
-        raw = bytes(memoryview(data))
+        # Skip the ``bytes(memoryview(data))`` rewrap when the input is
+        # already an immutable ``bytes`` — the codec primitives accept
+        # bytes directly. Keeps the hot small-payload path allocation-free.
+        if isinstance(data, bytes):
+            raw = data
+        else:
+            raw = bytes(memoryview(data))
 
         if codec is None:
             if len(raw) >= compress_threshold:

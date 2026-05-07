@@ -192,7 +192,10 @@ class CollectionSerialized(Serialized[T], Generic[T]):
 
     def _payload_buffer(self) -> BytesIO:
         if self.codec == CODEC_NONE:
-            return BytesIO(self.data.to_bytes())
+            # Zero-copy: a non-owning view over the same holder, with
+            # an independent cursor at 0. Iteration here only reads, so
+            # sharing the wire payload's bytes with the parent is safe.
+            return self.data.view(pos=0)
         return BytesIO(self.decode())
 
     def _read_count(self, buffer: BytesIO) -> int:

@@ -252,9 +252,9 @@ class PandasSerialized(Serialized[TPandas], Generic[TPandas]):
 
     @staticmethod
     def _nested_serialized_bytes(nested: Serialized[object]) -> bytes:
-        buf = BytesIO()
-        nested.write_to(buf)
-        return buf.to_bytes()
+        # ``write_to`` allocates + populates its own buffer; this is
+        # the same shape minus the redundant local ``buf`` handle.
+        return nested.write_to().to_bytes()
 
     @classmethod
     def from_python_object(
