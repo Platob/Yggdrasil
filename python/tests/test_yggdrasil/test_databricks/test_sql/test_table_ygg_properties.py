@@ -13,11 +13,13 @@ import unittest
 
 from databricks.sdk.service.catalog import DataSourceFormat, TableType
 
+from yggdrasil.data.enums import MimeTypes
 from yggdrasil.data.schema import Schema, field
 from yggdrasil.databricks.sql.table import (
     YGG_PROPERTY_PREFIX,
     YGG_SCHEMA_FIELD_PREFIX,
     _build_ygg_properties,
+    _resolve_format_mime,
 )
 from yggdrasil.version import __version__ as ygg_version
 
@@ -44,7 +46,7 @@ class TestYggProperties(unittest.TestCase):
             "ygg.version",
             "ygg.created_at",
             "ygg.engine",
-            "ygg.format",
+            "ygg.mime_type",
             "ygg.table_type",
             "ygg.field_count",
             "ygg.schema_fingerprint",
@@ -55,13 +57,15 @@ class TestYggProperties(unittest.TestCase):
             self.assertIn(key, props)
 
         self.assertEqual(props["ygg.engine"], "sql")
-        self.assertEqual(props["ygg.format"], "DELTA")
+        self.assertEqual(props["ygg.mime_type"], MimeTypes.DELTA.value)
         self.assertEqual(props["ygg.table_type"], "MANAGED")
         self.assertEqual(props["ygg.field_count"], "4")
         self.assertEqual(props["ygg.partition_columns"], "region")
         self.assertEqual(props["ygg.cluster_columns"], "bucket")
         self.assertEqual(props["ygg.primary_keys"], "id")
         self.assertEqual(props["ygg.version"], str(ygg_version))
+        # raw enum string is replaced by the ygg MimeType categorization.
+        self.assertNotIn("ygg.format", props)
 
     def test_no_giant_schema_json_blob(self) -> None:
         """Per-field properties replace the legacy ``ygg.schema_json`` dump."""
@@ -156,6 +160,40 @@ class TestYggProperties(unittest.TestCase):
         self.assertNotIn("ygg.cluster_columns", props)
         self.assertNotIn("ygg.primary_keys", props)
         self.assertNotIn("ygg.storage_location", props)
+
+    def test_format_resolves_to_ygg_mimetype(self) -> None:
+        """Common storage flavors map to a registered ygg MimeType."""
+        cases = [
+            (DataSourceFormat.DELTA, MimeTypes.DELTA),
+            (DataSourceFormat.PARQUET, MimeTypes.PARQUET),
+            (DataSourceFormat.AVRO, MimeTypes.AVRO),
+            (DataSourceFormat.ORC, MimeTypes.ORC),
+            (DataSourceFormat.CSV, MimeTypes.CSV),
+            (DataSourceFormat.JSON, MimeTypes.JSON),
+            (DataSourceFormat.ICEBERG, MimeTypes.ICEBERG),
+        ]
+        for fmt, expected in cases:
+            with self.subTest(format=fmt.value):
+                self.assertIs(_resolve_format_mime(fmt), expected)
+
+    def test_unknown_format_falls_back_to_uc_table_mime(self) -> None:
+        """Connector-style formats yggdrasil doesn't categorize land on the UC mime."""
+        for fmt in (
+            DataSourceFormat.UNITY_CATALOG,
+            DataSourceFormat.DELTASHARING,
+            DataSourceFormat.MYSQL_FORMAT,
+        ):
+            with self.subTest(format=fmt.value):
+                self.assertIs(
+                    _resolve_format_mime(fmt),
+                    MimeTypes.DATABRICKS_UNITY_CATALOG_TABLE,
+                )
+
+    def test_format_none_falls_back_to_uc_table_mime(self) -> None:
+        self.assertIs(
+            _resolve_format_mime(None),
+            MimeTypes.DATABRICKS_UNITY_CATALOG_TABLE,
+        )
 
     def test_all_values_are_strings(self) -> None:
         """TBLPROPERTIES values must be strings on both create paths."""

@@ -874,6 +874,32 @@ YGG_PROPERTY_PREFIX = "ygg."
 YGG_SCHEMA_FIELD_PREFIX = "ygg.schema."
 
 
+def _resolve_format_mime(
+    data_source_format: "DataSourceFormat | str | None",
+) -> MimeType:
+    """Map a Databricks ``DataSourceFormat`` onto a yggdrasil :class:`MimeType`.
+
+    Databricks ``DataSourceFormat`` is the storage flavor (DELTA,
+    PARQUET, AVRO, …); yggdrasil already carries IANA-ish ``MimeType``
+    descriptors for the ones with a recognized type. We prefer the
+    yggdrasil categorization on table properties so the full ygg stack
+    (loaders, codecs, format dispatch) can speak one vocabulary.
+
+    Unresolvable formats — Databricks-specific connectors like
+    ``UNITY_CATALOG`` / ``DELTASHARING`` / ``BIGQUERY_FORMAT`` —
+    collapse to :data:`MimeTypes.DATABRICKS_UNITY_CATALOG_TABLE`,
+    which is also :meth:`Table.default_media_type`.
+    """
+    if data_source_format is None:
+        return MimeTypes.DATABRICKS_UNITY_CATALOG_TABLE
+    name = (
+        data_source_format.value
+        if hasattr(data_source_format, "value")
+        else str(data_source_format)
+    )
+    return MimeType.from_(name, default=None) or MimeTypes.DATABRICKS_UNITY_CATALOG_TABLE
+
+
 def _build_ygg_properties(
     schema_info: DataSchema,
     *,
@@ -898,6 +924,10 @@ def _build_ygg_properties(
     The fingerprint is a short blake2b digest of the *full* schema
     JSON so a reader can detect schema drift without re-assembling the
     per-field payloads.
+
+    The storage flavor goes out as ``ygg.mime_type`` — resolved via
+    :func:`_resolve_format_mime` so a yggdrasil :class:`MimeType` is
+    preferred over the raw Databricks ``DataSourceFormat`` enum string.
     """
     from yggdrasil.version import __version__ as ygg_version
 
@@ -911,21 +941,16 @@ def _build_ygg_properties(
         if not getattr(f, "constraint_key", False)
     ]
 
-    fmt_value = (
-        data_source_format.value
-        if hasattr(data_source_format, "value")
-        else (str(data_source_format) if data_source_format is not None else None)
-    )
+    mime = _resolve_format_mime(data_source_format)
 
     props: dict[str, str] = {
         "ygg.version": str(ygg_version),
         "ygg.created_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
         "ygg.engine": engine,
+        "ygg.mime_type": mime.value,
         "ygg.field_count": str(len(data_fields)),
         "ygg.schema_fingerprint": digest,
     }
-    if fmt_value:
-        props["ygg.format"] = fmt_value
     if table_type is not None:
         props["ygg.table_type"] = (
             table_type.value if hasattr(table_type, "value") else str(table_type)
