@@ -204,7 +204,7 @@ class Join(PlanOp):
     *right* may be a :class:`Tabular` (lifted to a polars
     ``LazyFrame`` via :meth:`Tabular.scan_polars_frame`), a polars
     ``DataFrame`` / ``LazyFrame`` (used as-is), or a string name to
-    resolve against :data:`yggdrasil.io.tabular.engine.default_engine`
+    resolve against :data:`yggdrasil.io.tabular.engine.SYSTEM_ENGINE`
     at apply-time. *on* is shared join keys; pass ``left_on`` /
     ``right_on`` for asymmetric keys. Reshapes rows, so neither
     schema-preserving nor union-commutative.
@@ -245,8 +245,8 @@ class Join(PlanOp):
 
         right = self.right
         if isinstance(right, str):
-            from yggdrasil.io.tabular.engine import default_engine
-            right = default_engine.resolve(right)
+            from yggdrasil.io.tabular.engine import SYSTEM_ENGINE
+            right = SYSTEM_ENGINE.resolve(right)
         if isinstance(right, Tabular):
             return right.scan_polars_frame()
         # polars DataFrame / LazyFrame — both work as the join right;

@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Iterator, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Optional, Tuple
 
 from yggdrasil.io.tabular.base import Tabular
 from yggdrasil.io.tabular.execution.plan import ExecutionPlan, PlanOp
@@ -39,10 +39,13 @@ if TYPE_CHECKING:
 __all__ = [
     "TabularEntry",
     "TabularEngine",
-    "default_engine",
+    "SYSTEM_ENGINE",
     "register",
     "deregister",
     "get",
+    "resolve",
+    "execute_plan",
+    "execute_sql",
 ]
 
 
@@ -354,7 +357,7 @@ class TabularEngine:
         or a flat / dotted name resolvable via :meth:`resolve`. The
         plan is coerced to an :class:`ExecutionPlan` (or treated as
         empty when ``None``); join ops with string ``right`` will
-        resolve back through :data:`default_engine` at apply time.
+        resolve back through :data:`SYSTEM_ENGINE` at apply time.
         """
         if isinstance(source, Tabular):
             tabular = source
@@ -443,23 +446,41 @@ class TabularEngine:
 # :class:`TabularEngine` is the canonical home for ``catalog.schema.name``
 # registrations. The SQL stack (``Join.right`` strings, the per-execute
 # ``sources`` merge in :meth:`execute_sql`) routes back through
-# :data:`default_engine` so a single registration becomes visible to
+# :data:`SYSTEM_ENGINE` so a single registration becomes visible to
 # both the lazy-plan path and the SQL path without the caller wiring two
 # registries.
 
-default_engine: TabularEngine = TabularEngine()
+SYSTEM_ENGINE: TabularEngine = TabularEngine()
 
 
 def register(catalog: str, schema: str, name: str, tabular: Any) -> TabularEntry:
-    """Register on the process-wide :data:`default_engine`."""
-    return default_engine.register(catalog, schema, name, tabular)
+    """Register on the process-wide :data:`SYSTEM_ENGINE`."""
+    return SYSTEM_ENGINE.register(catalog, schema, name, tabular)
 
 
 def deregister(catalog: str, schema: str, name: str) -> "TabularEntry | None":
-    """Deregister from the process-wide :data:`default_engine`."""
-    return default_engine.deregister(catalog, schema, name)
+    """Deregister from the process-wide :data:`SYSTEM_ENGINE`."""
+    return SYSTEM_ENGINE.deregister(catalog, schema, name)
 
 
 def get(catalog: str, schema: str, name: str) -> "TabularEntry | None":
-    """Look up an entry on the process-wide :data:`default_engine`."""
-    return default_engine.get(catalog, schema, name)
+    """Look up an entry on the process-wide :data:`SYSTEM_ENGINE`."""
+    return SYSTEM_ENGINE.get(catalog, schema, name)
+
+
+def resolve(name: str) -> Tabular:
+    """Resolve a flat / dotted *name* on :data:`SYSTEM_ENGINE`."""
+    return SYSTEM_ENGINE.resolve(name)
+
+
+def execute_plan(
+    source: "Tabular | str | _Key",
+    plan: "ExecutionPlan | Iterable[PlanOp] | None",
+) -> Tabular:
+    """Apply *plan* to *source* on :data:`SYSTEM_ENGINE`."""
+    return SYSTEM_ENGINE.execute_plan(source, plan)
+
+
+def execute_sql(query: str, **kwargs: Any) -> "SqlStatementResult":
+    """Run *query* through :data:`SYSTEM_ENGINE`."""
+    return SYSTEM_ENGINE.execute_sql(query, **kwargs)

@@ -262,7 +262,7 @@ class LazyTabular(Tabular[CastOptions]):
 
         *right* accepts a :class:`Tabular`, a polars ``DataFrame`` /
         ``LazyFrame``, or a string name to resolve against
-        :data:`yggdrasil.io.tabular.engine.default_engine` at apply
+        :data:`yggdrasil.io.tabular.engine.SYSTEM_ENGINE` at apply
         time. ``on`` (or the symmetric ``left_on`` / ``right_on``)
         gives the join keys; ``how`` is any value polars accepts
         (``inner``, ``left``, ``right``, ``full``, ``cross``,
