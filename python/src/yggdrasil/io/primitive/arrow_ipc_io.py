@@ -101,7 +101,7 @@ class ArrowIPCIO(BytesIO):
         if self.size == 0:
             return
 
-        with self._format_view() as v:
+        with self._format_input() as v:
             reader = ipc.RecordBatchFileReader(v)
             for i in range(reader.num_record_batches):
                 yield reader.get_batch(i)
@@ -115,7 +115,7 @@ class ArrowIPCIO(BytesIO):
         """
         if self.size == 0:
             return Schema.empty()
-        with self._format_view() as v:
+        with self._format_input() as v:
             return Schema.from_arrow(ipc.RecordBatchFileReader(v).schema)
 
     # ==================================================================
@@ -183,20 +183,25 @@ class ArrowIPCIO(BytesIO):
                 chained, dataclasses.replace(options, mode=Mode.OVERWRITE),
             )
 
-        # OVERWRITE path — single writer session, codec-aware buffer.
+        # OVERWRITE path — single writer session over a pure-Arrow
+        # in-memory sink, then one bulk commit to self. See
+        # :meth:`BytesIO._commit_format_payload` for the rationale
+        # against streaming the encoder writes through BytesIO.
         schema = first.schema
 
-        with self._format_buffer() as buf:
-            with contextlib.ExitStack() as stack:
-                writer = ipc.RecordBatchFileWriter(
-                    buf, schema, options=options.to_writer_options(),
-                )
-                stack.callback(writer.close)
-                if first.num_rows > 0:
-                    writer.write_batch(first)
-                for batch in iterator:
-                    if batch.num_rows > 0:
-                        writer.write_batch(batch)
+        sink = pa.BufferOutputStream()
+        with contextlib.ExitStack() as stack:
+            writer = ipc.RecordBatchFileWriter(
+                sink, schema, options=options.to_writer_options(),
+            )
+            stack.callback(writer.close)
+            if first.num_rows > 0:
+                writer.write_batch(first)
+            for batch in iterator:
+                if batch.num_rows > 0:
+                    writer.write_batch(batch)
+
+        self._commit_format_payload(sink.getvalue())
 
     # ==================================================================
     # Helpers

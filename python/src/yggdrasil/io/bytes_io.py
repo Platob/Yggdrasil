@@ -502,6 +502,24 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         # a freshly-allocated decompressed BytesIO; caller closes.
         return codec.decompress(self)
 
+    def _format_input(self) -> "_FormatInputContext":
+        """Context manager yielding a pyarrow-friendly input source.
+
+        Resolution:
+
+        - **Local-path holder, no codec** → :func:`pyarrow.memory_map`
+          opens an mmap over the file. The Parquet / Arrow IPC / CSV
+          readers consume the mmap directly, so the file's pages stay
+          in the kernel page cache and no Python-side copy happens.
+        - **Anything else** → fall back to :meth:`_format_view` (a
+          :class:`BytesIO` view over self, decompressing through the
+          codec when one is bound).
+
+        The yielded value is whichever NativeFile / file-like object
+        won the resolution; the context manager closes it on exit.
+        """
+        return _FormatInputContext(self)
+
     def _format_buffer(self) -> "_FormatBufferContext":
         """Context manager yielding a buffer to write raw format bytes into.
 
@@ -512,6 +530,71 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         and committed to ``self``.
         """
         return _FormatBufferContext(self)
+
+    def _commit_format_payload(
+        self,
+        payload: "Any",
+        *,
+        append: bool = False,
+    ) -> int:
+        """Bulk-commit a fully-encoded format payload to this buffer.
+
+        ``payload`` is anything :func:`memoryview`-able — typically
+        an :class:`pyarrow.Buffer` from a
+        :class:`pyarrow.BufferOutputStream` after the format encoder
+        finishes. The codec on :attr:`media_type` (when set) is
+        applied here, then the bytes land in ``self`` with one
+        ``truncate`` + one ``write`` (overwrite) or one seek-to-end
+        + one ``write`` (append).
+
+        Built for the format-leaf write path: each leaf
+        (:class:`ParquetIO`, :class:`ArrowIPCIO`, :class:`CsvIO`,
+        :class:`NDJsonIO`, …) drives its encoder against an Arrow
+        sink, then hands the resulting buffer to this method instead
+        of streaming the encoder's per-row-group / per-batch /
+        per-row writes through :meth:`BytesIO.write`. Skips the
+        small-write cost on path-backed holders without touching the
+        BytesIO open / scratch / commit machinery.
+        """
+        view: "memoryview"
+        if isinstance(payload, memoryview):
+            view = payload
+        elif isinstance(payload, (bytes, bytearray)):
+            view = memoryview(payload)
+        else:
+            # ``pa.Buffer`` exposes the buffer protocol but isn't a
+            # memoryview itself.
+            view = memoryview(payload)
+
+        codec = self._codec()
+        if codec is not None and len(view) > 0:
+            scratch = BytesIO()
+            try:
+                scratch.write(view)
+                scratch.seek(0)
+                compressed = codec.compress(scratch)
+                try:
+                    view = memoryview(compressed.to_bytes())
+                finally:
+                    try:
+                        compressed.close()
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    scratch.close()
+                except Exception:
+                    pass
+
+        n = len(view)
+        if append:
+            self.seek(0, 2)  # SEEK_END
+        else:
+            self.seek(0)
+            self.truncate(0)
+        if n > 0:
+            self.write_bytes(view)
+        return n
 
     @property
     def owns_holder(self) -> bool:
@@ -1105,21 +1188,18 @@ class _FormatBufferContext:
     """Writer-side of :meth:`BytesIO._format_buffer`.
 
     Caller does ``with bio._format_buffer() as buf: writer(buf)``;
-    the yielded ``buf`` accepts raw format bytes. The yielded buffer
-    is **always** a fresh in-memory :class:`BytesIO` — the format
-    writers (Parquet's row-group flush, Arrow IPC's record-batch
-    encoder, CSV row-by-row …) call ``buf.write`` once per chunk,
-    and routing those calls straight at a path-backed holder turns
-    each one into an ``os.pwrite`` syscall. Buffering in memory
-    coalesces the whole file into one bulk commit on exit, so a
-    write that emitted N small chunks ends up costing one
-    truncate + one pwrite at the durable layer.
+    the yielded ``buf`` accepts raw format bytes. On exit:
 
-    On exit:
+    * No codec → ``buf is bio``; we just leave the bytes in place.
+      (We pre-truncate so the writer sees an empty target.)
+    * Codec set → ``buf`` is a fresh in-memory BytesIO; on exit the
+      bytes are compressed and committed to ``bio``.
 
-    * No codec → bulk-write the scratch payload into ``bio``.
-    * Codec set → compress scratch first, then bulk-write the
-      compressed bytes into ``bio``.
+    Bulk-buffering an entire formatted file in memory before
+    committing belongs in the format leaves themselves (they know
+    how to drive an :class:`pyarrow.BufferOutputStream` natively
+    without copying through a Python BytesIO), so this context is
+    intentionally a thin codec adapter and nothing more.
     """
 
     def __init__(self, parent: "BytesIO") -> None:
@@ -1128,83 +1208,91 @@ class _FormatBufferContext:
         self._codec = parent._codec()
 
     def __enter__(self) -> "BytesIO":
-        # Always go through a scratch buffer — direct writes to the
-        # durable holder turn each writer.write() into a pwrite
-        # syscall (one per Parquet row group, one per Arrow batch,
-        # one per CSV row, …). The bulk commit on exit collapses
-        # that into one syscall regardless of how many chunks the
-        # encoder emitted.
+        if self._codec is None:
+            # Direct write path: pre-truncate so the leaf writer
+            # opens onto an empty target.
+            self._parent.seek(0)
+            self._parent.truncate(0)
+            self._buf = self._parent
+            return self._parent
+        # Codec path: scratch buffer; we compress on exit.
         self._buf = BytesIO()
         return self._buf
 
     def __exit__(self, exc_type, exc, tb) -> None:
         if self._buf is None or exc_type is not None:
             return
-
         if self._codec is None:
-            payload = self._buf.to_bytes()
-        else:
-            compressed = self._codec.compress(self._buf)
+            return
+        # Compress scratch into the durable buffer.
+        compressed = self._codec.compress(self._buf)
+        try:
+            payload = compressed.to_bytes()
+        finally:
             try:
-                payload = compressed.to_bytes()
-            finally:
-                try:
-                    compressed.close()
-                except Exception:
-                    pass
+                compressed.close()
+            except Exception:
+                pass
         try:
             self._buf.close()
         except Exception:
             pass
+        self._parent.seek(0)
+        self._parent.truncate(0)
+        self._parent.write(payload)
 
-        self._commit(payload)
 
-    def _commit(self, payload: bytes) -> None:
-        """Push *payload* onto the parent buffer in one bulk acquire.
+class _FormatInputContext:
+    """Reader-side companion to :class:`_FormatBufferContext`.
 
-        Path-backed holders take the holder-direct fast path: open
-        the holder once, ``truncate`` + ``pwrite`` + ``flush`` +
-        close. On a local fd that's two syscalls (``ftruncate`` +
-        ``pwrite``) instead of the four a transient-fd ``truncate``
-        then a transient-fd ``pwrite`` would have cost going through
-        :meth:`BytesIO.write` twice.
+    Resolves the cheapest pyarrow-friendly input source for the
+    formatted bytes:
 
-        In-memory holders route through the BytesIO API — the
-        transient-fd overhead is zero for them and the BytesIO
-        layer keeps cursor / dirty-bit bookkeeping coherent.
-        """
-        parent = self._parent
-        holder = parent._holder
+    - Local-path holder with no codec → :func:`pyarrow.memory_map`.
+      The file lands in the kernel page cache once and every reader
+      (Parquet, Arrow IPC, CSV, NDJSON) walks it without a copy.
+    - Anything else → :meth:`BytesIO._format_view` (a non-owning
+      view of ``self`` when uncompressed, a decompressed in-memory
+      :class:`BytesIO` when a codec is bound).
 
-        use_fast_path = (
-            not parent._acquired
-            and (
-                getattr(holder, "is_local_path", False)
-                or getattr(holder, "is_remote_path", False)
-            )
-        )
+    The object yielded by ``__enter__`` is closed on ``__exit__`` —
+    callers don't have to track which branch fired.
+    """
 
-        if not use_fast_path:
-            parent.seek(0)
-            parent.truncate(0)
-            if payload:
-                parent.write(payload)
-            return
+    def __init__(self, parent: "BytesIO") -> None:
+        self._parent = parent
+        self._mm: "Any | None" = None
+        self._view: "BytesIO | None" = None
 
-        was_acquired = holder._acquired
-        if not was_acquired:
-            holder.acquire()
-        try:
-            holder.truncate(len(payload))
-            if payload:
-                holder.pwrite(memoryview(payload), 0)
+    def __enter__(self) -> "Any":
+        if self._parent._codec() is None:
+            holder = self._parent._holder
+            if holder is not None and getattr(holder, "is_local_path", False):
+                full_path = getattr(holder, "full_path", None)
+                if callable(full_path):
+                    try:
+                        import pyarrow as pa
+                        self._mm = pa.memory_map(full_path(), "r")
+                        return self._mm
+                    except Exception:
+                        # Fall through to the BytesIO view; mmap
+                        # failures (race with delete, fs that doesn't
+                        # support mmap, sandbox restrictions) shouldn't
+                        # break the read.
+                        self._mm = None
+        self._view = self._parent._format_view()
+        return self._view
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._mm is not None:
             try:
-                holder.flush()
+                self._mm.close()
             except Exception:
                 pass
-        finally:
-            if not was_acquired:
-                try:
-                    holder.close()
-                except Exception:
-                    pass
+            self._mm = None
+        if self._view is not None:
+            try:
+                self._view.close()
+            except Exception:
+                pass
+            self._view = None

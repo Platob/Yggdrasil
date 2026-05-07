@@ -105,7 +105,7 @@ class ParquetIO(BytesIO):
         """
         if self.size == 0:
             return Schema.empty()
-        with self._format_view() as v:
+        with self._format_input() as v:
             return Schema.from_arrow(pq.ParquetFile(v).schema_arrow)
 
     # ==================================================================
@@ -128,7 +128,7 @@ class ParquetIO(BytesIO):
             return
 
         batch_size = int(options.row_size or 65536)
-        with self._format_view() as v:
+        with self._format_input() as v:
             with pq.ParquetFile(v) as pf:
                 for batch in pf.iter_batches(
                     batch_size=batch_size,
@@ -190,26 +190,34 @@ class ParquetIO(BytesIO):
                 chained, dataclasses.replace(options, mode=Mode.OVERWRITE),
             )
 
-        # OVERWRITE — fresh writer over a codec-aware buffer.
+        # OVERWRITE — encode into a pure-Arrow in-memory sink, then
+        # bulk-commit to self. ``pa.BufferOutputStream`` keeps the
+        # row-group flushes in one contiguous Arrow buffer (no
+        # syscalls, no Python BytesIO indirection); the leaf hands
+        # the finished buffer to :meth:`BytesIO._commit_format_payload`,
+        # which applies any codec and lays the bytes down in one
+        # truncate+write against the durable holder.
         schema = first.schema
 
-        with self._format_buffer() as buf:
-            with contextlib.ExitStack() as stack:
-                writer = pq.ParquetWriter(
-                    buf,
-                    schema,
-                    compression=options.compression,
-                    compression_level=options.compression_level,
-                    use_dictionary=options.use_dictionary,
-                    write_statistics=options.write_statistics,
-                )
-                stack.callback(writer.close)
+        sink = pa.BufferOutputStream()
+        with contextlib.ExitStack() as stack:
+            writer = pq.ParquetWriter(
+                sink,
+                schema,
+                compression=options.compression,
+                compression_level=options.compression_level,
+                use_dictionary=options.use_dictionary,
+                write_statistics=options.write_statistics,
+            )
+            stack.callback(writer.close)
 
-                if first.num_rows > 0:
-                    writer.write_batch(first, row_group_size=options.row_group_size)
-                for batch in iterator:
-                    if batch.num_rows > 0:
-                        writer.write_batch(batch, row_group_size=options.row_group_size)
+            if first.num_rows > 0:
+                writer.write_batch(first, row_group_size=options.row_group_size)
+            for batch in iterator:
+                if batch.num_rows > 0:
+                    writer.write_batch(batch, row_group_size=options.row_group_size)
+
+        self._commit_format_payload(sink.getvalue())
 
     def _resolve_action(self, mode: Mode) -> Mode:
         """Pick the disposition for a write call.
@@ -248,7 +256,7 @@ class ParquetIO(BytesIO):
             return pds.dataset(
                 pa.table({}),
             )
-        with self._format_view() as v:
+        with self._format_input() as v:
             table = pq.read_table(v)
         return pds.dataset(table)
 
@@ -265,7 +273,7 @@ class ParquetIO(BytesIO):
         path = self._local_path_str()
         if path is not None:
             return pl.scan_parquet(path)
-        with self._format_view() as v:
+        with self._format_input() as v:
             return pl.scan_parquet(v)
 
     def _read_polars_frame(self, options: ParquetOptions) -> "pl.DataFrame":
@@ -274,5 +282,5 @@ class ParquetIO(BytesIO):
         path = self._local_path_str()
         if path is not None:
             return pl.read_parquet(path, use_pyarrow=False)
-        with self._format_view() as v:
+        with self._format_input() as v:
             return pl.read_parquet(v, use_pyarrow=False)
