@@ -13,7 +13,7 @@ Public surface:
 - :class:`CompareOp`, :class:`LogicalOp`, :class:`ArithmeticOp` —
   shared operator enums.
 
-Per-engine compilation lives under :mod:`yggdrasil.data.expr.backends`:
+Per-engine compilation lives under :mod:`yggdrasil.io.tabular.execution.expr.backends`:
 each backend ships ``to_<target>`` and (where introspection is
 feasible) ``from_<target>``. The :class:`Expression` base
 exposes them as instance and class methods (``to_python`` /

@@ -42,8 +42,8 @@ from pyarrow.fs import FileSystem, S3FileSystem
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data import Field
 from yggdrasil.data.data_utils import safe_constraint_name
-from yggdrasil.data.expr import Predicate, col as expr_col
-from yggdrasil.data.expr.backends.sql import Dialect, to_sql as expr_to_sql
+from yggdrasil.io.tabular.execution.expr import Predicate, col as expr_col
+from yggdrasil.io.tabular.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema as DataSchema
 from yggdrasil.data.statement import PreparedStatement, StatementResult
@@ -328,7 +328,7 @@ def _alias_columns(expr, alias: str):
     Returns a new tree — the AST is immutable so we never mutate
     the caller's predicate.
     """
-    from yggdrasil.data.expr.nodes import (
+    from yggdrasil.io.tabular.execution.expr.nodes import (
         Arithmetic,
         Between,
         Cast,

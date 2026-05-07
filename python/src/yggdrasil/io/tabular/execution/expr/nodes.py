@@ -128,7 +128,7 @@ class Expression:
     Subclasses override nothing; this class is a marker plus the
     operator surface and ``to_*`` dispatchers. Backend-specific
     compilation lives in the matching
-    ``yggdrasil.data.expr.backends.*`` module — kept off the node
+    ``yggdrasil.io.tabular.execution.expr.backends.*`` module — kept off the node
     so a build that excludes (say) pyspark doesn't import the
     optional dependency.
     """
@@ -576,7 +576,7 @@ class Selector(Column):
 
     .. code-block:: python
 
-        from yggdrasil.data.expr import select
+        from yggdrasil.io.tabular.execution.expr import select
 
         s = select("price", alias="price_usd").cast_to(usd_field)
     """

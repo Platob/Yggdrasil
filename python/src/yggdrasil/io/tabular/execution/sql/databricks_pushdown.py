@@ -33,7 +33,7 @@ Why duck-typed instead of ``isinstance(t, Table)``
 
 Importing :mod:`yggdrasil.databricks.sql.table` pulls in the
 Databricks SDK and a few transitive dependencies. We don't want a
-plain ``import yggdrasil.sql`` to require any of that on a base
+plain ``import yggdrasil.io.tabular.execution.sql`` to require any of that on a base
 install. Instead, the dispatcher matches the *class identity*
 through ``type().__module__`` + ``type().__name__`` — same effect,
 zero import cost.
@@ -43,15 +43,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional
 
-from yggdrasil.data.expr import Expression, Predicate
+from yggdrasil.io.tabular.execution.expr import Expression, Predicate
 from yggdrasil.io.tabular import Tabular
 
-from yggdrasil.sql.dialect import Dialect, resolve_dialect
+from yggdrasil.io.tabular.execution.sql.dialect import Dialect, resolve_dialect
 
 
 if TYPE_CHECKING:
     from yggdrasil.data.statement import StatementResult
-    from yggdrasil.sql.dynamic_catalog import DynamicCatalog
+    from yggdrasil.io.tabular.execution.sql.dynamic_catalog import DynamicCatalog
 
 
 __all__ = ["try_databricks_pushdown", "is_databricks_table"]

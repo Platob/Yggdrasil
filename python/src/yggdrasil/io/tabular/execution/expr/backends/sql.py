@@ -138,7 +138,7 @@ def from_sql(
         from sqlglot import expressions as sge
     except ImportError as exc:  # pragma: no cover - exercised when extra missing
         raise ImportError(
-            "yggdrasil.data.expr.backends.sql.from_sql requires sqlglot. "
+            "yggdrasil.io.tabular.execution.expr.backends.sql.from_sql requires sqlglot. "
             "Install it with `pip install sqlglot` to enable the lifter."
         ) from exc
 

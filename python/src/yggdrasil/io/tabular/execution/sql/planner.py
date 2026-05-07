@@ -41,12 +41,12 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
-from yggdrasil.data.expr import Expression, Predicate
+from yggdrasil.io.tabular.execution.expr import Expression, Predicate
 
-from yggdrasil.sql.dialect import Dialect, resolve_dialect
-from yggdrasil.sql.lib import sqlglot_expressions
-from yggdrasil.sql.parser import parse, SqlParseError
-from yggdrasil.sql.plan import (
+from yggdrasil.io.tabular.execution.sql.dialect import Dialect, resolve_dialect
+from yggdrasil.io.tabular.execution.sql.lib import sqlglot_expressions
+from yggdrasil.io.tabular.execution.sql.parser import parse, SqlParseError
+from yggdrasil.io.tabular.execution.sql.plan import (
     Aggregate,
     AggregateSpec,
     Filter,
@@ -63,7 +63,7 @@ from yggdrasil.sql.plan import (
 
 
 if TYPE_CHECKING:
-    from yggdrasil.sql.dynamic_catalog import DynamicCatalog
+    from yggdrasil.io.tabular.execution.sql.dynamic_catalog import DynamicCatalog
 
 
 __all__ = ["Planner", "PlanError", "plan"]

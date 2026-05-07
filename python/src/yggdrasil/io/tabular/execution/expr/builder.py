@@ -10,7 +10,7 @@ Example
 
 ::
 
-    from yggdrasil.data.expr import col, lit
+    from yggdrasil.io.tabular.execution.expr import col, lit
 
     p = (col("price") >= 100) & col("side").is_in(["buy", "sell"])
     p.to_sql()       # SQL string

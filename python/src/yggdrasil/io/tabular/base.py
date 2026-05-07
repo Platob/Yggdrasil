@@ -318,6 +318,49 @@ class Tabular(ABC, Generic[O]):
         return 0
 
     # ==================================================================
+    # Execution-plan entry point
+    # ==================================================================
+
+    def execute_plan(
+        self,
+        plan: "Any",
+        *,
+        options: "O | None" = None,
+        **kwargs: Any,
+    ) -> "Tabular":
+        """Apply an :class:`ExecutionPlan` to this Tabular.
+
+        The default returns a :class:`LazyTabular` wrapping ``self``
+        with the plan attached — execution stays lazy and routes
+        through whatever read hook the caller pulls (Arrow, polars
+        LazyFrame, …). An empty plan returns ``self`` unchanged so
+        callers can hand a possibly-empty plan in without an explicit
+        guard.
+
+        Subclasses with native plan execution (a SQL engine that can
+        push the whole plan to a remote, an in-engine LazyFrame
+        source, …) override to bypass the LazyTabular wrapper. The
+        contract is just: return a :class:`Tabular` whose reads
+        produce the same rows the wrapper would.
+        """
+        from yggdrasil.io.tabular.execution.plan import ExecutionPlan
+        from yggdrasil.io.tabular.lazy import LazyTabular
+
+        coerced = (
+            plan if isinstance(plan, ExecutionPlan)
+            else ExecutionPlan(tuple(plan)) if plan is not None
+            else ExecutionPlan.empty()
+        )
+        if coerced.is_empty():
+            return self
+        # ``options`` / ``**kwargs`` are accepted for forward-compat
+        # so subclasses can wire engine-specific knobs through;
+        # the default LazyTabular doesn't need them — its reads
+        # carry their own options.
+        del options, kwargs
+        return LazyTabular(self, plan=coerced)
+
+    # ==================================================================
     # Abstract batch hooks — the two things every implementer overrides
     # ==================================================================
 

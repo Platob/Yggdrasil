@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Iterator
 
-from yggdrasil.data.expr import Expression
+from yggdrasil.io.tabular.execution.expr import Expression
 
 from .dialect import Dialect, resolve_dialect
 from .lib import sqlglot_expressions, sqlglot_module

@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.data.expr import col
-from yggdrasil.data.expr.backends.python import filter_rows, to_python
+from yggdrasil.io.tabular.execution.expr import col
+from yggdrasil.io.tabular.execution.expr.backends.python import filter_rows, to_python
 
 
 class TestComparisonSemantics:

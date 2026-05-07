@@ -70,7 +70,6 @@ import functools
 from typing import Any, Iterable, Mapping, TypeVar, Union, TYPE_CHECKING
 
 import pyarrow as pa
-from yggdrasil.data.expr import Predicate
 
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
@@ -81,6 +80,7 @@ if TYPE_CHECKING:
     from pyspark.sql import SparkSession
     from yggdrasil.data.data_field import Field
     from yggdrasil.data.schema import Schema
+    from yggdrasil.io.tabular.execution.expr import Predicate
 
 # ``Field`` / ``Schema`` are imported lazily — top-level imports here
 # would form a cycle through ``yggdrasil.data.schema`` ↔

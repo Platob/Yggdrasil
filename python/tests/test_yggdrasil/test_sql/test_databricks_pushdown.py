@@ -15,8 +15,8 @@ import pyarrow as pa
 
 from yggdrasil.arrow.tests import ArrowTestCase
 from yggdrasil.io.tabular import ArrowTabular
-from yggdrasil.sql import Engine, system_catalog
-from yggdrasil.sql.databricks_pushdown import (
+from yggdrasil.io.tabular.execution.sql import Engine, system_catalog
+from yggdrasil.io.tabular.execution.sql.databricks_pushdown import (
     is_databricks_table,
     try_databricks_pushdown,
 )
@@ -295,7 +295,7 @@ class TestDirectEntry(ArrowTestCase):
         super().tearDown()
 
     def test_returns_none_on_unknown_source(self) -> None:
-        from yggdrasil.sql.dynamic_catalog import DynamicCatalog
+        from yggdrasil.io.tabular.execution.sql.dynamic_catalog import DynamicCatalog
         catalog = DynamicCatalog(parents=[])
         out = try_databricks_pushdown(
             "SELECT * FROM nope", catalog=catalog,

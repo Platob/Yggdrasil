@@ -25,7 +25,7 @@ Typical usage
 
 ::
 
-    import yggdrasil.sql as ysql
+    import yggdrasil.io.tabular.execution.sql as ysql
 
     # Register once, anywhere.
     ysql.system_catalog.register("trades", trades_tabular)
@@ -51,8 +51,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
-from yggdrasil.sql.catalog import default_context as _legacy_default_context
-from yggdrasil.sql.dynamic_catalog import DynamicCatalog
+from yggdrasil.io.tabular.execution.sql.catalog import default_context as _legacy_default_context
+from yggdrasil.io.tabular.execution.sql.dynamic_catalog import DynamicCatalog
 
 
 if TYPE_CHECKING:

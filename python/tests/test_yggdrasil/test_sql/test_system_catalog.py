@@ -9,13 +9,13 @@ from __future__ import annotations
 import pyarrow as pa
 
 from yggdrasil.arrow.tests import ArrowTestCase
-from yggdrasil.sql import (
+from yggdrasil.io.tabular.execution.sql import (
     Engine,
     SYSTEM_CATALOG,
     DynamicCatalog,
     system_catalog,
 )
-from yggdrasil.sql.catalog import default_context
+from yggdrasil.io.tabular.execution.sql.catalog import default_context
 
 
 def _t() -> pa.Table:
@@ -103,7 +103,7 @@ class TestLegacyBridge(_SystemCatalogTestCase):
         # The legacy ``yggdrasil.sql.register`` writes to
         # ``default_context``, which is wired in as a parent of
         # SYSTEM_CATALOG, so the new path picks it up too.
-        from yggdrasil.sql import register as legacy_register
+        from yggdrasil.io.tabular.execution.sql import register as legacy_register
 
         legacy_register("legacy_table", _t())
         self.assertIn("legacy_table", system_catalog.names())

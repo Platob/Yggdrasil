@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Iterable
 
 import pyarrow as pa
 
-from yggdrasil.data.expr import (
+from yggdrasil.io.tabular.execution.expr import (
     Column,
     Expression,
     Logical,
