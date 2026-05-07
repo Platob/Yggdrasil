@@ -247,6 +247,32 @@ class TestSourcesRouter(_BaseAPI):
         self.assertEqual(r.status_code, 415)
         self.assertIn("Unsupported upload media type", r.json()["detail"])
 
+    def test_register_upload_gzip_content_encoding(self) -> None:
+        # Exercises the existing :class:`MediaType` + :class:`Codec`
+        # stack: a gzip-compressed JSON body decodes correctly when
+        # the client sends ``Content-Encoding: gzip`` because
+        # :class:`BytesIO`'s ``_format_view`` sees the codec on the
+        # holder's :class:`MediaType` and decompresses on read.
+        from yggdrasil.data.enums import Codec
+        from yggdrasil.pickle import json as ygg_json
+
+        rows = [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]
+        body = Codec.from_("gzip").compress_bytes(ygg_json.dumps(rows, to_bytes=True))
+
+        r = self.client.post(
+            "/sources/main/core/zipped/upload",
+            headers={
+                "content-type": "application/json",
+                "content-encoding": "gzip",
+            },
+            content=body,
+        )
+        self.assertEqual(r.status_code, 200)
+        roundtrip = self.engine.get_tabular(
+            "main", "core", "zipped",
+        ).read_arrow_table()
+        self.assertEqual(roundtrip.to_pylist(), rows)
+
     def test_register_upload_empty_400(self) -> None:
         r = self.client.post(
             "/sources/main/core/empty/upload",

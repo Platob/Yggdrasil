@@ -2,49 +2,49 @@
 
 Two transport flavors:
 
-- Arrow IPC **stream** (default) — :func:`stream_arrow_ipc` writes
-  the source's :meth:`pa.RecordBatchReader` straight into the HTTP
+- **Arrow IPC stream** (default) — :func:`stream_arrow_ipc` writes the
+  source's :class:`pa.RecordBatchReader` straight into the HTTP
   response with :class:`pa.ipc.RecordBatchStreamWriter`. No footer,
   no seek, true streaming. The wire mime is
-  ``application/vnd.apache.arrow.stream``.
-- Anything else — :func:`tabular_response` resolves the requested
-  :class:`MediaType` through :meth:`Tabular.class_for_media_type`,
-  writes the source into a fresh :class:`BytesIO` of that format,
-  and returns the bytes. That covers parquet / CSV / JSON / NDJSON /
-  XLSX / Arrow IPC file out of the box, and any new
-  :class:`Tabular` leaf registered against a mime gets exposed for
-  free.
+  ``application/vnd.apache.arrow.stream``. The streaming format
+  isn't a registered :class:`Tabular` leaf (the registry tracks the
+  on-disk *file* format under ``ARROW_IPC``), so this case stays a
+  thin pyarrow-direct path.
+- **Anything else** — :func:`tabular_response` resolves the
+  requested :class:`MediaType` and writes the source through
+  :meth:`yggdrasil.io.bytes_io.BytesIO.as_media`. That returns the
+  :class:`Tabular` leaf already registered for the mime
+  (parquet / csv / json / ndjson / xlsx / arrow IPC file …), so
+  every new tabular leaf gets exposed automatically and codec
+  handling (``Content-Encoding``) round-trips through
+  :class:`BytesIO`'s ``_format_view``.
 
 Content negotiation
 -------------------
 
-:func:`resolve_media_type` looks at, in order:
+:func:`resolve_media_type` walks, in order:
 
-1. an explicit ``?format=`` / ``?media_type=`` query parameter;
-2. the ``Accept`` request header (first acceptable type wins);
-3. the configured ``default_media_type``.
+1. an explicit ``?format=`` / ``?media_type=`` query parameter,
+2. each entry in the ``Accept`` header,
+3. the configured default mime.
 
-The query param wins because it's the most explicit — Power
-Query / Excel / curl scripts often can't set ``Accept`` cleanly
-and a query string is the obvious override path.
+Each candidate goes through :meth:`MediaType.from_` so aliases,
+extension hints and ``mime+codec`` strings are normalised the same
+way the rest of the library does it.
 """
 
 from __future__ import annotations
 
 import io
-from typing import Any, Iterator
+from typing import Iterator
 
 import pyarrow as pa
 from fastapi import Response
+from fastapi.responses import StreamingResponse
 
 from yggdrasil.data.enums import MediaType, MimeTypes
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.tabular import Tabular
-
-# Pull every concrete tabular leaf into the registry so
-# :meth:`Tabular.class_for_media_type` can dispatch parquet / csv /
-# json / ndjson / xlsx / arrow-ipc the moment the API boots.
-import yggdrasil.io.primitive  # noqa: F401  — side-effect import
 
 from .exceptions import APIError
 
@@ -58,11 +58,10 @@ __all__ = [
 ]
 
 
-# Wire mime for the Arrow IPC stream format. Not in
-# :class:`MimeTypes` (the registry tracks the file format under
-# ``ARROW_IPC``); we keep it as a literal here and translate to the
-# file MimeType when we need to dispatch through
-# :meth:`Tabular.class_for_media_type`.
+# Wire mime for the Arrow IPC stream format. Not in :class:`MimeTypes`
+# (the registry tracks the file format under ``ARROW_IPC``); kept as a
+# literal so the negotiation chain can recognise it without forcing a
+# new mime registration.
 ARROW_STREAM_MIME = "application/vnd.apache.arrow.stream"
 ARROW_FILE_MIME = MimeTypes.ARROW_IPC.value  # application/vnd.apache.arrow.file
 
@@ -81,12 +80,11 @@ def resolve_media_type(
     """Pick the response media type. Returns ``(wire_mime, MediaType|None)``.
 
     ``MediaType`` is ``None`` when the wire mime is the Arrow IPC
-    stream — that one doesn't have a registered :class:`MimeType`
-    in :mod:`yggdrasil.data.enums`, and dispatch goes through
-    :func:`stream_arrow_ipc` directly.
+    stream — the writer goes through :func:`stream_arrow_ipc`
+    directly and there's no registered :class:`MimeType` for it.
+    Every other candidate is normalised by :meth:`MediaType.from_`.
     """
-    candidates = _candidate_chain(explicit=explicit, accept=accept, default=default)
-    for raw in candidates:
+    for raw in _candidate_chain(explicit=explicit, accept=accept, default=default):
         if not raw:
             continue
         if _is_stream_mime(raw):
@@ -126,18 +124,18 @@ def tabular_response(
     default: str = ARROW_STREAM_MIME,
     filename: "str | None" = None,
     stream_batch_rows: int = 65_536,
-) -> "Response":
+) -> Response:
     """Serialize *tabular* into the requested media type and respond.
 
-    Goes through :func:`stream_arrow_ipc` when the negotiated mime
-    is the Arrow IPC stream, otherwise routes through
-    :meth:`Tabular.class_for_media_type` to find the leaf for that
-    mime and writes the data into a fresh :class:`BytesIO`.
+    Routes through :func:`stream_arrow_ipc` when the negotiated mime
+    is the Arrow IPC stream; otherwise hands the work to
+    :meth:`BytesIO.as_media` which dispatches to the registered
+    :class:`Tabular` leaf for that mime.
     """
     explicit = media_type if isinstance(media_type, str) else None
     if isinstance(media_type, MediaType):
         wire = media_type.mime_type.value
-        target = media_type
+        target: "MediaType | None" = media_type
     else:
         wire, target = resolve_media_type(
             explicit=explicit, accept=accept, default=default,
@@ -160,85 +158,49 @@ def stream_arrow_ipc(
     *,
     filename: "str | None" = None,
     stream_batch_rows: int = 65_536,
-) -> "Response":
+) -> Response:
     """Stream *tabular* as Arrow IPC stream — the fast path.
 
     Drives :class:`pa.ipc.RecordBatchStreamWriter` over the source's
-    :class:`pa.RecordBatchReader`, yielding each emitted IPC chunk
-    as a separate response chunk. No footer, no seek, no full
-    materialization — the response starts flowing as soon as the
+    :class:`pa.RecordBatchReader`, draining the writer's bytes into
+    the response after each batch. No footer, no seek, no full
+    materialisation — the response starts flowing as soon as the
     first batch is ready.
     """
-    from fastapi.responses import StreamingResponse
-
     options = tabular.options_class()(row_size=stream_batch_rows or None)
     reader = tabular._read_arrow_batch_reader(options)
 
     def _iter_ipc_bytes() -> Iterator[bytes]:
-        sink = _ChunkSink()
+        # stdlib ``io.BytesIO`` is already an ideal sink for this:
+        # ``write`` + ``seek`` + ``getvalue`` + ``truncate`` is all
+        # the IPC writer needs, and we drain it after every batch
+        # so the response streams instead of buffering.
+        sink = io.BytesIO()
         writer = pa.ipc.RecordBatchStreamWriter(sink, reader.schema)
         try:
             for batch in reader:
                 writer.write_batch(batch)
-                # Drain whatever the writer produced for this batch
-                # so we hand bytes to ASGI as we go instead of
-                # buffering the entire stream.
-                chunk = sink.drain()
+                chunk = sink.getvalue()
                 if chunk:
                     yield chunk
+                    sink.seek(0)
+                    sink.truncate(0)
         finally:
             writer.close()
-        tail = sink.drain()
+        tail = sink.getvalue()
         if tail:
             yield tail
-
-    headers: "dict[str, str]" = {}
-    if filename:
-        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
 
     return StreamingResponse(
         _iter_ipc_bytes(),
         media_type=ARROW_STREAM_MIME,
-        headers=headers,
+        headers=_disposition_headers(filename),
     )
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Internal — non-stream materialisation
 # ---------------------------------------------------------------------------
-
-
-class _ChunkSink(io.RawIOBase):
-    """Tiny ``write``-only sink that hands buffered bytes back via :meth:`drain`.
-
-    Arrow's stream writer accepts any object with a ``write`` method
-    that takes bytes-like input; we don't need ``seek``/``tell`` for
-    the stream format. Buffering one batch at a time keeps memory
-    bounded — :meth:`drain` returns the accumulated chunk and clears
-    the slot so the next ``write_batch`` starts fresh.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._buf: "list[bytes]" = []
-
-    def writable(self) -> bool:  # noqa: D401 — stdlib protocol
-        return True
-
-    def write(self, data: Any) -> int:  # noqa: D401
-        if isinstance(data, memoryview):
-            data = data.tobytes()
-        elif not isinstance(data, (bytes, bytearray)):
-            data = bytes(data)
-        self._buf.append(bytes(data))
-        return len(data)
-
-    def drain(self) -> bytes:
-        if not self._buf:
-            return b""
-        out = b"".join(self._buf)
-        self._buf.clear()
-        return out
 
 
 def _materialize_response(
@@ -247,21 +209,20 @@ def _materialize_response(
     target: MediaType,
     wire_mime: str,
     filename: "str | None",
-) -> "Response":
-    """Write *tabular* into a :class:`BytesIO` of *target* mime and respond.
+) -> Response:
+    """Write *tabular* into a :class:`BytesIO` of *target* and respond.
 
-    Used for non-stream formats. The :class:`Tabular` registry maps
-    a mime to the leaf class that knows how to serialize into it
-    (parquet → :class:`ParquetIO`, csv → :class:`CsvIO`, json →
-    :class:`JsonIO`, …). We pop the writer's bytes once at the end —
-    formats that need a footer (parquet, arrow IPC file, xlsx)
-    can't be true-streamed in HTTP without a tee-and-buffer dance,
-    and the buffered path here is the honest implementation.
+    The serializer is whatever :meth:`BytesIO.as_media` resolves to —
+    that walks the same registry :meth:`Tabular.class_for_media_type`
+    uses, so a parquet target lands on :class:`ParquetIO`, a csv
+    target on :class:`CsvIO`, and so on. Codec handling on the way
+    out is :class:`BytesIO`'s job (``Content-Encoding`` round-trips
+    via the holder's :class:`MediaType`).
     """
-    from fastapi.responses import Response
-
-    leaf_cls = Tabular.class_for_media_type(target, default=None)
-    if leaf_cls is None:
+    sink = BytesIO(media_type=target)
+    try:
+        leaf = sink.as_media()
+    except KeyError as exc:
         raise APIError(
             (
                 f"No serializer registered for media type {target!r}. "
@@ -270,16 +231,23 @@ def _materialize_response(
                 "or any of the registered tabular mimes."
             ),
             status_code=415,
-        )
+        ) from exc
 
-    sink = BytesIO(media_type=target)
-    leaf = leaf_cls(holder=sink._holder)
     leaf.write_table(tabular)
     payload = sink.to_bytes()
 
-    headers: "dict[str, str]" = {}
-    if filename:
-        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    headers = _disposition_headers(filename)
     headers["Content-Length"] = str(len(payload))
+    if target.codec is not None:
+        # Mirror what :meth:`yggdrasil.io.response.Response._to_asgi_payload`
+        # does — surface the wrapper codec on the wire so the client
+        # decompresses correctly.
+        headers["Content-Encoding"] = target.codec.name
 
     return Response(content=payload, media_type=wire_mime, headers=headers)
+
+
+def _disposition_headers(filename: "str | None") -> "dict[str, str]":
+    if not filename:
+        return {}
+    return {"Content-Disposition": f'attachment; filename="{filename}"'}
