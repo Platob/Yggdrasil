@@ -29,12 +29,21 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Iterator, Mapping, Optional, Tuple
 
 from yggdrasil.io.tabular.base import Tabular
+from yggdrasil.io.tabular.execution.plan import ExecutionPlan, PlanOp
 
 if TYPE_CHECKING:
     from yggdrasil.data.schema import Schema
+    from yggdrasil.io.tabular.execution.sql.statement import SqlStatementResult
 
 
-__all__ = ["TabularEntry", "TabularEngine"]
+__all__ = [
+    "TabularEntry",
+    "TabularEngine",
+    "default_engine",
+    "register",
+    "deregister",
+    "get",
+]
 
 
 _Key = Tuple[str, str, str]
@@ -269,6 +278,138 @@ class TabularEngine:
     # Helpers
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Flat-name resolution — SqlContext-shaped surface so the engine
+    # can act as a parent of :class:`DynamicCatalog` and feed the SQL
+    # executor without a wrapper class.
+    # ------------------------------------------------------------------
+
+    def resolve(self, name: str) -> Tabular:
+        """Resolve a flat *name* to a :class:`Tabular`. Raises on miss.
+
+        Accepts the dotted ``catalog.schema.name`` form, the partial
+        ``schema.name`` form, or the bare leaf ``name``. Partial
+        matches return the only entry whose tail matches; an
+        ambiguous leaf (registered under two different schemas)
+        raises :class:`KeyError`.
+        """
+        hit = self.lookup(name)
+        if hit is None:
+            raise KeyError(
+                f"Tabular {name!r} is not registered on this engine. "
+                f"Available: {self.qualified_names()!r}. Register via "
+                "engine.register(catalog, schema, name, tabular)."
+            )
+        return hit
+
+    def lookup(self, name: str) -> "Tabular | None":
+        """Soft form of :meth:`resolve` — returns ``None`` on miss.
+
+        Resolution order: dotted three-part match first, then
+        ``schema.name``, then the bare leaf. The leaf form returns
+        ``None`` (rather than picking arbitrarily) when more than one
+        entry shares the leaf name.
+        """
+        if not name:
+            return None
+        parts = name.split(".")
+        with self._lock:
+            if len(parts) == 3:
+                hit = self._entries.get((parts[0], parts[1], parts[2]))
+                return hit.tabular if hit is not None else None
+            if len(parts) == 2:
+                matches = [
+                    e for k, e in self._entries.items()
+                    if k[1] == parts[0] and k[2] == parts[1]
+                ]
+                if len(matches) == 1:
+                    return matches[0].tabular
+                return None
+            matches = [e for k, e in self._entries.items() if k[2] == name]
+        if len(matches) == 1:
+            return matches[0].tabular
+        return None
+
+    # SqlContext-shaped lookup so a :class:`DynamicCatalog` can list
+    # this engine as a parent. ``names`` returns dotted identifiers so
+    # the SQL planner sees stable, fully-qualified table names.
+    def get_by_name(self, name: str) -> "Tabular | None":
+        return self.lookup(name)
+
+    def names(self) -> "list[str]":
+        return self.qualified_names()
+
+    # ------------------------------------------------------------------
+    # Plan execution
+    # ------------------------------------------------------------------
+
+    def execute_plan(
+        self,
+        source: "Tabular | str | _Key",
+        plan: "ExecutionPlan | Iterable[PlanOp] | None",
+    ) -> Tabular:
+        """Apply *plan* to *source* and return the resulting Tabular.
+
+        *source* accepts a :class:`Tabular` directly, a 3-tuple key,
+        or a flat / dotted name resolvable via :meth:`resolve`. The
+        plan is coerced to an :class:`ExecutionPlan` (or treated as
+        empty when ``None``); join ops with string ``right`` will
+        resolve back through :data:`default_engine` at apply time.
+        """
+        if isinstance(source, Tabular):
+            tabular = source
+        elif isinstance(source, tuple) and len(source) == 3:
+            tabular = self.get_tabular(*source)
+        elif isinstance(source, str):
+            tabular = self.resolve(source)
+        else:
+            raise TypeError(
+                f"execute_plan source must be a Tabular, 3-tuple key, or "
+                f"name; got {type(source).__name__}: {source!r}."
+            )
+        coerced = (
+            plan if isinstance(plan, ExecutionPlan)
+            else ExecutionPlan(tuple(plan)) if plan is not None
+            else ExecutionPlan.empty()
+        )
+        return tabular.execute_plan(coerced)
+
+    # ------------------------------------------------------------------
+    # SQL execution — delegate to the existing SQL Engine, feeding it
+    # this engine's entries as named sources.
+    # ------------------------------------------------------------------
+
+    def execute_sql(
+        self,
+        query: str,
+        *,
+        sources: "Mapping[str, Any] | None" = None,
+        **kwargs: Any,
+    ) -> "SqlStatementResult":
+        """Run *query* through :class:`yggdrasil.io.tabular.execution.sql.Engine`,
+        with this engine's entries available as named sources.
+
+        Each entry is registered under three aliases — its dotted
+        ``catalog.schema.name``, ``schema.name``, and bare ``name`` —
+        so SQL referencing any spelling resolves. Per-call *sources*
+        override individual aliases without polluting the engine.
+        """
+        from yggdrasil.io.tabular.execution.sql.engine import Engine as _SqlEngine
+
+        merged: dict[str, Any] = {}
+        with self._lock:
+            for k, e in self._entries.items():
+                merged.setdefault(k[2], e.tabular)
+                merged.setdefault(f"{k[1]}.{k[2]}", e.tabular)
+                merged[f"{k[0]}.{k[1]}.{k[2]}"] = e.tabular
+        if sources:
+            merged.update(sources)
+        return _SqlEngine(sources=merged).execute(query, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _check_key(catalog: str, schema: str, name: str) -> _Key:
         if not catalog or not schema or not name:
@@ -294,3 +435,31 @@ class TabularEngine:
             f"TabularEngine key must be a 3-tuple or dotted string; "
             f"got {type(key).__name__}: {key!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Process-wide singleton + module-level shortcuts
+# ---------------------------------------------------------------------------
+# :class:`TabularEngine` is the canonical home for ``catalog.schema.name``
+# registrations. The SQL stack (``Join.right`` strings, the per-execute
+# ``sources`` merge in :meth:`execute_sql`) routes back through
+# :data:`default_engine` so a single registration becomes visible to
+# both the lazy-plan path and the SQL path without the caller wiring two
+# registries.
+
+default_engine: TabularEngine = TabularEngine()
+
+
+def register(catalog: str, schema: str, name: str, tabular: Any) -> TabularEntry:
+    """Register on the process-wide :data:`default_engine`."""
+    return default_engine.register(catalog, schema, name, tabular)
+
+
+def deregister(catalog: str, schema: str, name: str) -> "TabularEntry | None":
+    """Deregister from the process-wide :data:`default_engine`."""
+    return default_engine.deregister(catalog, schema, name)
+
+
+def get(catalog: str, schema: str, name: str) -> "TabularEntry | None":
+    """Look up an entry on the process-wide :data:`default_engine`."""
+    return default_engine.get(catalog, schema, name)

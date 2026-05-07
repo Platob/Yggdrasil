@@ -43,6 +43,7 @@ __all__ = [
     "Select",
     "GroupByAgg",
     "Apply",
+    "Join",
     "ExecutionPlan",
 ]
 
@@ -194,6 +195,69 @@ class Apply(PlanOp):
 
     def apply_polars(self, lf: "pl.LazyFrame") -> "pl.LazyFrame":
         return self.fn(lf)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Join(PlanOp):
+    """``JOIN`` clause — right-side source + on-keys + kind.
+
+    *right* may be a :class:`Tabular` (lifted to a polars
+    ``LazyFrame`` via :meth:`Tabular.scan_polars_frame`), a polars
+    ``DataFrame`` / ``LazyFrame`` (used as-is), or a string name to
+    resolve against :data:`yggdrasil.io.tabular.engine.default_engine`
+    at apply-time. *on* is shared join keys; pass ``left_on`` /
+    ``right_on`` for asymmetric keys. Reshapes rows, so neither
+    schema-preserving nor union-commutative.
+    """
+
+    right: Any
+    on: Tuple[Any, ...] = ()
+    how: str = "inner"
+    left_on: Tuple[Any, ...] = ()
+    right_on: Tuple[Any, ...] = ()
+    suffix: str = "_right"
+
+    def apply_polars(self, lf: "pl.LazyFrame") -> "pl.LazyFrame":
+        right_lf = self._resolve_right_polars()
+        kwargs: dict[str, Any] = {"how": self.how, "suffix": self.suffix}
+        if self.left_on or self.right_on:
+            left_keys = self.left_on or self.on
+            right_keys = self.right_on or self.on
+            if not left_keys or not right_keys:
+                raise ValueError(
+                    "Join requires either ``on`` or both ``left_on`` and "
+                    f"``right_on``; got on={self.on!r}, "
+                    f"left_on={self.left_on!r}, right_on={self.right_on!r}."
+                )
+            kwargs["left_on"] = [_to_polars(c) for c in left_keys]
+            kwargs["right_on"] = [_to_polars(c) for c in right_keys]
+        elif self.how != "cross":
+            if not self.on:
+                raise ValueError(
+                    "Join requires ``on`` (or ``left_on`` / ``right_on``) "
+                    f"unless how='cross'; got how={self.how!r}."
+                )
+            kwargs["on"] = [_to_polars(c) for c in self.on]
+        return lf.join(right_lf, **kwargs)
+
+    def _resolve_right_polars(self) -> "pl.LazyFrame":
+        from yggdrasil.io.tabular.base import Tabular
+
+        right = self.right
+        if isinstance(right, str):
+            from yggdrasil.io.tabular.engine import default_engine
+            right = default_engine.resolve(right)
+        if isinstance(right, Tabular):
+            return right.scan_polars_frame()
+        # polars DataFrame / LazyFrame — both work as the join right;
+        # ``DataFrame.lazy()`` is cheap, ``LazyFrame`` passes through.
+        lazy = getattr(right, "lazy", None)
+        if callable(lazy):
+            try:
+                return lazy()
+            except TypeError:
+                pass
+        return right
 
 
 # ---------------------------------------------------------------------------

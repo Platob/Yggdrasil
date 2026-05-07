@@ -17,7 +17,11 @@ from yggdrasil.io.tabular.arrow import ArrowTabular
 from yggdrasil.io.tabular.spark import SparkTabular
 from yggdrasil.io.tabular.lazy import LazyTabular
 from yggdrasil.io.tabular.union import UnionTabular
-from yggdrasil.io.tabular.engine import TabularEngine, TabularEntry
+from yggdrasil.io.tabular.engine import (
+    TabularEngine,
+    TabularEntry,
+    default_engine,
+)
 
 __all__ = [
     "O",
@@ -28,4 +32,5 @@ __all__ = [
     "UnionTabular",
     "TabularEngine",
     "TabularEntry",
+    "default_engine",
 ]

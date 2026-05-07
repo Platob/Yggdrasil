@@ -47,6 +47,7 @@ from yggdrasil.io.tabular.execution.plan import (
     ExecutionPlan,
     Filter,
     GroupByAgg,
+    Join,
     PlanOp,
     Select,
 )
@@ -65,6 +66,20 @@ __all__ = ["LazyTabular"]
 # strings as strings (column names, not SQL fragments) and yggdrasil
 # nodes as nodes; native exprs pass through.
 _SelectorIn = Union[str, Expression, Any]
+
+
+def _coerce_keys(value: Any) -> "tuple[Any, ...]":
+    """Normalize a join-keys argument to a tuple.
+
+    Accepts ``None`` / a single column name / an iterable of column
+    names or expressions. A bare string is one key (not a sequence
+    of single-character keys).
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    return tuple(value)
 
 
 def _normalize_filter(value: Any) -> Any:
@@ -232,6 +247,46 @@ class LazyTabular(Tabular[CastOptions]):
         return _LazyGroupBy(self, tuple(by))
 
     groupby = group_by
+
+    def join(
+        self,
+        right: Any,
+        on: "str | Iterable[Any] | None" = None,
+        how: str = "inner",
+        *,
+        left_on: "str | Iterable[Any] | None" = None,
+        right_on: "str | Iterable[Any] | None" = None,
+        suffix: str = "_right",
+    ) -> "LazyTabular":
+        """Join with *right*.
+
+        *right* accepts a :class:`Tabular`, a polars ``DataFrame`` /
+        ``LazyFrame``, or a string name to resolve against
+        :data:`yggdrasil.io.tabular.engine.default_engine` at apply
+        time. ``on`` (or the symmetric ``left_on`` / ``right_on``)
+        gives the join keys; ``how`` is any value polars accepts
+        (``inner``, ``left``, ``right``, ``full``, ``cross``,
+        ``semi``, ``anti``).
+        """
+        on_keys = _coerce_keys(on)
+        left_keys = _coerce_keys(left_on)
+        right_keys = _coerce_keys(right_on)
+        if how != "cross" and not (on_keys or (left_keys and right_keys)):
+            raise ValueError(
+                "LazyTabular.join needs ``on`` or both ``left_on`` / "
+                f"``right_on`` unless how='cross'; got on={on!r}, "
+                f"left_on={left_on!r}, right_on={right_on!r}."
+            )
+        return self._append_op(
+            Join(
+                right=right,
+                on=on_keys,
+                how=how,
+                left_on=left_keys,
+                right_on=right_keys,
+                suffix=suffix,
+            )
+        )
 
     def apply(self, fn: Any) -> "LazyTabular":
         """Escape hatch: ``fn(LazyFrame) -> LazyFrame``.
