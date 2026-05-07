@@ -107,6 +107,17 @@ def any_to_spark_dataframe(
     if isinstance(obj, pyspark_sql.DataFrame):
         return opts.cast_spark_tabular(obj)
 
+    # ``Tabular`` (Response, StatementResult, ParquetIO, …) owns its
+    # own Spark fan-out — :meth:`Tabular.read_spark_frame` short-circuits
+    # to a persisted Spark frame when one is on hand (see
+    # ``StatementResult._read_spark_frame``) and otherwise runs the
+    # Arrow round-trip with the same cast options. The leaf already
+    # applies ``cast_spark`` / ``cast_spark_tabular`` against ``opts``,
+    # so we don't re-cast at the call site.
+    from yggdrasil.io.tabular import Tabular
+    if isinstance(obj, Tabular):
+        return obj.read_spark_frame(opts)
+
     spark = PyEnv.spark_session(
         create=True,
         import_error=True,
