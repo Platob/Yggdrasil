@@ -74,7 +74,11 @@ from __future__ import annotations
 
 import base64
 import io
+import os
+import pathlib
 import struct
+import tempfile
+import time
 from collections.abc import Iterable
 from typing import IO, Any, Iterator, Optional, TypeVar, Union
 
@@ -89,6 +93,23 @@ __all__ = ["BytesIO"]
 
 
 BytesLike = Union[bytes, bytearray, memoryview]
+
+
+def _mint_spill_path(ext: str, ttl_seconds: int) -> pathlib.Path:
+    """Mint a fresh temp file path under :func:`tempfile.gettempdir`.
+
+    Filename layout (time-sortable):
+    ``tmp-{start}-{end}-{seed}.{ext}``. Both timestamps are zero-
+    padded to 12 digits so a lexical sort of the temp directory
+    yields chronological order — useful for debugging and the
+    cross-process janitor that reaps orphans oldest-first. The file
+    itself is not created here — the caller writes to it.
+    """
+    seed = os.urandom(8).hex()
+    start = int(time.time())
+    end = start + max(0, int(ttl_seconds))
+    name = f"tmp-{start:012d}-{end:012d}-{seed}.{ext}"
+    return pathlib.Path(tempfile.gettempdir()) / name
 
 
 O = TypeVar("O", bound=CastOptions)
