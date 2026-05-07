@@ -1,20 +1,30 @@
+"""FastAPI dependencies — engine + settings accessors.
+
+The app stashes its :class:`TabularEngine` and :class:`Settings` on
+``app.state``; routers grab them via :func:`Depends`. Tests can swap
+the engine on a per-app basis without touching the process-wide
+:data:`yggdrasil.io.tabular.SYSTEM_ENGINE`.
+"""
+
 from __future__ import annotations
 
 from fastapi import Request
 
-from .services.databricks import DatabricksExcelService
-from .services.python import PythonService
-from .services.system import SystemService
+from yggdrasil.io.tabular import TabularEngine
+
+from .config import Settings
 
 
-def get_system_service(request: Request) -> SystemService:
-    return request.app.state.system_service
+def get_settings(request: Request) -> Settings:
+    """Return the :class:`Settings` bound on ``app.state``."""
+    return request.app.state.settings
 
 
-def get_python_service(request: Request) -> PythonService:
-    return request.app.state.python_service
+def get_engine(request: Request) -> TabularEngine:
+    """Return the :class:`TabularEngine` bound on ``app.state``.
 
-
-def get_databricks_excel_service(request: Request) -> DatabricksExcelService:
-    return request.app.state.databricks_excel_service
-
+    Defaults to :data:`yggdrasil.io.tabular.SYSTEM_ENGINE` when the
+    app is built without an explicit engine, so process-wide
+    registrations are visible to the API immediately.
+    """
+    return request.app.state.engine

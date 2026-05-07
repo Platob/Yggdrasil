@@ -1,8 +1,10 @@
+"""``ygg-api`` entry point — uvicorn launcher for :mod:`yggdrasil.fastapi.app`."""
+
 from __future__ import annotations
 
 import uvicorn
 
-from yggdrasil.fastapi.config import get_settings
+from .config import get_settings
 
 
 def main() -> None:
