@@ -394,3 +394,100 @@ class TestConvenienceDrains:
     def test_to_base64_url_safe(self) -> None:
         b = BytesIO(b"\xff\xfe\xfd")
         assert b.to_base64() == "__79"
+
+
+class TestAsMedia:
+    """`BytesIO.as_media(media_type=...)` returns the registered
+    Tabular leaf for that media type, sharing the underlying holder.
+
+    Pinned regression: callers (Response.to_polars, Response.dio,
+    DatabricksClient cache) used to crash with AttributeError when
+    the buffer was a BytesIO subclass without an as_media hop on the
+    base class.
+    """
+
+    def test_explicit_media_type_routes_to_leaf(self) -> None:
+        from yggdrasil.data.enums import MimeTypes
+        from yggdrasil.io.primitive.json_io import JsonIO
+
+        b = BytesIO(b'{"x": 1}')
+        mio = b.as_media(MimeTypes.JSON)
+        assert isinstance(mio, JsonIO)
+
+    def test_stamped_media_type_resolves_when_no_explicit(self) -> None:
+        from yggdrasil.data.enums import MediaTypes
+        from yggdrasil.io.primitive.json_io import JsonIO
+
+        b = BytesIO(b'{"x": 1}', media_type=MediaTypes.JSON)
+        mio = b.as_media()
+        assert isinstance(mio, JsonIO)
+
+    def test_returns_self_when_already_target_class(self) -> None:
+        from yggdrasil.data.enums import MediaTypes, MimeTypes
+
+        b = BytesIO(b'{"x": 1}', media_type=MediaTypes.JSON)
+        mio = b.as_media(MimeTypes.JSON)
+        assert mio is b
+
+    def test_shares_underlying_holder(self) -> None:
+        from yggdrasil.data.enums import MimeTypes
+
+        b = BytesIO(b'{"x": 1}')
+        mio = b.as_media(MimeTypes.JSON)
+        assert mio._holder is b._holder
+
+    def test_no_media_type_raises_keyerror(self) -> None:
+        b = BytesIO(b"hello")
+        with pytest.raises(KeyError, match="No media_type"):
+            b.as_media()
+
+    def test_unregistered_media_type_raises_keyerror(self) -> None:
+        b = BytesIO(b"hello")
+        with pytest.raises(KeyError):
+            b.as_media("application/x-bogus-format")
+
+    def test_round_trip_through_response_to_polars(self) -> None:
+        """Pinned regression — Response.to_polars(parse=True) used to
+        crash with `'JsonIO' object has no attribute 'as_media'`.
+        """
+        import datetime as dt
+
+        from yggdrasil.io.request import PreparedRequest
+        from yggdrasil.io.response import Response
+
+        req = PreparedRequest.prepare(method="GET", url="https://example.com/x")
+        body = b'[{"x": 1, "y": "a"}, {"x": 2, "y": "b"}]'
+        r = Response(
+            request=req,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            tags={},
+            buffer=body,  # type: ignore[arg-type]
+            received_at=dt.datetime.fromtimestamp(0, tz=dt.timezone.utc),
+        )
+        df = r.to_polars()
+        assert df.shape == (2, 2)
+        assert df["x"].to_list() == [1, 2]
+        assert df["y"].to_list() == ["a", "b"]
+
+    def test_response_as_media_returns_typed_leaf(self) -> None:
+        """Pinned regression — Response.as_media() used to fail for
+        the same reason as to_polars.
+        """
+        import datetime as dt
+
+        from yggdrasil.io.primitive.json_io import JsonIO
+        from yggdrasil.io.request import PreparedRequest
+        from yggdrasil.io.response import Response
+
+        req = PreparedRequest.prepare(method="GET", url="https://example.com/x")
+        r = Response(
+            request=req,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            tags={},
+            buffer=b'{"x": 1}',  # type: ignore[arg-type]
+            received_at=dt.datetime.fromtimestamp(0, tz=dt.timezone.utc),
+        )
+        mio = r.as_media()
+        assert isinstance(mio, JsonIO)
