@@ -89,6 +89,23 @@ _METADATA_DIR_NAME: str = ".ygg"
 #: inferring from a part file's footer.
 _SCHEMA_FILENAME: str = ".schema"
 
+#: Subdirectory inside :data:`_METADATA_DIR_NAME` that holds one log
+#: file per ``checkpoint_id``. Each log stores the relative path of
+#: the most recent part file fully drained by a checkpointed read,
+#: so the next read with the same id resumes after it.
+_CHECKPOINTS_DIR_NAME: str = "checkpoints"
+
+
+def _relpath(root: str, entry: "Path") -> str:
+    """Path of *entry* relative to *root*, normalized with ``/``.
+
+    Used as the checkpoint sort key so log files stay portable
+    across platforms (Windows writers / Linux readers and vice
+    versa).
+    """
+    rel = os.path.relpath(str(entry), root)
+    return rel.replace(os.sep, "/")
+
 
 def _quote(value: Any) -> str:
     """URL-quote a partition value the same way Spark / Hive do."""
@@ -261,6 +278,10 @@ class YGGFolderIO(FolderIO):
         self,
         options: FolderOptions,
     ) -> Iterator[pa.RecordBatch]:
+        if options.checkpoint_id:
+            yield from self._read_checkpointed(options)
+            return
+
         parts = self._resolve_partition_columns()
         if not parts:
             yield from super()._read_arrow_batches(options)
@@ -271,6 +292,155 @@ class YGGFolderIO(FolderIO):
             sub = FolderIO(path=part_path)
             for batch in sub._read_arrow_batches(options):
                 yield self._stamp_partitions(batch, part_kv, parts)
+
+    # ==================================================================
+    # Checkpoint streaming — resume reads after the last drained file
+    # ==================================================================
+
+    def _read_checkpointed(
+        self,
+        options: FolderOptions,
+    ) -> Iterator[pa.RecordBatch]:
+        """Yield batches from part files strictly newer than the log.
+
+        "Newer" is lexicographic over the file's path relative to
+        :attr:`path` — :meth:`make_child` mints
+        ``part-{epoch_ms}-{seed}.{ext}``, so lex order over the
+        relative path matches creation order across both the
+        partitioned and the flat layout. After each part file is
+        fully drained, the log is rewritten with that file's relative
+        path so a crash mid-stream resumes from the last *complete*
+        file rather than re-yielding it.
+
+        ``options.prune_values`` still applies on the partitioned
+        path; the checkpoint just narrows the file set further.
+        """
+        checkpoint_id = options.checkpoint_id
+        last_seen = self._read_checkpoint(checkpoint_id)
+        log_path = self._checkpoint_log_path(checkpoint_id)
+
+        parts = self._resolve_partition_columns()
+        for rel_path, file_path, kv in self._iter_checkpoint_files(
+            parts, options.prune_values or {},
+        ):
+            if last_seen is not None and rel_path <= last_seen:
+                continue
+            # Checkpoint file lives under the same tree we're scanning;
+            # never feed it back through the data reader.
+            if file_path == log_path:
+                continue
+            leaf = self._leaf_for(file_path)
+            if leaf is None:
+                continue
+            for batch in leaf._read_arrow_batches(leaf.options_class()()):
+                if parts and kv:
+                    batch = self._stamp_partitions(batch, kv, parts)
+                yield batch
+            self._write_checkpoint(checkpoint_id, rel_path)
+
+    def _iter_checkpoint_files(
+        self,
+        parts: "list[Field]",
+        prune: "dict[str, Any] | Any",
+    ) -> "Iterator[tuple[str, Path, dict[str, Any]]]":
+        """Yield ``(relative_path, file_path, partition_kv)`` for every
+        part file under :attr:`path`, sorted by relative path.
+
+        Relative paths use ``/`` as the separator regardless of OS so
+        the log is portable across platforms.
+        """
+        if not self.path.exists():
+            return
+        root = str(self.path)
+        collected: "list[tuple[str, Path, dict[str, Any]]]" = []
+
+        if parts:
+            for leaf_path, kv in self._iter_partitions(parts, prune):
+                for entry in self._iter_part_entries(leaf_path):
+                    collected.append((_relpath(root, entry), entry, kv))
+        else:
+            for entry in self._iter_part_entries_recursive(self.path):
+                collected.append((_relpath(root, entry), entry, {}))
+
+        collected.sort(key=lambda t: t[0])
+        yield from collected
+
+    def _iter_part_entries(self, directory: "Path") -> "Iterator[Path]":
+        """Direct, non-recursive list of part files in *directory*."""
+        if not directory.exists():
+            return
+        try:
+            entries = list(directory.iterdir())
+        except FileNotFoundError:
+            return
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            try:
+                if entry.is_dir():
+                    continue
+            except Exception:
+                continue
+            yield entry
+
+    def _iter_part_entries_recursive(
+        self, directory: "Path",
+    ) -> "Iterator[Path]":
+        """Recursive walk for the no-schema (flat / nested-folder) case."""
+        try:
+            entries = list(directory.iterdir())
+        except FileNotFoundError:
+            return
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            try:
+                is_dir = entry.is_dir()
+            except Exception:
+                continue
+            if is_dir:
+                yield from self._iter_part_entries_recursive(entry)
+            else:
+                yield entry
+
+    def _checkpoint_log_path(self, checkpoint_id: str) -> "Path":
+        return self._metadata_dir / _CHECKPOINTS_DIR_NAME / checkpoint_id
+
+    def _read_checkpoint(self, checkpoint_id: str) -> "str | None":
+        target = self._checkpoint_log_path(checkpoint_id)
+        try:
+            if not target.exists():
+                return None
+            with target.open(mode="rb") as bio:
+                payload = bio.to_bytes()
+        except Exception:
+            return None
+        if not payload:
+            return None
+        try:
+            return payload.decode("utf-8").strip() or None
+        except Exception:
+            return None
+
+    def _write_checkpoint(self, checkpoint_id: str, rel_path: str) -> None:
+        """Persist *rel_path* as the latest fully-drained file.
+
+        Best-effort: a write failure shouldn't take down the read
+        stream, so disk errors are swallowed. The next read just
+        re-yields any files that came after the previous successful
+        write.
+        """
+        target = self._checkpoint_log_path(checkpoint_id)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return
+        payload = rel_path.encode("utf-8")
+        try:
+            with target.open(mode="wb") as bio:
+                bio.write(payload)
+        except Exception:
+            pass
 
     def _iter_partitions(
         self,

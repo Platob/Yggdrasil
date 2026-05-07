@@ -575,3 +575,150 @@ class TestDelete:
         deleted = y.delete(col("id") == 2)
         assert deleted == 1
         assert sorted(y.read_arrow_table().column("id").to_pylist()) == [1, 3]
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint streaming
+# ---------------------------------------------------------------------------
+
+
+class TestCheckpointStreaming:
+
+    def test_first_read_yields_everything_and_writes_log(
+        self, tmp_path,
+    ) -> None:
+        y = YGGFolderIO(
+            path=str(tmp_path), schema=_single_partition_schema(),
+        )
+        y.write_arrow_table(pa.table({
+            "id": [1], "region": ["us"], "value": ["a"],
+        }))
+        y.write_arrow_batches(
+            pa.table({"id": [2], "region": ["eu"], "value": ["b"]}).to_batches(),
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+
+        out = y.read_arrow_table(
+            options=FolderOptions(checkpoint_id="stream1"),
+        )
+        assert sorted(out.column("id").to_pylist()) == [1, 2]
+        log = tmp_path / ".ygg" / "checkpoints" / "stream1"
+        assert log.exists()
+        rel = log.read_text(encoding="utf-8").strip()
+        # Last drained file is the one whose partition sorts last lex
+        # (region=us); recorded as a relative path with forward slashes.
+        assert rel.startswith("region=")
+        assert "/" in rel and "part-" in rel
+
+    def test_second_read_yields_only_new_files(self, tmp_path) -> None:
+        y = YGGFolderIO(
+            path=str(tmp_path), schema=_single_partition_schema(),
+        )
+        y.write_arrow_table(pa.table({
+            "id": [1], "region": ["us"], "value": ["a"],
+        }))
+        first = y.read_arrow_table(
+            options=FolderOptions(checkpoint_id="incr"),
+        )
+        assert first.column("id").to_pylist() == [1]
+
+        # Append a second part — only that new file shows up.
+        y.write_arrow_batches(
+            pa.table({"id": [2], "region": ["us"], "value": ["b"]}).to_batches(),
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+        second = y.read_arrow_table(
+            options=FolderOptions(checkpoint_id="incr"),
+        )
+        assert second.column("id").to_pylist() == [2]
+
+        # No new files → empty stream.
+        third = y.read_arrow_table(
+            options=FolderOptions(checkpoint_id="incr"),
+        )
+        assert third.num_rows == 0
+
+    def test_distinct_checkpoint_ids_are_independent(self, tmp_path) -> None:
+        y = YGGFolderIO(
+            path=str(tmp_path), schema=_single_partition_schema(),
+        )
+        y.write_arrow_table(pa.table({
+            "id": [1, 2], "region": ["us", "eu"], "value": ["a", "b"],
+        }))
+
+        a = y.read_arrow_table(options=FolderOptions(checkpoint_id="a"))
+        assert sorted(a.column("id").to_pylist()) == [1, 2]
+        b = y.read_arrow_table(options=FolderOptions(checkpoint_id="b"))
+        assert sorted(b.column("id").to_pylist()) == [1, 2]
+        a2 = y.read_arrow_table(options=FolderOptions(checkpoint_id="a"))
+        assert a2.num_rows == 0
+
+    def test_checkpoint_works_without_schema(self, tmp_path) -> None:
+        """Flat folder layout — checkpoint walks recursively from root."""
+        y = YGGFolderIO(path=str(tmp_path))
+        y.write_arrow_table(pa.table({"id": [1]}))
+        y.write_arrow_batches(
+            pa.table({"id": [2]}).to_batches(),
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+        out = y.read_arrow_table(
+            options=FolderOptions(checkpoint_id="flat"),
+        )
+        assert sorted(out.column("id").to_pylist()) == [1, 2]
+
+        y.write_arrow_batches(
+            pa.table({"id": [3]}).to_batches(),
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+        out2 = y.read_arrow_table(
+            options=FolderOptions(checkpoint_id="flat"),
+        )
+        assert out2.column("id").to_pylist() == [3]
+
+    def test_checkpoint_log_excluded_from_data_walk(self, tmp_path) -> None:
+        """The checkpoint log lives under .ygg/ and never feeds the reader."""
+        y = YGGFolderIO(
+            path=str(tmp_path), schema=_single_partition_schema(),
+        )
+        y.write_arrow_table(pa.table({
+            "id": [1], "region": ["us"], "value": ["a"],
+        }))
+        y.read_arrow_table(options=FolderOptions(checkpoint_id="cid"))
+        # A non-checkpointed read sees only the data parts; the
+        # .ygg/checkpoints/cid sidecar is invisible.
+        out = y.read_arrow_table()
+        assert out.column("id").to_pylist() == [1]
+
+    def test_checkpoint_resumes_after_partial_read(self, tmp_path) -> None:
+        """A read that's abandoned mid-stream resumes after the last
+        *fully drained* file rather than re-yielding it."""
+        y = YGGFolderIO(
+            path=str(tmp_path), schema=_single_partition_schema(),
+        )
+        for region, ids in (("ap", [1]), ("eu", [2]), ("us", [3])):
+            y.write_arrow_batches(
+                pa.table({
+                    "id": ids,
+                    "region": [region] * len(ids),
+                    "value": ["x"] * len(ids),
+                }).to_batches(),
+                options=FolderOptions(mode=Mode.APPEND),
+            )
+
+        # Two .next() calls drain file 1 (region=ap) fully — the
+        # second call advances past file 1's last yield, runs the
+        # post-loop checkpoint write, then yields file 2's batch.
+        # Drop the iterator there: file 2 isn't yet checkpointed.
+        it = iter(y.read_arrow_batches(
+            options=FolderOptions(checkpoint_id="resume"),
+        ))
+        b1 = next(it)
+        b2 = next(it)
+        assert b1.num_rows == 1 and b2.num_rows == 1
+        del it, b1, b2
+
+        # Resume: file 2 (eu) and file 3 (us) replay; file 1 stays done.
+        rest = y.read_arrow_table(
+            options=FolderOptions(checkpoint_id="resume"),
+        )
+        assert sorted(rest.column("id").to_pylist()) == [2, 3]

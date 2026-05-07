@@ -78,6 +78,18 @@ class FolderOptions(CastOptions):
     #: through :meth:`MediaType.from_`.
     child_media_type: MediaType = MediaTypes.ARROW_IPC
 
+    #: Optional checkpoint stream identifier. When set on a read
+    #: against :class:`YGGFolderIO`, the leaf orders every part file
+    #: under :attr:`path` lexicographically and yields only batches
+    #: from files strictly greater than the relative path stored in
+    #: ``.ygg/checkpoints/<checkpoint_id>``. After each file is fully
+    #: drained, the log is rewritten with that file's relative path,
+    #: so a subsequent read with the same id resumes after it. ``None``
+    #: (the default) disables checkpointing — the read sees every part
+    #: file every time, the legacy behavior. Plain :class:`FolderIO`
+    #: ignores this knob; only :class:`YGGFolderIO` honors it.
+    checkpoint_id: "str | None" = None
+
     def __post_init__(self) -> None:
         CastOptions.__post_init__(self)
         coerced = MediaType.from_(self.child_media_type, default=None)
