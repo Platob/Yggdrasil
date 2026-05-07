@@ -216,7 +216,7 @@ class KafkaIO(Tabular[CastOptions]):
     def _producer_client(self) -> "Producer":
         if self._producer is not None:
             return self._producer
-        from yggdrasil.kafka.lib import confluent_kafka
+        from yggdrasil.lazy_imports import confluent_kafka
 
         cfg: dict[str, Any] = {"bootstrap.servers": self.bootstrap_servers}
         cfg.update(self.config)
@@ -227,7 +227,7 @@ class KafkaIO(Tabular[CastOptions]):
     def _consumer_client(self) -> "Consumer":
         if self._consumer is not None:
             return self._consumer
-        from yggdrasil.kafka.lib import confluent_kafka
+        from yggdrasil.lazy_imports import confluent_kafka
 
         cfg: dict[str, Any] = {
             "bootstrap.servers": self.bootstrap_servers,
@@ -258,7 +258,7 @@ class KafkaIO(Tabular[CastOptions]):
         ``options.row_size`` (default: a single batch on EOF).
         """
         consumer = self._consumer_client()
-        from yggdrasil.kafka.lib import confluent_kafka  # noqa: F401  (clarity)
+        from yggdrasil.lazy_imports import confluent_kafka  # noqa: F401  (clarity)
 
         row_size = getattr(options, "row_size", None) or 0
         max_total = self.max_messages

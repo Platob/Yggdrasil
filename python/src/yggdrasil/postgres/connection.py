@@ -34,7 +34,7 @@ from urllib.parse import urlparse, urlunparse
 
 from yggdrasil.disposable import Disposable
 
-from .lib import adbc_dbapi_module, has_adbc, psycopg_module
+from yggdrasil.lazy_imports import adbc_dbapi_module, has_adbc, psycopg_module
 
 if TYPE_CHECKING:
     pass

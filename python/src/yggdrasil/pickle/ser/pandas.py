@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar, Generic, Mapping, TypeVar
 
-from yggdrasil.pandas.lib import pandas as pd
+from yggdrasil.lazy_imports import pandas as pd
 import pyarrow as pa
 
 from yggdrasil.io import BytesIO

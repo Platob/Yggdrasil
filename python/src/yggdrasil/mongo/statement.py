@@ -49,7 +49,7 @@ from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io.tabular.base import O
 from yggdrasil.data.enums import MimeType
 
-from .lib import has_pymongoarrow, pymongoarrow_api_module
+from yggdrasil.lazy_imports import has_pymongoarrow, pymongoarrow_api_module
 from .types import documents_to_arrow_table
 
 if TYPE_CHECKING:

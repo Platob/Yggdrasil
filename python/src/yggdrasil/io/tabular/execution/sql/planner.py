@@ -44,7 +44,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 from yggdrasil.io.tabular.execution.expr import Expression, Predicate
 
 from yggdrasil.io.tabular.execution.sql.dialect import Dialect, resolve_dialect
-from yggdrasil.io.tabular.execution.sql.lib import sqlglot_expressions
+from yggdrasil.lazy_imports import sqlglot_expressions
 from yggdrasil.io.tabular.execution.sql.parser import parse, SqlParseError
 from yggdrasil.io.tabular.execution.sql.plan import (
     Aggregate,

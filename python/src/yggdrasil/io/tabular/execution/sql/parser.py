@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any, Iterator
 from yggdrasil.io.tabular.execution.expr import Expression
 
 from .dialect import Dialect, resolve_dialect
-from .lib import sqlglot_expressions, sqlglot_module
+from yggdrasil.lazy_imports import sqlglot_expressions, sqlglot_module
 
 if TYPE_CHECKING:
     pass

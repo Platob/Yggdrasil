@@ -1146,7 +1146,7 @@ class Response(Tabular[CastOptions]):
         lazy: bool = False,
         **media_options: Any,
     ) -> "pl.DataFrame | pl.LazyFrame":
-        from yggdrasil.polars.lib import polars as _pl
+        from yggdrasil.lazy_imports import polars as _pl
 
         if parse:
             mio = self.buffer.as_media(media_type=self.media_type)

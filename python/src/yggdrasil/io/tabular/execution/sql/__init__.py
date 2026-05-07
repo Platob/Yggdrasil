@@ -87,7 +87,7 @@ from .executor import (
     SqlExecutor,
     resolve_executor,
 )
-from .lib import has_polars, has_sqlglot
+from yggdrasil.lazy_imports import has_polars, has_sqlglot
 from .parser import (
     SqlParseError,
     extract_sources,

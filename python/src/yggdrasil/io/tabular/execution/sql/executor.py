@@ -45,7 +45,7 @@ from yggdrasil.io.tabular import Tabular
 from yggdrasil.io.tabular import ArrowTabular
 
 from .catalog import SqlContext, default_context
-from .lib import has_polars, sqlglot_expressions
+from yggdrasil.lazy_imports import has_polars, sqlglot_expressions
 from .parser import SqlParseError, extract_sources, is_query, parse
 from .statement import SqlPreparedStatement, SqlStatementResult
 

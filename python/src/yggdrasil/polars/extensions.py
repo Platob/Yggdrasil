@@ -17,7 +17,7 @@ import inspect
 import weakref
 from typing import Any, Literal, Mapping, Optional, Sequence
 
-from .lib import polars as pl
+from yggdrasil.lazy_imports import polars as pl
 
 __all__ = [
     "join_coalesced",

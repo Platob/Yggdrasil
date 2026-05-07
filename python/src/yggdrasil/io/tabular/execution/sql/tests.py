@@ -25,7 +25,7 @@ from typing import Any, Mapping
 from yggdrasil.arrow.tests import ArrowTestCase
 
 from .catalog import SqlContext
-from .lib import has_polars, has_sqlglot
+from yggdrasil.lazy_imports import has_polars, has_sqlglot
 
 
 __all__ = ["SqlTestCase", "SqlPolarsTestCase", "SqlArrowTestCase"]

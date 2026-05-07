@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from yggdrasil.polars.lib import polars
+from yggdrasil.lazy_imports import polars
 
 from .catalog import GeoZoneCatalog
 

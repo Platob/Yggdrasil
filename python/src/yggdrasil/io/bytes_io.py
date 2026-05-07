@@ -1216,7 +1216,7 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
                 return None
             if orient is not None:
                 try:
-                    from yggdrasil.pandas.lib import pandas as pd
+                    from yggdrasil.lazy_imports import pandas as pd
                     return pd.read_json(text, orient=orient)
                 except Exception:
                     pass
