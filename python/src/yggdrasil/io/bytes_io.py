@@ -698,6 +698,51 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
             self._holder.stat().media_type = mt
         return self
 
+    def as_media(self, media_type: Any = None) -> "BytesIO":
+        """Return a typed Tabular leaf bound to this buffer's holder.
+
+        Resolution: explicit *media_type* wins; otherwise the buffer's
+        stamped media type (``self._holder.stat().media_type``) is used.
+        The leaf borrows the same :class:`Holder` so durable bytes are
+        shared without a copy. When ``self`` is already an instance of
+        the resolved leaf class, returns ``self`` unchanged.
+
+        Parallels :meth:`Path.as_media` at the BytesIO layer — useful
+        when the buffer was constructed without a media-type
+        discriminator and the caller now knows the format.
+
+        Raises :class:`KeyError` when no media type can be resolved or
+        the resolved type has no registered Tabular leaf.
+        """
+        # Side-effect import: every primitive leaf registers its
+        # mime_type on import.
+        import yggdrasil.io.primitive  # noqa: F401
+        from yggdrasil.io.tabular.base import Tabular
+        from yggdrasil.data.enums.media_type import MediaType
+
+        mt = MediaType.from_(media_type, default=None) if media_type is not None else None
+        if mt is None:
+            try:
+                mt = self._holder.stat().media_type
+            except Exception:
+                mt = None
+        if mt is None:
+            raise KeyError(
+                f"No media_type available for {self!r}. "
+                "Pass media_type= explicitly or stamp it on the "
+                "holder's IOStats via with_media_type()."
+            )
+
+        target = Tabular.class_for_media_type(mt)
+        if isinstance(self, target):
+            return self
+        return target(
+            holder=self._holder,
+            owns_holder=False,
+            mode=self._mode,
+            media_type=mt,
+        )
+
     @property
     def closed(self) -> bool:
         """Stdlib ``IO[bytes]`` parity — ``False`` while the durable
