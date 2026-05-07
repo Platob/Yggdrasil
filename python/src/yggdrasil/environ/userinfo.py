@@ -13,10 +13,12 @@ import pyarrow as pa
 
 from yggdrasil.io.url import URL
 
-# Sentinel for the lazy ``url`` / ``git_url`` caches. ``None`` is a
-# valid computed result (no detectable compute / repo), so we can't
-# use it to mean "not yet computed".
-_UNSET: Any = object()
+# Lazy field caches default to ``...`` (the ``Ellipsis`` singleton)
+# to mean "not yet resolved". ``None`` is a valid computed result
+# (no email, no detectable compute / repo, no project) and can't be
+# overloaded for that role; ``Ellipsis`` is a stable, importable
+# singleton so identity checks (``is ...``) are safe across pickling
+# and across worker boundaries without a private sentinel object.
 
 __all__ = [
     "UserInfo",
@@ -77,27 +79,59 @@ USERINFO_STRUCT: pa.StructType = pa.struct(list(USERINFO_SCHEMA))
 
 @dataclass(frozen=True, slots=True)
 class UserInfo:
-    key: str = ""
-    hostname: str = ""
-    email: str | None = None
-    first_name: str | None = None
-    last_name: str | None = None
-    product: str | None = None
-    product_version: str | None = None
+    """Snapshot of the user identity for the current process.
 
-    # ``cwd`` / ``url`` / ``git_url`` are derived per-process via the
-    # ``@property`` accessors below — they probe ``os.getcwd``, the
-    # Databricks runtime, ``dbutils``, and the on-disk ``.git`` tree.
-    # All three are too costly to run on every ``UserInfo``
-    # construction (e.g. when deserializing from struct on each
-    # request) and they shouldn't travel across the wire either —
-    # the receiver's filesystem is the only one that can answer the
-    # question correctly. Stored in ``init=False`` slots with the
-    # ``_UNSET`` sentinel so each lookup fires at most once per
-    # instance, matching the rest of the dataclass's frozen contract.
-    _cwd_cache: Any = field(default=_UNSET, init=False, repr=False, compare=False)
-    _url_cache: Any = field(default=_UNSET, init=False, repr=False, compare=False)
-    _git_url_cache: Any = field(default=_UNSET, init=False, repr=False, compare=False)
+    ``hostname`` is populated eagerly (``socket.gethostname()`` is
+    cheap and answers reliably without I/O fan-out). Every other
+    identity field is a lazy, memoized property:
+
+    - ``key`` / ``email`` shell out (``whoami``, ``whoami /UPN``) and
+      may call the Databricks SDK on DBR clusters.
+    - ``first_name`` / ``last_name`` are derived from ``email`` —
+      free once email has been resolved, but pulling them eagerly
+      forces email resolution.
+    - ``product`` / ``product_version`` walk parent directories
+      looking for ``pyproject.toml`` / ``setup.py`` and parse TOML.
+    - ``cwd`` / ``url`` / ``git_url`` probe the runtime, dbutils
+      context, and the on-disk ``.git`` tree.
+
+    All of those firing at construction would tax callers that only
+    care about a subset (typical of request/response sanitization on
+    the hot path). Each cache fires at most once per instance, and
+    once a value is resolved — or supplied via :meth:`from_struct_dict`
+    or constructor kwargs — it persists for the life of the instance.
+
+    Construction:
+
+    - :meth:`current` returns the process-wide singleton (preferred).
+    - :meth:`from_struct_dict` rebuilds an instance from a wire
+      payload, with every supplied field pre-populated so no
+      resolution fires on the receiver.
+    - The dataclass constructor accepts the underscore-prefixed
+      cache fields directly — useful for tests and for
+      :func:`dataclasses.replace`.
+    """
+
+    hostname: str = ""
+
+    # Lazy identity caches. Defaulted to ``...`` so the property
+    # accessors can distinguish "not yet resolved" from "resolved to
+    # ``None``" (a legal value for everything except ``key``). They
+    # participate in :func:`dataclasses.replace` (init=True) so wire
+    # round-trips and ``with_email`` don't need a custom builder.
+    _key: Any = field(default=..., repr=False)
+    _email: Any = field(default=..., repr=False)
+    _first_name: Any = field(default=..., repr=False)
+    _last_name: Any = field(default=..., repr=False)
+    _product: Any = field(default=..., repr=False)
+    _product_version: Any = field(default=..., repr=False)
+
+    # Per-process derived caches. ``init=False`` because they
+    # shouldn't travel across the wire — the receiver's filesystem
+    # / runtime is the only context that can answer correctly.
+    _cwd_cache: Any = field(default=..., init=False, repr=False, compare=False)
+    _url_cache: Any = field(default=..., init=False, repr=False, compare=False)
+    _git_url_cache: Any = field(default=..., init=False, repr=False, compare=False)
 
     @classmethod
     def current(cls) -> "UserInfo":
@@ -109,10 +143,72 @@ class UserInfo:
         return _userinfo_hash(self)
 
     @property
+    def key(self) -> str:
+        cached = self._key
+        if cached is not ...:
+            return cached
+        result = _resolve_key()
+        object.__setattr__(self, "_key", result)
+        return result
+
+    @property
+    def email(self) -> str | None:
+        cached = self._email
+        if cached is not ...:
+            return cached
+        result = _resolve_email()
+        object.__setattr__(self, "_email", result)
+        return result
+
+    @property
+    def first_name(self) -> str | None:
+        cached = self._first_name
+        if cached is not ...:
+            return cached
+        # Names derive from email — resolving one resolves the pair,
+        # so the second access skips the regex on the cache hit.
+        first, last = _names_from_email(self.email)
+        object.__setattr__(self, "_first_name", first)
+        object.__setattr__(self, "_last_name", last)
+        return first
+
+    @property
+    def last_name(self) -> str | None:
+        cached = self._last_name
+        if cached is not ...:
+            return cached
+        first, last = _names_from_email(self.email)
+        object.__setattr__(self, "_first_name", first)
+        object.__setattr__(self, "_last_name", last)
+        return last
+
+    @property
+    def product(self) -> str | None:
+        cached = self._product
+        if cached is not ...:
+            return cached
+        # Like the name pair, project name and version are resolved
+        # from a single ``pyproject.toml`` parse — fill both slots.
+        product, version = _infer_project(self.cwd)
+        object.__setattr__(self, "_product", product)
+        object.__setattr__(self, "_product_version", version)
+        return product
+
+    @property
+    def product_version(self) -> str | None:
+        cached = self._product_version
+        if cached is not ...:
+            return cached
+        product, version = _infer_project(self.cwd)
+        object.__setattr__(self, "_product", product)
+        object.__setattr__(self, "_product_version", version)
+        return version
+
+    @property
     def cwd(self) -> str:
         """Resolve the current working directory lazily (memoized)."""
         cached = self._cwd_cache
-        if cached is not _UNSET:
+        if cached is not ...:
             return cached
         result = _safe_getcwd()
         object.__setattr__(self, "_cwd_cache", result)
@@ -128,7 +224,7 @@ class UserInfo:
         request hot path.
         """
         cached = self._url_cache
-        if cached is not _UNSET:
+        if cached is not ...:
             return cached
         result = _current_compute_url(hostname=self.hostname, cwd=self.cwd)
         object.__setattr__(self, "_url_cache", result)
@@ -143,7 +239,7 @@ class UserInfo:
         sanitization paths.
         """
         cached = self._git_url_cache
-        if cached is not _UNSET:
+        if cached is not ...:
             return cached
         result = _git_url_from_info(_git_info(self.cwd))
         object.__setattr__(self, "_git_url_cache", result)
@@ -153,9 +249,9 @@ class UserInfo:
         first_name, last_name = _names_from_email(email)
         return replace(
             self,
-            email=email,
-            first_name=first_name,
-            last_name=last_name,
+            _email=email,
+            _first_name=first_name,
+            _last_name=last_name,
         )
 
     def to_struct_dict(self) -> dict[str, Any]:
@@ -164,6 +260,8 @@ class UserInfo:
         ``cwd`` / ``url`` / ``git_url`` are intentionally excluded —
         they're per-process derived values, not part of the wire
         contract; the receiver re-derives them from its own context.
+        Reading the lazy properties here forces resolution and pins
+        the result on the cache slots so subsequent reads are free.
         """
         return {
             "hash":            self.hash,
@@ -180,20 +278,22 @@ class UserInfo:
     def from_struct_dict(cls, value: Mapping[str, Any]) -> "UserInfo":
         """Inverse of :meth:`to_struct_dict` — drops derived fields.
 
-        ``hash`` is recomputed by the property; ``cwd`` / ``url`` /
-        ``git_url`` are lazy per-process properties and are likewise
-        ignored if present on the input — reconstructing them from
-        the struct would defeat the lazy contract on the receiving
-        side, which re-derives them locally.
+        Wire values land directly in the lazy cache slots so the
+        receiver never re-resolves them. ``hash`` is recomputed by
+        the property; ``cwd`` / ``url`` / ``git_url`` are
+        per-process and are ignored if present on the input —
+        reconstructing them from the struct would defeat the lazy
+        contract on the receiving side, which re-derives them
+        locally.
         """
         return cls(
-            key=str(value.get("key") or ""),
             hostname=str(value.get("hostname") or ""),
-            email=_or_none(value.get("email")),
-            first_name=_or_none(value.get("first_name")),
-            last_name=_or_none(value.get("last_name")),
-            product=_or_none(value.get("product")),
-            product_version=_or_none(value.get("product_version")),
+            _key=str(value.get("key") or ""),
+            _email=_or_none(value.get("email")),
+            _first_name=_or_none(value.get("first_name")),
+            _last_name=_or_none(value.get("last_name")),
+            _product=_or_none(value.get("product")),
+            _product_version=_or_none(value.get("product_version")),
         )
 
 
@@ -201,31 +301,20 @@ class UserInfo:
 
 
 def get_user_info(*, refresh: bool = False) -> UserInfo:
-    """Return cached UserInfo for the current execution context."""
+    """Return the cached :class:`UserInfo` for the current process.
+
+    Only ``hostname`` is resolved eagerly — every other field is a
+    lazy property on the instance that fires once on first access
+    and persists. ``refresh=True`` drops the cached singleton and
+    rebuilds, which also abandons any previously memoized lazy
+    fields (the new instance starts unresolved).
+    """
     global _CURRENT_CACHE
 
     if _CURRENT_CACHE is not None and not refresh:
         return _CURRENT_CACHE
 
-    hostname = socket.gethostname()
-    email = _get_upn_email() or _guess_email_from_env()
-    first_name, last_name = _names_from_email(email)
-    # Project inference is the only eager consumer of ``cwd`` here —
-    # it walks parents looking for ``pyproject.toml`` and stamps the
-    # result onto a stable ``product`` / ``product_version`` pair.
-    # ``cwd`` / ``url`` / ``git_url`` are lazy properties on
-    # ``UserInfo`` and re-resolve from process state on first access.
-    product, product_version = _infer_project(_safe_getcwd())
-
-    info = UserInfo(
-        key=_get_key(),
-        hostname=hostname,
-        email=email,
-        first_name=first_name,
-        last_name=last_name,
-        product=product,
-        product_version=product_version,
-    )
+    info = UserInfo(hostname=socket.gethostname())
     _CURRENT_CACHE = info
     return info
 
@@ -574,7 +663,7 @@ def _safe_getcwd() -> str:
         return ""
 
 
-def _get_key() -> str:
+def _resolve_key() -> str:
     if os.getenv("DATABRICKS_RUNTIME_VERSION"):
         dbx_user = _get_dbx_user()
         if dbx_user:
@@ -583,6 +672,10 @@ def _get_key() -> str:
     if whoami:
         return whoami.strip()
     return os.getenv("USERNAME") or os.getenv("USER") or os.getenv("LOGNAME") or "unknown"
+
+
+def _resolve_email() -> str | None:
+    return _get_upn_email() or _guess_email_from_env()
 
 
 def _get_upn_email() -> str | None:
