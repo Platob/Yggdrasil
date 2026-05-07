@@ -280,9 +280,14 @@ class TestObjectTypeIntegration(unittest.TestCase):
     def test_from_str_variant_alias(self) -> None:
         self.assertIsInstance(DataType.from_str("variant"), ObjectType)
 
-    def test_from_str_json_remains_string(self) -> None:
-        # JSON has its own type_id and stays a StringType.
-        self.assertIsInstance(DataType.from_str("json"), StringType)
+    def test_from_str_json_resolves_to_bjson(self) -> None:
+        # Bare ``json`` defaults to the binary-shaped variant; the
+        # text form is reachable via ``sjson`` / ``json_string``.
+        from yggdrasil.data.types import BJsonType, SJsonType
+
+        self.assertIsInstance(DataType.from_str("json"), BJsonType)
+        self.assertIsInstance(DataType.from_str("sjson"), SJsonType)
+        self.assertIsInstance(DataType.from_str("jsonb"), BJsonType)
 
     def test_from_pytype_object_class(self) -> None:
         self.assertIsInstance(DataType.from_pytype(object), ObjectType)

@@ -20,6 +20,7 @@ from __future__ import annotations
 from .base import PrimitiveType
 from .binary import BinaryType
 from .boolean import BooleanType
+from .json import BJsonType, SJsonType
 from .null import NullType
 from .numeric import (
     DecimalType,
@@ -49,6 +50,8 @@ __all__ = [
     "NullType",
     "ObjectType",
     "BinaryType",
+    "BJsonType",
+    "SJsonType",
     "StringType",
     "BooleanType",
     "NumericType",

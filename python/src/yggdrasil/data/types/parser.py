@@ -465,8 +465,15 @@ _NAME_ALIASES: dict[str, tuple[str, DataTypeId | None]] = {
 
     # union / json / enum / dictionary
     "union":        ("union",   DataTypeId.UNION),
-    "json":         ("json",    DataTypeId.JSON),
-    "jsonb":        ("json",    DataTypeId.JSON),
+    # Bare ``json`` resolves to BJSON (the binary/packed variant) — the
+    # text-shaped form is reachable as ``sjson`` / ``json_string``.
+    "json":         ("bjson",   DataTypeId.BJSON),
+    "bjson":        ("bjson",   DataTypeId.BJSON),
+    "jsonb":        ("bjson",   DataTypeId.BJSON),
+    "json_binary":  ("bjson",   DataTypeId.BJSON),
+    "sjson":        ("sjson",   DataTypeId.SJSON),
+    "json_string":  ("sjson",   DataTypeId.SJSON),
+    "json_text":    ("sjson",   DataTypeId.SJSON),
     "enum":         ("enum",    DataTypeId.ENUM),
     "literal":      ("literal", DataTypeId.ENUM),
     "dictionary":   ("dictionary", DataTypeId.DICTIONARY),
@@ -503,7 +510,8 @@ _BRACKET_METADATA_TYPE_IDS = frozenset({
     DataTypeId.DATE,
     DataTypeId.NULL,
     DataTypeId.OBJECT,
-    DataTypeId.JSON,
+    DataTypeId.SJSON,
+    DataTypeId.BJSON,
 })
 
 
@@ -853,7 +861,8 @@ class _Parser:
         if dtype in {
             DataTypeId.STRING,
             DataTypeId.BINARY,
-            DataTypeId.JSON,
+            DataTypeId.SJSON,
+            DataTypeId.BJSON,
             DataTypeId.TIME,
             DataTypeId.TIMESTAMP,
             DataTypeId.DURATION,

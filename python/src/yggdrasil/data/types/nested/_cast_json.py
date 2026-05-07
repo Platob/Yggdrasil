@@ -36,7 +36,16 @@ __all__ = [
 ]
 
 
-_JSON_STRING_SOURCE_TYPES = frozenset({DataTypeId.STRING, DataTypeId.BINARY})
+_JSON_STRING_SOURCE_TYPES = frozenset(
+    {
+        DataTypeId.STRING,
+        DataTypeId.BINARY,
+        # Storage-pinned JSON variants — same wire shape as STRING / BINARY,
+        # so the same vectorised decoder applies.
+        DataTypeId.SJSON,
+        DataTypeId.BJSON,
+    }
+)
 _JSON_NESTED_TYPES = frozenset(
     {DataTypeId.ARRAY, DataTypeId.MAP, DataTypeId.STRUCT}
 )
@@ -125,7 +134,9 @@ def cast_polars_json_string_expr(
 
     target_polars_type = target_field.dtype.to_polars()
 
-    if options.source_field.dtype.type_id == DataTypeId.BINARY:
+    src_id = options.source_field.dtype.type_id
+    src_dtype = options.source_field.dtype.to_polars()
+    if src_id == DataTypeId.BINARY or src_id == DataTypeId.BJSON or src_dtype == pl.Binary:
         expr = expr.cast(pl.String)
 
     return expr.str.json_decode(target_polars_type)
@@ -155,7 +166,8 @@ def cast_spark_json_string_column(
 
     target_ddl = target_field.dtype.to_databricks_ddl()
 
-    if options.source_field.dtype.type_id == DataTypeId.BINARY:
+    src_id = options.source_field.dtype.type_id
+    if src_id == DataTypeId.BINARY or src_id == DataTypeId.BJSON:
         column = column.cast("string")
 
     return F.from_json(column, target_ddl)
