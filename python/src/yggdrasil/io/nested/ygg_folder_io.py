@@ -52,6 +52,11 @@ from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.data.schema import Schema
 from yggdrasil.io.nested.folder_io import FolderIO, FolderOptions
 from yggdrasil.io.path.local_path import LocalPath
+from yggdrasil.io.tabular.execution.expr.nodes import (
+    Logical,
+    LogicalOp,
+    free_columns,
+)
 
 if TYPE_CHECKING:
     from yggdrasil.data.data_field import Field
@@ -539,6 +544,106 @@ class YGGFolderIO(FolderIO):
         self._listing_cache.clear()
 
     # ==================================================================
+    # Row-level delete with partition pruning
+    # ==================================================================
+
+    def _delete(self, predicate: Any, options: FolderOptions) -> int:
+        """Delete rows matching *predicate*, pruning partitions whose
+        directory KV makes the predicate trivially false.
+
+        Strategy:
+
+        1. Flatten the predicate's top-level ``AND`` into conjuncts.
+        2. For each partition leaf:
+
+           - Conjuncts that reference only partition columns are
+             evaluated against the partition's KV. If any such conjunct
+             evaluates to ``False`` / ``NULL``, no row in this partition
+             can match — skip the whole subtree (no IO).
+           - Conjuncts that mix partition and non-partition columns,
+             or reference only non-partition columns, are kept as
+             "residual" — they need a row-level filter inside the
+             partition.
+
+        3. If every conjunct is partition-only and all evaluate to
+           ``True``, the partition matches wholesale: count rows then
+           ``rmtree`` the directory (one stat-and-unlink per file
+           rather than reading + rewriting).
+        4. Otherwise hand the residual predicate to a plain
+           :class:`FolderIO` rooted at the partition leaf, which
+           applies the per-leaf filter shape from
+           :meth:`FolderIO._delete`.
+
+        Top-level ``OR`` / ``NOT`` predicates that aren't decomposable
+        into partition-only conjuncts fall through to step 4 unchanged
+        — correct, just no pruning win.
+        """
+        parts = self._resolve_partition_columns()
+        if not parts:
+            return super()._delete(predicate, options)
+
+        partition_names = {f.name for f in parts}
+        conjuncts = list(_iter_and_conjuncts(predicate))
+
+        deleted = 0
+        for leaf_path, kv in self._iter_partitions(parts, prune={}):
+            # One-row table over the partition KV — every partition-only
+            # conjunct compiles to a pyarrow expression and runs against
+            # this in C++. Conjuncts that mix partition and non-partition
+            # columns can't be evaluated here (the non-partition columns
+            # aren't in this row's schema), so they fall through to the
+            # row-level filter inside the partition.
+            kv_table = pa.Table.from_pydict({k: [v] for k, v in kv.items()})
+
+            residual: "list[Any]" = []
+            prune_partition = False
+            for conj in conjuncts:
+                free = set(free_columns(conj))
+                if free and free.issubset(partition_names):
+                    try:
+                        matches = conj.filter_arrow_table(kv_table).num_rows
+                    except Exception:
+                        matches = 0
+                    if matches == 1:
+                        continue
+                    # 0 (predicate False) or eval failure → conservatively
+                    # treat as "no row in this partition can match" so we
+                    # never delete rows that might survive at row level.
+                    prune_partition = True
+                    break
+                residual.append(conj)
+            if prune_partition:
+                continue
+
+            if not residual:
+                deleted += self._wholesale_delete_partition(leaf_path)
+                continue
+
+            residual_pred = _and_combine(residual)
+            sub = FolderIO(path=leaf_path)
+            deleted += sub._delete(residual_pred, FolderOptions())
+            self.invalidate_listing(leaf_path)
+        return deleted
+
+    def _wholesale_delete_partition(self, leaf_path: "Path") -> int:
+        """Count rows in *leaf_path* then ``rmtree`` it."""
+        sub = FolderIO(path=leaf_path)
+        count = 0
+        try:
+            for batch in sub._read_arrow_batches(FolderOptions()):
+                count += batch.num_rows
+        except Exception:
+            count = 0
+        try:
+            shutil.rmtree(str(leaf_path))
+        except FileNotFoundError:
+            pass
+        except Exception:
+            return 0
+        self.invalidate_listing(leaf_path)
+        return count
+
+    # ==================================================================
     # Optimize — compact small parts per partition
     # ==================================================================
 
@@ -603,3 +708,19 @@ class YGGFolderIO(FolderIO):
     def __repr__(self) -> str:
         cols = ", ".join(self.partition_columns)
         return f"YGGFolderIO(path={self.path!r}, partition_by=[{cols}])"
+
+
+def _iter_and_conjuncts(predicate: Any) -> "Iterator[Any]":
+    """Flatten nested top-level ``AND`` nodes into individual conjuncts."""
+    if isinstance(predicate, Logical) and predicate.op is LogicalOp.AND:
+        for op in predicate.operands:
+            yield from _iter_and_conjuncts(op)
+        return
+    yield predicate
+
+
+def _and_combine(conjs: "list[Any]") -> Any:
+    """Re-assemble *conjs* into a single ``AND`` (or pass through one)."""
+    if len(conjs) == 1:
+        return conjs[0]
+    return Logical(LogicalOp.AND, tuple(conjs))

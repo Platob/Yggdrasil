@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
-from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Iterator, Union
 
 if TYPE_CHECKING:
     from yggdrasil.data.data_field import Field
@@ -524,11 +524,78 @@ class Predicate(Expression):
 
     Every comparison / logical / membership / null-check node
     inherits this so callers can guard a ``where=`` argument with
-    ``isinstance(x, Predicate)``. Doesn't add behaviour beyond the
-    type tag.
+    ``isinstance(x, Predicate)``. Adds two convenience filters
+    (:meth:`filter_arrow_batch`, :meth:`filter_arrow_table`) that
+    compile the predicate to a :class:`pyarrow.compute.Expression`
+    and run the row-level filter natively in C++ — no Python row
+    iteration. Used by :meth:`yggdrasil.io.tabular.base.Tabular.delete`
+    on every leaf rewrite.
     """
 
     _IS_PREDICATE: ClassVar[bool] = True
+
+    def filter_arrow_batch(self, batch: "Any") -> "Any":
+        """Return *batch* keeping only rows where the predicate holds.
+
+        Wraps the input :class:`pyarrow.RecordBatch` in a single-row-
+        group :class:`pyarrow.dataset.InMemoryDataset` and runs the
+        filter through ``Dataset.to_table(filter=...)``, which executes
+        in pyarrow's C++ kernels. Returns a fresh ``RecordBatch``;
+        when the filter drops every row, the result is a zero-row
+        batch with the same schema. Pass-through on a zero-row input.
+        """
+        import pyarrow as pa
+        import pyarrow.dataset as pds
+
+        if batch.num_rows == 0:
+            return batch
+        table = pds.dataset(pa.Table.from_batches([batch])).to_table(
+            filter=self.to_arrow(),
+        )
+        out = table.combine_chunks().to_batches()
+        if out:
+            return out[0]
+        return pa.RecordBatch.from_pylist([], schema=batch.schema)
+
+    def filter_arrow_table(self, table: "Any") -> "Any":
+        """Return *table* keeping only rows where the predicate holds.
+
+        Same shape as :meth:`filter_arrow_batch` but for
+        :class:`pyarrow.Table`. Empty input returns the input
+        unchanged so callers don't have to guard the zero-row case.
+        """
+        import pyarrow.dataset as pds
+
+        if table.num_rows == 0:
+            return table
+        return pds.dataset(table).to_table(filter=self.to_arrow())
+
+    def filter_arrow_batches(
+        self, batches: "Iterable[Any]",
+    ) -> "Iterator[Any]":
+        """Streaming filter — yield surviving batches one at a time.
+
+        Compiles the predicate to a pyarrow expression once and
+        reuses it across the stream. Empty / fully-dropped batches
+        are skipped (no zero-row pass-through), so consumers can
+        treat the output as "non-empty rows that match" without an
+        extra guard.
+        """
+        import pyarrow as pa
+        import pyarrow.dataset as pds
+
+        expr = self.to_arrow()
+        for batch in batches:
+            if batch.num_rows == 0:
+                continue
+            kept = pds.dataset(pa.Table.from_batches([batch])).to_table(
+                filter=expr,
+            )
+            if kept.num_rows == 0:
+                continue
+            for inner in kept.combine_chunks().to_batches():
+                if inner.num_rows > 0:
+                    yield inner
 
 
 # ---------------------------------------------------------------------------

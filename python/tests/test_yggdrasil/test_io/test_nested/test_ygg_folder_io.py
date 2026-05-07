@@ -447,3 +447,131 @@ class TestModes:
         )
         dirs = sorted(d for d in os.listdir(tmp_path) if not d.startswith("."))
         assert dirs == ["region=ap", "region=eu", "region=us"]
+
+
+# ---------------------------------------------------------------------------
+# Delete with partition pruning
+# ---------------------------------------------------------------------------
+
+
+class TestDelete:
+
+    def test_partition_only_predicate_deletes_whole_subtree(
+        self, tmp_path, table,
+    ) -> None:
+        """``region == 'us'`` is partition-only — drop the whole dir."""
+        from yggdrasil.io.tabular.execution.expr import col
+
+        y = YGGFolderIO(
+            path=str(tmp_path), schema=_single_partition_schema(),
+        )
+        y.write_arrow_table(table)
+        deleted = y.delete(col("region") == "us")
+        assert deleted == 2
+        # The us partition directory is gone wholesale; eu untouched.
+        dirs = sorted(d for d in os.listdir(tmp_path) if not d.startswith("."))
+        assert dirs == ["region=eu"]
+        out = y.read_arrow_table()
+        assert sorted(out.column("id").to_pylist()) == [3, 4]
+
+    def test_partition_only_predicate_no_match_skips_all(
+        self, tmp_path, table,
+    ) -> None:
+        from yggdrasil.io.tabular.execution.expr import col
+
+        y = YGGFolderIO(
+            path=str(tmp_path), schema=_single_partition_schema(),
+        )
+        y.write_arrow_table(table)
+        before = sorted(os.listdir(tmp_path))
+        deleted = y.delete(col("region") == "ap")  # no such partition
+        assert deleted == 0
+        assert sorted(os.listdir(tmp_path)) == before
+
+    def test_partition_pruning_skips_non_matching_partitions(
+        self, tmp_path,
+    ) -> None:
+        """Mixed predicate: ``region='us' AND id=2`` only scans us."""
+        from yggdrasil.io.tabular.execution.expr import col
+
+        y = YGGFolderIO(
+            path=str(tmp_path), schema=_single_partition_schema(),
+        )
+        # Two regions, two rows each.
+        y.write_arrow_table(
+            pa.table({
+                "id": [1, 2, 3, 4],
+                "region": ["us", "us", "eu", "eu"],
+                "value": ["a", "b", "c", "d"],
+            })
+        )
+        # Snapshot the eu partition before the delete — pruning means
+        # its part files must be untouched (same names after).
+        eu_before = sorted(p.name for p in (tmp_path / "region=eu").iterdir())
+
+        deleted = y.delete((col("region") == "us") & (col("id") == 2))
+        assert deleted == 1
+
+        # eu partition completely untouched (pruned out by ``region``).
+        eu_after = sorted(p.name for p in (tmp_path / "region=eu").iterdir())
+        assert eu_after == eu_before
+        # us partition rewritten without id=2.
+        out = y.read_arrow_table().sort_by("id")
+        assert out.column("id").to_pylist() == [1, 3, 4]
+
+    def test_non_partition_predicate_scans_all_partitions(
+        self, tmp_path,
+    ) -> None:
+        """``id > 2`` references no partition columns → scan everywhere."""
+        from yggdrasil.io.tabular.execution.expr import col
+
+        y = YGGFolderIO(
+            path=str(tmp_path), schema=_single_partition_schema(),
+        )
+        y.write_arrow_table(
+            pa.table({
+                "id": [1, 2, 3, 4],
+                "region": ["us", "us", "eu", "eu"],
+                "value": ["a", "b", "c", "d"],
+            })
+        )
+        deleted = y.delete(col("id") > 2)
+        assert deleted == 2
+        out = y.read_arrow_table().sort_by("id")
+        assert out.column("id").to_pylist() == [1, 2]
+
+    def test_multi_partition_pruning(self, tmp_path) -> None:
+        from yggdrasil.io.tabular.execution.expr import col
+
+        y = YGGFolderIO(
+            path=str(tmp_path), schema=_multi_partition_schema(),
+        )
+        y.write_arrow_table(pa.table({
+            "id": [1, 2, 3, 4],
+            "year": [2024, 2024, 2025, 2025],
+            "region": ["us", "eu", "us", "eu"],
+            "value": ["a", "b", "c", "d"],
+        }))
+        # Drop the entire ``year=2024/region=us`` subtree.
+        deleted = y.delete(
+            (col("year") == 2024) & (col("region") == "us")
+        )
+        assert deleted == 1
+        # That specific leaf dir is gone; siblings intact.
+        assert not (tmp_path / "year=2024" / "region=us").exists()
+        assert (tmp_path / "year=2024" / "region=eu").exists()
+        assert (tmp_path / "year=2025" / "region=us").exists()
+        out = y.read_arrow_table().sort_by("id")
+        assert out.column("id").to_pylist() == [2, 3, 4]
+
+    def test_no_schema_falls_through_to_folder_io(
+        self, tmp_path,
+    ) -> None:
+        """Without partition tags, behave like plain FolderIO."""
+        from yggdrasil.io.tabular.execution.expr import col
+
+        y = YGGFolderIO(path=str(tmp_path))
+        y.write_arrow_table(pa.table({"id": [1, 2, 3]}))
+        deleted = y.delete(col("id") == 2)
+        assert deleted == 1
+        assert sorted(y.read_arrow_table().column("id").to_pylist()) == [1, 3]
