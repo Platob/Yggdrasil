@@ -2394,6 +2394,33 @@ class Table(DatabricksResource, Tabular[CastOptions]):
     # arrow_insert — warehouse path, Volume staging
     # =========================================================================
 
+    def insert_volume_path(
+        self,
+        target: "Table | None" = None,
+        *,
+        temporary: bool = True,
+        max_lifetime: float | None = 3600,
+    ) -> VolumePath:
+        """Mint the staging :class:`VolumePath` used by :meth:`arrow_insert`.
+
+        Wraps :meth:`VolumePath.staging_path` with this table's
+        catalog/schema/name and workspace client. Lifted out of
+        :meth:`arrow_insert` so callers — and tests — can pre-mint
+        or swap the staging location without driving the full
+        insert. ``target`` defaults to ``self``; pass another
+        :class:`Table` when the staging hierarchy needs to live next
+        to a different table (e.g. dispatch fan-out).
+        """
+        target = target if target is not None else self
+        return VolumePath.staging_path(
+            client=self.client,
+            catalog_name=target.catalog_name,
+            schema_name=target.schema_name,
+            resource_name=target.table_name,
+            max_lifetime=max_lifetime,
+            temporary=temporary,
+        )
+
     def arrow_insert(
         self,
         data,
@@ -2475,14 +2502,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
 
         wait_cfg = WaitingConfig.from_(wait)
 
-        staging = VolumePath.staging_path(
-            client=self.client,
-            catalog_name=target.catalog_name,
-            schema_name=target.schema_name,
-            resource_name=target.table_name,
-            max_lifetime=3600,
-            temporary=bool(wait_cfg),
-        )
+        staging = self.insert_volume_path(target, temporary=bool(wait_cfg))
 
         prune_values = prune_values or {}
         output_data: "Tabular | None" = None
