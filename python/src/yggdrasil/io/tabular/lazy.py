@@ -162,6 +162,29 @@ class LazyTabular(Tabular[CastOptions]):
         """
         return type(self)(self._source, plan=plan)
 
+    def execute_plan(
+        self,
+        plan: Any,
+        *,
+        options: "CastOptions | None" = None,
+        **kwargs: Any,
+    ) -> "LazyTabular":
+        """Append *plan*'s ops onto this LazyTabular's plan.
+
+        Stacking two :class:`LazyTabular` wrappers is wasteful when we
+        can just fold the second plan's ops into the first — adjacent
+        :class:`Filter` nodes still fuse via :meth:`ExecutionPlan.append`.
+        """
+        coerced = (
+            plan if isinstance(plan, ExecutionPlan)
+            else ExecutionPlan(tuple(plan)) if plan is not None
+            else ExecutionPlan.empty()
+        )
+        if coerced.is_empty():
+            return self
+        del options, kwargs
+        return self._clone(self._plan.extend(coerced))
+
     def _append_op(self, op: PlanOp) -> "LazyTabular":
         return self._clone(self._plan.append(op))
 

@@ -193,6 +193,37 @@ class TestLazyTabular(PolarsTestCase, ArrowTestCase):
             lazy.read_polars_frame()["x"].to_list(), [3, 4, 5],
         )
 
+    def test_execute_plan_on_plain_tabular(self) -> None:
+        # Tabular.execute_plan on a non-lazy source wraps in LazyTabular.
+        plan = ExecutionPlan().append(Filter((col("x") > 2,)))
+        result = self._source().execute_plan(plan)
+        self.assertIsInstance(result, LazyTabular)
+        self.assertEqual(
+            result.read_polars_frame()["x"].to_list(), [3, 4, 5],
+        )
+
+    def test_execute_plan_empty_returns_self(self) -> None:
+        src = self._source()
+        self.assertIs(src.execute_plan(ExecutionPlan.empty()), src)
+        self.assertIs(src.execute_plan(None), src)
+
+    def test_execute_plan_on_lazy_tabular_composes(self) -> None:
+        # Stacking via execute_plan should fold ops into the existing
+        # plan rather than wrapping in a second LazyTabular.
+        first = LazyTabular(self._source()).where(col("x") > 1)
+        plan = ExecutionPlan().append(Select(("x",)))
+        second = first.execute_plan(plan)
+        self.assertIsInstance(second, LazyTabular)
+        self.assertIs(second.source, first.source)
+        # Plans fuse: filter + select on the same plan, no nesting.
+        self.assertEqual(
+            [type(o).__name__ for o in second.plan.ops],
+            ["Filter", "Select"],
+        )
+        self.assertEqual(
+            second.read_polars_frame()["x"].to_list(), [2, 3, 4, 5],
+        )
+
     def test_plan_split_pushdownable(self) -> None:
         pl = self.pl
         lazy = (
