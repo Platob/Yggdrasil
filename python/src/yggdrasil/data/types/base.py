@@ -1804,7 +1804,7 @@ class DataType(BaseChildrenFields, ABC):
         if default_scalar is None:
             default_scalar = self.default_spark_scalar(nullable=nullable)
 
-        if default_scalar is None or default_scalar in ({}, []):
+        if default_scalar is None or self.type_id.is_nested:
             return column
 
         # ``F.lit`` introspects the value via ``_get_object_id`` and a
@@ -1958,6 +1958,11 @@ class DataType(BaseChildrenFields, ABC):
         nullable: bool = True,
     ):
         spark = get_spark_sql()
+
+        # TODO: Spark should handle nested types
+        if self.type_id.is_nested:
+            return spark.functions.lit(None).cast(self.to_spark())
+
         value = self.default_spark_scalar(nullable=nullable) if value is None else value
         return spark.functions.lit(value).cast(self.to_spark())
 

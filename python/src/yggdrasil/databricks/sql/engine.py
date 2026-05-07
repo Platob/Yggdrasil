@@ -321,7 +321,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
                 row_limit=row_limit,
                 retry=retry,
             )
-
         return super().execute(prepared, wait=wait, raise_error=raise_error)
 
     def execute_many(
