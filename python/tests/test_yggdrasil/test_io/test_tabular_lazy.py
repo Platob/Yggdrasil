@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from yggdrasil.arrow.tests import ArrowTestCase
 from yggdrasil.polars.tests import PolarsTestCase
+from yggdrasil.data.expr import Logical, Predicate, col
 from yggdrasil.io.tabular import ArrowTabular, LazyTabular
 
 
@@ -33,20 +34,53 @@ class TestLazyTabular(PolarsTestCase, ArrowTestCase):
         self.assertEqual(table.column_names, ["x", "g"])
         self.assertEqual(table.num_rows, 5)
 
-    def test_filter_chain_conjoins(self) -> None:
+    def test_filter_chain_collapses_to_single_op(self) -> None:
         pl = self.pl
         lazy = (
             LazyTabular(self._source())
             .where(pl.col("x") > 1)
             .where(pl.col("x") < 5)
         )
-        # Two filter ops are recorded but the planner conjoins them
-        # into a single filter node before the scan.
+        # Two adjacent filter calls fuse into one ``filter`` op
+        # holding both polars predicates side-by-side.
         kinds = [op[0] for op in lazy.ops]
-        self.assertEqual(kinds, ["filter", "filter"])
+        self.assertEqual(kinds, ["filter"])
+        items = lazy.ops[0][1]
+        self.assertEqual(len(items), 2)
 
         df = lazy.read_polars_frame()
         self.assertEqual(df["x"].to_list(), [2, 3, 4])
+
+    def test_filter_accepts_yggdrasil_predicate(self) -> None:
+        lazy = LazyTabular(self._source()).where(col("x") > 2)
+        df = lazy.read_polars_frame()
+        self.assertEqual(df["x"].to_list(), [3, 4, 5])
+
+    def test_filter_yggdrasil_predicates_merge_into_logical(self) -> None:
+        # Stacked yggdrasil predicates fuse into a single canonical
+        # Logical(AND) node — visible in ``.ops`` and emitted as a
+        # single polars filter.
+        lazy = (
+            LazyTabular(self._source())
+            .where(col("x") > 1)
+            .where(col("x") < 5)
+        )
+        items = lazy.ops[0][1]
+        self.assertEqual(len(items), 1)
+        self.assertIsInstance(items[0], Logical)
+        self.assertIsInstance(items[0], Predicate)
+
+        df = lazy.read_polars_frame()
+        self.assertEqual(df["x"].to_list(), [2, 3, 4])
+
+    def test_filter_accepts_sql_string(self) -> None:
+        lazy = LazyTabular(self._source()).where("x >= 3 AND g = 'a'")
+        df = lazy.read_polars_frame()
+        self.assertEqual(df["x"].to_list(), [3, 5])
+
+    def test_filter_rejects_non_predicate_yggdrasil(self) -> None:
+        with self.assertRaises(TypeError):
+            LazyTabular(self._source()).where(col("x") + 1)
 
     def test_chained_select_after_filter(self) -> None:
         pl = self.pl
