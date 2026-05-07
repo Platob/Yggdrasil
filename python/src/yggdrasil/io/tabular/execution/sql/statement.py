@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Iterator, Mapping, Op
 
 import pyarrow as pa
 
-from yggdrasil.data.expr import Expression
+from yggdrasil.io.tabular.execution.expr import Expression
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.statement import PreparedStatement, StatementResult
 from yggdrasil.data.enums import MimeType

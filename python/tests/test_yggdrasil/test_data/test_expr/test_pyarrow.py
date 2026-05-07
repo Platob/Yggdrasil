@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pyarrow as pa
 
-from yggdrasil.data.expr import col
+from yggdrasil.io.tabular.execution.expr import col
 
 
 def _table():

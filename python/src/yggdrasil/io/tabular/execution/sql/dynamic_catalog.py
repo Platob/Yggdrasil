@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Optional
 
 from yggdrasil.io.tabular import ArrowTabular, Tabular
 
-from yggdrasil.sql.catalog import SqlContext, default_context
+from yggdrasil.io.tabular.execution.sql.catalog import SqlContext, default_context
 
 if TYPE_CHECKING:
     from yggdrasil.data.schema import Schema
@@ -283,7 +283,7 @@ def _default_parent_chain() -> Any:
     parent chain so a missing system catalog isn't fatal.
     """
     try:
-        from yggdrasil.sql.system_catalog import SYSTEM_CATALOG
+        from yggdrasil.io.tabular.execution.sql.system_catalog import SYSTEM_CATALOG
     except ImportError:
         return None
     return SYSTEM_CATALOG

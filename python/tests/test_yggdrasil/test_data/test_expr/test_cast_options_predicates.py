@@ -8,7 +8,7 @@ is the orthogonal child-discovery filter. These tests verify that
 
 from __future__ import annotations
 
-from yggdrasil.data.expr import Predicate, col
+from yggdrasil.io.tabular.execution.expr import Predicate, col
 from yggdrasil.data.options import CastOptions
 
 

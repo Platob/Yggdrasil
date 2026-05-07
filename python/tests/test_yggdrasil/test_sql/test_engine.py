@@ -4,8 +4,8 @@ from __future__ import annotations
 import pyarrow as pa
 
 from yggdrasil.arrow.tests import ArrowTestCase
-from yggdrasil.data.expr import col
-from yggdrasil.sql import (
+from yggdrasil.io.tabular.execution.expr import col
+from yggdrasil.io.tabular.execution.sql import (
     Aggregate,
     Engine,
     EnginePlan,

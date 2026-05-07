@@ -11,9 +11,9 @@ Filtering helper
 For row collections, :func:`filter_rows` calls the compiled
 predicate against each row and yields the matches:
 
-    >>> from yggdrasil.data.expr import col
+    >>> from yggdrasil.io.tabular.execution.expr import col
     >>> rows = [{"x": 1}, {"x": 2}, {"x": 3}]
-    >>> from yggdrasil.data.expr.backends.python import filter_rows
+    >>> from yggdrasil.io.tabular.execution.expr.backends.python import filter_rows
     >>> list(filter_rows(col("x") > 1, rows))
     [{'x': 2}, {'x': 3}]
 

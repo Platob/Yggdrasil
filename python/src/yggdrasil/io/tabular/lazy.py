@@ -1,54 +1,55 @@
-"""Lazy :class:`Tabular` wrapper that defers transformations to read time.
+"""Lazy :class:`Tabular` wrapper backed by an :class:`ExecutionPlan`.
 
-:class:`LazyTabular` wraps an inner :class:`Tabular` with a chain of
-pending transformations — :meth:`select`, :meth:`filter` (alias
-:meth:`where`), :meth:`group_by` — and only runs them when something
-pulls data (``read_arrow_batches``, ``read_arrow_table``, ``collect_schema``,
-``read_polars_frame``, …). Each call returns a new :class:`LazyTabular`;
-the original is never mutated, so chains like
-``lt.where(...).where(...).select(...)`` are safe.
+:class:`LazyTabular` wraps a *source* :class:`Tabular` and a *plan* —
+an :class:`ExecutionPlan` of pending transformations
+(:meth:`select`, :meth:`filter` / :meth:`where`, :meth:`group_by`,
+:meth:`apply`). Nothing runs until something pulls data
+(``read_arrow_batches``, ``read_arrow_table``, ``collect_schema``,
+``read_polars_frame``, …). Each builder call returns a new
+:class:`LazyTabular` carrying an extended plan; the original instance
+is never mutated, so chains like ``lt.where(...).where(...).select(...)``
+are safe.
 
-Predicate canonicalization
---------------------------
-
-Filters and column expressions are canonicalized through the
-:mod:`yggdrasil.data.expr` AST so the same predicate can target any
-backend without each engine getting its own builder. Anything
-:meth:`Expression.from_` accepts is fair game — SQL strings, pyarrow
-``compute.Expression`` nodes, polars ``Expr`` nodes, pyspark ``Column``,
-or already-built :class:`Expression` trees. They're stored as
-:class:`Expression` and compiled to the target engine (``to_polars`` for
-the LazyFrame plan, ``to_arrow`` if a caller wants the dataset filter
-directly) at execution time.
-
-Stacked filters AND-merge into a single :class:`Logical` node via
-:meth:`Predicate.merge_with` as soon as they're recorded — both for
-plan tightness and so the canonical form survives a print-the-ops
-debug session.
+The plan is the single intermediate representation. Predicates are
+canonicalized through :class:`yggdrasil.io.tabular.execution.expr.Expression`
+when the input is a SQL string or a yggdrasil node, and kept
+backend-native otherwise (round-tripping a polars ``Expr`` through
+the AST loses dtype information). Adjacent :class:`Filter` nodes fuse
+inside :meth:`ExecutionPlan.append`, so two stacked ``where`` calls
+share one op and the merged form is what introspecting ``.plan``
+shows.
 
 Pushdown
 --------
 
-Execution routes through a polars :class:`LazyFrame` scan of the inner
-Tabular. Polars' query planner pushes projections and predicates into
-the underlying pyarrow dataset (the inner's :meth:`_scan_polars_frame`
-returns ``pl.scan_pyarrow_dataset(...)`` by default), so filters and
-column selections never read the columns / rows they don't need.
+Execution routes through a polars :class:`LazyFrame` scan of the
+source. Polars' query planner pushes projections and predicates into
+the underlying pyarrow dataset whenever the source exposes one (the
+default :meth:`Tabular._scan_polars_frame` returns
+``pl.scan_pyarrow_dataset(...)``).
 
-Writes are forwarded to the inner Tabular as-is. The lazy ops describe
-a *view* of the source; they don't apply on the write path.
+Writes are forwarded to the source as-is. The plan describes a *view*
+of the source; it does not apply on the write path.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Tuple, Union
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Union
 
 import pyarrow as pa
 
-from yggdrasil.data.expr import Expression, Predicate
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.io.tabular.base import Tabular
+from yggdrasil.io.tabular.execution.expr import Expression, Predicate
+from yggdrasil.io.tabular.execution.plan import (
+    Apply,
+    ExecutionPlan,
+    Filter,
+    GroupByAgg,
+    PlanOp,
+    Select,
+)
 from yggdrasil.lazy_imports import polars_module
 
 if TYPE_CHECKING:
@@ -58,44 +59,20 @@ if TYPE_CHECKING:
 __all__ = ["LazyTabular"]
 
 
-# A "selector" in this module is anything that fronts a column /
-# column-expression: a bare column name, a yggdrasil :class:`Expression`,
-# or a backend-native expression (polars ``Expr``, pyarrow
-# ``compute.Expression``, …) that :meth:`Expression.from_` can lift.
-# We keep strings as strings (they're column names, not SQL fragments —
-# polars / pyarrow both accept them directly) and lift everything else
-# through :meth:`Expression.from_` so the stored form is canonical.
+# A "selector" is anything that fronts a column / column-expression: a
+# bare column name, a yggdrasil :class:`Expression`, or a backend-
+# native expression that ``Expression.from_`` could lift. We keep
+# strings as strings (column names, not SQL fragments) and yggdrasil
+# nodes as nodes; native exprs pass through.
 _SelectorIn = Union[str, Expression, Any]
 
 
-# Each pending operation is a small immutable tuple. Keeping them as
-# data (instead of as already-bound polars closures) lets ``__repr__``,
-# equality checks, and the merge-filters pass inspect them without
-# evaluating any engine-side expression. Filters are stored as a single
-# canonical :class:`Predicate` — :meth:`filter` AND-merges with the
-# trailing filter op so two stacked ``where`` calls share one node.
-#
-#   ("select",   tuple_of_stored_selectors)
-#   ("filter",   single_predicate_expression)
-#   ("group_by", tuple_of_stored_selectors, tuple_of_aggs)
-#   ("apply",    callable_lazyframe_to_lazyframe)   # escape hatch
-_Op = Tuple[Any, ...]
-
-
 def _normalize_filter(value: Any) -> Any:
-    """Normalize a filter input to its stored form.
+    """Normalize a filter input to its canonical stored form.
 
-    - Yggdrasil :class:`Expression`: kept as-is (must be a
-      :class:`Predicate`).
+    - :class:`Expression`: kept as-is (must be a :class:`Predicate`).
     - ``str``: parsed as a SQL predicate via :meth:`Expression.from_sql`.
-    - Anything else (polars / pyarrow / pyspark expression): kept
-      backend-native — round-tripping a polars ``Expr`` through the AST
-      can lose type information (literal precision, struct dtype),
-      so we don't try to canonicalize what the engine already has.
-
-    The result either *is* a :class:`Predicate` or is opaquely
-    "engine-native"; :meth:`LazyTabular._apply_ops` compiles it to the
-    LazyFrame at execution time without further translation.
+    - Anything else: kept backend-native (polars / pyarrow / pyspark).
     """
     if isinstance(value, Expression):
         if not isinstance(value, Predicate):
@@ -118,67 +95,41 @@ def _normalize_filter(value: Any) -> Any:
     return value
 
 
-def _compile_filter(value: Any) -> Any:
-    """Compile a stored filter to a polars-friendly value."""
-    if isinstance(value, Predicate):
-        return value.to_polars()
-    return value
-
-
-def _compile_selector(value: _SelectorIn) -> Any:
-    """Compile a stored selector to a polars-friendly value.
-
-    Strings (column names) and backend-native expressions pass
-    through untouched; yggdrasil :class:`Expression` nodes compile
-    via :meth:`Expression.to_polars`.
-    """
-    if isinstance(value, Expression):
-        return value.to_polars()
-    return value
-
-
 class LazyTabular(Tabular[CastOptions]):
-    """Tabular view over an inner Tabular plus a chain of lazy ops.
+    """:class:`Tabular` view over a source plus an :class:`ExecutionPlan`.
 
-    The inner Tabular is the source of truth — schema, batches, and
-    writes all originate from it. The op chain is replayed on every
-    read against a polars LazyFrame scan, which means engine-side
-    pushdown happens automatically as long as the inner exposes a
-    pyarrow dataset (the default :meth:`Tabular._scan_polars_frame`
-    does).
+    The source is the I/O truth — schema, batches, and writes all
+    originate from it. The plan is replayed on every read against a
+    polars LazyFrame scan of the source, so engine-side pushdown
+    happens automatically as long as the source exposes a pyarrow
+    dataset.
 
-    Operations
-    ~~~~~~~~~~
-
-    - :meth:`select` — column projection. Accepts column names or any
-      :meth:`Expression.from_`-coercible expression.
-    - :meth:`filter` / :meth:`where` — row filtering. Accepts SQL
-      predicate strings, yggdrasil predicates, or backend-native
-      expressions. Multiple calls AND-merge into one canonical
-      :class:`Predicate` before the scan.
-    - :meth:`group_by` — returns a small builder whose :meth:`agg`
-      finalizes back into a new :class:`LazyTabular`. Aggregation
-      expressions stay polars-native (the AST doesn't model
-      aggregations).
-    - :meth:`apply` — escape hatch for one-off polars transforms that
-      don't fit the dedicated methods.
+    Builder methods (:meth:`select`, :meth:`filter` / :meth:`where`,
+    :meth:`group_by`, :meth:`apply`) return new instances carrying
+    extended plans. They preserve the concrete subclass via
+    :meth:`_clone`, so subclasses like :class:`UnionTabular` keep
+    their state across chained calls.
     """
 
     def __init__(
         self,
-        inner: Tabular,
+        source: Tabular,
         *,
-        ops: Iterable[_Op] = (),
+        plan: "ExecutionPlan | Iterable[PlanOp] | None" = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        self._inner: Tabular = inner
-        self._ops: Tuple[_Op, ...] = tuple(ops)
+        self._source: Tabular = source
+        self._plan: ExecutionPlan = (
+            plan if isinstance(plan, ExecutionPlan)
+            else ExecutionPlan(tuple(plan)) if plan is not None
+            else ExecutionPlan.empty()
+        )
 
     def __repr__(self) -> str:
         return (
-            f"LazyTabular(inner={self._inner!r}, "
-            f"ops={[op[0] for op in self._ops]!r})"
+            f"{type(self).__name__}(source={self._source!r}, "
+            f"plan={self._plan!r})"
         )
 
     # ------------------------------------------------------------------
@@ -186,33 +137,33 @@ class LazyTabular(Tabular[CastOptions]):
     # ------------------------------------------------------------------
 
     @property
-    def inner(self) -> Tabular:
-        return self._inner
+    def source(self) -> Tabular:
+        return self._source
 
     @property
-    def ops(self) -> Tuple[_Op, ...]:
-        return self._ops
+    def plan(self) -> ExecutionPlan:
+        return self._plan
 
     @classmethod
     def options_class(cls) -> "type[CastOptions]":
         return CastOptions
 
     # ------------------------------------------------------------------
-    # Builder methods — return a new LazyTabular each time
+    # Builder methods
     # ------------------------------------------------------------------
 
-    def _clone(self, ops: Tuple[_Op, ...]) -> "LazyTabular":
-        """Build a sibling instance carrying *ops*.
+    def _clone(self, plan: ExecutionPlan) -> "LazyTabular":
+        """Build a sibling instance carrying *plan*.
 
         Hook for subclasses (:class:`UnionTabular`, …) that need to
         preserve their own state when chaining methods. Default
         rebuilds the same kind of :class:`LazyTabular` over the same
-        inner.
+        source.
         """
-        return type(self)(self._inner, ops=ops)
+        return type(self)(self._source, plan=plan)
 
-    def _with(self, op: _Op) -> "LazyTabular":
-        return self._clone((*self._ops, op))
+    def _append_op(self, op: PlanOp) -> "LazyTabular":
+        return self._clone(self._plan.append(op))
 
     def select(self, *columns: _SelectorIn) -> "LazyTabular":
         """Project to *columns*. Accepts column names or expressions."""
@@ -222,51 +173,20 @@ class LazyTabular(Tabular[CastOptions]):
                 "Pass column names ('a', 'b'), yggdrasil expressions "
                 "(col('a').alias('x')), or polars / pyarrow expressions."
             )
-        return self._with(("select", tuple(columns)))
+        return self._append_op(Select(tuple(columns)))
 
     def filter(self, *predicates: Any) -> "LazyTabular":
-        """Row filter. Multiple predicates AND-merge.
-
-        Predicates expressed via the yggdrasil AST (or SQL strings,
-        which we parse to AST) are folded into a single canonical
-        :class:`Logical` node via :meth:`Predicate.merge_with` —
-        adjacent calls fuse their predicates so the stored plan
-        stays tight. Backend-native expressions (polars ``Expr``,
-        pyarrow ``compute.Expression``) are kept native and stacked
-        alongside; polars' planner ANDs the resulting filter calls
-        on its own.
-        """
+        """Row filter. Adjacent :class:`Filter` ops fuse via
+        :meth:`Filter.extend` (yggdrasil predicates AND-merge into one
+        :class:`Logical`; native predicates stack)."""
         if not predicates:
             raise ValueError(
                 "LazyTabular.filter needs at least one predicate; got none. "
                 "Pass a SQL string ('x > 0'), a yggdrasil predicate "
                 "(col('x') > 0), or a polars / pyarrow expression."
             )
-
-        ops = list(self._ops)
-        items: list[Any] = list(ops[-1][1]) if (
-            ops and ops[-1][0] == "filter"
-        ) else []
-        for raw in predicates:
-            normalized = _normalize_filter(raw)
-            # Fuse adjacent yggdrasil predicates into one canonical
-            # Logical(AND, ...) so introspecting ``.ops`` shows the
-            # merged tree the AST guarantees.
-            if (
-                items
-                and isinstance(items[-1], Predicate)
-                and isinstance(normalized, Predicate)
-            ):
-                items[-1] = items[-1].merge_with(normalized)
-            else:
-                items.append(normalized)
-
-        new_op: _Op = ("filter", tuple(items))
-        if ops and ops[-1][0] == "filter":
-            ops[-1] = new_op
-        else:
-            ops.append(new_op)
-        return self._clone(tuple(ops))
+        normalized = tuple(_normalize_filter(p) for p in predicates)
+        return self._append_op(Filter(normalized))
 
     where = filter
 
@@ -284,45 +204,23 @@ class LazyTabular(Tabular[CastOptions]):
     def apply(self, fn: Any) -> "LazyTabular":
         """Escape hatch: ``fn(LazyFrame) -> LazyFrame``.
 
-        Use only when the dedicated methods don't fit — e.g. ``join``,
-        ``with_columns``, ``sort``. The callable runs once per execution
-        with the in-flight :class:`pl.LazyFrame`.
+        Schema-changing and non-commutative — anything after this
+        op runs post-union in :class:`UnionTabular`.
         """
         if not callable(fn):
             raise TypeError(
                 f"LazyTabular.apply expected a callable LazyFrame -> "
                 f"LazyFrame; got {type(fn).__name__}: {fn!r}."
             )
-        return self._with(("apply", fn))
+        return self._append_op(Apply(fn))
 
     # ------------------------------------------------------------------
     # Plan execution
     # ------------------------------------------------------------------
 
     def _build_lazy(self, options: CastOptions) -> "pl.LazyFrame":
-        lf = self._inner._scan_polars_frame(options)
-        return self._apply_ops(lf, self._ops)
-
-    @staticmethod
-    def _apply_ops(
-        lf: "pl.LazyFrame",
-        ops: Tuple[_Op, ...],
-    ) -> "pl.LazyFrame":
-        for op in ops:
-            kind = op[0]
-            if kind == "select":
-                lf = lf.select(*(_compile_selector(c) for c in op[1]))
-            elif kind == "filter":
-                lf = lf.filter(*(_compile_filter(p) for p in op[1]))
-            elif kind == "group_by":
-                _, keys, aggs = op
-                gb = lf.group_by(*(_compile_selector(k) for k in keys))
-                lf = gb.agg(*aggs) if aggs else gb.agg()
-            elif kind == "apply":
-                lf = op[1](lf)
-            else:
-                raise ValueError(f"Unknown LazyTabular op kind: {kind!r}")
-        return lf
+        lf = self._source._scan_polars_frame(options)
+        return self._plan.apply_polars(lf)
 
     # ------------------------------------------------------------------
     # Tabular contract — read hooks
@@ -331,8 +229,8 @@ class LazyTabular(Tabular[CastOptions]):
     def _read_arrow_batches(
         self, options: CastOptions,
     ) -> Iterator[pa.RecordBatch]:
-        if not self._ops:
-            yield from self._inner._read_arrow_batches(options)
+        if self._plan.is_empty():
+            yield from self._source._read_arrow_batches(options)
             return
 
         lf = self._build_lazy(options)
@@ -342,22 +240,23 @@ class LazyTabular(Tabular[CastOptions]):
             yield options.cast_arrow_tabular(batch)
 
     def _scan_polars_frame(self, options: CastOptions) -> "pl.LazyFrame":
-        # Stacking another LazyTabular on top of this one composes
-        # cleanly because scan_polars_frame returns an already-planned
-        # LazyFrame — polars folds the two plans together.
         return self._build_lazy(options)
 
     def _read_polars_frame(self, options: CastOptions) -> "pl.DataFrame":
-        if not self._ops:
-            return self._inner._read_polars_frame(options)
+        if self._plan.is_empty():
+            return self._source._read_polars_frame(options)
         return self._build_lazy(options).collect()
 
     def _collect_schema(self, options: CastOptions) -> Schema:
-        if not self._ops:
-            return self._inner._collect_schema(options)
-        # ``LazyFrame.collect_schema`` returns a polars Schema without
-        # materializing rows — that's the whole point of routing through
-        # polars for the lazy plan.
+        if self._plan.is_empty():
+            return self._source._collect_schema(options)
+        if self._plan.is_schema_preserving():
+            # Nothing in the plan reshapes columns — answer comes
+            # straight from the source's own canonical Schema.
+            return self._source._collect_schema(options)
+        # Reshape op present (select / group_by / apply) — derive the
+        # post-plan schema from polars, since the AST doesn't model
+        # all output column shapes (especially aggregations).
         pl = polars_module()
         lf = self._build_lazy(options)
         pl_schema = lf.collect_schema()
@@ -366,7 +265,7 @@ class LazyTabular(Tabular[CastOptions]):
         return Schema.from_polars(lf)
 
     # ------------------------------------------------------------------
-    # Tabular contract — write hooks (forward to inner)
+    # Tabular contract — write hooks (forward to source)
     # ------------------------------------------------------------------
 
     def _write_arrow_batches(
@@ -374,23 +273,23 @@ class LazyTabular(Tabular[CastOptions]):
         batches: Iterable[pa.RecordBatch],
         options: CastOptions,
     ) -> None:
-        self._inner._write_arrow_batches(batches, options)
+        self._source._write_arrow_batches(batches, options)
 
 
 class _LazyGroupBy:
     """Builder returned by :meth:`LazyTabular.group_by`.
 
     Calling :meth:`agg` finalizes the group-by and returns a new
-    :class:`LazyTabular` with the operation appended. Kept as a
-    distinct type rather than inlining onto :class:`LazyTabular` so
-    typos like ``lt.group_by('x').where(...)`` fail loudly instead
+    :class:`LazyTabular` with a :class:`GroupByAgg` op appended. Kept
+    as a distinct type rather than inlining onto :class:`LazyTabular`
+    so typos like ``lt.group_by('x').where(...)`` fail loudly instead
     of silently dropping the grouping.
     """
 
     __slots__ = ("_parent", "_by")
 
     def __init__(
-        self, parent: LazyTabular, by: Tuple[_SelectorIn, ...],
+        self, parent: LazyTabular, by: "tuple[_SelectorIn, ...]",
     ) -> None:
         self._parent = parent
         self._by = by
@@ -401,10 +300,9 @@ class _LazyGroupBy:
     def agg(self, *aggs: Any) -> LazyTabular:
         """Finalize the group-by with zero or more aggregations.
 
-        Aggregation expressions stay polars-native — the yggdrasil
-        AST doesn't model aggregations yet, and rebuilding that here
-        would duplicate planner logic polars already does well.
-        Zero aggs is the polars "distinct keys" behavior — equivalent
-        to ``lf.group_by(*by).agg()``.
+        Aggregation expressions stay backend-native — the AST
+        doesn't model aggregations, and rebuilding that here would
+        duplicate planner logic polars already does well. Zero aggs
+        is the polars "distinct keys" behavior.
         """
-        return self._parent._with(("group_by", self._by, tuple(aggs)))
+        return self._parent._append_op(GroupByAgg(self._by, tuple(aggs)))

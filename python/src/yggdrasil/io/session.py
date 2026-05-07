@@ -94,7 +94,7 @@ def _request_partition_predicate(
     reader. Returns ``None`` when the cache isn't partitioned or
     no usable values come out.
     """
-    from yggdrasil.data.expr import col
+    from yggdrasil.io.tabular.execution.expr import col
 
     parts = cache._resolve_partition_columns()
     if not parts:
@@ -135,7 +135,7 @@ def _request_body_hash_predicate(
     reader. Returns ``None`` when no useful value can be derived
     from the request set.
     """
-    from yggdrasil.data.expr import col
+    from yggdrasil.io.tabular.execution.expr import col
 
     hashes: set[int] = set()
     for r in requests:
@@ -193,7 +193,7 @@ def _lookup_local_responses(
     if not cache.path.exists():
         return {}
 
-    from yggdrasil.data.expr import col
+    from yggdrasil.io.tabular.execution.expr import col
     from yggdrasil.data.options import CastOptions
 
     # Push the partition / body-hash / received-window prune as a

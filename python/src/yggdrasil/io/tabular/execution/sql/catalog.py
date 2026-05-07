@@ -46,7 +46,7 @@ def coerce_source(obj: Any) -> Tabular:
     work — the canonical helper now lives next to the
     :class:`DynamicCatalog`.
     """
-    from yggdrasil.sql.dynamic_catalog import coerce_to_tabular
+    from yggdrasil.io.tabular.execution.sql.dynamic_catalog import coerce_to_tabular
 
     return coerce_to_tabular(obj)
 
