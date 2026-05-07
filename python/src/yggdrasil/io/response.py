@@ -589,6 +589,18 @@ class Response(Tabular[CastOptions]):
     # ------------------------------------------------------------------
 
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
+        # Parse the body when its declared mime resolves to a
+        # registered tabular leaf (Parquet, CSV, NDJSON, Arrow IPC, …);
+        # otherwise fall back to the deterministic single-row metadata
+        # projection that matches :data:`RESPONSE_ARROW_SCHEMA`
+        # (envelope mime :attr:`MimeTypes.HTTP_RESPONSE`).
+        if Tabular.class_for_media_type(
+            self.media_type.mime_type, default=None,
+        ) is not None:
+            with self.as_media() as b:
+                for batch in b.read_arrow_batches():
+                    yield options.cast_arrow_tabular(batch)
+            return
         yield options.cast_arrow_tabular(self._arrow_batch_from_values())
 
     def _write_arrow_batches(

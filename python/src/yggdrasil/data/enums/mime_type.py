@@ -815,6 +815,21 @@ class MimeTypes:
         )
     )
 
+    HTTP_RESPONSE = MimeType.define(
+        MimeType(
+            "HTTP_RESPONSE",
+            # Envelope mime for a yggdrasil :class:`Response` row — the
+            # deterministic single-row metadata projection (status,
+            # headers, body bytes, identity hashes, …) defined by
+            # :data:`RESPONSE_ARROW_SCHEMA`. Used as the fallback mime
+            # when the response body's own Content-Type doesn't
+            # resolve to a registered tabular leaf, so the row still
+            # reads through the Tabular surface as a one-row table.
+            "application/vnd.yggdrasil.http-response",
+            is_tabular=True,
+        )
+    )
+
     DATABRICKS_STATEMENT_RESULT = MimeType.define(
         MimeType(
             "DATABRICKS_STATEMENT",
