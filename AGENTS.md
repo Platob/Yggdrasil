@@ -31,6 +31,30 @@ A good change should do at least one of these:
 
 If it does none of those, it is probably not worth adding.
 
+### Integrate, don't invent
+
+Before writing anything new, find where the behavior already lives and extend it.
+A patch that grows an existing module, registers into the existing registry, or adds a field to an existing dataclass is almost always better than a new parallel module, helper, or option object.
+
+Default to:
+
+- modifying the function or class that already does 80% of the job
+- adding the converter to `data/cast/registry.py` (or the engine `cast.py` that registers on import) instead of writing a one-off conversion at the call site
+- adding a flag to `CastOptions` instead of inventing a new options object
+- adding a method to `DataField` / `Schema` / `DataTable` / `StatementResult` instead of writing a sibling helper module
+- using `HTTPSession` / `PreparedRequest` / `Response` instead of bypassing the modern HTTP stack
+- using `lib.py` guards already in the subsystem instead of writing a new guard pattern
+
+Only create a new module, class, or abstraction when the existing surface genuinely cannot host the behavior — and when you do, wire it back into the existing surface so the next caller finds it through the canonical path.
+
+Red flags that you are inventing instead of integrating:
+
+- a new helper that duplicates 90% of an existing one with one extra branch
+- a new options dataclass that overlaps with `CastOptions`
+- conversion logic added at a call site that should have been a registered converter
+- a private utility that re-implements something already in `pyutils/` or `data/`
+- a "v2" of something with no migration path from "v1"
+
 ---
 
 ## Tone and style rules
@@ -737,6 +761,12 @@ Before implementing a fix, check:
 - Does it accept the shapes users naturally have?
 - Does it improve recovery when input is wrong?
 
+### Integration vs invention
+- Did you extend the existing module/class/registry instead of creating a parallel one?
+- Is every new public symbol actually called by something in this change?
+- Did you remove any helper, parameter, or branch that ended up unused?
+- Is the diff the smallest change that cleanly solves the problem?
+
 ### Semantics
 - Are names, metadata, nullability, and nested structure preserved?
 - Is lossy behavior explicit?
@@ -778,6 +808,37 @@ Follow patterns already used in the subsystem unless there is a clear upgrade pa
 ### Prefer extending existing abstractions
 If the new behavior belongs naturally in an existing abstraction, put it there.
 Do not create isolated side APIs without a strong reason.
+
+Concrete checks before adding a new symbol:
+
+- Search for existing helpers with the same intent. If one already exists, extend it or call it.
+- If the new behavior is "like X but with one extra option", add the option to X — don't fork X.
+- If the change touches conversion or schema, register it through `yggdrasil.data` so other callers benefit.
+- If you add a public name, make sure something actually imports and uses it in this same change. Unused public surface is a maintenance tax.
+
+### Keep the diff small and reuse-heavy
+Default to the smallest change that solves the problem cleanly.
+
+- Prefer a 5-line edit to an existing function over a new 50-line module.
+- Don't add parameters, branches, or hooks "in case we need them later". Add them when a real caller needs them.
+- Don't introduce abstractions before there are at least two real call sites that benefit from them. Three nearly-identical lines is fine; a premature base class is not.
+- Don't add backwards-compat shims, deprecated re-exports, or `# removed` placeholder comments unless the user explicitly asked for a deprecation path.
+
+### No dead or isolated code
+Every new function, class, option, file, or test should be reachable from a real caller in the same change.
+
+If you add it and nothing uses it yet, delete it or wait until the caller exists.
+
+Specifically avoid:
+
+- helpers defined but never called
+- options/flags/parameters never read
+- new classes with no instantiation site
+- new files that only re-export already-public names
+- speculative branches for inputs the public API does not actually accept
+- TODO scaffolding without an issue or a follow-up call site
+
+If a piece of code only exists to support a future hypothetical, it is dead weight today. Cut it.
 
 ### Prefer boring reliability
 This library sits on integration boundaries.
