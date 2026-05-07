@@ -36,7 +36,7 @@ class HTTPResponse(Response):
         # tabular-ready buffer without an extra as_media() hop.
         headers = dict(response.headers)
         pre_media = _media_type_from_headers(headers)
-        buffer_class = Tabular.media_type_class(pre_media, default=BytesIO)
+        buffer_class = Tabular.class_for_media_type(pre_media, default=BytesIO)
         buffer = (
             buffer_class(media_type=pre_media)
             if pre_media is not None

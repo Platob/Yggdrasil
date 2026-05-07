@@ -300,6 +300,77 @@ class TestBodyParity:
         assert r.buffer.to_bytes() == b"abc"
 
 
+class TestFromUrllib3:
+    """Regression cover for ``HTTPResponse.from_urllib3`` / ``drain_urllib3``.
+
+    The stubbed ``StubSession`` path bypasses these methods entirely,
+    so we drive them with a duck-typed urllib3 response. The test is
+    here to pin: (a) the buffer class is resolved via the Tabular
+    registry, (b) drain copies bytes into the buffer and rewinds it,
+    (c) callers can read JSON / bytes back out.
+    """
+
+    def _make_raw(self, *, body: bytes, headers: dict[str, str], status: int = 200):
+        class _RawResp:
+            def __init__(self) -> None:
+                self.status = status
+                self.headers = dict(headers)
+                self._body = body
+                self.released = False
+
+            def read(self) -> bytes:
+                return self._body
+
+            def stream(self, amt: int = 65536):
+                yield self._body
+
+            def release_conn(self) -> None:
+                self.released = True
+
+        return _RawResp()
+
+    def test_from_urllib3_returns_tabular_buffer_for_json(self) -> None:
+        import datetime as dt
+        from yggdrasil.io.http_.response import HTTPResponse
+        from yggdrasil.io.primitive.json_io import JsonIO
+
+        raw = self._make_raw(
+            body=b'{"ok":true}',
+            headers={"Content-Type": "application/json"},
+        )
+        resp = HTTPResponse.from_urllib3(
+            request=make_request("https://example.com/x"),
+            response=raw,
+            tags=None,
+            received_at=dt.datetime.now(dt.timezone.utc),
+        )
+        assert isinstance(resp.buffer, JsonIO)
+        resp.drain_urllib3(raw, stream=False)
+        assert raw.released is True
+        assert resp.buffer.to_bytes() == b'{"ok":true}'
+        assert resp.json() == {"ok": True}
+
+    def test_from_urllib3_falls_back_to_bytes_io_on_unknown_media(self) -> None:
+        import datetime as dt
+        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.http_.response import HTTPResponse
+
+        raw = self._make_raw(
+            body=b"binary blob",
+            headers={"Content-Type": "application/x-not-registered"},
+        )
+        resp = HTTPResponse.from_urllib3(
+            request=make_request("https://example.com/x"),
+            response=raw,
+            tags=None,
+            received_at=dt.datetime.now(dt.timezone.utc),
+        )
+        # Unknown media types must not crash — we fall back to BytesIO.
+        assert type(resp.buffer) is BytesIO
+        resp.drain_urllib3(raw, stream=True)
+        assert resp.buffer.to_bytes() == b"binary blob"
+
+
 # ---------------------------------------------------------------------------
 # Predicate helpers used by the cache
 # ---------------------------------------------------------------------------
