@@ -702,7 +702,7 @@ def any_to_arrow_scalar(
 
     if scalar is None:
         return default_arrow_scalar(
-            target_field,
+            target_field.arrow_type if target_field is not None else None,
             nullable=True if target_field is None else target_field.nullable,
         )
 
@@ -716,7 +716,7 @@ def any_to_arrow_scalar(
         return pa.scalar(scalar)
 
     try:
-        scalar = pa.scalar(scalar, type=target_field.type)
+        scalar = pa.scalar(scalar, type=target_field.arrow_type)
     except pa.ArrowInvalid:
         scalar = pa.scalar(scalar)
 
@@ -871,13 +871,14 @@ def _polars_eager_to_arrow(
     projection = _resolve_projection(options)
 
     if isinstance(df, pl.Series):
-        options = _bind_source(options, df)
-        if options.target_field is not None and options.need_cast():
-            df = options.cast_polars(df)
-            options = options.copy(target_field=None)
+        # Wrap into a single-column frame *before* binding so the
+        # source schema is struct-shaped — matches the pandas Series
+        # path and lets struct-shaped targets (a Schema or struct
+        # Field) cast in-engine without tripping the leaf↔struct
+        # mismatch in the polars cast dispatcher.
         df = df.to_frame()
 
-    elif isinstance(df, pl.DataFrame):
+    if isinstance(df, pl.DataFrame):
         options = _bind_source(options, df)
         if projection:
             keep = [c for c in projection if c in df.columns]
