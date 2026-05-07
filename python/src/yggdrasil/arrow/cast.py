@@ -702,7 +702,7 @@ def any_to_arrow_scalar(
 
     if scalar is None:
         return default_arrow_scalar(
-            target_field,
+            target_field.arrow_type if target_field is not None else None,
             nullable=True if target_field is None else target_field.nullable,
         )
 
@@ -716,7 +716,7 @@ def any_to_arrow_scalar(
         return pa.scalar(scalar)
 
     try:
-        scalar = pa.scalar(scalar, type=target_field.type)
+        scalar = pa.scalar(scalar, type=target_field.arrow_type)
     except pa.ArrowInvalid:
         scalar = pa.scalar(scalar)
 
