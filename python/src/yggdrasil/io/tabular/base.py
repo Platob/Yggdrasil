@@ -482,14 +482,15 @@ class Tabular(ABC, Generic[O]):
             self._write_arrow_batches(obj, options)
             return
 
-        module = (type(obj).__module__ or "").split(".", 1)[0]
-        if module == "polars":
+        from yggdrasil.pickle.serde import ObjectSerde
+        ns, _ = ObjectSerde.module_and_name(obj)
+        if ns.startswith("polars"):
             self._write_polars_frame(obj, options)
             return
-        if module == "pandas":
+        if ns.startswith("pandas"):
             self._write_pandas_frame(obj, options)
             return
-        if module == "pyspark":
+        if ns.startswith("pyspark"):
             self._write_spark_frame(obj, options)
             return
 
@@ -514,7 +515,7 @@ class Tabular(ABC, Generic[O]):
         except TypeError as exc:
             raise TypeError(
                 f"{type(self).__name__}.write_table can't infer a writer for "
-                f"{type(obj).__module__}.{type(obj).__name__}: {obj!r}. "
+                f"{ObjectSerde.full_namespace(obj)}: {obj!r}. "
                 "Accepted: pyarrow Table/RecordBatch/RecordBatchReader, "
                 "polars DataFrame/LazyFrame, pandas DataFrame, pyspark "
                 "DataFrame, list[dict], dict[str, list], or an iterable of "
