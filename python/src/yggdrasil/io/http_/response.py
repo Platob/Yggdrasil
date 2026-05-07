@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
-from typing import Mapping, Optional
+from typing import TYPE_CHECKING, Mapping, Optional
 
 from urllib3 import BaseHTTPResponse
 
@@ -9,6 +9,9 @@ from ..bytes_io import BytesIO
 from ..tabular import Tabular
 from ..request import PreparedRequest
 from ..response import Response, _ensure_media_headers, _media_type_from_headers
+
+if TYPE_CHECKING:
+    from .path import HTTPPath
 
 __all__ = [
     "HTTPResponse"
@@ -19,6 +22,21 @@ class HTTPResponse(Response):
     # No new fields — inherits ``Response.__slots__`` so the parent's
     # slotted layout still applies.
     __slots__ = ()
+
+    @property
+    def path(self) -> "HTTPPath":
+        """:class:`HTTPPath` view of the request URL.
+
+        Bound to the response's attached :class:`HTTPSession` (when
+        present) so the HTTPPath reuses the same connection pool.
+        Useful for re-fetching the resource, issuing a HEAD probe via
+        :meth:`HTTPPath.stat`, or doing a follow-up PUT / DELETE.
+        """
+        from .path import HTTPPath
+        from .session import HTTPSession
+
+        sess = self._session if isinstance(self._session, HTTPSession) else None
+        return HTTPPath(url=self.request.url, session=sess)
 
 
     @classmethod

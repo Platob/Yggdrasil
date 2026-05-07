@@ -397,11 +397,20 @@ class PreparedRequest:
         **kwargs: Any,
     ) -> "Response":
         if self._session is None:
-            raise RuntimeError(
-                f"{type(self).__name__}.send requires an attached session — "
-                "call request.attach_session(session) first, or use "
-                "session.send(request) directly."
-            )
+            # Orphan request — lazy-build a default session for HTTP(S)
+            # URLs so callers can ``PreparedRequest.prepare(...).send()``
+            # without first instantiating a Session. The session is
+            # cached on the request via :meth:`attach_session` so
+            # subsequent calls reuse the same connection pool.
+            if not self.url.is_http:
+                raise RuntimeError(
+                    f"{type(self).__name__}.send requires an attached "
+                    f"session for non-HTTP URL {self.url.to_string()!r} — "
+                    "call request.attach_session(session) first, or use "
+                    "session.send(request) directly."
+                )
+            from .http_ import HTTPSession
+            self.attach_session(HTTPSession())
         return self._session.send(self, config, **kwargs)
 
     @classmethod
