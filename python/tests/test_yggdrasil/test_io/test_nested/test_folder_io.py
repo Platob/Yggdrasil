@@ -88,14 +88,14 @@ class TestRoundTrip:
     def test_write_then_read(self, tmp_path, table) -> None:
         folder = FolderIO(path=str(tmp_path))
         folder.write_arrow_table(table)
-        # Default child extension is Arrow IPC.
-        assert any(p.name.endswith(".arrow") for p in tmp_path.iterdir())
+        # Default child media type is Arrow IPC (extension ``.ipc``).
+        assert any(p.name.endswith(".ipc") for p in tmp_path.iterdir())
         assert folder.read_arrow_table().equals(table)
 
     def test_csv_default_extension(self, tmp_path, table) -> None:
         folder = FolderIO(path=str(tmp_path))
         folder.write_arrow_table(
-            table, options=FolderOptions(child_extension="csv"),
+            table, options=FolderOptions(child_media_type="csv"),
         )
         assert any(p.name.endswith(".csv") for p in tmp_path.iterdir())
         # Aggregate read picks up the CSV via media type dispatch.
@@ -156,7 +156,9 @@ class TestMakeChild:
 
     def test_part_filename_shape(self, tmp_path) -> None:
         folder = FolderIO(path=str(tmp_path))
-        child = folder.make_child(options=FolderOptions(child_extension="parquet"))
+        child = folder.make_child(
+            options=FolderOptions(child_media_type="parquet"),
+        )
         # Fresh path under tmp_path with the correct extension.
         assert os.fspath(child._holder).startswith(str(tmp_path))
         assert os.fspath(child._holder).endswith(".parquet")
@@ -165,7 +167,7 @@ class TestMakeChild:
 
     def test_csv_child(self, tmp_path) -> None:
         folder = FolderIO(path=str(tmp_path))
-        child = folder.make_child(options=FolderOptions(child_extension="csv"))
+        child = folder.make_child(options=FolderOptions(child_media_type="csv"))
         assert isinstance(child, CsvIO)
 
 

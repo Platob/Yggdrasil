@@ -51,7 +51,7 @@ import pyarrow as pa
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.enums import MimeTypes, Mode
-from yggdrasil.data.enums.media_type import MediaType
+from yggdrasil.data.enums.media_type import MediaType, MediaTypes
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.tabular.base import Tabular
 
@@ -66,13 +66,30 @@ __all__ = ["FolderIO", "FolderOptions"]
 class FolderOptions(CastOptions):
     """:class:`CastOptions` extended with folder-write knobs."""
 
-    #: Extension stamped onto minted child filenames. Resolves into
-    #: a tabular leaf via :class:`MediaType` — ``"arrow"`` (Arrow
-    #: IPC) is the default since it matches the in-memory batch
-    #: shape and writes column-by-column without a footer to
-    #: rewrite. ``"parquet"`` / ``"csv"`` / ``"ndjson"`` are the
-    #: other obvious choices.
-    child_extension: str = "arrow"
+    #: Media type of newly minted child files. Drives both the
+    #: filename extension and the :class:`Tabular` leaf class
+    #: (``ParquetIO`` / ``ArrowIPCIO`` / ``CsvIO`` / …) the folder
+    #: dispatches to. Defaults to Arrow IPC — matches the in-memory
+    #: batch shape, no row-group footer to rewrite, cheapest format
+    #: to land a stream of small batches into. Pass
+    #: ``MediaTypes.PARQUET`` (or any registered :class:`MediaType`)
+    #: to override; a bare string (``"parquet"``) / extension
+    #: (``"csv"``) / mime value (``"application/json"``) is coerced
+    #: through :meth:`MediaType.from_`.
+    child_media_type: MediaType = MediaTypes.ARROW_IPC
+
+    def __post_init__(self) -> None:
+        CastOptions.__post_init__(self)
+        coerced = MediaType.from_(self.child_media_type, default=None)
+        if coerced is None:
+            raise ValueError(
+                f"FolderOptions.child_media_type must coerce to a MediaType; "
+                f"got {self.child_media_type!r}. Pass one of "
+                f"MediaTypes.ARROW_IPC / .PARQUET / a registered extension "
+                f"string, or a MediaType instance."
+            )
+        if coerced is not self.child_media_type:
+            object.__setattr__(self, "child_media_type", coerced)
 
 
 class FolderIO(Tabular[FolderOptions]):
@@ -213,9 +230,17 @@ class FolderIO(Tabular[FolderOptions]):
         """Mint a fresh tabular leaf bound to a fresh path under :attr:`path`.
 
         Filename shape: ``part-{epoch_ms}-{seed}.{ext}`` where ``ext``
-        comes from ``options.child_extension``. The millisecond
-        timestamp gives lexical-time ordering; the 8-byte seed makes
-        within-millisecond collisions effectively impossible.
+        is ``options.child_media_type.full_extension``. The
+        millisecond timestamp gives lexical-time ordering; a 2-byte
+        seed (~65k-value space) breaks ties between writes that land
+        in the same millisecond.
+
+        The :class:`Tabular` leaf is dispatched directly from the
+        media type via :meth:`Tabular.class_for_media_type`, so the
+        write path doesn't go through the path-extension reverse-
+        lookup. A media type with no registered leaf falls back to
+        a raw :class:`BytesIO` so non-tabular extensions still get a
+        working write.
 
         Returns a closed leaf. Caller opens it inside a ``with``
         block to write bytes.
@@ -223,21 +248,21 @@ class FolderIO(Tabular[FolderOptions]):
         opts = options or FolderOptions()
         self.path.mkdir(parents=True, exist_ok=True)
 
-        suffix = f".{opts.child_extension}" if opts.child_extension else ""
+        ext = opts.child_media_type.full_extension
+        suffix = f".{ext}" if ext else ""
         epoch_ms = int(time.time() * 1000)
-        # 2 bytes (4 hex chars, ~65k-value space) is enough to break
-        # ties between writes that land in the same millisecond — the
-        # epoch_ms prefix already carries the temporal uniqueness, no
-        # need for a 16-character seed on every part filename.
         seed = os.urandom(2).hex()
         name = f"part-{epoch_ms}-{seed}{suffix}"
 
         child_path = self.path / name
-        leaf = self._leaf_for(child_path)
-        if leaf is None:
-            # Fall back to a raw BytesIO over the path; subclasses
-            # with non-tabular extensions still get a working write.
-            leaf = BytesIO(holder=child_path, owns_holder=False)
+        # Side-effect import: ensures every primitive leaf has
+        # registered itself in the Tabular registry before lookup.
+        import yggdrasil.io.primitive  # noqa: F401
+        cls = Tabular.class_for_media_type(opts.child_media_type, default=None)
+        if cls is None:
+            leaf: "Tabular" = BytesIO(holder=child_path, owns_holder=False)
+        else:
+            leaf = cls(holder=child_path, owns_holder=False)
         return self.adopt_child(leaf)
 
     # ==================================================================
@@ -553,7 +578,7 @@ class FolderIO(Tabular[FolderOptions]):
         self,
         byte_size: "int | None" = None,
         *,
-        target_extension: str = "arrow",
+        target_media_type: "MediaType | str | Any" = MediaTypes.ARROW_IPC,
         tolerance: float = OPTIMIZE_TOLERANCE,
         **kwargs: Any,
     ) -> int:
@@ -572,16 +597,21 @@ class FolderIO(Tabular[FolderOptions]):
           are already "close enough" and rewriting them would just
           burn IO.
 
+        ``target_media_type`` (a :class:`MediaType` or anything
+        :meth:`MediaType.from_` accepts) selects the format the
+        rewritten parts are encoded in. Defaults to Arrow IPC.
+
         Returns the number of new part files created. Idempotent: a
         second call on a tree that's already at target leaves
         nothing to do and returns ``0``.
         """
         if not self.path.exists():
             return 0
+        media = MediaType.from_(target_media_type, default=MediaTypes.ARROW_IPC)
         return self._optimize_walk(
             self.path,
             byte_size=byte_size,
-            target_extension=target_extension,
+            target_media_type=media,
             tolerance=tolerance,
         )
 
@@ -590,18 +620,10 @@ class FolderIO(Tabular[FolderOptions]):
         directory: "Path",
         *,
         byte_size: "int | None",
-        target_extension: str,
+        target_media_type: MediaType,
         tolerance: float,
     ) -> int:
-        """Recurse into *directory*, compacting part files at each level.
-
-        Sub-directories recurse first so the inner leaves drop down to
-        a single big file before the outer level looks at its own
-        children — keeps the bin-pack input stable when a folder
-        carries both nested and flat content (rare, but the cache's
-        Hive layout flattens this naturally so the cost is zero
-        there).
-        """
+        """Recurse into *directory*, compacting part files at each level."""
         try:
             entries = list(directory.iterdir())
         except FileNotFoundError:
@@ -625,7 +647,7 @@ class FolderIO(Tabular[FolderOptions]):
             compacted += self._optimize_walk(
                 sub,
                 byte_size=byte_size,
-                target_extension=target_extension,
+                target_media_type=target_media_type,
                 tolerance=tolerance,
             )
 
@@ -634,7 +656,7 @@ class FolderIO(Tabular[FolderOptions]):
             directory,
             parts,
             byte_size=byte_size,
-            target_extension=target_extension,
+            target_media_type=target_media_type,
             tolerance=tolerance,
         )
         return compacted
@@ -645,7 +667,7 @@ class FolderIO(Tabular[FolderOptions]):
         parts: "list[Path]",
         *,
         byte_size: "int | None",
-        target_extension: str,
+        target_media_type: MediaType,
         tolerance: float,
     ) -> int:
         """Group *parts* by size and rewrite each group as one file."""
@@ -692,7 +714,7 @@ class FolderIO(Tabular[FolderOptions]):
         compacted = 0
         leaf_folder = FolderIO(path=directory)
         write_options = FolderOptions(
-            mode=Mode.APPEND, child_extension=target_extension,
+            mode=Mode.APPEND, child_media_type=target_media_type,
         )
         for group in groups:
             if len(group) < 2:

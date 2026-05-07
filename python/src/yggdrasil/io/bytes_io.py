@@ -1131,30 +1131,68 @@ class _FormatBufferContext:
 
         if self._codec is None:
             payload = self._buf.to_bytes()
+        else:
+            compressed = self._codec.compress(self._buf)
             try:
-                self._buf.close()
-            except Exception:
-                pass
-            self._parent.seek(0)
-            self._parent.truncate(0)
-            if payload:
-                self._parent.write(payload)
-            return
-
-        # Compress scratch into the durable buffer.
-        compressed = self._codec.compress(self._buf)
-        try:
-            payload = compressed.to_bytes()
-        finally:
-            try:
-                compressed.close()
-            except Exception:
-                pass
+                payload = compressed.to_bytes()
+            finally:
+                try:
+                    compressed.close()
+                except Exception:
+                    pass
         try:
             self._buf.close()
         except Exception:
             pass
-        self._parent.seek(0)
-        self._parent.truncate(0)
-        if payload:
-            self._parent.write(payload)
+
+        self._commit(payload)
+
+    def _commit(self, payload: bytes) -> None:
+        """Push *payload* onto the parent buffer in one bulk acquire.
+
+        Path-backed holders take the holder-direct fast path: open
+        the holder once, ``truncate`` + ``pwrite`` + ``flush`` +
+        close. On a local fd that's two syscalls (``ftruncate`` +
+        ``pwrite``) instead of the four a transient-fd ``truncate``
+        then a transient-fd ``pwrite`` would have cost going through
+        :meth:`BytesIO.write` twice.
+
+        In-memory holders route through the BytesIO API — the
+        transient-fd overhead is zero for them and the BytesIO
+        layer keeps cursor / dirty-bit bookkeeping coherent.
+        """
+        parent = self._parent
+        holder = parent._holder
+
+        use_fast_path = (
+            not parent._acquired
+            and (
+                getattr(holder, "is_local_path", False)
+                or getattr(holder, "is_remote_path", False)
+            )
+        )
+
+        if not use_fast_path:
+            parent.seek(0)
+            parent.truncate(0)
+            if payload:
+                parent.write(payload)
+            return
+
+        was_acquired = holder._acquired
+        if not was_acquired:
+            holder.acquire()
+        try:
+            holder.truncate(len(payload))
+            if payload:
+                holder.pwrite(memoryview(payload), 0)
+            try:
+                holder.flush()
+            except Exception:
+                pass
+        finally:
+            if not was_acquired:
+                try:
+                    holder.close()
+                except Exception:
+                    pass

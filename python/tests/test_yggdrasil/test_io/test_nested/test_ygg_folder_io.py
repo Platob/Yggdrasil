@@ -83,7 +83,10 @@ class TestHiveLayout:
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         y.write_arrow_table(table)
-        dirs = sorted(os.listdir(tmp_path))
+        # Filter the .ygg/ metadata sidecar from the data listing.
+        dirs = sorted(
+            d for d in os.listdir(tmp_path) if not d.startswith(".")
+        )
         assert dirs == ["region=eu", "region=us"]
 
     def test_partition_columns_dropped_from_payload(
@@ -94,7 +97,7 @@ class TestHiveLayout:
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         y.write_arrow_table(
-            table, options=FolderOptions(child_extension="parquet"),
+            table, options=FolderOptions(child_media_type="parquet"),
         )
         # Inspect the parquet footer schema directly — pyarrow's
         # ``read_table`` would synthesize the partition column back
@@ -119,8 +122,9 @@ class TestHiveLayout:
             "value": ["a", "b", "c"],
         })
         y.write_arrow_table(t)
-        # Year is the outer partition.
-        assert sorted(os.listdir(tmp_path)) == ["year=2024", "year=2025"]
+        # Year is the outer partition. Skip the .ygg/ sidecar.
+        top = sorted(d for d in os.listdir(tmp_path) if not d.startswith("."))
+        assert top == ["year=2024", "year=2025"]
         assert sorted(os.listdir(tmp_path / "year=2024")) == [
             "region=eu", "region=us",
         ]
@@ -369,6 +373,31 @@ class TestOptimize:
         after = [p for p in us_dir.iterdir() if p.name.startswith("part-")]
         assert len(after) == 2
 
+    def test_schema_sidecar_persisted_on_first_write(
+        self, tmp_path, table,
+    ) -> None:
+        y = YGGFolderIO(
+            path=str(tmp_path), schema=_single_partition_schema(),
+        )
+        # No write yet → no .ygg/ directory.
+        assert not (tmp_path / ".ygg").exists()
+        y.write_arrow_table(table)
+        # First write drops .ygg/.schema with the bound schema.
+        sidecar = tmp_path / ".ygg" / ".schema"
+        assert sidecar.exists()
+        assert sidecar.stat().st_size > 0
+
+    def test_schema_sidecar_loaded_when_construction_omits_schema(
+        self, tmp_path, table,
+    ) -> None:
+        # First instance writes the sidecar.
+        YGGFolderIO(
+            path=str(tmp_path), schema=_single_partition_schema(),
+        ).write_arrow_table(table)
+        # Fresh instance with no schema reads it back from .ygg/.schema.
+        fresh = YGGFolderIO(path=str(tmp_path))
+        assert fresh.partition_columns == ["region"]
+
     def test_no_schema_falls_back_to_folderio_walk(self, tmp_path, table) -> None:
         # No schema → no partition columns → optimize delegates to the
         # plain :meth:`FolderIO.optimize` walk.
@@ -402,8 +431,10 @@ class TestModes:
             pa.table({"id": [9], "region": ["ap"], "value": ["z"]}),
             options=FolderOptions(mode=Mode.OVERWRITE),
         )
-        # Old partitions wiped; only the new one survives.
-        assert os.listdir(tmp_path) == ["region=ap"]
+        # Old partitions wiped; only the new one survives (plus the
+        # .ygg/ sidecar rewritten by the new write).
+        dirs = sorted(d for d in os.listdir(tmp_path) if not d.startswith("."))
+        assert dirs == ["region=ap"]
 
     def test_append_keeps_existing_partitions(self, tmp_path, table) -> None:
         y = YGGFolderIO(
@@ -414,6 +445,5 @@ class TestModes:
             pa.table({"id": [9], "region": ["ap"], "value": ["z"]}),
             options=FolderOptions(mode=Mode.APPEND),
         )
-        assert sorted(os.listdir(tmp_path)) == [
-            "region=ap", "region=eu", "region=us",
-        ]
+        dirs = sorted(d for d in os.listdir(tmp_path) if not d.startswith("."))
+        assert dirs == ["region=ap", "region=eu", "region=us"]
