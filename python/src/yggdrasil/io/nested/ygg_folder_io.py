@@ -131,9 +131,9 @@ class YGGFolderIO(FolderIO):
         schema: "Schema | None" = None,
         listing_ttl: float = _LISTING_TTL_SECONDS,
         listing_max: int = _LISTING_MAX,
-        parent: "Any | None" = None,
+        tabular_parent: "Any | None" = None,
     ) -> None:
-        super().__init__(data, path=path, parent=parent)
+        super().__init__(data, path=path, tabular_parent=tabular_parent)
         # Load the schema from the .ygg/.schema sidecar when the
         # caller didn't pass one — lets a "just point me at this
         # folder" call still pick up the partition layout that

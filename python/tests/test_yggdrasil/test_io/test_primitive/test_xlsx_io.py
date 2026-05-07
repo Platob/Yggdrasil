@@ -150,7 +150,7 @@ class TestEntries:
         children = list(workbook.iter_children())
         assert [c.sheet_name for c in children] == ["Sales", "Inventory"]
         assert all(isinstance(c, XlsxSheetIO) for c in children)
-        assert all(c.parent is workbook for c in children)
+        assert all(c.tabular_parent is workbook for c in children)
 
     def test_child_reads_only_its_sheet(self, workbook: XlsxIO) -> None:
         sales = workbook.child("Sales")

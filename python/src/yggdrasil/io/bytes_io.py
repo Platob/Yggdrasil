@@ -157,23 +157,56 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         owns_holder: bool = False,
         mode: str = "rb+",
         media_type: Any = None,
+        path: Any = None,
         **kwargs: Any,
     ):
-        """Dispatch to a registered Tabular leaf when *media_type*
-        identifies one.
+        """Dispatch to a registered Tabular leaf when the inputs
+        identify one.
 
-        Lets ``BytesIO(data, media_type=MediaTypes.PARQUET)`` land on
-        :class:`ParquetIO` directly, which is what the pickle ser
-        layer relies on for round-tripping a typed buffer through
-        ``BytesIO(payload, media_type=...)`` — same shape as the
-        scheme dispatch on :class:`Holder`. Subclass calls
-        (``ParquetIO(...)``) skip the dispatch and stay on the
-        concrete class.
+        Lets ``BytesIO(data, media_type=MediaTypes.PARQUET)``,
+        ``BytesIO(path="…/x.xlsx")``, or ``BytesIO(holder=local_path)``
+        all land on the right leaf (:class:`ParquetIO`,
+        :class:`XlsxIO`, …) without the caller naming it. Resolution
+        order:
+
+        1. Explicit *media_type* kwarg.
+        2. *path* — extension via :meth:`URL.infer_media_type`.
+        3. *data* — same, when it's URL-shaped (``str`` /
+           ``pathlib.Path`` / :class:`URL`).
+        4. *holder* — its ``stat().media_type``.
+
+        Subclass calls (``ParquetIO(...)``) skip the dispatch and
+        stay on the concrete class.
         """
-        if cls is BytesIO and media_type is not None:
+        if cls is BytesIO:
+            # Side-effect import: ensures every leaf module has registered
+            # its mime_type by the time we hit the registry.
+            import yggdrasil.io.primitive  # noqa: F401
             from yggdrasil.io.tabular.base import Tabular
             from yggdrasil.data.enums.media_type import MediaType
-            mt = MediaType.from_(media_type, default=None)
+
+            mt = MediaType.from_(media_type, default=None) if media_type is not None else None
+
+            if mt is None:
+                from yggdrasil.io.url import URL
+                for src in (path, data):
+                    if src is None or isinstance(src, (bytes, bytearray, memoryview)):
+                        continue
+                    if hasattr(src, "read") and not isinstance(src, str):
+                        continue
+                    try:
+                        url = URL.from_(src)
+                    except Exception:
+                        continue
+                    mt = url.infer_media_type(default=None)
+                    if mt is not None:
+                        break
+                if mt is None and holder is not None:
+                    try:
+                        mt = getattr(holder.stat(), "media_type", None)
+                    except Exception:
+                        pass
+
             if mt is not None:
                 target = Tabular.class_for_media_type(mt, default=None)
                 if target is not None and issubclass(target, BytesIO) and target is not cls:
@@ -184,6 +217,7 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
                         owns_holder=owns_holder,
                         mode=mode,
                         media_type=media_type,
+                        path=path,
                         **kwargs,
                     )
         return super().__new__(cls)
@@ -196,17 +230,23 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         owns_holder: bool = False,
         mode: str = "rb+",
         media_type: Any = None,
+        path: Any = None,
         **kwargs: Any,
     ) -> None:
         """Construct a cursor over a :class:`Holder`. Does NOT open.
 
-        Pass exactly one of *holder* or *data*:
+        Pass exactly one of *holder*, *data*, or *path*:
 
         - *holder*: borrow an existing holder. Set ``owns_holder=True``
           to transfer close-ownership to this BytesIO (typically only
           :meth:`Holder.open` does this).
-        - *data*: routed through :meth:`from_` to build a fresh
-          holder; the new BytesIO owns it.
+        - *data*: bytes-like / file-like input routed through
+          :meth:`from_` to build a fresh in-memory holder; the new
+          BytesIO owns it.
+        - *path*: ``str`` / :class:`pathlib.PurePath` / :class:`URL`
+          routed through :class:`Holder` scheme dispatch (file://,
+          s3://, dbfs://, …). The new BytesIO owns the resulting
+          path-bound holder.
 
         ``mode`` follows stdlib :func:`open` semantics. The BytesIO
         is constructed in the **closed** state — ops in that state
@@ -217,8 +257,29 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         """
         super().__init__(**kwargs)
 
+        if holder is not None and (data is not None or path is not None):
+            raise TypeError(
+                "BytesIO accepts holder= OR data OR path=, not multiple. "
+                "Use BytesIO(holder=h) to borrow an existing holder, "
+                "BytesIO(data) for bytes/file-like inputs, or "
+                "BytesIO(path=...) for filesystem/URL paths."
+            )
+        if data is not None and path is not None:
+            raise TypeError(
+                "BytesIO accepts data= OR path=, not both. "
+                "Use BytesIO(data=...) for bytes/file-like inputs and "
+                "BytesIO(path=...) for filesystem/URL paths."
+            )
+
         if holder is None:
-            if data is None:
+            if path is not None:
+                # Holder.__new__ scheme-dispatches: str / PurePath /
+                # URL → LocalPath, s3:// → S3Path, … . The fresh holder
+                # owns its identity (URL + IOStats), so the BytesIO
+                # owns it back.
+                holder = Holder(path=path)
+                owns_holder = True
+            elif data is None:
                 # Empty memory holder — equivalent to stdlib io.BytesIO().
                 holder = Memory()
                 owns_holder = True
@@ -226,12 +287,6 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
                 tmp = self.from_(data, mode=mode)
                 holder = tmp._holder
                 owns_holder = True
-        elif data is not None:
-            raise TypeError(
-                "BytesIO accepts holder= OR data, not both. "
-                "Use BytesIO(data) for the auto-construct shape, or "
-                "BytesIO(holder=h) to borrow an existing holder."
-            )
 
         self._holder: "Holder" = holder
         self._owns_holder: bool = bool(owns_holder)

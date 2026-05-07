@@ -133,22 +133,29 @@ class Tabular(ABC, Generic[O]):
             )
         _TABULAR_REGISTRY[key] = cls
 
-    def __init__(self, *, parent: "Tabular | None" = None, **kwargs: Any) -> None:
-        """Initialize the parent slot.
+    def __init__(
+        self, *, tabular_parent: "Tabular | None" = None, **kwargs: Any,
+    ) -> None:
+        """Initialize the tree-parent slot.
 
         Subclasses chain ``super().__init__(**kwargs)`` and don't
-        otherwise touch :attr:`parent` — aggregators set it via
-        :meth:`adopt_child` when they yield / mint the child.
+        otherwise touch :attr:`tabular_parent` — aggregators set it
+        via :meth:`adopt_child` when they yield / mint the child.
+
+        The slot is named ``tabular_parent`` (not ``parent``) so it
+        doesn't collide with :attr:`yggdrasil.io.path.path.Path.parent`,
+        which is the path-shaped parent directory and therefore
+        property-backed and read-only.
         """
         super().__init__(**kwargs)
-        self.parent: "Tabular | None" = parent
+        self.tabular_parent: "Tabular | None" = tabular_parent
 
     # ==================================================================
     # Parent / child linkage
     # ==================================================================
 
     def adopt_child(self, child: "_ChildT") -> "_ChildT":
-        """Stamp ``child.parent = self`` and return *child*.
+        """Stamp ``child.tabular_parent = self`` and return *child*.
 
         Used by aggregator Tabulars (folders, archives, partitioned
         tables) inside their child-yielding hooks (``iter_children``,
@@ -162,7 +169,7 @@ class Tabular(ABC, Generic[O]):
         Re-adopting an already-attached child is fine — the slot
         is just overwritten. No checks, no ceremony.
         """
-        child.parent = self
+        child.tabular_parent = self
         return child
 
     # ==================================================================

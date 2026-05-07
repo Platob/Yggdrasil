@@ -305,3 +305,27 @@ class TestWriteStream:
         m = Memory()
         with pytest.raises(ValueError, match="pos must be >= 0"):
             m.write_stream(_stdio.BytesIO(b"x"), pos=-1)
+
+
+class TestHolderTabular:
+    """Holder satisfies the :class:`Tabular` interface — its default
+    Tabular hooks open the holder contextually and delegate to the
+    format-dispatched :class:`BytesIO` leaf, so ``LocalPath("x.csv")
+    .read_arrow_table()`` works with no per-format ceremony.
+    """
+
+    def test_local_path_reads_csv_via_tabular_surface(self, tmp_path) -> None:
+        import yggdrasil.io.primitive  # noqa: F401 — register leaves
+        from yggdrasil.io.tabular.base import Tabular
+
+        csv_path = tmp_path / "data.csv"
+        csv_path.write_bytes(b"id,value\n1,10\n2,20\n3,30\n")
+
+        lp = LocalPath(csv_path)
+        assert isinstance(lp, Tabular)
+        rows = lp.read_arrow_table().to_pylist()
+        assert rows == [
+            {"id": 1, "value": 10},
+            {"id": 2, "value": 20},
+            {"id": 3, "value": 30},
+        ]

@@ -112,17 +112,17 @@ class FolderIO(Tabular[FolderOptions]):
         data: Any = None,
         *,
         path: Any = None,
-        parent: "Tabular | None" = None,
+        tabular_parent: "Tabular | None" = None,
         **kwargs: Any,
     ) -> None:
         """Bind to a folder path. No I/O.
 
         ``data`` and ``path`` accept the same shape; ``path`` wins
-        when both are supplied. ``parent`` rides through to the
-        :class:`Tabular` slot — set by the enclosing folder when
+        when both are supplied. ``tabular_parent`` rides through to
+        the :class:`Tabular` slot — set by the enclosing folder when
         it yields this one as a child.
         """
-        super().__init__(parent=parent, **kwargs)
+        super().__init__(tabular_parent=tabular_parent, **kwargs)
 
         raw = path if path is not None else data
         if raw is None:
