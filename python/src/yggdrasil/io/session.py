@@ -342,7 +342,7 @@ class Session(ABC):
         received-window.
         """
         match_by = tuple(cache_cfg.request_by or ()) or ("public_url_hash",)
-        cache = cache_cfg.local_cache()
+        cache = cache_cfg.local_cache(session=self)
         looked = _lookup_local_responses(
             cache, [request],
             match_by=match_by,
@@ -387,7 +387,7 @@ class Session(ABC):
         if not response.ok:
             return
 
-        cache = cache or cache_cfg.local_cache()
+        cache = cache or cache_cfg.local_cache(session=self)
         # The original response is persisted as-is — userinfo and
         # sensitive headers stay in the row. Cache matching on the
         # read path uses the ``public_*`` hash columns, which are
@@ -584,7 +584,7 @@ class Session(ABC):
         # a newer row that wins on the next read.
         local_cache: "FolderIO | None" = None
         if effective_local_cfg.local_cache_enabled:
-            local_cache = effective_local_cfg.local_cache()
+            local_cache = effective_local_cfg.local_cache(session=self)
             if effective_local_cfg.mode != Mode.UPSERT:
                 local_response = self._load_local_cached_response(
                     request, effective_local_cfg
@@ -792,7 +792,7 @@ class Session(ABC):
             if not eff.local_cache_enabled or eff.mode == Mode.UPSERT:
                 misses.append(req)
                 continue
-            pkey = str(eff.local_cache_folder())
+            pkey = str(eff.local_cache_folder(session=self))
             slot = cfg_groups.get(pkey)
             if slot is None:
                 cfg_groups[pkey] = (eff, [req])
@@ -800,7 +800,7 @@ class Session(ABC):
                 slot[1].append(req)
 
         for pkey, (eff, group_reqs) in cfg_groups.items():
-            cache = eff.local_cache()
+            cache = eff.local_cache(session=self)
             match_by = tuple(eff.request_by or ()) or ("public_url_hash",)
             looked_up = _lookup_local_responses(
                 cache, group_reqs,
@@ -1150,10 +1150,10 @@ class Session(ABC):
                 continue
             # Store the response unchanged; matching uses the
             # ``public_*`` hash columns at lookup time.
-            pkey = str(eff.local_cache_folder())
+            pkey = str(eff.local_cache_folder(session=self))
             slot = groups.get(pkey)
             if slot is None:
-                groups[pkey] = (eff.local_cache(), eff, [response])
+                groups[pkey] = (eff.local_cache(session=self), eff, [response])
             else:
                 slot[2].append(response)
 
@@ -1262,10 +1262,10 @@ class Session(ABC):
                 continue
             if not getattr(eff, "optimize_on_write", True):
                 continue
-            pkey = str(eff.local_cache_folder())
+            pkey = str(eff.local_cache_folder(session=self))
             slot = groups.get(pkey)
             if slot is None:
-                groups[pkey] = (eff.local_cache(), eff, [response])
+                groups[pkey] = (eff.local_cache(session=self), eff, [response])
             else:
                 slot[2].append(response)
 

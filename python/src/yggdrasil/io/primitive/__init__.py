@@ -10,7 +10,7 @@ Each concrete subclass under this package implements one file format
 
 Importing this package as a whole forces every leaf module to load,
 which auto-registers them in :data:`Tabular._DATAIO_REGISTRY` via
-``__init_subclass__``. :meth:`Tabular.media_type_class` triggers
+``__init_subclass__``. :meth:`Tabular.class_for_media_type` triggers
 this import lazily so registry hits stay correct even when callers
 start at a leaf module directly.
 """

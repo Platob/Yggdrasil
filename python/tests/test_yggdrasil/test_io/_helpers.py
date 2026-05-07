@@ -38,6 +38,7 @@ def make_response(
     body: bytes = b'{"ok":true}',
     content_type: str = "application/json",
     headers: dict[str, str] | None = None,
+    received_at: dt.datetime | None = None,
 ) -> Response:
     base_headers = {"Content-Type": content_type}
     if headers:
@@ -48,7 +49,7 @@ def make_response(
         headers=base_headers,
         tags={},
         buffer=body,  # type: ignore[arg-type]
-        received_at=EPOCH,
+        received_at=received_at if received_at is not None else EPOCH,
     )
 
 
