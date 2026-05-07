@@ -599,6 +599,22 @@ class StatementResult(Tabular, Generic[PS]):
             self._cached_schema = super()._collect_schema(options)
         return self._cached_schema
 
+    def _read_spark_frame(self, options: CastOptions):
+        """Skip the Arrow round-trip when a Spark-native cache exists.
+
+        The default :class:`Tabular` implementation collects the
+        result via Arrow and rebuilds a Spark DataFrame on the
+        driver. When :attr:`_persisted_data` is itself a
+        Spark-backed :class:`Tabular` (e.g. :class:`SparkTabular`,
+        produced by a SparkSQL fallback or by an explicit
+        ``persist(data=df)``), its ``_read_spark_frame`` returns
+        the inner Spark DataFrame as-is — no driver collect.
+        """
+        persisted = getattr(self, "_persisted_data", None)
+        if persisted is not None:
+            return persisted._read_spark_frame(options)
+        return super()._read_spark_frame(options)
+
 
 SR = TypeVar("SR", bound="StatementResult")
 

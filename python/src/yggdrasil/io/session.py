@@ -438,7 +438,7 @@ class Session(ABC):
             else:
                 raise
 
-        for response in Response.from_arrow_tabular(cache_result.to_arrow_batches()):
+        for response in Response.from_arrow_tabular(cache_result.read_arrow_batches()):
             if cache_cfg.filter_response(response, request=request):
                 LOGGER.debug(
                     "Found remote %s %s in %s",
@@ -927,7 +927,7 @@ class Session(ABC):
                 raise
 
         result_map: dict[tuple, Response] = {}
-        for response in Response.from_arrow_tabular(cache_result.to_arrow_batches()):
+        for response in Response.from_arrow_tabular(cache_result.read_arrow_batches()):
             result_map[cfg.request_tuple(response.request)] = response
 
         hits: list[Response] = []
