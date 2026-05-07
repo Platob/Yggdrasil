@@ -19,7 +19,7 @@ from yggdrasil.dataclasses.waiting import (
     WaitingConfig,
     WaitingConfigArg,
 )
-from yggdrasil.data.enums import ByteUnit, Mode
+from yggdrasil.data.enums import Mode
 from .bytes_io import BytesIO
 from yggdrasil.io.nested import FolderIO, FolderOptions
 from .request import PreparedRequest
@@ -52,16 +52,6 @@ LOGGER = logging.getLogger(__name__)
 _SPARK_RESPONSE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
 
 
-# Target part size for local-cache writes and post-write compaction.
-# Threaded into ``FolderOptions.byte_size`` on every cache write so the
-# Arrow rechunker bounds individual part files at ~128 MiB, and reused
-# as ``YGGFolderIO.optimize(byte_size=...)`` so the compaction pass
-# bin-packs to the same target — parts already inside the tolerance
-# band are left alone, so a hot cache stops rewriting itself once
-# the partitions reach steady state.
-_LOCAL_CACHE_PART_BYTE_SIZE: int = 128 * ByteUnit.MIB
-
-
 # Local cache lives in a partitioned :class:`FolderIO` rooted at
 # ``<CacheConfig.path>/cache``. Partition columns come from
 # ``RESPONSE_SCHEMA``'s ``partition_by``-tagged fields and the schema
@@ -86,11 +76,7 @@ def _store_local_arrow_batch(
     directory.
     """
     cache.write_arrow_batches(
-        [batch],
-        options=FolderOptions(
-            mode=Mode.APPEND,
-            byte_size=_LOCAL_CACHE_PART_BYTE_SIZE,
-        ),
+        [batch], options=FolderOptions(mode=Mode.APPEND),
     )
 
 
@@ -1182,7 +1168,6 @@ class Session(ABC):
             options = FolderOptions(
                 mode=mode,
                 match_by_names=list(eff.request_by or ()) or None,
-                byte_size=_LOCAL_CACHE_PART_BYTE_SIZE,
             )
             with cache:
                 cache.write_arrow_table(table, options=options)
@@ -1236,10 +1221,7 @@ class Session(ABC):
 
         try:
             with cache:
-                optimize(
-                    byte_size=_LOCAL_CACHE_PART_BYTE_SIZE,
-                    partitions={"partition_key": partition_keys},
-                )
+                optimize(partitions={"partition_key": partition_keys})
         except Exception as exc:
             # Compaction is best-effort; a failed optimize leaves the
             # newly-written small files in place — readers still see
