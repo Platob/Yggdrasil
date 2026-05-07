@@ -494,23 +494,6 @@ class ArrowTabular(Tabular[CastOptions]):
             except Exception:
                 pass
 
-    def _mint_or_reuse_spill_path(self) -> Any:
-        """Return the path to write the consolidated IPC into.
-
-        Caller-supplied ``spill_path=`` is honored (we just rewrite
-        in place). Otherwise a fresh ``tmp-{start}-{end}-{seed}.arrow``
-        name is minted under :func:`tempfile.gettempdir()` —
-        time-sortable + matches the
-        :func:`cleanup_stale_spill_files` regex so the cross-process
-        janitor reaps stale files automatically.
-        """
-        if self._spill_path is not None and not self._owns_spill_path:
-            return self._spill_path
-        # Lazy import to avoid pulling the BytesIO module at import time.
-        from yggdrasil.io.bytes_io import _mint_spill_path
-
-        return _mint_spill_path("arrow", self._spill_ttl)
-
     def _drop_spill_table(self) -> None:
         """Tear down the mmap + spilled-table refs (without unlinking)."""
         self._spilled_table = None
