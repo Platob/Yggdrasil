@@ -25,7 +25,7 @@ from yggdrasil.io.nested import FolderIO, FolderOptions
 from .request import PreparedRequest
 from .response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
 from .response_batch import ResponseBatch
-from .send_config import CacheConfig, SendConfig, SendManyConfig
+from .send_config import CacheConfig, SendConfig, SendManyConfig, _request_column_sql_name
 from .url import URL
 
 if TYPE_CHECKING:
@@ -1072,9 +1072,16 @@ class Session(ABC):
                 return hits_df, []
             return None, list(requests)
 
-        matched_rows = hits_df.select(*key_cols).distinct().toLocalIterator()
+        # Request-side ``request_by`` keys (``public_url_hash``,
+        # ``method`` …) are stored on the response cache table under
+        # the flattened ``request_<col>`` form, so the bare keys can't
+        # be referenced as Spark column names — select via
+        # ``_request_column_sql_name`` and read rows back through the
+        # same prefixed names.
+        sql_cols = [_request_column_sql_name(c) for c in key_cols]
+        matched_rows = hits_df.select(*sql_cols).distinct().toLocalIterator()
         matched: set[tuple] = {
-            tuple(row[c] for c in key_cols) for row in matched_rows
+            tuple(row[c] for c in sql_cols) for row in matched_rows
         }
 
         misses: list[PreparedRequest] = []
