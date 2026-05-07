@@ -188,6 +188,15 @@ class LazyTabular(Tabular[CastOptions]):
     def _append_op(self, op: PlanOp) -> "LazyTabular":
         return self._clone(self._plan.append(op))
 
+    def lazy(self) -> "LazyTabular":
+        """Already lazy — return ``self`` instead of re-wrapping.
+
+        Overrides :meth:`Tabular.lazy`, which would otherwise stack a
+        second :class:`LazyTabular` carrying a ``SELECT *`` plan on top
+        of this one.
+        """
+        return self
+
     def select(self, *columns: _SelectorIn) -> "LazyTabular":
         """Project to *columns*. Accepts column names or expressions."""
         if not columns:
