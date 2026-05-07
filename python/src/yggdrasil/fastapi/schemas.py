@@ -22,6 +22,10 @@ __all__ = [
     "RegisterPathRequest",
     "RegisterInlineRequest",
     "RegisterResult",
+    "QueryRequest",
+    "InsertRowsRequest",
+    "WriteResult",
+    "DeleteResult",
 ]
 
 
@@ -103,5 +107,53 @@ class RegisterResult(BaseModel):
     qualified_name: str
     rows: int | None = None
     field_count: int
+
+    model_config = {"populate_by_name": True}
+
+
+class QueryRequest(BaseModel):
+    """Builder-style query: optional projection, predicate, paging.
+
+    The ``where`` field accepts any SQL boolean expression
+    :func:`yggdrasil.io.tabular.execution.expr.Expression.from_sql`
+    parses (``"price > 100 AND region = 'EU'"`` etc.). ``select`` is
+    a list of column names. ``limit`` / ``offset`` are applied after
+    projection / filtering.
+    """
+
+    select: list[str] | None = None
+    where: str | None = None
+    limit: int | None = None
+    offset: int | None = None
+
+
+class InsertRowsRequest(BaseModel):
+    """Inline row / column data for ``POST /data/.../rows``.
+
+    Mirrors :class:`RegisterInlineRequest` — pass exactly one of
+    ``rows`` (list of dicts) or ``columns`` (dict of name → list).
+    Binary inserts go through the same endpoint with a non-JSON
+    content type.
+    """
+
+    rows: list[dict[str, Any]] | None = None
+    columns: dict[str, list[Any]] | None = None
+
+
+class WriteResult(BaseModel):
+    catalog: str
+    schema_name: str = Field(alias="schema")
+    name: str
+    rows_written: int
+    mode: str
+
+    model_config = {"populate_by_name": True}
+
+
+class DeleteResult(BaseModel):
+    catalog: str
+    schema_name: str = Field(alias="schema")
+    name: str
+    rows_deleted: int
 
     model_config = {"populate_by_name": True}

@@ -27,14 +27,13 @@ from __future__ import annotations
 import pyarrow as pa
 from fastapi import APIRouter, Depends, Request
 
-from yggdrasil.data.enums import Codec, MediaType
-from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.data.enums import MediaType
 from yggdrasil.io.tabular import ArrowTabular, Tabular, TabularEngine
 
 from ..config import Settings
 from ..deps import get_engine, get_settings
 from ..exceptions import APIError, NotFound
-from ..responses import ARROW_FILE_MIME, ARROW_STREAM_MIME
+from ..payloads import decode_payload, extract_wire_mime, read_capped_body
 from ..schemas import (
     RegisterInlineRequest,
     RegisterPathRequest,
@@ -55,6 +54,61 @@ def _entry_to_result(entry, *, rows: "int | None") -> RegisterResult:
         rows=rows,
         field_count=len(schema.fields),
     )
+
+
+def _require_entry(engine: TabularEngine, catalog: str, schema: str, name: str):
+    entry = engine.get(catalog, schema, name)
+    if entry is None:
+        raise NotFound(
+            f"No tabular registered as {catalog!r}.{schema!r}.{name!r}. "
+            f"Registered: {engine.qualified_names()!r}."
+        )
+    return entry
+
+
+# ---------------------------------------------------------------------------
+# Read — listing + per-entry metadata
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "",
+    summary="List every registered source",
+)
+def list_sources(
+    catalog: "str | None" = None,
+    schema: "str | None" = None,
+    engine: TabularEngine = Depends(get_engine),
+) -> "list[dict]":
+    """Return every registered source as a list of metadata dicts.
+
+    Optional ``?catalog=`` / ``?schema=`` filters scope the result.
+    """
+    return [
+        {
+            "catalog": e.catalog,
+            "schema": e.schema,
+            "name": e.name,
+            "qualified_name": e.qualified_name,
+            "tabular_class": type(e.tabular).__name__,
+        }
+        for e in engine.entries(catalog=catalog, schema=schema)
+    ]
+
+
+@router.get(
+    "/{catalog}/{schema}/{name}",
+    response_model=RegisterResult,
+    summary="Get a registered source's metadata",
+)
+def get_source(
+    catalog: str,
+    schema: str,
+    name: str,
+    engine: TabularEngine = Depends(get_engine),
+) -> RegisterResult:
+    entry = _require_entry(engine, catalog, schema, name)
+    return _entry_to_result(entry, rows=None)
 
 
 @router.post(
@@ -135,28 +189,16 @@ async def register_upload(
     engine: TabularEngine = Depends(get_engine),
     settings: Settings = Depends(get_settings),
 ) -> RegisterResult:
-    payload = await _read_capped_body(request, settings.max_request_bytes)
+    payload = await read_capped_body(request, settings.max_request_bytes)
     if not payload:
         raise APIError(
             "Empty upload. Send the tabular bytes in the request body and "
             "set Content-Type to the format mime (or pass ?media_type=)."
         )
 
-    wire_mime = (
-        media_type
-        or (request.headers.get("content-type") or "").split(";", 1)[0].strip()
-    )
-    if not wire_mime:
-        raise APIError(
-            "Missing media type. Pass ?media_type=<mime> or set Content-Type "
-            "(e.g. application/vnd.apache.arrow.stream / "
-            "application/vnd.apache.arrow.file / "
-            "application/vnd.apache.parquet / text/csv / application/json)."
-        )
-
-    table, rows = _decode_upload(
+    table, rows = decode_payload(
         payload,
-        wire_mime,
+        extract_wire_mime(request, override=media_type),
         content_encoding=request.headers.get("content-encoding"),
     )
     entry = engine.register(catalog, schema, name, ArrowTabular(table))
@@ -183,89 +225,27 @@ def deregister(
 
 
 # ---------------------------------------------------------------------------
-# Internal — body reads and format decode
+# Bulk delete
 # ---------------------------------------------------------------------------
 
 
-async def _read_capped_body(request: Request, cap: int) -> bytes:
-    """Read the request body, refusing to buffer past *cap* bytes."""
-    chunks: "list[bytes]" = []
-    total = 0
-    async for chunk in request.stream():
-        if not chunk:
-            continue
-        total += len(chunk)
-        if total > cap:
-            raise APIError(
-                f"Upload exceeds the configured cap of {cap} bytes. "
-                "Bump YGG_API_MAX_REQUEST_BYTES or split the payload "
-                "and POST in chunks.",
-                status_code=413,
-            )
-        chunks.append(chunk)
-    return b"".join(chunks)
+@router.delete(
+    "",
+    summary="Deregister every source (optionally scoped)",
+)
+def clear_sources(
+    catalog: "str | None" = None,
+    schema: "str | None" = None,
+    engine: TabularEngine = Depends(get_engine),
+) -> "dict[str, int]":
+    """Drop every registration, optionally scoped to a catalog / schema.
 
-
-def _decode_upload(
-    payload: bytes,
-    wire_mime: str,
-    *,
-    content_encoding: "str | None" = None,
-) -> "tuple[pa.Table, int]":
-    """Decode *payload* into a :class:`pa.Table`.
-
-    Resolution:
-
-    1. **Arrow IPC stream** — the wire format isn't a registered
-       :class:`Tabular` leaf (the registry only tracks the on-disk
-       file format), so this branch goes straight through
-       :func:`pa.ipc.open_stream` against a zero-copy
-       :class:`pa.py_buffer`. Cheapest path.
-    2. **Anything else** — :class:`BytesIO` over the payload, stamped
-       with the resolved :class:`MediaType` (and ``Content-Encoding``
-       folded into the codec slot). :meth:`BytesIO.as_media`
-       dispatches to the registered :class:`Tabular` leaf and reads
-       a single :class:`pa.Table` back. Codec on the buffer is
-       handled by :class:`BytesIO`'s ``_format_view`` for the leaves
-       that consume it on read.
+    Returns ``{"removed": <count>}`` so callers know what was wiped.
     """
-    head = wire_mime.lower().strip()
+    removed = 0
+    for entry in engine.entries(catalog=catalog, schema=schema):
+        if engine.deregister(entry.catalog, entry.schema, entry.name) is not None:
+            removed += 1
+    return {"removed": removed}
 
-    if head == ARROW_STREAM_MIME:
-        # No registered leaf for the streaming wire format — pyarrow
-        # has the cheapest path.
-        reader = pa.ipc.open_stream(pa.py_buffer(payload))
-        table = reader.read_all()
-        return table, table.num_rows
 
-    media = MediaType.from_(head, default=None)
-    if media is None:
-        raise APIError(
-            f"Unsupported upload media type {wire_mime!r}. Supported: "
-            f"{sorted(Tabular.registered_classes())}, "
-            f"{ARROW_STREAM_MIME!r}, {ARROW_FILE_MIME!r}, "
-            "or application/json.",
-            status_code=415,
-        )
-
-    # Surface ``Content-Encoding`` as the codec on the buffer's
-    # MediaType. :class:`BytesIO`'s ``_format_view`` reads it back
-    # on the leaf side and decompresses transparently.
-    if content_encoding and media.codec is None:
-        codec = Codec.from_(content_encoding, default=None)
-        if codec is not None:
-            media = media.with_codec(codec)
-
-    buf = BytesIO(data=payload, media_type=media)
-    try:
-        leaf = buf.as_media()
-    except KeyError as exc:
-        raise APIError(
-            f"Unsupported upload media type {wire_mime!r}. Supported: "
-            f"{sorted(Tabular.registered_classes())}, "
-            f"{ARROW_STREAM_MIME!r}, {ARROW_FILE_MIME!r}.",
-            status_code=415,
-        ) from exc
-
-    table = leaf.read_arrow_table()
-    return table, table.num_rows

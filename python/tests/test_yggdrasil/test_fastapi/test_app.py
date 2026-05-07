@@ -171,6 +171,219 @@ class TestDataRouter(_BaseAPI):
         self.assertEqual(r.status_code, 404)
 
 
+class TestSourcesCRUD(_BaseAPI):
+    """Listing + single-entry GET + bulk delete on the sources router."""
+
+    def test_list_sources(self) -> None:
+        r = self.client.get("/sources")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(len(body), 1)
+        self.assertEqual(body[0]["qualified_name"], "main.core.t1")
+
+    def test_list_sources_filtered(self) -> None:
+        from yggdrasil.io.tabular import ArrowTabular
+
+        self.engine.register(
+            "other", "core", "tx", ArrowTabular(self.pa.table({"a": [1]})),
+        )
+        r = self.client.get("/sources?catalog=main")
+        self.assertEqual(
+            [e["qualified_name"] for e in r.json()], ["main.core.t1"],
+        )
+
+    def test_get_source(self) -> None:
+        r = self.client.get("/sources/main/core/t1")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["qualified_name"], "main.core.t1")
+
+    def test_get_source_404(self) -> None:
+        r = self.client.get("/sources/main/core/missing")
+        self.assertEqual(r.status_code, 404)
+
+    def test_clear_sources_scoped(self) -> None:
+        from yggdrasil.io.tabular import ArrowTabular
+
+        self.engine.register(
+            "main", "core", "t2", ArrowTabular(self.pa.table({"a": [1]})),
+        )
+        self.engine.register(
+            "main", "x", "t3", ArrowTabular(self.pa.table({"a": [1]})),
+        )
+        r = self.client.delete("/sources?catalog=main&schema=core")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json(), {"removed": 2})
+        self.assertEqual(self.engine.qualified_names(), ["main.x.t3"])
+
+    def test_clear_sources_all(self) -> None:
+        r = self.client.delete("/sources")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["removed"], 1)
+        self.assertEqual(self.engine.qualified_names(), [])
+
+
+class TestDataQuery(_BaseAPI):
+    """Builder-style query with ``select`` / ``where`` / ``limit`` / ``offset``."""
+
+    def test_query_where_and_select(self) -> None:
+        r = self.client.post(
+            "/data/main/core/t1/query?format=application/json",
+            json={"where": "id > 1", "select": ["id"]},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json(), [{"id": 2}, {"id": 3}])
+
+    def test_query_limit_offset(self) -> None:
+        r = self.client.post(
+            "/data/main/core/t1/query?format=application/json",
+            json={"limit": 1, "offset": 1},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json(), [{"id": 2, "name": "b"}])
+
+    def test_query_via_query_string(self) -> None:
+        r = self.client.post(
+            "/data/main/core/t1/query?format=application/json"
+            "&where=id%3E1&limit=1",
+        )
+        self.assertEqual(r.status_code, 200)
+        rows = r.json()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], 2)
+
+    def test_query_empty_body_returns_full_table(self) -> None:
+        r = self.client.post(
+            "/data/main/core/t1/query?format=application/json",
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(len(r.json()), 3)
+
+    def test_query_bad_where_400(self) -> None:
+        r = self.client.post(
+            "/data/main/core/t1/query",
+            json={"where": "not a real expr !!!"},
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("`where` predicate", r.json()["detail"])
+
+    def test_query_bad_select_400(self) -> None:
+        r = self.client.post(
+            "/data/main/core/t1/query",
+            json={"select": ["does_not_exist"]},
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("does_not_exist", r.json()["detail"])
+
+    def test_query_404(self) -> None:
+        r = self.client.post(
+            "/data/missing/core/none/query", json={},
+        )
+        self.assertEqual(r.status_code, 404)
+
+
+class TestDataInsert(_BaseAPI):
+    """``POST /data/.../rows`` — append rows from JSON or binary upload."""
+
+    def test_insert_json_rows(self) -> None:
+        r = self.client.post(
+            "/data/main/core/t1/rows",
+            json={"rows": [{"id": 4, "name": "d"}]},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["mode"], "APPEND")
+        self.assertEqual(r.json()["rows_written"], 1)
+        roundtrip = self.engine.get_tabular(
+            "main", "core", "t1",
+        ).read_arrow_table()
+        self.assertEqual(roundtrip.num_rows, 4)
+
+    def test_insert_json_columns(self) -> None:
+        r = self.client.post(
+            "/data/main/core/t1/rows",
+            json={"columns": {"id": [10, 20], "name": ["x", "y"]}},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["rows_written"], 2)
+
+    def test_insert_binary_parquet(self) -> None:
+        sink = pa.BufferOutputStream()
+        pq.write_table(
+            self.pa.table({"id": [99], "name": ["z"]}), sink,
+        )
+        r = self.client.post(
+            "/data/main/core/t1/rows",
+            headers={"content-type": "application/vnd.apache.parquet"},
+            content=sink.getvalue().to_pybytes(),
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["rows_written"], 1)
+
+    def test_insert_empty_400(self) -> None:
+        r = self.client.post(
+            "/data/main/core/t1/rows",
+            json={},
+        )
+        self.assertEqual(r.status_code, 400)
+
+    def test_insert_404(self) -> None:
+        r = self.client.post(
+            "/data/missing/core/none/rows", json={"rows": [{"a": 1}]},
+        )
+        self.assertEqual(r.status_code, 404)
+
+
+class TestDataReplace(_BaseAPI):
+    """``PUT /data/.../rows`` — overwrite every row."""
+
+    def test_replace_rows(self) -> None:
+        r = self.client.put(
+            "/data/main/core/t1/rows",
+            json={"rows": [{"id": 100, "name": "z"}]},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["mode"], "OVERWRITE")
+        self.assertEqual(r.json()["rows_written"], 1)
+        roundtrip = self.engine.get_tabular(
+            "main", "core", "t1",
+        ).read_arrow_table()
+        self.assertEqual(roundtrip.to_pylist(), [{"id": 100, "name": "z"}])
+
+
+class TestDataDelete(_BaseAPI):
+    """``DELETE /data/.../rows`` — predicate-based row delete."""
+
+    def test_delete_predicate(self) -> None:
+        r = self.client.delete(
+            "/data/main/core/t1/rows?where=id%3E1",
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["rows_deleted"], 2)
+        roundtrip = self.engine.get_tabular(
+            "main", "core", "t1",
+        ).read_arrow_table()
+        self.assertEqual(roundtrip.to_pylist(), [{"id": 1, "name": "a"}])
+
+    def test_delete_all_rows(self) -> None:
+        r = self.client.delete("/data/main/core/t1/rows")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["rows_deleted"], 3)
+        roundtrip = self.engine.get_tabular(
+            "main", "core", "t1",
+        ).read_arrow_table()
+        self.assertEqual(roundtrip.num_rows, 0)
+
+    def test_delete_bad_where_400(self) -> None:
+        r = self.client.delete(
+            "/data/main/core/t1/rows?where=this+is+not+sql+!!",
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("predicate", r.json()["detail"])
+
+    def test_delete_404(self) -> None:
+        r = self.client.delete("/data/missing/core/none/rows")
+        self.assertEqual(r.status_code, 404)
+
+
 class TestSourcesRouter(_BaseAPI):
     def test_register_inline_rows(self) -> None:
         r = self.client.post(
