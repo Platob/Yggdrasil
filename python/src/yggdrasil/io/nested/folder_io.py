@@ -563,6 +563,75 @@ class FolderIO(Tabular[FolderOptions]):
                 pass
 
     # ==================================================================
+    # Row-level delete
+    # ==================================================================
+
+    def _delete(self, predicate: Any, options: FolderOptions) -> int:
+        """Walk children, filter each leaf in isolation, rewrite survivors.
+
+        Streams leaf-by-leaf so a single match in one part file doesn't
+        trigger a folder-wide rewrite — only the leaves that actually
+        hold matched rows are rewritten. Sub-folders recurse. Files
+        the predicate fully drains are unlinked outright; leaves with
+        a mix of survivors and matches are rewritten as a fresh part
+        and the original is unlinked once the new file is on disk.
+
+        Per-batch filtering goes through
+        :meth:`Predicate.filter_arrow_batches`, so the row work runs
+        in pyarrow's C++ kernels — no Python row iteration.
+        """
+        if not self.path.exists():
+            return 0
+        not_pred = ~predicate
+        deleted = 0
+        for child in self.iter_children():
+            if isinstance(child, FolderIO):
+                deleted += child._delete(predicate, child.options_class()())
+                continue
+            deleted += self._delete_leaf(child, not_pred, options)
+        return deleted
+
+    def _delete_leaf(
+        self,
+        child: "Tabular",
+        not_pred: Any,
+        options: FolderOptions,
+    ) -> int:
+        """Filter rows in *child*; rewrite as a fresh part or unlink it."""
+        survivors: "list[pa.RecordBatch]" = []
+        kept_rows = 0
+        total_rows = 0
+
+        def _counted() -> "Iterator[pa.RecordBatch]":
+            nonlocal total_rows
+            for b in child._read_arrow_batches(child.options_class()()):
+                total_rows += b.num_rows
+                yield b
+
+        try:
+            for kept in not_pred.filter_arrow_batches(_counted()):
+                kept_rows += kept.num_rows
+                survivors.append(kept)
+        except Exception:
+            return 0
+
+        deleted = total_rows - kept_rows
+        if deleted == 0:
+            return 0
+
+        leaf_path = getattr(child, "_holder", None)
+        if survivors:
+            # Mixed: write survivors first, then drop the original. A
+            # failed rewrite leaves the original intact.
+            self._write_parts(iter(survivors), options)
+        if leaf_path is not None:
+            try:
+                leaf_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return deleted
+
+    # ==================================================================
     # Compaction — bin-pack small parts towards a target byte size
     # ==================================================================
 

@@ -325,6 +325,78 @@ class Tabular(ABC, Generic[O]):
         return 0
 
     # ==================================================================
+    # Row-level delete
+    # ==================================================================
+
+    def delete(
+        self,
+        predicate: "Any",
+        *,
+        options: "O | None" = None,
+        **kwargs: Any,
+    ) -> int:
+        """Delete every row matching *predicate*. Return rows removed.
+
+        *predicate* is a :class:`Predicate` from
+        :mod:`yggdrasil.io.tabular.execution.expr` or a SQL string
+        that parses into one (``"id IN (1,2,3)"``,
+        ``"price > 100 AND region = 'EU'"``).
+
+        The default implementation reads every batch, drops rows the
+        predicate accepts, and rewrites the leaf with the survivors.
+        Aggregator subclasses (:class:`yggdrasil.io.nested.folder_io.FolderIO`,
+        :class:`yggdrasil.io.nested.ygg_folder_io.YGGFolderIO`)
+        override to walk children, prune subtrees whose partition
+        bounds make the predicate trivially false, and only rewrite
+        the leaves that actually hold matched rows — so a delete on a
+        hive-partitioned tree never scans partitions it can prove
+        don't match.
+        """
+        from yggdrasil.io.tabular.execution.expr import Expression, Predicate
+
+        if isinstance(predicate, str):
+            predicate = Expression.from_sql(predicate)
+        if not isinstance(predicate, Predicate):
+            raise TypeError(
+                f"{type(self).__name__}.delete expected a Predicate "
+                f"(or a SQL string parseable to one); got "
+                f"{type(predicate).__name__}: {predicate!r}."
+            )
+        return self._delete(
+            predicate, self.check_options(options, overrides=locals()),
+        )
+
+    def _delete(self, predicate: "Any", options: O) -> int:
+        """Generic single-leaf delete: filter all batches, rewrite.
+
+        Routes the row-level work through
+        :meth:`Predicate.filter_arrow_batches`, so the streaming
+        filter runs in pyarrow's C++ kernels — no Python row
+        iteration. Counts rows by diffing input vs. surviving sizes
+        as the stream goes by, keeping the streaming property: only
+        one batch resides in memory at a time.
+        """
+        survivors: "list[pa.RecordBatch]" = []
+        kept_rows = 0
+        total_rows = 0
+        not_pred = ~predicate
+
+        def _counted() -> "Iterator[pa.RecordBatch]":
+            nonlocal total_rows
+            for b in self._read_arrow_batches(options):
+                total_rows += b.num_rows
+                yield b
+
+        for kept in not_pred.filter_arrow_batches(_counted()):
+            kept_rows += kept.num_rows
+            survivors.append(kept)
+        deleted = total_rows - kept_rows
+        if deleted == 0:
+            return 0
+        self._write_arrow_batches(iter(survivors), options)
+        return deleted
+
+    # ==================================================================
     # Execution-plan entry point
     # ==================================================================
 

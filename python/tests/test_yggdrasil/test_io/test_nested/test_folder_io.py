@@ -330,6 +330,94 @@ class TestMergeByName:
         assert out.column("id").to_pylist() == [1, 2, 2, 3]
 
 
+class TestDelete:
+
+    def test_delete_drops_matching_rows_and_leaves_others(self, tmp_path) -> None:
+        from yggdrasil.io.tabular.execution.expr import col
+
+        folder = FolderIO(path=str(tmp_path))
+        folder.write_arrow_table(
+            pa.table({"id": [1, 2, 3, 4, 5], "v": ["a", "b", "c", "d", "e"]}),
+        )
+        deleted = folder.delete(col("id") >= 3)
+        assert deleted == 3
+        out = folder.read_arrow_table().sort_by("id")
+        assert out.column("id").to_pylist() == [1, 2]
+
+    def test_delete_returns_zero_when_nothing_matches(self, tmp_path) -> None:
+        from yggdrasil.io.tabular.execution.expr import col
+
+        folder = FolderIO(path=str(tmp_path))
+        folder.write_arrow_table(pa.table({"id": [1, 2, 3]}))
+        before = sorted(p.name for p in tmp_path.iterdir())
+        deleted = folder.delete(col("id") > 100)
+        assert deleted == 0
+        # No rewrite happened — the part file is the same.
+        after = sorted(p.name for p in tmp_path.iterdir())
+        assert before == after
+
+    def test_delete_full_part_unlinks_file(self, tmp_path) -> None:
+        from yggdrasil.io.tabular.execution.expr import col
+
+        folder = FolderIO(path=str(tmp_path))
+        folder.write_arrow_table(pa.table({"id": [1, 2, 3]}))
+        # Predicate matches every row → file deleted, no replacement.
+        deleted = folder.delete(col("id") >= 1)
+        assert deleted == 3
+        assert list(tmp_path.iterdir()) == []
+        assert folder.read_arrow_table().num_rows == 0
+
+    def test_delete_per_leaf_isolation(self, tmp_path) -> None:
+        """Only the leaf containing matching rows is rewritten."""
+        from yggdrasil.io.tabular.execution.expr import col
+
+        folder = FolderIO(path=str(tmp_path))
+        # Two appended parts. The predicate only matches rows in the
+        # second part — the first part stays on disk untouched.
+        folder.write_arrow_table(pa.table({"id": [1, 2]}))
+        folder.write_arrow_table(
+            pa.table({"id": [3, 4]}), options=FolderOptions(mode=Mode.APPEND),
+        )
+        before = {p.name for p in tmp_path.iterdir()}
+        deleted = folder.delete(col("id") == 4)
+        assert deleted == 1
+        after = {p.name for p in tmp_path.iterdir()}
+        # The id=[1,2] leaf is bit-identical (same name); the id=[3,4]
+        # leaf has been replaced by a fresh-named part holding id=[3].
+        unchanged = before & after
+        assert len(unchanged) == 1
+        assert sorted(folder.read_arrow_table().column("id").to_pylist()) == [1, 2, 3]
+
+    def test_delete_recurses_into_subfolders(self, tmp_path) -> None:
+        from yggdrasil.io.tabular.execution.expr import col
+
+        folder = FolderIO(path=str(tmp_path))
+        folder.write_arrow_table(pa.table({"id": [1, 2]}))
+        sub_path = tmp_path / "shard"
+        sub_path.mkdir()
+        sub = FolderIO(path=str(sub_path))
+        sub.write_arrow_table(pa.table({"id": [3, 4]}))
+
+        deleted = folder.delete(col("id") > 2)
+        assert deleted == 2
+        assert sorted(folder.read_arrow_table().column("id").to_pylist()) == [1, 2]
+
+    def test_delete_accepts_sql_string(self, tmp_path) -> None:
+        folder = FolderIO(path=str(tmp_path))
+        folder.write_arrow_table(pa.table({"id": [1, 2, 3, 4]}))
+        deleted = folder.delete("id IN (2, 4)")
+        assert deleted == 2
+        assert sorted(folder.read_arrow_table().column("id").to_pylist()) == [1, 3]
+
+    def test_delete_rejects_non_predicate(self, tmp_path) -> None:
+        from yggdrasil.io.tabular.execution.expr import col
+
+        folder = FolderIO(path=str(tmp_path))
+        folder.write_arrow_table(pa.table({"id": [1]}))
+        with pytest.raises(TypeError, match="Predicate"):
+            folder.delete(col("id"))  # bare column is not a predicate
+
+
 class TestTabularBaseOptimize:
 
     def test_single_file_leaf_is_noop(self, tmp_path, table) -> None:

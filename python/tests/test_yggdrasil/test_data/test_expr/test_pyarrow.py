@@ -56,6 +56,53 @@ class TestArrowFiltering:
         assert "buy" in sides and "sell" in sides
 
 
+class TestFilterMethods:
+    """Direct ``Predicate.filter_arrow_*`` helpers (no Python row loop)."""
+
+    def test_filter_arrow_table_keeps_matching_rows(self):
+        t = _table()
+        out = (col("price") >= 100).filter_arrow_table(t)
+        assert out.column("price").to_pylist() == [200, 150]
+
+    def test_filter_arrow_table_empty_input_passthrough(self):
+        empty = _table().slice(0, 0)
+        out = (col("price") > 0).filter_arrow_table(empty)
+        assert out.num_rows == 0
+        assert out.schema == empty.schema
+
+    def test_filter_arrow_batch_returns_record_batch(self):
+        batch = _table().to_batches()[0]
+        kept = (col("side") == "buy").filter_arrow_batch(batch)
+        assert isinstance(kept, pa.RecordBatch)
+        assert kept.column("side").to_pylist() == ["buy", "buy"]
+
+    def test_filter_arrow_batch_preserves_schema_when_empty(self):
+        batch = _table().to_batches()[0]
+        kept = (col("side") == "nope").filter_arrow_batch(batch)
+        assert kept.num_rows == 0
+        assert kept.schema == batch.schema
+
+    def test_filter_arrow_batches_streams_survivors(self):
+        batches = _table().to_batches()
+        out = list(
+            (col("price") >= 100).filter_arrow_batches(batches)
+        )
+        merged = pa.Table.from_batches(out) if out else _table().slice(0, 0)
+        assert sorted(merged.column("price").to_pylist()) == [150, 200]
+
+    def test_filter_arrow_batches_skips_zero_row_batches(self):
+        # Mix an empty batch in and confirm it doesn't appear in output.
+        full = _table().to_batches()[0]
+        empty = full.slice(0, 0)
+        out = list(
+            (col("price") < 1000).filter_arrow_batches([empty, full, empty])
+        )
+        assert all(b.num_rows > 0 for b in out)
+        # All non-null prices survive ``< 1000``.
+        rows = pa.Table.from_batches(out).column("price").to_pylist()
+        assert sorted(r for r in rows if r is not None) == [50, 150, 200]
+
+
 class TestNullInListExpansion:
     def test_includes_null_matches_null_rows(self):
         # ``IN (1, 2, None)`` — explicit NULL in the value list
