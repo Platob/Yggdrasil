@@ -422,6 +422,26 @@ class Tabular(ABC, Generic[O]):
         reader = self._read_arrow_batch_reader(options)
         return pds.dataset(reader, schema=reader.schema)
 
+    def read_table(
+        self, options: "O | None" = None, **kwargs: Any,
+    ) -> Any:
+        """Read into the best in-memory representation for the environment.
+
+        Picks pyspark when running on Databricks
+        (:meth:`yggdrasil.environ.PyEnv.in_databricks`) so the result
+        rides the cluster's distributed runtime; falls back to a
+        pyarrow :class:`pa.Table` everywhere else. Pandas is
+        intentionally not in the rotation — callers that need it
+        should ask for :meth:`read_pandas_frame` explicitly.
+        """
+        return self._read_table(self.check_options(options, overrides=locals()))
+
+    def _read_table(self, options: O) -> Any:
+        from yggdrasil.environ import PyEnv
+        if PyEnv.in_databricks():
+            return self._read_spark_frame(options)
+        return self._read_arrow_table(options)
+
     def write_table(
         self,
         obj: Any,
@@ -430,17 +450,27 @@ class Tabular(ABC, Generic[O]):
     ) -> None:
         """Dispatch *obj* to the best ``_write_*`` hook based on its runtime type.
 
-        Recognizes ``pa.Table`` / ``pa.RecordBatch`` / ``pa.RecordBatchReader``,
-        polars ``DataFrame`` / ``LazyFrame``, pandas ``DataFrame``, pyspark
-        ``DataFrame``, ``list[dict]``, ``dict[str, list]``, and iterables of
-        any of the above. Module-name sniffing keeps optional engine deps
-        out of the import graph — we only touch a frame's API once we've
+        Recognizes another :class:`Tabular` (piped through the best
+        engine for the current environment — pyspark on Databricks,
+        pyarrow batches otherwise), ``pa.Table`` / ``pa.RecordBatch`` /
+        ``pa.RecordBatchReader``, polars ``DataFrame`` / ``LazyFrame``,
+        pandas ``DataFrame``, pyspark ``DataFrame``, ``list[dict]``,
+        ``dict[str, list]``, and iterables of any of the above.
+        Module-name sniffing keeps optional engine deps out of the
+        import graph — we only touch a frame's API once we've
         confirmed it's an instance of one we know how to drain.
         """
         self._write_table(obj, self.check_options(options, overrides=locals()))
 
     def _write_table(self, obj: Any, options: O) -> None:
         if obj is None:
+            return
+        if isinstance(obj, Tabular):
+            from yggdrasil.environ import PyEnv
+            if PyEnv.in_databricks():
+                self._write_spark_frame(obj.read_spark_frame(), options)
+                return
+            self._write_arrow_batches(obj.read_arrow_batches(), options)
             return
         if isinstance(obj, pa.Table):
             self._write_arrow_table(obj, options)
