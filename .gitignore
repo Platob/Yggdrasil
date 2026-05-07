@@ -212,3 +212,9 @@ __marimo__/
 /csharp/Yggdrasil/*/obj/
 /csharp/Yggdrasil/YGGXLAddin/.vs/
 /csharp/Yggdrasil/packages/
+
+# Stray scratch artifacts that have leaked into the tree before
+# (see commits ded4d57 / 68ec8f4 — empty ``data.qqq`` reappeared,
+# and ``python/*/`` is the result of an unquoted-glob accident).
+/python/data.qqq
+/python/\*/
