@@ -470,9 +470,9 @@ class TestAsMedia:
         assert df["x"].to_list() == [1, 2]
         assert df["y"].to_list() == ["a", "b"]
 
-    def test_response_dio_returns_typed_leaf(self) -> None:
-        """Pinned regression — Response.dio() used to fail for the
-        same reason as to_polars.
+    def test_response_as_media_returns_typed_leaf(self) -> None:
+        """Pinned regression — Response.as_media() used to fail for
+        the same reason as to_polars.
         """
         import datetime as dt
 
@@ -489,5 +489,5 @@ class TestAsMedia:
             buffer=b'{"x": 1}',  # type: ignore[arg-type]
             received_at=dt.datetime.fromtimestamp(0, tz=dt.timezone.utc),
         )
-        mio = r.dio()
+        mio = r.as_media()
         assert isinstance(mio, JsonIO)

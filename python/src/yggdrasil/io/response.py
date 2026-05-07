@@ -829,8 +829,8 @@ class Response(Tabular[CastOptions]):
     def body(self) -> BytesIO:
         return self.buffer
 
-    def dio(self, media_type: MediaType | None = None):
-        return self.buffer.as_media(media_type=self.media_type)
+    def as_media(self, media_type: MediaType | None = None) -> BytesIO:
+        return self.buffer.as_media(media_type=media_type or self.media_type)
 
     @property
     def codec(self) -> Optional[Codec]:
@@ -1083,7 +1083,7 @@ class Response(Tabular[CastOptions]):
         **options: Any
     ) -> Iterator[pa.RecordBatch]:
         if parse:
-            with self.dio() as b:
+            with self.as_media() as b:
                 yield from b.read_arrow_batches(**options)
             return
 
@@ -1135,7 +1135,7 @@ class Response(Tabular[CastOptions]):
         **media_options: Any,
     ):
         if parse:
-            yield from self.dio().read_polars_frames(lazy=lazy, **media_options)
+            yield from self.as_media().read_polars_frames(lazy=lazy, **media_options)
         else:
             yield pl.from_arrow(self.to_arrow_batch(parse=False))
 
