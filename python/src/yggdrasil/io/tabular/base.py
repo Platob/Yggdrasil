@@ -422,6 +422,120 @@ class Tabular(ABC, Generic[O]):
         reader = self._read_arrow_batch_reader(options)
         return pds.dataset(reader, schema=reader.schema)
 
+    def read_table(
+        self, options: "O | None" = None, **kwargs: Any,
+    ) -> pa.Table:
+        """Read into a pyarrow :class:`pa.Table`.
+
+        Pyarrow is the only hard runtime dependency, so it's the
+        portable default. Callers that want a different engine can
+        ask for :meth:`read_polars_frame` / :meth:`read_spark_frame`
+        explicitly.
+        """
+        return self._read_arrow_table(self.check_options(options, overrides=locals()))
+
+    def write_table(
+        self,
+        obj: Any,
+        options: "O | None" = None,
+        **kwargs: Any,
+    ) -> None:
+        """Dispatch *obj* to the best ``_write_*`` hook based on its runtime type.
+
+        Recognizes another :class:`Tabular` (drained as a pyarrow
+        record-batch stream), ``pa.Table`` / ``pa.RecordBatch`` /
+        ``pa.RecordBatchReader``, polars ``DataFrame`` / ``LazyFrame``,
+        pandas ``DataFrame``, pyspark ``DataFrame``, ``list[dict]``,
+        ``dict[str, list]``, and iterables of any of the above.
+        Module-name sniffing keeps optional engine deps out of the
+        import graph — we only touch a frame's API once we've
+        confirmed it's an instance of one we know how to drain.
+        """
+        self._write_table(obj, self.check_options(options, overrides=locals()))
+
+    def _write_table(self, obj: Any, options: O) -> None:
+        if obj is None:
+            return
+        if isinstance(obj, Tabular):
+            self._write_arrow_batches(obj.read_arrow_batches(), options)
+            return
+        if isinstance(obj, pa.Table):
+            self._write_arrow_table(obj, options)
+            return
+        if isinstance(obj, pa.RecordBatch):
+            self._write_arrow_batches([obj], options)
+            return
+        if isinstance(obj, pa.RecordBatchReader):
+            self._write_arrow_batches(obj, options)
+            return
+
+        from yggdrasil.pickle.serde import ObjectSerde
+        ns, _ = ObjectSerde.module_and_name(obj)
+        if ns.startswith("polars"):
+            self._write_polars_frame(obj, options)
+            return
+        if ns.startswith("pandas"):
+            self._write_pandas_frame(obj, options)
+            return
+        if ns.startswith("pyspark"):
+            self._write_spark_frame(obj, options)
+            return
+
+        if isinstance(obj, Mapping):
+            if obj and all(isinstance(v, (list, tuple)) for v in obj.values()):
+                self._write_pydict({k: list(v) for k, v in obj.items()}, options)
+                return
+            self._write_pylist([dict(obj)], options)
+            return
+
+        if isinstance(obj, (str, bytes, bytearray, memoryview)):
+            raise TypeError(
+                f"{type(self).__name__}.write_table can't infer a writer for "
+                f"{type(obj).__name__}: {obj!r}. Accepted: pyarrow "
+                "Table/RecordBatch/RecordBatchReader, polars DataFrame/LazyFrame, "
+                "pandas DataFrame, pyspark DataFrame, list[dict], dict[str, list], "
+                "or an iterable of any of those."
+            )
+
+        try:
+            iterator = iter(obj)
+        except TypeError as exc:
+            raise TypeError(
+                f"{type(self).__name__}.write_table can't infer a writer for "
+                f"{ObjectSerde.full_namespace(obj)}: {obj!r}. "
+                "Accepted: pyarrow Table/RecordBatch/RecordBatchReader, "
+                "polars DataFrame/LazyFrame, pandas DataFrame, pyspark "
+                "DataFrame, list[dict], dict[str, list], or an iterable of "
+                "any of those."
+            ) from exc
+
+        try:
+            first = next(iterator)
+        except StopIteration:
+            return
+        import itertools as _it
+        rest = _it.chain([first], iterator)
+        if isinstance(first, pa.RecordBatch):
+            self._write_arrow_batches(rest, options)
+            return
+        if isinstance(first, pa.Table):
+            for inner in rest:
+                self._write_arrow_table(inner, options)
+            return
+        if isinstance(first, Mapping):
+            self._write_pylist(rest, options)
+            return
+        from yggdrasil.data.record import Record
+        if isinstance(first, Record):
+            self._write_records(rest, options)
+            return
+        raise TypeError(
+            f"{type(self).__name__}.write_table can't infer a writer for "
+            f"iterable of {type(first).__name__}: first item {first!r}. "
+            "Accepted element types: pyarrow Table/RecordBatch, Mapping, "
+            "or yggdrasil Record."
+        )
+
     def write_arrow_batches(
         self,
         batches: Iterable[pa.RecordBatch],
