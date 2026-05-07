@@ -1093,12 +1093,21 @@ class _FormatBufferContext:
     """Writer-side of :meth:`BytesIO._format_buffer`.
 
     Caller does ``with bio._format_buffer() as buf: writer(buf)``;
-    the yielded ``buf`` accepts raw format bytes. On exit:
+    the yielded ``buf`` accepts raw format bytes. The yielded buffer
+    is **always** a fresh in-memory :class:`BytesIO` — the format
+    writers (Parquet's row-group flush, Arrow IPC's record-batch
+    encoder, CSV row-by-row …) call ``buf.write`` once per chunk,
+    and routing those calls straight at a path-backed holder turns
+    each one into an ``os.pwrite`` syscall. Buffering in memory
+    coalesces the whole file into one bulk commit on exit, so a
+    write that emitted N small chunks ends up costing one
+    truncate + one pwrite at the durable layer.
 
-    * No codec → ``buf is bio``; we just leave the bytes in place.
-      (We pre-truncate so the writer sees an empty target.)
-    * Codec set → ``buf`` is a fresh in-memory BytesIO; on exit the
-      bytes are compressed and committed to ``bio``.
+    On exit:
+
+    * No codec → bulk-write the scratch payload into ``bio``.
+    * Codec set → compress scratch first, then bulk-write the
+      compressed bytes into ``bio``.
     """
 
     def __init__(self, parent: "BytesIO") -> None:
@@ -1107,22 +1116,31 @@ class _FormatBufferContext:
         self._codec = parent._codec()
 
     def __enter__(self) -> "BytesIO":
-        if self._codec is None:
-            # Direct write path: pre-truncate so the leaf writer
-            # opens onto an empty target.
-            self._parent.seek(0)
-            self._parent.truncate(0)
-            self._buf = self._parent
-            return self._parent
-        # Codec path: scratch buffer; we compress on exit.
+        # Always go through a scratch buffer — direct writes to the
+        # durable holder turn each writer.write() into a pwrite
+        # syscall (one per Parquet row group, one per Arrow batch,
+        # one per CSV row, …). The bulk commit on exit collapses
+        # that into one syscall regardless of how many chunks the
+        # encoder emitted.
         self._buf = BytesIO()
         return self._buf
 
     def __exit__(self, exc_type, exc, tb) -> None:
         if self._buf is None or exc_type is not None:
             return
+
         if self._codec is None:
+            payload = self._buf.to_bytes()
+            try:
+                self._buf.close()
+            except Exception:
+                pass
+            self._parent.seek(0)
+            self._parent.truncate(0)
+            if payload:
+                self._parent.write(payload)
             return
+
         # Compress scratch into the durable buffer.
         compressed = self._codec.compress(self._buf)
         try:
@@ -1138,4 +1156,5 @@ class _FormatBufferContext:
             pass
         self._parent.seek(0)
         self._parent.truncate(0)
-        self._parent.write(payload)
+        if payload:
+            self._parent.write(payload)

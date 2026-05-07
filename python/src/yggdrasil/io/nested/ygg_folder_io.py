@@ -362,6 +362,21 @@ class YGGFolderIO(FolderIO):
         if not groups:
             return
 
+        # Partition columns are constant within a partition (encoded
+        # in the directory name and dropped from the per-leaf payload),
+        # so they can't drive a per-leaf merge. Strip them out of the
+        # match-by set before delegating; if nothing useful remains,
+        # null out the field so the leaf write skips the merge path.
+        leaf_options = options
+        if options.match_by_names:
+            sub_match = [
+                m for m in options.match_by_names if m not in partition_names
+            ]
+            if sub_match != list(options.match_by_names):
+                leaf_options = dataclasses.replace(
+                    options, match_by_names=sub_match or None,
+                )
+
         for key_tuple, sub_batches in groups.items():
             kv = dict(zip(partition_names, key_tuple))
             target = self._ensure_partition_dir(parts, kv)
@@ -369,8 +384,8 @@ class YGGFolderIO(FolderIO):
             sub._write_arrow_batches(
                 sub_batches,
                 # The leaf write picks the right Tabular leaf via
-                # ``child_extension`` (defaults to parquet).
-                options,
+                # ``child_extension`` (defaults to arrow IPC).
+                leaf_options,
             )
             self.invalidate_listing(target)
 
@@ -433,7 +448,7 @@ class YGGFolderIO(FolderIO):
         self,
         byte_size: "int | None" = None,
         *,
-        target_extension: str = "parquet",
+        target_extension: str = "arrow",
         tolerance: float = FolderIO.OPTIMIZE_TOLERANCE,
         **kwargs: Any,
     ) -> int:

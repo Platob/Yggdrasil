@@ -89,11 +89,13 @@ class TestHiveLayout:
     def test_partition_columns_dropped_from_payload(
         self, tmp_path, table,
     ) -> None:
-        """Partition column lives in the dir name, not the parquet."""
+        """Partition column lives in the dir name, not the part file."""
         y = YGGFolderIO(
             path=str(tmp_path), schema=_single_partition_schema(),
         )
-        y.write_arrow_table(table)
+        y.write_arrow_table(
+            table, options=FolderOptions(child_extension="parquet"),
+        )
         # Inspect the parquet footer schema directly — pyarrow's
         # ``read_table`` would synthesize the partition column back
         # from the directory name (Hive-style auto-inference), so

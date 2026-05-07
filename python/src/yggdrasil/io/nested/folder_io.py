@@ -24,8 +24,12 @@ Writes
 :meth:`make_child` mints ``part-{epoch_ms}-{seed}.{ext}`` under
 :attr:`path` and returns a closed :class:`Tabular` leaf bound to
 the new path. The default writer extension is configurable on
-:class:`FolderOptions` via ``child_extension``; a call site that
-wants parquet writes supplies ``FolderOptions(child_extension="parquet")``.
+:class:`FolderOptions` via ``child_extension``; the default is
+``"arrow"`` (Arrow IPC) — single-pass column-oriented encoding,
+no row-group footer to rewrite on append, and a write-side that
+matches the in-memory batch shape almost 1:1, so it's the
+cheapest format to land a stream of small batches into. Callers
+that want parquet supply ``FolderOptions(child_extension="parquet")``.
 
 What "private" means
 --------------------
@@ -63,9 +67,12 @@ class FolderOptions(CastOptions):
     """:class:`CastOptions` extended with folder-write knobs."""
 
     #: Extension stamped onto minted child filenames. Resolves into
-    #: a tabular leaf via :class:`MediaType` — ``"parquet"`` /
-    #: ``"csv"`` / ``"arrow"`` / ``"ndjson"`` are the obvious choices.
-    child_extension: str = "parquet"
+    #: a tabular leaf via :class:`MediaType` — ``"arrow"`` (Arrow
+    #: IPC) is the default since it matches the in-memory batch
+    #: shape and writes column-by-column without a footer to
+    #: rewrite. ``"parquet"`` / ``"csv"`` / ``"ndjson"`` are the
+    #: other obvious choices.
+    child_extension: str = "arrow"
 
 
 class FolderIO(Tabular[FolderOptions]):
@@ -218,7 +225,11 @@ class FolderIO(Tabular[FolderOptions]):
 
         suffix = f".{opts.child_extension}" if opts.child_extension else ""
         epoch_ms = int(time.time() * 1000)
-        seed = os.urandom(8).hex()
+        # 2 bytes (4 hex chars, ~65k-value space) is enough to break
+        # ties between writes that land in the same millisecond — the
+        # epoch_ms prefix already carries the temporal uniqueness, no
+        # need for a 16-character seed on every part filename.
+        seed = os.urandom(2).hex()
         name = f"part-{epoch_ms}-{seed}{suffix}"
 
         child_path = self.path / name
@@ -251,19 +262,35 @@ class FolderIO(Tabular[FolderOptions]):
     ) -> None:
         """Mint one child per rechunked group and drain into it.
 
-        OVERWRITE wipes the folder of tabular siblings before
-        writing. APPEND just adds a new part file. IGNORE is a
-        no-op when the folder is non-empty.
+        Mode dispatch:
 
-        ``options.byte_size`` (and ``options.row_size``) control the
-        on-disk part shape: when either is set, the incoming batch
-        stream is run through
-        :func:`rechunk_arrow_batches_by_byte_size` and **one part file
-        is minted per rechunked batch** — turning a stream of small
-        record batches into a small number of ~``byte_size``-sized
-        files instead of either one big file or one tiny file per
-        batch. With both unset the legacy "one part file per write
-        call" shape is preserved.
+        - **OVERWRITE / TRUNCATE** — drop every tabular sibling first,
+          then write incoming as fresh part(s).
+        - **AUTO / APPEND** (the default for tabular folders) — just
+          add a new part file; existing parts are untouched.
+        - **UPSERT / MERGE** — only meaningful with
+          ``options.match_by_names``; see below.
+        - **IGNORE** — no-op when the folder already holds tabular
+          parts; otherwise behaves as APPEND.
+        - **ERROR_IF_EXISTS** — raises when the folder is non-empty.
+
+        Merge semantics (``options.match_by_names`` set):
+
+        - **APPEND** — drop incoming rows whose key tuple already
+          exists on disk; write only the survivors into a new part.
+          Existing parts are not rewritten.
+        - **UPSERT / MERGE** — collect incoming key tuples, walk
+          existing parts and keep only rows whose key is *not* in
+          that set, then write the survivors plus all incoming as
+          fresh part(s). Old parts are dropped at the end so a
+          failed write leaves them in place.
+
+        ``options.byte_size`` / ``options.row_size`` route the actual
+        bytes-to-disk write through
+        :func:`rechunk_arrow_batches_by_byte_size`, so the
+        bin-packing applies regardless of which mode picked the
+        rows. Setting both knobs unset keeps the legacy
+        "one part file per write call" shape.
         """
         action = self._resolve_action(options.mode)
 
@@ -276,7 +303,33 @@ class FolderIO(Tabular[FolderOptions]):
             )
         if action is Mode.OVERWRITE:
             self._clear_tabular_children()
+            self._write_parts(batches, options)
+            return
 
+        match_by = list(getattr(options, "match_by_names", None) or ())
+        is_upsert = options.mode in (Mode.UPSERT, Mode.MERGE)
+
+        if match_by and self._has_tabular_children():
+            if is_upsert:
+                self._merge_upsert(batches, match_by, options)
+            else:
+                self._merge_append(batches, match_by, options)
+            return
+
+        # Plain APPEND (or empty folder): mint a fresh part and drain.
+        self._write_parts(batches, options)
+
+    def _write_parts(
+        self,
+        batches: Iterable[pa.RecordBatch],
+        options: FolderOptions,
+    ) -> None:
+        """Mint one or more part files and drain *batches* into them.
+
+        Honors ``options.byte_size`` / ``options.row_size`` for
+        per-part rechunking; with neither set, drains the whole
+        stream into a single part.
+        """
         byte_size = getattr(options, "byte_size", None) or 0
         row_size = getattr(options, "row_size", None) or 0
 
@@ -307,6 +360,161 @@ class FolderIO(Tabular[FolderOptions]):
             _chain_first(first, batch_iter),
             options=child.options_class()(),
         )
+
+    # ==================================================================
+    # Merge helpers — used when options.match_by_names is set
+    # ==================================================================
+
+    def _merge_append(
+        self,
+        batches: Iterable[pa.RecordBatch],
+        match_by: "list[str]",
+        options: FolderOptions,
+    ) -> None:
+        """APPEND with key-aware dedup.
+
+        Rows whose ``match_by`` tuple already exists on disk are
+        dropped from the incoming stream; survivors land in a new
+        part file. Existing parts are not rewritten.
+        """
+        existing = self._collect_existing_keys(match_by)
+        survivors = self._filter_batches_drop_keys(batches, match_by, existing)
+        self._write_parts(survivors, options)
+
+    def _merge_upsert(
+        self,
+        batches: Iterable[pa.RecordBatch],
+        match_by: "list[str]",
+        options: FolderOptions,
+    ) -> None:
+        """UPSERT / MERGE with key-aware rewrite.
+
+        Drains incoming into memory once to capture the set of
+        incoming keys, walks existing parts, drops every row whose
+        key matches an incoming key, then writes the (filtered
+        existing + incoming) stream into fresh parts and unlinks the
+        old ones.
+        """
+        incoming = list(batches)
+        if not incoming:
+            return
+
+        incoming_keys = self._collect_keys_from_batches(incoming, match_by)
+        survivors_existing = self._iter_existing_filtered(match_by, incoming_keys)
+
+        # Snapshot old part files before we touch anything new — we
+        # only delete them after the rewrite has succeeded.
+        old_files = self._tabular_files()
+
+        merged_iter = _chain_iter(survivors_existing, iter(incoming))
+        self._write_parts(merged_iter, options)
+
+        for f in old_files:
+            try:
+                f.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def _tabular_files(self) -> "list[Path]":
+        if not self.path.exists():
+            return []
+        out: "list[Path]" = []
+        for entry in self.path.iterdir():
+            if entry.name.startswith("."):
+                continue
+            try:
+                if entry.is_dir():
+                    continue
+            except Exception:
+                continue
+            out.append(entry)
+        return out
+
+    def _collect_existing_keys(
+        self, match_by: "list[str]",
+    ) -> "set[tuple]":
+        keys: "set[tuple]" = set()
+        for child in self.iter_children():
+            if isinstance(child, FolderIO):
+                continue
+            try:
+                for batch in child._read_arrow_batches(child.options_class()()):
+                    self._extend_keys_from_batch(keys, batch, match_by)
+            except Exception:
+                continue
+        return keys
+
+    @staticmethod
+    def _collect_keys_from_batches(
+        batches: "Iterable[pa.RecordBatch]", match_by: "list[str]",
+    ) -> "set[tuple]":
+        keys: "set[tuple]" = set()
+        for batch in batches:
+            FolderIO._extend_keys_from_batch(keys, batch, match_by)
+        return keys
+
+    @staticmethod
+    def _extend_keys_from_batch(
+        keys: "set[tuple]",
+        batch: pa.RecordBatch,
+        match_by: "list[str]",
+    ) -> None:
+        if not all(c in batch.schema.names for c in match_by):
+            return
+        cols = [batch.column(c).to_pylist() for c in match_by]
+        for row in zip(*cols):
+            keys.add(row)
+
+    def _filter_batches_drop_keys(
+        self,
+        batches: "Iterable[pa.RecordBatch]",
+        match_by: "list[str]",
+        drop_keys: "set[tuple]",
+    ) -> "Iterator[pa.RecordBatch]":
+        if not drop_keys:
+            yield from batches
+            return
+        for batch in batches:
+            yield from self._batch_filter_drop(batch, match_by, drop_keys)
+
+    @staticmethod
+    def _batch_filter_drop(
+        batch: pa.RecordBatch,
+        match_by: "list[str]",
+        drop_keys: "set[tuple]",
+    ) -> "Iterator[pa.RecordBatch]":
+        if batch.num_rows == 0:
+            return
+        if not all(c in batch.schema.names for c in match_by):
+            yield batch
+            return
+        cols = [batch.column(c).to_pylist() for c in match_by]
+        mask = [row not in drop_keys for row in zip(*cols)]
+        if all(mask):
+            yield batch
+            return
+        if not any(mask):
+            return
+        keep_idx = [i for i, m in enumerate(mask) if m]
+        table = pa.Table.from_batches([batch]).take(keep_idx).combine_chunks()
+        for inner in table.to_batches():
+            if inner.num_rows > 0:
+                yield inner
+
+    def _iter_existing_filtered(
+        self,
+        match_by: "list[str]",
+        drop_keys: "set[tuple]",
+    ) -> "Iterator[pa.RecordBatch]":
+        """Walk existing leaves, yielding only rows whose key isn't in *drop_keys*."""
+        for child in self.iter_children():
+            if isinstance(child, FolderIO):
+                continue
+            try:
+                stream = child._read_arrow_batches(child.options_class()())
+            except Exception:
+                continue
+            yield from self._filter_batches_drop_keys(stream, match_by, drop_keys)
 
     def _has_tabular_children(self) -> bool:
         for _ in self.iter_children():
@@ -345,7 +553,7 @@ class FolderIO(Tabular[FolderOptions]):
         self,
         byte_size: "int | None" = None,
         *,
-        target_extension: str = "parquet",
+        target_extension: str = "arrow",
         tolerance: float = OPTIMIZE_TOLERANCE,
         **kwargs: Any,
     ) -> int:
@@ -523,9 +731,15 @@ class FolderIO(Tabular[FolderOptions]):
         return compacted
 
     def _resolve_action(self, mode: Mode) -> Mode:
-        if mode is Mode.AUTO or mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:
+        # AUTO maps to APPEND for tabular folders: each write adds a
+        # fresh part file alongside the existing ones, the way the
+        # response cache and any "drop another batch into the
+        # partition" workflow expects. OVERWRITE / TRUNCATE stay
+        # destructive and are reserved for the explicit
+        # "rewrite the whole folder" call.
+        if mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:
             return Mode.OVERWRITE
-        if mode is Mode.APPEND:
+        if mode is Mode.AUTO or mode is Mode.APPEND:
             return Mode.APPEND
         if mode is Mode.IGNORE:
             return Mode.IGNORE
@@ -533,7 +747,7 @@ class FolderIO(Tabular[FolderOptions]):
             return Mode.ERROR_IF_EXISTS
         if mode is Mode.UPSERT or mode is Mode.MERGE:
             return Mode.APPEND
-        return Mode.OVERWRITE
+        return Mode.APPEND
 
 
 def _chain_first(
@@ -542,3 +756,8 @@ def _chain_first(
 ) -> "Iterator[pa.RecordBatch]":
     yield first
     yield from rest
+
+
+def _chain_iter(*iters: "Iterable[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
+    for it in iters:
+        yield from it

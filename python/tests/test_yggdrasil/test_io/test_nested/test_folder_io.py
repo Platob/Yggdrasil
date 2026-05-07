@@ -88,7 +88,8 @@ class TestRoundTrip:
     def test_write_then_read(self, tmp_path, table) -> None:
         folder = FolderIO(path=str(tmp_path))
         folder.write_arrow_table(table)
-        assert any(p.name.endswith(".parquet") for p in tmp_path.iterdir())
+        # Default child extension is Arrow IPC.
+        assert any(p.name.endswith(".arrow") for p in tmp_path.iterdir())
         assert folder.read_arrow_table().equals(table)
 
     def test_csv_default_extension(self, tmp_path, table) -> None:
@@ -274,6 +275,57 @@ class TestWriteRechunking:
         )
         parts = [p for p in tmp_path.iterdir() if p.name.startswith("part-")]
         assert len(parts) == 1
+
+
+class TestMergeByName:
+
+    @staticmethod
+    def _ids(folder) -> list[int]:
+        return sorted(folder.read_arrow_table().column("id").to_pylist())
+
+    def test_append_drops_already_present_keys(self, tmp_path) -> None:
+        folder = FolderIO(path=str(tmp_path))
+        folder.write_arrow_table(
+            pa.table({"id": [1, 2, 3], "v": ["a", "b", "c"]}),
+        )
+        # Same id=2 collides with existing; id=4 is fresh.
+        folder.write_arrow_table(
+            pa.table({"id": [2, 4], "v": ["B", "D"]}),
+            options=FolderOptions(
+                mode=Mode.APPEND, match_by_names=["id"],
+            ),
+        )
+        # Existing rows untouched (id=2 keeps "b"); only id=4 added.
+        out = folder.read_arrow_table().sort_by("id")
+        assert out.column("id").to_pylist() == [1, 2, 3, 4]
+        assert out.column("v").to_pylist() == ["a", "b", "c", "D"]
+
+    def test_upsert_rewrites_matching_keys(self, tmp_path) -> None:
+        folder = FolderIO(path=str(tmp_path))
+        folder.write_arrow_table(
+            pa.table({"id": [1, 2, 3], "v": ["a", "b", "c"]}),
+        )
+        folder.write_arrow_table(
+            pa.table({"id": [2, 4], "v": ["B", "D"]}),
+            options=FolderOptions(
+                mode=Mode.UPSERT, match_by_names=["id"],
+            ),
+        )
+        out = folder.read_arrow_table().sort_by("id")
+        # id=2 was overwritten ("b" → "B"); id=4 added; rest untouched.
+        assert out.column("id").to_pylist() == [1, 2, 3, 4]
+        assert out.column("v").to_pylist() == ["a", "B", "c", "D"]
+
+    def test_append_without_match_by_keeps_duplicates(self, tmp_path) -> None:
+        folder = FolderIO(path=str(tmp_path))
+        folder.write_arrow_table(pa.table({"id": [1, 2]}))
+        folder.write_arrow_table(
+            pa.table({"id": [2, 3]}),
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+        out = folder.read_arrow_table().sort_by("id")
+        # No match_by → no dedup; id=2 appears twice.
+        assert out.column("id").to_pylist() == [1, 2, 2, 3]
 
 
 class TestTabularBaseOptimize:
