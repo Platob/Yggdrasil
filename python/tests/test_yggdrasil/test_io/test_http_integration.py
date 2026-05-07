@@ -416,6 +416,64 @@ class TestCacheConfigCoercion:
         assert cfg.mode is Mode.APPEND
 
 
+class TestLocalCacheFolderPerHost:
+    """Default cache path splits per ``Session.base_url`` host + path.
+
+    Different APIs sharing the same machine should not collide on
+    disk. When a session has no ``base_url`` the cache falls back to
+    the ``default`` bucket so behavior is well-defined.
+    """
+
+    def test_default_when_no_base_url(self) -> None:
+        s = StubSession()
+        cfg = CacheConfig()
+        path = cfg.local_cache_folder(session=s)
+        assert path.name == "default"
+        assert path.parent.name == "response"
+
+    def test_host_only_base_url(self) -> None:
+        from yggdrasil.io.url import URL
+
+        s = StubSession(base_url=URL.from_("https://api.example.com/"))
+        path = CacheConfig().local_cache_folder(session=s)
+        assert path.name == "api.example.com"
+        assert path.parent.name == "response"
+
+    def test_host_plus_path_base_url(self) -> None:
+        from yggdrasil.io.url import URL
+
+        s = StubSession(base_url=URL.from_("https://api.example.com/v1/markets/"))
+        path = CacheConfig().local_cache_folder(session=s)
+        # Trailing / on base_url must not produce an empty leaf.
+        assert path.parts[-3:] == ("response", "api.example.com", "v1/markets") or (
+            path.parts[-4:] == ("response", "api.example.com", "v1", "markets")
+        )
+
+    def test_explicit_tabular_overrides_default(self, tmp_path) -> None:
+        from yggdrasil.io.url import URL
+        s = StubSession(base_url=URL.from_("https://api.example.com/"))
+        cache = CacheConfig(
+            tabular=YGGFolderIO(
+                path=LocalPath(str(tmp_path)),
+                schema=RESPONSE_SCHEMA,
+            ),
+            mode=Mode.APPEND,
+        )
+        # Explicit FolderIO wins — host derivation is for the
+        # auto-built default only.
+        assert str(cache.local_cache_folder(session=s)) == str(tmp_path)
+
+    def test_distinct_hosts_get_distinct_folders(self) -> None:
+        from yggdrasil.io.url import URL
+        a = StubSession(base_url=URL.from_("https://a.example.com/"))
+        b = StubSession(base_url=URL.from_("https://b.example.com/"))
+        pa = CacheConfig().local_cache_folder(session=a)
+        pb = CacheConfig().local_cache_folder(session=b)
+        assert pa != pb
+        assert pa.name == "a.example.com"
+        assert pb.name == "b.example.com"
+
+
 # ---------------------------------------------------------------------------
 # Send config merging
 # ---------------------------------------------------------------------------
@@ -436,10 +494,12 @@ class TestSendConfig:
 
     def test_local_cache_folder_default(self) -> None:
         cfg = CacheConfig()
-        # Default falls back to ``~/.yggdrasil/cache/response`` —
-        # we just assert the path resolves to *something* without
-        # touching the real ~/ tree.
-        assert cfg.local_cache_folder().name == "response"
+        # No session → no host context → falls back to the
+        # ``response/default`` bucket so it doesn't collide with
+        # any real per-host cache root.
+        path = cfg.local_cache_folder()
+        assert path.name == "default"
+        assert path.parent.name == "response"
 
 
 # ---------------------------------------------------------------------------

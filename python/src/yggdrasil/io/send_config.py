@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from yggdrasil.io.tabular import Tabular
     from yggdrasil.io.nested.folder_io import FolderIO
     from yggdrasil.io.response import Response
+    from yggdrasil.io.session import Session
 
 
 __all__ = ["CacheConfig", "SendConfig", "SendManyConfig"]
@@ -513,20 +514,32 @@ class CacheConfig(_ConfigBase):
             value = str(value)
         return f"'{value.replace(chr(39), chr(39) * 2)}'"
 
-    def local_cache_folder(self) -> Path:
+    def local_cache_folder(self, session: "Session | None" = None) -> Path:
         """Filesystem root for the local cache.
 
         Returns ``self.tabular.path`` when ``tabular`` is a
-        :class:`FolderIO`, otherwise the default
-        ``~/.yggdrasil/cache/response``. Used as the per-config key
-        for grouping cache hits in
+        :class:`FolderIO`. Otherwise builds the default path under
+        ``~/.yggdrasil/cache/response``, suffixed with the session's
+        ``base_url`` host + path when one is available so different
+        APIs sharing the same machine don't collide on disk:
+
+        * ``base_url=https://api.example.com/v1/`` → ``…/response/api.example.com/v1``
+        * ``base_url`` unset → ``…/response/default``
+
+        Used as the per-config key for grouping cache hits in
         :class:`yggdrasil.io.response_batch.ResponseBatch`.
         """
         if self.is_local_tabular:
             return Path(str(self.tabular.path))
-        return Path.home() / ".yggdrasil" / "cache" / "response"
+        root = Path.home() / ".yggdrasil" / "cache" / "response"
+        base_url = getattr(session, "base_url", None) if session is not None else None
+        host = getattr(base_url, "host", None) if base_url is not None else None
+        if not host:
+            return root / "default"
+        path = (getattr(base_url, "path", "") or "").strip("/")
+        return root / host / path if path else root / host
 
-    def local_cache(self) -> "FolderIO":
+    def local_cache(self, session: "Session | None" = None) -> "FolderIO":
         """Return the local-cache folder.
 
         Returns ``self.tabular`` when it's already a FolderIO,
@@ -538,11 +551,14 @@ class CacheConfig(_ConfigBase):
         Hive layout automatically; the ``.ygg/`` sidecar lets the
         cache attach stats / checkpoints without a separate
         wrapper.
+
+        Pass *session* so the lazy default path picks up the
+        session's ``base_url`` host/path (see :meth:`local_cache_folder`).
         """
         if self.is_local_tabular:
             return self.tabular  # type: ignore[return-value]
 
-        folder = _folderio_for_local_cache(self.local_cache_folder())
+        folder = _folderio_for_local_cache(self.local_cache_folder(session=session))
         # Cache the lazy-built FolderIO so repeated send_many()
         # calls don't keep re-instantiating it. Frozen-dataclass
         # safe via ``object.__setattr__``.
