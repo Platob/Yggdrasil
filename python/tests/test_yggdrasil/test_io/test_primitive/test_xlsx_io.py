@@ -1,39 +1,18 @@
 """Behavior tests for :class:`yggdrasil.io.primitive.xlsx_io.XlsxIO`."""
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import datetime
 
 import pyarrow as pa
 import pytest
 
 openpyxl = pytest.importorskip("openpyxl")  # noqa: E402  (after importorskip)
+pytest.importorskip("fastexcel")  # noqa: E402
 
 from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.io.path.local_path import LocalPath
 from yggdrasil.io.primitive.xlsx_io import XlsxIO, XlsxOptions, XlsxSheetIO
 from yggdrasil.io.tabular import Tabular
-
-
-def _xlsx_with_string_cells(
-    rows: "list[list[object]]",
-    *,
-    sheet: str = "Sheet1",
-) -> XlsxIO:
-    """Build an XlsxIO whose cells carry the literal values in *rows*.
-
-    openpyxl normally types cells based on Python value at write
-    time, so writing strings keeps them as strings on read-back —
-    which is exactly what we want for inference tests.
-    """
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = sheet
-    for row in rows:
-        ws.append(row)
-    import io as _io
-    buf = _io.BytesIO()
-    wb.save(buf)
-    return XlsxIO(buf.getvalue())
 
 
 @pytest.fixture
@@ -56,7 +35,8 @@ class TestRoundTrip:
         io = XlsxIO()
         io.write_arrow_table(table)
         loaded = io.read_arrow_table()
-        # XLSX numbers come back as native ints / strings as native strings.
+        # XLSX numbers come back as native floats / strings as native strings
+        # (calamine reads numeric cells as f64).
         assert loaded.column("id").to_pylist() == [1, 2, 3]
         assert loaded.column("name").to_pylist() == ["a", "b", "c"]
 
@@ -205,192 +185,9 @@ class TestEntries:
         assert io.child("S").read_arrow_table().column("id").to_pylist() == [1, 2]
 
 
-# ---------------------------------------------------------------------------
-# Read-side type inference
-# ---------------------------------------------------------------------------
-
-
-class TestNullMarkers:
-    """Configurable null tokens replace string-typed cells with ``None``."""
-
-    def test_default_markers(self) -> None:
-        io = _xlsx_with_string_cells([
-            ["id", "name"],
-            ["1", "Alice"],
-            ["2", "NULL"],
-            ["3", "N/A"],
-            ["4", ""],
-            ["5", "-"],
-        ])
-        loaded = io.read_arrow_table()
-        assert loaded.column("name").to_pylist() == [
-            "Alice", None, None, None, None,
-        ]
-
-    def test_custom_marker(self) -> None:
-        io = _xlsx_with_string_cells([
-            ["id", "name"],
-            ["1", "MISSING"],
-            ["2", "Bob"],
-        ])
-        loaded = io.read_arrow_table(
-            options=XlsxOptions(null_values=("MISSING",)),
-        )
-        assert loaded.column("name").to_pylist() == [None, "Bob"]
-
-    def test_disable_inference_keeps_literal(self) -> None:
-        io = _xlsx_with_string_cells([
-            ["id", "name"],
-            ["1", "NULL"],
-        ])
-        loaded = io.read_arrow_table(options=XlsxOptions(infer_types=False))
-        assert loaded.column("name").to_pylist() == ["NULL"]
-
-
-class TestNumericInference:
-    """Numeric strings — including thousands separators and signs."""
-
-    def test_thousands_separated_floats(self) -> None:
-        io = _xlsx_with_string_cells([
-            ["price"],
-            ["1,234.56"],
-            ["123,892.0"],
-            ["999.99"],
-        ])
-        loaded = io.read_arrow_table()
-        assert loaded.column("price").to_pylist() == [1234.56, 123892.0, 999.99]
-        # All-numeric → arrow promotes to float64.
-        assert pa.types.is_floating(loaded.schema.field("price").type)
-
-    def test_thousands_separated_ints(self) -> None:
-        io = _xlsx_with_string_cells([
-            ["qty"],
-            ["1,000"],
-            ["12,345"],
-        ])
-        loaded = io.read_arrow_table()
-        assert loaded.column("qty").to_pylist() == [1000, 12345]
-        assert pa.types.is_integer(loaded.schema.field("qty").type)
-
-    def test_negative_numbers(self) -> None:
-        io = _xlsx_with_string_cells([
-            ["pnl"],
-            ["-1,234.50"],
-            ["+50.0"],
-        ])
-        loaded = io.read_arrow_table()
-        assert loaded.column("pnl").to_pylist() == [-1234.50, 50.0]
-
-    def test_european_decimal(self) -> None:
-        # ``"1.234,56"`` → ``1234.56`` when caller flips the
-        # separators around to en-EU style.
-        io = _xlsx_with_string_cells([
-            ["price"],
-            ["1.234,56"],
-            ["7,5"],
-        ])
-        loaded = io.read_arrow_table(
-            options=XlsxOptions(
-                thousands_separator=".",
-                decimal_separator=",",
-            ),
-        )
-        assert loaded.column("price").to_pylist() == [1234.56, 7.5]
-
-    def test_scientific_notation(self) -> None:
-        io = _xlsx_with_string_cells([
-            ["x"],
-            ["1e5"],
-            ["2.5E-3"],
-        ])
-        loaded = io.read_arrow_table()
-        assert loaded.column("x").to_pylist() == [1e5, 2.5e-3]
-
-    def test_string_columns_bypass_numeric(self) -> None:
-        # ID column has leading-zero strings; we don't want them
-        # turned into ``"0042" → 42``.
-        io = _xlsx_with_string_cells([
-            ["id", "qty"],
-            ["0042", "100"],
-            ["0007", "200"],
-        ])
-        loaded = io.read_arrow_table(
-            options=XlsxOptions(string_columns=("id",)),
-        )
-        assert loaded.column("id").to_pylist() == ["0042", "0007"]
-        assert loaded.column("qty").to_pylist() == [100, 200]
-
-    def test_mixed_numeric_and_null(self) -> None:
-        io = _xlsx_with_string_cells([
-            ["x"],
-            ["1,000"],
-            ["N/A"],
-            ["2,000"],
-        ])
-        loaded = io.read_arrow_table()
-        assert loaded.column("x").to_pylist() == [1000, None, 2000]
-
-
-class TestDateInference:
-    """ISO and a handful of common locale-flavored date / datetime strings."""
-
-    def test_iso_date(self) -> None:
-        io = _xlsx_with_string_cells([
-            ["d"],
-            ["2026-01-02"],
-            ["2026-12-31"],
-        ])
-        loaded = io.read_arrow_table()
-        assert loaded.column("d").to_pylist() == [
-            date(2026, 1, 2), date(2026, 12, 31),
-        ]
-
-    def test_iso_datetime(self) -> None:
-        io = _xlsx_with_string_cells([
-            ["t"],
-            ["2026-01-02T03:04:05"],
-            ["2026-01-02 03:04:05"],
-        ])
-        loaded = io.read_arrow_table()
-        assert loaded.column("t").to_pylist() == [
-            datetime(2026, 1, 2, 3, 4, 5),
-            datetime(2026, 1, 2, 3, 4, 5),
-        ]
-
-    def test_eu_format(self) -> None:
-        io = _xlsx_with_string_cells([
-            ["d"],
-            ["02/01/2026"],
-            ["31/12/2026"],
-        ])
-        loaded = io.read_arrow_table()
-        assert loaded.column("d").to_pylist() == [
-            date(2026, 1, 2), date(2026, 12, 31),
-        ]
-
-    def test_custom_format(self) -> None:
-        io = _xlsx_with_string_cells([
-            ["d"],
-            ["Jan 02, 2026"],
-        ])
-        loaded = io.read_arrow_table(
-            options=XlsxOptions(date_formats=("%b %d, %Y",)),
-        )
-        assert loaded.column("d").to_pylist() == [date(2026, 1, 2)]
-
-    def test_unparseable_string_stays_string(self) -> None:
-        io = _xlsx_with_string_cells([
-            ["note"],
-            ["just a label"],
-            ["another"],
-        ])
-        loaded = io.read_arrow_table()
-        assert loaded.column("note").to_pylist() == ["just a label", "another"]
-
-
-class TestNativeTypesPassThrough:
-    """openpyxl-native cell types (real numbers, real dates) flow
-    through inference unchanged."""
+class TestNativeTypes:
+    """Native cell types (real numbers, real dates) round-trip through
+    fastexcel's calamine parser."""
 
     def test_native_int_and_float(self) -> None:
         io = XlsxIO()
