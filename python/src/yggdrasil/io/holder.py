@@ -857,6 +857,25 @@ class Holder(Disposable):
                     remaining -= written
         return total
 
+    def write_stream(self, src: IO[bytes], *, pos: int = 0) -> int:
+        """Drain a binary file-like ``src`` into this holder at ``pos``.
+
+        Mirrors :meth:`write_local_path` for IO-shaped sources
+        (:class:`io.BytesIO`, ``open(..., "rb")``, urllib3 responses,
+        :class:`yggdrasil.io.tabular.parquet_io.ParquetIO`). Reads the
+        full payload once and commits it via a single
+        :meth:`write_bytes`, so backends whose ``_write_mv`` implements
+        an atomic upload at ``pos == 0`` (Files API ``upload``, S3
+        ``PutObject``) push a single request rather than chunked
+        read-modify-rewrites.
+        """
+        if pos < 0:
+            raise ValueError("write_stream pos must be >= 0")
+        payload = src.read()
+        if not payload:
+            return 0
+        return self.write_bytes(payload, pos=pos)
+
     # ------------------------------------------------------------------
     # Hashing — full-payload digests over the durable bytes.
     # ------------------------------------------------------------------

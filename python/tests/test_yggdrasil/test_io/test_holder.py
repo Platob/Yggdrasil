@@ -249,3 +249,59 @@ class TestWriteLocalPath:
         m = Memory()
         with pytest.raises(ValueError, match="pos must be >= 0"):
             m.write_local_path(os.fspath(p), pos=-1)
+
+
+class TestWriteStream:
+
+    def test_drains_bytesio_into_memory(self) -> None:
+        import io as _stdio
+        m = Memory()
+        n = m.write_stream(_stdio.BytesIO(b"stream-bytes"))
+        assert n == 12
+        assert m.read_bytes() == b"stream-bytes"
+
+    def test_drains_into_local_path(self, tmp_path) -> None:
+        import io as _stdio
+        target = LocalPath(tmp_path / "out.bin")
+        n = target.write_stream(_stdio.BytesIO(b"hello"))
+        assert n == 5
+        assert (tmp_path / "out.bin").read_bytes() == b"hello"
+
+    def test_atomic_single_write_for_remote_like_backend(self) -> None:
+        """Stream-write must hit ``_write_mv`` exactly once.
+
+        Remote backends (VolumePath / S3Path) implement ``_write_mv``
+        as an atomic upload + read-modify-rewrite for non-zero pos —
+        anything that chunks a stream into per-chunk
+        ``write_mv(...,pos=cursor)`` calls would devolve into N
+        downloads + N uploads. This test pins the contract.
+        """
+        import io as _stdio
+        m = Memory()
+        calls: list[int] = []
+        original = type(m)._write_mv
+
+        def _spy(self, data, pos):
+            calls.append(len(data))
+            return original(self, data, pos)
+
+        type(m)._write_mv = _spy
+        try:
+            m.write_stream(_stdio.BytesIO(b"x" * (4 * 1024 * 1024)))
+        finally:
+            type(m)._write_mv = original
+
+        assert calls == [4 * 1024 * 1024]
+
+    def test_empty_stream_is_noop(self) -> None:
+        import io as _stdio
+        m = Memory(b"keep")
+        n = m.write_stream(_stdio.BytesIO(b""))
+        assert n == 0
+        assert m.read_bytes() == b"keep"
+
+    def test_negative_pos_raises(self) -> None:
+        import io as _stdio
+        m = Memory()
+        with pytest.raises(ValueError, match="pos must be >= 0"):
+            m.write_stream(_stdio.BytesIO(b"x"), pos=-1)
