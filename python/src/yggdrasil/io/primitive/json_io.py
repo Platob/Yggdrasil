@@ -91,28 +91,38 @@ class JsonIO(BytesIO):
         if self.size == 0:
             return
 
-        # Sniff the buffer shape: NDJSON-ish (line-terminated) goes
-        # through pyarrow's streaming reader; everything else through
-        # the standard library JSON parser.
-        head = self.pread(1, 0)
-        is_array = head.lstrip().startswith(b"[")
-        if is_array or not self.pread(1, max(0, self.size - 1)).endswith(b"\n"):
-            data = self.to_bytes()
-            parsed = json.loads(data.decode(options.encoding))
-            if isinstance(parsed, list):
-                if parsed:
-                    yield pa.RecordBatch.from_pylist(parsed)
+        # Route through ``_format_view`` so a codec on the buffer's
+        # MediaType (e.g. ``application/json + application/gzip`` from
+        # an HTTP response with ``Content-Encoding: gzip``) is peeled
+        # before we sniff and parse — pyarrow's JSON reader and
+        # ``json.loads`` both want the decompressed payload.
+        with self._format_view() as v:
+            size = v.size
+            if size == 0:
                 return
-            if isinstance(parsed, dict):
-                yield pa.RecordBatch.from_pylist([parsed])
-                return
-            raise ValueError(
-                f"{type(self).__name__}: expected a JSON array of objects "
-                f"or a single object; got {type(parsed).__name__}."
-            )
 
-        # Newline-terminated → NDJSON-shaped. Stream via pyarrow.
-        with self.view(pos=0) as v:
+            # Sniff the buffer shape: NDJSON-ish (line-terminated) goes
+            # through pyarrow's streaming reader; everything else through
+            # the standard library JSON parser.
+            head = v.pread(1, 0)
+            is_array = head.lstrip().startswith(b"[")
+            if is_array or not v.pread(1, max(0, size - 1)).endswith(b"\n"):
+                data = v.to_bytes()
+                parsed = json.loads(data.decode(options.encoding))
+                if isinstance(parsed, list):
+                    if parsed:
+                        yield pa.RecordBatch.from_pylist(parsed)
+                    return
+                if isinstance(parsed, dict):
+                    yield pa.RecordBatch.from_pylist([parsed])
+                    return
+                raise ValueError(
+                    f"{type(self).__name__}: expected a JSON array of objects "
+                    f"or a single object; got {type(parsed).__name__}."
+                )
+
+            # Newline-terminated → NDJSON-shaped. Stream via pyarrow.
+            v.seek(0)
             reader = pa_json.open_json(
                 v,
                 read_options=options.to_read_options(),
@@ -183,9 +193,10 @@ class JsonIO(BytesIO):
             sort_keys=options.sort_keys,
             default=str,
         )
-        self.seek(0)
-        self.truncate(0)
-        self.write(text.encode(options.encoding))
+        # Bulk-commit through ``_commit_format_payload`` so a codec
+        # on the holder's MediaType (e.g. ``.json.gz``) is applied
+        # to the encoded payload before it lands in the buffer.
+        self._commit_format_payload(text.encode(options.encoding))
 
     def _resolve_action(self, mode: Mode) -> Mode:
         if mode is Mode.AUTO or mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:
