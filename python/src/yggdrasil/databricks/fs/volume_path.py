@@ -22,7 +22,9 @@ filesystem contract.
 from __future__ import annotations
 
 import io as _stdio
-from typing import ClassVar, Iterator
+import os
+import time
+from typing import Any, ClassVar, Iterator, Optional
 
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
@@ -78,6 +80,60 @@ class VolumePath(DatabricksPath):
     @property
     def size(self) -> int:
         return int(self._stat().size)
+
+    # ==================================================================
+    # SQL staging factory
+    # ==================================================================
+
+    @classmethod
+    def staging_path(
+        cls,
+        *,
+        catalog_name: str,
+        schema_name: str,
+        resource_name: Optional[str] = None,
+        temporary: bool = True,
+        client: Any = None,
+        workspace: Any = None,
+        max_lifetime: Optional[float] = None,
+    ) -> "VolumePath":
+        """Mint a fresh Parquet staging file under
+        ``/Volumes/<cat>/<sch>/tmp/.sql/<cat>/<sch>/<resource>/part-...``.
+
+        The leaf filename is unique per call (epoch-ms + 8 bytes of
+        randomness). Pass ``temporary=False`` to keep the file past
+        process exit; otherwise it is unlinked when the holder is
+        released.
+
+        Either ``workspace`` (a workspace client) or ``client`` (a
+        :class:`DatabricksClient`-shaped aggregator with a
+        ``workspace_client()`` method) may be supplied; if both are
+        omitted the path lazy-resolves through the active aggregator
+        on first use.
+
+        ``max_lifetime`` is accepted for backwards compatibility —
+        external sweepers honour it via the ``part-{epoch_ms}-...``
+        filename convention.
+        """
+        del max_lifetime  # filename carries the timestamp; unused here
+
+        cat = _staging_clean_part(catalog_name)
+        sch = _staging_clean_part(schema_name)
+        tbl = _staging_clean_part(resource_name or "default")
+
+        if workspace is None and client is not None:
+            workspace = client.workspace_client()
+
+        epoch_ms = int(time.time() * 1000)
+        seed = os.urandom(8).hex()
+        leaf = f"part-{epoch_ms}-{seed}.parquet"
+        path = f"/{cat}/{sch}/tmp/.sql/{cat}/{sch}/{tbl}/{leaf}"
+
+        return cls(
+            url=URL(scheme=cls.scheme, path=path),
+            workspace=workspace,
+            temporary=temporary,
+        )
 
     # ==================================================================
     # Listing
@@ -233,3 +289,8 @@ def _looks_like_not_found(exc: BaseException) -> bool:
 def _looks_like_already_exists(exc: BaseException) -> bool:
     name = type(exc).__name__
     return name in ("AlreadyExists", "ResourceAlreadyExists", "FileExistsError")
+
+
+def _staging_clean_part(value: str) -> str:
+    """Strip backticks/whitespace and forbid ``/`` in path segments."""
+    return str(value).strip().strip("`").replace("/", "_")

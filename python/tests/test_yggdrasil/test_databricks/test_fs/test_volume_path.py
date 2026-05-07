@@ -138,6 +138,59 @@ class TestMutators:
         )
 
 
+class TestStagingPath:
+
+    def test_default_layout(self, workspace) -> None:
+        p = VolumePath.staging_path(
+            catalog_name="cat",
+            schema_name="sch",
+            resource_name="tbl",
+            workspace=workspace,
+        )
+        full = p.full_path()
+        assert full.startswith("/Volumes/cat/sch/tmp/.sql/cat/sch/tbl/part-")
+        assert full.endswith(".parquet")
+        assert p.temporary is True
+        assert p.workspace is workspace
+
+    def test_temporary_false(self, workspace) -> None:
+        p = VolumePath.staging_path(
+            catalog_name="cat",
+            schema_name="sch",
+            temporary=False,
+            workspace=workspace,
+        )
+        assert p.temporary is False
+        assert "/cat/sch/tmp/.sql/cat/sch/default/" in p.full_path()
+
+    def test_unique_per_call(self, workspace) -> None:
+        a = VolumePath.staging_path(
+            catalog_name="c", schema_name="s", workspace=workspace,
+        )
+        b = VolumePath.staging_path(
+            catalog_name="c", schema_name="s", workspace=workspace,
+        )
+        assert a.full_path() != b.full_path()
+
+    def test_client_aggregator(self, workspace) -> None:
+        client = MagicMock()
+        client.workspace_client.return_value = workspace
+        p = VolumePath.staging_path(
+            catalog_name="c", schema_name="s", client=client,
+        )
+        assert p.workspace is workspace
+
+    def test_segments_are_sanitized(self, workspace) -> None:
+        p = VolumePath.staging_path(
+            catalog_name="`cat`",
+            schema_name="  sch  ",
+            resource_name="a/b",
+            workspace=workspace,
+        )
+        full = p.full_path()
+        assert "/cat/sch/tmp/.sql/cat/sch/a_b/" in full
+
+
 class TestRetryPolicy:
 
     @pytest.fixture
