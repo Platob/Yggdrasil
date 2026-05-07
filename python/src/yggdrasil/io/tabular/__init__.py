@@ -15,5 +15,6 @@ already have in memory and don't want to round-trip through IPC bytes.
 from .base import O, Tabular
 from yggdrasil.io.tabular.arrow import ArrowTabular
 from yggdrasil.io.tabular.spark import SparkTabular
+from yggdrasil.io.tabular.lazy import LazyTabular
 
-__all__ = ["O", "Tabular", "ArrowTabular", "SparkTabular"]
+__all__ = ["O", "Tabular", "ArrowTabular", "SparkTabular", "LazyTabular"]
