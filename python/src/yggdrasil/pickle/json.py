@@ -13,7 +13,15 @@ from types import MappingProxyType
 from typing import Any, IO, Mapping, overload
 from uuid import UUID
 
+import orjson
+
 __all__ = ["load", "loads", "dump", "dumps"]
+
+# orjson is a hard dependency: 3-10x faster than stdlib for both
+# encode and decode, emits UTF-8 bytes natively, and serializes
+# datetime / date / time / UUID / dataclass without a default hook.
+# We fall back to stdlib only when the caller picks an option orjson
+# can't express (ensure_ascii=True, indent != 2, custom separators).
 
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-"
@@ -38,7 +46,7 @@ def _decode_bytes_best_effort(data: bytes, *, errors: str = "strict") -> str:
 def _default_safe(obj: Any) -> Any:
     """Conservative leaf-only conversions.
 
-    Used with stdlib json.dumps(default=...). This does not pre-normalize nested
+    Used with json.dumps(default=...). This does not pre-normalize nested
     structures or mapping keys.
     """
     if is_dataclass(obj):
@@ -65,6 +73,68 @@ def _default_safe(obj: Any) -> Any:
         except UnicodeDecodeError:
             raise TypeError(f"Cannot encode bytes as JSON: {obj!r}")
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def _default_safe_orjson(obj: Any) -> Any:
+    """Same as :func:`_default_safe` but skips types orjson handles natively.
+
+    orjson already serializes :class:`datetime`, :class:`date`,
+    :class:`time`, :class:`UUID`, and dataclasses without a default
+    hook — so the hook only fires for the rest of the type set.
+    """
+    if isinstance(obj, timedelta):
+        return obj.total_seconds()
+    if isinstance(obj, Enum):
+        return obj.value
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, Mapping | MappingProxyType):
+        return dict(obj)
+    if isinstance(obj, (set, frozenset)):
+        return list(obj)
+    if _is_namedtuple_instance(obj):
+        return obj._asdict()
+    if isinstance(obj, bytes):
+        try:
+            return obj.decode("utf-8")
+        except UnicodeDecodeError:
+            raise TypeError(f"Cannot encode bytes as JSON: {obj!r}")
+    if isinstance(obj, Decimal):
+        return str(obj)
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def _orjson_can_handle(
+    *,
+    ensure_ascii: bool,
+    indent: int | None,
+    separators: tuple[str, str] | None,
+) -> bool:
+    """Whether orjson can satisfy the requested formatting options.
+
+    orjson always emits UTF-8 bytes (no ``ensure_ascii``), supports
+    only 2-space indent (``OPT_INDENT_2``), and writes compact
+    separators (``,`` + ``:``) — or with indent the JSON-canonical
+    ``,`` + ``: ``. Anything else falls back to stdlib json.
+    """
+    if ensure_ascii:
+        return False
+    if indent not in (None, 2):
+        return False
+    if separators is not None:
+        if indent == 2:
+            return separators == (",", ": ")
+        return separators == (",", ":")
+    return True
+
+
+def _orjson_options(*, sort_keys: bool, indent: int | None) -> int:
+    opt = 0
+    if sort_keys:
+        opt |= orjson.OPT_SORT_KEYS
+    if indent == 2:
+        opt |= orjson.OPT_INDENT_2
+    return opt
 
 
 def _normalize_key_broad(key: Any, *, errors: str) -> str:
@@ -250,10 +320,19 @@ def loads(
         Parse JSON, then recursively try to restore richer Python types from
         string values such as datetime/date/time/UUID.
     """
-    if isinstance(s, (bytes, bytearray, memoryview)):
-        s = bytes(s).decode(encoding, errors=errors)
-
-    obj = _json.loads(s)
+    if isinstance(s, str):
+        try:
+            obj = orjson.loads(s)
+        except orjson.JSONDecodeError:
+            obj = _json.loads(s)
+    else:
+        try:
+            obj = orjson.loads(bytes(s) if isinstance(s, memoryview) else s)
+        except orjson.JSONDecodeError:
+            # orjson rejects malformed UTF-8 outright; fall back to
+            # stdlib so caller-controlled ``errors=`` still applies.
+            text = bytes(s).decode(encoding, errors=errors)
+            obj = _json.loads(text)
 
     if safe:
         return obj
@@ -315,6 +394,30 @@ def dumps(
     if separators is None and indent is None:
         separators = (",", ":")
 
+    use_orjson = _orjson_can_handle(
+        ensure_ascii=ensure_ascii, indent=indent, separators=separators,
+    )
+
+    if use_orjson:
+        opt = _orjson_options(sort_keys=sort_keys, indent=indent)
+        if safe:
+            data = orjson.dumps(obj, default=_default_safe_orjson, option=opt)
+        else:
+            data = orjson.dumps(
+                _normalize_obj_broad(obj, errors=errors), option=opt,
+            )
+        # orjson always emits UTF-8 bytes; re-encode when the caller
+        # asked for a different encoding (or wanted a str).
+        target_enc = (encoding or "utf-8").lower()
+        if not to_bytes:
+            return data.decode("utf-8", errors=errors)
+        if target_enc in ("utf-8", "utf8"):
+            return data
+        return data.decode("utf-8", errors=errors).encode(
+            encoding, errors=errors,
+        )
+
+    # Stdlib fallback for option combinations orjson can't express.
     if safe:
         text = _json.dumps(
             obj,

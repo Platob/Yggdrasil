@@ -24,7 +24,7 @@ pip install ygg
 ## Install with the right extras
 
 ```bash
-pip install ygg                   # core: pyarrow + polars + yggrs
+pip install ygg                   # core: pyarrow + polars + xxhash + orjson + yggrs
 pip install "ygg[data]"           # pandas + numpy + sqlglot
 pip install "ygg[bigdata]"        # pyspark + delta-spark
 pip install "ygg[delta]"          # deltalake

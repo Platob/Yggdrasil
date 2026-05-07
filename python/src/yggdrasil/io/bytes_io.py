@@ -953,25 +953,93 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
     # ==================================================================
 
     def json_load(self, *, media_type: Any = None, orient: Any = None) -> Any:
-        """Parse the buffer as JSON and return the Python object.
+        """Parse the buffer, auto-detecting media type and compression.
 
-        ``media_type`` and ``orient`` are accepted for compatibility
-        with the response layer — when ``orient`` is set the buffer
-        is treated as a pandas-shaped JSON document. The default
-        path is the stdlib ``json.loads`` over the decoded bytes.
+        Resolution order for the media type:
+
+        1. Explicit *media_type* kwarg.
+        2. Cached :attr:`media_type` on the holder.
+        3. Magic-byte sniff via :meth:`MediaType.from_io` — when this
+           fires and the holder had no cached media type, the sniffed
+           value is stamped onto the holder so future callers (codec
+           handling, tabular dispatch) see it without re-sniffing.
+
+        If the resolved type carries a codec the buffer is
+        decompressed first and the inner mime is stamped onto the
+        decompressed buffer. JSON / NDJSON / opaque-bytes payloads go
+        through ``json.loads`` (or ``pandas.read_json`` when *orient*
+        is set); every other registered format dispatches to its
+        :class:`Tabular` leaf and returns ``read_pylist()``.
         """
         import json as _json
-        text = self.to_bytes().decode("utf-8", errors="replace")
-        if not text.strip():
-            return None
-        if orient is not None:
+        from yggdrasil.data.enums.media_type import MediaType
+        from yggdrasil.data.enums.mime_type import MimeTypes
+
+        mt = (
+            MediaType.from_(media_type, default=None)
+            if media_type is not None else None
+        )
+        if mt is None:
+            mt = self.media_type
+            cached = mt is not None
+        else:
+            cached = True
+
+        if mt is None:
+            mt = MediaType.from_io(self, default=None)
+
+        # Auto-enrich the holder when we sniffed a fresh type so
+        # codec handling and tabular dispatch downstream see it
+        # without re-running the magic-byte probe.
+        if mt is not None and not cached:
             try:
-                import pandas as pd
-                return pd.read_json(text, orient=orient)
+                self._holder.stat().media_type = mt
             except Exception:
-                # Fall through to plain json on any pandas snag.
                 pass
-        return _json.loads(text)
+
+        if mt is not None and mt.codec is not None:
+            buf = mt.codec.decompress(self)
+            inner_mt = MediaType(mime_type=mt.mime_type, codec=None)
+            try:
+                buf._holder.stat().media_type = inner_mt
+            except Exception:
+                pass
+            mt = inner_mt
+        else:
+            buf = self
+
+        mime = mt.mime_type if mt is not None else None
+        is_jsonlike = (
+            mime is None
+            or mime is MimeTypes.JSON
+            or mime.is_any_bytes
+        )
+
+        if is_jsonlike:
+            text = buf.to_bytes().decode("utf-8", errors="replace")
+            if not text.strip():
+                return None
+            if orient is not None:
+                try:
+                    from yggdrasil.pandas.lib import pandas as pd
+                    return pd.read_json(text, orient=orient)
+                except Exception:
+                    pass
+            return _json.loads(text)
+
+        import yggdrasil.io.primitive  # noqa: F401  -- register leaves
+        from yggdrasil.io.tabular.base import Tabular
+        leaf_cls = Tabular.class_for_media_type(mt, default=None)
+        if leaf_cls is None:
+            text = buf.to_bytes().decode("utf-8", errors="replace")
+            if not text.strip():
+                return None
+            return _json.loads(text)
+        leaf = (
+            buf if isinstance(buf, leaf_cls)
+            else leaf_cls(holder=buf._holder, owns_holder=False)
+        )
+        return leaf.read_pylist()
 
     def decompress(self, *, codec: Any = None, copy: bool = True) -> "BytesIO":
         """Return a new :class:`BytesIO` over the decompressed payload.
