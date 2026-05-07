@@ -367,6 +367,20 @@ class Tabular(ABC, Generic[O]):
         del options, kwargs
         return LazyTabular(self, plan=coerced)
 
+    def lazy(self) -> "Tabular":
+        """Return a :class:`LazyTabular` view with a ``SELECT *`` plan.
+
+        Entry point for the builder API — chain :meth:`select`,
+        :meth:`filter`, :meth:`group_by`, :meth:`apply` off the result
+        without each call paying the wrapping cost. The seeded plan is
+        a single :class:`Select` over ``"*"`` so the lazy frame still
+        round-trips every column when collected with no further ops.
+        """
+        from yggdrasil.io.tabular.execution.plan import ExecutionPlan, Select
+        from yggdrasil.io.tabular.lazy import LazyTabular
+
+        return LazyTabular(self, plan=ExecutionPlan((Select(("*",)),)))
+
     # ==================================================================
     # Abstract batch hooks — the two things every implementer overrides
     # ==================================================================
