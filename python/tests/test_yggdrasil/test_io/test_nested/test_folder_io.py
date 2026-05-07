@@ -236,6 +236,46 @@ class TestOptimize:
         assert folder.optimize(byte_size=4096) == 0
 
 
+class TestWriteRechunking:
+
+    def test_byte_size_splits_stream_into_multiple_parts(self, tmp_path) -> None:
+        # Wide-ish batches so the byte_size threshold is reachable
+        # without spilling tens of MiB through the test.
+        rng = list(range(2048))
+        batches = [
+            pa.record_batch({
+                "id": rng,
+                "blob": ["x" * 64] * len(rng),
+            })
+            for _ in range(8)
+        ]
+        single_nbytes = batches[0].nbytes
+        # Pick byte_size so the rechunker emits at least 3 parts.
+        target = max(1, single_nbytes * 2)
+
+        folder = FolderIO(path=str(tmp_path))
+        folder.write_arrow_batches(
+            batches,
+            options=FolderOptions(byte_size=target, mode=Mode.APPEND),
+        )
+
+        parts = [p for p in tmp_path.iterdir() if p.name.startswith("part-")]
+        assert len(parts) >= 3
+        # All rows survive the split.
+        loaded = folder.read_arrow_table()
+        assert loaded.num_rows == sum(b.num_rows for b in batches)
+
+    def test_no_byte_size_keeps_single_part(self, tmp_path, table) -> None:
+        folder = FolderIO(path=str(tmp_path))
+        # Many small batches with no sizing knob → one part file.
+        folder.write_arrow_batches(
+            [table.to_batches()[0]] * 5,
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+        parts = [p for p in tmp_path.iterdir() if p.name.startswith("part-")]
+        assert len(parts) == 1
+
+
 class TestTabularBaseOptimize:
 
     def test_single_file_leaf_is_noop(self, tmp_path, table) -> None:

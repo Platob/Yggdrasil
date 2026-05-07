@@ -249,11 +249,21 @@ class FolderIO(Tabular[FolderOptions]):
         batches: Iterable[pa.RecordBatch],
         options: FolderOptions,
     ) -> None:
-        """Mint one child and drain *batches* into it.
+        """Mint one child per rechunked group and drain into it.
 
         OVERWRITE wipes the folder of tabular siblings before
         writing. APPEND just adds a new part file. IGNORE is a
         no-op when the folder is non-empty.
+
+        ``options.byte_size`` (and ``options.row_size``) control the
+        on-disk part shape: when either is set, the incoming batch
+        stream is run through
+        :func:`rechunk_arrow_batches_by_byte_size` and **one part file
+        is minted per rechunked batch** — turning a stream of small
+        record batches into a small number of ~``byte_size``-sized
+        files instead of either one big file or one tiny file per
+        batch. With both unset the legacy "one part file per write
+        call" shape is preserved.
         """
         action = self._resolve_action(options.mode)
 
@@ -266,6 +276,26 @@ class FolderIO(Tabular[FolderOptions]):
             )
         if action is Mode.OVERWRITE:
             self._clear_tabular_children()
+
+        byte_size = getattr(options, "byte_size", None) or 0
+        row_size = getattr(options, "row_size", None) or 0
+
+        if byte_size > 0 or row_size > 0:
+            from yggdrasil.arrow.cast import rechunk_arrow_batches_by_byte_size
+
+            rechunked = rechunk_arrow_batches_by_byte_size(
+                batches,
+                byte_size=byte_size or None,
+                row_size=row_size or None,
+            )
+            for batch in rechunked:
+                if batch.num_rows == 0:
+                    continue
+                child = self.make_child(options=options)
+                child.write_arrow_batches(
+                    [batch], options=child.options_class()(),
+                )
+            return
 
         batch_iter = iter(batches)
         first = next(batch_iter, None)
