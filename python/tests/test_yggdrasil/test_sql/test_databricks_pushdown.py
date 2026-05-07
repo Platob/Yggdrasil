@@ -69,19 +69,31 @@ class _FakeClient:
         return _FakeSqlEngine(self)
 
 
+_CACHED_FAKE_TABLE: type | None = None
+
+
 def _make_fake_table_class():
     """Build a class whose module + qualname match the real one.
 
-    The duck-type identity check inspects ``cls.__module__`` and
-    ``cls.__name__``; we install a fresh ``Table`` class at
-    ``yggdrasil.databricks.sql.table.Table`` so the check accepts it.
+    :func:`is_databricks_table` accepts any class whose
+    ``__module__`` is ``yggdrasil.databricks.sql.table`` and whose
+    ``__name__`` is ``Table`` — it never reaches into
+    ``sys.modules[...]`` to compare identity. So we forge a class with
+    those two attributes and don't touch the real module's ``Table``
+    binding (which would shadow the SDK class for any later test on
+    the same session).
 
-    We import each parent through the real Python machinery first so
-    we don't shadow the on-disk ``yggdrasil/databricks`` package
-    (which other tests rely on for ``yggdrasil.databricks.fs``). Only
-    if the parent genuinely isn't importable do we install a
-    namespace-package stub.
+    Parent modules are imported through the real Python machinery
+    first so we don't accidentally shadow the on-disk
+    ``yggdrasil/databricks`` package (other tests rely on
+    ``yggdrasil.databricks.fs`` resolving normally). Only when a
+    parent genuinely isn't importable do we install a namespace-
+    package stub.
     """
+    global _CACHED_FAKE_TABLE
+    if _CACHED_FAKE_TABLE is not None:
+        return _CACHED_FAKE_TABLE
+
     import importlib
 
     mod_path = "yggdrasil.databricks.sql.table"
@@ -100,10 +112,6 @@ def _make_fake_table_class():
         mod = types.ModuleType(sub)
         mod.__path__ = []  # type: ignore[attr-defined]
         sys.modules[sub] = mod
-
-    module = sys.modules[mod_path]
-    if hasattr(module, "Table"):
-        return module.Table
 
     class Table(ArrowTabular):
         """Fake :class:`yggdrasil.databricks.sql.table.Table` stand-in."""
@@ -129,7 +137,7 @@ def _make_fake_table_class():
             return f"{self.catalog_name}.{self.schema_name}.{self.table_name}"
 
     Table.__module__ = mod_path
-    module.Table = Table
+    _CACHED_FAKE_TABLE = Table
     return Table
 
 
