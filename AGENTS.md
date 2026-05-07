@@ -825,6 +825,13 @@ Tell the user how to get back on track.
 ### Prefer local consistency
 Follow patterns already used in the subsystem unless there is a clear upgrade path.
 
+### Prefer `yggdrasil.pickle.json` (orjson) over the stdlib `json`
+`orjson` is a hard dependency of `ygg`, and `yggdrasil.pickle.json` wraps it with the type coverage we already use across the codebase (datetime, date, time, UUID, Path, Enum, dataclasses, namedtuples, sets, Mapping subclasses, bytes, Decimal, …).
+
+When you need to serialize or parse JSON in feature code, reach for `yggdrasil.pickle.json` (`from yggdrasil.pickle import json` or `from yggdrasil.pickle.json import dumps, loads, dump, load`) — not the stdlib `json` module. Same `loads / dumps / load / dump` surface, faster, and it already handles the rich types we round-trip through Arrow / Parquet / API responses. Drop down to `import orjson` directly only inside hot inner loops where you don't need any of the type coercions.
+
+Stdlib `import json` is acceptable for: parsing third-party config files where stdlib semantics are part of the contract, debug `print` formatting, and anything inside `yggdrasil.pickle.json` itself (which uses stdlib only as a fallback for option combinations orjson can't express).
+
 ### Prefer extending existing abstractions
 If the new behavior belongs naturally in an existing abstraction, put it there.
 Do not create isolated side APIs without a strong reason.
