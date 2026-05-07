@@ -2506,7 +2506,6 @@ class Table(DatabricksResource, Tabular[CastOptions]):
                 buffer.seek(0)
                 output_data = ArrowTabular(buffer.read_arrow_table())
 
-        buffer.clear()
         prune_predicates = _build_prune_predicates(prune_values, target_alias="T") if prune_values else []
         if where is not None:
             prune_predicates.append(_wrap_user_predicate(where, target_alias="T"))
