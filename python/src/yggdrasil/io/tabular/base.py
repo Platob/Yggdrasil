@@ -424,23 +424,15 @@ class Tabular(ABC, Generic[O]):
 
     def read_table(
         self, options: "O | None" = None, **kwargs: Any,
-    ) -> Any:
-        """Read into the best in-memory representation for the environment.
+    ) -> pa.Table:
+        """Read into a pyarrow :class:`pa.Table`.
 
-        Picks pyspark when running on Databricks
-        (:meth:`yggdrasil.environ.PyEnv.in_databricks`) so the result
-        rides the cluster's distributed runtime; falls back to a
-        pyarrow :class:`pa.Table` everywhere else. Pandas is
-        intentionally not in the rotation — callers that need it
-        should ask for :meth:`read_pandas_frame` explicitly.
+        Pyarrow is the only hard runtime dependency, so it's the
+        portable default. Callers that want a different engine can
+        ask for :meth:`read_polars_frame` / :meth:`read_spark_frame`
+        explicitly.
         """
-        return self._read_table(self.check_options(options, overrides=locals()))
-
-    def _read_table(self, options: O) -> Any:
-        from yggdrasil.environ import PyEnv
-        if PyEnv.in_databricks():
-            return self._read_spark_frame(options)
-        return self._read_arrow_table(options)
+        return self._read_arrow_table(self.check_options(options, overrides=locals()))
 
     def write_table(
         self,
@@ -450,9 +442,8 @@ class Tabular(ABC, Generic[O]):
     ) -> None:
         """Dispatch *obj* to the best ``_write_*`` hook based on its runtime type.
 
-        Recognizes another :class:`Tabular` (piped through the best
-        engine for the current environment — pyspark on Databricks,
-        pyarrow batches otherwise), ``pa.Table`` / ``pa.RecordBatch`` /
+        Recognizes another :class:`Tabular` (drained as a pyarrow
+        record-batch stream), ``pa.Table`` / ``pa.RecordBatch`` /
         ``pa.RecordBatchReader``, polars ``DataFrame`` / ``LazyFrame``,
         pandas ``DataFrame``, pyspark ``DataFrame``, ``list[dict]``,
         ``dict[str, list]``, and iterables of any of the above.
@@ -466,10 +457,6 @@ class Tabular(ABC, Generic[O]):
         if obj is None:
             return
         if isinstance(obj, Tabular):
-            from yggdrasil.environ import PyEnv
-            if PyEnv.in_databricks():
-                self._write_spark_frame(obj.read_spark_frame(), options)
-                return
             self._write_arrow_batches(obj.read_arrow_batches(), options)
             return
         if isinstance(obj, pa.Table):
