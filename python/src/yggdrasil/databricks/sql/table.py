@@ -135,7 +135,12 @@ def _resolve_table_operation(
         op = TableOperation.READ
     return op
 
-__all__ = ["Table", "YGG_PROPERTY_PREFIX", "YGG_SCHEMA_FIELD_PREFIX"]
+__all__ = [
+    "Table",
+    "YGG_PROPERTY_PREFIX",
+    "YGG_SCHEMA_FIELD_PREFIX",
+    "YGG_SCHEMA_FIELD_SUFFIX",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -871,7 +876,18 @@ def _column_type_name_from_ddl(ddl: str) -> ColumnTypeName:
 # ---------------------------------------------------------------------------
 
 YGG_PROPERTY_PREFIX = "ygg."
-YGG_SCHEMA_FIELD_PREFIX = "ygg.schema."
+# Per-field schema dump key shape: ``ygg.schema[<field_name>]``. Brackets
+# wrap the field name so identifiers containing ``.`` don't collide with
+# the property-namespace separator (``ygg.schema.user.first_name`` would
+# otherwise be ambiguous between a field named ``user.first_name`` and a
+# nested ``user`` field with a ``first_name`` child).
+YGG_SCHEMA_FIELD_PREFIX = "ygg.schema["
+YGG_SCHEMA_FIELD_SUFFIX = "]"
+
+
+def _ygg_schema_key(name: str) -> str:
+    """Build the ``ygg.schema[<name>]`` TBLPROPERTIES key for a field."""
+    return f"{YGG_SCHEMA_FIELD_PREFIX}{name}{YGG_SCHEMA_FIELD_SUFFIX}"
 
 
 def _resolve_format_mime(
@@ -915,11 +931,12 @@ def _build_ygg_properties(
     surfaces stay observable in the same way.
 
     Top-level data fields are dumped one-per-property under
-    ``ygg.schema.<field_name>`` (each value is a JSON document for that
+    ``ygg.schema[<field_name>]`` (each value is a JSON document for that
     field) rather than as a single ``ygg.schema_json`` blob. Per-field
     keys keep individual TBLPROPERTIES values comfortably under
     Databricks' per-property size budget on wide schemas, and let
-    readers fetch only the columns they care about.
+    readers fetch only the columns they care about. The bracket wrap
+    keeps names containing ``.`` unambiguous.
 
     The fingerprint is a short blake2b digest of the *full* schema
     JSON so a reader can detect schema drift without re-assembling the
@@ -985,7 +1002,7 @@ def _build_ygg_properties(
         if not name or name in seen:
             continue
         seen.add(name)
-        props[f"{YGG_SCHEMA_FIELD_PREFIX}{name}"] = f.to_json(to_bytes=False)
+        props[_ygg_schema_key(name)] = f.to_json(to_bytes=False)
 
     return props
 

@@ -18,8 +18,10 @@ from yggdrasil.data.schema import Schema, field
 from yggdrasil.databricks.sql.table import (
     YGG_PROPERTY_PREFIX,
     YGG_SCHEMA_FIELD_PREFIX,
+    YGG_SCHEMA_FIELD_SUFFIX,
     _build_ygg_properties,
     _resolve_format_mime,
+    _ygg_schema_key,
 )
 from yggdrasil.version import __version__ as ygg_version
 
@@ -89,16 +91,20 @@ class TestYggProperties(unittest.TestCase):
         self.assertEqual(
             schema_keys,
             sorted([
-                "ygg.schema.id",
-                "ygg.schema.region",
-                "ygg.schema.bucket",
-                "ygg.schema.amount",
+                "ygg.schema[id]",
+                "ygg.schema[region]",
+                "ygg.schema[bucket]",
+                "ygg.schema[amount]",
             ]),
         )
-        # Each per-field value is a self-contained JSON document.
+        # Each per-field value is a self-contained JSON document; its
+        # ``name`` matches the bracketed field name in the key.
         for key in schema_keys:
             payload = json.loads(props[key])
-            self.assertEqual(payload["name"], key.removeprefix(YGG_SCHEMA_FIELD_PREFIX))
+            unwrapped = key.removeprefix(YGG_SCHEMA_FIELD_PREFIX).removesuffix(
+                YGG_SCHEMA_FIELD_SUFFIX
+            )
+            self.assertEqual(payload["name"], unwrapped)
             self.assertIn("dtype", payload)
             self.assertIn("nullable", payload)
 
@@ -107,9 +113,17 @@ class TestYggProperties(unittest.TestCase):
         self.assertEqual(props["ygg.storage_location"], "s3://bucket/path")
 
     def test_schema_field_prefix_is_namespaced(self) -> None:
-        """Per-field keys live under the documented prefix only."""
+        """Per-field keys live under the documented bracketed shape."""
         self.assertTrue(YGG_SCHEMA_FIELD_PREFIX.startswith(YGG_PROPERTY_PREFIX))
-        self.assertEqual(YGG_SCHEMA_FIELD_PREFIX, "ygg.schema.")
+        self.assertEqual(YGG_SCHEMA_FIELD_PREFIX, "ygg.schema[")
+        self.assertEqual(YGG_SCHEMA_FIELD_SUFFIX, "]")
+        self.assertEqual(_ygg_schema_key("amount"), "ygg.schema[amount]")
+        # Bracket wrap survives field names containing the property
+        # separator without colliding with adjacent keys.
+        self.assertEqual(
+            _ygg_schema_key("user.first_name"),
+            "ygg.schema[user.first_name]",
+        )
 
     def test_fingerprint_stable_across_engines(self) -> None:
         """SQL and API paths agree on the schema fingerprint for the same shape."""
@@ -148,8 +162,8 @@ class TestYggProperties(unittest.TestCase):
             ),
         ])
         props = _build_ygg_properties(s, engine="sql")
-        self.assertIn("ygg.schema.id", props)
-        self.assertNotIn("ygg.schema.fk_orders_customer", props)
+        self.assertIn("ygg.schema[id]", props)
+        self.assertNotIn("ygg.schema[fk_orders_customer]", props)
         self.assertEqual(props["ygg.field_count"], "1")
 
     def test_optional_keys_only_when_relevant(self) -> None:
