@@ -871,13 +871,14 @@ def _polars_eager_to_arrow(
     projection = _resolve_projection(options)
 
     if isinstance(df, pl.Series):
-        options = _bind_source(options, df)
-        if options.target_field is not None and options.need_cast():
-            df = options.cast_polars(df)
-            options = options.copy(target_field=None)
+        # Wrap into a single-column frame *before* binding so the
+        # source schema is struct-shaped — matches the pandas Series
+        # path and lets struct-shaped targets (a Schema or struct
+        # Field) cast in-engine without tripping the leaf↔struct
+        # mismatch in the polars cast dispatcher.
         df = df.to_frame()
 
-    elif isinstance(df, pl.DataFrame):
+    if isinstance(df, pl.DataFrame):
         options = _bind_source(options, df)
         if projection:
             keep = [c for c in projection if c in df.columns]
