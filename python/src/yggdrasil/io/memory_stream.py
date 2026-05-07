@@ -417,7 +417,10 @@ class MemoryStream(Holder):
         self._slide_window()
         stats = self.stat()
         stats.size = self.size
-        stats.mtime = time.time()
+        # ``mtime`` left alone — see :meth:`Memory.truncate` for the
+        # rationale: per-call clock reads in the write hot path are
+        # expensive enough to dominate tight loops. Use
+        # :meth:`touch_mtime` post-loop when freshness matters.
         return self.size
 
     def _clear(self) -> None:
@@ -433,7 +436,6 @@ class MemoryStream(Holder):
         # of the buffer doesn't unsignal EOF on a drained source.
         stats = self.stat()
         stats.size = 0
-        stats.mtime = time.time()
 
     # ------------------------------------------------------------------
     # Convenience overrides

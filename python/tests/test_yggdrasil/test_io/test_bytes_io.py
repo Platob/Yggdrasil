@@ -203,6 +203,21 @@ class TestWritePaths:
         assert b.pread(2, 4) == b"ef"
         assert b.tell() == 2
 
+    def test_write_update_stat_false_skips_per_write_dirty(self) -> None:
+        b = BytesIO(b"seed")
+        holder = b._holder
+        # Pre-acquired memory holder seeded above is clean to start.
+        holder.clear_dirty()
+        # In-place overwrites (no resize) with update_stat=False
+        # should not flip the holder's dirty bit on each call.
+        for offset in range(4):
+            b.pwrite(b"X", offset, update_stat=False)
+        assert b.to_bytes() == b"XXXX"
+        assert holder.is_dirty() is False
+        # Default kwarg restores the per-write dirty mark.
+        b.pwrite(b"Y", 0)
+        assert holder.is_dirty() is True
+
 
 class TestStructuredPrimitives:
 

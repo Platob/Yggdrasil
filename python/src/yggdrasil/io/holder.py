@@ -427,7 +427,9 @@ class Holder(Disposable):
         the view before any other I/O against the holder.
         """
 
-    def write_mv(self, data: memoryview, pos: int) -> int:
+    def write_mv(
+        self, data: memoryview, pos: int, *, update_stat: bool = True,
+    ) -> int:
         """Splice ``data`` at ``pos``, pre-growing the holder as needed.
 
         Pipeline:
@@ -445,6 +447,14 @@ class Holder(Disposable):
         gives subclasses with a cheap grow path (S3 multipart capacity
         hint, ``ftruncate`` on local fd) a chance to skip the work
         ``_write_mv`` would have done byte-by-byte.
+
+        ``update_stat=False`` skips the post-write
+        :meth:`_touch_stat` and :meth:`mark_dirty` calls. Use it for
+        bulk loops that want a single stat refresh at the end (one
+        :func:`time.time` call instead of one per write); the caller
+        is then responsible for calling :meth:`_touch_stat` (or
+        re-statting via the path-side ``_stat`` for filesystem
+        backends) once the loop finishes.
         """
         size = self.size
         pos = _resolve_pos(pos, size)
@@ -467,7 +477,7 @@ class Holder(Disposable):
 
         written = self._write_mv(data, pos)
 
-        if written > 0:
+        if written > 0 and update_stat:
             self._touch_stat(size=max(end, self.size))
             self.mark_dirty()
         return written
@@ -590,15 +600,35 @@ class Holder(Disposable):
         Mutates the existing instance in place if one is materialized;
         otherwise lazily creates one via :meth:`stat`. Centralized so
         :meth:`write_mv` (and any subclass with a cheaper write path
-        that bypasses :meth:`write_mv`) can keep size/mtime fresh
-        without duplicating the bookkeeping.
+        that bypasses :meth:`write_mv`) can keep ``size`` /
+        ``media_type`` fresh without duplicating the bookkeeping.
+
+        ``mtime`` is **only** updated when the caller passes it
+        explicitly. The previous behavior — bumping ``mtime`` to
+        ``time.time()`` on every write — added a syscall-equivalent
+        clock read to every byte-level call and dominated tight
+        write loops; callers that actually want the freshness should
+        either pass ``mtime=`` or call :meth:`touch_mtime` once at
+        the end of the operation.
         """
         s = self.stat()
         if size is not None:
             s.size = size
-        s.mtime = mtime if mtime is not None else time.time()
+        if mtime is not None:
+            s.mtime = mtime
         if media_type is not None:
             s.media_type = media_type
+
+    def touch_mtime(self, when: float | None = None) -> None:
+        """Stamp the cached :class:`IOStats` with the current time.
+
+        Bulk-write helper — call once after a write loop instead of
+        letting every :meth:`write_mv` call sample the clock. ``when``
+        accepts an explicit timestamp (e.g. an upstream "Last-Modified"
+        header); ``None`` defaults to :func:`time.time`.
+        """
+        s = self.stat()
+        s.mtime = float(when) if when is not None else time.time()
 
     @property
     def mtime(self) -> float:
@@ -745,9 +775,15 @@ class Holder(Disposable):
         self,
         data: Union[bytes, bytearray, memoryview],
         pos: int,
+        *,
+        update_stat: bool = True,
     ) -> int:
-        """Positionally write. Returns bytes actually written."""
-        return self.write_mv(_as_byte_mv(data), pos)
+        """Positionally write. Returns bytes actually written.
+
+        ``update_stat=False`` defers the post-write stat refresh to
+        the caller — see :meth:`write_mv` for the bulk-write rationale.
+        """
+        return self.write_mv(_as_byte_mv(data), pos, update_stat=update_stat)
 
     def memoryview(self) -> memoryview:
         """View over the holder's visible bytes."""

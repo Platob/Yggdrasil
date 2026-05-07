@@ -374,7 +374,11 @@ class Memory(Holder):
             # so reserve() does both the capacity grow and the zero-fill.
             self.reserve(n)
         stats.size = n
-        stats.mtime = time.time()
+        # ``mtime`` intentionally not bumped here — :meth:`truncate`
+        # is in the bulk-write hot path (``write_mv`` calls
+        # ``resize`` which calls us once per chunk), and a per-call
+        # ``time.time()`` dominated tight loops. Callers that want
+        # freshness call :meth:`touch_mtime` after the loop.
         return n
 
     def _clear(self) -> None:
@@ -389,7 +393,6 @@ class Memory(Holder):
         self._buf = bytearray()
         stats = self.stat()
         stats.size = 0
-        stats.mtime = time.time()
 
     # ------------------------------------------------------------------
     # Spill machinery

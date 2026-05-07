@@ -702,13 +702,17 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         """Positional read against the active holder. Cursor untouched."""
         return self._active().pread(n, pos)
 
-    def pwrite(self, data: BytesLike, pos: int) -> int:
+    def pwrite(
+        self, data: BytesLike, pos: int, *, update_stat: bool = True,
+    ) -> int:
         """Positional write against the active holder. Cursor untouched.
 
         Marks the BytesIO dirty when scratch is active so the commit
         on :meth:`flush` / :meth:`_release` actually fires.
+        ``update_stat=False`` is forwarded to the holder so a bulk
+        loop can skip the per-write stat refresh.
         """
-        n = self._active().pwrite(data, pos)
+        n = self._active().pwrite(data, pos, update_stat=update_stat)
         if n > 0 and self._scratch is not None:
             self.mark_dirty()
         return n
@@ -789,35 +793,43 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
                 break
         return lines
 
-    def write(self, b: Any) -> int:
+    def write(self, b: Any, *, update_stat: bool = True) -> int:
         """Write *b* at the cursor, advancing it.
 
         Accepts bytes-like, ``str`` (UTF-8), ``io.BytesIO``, or any
         file-like with ``.read``. The buffer-protocol fallback catches
         things like :class:`pyarrow.Buffer` that aren't
         bytes/bytearray/memoryview but ARE memoryview-able.
+
+        ``update_stat=False`` propagates straight down to the holder's
+        :meth:`write_mv` so the per-write stat refresh / mtime bump
+        is skipped — useful for tight bulk loops that prefer a single
+        post-loop refresh (a re-stat on a path holder, or one
+        :meth:`_touch_stat` on a memory holder). Default keeps the
+        per-write behavior so the size / mtime fields stay live for
+        observers reading them concurrently.
         """
         if b is None:
             return 0
         if isinstance(b, str):
-            return self.write_bytes(b.encode("utf-8"))
+            return self.write_bytes(b.encode("utf-8"), update_stat=update_stat)
         if isinstance(b, (bytes, bytearray, memoryview)):
-            return self.write_bytes(b)
+            return self.write_bytes(b, update_stat=update_stat)
         if hasattr(b, "read"):
             total = 0
             while True:
                 chunk = b.read(1024 * 1024)
                 if not chunk:
                     break
-                total += self.write_bytes(chunk)
+                total += self.write_bytes(chunk, update_stat=update_stat)
             return total
-        return self.write_bytes(memoryview(b))
+        return self.write_bytes(memoryview(b), update_stat=update_stat)
 
-    def write_bytes(self, b: BytesLike) -> int:
+    def write_bytes(self, b: BytesLike, *, update_stat: bool = True) -> int:
         mv = _as_byte_mv(b)
         if len(mv) == 0:
             return 0
-        n = self._active().pwrite(mv, self._pos)
+        n = self._active().pwrite(mv, self._pos, update_stat=update_stat)
         self._pos += n
         if n > 0 and self._scratch is not None:
             self.mark_dirty()
