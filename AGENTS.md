@@ -55,6 +55,26 @@ Red flags that you are inventing instead of integrating:
 - a private utility that re-implements something already in `pyutils/` or `data/`
 - a "v2" of something with no migration path from "v1"
 
+### Reach for `yggdrasil.data.enums` first
+
+Whenever a value belongs to a fixed token set — currencies, time units, byte sizes (`ByteUnit`), media types, MIME types, modes, codecs, geozones, timezones — go through the enum at the API boundary. Use a member directly (`128 * ByteUnit.MIB`) or coerce with the enum's `from_(...)` / `parse_size(...)` / `parse(...)` classmethod. The enum is the single place that knows the canonical token, the accepted aliases, and how to format the value back out.
+
+Default to:
+
+- using `ByteUnit.parse_size(x)` instead of `int(x) * 1024 * 1024` or a regex inline
+- using `TimeUnit.from_(x)` instead of a local `{"us": ..., "micros": ...}` dict
+- using `Currency` / `MediaType` / `MimeType` / `Mode` / `Codec` / `Geozone` / `Timezone` members and their `from_` classmethods instead of bare strings at call sites
+- subclassing `int` (`IntEnum`) or `str` (`StrEnum`) on new enums so members slot into existing typed fields without a cast
+
+If the enum is missing a member or alias the code legitimately needs, **add it to the enum** and let the caller route through it. Do not branch around the enum with a one-off lookup, and do not scatter string constants for what is conceptually a new fixed-vocabulary concept — add a new enum to `yggdrasil.data.enums` (matching the `from_` / `parse*` / `is_valid` shape of the existing ones) instead.
+
+Red flags that you are bypassing the enum layer:
+
+- inline alias tables / regexes for tokens an enum already canonicalizes
+- expressions like `n * 1024 * 1024 * 1024` repeated across modules instead of `n * ByteUnit.GIB`
+- accepting a string at the boundary, normalizing it ad-hoc, then never round-tripping it
+- string constants that mean the same thing across files but are typed out separately
+
 ---
 
 ## Tone and style rules

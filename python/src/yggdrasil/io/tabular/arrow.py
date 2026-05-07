@@ -79,9 +79,10 @@ ArrowSource = Union[
 ]
 
 
-# Default spill threshold — matches BytesIO so the two layers behave
-# identically on big payloads. Override per-instance via
-# ``spill_bytes=`` or per-call via ``ArrowTabular.spill_bytes = N``.
+# Default spill threshold — matches :class:`yggdrasil.io.memory.Memory`'s
+# spill convention so the two layers behave identically on big payloads.
+# Override per-instance via ``spill_bytes=`` or per-call via
+# ``ArrowTabular.spill_bytes = N``.
 _DEFAULT_SPILL_BYTES = 128 * 1024 * 1024
 _DEFAULT_SPILL_TTL = 86400
 
