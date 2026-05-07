@@ -1506,7 +1506,7 @@ class Session(ABC):
         else:
             pool = self.job_pool
             batch_size = config.batch_size or min(
-                config.max_batch_size or 1024, pool.max_workers * 100
+                config.max_batch_size or 1024, pool.max_workers * 10
             )
 
         ttl = config.max_batch_ttl

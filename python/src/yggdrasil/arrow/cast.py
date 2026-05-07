@@ -391,7 +391,6 @@ def _pandas_to_arrow(obj: Any, options: CastOptions) -> tuple[pa.Table, CastOpti
     table = pa.Table.from_pandas(
         obj,
         preserve_index=bool(obj.index.name),
-        safe=options.safe,
     )
     return table, options.copy(target_field=None)
 
