@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import dataclasses
 import io as _stdlib_io
+from datetime import date, datetime
 from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Iterator, Mapping
 
 import pyarrow as pa
@@ -51,6 +52,41 @@ if TYPE_CHECKING:
 __all__ = ["XlsxIO", "XlsxOptions", "XlsxSheetIO"]
 
 
+#: Default sentinel strings that map to ``None`` during type inference.
+#: Mirrors :attr:`yggdrasil.io.primitive.csv_io.CsvOptions.null_values`
+#: with a couple of common spreadsheet markers added (``#N/A``,
+#: ``-``, ``--``).
+_DEFAULT_NULL_VALUES: tuple[str, ...] = (
+    "", "N/A", "n/a", "NA", "na", "#N/A",
+    "NULL", "null", "Null",
+    "None", "none",
+    "-", "--",
+)
+
+#: Date formats tried in order during string-cell inference. The
+#: first match wins, so ISO comes first.
+_DEFAULT_DATE_FORMATS: tuple[str, ...] = (
+    "%Y-%m-%d",
+    "%Y/%m/%d",
+    "%d/%m/%Y",
+    "%m/%d/%Y",
+    "%d-%m-%Y",
+    "%d.%m.%Y",
+)
+
+#: Datetime formats. Tried before the date formats above on the same
+#: input; a successful match returns a :class:`datetime.datetime`.
+_DEFAULT_DATETIME_FORMATS: tuple[str, ...] = (
+    "%Y-%m-%dT%H:%M:%S.%f",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S.%f",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%d/%m/%Y %H:%M:%S",
+    "%m/%d/%Y %H:%M:%S",
+)
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class XlsxOptions(CastOptions):
     """:class:`CastOptions` extended with XLSX-specific knobs."""
@@ -60,6 +96,46 @@ class XlsxOptions(CastOptions):
     #: the sheet that receives the incoming batches.
     sheet_name: str = "Sheet1"
     has_header: bool = True
+
+    # ------------------------------------------------------------------
+    # Read-side type inference (string cells only — openpyxl already
+    # types numbers, dates, and booleans natively).
+    # ------------------------------------------------------------------
+
+    #: Master switch. When ``False``, raw cell values flow through
+    #: untouched (openpyxl-native types for typed cells, plain
+    #: strings for everything else).
+    infer_types: bool = True
+
+    #: String tokens that map to ``None`` during inference. Compared
+    #: against the cell's stripped value (case-sensitive — list both
+    #: cases when needed).
+    null_values: "tuple[str, ...]" = _DEFAULT_NULL_VALUES
+
+    #: Character treated as a thousands grouping separator inside
+    #: numeric strings. ``"123,892.50"`` → ``123892.50``. Set to
+    #: empty string to disable.
+    thousands_separator: str = ","
+
+    #: Decimal mark inside numeric strings. ``"1.234,56"`` parses
+    #: when ``thousands_separator=","`` and ``decimal_separator=","``
+    #: — but not both at once on the same character; the helper
+    #: normalizes to ``.`` before :func:`float`.
+    decimal_separator: str = "."
+
+    #: ``strptime`` patterns for date inference. The first one that
+    #: matches wins.
+    date_formats: "tuple[str, ...]" = _DEFAULT_DATE_FORMATS
+
+    #: ``strptime`` patterns for datetime inference. Tried before the
+    #: date formats so an ``"YYYY-MM-DD HH:MM:SS"`` cell becomes a
+    #: ``datetime``, not a ``date``.
+    datetime_formats: "tuple[str, ...]" = _DEFAULT_DATETIME_FORMATS
+
+    #: Column names whose cells should be left alone (no numeric /
+    #: date coercion). Useful for IDs that look numeric but must
+    #: stay string. Null-marker handling still applies.
+    string_columns: "tuple[str, ...]" = ()
 
 
 def _openpyxl():
@@ -84,21 +160,110 @@ def _chain_one(first, rest):
     yield from rest
 
 
+def _coerce_cell(
+    value: Any,
+    *,
+    null_values: frozenset,
+    thousands_sep: str,
+    decimal_sep: str,
+    date_formats: tuple[str, ...],
+    datetime_formats: tuple[str, ...],
+    keep_string: bool,
+) -> Any:
+    """Apply the read-side inference rules to a single openpyxl cell.
+
+    Non-string cells (openpyxl already typed them: int / float /
+    bool / datetime / date / None) flow through unchanged. String
+    cells walk this ladder:
+
+    1. Strip whitespace.
+    2. Empty or in *null_values* → ``None``.
+    3. *keep_string* short-circuits the rest — caller asked for a
+       string column (e.g. an ID).
+    4. Numeric: strip *thousands_sep*, normalize *decimal_sep* to
+       ``.``; try :func:`int`, then :func:`float`.
+    5. Datetime: try each *datetime_formats* pattern.
+    6. Date: try each *date_formats* pattern.
+    7. Fall back to the original (un-stripped) string.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return value
+
+    stripped = value.strip()
+    if not stripped or stripped in null_values:
+        return None
+    if keep_string:
+        return value
+
+    # Numeric — handle a leading sign, optional thousands grouping,
+    # optional non-period decimal mark.
+    candidate = stripped
+    if thousands_sep and thousands_sep != decimal_sep:
+        candidate = candidate.replace(thousands_sep, "")
+    if decimal_sep != ".":
+        candidate = candidate.replace(decimal_sep, ".")
+    if candidate and candidate[0] in "+-":
+        sign, body = candidate[0], candidate[1:]
+    else:
+        sign, body = "", candidate
+    if body and (body.replace(".", "", 1).isdigit() or _is_scientific(body)):
+        try:
+            if "." not in body and "e" not in body.lower():
+                return int(sign + body)
+        except ValueError:
+            pass
+        try:
+            return float(sign + body)
+        except ValueError:
+            pass
+
+    # Datetime first (more specific), then date.
+    for fmt in datetime_formats:
+        try:
+            return datetime.strptime(stripped, fmt)
+        except ValueError:
+            continue
+    for fmt in date_formats:
+        try:
+            return datetime.strptime(stripped, fmt).date()
+        except ValueError:
+            continue
+
+    return value
+
+
+def _is_scientific(body: str) -> bool:
+    """``"1e5"`` / ``"2.5E-3"`` shape — mantissa + ``e`` + signed exponent."""
+    lower = body.lower()
+    if "e" not in lower:
+        return False
+    mantissa, _, exponent = lower.partition("e")
+    if not mantissa or not exponent:
+        return False
+    if exponent[0] in "+-":
+        exponent = exponent[1:]
+    return (
+        mantissa.replace(".", "", 1).isdigit()
+        and exponent.isdigit()
+    )
+
+
 def _stream_sheet_batches(
     ws: Any,
     *,
-    has_header: bool,
-    row_size: int,
+    options: "XlsxOptions",
 ) -> Iterator[pa.RecordBatch]:
-    """Yield arrow batches for *ws* in ``row_size`` chunks.
+    """Yield arrow batches for *ws* in ``options.row_size`` chunks.
 
     Shared by :class:`XlsxIO` (single-sheet read) and
     :class:`XlsxSheetIO` (per-child read) so the column-discovery /
-    batching rules don't drift between them.
+    batching / inference rules don't drift between them.
     """
     row_iter = ws.iter_rows(values_only=True)
 
-    if has_header:
+    if options.has_header:
         headers = next(row_iter, None)
         if headers is None:
             return
@@ -113,9 +278,34 @@ def _stream_sheet_batches(
         columns = [f"col_{i}" for i in range(len(first_row))]
         row_iter = _chain_one(first_row, row_iter)
 
+    if options.infer_types:
+        nulls = frozenset(options.null_values)
+        string_cols = frozenset(options.string_columns)
+        date_fmts = tuple(options.date_formats)
+        dt_fmts = tuple(options.datetime_formats)
+        keep_string_flags = [c in string_cols for c in columns]
+
+        def _row_to_dict(raw_row):
+            out: dict = {}
+            for col, flag, value in zip(columns, keep_string_flags, raw_row):
+                out[col] = _coerce_cell(
+                    value,
+                    null_values=nulls,
+                    thousands_sep=options.thousands_separator,
+                    decimal_sep=options.decimal_separator,
+                    date_formats=date_fmts,
+                    datetime_formats=dt_fmts,
+                    keep_string=flag,
+                )
+            return out
+    else:
+        def _row_to_dict(raw_row):
+            return dict(zip(columns, raw_row))
+
+    row_size = options.row_size if options.row_size else 4096
     rows: list[dict] = []
     for raw_row in row_iter:
-        rows.append(dict(zip(columns, raw_row)))
+        rows.append(_row_to_dict(raw_row))
         if len(rows) >= row_size:
             yield from _rows_to_batches(rows)
             rows = []
@@ -261,10 +451,7 @@ class XlsxSheetIO(BytesIO):
                 if self.sheet_name not in wb.sheetnames:
                     return
                 ws = wb[self.sheet_name]
-                row_size = options.row_size if options.row_size else 4096
-                yield from _stream_sheet_batches(
-                    ws, has_header=options.has_header, row_size=row_size,
-                )
+                yield from _stream_sheet_batches(ws, options=options)
             finally:
                 wb.close()
 
@@ -449,10 +636,7 @@ class XlsxIO(BytesIO):
                     if options.sheet_name in wb.sheetnames
                     else wb[wb.sheetnames[0]]
                 )
-                row_size = options.row_size if options.row_size else 4096
-                yield from _stream_sheet_batches(
-                    ws, has_header=options.has_header, row_size=row_size,
-                )
+                yield from _stream_sheet_batches(ws, options=options)
             finally:
                 wb.close()
 
