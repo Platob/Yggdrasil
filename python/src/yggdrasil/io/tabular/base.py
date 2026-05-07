@@ -290,6 +290,34 @@ class Tabular(ABC, Generic[O]):
         return cls.options_class().check(options, **kwargs)
 
     # ==================================================================
+    # Compaction hook
+    # ==================================================================
+
+    def optimize(
+        self,
+        byte_size: "int | None" = None,
+        **kwargs: Any,
+    ) -> int:
+        """Repartition / compact this Tabular's storage.
+
+        Default implementation is a no-op and returns ``0`` — single-file
+        leaves (parquet, csv, arrow IPC, …) don't have a compaction
+        concept. Aggregator subclasses (:class:`FolderIO`,
+        :class:`YGGFolderIO`) override this to walk their child leaves
+        and bin-pack small part files into bundles near *byte_size*.
+        Files already close to the target size are left alone so a
+        repeated call is cheap.
+
+        ``byte_size=None`` keeps the legacy "collapse every leaf with
+        more than one part into a single file" behavior, which is what
+        the local-cache compaction loop in :class:`Session` expects.
+        Any extra keyword arguments are accepted and ignored so
+        upstream callers can pass forward-compatible knobs without the
+        base raising.
+        """
+        return 0
+
+    # ==================================================================
     # Abstract batch hooks — the two things every implementer overrides
     # ==================================================================
 

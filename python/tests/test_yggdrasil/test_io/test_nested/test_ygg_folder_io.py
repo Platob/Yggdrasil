@@ -345,6 +345,42 @@ class TestOptimize:
         # Single write → one part per partition; optimize is a no-op.
         assert y.optimize() == 0
 
+    def test_byte_size_skips_close_to_target(self, tmp_path) -> None:
+        y = YGGFolderIO(
+            path=str(tmp_path), schema=_single_partition_schema(),
+        )
+        y.write_arrow_table(pa.table({
+            "id": [1], "region": ["us"], "value": ["a"],
+        }))
+        y.write_arrow_batches(
+            pa.table({"id": [2], "region": ["us"], "value": ["b"]}).to_batches(),
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+        us_dir = tmp_path / "region=us"
+        sizes = [
+            p.stat().st_size for p in us_dir.iterdir()
+            if p.name.startswith("part-")
+        ]
+        # Pick byte_size matching the existing parts — both should be
+        # left alone (they're already "at target") so optimize is a no-op.
+        assert y.optimize(byte_size=max(sizes)) == 0
+        after = [p for p in us_dir.iterdir() if p.name.startswith("part-")]
+        assert len(after) == 2
+
+    def test_no_schema_falls_back_to_folderio_walk(self, tmp_path, table) -> None:
+        # No schema → no partition columns → optimize delegates to the
+        # plain :meth:`FolderIO.optimize` walk.
+        y = YGGFolderIO(path=str(tmp_path))
+        # Drop two parquet parts directly under the root so there's
+        # something to compact.
+        from yggdrasil.io.primitive.parquet_io import ParquetIO
+        from yggdrasil.io.path.local_path import LocalPath
+        for name in ("part-1.parquet", "part-2.parquet"):
+            ParquetIO(
+                holder=LocalPath(str(tmp_path / name)), owns_holder=False,
+            ).write_arrow_table(table)
+        assert y.optimize() == 1
+
 
 # ---------------------------------------------------------------------------
 # Mode dispatch

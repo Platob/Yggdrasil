@@ -299,6 +299,199 @@ class FolderIO(Tabular[FolderOptions]):
             except Exception:
                 pass
 
+    # ==================================================================
+    # Compaction — bin-pack small parts towards a target byte size
+    # ==================================================================
+
+    #: Default ``±`` tolerance band around *byte_size* for the
+    #: "already close enough to the target" check. A 25 % cushion is
+    #: wide enough that a Parquet file written from a slightly
+    #: smaller-than-target Arrow table doesn't get rewritten the next
+    #: pass (saving the read+write round-trip), and tight enough that
+    #: a 50 %-of-target file still gets folded into a peer.
+    OPTIMIZE_TOLERANCE: "ClassVar[float]" = 0.25
+
+    def optimize(
+        self,
+        byte_size: "int | None" = None,
+        *,
+        target_extension: str = "parquet",
+        tolerance: float = OPTIMIZE_TOLERANCE,
+        **kwargs: Any,
+    ) -> int:
+        """Compact small part files into ``byte_size``-shaped bundles.
+
+        Walks the tree under :attr:`path` and at every directory that
+        holds part files, groups them by combined size and rewrites
+        each group as a single fresh part. Two flavors of the pass:
+
+        - ``byte_size=None`` (the default and the shape the local-cache
+          compaction loop in :class:`Session` calls with) — collapses
+          every directory with more than one part into a single file.
+        - ``byte_size=N`` — first-fit-decreasing bin pack into bins of
+          capacity ``N`` bytes. Parts whose size is within
+          ``±tolerance`` of *N* (or already larger) are skipped: they
+          are already "close enough" and rewriting them would just
+          burn IO.
+
+        Returns the number of new part files created. Idempotent: a
+        second call on a tree that's already at target leaves
+        nothing to do and returns ``0``.
+        """
+        if not self.path.exists():
+            return 0
+        return self._optimize_walk(
+            self.path,
+            byte_size=byte_size,
+            target_extension=target_extension,
+            tolerance=tolerance,
+        )
+
+    def _optimize_walk(
+        self,
+        directory: "Path",
+        *,
+        byte_size: "int | None",
+        target_extension: str,
+        tolerance: float,
+    ) -> int:
+        """Recurse into *directory*, compacting part files at each level.
+
+        Sub-directories recurse first so the inner leaves drop down to
+        a single big file before the outer level looks at its own
+        children — keeps the bin-pack input stable when a folder
+        carries both nested and flat content (rare, but the cache's
+        Hive layout flattens this naturally so the cost is zero
+        there).
+        """
+        try:
+            entries = list(directory.iterdir())
+        except FileNotFoundError:
+            return 0
+
+        subdirs: "list[Path]" = []
+        files: "list[Path]" = []
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            try:
+                if entry.is_dir():
+                    subdirs.append(entry)
+                else:
+                    files.append(entry)
+            except Exception:
+                continue
+
+        compacted = 0
+        for sub in subdirs:
+            compacted += self._optimize_walk(
+                sub,
+                byte_size=byte_size,
+                target_extension=target_extension,
+                tolerance=tolerance,
+            )
+
+        parts = [f for f in files if f.name.startswith("part-")]
+        compacted += self._compact_parts(
+            directory,
+            parts,
+            byte_size=byte_size,
+            target_extension=target_extension,
+            tolerance=tolerance,
+        )
+        return compacted
+
+    def _compact_parts(
+        self,
+        directory: "Path",
+        parts: "list[Path]",
+        *,
+        byte_size: "int | None",
+        target_extension: str,
+        tolerance: float,
+    ) -> int:
+        """Group *parts* by size and rewrite each group as one file."""
+        if len(parts) < 2:
+            return 0
+
+        groups: "list[list[Path]]"
+        if byte_size is None:
+            # No size knob — keep the legacy "everything into one"
+            # shape the cache compaction loop expects.
+            groups = [list(parts)]
+        else:
+            sized: "list[tuple[int, Path]]" = []
+            for p in parts:
+                try:
+                    size = int(p.size)
+                except Exception:
+                    continue
+                # Already at target (within ``±tolerance``) or already
+                # larger — leave it alone. Splitting an oversized part
+                # is a different operation and out of scope here.
+                if size >= byte_size * (1.0 - tolerance):
+                    continue
+                sized.append((size, p))
+
+            if len(sized) < 2:
+                return 0
+
+            sized.sort(key=lambda t: t[0], reverse=True)
+            groups = []
+            bin_sizes: "list[int]" = []
+            for size, path in sized:
+                placed = False
+                for idx, current in enumerate(bin_sizes):
+                    if current + size <= byte_size:
+                        groups[idx].append(path)
+                        bin_sizes[idx] = current + size
+                        placed = True
+                        break
+                if not placed:
+                    groups.append([path])
+                    bin_sizes.append(size)
+
+        compacted = 0
+        leaf_folder = FolderIO(path=directory)
+        write_options = FolderOptions(
+            mode=Mode.APPEND, child_extension=target_extension,
+        )
+        for group in groups:
+            if len(group) < 2:
+                continue
+            tables: "list[pa.Table]" = []
+            for f in group:
+                leaf = leaf_folder._leaf_for(f)
+                if leaf is None:
+                    continue
+                try:
+                    tables.append(leaf.read_arrow_table())
+                except Exception:
+                    # Unreadable part — leave it on disk; another
+                    # writer might still be flushing it.
+                    tables = []
+                    break
+            if not tables:
+                continue
+
+            try:
+                merged = pa.concat_tables(tables, promote_options="default")
+            except TypeError:
+                # pyarrow < 14 had no ``promote_options`` kwarg.
+                merged = pa.concat_tables(tables, promote=True)
+
+            # Write the merged table first; only after the new part
+            # is on disk do we drop the originals. A failed write
+            # leaves the source files intact.
+            leaf_folder.write_arrow_table(merged, options=write_options)
+            for f in group:
+                try:
+                    f.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            compacted += 1
+        return compacted
+
     def _resolve_action(self, mode: Mode) -> Mode:
         if mode is Mode.AUTO or mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:
             return Mode.OVERWRITE

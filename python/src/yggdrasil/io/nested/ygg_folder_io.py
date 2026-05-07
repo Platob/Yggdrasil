@@ -429,44 +429,55 @@ class YGGFolderIO(FolderIO):
     # Optimize — compact small parts per partition
     # ==================================================================
 
-    def optimize(self, *, target_extension: str = "parquet") -> int:
-        """Compact every partition's small parts into a single file.
+    def optimize(
+        self,
+        byte_size: "int | None" = None,
+        *,
+        target_extension: str = "parquet",
+        tolerance: float = FolderIO.OPTIMIZE_TOLERANCE,
+        **kwargs: Any,
+    ) -> int:
+        """Compact each partition leaf's small parts.
 
-        Walks each leaf partition directory; if it has more than
-        one part file, reads them all back through the matching
-        :class:`Tabular` leaf, writes a single fresh part, then
-        unlinks the originals. Returns the number of partitions
-        compacted.
+        Walks the partition tree (one branch per ``col=val`` segment)
+        and dispatches each leaf folder to :meth:`FolderIO.optimize`,
+        which does the actual bin-pack:
 
-        Cheap when the cache is already optimized (one part per
-        leaf): the pass returns immediately for those directories.
+        - ``byte_size=None`` collapses every leaf with more than one
+          part into a single file — the legacy shape the local-cache
+          compaction loop in :class:`Session` calls with.
+        - ``byte_size=N`` packs small parts into bundles near *N*
+          bytes; parts within ``±tolerance`` of *N* (or already
+          larger) are left untouched.
+
+        Returns the total number of new part files written across
+        every leaf. A no-schema :class:`YGGFolderIO` falls through to
+        :meth:`FolderIO.optimize`, so the operation still works on
+        an unpartitioned tree.
         """
-        parts = self._resolve_partition_columns()
-        if not parts or not self.path.exists():
+        if not self.path.exists():
             return 0
+
+        parts = self._resolve_partition_columns()
+        if not parts:
+            return super().optimize(
+                byte_size=byte_size,
+                target_extension=target_extension,
+                tolerance=tolerance,
+            )
 
         compacted = 0
         for leaf_path, _kv in self._iter_partitions(parts, prune={}):
             if not leaf_path.exists():
                 continue
-            entries = list(leaf_path.iterdir())
-            files = [
-                e for e in entries
-                if e.name.startswith("part-") and not e.is_dir()
-            ]
-            if len(files) <= 1:
-                continue
-
-            sub = FolderIO(path=leaf_path)
-            table = sub.read_arrow_table()
-            for f in files:
-                f.unlink(missing_ok=True)
-            sub.write_arrow_table(
-                table,
-                options=FolderOptions(child_extension=target_extension),
+            leaf = FolderIO(path=leaf_path)
+            compacted += leaf._optimize_walk(
+                leaf_path,
+                byte_size=byte_size,
+                target_extension=target_extension,
+                tolerance=tolerance,
             )
             self.invalidate_listing(leaf_path)
-            compacted += 1
         return compacted
 
     # ==================================================================
