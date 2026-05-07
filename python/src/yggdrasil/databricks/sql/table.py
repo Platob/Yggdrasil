@@ -19,6 +19,8 @@ on write keep the cache fresh without fan-out invalidation.
 
 from __future__ import annotations
 
+import datetime as _dt
+import hashlib
 import logging
 import re
 import time
@@ -133,7 +135,7 @@ def _resolve_table_operation(
         op = TableOperation.READ
     return op
 
-__all__ = ["Table"]
+__all__ = ["Table", "YGG_PROPERTY_PREFIX", "YGG_SCHEMA_FIELD_PREFIX"]
 
 logger = logging.getLogger(__name__)
 
@@ -864,6 +866,105 @@ def _column_type_name_from_ddl(ddl: str) -> ColumnTypeName:
     return _DDL_TO_COLUMN_TYPE_NAME.get(head, ColumnTypeName.STRING)
 
 
+# ---------------------------------------------------------------------------
+# ``ygg.*`` TBLPROPERTIES — shared by sql_create and api_create
+# ---------------------------------------------------------------------------
+
+YGG_PROPERTY_PREFIX = "ygg."
+YGG_SCHEMA_FIELD_PREFIX = "ygg.schema."
+
+
+def _build_ygg_properties(
+    schema_info: DataSchema,
+    *,
+    engine: Literal["sql", "api"],
+    data_source_format: "DataSourceFormat | str | None" = None,
+    table_type: "TableType | str | None" = None,
+    storage_location: str | None = None,
+) -> dict[str, str]:
+    """Build the ``ygg.*`` TBLPROPERTIES that yggdrasil stamps on every create.
+
+    The same dict is emitted by both create paths
+    (:meth:`Table.sql_create` and :meth:`Table.api_create`) so the two
+    surfaces stay observable in the same way.
+
+    Top-level data fields are dumped one-per-property under
+    ``ygg.schema.<field_name>`` (each value is a JSON document for that
+    field) rather than as a single ``ygg.schema_json`` blob. Per-field
+    keys keep individual TBLPROPERTIES values comfortably under
+    Databricks' per-property size budget on wide schemas, and let
+    readers fetch only the columns they care about.
+
+    The fingerprint is a short blake2b digest of the *full* schema
+    JSON so a reader can detect schema drift without re-assembling the
+    per-field payloads.
+    """
+    from yggdrasil.version import __version__ as ygg_version
+
+    digest = hashlib.blake2b(
+        schema_info.to_json(to_bytes=False).encode("utf-8"),
+        digest_size=16,
+    ).hexdigest()
+
+    data_fields = [
+        f for f in schema_info.children_fields
+        if not getattr(f, "constraint_key", False)
+    ]
+
+    fmt_value = (
+        data_source_format.value
+        if hasattr(data_source_format, "value")
+        else (str(data_source_format) if data_source_format is not None else None)
+    )
+
+    props: dict[str, str] = {
+        "ygg.version": str(ygg_version),
+        "ygg.created_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+        "ygg.engine": engine,
+        "ygg.field_count": str(len(data_fields)),
+        "ygg.schema_fingerprint": digest,
+    }
+    if fmt_value:
+        props["ygg.format"] = fmt_value
+    if table_type is not None:
+        props["ygg.table_type"] = (
+            table_type.value if hasattr(table_type, "value") else str(table_type)
+        )
+    if storage_location:
+        props["ygg.storage_location"] = str(storage_location)
+
+    partition_names = [f.name for f in schema_info.partition_fields]
+    cluster_names = [f.name for f in schema_info.cluster_fields]
+    primary_names = [f.name for f in schema_info.primary_fields]
+
+    if partition_names:
+        props["ygg.partition_columns"] = ",".join(partition_names)
+    if cluster_names:
+        props["ygg.cluster_columns"] = ",".join(cluster_names)
+    if primary_names:
+        props["ygg.primary_keys"] = ",".join(primary_names)
+
+    comment = schema_info.comment
+    if comment:
+        props["ygg.comment"] = comment
+
+    # Per-field JSON entries — one TBLPROPERTIES key per top-level data
+    # field. Constraint-only fields (FK/CHECK rows on ``schema.constraints``)
+    # are skipped: they're applied via the SDK constraints API and aren't
+    # columns the table actually carries.
+    seen: set[str] = set()
+    for f in data_fields:
+        name = f.name
+        # Defensive de-dup: schemas constructed by hand can repeat names;
+        # later definitions would silently shadow earlier ones in a dict.
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        props[f"{YGG_SCHEMA_FIELD_PREFIX}{name}"] = f.to_json(to_bytes=False)
+
+    return props
+
+
 # ===========================================================================
 # Table — per-table resource
 # ===========================================================================
@@ -1530,6 +1631,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
         table_type: TableType | None = None,
         data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
         if_not_exists: bool = True,
+        record_ygg_properties: bool = True,
     ) -> "Table":
         mode = Mode.from_(mode, default=Mode.AUTO)
         schema = DataSchema.from_(definition)
@@ -1550,6 +1652,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
                 comment=comment,
                 if_not_exists=if_not_exists,
                 properties=properties,
+                record_ygg_properties=record_ygg_properties,
             )
         else:
             if table_type == TableType.EXTERNAL and not storage_location:
@@ -1565,6 +1668,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
                 table_type=table_type,
                 data_source_format=data_source_format,
                 if_not_exists=if_not_exists,
+                record_ygg_properties=record_ygg_properties,
             )
 
         return result
@@ -1587,6 +1691,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
         column_mapping_mode: str | None = None,
         wait_result: bool = True,
         auto_tag: bool = True,
+        record_ygg_properties: bool = True,
     ) -> "Table":
         schema_info = DataSchema.from_any(description)
         if auto_tag:
@@ -1666,6 +1771,14 @@ class Table(DatabricksResource, Tabular[CastOptions]):
             props["delta.columnMapping.mode"] = column_mapping_mode
             props["delta.minReaderVersion"] = 2
             props["delta.minWriterVersion"] = 5
+        if record_ygg_properties:
+            props.update(_build_ygg_properties(
+                schema_info,
+                engine="sql",
+                data_source_format=data_source_format,
+                table_type=TableType.EXTERNAL if storage_location else TableType.MANAGED,
+                storage_location=storage_location,
+            ))
         if properties:
             props.update(properties)
 
@@ -1913,6 +2026,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
         table_type: TableType | None = None,
         data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
         if_not_exists: bool = False,
+        record_ygg_properties: bool = True,
     ) -> "Table":
         """Create the table via the Unity Catalog ``tables.create`` REST API.
 
@@ -1951,7 +2065,17 @@ class Table(DatabricksResource, Tabular[CastOptions]):
                 "Use sql_create for managed Delta tables."
             )
 
-        merged_properties: dict[str, str] = {str(k): str(v) for k, v in (properties or {}).items()}
+        merged_properties: dict[str, str] = {}
+        if record_ygg_properties:
+            merged_properties.update(_build_ygg_properties(
+                schema_info,
+                engine="api",
+                data_source_format=data_source_format,
+                table_type=table_type,
+                storage_location=storage_location,
+            ))
+        if properties:
+            merged_properties.update({str(k): str(v) for k, v in properties.items()})
 
         try:
             self.client.workspace_client().tables.create(
