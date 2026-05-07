@@ -80,7 +80,7 @@ class NDJsonIO(BytesIO):
     def _collect_schema(self, options: NDJsonOptions) -> Schema:
         if self.size == 0:
             return Schema.empty()
-        with self._format_view() as v:
+        with self._format_input() as v:
             reader = pa_json.open_json(
                 v,
                 read_options=options.to_read_options(),
@@ -101,7 +101,7 @@ class NDJsonIO(BytesIO):
     ) -> Iterator[pa.RecordBatch]:
         if self.size == 0:
             return
-        with self._format_view() as v:
+        with self._format_input() as v:
             reader = pa_json.open_json(
                 v,
                 read_options=options.to_read_options(),
@@ -164,27 +164,34 @@ class NDJsonIO(BytesIO):
 
         line_term = options.line_ending.encode(options.encoding)
 
-        def _emit(buf):
-            for batch in batches:
-                for row in batch.to_pylist():
-                    line = json.dumps(
-                        row,
-                        ensure_ascii=options.ensure_ascii,
-                        sort_keys=options.sort_keys,
-                        default=str,
-                    ).encode(options.encoding)
-                    buf.write(line)
-                    buf.write(line_term)
+        # Encode every row into a pure-Arrow ``BufferOutputStream``
+        # before touching ``self``. Pyarrow's sink coalesces the
+        # per-row writes into one contiguous Arrow buffer; we hand
+        # the whole thing to :meth:`BytesIO._commit_format_payload`
+        # at the end so the durable holder sees one bulk write
+        # instead of one per row.
+        sink = pa.BufferOutputStream()
+        for batch in batches:
+            for row in batch.to_pylist():
+                line = json.dumps(
+                    row,
+                    ensure_ascii=options.ensure_ascii,
+                    sort_keys=options.sort_keys,
+                    default=str,
+                ).encode(options.encoding)
+                sink.write(line)
+                sink.write(line_term)
 
         if is_append_uncompressed:
-            self.seek(0, 2)  # SEEK_END
-            if self.pread(1, self.size - 1) != b"\n":
-                self.write(line_term)
-            _emit(self)
+            # Existing payload may not end with a newline — guard
+            # before bulk-appending the freshly-encoded batch.
+            if self.size > 0 and self.pread(1, self.size - 1) != b"\n":
+                self.seek(0, 2)
+                self.write_bytes(line_term)
+            self._commit_format_payload(sink.getvalue(), append=True)
             return
 
-        with self._format_buffer() as buf:
-            _emit(buf)
+        self._commit_format_payload(sink.getvalue())
 
     def _resolve_action(self, mode: Mode) -> Mode:
         if mode is Mode.AUTO or mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:

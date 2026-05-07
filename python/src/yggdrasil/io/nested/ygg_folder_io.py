@@ -72,6 +72,18 @@ _LISTING_MAX: int = 1024
 #: prefixed sidecars stay invisible (FolderIO already filters those).
 _PART_PATTERN: str = "part-*"
 
+#: Sidecar directory holding YGGFolderIO-managed metadata. Dot-
+#: prefixed so :meth:`FolderIO.iter_children` skips it on the data
+#: walk; subfolders inside it are free to use any naming scheme
+#: without being mistaken for partition directories.
+_METADATA_DIR_NAME: str = ".ygg"
+
+#: Schema sidecar filename inside :data:`_METADATA_DIR_NAME`. Stores
+#: the bound :class:`Schema` as Arrow IPC bytes so future readers
+#: can reconstruct the partition tags / nested types without
+#: inferring from a part file's footer.
+_SCHEMA_FILENAME: str = ".schema"
+
 
 def _quote(value: Any) -> str:
     """URL-quote a partition value the same way Spark / Hive do."""
@@ -122,6 +134,12 @@ class YGGFolderIO(FolderIO):
         parent: "Any | None" = None,
     ) -> None:
         super().__init__(data, path=path, parent=parent)
+        # Load the schema from the .ygg/.schema sidecar when the
+        # caller didn't pass one — lets a "just point me at this
+        # folder" call still pick up the partition layout that
+        # produced the data.
+        if schema is None:
+            schema = self._load_schema_sidecar()
         self._schema: "Schema | None" = schema
         # Per-instance cache: maps (partition tuple-key) → list of
         # part files. Short TTL covers dirs that grow under
@@ -130,6 +148,80 @@ class YGGFolderIO(FolderIO):
             default_ttl=listing_ttl,
             max_size=listing_max,
         )
+
+    # ==================================================================
+    # Metadata sidecar — .ygg/.schema persists the bound Schema
+    # ==================================================================
+
+    @property
+    def _metadata_dir(self) -> "Path":
+        return self.path / _METADATA_DIR_NAME
+
+    @property
+    def _schema_sidecar_path(self) -> "Path":
+        return self._metadata_dir / _SCHEMA_FILENAME
+
+    def _persist_schema_sidecar(self) -> None:
+        """Write the bound :class:`Schema` to ``.ygg/.schema``.
+
+        No-op when no schema is bound or when the sidecar already
+        holds the same bytes — keeps the call cheap on repeated
+        writes. The sidecar is created lazily on the first write
+        rather than at construction so a read-only :class:`YGGFolderIO`
+        doesn't materialize the ``.ygg/`` directory.
+        """
+        if self._schema is None:
+            return
+        try:
+            payload = self._schema.to_arrow_schema().serialize().to_pybytes()
+        except Exception:
+            return
+
+        target = self._schema_sidecar_path
+        try:
+            if target.exists() and target.size == len(payload):
+                with target.open(mode="rb") as bio:
+                    if bio.to_bytes() == payload:
+                        return
+        except Exception:
+            pass
+
+        try:
+            self._metadata_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return
+        try:
+            with target.open(mode="wb") as bio:
+                bio.write(payload)
+        except Exception:
+            pass
+
+    def _load_schema_sidecar(self) -> "Schema | None":
+        """Read ``.ygg/.schema`` back into a :class:`Schema`, or ``None``.
+
+        Robust to missing folders / sidecars / partial writes — the
+        sidecar is a best-effort hint; data files still carry their
+        own footer schema, so a corrupted side-car shouldn't break
+        the read path.
+        """
+        target = self._schema_sidecar_path
+        try:
+            if not target.exists():
+                return None
+            with target.open(mode="rb") as bio:
+                payload = bio.to_bytes()
+        except Exception:
+            return None
+        if not payload:
+            return None
+        try:
+            arrow_schema = pa.ipc.read_schema(pa.BufferReader(payload))
+        except Exception:
+            return None
+        try:
+            return Schema.from_arrow(arrow_schema)
+        except Exception:
+            return None
 
     # ==================================================================
     # Schema-driven partition discovery
@@ -327,6 +419,12 @@ class YGGFolderIO(FolderIO):
         batches: Iterable[pa.RecordBatch],
         options: FolderOptions,
     ) -> None:
+        # Drop the schema sidecar before any data writes — first call
+        # creates ``.ygg/.schema`` so future readers (or a fresh
+        # :class:`YGGFolderIO` over the same path) inherit the
+        # partition layout without touching a part file's footer.
+        self._persist_schema_sidecar()
+
         parts = self._resolve_partition_columns()
         if not parts:
             super()._write_arrow_batches(batches, options)
@@ -362,6 +460,21 @@ class YGGFolderIO(FolderIO):
         if not groups:
             return
 
+        # Partition columns are constant within a partition (encoded
+        # in the directory name and dropped from the per-leaf payload),
+        # so they can't drive a per-leaf merge. Strip them out of the
+        # match-by set before delegating; if nothing useful remains,
+        # null out the field so the leaf write skips the merge path.
+        leaf_options = options
+        if options.match_by_names:
+            sub_match = [
+                m for m in options.match_by_names if m not in partition_names
+            ]
+            if sub_match != list(options.match_by_names):
+                leaf_options = dataclasses.replace(
+                    options, match_by_names=sub_match or None,
+                )
+
         for key_tuple, sub_batches in groups.items():
             kv = dict(zip(partition_names, key_tuple))
             target = self._ensure_partition_dir(parts, kv)
@@ -369,8 +482,8 @@ class YGGFolderIO(FolderIO):
             sub._write_arrow_batches(
                 sub_batches,
                 # The leaf write picks the right Tabular leaf via
-                # ``child_extension`` (defaults to parquet).
-                options,
+                # ``child_extension`` (defaults to arrow IPC).
+                leaf_options,
             )
             self.invalidate_listing(target)
 
@@ -429,44 +542,58 @@ class YGGFolderIO(FolderIO):
     # Optimize — compact small parts per partition
     # ==================================================================
 
-    def optimize(self, *, target_extension: str = "parquet") -> int:
-        """Compact every partition's small parts into a single file.
+    def optimize(
+        self,
+        byte_size: "int | None" = None,
+        *,
+        target_media_type: "Any" = None,
+        tolerance: float = FolderIO.OPTIMIZE_TOLERANCE,
+        **kwargs: Any,
+    ) -> int:
+        """Compact each partition leaf's small parts.
 
-        Walks each leaf partition directory; if it has more than
-        one part file, reads them all back through the matching
-        :class:`Tabular` leaf, writes a single fresh part, then
-        unlinks the originals. Returns the number of partitions
-        compacted.
+        Walks the partition tree (one branch per ``col=val`` segment)
+        and dispatches each leaf folder to :meth:`FolderIO.optimize`,
+        which does the actual bin-pack:
 
-        Cheap when the cache is already optimized (one part per
-        leaf): the pass returns immediately for those directories.
+        - ``byte_size=None`` collapses every leaf with more than one
+          part into a single file — the legacy shape the local-cache
+          compaction loop in :class:`Session` calls with.
+        - ``byte_size=N`` packs small parts into bundles near *N*
+          bytes; parts within ``±tolerance`` of *N* (or already
+          larger) are left untouched.
+
+        Returns the total number of new part files written across
+        every leaf. A no-schema :class:`YGGFolderIO` falls through to
+        :meth:`FolderIO.optimize`, so the operation still works on
+        an unpartitioned tree.
         """
-        parts = self._resolve_partition_columns()
-        if not parts or not self.path.exists():
+        if not self.path.exists():
             return 0
+
+        from yggdrasil.data.enums import MediaType, MediaTypes
+        media = MediaType.from_(target_media_type, default=MediaTypes.ARROW_IPC)
+
+        parts = self._resolve_partition_columns()
+        if not parts:
+            return super().optimize(
+                byte_size=byte_size,
+                target_media_type=media,
+                tolerance=tolerance,
+            )
 
         compacted = 0
         for leaf_path, _kv in self._iter_partitions(parts, prune={}):
             if not leaf_path.exists():
                 continue
-            entries = list(leaf_path.iterdir())
-            files = [
-                e for e in entries
-                if e.name.startswith("part-") and not e.is_dir()
-            ]
-            if len(files) <= 1:
-                continue
-
-            sub = FolderIO(path=leaf_path)
-            table = sub.read_arrow_table()
-            for f in files:
-                f.unlink(missing_ok=True)
-            sub.write_arrow_table(
-                table,
-                options=FolderOptions(child_extension=target_extension),
+            leaf = FolderIO(path=leaf_path)
+            compacted += leaf._optimize_walk(
+                leaf_path,
+                byte_size=byte_size,
+                target_media_type=media,
+                tolerance=tolerance,
             )
             self.invalidate_listing(leaf_path)
-            compacted += 1
         return compacted
 
     # ==================================================================

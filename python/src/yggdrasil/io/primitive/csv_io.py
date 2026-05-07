@@ -102,7 +102,7 @@ class CsvIO(BytesIO):
     def _collect_schema(self, options: CsvOptions) -> Schema:
         if self.size == 0:
             return Schema.empty()
-        with self._format_view() as v:
+        with self._format_input() as v:
             reader = pa_csv.open_csv(
                 v,
                 read_options=options.to_read_options(),
@@ -124,7 +124,7 @@ class CsvIO(BytesIO):
     ) -> Iterator[pa.RecordBatch]:
         if self.size == 0:
             return
-        with self._format_view() as v:
+        with self._format_input() as v:
             reader = pa_csv.open_csv(
                 v,
                 read_options=options.to_read_options(),
@@ -206,13 +206,16 @@ class CsvIO(BytesIO):
         schema = first.schema
 
         if is_append_uncompressed:
+            # Append path: still encode into an Arrow sink so the
+            # CSVWriter's per-row writes don't turn into per-row
+            # syscalls, then one bulk seek-to-end + write to self.
             write_options = pa_csv.WriteOptions(
                 include_header=False, delimiter=options.delimiter,
             )
-            self.seek(0, _stdlib_io.SEEK_END)
+            sink = pa.BufferOutputStream()
             with contextlib.ExitStack() as stack:
                 writer = pa_csv.CSVWriter(
-                    self, schema, write_options=write_options,
+                    sink, schema, write_options=write_options,
                 )
                 stack.callback(writer.close)
                 if first.num_rows > 0:
@@ -220,18 +223,20 @@ class CsvIO(BytesIO):
                 for batch in iterator:
                     if batch.num_rows > 0:
                         writer.write_batch(batch)
+            self._commit_format_payload(sink.getvalue(), append=True)
             return
 
         write_options = options.to_write_options()
-        with self._format_buffer() as buf:
-            with contextlib.ExitStack() as stack:
-                writer = pa_csv.CSVWriter(buf, schema, write_options=write_options)
-                stack.callback(writer.close)
-                if first.num_rows > 0:
-                    writer.write_batch(first)
-                for batch in iterator:
-                    if batch.num_rows > 0:
-                        writer.write_batch(batch)
+        sink = pa.BufferOutputStream()
+        with contextlib.ExitStack() as stack:
+            writer = pa_csv.CSVWriter(sink, schema, write_options=write_options)
+            stack.callback(writer.close)
+            if first.num_rows > 0:
+                writer.write_batch(first)
+            for batch in iterator:
+                if batch.num_rows > 0:
+                    writer.write_batch(batch)
+        self._commit_format_payload(sink.getvalue())
 
     def _resolve_action(self, mode: Mode) -> Mode:
         if mode is Mode.AUTO or mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:
