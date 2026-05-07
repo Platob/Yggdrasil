@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-from .holder import Holder
+# URL must be importable from ``yggdrasil.io`` before Holder/Memory load,
+# because Holder now inherits :class:`yggdrasil.io.tabular.base.Tabular`
+# and that pulls in :mod:`yggdrasil.data.enums.mime_type`, which itself
+# does ``from yggdrasil.io import URL``. Ordering URL first short-circuits
+# the otherwise-circular dependency.
+from .url import URL
 from .io_stats import IOStats
+from .holder import Holder
 from .memory import Memory
 from .memory_stream import MemoryStream
-from .url import URL
 
 
 # Lazy re-exports — a top-level ``from .buffer import BytesIO`` here would

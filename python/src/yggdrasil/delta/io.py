@@ -149,10 +149,12 @@ class DeltaIO(FolderIO):
         data: Any = None,
         *,
         path: Any = None,
-        parent: Any = None,
+        tabular_parent: Any = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(data, path=path, parent=parent, **kwargs)
+        super().__init__(
+            data, path=path, tabular_parent=tabular_parent, **kwargs,
+        )
         self._log = DeltaLog(self.path)
         self._snapshot: "Optional[Snapshot]" = None
 

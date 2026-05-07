@@ -39,12 +39,18 @@ import os
 import pathlib
 import time
 from abc import abstractmethod
-from typing import Union, Any, ClassVar, IO
+from typing import TYPE_CHECKING, Union, Any, ClassVar, IO, Iterable, Iterator
+
+import pyarrow as pa
 
 from yggdrasil.disposable import Disposable
+from yggdrasil.io.tabular.base import O, Tabular
 
 from .io_stats import IOStats, IOKind
 from .url import URL
+
+if TYPE_CHECKING:
+    from yggdrasil.io.bytes_io import BytesIO
 
 __all__ = ["Holder"]
 
@@ -125,12 +131,21 @@ def _resolve_subclass(
     return Memory
 
 
-class Holder(Disposable):
-    """Position-addressable byte holder + :class:`Disposable` lifecycle.
+class Holder(Tabular[O], Disposable):
+    """Position-addressable byte holder + :class:`Disposable` lifecycle
+    + :class:`Tabular` view of its bytes.
 
     A holder IS a Disposable: it can be opened, closed, used in a
-    ``with`` block, marked dirty / clean. Concrete subclasses
-    (:class:`yggdrasil.io.memory.Memory`,
+    ``with`` block, marked dirty / clean. It is also a :class:`Tabular`
+    — the default :meth:`_read_arrow_batches` / :meth:`_write_arrow_batches`
+    contextually open the holder (``with self.open() as bio:``) and
+    delegate to whichever format-specific :class:`BytesIO` leaf the
+    holder's :class:`MediaType` resolves to. That means
+    ``LocalPath("data.xlsx").read_pandas_frame()`` works the same way
+    ``LocalPath("data.xlsx").open()`` does — the open / dispatch /
+    close cycle is hidden behind the Tabular surface.
+
+    Concrete subclasses (:class:`yggdrasil.io.memory.Memory`,
     :class:`yggdrasil.io.fs.Path`) plug acquire/release into the
     Disposable hooks so :class:`BytesIO` can compose with either
     one through the same API and seamlessly swap (e.g. on spill)
@@ -702,6 +717,42 @@ class Holder(Disposable):
         """
         self.acquire()
         return self
+
+    # ==================================================================
+    # Tabular surface — open contextually, delegate to the dispatched leaf
+    # ==================================================================
+
+    def _read_arrow_batches(self, options: O) -> Iterator[pa.RecordBatch]:
+        """Stream batches from a borrowed cursor on the dispatched leaf.
+
+        The :class:`BytesIO` constructor dispatches to the right
+        format leaf (ParquetIO / XlsxIO / CsvIO / …) using this
+        holder's :class:`MediaType`. We re-home *options* onto the
+        leaf's options class so format-specific knobs (sheet name,
+        delimiter, …) survive the hop, then read through the
+        closed-mode path (direct to durable holder) so we don't pay
+        the scratch-buffer slurp that ``with bio:`` would trigger —
+        format-specific leaves like :class:`XlsxIO` already manage
+        their own scoped views internally via ``_format_view``.
+        """
+        from yggdrasil.io.bytes_io import BytesIO
+        bio = BytesIO(holder=self, owns_holder=False)
+        try:
+            leaf_options = type(bio).check_options(options=options)
+            yield from bio._read_arrow_batches(leaf_options)
+        finally:
+            bio.close()
+
+    def _write_arrow_batches(
+        self,
+        batches: "Iterable[pa.RecordBatch]",
+        options: O,
+    ) -> None:
+        """Write batches via the dispatched leaf in a contextual transaction."""
+        from yggdrasil.io.bytes_io import BytesIO
+        with BytesIO(holder=self, owns_holder=False, mode="wb") as bio:
+            leaf_options = type(bio).check_options(options=options)
+            bio._write_arrow_batches(batches, leaf_options)
 
     def flush(self) -> None:
         """Push buffered writes to the durable backing. Default no-op."""

@@ -62,8 +62,16 @@ class TestConstruction:
         assert mem.size == 5
 
     def test_data_and_holder_both_raise(self) -> None:
-        with pytest.raises(TypeError, match="OR data, not both"):
+        with pytest.raises(TypeError, match="not multiple"):
             BytesIO(b"x", holder=Memory())
+
+    def test_path_and_holder_both_raise(self, tmp_path) -> None:
+        with pytest.raises(TypeError, match="not multiple"):
+            BytesIO(holder=Memory(), path=str(tmp_path / "x.csv"))
+
+    def test_data_and_path_both_raise(self, tmp_path) -> None:
+        with pytest.raises(TypeError, match="not both"):
+            BytesIO(b"x", path=str(tmp_path / "x.csv"))
 
     def test_idempotent_from_(self) -> None:
         a = BytesIO(b"abc")
@@ -74,6 +82,47 @@ class TestConstruction:
         src = io.BytesIO(b"piped-bytes")
         b = BytesIO.from_(src)
         assert b.to_bytes() == b"piped-bytes"
+
+    def test_path_kwarg_dispatches_via_extension(self, tmp_path) -> None:
+        """``BytesIO(path=...)`` lands on the format leaf for the URL's
+        extension. Closes the bug where the ``__new__`` dispatch only
+        fired on an explicit ``media_type=``.
+        """
+        # Side-effect import: register the primitive leaves.
+        import yggdrasil.io.primitive  # noqa: F401
+        from yggdrasil.io.primitive.parquet_io import ParquetIO
+        from yggdrasil.io.primitive.csv_io import CsvIO
+
+        pq_path = str(tmp_path / "x.parquet")
+        csv_path = str(tmp_path / "x.csv")
+        assert isinstance(BytesIO(path=pq_path), ParquetIO)
+        assert isinstance(BytesIO(path=csv_path), CsvIO)
+
+    def test_path_kwarg_owns_path_holder(self, tmp_path) -> None:
+        from yggdrasil.io.path.local_path import LocalPath
+        b = BytesIO(path=str(tmp_path / "data.csv"))
+        assert isinstance(b.holder, LocalPath)
+        assert b.owns_holder
+
+    def test_explicit_media_type_still_wins(self, tmp_path) -> None:
+        from yggdrasil.data.enums import MediaType, MimeTypes
+        from yggdrasil.io.primitive.parquet_io import ParquetIO
+        b = BytesIO(
+            path=str(tmp_path / "x.csv"),
+            media_type=MediaType(MimeTypes.PARQUET),
+        )
+        assert isinstance(b, ParquetIO)
+
+    def test_holder_media_type_drives_dispatch(self) -> None:
+        """A holder pre-tagged with a :class:`MediaType` routes through
+        the dispatch table even when no explicit ``media_type=`` /
+        ``path=`` is given.
+        """
+        from yggdrasil.data.enums import MediaType, MimeTypes
+        from yggdrasil.io.primitive.parquet_io import ParquetIO
+        mem = Memory()
+        mem.stat().media_type = MediaType(MimeTypes.PARQUET)
+        assert isinstance(BytesIO(holder=mem), ParquetIO)
 
 
 class TestIOProtocolBasics:
