@@ -201,8 +201,18 @@ class LazyTabular(Tabular[CastOptions]):
     # Builder methods — return a new LazyTabular each time
     # ------------------------------------------------------------------
 
+    def _clone(self, ops: Tuple[_Op, ...]) -> "LazyTabular":
+        """Build a sibling instance carrying *ops*.
+
+        Hook for subclasses (:class:`UnionTabular`, …) that need to
+        preserve their own state when chaining methods. Default
+        rebuilds the same kind of :class:`LazyTabular` over the same
+        inner.
+        """
+        return type(self)(self._inner, ops=ops)
+
     def _with(self, op: _Op) -> "LazyTabular":
-        return LazyTabular(self._inner, ops=(*self._ops, op))
+        return self._clone((*self._ops, op))
 
     def select(self, *columns: _SelectorIn) -> "LazyTabular":
         """Project to *columns*. Accepts column names or expressions."""
@@ -256,7 +266,7 @@ class LazyTabular(Tabular[CastOptions]):
             ops[-1] = new_op
         else:
             ops.append(new_op)
-        return LazyTabular(self._inner, ops=tuple(ops))
+        return self._clone(tuple(ops))
 
     where = filter
 

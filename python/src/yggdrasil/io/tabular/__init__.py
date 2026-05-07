@@ -16,5 +16,13 @@ from .base import O, Tabular
 from yggdrasil.io.tabular.arrow import ArrowTabular
 from yggdrasil.io.tabular.spark import SparkTabular
 from yggdrasil.io.tabular.lazy import LazyTabular
+from yggdrasil.io.tabular.union import UnionTabular
 
-__all__ = ["O", "Tabular", "ArrowTabular", "SparkTabular", "LazyTabular"]
+__all__ = [
+    "O",
+    "Tabular",
+    "ArrowTabular",
+    "SparkTabular",
+    "LazyTabular",
+    "UnionTabular",
+]
