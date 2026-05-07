@@ -9,7 +9,7 @@ import pyspark.sql as SparkSQL
 import pyspark.sql.functions as F
 import pyspark.sql.types as T
 from yggdrasil.data.cast import convert
-from yggdrasil.pandas.lib import pandas
+from yggdrasil.lazy_imports import pandas
 
 __all__ = []
 

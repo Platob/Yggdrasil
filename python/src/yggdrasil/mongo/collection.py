@@ -53,7 +53,7 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.data.enums import MimeType, Mode
 from yggdrasil.io.tabular.base import O, Tabular
 
-from .lib import has_pymongoarrow, pymongoarrow_api_module
+from yggdrasil.lazy_imports import has_pymongoarrow, pymongoarrow_api_module
 from .statement import (
     MONGO_COLLECTION_MIME,
     MongoCommand,

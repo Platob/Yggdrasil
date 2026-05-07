@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Mapping
 
-from yggdrasil.databricks import lib as databricks_lib
+from yggdrasil import lazy_imports as databricks_lib
 from yggdrasil.databricks.client import (
     DATABRICKS_CLIENT_INIT_NAMES as _YGG_DATABRICKS_CLIENT_INIT_NAMES,
     DatabricksClient as _YGGDatabricksClient,

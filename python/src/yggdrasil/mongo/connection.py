@@ -31,7 +31,7 @@ from urllib.parse import urlparse, urlunparse
 from yggdrasil.disposable import Disposable
 from yggdrasil.io import URL
 
-from .lib import has_pymongoarrow, pymongo_module
+from yggdrasil.lazy_imports import has_pymongoarrow, pymongo_module
 
 if TYPE_CHECKING:
     from pymongo import MongoClient

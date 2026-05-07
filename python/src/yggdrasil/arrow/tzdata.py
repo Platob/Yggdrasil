@@ -22,7 +22,7 @@ import tarfile
 import time
 from pathlib import Path
 
-from .lib import pyarrow
+from yggdrasil.lazy_imports import pyarrow
 
 __all__ = ["ensure_tzdata"]
 

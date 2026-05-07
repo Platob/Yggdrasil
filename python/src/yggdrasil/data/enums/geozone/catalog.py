@@ -217,7 +217,7 @@ class GeoZoneCatalog:
         eic: str | None = None,
         text: str | None = None,
     ):
-        from yggdrasil.polars.lib import polars
+        from yggdrasil.lazy_imports import polars
 
         zones = self.filter_zones(
             key=key,

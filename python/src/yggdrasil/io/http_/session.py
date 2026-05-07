@@ -334,7 +334,7 @@ class HTTPSession(Session):
                     pool=parsed_pool,
                 )
 
-        from yggdrasil.polars.lib import polars as pl
+        from yggdrasil.lazy_imports import polars as pl
 
         init_df = result.to_polars(parse=True, lazy=False)
         if total_pages <= current_page:

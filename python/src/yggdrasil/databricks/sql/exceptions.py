@@ -4,7 +4,7 @@ from typing import Optional, TYPE_CHECKING
 
 from databricks.sdk.service.sql import ServiceErrorCode, StatementState
 
-from ..lib import DatabricksError
+from yggdrasil.lazy_imports import DatabricksError
 
 if TYPE_CHECKING:
     from .statement import StatementResult

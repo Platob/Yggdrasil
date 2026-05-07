@@ -663,7 +663,7 @@ class DatabricksClient:
         return self.workspace_id
 
     def get_account_id(self) -> str:
-        from yggdrasil.polars.lib import polars as pl
+        from yggdrasil.lazy_imports import polars as pl
 
         if self.account_id:
             return self.account_id

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from io import BytesIO as StdBytesIO
 from typing import ClassVar, Generic, TypeVar
 
-from yggdrasil.polars.lib import polars as pl
+from yggdrasil.lazy_imports import polars as pl
 import pyarrow as pa
 
 from yggdrasil.io import BytesIO

@@ -112,7 +112,8 @@ kafka = [
 ]
 
 excel = [
-  "fastexcel"
+  "fastexcel",
+  "openpyxl",
 ]
 
 sql = [

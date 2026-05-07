@@ -443,10 +443,10 @@ def encode_value_for_bson(value: Any, *, target_type: pa.DataType | None = None)
 
     if target_type is not None:
         if pa.types.is_fixed_size_binary(target_type) and target_type.byte_width == OBJECT_ID_BYTES:
-            from .lib import bson_module
+            from yggdrasil.lazy_imports import bson_module
             return bson_module().ObjectId(value)
         if pa.types.is_decimal(target_type):
-            from .lib import bson_module
+            from yggdrasil.lazy_imports import bson_module
             return bson_module().Decimal128(str(value))
 
     return value
@@ -542,15 +542,15 @@ def arrow_table_to_documents(
                 encoded[name] = None
                 continue
             if encode_object_ids and alias == b"objectId":
-                from .lib import bson_module
+                from yggdrasil.lazy_imports import bson_module
                 encoded[name] = bson_module().ObjectId(value)
                 continue
             if alias == b"decimal":
-                from .lib import bson_module
+                from yggdrasil.lazy_imports import bson_module
                 encoded[name] = bson_module().Decimal128(str(value))
                 continue
             if alias == b"binData":
-                from .lib import bson_module
+                from yggdrasil.lazy_imports import bson_module
                 subtype = int.from_bytes(md.get(BSON_SUBTYPE_METADATA_KEY, b"\x00"), "big") if md else 0
                 encoded[name] = bson_module().Binary(value, subtype)
                 continue

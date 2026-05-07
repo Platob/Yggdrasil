@@ -6,7 +6,7 @@ from yggdrasil.arrow.cast import cast_arrow_array, cast_arrow_tabular
 import pyarrow as pa
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.cast.registry import register_converter
-from yggdrasil.pandas.lib import pandas
+from yggdrasil.lazy_imports import pandas
 
 __all__ = [
     "cast_pandas_series",

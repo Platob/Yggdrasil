@@ -902,3 +902,21 @@ class Tabular(ABC, Generic[O]):
             if len(chunk_rows) >= chunk_size:
                 _flush()
         _flush()
+
+    # ==================================================================
+    # ``to_*`` aliases — pandas-style spelling for the ``read_*`` surface.
+    # ==================================================================
+
+    to_arrow_batches = read_arrow_batches
+    to_arrow_table = read_arrow_table
+    to_arrow_batch_reader = read_arrow_batch_reader
+    to_arrow_dataset = read_arrow_dataset
+    to_table = read_table
+    to_polars_frame = read_polars_frame
+    to_polars_frames = read_polars_frames
+    to_pandas_frame = read_pandas_frame
+    to_spark_frame = read_spark_frame
+    to_pylist = read_pylist
+    to_pydict = read_pydict
+    to_record_iterator = read_record_iterator
+    to_records = read_records

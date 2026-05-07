@@ -45,7 +45,7 @@ import unittest
 import uuid
 from typing import Any, ClassVar, Optional
 
-from .lib import has_adbc, has_psycopg
+from yggdrasil.lazy_imports import has_adbc, has_psycopg
 
 LOGGER = logging.getLogger(__name__)
 

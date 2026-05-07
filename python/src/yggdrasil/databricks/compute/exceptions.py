@@ -1,4 +1,4 @@
-from ..lib import DatabricksError
+from yggdrasil.lazy_imports import DatabricksError
 
 __all__ = [
     "ComputeException",
