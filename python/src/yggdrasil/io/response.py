@@ -13,11 +13,14 @@ import pyarrow as pa
 import yggdrasil.pickle.json as json_module
 from yggdrasil.data.cast import any_to_datetime
 from yggdrasil.data.data_field import field as schema_field
+from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
 from .bytes_io import BytesIO
 from yggdrasil.data.enums import Codec, MediaType, MimeTypes
 from .headers import normalize_headers
+from .holder import Holder
+from .tabular.base import Tabular
 from yggdrasil.environ.userinfo import USERINFO_STRUCT, UserInfo
 from .request import (
     PreparedRequest,
@@ -482,10 +485,7 @@ def _compute_response_identity_hash(
     headers: Mapping[str, str] | None,
     body: BytesIO | None,
 ) -> int:
-    try:
-        import xxhash
-    except ImportError:
-        return 0
+    import xxhash
     h = xxhash.xxh3_64()
     h.update(int(request_hash).to_bytes(8, "little", signed=True))
     h.update(b"\x00")
@@ -506,8 +506,19 @@ def _compute_response_identity_hash(
 # Response dataclass
 # ---------------------------------------------------------------------------
 
-class Response:
-    """HTTP response model — paired with the originating :class:`PreparedRequest`."""
+class Response(Tabular[CastOptions]):
+    """HTTP response model — paired with the originating :class:`PreparedRequest`.
+
+    Implements :class:`Tabular` over the deterministic metadata
+    projection: :meth:`read_arrow_batches` (and the engine fan-out
+    derived from it) yields a single Arrow row built from
+    :attr:`arrow_values`, matching :data:`RESPONSE_ARROW_SCHEMA`. To
+    parse the *body* as a tabular payload (Parquet, CSV, JSON …),
+    open a cursor with :meth:`open` and use that cursor's Tabular
+    surface — :class:`BytesIO` dispatches to the right format leaf
+    via the holder's media type — or call the existing
+    :meth:`to_arrow_batches` with ``parse=True``.
+    """
 
     __slots__ = (
         "request",
@@ -531,6 +542,7 @@ class Response:
         received_at: dt.datetime,
         receiver: Optional[UserInfo] = None,
     ) -> None:
+        super().__init__()
         self.request = request
         self.status_code = int(status_code)
         self.headers = _string_dict(headers)
@@ -545,6 +557,51 @@ class Response:
 
         self._id_cache: int | None = None
         self._session: "Session | None" = None
+
+    # ------------------------------------------------------------------
+    # Holder access — the response's body lives on a :class:`Holder`;
+    # :attr:`buffer` is the long-lived cursor over it. :meth:`open`
+    # mints a fresh cursor for callers that want their own cursor
+    # lifetime instead of sharing the response's.
+    # ------------------------------------------------------------------
+
+    @property
+    def holder(self) -> Holder:
+        """The :class:`Holder` backing the response body."""
+        return self.buffer._holder
+
+    def open(self, mode: str = "rb+") -> BytesIO:
+        """Open a fresh :class:`BytesIO` cursor over the response's holder.
+
+        The returned cursor is non-owning: closing it does not close
+        the holder (the response keeps its own cursor in
+        :attr:`buffer`). Use this when you need an independent
+        cursor — for parallel reads, for a dedicated tabular leaf
+        via the holder's media type, etc.
+        """
+        return BytesIO(holder=self.holder, owns_holder=False, mode=mode)
+
+    # ------------------------------------------------------------------
+    # Tabular contract — yield the deterministic single-row metadata
+    # projection. The body itself is reachable via :meth:`open` (its
+    # cursor is a :class:`Tabular` too) or :meth:`to_arrow_batches`
+    # with ``parse=True``.
+    # ------------------------------------------------------------------
+
+    def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
+        yield options.cast_arrow_tabular(self._arrow_batch_from_values())
+
+    def _write_arrow_batches(
+        self,
+        batches: Iterable[pa.RecordBatch],
+        options: CastOptions,
+    ) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} is read-only. To persist a "
+            "response row, call ``response.to_arrow_batch(parse=False)`` "
+            "and write that batch through a writable Tabular sink "
+            "(ArrowTabular, ParquetIO, a Delta/SQL table, …)."
+        )
 
     @property
     def receiver(self) -> UserInfo | None:
@@ -863,10 +920,7 @@ class Response:
         """
         if self.buffer is None:
             return 0
-        try:
-            return self.buffer.xxh3_int64()
-        except ImportError:
-            return 0
+        return self.buffer.xxh3_int64()
 
     @property
     def hash(self) -> int:
@@ -904,10 +958,7 @@ class Response:
         body_hash: int
         if self.buffer is not None:
             body_bytes = self.buffer.to_bytes()
-            try:
-                body_hash = self.buffer.xxh3_int64()
-            except ImportError:
-                body_hash = 0
+            body_hash = self.buffer.xxh3_int64()
         else:
             body_bytes = None
             body_hash = 0

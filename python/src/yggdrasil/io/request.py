@@ -252,17 +252,10 @@ def _epoch_us_to_utc_datetime(value: int) -> dt.datetime:
 
 
 def _xxh3_int64_str(text: str) -> int:
-    """Signed-int64 xxh3_64 digest of *text*.
-
-    Returns 0 on missing optional ``xxhash`` so the schema's nullable
-    semantics still hold without forcing the dependency.
-    """
+    """Signed-int64 xxh3_64 digest of *text*."""
     if not text:
         return 0
-    try:
-        import xxhash
-    except ImportError:
-        return 0
+    import xxhash
     u = xxhash.xxh3_64(text.encode("utf-8")).intdigest()
     return u if u < 2**63 else u - 2**64
 
@@ -665,6 +658,24 @@ class PreparedRequest:
         return self.buffer
 
     @property
+    def holder(self):
+        """The :class:`Holder` backing the request body, or ``None``."""
+        if self.buffer is None:
+            return None
+        return self.buffer._holder
+
+    def open(self, mode: str = "rb+") -> Optional[BytesIO]:
+        """Open a fresh :class:`BytesIO` cursor over the request's holder.
+
+        Returns ``None`` when the request has no body. The returned
+        cursor is non-owning: closing it does not close the holder
+        (the request keeps its own cursor in :attr:`buffer`).
+        """
+        if self.buffer is None:
+            return None
+        return BytesIO(holder=self.buffer._holder, owns_holder=False, mode=mode)
+
+    @property
     def content_length(self) -> int:
         return self.buffer.size if self.buffer is not None else 0
 
@@ -754,10 +765,7 @@ class PreparedRequest:
         """
         if self.buffer is None:
             return 0
-        try:
-            return self.buffer.xxh3_int64()
-        except ImportError:
-            return 0
+        return self.buffer.xxh3_int64()
 
     @property
     def private_url_hash(self) -> int:
@@ -792,10 +800,7 @@ class PreparedRequest:
         return self._compute_identity_hash(anonymize=True)
 
     def _compute_identity_hash(self, *, anonymize: bool = False) -> int:
-        try:
-            import xxhash
-        except ImportError:
-            return 0
+        import xxhash
 
         if anonymize:
             url_str = self.url.anonymize(mode="remove").to_string()

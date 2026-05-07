@@ -998,53 +998,19 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         return out
 
     def xxh3_64(self):
-        """Return an :class:`xxhash.xxh3_64` instance over the payload.
-
-        Mirrors the legacy buffer surface a couple of HTTP layer
-        consumers expect (:func:`response._compute_response_identity_hash`
-        calls ``buffer.xxh3_64().digest()``). Falls back to a
-        ``hashlib`` shim when ``xxhash`` isn't installed; the shim
-        exposes ``digest`` / ``intdigest`` so the caller doesn't
-        notice.
-        """
-        payload = self.to_bytes()
-        try:
-            import xxhash as _xx
-            return _xx.xxh3_64(payload)
-        except Exception:
-            import hashlib
-
-            class _Fallback:
-                def __init__(self, p: bytes) -> None:
-                    self._d = hashlib.blake2b(p, digest_size=8).digest()
-
-                def digest(self) -> bytes:
-                    return self._d
-
-                def hexdigest(self) -> str:
-                    return self._d.hex()
-
-                def intdigest(self) -> int:
-                    return int.from_bytes(self._d, "big", signed=False)
-
-            return _Fallback(payload)
+        """Return an :class:`xxhash.xxh3_64` instance over the payload."""
+        import xxhash
+        return xxhash.xxh3_64(self.to_bytes())
 
     def xxh3_int64(self) -> int:
         """64-bit xxh3 hash of the buffer's payload as a signed int64.
 
         ``xxh3_64`` itself produces an unsigned 64-bit value;
         downstream Arrow schemas pin the field as ``int64``, so we
-        wrap into signed range ``[-2**63, 2**63)`` here. Falls back
-        to ``blake2b`` when ``xxhash`` isn't installed.
+        wrap into signed range ``[-2**63, 2**63)`` here.
         """
-        payload = self.to_bytes()
-        try:
-            import xxhash as _xx
-            v = _xx.xxh3_64(payload).intdigest()
-        except Exception:
-            import hashlib
-            digest = hashlib.blake2b(payload, digest_size=8).digest()
-            v = int.from_bytes(digest, "big", signed=False)
+        import xxhash
+        v = xxhash.xxh3_64(self.to_bytes()).intdigest()
         if v >= 2 ** 63:
             v -= 2 ** 64
         return v

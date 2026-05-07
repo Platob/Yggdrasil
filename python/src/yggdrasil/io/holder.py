@@ -858,6 +858,36 @@ class Holder(Disposable):
         return total
 
     # ------------------------------------------------------------------
+    # Hashing — full-payload digests over the durable bytes.
+    # ------------------------------------------------------------------
+    #
+    # Lives on the holder rather than only on :class:`BytesIO` because
+    # callers that only have a holder shouldn't have to open a cursor
+    # just to compute a digest — the holder owns the bytes.
+
+    def to_bytes(self) -> bytes:
+        """Full payload as :class:`bytes` — alias for ``read_bytes()``."""
+        return self.read_bytes()
+
+    def xxh3_64(self):
+        """Return an :class:`xxhash.xxh3_64` instance over the payload."""
+        import xxhash
+        return xxhash.xxh3_64(self.read_bytes())
+
+    def xxh3_int64(self) -> int:
+        """64-bit xxh3 hash of the payload as a signed int64.
+
+        ``xxh3_64`` produces an unsigned 64-bit value; downstream Arrow
+        schemas pin the field as ``int64``, so the digest is wrapped
+        into signed range ``[-2**63, 2**63)``.
+        """
+        import xxhash
+        v = xxhash.xxh3_64(self.read_bytes()).intdigest()
+        if v >= 2 ** 63:
+            v -= 2 ** 64
+        return v
+
+    # ------------------------------------------------------------------
     # Dunder
     # ------------------------------------------------------------------
 
