@@ -265,6 +265,22 @@ class MediaType:
         except Exception:
             pass
 
+        # Magic-byte sniffing requires an existing file. Skip the open
+        # when the path doesn't exist so we don't create an empty stub
+        # on disk just to fail back to *default* (LocalPath._acquire
+        # opens ``O_RDWR | O_CREAT`` regardless of the requested mode).
+        try:
+            path_exists = path.exists()
+        except Exception:
+            path_exists = True  # opaque backend — let the open below decide
+
+        if not path_exists:
+            if default is ...:
+                raise ValueError(
+                    f"Cannot parse {cls.__name__} from {path!r} (does not exist)"
+                )
+            return default
+
         try:
             with path.open(mode="rb") as f:
                 return cls.from_io(f, default=default)

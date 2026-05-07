@@ -837,6 +837,138 @@ class MimeTypes:
         )
     )
 
+    # --- Databricks ``DataSourceFormat`` connectors ---------------------
+    # One :class:`MimeType` per Databricks ``DataSourceFormat`` enum value
+    # that doesn't already map to a generic columnar mime (DELTA / PARQUET
+    # / AVRO / ORC / CSV / JSON / ICEBERG / TEXT live above). Names match
+    # the SDK enum values so :meth:`MimeType.from_` resolves a Databricks
+    # format string in one hop, and the values describe the underlying
+    # system (``application/vnd.mysql`` not ``application/vnd.databricks
+    # .mysql``) so non-Databricks integrations targeting the same source
+    # can share the categorization.
+    HIVE = MimeType.define(
+        MimeType("HIVE", "application/vnd.apache.hive", is_tabular=True)
+    )
+    DELTASHARING = MimeType.define(
+        MimeType("DELTASHARING", "application/vnd.delta.sharing", is_tabular=True)
+    )
+    DELTA_UNIFORM_HUDI = MimeType.define(
+        MimeType(
+            "DELTA_UNIFORM_HUDI",
+            "application/vnd.delta.uniform.hudi",
+            is_tabular=True,
+        )
+    )
+    DELTA_UNIFORM_ICEBERG = MimeType.define(
+        MimeType(
+            "DELTA_UNIFORM_ICEBERG",
+            "application/vnd.delta.uniform.iceberg",
+            is_tabular=True,
+        )
+    )
+    UNITY_CATALOG = MimeType.define(
+        MimeType(
+            "UNITY_CATALOG",
+            # Foreign UC entry — distinct from the table-itself mime
+            # (``application/vnd.databricks.uc.table``) which carries
+            # the table resource. ``uc.foreign`` is the proxy view that
+            # points outside Databricks-managed storage.
+            "application/vnd.databricks.uc.foreign",
+            is_tabular=True,
+        )
+    )
+    DATABRICKS_FORMAT = MimeType.define(
+        MimeType(
+            "DATABRICKS_FORMAT", "application/vnd.databricks", is_tabular=True
+        )
+    )
+    DATABRICKS_ROW_STORE_FORMAT = MimeType.define(
+        MimeType(
+            "DATABRICKS_ROW_STORE_FORMAT",
+            "application/vnd.databricks.row_store",
+            is_tabular=True,
+        )
+    )
+    VECTOR_INDEX_FORMAT = MimeType.define(
+        MimeType(
+            "VECTOR_INDEX_FORMAT",
+            "application/vnd.databricks.vector_index",
+            is_tabular=True,
+        )
+    )
+    BIGQUERY_FORMAT = MimeType.define(
+        MimeType(
+            "BIGQUERY_FORMAT",
+            "application/vnd.google.bigquery",
+            is_tabular=True,
+        )
+    )
+    MONGODB_FORMAT = MimeType.define(
+        MimeType("MONGODB_FORMAT", "application/vnd.mongodb", is_tabular=True)
+    )
+    MYSQL_FORMAT = MimeType.define(
+        MimeType("MYSQL_FORMAT", "application/vnd.mysql", is_tabular=True)
+    )
+    NETSUITE_FORMAT = MimeType.define(
+        MimeType("NETSUITE_FORMAT", "application/vnd.netsuite", is_tabular=True)
+    )
+    ORACLE_FORMAT = MimeType.define(
+        MimeType("ORACLE_FORMAT", "application/vnd.oracle", is_tabular=True)
+    )
+    POSTGRESQL_FORMAT = MimeType.define(
+        MimeType(
+            "POSTGRESQL_FORMAT", "application/vnd.postgresql", is_tabular=True
+        )
+    )
+    REDSHIFT_FORMAT = MimeType.define(
+        MimeType(
+            "REDSHIFT_FORMAT",
+            "application/vnd.amazon.redshift",
+            is_tabular=True,
+        )
+    )
+    SALESFORCE_FORMAT = MimeType.define(
+        MimeType(
+            "SALESFORCE_FORMAT", "application/vnd.salesforce", is_tabular=True
+        )
+    )
+    SALESFORCE_DATA_CLOUD_FORMAT = MimeType.define(
+        MimeType(
+            "SALESFORCE_DATA_CLOUD_FORMAT",
+            "application/vnd.salesforce.data_cloud",
+            is_tabular=True,
+        )
+    )
+    SNOWFLAKE_FORMAT = MimeType.define(
+        MimeType(
+            "SNOWFLAKE_FORMAT", "application/vnd.snowflake", is_tabular=True
+        )
+    )
+    SQLDW_FORMAT = MimeType.define(
+        MimeType(
+            "SQLDW_FORMAT",
+            "application/vnd.microsoft.sqldw",
+            is_tabular=True,
+        )
+    )
+    SQLSERVER_FORMAT = MimeType.define(
+        MimeType(
+            "SQLSERVER_FORMAT",
+            "application/vnd.microsoft.sqlserver",
+            is_tabular=True,
+        )
+    )
+    TERADATA_FORMAT = MimeType.define(
+        MimeType("TERADATA_FORMAT", "application/vnd.teradata", is_tabular=True)
+    )
+    WORKDAY_RAAS_FORMAT = MimeType.define(
+        MimeType(
+            "WORKDAY_RAAS_FORMAT",
+            "application/vnd.workday.raas",
+            is_tabular=True,
+        )
+    )
+
     # Kafka — a topic, addressed by broker + topic name. Streaming
     # tabular source; values can be any of the registered codecs
     # (JSON, Avro, Protobuf, plain bytes).
