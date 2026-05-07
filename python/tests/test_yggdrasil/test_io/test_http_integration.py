@@ -188,6 +188,27 @@ class TestLocalCacheIntegration:
             _time.sleep(0.02)
         return False
 
+    def _wait_for_readable(self, cache, *, timeout: float = 3.0) -> bool:
+        """Poll until the cache reads back a non-empty Arrow table.
+
+        Writeback fires on a daemon thread; the partition dir may
+        appear before the parquet file is fully flushed. Retry the
+        read until it succeeds with rows or the deadline passes.
+        """
+        import time as _time
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            try:
+                cache.tabular.invalidate_listing()
+                with cache.tabular:
+                    table = cache.tabular.read_arrow_table()
+                if table.num_rows > 0:
+                    return True
+            except Exception:
+                pass
+            _time.sleep(0.05)
+        return False
+
     def _prepopulate(
         self, cache: CacheConfig, response,
     ) -> None:
@@ -245,6 +266,154 @@ class TestLocalCacheIntegration:
             if f._tag_flag(b"partition_by")
         ]
         assert folder.partition_columns == expected
+
+    def test_cache_hit_distinct_url_does_not_match(self, tmp_path) -> None:
+        """A cached row for /a must not satisfy a request for /b."""
+        s = StubSession()
+        cache = self._cache(tmp_path)
+        seed_req = make_request("https://example.com/a")
+        self._prepopulate(cache, make_response(request=seed_req, body=b'{"v":"a"}'))
+
+        s.queue(make_response(body=b'{"v":"b"}'))
+        out = s.send(make_request("https://example.com/b"), local_cache=cache)
+        assert len(s.calls) == 1, "different URL must miss cache"
+        assert out.json() == {"v": "b"}
+
+    def test_cache_hit_5xx_still_raises_when_raise_error(self, tmp_path) -> None:
+        """raise_error applies after a cache hit too."""
+        s = StubSession()
+        cache = self._cache(tmp_path)
+        req = make_request("https://example.com/x")
+        self._prepopulate(
+            cache, make_response(request=req, status_code=500, body=b"boom"),
+        )
+        with pytest.raises(Exception):
+            s.send(req, local_cache=cache, raise_error=True)
+        assert len(s.calls) == 0, "cache hit must precede the network"
+
+    def test_received_to_filters_out_stale_row(self, tmp_path) -> None:
+        """A row outside [received_from, received_to) is ignored on read."""
+        import datetime as dt
+        s = StubSession()
+        folder = YGGFolderIO(
+            path=LocalPath(str(tmp_path)),
+            schema=RESPONSE_SCHEMA,
+        )
+        old = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+        cache = CacheConfig(
+            tabular=folder,
+            mode=Mode.APPEND,
+            received_from=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+            received_to=dt.datetime(2030, 1, 1, tzinfo=dt.timezone.utc),
+        )
+        req = make_request("https://example.com/x")
+        self._prepopulate(
+            cache,
+            make_response(request=req, body=b'{"old":true}', received_at=old),
+        )
+
+        s.queue(make_response(body=b'{"fresh":true}'))
+        out = s.send(req, local_cache=cache)
+        assert len(s.calls) == 1, "stale row outside the window must miss"
+        assert out.json() == {"fresh": True}
+
+    def test_upsert_mode_skips_lookup_and_refetches(self, tmp_path) -> None:
+        """UPSERT bypasses the read, always going to the network."""
+        s = StubSession()
+        cache = CacheConfig(
+            tabular=YGGFolderIO(
+                path=LocalPath(str(tmp_path)),
+                schema=RESPONSE_SCHEMA,
+            ),
+            mode=Mode.UPSERT,
+        )
+        req = make_request("https://example.com/x")
+        self._prepopulate(
+            cache, make_response(request=req, body=b'{"cached":true}'),
+        )
+
+        s.queue(make_response(body=b'{"fresh":true}'))
+        out = s.send(req, local_cache=cache)
+        assert len(s.calls) == 1, "UPSERT must always hit the network"
+        assert out.json() == {"fresh": True}
+
+    def test_per_request_cache_override_wins(self, tmp_path) -> None:
+        """A request-level cache config overrides the session-level one."""
+        s = StubSession()
+        s.queue(make_response(body=b'{"network":true}'))
+        session_cache = self._cache(tmp_path)
+        # Pre-seed the session-level cache with a row that *would* match
+        # if the session config were used.
+        seed_req = make_request("https://example.com/x")
+        self._prepopulate(
+            session_cache,
+            make_response(request=seed_req, body=b'{"cached":true}'),
+        )
+
+        # Per-request config points at a fresh empty folder — that must
+        # win, forcing a network fetch.
+        empty_dir = tmp_path / "alt"
+        empty_dir.mkdir()
+        req_cache = CacheConfig(
+            tabular=YGGFolderIO(
+                path=LocalPath(str(empty_dir)),
+                schema=RESPONSE_SCHEMA,
+            ),
+            mode=Mode.APPEND,
+        )
+        req = make_request("https://example.com/x").copy(
+            local_cache_config=req_cache,
+        )
+
+        out = s.send(req, local_cache=session_cache)
+        assert len(s.calls) == 1, "per-request config must override the session"
+        assert out.json() == {"network": True}
+
+    def test_writeback_round_trips_on_second_send(self, tmp_path) -> None:
+        """Send → writeback → identical send reads the persisted row."""
+        s = StubSession()
+        cache = self._cache(tmp_path)
+        req = make_request("https://example.com/x")
+        # Queue a response bound to *this* request — the lookup keys
+        # off the embedded request's hash, so the queued response must
+        # carry it for the round-trip read to find it.
+        s.queue(make_response(request=req, body=b'{"v":"first"}'))
+
+        first = s.send(req, local_cache=cache)
+        assert first.json() == {"v": "first"}
+        assert self._wait_for_readable(cache), "writeback never landed on disk"
+
+        # Second send must hit the cache rather than the network.
+        second = s.send(req, local_cache=cache)
+        assert len(s.calls) == 1, "second send must read from disk"
+        assert second.json() == {"v": "first"}
+
+
+class TestCacheConfigCoercion:
+    """``CacheConfig.check_arg`` accepts a few convenience shapes."""
+
+    def test_check_arg_path_builds_local_folder(self, tmp_path) -> None:
+        from yggdrasil.io.nested.folder_io import FolderIO
+
+        cfg = CacheConfig.check_arg(tmp_path)
+        assert cfg.is_local_tabular is True
+        assert isinstance(cfg.tabular, FolderIO)
+        assert cfg.local_cache_enabled is True
+        assert str(cfg.local_cache_folder()) == str(tmp_path)
+
+    def test_check_arg_timedelta_sets_window(self) -> None:
+        import datetime as dt
+
+        cfg = CacheConfig.check_arg(dt.timedelta(hours=6))
+        # ``check_arg`` resolves a timedelta into a concrete window
+        # (received_to defaults to now, received_from = now - delta).
+        assert cfg.received_from is not None
+        assert cfg.received_to is not None
+        assert cfg.received_to - cfg.received_from == dt.timedelta(hours=6)
+
+    def test_check_arg_dict_round_trip(self) -> None:
+        cfg = CacheConfig.check_arg({"mode": "APPEND"})
+        assert cfg.mode is Mode.APPEND
 
 
 # ---------------------------------------------------------------------------
