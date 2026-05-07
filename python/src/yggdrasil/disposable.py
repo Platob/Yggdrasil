@@ -5,7 +5,19 @@ from abc import ABC
 
 class Disposable(ABC):
     """Transactional resource with binary open/close, with-stack
-    nesting, and an owned-children graph."""
+    nesting, and an owned-children graph.
+
+    Reopenable: subclasses inheriting from :class:`Disposable` are
+    expected to support being reopened after :meth:`close`. Calling
+    :meth:`open` on a closed instance must restore it to a fresh,
+    usable state — the same instance can cycle through
+    open → close → open → close any number of times. Subclass
+    :meth:`_acquire` / :meth:`_release` implementations must therefore
+    avoid one-shot state that would prevent a subsequent
+    :meth:`_acquire` from succeeding (e.g. don't null out config the
+    next open will need, and don't leave latch-style flags set after
+    teardown). A ``with`` block on a previously-closed instance must
+    reopen it cleanly."""
 
     __slots__ = (
         '_acquired',
