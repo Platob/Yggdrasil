@@ -8,7 +8,7 @@ openpyxl = pytest.importorskip("openpyxl")  # noqa: E402  (after importorskip)
 
 from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.io.path.local_path import LocalPath
-from yggdrasil.io.primitive.xlsx_io import XlsxIO, XlsxOptions
+from yggdrasil.io.primitive.xlsx_io import XlsxIO, XlsxOptions, XlsxSheetIO
 from yggdrasil.io.tabular import Tabular
 
 
@@ -57,13 +57,23 @@ class TestModes:
         io.write_arrow_table(smaller, options=XlsxOptions(mode=Mode.OVERWRITE))
         assert io.read_arrow_table().column("id").to_pylist() == [9]
 
-    def test_append_rejected(self, table) -> None:
+    def test_append_replaces_target_sheet_keeps_others(self, table) -> None:
         io = XlsxIO()
-        io.write_arrow_table(table)
-        with pytest.raises(NotImplementedError, match="OVERWRITE"):
-            io.write_arrow_batches(
-                table.to_batches(), options=XlsxOptions(mode=Mode.APPEND),
-            )
+        # Two sheets up front via the convenience writer.
+        io.write_sheets({
+            "S1": table,
+            "S2": pa.table({"id": [4, 5], "name": ["d", "e"]}),
+        })
+        # APPEND a new payload onto the named sheet.
+        io.write_arrow_batches(
+            pa.table({"id": [9], "name": ["z"]}).to_batches(),
+            options=XlsxOptions(sheet_name="S2", mode=Mode.APPEND),
+        )
+        sheets = set(io.list_sheets())
+        assert sheets == {"S1", "S2"}
+        # Only S2's payload changed; S1 is untouched.
+        assert io.child("S1").read_arrow_table().column("id").to_pylist() == [1, 2, 3]
+        assert io.child("S2").read_arrow_table().column("id").to_pylist() == [9]
 
     def test_error_if_exists(self, table) -> None:
         io = XlsxIO()
@@ -86,3 +96,86 @@ class TestHolderBacked:
         rows = [tuple(r) for r in ws.iter_rows(values_only=True)]
         assert rows[0] == ("id", "name")
         assert rows[1:] == [(1, "a"), (2, "b"), (3, "c")]
+
+
+# ---------------------------------------------------------------------------
+# Entries API — per-sheet children
+# ---------------------------------------------------------------------------
+
+
+class TestEntries:
+    """Multi-sheet workbook: each sheet is a lazy :class:`XlsxSheetIO`
+    child, mirroring the :class:`ZipIO` / :class:`ZipEntryIO` pattern."""
+
+    @pytest.fixture
+    def workbook(self) -> XlsxIO:
+        io = XlsxIO()
+        io.write_sheets({
+            "Sales": pa.table({"id": [1, 2], "price": [10, 20]}),
+            "Inventory": pa.table({"sku": ["A", "B", "C"], "qty": [100, 200, 300]}),
+        })
+        return io
+
+    def test_list_sheets(self, workbook: XlsxIO) -> None:
+        assert workbook.list_sheets() == ["Sales", "Inventory"]
+
+    def test_list_sheets_on_empty_workbook(self) -> None:
+        assert XlsxIO().list_sheets() == []
+
+    def test_iter_children_yields_sheet_io(self, workbook: XlsxIO) -> None:
+        children = list(workbook.iter_children())
+        assert [c.sheet_name for c in children] == ["Sales", "Inventory"]
+        assert all(isinstance(c, XlsxSheetIO) for c in children)
+        assert all(c.parent is workbook for c in children)
+
+    def test_child_reads_only_its_sheet(self, workbook: XlsxIO) -> None:
+        sales = workbook.child("Sales")
+        rows = sales.read_arrow_table().to_pylist()
+        assert rows == [{"id": 1, "price": 10}, {"id": 2, "price": 20}]
+
+    def test_child_unknown_name_raises(self, workbook: XlsxIO) -> None:
+        with pytest.raises(KeyError, match="Inventory"):
+            workbook.child("Missing")
+
+    def test_child_collect_schema(self, workbook: XlsxIO) -> None:
+        inv = workbook.child("Inventory")
+        assert set(inv.collect_schema().field_names()) == {"sku", "qty"}
+
+    def test_child_byte_surface_materializes_csv(self, workbook: XlsxIO) -> None:
+        sales = workbook.child("Sales")
+        assert not sales._materialized
+        # First byte-level access drives materialization.
+        payload = sales.to_bytes()
+        assert sales._materialized
+        # CSV view of the sheet — header row plus two data rows.
+        text = payload.decode("utf-8")
+        assert text.splitlines()[0] == "id,price"
+        assert "10" in text and "20" in text
+
+    def test_iter_children_is_lazy(self, workbook: XlsxIO) -> None:
+        # Walking the directory does NOT materialize per-sheet bytes.
+        children = list(workbook.iter_children())
+        assert all(not c._materialized for c in children)
+
+    def test_child_write_replaces_only_target_sheet(
+        self, workbook: XlsxIO,
+    ) -> None:
+        # Update Sales through its child handle; Inventory stays put.
+        sales = workbook.child("Sales")
+        sales.write_arrow_table(pa.table({"id": [9], "price": [99]}))
+        assert set(workbook.list_sheets()) == {"Sales", "Inventory"}
+        assert workbook.child("Sales").read_arrow_table().column("id").to_pylist() == [9]
+        assert workbook.child("Inventory").read_arrow_table().column("qty").to_pylist() == [100, 200, 300]
+
+    def test_write_sheets_replaces_workbook(self, workbook: XlsxIO) -> None:
+        workbook.write_sheets({
+            "Only": pa.table({"x": [1]}),
+        })
+        assert workbook.list_sheets() == ["Only"]
+        assert workbook.child("Only").read_arrow_table().column("x").to_pylist() == [1]
+
+    def test_write_sheets_accepts_record_batches(self) -> None:
+        io = XlsxIO()
+        batch = pa.record_batch({"id": pa.array([1, 2])})
+        io.write_sheets({"S": batch})
+        assert io.child("S").read_arrow_table().column("id").to_pylist() == [1, 2]

@@ -25,8 +25,10 @@ from yggdrasil.io.memory import Memory
 from yggdrasil.io.path.local_path import LocalPath
 from yggdrasil.io.primitive.arrow_ipc_io import ArrowIPCIO
 from yggdrasil.io.primitive.csv_io import CsvIO
+from yggdrasil.io.primitive.json_io import JsonIO
 from yggdrasil.io.primitive.ndjson_io import NDJsonIO
 from yggdrasil.io.primitive.parquet_io import ParquetIO
+from yggdrasil.io.primitive.xlsx_io import XlsxIO
 
 
 @pytest.fixture
@@ -197,3 +199,107 @@ class TestParityWithCodec:
         compressed_rows = compressed.read_arrow_table().to_pylist()
 
         assert plain_rows == compressed_rows
+
+
+# ---------------------------------------------------------------------------
+# JSON + gzip
+# ---------------------------------------------------------------------------
+
+
+class TestJsonGzipMemory:
+    """Regression: an HTTP response body with
+    ``Content-Encoding: gzip`` lands as ``application/json +
+    application/gzip`` on the buffer's MediaType. JsonIO must peel
+    the codec layer before parsing."""
+
+    def test_round_trip(self, table) -> None:
+        mem = _seed_codec(Memory(), MimeTypes.JSON, Codecs.GZIP)
+        JsonIO(holder=mem, owns_holder=False).write_arrow_table(table)
+        # On-the-wire bytes are gzip-framed.
+        assert mem.read_bytes()[:2] == b"\x1f\x8b"
+        # Decompressed payload looks like a JSON array.
+        decoded = gzip.decompress(mem.read_bytes())
+        assert decoded.startswith(b"[")
+        # Read-back transparently decompresses.
+        loaded = JsonIO(holder=mem, owns_holder=False).read_arrow_table()
+        assert loaded.column("id").to_pylist() == [1, 2, 3]
+
+    def test_reads_externally_gzipped_array(self) -> None:
+        # Server-side gzip of a hand-rolled JSON array body — the
+        # exact shape that triggered the original UnicodeDecodeError.
+        body = b'[{"id":1,"name":"a"},{"id":2,"name":"b"}]'
+        mem = _seed_codec(Memory(), MimeTypes.JSON, Codecs.GZIP)
+        # Writing pre-compressed bytes via the raw BytesIO surface so
+        # the test mirrors the HTTP response path (response body is
+        # already gzip-framed; only the MediaType is stamped).
+        BytesIO(holder=mem, owns_holder=False).write_bytes(gzip.compress(body))
+        loaded = JsonIO(holder=mem, owns_holder=False).read_arrow_table()
+        assert loaded.column("id").to_pylist() == [1, 2]
+
+    def test_reads_externally_gzipped_ndjson_shape(self) -> None:
+        # JsonIO also accepts NDJSON-shaped (newline-terminated) input.
+        body = b'{"id":1,"name":"a"}\n{"id":2,"name":"b"}\n'
+        mem = _seed_codec(Memory(), MimeTypes.JSON, Codecs.GZIP)
+        BytesIO(holder=mem, owns_holder=False).write_bytes(gzip.compress(body))
+        loaded = JsonIO(holder=mem, owns_holder=False).read_arrow_table()
+        assert loaded.column("id").to_pylist() == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# XLSX + gzip
+# ---------------------------------------------------------------------------
+
+
+class TestXlsxGzipMemory:
+    """An ``.xlsx.gz`` LocalPath stamps xlsx + gzip onto the holder.
+    Reads should peel the codec before openpyxl opens the workbook;
+    writes should compress the workbook ZIP into the holder."""
+
+    def test_round_trip(self, table) -> None:
+        try:
+            import openpyxl  # noqa: F401
+        except ImportError:
+            pytest.skip("openpyxl not installed")
+        mem = _seed_codec(Memory(), MimeTypes.XLSX, Codecs.GZIP)
+        XlsxIO(holder=mem, owns_holder=False).write_arrow_table(table)
+        assert mem.read_bytes()[:2] == b"\x1f\x8b"
+        # Decompressed payload is a ZIP (xlsx archive).
+        decoded = gzip.decompress(mem.read_bytes())
+        assert decoded[:2] == b"PK"
+        loaded = XlsxIO(holder=mem, owns_holder=False).read_arrow_table()
+        assert loaded.column("id").to_pylist() == [1, 2, 3]
+
+
+# ---------------------------------------------------------------------------
+# Parquet + gzip codec wrapper
+# ---------------------------------------------------------------------------
+
+
+class TestParquetGzipMemory:
+    """Parquet has its own internal compression, but the orthogonal
+    holder-level codec still has to round-trip cleanly."""
+
+    def test_round_trip(self, table) -> None:
+        mem = _seed_codec(Memory(), MimeTypes.PARQUET, Codecs.GZIP)
+        ParquetIO(holder=mem, owns_holder=False).write_arrow_table(table)
+        assert mem.read_bytes()[:2] == b"\x1f\x8b"
+        decoded = gzip.decompress(mem.read_bytes())
+        # Parquet files start with the "PAR1" magic.
+        assert decoded[:4] == b"PAR1"
+        loaded = ParquetIO(holder=mem, owns_holder=False).read_arrow_table()
+        assert loaded.column("id").to_pylist() == [1, 2, 3]
+
+
+# ---------------------------------------------------------------------------
+# Arrow IPC + gzip
+# ---------------------------------------------------------------------------
+
+
+class TestArrowIPCGzipMemory:
+
+    def test_round_trip(self, table) -> None:
+        mem = _seed_codec(Memory(), MimeTypes.ARROW_IPC, Codecs.GZIP)
+        ArrowIPCIO(holder=mem, owns_holder=False).write_arrow_table(table)
+        assert mem.read_bytes()[:2] == b"\x1f\x8b"
+        loaded = ArrowIPCIO(holder=mem, owns_holder=False).read_arrow_table()
+        assert loaded.equals(table)
