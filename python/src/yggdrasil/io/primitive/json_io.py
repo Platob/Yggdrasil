@@ -91,23 +91,25 @@ class JsonIO(IO[bytes, JsonOptions]):
         if self.size == 0:
             return
 
-        # Route through ``_format_view`` so a codec on the buffer's
-        # MediaType (e.g. ``application/json + application/gzip`` from
-        # an HTTP response with ``Content-Encoding: gzip``) is peeled
-        # before we sniff and parse — pyarrow's JSON reader and
-        # ``json.loads`` both want the decompressed payload.
-        with self._format_view() as v:
-            size = v.size
+        # Route through ``arrow_input_stream`` so a codec on the
+        # buffer's MediaType (e.g. ``application/json +
+        # application/gzip`` from an HTTP response with
+        # ``Content-Encoding: gzip``) is peeled before we sniff and
+        # parse — pyarrow's JSON reader and ``json.loads`` both want
+        # the decompressed payload.
+        with self.arrow_input_stream() as v:
+            size = v.size()
             if size == 0:
                 return
 
             # Sniff the buffer shape: NDJSON-ish (line-terminated) goes
             # through pyarrow's streaming reader; everything else through
             # the standard library JSON parser.
-            head = v.pread(1, 0)
+            head = v.read_at(1, 0)
             is_array = head.lstrip().startswith(b"[")
-            if is_array or not v.pread(1, max(0, size - 1)).endswith(b"\n"):
-                data = v.to_bytes()
+            if is_array or not v.read_at(1, max(0, size - 1)).endswith(b"\n"):
+                v.seek(0)
+                data = v.read()
                 parsed = json.loads(data.decode(options.encoding))
                 if isinstance(parsed, list):
                     if parsed:
@@ -193,10 +195,13 @@ class JsonIO(IO[bytes, JsonOptions]):
             sort_keys=options.sort_keys,
             default=str,
         )
-        # Bulk-commit through ``_commit_format_payload`` so a codec
-        # on the holder's MediaType (e.g. ``.json.gz``) is applied
-        # to the encoded payload before it lands in the buffer.
-        self._commit_format_payload(text.encode(options.encoding))
+        # Drive the JSON payload through the IO's
+        # :meth:`arrow_output_stream`, which yields a
+        # :class:`pa.BufferOutputStream` and bulk-commits the encoded
+        # payload — applying any codec on the holder's MediaType
+        # (e.g. ``.json.gz``) — on context exit.
+        with self.arrow_output_stream() as sink:
+            sink.write(text.encode(options.encoding))
 
     def _resolve_action(self, mode: Mode) -> Mode:
         if mode is Mode.AUTO or mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:

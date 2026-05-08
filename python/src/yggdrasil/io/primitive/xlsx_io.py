@@ -187,8 +187,7 @@ class XlsxSheetIO(IO[bytes, XlsxOptions]):
             self._materialized = True
             return
 
-        with self._xlsx_parent._format_view() as v:
-            v.seek(0)
+        with self._xlsx_parent.arrow_input_stream() as v:
             data = v.read()
         batch = _read_sheet_batch(
             data,
@@ -200,15 +199,15 @@ class XlsxSheetIO(IO[bytes, XlsxOptions]):
             self._materialized = True
             return
         from pyarrow import csv as _pa_csv
-        buf = _stdlib_io.BytesIO()
+        sink = pa.BufferOutputStream()
         _pa_csv.write_csv(
             pa.Table.from_batches([batch]),
-            buf,
+            sink,
             write_options=_pa_csv.WriteOptions(
                 quoting_style="none", quoting_header="none",
             ),
         )
-        self._holder.write_bytes(buf.getvalue(), 0)
+        self._holder.write_bytes(sink.getvalue(), 0)
         self._materialized = True
 
     def _active(self):
@@ -238,8 +237,7 @@ class XlsxSheetIO(IO[bytes, XlsxOptions]):
     ) -> Iterator[pa.RecordBatch]:
         if self._xlsx_parent.size == 0:
             return
-        with self._xlsx_parent._format_view() as v:
-            v.seek(0)
+        with self._xlsx_parent.arrow_input_stream() as v:
             data = v.read()
         batch = _read_sheet_batch(
             data,
@@ -276,8 +274,7 @@ class XlsxSheetIO(IO[bytes, XlsxOptions]):
         carry: list[tuple[str, list[tuple]]] = []
         if self._xlsx_parent.size > 0:
             openpyxl = _openpyxl()
-            with self._xlsx_parent._format_view() as v:
-                v.seek(0)
+            with self._xlsx_parent.arrow_input_stream() as v:
                 wb = openpyxl.load_workbook(v, read_only=True, data_only=True)
                 try:
                     for name in wb.sheetnames:
@@ -302,9 +299,15 @@ class XlsxSheetIO(IO[bytes, XlsxOptions]):
                 ws_target, batches, has_header=options.has_header,
             )
 
+            # openpyxl writes a ZIP archive and needs a seekable sink;
+            # ``pa.BufferOutputStream`` is forward-only, so save into a
+            # stdlib ``BytesIO`` scratch and bulk-commit through the
+            # IO's :meth:`arrow_output_stream` (which applies any codec
+            # and lays the bytes down on the durable holder on exit).
             scratch = _stdlib_io.BytesIO()
             wb_out.save(scratch)
-            self._xlsx_parent._commit_format_payload(scratch.getbuffer())
+            with self._xlsx_parent.arrow_output_stream() as sink:
+                sink.write(scratch.getvalue())
         finally:
             wb_out.close()
 
@@ -341,8 +344,7 @@ class XlsxIO(IO[bytes, XlsxOptions]):
         """Return sheet names in workbook order. One fastexcel pass; no row reads."""
         if self.size == 0:
             return []
-        with self._format_view() as v:
-            v.seek(0)
+        with self.arrow_input_stream() as v:
             return _list_sheet_names(v.read())
 
     def iter_children(self) -> Iterator[XlsxSheetIO]:
@@ -403,11 +405,12 @@ class XlsxIO(IO[bytes, XlsxOptions]):
         """
         if self.size == 0:
             return
-        # ``_format_view`` peels any codec on the buffer's MediaType
-        # (e.g. ``xlsx + gzip`` from a ``.xlsx.gz`` LocalPath) so the
-        # parser receives the uncompressed ZIP bytes.
-        with self._format_view() as v:
-            v.seek(0)
+        # ``arrow_input_stream`` peels any codec on the buffer's
+        # MediaType (e.g. ``xlsx + gzip`` from a ``.xlsx.gz``
+        # LocalPath) so the parser receives the uncompressed ZIP
+        # bytes — and uses :func:`pyarrow.memory_map` for local-path
+        # holders so the workbook lands in the page cache once.
+        with self.arrow_input_stream() as v:
             data = v.read()
         batch = _read_sheet_batch(
             data,
@@ -467,8 +470,7 @@ class XlsxIO(IO[bytes, XlsxOptions]):
         carry: list[tuple[str, list[tuple]]] = []
         if action is Mode.APPEND and self.size > 0:
             openpyxl = _openpyxl()
-            with self._format_view() as v:
-                v.seek(0)
+            with self.arrow_input_stream() as v:
                 wb_in = openpyxl.load_workbook(v, read_only=True, data_only=True)
                 try:
                     for name in wb_in.sheetnames:
@@ -494,12 +496,15 @@ class XlsxIO(IO[bytes, XlsxOptions]):
                 _it.chain([first], iterator),
                 has_header=options.has_header,
             )
-            # Save into an in-memory scratch buffer, then bulk-commit
-            # via ``_commit_format_payload`` so a codec on the buffer's
-            # MediaType (e.g. ``.xlsx.gz``) is applied transparently.
+            # openpyxl writes a ZIP archive and needs a seekable sink;
+            # ``pa.BufferOutputStream`` is forward-only, so save into
+            # a stdlib ``BytesIO`` scratch and bulk-commit through the
+            # IO's :meth:`arrow_output_stream` — that applies any codec
+            # on the buffer's MediaType (e.g. ``.xlsx.gz``) transparently.
             scratch = _stdlib_io.BytesIO()
             wb.save(scratch)
-            self._commit_format_payload(scratch.getbuffer())
+            with self.arrow_output_stream() as sink:
+                sink.write(scratch.getvalue())
         finally:
             wb.close()
 
@@ -536,7 +541,8 @@ class XlsxIO(IO[bytes, XlsxOptions]):
 
             scratch = _stdlib_io.BytesIO()
             wb.save(scratch)
-            self._commit_format_payload(scratch.getbuffer())
+            with self.arrow_output_stream() as sink:
+                sink.write(scratch.getvalue())
         finally:
             wb.close()
 

@@ -25,7 +25,6 @@ no-spill path and keeps Arrow IPC's "no decode" promise intact.
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 from typing import TYPE_CHECKING, ClassVar, Iterable, Iterator
 
@@ -101,7 +100,7 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
         if self.size == 0:
             return
 
-        with self._format_input() as v:
+        with self.arrow_input_stream() as v:
             reader = ipc.RecordBatchFileReader(v)
             for i in range(reader.num_record_batches):
                 yield reader.get_batch(i)
@@ -110,12 +109,12 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
         """Read the schema straight from the IPC footer.
 
         Empty buffer short-circuits to :meth:`Schema.empty`. Routes
-        through :meth:`_format_view` so a codec'd holder is
+        through :meth:`arrow_input_stream` so a codec'd holder is
         transparently decompressed before the footer probe.
         """
         if self.size == 0:
             return Schema.empty()
-        with self._format_input() as v:
+        with self.arrow_input_stream() as v:
             return Schema.from_arrow(ipc.RecordBatchFileReader(v).schema)
 
     # ==================================================================
@@ -183,25 +182,21 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
                 chained, dataclasses.replace(options, mode=Mode.OVERWRITE),
             )
 
-        # OVERWRITE path — single writer session over a pure-Arrow
-        # in-memory sink, then one bulk commit to self. See
-        # :meth:`BytesIO._commit_format_payload` for the rationale
-        # against streaming the encoder writes through BytesIO.
+        # OVERWRITE path — drive the writer against the IO's
+        # :meth:`arrow_output_stream`, which yields a
+        # :class:`pa.BufferOutputStream` and bulk-commits the encoded
+        # bytes (with codec compression when set) on context exit.
         schema = first.schema
 
-        sink = pa.BufferOutputStream()
-        with contextlib.ExitStack() as stack:
-            writer = ipc.RecordBatchFileWriter(
+        with self.arrow_output_stream() as sink:
+            with ipc.RecordBatchFileWriter(
                 sink, schema, options=options.to_writer_options(),
-            )
-            stack.callback(writer.close)
-            if first.num_rows > 0:
-                writer.write_batch(first)
-            for batch in iterator:
-                if batch.num_rows > 0:
-                    writer.write_batch(batch)
-
-        self._commit_format_payload(sink.getvalue())
+            ) as writer:
+                if first.num_rows > 0:
+                    writer.write_batch(first)
+                for batch in iterator:
+                    if batch.num_rows > 0:
+                        writer.write_batch(batch)
 
     # ==================================================================
     # Helpers
