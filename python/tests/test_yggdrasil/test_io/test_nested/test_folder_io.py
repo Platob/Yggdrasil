@@ -5,7 +5,7 @@ that resolves to a tabular leaf (parquet, csv, arrow, ndjson, …)
 shows up as a child; sub-directories recurse as fresh `Folder`s.
 Tests pin:
 
-* iter_children walks non-private files + dirs and dispatches each
+* children walks non-private files + dirs and dispatches each
   file to the right :class:`Tabular` leaf;
 * sub-directory recursion;
 * :meth:`make_child` creates a ``part-{epoch_ms}-{seed}.{ext}`` file
@@ -54,14 +54,14 @@ class TestIterChildren:
         ParquetFile(holder=__class__._lp(tmp_path / "a.parquet"), owns_holder=False).write_arrow_table(table)
         CsvFile(holder=__class__._lp(tmp_path / "b.csv"), owns_holder=False).write_arrow_table(table)
         folder = Folder(path=str(tmp_path))
-        kinds = sorted(type(c).__name__ for c in folder.iter_children())
+        kinds = sorted(type(c).__name__ for c in folder.children())
         assert kinds == ["CsvFile", "ParquetFile"]
 
     def test_skips_private_entries(self, tmp_path, table) -> None:
         ParquetFile(holder=__class__._lp(tmp_path / ".hidden.parquet"), owns_holder=False).write_arrow_table(table)
         ParquetFile(holder=__class__._lp(tmp_path / "real.parquet"), owns_holder=False).write_arrow_table(table)
         folder = Folder(path=str(tmp_path))
-        names = [c._holder.name for c in folder.iter_children()]
+        names = [c._holder.name for c in folder.children()]
         assert "real.parquet" in names[0]
         assert all(".hidden" not in n for n in names)
 
@@ -70,12 +70,12 @@ class TestIterChildren:
         sub.mkdir()
         ParquetFile(holder=__class__._lp(sub / "x.parquet"), owns_holder=False).write_arrow_table(table)
         folder = Folder(path=str(tmp_path))
-        kids = list(folder.iter_children())
+        kids = list(folder.children())
         assert any(isinstance(c, Folder) for c in kids)
 
     def test_missing_folder_yields_nothing(self, tmp_path) -> None:
         folder = Folder(path=str(tmp_path / "absent"))
-        assert list(folder.iter_children()) == []
+        assert list(folder.children()) == []
 
     @staticmethod
     def _lp(path):

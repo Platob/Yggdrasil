@@ -127,7 +127,7 @@ class TestEntries:
         assert XlsxFile().list_sheets() == []
 
     def test_iter_children_yields_sheet_io(self, workbook: XlsxFile) -> None:
-        children = list(workbook.iter_children())
+        children = list(workbook.children())
         assert [c.sheet_name for c in children] == ["Sales", "Inventory"]
         assert all(isinstance(c, XlsxSheetFile) for c in children)
         assert all(c.tabular_parent is workbook for c in children)
@@ -158,7 +158,7 @@ class TestEntries:
 
     def test_iter_children_is_lazy(self, workbook: XlsxFile) -> None:
         # Walking the directory does NOT materialize per-sheet bytes.
-        children = list(workbook.iter_children())
+        children = list(workbook.children())
         assert all(not c._materialized for c in children)
 
     def test_child_write_replaces_only_target_sheet(

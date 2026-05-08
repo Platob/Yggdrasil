@@ -8,7 +8,7 @@ state is the bound :attr:`path` plus the children walk.
 Reads
 -----
 
-:meth:`iter_children` walks :attr:`path` and yields one child per
+:meth:`children` walks :attr:`path` and yields one child per
 non-private entry:
 
 * Files resolve through :class:`MediaType.from_` (extension first,
@@ -154,7 +154,7 @@ class Folder(Tabular[FolderOptions]):
     # Children — read
     # ==================================================================
 
-    def iter_children(self) -> "Iterator[Tabular]":
+    def children(self) -> "Iterator[Tabular]":
         """Yield every non-private direct entry of :attr:`path`.
 
         Sub-directories come back as a fresh :class:`Folder`. File
@@ -272,12 +272,12 @@ class Folder(Tabular[FolderOptions]):
     def _read_arrow_batches(
         self, options: FolderOptions,
     ) -> Iterator[pa.RecordBatch]:
-        """Chain :meth:`iter_children` into one Arrow batch stream.
+        """Chain :meth:`children` into one Arrow batch stream.
 
         Sub-folders recurse through their own
         :meth:`_read_arrow_batches`; leaf children read in turn.
         """
-        for child in self.iter_children():
+        for child in self.children():
             yield from child._read_arrow_batches(child.options_class()())
 
     def _write_arrow_batches(
@@ -459,7 +459,7 @@ class Folder(Tabular[FolderOptions]):
         self, match_by: "list[str]",
     ) -> "set[tuple]":
         keys: "set[tuple]" = set()
-        for child in self.iter_children():
+        for child in self.children():
             if isinstance(child, Folder):
                 continue
             try:
@@ -532,7 +532,7 @@ class Folder(Tabular[FolderOptions]):
         drop_keys: "set[tuple]",
     ) -> "Iterator[pa.RecordBatch]":
         """Walk existing leaves, yielding only rows whose key isn't in *drop_keys*."""
-        for child in self.iter_children():
+        for child in self.children():
             if isinstance(child, Folder):
                 continue
             try:
@@ -542,7 +542,7 @@ class Folder(Tabular[FolderOptions]):
             yield from self._filter_batches_drop_keys(stream, match_by, drop_keys)
 
     def _has_tabular_children(self) -> bool:
-        for _ in self.iter_children():
+        for _ in self.children():
             return True
         return False
 
@@ -584,7 +584,7 @@ class Folder(Tabular[FolderOptions]):
             return 0
         not_pred = ~predicate
         deleted = 0
-        for child in self.iter_children():
+        for child in self.children():
             if isinstance(child, Folder):
                 deleted += child._delete(predicate, child.options_class()())
                 continue
@@ -890,7 +890,7 @@ class LazyFolder(LazyTabular):
     def _push_children(self) -> "tuple[tuple[Tabular, ...], Any]":
         """Return ``(children, tail_plan)`` with prefix pushed into each child."""
         prefix, tail = self._plan.split_pushdownable()
-        children = tuple(self._source.iter_children())
+        children = tuple(self._source.children())
         if prefix.is_empty():
             return children, tail
         return tuple(c.execute_plan(prefix) for c in children), tail
@@ -922,7 +922,7 @@ class LazyFolder(LazyTabular):
     def _build_lazy(self, options: FolderOptions) -> "Any":
         from yggdrasil.io.tabular.union import UnionTabular
 
-        children = tuple(self._source.iter_children())
+        children = tuple(self._source.children())
         if not children:
             return polars_module().LazyFrame()
         return UnionTabular(children, plan=self._plan)._build_lazy(options)

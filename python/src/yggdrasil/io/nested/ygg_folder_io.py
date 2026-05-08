@@ -78,7 +78,7 @@ _LISTING_MAX: int = 1024
 _PART_PATTERN: str = "part-*"
 
 #: Sidecar directory holding YGGFolder-managed metadata. Dot-
-#: prefixed so :meth:`Folder.iter_children` skips it on the data
+#: prefixed so :meth:`Folder.children` skips it on the data
 #: walk; subfolders inside it are free to use any naming scheme
 #: without being mistaken for partition directories.
 _METADATA_DIR_NAME: str = ".ygg"

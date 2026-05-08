@@ -56,7 +56,7 @@ class TestDirectoryWalk:
     def test_iter_children_yields_lazy_handles(self) -> None:
         z = ZipIO()
         z.write_entries([("a.txt", b"hello"), ("b.txt", b"world")])
-        children = list(z.iter_children())
+        children = list(z.children())
         assert all(isinstance(c, ZipEntryIO) for c in children)
         # Entries are lazy at construction time.
         assert all(not c._materialized for c in children)
@@ -119,7 +119,7 @@ class TestEmpty:
     def test_empty_zip_yields_no_entries(self) -> None:
         z = ZipIO()
         assert z.list_entries() == []
-        assert list(z.iter_children()) == []
+        assert list(z.children()) == []
 
     def test_empty_zip_read_arrow_returns_empty(self) -> None:
         assert list(ZipIO()._read_arrow_batches(ZipOptions())) == []
@@ -212,14 +212,14 @@ class TestLazinessIsHonest:
             (f"part-{i}.txt", b"x" * 1024) for i in range(8)
         ])
         # Walking the directory is one infolist call. No materialization.
-        children = list(z.iter_children())
+        children = list(z.children())
         assert len(children) == 8
         assert all(not c._materialized for c in children)
 
     def test_only_touched_children_materialize(self) -> None:
         z = ZipIO()
         z.write_entries([(f"p-{i}.txt", b"abc") for i in range(4)])
-        children = list(z.iter_children())
+        children = list(z.children())
         # Read just one.
         children[2].to_bytes()
         materialized = [c._materialized for c in children]

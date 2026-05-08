@@ -6,7 +6,7 @@ archive. It exposes two surfaces:
 1. **Byte surface** — inherited from :class:`BytesIO`. Read / write /
    seek the raw archive bytes (useful for "open zip, drive
    :mod:`zipfile` yourself" flows).
-2. **Children surface** — :meth:`iter_children` walks every entry as
+2. **Children surface** — :meth:`children` walks every entry as
    a :class:`ZipEntryIO`. The entries are **lazy**: their bytes are
    fetched from the parent archive on first read and cached after.
    Iterating doesn't decompress every entry up front.
@@ -88,7 +88,7 @@ class ZipEntryIO(BytesIO):
 
     The payload is fetched from the parent archive on first access
     and cached in the inner :class:`Memory` holder. Reading the
-    archive's directory (``ZipIO.list_entries`` / ``iter_children``)
+    archive's directory (``ZipIO.list_entries`` / ``children``)
     is a fixed-cost walk; per-entry decompression only happens for
     the entries the caller actually touches.
 
@@ -246,7 +246,7 @@ class ZipIO(BytesIO):
     # Children surface — lazy iteration
     # ==================================================================
 
-    def iter_children(self) -> Iterator[ZipEntryIO]:
+    def children(self) -> Iterator[ZipEntryIO]:
         """Yield every archive entry as a lazy :class:`ZipEntryIO`.
 
         Skips directories (entries whose name ends with ``/``).
@@ -305,7 +305,7 @@ class ZipIO(BytesIO):
     # ==================================================================
 
     def _collect_schema(self, options: ZipOptions) -> Schema:
-        for child in self.iter_children():
+        for child in self.children():
             try:
                 schema = child._collect_schema(child.options_class()())
             except Exception:
@@ -327,9 +327,9 @@ class ZipIO(BytesIO):
         Entries that don't resolve to a registered tabular leaf
         (text, opaque binary, …) are skipped silently — that's the
         contract for the zip-as-Tabular view. Use
-        :meth:`iter_children` for an unfiltered walk.
+        :meth:`children` for an unfiltered walk.
         """
-        for child in self.iter_children():
+        for child in self.children():
             yield from child._read_arrow_batches(child.options_class()())
 
     # ==================================================================

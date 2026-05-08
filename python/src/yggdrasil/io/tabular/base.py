@@ -158,7 +158,7 @@ class Tabular(ABC, Generic[O]):
         """Stamp ``child.tabular_parent = self`` and return *child*.
 
         Used by aggregator Tabulars (folders, archives, partitioned
-        tables) inside their child-yielding hooks (``iter_children``,
+        tables) inside their child-yielding hooks (``children``,
         ``make_child``) so consumers can walk back up the tree
         without the aggregator scattering the same line of attribute
         assignment across every implementation::

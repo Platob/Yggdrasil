@@ -729,10 +729,10 @@ class DeltaIO(Folder):
     # Folder surface — children = active files
     # ==================================================================
 
-    def iter_children(self) -> "Iterator":
+    def children(self) -> "Iterator":
         """Yield one :class:`ParquetFile` per active file in the snapshot.
 
-        Override of :meth:`Folder.iter_children`: we never list the
+        Override of :meth:`Folder.children`: we never list the
         physical folder. The snapshot is the source of truth.
         """
         snap = self.snapshot()

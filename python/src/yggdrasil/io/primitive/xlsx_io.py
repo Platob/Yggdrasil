@@ -5,7 +5,7 @@ xlsx workbook (a ZIP archive). Mirrors the :class:`ZipIO` shape:
 
 1. **Byte surface** — inherited from :class:`BytesIO`. Read / write
    the raw workbook bytes.
-2. **Children surface** — :meth:`iter_children` walks every
+2. **Children surface** — :meth:`children` walks every
    worksheet as a :class:`XlsxSheetFile`. Sheets are **lazy**: rows
    are pulled out of the parent workbook on first read.
 
@@ -345,7 +345,7 @@ class XlsxFile(BytesIO):
             v.seek(0)
             return _list_sheet_names(v.read())
 
-    def iter_children(self) -> Iterator[XlsxSheetFile]:
+    def children(self) -> Iterator[XlsxSheetFile]:
         """Yield every sheet as a lazy :class:`XlsxSheetFile`.
 
         The directory walk is one ``fastexcel.read_excel`` call;
@@ -396,7 +396,7 @@ class XlsxFile(BytesIO):
     ) -> Iterator[pa.RecordBatch]:
         """Stream rows from the named sheet, batch them, yield.
 
-        For multi-sheet walks use :meth:`iter_children` and call
+        For multi-sheet walks use :meth:`children` and call
         :meth:`XlsxSheetFile.read_arrow_batches` per sheet — concatenating
         sheets with different shapes at this level would silently
         corrupt the schema.
