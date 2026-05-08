@@ -700,13 +700,16 @@ class LocalPath(Path):
         if n < 0:
             raise ValueError(f"reserve size must be >= 0, got {n!r}")
 
-    def truncate(self, n: int) -> int:
+    def _truncate(self, n: int) -> int:
         """Set the file size to exactly ``n`` bytes via :func:`os.ftruncate`.
 
-        Shrinks drop the tail; extends zero-pad. Overrides the
-        :class:`Path` default (read-truncate-rewrite via _bread/_bwrite)
-        with the direct syscall. Transient fd when the holder isn't
-        acquired so ``truncate`` is usable on a fresh path.
+        *n* is the absolute backing size — the public
+        :meth:`Holder.truncate` adds :attr:`Holder.offset` before
+        delegating, so this primitive stays offset-blind. Shrinks
+        drop the tail; extends zero-pad. Overrides the :class:`Path`
+        default (read-truncate-rewrite via _bread/_bwrite) with the
+        direct syscall. Transient fd when the holder isn't acquired
+        so ``_truncate`` is usable on a fresh path.
         """
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")

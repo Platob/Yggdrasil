@@ -67,7 +67,7 @@ class WorkspacePath(DatabricksPath):
         )
 
     @property
-    def size(self) -> int:
+    def _size(self) -> int:
         return int(self._stat().size)
 
     # ==================================================================
@@ -195,7 +195,7 @@ class WorkspacePath(DatabricksPath):
         )
         self._invalidate_stat_cache()
 
-    def truncate(self, n: int) -> int:
+    def _truncate(self, n: int) -> int:
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
         try:

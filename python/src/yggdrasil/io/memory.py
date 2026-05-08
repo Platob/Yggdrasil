@@ -300,7 +300,9 @@ class Memory(Holder):
     # ------------------------------------------------------------------
 
     @property
-    def size(self) -> int:
+    def _size(self) -> int:
+        # Absolute backing size (offset-blind); the public
+        # :attr:`Holder.size` subtracts :attr:`Holder.offset` from this.
         return self.stat().size
 
     @property
@@ -363,7 +365,10 @@ class Memory(Holder):
 
         self._buf.extend(b"\x00" * (new_cap - cur))
 
-    def truncate(self, n: int) -> int:
+    def _truncate(self, n: int) -> int:
+        # *n* is the absolute backing size; the public
+        # :meth:`Holder.truncate` adds :attr:`Holder.offset` before
+        # delegating here, so this primitive stays offset-blind.
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
         stats = self.stat()
@@ -569,13 +574,15 @@ class Memory(Holder):
     # ------------------------------------------------------------------
 
     def memoryview(self) -> memoryview:
-        """Memoryview over the visible payload (size-bounded).
+        """Memoryview over the visible (logical) payload.
 
         Override of :meth:`Holder.memoryview` that aliases the
         underlying buffer directly — no copy, no per-byte dispatch.
         Works equally on bytearray and mmap backings.
+        :attr:`Holder.offset` is honored: a windowed holder hands
+        back only the bytes inside the window.
         """
-        return memoryview(self._buf)[: self.stat().size]
+        return memoryview(self._buf)[self.offset : self.stat().size]
 
     def to_bytes(self) -> bytes:
         return bytes(self.memoryview())

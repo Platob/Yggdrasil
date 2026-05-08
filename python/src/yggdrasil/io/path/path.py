@@ -178,7 +178,9 @@ class Path(Holder, os.PathLike, ABC):
     # ==================================================================
 
     @property
-    def size(self) -> int:
+    def _size(self) -> int:
+        # Absolute backing size (offset-blind); the public
+        # :attr:`Holder.size` subtracts :attr:`Holder.offset` from this.
         return int(self._stat().size)
 
     def stat(self) -> IOStats:
@@ -205,10 +207,13 @@ class Path(Holder, os.PathLike, ABC):
         """No-op by default — files have no separate capacity layer."""
         del n
 
-    def truncate(self, n: int) -> int:
+    def _truncate(self, n: int) -> int:
+        # *n* is the absolute backing size; the public
+        # :meth:`Holder.truncate` adds :attr:`Holder.offset` before
+        # delegating, so this primitive stays offset-blind.
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
-        current = self.size
+        current = self._size
         if n == current:
             return n
         bio = self._bread(-1, 0, Mode.READ_ONLY)

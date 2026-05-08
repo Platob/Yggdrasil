@@ -282,7 +282,9 @@ class MemoryStream(Holder):
     # ------------------------------------------------------------------
 
     @property
-    def size(self) -> int:
+    def _size(self) -> int:
+        # Absolute backing size (offset-blind); the public
+        # :attr:`Holder.size` subtracts :attr:`Holder.offset` from this.
         return self._window_start + len(self._buf)
 
     def read_mv(self, n: int, pos: int) -> memoryview:
@@ -397,9 +399,13 @@ class MemoryStream(Holder):
         self._buf.extend(b"\x00" * (target_local - cur))
         self._touch_stat(size=self.size)
 
-    def truncate(self, n: int) -> int:
-        """Set visible :attr:`size` to ``n``. Shrinks drop the tail;
+    def _truncate(self, n: int) -> int:
+        """Set the absolute backing size to ``n``. Shrinks drop the tail;
         extends zero-pad. Truncating below :attr:`window_start` raises.
+
+        *n* is the absolute backing size — the public
+        :meth:`Holder.truncate` adds :attr:`Holder.offset` before
+        delegating, so this primitive stays offset-blind.
         """
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
@@ -416,12 +422,12 @@ class MemoryStream(Holder):
             self._buf.extend(b"\x00" * (local - cur))
         self._slide_window()
         stats = self.stat()
-        stats.size = self.size
-        # ``mtime`` left alone — see :meth:`Memory.truncate` for the
+        stats.size = self._size
+        # ``mtime`` left alone — see :meth:`Memory._truncate` for the
         # rationale: per-call clock reads in the write hot path are
         # expensive enough to dominate tight loops. Use
         # :meth:`touch_mtime` post-loop when freshness matters.
-        return self.size
+        return self._size
 
     def _clear(self) -> None:
         """Drop the buffered window and reset :attr:`window_start` to 0.

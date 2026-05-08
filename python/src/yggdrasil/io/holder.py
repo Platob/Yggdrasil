@@ -434,7 +434,11 @@ class Holder(Tabular[O], Disposable):
                 f"{type(self).__name__} of size {size}"
             )
 
-        return self._read_mv(n, pos)
+        # *pos* is in the holder's logical view (zero == start of the
+        # offset window). The :attr:`offset` slot translates it to the
+        # absolute backing position before delegating, so subclass
+        # primitives stay offset-blind.
+        return self._read_mv(n, pos + self.offset)
 
     @abstractmethod
     def _read_mv(self, n: int, pos: int) -> memoryview:
@@ -500,7 +504,10 @@ class Holder(Tabular[O], Disposable):
         if end > size:
             self.resize(end)
 
-        written = self._write_mv(data, pos)
+        # *pos* is logical; subclass primitives expect an absolute
+        # backing position. The :attr:`offset` slot is added once here
+        # so leaves don't have to know about windowing.
+        written = self._write_mv(data, pos + self.offset)
 
         if written > 0 and update_stat:
             self._touch_stat(size=max(end, self.size))
@@ -550,10 +557,25 @@ class Holder(Tabular[O], Disposable):
             return current
         return self.truncate(n)
 
-    @abstractmethod
     def truncate(self, n: int) -> int:
-        """Set the visible :attr:`size` to exactly ``n`` bytes.
+        """Set the visible (logical) :attr:`size` to exactly ``n`` bytes.
 
+        Shrinks drop the tail; extends zero-pad. Returns the new
+        visible size. :attr:`offset` is added once here so the
+        backing primitive (:meth:`_truncate`) sees the absolute
+        physical size to land at — the prefix bytes before
+        :attr:`offset` stay intact.
+        """
+        if n < 0:
+            raise ValueError(f"truncate size must be >= 0, got {n!r}")
+        new_phys = self._truncate(n + self.offset)
+        return max(0, new_phys - self.offset)
+
+    @abstractmethod
+    def _truncate(self, n: int) -> int:
+        """Set the absolute backing size to exactly ``n`` bytes.
+
+        Subclass primitive — works in physical bytes, offset-blind.
         Shrinks drop the tail; extends zero-pad. Returns ``n``.
         """
 
@@ -582,9 +604,24 @@ class Holder(Tabular[O], Disposable):
         """
 
     @property
-    @abstractmethod
     def size(self) -> int:
-        """Current visible size in bytes."""
+        """Current visible (logical) size in bytes.
+
+        Subtracts :attr:`offset` from the absolute backing size
+        (:attr:`_size`), so a windowed holder reports only the
+        bytes inside the window.
+        """
+        return max(0, self._size - self.offset)
+
+    @property
+    @abstractmethod
+    def _size(self) -> int:
+        """Current absolute backing size in bytes (offset-blind).
+
+        Subclass primitive. The public :attr:`size` subtracts
+        :attr:`offset` from this so callers see only the windowed
+        view.
+        """
 
     # ------------------------------------------------------------------
     # IOStats — the canonical metadata holder
