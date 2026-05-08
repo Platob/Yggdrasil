@@ -80,14 +80,13 @@ import struct
 import tempfile
 import time
 from collections.abc import Iterable
-from typing import IO, Any, Iterator, Optional, TypeVar, Union
+from typing import Any, BinaryIO, Iterator, Optional, TypeVar, Union
 
 import pyarrow as pa
 from yggdrasil.data.options import CastOptions
-from yggdrasil.disposable import Disposable
+from yggdrasil.io.base import IO
 from yggdrasil.io.holder import Holder
 from yggdrasil.io.memory import Memory
-from yggdrasil.io.tabular import Tabular
 
 __all__ = ["BytesIO"]
 
@@ -135,7 +134,7 @@ def _as_byte_mv(data: BytesLike) -> memoryview:
 # ===========================================================================
 
 
-class BytesIO(Tabular[O], Disposable, IO[bytes]):
+class BytesIO(IO[bytes, O], BinaryIO):
     """Cursor + ``IO[bytes]`` + tabular view over a :class:`Holder`.
 
     Two operating modes:
@@ -163,8 +162,6 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
     """
 
     __slots__ = (
-        "_holder",
-        "_owns_holder",
         "_pos",
         "_mode",
         "_scratch",
@@ -276,8 +273,6 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         call :meth:`acquire`, use a ``with`` block, or go through
         :meth:`Holder.open`.
         """
-        super().__init__(**kwargs)
-
         if holder is not None and (data is not None or path is not None):
             raise TypeError(
                 "BytesIO accepts holder= OR data OR path=, not multiple. "
@@ -309,8 +304,7 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
                 holder = tmp._holder
                 owns_holder = True
 
-        self._holder: "Holder" = holder
-        self._owns_holder: bool = bool(owns_holder)
+        super().__init__(holder=holder, owns_holder=owns_holder, **kwargs)
         self._pos: int = 0
         self._mode: str = mode
         # Memory scratch buffer — populated by :meth:`_acquire`,
@@ -418,8 +412,7 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         Note: must NOT call ``self._holder.open()`` — that's the
         BytesIO-returning convenience and would recurse.
         """
-        if self._owns_holder:
-            self._holder.acquire()
+        super()._acquire()
 
         if "x" in self._mode and self._holder.size > 0:
             raise FileExistsError(
@@ -468,11 +461,7 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
                 pass
             self._scratch = None
 
-        if self._owns_holder:
-            try:
-                self._holder.close()
-            except Exception:
-                pass
+        super()._release()
 
     def _commit_scratch(self, scratch: "Holder") -> None:
         """Push *scratch*'s bytes onto the durable holder.
@@ -502,11 +491,6 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
     # ==================================================================
     # Identity / state
     # ==================================================================
-
-    @property
-    def holder(self) -> "Holder":
-        """The underlying :class:`Holder`."""
-        return self._holder
 
     def view(
         self,
@@ -671,11 +655,6 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         if n > 0:
             self.write_bytes(view)
         return n
-
-    @property
-    def owns_holder(self) -> bool:
-        """Whether closing self also closes the holder."""
-        return self._owns_holder
 
     @property
     def size(self) -> int:
