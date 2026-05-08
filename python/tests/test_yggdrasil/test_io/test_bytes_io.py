@@ -61,6 +61,14 @@ class TestConstruction:
         # just means BytesIO told the holder to release.
         assert mem.size == 5
 
+    def test_close_resets_cursor_to_zero(self) -> None:
+        mem = Memory(b"shared")
+        b = BytesIO(holder=mem)
+        b.read(3)
+        assert b.tell() == 3
+        b.close()
+        assert b.tell() == 0
+
     def test_data_and_holder_both_raise(self) -> None:
         with pytest.raises(TypeError, match="not multiple"):
             BytesIO(b"x", holder=Memory())

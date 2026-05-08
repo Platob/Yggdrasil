@@ -1171,7 +1171,13 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
             self.clear_dirty()
 
     def close(self, force: bool = False) -> None:
-        """Close the IO; closes the holder iff :attr:`owns_holder`."""
+        """Close the IO; closes the holder iff :attr:`owns_holder`.
+
+        Resets the cursor to byte 0 so a subsequent reopen / borrow
+        starts at the beginning rather than wherever the previous
+        transaction left off.
+        """
+        self._pos = 0
         super().close(force=force)
 
     # ==================================================================
