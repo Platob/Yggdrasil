@@ -80,7 +80,7 @@ class NDJsonIO(IO[bytes, NDJsonOptions]):
     def _collect_schema(self, options: NDJsonOptions) -> Schema:
         if self.size == 0:
             return Schema.empty()
-        with self._format_input() as v:
+        with self.arrow_input_stream() as v:
             reader = pa_json.open_json(
                 v,
                 read_options=options.to_read_options(),
@@ -101,7 +101,7 @@ class NDJsonIO(IO[bytes, NDJsonOptions]):
     ) -> Iterator[pa.RecordBatch]:
         if self.size == 0:
             return
-        with self._format_input() as v:
+        with self.arrow_input_stream() as v:
             reader = pa_json.open_json(
                 v,
                 read_options=options.to_read_options(),
@@ -164,34 +164,33 @@ class NDJsonIO(IO[bytes, NDJsonOptions]):
 
         line_term = options.line_ending.encode(options.encoding)
 
-        # Encode every row into a pure-Arrow ``BufferOutputStream``
-        # before touching ``self``. Pyarrow's sink coalesces the
-        # per-row writes into one contiguous Arrow buffer; we hand
-        # the whole thing to :meth:`BytesIO._commit_format_payload`
-        # at the end so the durable holder sees one bulk write
-        # instead of one per row.
-        sink = pa.BufferOutputStream()
-        for batch in batches:
-            for row in batch.to_pylist():
-                line = json.dumps(
-                    row,
-                    ensure_ascii=options.ensure_ascii,
-                    sort_keys=options.sort_keys,
-                    default=str,
-                ).encode(options.encoding)
-                sink.write(line)
+        # Existing payload may not end with a newline — guard so the
+        # appended batch starts on a fresh line.
+        needs_newline_prefix = (
+            is_append_uncompressed
+            and self.size > 0
+            and self.pread(1, self.size - 1) != b"\n"
+        )
+
+        # Drive the per-row writes through the IO's
+        # :meth:`arrow_output_stream`, which yields a
+        # :class:`pa.BufferOutputStream`; pyarrow's sink coalesces
+        # them into one contiguous Arrow buffer that gets bulk-
+        # committed (overwrite or append, with codec compression
+        # when set) on context exit.
+        with self.arrow_output_stream(append=is_append_uncompressed) as sink:
+            if needs_newline_prefix:
                 sink.write(line_term)
-
-        if is_append_uncompressed:
-            # Existing payload may not end with a newline — guard
-            # before bulk-appending the freshly-encoded batch.
-            if self.size > 0 and self.pread(1, self.size - 1) != b"\n":
-                self.seek(0, 2)
-                self.write_bytes(line_term)
-            self._commit_format_payload(sink.getvalue(), append=True)
-            return
-
-        self._commit_format_payload(sink.getvalue())
+            for batch in batches:
+                for row in batch.to_pylist():
+                    line = json.dumps(
+                        row,
+                        ensure_ascii=options.ensure_ascii,
+                        sort_keys=options.sort_keys,
+                        default=str,
+                    ).encode(options.encoding)
+                    sink.write(line)
+                    sink.write(line_term)
 
     def _resolve_action(self, mode: Mode) -> Mode:
         if mode is Mode.AUTO or mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:
