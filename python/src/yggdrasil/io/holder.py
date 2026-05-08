@@ -769,11 +769,10 @@ class Holder(Tabular[O], Disposable):
         format leaf (ParquetIO / XlsxIO / CsvIO / …) using this
         holder's :class:`MediaType`. We re-home *options* onto the
         leaf's options class so format-specific knobs (sheet name,
-        delimiter, …) survive the hop, then read through the
-        closed-mode path (direct to durable holder) so we don't pay
-        the scratch-buffer slurp that ``with bio:`` would trigger —
-        format-specific leaves like :class:`XlsxIO` already manage
-        their own scoped views internally via ``_format_view``.
+        delimiter, …) survive the hop, then read directly against
+        the durable holder — the IO is a pure cursor and format
+        leaves like :class:`XlsxIO` manage their own scoped views
+        via ``_format_view``.
         """
         from yggdrasil.io.bytes_io import BytesIO
         bio = BytesIO(holder=self, owns_holder=False)

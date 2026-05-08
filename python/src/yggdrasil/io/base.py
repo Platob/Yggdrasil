@@ -1,12 +1,17 @@
 """Cursor + tabular handle bound to a managed :class:`Holder`.
 
-:class:`IO[T, O]` IS-A :class:`Tabular`. It carries the cursor a
-holder lacks (every public op is "do this at the cursor"), implements
-the bytes surface (``read`` / ``write`` / ``seek`` / ``tell`` /
-positional reads / structured primitives / codec-aware format helpers)
-on top of a :class:`Holder`, and inherits the row-oriented surface
-from :class:`Tabular` so byte-level and Arrow-level operations live
-on the same handle.
+:class:`IO[T, O]` IS-A :class:`Tabular`. It is a **pure seekable
+cursor over a :class:`Holder`** — every public op is "do this at the
+cursor" and dispatches straight to the bound holder. The IO carries
+no scratch buffer of its own; reads / writes / truncates flow through
+the holder's positional API, so the holder remains the single source
+of truth for the durable bytes.
+
+On top of that cursor it implements the bytes surface (``read`` /
+``write`` / ``seek`` / ``tell`` / positional reads / structured
+primitives / codec-aware format helpers) and inherits the
+row-oriented surface from :class:`Tabular` so byte-level and
+Arrow-level operations live on the same handle.
 
 The default :class:`IO` doesn't know what format its bytes encode,
 so the two abstract :class:`Tabular` hooks
@@ -37,29 +42,17 @@ Construction shapes
   ``IO(path="x.parquet")``, … resolve to the registered Tabular leaf
   (:class:`CsvIO`, :class:`ParquetIO`, …) automatically.
 
-Lifecycle — closed = direct, open = buffered transaction
---------------------------------------------------------
+Lifecycle
+---------
 
-A :class:`IO` has two operating modes, switched by its
-:class:`Disposable` state:
-
-- **Closed** — every read / write goes **straight to the durable
-  holder**. No buffering. Useful when you want each op to commit
-  immediately (logging, append-only sinks, throwaway one-shots).
-  The durable holder must already be acquired by someone — typically
-  the caller.
-
-- **Open** — a :class:`Memory` scratch buffer sits between the cursor
-  and the holder. :meth:`_acquire` seeds scratch from the durable
-  bytes (or empty for OVERWRITE-class modes). All ops route through
-  scratch; the durable holder is **untouched** until :meth:`flush`
-  or :meth:`_release` commits.
-
-The dirty bit drives commit decisions: writes through the open
-IO call :meth:`mark_dirty`; :meth:`flush` and :meth:`_release` check
-:attr:`_dirty` before pushing scratch onto the durable holder.
-Setting ``temporary=True`` on the holder discards the scratch on
-close instead of committing.
+:meth:`_acquire` makes sure the holder is acquired (when owned),
+applies the mode-driven side effects (``ERROR_IF_EXISTS`` guard,
+``OVERWRITE`` / ``TRUNCATE`` zeroing the holder, ``APPEND``-style
+cursor positioning) and returns. Reads and writes routed through the
+IO between :meth:`_acquire` and :meth:`_release` go directly to the
+durable holder. :meth:`_release` closes the holder when ``self`` owns
+it; the holder honors its own :attr:`temporary` flag and discards the
+payload at that point.
 
 Modes
 -----
@@ -75,9 +68,6 @@ directly). Effects on top of a holder:
   :meth:`_acquire`.
 - :data:`Mode.ERROR_IF_EXISTS` raises :class:`FileExistsError` on
   :meth:`_acquire` when the holder is non-empty.
-
-The mode never touches the holder itself — a :class:`Memory` doesn't
-know or care what mode the IO over it is in.
 """
 
 from __future__ import annotations
@@ -219,22 +209,17 @@ def _resolve_format_target(
 class IO(Tabular[O], Disposable, Generic[T, O]):
     """Cursor + bytes surface + tabular view over a managed :class:`Holder`.
 
-    Two operating modes:
-
-    - **Closed** — ops route directly to the durable holder. Each
-      write commits synchronously; useful for append-only sinks or
-      one-shot reads where buffering would be overhead.
-    - **Open** — :meth:`_acquire` builds a :class:`Memory` scratch
-      seeded from the durable holder; ops route through scratch,
-      the durable holder is committed-to on :meth:`flush` /
-      :meth:`_release`. The standard "edit in memory, save on
-      close" transaction.
+    The IO is a **pure seekable cursor** over the bound holder: every
+    read / write / truncate dispatches straight through to the
+    holder's positional API, so the holder remains the single source
+    of truth for the durable bytes. There is no IO-side scratch
+    buffer — the IO carries only the cursor and the mode.
 
     Mode-aware but format-agnostic at this layer. Mode controls
     cursor position (:data:`Mode.APPEND` → EOF), :meth:`readable` /
-    :meth:`writable` reporting, whether :meth:`_acquire` starts
-    scratch empty (:data:`Mode.OVERWRITE`) or seeds from durable bytes,
-    and the :class:`FileExistsError` for :data:`Mode.ERROR_IF_EXISTS`.
+    :meth:`writable` reporting, whether :meth:`_acquire` truncates
+    the holder (:data:`Mode.OVERWRITE` / :data:`Mode.TRUNCATE`), and
+    the :class:`FileExistsError` for :data:`Mode.ERROR_IF_EXISTS`.
 
     The two :class:`Tabular` batch hooks default to
     :class:`NotImplementedError` — a plain :class:`IO` doesn't know
@@ -248,7 +233,6 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         "_owns_holder",
         "_pos",
         "_mode",
-        "_scratch",
     )
 
     def __new__(
@@ -386,11 +370,13 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
           holder.
 
         ``mode`` follows stdlib :func:`open` semantics, normalized to
-        a :class:`Mode` enum. The IO is constructed in the **closed**
-        state — ops in that state commit synchronously to the durable
-        holder. To enter the buffered-transaction mode (scratch buffer
-        + commit-on-close), call :meth:`acquire`, use a ``with`` block,
-        or go through :meth:`Holder.open`.
+        a :class:`Mode` enum. The IO is constructed un-acquired; reads
+        and writes are valid against the durable holder regardless of
+        whether the IO has been entered via ``with`` / :meth:`acquire`.
+        Entering the IO applies the mode-driven side effects
+        (``OVERWRITE`` truncates, ``ERROR_IF_EXISTS`` guards, ``APPEND``
+        positions the cursor at EOF) and acquires the holder when
+        :attr:`owns_holder`.
         """
         super().__init__(**kwargs)
         self._pos: int = 0
@@ -405,12 +391,6 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
             tmp = self.from_(data, mode=mode)
             self._holder = tmp._holder
             self._owns_holder = True
-
-        # Memory scratch buffer — populated by :meth:`_acquire`,
-        # commits to ``self._holder`` on :meth:`flush` /
-        # :meth:`_release`. ``None`` when the IO is closed; in that
-        # state, ops route directly to ``self._holder``.
-        self._scratch: "Holder | None" = None
 
         # Stamp media type onto the holder's IOStats — gives the codec
         # auto-handling path something to inspect, and makes the buffer
@@ -508,28 +488,21 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         return self._owns_holder
 
     # ==================================================================
-    # Disposable lifecycle — open is "buffered transaction"
+    # Disposable lifecycle — apply mode side effects, acquire the holder
     # ==================================================================
 
     def _acquire(self) -> None:
-        """Open a buffered transaction over the holder.
-
-        Builds a :class:`Memory` scratch holder seeded from the
-        durable holder's bytes (or empty for OVERWRITE-class modes
-        that truncate at open). All read / write ops while open
-        route through scratch — the durable holder is untouched
-        until :meth:`flush` or :meth:`_release` commits.
+        """Acquire the bound holder and apply the mode side effects.
 
         Mode side-effects:
 
-        - :data:`Mode.OVERWRITE` / :data:`Mode.TRUNCATE` — scratch
-          starts empty (the durable truncate happens at commit time).
-        - :data:`Mode.APPEND` — scratch seeded from durable bytes,
-          cursor parked at EOF.
+        - :data:`Mode.OVERWRITE` / :data:`Mode.TRUNCATE` — truncate
+          the durable holder to zero bytes.
+        - :data:`Mode.APPEND` — cursor parked at EOF.
         - :data:`Mode.ERROR_IF_EXISTS` — fail-fast
           :class:`FileExistsError` if the durable holder is non-empty.
         - :data:`Mode.READ_ONLY` / :data:`Mode.AUTO` / default —
-          scratch seeded from durable bytes, cursor at 0.
+          cursor at 0, durable bytes untouched.
 
         Note: must NOT call ``self._holder.open()`` — that's the
         IO-returning convenience and would recurse.
@@ -543,80 +516,34 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
                 f"but holder is non-empty ({self._holder.size} bytes)."
             )
 
-        from yggdrasil.io.memory import Memory
-        scratch = Memory()
-        scratch.acquire()
+        if self._mode in (Mode.OVERWRITE, Mode.TRUNCATE):
+            self._holder.truncate(0)
 
-        # Seed scratch from the durable holder for read-friendly
-        # modes; OVERWRITE / TRUNCATE start clean (truncate-on-commit).
-        if (
-            self._mode not in (Mode.OVERWRITE, Mode.TRUNCATE)
-            and self._holder.size > 0
-        ):
-            scratch.pwrite(self._holder.read_bytes(), 0)
-
-        self._scratch = scratch
-        self._pos = scratch.size if self._mode.appendable else 0
-
-    def _commit(self) -> None:
-        """Push the scratch buffer's bytes onto the durable holder.
-
-        :class:`Disposable._close` calls :meth:`commit` (which routes
-        here when :attr:`_dirty`) before :meth:`_release`, so by the
-        time :meth:`_release` runs the durable holder already has the
-        new bytes. ``temporary`` holders skip this — :meth:`_release`
-        on the holder side drops the payload.
-        """
-        scratch = self._scratch
-        if scratch is None:
-            return
-        if getattr(self._holder, "temporary", False):
-            return
-        self._commit_scratch(scratch)
+        self._pos = self._holder.size if self._mode.appendable else 0
 
     def _release(self) -> None:
-        """Tear down scratch and release the durable holder if owned.
+        """Release the durable holder when ``self`` owns it.
 
-        Commit is :meth:`_commit`'s job — this method is pure cleanup.
+        Pure cleanup — the cursor sits on top of the holder; there is
+        no IO-side scratch to tear down. Holders honor their own
+        :attr:`temporary` flag and discard the payload at close time.
         """
-        scratch = self._scratch
-        if scratch is not None:
-            try:
-                scratch.close()
-            except Exception:
-                pass
-            self._scratch = None
-
         if self._owns_holder:
             try:
                 self._holder.close()
             except Exception:
                 pass
 
-    def _commit_scratch(self, scratch: "Holder") -> None:
-        """Push *scratch*'s bytes onto the durable holder.
-
-        Truncate-then-rewrite: the simplest correct shape that
-        preserves "what's in scratch" exactly. Backends with cheaper
-        partial-update primitives (a remote multipart upload, a
-        Delta append) override at the holder level — this is the
-        universal fallback.
-        """
-        size = scratch.size
-        self._holder.truncate(size)
-        if size > 0:
-            self._holder.pwrite(scratch.read_bytes(), 0)
-        self._holder.flush()
-
     def _active(self) -> "Holder":
-        """The holder ops should hit right now — scratch when open,
-        durable otherwise.
+        """The holder this cursor reads / writes against.
 
-        Centralizing the dispatch means every ``read`` / ``write`` /
-        ``truncate`` / ``size`` call site stays unchanged whether
-        the IO is in a transaction or not.
+        Returns ``self._holder`` directly — the IO is a pure cursor
+        over a single holder. Subclasses that need a side effect
+        before every byte-level access (lazy materialization in
+        :class:`ZipEntryIO` / :class:`XlsxSheetIO`) override this
+        hook to drive the side effect, then ``return super()._active()``.
         """
-        return self._scratch if self._scratch is not None else self._holder
+        return self._holder
 
     def view(
         self,
@@ -735,8 +662,7 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         sink, then hands the resulting buffer to this method instead
         of streaming the encoder's per-row-group / per-batch / per-row
         writes through :meth:`write`. Skips the small-write cost on
-        path-backed holders without touching the IO open / scratch /
-        commit machinery.
+        path-backed holders without touching the IO open machinery.
         """
         view: "memoryview"
         if isinstance(payload, memoryview):
@@ -780,8 +706,7 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
 
     @property
     def size(self) -> int:
-        """Live size from the active holder — scratch when open,
-        durable otherwise."""
+        """Live size from the bound holder."""
         return self._active().size
 
     def __len__(self) -> int:
@@ -795,7 +720,7 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         return self.to_bytes()
 
     def __repr__(self) -> str:
-        state = "open" if self._acquired else "closed"
+        state = "acquired" if self._acquired else "idle"
         own = "owns" if self._owns_holder else "borrows"
         return (
             f"<{type(self).__name__} {state} {own} holder={self._holder!r} "
@@ -935,15 +860,14 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
 
     @property
     def closed(self) -> bool:
-        """Stdlib ``IO[bytes]`` parity — ``False`` while the durable
+        """Stdlib ``IO[bytes]`` parity — ``False`` while the bound
         holder is reachable.
 
         Stdlib semantics: ``closed`` means "file unusable for I/O."
-        Our holders are reachable in both the closed-Disposable
-        (direct synchronous commit) and open-Disposable (scratch
-        transaction) states, so the property only flips when a
-        ``close(force=True)`` has actually run teardown. This matters
-        for pyarrow / pandas / polars / zipfile, which guard every op
+        The IO is a pure cursor over the holder, so a fresh
+        un-acquired IO is still usable; ``closed`` only flips when
+        teardown has dropped the holder reference. This matters for
+        pyarrow / pandas / polars / zipfile, which guard every op
         with an ``assert not closed`` and would otherwise refuse to
         write into a fresh, never-explicitly-opened IO.
         """
@@ -1015,17 +939,12 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
     def pwrite(
         self, data: BytesLike, pos: int, *, update_stat: bool = True,
     ) -> int:
-        """Positional write against the active holder. Cursor untouched.
+        """Positional write against the holder. Cursor untouched.
 
-        Marks the IO dirty when scratch is active so the commit on
-        :meth:`flush` / :meth:`_release` actually fires.
         ``update_stat=False`` is forwarded to the holder so a bulk
         loop can skip the per-write stat refresh.
         """
-        n = self._active().pwrite(data, pos, update_stat=update_stat)
-        if n > 0 and self._scratch is not None:
-            self.mark_dirty()
-        return n
+        return self._active().pwrite(data, pos, update_stat=update_stat)
 
     def memoryview(self) -> memoryview:
         """Memoryview over the active holder's full payload."""
@@ -1133,8 +1052,6 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
             return 0
         n = self._active().pwrite(mv, self._pos, update_stat=update_stat)
         self._pos += n
-        if n > 0 and self._scratch is not None:
-            self.mark_dirty()
         return n
 
     def writelines(self, lines: Any) -> None:
@@ -1146,29 +1063,23 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
             size = self._pos
         size = int(size)
         active = self._active()
-        prev = active.size
         n = active.truncate(size)
         if self._pos > n:
             self._pos = n
-        if n != prev and self._scratch is not None:
-            self.mark_dirty()
         return n
 
     def flush(self) -> None:
-        """Push scratch buffer to the durable holder.
+        """Forward the flush to the bound holder.
 
-        When open: commit the scratch buffer's bytes onto the durable
-        holder, then clear the dirty bit. The scratch stays — further
-        writes continue to buffer.
-        When closed: no-op (every closed-mode op already committed
-        synchronously through the durable holder).
+        Backends with deferred-write semantics (remote multipart
+        uploads, transactional sinks) commit pending state on
+        :meth:`Holder.flush`; in-memory holders treat this as a
+        cheap no-op.
         """
-        scratch = self._scratch
-        if scratch is None:
-            return
-        if self._dirty:
-            self._commit_scratch(scratch)
-            self.clear_dirty()
+        try:
+            self._holder.flush()
+        except Exception:
+            pass
 
     def close(self, force: bool = False) -> None:
         """Close the IO; closes the holder iff :attr:`owns_holder`.

@@ -1,7 +1,7 @@
 """Stdlib :class:`typing.BinaryIO`-compatible facade over :class:`IO`.
 
 :class:`BytesIO` is a thin shim that pairs the rich :class:`IO`
-substrate (holder + cursor + scratch + format helpers) with the
+substrate (holder + cursor + format helpers) with the
 :class:`typing.BinaryIO` protocol, so external libraries that
 type-check against the stdlib file-like interface (pandas,
 pyarrow, zipfile, …) continue to accept Yggdrasil byte buffers.

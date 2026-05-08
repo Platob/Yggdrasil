@@ -319,29 +319,36 @@ class TestStructuredPrimitives:
             b.read_bytes_u32()
 
 
-class TestTransactionalScratch:
-    """`with bio: ...` opens a scratch buffer that commits on close."""
+class TestCursorOverHolder:
+    """`with bio: ...` runs the IO as a cursor over the bound holder.
 
-    def test_open_seeds_scratch_from_durable(self) -> None:
+    The IO carries no scratch buffer of its own — every read / write
+    flows directly through the holder, so each assertion below is
+    really a check that the holder's state matches the caller's view.
+    """
+
+    def test_acquire_reads_from_durable(self) -> None:
         mem = Memory(b"durable-bytes")
         b = BytesIO(holder=mem, owns_holder=False, mode="rb+")
         with b:
             assert b.size == len(b"durable-bytes")
             assert b.read() == b"durable-bytes"
 
-    def test_writes_route_through_scratch_and_commit(self) -> None:
+    def test_writes_land_directly_on_holder(self) -> None:
         mem = Memory(b"original")
         b = BytesIO(holder=mem, owns_holder=False, mode="rb+")
         with b:
             b.seek(0)
             b.write(b"REPLACED")
+            # No scratch — the holder already has the new bytes.
+            assert mem.read_bytes() == b"REPLACED"
         assert mem.read_bytes() == b"REPLACED"
 
     def test_wb_mode_truncates_at_open(self) -> None:
         mem = Memory(b"old-bytes")
         b = BytesIO(holder=mem, owns_holder=False, mode="wb")
         with b:
-            assert b.size == 0  # scratch starts empty
+            assert b.size == 0  # holder truncated at acquire
             b.write(b"new")
         assert mem.read_bytes() == b"new"
 
@@ -359,7 +366,7 @@ class TestTransactionalScratch:
             b.write(b"tail")
         assert mem.read_bytes() == b"head-tail"
 
-    def test_flush_commits_without_closing(self) -> None:
+    def test_flush_is_visible_on_holder(self) -> None:
         mem = Memory()
         b = BytesIO(holder=mem, owns_holder=False, mode="wb+")
         with b:
@@ -369,13 +376,13 @@ class TestTransactionalScratch:
             b.write(b"chunk2")
         assert mem.read_bytes() == b"chunk1chunk2"
 
-    def test_temporary_holder_discards_scratch(self) -> None:
+    def test_temporary_holder_clears_on_release(self) -> None:
         mem = Memory(temporary=True)
         b = BytesIO(holder=mem, owns_holder=True, mode="wb+")
         with b:
             b.write(b"throwaway")
-        # The temporary clear runs in Holder._release, dropping the
-        # bytes the BytesIO scratch had committed.
+        # ``Holder._release`` honors :attr:`temporary` and clears the
+        # payload when the IO closes.
         assert mem.size == 0
 
 
