@@ -640,6 +640,48 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         """
         return _FormatBufferContext(self)
 
+    def arrow_input_stream(self) -> "_ArrowInputStreamContext":
+        """Context manager yielding the cheapest :class:`pa.NativeFile` over the payload.
+
+        Resolution:
+
+        - **Local-path holder, no codec** → :func:`pyarrow.memory_map`
+          (zero-copy :class:`pa.MemoryMappedFile`).
+        - **Codec-tagged holder** → decompress the payload (via the
+          codec's streaming :meth:`Codec.decompress`) and wrap the
+          uncompressed bytes in a :class:`pa.BufferReader`.
+        - **Anything else** → snapshot the payload and wrap in a
+          :class:`pa.BufferReader`.
+
+        The yielded stream is always a real :class:`pa.NativeFile`, so
+        the caller can hand it directly to
+        :class:`pa.ipc.RecordBatchFileReader`,
+        :func:`pa.parquet.read_table`, :func:`pa.csv.read_csv`, etc.
+        without re-wrapping. The stream and any scratch decompression
+        buffer are closed on exit.
+        """
+        return _ArrowInputStreamContext(self)
+
+    def arrow_output_stream(
+        self, *, append: bool = False,
+    ) -> "_ArrowOutputStreamContext":
+        """Context manager yielding a :class:`pa.BufferOutputStream` writer.
+
+        Caller pattern: ``with bio.arrow_output_stream() as sink:
+        writer(sink)``. The yielded sink accepts the format encoder's
+        writes against a pure-Arrow in-memory buffer. On a clean exit
+        the encoded bytes are committed to ``self`` via
+        :meth:`_commit_format_payload`, which:
+
+        - compresses with the holder's codec when one is bound, and
+        - replaces the buffer (``append=False``, default) or seeks
+          to EOF and appends (``append=True``).
+
+        On an exception the sink is closed and the parent is left
+        untouched.
+        """
+        return _ArrowOutputStreamContext(self, append=append)
+
     def _commit_format_payload(
         self,
         payload: "Any",
@@ -1416,3 +1458,116 @@ class _FormatInputContext:
             except Exception:
                 pass
             self._view = None
+
+
+class _ArrowInputStreamContext:
+    """Reader-side companion for :meth:`IO.arrow_input_stream`.
+
+    Yields a real :class:`pa.NativeFile` over the buffer's payload,
+    transparently decompressing first when the holder's media type
+    carries a codec. Resolution:
+
+    - Local-path holder + no codec → :func:`pyarrow.memory_map`
+      (zero-copy :class:`pa.MemoryMappedFile`). The kernel pages the
+      file in once and every reader walks it without a Python copy.
+    - Codec-tagged holder → :meth:`Codec.decompress` into a scratch
+      in-memory IO; the uncompressed bytes are then handed to a
+      :class:`pa.BufferReader`.
+    - Anything else → snapshot :meth:`IO.to_bytes` and wrap in a
+      :class:`pa.BufferReader`.
+
+    The stream and any scratch decompression buffer are closed on
+    ``__exit__``.
+    """
+
+    def __init__(self, parent: "IO") -> None:
+        self._parent = parent
+        self._stream: "pa.NativeFile | None" = None
+        self._scratch: "IO | None" = None
+
+    def __enter__(self) -> "pa.NativeFile":
+        parent = self._parent
+        codec = parent._codec()
+
+        if codec is None:
+            holder = parent._holder
+            if holder is not None and getattr(holder, "is_local_path", False):
+                full_path = getattr(holder, "full_path", None)
+                if callable(full_path):
+                    try:
+                        self._stream = pa.memory_map(full_path(), "r")
+                        return self._stream
+                    except Exception:
+                        # mmap can fail on sandboxed filesystems or if
+                        # the file was deleted under us; fall back to
+                        # the bytes snapshot path rather than escalate.
+                        self._stream = None
+            self._stream = pa.BufferReader(parent.to_bytes())
+            return self._stream
+
+        # Codec path — decompress through the codec's streaming
+        # roundtrip, then expose the uncompressed bytes as a NativeFile.
+        self._scratch = codec.decompress(parent)
+        self._stream = pa.BufferReader(self._scratch.to_bytes())
+        return self._stream
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._stream is not None:
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+        if self._scratch is not None:
+            try:
+                self._scratch.close()
+            except Exception:
+                pass
+            self._scratch = None
+
+
+class _ArrowOutputStreamContext:
+    """Writer-side companion for :meth:`IO.arrow_output_stream`.
+
+    Yields a :class:`pa.BufferOutputStream` so format encoders
+    (:class:`pa.ipc.RecordBatchFileWriter`,
+    :func:`pa.parquet.ParquetWriter`, :func:`pa.csv.CSVWriter`, …) can
+    write against a pure-Arrow in-memory sink. On a clean exit, the
+    accumulated bytes are bulk-committed to the parent IO through
+    :meth:`IO._commit_format_payload`, which handles codec
+    compression (when the holder's media type carries one) and the
+    overwrite-vs-append disposition.
+
+    On exception the sink is closed and the parent is left untouched
+    — the caller's prior payload is not overwritten by a half-written
+    encoder run.
+    """
+
+    def __init__(self, parent: "IO", *, append: bool = False) -> None:
+        self._parent = parent
+        self._append = bool(append)
+        self._sink: "pa.BufferOutputStream | None" = None
+
+    def __enter__(self) -> "pa.BufferOutputStream":
+        self._sink = pa.BufferOutputStream()
+        return self._sink
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        sink = self._sink
+        self._sink = None
+        if sink is None:
+            return
+        if exc_type is not None:
+            try:
+                sink.close()
+            except Exception:
+                pass
+            return
+        try:
+            payload = sink.getvalue()
+        finally:
+            try:
+                sink.close()
+            except Exception:
+                pass
+        self._parent._commit_format_payload(payload, append=self._append)

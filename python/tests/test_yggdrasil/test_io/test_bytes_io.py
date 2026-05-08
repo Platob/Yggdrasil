@@ -555,3 +555,109 @@ class TestAsMedia:
         )
         mio = r.as_media()
         assert isinstance(mio, JsonIO)
+
+
+class TestArrowStreams:
+    """``BytesIO.arrow_input_stream`` / ``arrow_output_stream`` yield
+    real :class:`pa.NativeFile` handles, decompress on read when the
+    holder carries a codec, and commit (with compression when set) on
+    write.
+    """
+
+    def test_input_stream_in_memory_is_buffer_reader(self) -> None:
+        import pyarrow as pa
+
+        b = BytesIO(b"hello world")
+        with b.arrow_input_stream() as src:
+            assert isinstance(src, pa.NativeFile)
+            assert src.read() == b"hello world"
+
+    def test_input_stream_local_path_uses_memory_map(self, tmp_path) -> None:
+        import pyarrow as pa
+
+        p = tmp_path / "blob.bin"
+        p.write_bytes(b"on-disk-payload")
+        b = BytesIO(path=p)
+        with b.arrow_input_stream() as src:
+            assert isinstance(src, pa.MemoryMappedFile)
+            assert src.read() == b"on-disk-payload"
+
+    def test_input_stream_decompresses_codec(self) -> None:
+        import gzip
+        import pyarrow as pa
+
+        from yggdrasil.data.enums import MediaType, MimeTypes
+        from yggdrasil.data.enums.codec import Codecs
+
+        raw = b"compressed payload" * 32
+        b = BytesIO(gzip.compress(raw))
+        b.with_media_type(MediaType(mime_type=MimeTypes.JSON, codec=Codecs.GZIP))
+        with b.arrow_input_stream() as src:
+            assert isinstance(src, pa.NativeFile)
+            assert src.read() == raw
+
+    def test_output_stream_overwrite_commits_bytes(self) -> None:
+        import pyarrow as pa
+
+        b = BytesIO(b"stale")
+        with b.arrow_output_stream() as sink:
+            assert isinstance(sink, pa.NativeFile)
+            sink.write(b"fresh")
+        assert b.to_bytes() == b"fresh"
+
+    def test_output_stream_append_extends_payload(self) -> None:
+        b = BytesIO(b"head:")
+        with b.arrow_output_stream(append=True) as sink:
+            sink.write(b"tail")
+        assert b.to_bytes() == b"head:tail"
+
+    def test_output_stream_compresses_when_codec_set(self) -> None:
+        import gzip
+
+        from yggdrasil.data.enums import MediaType, MimeTypes
+        from yggdrasil.data.enums.codec import Codecs
+
+        b = BytesIO()
+        b.with_media_type(MediaType(mime_type=MimeTypes.JSON, codec=Codecs.GZIP))
+        with b.arrow_output_stream() as sink:
+            sink.write(b"writer payload")
+        # On the wire we got gzip; round-trip should yield the source bytes.
+        assert b.to_bytes().startswith(b"\x1f\x8b")
+        assert gzip.decompress(b.to_bytes()) == b"writer payload"
+
+    def test_arrow_streams_round_trip_ipc_with_codec(self) -> None:
+        """End-to-end — write IPC into an arrow_output_stream over a
+        gzip-tagged buffer, then read it back through
+        arrow_input_stream. Pins the contract the format leaves rely
+        on.
+        """
+        import pyarrow as pa
+        import pyarrow.ipc as ipc
+
+        from yggdrasil.data.enums import MediaType, MimeTypes
+        from yggdrasil.data.enums.codec import Codecs
+
+        table = pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]})
+
+        b = BytesIO()
+        b.with_media_type(MediaType(mime_type=MimeTypes.ARROW_IPC, codec=Codecs.GZIP))
+
+        with b.arrow_output_stream() as sink:
+            with ipc.RecordBatchFileWriter(sink, table.schema) as writer:
+                writer.write_table(table)
+
+        # Bytes on disk are gzipped IPC.
+        assert b.to_bytes().startswith(b"\x1f\x8b")
+
+        with b.arrow_input_stream() as src:
+            reader = ipc.RecordBatchFileReader(src)
+            out = reader.read_all()
+        assert out.equals(table)
+
+    def test_output_stream_does_not_commit_on_exception(self) -> None:
+        b = BytesIO(b"original")
+        with pytest.raises(RuntimeError, match="boom"):
+            with b.arrow_output_stream() as sink:
+                sink.write(b"ignored")
+                raise RuntimeError("boom")
+        assert b.to_bytes() == b"original"
