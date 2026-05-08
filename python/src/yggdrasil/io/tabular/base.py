@@ -61,7 +61,7 @@ import pyarrow as pa
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.data.enums import MediaType, MimeType
+from yggdrasil.data.enums import MediaType, MimeType, PersistMode
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
 
 if TYPE_CHECKING:
@@ -323,6 +323,34 @@ class Tabular(ABC, Generic[O]):
         base raising.
         """
         return 0
+
+    # ==================================================================
+    # Cache hook
+    # ==================================================================
+
+    def cache(
+        self,
+        mode: "PersistMode | str | int | None" = PersistMode.AUTO,
+        **kwargs: Any,
+    ) -> "Tabular":
+        """Materialize this Tabular at the requested storage tier.
+
+        *mode* names the disposition (``MEMORY`` / ``DISK`` /
+        ``MEMORY_AND_DISK`` / ``OFF_HEAP`` / ``NONE`` / ``AUTO``);
+        accepts a :class:`PersistMode`, an alias string
+        (``"memory"`` / ``"disk"`` / …), or an integer code.
+
+        The default implementation is a no-op and returns ``self``
+        — most leaves either have nothing to cache (a one-shot
+        Arrow batch source) or are already materialized. Backends
+        with a real cache primitive (Spark ``persist``,
+        :class:`ArrowTabular`'s in-memory + spill buffer) override
+        to honor the tier and return either ``self`` or a wrapper
+        that satisfies the same :class:`Tabular` contract.
+        """
+        del kwargs
+        PersistMode.from_(mode)
+        return self
 
     # ==================================================================
     # Row-level delete
