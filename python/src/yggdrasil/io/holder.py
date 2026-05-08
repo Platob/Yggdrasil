@@ -174,6 +174,8 @@ class Holder(Tabular[O], Disposable):
         "_cached_stat",
         "temporary",
         "offset",
+        "length",
+        "holder_parent",
     )
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
@@ -259,6 +261,8 @@ class Holder(Tabular[O], Disposable):
         path: PathLike | None = None,
         temporary: bool = False,
         offset: int = 0,
+        length: int | None = None,
+        holder_parent: "Holder | None" = None,
         **kwargs,
     ):
         """Initialize the holder.
@@ -271,12 +275,21 @@ class Holder(Tabular[O], Disposable):
         when the holder closes. Default ``False`` — clears only happen
         when the caller asks.
 
-        ``offset`` is the byte position within the backing payload
-        where this holder's logical view starts. Defaults to ``0`` —
-        the holder is a window over its full backing storage. Used
-        by container-entry holders (e.g. a zip-archive entry that
-        points at a slice inside the parent archive's buffer) to
-        record where the view begins without copying bytes.
+        ``offset`` / ``length`` carve a window into the backing
+        payload — :attr:`size` reports
+        ``min(length, backing_size - offset)`` (or just
+        ``backing_size - offset`` when *length* is ``None``). Used
+        by container-entry holders that point at a slice inside a
+        parent buffer (zip archive entry, sub-range of a memory map,
+        …) without copying bytes.
+
+        ``holder_parent`` is the holder this one was carved from —
+        set by :meth:`view` so the view can walk back up to its
+        origin. Top-level holders leave it ``None``. The slot is
+        named ``holder_parent`` (not ``parent``) so it doesn't
+        collide with :attr:`Path.parent`, the path-shaped parent
+        directory which is property-backed and read-only — same
+        rationale as :attr:`Tabular.tabular_parent`.
 
         ``stat`` lets callers seed the metadata cache (size / mtime /
         media_type) when they already know it — saves a backend probe
@@ -290,6 +303,8 @@ class Holder(Tabular[O], Disposable):
         self._cached_stat: IOStats = IOStats() if stat is None else stat
         self.temporary: bool = bool(temporary)
         self.offset: int = int(offset)
+        self.length: int | None = None if length is None else int(length)
+        self.holder_parent: "Holder | None" = holder_parent
 
         # ``url=`` only fixes identity; payload-bearing seeds
         # (binary / path / data) are still routed below. Skip ``data``
@@ -408,6 +423,120 @@ class Holder(Tabular[O], Disposable):
     def from_url(cls, url: URL, **kwargs) -> Holder:
         """Create a new holder from a URL."""
         return cls(url=url, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Cloning — with_ / copy / view
+    # ------------------------------------------------------------------
+
+    def _slot_names(self) -> "Iterator[str]":
+        """Yield every slot name declared by this class's MRO.
+
+        Walks every base in ``type(self).__mro__`` and emits each
+        ``__slots__`` entry once. Used by :meth:`with_` /
+        :meth:`copy` to round-trip every slot — :func:`copy.copy`
+        on a slotted hierarchy mixed with non-slotted bases (like
+        :class:`Disposable`) skips slots that aren't pickleable,
+        so we copy them by hand.
+        """
+        seen: "set[str]" = set()
+        for cls in type(self).__mro__:
+            slots = getattr(cls, "__slots__", ())
+            if isinstance(slots, str):
+                slots = (slots,)
+            for slot in slots:
+                if slot in seen or slot in ("__dict__", "__weakref__"):
+                    continue
+                seen.add(slot)
+                yield slot
+
+    def with_(self, **kwargs: Any) -> "Holder":
+        """Return a sibling holder sharing this one's payload.
+
+        Shallow-copies every slot (``_buf``, ``_url``,
+        ``_cached_stat``, …) and applies *kwargs* via ``setattr``,
+        so the new holder aliases the same backing bytes / file /
+        remote object — no payload copy. Callers use it to spin
+        off a holder with one or two fields tweaked
+        (``h.with_(offset=128)``, ``h.with_(temporary=True)``).
+        Subclasses with state that must NOT be shared (an open fd,
+        an mmap handle) override.
+        """
+        cls = type(self)
+        out = cls.__new__(cls)
+        for slot in self._slot_names():
+            try:
+                value = getattr(self, slot)
+            except AttributeError:
+                continue
+            try:
+                setattr(out, slot, value)
+            except AttributeError:
+                continue
+        for k, v in kwargs.items():
+            setattr(out, k, v)
+        return out
+
+    def copy(self, *, deep: bool = False, **kwargs: Any) -> "Holder":
+        """Return a copy of this holder, optionally with a private payload.
+
+        * ``deep=False`` (default) — same shape as :meth:`with_`:
+          shallow copy, payload aliased.
+        * ``deep=True`` — :func:`copy.deepcopy` is run on every
+          slot value, so the new holder owns an independent
+          ``bytearray`` / cached metadata / etc. Mutations on
+          either side don't leak into the other.
+
+        *kwargs* are applied via ``setattr`` after the (deep)
+        copy, the same way :meth:`with_` does it.
+        """
+        import copy as _copy
+
+        cls = type(self)
+        out = cls.__new__(cls)
+        memo: "dict[int, Any]" = {} if deep else {}
+        for slot in self._slot_names():
+            try:
+                value = getattr(self, slot)
+            except AttributeError:
+                continue
+            if deep:
+                value = _copy.deepcopy(value, memo)
+            try:
+                setattr(out, slot, value)
+            except AttributeError:
+                continue
+        for k, v in kwargs.items():
+            setattr(out, k, v)
+        return out
+
+    def view(self, size: int, offset: int) -> "Holder":
+        """Return a sub-window of this holder as a fresh borrowing view.
+
+        *offset* is added to :attr:`offset` (so views nest cleanly
+        — a view of a view of a buffer addresses the right bytes
+        without the caller composing offsets) and *size* becomes
+        the window's :attr:`length`. The result shares the backing
+        payload with ``self`` and pins ``self`` as
+        :attr:`holder_parent`, so a consumer can walk back up to
+        the origin.
+
+        ``size`` clamps :attr:`size` even when the backing payload
+        is larger; reads past ``size`` are out of bounds. Negative
+        *offset* / *size* raise :class:`ValueError`.
+        """
+        if offset < 0:
+            raise ValueError(
+                f"view offset must be >= 0, got {offset!r}"
+            )
+        if size < 0:
+            raise ValueError(
+                f"view size must be >= 0, got {size!r}"
+            )
+        return self.with_(
+            holder_parent=self,
+            offset=self.offset + int(offset),
+            length=int(size),
+        )
 
     @classmethod
     def from_bytes(cls, data: bytes, **kwargs) -> Holder:
@@ -608,10 +737,15 @@ class Holder(Tabular[O], Disposable):
         """Current visible (logical) size in bytes.
 
         Subtracts :attr:`offset` from the absolute backing size
-        (:attr:`_size`), so a windowed holder reports only the
-        bytes inside the window.
+        (:attr:`_size`) and clamps to :attr:`length` when set. A
+        view created with ``view(size=…, offset=…)`` therefore
+        reports exactly *size* bytes (or fewer when the backing
+        truncates below the window).
         """
-        return max(0, self._size - self.offset)
+        physical = max(0, self._size - self.offset)
+        if self.length is None:
+            return physical
+        return min(physical, max(0, self.length))
 
     @property
     @abstractmethod

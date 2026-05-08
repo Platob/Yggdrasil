@@ -228,7 +228,7 @@ class Memory(Holder):
     # past close would be a real fd leak, not just a GC oddity.
 
     @classmethod
-    def view(
+    def alias(
         cls,
         buf: bytearray,
         size: Optional[int] = None,
@@ -579,10 +579,14 @@ class Memory(Holder):
         Override of :meth:`Holder.memoryview` that aliases the
         underlying buffer directly — no copy, no per-byte dispatch.
         Works equally on bytearray and mmap backings.
-        :attr:`Holder.offset` is honored: a windowed holder hands
-        back only the bytes inside the window.
+        :attr:`Holder.offset` and :attr:`Holder.length` are honored:
+        a windowed holder hands back only the bytes inside the
+        ``offset .. offset + length`` window.
         """
-        return memoryview(self._buf)[self.offset : self.stat().size]
+        end = self.stat().size
+        if self.length is not None:
+            end = min(end, self.offset + max(0, self.length))
+        return memoryview(self._buf)[self.offset : end]
 
     def to_bytes(self) -> bytes:
         return bytes(self.memoryview())
