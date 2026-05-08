@@ -175,11 +175,13 @@ class TestStatAndMtime:
 
     def test_stat_reflects_live_size(self) -> None:
         m = Memory()
-        s = m.stat()
         m.write_bytes(b"abcd", 0)
-        # Same instance — caller pinned it.
-        assert s.size == 4
-        assert m.stat() is s
+        # ``stat()`` snapshots the holder's current state into a
+        # fresh :class:`IOStats` on each call.
+        assert m.stat().size == 4
+        # The holder also exposes ``size`` directly for the hot-path
+        # readers that don't need a full stat snapshot.
+        assert m.size == 4
 
 
 class TestPredicates:

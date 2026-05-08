@@ -38,7 +38,7 @@ import pyarrow as pa
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MimeTypes, Mode
-from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.io.base import IO
 from yggdrasil.io.memory import Memory
 
 __all__ = ["XlsxIO", "XlsxOptions", "XlsxSheetIO"]
@@ -144,7 +144,7 @@ def _write_sheet_rows(
 # ---------------------------------------------------------------------------
 
 
-class XlsxSheetIO(BytesIO):
+class XlsxSheetIO(IO[bytes, XlsxOptions]):
     """:class:`BytesIO` over a single worksheet's rows.
 
     A sheet has no standalone byte representation — the workbook
@@ -324,7 +324,7 @@ class XlsxSheetIO(BytesIO):
 # ---------------------------------------------------------------------------
 
 
-class XlsxIO(BytesIO):
+class XlsxIO(IO[bytes, XlsxOptions]):
     """:class:`Tabular` leaf for xlsx workbooks (single- or multi-sheet)."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.XLSX

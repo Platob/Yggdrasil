@@ -38,7 +38,7 @@ import io
 import time
 from typing import Any, Callable, Iterable, Iterator, Optional, Union
 
-from yggdrasil.io.io_stats import IOKind
+from yggdrasil.io.io_stats import IOKind, IOStats
 
 from .holder import Holder, _resolve_pos
 
@@ -130,7 +130,6 @@ class MemoryStream(Holder):
         # content feed, not a bytes/path/url seed. Pass only the
         # identity/stat kwargs through.
         super().__init__(**kwargs)
-        self.stat().kind = IOKind.MEMORY
 
     # ------------------------------------------------------------------
     # Source binding — normalize the four accepted shapes into a single
@@ -284,6 +283,14 @@ class MemoryStream(Holder):
     @property
     def size(self) -> int:
         return self._window_start + len(self._buf)
+
+    def _stat(self) -> IOStats:
+        return IOStats(
+            kind=IOKind.MEMORY,
+            size=self.size,
+            mtime=self._mtime,
+            media_type=self._media_type,
+        )
 
     def read_mv(self, n: int, pos: int) -> memoryview:
         """Read ``n`` bytes at absolute ``pos``, pulling from source as

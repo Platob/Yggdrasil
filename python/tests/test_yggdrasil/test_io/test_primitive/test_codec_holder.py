@@ -42,7 +42,7 @@ def _seed_codec(holder: Memory, mime: MimeTypes, codec) -> Memory:
     This is what a path-bound holder learns from a ``.csv.gz``
     URL extension; for in-memory tests we pin it explicitly.
     """
-    holder.stat().media_type = MediaType(mime_type=mime, codec=codec)
+    holder.media_type = MediaType(mime_type=mime, codec=codec)
     return holder
 
 

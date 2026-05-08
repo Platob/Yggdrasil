@@ -121,7 +121,7 @@ class TestConstruction:
         from yggdrasil.data.enums import MediaType, MimeTypes
         from yggdrasil.io.primitive.parquet_io import ParquetIO
         mem = Memory()
-        mem.stat().media_type = MediaType(MimeTypes.PARQUET)
+        mem.media_type = MediaType(MimeTypes.PARQUET)
         assert isinstance(BytesIO(holder=mem), ParquetIO)
 
 

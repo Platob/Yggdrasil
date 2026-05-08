@@ -64,6 +64,43 @@ class Mode(IntEnum):
         return self is not Mode.READ_ONLY
 
     @property
+    def readable(self) -> bool:
+        """True when the mode admits reads.
+
+        Every :class:`Mode` canonically resolves to a ``+`` POSIX form
+        (``rb``, ``rb+``, ``wb+``, ``ab+``, ``xb+``) — all of those
+        admit reads. Only the strict :data:`READ_ONLY` ``rb`` and
+        :data:`IGNORE` (which is no-op) deny writes; nothing here
+        denies reads.
+        """
+        return True
+
+    @property
+    def writable(self) -> bool:
+        """True when the mode admits writes — alias of :attr:`allows_write`."""
+        return self is not Mode.READ_ONLY
+
+    @property
+    def appendable(self) -> bool:
+        """True when writes append at EOF rather than at the cursor.
+
+        Only :data:`APPEND` carries POSIX ``O_APPEND`` semantics; every
+        other write mode positions writes at the explicit cursor.
+        """
+        return self is Mode.APPEND
+
+    def __contains__(self, item: object) -> bool:
+        """Delegate substring checks to :attr:`os_mode`.
+
+        pandas / pyarrow / zipfile inspect file-like ``.mode`` with
+        ``"b" in handle.mode`` to dispatch binary vs text reads. The
+        IO surface returns the typed :class:`Mode` enum, so we make
+        the enum behave like its POSIX form for these checks instead
+        of forcing every consumer to reach for ``mode.os_mode``.
+        """
+        return item in self.os_mode
+
+    @property
     def os_mode(self) -> str:
         """Stdlib :func:`open` mode string for this :class:`Mode`.
 

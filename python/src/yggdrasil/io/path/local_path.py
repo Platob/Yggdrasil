@@ -297,7 +297,7 @@ class LocalPath(Path):
 
     scheme: ClassVar[str] = "file"
 
-    __slots__ = ("_fd", "_stats")
+    __slots__ = ("_fd",)
 
     # ------------------------------------------------------------------
     # Construction
@@ -307,11 +307,6 @@ class LocalPath(Path):
         # Slots must exist before super().__init__ runs — Disposable
         # may call _acquire (which reads self._fd) during construction.
         self._fd: int = -1
-        # Pinned :class:`IOStats` cache — same instance returned across
-        # every :meth:`_stat` call so callers can hold a reference and
-        # observe live size / mtime updates. Lazily allocated on first
-        # :meth:`_stat`; mutated in place thereafter.
-        self._stats: "IOStats | None" = None
 
         # Auto-stage when no path / url / data is provided. Lets
         # ``LocalPath()`` produce an anonymous local file (handy as a
@@ -474,38 +469,38 @@ class LocalPath(Path):
         or :func:`os.stat` (when closed). Returns ``MISSING`` for
         non-existent paths; never raises :class:`FileNotFoundError`.
 
-        Pins the :class:`IOStats` instance across calls so callers
-        can hold a reference and observe live updates after writes
-        / truncates / clears. Fields are mutated in place; only the
-        first call allocates.
+        Each call builds a fresh :class:`IOStats` from the live
+        filesystem state. The holder's stamped
+        :attr:`Holder.media_type` (or the URL-inferred default) is
+        merged in so the result is self-describing without a second
+        lookup.
         """
-        s = self._stats
-        if s is None:
-            s = IOStats(
-                size=0, mtime=0.0, kind=IOKind.MISSING,
-                media_type=self.url.infer_media_type(default=None),
-            )
-            self._stats = s
-
+        media_type = (
+            self._media_type
+            if self._media_type is not None
+            else self.url.infer_media_type(default=None)
+        )
         try:
             if self._fd >= 0:
                 st = os.fstat(self._fd)
             else:
                 st = os.stat(self.os_path)
         except (FileNotFoundError, NotADirectoryError):
-            s.size = 0
-            s.mtime = 0.0
-            s.kind = IOKind.MISSING
-            return s
+            return IOStats(
+                size=0, mtime=0.0, kind=IOKind.MISSING,
+                media_type=media_type,
+            )
 
-        s.size = int(st.st_size)
-        s.mtime = float(st.st_mtime)
-        s.mode = int(st.st_mode)
-        s.kind = (
-            IOKind.DIRECTORY if os.path.isdir(self.os_path)
-            else IOKind.FILE
+        return IOStats(
+            size=int(st.st_size),
+            mtime=float(st.st_mtime),
+            mode=int(st.st_mode),
+            kind=(
+                IOKind.DIRECTORY if os.path.isdir(self.os_path)
+                else IOKind.FILE
+            ),
+            media_type=media_type,
         )
-        return s
 
     def _ls(self, recursive: bool = False) -> Iterator["LocalPath"]:
         """Yield children. Empty when missing or not a directory."""

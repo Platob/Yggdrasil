@@ -538,7 +538,7 @@ class Stats:
         stage+rename; raw paths get a single write).
         """
         from yggdrasil.io.path import Path as _Path  # local — avoid cycle
-        from yggdrasil.io.bytes_io import BytesIO as _BytesIO
+        from yggdrasil.io.base import IO as _BytesIO
 
         payload = self.to_ipc()
         if isinstance(target, _BytesIO):
@@ -558,7 +558,7 @@ class Stats:
         """Inverse of :meth:`write`. EAFP — missing files raise
         :class:`FileNotFoundError`."""
         from yggdrasil.io.path import Path as _Path
-        from yggdrasil.io.bytes_io import BytesIO as _BytesIO
+        from yggdrasil.io.base import IO as _BytesIO
 
         if isinstance(source, (bytes, bytearray, memoryview)):
             return cls.from_ipc(source)

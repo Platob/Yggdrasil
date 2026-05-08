@@ -35,7 +35,7 @@ import pyarrow.ipc as ipc
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MimeTypes, Mode
-from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.io.base import IO
 
 if TYPE_CHECKING:
     pass
@@ -67,7 +67,7 @@ class ArrowIPCOptions(CastOptions):
         )
 
 
-class ArrowIPCIO(BytesIO):
+class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
     """:class:`Tabular` leaf for the Arrow IPC **file** format.
 
     File-format reads parse the footer once on construction of the

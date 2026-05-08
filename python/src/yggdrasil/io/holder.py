@@ -171,7 +171,9 @@ class Holder(Tabular[O], Disposable):
 
     __slots__ = (
         "_url",
-        "_cached_stat",
+        "_size",
+        "_mtime",
+        "_media_type",
         "temporary",
     )
 
@@ -278,7 +280,22 @@ class Holder(Tabular[O], Disposable):
         self._url: URL | None = None
         if url is not None:
             self.url = url
-        self._cached_stat: IOStats = IOStats() if stat is None else stat
+        # Holder owns its own size + mtime + media_type. Subclasses
+        # update these via :meth:`_touch_stat` (or direct mutation
+        # on hot paths); :meth:`_stat` snapshots them into a fresh
+        # :class:`IOStats` on demand.
+        self._size: int = int(stat.size) if stat is not None else 0
+        self._mtime: float = float(stat.mtime) if stat is not None else 0.0
+        if stat is not None and stat.media_type is not None:
+            self._media_type = stat.media_type
+        else:
+            try:
+                self._media_type = (
+                    self._url.infer_media_type(default=None)
+                    if self._url is not None else None
+                )
+            except Exception:
+                self._media_type = None
         self.temporary: bool = bool(temporary)
 
         # ``url=`` only fixes identity; payload-bearing seeds
@@ -577,31 +594,39 @@ class Holder(Tabular[O], Disposable):
         """Current visible size in bytes."""
 
     # ------------------------------------------------------------------
-    # IOStats — the canonical metadata holder
+    # IOStats — built fresh from holder-owned slots
     # ------------------------------------------------------------------
     #
-    # Every concrete :class:`Holder` keeps a single mutable
-    # :class:`IOStats` instance. Writes mutate it in place
-    # (``stats.size = new_size``, ``stats.mtime = time.time()``);
-    # readers either pin :meth:`stat` and observe the live values, or
-    # use the convenience properties below which read straight off the
-    # same object.
+    # The holder itself owns the canonical ``_size`` / ``_mtime`` /
+    # ``_media_type`` fields. :meth:`_stat` is the abstract hook
+    # subclasses implement to snapshot those (plus any backend-derived
+    # fields like ``kind``) into a fresh :class:`IOStats`. Callers that
+    # need to mutate metadata go through the typed surfaces
+    # (``holder.media_type = ...``, :meth:`_touch_stat`) — mutating the
+    # returned ``IOStats`` no longer round-trips, since each call
+    # produces a fresh instance.
 
     def stat(self) -> IOStats:
-        """The mutable :class:`IOStats` carrying this holder's metadata.
+        """Snapshot the holder's metadata into a fresh :class:`IOStats`.
 
-        Lazy: first call materializes an :class:`IOStats` seeded from
-        the URL's media-type. Subsequent calls return the same
-        instance, so callers can pin it to observe live size / mtime
-        / media_type updates as writes land.
+        Delegates to :meth:`_stat` for the backend-specific fields
+        (``kind`` and the live size for path-bound holders); mutating
+        the returned instance does NOT round-trip onto the holder.
+        Use the holder's own setters / :meth:`_touch_stat` when you
+        need to update metadata.
         """
-        if self._cached_stat is None:
-            kind = IOKind.MEMORY if self.is_memory else IOKind.MISSING
-            self._cached_stat = IOStats(
-                kind=kind,
-                media_type=self.url.infer_media_type(default=None),
-            )
-        return self._cached_stat
+        return self._stat()
+
+    @abstractmethod
+    def _stat(self) -> IOStats:
+        """Snapshot the holder's metadata into a fresh :class:`IOStats`.
+
+        Subclasses build the :class:`IOStats` from their authoritative
+        state — ``self._size`` / ``self._mtime`` for in-memory
+        holders, a backend round-trip for path holders. The base
+        :meth:`stat` always routes through this hook so callers don't
+        need to know which backend they're against.
+        """
 
     def _touch_stat(
         self,
@@ -610,13 +635,12 @@ class Holder(Tabular[O], Disposable):
         mtime: float | None = None,
         media_type: Any = None,
     ) -> None:
-        """Update the cached :class:`IOStats` after a successful write.
+        """Update the holder-owned metadata fields after a successful write.
 
-        Mutates the existing instance in place if one is materialized;
-        otherwise lazily creates one via :meth:`stat`. Centralized so
-        :meth:`write_mv` (and any subclass with a cheaper write path
-        that bypasses :meth:`write_mv`) can keep ``size`` /
-        ``media_type`` fresh without duplicating the bookkeeping.
+        Centralized so :meth:`write_mv` (and any subclass with a
+        cheaper write path that bypasses :meth:`write_mv`) can keep
+        ``size`` / ``media_type`` fresh without duplicating the
+        bookkeeping.
 
         ``mtime`` is **only** updated when the caller passes it
         explicitly. The previous behavior — bumping ``mtime`` to
@@ -626,34 +650,50 @@ class Holder(Tabular[O], Disposable):
         either pass ``mtime=`` or call :meth:`touch_mtime` once at
         the end of the operation.
         """
-        s = self.stat()
         if size is not None:
-            s.size = size
+            self._size = int(size)
         if mtime is not None:
-            s.mtime = mtime
+            self._mtime = float(mtime)
         if media_type is not None:
-            s.media_type = media_type
+            self._media_type = media_type
 
     def touch_mtime(self, when: float | None = None) -> None:
-        """Stamp the cached :class:`IOStats` with the current time.
+        """Stamp the holder's mtime with the current time.
 
         Bulk-write helper — call once after a write loop instead of
         letting every :meth:`write_mv` call sample the clock. ``when``
         accepts an explicit timestamp (e.g. an upstream "Last-Modified"
         header); ``None`` defaults to :func:`time.time`.
         """
-        s = self.stat()
-        s.mtime = float(when) if when is not None else time.time()
+        self._mtime = float(when) if when is not None else time.time()
 
     @property
     def mtime(self) -> float:
-        """Convenience accessor — same as ``self.stat().mtime``."""
-        return self.stat().mtime
+        """Last-modified time stamp."""
+        return self._mtime
 
     @property
     def media_type(self):
-        """Convenience accessor — same as ``self.stat().media_type``."""
-        return self.stat().media_type
+        """The holder's :class:`MediaType`, or ``None`` if unset."""
+        return self._media_type
+
+    @media_type.setter
+    def media_type(self, value: Any) -> None:
+        """Stamp a :class:`MediaType` onto the holder.
+
+        Accepts anything :meth:`MediaType.from_` can coerce (a
+        :class:`MediaType`, a :class:`MimeType`, a string mime form,
+        or ``None`` to clear).
+        """
+        if value is None:
+            self._media_type = None
+            return
+        try:
+            from yggdrasil.data.enums.media_type import MediaType
+            mt = MediaType.from_(value, default=None)
+        except Exception:
+            mt = value
+        self._media_type = mt
 
     # ------------------------------------------------------------------
     # Per-open lifecycle — Path overrides; Memory and other always-live

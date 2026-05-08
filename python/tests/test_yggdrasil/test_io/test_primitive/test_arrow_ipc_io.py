@@ -224,7 +224,7 @@ class TestTabularForHolder:
         # has something to look at without needing magic bytes.
         from yggdrasil.data.enums.media_type import MediaType
         target = LocalPath(str(tmp_path / "x.arrow"))
-        target.stat().media_type = MediaType.from_(MimeTypes.ARROW_IPC)
+        target.media_type = MediaType.from_(MimeTypes.ARROW_IPC)
 
         leaf = Tabular.for_holder(target)
         assert isinstance(leaf, ArrowIPCIO)
