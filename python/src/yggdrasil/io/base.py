@@ -17,8 +17,10 @@ chunk-typed protocol on top.
 
 from __future__ import annotations
 
+import io as _stdlib_io
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
+from yggdrasil.data.enums.mode import Mode, ModeLike
 from yggdrasil.data.options import CastOptions
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.tabular import Tabular
@@ -56,25 +58,81 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
     the :class:`CastOptions` subtype carried by :class:`Tabular`.
     """
 
-    __slots__ = ("_holder", "_owns_holder")
+    __slots__ = ("_holder", "_owns_holder", "_pos", "_mode")
+
+    def __new__(
+        cls,
+        data: Any = None,
+        *,
+        holder: "Holder | None" = None,
+        owns_holder: bool = False,
+        mode: ModeLike = "rb+",
+        path: Any = None,
+        binary: Any = None,
+        url: Any = None,
+        **kwargs: Any,
+    ):
+        """Allocate the instance and resolve a holder via :class:`Holder`.
+
+        The holder argument is the load-bearing one: when supplied,
+        the instance borrows it (``owns_holder`` controls teardown).
+        When ``holder`` is ``None``, the holder-shaped kwargs
+        (``data`` / ``path`` / ``binary`` / ``url``) are forwarded
+        to :class:`Holder`, whose own ``__new__`` scheme-dispatches
+        to the right concrete subclass (:class:`Memory`,
+        :class:`LocalPath`, :class:`S3Path`, …). The new holder is
+        stamped onto the instance and the instance owns it.
+
+        Inputs :class:`Holder` doesn't recognize (file-like objects,
+        backend-specific shapes) are left for the subclass
+        ``__init__`` to drain — :meth:`_holder` stays ``None`` until
+        the subclass populates it.
+        """
+        instance = super().__new__(cls)
+        instance._holder = holder
+        instance._owns_holder = bool(owns_holder)
+        if holder is None:
+            from yggdrasil.io.holder import Holder as _Holder
+            try:
+                instance._holder = _Holder(
+                    data=data, path=path, binary=binary, url=url,
+                )
+                instance._owns_holder = True
+            except TypeError:
+                # Subclass may have richer drain logic (e.g. file-like
+                # objects in :class:`BytesIO.from_`). Leave the slots
+                # at their initial values for the subclass to finish.
+                pass
+        return instance
 
     def __init__(
         self,
+        data: Any = None,
         *,
-        holder: "Holder",
+        holder: "Holder | None" = None,
         owns_holder: bool = False,
+        mode: ModeLike = "rb+",
+        path: Any = None,
+        binary: Any = None,
+        url: Any = None,
         **kwargs: Any,
     ) -> None:
-        """Bind *holder* and record ownership.
+        """Initialize Tabular / Disposable bookkeeping.
 
-        ``owns_holder=True`` transfers close-ownership of *holder*
-        to this handle — :meth:`_release` will close it. ``False``
-        (the default) borrows the holder; the caller stays
-        responsible for its lifecycle.
+        ``_holder`` and ``_owns_holder`` are populated by
+        :meth:`__new__`; this hook only chains the ``Tabular`` /
+        ``Disposable`` super-init. The holder-shaped kwargs are
+        accepted purely so subclass calls like
+        ``BytesIO(path="x.csv")`` reach :meth:`__new__` and get
+        absorbed before they reach :class:`Tabular.__init__`.
+
+        ``mode`` follows stdlib :func:`open` semantics. Subclasses
+        consume it for read/write predicates, EOF positioning, and
+        truncate-on-open behavior.
         """
         super().__init__(**kwargs)
-        self._holder: "Holder" = holder
-        self._owns_holder: bool = bool(owns_holder)
+        self._pos: int = 0
+        self._mode: Mode = Mode.from_(mode)
 
     # ==================================================================
     # Identity
@@ -106,3 +164,82 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
                 self._holder.close()
             except Exception:
                 pass
+
+    # ==================================================================
+    # Cursor — position tracking shared by every chunk-shaped child
+    # ==================================================================
+
+    @property
+    def size(self) -> int:
+        """Live size of the bound holder.
+
+        Subclasses that interpose a buffered scratch (e.g.
+        :class:`BytesIO` while open) override to read from the
+        active surface instead of the durable holder.
+        """
+        return self._holder.size
+
+    def tell(self) -> int:
+        """Current cursor position."""
+        return self._pos
+
+    def seek(self, offset: int, whence: int = _stdlib_io.SEEK_SET) -> int:
+        """Seek to *offset* relative to *whence*.
+
+        Mirrors :meth:`io.IOBase.seek` with two ergonomic deviations
+        that match the rest of the codebase:
+
+        * ``seek(-1, SEEK_SET)`` is a "go to end" sentinel — pairs
+          with ``read(-1)`` / "read all". Any other negative
+          ``SEEK_SET`` offset raises :class:`ValueError`.
+        * ``SEEK_CUR`` / ``SEEK_END`` with a negative offset that
+          would land before byte 0 clamps to 0 instead of raising.
+        """
+        offset = int(offset)
+        size = self.size
+        if whence == _stdlib_io.SEEK_SET:
+            if offset == -1:
+                self._pos = size
+            elif offset < 0:
+                raise ValueError(
+                    f"Negative SEEK_SET offset {offset!r} is invalid; "
+                    f"use SEEK_END to count from the end."
+                )
+            else:
+                self._pos = offset
+        elif whence == _stdlib_io.SEEK_CUR:
+            self._pos = max(0, self._pos + offset)
+        elif whence == _stdlib_io.SEEK_END:
+            self._pos = max(0, size + offset)
+        else:
+            raise ValueError(f"Invalid whence: {whence!r}")
+        return self._pos
+
+    def seekable(self) -> bool:
+        return True
+
+    # ==================================================================
+    # Mode predicates — stdlib open() semantics
+    # ==================================================================
+
+    @property
+    def mode(self) -> Mode:
+        """Normalized :class:`Mode` for this handle.
+
+        Stored as an enum so predicates like :meth:`readable`,
+        :meth:`writable`, :meth:`appendable` route through one
+        canonical token instead of re-parsing strings at every
+        call site. The original POSIX form is recoverable via
+        ``self.mode.os_mode``.
+        """
+        return self._mode
+
+    def readable(self) -> bool:
+        return self._mode.readable
+
+    def writable(self) -> bool:
+        return self._mode.writable
+
+    def appendable(self) -> bool:
+        """True when writes append at EOF — :data:`Mode.APPEND` only."""
+        return self._mode.appendable

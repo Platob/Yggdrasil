@@ -162,8 +162,6 @@ class BytesIO(IO[bytes, O], BinaryIO):
     """
 
     __slots__ = (
-        "_pos",
-        "_mode",
         "_scratch",
     )
 
@@ -238,7 +236,14 @@ class BytesIO(IO[bytes, O], BinaryIO):
                         path=path,
                         **kwargs,
                     )
-        return super().__new__(cls)
+        return super().__new__(
+            cls,
+            data=data,
+            holder=holder,
+            owns_holder=owns_holder,
+            path=path,
+            **kwargs,
+        )
 
     def __init__(
         self,
@@ -287,26 +292,17 @@ class BytesIO(IO[bytes, O], BinaryIO):
                 "BytesIO(path=...) for filesystem/URL paths."
             )
 
-        if holder is None:
-            if path is not None:
-                # Holder.__new__ scheme-dispatches: str / PurePath /
-                # URL → LocalPath, s3:// → S3Path, … . The fresh holder
-                # owns its identity (URL + IOStats), so the BytesIO
-                # owns it back.
-                holder = Holder(path=path)
-                owns_holder = True
-            elif data is None:
-                # Empty memory holder — equivalent to stdlib io.BytesIO().
-                holder = Memory()
-                owns_holder = True
-            else:
-                tmp = self.from_(data, mode=mode)
-                holder = tmp._holder
-                owns_holder = True
+        super().__init__(mode=mode, **kwargs)
 
-        super().__init__(holder=holder, owns_holder=owns_holder, **kwargs)
-        self._pos: int = 0
-        self._mode: str = mode
+        # :meth:`IO.__new__` resolves the holder via :class:`Holder`'s
+        # scheme dispatch for everything Holder understands (path,
+        # binary, url, bytes-like data, all-None → empty Memory). The
+        # only shape it can't drain is a file-like ``data`` argument —
+        # :meth:`from_` handles that drain into a fresh Memory holder.
+        if self._holder is None:
+            tmp = self.from_(data, mode=mode)
+            self._holder = tmp._holder
+            self._owns_holder = True
         # Memory scratch buffer — populated by :meth:`_acquire`,
         # commits to ``self._holder`` on :meth:`flush` /
         # :meth:`_release`. ``None`` when the BytesIO is closed; in
@@ -414,7 +410,9 @@ class BytesIO(IO[bytes, O], BinaryIO):
         """
         super()._acquire()
 
-        if "x" in self._mode and self._holder.size > 0:
+        from yggdrasil.data.enums.mode import Mode
+
+        if self._mode is Mode.ERROR_IF_EXISTS and self._holder.size > 0:
             raise FileExistsError(
                 f"{type(self).__name__} opened with mode={self._mode!r} "
                 f"but holder is non-empty ({self._holder.size} bytes)."
@@ -425,12 +423,15 @@ class BytesIO(IO[bytes, O], BinaryIO):
         scratch.acquire()
 
         # Seed scratch from the durable holder for read-friendly
-        # modes; "wb" / "w+b" start clean (truncate-on-commit).
-        if "w" not in self._mode and self._holder.size > 0:
+        # modes; OVERWRITE / TRUNCATE start clean (truncate-on-commit).
+        if (
+            self._mode not in (Mode.OVERWRITE, Mode.TRUNCATE)
+            and self._holder.size > 0
+        ):
             scratch.pwrite(self._holder.read_bytes(), 0)
 
         self._scratch = scratch
-        self._pos = scratch.size if "a" in self._mode else 0
+        self._pos = scratch.size if self._mode.appendable else 0
 
     def _commit(self) -> None:
         """Push the scratch buffer's bytes onto the durable holder.
@@ -718,7 +719,16 @@ class BytesIO(IO[bytes, O], BinaryIO):
 
     @property
     def mode(self) -> str:
-        return self._mode
+        """POSIX mode string — stdlib :class:`IO[bytes]` parity.
+
+        pandas / pyarrow / zipfile inspect ``.mode`` for substrings
+        like ``"b"`` to dispatch binary vs text reads, so the
+        :class:`BytesIO` surface returns the os-mode form
+        (``"rb+"`` / ``"wb+"`` / ``"ab+"`` / ``"xb+"``) instead of
+        the :class:`Mode` enum. The typed mode is still available via
+        ``self._mode``.
+        """
+        return self._mode.os_mode
 
     @property
     def name(self) -> str:
@@ -816,15 +826,6 @@ class BytesIO(IO[bytes, O], BinaryIO):
         # to fall back onto — that's the only honestly-closed state.
         return self._holder is None
 
-    def readable(self) -> bool:
-        return "r" in self._mode or "+" in self._mode
-
-    def writable(self) -> bool:
-        return any(c in self._mode for c in "wax+")
-
-    def seekable(self) -> bool:
-        return True
-
     def isatty(self) -> bool:
         return False
 
@@ -837,45 +838,6 @@ class BytesIO(IO[bytes, O], BinaryIO):
                 "has no underlying file descriptor."
             )
         return fileno()
-
-    # ==================================================================
-    # Cursor
-    # ==================================================================
-
-    def tell(self) -> int:
-        return self._pos
-
-    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
-        """Seek to *offset* relative to *whence*.
-
-        Mirrors :meth:`io.IOBase.seek` with two ergonomic deviations
-        that match the rest of the codebase:
-
-        * ``seek(-1, SEEK_SET)`` is a "go to end" sentinel — pairs
-          with ``read(-1)`` / "read all". Any other negative
-          ``SEEK_SET`` offset raises :class:`ValueError`.
-        * ``SEEK_CUR`` / ``SEEK_END`` with a negative offset that
-          would land before byte 0 clamps to 0 instead of raising.
-        """
-        offset = int(offset)
-        size = self.size
-        if whence == io.SEEK_SET:
-            if offset == -1:
-                self._pos = size
-            elif offset < 0:
-                raise ValueError(
-                    f"Negative SEEK_SET offset {offset!r} is invalid; "
-                    f"use SEEK_END to count from the end."
-                )
-            else:
-                self._pos = offset
-        elif whence == io.SEEK_CUR:
-            self._pos = max(0, self._pos + offset)
-        elif whence == io.SEEK_END:
-            self._pos = max(0, size + offset)
-        else:
-            raise ValueError(f"Invalid whence: {whence!r}")
-        return self._pos
 
     # ==================================================================
     # Cursorless I/O — pass through to the holder
