@@ -319,9 +319,9 @@ class Folder(Tabular[FolderOptions]):
         """
         action = self._resolve_action(options.mode)
 
-        if action is Mode.IGNORE and self._has_tabular_children():
+        if action is Mode.IGNORE and self.has_children:
             return
-        if action is Mode.ERROR_IF_EXISTS and self._has_tabular_children():
+        if action is Mode.ERROR_IF_EXISTS and self.has_children:
             raise FileExistsError(
                 f"{type(self).__name__} already contains tabular files; "
                 f"refusing to write under mode={options.mode!r}."
@@ -334,7 +334,7 @@ class Folder(Tabular[FolderOptions]):
         match_by = list(getattr(options, "match_by_names", None) or ())
         is_upsert = options.mode in (Mode.UPSERT, Mode.MERGE)
 
-        if match_by and self._has_tabular_children():
+        if match_by and self.has_children:
             if is_upsert:
                 self._merge_upsert(batches, match_by, options)
             else:
@@ -541,7 +541,13 @@ class Folder(Tabular[FolderOptions]):
                 continue
             yield from self._filter_batches_drop_keys(stream, match_by, drop_keys)
 
-    def _has_tabular_children(self) -> bool:
+    @property
+    def has_children(self) -> bool:
+        """``True`` when :meth:`children` would yield at least one entry.
+
+        Short-circuits on the first hit, so it costs one ``stat`` /
+        ``iterdir`` step instead of walking the whole directory.
+        """
         for _ in self.children():
             return True
         return False
