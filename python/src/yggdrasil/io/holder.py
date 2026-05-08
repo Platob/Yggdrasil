@@ -173,6 +173,7 @@ class Holder(Tabular[O], Disposable):
         "_url",
         "_cached_stat",
         "temporary",
+        "offset",
     )
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
@@ -257,6 +258,7 @@ class Holder(Tabular[O], Disposable):
         binary: bytes | bytearray | memoryview | None = None,
         path: PathLike | None = None,
         temporary: bool = False,
+        offset: int = 0,
         **kwargs,
     ):
         """Initialize the holder.
@@ -269,6 +271,13 @@ class Holder(Tabular[O], Disposable):
         when the holder closes. Default ``False`` — clears only happen
         when the caller asks.
 
+        ``offset`` is the byte position within the backing payload
+        where this holder's logical view starts. Defaults to ``0`` —
+        the holder is a window over its full backing storage. Used
+        by container-entry holders (e.g. a zip-archive entry that
+        points at a slice inside the parent archive's buffer) to
+        record where the view begins without copying bytes.
+
         ``stat`` lets callers seed the metadata cache (size / mtime /
         media_type) when they already know it — saves a backend probe
         on the first :meth:`stat` call.
@@ -280,6 +289,7 @@ class Holder(Tabular[O], Disposable):
             self.url = url
         self._cached_stat: IOStats = IOStats() if stat is None else stat
         self.temporary: bool = bool(temporary)
+        self.offset: int = int(offset)
 
         # ``url=`` only fixes identity; payload-bearing seeds
         # (binary / path / data) are still routed below. Skip ``data``
