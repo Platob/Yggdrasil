@@ -237,6 +237,7 @@ class ZipIO(BytesIO):
     """:class:`Tabular` leaf for ``.zip`` archives."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.ZIP
+    has_children: ClassVar[bool] = True
 
     @classmethod
     def options_class(cls):

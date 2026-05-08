@@ -328,6 +328,7 @@ class XlsxFile(BytesIO):
     """:class:`Tabular` leaf for xlsx workbooks (single- or multi-sheet)."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.XLSX
+    has_children: ClassVar[bool] = True
 
     @classmethod
     def options_class(cls):

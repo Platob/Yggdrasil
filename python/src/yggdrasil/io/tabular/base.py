@@ -116,6 +116,15 @@ class Tabular(ABC, Generic[O]):
     #: real format leaves. Mirrors :attr:`Holder.scheme`.
     mime_type: "ClassVar[MimeType | None]" = None
 
+    #: Container marker — ``True`` for Tabulars whose contents are a
+    #: stream of nested Tabular *children* (:class:`Folder` over a
+    #: directory of part files, :class:`ZipIO` over archive entries,
+    #: :class:`XlsxFile` over worksheet sheets). Concrete leaves
+    #: backed by a single byte buffer (parquet, csv, arrow IPC, …)
+    #: keep the default ``False``. Callers use it to decide whether
+    #: to walk :meth:`children` or treat this as a leaf.
+    has_children: "ClassVar[bool]" = False
+
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Auto-register concrete subclasses keyed on :attr:`mime_type`."""
         super().__init_subclass__(**kwargs)
