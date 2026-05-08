@@ -260,12 +260,9 @@ class Memory(Holder):
         m._spill_fd = None
         m._spill_path = None
         m._owns_spill_path = True
-        m._stat = IOStats(
-            size=len(buf) if size is None else int(size),
-            mtime=time.time(),
-            kind=IOKind.MEMORY,
-            media_type=media_type,
-        )
+        m._size = len(buf) if size is None else int(size)
+        m._mtime = time.time()
+        m._media_type = media_type
         m._acquired = True
         return m
 
@@ -301,7 +298,21 @@ class Memory(Holder):
 
     @property
     def size(self) -> int:
-        return self.stat().size
+        return self._size
+
+    def _stat(self) -> IOStats:
+        """Snapshot the in-memory metadata into a fresh :class:`IOStats`.
+
+        Memory holders own their size / mtime / media_type directly —
+        no backend round-trip — so :meth:`stat` is just a copy of the
+        slot fields plus :data:`IOKind.MEMORY`.
+        """
+        return IOStats(
+            kind=IOKind.MEMORY,
+            size=self._size,
+            mtime=self._mtime,
+            media_type=self._media_type,
+        )
 
     @property
     def capacity(self) -> int:
@@ -366,14 +377,13 @@ class Memory(Holder):
     def truncate(self, n: int) -> int:
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
-        stats = self.stat()
-        if n == stats.size:
+        if n == self._size:
             return n
         if n > len(self._buf):
             # bytearray.extend(b"\x00"*…) gives zero-padding for free,
             # so reserve() does both the capacity grow and the zero-fill.
             self.reserve(n)
-        stats.size = n
+        self._size = n
         # ``mtime`` intentionally not bumped here — :meth:`truncate`
         # is in the bulk-write hot path (``write_mv`` calls
         # ``resize`` which calls us once per chunk), and a per-call
@@ -391,8 +401,7 @@ class Memory(Holder):
         """
         self._teardown_spill()
         self._buf = bytearray()
-        stats = self.stat()
-        stats.size = 0
+        self._size = 0
 
     # ------------------------------------------------------------------
     # Spill machinery
@@ -436,7 +445,7 @@ class Memory(Holder):
             # zero-pad of the bytearray's tail (past stat().size) is
             # not user-visible, and the mmap is freshly zeroed by
             # ftruncate, so we don't bother carrying it forward.
-            visible = self.stat().size
+            visible = self._size
             if visible > 0 and isinstance(self._buf, bytearray):
                 os.lseek(fd, 0, os.SEEK_SET)
                 # write() may short on huge buffers — loop until done.
@@ -575,7 +584,7 @@ class Memory(Holder):
         underlying buffer directly — no copy, no per-byte dispatch.
         Works equally on bytearray and mmap backings.
         """
-        return memoryview(self._buf)[: self.stat().size]
+        return memoryview(self._buf)[: self._size]
 
     def to_bytes(self) -> bytes:
         return bytes(self.memoryview())

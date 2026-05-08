@@ -420,7 +420,7 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
                 from yggdrasil.data.enums.media_type import MediaType
                 mt = MediaType.from_(media_type, default=None)
                 if mt is not None:
-                    self._holder.stat().media_type = mt
+                    self._holder.media_type = mt
             except Exception:
                 pass
 
@@ -889,7 +889,7 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
             payload = self.to_bytes()
             return type(self)(payload, media_type=mt)
         if mt is not None:
-            self._holder.stat().media_type = mt
+            self._holder.media_type = mt
         return self
 
     def as_media(self, media_type: Any = None) -> "IO":
@@ -1299,7 +1299,7 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
 
         if mt is not None and not cached:
             try:
-                self._holder.stat().media_type = mt
+                self._holder.media_type = mt
             except Exception:
                 pass
 
@@ -1307,7 +1307,7 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
             buf = mt.codec.decompress(self)
             inner_mt = MediaType(mime_type=mt.mime_type, codec=None)
             try:
-                buf._holder.stat().media_type = inner_mt
+                buf._holder.media_type = inner_mt
             except Exception:
                 pass
             mt = inner_mt

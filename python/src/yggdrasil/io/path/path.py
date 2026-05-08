@@ -181,11 +181,6 @@ class Path(Holder, os.PathLike, ABC):
     def size(self) -> int:
         return int(self._stat().size)
 
-    def stat(self) -> IOStats:
-        s = self._stat()
-        s.media_type = self.url.media_type
-        return s
-
     def _read_mv(self, n: int, pos: int) -> memoryview:
         bio = self._bread(n, pos, Mode.READ_ONLY)
         try:
