@@ -34,7 +34,7 @@ of the source; it does not apply on the write path.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Union
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Union
 
 import pyarrow as pa
 
@@ -48,6 +48,7 @@ from yggdrasil.io.tabular.execution.plan import (
     Filter,
     GroupByAgg,
     Join,
+    MapPartitions,
     PlanOp,
     Select,
 )
@@ -287,6 +288,38 @@ class LazyTabular(Tabular[CastOptions]):
                 suffix=suffix,
             )
         )
+
+    def map_partitions(
+        self,
+        transformer: Callable[[Iterator[Tabular]], Iterable[Tabular]],
+        schema: Schema,
+    ) -> "LazyTabular":
+        """Stream :class:`Tabular` partitions through *transformer*.
+
+        *transformer* receives an iterator of single-batch
+        :class:`yggdrasil.io.tabular.arrow.ArrowTabular` partitions and
+        returns an iterable of :class:`Tabular` partitions whose Arrow
+        batches form the output stream. *schema* declares the output
+        :class:`Schema` so empty results still carry the right column
+        shape and downstream ops can reason about types.
+
+        Like :meth:`apply`, this is an escape hatch — the callable is
+        opaque, so the op is treated as schema-changing and
+        non-commutative with vertical union.
+        """
+        if not callable(transformer):
+            raise TypeError(
+                f"LazyTabular.map_partitions expected a callable "
+                f"Iterator[Tabular] -> Iterable[Tabular]; got "
+                f"{type(transformer).__name__}: {transformer!r}."
+            )
+        if not isinstance(schema, Schema):
+            raise TypeError(
+                f"LazyTabular.map_partitions expected a yggdrasil "
+                f"Schema for the output; got "
+                f"{type(schema).__name__}: {schema!r}."
+            )
+        return self._append_op(MapPartitions(transformer, schema))
 
     def apply(self, fn: Any) -> "LazyTabular":
         """Escape hatch: ``fn(LazyFrame) -> LazyFrame``.

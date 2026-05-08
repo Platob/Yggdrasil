@@ -44,6 +44,7 @@ __all__ = [
     "GroupByAgg",
     "Apply",
     "Join",
+    "MapPartitions",
     "ExecutionPlan",
 ]
 
@@ -195,6 +196,47 @@ class Apply(PlanOp):
 
     def apply_polars(self, lf: "pl.LazyFrame") -> "pl.LazyFrame":
         return self.fn(lf)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class MapPartitions(PlanOp):
+    """Stream Tabular partitions through *transformer*, declared by *schema*.
+
+    *transformer* is a ``Callable`` that receives an iterator of
+    single-batch :class:`yggdrasil.io.tabular.arrow.ArrowTabular`
+    partitions and returns an iterable of
+    :class:`yggdrasil.io.tabular.base.Tabular` partitions whose Arrow
+    batches concatenate into the output stream. *schema* is the output
+    schema — it pins the Arrow schema of empty results and lets
+    callers reason about column shape without invoking the callable.
+
+    Schema-changing and non-commutative with vertical union by default
+    (the callable is opaque, like :class:`Apply`).
+    """
+
+    transformer: Callable[[Iterator[Any]], Iterable[Any]]
+    schema: Any
+
+    def apply_polars(self, lf: "pl.LazyFrame") -> "pl.LazyFrame":
+        import pyarrow as pa
+        from yggdrasil.io.tabular.arrow import ArrowTabular
+        from yggdrasil.lazy_imports import polars_module
+
+        table: pa.Table = lf.collect().to_arrow()
+        partitions = (
+            ArrowTabular(data=batch) for batch in table.to_batches()
+        )
+
+        out_batches: list[pa.RecordBatch] = []
+        for tab in self.transformer(partitions):
+            out_batches.extend(tab.read_arrow_batches())
+
+        arrow_schema = self.schema.to_arrow_schema()
+        if out_batches:
+            out_table = pa.Table.from_batches(out_batches, schema=arrow_schema)
+        else:
+            out_table = arrow_schema.empty_table()
+        return polars_module().from_arrow(out_table).lazy()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
