@@ -34,7 +34,7 @@ of the source; it does not apply on the write path.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Iterator, Union
 
 import pyarrow as pa
 
@@ -57,7 +57,35 @@ if TYPE_CHECKING:
     import polars as pl
 
 
-__all__ = ["LazyTabular"]
+__all__ = ["LazyTabular", "lazy_for"]
+
+
+# Process-wide registry mapping a source :class:`Tabular` subclass to
+# the :class:`LazyTabular` that specializes for it. Populated by
+# :meth:`LazyTabular.__init_subclass__` whenever a subclass declares
+# :attr:`LazyTabular.source_cls`. Mirror of
+# :data:`yggdrasil.io.tabular.base._TABULAR_REGISTRY` — same shape,
+# same rules: declarative class-level discriminator, populated at
+# import time, looked up by :func:`lazy_for`.
+_LAZY_REGISTRY: "dict[type[Tabular], type[LazyTabular]]" = {}
+
+
+def lazy_for(source: Tabular, plan: "ExecutionPlan") -> "LazyTabular":
+    """Build the most specific :class:`LazyTabular` subclass for *source*.
+
+    Walks ``type(source).__mro__`` looking for an entry in
+    :data:`_LAZY_REGISTRY`; falls back to the plain :class:`LazyTabular`
+    when nothing matches. Triggers a side-effect import of
+    :mod:`yggdrasil.io.tabular.lazy_format` so the bundled format-
+    specific Lazy IO classes (``LazyParquetIO`` / ``LazyArrowIPCIO``
+    / ``LazyFolderIO`` / …) are registered before the lookup runs.
+    """
+    import yggdrasil.io.tabular.lazy_format  # noqa: F401  (registers subclasses)
+    for cls in type(source).__mro__:
+        hit = _LAZY_REGISTRY.get(cls)
+        if hit is not None:
+            return hit(source, plan=plan)
+    return LazyTabular(source, plan=plan)
 
 
 # A "selector" is anything that fronts a column / column-expression: a
@@ -125,6 +153,29 @@ class LazyTabular(Tabular[CastOptions]):
     :meth:`_clone`, so subclasses like :class:`UnionTabular` keep
     their state across chained calls.
     """
+
+    #: Source :class:`Tabular` subclass this Lazy specializes for.
+    #: Concrete subclasses set to a registered leaf (``ParquetIO`` /
+    #: ``FolderIO`` / …) so :func:`lazy_for` can pick this class when
+    #: wrapping a source of the matching type. ``None`` (the default)
+    #: opts out of registration — :class:`LazyTabular` itself stays
+    #: out so it remains the universal fallback.
+    source_cls: ClassVar["type[Tabular] | None"] = None
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        sc = cls.source_cls
+        if sc is None:
+            return
+        existing = _LAZY_REGISTRY.get(sc)
+        if existing is not None and existing is not cls:
+            raise RuntimeError(
+                f"Duplicate LazyTabular registration for {sc.__name__}: "
+                f"{cls.__name__} clashes with {existing.__name__}. If "
+                f"the override is intentional, clear the slot first via "
+                f"_LAZY_REGISTRY.pop(...) at module-load time."
+            )
+        _LAZY_REGISTRY[sc] = cls
 
     def __init__(
         self,

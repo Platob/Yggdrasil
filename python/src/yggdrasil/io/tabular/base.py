@@ -449,9 +449,16 @@ class Tabular(ABC, Generic[O]):
         source, …) override to bypass the LazyTabular wrapper. The
         contract is just: return a :class:`Tabular` whose reads
         produce the same rows the wrapper would.
+
+        Dispatch goes through :func:`yggdrasil.io.tabular.lazy.lazy_for`,
+        which picks the most specific :class:`LazyTabular` subclass
+        registered for ``type(self)`` (``LazyParquetIO`` for
+        :class:`ParquetIO`, ``LazyFolderIO`` for :class:`FolderIO`,
+        …) and falls back to the plain :class:`LazyTabular` when
+        nothing matches.
         """
         from yggdrasil.io.tabular.execution.plan import ExecutionPlan
-        from yggdrasil.io.tabular.lazy import LazyTabular
+        from yggdrasil.io.tabular.lazy import lazy_for
 
         coerced = (
             plan if isinstance(plan, ExecutionPlan)
@@ -465,7 +472,7 @@ class Tabular(ABC, Generic[O]):
         # the default LazyTabular doesn't need them — its reads
         # carry their own options.
         del options, kwargs
-        return LazyTabular(self, plan=coerced)
+        return lazy_for(self, coerced)
 
     def lazy(self) -> "Tabular":
         """Return a :class:`LazyTabular` view with a ``SELECT *`` plan.
@@ -477,9 +484,9 @@ class Tabular(ABC, Generic[O]):
         round-trips every column when collected with no further ops.
         """
         from yggdrasil.io.tabular.execution.plan import ExecutionPlan, Select
-        from yggdrasil.io.tabular.lazy import LazyTabular
+        from yggdrasil.io.tabular.lazy import lazy_for
 
-        return LazyTabular(self, plan=ExecutionPlan((Select(("*",)),)))
+        return lazy_for(self, ExecutionPlan((Select(("*",)),)))
 
     # ==================================================================
     # Abstract batch hooks — the two things every implementer overrides
