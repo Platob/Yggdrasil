@@ -32,7 +32,7 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.lazy_imports import pyarrow_dataset_module
-from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.io.base import IO
 
 if TYPE_CHECKING:
     import pyarrow.dataset as pds
@@ -58,7 +58,7 @@ class JsonOptions(CastOptions):
         return pa_json.ParseOptions()
 
 
-class JsonIO(BytesIO):
+class JsonIO(IO[bytes, JsonOptions]):
     """:class:`Tabular` leaf for JSON documents."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.JSON

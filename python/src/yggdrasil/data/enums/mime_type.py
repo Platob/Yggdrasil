@@ -7,7 +7,7 @@ from typing import Any, Callable, ClassVar, IO, Mapping, Union, Iterable, Iterat
 __all__ = ["MimeType", "MimeTypes"]
 from yggdrasil.io import URL
 
-from yggdrasil.lazy_imports import bytes_io_class
+from yggdrasil.lazy_imports import io_class
 
 MagicMatcher = Callable[[bytes], bool]
 
@@ -321,9 +321,9 @@ class MimeType:
             return _miss(default, "empty magic buffer")
 
         if not isinstance(magic, (bytes, bytearray)):
-            BytesIO = bytes_io_class()
+            IO = io_class()
 
-            if isinstance(magic, BytesIO):
+            if isinstance(magic, IO):
                 magic = bytes(magic.pread(64, 0))
             elif hasattr(magic, "read") and hasattr(magic, "seek"):
                 # Stdlib-style file-like — read head, restore cursor so

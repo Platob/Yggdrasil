@@ -29,6 +29,12 @@ def bytes_io_class():
 
 
 @lru_cache(maxsize=1)
+def io_class():
+    from yggdrasil.io.base import IO
+    return IO
+
+
+@lru_cache(maxsize=1)
 def media_type_class():
     from yggdrasil.data.enums import MediaType
     return MediaType

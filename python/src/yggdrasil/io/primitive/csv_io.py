@@ -22,7 +22,7 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
-from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.io.base import IO
 
 if TYPE_CHECKING:
     import polars as pl
@@ -75,7 +75,7 @@ class CsvOptions(CastOptions):
         )
 
 
-class CsvIO(BytesIO):
+class CsvIO(IO[bytes, CsvOptions]):
     """:class:`Tabular` leaf for CSV files."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.CSV

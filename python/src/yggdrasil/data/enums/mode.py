@@ -89,6 +89,17 @@ class Mode(IntEnum):
         """
         return self is Mode.APPEND
 
+    def __contains__(self, item: object) -> bool:
+        """Delegate substring checks to :attr:`os_mode`.
+
+        pandas / pyarrow / zipfile inspect file-like ``.mode`` with
+        ``"b" in handle.mode`` to dispatch binary vs text reads. The
+        IO surface returns the typed :class:`Mode` enum, so we make
+        the enum behave like its POSIX form for these checks instead
+        of forcing every consumer to reach for ``mode.os_mode``.
+        """
+        return item in self.os_mode
+
     @property
     def os_mode(self) -> str:
         """Stdlib :func:`open` mode string for this :class:`Mode`.

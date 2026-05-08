@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import ClassVar, Mapping
 
 from yggdrasil.io import BytesIO
+from yggdrasil.io.base import IO
 from yggdrasil.pickle.ser.serialized import Serialized
 from yggdrasil.pickle.ser.tags import Tags
 
@@ -305,7 +306,7 @@ class IOSerialized(Serialized[object]):
         # checks below would miss it. Match it first and route through
         # the binary path, which already preserves ``_media_type`` via
         # :func:`_encode_media_type`.
-        if isinstance(obj, BytesIO):
+        if isinstance(obj, IO):
             return BinaryIOSerialized.from_value(obj, metadata=metadata, codec=codec)
 
         if isinstance(obj, io.BytesIO):
@@ -516,6 +517,7 @@ class StringBufferSerialized(TextIOSerialized):
 # ============================================================================
 
 for pytype, cls in (
+    (IO, IOSerialized),
     (BytesIO, IOSerialized),
     (io.IOBase, BinaryIOSerialized),
     (io.TextIOBase, TextIOSerialized),

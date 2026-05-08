@@ -36,7 +36,7 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
-from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.io.base import IO
 
 if TYPE_CHECKING:
     import polars as pl
@@ -58,7 +58,7 @@ class ParquetOptions(CastOptions):
     use_threads: bool = True
 
 
-class ParquetIO(BytesIO):
+class ParquetIO(IO[bytes, ParquetOptions]):
     """:class:`Tabular` leaf for Apache Parquet."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.PARQUET

@@ -16,6 +16,7 @@ from yggdrasil.data.data_field import field as schema_field
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
+from .base import IO
 from .bytes_io import BytesIO
 from yggdrasil.data.enums import Codec, MediaType, MimeTypes
 from .headers import normalize_headers
@@ -221,7 +222,7 @@ def _parse_response_buffer(
     body = get_from_dict(obj, keys=("buffer", "body", "content", "data"), prefix=None)
     if body is MISSING or body is None:
         return BytesIO(media_type=media_type) if media_type is not None else BytesIO()
-    if isinstance(body, BytesIO):
+    if isinstance(body, IO):
         if media_type is not None and body.media_type is None:
             try:
                 body.with_media_type(media_type, copy=False)
@@ -548,7 +549,7 @@ class Response(Tabular[CastOptions]):
         self.headers = _string_dict(headers)
         self.tags = _string_dict(tags)
         self.received_at = any_to_datetime(received_at)
-        self.buffer = buffer if isinstance(buffer, BytesIO) else BytesIO(buffer, copy=False)
+        self.buffer = buffer if isinstance(buffer, IO) else BytesIO(buffer, copy=False)
         self._receiver: UserInfo | None = (
             _coerce_userinfo(receiver) if receiver is not None else _default_sender()
         )

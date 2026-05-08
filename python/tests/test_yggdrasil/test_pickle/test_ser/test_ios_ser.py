@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 
 from yggdrasil.io import BytesIO
+from yggdrasil.io.base import IO
 from yggdrasil.data.enums.codec import GZIP
 from yggdrasil.data.enums.media_type import MediaType
 from yggdrasil.data.enums.mime_type import MimeTypes
@@ -60,7 +61,7 @@ def test_ygg_bytesio_media_type_roundtrip() -> None:
     assert metadata.get(b"mt") == b"JSON"
 
     out = ser.as_python()
-    assert isinstance(out, BytesIO)
+    assert isinstance(out, IO)
     out_mt = _media_type_of(out)
     assert out_mt is not None
     assert out_mt.mime_type is MimeTypes.JSON
@@ -80,7 +81,7 @@ def test_ygg_bytesio_media_type_with_codec_roundtrip() -> None:
     assert metadata.get(b"mt") == b"PARQUET+gzip"
 
     out = ser.as_python()
-    assert isinstance(out, BytesIO)
+    assert isinstance(out, IO)
     out_mt = _media_type_of(out)
     assert out_mt is not None
     assert out_mt.mime_type is MimeTypes.PARQUET
@@ -99,7 +100,7 @@ def test_ygg_bytesio_no_media_type_no_metadata() -> None:
     assert b"mt" not in metadata
 
     out = ser.as_python()
-    assert isinstance(out, BytesIO)
+    assert isinstance(out, IO)
     assert _media_type_of(out) is None
 
 

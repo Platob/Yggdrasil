@@ -22,7 +22,7 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
-from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.io.base import IO
 
 if TYPE_CHECKING:
     import polars as pl
@@ -53,7 +53,7 @@ class NDJsonOptions(CastOptions):
         return pa_json.ParseOptions()
 
 
-class NDJsonIO(BytesIO):
+class NDJsonIO(IO[bytes, NDJsonOptions]):
     """:class:`Tabular` leaf for newline-delimited JSON."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.NDJSON

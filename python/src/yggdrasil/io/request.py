@@ -15,6 +15,7 @@ from yggdrasil.data.schema import schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
 from yggdrasil.environ.userinfo import USERINFO_STRUCT, UserInfo
 from yggdrasil.data.enums import MediaType, MimeTypes
+from .base import IO
 from .bytes_io import BytesIO
 from yggdrasil.data.enums import GZIP, Codec, MimeType
 from .headers import normalize_headers
@@ -317,7 +318,7 @@ class PreparedRequest:
         )
         self.buffer = (
             BytesIO.from_(buffer)
-            if buffer is not None and not isinstance(buffer, BytesIO)
+            if buffer is not None and not isinstance(buffer, IO)
             else buffer
         )
         self.local_cache_config = local_cache_config
@@ -943,7 +944,7 @@ class PreparedRequest:
                 for k, val in sorted(v.items()):
                     buff.write(str(k).encode("utf-8"))
                     buff.write(str(val).encode("utf-8"))
-            elif isinstance(v, BytesIO):
+            elif isinstance(v, IO):
                 buff.write(v.xxh3_64().digest())
             elif v is None:
                 buff.write(b"0")
