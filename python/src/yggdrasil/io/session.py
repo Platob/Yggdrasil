@@ -21,7 +21,7 @@ from yggdrasil.dataclasses.waiting import (
 )
 from yggdrasil.data.enums import Mode
 from .bytes_io import BytesIO
-from yggdrasil.io.nested import FolderIO, FolderOptions
+from yggdrasil.io.nested import Folder, FolderOptions
 from .request import PreparedRequest
 from .response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
 from .response_batch import ResponseBatch
@@ -52,7 +52,7 @@ LOGGER = logging.getLogger(__name__)
 _SPARK_RESPONSE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
 
 
-# Local cache lives in a partitioned :class:`FolderIO` rooted at
+# Local cache lives in a partitioned :class:`Folder` rooted at
 # ``<CacheConfig.path>/cache``. Partition columns come from
 # ``RESPONSE_SCHEMA``'s ``partition_by``-tagged fields and the schema
 # itself is dropped to ``<root>/.schema`` on first write so future
@@ -63,7 +63,7 @@ _SPARK_RESPONSE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
 
 
 def _store_local_arrow_batch(
-    cache: "FolderIO",
+    cache: "Folder",
     batch: pa.RecordBatch,
 ) -> None:
     """Append a single Arrow batch to ``cache`` from a worker thread.
@@ -71,7 +71,7 @@ def _store_local_arrow_batch(
     Module-level so the fire-and-forget Job pickles cleanly without
     dragging Session state along. Routes the batch through the
     folder's ``write_arrow_batches`` with ``Mode.APPEND`` —
-    :class:`FolderIO` resolves the partition tuple from the batch's
+    :class:`Folder` resolves the partition tuple from the batch's
     own columns and drops a UUID-named leaf into the matching
     directory.
     """
@@ -81,7 +81,7 @@ def _store_local_arrow_batch(
 
 
 def _request_partition_predicate(
-    cache: "FolderIO",
+    cache: "Folder",
     requests: "list[PreparedRequest]",
 ) -> "Any | None":
     """Build a universal predicate pruning to the partitions in ``requests``.
@@ -170,7 +170,7 @@ def _combine_predicates(*exprs: "Any") -> "Any | None":
 
 
 def _lookup_local_responses(
-    cache: "FolderIO",
+    cache: "Folder",
     requests: "list[PreparedRequest]",
     *,
     match_by: "tuple[str, ...]",
@@ -369,19 +369,19 @@ class Session(ABC):
         response: Response,
         cache_cfg: CacheConfig,
         *,
-        cache: "FolderIO | None" = None,
+        cache: "Folder | None" = None,
     ) -> None:
         """Persist one response to the partitioned local cache.
 
         The response is anonymized first (matches the on-disk
         identity used at lookup time) and the actual write is fired
-        off through the job pool — :class:`FolderIO` resolves the
+        off through the job pool — :class:`Folder` resolves the
         partition tuple from the batch's own columns and drops a
         UUID-named leaf into the matching directory, so concurrent
         fire-and-forget workers can't race on a final filename.
 
         ``cache`` lets a hot-loop caller reuse a single
-        :class:`FolderIO` instance across many writes instead of
+        :class:`Folder` instance across many writes instead of
         paying for the per-call construction (cheap but not free).
         """
         if not response.ok:
@@ -582,7 +582,7 @@ class Session(ABC):
         # stale entry can sit on disk indefinitely without
         # affecting correctness; the fresh fetch below will append
         # a newer row that wins on the next read.
-        local_cache: "FolderIO | None" = None
+        local_cache: "Folder | None" = None
         if effective_local_cfg.local_cache_enabled:
             local_cache = effective_local_cfg.local_cache(session=self)
             if effective_local_cfg.mode != Mode.UPSERT:
@@ -1141,13 +1141,13 @@ class Session(ABC):
         session-level config for every response would be wrong
         whenever a request carries a custom per-request local
         cache. Responses are anonymized then grouped by the
-        effective cache root so each :class:`FolderIO` takes a
+        effective cache root so each :class:`Folder` takes a
         single bulk write instead of one fire-and-forget per
         response — collapsing N small writes into one
-        partition-routed write per root, with FolderIO's auto-prune
+        partition-routed write per root, with Folder's auto-prune
         path handling the merge when the config is in UPSERT mode.
         """
-        groups: dict[str, tuple["FolderIO", "CacheConfig", list[Response]]] = {}
+        groups: dict[str, tuple["Folder", "CacheConfig", list[Response]]] = {}
         for response in responses:
             url_key = str(response.request.url) if response.request else None
             eff = url_to_local_cfg.get(url_key) if url_key else None
@@ -1182,7 +1182,7 @@ class Session(ABC):
 
     def _optimize_cache_partitions(
         self,
-        cache: "FolderIO",
+        cache: "Folder",
         cfg: CacheConfig,
         responses: "list[Response]",
     ) -> None:
@@ -1206,7 +1206,7 @@ class Session(ABC):
             return
         if not responses:
             return
-        # Optimize is a YGGFolderIO concern; remote / non-folder
+        # Optimize is a YGGFolder concern; remote / non-folder
         # caches don't expose a leaf layout to compact against.
         optimize = getattr(cache, "optimize", None)
         if not callable(optimize):
@@ -1257,7 +1257,7 @@ class Session(ABC):
         if not responses:
             return
 
-        groups: dict[str, tuple["FolderIO", CacheConfig, list[Response]]] = {}
+        groups: dict[str, tuple["Folder", CacheConfig, list[Response]]] = {}
         for response in responses:
             if not response.ok:
                 continue

@@ -1,12 +1,12 @@
-"""Hive-partitioned :class:`FolderIO` with metadata caching.
+"""Hive-partitioned :class:`Folder` with metadata caching.
 
-:class:`YGGFolderIO` is the local-cache backend for the response
+:class:`YGGFolder` is the local-cache backend for the response
 batch layer. The shape — ``<root>/<col>=<val>/<col=val>/...`` — is
 the standard Hive layout, so any external reader (Spark,
 ``pyarrow.dataset``, polars) can scan the same tree without going
 through this class.
 
-What it adds on top of :class:`FolderIO`
+What it adds on top of :class:`Folder`
 ----------------------------------------
 
 1. **Schema-driven partitioning** — the bound :class:`Schema`
@@ -50,7 +50,7 @@ import pyarrow as pa
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.data.schema import Schema
-from yggdrasil.io.nested.folder_io import FolderIO, FolderOptions
+from yggdrasil.io.nested.folder_io import Folder, FolderOptions
 from yggdrasil.io.path.local_path import LocalPath
 from yggdrasil.io.tabular.execution.expr.nodes import (
     Logical,
@@ -63,7 +63,7 @@ if TYPE_CHECKING:
     from yggdrasil.io.path import Path
 
 
-__all__ = ["YGGFolderIO"]
+__all__ = ["YGGFolder"]
 
 
 #: Default listing-cache TTL. Short enough that a stale directory
@@ -74,11 +74,11 @@ _LISTING_MAX: int = 1024
 
 #: Glob to match part files inside a partition directory. ``*.*``
 #: keeps anything with an extension; ``.schema`` and other dot-
-#: prefixed sidecars stay invisible (FolderIO already filters those).
+#: prefixed sidecars stay invisible (Folder already filters those).
 _PART_PATTERN: str = "part-*"
 
-#: Sidecar directory holding YGGFolderIO-managed metadata. Dot-
-#: prefixed so :meth:`FolderIO.iter_children` skips it on the data
+#: Sidecar directory holding YGGFolder-managed metadata. Dot-
+#: prefixed so :meth:`Folder.iter_children` skips it on the data
 #: walk; subfolders inside it are free to use any naming scheme
 #: without being mistaken for partition directories.
 _METADATA_DIR_NAME: str = ".ygg"
@@ -121,8 +121,8 @@ def _coerce_partition_value(field: "Field", raw: str) -> Any:
         return raw
 
 
-class YGGFolderIO(FolderIO):
-    """:class:`FolderIO` with Hive-partitioned writes + read pruning."""
+class YGGFolder(Folder):
+    """:class:`Folder` with Hive-partitioned writes + read pruning."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.YGG_FOLDER
 
@@ -172,7 +172,7 @@ class YGGFolderIO(FolderIO):
         No-op when no schema is bound or when the sidecar already
         holds the same bytes — keeps the call cheap on repeated
         writes. The sidecar is created lazily on the first write
-        rather than at construction so a read-only :class:`YGGFolderIO`
+        rather than at construction so a read-only :class:`YGGFolder`
         doesn't materialize the ``.ygg/`` directory.
         """
         if self._schema is None:
@@ -239,7 +239,7 @@ class YGGFolderIO(FolderIO):
         decompose the directory tree. Returns an empty list when no
         schema is bound — :meth:`_read_arrow_batches` and
         :meth:`_write_arrow_batches` short-circuit through the
-        plain :class:`FolderIO` flow in that case.
+        plain :class:`Folder` flow in that case.
         """
         if self._schema is None:
             return []
@@ -268,7 +268,7 @@ class YGGFolderIO(FolderIO):
 
         prune = options.prune_values or {}
         for part_path, part_kv in self._iter_partitions(parts, prune):
-            sub = FolderIO(path=part_path)
+            sub = Folder(path=part_path)
             for batch in sub._read_arrow_batches(options):
                 yield self._stamp_partitions(batch, part_kv, parts)
 
@@ -426,7 +426,7 @@ class YGGFolderIO(FolderIO):
     ) -> None:
         # Drop the schema sidecar before any data writes — first call
         # creates ``.ygg/.schema`` so future readers (or a fresh
-        # :class:`YGGFolderIO` over the same path) inherit the
+        # :class:`YGGFolder` over the same path) inherit the
         # partition layout without touching a part file's footer.
         self._persist_schema_sidecar()
 
@@ -438,7 +438,7 @@ class YGGFolderIO(FolderIO):
         action = self._resolve_action(options.mode)
 
         # OVERWRITE wipes the whole partition tree before writing —
-        # the same shape as plain ``FolderIO``'s overwrite.
+        # the same shape as plain ``Folder``'s overwrite.
         if action is Mode.OVERWRITE and self.path.exists():
             self._clear_partition_tree()
 
@@ -483,7 +483,7 @@ class YGGFolderIO(FolderIO):
         for key_tuple, sub_batches in groups.items():
             kv = dict(zip(partition_names, key_tuple))
             target = self._ensure_partition_dir(parts, kv)
-            sub = FolderIO(path=target)
+            sub = Folder(path=target)
             sub._write_arrow_batches(
                 sub_batches,
                 # The leaf write picks the right Tabular leaf via
@@ -570,9 +570,9 @@ class YGGFolderIO(FolderIO):
            ``rmtree`` the directory (one stat-and-unlink per file
            rather than reading + rewriting).
         4. Otherwise hand the residual predicate to a plain
-           :class:`FolderIO` rooted at the partition leaf, which
+           :class:`Folder` rooted at the partition leaf, which
            applies the per-leaf filter shape from
-           :meth:`FolderIO._delete`.
+           :meth:`Folder._delete`.
 
         Top-level ``OR`` / ``NOT`` predicates that aren't decomposable
         into partition-only conjuncts fall through to step 4 unchanged
@@ -620,14 +620,14 @@ class YGGFolderIO(FolderIO):
                 continue
 
             residual_pred = _and_combine(residual)
-            sub = FolderIO(path=leaf_path)
+            sub = Folder(path=leaf_path)
             deleted += sub._delete(residual_pred, FolderOptions())
             self.invalidate_listing(leaf_path)
         return deleted
 
     def _wholesale_delete_partition(self, leaf_path: "Path") -> int:
         """Count rows in *leaf_path* then ``rmtree`` it."""
-        sub = FolderIO(path=leaf_path)
+        sub = Folder(path=leaf_path)
         count = 0
         try:
             for batch in sub._read_arrow_batches(FolderOptions()):
@@ -652,13 +652,13 @@ class YGGFolderIO(FolderIO):
         byte_size: "int | None" = None,
         *,
         target_media_type: "Any" = None,
-        tolerance: float = FolderIO.OPTIMIZE_TOLERANCE,
+        tolerance: float = Folder.OPTIMIZE_TOLERANCE,
         **kwargs: Any,
     ) -> int:
         """Compact each partition leaf's small parts.
 
         Walks the partition tree (one branch per ``col=val`` segment)
-        and dispatches each leaf folder to :meth:`FolderIO.optimize`,
+        and dispatches each leaf folder to :meth:`Folder.optimize`,
         which does the actual bin-pack:
 
         - ``byte_size=None`` collapses every leaf with more than one
@@ -669,8 +669,8 @@ class YGGFolderIO(FolderIO):
           larger) are left untouched.
 
         Returns the total number of new part files written across
-        every leaf. A no-schema :class:`YGGFolderIO` falls through to
-        :meth:`FolderIO.optimize`, so the operation still works on
+        every leaf. A no-schema :class:`YGGFolder` falls through to
+        :meth:`Folder.optimize`, so the operation still works on
         an unpartitioned tree.
         """
         if not self.path.exists():
@@ -691,7 +691,7 @@ class YGGFolderIO(FolderIO):
         for leaf_path, _kv in self._iter_partitions(parts, prune={}):
             if not leaf_path.exists():
                 continue
-            leaf = FolderIO(path=leaf_path)
+            leaf = Folder(path=leaf_path)
             compacted += leaf._optimize_walk(
                 leaf_path,
                 byte_size=byte_size,
@@ -707,7 +707,7 @@ class YGGFolderIO(FolderIO):
 
     def __repr__(self) -> str:
         cols = ", ".join(self.partition_columns)
-        return f"YGGFolderIO(path={self.path!r}, partition_by=[{cols}])"
+        return f"YGGFolder(path={self.path!r}, partition_by=[{cols}])"
 
 
 def _iter_and_conjuncts(predicate: Any) -> "Iterator[Any]":

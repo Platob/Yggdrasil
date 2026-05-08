@@ -76,7 +76,7 @@ def lazy_for(source: Tabular, plan: "ExecutionPlan") -> "LazyTabular":
     Walks ``type(source).__mro__`` looking for an entry in
     :data:`_LAZY_REGISTRY`; falls back to the plain :class:`LazyTabular`
     when nothing matches. Format-specific Lazy IO subclasses
-    (``LazyParquetFile`` / ``LazyArrowIPCFile`` / ``LazyFolderIO``
+    (``LazyParquetFile`` / ``LazyArrowIPCFile`` / ``LazyFolder``
     / …) live next to their source class and register themselves
     on import — so any *source* a caller can construct has its
     matching Lazy subclass loaded by the time this is called.
@@ -156,7 +156,7 @@ class LazyTabular(Tabular[CastOptions]):
 
     #: Source :class:`Tabular` subclass this Lazy specializes for.
     #: Concrete subclasses set to a registered leaf (``ParquetFile`` /
-    #: ``FolderIO`` / …) so :func:`lazy_for` can pick this class when
+    #: ``Folder`` / …) so :func:`lazy_for` can pick this class when
     #: wrapping a source of the matching type. ``None`` (the default)
     #: opts out of registration — :class:`LazyTabular` itself stays
     #: out so it remains the universal fallback.

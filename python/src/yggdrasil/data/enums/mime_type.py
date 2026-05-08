@@ -803,7 +803,7 @@ class MimeTypes:
             # Yggdrasil-managed folder: a regular tabular folder
             # plus a ``.ygg/`` sidecar holding checkpoints, metadata,
             # and stats. Detected at runtime from the presence of
-            # the sidecar; ``YGGFolderIO`` is the matching reader.
+            # the sidecar; ``YGGFolder`` is the matching reader.
             "inode/directory+ygg",
         )
     )

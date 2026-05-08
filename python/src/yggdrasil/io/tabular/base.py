@@ -309,8 +309,8 @@ class Tabular(ABC, Generic[O]):
 
         Default implementation is a no-op and returns ``0`` — single-file
         leaves (parquet, csv, arrow IPC, …) don't have a compaction
-        concept. Aggregator subclasses (:class:`FolderIO`,
-        :class:`YGGFolderIO`) override this to walk their child leaves
+        concept. Aggregator subclasses (:class:`Folder`,
+        :class:`YGGFolder`) override this to walk their child leaves
         and bin-pack small part files into bundles near *byte_size*.
         Files already close to the target size are left alone so a
         repeated call is cheap.
@@ -372,8 +372,8 @@ class Tabular(ABC, Generic[O]):
 
         The default implementation reads every batch, drops rows the
         predicate accepts, and rewrites the leaf with the survivors.
-        Aggregator subclasses (:class:`yggdrasil.io.nested.folder_io.FolderIO`,
-        :class:`yggdrasil.io.nested.ygg_folder_io.YGGFolderIO`)
+        Aggregator subclasses (:class:`yggdrasil.io.nested.folder_io.Folder`,
+        :class:`yggdrasil.io.nested.ygg_folder_io.YGGFolder`)
         override to walk children, prune subtrees whose partition
         bounds make the predicate trivially false, and only rewrite
         the leaves that actually hold matched rows — so a delete on a
@@ -453,7 +453,7 @@ class Tabular(ABC, Generic[O]):
         Dispatch goes through :func:`yggdrasil.io.tabular.lazy.lazy_for`,
         which picks the most specific :class:`LazyTabular` subclass
         registered for ``type(self)`` (``LazyParquetFile`` for
-        :class:`ParquetFile`, ``LazyFolderIO`` for :class:`FolderIO`,
+        :class:`ParquetFile`, ``LazyFolder`` for :class:`Folder`,
         …) and falls back to the plain :class:`LazyTabular` when
         nothing matches.
         """

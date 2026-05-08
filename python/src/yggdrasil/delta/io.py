@@ -1,4 +1,4 @@
-"""DeltaIO — :class:`FolderIO` over a Delta Lake table.
+"""DeltaIO — :class:`Folder` over a Delta Lake table.
 
 The leaf orchestrates three subsystems already documented in this
 package:
@@ -10,7 +10,7 @@ package:
 - :class:`yggdrasil.delta.deletion_vector` decodes per-file DV blobs
   and masks rows out of each :class:`pyarrow.RecordBatch`.
 
-What changes vs :class:`FolderIO`
+What changes vs :class:`Folder`
 ---------------------------------
 
 - **Children** come from the snapshot, not :func:`Path.iterdir`. We
@@ -57,7 +57,7 @@ import pyarrow as pa
 from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.data.options import CastOptions
 from yggdrasil.io.bytes_io import BytesIO
-from yggdrasil.io.nested.folder_io import FolderIO, FolderOptions
+from yggdrasil.io.nested.folder_io import Folder, FolderOptions
 from yggdrasil.io.primitive.parquet_io import ParquetFile, ParquetOptions
 
 from yggdrasil.delta.deletion_vector import (
@@ -129,8 +129,8 @@ class DeltaOptions(FolderOptions):
 # ---------------------------------------------------------------------------
 
 
-class DeltaIO(FolderIO):
-    """:class:`FolderIO` over a Delta Lake table at a :class:`Path`."""
+class DeltaIO(Folder):
+    """:class:`Folder` over a Delta Lake table at a :class:`Path`."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.DELTA_FOLDER
 
@@ -726,13 +726,13 @@ class DeltaIO(FolderIO):
             bio.write_bytes(body)
 
     # ==================================================================
-    # FolderIO surface — children = active files
+    # Folder surface — children = active files
     # ==================================================================
 
     def iter_children(self) -> "Iterator":
         """Yield one :class:`ParquetFile` per active file in the snapshot.
 
-        Override of :meth:`FolderIO.iter_children`: we never list the
+        Override of :meth:`Folder.iter_children`: we never list the
         physical folder. The snapshot is the source of truth.
         """
         snap = self.snapshot()
@@ -787,7 +787,7 @@ def _split_batch(
         return
     if not all(c in batch.schema.names for c in partition_columns):
         # Mismatch → emit whole batch under all-None keys; same fallback
-        # YGGFolderIO uses so the row data isn't silently dropped.
+        # YGGFolder uses so the row data isn't silently dropped.
         yield (tuple(None for _ in partition_columns), batch)
         return
     table = pa.Table.from_batches([batch])

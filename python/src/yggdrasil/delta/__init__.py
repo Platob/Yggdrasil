@@ -16,7 +16,7 @@ pulling the whole stack:
   collapses the action stream into the active file set + metadata +
   protocol + per-file deletion-vector map.
 - :mod:`yggdrasil.delta.io` — :class:`DeltaIO`, a
-  :class:`yggdrasil.io.nested.FolderIO` that runs the snapshot and
+  :class:`yggdrasil.io.nested.Folder` that runs the snapshot and
   surfaces the active files as Arrow batches with predicate /
   partition pruning, deletion-vector masking, and a write path that
   emits parquet parts plus a fresh commit.

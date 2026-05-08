@@ -2,7 +2,7 @@
 
 These tests exercise the :class:`Session` pipeline end-to-end with
 a stubbed transport (no real network) and a partitioned local
-cache backed by :class:`YGGFolderIO`. The shape:
+cache backed by :class:`YGGFolder`. The shape:
 
     request ──► local-cache lookup
               └► remote-cache lookup (skipped here)
@@ -33,7 +33,7 @@ import pyarrow as pa
 import pytest
 
 from yggdrasil.data.enums import Mode
-from yggdrasil.io.nested.ygg_folder_io import YGGFolderIO
+from yggdrasil.io.nested.ygg_folder_io import YGGFolder
 from yggdrasil.io.path.local_path import LocalPath
 from yggdrasil.io.response import RESPONSE_SCHEMA
 from yggdrasil.io.send_config import CacheConfig, SendConfig
@@ -165,14 +165,14 @@ class TestSessionSend:
 
 
 # ---------------------------------------------------------------------------
-# Local cache integration via YGGFolderIO
+# Local cache integration via YGGFolder
 # ---------------------------------------------------------------------------
 
 
 class TestLocalCacheIntegration:
 
     def _cache(self, tmp_path) -> CacheConfig:
-        folder = YGGFolderIO(
+        folder = YGGFolder(
             path=LocalPath(str(tmp_path)),
             schema=RESPONSE_SCHEMA,
         )
@@ -295,7 +295,7 @@ class TestLocalCacheIntegration:
         """A row outside [received_from, received_to) is ignored on read."""
         import datetime as dt
         s = StubSession()
-        folder = YGGFolderIO(
+        folder = YGGFolder(
             path=LocalPath(str(tmp_path)),
             schema=RESPONSE_SCHEMA,
         )
@@ -321,7 +321,7 @@ class TestLocalCacheIntegration:
         """UPSERT bypasses the read, always going to the network."""
         s = StubSession()
         cache = CacheConfig(
-            tabular=YGGFolderIO(
+            tabular=YGGFolder(
                 path=LocalPath(str(tmp_path)),
                 schema=RESPONSE_SCHEMA,
             ),
@@ -355,7 +355,7 @@ class TestLocalCacheIntegration:
         empty_dir = tmp_path / "alt"
         empty_dir.mkdir()
         req_cache = CacheConfig(
-            tabular=YGGFolderIO(
+            tabular=YGGFolder(
                 path=LocalPath(str(empty_dir)),
                 schema=RESPONSE_SCHEMA,
             ),
@@ -393,11 +393,11 @@ class TestCacheConfigCoercion:
     """``CacheConfig.check_arg`` accepts a few convenience shapes."""
 
     def test_check_arg_path_builds_local_folder(self, tmp_path) -> None:
-        from yggdrasil.io.nested.folder_io import FolderIO
+        from yggdrasil.io.nested.folder_io import Folder
 
         cfg = CacheConfig.check_arg(tmp_path)
         assert cfg.is_local_tabular is True
-        assert isinstance(cfg.tabular, FolderIO)
+        assert isinstance(cfg.tabular, Folder)
         assert cfg.local_cache_enabled is True
         assert str(cfg.local_cache_folder()) == str(tmp_path)
 
@@ -453,13 +453,13 @@ class TestLocalCacheFolderPerHost:
         from yggdrasil.io.url import URL
         s = StubSession(base_url=URL.from_("https://api.example.com/"))
         cache = CacheConfig(
-            tabular=YGGFolderIO(
+            tabular=YGGFolder(
                 path=LocalPath(str(tmp_path)),
                 schema=RESPONSE_SCHEMA,
             ),
             mode=Mode.APPEND,
         )
-        # Explicit FolderIO wins — host derivation is for the
+        # Explicit Folder wins — host derivation is for the
         # auto-built default only.
         assert str(cache.local_cache_folder(session=s)) == str(tmp_path)
 
@@ -610,7 +610,7 @@ class TestPartitionPrunePredicate:
 
     We don't drive the session directly here (that would re-test the
     StubSession path); we exercise the helper that turns a list of
-    requests into the partition-IN map :class:`YGGFolderIO` reads.
+    requests into the partition-IN map :class:`YGGFolder` reads.
     """
 
     def test_partition_predicate_collects_unique_keys(self) -> None:
@@ -619,7 +619,7 @@ class TestPartitionPrunePredicate:
         # so we just check we can extract a tuple from a batch of
         # requests.
         from yggdrasil.io.session import _request_partition_predicate
-        cache = YGGFolderIO(
+        cache = YGGFolder(
             path=LocalPath("/tmp/none"),  # path isn't read here
             schema=RESPONSE_SCHEMA,
         )

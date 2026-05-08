@@ -1,8 +1,8 @@
-"""Behavior tests for :class:`yggdrasil.io.nested.folder_io.FolderIO`.
+"""Behavior tests for :class:`yggdrasil.io.nested.folder_io.Folder`.
 
-`FolderIO` views a filesystem directory as a Tabular: every entry
+`Folder` views a filesystem directory as a Tabular: every entry
 that resolves to a tabular leaf (parquet, csv, arrow, ndjson, …)
-shows up as a child; sub-directories recurse as fresh `FolderIO`s.
+shows up as a child; sub-directories recurse as fresh `Folder`s.
 Tests pin:
 
 * iter_children walks non-private files + dirs and dispatches each
@@ -22,7 +22,7 @@ import pyarrow as pa
 import pytest
 
 from yggdrasil.data.enums import Mode
-from yggdrasil.io.nested.folder_io import FolderIO, FolderOptions
+from yggdrasil.io.nested.folder_io import Folder, FolderOptions
 from yggdrasil.io.primitive.csv_io import CsvFile
 from yggdrasil.io.primitive.parquet_io import ParquetFile
 
@@ -35,16 +35,16 @@ def table() -> pa.Table:
 class TestConstruction:
 
     def test_string_path(self, tmp_path) -> None:
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         assert os.fspath(folder.path) == str(tmp_path)
 
     def test_pathlib_path(self, tmp_path) -> None:
-        folder = FolderIO(path=pathlib.Path(tmp_path))
+        folder = Folder(path=pathlib.Path(tmp_path))
         assert os.fspath(folder.path) == str(tmp_path)
 
     def test_none_path_raises(self) -> None:
         with pytest.raises(ValueError, match="requires a path"):
-            FolderIO()
+            Folder()
 
 
 class TestIterChildren:
@@ -53,14 +53,14 @@ class TestIterChildren:
         # Drop a parquet and a csv into the folder.
         ParquetFile(holder=__class__._lp(tmp_path / "a.parquet"), owns_holder=False).write_arrow_table(table)
         CsvFile(holder=__class__._lp(tmp_path / "b.csv"), owns_holder=False).write_arrow_table(table)
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         kinds = sorted(type(c).__name__ for c in folder.iter_children())
         assert kinds == ["CsvFile", "ParquetFile"]
 
     def test_skips_private_entries(self, tmp_path, table) -> None:
         ParquetFile(holder=__class__._lp(tmp_path / ".hidden.parquet"), owns_holder=False).write_arrow_table(table)
         ParquetFile(holder=__class__._lp(tmp_path / "real.parquet"), owns_holder=False).write_arrow_table(table)
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         names = [c._holder.name for c in folder.iter_children()]
         assert "real.parquet" in names[0]
         assert all(".hidden" not in n for n in names)
@@ -69,12 +69,12 @@ class TestIterChildren:
         sub = tmp_path / "nested"
         sub.mkdir()
         ParquetFile(holder=__class__._lp(sub / "x.parquet"), owns_holder=False).write_arrow_table(table)
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         kids = list(folder.iter_children())
-        assert any(isinstance(c, FolderIO) for c in kids)
+        assert any(isinstance(c, Folder) for c in kids)
 
     def test_missing_folder_yields_nothing(self, tmp_path) -> None:
-        folder = FolderIO(path=str(tmp_path / "absent"))
+        folder = Folder(path=str(tmp_path / "absent"))
         assert list(folder.iter_children()) == []
 
     @staticmethod
@@ -86,14 +86,14 @@ class TestIterChildren:
 class TestRoundTrip:
 
     def test_write_then_read(self, tmp_path, table) -> None:
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(table)
         # Default child media type is Arrow IPC (extension ``.ipc``).
         assert any(p.name.endswith(".ipc") for p in tmp_path.iterdir())
         assert folder.read_arrow_table().equals(table)
 
     def test_csv_default_extension(self, tmp_path, table) -> None:
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(
             table, options=FolderOptions(child_media_type="csv"),
         )
@@ -103,12 +103,12 @@ class TestRoundTrip:
         assert loaded.column("id").to_pylist() == [1, 2, 3]
 
     def test_aggregate_read_across_subfolder(self, tmp_path, table) -> None:
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(table)
         # Add another part inside a sub-directory.
         nested = tmp_path / "shard"
         nested.mkdir()
-        sub = FolderIO(path=str(nested))
+        sub = Folder(path=str(nested))
         sub.write_arrow_table(table)
 
         out = folder.read_arrow_table()
@@ -118,7 +118,7 @@ class TestRoundTrip:
 class TestModes:
 
     def test_overwrite_clears_then_writes(self, tmp_path, table) -> None:
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(table)
         before = list(tmp_path.iterdir())
         assert len(before) == 1
@@ -128,7 +128,7 @@ class TestModes:
         assert after[0].name != before[0].name  # fresh part filename
 
     def test_append_adds_part(self, tmp_path, table) -> None:
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(table)
         folder.write_arrow_table(table, options=FolderOptions(mode=Mode.APPEND))
         assert len(list(tmp_path.iterdir())) == 2
@@ -136,7 +136,7 @@ class TestModes:
         assert folder.read_arrow_table().num_rows == 6
 
     def test_ignore_skips_when_non_empty(self, tmp_path, table) -> None:
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(table)
         before = sorted(p.name for p in tmp_path.iterdir())
         folder.write_arrow_table(table, options=FolderOptions(mode=Mode.IGNORE))
@@ -144,7 +144,7 @@ class TestModes:
         assert before == after
 
     def test_error_if_exists_raises(self, tmp_path, table) -> None:
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(table)
         with pytest.raises(FileExistsError):
             folder.write_arrow_table(
@@ -155,7 +155,7 @@ class TestModes:
 class TestMakeChild:
 
     def test_part_filename_shape(self, tmp_path) -> None:
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         child = folder.make_child(
             options=FolderOptions(child_media_type="parquet"),
         )
@@ -166,7 +166,7 @@ class TestMakeChild:
         assert isinstance(child, ParquetFile)
 
     def test_csv_child(self, tmp_path) -> None:
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         child = folder.make_child(options=FolderOptions(child_media_type="csv"))
         assert isinstance(child, CsvFile)
 
@@ -178,7 +178,7 @@ class TestOptimize:
         return sum(1 for p in path.iterdir() if p.name.startswith("part-"))
 
     def test_no_byte_size_collapses_parts(self, tmp_path, table) -> None:
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(table)
         folder.write_arrow_table(table, options=FolderOptions(mode=Mode.APPEND))
         assert self._part_count(tmp_path) == 2
@@ -190,7 +190,7 @@ class TestOptimize:
         assert folder.read_arrow_table().num_rows == 6
 
     def test_byte_size_skips_parts_close_to_target(self, tmp_path, table) -> None:
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(table)
         folder.write_arrow_table(table, options=FolderOptions(mode=Mode.APPEND))
         # Pick a target so each existing part is "close enough" — the
@@ -207,7 +207,7 @@ class TestOptimize:
         assert self._part_count(tmp_path) == 2
 
     def test_byte_size_packs_small_parts(self, tmp_path, table) -> None:
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         for _ in range(4):
             folder.write_arrow_table(table, options=FolderOptions(mode=Mode.APPEND))
         sizes = [
@@ -227,14 +227,14 @@ class TestOptimize:
         assert folder.read_arrow_table().num_rows == 12
 
     def test_idempotent_on_clean_folder(self, tmp_path, table) -> None:
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(table)
         # Single part — nothing to compact.
         assert folder.optimize() == 0
         assert folder.optimize(byte_size=1_000_000) == 0
 
     def test_missing_folder(self, tmp_path) -> None:
-        folder = FolderIO(path=str(tmp_path / "absent"))
+        folder = Folder(path=str(tmp_path / "absent"))
         assert folder.optimize() == 0
         assert folder.optimize(byte_size=4096) == 0
 
@@ -256,7 +256,7 @@ class TestWriteRechunking:
         # Pick byte_size so the rechunker emits at least 3 parts.
         target = max(1, single_nbytes * 2)
 
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_batches(
             batches,
             options=FolderOptions(byte_size=target, mode=Mode.APPEND),
@@ -269,7 +269,7 @@ class TestWriteRechunking:
         assert loaded.num_rows == sum(b.num_rows for b in batches)
 
     def test_no_byte_size_keeps_single_part(self, tmp_path, table) -> None:
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         # Many small batches with no sizing knob → one part file.
         folder.write_arrow_batches(
             [table.to_batches()[0]] * 5,
@@ -286,7 +286,7 @@ class TestMergeByName:
         return sorted(folder.read_arrow_table().column("id").to_pylist())
 
     def test_append_drops_already_present_keys(self, tmp_path) -> None:
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(
             pa.table({"id": [1, 2, 3], "v": ["a", "b", "c"]}),
         )
@@ -303,7 +303,7 @@ class TestMergeByName:
         assert out.column("v").to_pylist() == ["a", "b", "c", "D"]
 
     def test_upsert_rewrites_matching_keys(self, tmp_path) -> None:
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(
             pa.table({"id": [1, 2, 3], "v": ["a", "b", "c"]}),
         )
@@ -319,7 +319,7 @@ class TestMergeByName:
         assert out.column("v").to_pylist() == ["a", "B", "c", "D"]
 
     def test_append_without_match_by_keeps_duplicates(self, tmp_path) -> None:
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(pa.table({"id": [1, 2]}))
         folder.write_arrow_table(
             pa.table({"id": [2, 3]}),
@@ -335,7 +335,7 @@ class TestDelete:
     def test_delete_drops_matching_rows_and_leaves_others(self, tmp_path) -> None:
         from yggdrasil.io.tabular.execution.expr import col
 
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(
             pa.table({"id": [1, 2, 3, 4, 5], "v": ["a", "b", "c", "d", "e"]}),
         )
@@ -347,7 +347,7 @@ class TestDelete:
     def test_delete_returns_zero_when_nothing_matches(self, tmp_path) -> None:
         from yggdrasil.io.tabular.execution.expr import col
 
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(pa.table({"id": [1, 2, 3]}))
         before = sorted(p.name for p in tmp_path.iterdir())
         deleted = folder.delete(col("id") > 100)
@@ -359,7 +359,7 @@ class TestDelete:
     def test_delete_full_part_unlinks_file(self, tmp_path) -> None:
         from yggdrasil.io.tabular.execution.expr import col
 
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(pa.table({"id": [1, 2, 3]}))
         # Predicate matches every row → file deleted, no replacement.
         deleted = folder.delete(col("id") >= 1)
@@ -371,7 +371,7 @@ class TestDelete:
         """Only the leaf containing matching rows is rewritten."""
         from yggdrasil.io.tabular.execution.expr import col
 
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         # Two appended parts. The predicate only matches rows in the
         # second part — the first part stays on disk untouched.
         folder.write_arrow_table(pa.table({"id": [1, 2]}))
@@ -391,11 +391,11 @@ class TestDelete:
     def test_delete_recurses_into_subfolders(self, tmp_path) -> None:
         from yggdrasil.io.tabular.execution.expr import col
 
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(pa.table({"id": [1, 2]}))
         sub_path = tmp_path / "shard"
         sub_path.mkdir()
-        sub = FolderIO(path=str(sub_path))
+        sub = Folder(path=str(sub_path))
         sub.write_arrow_table(pa.table({"id": [3, 4]}))
 
         deleted = folder.delete(col("id") > 2)
@@ -403,7 +403,7 @@ class TestDelete:
         assert sorted(folder.read_arrow_table().column("id").to_pylist()) == [1, 2]
 
     def test_delete_accepts_sql_string(self, tmp_path) -> None:
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(pa.table({"id": [1, 2, 3, 4]}))
         deleted = folder.delete("id IN (2, 4)")
         assert deleted == 2
@@ -412,7 +412,7 @@ class TestDelete:
     def test_delete_rejects_non_predicate(self, tmp_path) -> None:
         from yggdrasil.io.tabular.execution.expr import col
 
-        folder = FolderIO(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(pa.table({"id": [1]}))
         with pytest.raises(TypeError, match="Predicate"):
             folder.delete(col("id"))  # bare column is not a predicate

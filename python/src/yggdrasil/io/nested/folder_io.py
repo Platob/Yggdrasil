@@ -1,6 +1,6 @@
 """Filesystem folder of tabular files.
 
-:class:`FolderIO` is a :class:`Tabular` over a directory whose
+:class:`Folder` is a :class:`Tabular` over a directory whose
 entries are tabular files (parquet, csv, arrow IPC, ndjson, …) and /
 or sub-directories. The class has no byte buffer of its own — its
 state is the bound :attr:`path` plus the children walk.
@@ -14,7 +14,7 @@ non-private entry:
 * Files resolve through :class:`MediaType.from_` (extension first,
   magic-byte fallback) to a :class:`Tabular` leaf, or to a generic
   :class:`BytesIO` if the resolution fails.
-* Directories come back as a fresh :class:`FolderIO` of the same
+* Directories come back as a fresh :class:`Folder` of the same
   concrete class, so a tree of folders flattens transparently into
   one batch stream.
 
@@ -59,7 +59,7 @@ if TYPE_CHECKING:
     from yggdrasil.io.path import Path
 
 
-__all__ = ["FolderIO", "FolderOptions", "LazyFolderIO"]
+__all__ = ["Folder", "FolderOptions", "LazyFolder"]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -92,7 +92,7 @@ class FolderOptions(CastOptions):
             object.__setattr__(self, "child_media_type", coerced)
 
 
-class FolderIO(Tabular[FolderOptions]):
+class Folder(Tabular[FolderOptions]):
     """:class:`Tabular` over a directory of tabular files."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.FOLDER
@@ -144,7 +144,7 @@ class FolderIO(Tabular[FolderOptions]):
     # against either a BytesIO (real Disposable) or a folder.
     # ==================================================================
 
-    def __enter__(self) -> "FolderIO":
+    def __enter__(self) -> "Folder":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -157,7 +157,7 @@ class FolderIO(Tabular[FolderOptions]):
     def iter_children(self) -> "Iterator[Tabular]":
         """Yield every non-private direct entry of :attr:`path`.
 
-        Sub-directories come back as a fresh :class:`FolderIO`. File
+        Sub-directories come back as a fresh :class:`Folder`. File
         entries route through :class:`MediaType.from_` (extension
         first, magic-byte fallback) to a registered :class:`Tabular`
         leaf — :class:`ParquetFile` for ``.parquet``,
@@ -460,7 +460,7 @@ class FolderIO(Tabular[FolderOptions]):
     ) -> "set[tuple]":
         keys: "set[tuple]" = set()
         for child in self.iter_children():
-            if isinstance(child, FolderIO):
+            if isinstance(child, Folder):
                 continue
             try:
                 for batch in child._read_arrow_batches(child.options_class()()):
@@ -475,7 +475,7 @@ class FolderIO(Tabular[FolderOptions]):
     ) -> "set[tuple]":
         keys: "set[tuple]" = set()
         for batch in batches:
-            FolderIO._extend_keys_from_batch(keys, batch, match_by)
+            Folder._extend_keys_from_batch(keys, batch, match_by)
         return keys
 
     @staticmethod
@@ -533,7 +533,7 @@ class FolderIO(Tabular[FolderOptions]):
     ) -> "Iterator[pa.RecordBatch]":
         """Walk existing leaves, yielding only rows whose key isn't in *drop_keys*."""
         for child in self.iter_children():
-            if isinstance(child, FolderIO):
+            if isinstance(child, Folder):
                 continue
             try:
                 stream = child._read_arrow_batches(child.options_class()())
@@ -585,7 +585,7 @@ class FolderIO(Tabular[FolderOptions]):
         not_pred = ~predicate
         deleted = 0
         for child in self.iter_children():
-            if isinstance(child, FolderIO):
+            if isinstance(child, Folder):
                 deleted += child._delete(predicate, child.options_class()())
                 continue
             deleted += self._delete_leaf(child, not_pred, options)
@@ -781,7 +781,7 @@ class FolderIO(Tabular[FolderOptions]):
                     bin_sizes.append(size)
 
         compacted = 0
-        leaf_folder = FolderIO(path=directory)
+        leaf_folder = Folder(path=directory)
         write_options = FolderOptions(
             mode=Mode.APPEND, child_media_type=target_media_type,
         )
@@ -865,8 +865,8 @@ from yggdrasil.io.tabular.lazy import LazyTabular  # noqa: E402
 from yggdrasil.lazy_imports import polars_module  # noqa: E402
 
 
-class LazyFolderIO(LazyTabular):
-    """:class:`LazyTabular` over a :class:`FolderIO` source.
+class LazyFolder(LazyTabular):
+    """:class:`LazyTabular` over a :class:`Folder` source.
 
     Splits the plan at the first non-commutative op via
     :meth:`ExecutionPlan.split_pushdownable` and dispatches the
@@ -881,10 +881,10 @@ class LazyFolderIO(LazyTabular):
     An empty folder yields an empty LazyFrame / batch stream.
     """
 
-    source_cls: "ClassVar[type[Tabular]]" = FolderIO
+    source_cls: "ClassVar[type[Tabular]]" = Folder
 
     @property
-    def source(self) -> "FolderIO":
+    def source(self) -> "Folder":
         return self._source  # type: ignore[return-value]
 
     def _push_children(self) -> "tuple[tuple[Tabular, ...], Any]":

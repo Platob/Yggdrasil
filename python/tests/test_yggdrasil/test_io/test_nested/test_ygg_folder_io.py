@@ -1,4 +1,4 @@
-"""Tests for :class:`yggdrasil.io.nested.ygg_folder_io.YGGFolderIO`.
+"""Tests for :class:`yggdrasil.io.nested.ygg_folder_io.YGGFolder`.
 
 Coverage:
 
@@ -23,7 +23,7 @@ from yggdrasil.data.enums import Mode
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.types.primitive import Int64Type, StringType
 from yggdrasil.io.nested.folder_io import FolderOptions
-from yggdrasil.io.nested.ygg_folder_io import YGGFolderIO
+from yggdrasil.io.nested.ygg_folder_io import YGGFolder
 
 
 # ---------------------------------------------------------------------------
@@ -71,15 +71,15 @@ def table() -> pa.Table:
 class TestHiveLayout:
 
     def test_partition_columns_from_schema(self, tmp_path) -> None:
-        y = YGGFolderIO(path=str(tmp_path), schema=_single_partition_schema())
+        y = YGGFolder(path=str(tmp_path), schema=_single_partition_schema())
         assert y.partition_columns == ["region"]
 
     def test_no_schema_means_no_partitions(self, tmp_path) -> None:
-        y = YGGFolderIO(path=str(tmp_path))
+        y = YGGFolder(path=str(tmp_path))
         assert y.partition_columns == []
 
     def test_write_creates_col_eq_val_dirs(self, tmp_path, table) -> None:
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         y.write_arrow_table(table)
@@ -93,7 +93,7 @@ class TestHiveLayout:
         self, tmp_path, table,
     ) -> None:
         """Partition column lives in the dir name, not the part file."""
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         y.write_arrow_table(
@@ -112,7 +112,7 @@ class TestHiveLayout:
         assert {"id", "value"} <= set(stored_cols)
 
     def test_multi_partition_layout(self, tmp_path) -> None:
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_multi_partition_schema(),
         )
         t = pa.table({
@@ -138,7 +138,7 @@ class TestHiveLayout:
 class TestReadAfterWrite:
 
     def test_partition_column_reattached(self, tmp_path, table) -> None:
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         y.write_arrow_table(table)
@@ -150,7 +150,7 @@ class TestReadAfterWrite:
         )
 
     def test_multi_partition_round_trip(self, tmp_path) -> None:
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_multi_partition_schema(),
         )
         t = pa.table({
@@ -173,7 +173,7 @@ class TestReadAfterWrite:
 class TestPartitionPruning:
 
     def test_prune_to_single_partition(self, tmp_path, table) -> None:
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         y.write_arrow_table(table)
@@ -184,7 +184,7 @@ class TestPartitionPruning:
         assert set(out.column("region").to_pylist()) == {"us"}
 
     def test_prune_to_multiple_partitions(self, tmp_path) -> None:
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         y.write_arrow_table(pa.table({
@@ -199,7 +199,7 @@ class TestPartitionPruning:
         assert set(out.column("region").to_pylist()) == {"us", "ap"}
 
     def test_prune_unknown_value_returns_empty(self, tmp_path, table) -> None:
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         y.write_arrow_table(table)
@@ -209,7 +209,7 @@ class TestPartitionPruning:
         assert out.num_rows == 0
 
     def test_prune_int_partition_value(self, tmp_path) -> None:
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_multi_partition_schema(),
         )
         t = pa.table({
@@ -229,7 +229,7 @@ class TestPartitionPruning:
         self, tmp_path, table, monkeypatch,
     ) -> None:
         """Pruned partitions don't scandir partitions outside the IN set."""
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         y.write_arrow_table(table)
@@ -271,7 +271,7 @@ class TestListingCache:
         only the tree walks (scandir on a path equal to the root,
         not a leaf).
         """
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         y.write_arrow_table(table)
@@ -293,7 +293,7 @@ class TestListingCache:
         assert root_calls["n"] == first
 
     def test_invalidate_after_write(self, tmp_path, table) -> None:
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         y.write_arrow_table(table)
@@ -322,7 +322,7 @@ class TestListingCache:
 class TestOptimize:
 
     def test_compacts_multiple_parts(self, tmp_path) -> None:
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         y.write_arrow_table(pa.table({
@@ -344,7 +344,7 @@ class TestOptimize:
         assert sorted(out.column("id").to_pylist()) == [1, 2]
 
     def test_optimize_is_idempotent(self, tmp_path, table) -> None:
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         y.write_arrow_table(table)
@@ -352,7 +352,7 @@ class TestOptimize:
         assert y.optimize() == 0
 
     def test_byte_size_skips_close_to_target(self, tmp_path) -> None:
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         y.write_arrow_table(pa.table({
@@ -376,7 +376,7 @@ class TestOptimize:
     def test_schema_sidecar_persisted_on_first_write(
         self, tmp_path, table,
     ) -> None:
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         # No write yet → no .ygg/ directory.
@@ -391,17 +391,17 @@ class TestOptimize:
         self, tmp_path, table,
     ) -> None:
         # First instance writes the sidecar.
-        YGGFolderIO(
+        YGGFolder(
             path=str(tmp_path), schema=_single_partition_schema(),
         ).write_arrow_table(table)
         # Fresh instance with no schema reads it back from .ygg/.schema.
-        fresh = YGGFolderIO(path=str(tmp_path))
+        fresh = YGGFolder(path=str(tmp_path))
         assert fresh.partition_columns == ["region"]
 
     def test_no_schema_falls_back_to_folderio_walk(self, tmp_path, table) -> None:
         # No schema → no partition columns → optimize delegates to the
-        # plain :meth:`FolderIO.optimize` walk.
-        y = YGGFolderIO(path=str(tmp_path))
+        # plain :meth:`Folder.optimize` walk.
+        y = YGGFolder(path=str(tmp_path))
         # Drop two parquet parts directly under the root so there's
         # something to compact.
         from yggdrasil.io.primitive.parquet_io import ParquetFile
@@ -421,7 +421,7 @@ class TestOptimize:
 class TestModes:
 
     def test_overwrite_clears_partition_tree(self, tmp_path) -> None:
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         y.write_arrow_table(pa.table({
@@ -437,7 +437,7 @@ class TestModes:
         assert dirs == ["region=ap"]
 
     def test_append_keeps_existing_partitions(self, tmp_path, table) -> None:
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         y.write_arrow_table(table)
@@ -462,7 +462,7 @@ class TestDelete:
         """``region == 'us'`` is partition-only — drop the whole dir."""
         from yggdrasil.io.tabular.execution.expr import col
 
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         y.write_arrow_table(table)
@@ -479,7 +479,7 @@ class TestDelete:
     ) -> None:
         from yggdrasil.io.tabular.execution.expr import col
 
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         y.write_arrow_table(table)
@@ -494,7 +494,7 @@ class TestDelete:
         """Mixed predicate: ``region='us' AND id=2`` only scans us."""
         from yggdrasil.io.tabular.execution.expr import col
 
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         # Two regions, two rows each.
@@ -525,7 +525,7 @@ class TestDelete:
         """``id > 2`` references no partition columns → scan everywhere."""
         from yggdrasil.io.tabular.execution.expr import col
 
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_single_partition_schema(),
         )
         y.write_arrow_table(
@@ -543,7 +543,7 @@ class TestDelete:
     def test_multi_partition_pruning(self, tmp_path) -> None:
         from yggdrasil.io.tabular.execution.expr import col
 
-        y = YGGFolderIO(
+        y = YGGFolder(
             path=str(tmp_path), schema=_multi_partition_schema(),
         )
         y.write_arrow_table(pa.table({
@@ -567,10 +567,10 @@ class TestDelete:
     def test_no_schema_falls_through_to_folder_io(
         self, tmp_path,
     ) -> None:
-        """Without partition tags, behave like plain FolderIO."""
+        """Without partition tags, behave like plain Folder."""
         from yggdrasil.io.tabular.execution.expr import col
 
-        y = YGGFolderIO(path=str(tmp_path))
+        y = YGGFolder(path=str(tmp_path))
         y.write_arrow_table(pa.table({"id": [1, 2, 3]}))
         deleted = y.delete(col("id") == 2)
         assert deleted == 1
