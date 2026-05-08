@@ -53,7 +53,7 @@ from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io import URL
 from yggdrasil.io.tabular import Tabular, O
-from yggdrasil.io.primitive import ParquetIO
+from yggdrasil.io.primitive import ParquetFile
 from yggdrasil.data.enums import MimeTypes, MimeType, MediaType
 from yggdrasil.data.enums.mode import ModeLike, Mode
 from yggdrasil.lazy_imports import aws_config_class
@@ -391,7 +391,7 @@ def _alias_columns(expr, alias: str):
 
 
 def _collect_prune_values_polars(
-    buffer: ParquetIO,
+    buffer: ParquetFile,
     prune_by: list[str],
 ) -> dict[str, tuple[Any, ...]]:
     df = buffer.scan_polars_frame().select(*prune_by).unique().collect()
@@ -2506,7 +2506,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
 
         prune_values = prune_values or {}
         output_data: "Tabular | None" = None
-        with ParquetIO() as buffer:
+        with ParquetFile() as buffer:
             buffer.write_table(data, cast_options)
             buffer.seek(0)
             if prune_by:

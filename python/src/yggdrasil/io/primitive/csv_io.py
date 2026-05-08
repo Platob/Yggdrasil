@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     import pyarrow.dataset as pds
 
 
-__all__ = ["CsvIO", "CsvOptions"]
+__all__ = ["CsvFile", "CsvOptions", "LazyCsvFile"]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -75,7 +75,7 @@ class CsvOptions(CastOptions):
         )
 
 
-class CsvIO(BytesIO):
+class CsvFile(BytesIO):
     """:class:`Tabular` leaf for CSV files."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.CSV
@@ -285,3 +285,76 @@ class CsvIO(BytesIO):
                 quote_char=options.quote_char,
             )
         return super()._read_polars_frame(options)
+
+
+# ----------------------------------------------------------------------
+# Lazy wrapper — pushes column projection (and pyarrow filters) into
+# the CSV reader for plans that only carry those ops.
+# ----------------------------------------------------------------------
+
+from yggdrasil.io.tabular.lazy import LazyTabular  # noqa: E402
+
+
+class LazyCsvFile(LazyTabular):
+    """:class:`LazyTabular` over a :class:`CsvFile` source.
+
+    For local-path holders, plans containing only :class:`Select`
+    (bare names) and :class:`Filter` (yggdrasil predicates) push
+    column projection and the AND-merged filter into a
+    :class:`pyarrow.dataset.Dataset` scanner over the CSV file. For
+    in-memory holders, ``include_columns`` on
+    :class:`pyarrow.csv.ConvertOptions` does the projection and a
+    remaining filter falls through to the base polars route.
+    """
+
+    source_cls: ClassVar["type"] = CsvFile
+
+    @property
+    def source(self) -> "CsvFile":
+        return self._source  # type: ignore[return-value]
+
+    def _read_arrow_batches(
+        self, options: CsvOptions,
+    ) -> Iterator[pa.RecordBatch]:
+        spec = self._arrow_pushdown_spec()
+        if spec is None:
+            yield from super()._read_arrow_batches(options)
+            return
+
+        columns, filt = spec
+        src = self._source
+        if src.size == 0:
+            return
+
+        path = src._local_path_str()
+        if path is not None:
+            pds = pyarrow_dataset_module()
+            scanner = pds.dataset(path, format="csv").scanner(
+                columns=columns, filter=filt,
+            )
+            for batch in scanner.to_batches():
+                if batch.num_rows > 0:
+                    yield options.cast_arrow_tabular(batch)
+            return
+
+        if filt is not None:
+            yield from super()._read_arrow_batches(options)
+            return
+        with src._format_input() as v:
+            convert_options = pa_csv.ConvertOptions(
+                null_values=list(options.null_values),
+                strings_can_be_null=True,
+                include_columns=columns,
+            )
+            reader = pa_csv.open_csv(
+                v,
+                read_options=options.to_read_options(),
+                parse_options=options.to_parse_options(),
+                convert_options=convert_options,
+            )
+            try:
+                for batch in reader:
+                    if batch.num_rows > 0:
+                        yield options.cast_arrow_tabular(batch)
+            finally:
+                reader.close()

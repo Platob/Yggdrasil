@@ -1,6 +1,6 @@
 """NDJSON (newline-delimited JSON) Tabular leaf.
 
-:class:`NDJsonIO` is the streamable counterpart to :class:`JsonIO`.
+:class:`NDJsonFile` is the streamable counterpart to :class:`JsonFile`.
 One JSON object per line, no array wrapper. APPEND is honest at
 the byte level (concatenate new lines onto the existing buffer);
 no read-modify-rewrite needed.
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     import pyarrow.dataset as pds
 
 
-__all__ = ["NDJsonIO", "NDJsonOptions"]
+__all__ = ["LazyNDJsonFile", "NDJsonFile", "NDJsonOptions"]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -53,7 +53,7 @@ class NDJsonOptions(CastOptions):
         return pa_json.ParseOptions()
 
 
-class NDJsonIO(BytesIO):
+class NDJsonFile(BytesIO):
     """:class:`Tabular` leaf for newline-delimited JSON."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.NDJSON
@@ -230,3 +230,60 @@ class NDJsonIO(BytesIO):
         if path is not None:
             return pl.read_ndjson(path)
         return super()._read_polars_frame(options)
+
+
+# ----------------------------------------------------------------------
+# Lazy wrapper — for plans containing only Select / Filter, push the
+# pyarrow scanner over the local file. NDJSON has no random access at
+# the byte level, but pyarrow.dataset still benefits from projection.
+# ----------------------------------------------------------------------
+
+from yggdrasil.io.tabular.lazy import LazyTabular  # noqa: E402
+
+
+class LazyNDJsonFile(LazyTabular):
+    """:class:`LazyTabular` over an :class:`NDJsonFile` source.
+
+    For local-path holders, plans containing only :class:`Select`
+    (bare names) and :class:`Filter` (yggdrasil predicates) push
+    column projection and the AND-merged filter into a
+    :class:`pyarrow.dataset.Dataset` scanner over the NDJSON file.
+    Anything more complex falls back to the base polars route
+    (``pl.scan_ndjson(path)``), which still pushes projection /
+    predicate at plan time.
+    """
+
+    source_cls: ClassVar["type"] = NDJsonFile
+
+    @property
+    def source(self) -> "NDJsonFile":
+        return self._source  # type: ignore[return-value]
+
+    def _read_arrow_batches(
+        self, options: NDJsonOptions,
+    ) -> Iterator[pa.RecordBatch]:
+        spec = self._arrow_pushdown_spec()
+        if spec is None:
+            yield from super()._read_arrow_batches(options)
+            return
+
+        columns, filt = spec
+        src = self._source
+        if src.size == 0:
+            return
+
+        path = self._local_path_str()
+        if path is None:
+            # In-memory NDJSON has no native projection hook; defer
+            # to the base path so polars handles the pushdown via
+            # scan_ndjson on the file-like view.
+            yield from super()._read_arrow_batches(options)
+            return
+
+        pds = pyarrow_dataset_module()
+        scanner = pds.dataset(path, format="json").scanner(
+            columns=columns, filter=filt,
+        )
+        for batch in scanner.to_batches():
+            if batch.num_rows > 0:
+                yield options.cast_arrow_tabular(batch)

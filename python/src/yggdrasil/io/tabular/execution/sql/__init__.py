@@ -57,7 +57,7 @@ them together:
 - :class:`yggdrasil.data.statement.StatementResult` is the
   lifecycle + Arrow-IO base.
 - :class:`yggdrasil.io.buffer.memory.ArrowTabular` is the
-  zero-copy in-memory holder. ParquetIO handles the on-disk
+  zero-copy in-memory holder. ParquetFile handles the on-disk
   spill case.
 
 That keeps :mod:`yggdrasil.sql` itself small and focused on the

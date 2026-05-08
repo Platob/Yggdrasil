@@ -726,13 +726,13 @@ class Holder(Tabular[O], Disposable):
         """Stream batches from a borrowed cursor on the dispatched leaf.
 
         The :class:`BytesIO` constructor dispatches to the right
-        format leaf (ParquetIO / XlsxIO / CsvIO / …) using this
+        format leaf (ParquetFile / XlsxFile / CsvFile / …) using this
         holder's :class:`MediaType`. We re-home *options* onto the
         leaf's options class so format-specific knobs (sheet name,
         delimiter, …) survive the hop, then read through the
         closed-mode path (direct to durable holder) so we don't pay
         the scratch-buffer slurp that ``with bio:`` would trigger —
-        format-specific leaves like :class:`XlsxIO` already manage
+        format-specific leaves like :class:`XlsxFile` already manage
         their own scoped views internally via ``_format_view``.
         """
         from yggdrasil.io.bytes_io import BytesIO
@@ -949,7 +949,7 @@ class Holder(Tabular[O], Disposable):
 
         Mirrors :meth:`write_local_path` for IO-shaped sources
         (:class:`io.BytesIO`, ``open(..., "rb")``, urllib3 responses,
-        :class:`yggdrasil.io.tabular.parquet_io.ParquetIO`). Reads the
+        :class:`yggdrasil.io.tabular.parquet_io.ParquetFile`). Reads the
         full payload once and commits it via a single
         :meth:`write_bytes`, so backends whose ``_write_mv`` implements
         an atomic upload at ``pos == 0`` (Files API ``upload``, S3

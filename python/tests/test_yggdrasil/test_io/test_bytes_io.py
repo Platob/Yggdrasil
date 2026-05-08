@@ -90,13 +90,13 @@ class TestConstruction:
         """
         # Side-effect import: register the primitive leaves.
         import yggdrasil.io.primitive  # noqa: F401
-        from yggdrasil.io.primitive.parquet_io import ParquetIO
-        from yggdrasil.io.primitive.csv_io import CsvIO
+        from yggdrasil.io.primitive.parquet_io import ParquetFile
+        from yggdrasil.io.primitive.csv_io import CsvFile
 
         pq_path = str(tmp_path / "x.parquet")
         csv_path = str(tmp_path / "x.csv")
-        assert isinstance(BytesIO(path=pq_path), ParquetIO)
-        assert isinstance(BytesIO(path=csv_path), CsvIO)
+        assert isinstance(BytesIO(path=pq_path), ParquetFile)
+        assert isinstance(BytesIO(path=csv_path), CsvFile)
 
     def test_path_kwarg_owns_path_holder(self, tmp_path) -> None:
         from yggdrasil.io.path.local_path import LocalPath
@@ -106,12 +106,12 @@ class TestConstruction:
 
     def test_explicit_media_type_still_wins(self, tmp_path) -> None:
         from yggdrasil.data.enums import MediaType, MimeTypes
-        from yggdrasil.io.primitive.parquet_io import ParquetIO
+        from yggdrasil.io.primitive.parquet_io import ParquetFile
         b = BytesIO(
             path=str(tmp_path / "x.csv"),
             media_type=MediaType(MimeTypes.PARQUET),
         )
-        assert isinstance(b, ParquetIO)
+        assert isinstance(b, ParquetFile)
 
     def test_holder_media_type_drives_dispatch(self) -> None:
         """A holder pre-tagged with a :class:`MediaType` routes through
@@ -119,10 +119,10 @@ class TestConstruction:
         ``path=`` is given.
         """
         from yggdrasil.data.enums import MediaType, MimeTypes
-        from yggdrasil.io.primitive.parquet_io import ParquetIO
+        from yggdrasil.io.primitive.parquet_io import ParquetFile
         mem = Memory()
         mem.stat().media_type = MediaType(MimeTypes.PARQUET)
-        assert isinstance(BytesIO(holder=mem), ParquetIO)
+        assert isinstance(BytesIO(holder=mem), ParquetFile)
 
 
 class TestIOProtocolBasics:
@@ -457,19 +457,19 @@ class TestAsMedia:
 
     def test_explicit_media_type_routes_to_leaf(self) -> None:
         from yggdrasil.data.enums import MimeTypes
-        from yggdrasil.io.primitive.json_io import JsonIO
+        from yggdrasil.io.primitive.json_io import JsonFile
 
         b = BytesIO(b'{"x": 1}')
         mio = b.as_media(MimeTypes.JSON)
-        assert isinstance(mio, JsonIO)
+        assert isinstance(mio, JsonFile)
 
     def test_stamped_media_type_resolves_when_no_explicit(self) -> None:
         from yggdrasil.data.enums import MediaTypes
-        from yggdrasil.io.primitive.json_io import JsonIO
+        from yggdrasil.io.primitive.json_io import JsonFile
 
         b = BytesIO(b'{"x": 1}', media_type=MediaTypes.JSON)
         mio = b.as_media()
-        assert isinstance(mio, JsonIO)
+        assert isinstance(mio, JsonFile)
 
     def test_returns_self_when_already_target_class(self) -> None:
         from yggdrasil.data.enums import MediaTypes, MimeTypes
@@ -497,7 +497,7 @@ class TestAsMedia:
 
     def test_round_trip_through_response_to_polars(self) -> None:
         """Pinned regression — Response.to_polars(parse=True) used to
-        crash with `'JsonIO' object has no attribute 'as_media'`.
+        crash with `'JsonFile' object has no attribute 'as_media'`.
         """
         import datetime as dt
 
@@ -525,7 +525,7 @@ class TestAsMedia:
         """
         import datetime as dt
 
-        from yggdrasil.io.primitive.json_io import JsonIO
+        from yggdrasil.io.primitive.json_io import JsonFile
         from yggdrasil.io.request import PreparedRequest
         from yggdrasil.io.response import Response
 
@@ -539,4 +539,4 @@ class TestAsMedia:
             received_at=dt.datetime.fromtimestamp(0, tz=dt.timezone.utc),
         )
         mio = r.as_media()
-        assert isinstance(mio, JsonIO)
+        assert isinstance(mio, JsonFile)

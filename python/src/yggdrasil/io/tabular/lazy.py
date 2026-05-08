@@ -75,12 +75,12 @@ def lazy_for(source: Tabular, plan: "ExecutionPlan") -> "LazyTabular":
 
     Walks ``type(source).__mro__`` looking for an entry in
     :data:`_LAZY_REGISTRY`; falls back to the plain :class:`LazyTabular`
-    when nothing matches. Triggers a side-effect import of
-    :mod:`yggdrasil.io.tabular.lazy_format` so the bundled format-
-    specific Lazy IO classes (``LazyParquetIO`` / ``LazyArrowIPCIO``
-    / ``LazyFolderIO`` / …) are registered before the lookup runs.
+    when nothing matches. Format-specific Lazy IO subclasses
+    (``LazyParquetFile`` / ``LazyArrowIPCFile`` / ``LazyFolderIO``
+    / …) live next to their source class and register themselves
+    on import — so any *source* a caller can construct has its
+    matching Lazy subclass loaded by the time this is called.
     """
-    import yggdrasil.io.tabular.lazy_format  # noqa: F401  (registers subclasses)
     for cls in type(source).__mro__:
         hit = _LAZY_REGISTRY.get(cls)
         if hit is not None:
@@ -155,7 +155,7 @@ class LazyTabular(Tabular[CastOptions]):
     """
 
     #: Source :class:`Tabular` subclass this Lazy specializes for.
-    #: Concrete subclasses set to a registered leaf (``ParquetIO`` /
+    #: Concrete subclasses set to a registered leaf (``ParquetFile`` /
     #: ``FolderIO`` / …) so :func:`lazy_for` can pick this class when
     #: wrapping a source of the matching type. ``None`` (the default)
     #: opts out of registration — :class:`LazyTabular` itself stays
@@ -351,6 +351,74 @@ class LazyTabular(Tabular[CastOptions]):
                 f"LazyFrame; got {type(fn).__name__}: {fn!r}."
             )
         return self._append_op(Apply(fn))
+
+    # ------------------------------------------------------------------
+    # Native-arrow pushdown helpers — used by format-specific subclasses
+    # ------------------------------------------------------------------
+
+    def _local_path_str(self) -> "str | None":
+        """Backend-native local-path string for the source's holder, else ``None``.
+
+        Looks for the conventional :meth:`is_local_path` /
+        :meth:`full_path` pair on the source's ``_holder``. Format
+        Lazy subclasses (``LazyParquetFile`` / ``LazyArrowIPCFile``
+        / ``LazyCsvFile``) use this to decide whether the
+        :mod:`pyarrow.dataset` scanner can take the path directly
+        — that's what enables column / predicate pushdown into the
+        format reader. Returns ``None`` for in-memory holders or
+        anything that doesn't expose a path; subclasses then route
+        through their in-memory fallback.
+        """
+        src = self._source
+        holder = getattr(src, "_holder", None)
+        if holder is None or not getattr(holder, "is_local_path", False):
+            return None
+        full_path = getattr(holder, "full_path", None)
+        return full_path() if callable(full_path) else None
+
+    def _arrow_pushdown_spec(
+        self,
+    ) -> "tuple[list[str] | None, Any | None] | None":
+        """Compile the plan to ``(columns, filter_expr)`` for pyarrow.
+
+        Walks :attr:`plan` accumulating column projection from
+        :class:`Select` ops (bare column names only) and an
+        AND-combined :class:`pyarrow.compute.Expression` from
+        :class:`Filter` ops with yggdrasil :class:`Predicate`
+        bodies. Returns ``None`` (== "not pushdownable") on the
+        first op that breaks the pattern: a ``Select`` carrying an
+        expression instead of a bare name, ``SELECT *``, a
+        ``Filter`` with a backend-native predicate that can't lift
+        to pyarrow, or any of :class:`GroupByAgg` /
+        :class:`Apply` / :class:`Join`.
+
+        Format-specific Lazy subclasses call this from their
+        :meth:`_read_arrow_batches` override — when it returns
+        ``None`` they fall back to the base polars-LazyFrame path.
+        """
+        columns: "list[str] | None" = None
+        filter_expr: Any = None
+        for op in self._plan.ops:
+            if isinstance(op, Select):
+                cols: "list[str]" = []
+                for c in op.columns:
+                    if not isinstance(c, str) or c == "*":
+                        return None
+                    cols.append(c)
+                # A later Select narrows further; the final projection wins.
+                columns = cols
+            elif isinstance(op, Filter):
+                for p in op.predicates:
+                    if not isinstance(p, Predicate):
+                        return None
+                    try:
+                        e = p.to_arrow()
+                    except Exception:
+                        return None
+                    filter_expr = e if filter_expr is None else filter_expr & e
+            else:
+                return None
+        return columns, filter_expr
 
     # ------------------------------------------------------------------
     # Plan execution

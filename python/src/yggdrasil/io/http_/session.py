@@ -12,7 +12,7 @@ from yggdrasil.io import BytesIO
 from yggdrasil.data.enums import MediaTypes
 
 from .response import HTTPResponse
-from yggdrasil.io.primitive import ArrowIPCIO
+from yggdrasil.io.primitive import ArrowIPCFile
 from ..request import PreparedRequest
 from ..send_config import SendConfig
 from ..session import Session
@@ -369,7 +369,7 @@ class HTTPSession(Session):
 
         final_df = pl.concat(frames, how="diagonal_relaxed", rechunk=True)
 
-        new_buffer = ArrowIPCIO(media_type=MediaTypes.ARROW_IPC)
+        new_buffer = ArrowIPCFile(media_type=MediaTypes.ARROW_IPC)
         new_buffer.write_arrow_table(
             final_df.to_arrow(compat_level=pl.CompatLevel.newest()),
             compression="zstd",

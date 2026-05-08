@@ -15,14 +15,14 @@ this import lazily so registry hits stay correct even when callers
 start at a leaf module directly.
 """
 
-from .arrow_ipc_io import ArrowIPCIO
-from .parquet_io import ParquetIO
-from .csv_io import CsvIO
-from .json_io import JsonIO
-from .ndjson_io import NDJsonIO
-from .xlsx_io import XlsxIO
+from .arrow_ipc_io import ArrowIPCFile
+from .parquet_io import ParquetFile
+from .csv_io import CsvFile
+from .json_io import JsonFile
+from .ndjson_io import NDJsonFile
+from .xlsx_io import XlsxFile
 
 __all__ = [
-    'ArrowIPCIO',
-    'ParquetIO', 'CsvIO', 'JsonIO', 'NDJsonIO', 'XlsxIO',
+    'ArrowIPCFile',
+    'ParquetFile', 'CsvFile', 'JsonFile', 'NDJsonFile', 'XlsxFile',
 ]

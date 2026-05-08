@@ -17,10 +17,10 @@ import pytest
 
 from yggdrasil.aws.fs.path import S3Path
 from yggdrasil.databricks.fs import DBFSPath, VolumePath
-from yggdrasil.io.primitive.arrow_ipc_io import ArrowIPCIO
-from yggdrasil.io.primitive.csv_io import CsvIO
-from yggdrasil.io.primitive.ndjson_io import NDJsonIO
-from yggdrasil.io.primitive.parquet_io import ParquetIO
+from yggdrasil.io.primitive.arrow_ipc_io import ArrowIPCFile
+from yggdrasil.io.primitive.csv_io import CsvFile
+from yggdrasil.io.primitive.ndjson_io import NDJsonFile
+from yggdrasil.io.primitive.parquet_io import ParquetFile
 
 
 @pytest.fixture
@@ -176,12 +176,12 @@ class TestParquetOverS3:
         client = _s3_round_trip_client(store)
         s3 = S3Path("s3://my-bucket/data.parquet", client=client)
 
-        writer = ParquetIO(holder=s3, owns_holder=False)
+        writer = ParquetFile(holder=s3, owns_holder=False)
         writer.write_arrow_table(table)
         # Bytes ended up in the mock store.
         assert store["buf"].startswith(b"PAR1")
 
-        reader = ParquetIO(holder=s3, owns_holder=False)
+        reader = ParquetFile(holder=s3, owns_holder=False)
         loaded = reader.read_arrow_table()
         assert loaded.equals(table)
 
@@ -189,9 +189,9 @@ class TestParquetOverS3:
         store = {}
         client = _s3_round_trip_client(store)
         s3 = S3Path("s3://my-bucket/data.parquet", client=client)
-        ParquetIO(holder=s3, owns_holder=False).write_arrow_table(table)
+        ParquetFile(holder=s3, owns_holder=False).write_arrow_table(table)
 
-        schema = ParquetIO(holder=s3, owns_holder=False).collect_schema()
+        schema = ParquetFile(holder=s3, owns_holder=False).collect_schema()
         assert set(schema.field_names()) == {"id", "name"}
 
 
@@ -207,8 +207,8 @@ class TestCsvOverS3:
         client = _s3_round_trip_client(store)
         s3 = S3Path("s3://my-bucket/data.csv", client=client)
 
-        CsvIO(holder=s3, owns_holder=False).write_arrow_table(table)
-        loaded = CsvIO(holder=s3, owns_holder=False).read_arrow_table()
+        CsvFile(holder=s3, owns_holder=False).write_arrow_table(table)
+        loaded = CsvFile(holder=s3, owns_holder=False).read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2, 3]
 
 
@@ -224,8 +224,8 @@ class TestArrowIPCOverS3:
         client = _s3_round_trip_client(store)
         s3 = S3Path("s3://my-bucket/data.arrow", client=client)
 
-        ArrowIPCIO(holder=s3, owns_holder=False).write_arrow_table(table)
-        loaded = ArrowIPCIO(holder=s3, owns_holder=False).read_arrow_table()
+        ArrowIPCFile(holder=s3, owns_holder=False).write_arrow_table(table)
+        loaded = ArrowIPCFile(holder=s3, owns_holder=False).read_arrow_table()
         assert loaded.equals(table)
 
 
@@ -241,11 +241,11 @@ class TestNDJsonOverS3:
         client = _s3_round_trip_client(store)
         s3 = S3Path("s3://my-bucket/data.ndjson", client=client)
 
-        NDJsonIO(holder=s3, owns_holder=False).write_arrow_table(table)
+        NDJsonFile(holder=s3, owns_holder=False).write_arrow_table(table)
         # Sanity check the line shape on the wire.
         lines = store["buf"].decode("utf-8").splitlines()
         assert len(lines) == 3
-        loaded = NDJsonIO(holder=s3, owns_holder=False).read_arrow_table()
+        loaded = NDJsonFile(holder=s3, owns_holder=False).read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2, 3]
 
 
@@ -261,14 +261,14 @@ class TestParquetOverDBFS:
         ws = _dbfs_round_trip_workspace(store)
         dbfs = DBFSPath("/dbfs/data.parquet", workspace=ws)
 
-        ParquetIO(holder=dbfs, owns_holder=False).write_arrow_table(table)
+        ParquetFile(holder=dbfs, owns_holder=False).write_arrow_table(table)
         assert store["buf"].startswith(b"PAR1")
 
         # Stat cache is invalidated by the write; the reader's first
         # head call sees the freshly committed size.
         from yggdrasil.io.path.remote_path import RemotePath
         RemotePath._STAT_CACHE.clear()
-        loaded = ParquetIO(holder=dbfs, owns_holder=False).read_arrow_table()
+        loaded = ParquetFile(holder=dbfs, owns_holder=False).read_arrow_table()
         assert loaded.equals(table)
 
 
@@ -284,10 +284,10 @@ class TestCsvOverDBFS:
         ws = _dbfs_round_trip_workspace(store)
         dbfs = DBFSPath("/dbfs/data.csv", workspace=ws)
 
-        CsvIO(holder=dbfs, owns_holder=False).write_arrow_table(table)
+        CsvFile(holder=dbfs, owns_holder=False).write_arrow_table(table)
         from yggdrasil.io.path.remote_path import RemotePath
         RemotePath._STAT_CACHE.clear()
-        loaded = CsvIO(holder=dbfs, owns_holder=False).read_arrow_table()
+        loaded = CsvFile(holder=dbfs, owns_holder=False).read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2, 3]
 
 
@@ -326,8 +326,8 @@ class TestArrowIPCOverVolume:
         ws.files.upload.side_effect = upload
 
         vol = VolumePath("/Volumes/c/s/v/data.arrow", workspace=ws)
-        ArrowIPCIO(holder=vol, owns_holder=False).write_arrow_table(table)
+        ArrowIPCFile(holder=vol, owns_holder=False).write_arrow_table(table)
         from yggdrasil.io.path.remote_path import RemotePath
         RemotePath._STAT_CACHE.clear()
-        loaded = ArrowIPCIO(holder=vol, owns_holder=False).read_arrow_table()
+        loaded = ArrowIPCFile(holder=vol, owns_holder=False).read_arrow_table()
         assert loaded.equals(table)

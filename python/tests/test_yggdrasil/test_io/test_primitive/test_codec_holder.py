@@ -23,12 +23,12 @@ from yggdrasil.data.enums.media_type import MediaType
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.path.local_path import LocalPath
-from yggdrasil.io.primitive.arrow_ipc_io import ArrowIPCIO
-from yggdrasil.io.primitive.csv_io import CsvIO
-from yggdrasil.io.primitive.json_io import JsonIO
-from yggdrasil.io.primitive.ndjson_io import NDJsonIO
-from yggdrasil.io.primitive.parquet_io import ParquetIO
-from yggdrasil.io.primitive.xlsx_io import XlsxIO
+from yggdrasil.io.primitive.arrow_ipc_io import ArrowIPCFile
+from yggdrasil.io.primitive.csv_io import CsvFile
+from yggdrasil.io.primitive.json_io import JsonFile
+from yggdrasil.io.primitive.ndjson_io import NDJsonFile
+from yggdrasil.io.primitive.parquet_io import ParquetFile
+from yggdrasil.io.primitive.xlsx_io import XlsxFile
 
 
 @pytest.fixture
@@ -56,19 +56,19 @@ class TestUncompressedSanity:
     writes straight into self."""
 
     def test_csv_round_trip(self, table) -> None:
-        io = CsvIO()
+        io = CsvFile()
         io.write_arrow_table(table)
         assert not io.to_bytes().startswith(b"\x1f\x8b")  # not gzip
         loaded = io.read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2, 3]
 
     def test_arrow_round_trip(self, table) -> None:
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_table(table)
         assert io.read_arrow_table().equals(table)
 
     def test_parquet_round_trip(self, table) -> None:
-        io = ParquetIO()
+        io = ParquetFile()
         io.write_arrow_table(table)
         assert io.read_arrow_table().equals(table)
 
@@ -82,7 +82,7 @@ class TestCsvGzipMemory:
 
     def test_round_trip(self, table) -> None:
         mem = _seed_codec(Memory(), MimeTypes.CSV, Codecs.GZIP)
-        io = CsvIO(holder=mem, owns_holder=False)
+        io = CsvFile(holder=mem, owns_holder=False)
         io.write_arrow_table(table)
 
         # Bytes on the holder are gzip-compressed.
@@ -93,7 +93,7 @@ class TestCsvGzipMemory:
         assert decoded.startswith(b'"id","name"')
 
         # Reading back transparently decompresses.
-        reader = CsvIO(holder=mem, owns_holder=False)
+        reader = CsvFile(holder=mem, owns_holder=False)
         loaded = reader.read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2, 3]
 
@@ -107,9 +107,9 @@ class TestNDJsonGzipMemory:
 
     def test_round_trip(self, table) -> None:
         mem = _seed_codec(Memory(), MimeTypes.NDJSON, Codecs.GZIP)
-        NDJsonIO(holder=mem, owns_holder=False).write_arrow_table(table)
+        NDJsonFile(holder=mem, owns_holder=False).write_arrow_table(table)
         assert mem.read_bytes()[:2] == b"\x1f\x8b"
-        loaded = NDJsonIO(holder=mem, owns_holder=False).read_arrow_table()
+        loaded = NDJsonFile(holder=mem, owns_holder=False).read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2, 3]
 
 
@@ -126,10 +126,10 @@ class TestArrowIPCZstd:
         except ImportError:
             pytest.skip("zstandard not installed")
         mem = _seed_codec(Memory(), MimeTypes.ARROW_IPC, Codecs.ZSTD)
-        ArrowIPCIO(holder=mem, owns_holder=False).write_arrow_table(table)
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(table)
         # Zstd magic bytes.
         assert mem.read_bytes()[:4] == b"\x28\xb5\x2f\xfd"
-        loaded = ArrowIPCIO(holder=mem, owns_holder=False).read_arrow_table()
+        loaded = ArrowIPCFile(holder=mem, owns_holder=False).read_arrow_table()
         assert loaded.equals(table)
 
 
@@ -149,7 +149,7 @@ class TestCsvGzipLocalPath:
         # via the URL extension chain at construction.
         assert target.stat().media_type.codec is Codecs.GZIP
 
-        CsvIO(holder=target, owns_holder=False).write_arrow_table(table)
+        CsvFile(holder=target, owns_holder=False).write_arrow_table(table)
         # On-disk bytes are gzip.
         assert target.read_bytes()[:2] == b"\x1f\x8b"
         # Decompressed contents look like CSV.
@@ -157,7 +157,7 @@ class TestCsvGzipLocalPath:
             assert fh.read().startswith(b'"id","name"')
 
         # Read-back side decompresses transparently.
-        loaded = CsvIO(holder=target, owns_holder=False).read_arrow_table()
+        loaded = CsvFile(holder=target, owns_holder=False).read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2, 3]
 
     def test_append_into_compressed_does_full_rewrite(
@@ -167,12 +167,12 @@ class TestCsvGzipLocalPath:
         from yggdrasil.io.primitive.csv_io import CsvOptions
 
         target = LocalPath(str(tmp_path / "trades.csv.gz"))
-        CsvIO(holder=target, owns_holder=False).write_arrow_table(table)
+        CsvFile(holder=target, owns_holder=False).write_arrow_table(table)
         more = pa.table({"id": [4], "name": ["d"]})
-        CsvIO(holder=target, owns_holder=False).write_arrow_batches(
+        CsvFile(holder=target, owns_holder=False).write_arrow_batches(
             more.to_batches(), options=CsvOptions(mode=Mode.APPEND),
         )
-        loaded = CsvIO(holder=target, owns_holder=False).read_arrow_table()
+        loaded = CsvFile(holder=target, owns_holder=False).read_arrow_table()
         assert loaded.num_rows == 4
         # Header still appears exactly once after the rewrite.
         decoded = gzip.decompress(target.read_bytes()).decode("utf-8")
@@ -185,16 +185,16 @@ class TestCsvGzipLocalPath:
 
 
 class TestParityWithCodec:
-    """A buffer written through CsvIO with a codec produces the same
+    """A buffer written through CsvFile with a codec produces the same
     arrow rows as the same data written without one."""
 
     def test_csv_compressed_equals_uncompressed(self, table) -> None:
-        plain = CsvIO()
+        plain = CsvFile()
         plain.write_arrow_table(table)
         plain_rows = plain.read_arrow_table().to_pylist()
 
         mem = _seed_codec(Memory(), MimeTypes.CSV, Codecs.GZIP)
-        compressed = CsvIO(holder=mem, owns_holder=False)
+        compressed = CsvFile(holder=mem, owns_holder=False)
         compressed.write_arrow_table(table)
         compressed_rows = compressed.read_arrow_table().to_pylist()
 
@@ -209,19 +209,19 @@ class TestParityWithCodec:
 class TestJsonGzipMemory:
     """Regression: an HTTP response body with
     ``Content-Encoding: gzip`` lands as ``application/json +
-    application/gzip`` on the buffer's MediaType. JsonIO must peel
+    application/gzip`` on the buffer's MediaType. JsonFile must peel
     the codec layer before parsing."""
 
     def test_round_trip(self, table) -> None:
         mem = _seed_codec(Memory(), MimeTypes.JSON, Codecs.GZIP)
-        JsonIO(holder=mem, owns_holder=False).write_arrow_table(table)
+        JsonFile(holder=mem, owns_holder=False).write_arrow_table(table)
         # On-the-wire bytes are gzip-framed.
         assert mem.read_bytes()[:2] == b"\x1f\x8b"
         # Decompressed payload looks like a JSON array.
         decoded = gzip.decompress(mem.read_bytes())
         assert decoded.startswith(b"[")
         # Read-back transparently decompresses.
-        loaded = JsonIO(holder=mem, owns_holder=False).read_arrow_table()
+        loaded = JsonFile(holder=mem, owns_holder=False).read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2, 3]
 
     def test_reads_externally_gzipped_array(self) -> None:
@@ -233,15 +233,15 @@ class TestJsonGzipMemory:
         # the test mirrors the HTTP response path (response body is
         # already gzip-framed; only the MediaType is stamped).
         BytesIO(holder=mem, owns_holder=False).write_bytes(gzip.compress(body))
-        loaded = JsonIO(holder=mem, owns_holder=False).read_arrow_table()
+        loaded = JsonFile(holder=mem, owns_holder=False).read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2]
 
     def test_reads_externally_gzipped_ndjson_shape(self) -> None:
-        # JsonIO also accepts NDJSON-shaped (newline-terminated) input.
+        # JsonFile also accepts NDJSON-shaped (newline-terminated) input.
         body = b'{"id":1,"name":"a"}\n{"id":2,"name":"b"}\n'
         mem = _seed_codec(Memory(), MimeTypes.JSON, Codecs.GZIP)
         BytesIO(holder=mem, owns_holder=False).write_bytes(gzip.compress(body))
-        loaded = JsonIO(holder=mem, owns_holder=False).read_arrow_table()
+        loaded = JsonFile(holder=mem, owns_holder=False).read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2]
 
 
@@ -261,12 +261,12 @@ class TestXlsxGzipMemory:
         except ImportError:
             pytest.skip("openpyxl not installed")
         mem = _seed_codec(Memory(), MimeTypes.XLSX, Codecs.GZIP)
-        XlsxIO(holder=mem, owns_holder=False).write_arrow_table(table)
+        XlsxFile(holder=mem, owns_holder=False).write_arrow_table(table)
         assert mem.read_bytes()[:2] == b"\x1f\x8b"
         # Decompressed payload is a ZIP (xlsx archive).
         decoded = gzip.decompress(mem.read_bytes())
         assert decoded[:2] == b"PK"
-        loaded = XlsxIO(holder=mem, owns_holder=False).read_arrow_table()
+        loaded = XlsxFile(holder=mem, owns_holder=False).read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2, 3]
 
 
@@ -281,12 +281,12 @@ class TestParquetGzipMemory:
 
     def test_round_trip(self, table) -> None:
         mem = _seed_codec(Memory(), MimeTypes.PARQUET, Codecs.GZIP)
-        ParquetIO(holder=mem, owns_holder=False).write_arrow_table(table)
+        ParquetFile(holder=mem, owns_holder=False).write_arrow_table(table)
         assert mem.read_bytes()[:2] == b"\x1f\x8b"
         decoded = gzip.decompress(mem.read_bytes())
         # Parquet files start with the "PAR1" magic.
         assert decoded[:4] == b"PAR1"
-        loaded = ParquetIO(holder=mem, owns_holder=False).read_arrow_table()
+        loaded = ParquetFile(holder=mem, owns_holder=False).read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2, 3]
 
 
@@ -299,7 +299,7 @@ class TestArrowIPCGzipMemory:
 
     def test_round_trip(self, table) -> None:
         mem = _seed_codec(Memory(), MimeTypes.ARROW_IPC, Codecs.GZIP)
-        ArrowIPCIO(holder=mem, owns_holder=False).write_arrow_table(table)
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(table)
         assert mem.read_bytes()[:2] == b"\x1f\x8b"
-        loaded = ArrowIPCIO(holder=mem, owns_holder=False).read_arrow_table()
+        loaded = ArrowIPCFile(holder=mem, owns_holder=False).read_arrow_table()
         assert loaded.equals(table)

@@ -42,7 +42,7 @@ satisfy it without lying.
 Format registry
 ---------------
 
-Concrete byte-backed leaves (ParquetIO, CsvIO, ArrowIPCIO, …)
+Concrete byte-backed leaves (ParquetFile, CsvFile, ArrowIPCFile, …)
 declare :attr:`Tabular.mime_type` at the class level and the
 :meth:`__init_subclass__` hook auto-registers them in
 :data:`_TABULAR_REGISTRY`. :meth:`Tabular.for_holder` resolves a
@@ -100,7 +100,7 @@ class Tabular(ABC, Generic[O]):
     Concrete implementers add whatever substrate they need (a
     holder + cursor for byte-backed shapes, a session reference
     for catalog-backed shapes, etc.) and override the two batch
-    hooks. Format-specific leaves (ParquetIO, CsvIO, ArrowIPCIO, …)
+    hooks. Format-specific leaves (ParquetFile, CsvFile, ArrowIPCFile, …)
     additionally declare :attr:`mime_type` to register against the
     process-wide :data:`_TABULAR_REGISTRY` — :meth:`for_holder` uses
     that registry to dispatch from a holder's :class:`MediaType` to
@@ -188,7 +188,7 @@ class Tabular(ABC, Generic[O]):
         Looks up :attr:`MediaType.mime_type`'s name in
         :data:`_TABULAR_REGISTRY`. Codec is orthogonal — Parquet
         compressed with zstd or snappy still resolves to
-        :class:`ParquetIO`; the codec layer is the holder's concern.
+        :class:`ParquetFile`; the codec layer is the holder's concern.
 
         Returns *default* on miss when supplied; otherwise raises
         :class:`KeyError` with a list of registered names.
@@ -452,8 +452,8 @@ class Tabular(ABC, Generic[O]):
 
         Dispatch goes through :func:`yggdrasil.io.tabular.lazy.lazy_for`,
         which picks the most specific :class:`LazyTabular` subclass
-        registered for ``type(self)`` (``LazyParquetIO`` for
-        :class:`ParquetIO`, ``LazyFolderIO`` for :class:`FolderIO`,
+        registered for ``type(self)`` (``LazyParquetFile`` for
+        :class:`ParquetFile`, ``LazyFolderIO`` for :class:`FolderIO`,
         …) and falls back to the plain :class:`LazyTabular` when
         nothing matches.
         """

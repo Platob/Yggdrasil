@@ -22,8 +22,8 @@ import pytest
 from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.io.nested.zip_io import ZipEntryIO, ZipIO, ZipOptions
 from yggdrasil.io.path.local_path import LocalPath
-from yggdrasil.io.primitive.csv_io import CsvIO
-from yggdrasil.io.primitive.parquet_io import ParquetIO
+from yggdrasil.io.primitive.csv_io import CsvFile
+from yggdrasil.io.primitive.parquet_io import ParquetFile
 from yggdrasil.io.tabular import Tabular
 
 
@@ -103,7 +103,7 @@ class TestTabularDispatch:
     def test_skip_non_tabular_entries_in_aggregate_read(self) -> None:
         # Mix a tabular entry with a non-tabular one; the aggregate
         # read filters out the latter automatically.
-        csv = CsvIO()
+        csv = CsvFile()
         csv.write_arrow_table(pa.table({"id": [1, 2]}))
         z = ZipIO()
         z.write_entries([
@@ -187,7 +187,7 @@ class TestExternalReader:
             assert zf.namelist() == ["data.parquet"]
             payload = zf.read("data.parquet")
         # The payload is a real parquet file readable directly.
-        leaf = ParquetIO(payload)
+        leaf = ParquetFile(payload)
         assert leaf.read_arrow_table().equals(table)
 
     def test_external_writer_into_path_open(self, tmp_path) -> None:

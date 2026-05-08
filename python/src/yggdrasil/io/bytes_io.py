@@ -157,8 +157,8 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
 
     The two :class:`Tabular` batch hooks default to
     :class:`NotImplementedError` — a plain :class:`BytesIO` doesn't
-    know what its bytes encode. Subclasses (ParquetIO, CsvIO,
-    ArrowIPCIO, …) override the hooks to do format-specific decoding
+    know what its bytes encode. Subclasses (ParquetFile, CsvFile,
+    ArrowIPCFile, …) override the hooks to do format-specific decoding
     against the same holder.
     """
 
@@ -186,8 +186,8 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
 
         Lets ``BytesIO(data, media_type=MediaTypes.PARQUET)``,
         ``BytesIO(path="…/x.xlsx")``, or ``BytesIO(holder=local_path)``
-        all land on the right leaf (:class:`ParquetIO`,
-        :class:`XlsxIO`, …) without the caller naming it. Resolution
+        all land on the right leaf (:class:`ParquetFile`,
+        :class:`XlsxFile`, …) without the caller naming it. Resolution
         order:
 
         1. Explicit *media_type* kwarg.
@@ -196,7 +196,7 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
            ``pathlib.Path`` / :class:`URL`).
         4. *holder* — its ``stat().media_type``.
 
-        Subclass calls (``ParquetIO(...)``) skip the dispatch and
+        Subclass calls (``ParquetFile(...)``) skip the dispatch and
         stay on the concrete class.
         """
         if cls is BytesIO:
@@ -624,8 +624,8 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         + one ``write`` (append).
 
         Built for the format-leaf write path: each leaf
-        (:class:`ParquetIO`, :class:`ArrowIPCIO`, :class:`CsvIO`,
-        :class:`NDJsonIO`, …) drives its encoder against an Arrow
+        (:class:`ParquetFile`, :class:`ArrowIPCFile`, :class:`CsvFile`,
+        :class:`NDJsonFile`, …) drives its encoder against an Arrow
         sink, then hands the resulting buffer to this method instead
         of streaming the encoder's per-row-group / per-batch /
         per-row writes through :meth:`BytesIO.write`. Skips the
@@ -708,13 +708,13 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
     def _read_arrow_batches(self, options: O) -> Iterator[pa.RecordBatch]:
         """Default — opaque buffer can't honestly yield Arrow batches.
 
-        Format-specific subclasses (ParquetIO, CsvIO, ArrowIPCIO, …)
+        Format-specific subclasses (ParquetFile, CsvFile, ArrowIPCFile, …)
         override against the same holder. For dispatch by media type,
         construct via the format leaf directly.
         """
         raise NotImplementedError(
             f"{type(self).__name__} has no tabular decoder. "
-            "Construct via the format leaf (ParquetIO, CsvIO, …) "
+            "Construct via the format leaf (ParquetFile, CsvFile, …) "
             "to read Arrow record batches from this byte buffer."
         )
 
@@ -729,7 +729,7 @@ class BytesIO(Tabular[O], Disposable, IO[bytes]):
         """
         raise NotImplementedError(
             f"{type(self).__name__} has no tabular encoder. "
-            "Construct via the format leaf (ParquetIO, CsvIO, …) "
+            "Construct via the format leaf (ParquetFile, CsvFile, …) "
             "to write Arrow record batches into this byte buffer."
         )
 

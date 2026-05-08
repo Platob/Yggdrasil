@@ -423,15 +423,15 @@ class TestResponseRoundTrip:
         Regression test: ``Response._from_arrow_cols`` previously
         constructed a plain :class:`BytesIO` and only attached the
         media type post-hoc, so the buffer class wasn't promoted to
-        the registered leaf (``JsonIO``, ``ParquetIO``, …).
+        the registered leaf (``JsonFile``, ``ParquetFile``, …).
         """
-        from yggdrasil.io.primitive import JsonIO
+        from yggdrasil.io.primitive import JsonFile
         from yggdrasil.data.enums.media_type import MediaType
         from yggdrasil.data.enums.mime_type import MimeTypes
 
         req = _make_request()
         buf = BytesIO(b'{"x":1}', media_type=MediaType(MimeTypes.JSON))
-        assert isinstance(buf, JsonIO)
+        assert isinstance(buf, JsonFile)
         orig = Response(
             request=req,
             status_code=200,
@@ -440,11 +440,11 @@ class TestResponseRoundTrip:
             buffer=buf,
             received_at=_NOW,
         )
-        assert isinstance(orig.buffer, JsonIO)
+        assert isinstance(orig.buffer, JsonFile)
 
         ser = ResponseSerialized.from_value(orig)
         r = ser.value
-        assert isinstance(r.buffer, JsonIO)
+        assert isinstance(r.buffer, JsonFile)
         assert r.buffer.to_bytes() == b'{"x":1}'
 
 

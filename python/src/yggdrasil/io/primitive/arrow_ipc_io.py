@@ -1,6 +1,6 @@
 """Arrow IPC file Tabular leaf over the new :class:`BytesIO` substrate.
 
-:class:`ArrowIPCIO` is a :class:`BytesIO` subclass with
+:class:`ArrowIPCFile` is a :class:`BytesIO` subclass with
 :attr:`mime_type` set to :data:`MimeTypes.ARROW_IPC`, which auto-
 registers it in the Tabular registry so :meth:`Tabular.for_holder`
 dispatches a holder with that media type to this class.
@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     pass
 
 
-__all__ = ["ArrowIPCIO", "ArrowIPCOptions"]
+__all__ = ["ArrowIPCFile", "ArrowIPCOptions", "LazyArrowIPCFile"]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -67,7 +67,7 @@ class ArrowIPCOptions(CastOptions):
         )
 
 
-class ArrowIPCIO(BytesIO):
+class ArrowIPCFile(BytesIO):
     """:class:`Tabular` leaf for the Arrow IPC **file** format.
 
     File-format reads parse the footer once on construction of the
@@ -230,3 +230,70 @@ class ArrowIPCIO(BytesIO):
             # behavior is APPEND.
             return Mode.APPEND
         return Mode.OVERWRITE
+
+
+# ----------------------------------------------------------------------
+# Lazy wrapper — pushes column projection (+ pyarrow filter) into the
+# IPC reader for plans that only carry those ops.
+# ----------------------------------------------------------------------
+
+from yggdrasil.lazy_imports import pyarrow_dataset_module  # noqa: E402
+from yggdrasil.io.tabular.lazy import LazyTabular  # noqa: E402
+
+
+class LazyArrowIPCFile(LazyTabular):
+    """:class:`LazyTabular` over an :class:`ArrowIPCFile` source.
+
+    For local-path holders, plans containing only :class:`Select`
+    (bare names) and :class:`Filter` (yggdrasil predicates) push
+    column projection and the AND-merged filter into a
+    :class:`pyarrow.dataset.Dataset` scanner over the IPC file. For
+    in-memory holders the reader can't take a path; column
+    projection still fires by selecting on the loaded table, and a
+    remaining filter falls through to the base polars route.
+    """
+
+    source_cls: ClassVar["type"] = ArrowIPCFile
+
+    @property
+    def source(self) -> "ArrowIPCFile":
+        return self._source  # type: ignore[return-value]
+
+    def _read_arrow_batches(
+        self, options: ArrowIPCOptions,
+    ) -> Iterator[pa.RecordBatch]:
+        spec = self._arrow_pushdown_spec()
+        if spec is None:
+            yield from super()._read_arrow_batches(options)
+            return
+
+        columns, filt = spec
+        src = self._source
+        if src.size == 0:
+            return
+
+        path = self._local_path_str()
+        if path is not None:
+            pds = pyarrow_dataset_module()
+            scanner = pds.dataset(path, format="ipc").scanner(
+                columns=columns, filter=filt,
+            )
+            for batch in scanner.to_batches():
+                if batch.num_rows > 0:
+                    yield options.cast_arrow_tabular(batch)
+            return
+
+        # In-memory: IPC has no on-disk column-skip primitive for a
+        # file-like input, so read the table once and project /
+        # filter post-load. Falling back to the base path on a
+        # filter would route through polars; keeping it here keeps
+        # the fast Arrow path.
+        with src._format_input() as v:
+            table = ipc.RecordBatchFileReader(v).read_all()
+        if columns is not None:
+            table = table.select(columns)
+        if filt is not None:
+            table = table.filter(filt)
+        for batch in table.to_batches():
+            if batch.num_rows > 0:
+                yield options.cast_arrow_tabular(batch)

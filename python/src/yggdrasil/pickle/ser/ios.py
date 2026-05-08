@@ -223,7 +223,7 @@ def _decode_media_type(metadata: Mapping[bytes, bytes] | None):
     Returned to the caller (rather than mutated onto an existing buffer)
     so it can be passed to ``BytesIO(data, media_type=...)``. That route
     runs the registry dispatch in :meth:`BytesIO.__new__` and lands on
-    the right registered leaf (ParquetIO, JsonIO, …); a post-hoc
+    the right registered leaf (ParquetFile, JsonFile, …); a post-hoc
     ``buf._stats.media_type = ...`` would leave the class as the opaque
     ``BytesIO``.
     """

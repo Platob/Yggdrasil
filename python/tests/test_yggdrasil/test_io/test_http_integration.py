@@ -561,7 +561,7 @@ class TestFromUrllib3:
     def test_from_urllib3_returns_tabular_buffer_for_json(self) -> None:
         import datetime as dt
         from yggdrasil.io.http_.response import HTTPResponse
-        from yggdrasil.io.primitive.json_io import JsonIO
+        from yggdrasil.io.primitive.json_io import JsonFile
 
         raw = self._make_raw(
             body=b'{"ok":true}',
@@ -573,7 +573,7 @@ class TestFromUrllib3:
             tags=None,
             received_at=dt.datetime.now(dt.timezone.utc),
         )
-        assert isinstance(resp.buffer, JsonIO)
+        assert isinstance(resp.buffer, JsonFile)
         resp.drain_urllib3(raw, stream=False)
         assert raw.released is True
         assert resp.buffer.to_bytes() == b'{"ok":true}'

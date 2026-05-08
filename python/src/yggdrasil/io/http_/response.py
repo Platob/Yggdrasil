@@ -49,7 +49,7 @@ class HTTPResponse(Response):
     ) -> "HTTPResponse":
         # Pre-infer media type from the response's Content-Type /
         # Content-Encoding so the buffer is constructed as the
-        # registered leaf (ParquetIO, JsonIO, ArrowIPCIO, …) up
+        # registered leaf (ParquetFile, JsonFile, ArrowIPCFile, …) up
         # front. Once bytes land via drain_urllib3, callers get a
         # tabular-ready buffer without an extra as_media() hop.
         headers = dict(response.headers)

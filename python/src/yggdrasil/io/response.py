@@ -612,7 +612,7 @@ class Response(Tabular[CastOptions]):
             f"{type(self).__name__} is read-only. To persist a "
             "response row, call ``response.to_arrow_batch(parse=False)`` "
             "and write that batch through a writable Tabular sink "
-            "(ArrowTabular, ParquetIO, a Delta/SQL table, …)."
+            "(ArrowTabular, ParquetFile, a Delta/SQL table, …)."
         )
 
     @property

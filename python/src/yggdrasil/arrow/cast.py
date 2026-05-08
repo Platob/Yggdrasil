@@ -473,7 +473,7 @@ def any_to_arrow_table(
         table = _project(obj.read_all(), options)
 
     elif _is_yggdrasil_tabular(obj):
-        # ``Tabular`` (Response, StatementResult, ParquetIO, …) owns
+        # ``Tabular`` (Response, StatementResult, ParquetFile, …) owns
         # its own engine fan-out — let it produce the table so format
         # leaves use their native scanners (Parquet predicate pushdown,
         # StatementResult's persisted-frame short-circuit) instead of

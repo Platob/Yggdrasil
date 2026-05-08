@@ -59,7 +59,7 @@ if TYPE_CHECKING:
     from yggdrasil.io.path import Path
 
 
-__all__ = ["FolderIO", "FolderOptions"]
+__all__ = ["FolderIO", "FolderOptions", "LazyFolderIO"]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -68,7 +68,7 @@ class FolderOptions(CastOptions):
 
     #: Media type of newly minted child files. Drives both the
     #: filename extension and the :class:`Tabular` leaf class
-    #: (``ParquetIO`` / ``ArrowIPCIO`` / ``CsvIO`` / …) the folder
+    #: (``ParquetFile`` / ``ArrowIPCFile`` / ``CsvFile`` / …) the folder
     #: dispatches to. Defaults to Arrow IPC — matches the in-memory
     #: batch shape, no row-group footer to rewrite, cheapest format
     #: to land a stream of small batches into. Pass
@@ -160,8 +160,8 @@ class FolderIO(Tabular[FolderOptions]):
         Sub-directories come back as a fresh :class:`FolderIO`. File
         entries route through :class:`MediaType.from_` (extension
         first, magic-byte fallback) to a registered :class:`Tabular`
-        leaf — :class:`ParquetIO` for ``.parquet``,
-        :class:`ArrowIPCIO` for ``.arrow``, etc. Files that don't
+        leaf — :class:`ParquetFile` for ``.parquet``,
+        :class:`ArrowIPCFile` for ``.arrow``, etc. Files that don't
         resolve fall back to a plain :class:`BytesIO`, which is
         useful for the children-surface walk but raises on the
         Tabular hooks (so they're transparently skipped by
@@ -852,3 +852,77 @@ def _chain_first(
 def _chain_iter(*iters: "Iterable[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
     for it in iters:
         yield from it
+
+
+# ----------------------------------------------------------------------
+# Lazy wrapper — pushes the commutative prefix of the plan into each
+# child so per-leaf format-aware pushdowns (parquet column projection,
+# pyarrow filter expressions, …) fire on the way *in*, instead of
+# running over an eagerly materialized record-batch reader.
+# ----------------------------------------------------------------------
+
+from yggdrasil.io.tabular.lazy import LazyTabular  # noqa: E402
+from yggdrasil.lazy_imports import polars_module  # noqa: E402
+
+
+class LazyFolderIO(LazyTabular):
+    """:class:`LazyTabular` over a :class:`FolderIO` source.
+
+    Splits the plan at the first non-commutative op via
+    :meth:`ExecutionPlan.split_pushdownable` and dispatches the
+    *prefix* through each child's own ``execute_plan`` — so a
+    ``where`` over a parquet folder becomes a per-leaf
+    :class:`LazyParquetFile` that pushes the filter into the
+    parquet reader's row-group pruning. The non-commutative *tail*
+    (``GroupByAgg`` / ``Apply`` / ``Join``) runs once over a
+    :class:`UnionTabular` of the pushed children so the union
+    schema reconciliation only has to happen at one place.
+
+    An empty folder yields an empty LazyFrame / batch stream.
+    """
+
+    source_cls: "ClassVar[type[Tabular]]" = FolderIO
+
+    @property
+    def source(self) -> "FolderIO":
+        return self._source  # type: ignore[return-value]
+
+    def _push_children(self) -> "tuple[tuple[Tabular, ...], Any]":
+        """Return ``(children, tail_plan)`` with prefix pushed into each child."""
+        prefix, tail = self._plan.split_pushdownable()
+        children = tuple(self._source.iter_children())
+        if prefix.is_empty():
+            return children, tail
+        return tuple(c.execute_plan(prefix) for c in children), tail
+
+    def _read_arrow_batches(
+        self, options: FolderOptions,
+    ) -> "Iterator[pa.RecordBatch]":
+        children, tail = self._push_children()
+        if not children:
+            return
+        if tail.is_empty():
+            # No post-union reshape — stream each child directly so
+            # the format's native arrow pushdown (parquet column /
+            # filter, ipc projection, csv include_columns) reaches
+            # the holder without a polars round-trip.
+            for child in children:
+                child_opts = child.options_class()()
+                for batch in child._read_arrow_batches(child_opts):
+                    if batch.num_rows > 0:
+                        yield options.cast_arrow_tabular(batch)
+            return
+        # Tail present: route through UnionTabular for union-schema
+        # reconciliation + the post-union ops (group_by / apply).
+        from yggdrasil.io.tabular.union import UnionTabular
+
+        unioned = UnionTabular(children, plan=tail)
+        yield from unioned._read_arrow_batches(options)
+
+    def _build_lazy(self, options: FolderOptions) -> "Any":
+        from yggdrasil.io.tabular.union import UnionTabular
+
+        children = tuple(self._source.iter_children())
+        if not children:
+            return polars_module().LazyFrame()
+        return UnionTabular(children, plan=self._plan)._build_lazy(options)

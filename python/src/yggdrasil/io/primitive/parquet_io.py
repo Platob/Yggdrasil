@@ -1,6 +1,6 @@
 """Parquet Tabular leaf over the new :class:`BytesIO` substrate.
 
-:class:`ParquetIO` is a :class:`BytesIO` subclass that auto-registers
+:class:`ParquetFile` is a :class:`BytesIO` subclass that auto-registers
 under :data:`MimeTypes.PARQUET`. The Parquet file format is
 footer-indexed: readers parse the metadata block at the end of the
 file once and use it to plan column reads. Writes buffer row groups
@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     import pyarrow.dataset as pds
 
 
-__all__ = ["ParquetIO", "ParquetOptions"]
+__all__ = ["LazyParquetFile", "ParquetFile", "ParquetOptions"]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -58,7 +58,7 @@ class ParquetOptions(CastOptions):
     use_threads: bool = True
 
 
-class ParquetIO(BytesIO):
+class ParquetFile(BytesIO):
     """:class:`Tabular` leaf for Apache Parquet."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.PARQUET
@@ -284,3 +284,85 @@ class ParquetIO(BytesIO):
             return pl.read_parquet(path, use_pyarrow=False)
         with self._format_input() as v:
             return pl.read_parquet(v, use_pyarrow=False)
+
+
+# ----------------------------------------------------------------------
+# Lazy wrapper — pushes column projection + predicate filters straight
+# into the parquet reader for plans that only contain those ops.
+# ----------------------------------------------------------------------
+
+from yggdrasil.io.tabular.lazy import LazyTabular  # noqa: E402  (circular-safe)
+
+
+class LazyParquetFile(LazyTabular):
+    """:class:`LazyTabular` over a :class:`ParquetFile` source.
+
+    Plans containing only :class:`Select` (bare column names) and
+    :class:`Filter` (yggdrasil predicates that lift to
+    :class:`pyarrow.compute.Expression`) push column projection and
+    the AND-merged filter directly into a
+    :class:`pyarrow.dataset.Dataset` scanner — so unselected columns
+    are never read off disk and row groups whose footer statistics
+    rule out the predicate are skipped. For in-memory holders the
+    scanner can't take a file-like, so column projection still
+    fires via :meth:`pyarrow.parquet.ParquetFile.iter_batches` and
+    a remaining filter falls through to the base polars route.
+
+    Plans containing :class:`GroupByAgg` / :class:`Apply` /
+    :class:`Join` (or selectors that aren't bare column names)
+    inherit the base :class:`LazyTabular` polars-LazyFrame path,
+    which still pushes predicate / projection through
+    ``pl.scan_parquet`` at the format level.
+    """
+
+    source_cls: ClassVar["type"] = ParquetFile
+
+    @property
+    def source(self) -> "ParquetFile":
+        return self._source  # type: ignore[return-value]
+
+    def _read_arrow_batches(
+        self, options: ParquetOptions,
+    ) -> Iterator[pa.RecordBatch]:
+        spec = self._arrow_pushdown_spec()
+        if spec is None:
+            yield from super()._read_arrow_batches(options)
+            return
+
+        columns, filt = spec
+        src = self._source
+        if src.size == 0:
+            return
+
+        batch_size = int(getattr(options, "row_size", None) or 65536)
+        path = src._local_path_str()
+        if path is not None:
+            pds = pyarrow_dataset_module()
+            scanner = pds.dataset(path, format="parquet").scanner(
+                columns=columns,
+                filter=filt,
+                batch_size=batch_size,
+                use_threads=options.use_threads,
+            )
+            for batch in scanner.to_batches():
+                if batch.num_rows > 0:
+                    yield options.cast_arrow_tabular(batch)
+            return
+
+        # In-memory holder: pq.ParquetFile.iter_batches takes
+        # ``columns=`` but its ``filters=`` slot wants DNF tuples
+        # rather than pyarrow Expressions. Push the projection
+        # only; if a filter is present, defer to the base path so
+        # polars' scan_parquet can do its own predicate pushdown.
+        if filt is not None:
+            yield from super()._read_arrow_batches(options)
+            return
+        with src._format_input() as v:
+            with pq.ParquetFile(v) as pf:
+                for batch in pf.iter_batches(
+                    batch_size=batch_size,
+                    columns=columns,
+                    use_threads=options.use_threads,
+                ):
+                    if batch.num_rows > 0:
+                        yield options.cast_arrow_tabular(batch)

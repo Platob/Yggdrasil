@@ -404,10 +404,10 @@ class TestOptimize:
         y = YGGFolderIO(path=str(tmp_path))
         # Drop two parquet parts directly under the root so there's
         # something to compact.
-        from yggdrasil.io.primitive.parquet_io import ParquetIO
+        from yggdrasil.io.primitive.parquet_io import ParquetFile
         from yggdrasil.io.path.local_path import LocalPath
         for name in ("part-1.parquet", "part-2.parquet"):
-            ParquetIO(
+            ParquetFile(
                 holder=LocalPath(str(tmp_path / name)), owns_holder=False,
             ).write_arrow_table(table)
         assert y.optimize() == 1

@@ -1,9 +1,9 @@
 """JSON Tabular leaf over the new :class:`BytesIO` substrate.
 
-:class:`JsonIO` writes a single JSON document — either an array of
+:class:`JsonFile` writes a single JSON document — either an array of
 objects (``[{...}, {...}, …]``) or a single object — and reads
 either shape back. For the streamable line-per-record format use
-:class:`NDJsonIO`.
+:class:`NDJsonFile`.
 
 Reads accept three on-disk shapes:
 
@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     import pyarrow.dataset as pds
 
 
-__all__ = ["JsonIO", "JsonOptions"]
+__all__ = ["JsonFile", "JsonOptions", "LazyJsonFile"]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -58,7 +58,7 @@ class JsonOptions(CastOptions):
         return pa_json.ParseOptions()
 
 
-class JsonIO(BytesIO):
+class JsonFile(BytesIO):
     """:class:`Tabular` leaf for JSON documents."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.JSON
@@ -223,3 +223,63 @@ class JsonIO(BytesIO):
             if full_path is not None:
                 return pds.dataset(full_path(), format="json")
         return super()._read_arrow_dataset(options)
+
+
+# ----------------------------------------------------------------------
+# Lazy wrapper — for plans containing only Select / Filter, route
+# through the pyarrow.dataset scanner; everything else routes via the
+# base path.
+# ----------------------------------------------------------------------
+
+from yggdrasil.io.tabular.lazy import LazyTabular  # noqa: E402
+
+
+class LazyJsonFile(LazyTabular):
+    """:class:`LazyTabular` over a :class:`JsonFile` source.
+
+    For NDJSON-flavored on-disk JSON at a local path, projections
+    and yggdrasil predicates push through a
+    :class:`pyarrow.dataset.Dataset` scanner. The single-array and
+    single-object on-disk shapes don't have a streaming reader and
+    fall back to the base path, which still applies the plan
+    against the materialized table.
+    """
+
+    source_cls: ClassVar["type"] = JsonFile
+
+    @property
+    def source(self) -> "JsonFile":
+        return self._source  # type: ignore[return-value]
+
+    def _read_arrow_batches(
+        self, options: JsonOptions,
+    ) -> Iterator[pa.RecordBatch]:
+        spec = self._arrow_pushdown_spec()
+        if spec is None:
+            yield from super()._read_arrow_batches(options)
+            return
+
+        columns, filt = spec
+        src = self._source
+        if src.size == 0:
+            return
+
+        path = self._local_path_str()
+        if path is None:
+            yield from super()._read_arrow_batches(options)
+            return
+
+        try:
+            pds = pyarrow_dataset_module()
+            scanner = pds.dataset(path, format="json").scanner(
+                columns=columns, filter=filt,
+            )
+            for batch in scanner.to_batches():
+                if batch.num_rows > 0:
+                    yield options.cast_arrow_tabular(batch)
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError, OSError):
+            # Single-object / array-of-objects shapes aren't readable
+            # by the JSON scanner (which expects NDJSON). Fall back
+            # to the base path, which routes through the JsonFile's
+            # own _read_arrow_batches with full shape detection.
+            yield from super()._read_arrow_batches(options)

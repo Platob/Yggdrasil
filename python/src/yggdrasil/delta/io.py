@@ -58,7 +58,7 @@ from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.data.options import CastOptions
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.nested.folder_io import FolderIO, FolderOptions
-from yggdrasil.io.primitive.parquet_io import ParquetIO, ParquetOptions
+from yggdrasil.io.primitive.parquet_io import ParquetFile, ParquetOptions
 
 from yggdrasil.delta.deletion_vector import (
     DeletionVector,
@@ -224,7 +224,7 @@ class DeltaIO(FolderIO):
         1. Resolve snapshot at ``options.version`` (HEAD by default).
         2. Filter active files via ``options.prune_values`` (partition
            pruning) before any parquet open.
-        3. Read each parquet through :class:`ParquetIO` so codec /
+        3. Read each parquet through :class:`ParquetFile` so codec /
            memory-map / native pushdown all work as usual.
         4. Mask rows with the file's :class:`DeletionVector` when one
            is present.
@@ -276,7 +276,7 @@ class DeltaIO(FolderIO):
         sidecar_cache: dict,
     ) -> Iterator[pa.RecordBatch]:
         file_path = snap.resolve(add)
-        leaf = ParquetIO(holder=file_path, owns_holder=False)
+        leaf = ParquetFile(holder=file_path, owns_holder=False)
 
         # Decode the file's DV once (shared sidecar cache amortizes
         # multiple files that point at the same sidecar window).
@@ -577,7 +577,7 @@ class DeltaIO(FolderIO):
                 drop = [c for c in partition_columns if c in sb.schema.names]
                 payload_batches.append(sb.drop_columns(drop) if drop else sb)
 
-            leaf = ParquetIO(holder=file_path, owns_holder=False)
+            leaf = ParquetFile(holder=file_path, owns_holder=False)
             with leaf as opened:
                 opened._write_arrow_batches(
                     payload_batches,
@@ -669,7 +669,7 @@ class DeltaIO(FolderIO):
         ck_path = self._log.log_path / format_checkpoint_v1_name(version)
         table = _actions_to_arrow_table(actions)
 
-        leaf = ParquetIO(holder=ck_path, owns_holder=False)
+        leaf = ParquetFile(holder=ck_path, owns_holder=False)
         with leaf as opened:
             opened._write_arrow_table(table, ParquetOptions(mode=Mode.OVERWRITE))
 
@@ -681,7 +681,7 @@ class DeltaIO(FolderIO):
         sidecar_path = sidecar_dir / sidecar_name
 
         table = _actions_to_arrow_table(actions)
-        leaf = ParquetIO(holder=sidecar_path, owns_holder=False)
+        leaf = ParquetFile(holder=sidecar_path, owns_holder=False)
         with leaf as opened:
             opened._write_arrow_table(table, ParquetOptions(mode=Mode.OVERWRITE))
 
@@ -730,7 +730,7 @@ class DeltaIO(FolderIO):
     # ==================================================================
 
     def iter_children(self) -> "Iterator":
-        """Yield one :class:`ParquetIO` per active file in the snapshot.
+        """Yield one :class:`ParquetFile` per active file in the snapshot.
 
         Override of :meth:`FolderIO.iter_children`: we never list the
         physical folder. The snapshot is the source of truth.
@@ -738,7 +738,7 @@ class DeltaIO(FolderIO):
         snap = self.snapshot()
         for add in snap.active_files.values():
             file_path = snap.resolve(add)
-            yield self.adopt_child(ParquetIO(holder=file_path, owns_holder=False))
+            yield self.adopt_child(ParquetFile(holder=file_path, owns_holder=False))
 
 
 # ---------------------------------------------------------------------------
