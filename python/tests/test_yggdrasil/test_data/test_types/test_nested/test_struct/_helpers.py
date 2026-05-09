@@ -26,6 +26,15 @@ def _normalize_scalar(value: Any) -> Any:
 
 
 def normalize_nested(value: Any) -> Any:
+    # PySpark hands struct columns back as ``Row`` when the toPandas
+    # path bypasses Arrow optimization (Java 17+ on PySpark 3.x);
+    # collapse to a plain dict so assertions can stay direct.
+    as_dict = getattr(value, "asDict", None)
+    if callable(as_dict):
+        try:
+            value = as_dict(recursive=True)
+        except TypeError:
+            value = as_dict()
     if isinstance(value, dict):
         return {k: normalize_nested(v) for k, v in value.items()}
     if isinstance(value, list):

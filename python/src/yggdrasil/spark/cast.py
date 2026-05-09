@@ -57,12 +57,127 @@ __all__ = [
     "any_to_spark_dataframe",
     "cast_spark_column",
     "cast_spark_dataframe",
+    "spark_dataframe_to_arrow",
+    "spark_dataframe_to_pandas",
 ]
 
 #: Cap on per-batch Arrow size handed to ``createDataFrame``. 128 MiB matches
 #: Spark's preferred Arrow batch size and keeps a single oversized chunk from
 #: pinning a partition's working memory.
 _SPARK_ARROW_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
+
+
+def spark_dataframe_to_arrow(df: "pyspark_sql.DataFrame") -> pa.Table:
+    """Materialize *df* as a ``pa.Table``, working on PySpark 3 and 4.
+
+    PySpark 4.x added the native :meth:`pyspark.sql.DataFrame.toArrow`
+    helper that we prefer when available — single driver-side collect
+    that round-trips through Arrow IPC.  Older releases (3.x) don't
+    expose it; we fall back to the streaming
+    :meth:`toArrowBatchIterator` API when present, and finally to a
+    pandas round-trip.
+
+    Both Arrow paths can fail at the JVM level on Java 17+ when the
+    cluster JVM was started without the ``sun.misc.Unsafe`` /
+    ``java.nio.DirectByteBuffer`` ``--add-opens`` flags
+    (``IllegalAccessException`` deep inside the Spark allocator).  We
+    catch that and fall back to ``toPandas`` so callers see a working
+    table instead of a JVM stack trace.  The pandas path itself
+    benefits from Spark's Arrow optimization when the session has
+    ``spark.sql.execution.arrow.pyspark.enabled=true``.
+
+    Centralizing the polyfill here keeps callers from sprinkling
+    ``hasattr(df, "toArrow")`` and exception-handling boilerplate
+    throughout the codebase.
+    """
+    to_arrow = getattr(df, "toArrow", None)
+    if callable(to_arrow):
+        try:
+            return to_arrow()
+        except Exception as exc:
+            # Java 17+ without the Unsafe ``--add-opens`` flags surfaces
+            # here; fall back rather than fail the whole call.
+            _log_arrow_path_fallback("toArrow", exc)
+
+    to_iter = getattr(df, "toArrowBatchIterator", None)
+    if callable(to_iter):
+        try:
+            batches = list(to_iter())
+        except Exception as exc:
+            _log_arrow_path_fallback("toArrowBatchIterator", exc)
+        else:
+            if not batches:
+                # Empty result — synthesize an empty table with the
+                # right schema rather than returning ``None``.
+                from yggdrasil.data.schema import Schema
+                return pa.Table.from_batches(
+                    [], schema=Schema.from_(df.schema).to_arrow_schema(),
+                )
+            return pa.Table.from_batches(batches)
+
+    # Last resort: pandas round-trip.  The session-level Arrow
+    # optimization (``spark.sql.execution.arrow.pyspark.enabled``)
+    # accelerates this transparently when it works, but trips on
+    # Java 17+ if the JVM was started without the
+    # ``--add-opens java.base/sun.misc=ALL-UNNAMED`` flag (the JVM-side
+    # Arrow allocator can't reach ``sun.misc.Unsafe``).  Force-disable
+    # arrow.pyspark for the duration of the collect so we use the
+    # plain row-based path, then restore the previous setting.
+    return pa.Table.from_pandas(_to_pandas_no_arrow(df), preserve_index=False)
+
+
+def spark_dataframe_to_pandas(df: "pyspark_sql.DataFrame"):
+    """Public alias for :func:`_to_pandas_no_arrow`.
+
+    Same JVM-Arrow-bypass behavior; exposed so tests and callers that
+    just want a pandas DataFrame don't have to round-trip through Arrow
+    or hand-roll the same conf-toggle dance.
+    """
+    return _to_pandas_no_arrow(df)
+
+
+def _to_pandas_no_arrow(df: "pyspark_sql.DataFrame"):
+    """Run ``df.toPandas()`` with Spark's Arrow optimization disabled.
+
+    PySpark's ``spark.sql.execution.arrow.pyspark.fallback.enabled``
+    catches Python-level conversion errors but propagates JVM-side
+    failures (e.g. the Java 17+ ``IllegalAccessException`` against
+    ``sun.misc.Unsafe``) directly, which means a single broken JVM can
+    take down every ``toPandas`` call in the process.  Toggling the
+    arrow conf for the duration of this one call sidesteps that.
+    """
+    spark = df.sparkSession
+    arrow_key = "spark.sql.execution.arrow.pyspark.enabled"
+    try:
+        prev = spark.conf.get(arrow_key)
+    except Exception:
+        prev = None
+    try:
+        spark.conf.set(arrow_key, "false")
+        return df.toPandas()
+    finally:
+        if prev is None:
+            try:
+                spark.conf.unset(arrow_key)
+            except Exception:
+                pass
+        else:
+            spark.conf.set(arrow_key, prev)
+
+
+def _log_arrow_path_fallback(api: str, exc: BaseException) -> None:
+    """One-line debug note when an Arrow fast path falls back to pandas.
+
+    Kept private and at DEBUG so the fallback is visible to anyone who
+    enables the ``yggdrasil.spark`` logger but doesn't spam the default
+    output.  The call site continues with the pandas path; see
+    :func:`spark_dataframe_to_arrow`.
+    """
+    import logging
+    logging.getLogger(__name__).debug(
+        "spark_dataframe_to_arrow: %s failed (%s); falling back",
+        api, exc.__class__.__name__,
+    )
 
 
 @register_converter(Any, T.StructField)

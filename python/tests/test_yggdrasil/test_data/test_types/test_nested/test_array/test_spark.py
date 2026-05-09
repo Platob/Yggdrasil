@@ -24,6 +24,7 @@ from yggdrasil.data.types.primitive import IntegerType
 pytest.importorskip("pyspark")
 
 from yggdrasil.spark.tests import spark  # noqa: E402,F401
+from yggdrasil.spark.cast import spark_dataframe_to_arrow  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +55,10 @@ class TestSparkDtype:
         )
 
         assert isinstance(rebuilt, ArrayType)
-        assert rebuilt.item_field.dtype.type_id == DataTypeId.INTEGER
+        # Spark ``LongType`` is unambiguously 64-bit; the rebuilt dtype
+        # must preserve that width rather than collapse to the abstract
+        # ``INTEGER`` family tag.
+        assert rebuilt.item_field.dtype.type_id == DataTypeId.INT64
         assert rebuilt.item_field.nullable is False
 
     def test_handles_spark_type_only_for_array(self, spark) -> None:  # noqa: F811
@@ -100,7 +104,7 @@ class TestSparkCast:
             ).alias("target_array")
         )
 
-        rows = result.toArrow()["target_array"].to_pylist()
+        rows = spark_dataframe_to_arrow(result)["target_array"].to_pylist()
         assert rows == [["1", "2"], ["3", None], None]
 
     def test_target_none_returns_input_column(
