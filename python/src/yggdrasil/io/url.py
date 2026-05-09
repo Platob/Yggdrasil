@@ -1013,7 +1013,9 @@ class URL(os.PathLike):
         return self.to_string()
 
     def __repr__(self):
-        return f"URL({self.to_string()!r})"
+        # Redact credentials/tokens so URLs are safe in logs and tracebacks.
+        # str(url) keeps the unredacted form for callers that need it.
+        return f"URL({self.anonymize('redact').to_string(encode=False)!r})"
 
     def __fspath__(self) -> str:
         """Return a filesystem-style string so :class:`URL` satisfies
