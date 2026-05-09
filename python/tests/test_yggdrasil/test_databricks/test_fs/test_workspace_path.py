@@ -111,6 +111,12 @@ class TestWrite:
         assert kwargs["path"] == "/Workspace/x"
         assert kwargs["overwrite"] is True
         assert kwargs["content"].getvalue() == b"abcdef"
+        # ``format`` must be passed: the SDK default is ``SOURCE``,
+        # which routes raw bytes through the notebook importer and
+        # fails with ``BadRequest: The zip archive contains no items``.
+        # ``AUTO`` lets the server inspect the extension/content.
+        fmt = kwargs["format"]
+        assert getattr(fmt, "name", str(fmt)).upper() == "AUTO"
 
 
 class TestMutators:

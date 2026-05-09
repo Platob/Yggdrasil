@@ -223,11 +223,16 @@ class VolumePath(DatabricksPath):
         return True
 
     def _ensure_volume(self) -> bool:
-        """Blind-create catalog / schema / managed volume.
+        """Bottom-up create of the missing pieces of catalog / schema / volume.
 
-        Each step swallows ``AlreadyExists`` so re-runs are free.
-        Returns ``True`` if at least one ``create`` actually landed
-        (so the caller knows something changed).
+        Production callers usually have catalog and schema already in
+        place and only need the managed volume created (and frequently
+        lack permission to create catalogs at all). So the order is:
+        try volume first, walk up only when a NotFound proves the
+        next ancestor is also missing.
+
+        Each ``create`` swallows ``AlreadyExists`` so re-runs are free.
+        Returns ``True`` if at least one ``create`` landed.
         """
         triple = self._split_volume()
         if triple is None:
@@ -235,19 +240,44 @@ class VolumePath(DatabricksPath):
         catalog, schema, volume = triple
         ws = self.workspace
 
-        created = _safe_create(lambda: ws.catalogs.create(name=catalog))
-        created = _safe_create(
-            lambda: ws.schemas.create(name=schema, catalog_name=catalog),
-        ) or created
-        created = _safe_create(
-            lambda: ws.volumes.create(
+        def _create_volume() -> Any:
+            return ws.volumes.create(
                 catalog_name=catalog,
                 schema_name=schema,
                 name=volume,
                 volume_type=_managed_volume_type(),
-            ),
-        ) or created
-        return created
+            )
+
+        # 1) Try volume only — common case where catalog + schema exist.
+        try:
+            _create_volume()
+            return True
+        except Exception as exc:
+            if _looks_like_already_exists(exc):
+                return False
+            if not _looks_like_not_found(exc):
+                raise
+            # Fall through: a parent (schema or catalog) is missing.
+
+        # 2) Schema may be missing — create it, then retry volume.
+        try:
+            ws.schemas.create(name=schema, catalog_name=catalog)
+        except Exception as exc:
+            if _looks_like_already_exists(exc):
+                pass
+            elif _looks_like_not_found(exc):
+                # 3) Catalog also missing — create catalog, then schema.
+                _safe_create(lambda: ws.catalogs.create(name=catalog))
+                _safe_create(
+                    lambda: ws.schemas.create(
+                        name=schema, catalog_name=catalog,
+                    ),
+                )
+            else:
+                raise
+
+        _safe_create(_create_volume)
+        return True
 
     # ==================================================================
     # Mutators
