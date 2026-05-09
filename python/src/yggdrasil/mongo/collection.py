@@ -27,7 +27,7 @@ Save modes
 * :data:`Mode.ERROR_IF_EXISTS` → raise when non-empty, otherwise
   ``insert_many``.
 * :data:`Mode.UPSERT` / :data:`Mode.MERGE` → ``bulk_write`` of
-  ``ReplaceOne`` upserts keyed on ``options.match_by_names`` (or
+  ``ReplaceOne`` upserts keyed on ``options.match_by`` (or
   ``["_id"]`` by default).
 """
 
@@ -469,7 +469,7 @@ class MongoCollection(Tabular):
         """
         from pymongo import UpdateOne  # type: ignore[import-not-found]
 
-        match_by = options.match_by_names or ["_id"]
+        match_by = options.match_by_keys or ["_id"]
         update_cols = options.update_column_names or None
         documents = arrow_table_to_documents(table)
         if not documents:
@@ -572,7 +572,7 @@ class MongoCollection(Tabular):
         options = self.check_options(
             cast_options,
             mode=mode if mode is not None else Mode.AUTO,
-            match_by_names=list(match_by) if match_by else None,
+            match_by=list(match_by) if match_by else None,
             update_column_names=list(update_column_names) if update_column_names else None,
         )
         if isinstance(data, list) and (not data or isinstance(data[0], Mapping)):

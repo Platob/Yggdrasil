@@ -85,7 +85,7 @@ class TestModes:
 
 
 class TestKeyedMerge:
-    """``options.match_by_names`` drives key-aware APPEND / UPSERT."""
+    """``options.match_by`` drives key-aware APPEND / UPSERT."""
 
     def test_append_with_keys_drops_incoming_duplicates(self, table) -> None:
         io = NDJsonIO()
@@ -93,7 +93,7 @@ class TestKeyedMerge:
         more = pa.table({"id": [2, 4], "name": ["X", "d"]})
         io.write_arrow_batches(
             more.to_batches(),
-            options=NDJsonOptions(mode=Mode.APPEND, match_by_names=["id"]),
+            options=NDJsonOptions(mode=Mode.APPEND, match_by=["id"]),
         )
         loaded = io.read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2, 3, 4]
@@ -105,7 +105,7 @@ class TestKeyedMerge:
         more = pa.table({"id": [2, 4], "name": ["X", "d"]})
         io.write_arrow_batches(
             more.to_batches(),
-            options=NDJsonOptions(mode=Mode.UPSERT, match_by_names=["id"]),
+            options=NDJsonOptions(mode=Mode.UPSERT, match_by=["id"]),
         )
         loaded = io.read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 3, 2, 4]

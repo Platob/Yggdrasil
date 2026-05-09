@@ -164,14 +164,14 @@ class CsvIO(IO[bytes, CsvOptions]):
           ``options.match_by_keys`` is set, falls back to
           read-modify-rewrite so the key-aware dedup can run.
         - **UPSERT / MERGE** — read existing, merge against incoming
-          via :func:`upsert_arrow_batches` (with ``match_by_names``
+          via :func:`upsert_arrow_batches` (with ``match_by``
           driving the per-row dedup), rewrite via OVERWRITE. Without
-          ``match_by_names`` collapses to plain APPEND — CSV has no
+          ``match_by`` collapses to plain APPEND — CSV has no
           row-level identity at this layer.
         - **IGNORE** — skip when non-empty.
         - **ERROR_IF_EXISTS** — raise when non-empty.
         """
-        # Mode resolution. AUTO picks UPSERT when ``match_by_names``
+        # Mode resolution. AUTO picks UPSERT when ``match_by``
         # is set or APPEND otherwise — APPEND keeps the byte-level
         # fast path on uncompressed buffers, UPSERT triggers a
         # read-modify-rewrite. TRUNCATE collapses to OVERWRITE;

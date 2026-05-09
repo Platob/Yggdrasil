@@ -164,7 +164,7 @@ class ParquetIO(IO[bytes, ParquetOptions]):
           incoming rows whose key tuple already exists are dropped
           (existing wins); without keys the streams are concatenated.
         - **UPSERT / MERGE** — same read-modify-rewrite, but with
-          ``match_by_names`` set existing rows whose key matches the
+          ``match_by`` set existing rows whose key matches the
           incoming stream are dropped (incoming wins). Without keys
           this collapses to plain APPEND — Parquet has no row-level
           identity at this layer.
@@ -174,7 +174,7 @@ class ParquetIO(IO[bytes, ParquetOptions]):
         Key-aware merges are powered by
         :func:`yggdrasil.arrow.ops.upsert_arrow_batches`.
         """
-        # Mode resolution. AUTO picks UPSERT when ``match_by_names``
+        # Mode resolution. AUTO picks UPSERT when ``match_by``
         # is set (incoming wins on key conflict) or APPEND otherwise
         # — Parquet has no in-place append, so both end up doing the
         # same read-modify-rewrite, but the semantics line up with

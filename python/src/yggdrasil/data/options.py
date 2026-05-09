@@ -182,18 +182,15 @@ class CastOptions:
     #: the default by re-declaring the field.
     use_threads: bool = True
     recursive: bool = False
-    #: Plain-string column names to dedup on. The original key-based
-    #: merge knob — kept for callers (and integrations like Postgres,
-    #: Mongo, Databricks SQL) that don't have a Field handy.
-    match_by_names: list[str] | None = None
     #: Field-typed column references to dedup on. Each entry's
     #: :attr:`Field.name` resolves to the target column; the optional
     #: :attr:`Field.alias` lets a source frame label the column
     #: differently (consumers route through
     #: :meth:`Field.select_in_arrow_tabular` etc. when they need the
-    #: alias-aware lookup). Use :attr:`match_by_keys` to get the
-    #: resolved name list — readers should prefer that over reading
-    #: ``match_by`` / ``match_by_names`` directly.
+    #: alias-aware lookup). Bare strings passed in ``__init__`` are
+    #: coerced to a default-typed :class:`Field` in
+    #: :meth:`__post_init__` so callers can still pass plain key
+    #: names — the Field-typed shape is the canonical surface.
     match_by: list["Field"] | None = None
     with_io: bool = True
     seek_source: bool = False
@@ -334,6 +331,24 @@ class CastOptions:
         object.__setattr__(self, "mode", Mode.from_(self.mode, default=Mode.AUTO))
         object.__setattr__(self, "schema_mode", Mode.from_(self.schema_mode, default=Mode.IGNORE))
 
+        # match_by normalization — accept list[Field | str | dict |
+        # pa.Field]. Plain strings become a default-typed Field so
+        # the selector machinery (alias / position lookup) has a
+        # Field to drive. Empty lists collapse to ``None`` so
+        # consumers can branch on truthiness.
+        if self.match_by:
+            object.__setattr__(
+                self, "match_by",
+                [
+                    item if isinstance(item, Field)
+                    else Field.make_default_field(name=item) if isinstance(item, str)
+                    else Field.from_(item)
+                    for item in self.match_by
+                ],
+            )
+        elif self.match_by is not None:
+            object.__setattr__(self, "match_by", None)
+
     # ==================================================================
     # Derived properties
     # ==================================================================
@@ -414,40 +429,14 @@ class CastOptions:
     def match_by_keys(self) -> list[str] | None:
         """Resolved key column names to dedup on.
 
-        Prefers :attr:`match_by` (Field-typed) when set — pulls the
-        :attr:`Field.name` of each entry — and falls back to
-        :attr:`match_by_names` (plain strings). Returns ``None`` when
-        neither is set so callers can branch on "keys vs no-keys"
-        without a second null check on both fields.
+        Pulls the :attr:`Field.name` of each entry in
+        :attr:`match_by`. Returns ``None`` when no keys are set so
+        callers can branch on "keys vs no-keys" with a single
+        truthiness check.
         """
-        if self.match_by:
-            return [f.name for f in self.match_by]
-        if self.match_by_names:
-            return list(self.match_by_names)
-        return None
-
-    @property
-    def match_by_fields(self) -> list["Field"] | None:
-        """Field-typed view of the merge keys.
-
-        Returns :attr:`match_by` when set, otherwise resolves
-        :attr:`match_by_names` against :attr:`merged_field`'s schema
-        when one is available — so a caller that bound a target
-        schema gets back fully-typed Fields it can hand to
-        :meth:`Field.select_in_arrow_tabular`. Returns ``None`` if
-        neither source carries enough info to build a Field list.
-        """
-        if self.match_by:
-            return list(self.match_by)
-        if not self.match_by_names:
+        if not self.match_by:
             return None
-        merged = self.merged_field
-        if merged is None:
-            return None
-        # ``select`` raises on misses with the suggestion-rich error
-        # path; fall back to silent skip so a half-bound schema
-        # doesn't tank the caller's plan.
-        return merged.select(list(self.match_by_names), raise_error=False)
+        return [f.name for f in self.match_by]
 
     # ==================================================================
     # Construction / merge entry point

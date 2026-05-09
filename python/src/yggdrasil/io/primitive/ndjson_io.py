@@ -133,14 +133,14 @@ class NDJsonIO(IO[bytes, NDJsonOptions]):
 
         OVERWRITE truncates and writes from scratch.
         APPEND seeks to EOF and writes — concatenation is a valid
-        NDJSON append on uncompressed buffers without ``match_by_names``.
-        With ``match_by_names`` set, or under :data:`Mode.UPSERT` /
+        NDJSON append on uncompressed buffers without ``match_by``.
+        With ``match_by`` set, or under :data:`Mode.UPSERT` /
         :data:`Mode.MERGE`, the existing payload is read back and
         merged via :func:`yggdrasil.arrow.ops.upsert_arrow_batches`
         before a single rewrite. IGNORE / ERROR_IF_EXISTS guard
         non-empty buffers.
         """
-        # Mode resolution. AUTO picks UPSERT when ``match_by_names``
+        # Mode resolution. AUTO picks UPSERT when ``match_by``
         # is set or APPEND otherwise — APPEND keeps the byte-level
         # fast path on uncompressed buffers, UPSERT triggers a
         # read-modify-rewrite. TRUNCATE collapses to OVERWRITE;

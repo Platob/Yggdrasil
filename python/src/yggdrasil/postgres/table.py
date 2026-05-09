@@ -577,14 +577,14 @@ class Table(Tabular):
     def _write_upsert(self, batches: Iterable[pa.RecordBatch], options: O) -> None:
         """UPSERT via temp-table + ``INSERT … ON CONFLICT … DO UPDATE``.
 
-        ``match_by_names`` (or the target's primary-key columns) define
-        the conflict target. Update columns default to all non-key
-        columns; override with ``CastOptions.update_column_names``.
+        ``options.match_by`` (or the target's primary-key columns)
+        define the conflict target. Update columns default to all
+        non-key columns; override with ``CastOptions.update_column_names``.
         """
-        match_by = options.match_by_names or self._primary_key_columns()
+        match_by = options.match_by_keys or self._primary_key_columns()
         if not match_by:
             raise ValueError(
-                f"UPSERT into {self.full_name()} requires match_by_names or a "
+                f"UPSERT into {self.full_name()} requires match_by or a "
                 "primary key on the target table."
             )
 
@@ -681,7 +681,7 @@ class Table(Tabular):
         options = self.check_options(
             cast_options,
             mode=mode if mode is not None else Mode.AUTO,
-            match_by_names=list(match_by) if match_by else None,
+            match_by=list(match_by) if match_by else None,
             update_column_names=list(update_column_names) if update_column_names else None,
         )
         table = any_to_arrow_table(data, options)

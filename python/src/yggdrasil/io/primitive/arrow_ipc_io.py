@@ -144,16 +144,16 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
         - **APPEND** — read existing batches, merge with the incoming
           iterator, recurse with OVERWRITE. The IPC file format has
           one footer for all batches; partial appends would require
-          rewriting the footer anyway. With ``match_by_names`` set,
+          rewriting the footer anyway. With ``match_by`` set,
           incoming rows whose key tuple already exists on disk are
           dropped (existing values win); without keys, the incoming
           stream is concatenated as-is.
         - **UPSERT / MERGE** — same read-modify-rewrite shape as
-          APPEND, but with ``match_by_names`` set the existing rows
+          APPEND, but with ``match_by`` set the existing rows
           whose key tuple is present in the incoming stream are
           dropped (incoming values win). Without keys this is
           undefined at the IPC file level and degrades to plain
-          APPEND — pass ``options.match_by_keys=[...]`` to get
+          APPEND — pass ``options.match_by=[...]`` to get
           actual upsert semantics.
         - **IGNORE** — skip when the buffer is non-empty.
         - **ERROR_IF_EXISTS** — raise when the buffer is non-empty.
@@ -164,10 +164,10 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
         smaller of the two key sets needed to drive the dedup.
         """
         # AUTO picks the most useful mode from context:
-        # ``match_by_names`` set → UPSERT (incoming wins on key
+        # ``match_by`` set → UPSERT (incoming wins on key
         # conflict); otherwise APPEND. This keeps the historical
         # "default = grow the file" behaviour while letting callers
-        # opt into key-aware writes purely via ``match_by_names``.
+        # opt into key-aware writes purely via ``match_by``.
         action = options.mode
         if action is Mode.AUTO:
             action = Mode.UPSERT if options.match_by_keys else Mode.APPEND
@@ -208,7 +208,7 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
             # Read existing batches, merge with the incoming iter, then
             # recurse with OVERWRITE. The merge is delegated to
             # :func:`upsert_arrow_batches`, which centralizes the
-            # key-aware dedup *and* the keyless ``match_by_names is
+            # key-aware dedup *and* the keyless ``match_by is
             # None`` fallback (plain concat) — so we don't fork on
             # ``options.match_by_keys`` here. Existing batches are
             # materialized because we're about to truncate the same

@@ -1117,7 +1117,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
         return self.insert(
             batches,
             mode=options.mode,
-            match_by=options.match_by_names,
+            match_by=options.match_by_keys,
             update_column_names=options.update_column_names,
             wait=options.wait,
             zorder_by=options.zorder_by,
@@ -1148,7 +1148,7 @@ class Table(DatabricksResource, Tabular[CastOptions]):
         return self.spark_insert(
             frame,
             mode=options.mode,
-            match_by=options.match_by_names,
+            match_by=options.match_by_keys,
             wait=options.wait,
             return_data=options.return_data,
             safe_merge=options.safe_merge,

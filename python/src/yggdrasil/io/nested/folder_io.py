@@ -294,12 +294,12 @@ class FolderIO(Tabular[FolderOptions]):
         - **AUTO / APPEND** (the default for tabular folders) — just
           add a new part file; existing parts are untouched.
         - **UPSERT / MERGE** — only meaningful with
-          ``options.match_by_names``; see below.
+          ``options.match_by``; see below.
         - **IGNORE** — no-op when the folder already holds tabular
           parts; otherwise behaves as APPEND.
         - **ERROR_IF_EXISTS** — raises when the folder is non-empty.
 
-        Merge semantics (``options.match_by_names`` set):
+        Merge semantics (``options.match_by`` set):
 
         - **APPEND** — drop incoming rows whose key tuple already
           exists on disk; write only the survivors into a new part.
@@ -331,7 +331,7 @@ class FolderIO(Tabular[FolderOptions]):
             self._write_parts(batches, options)
             return
 
-        match_by = list(getattr(options, "match_by_names", None) or ())
+        match_by = list(options.match_by_keys or ())
         is_upsert = options.mode in (Mode.UPSERT, Mode.MERGE)
 
         if match_by and self._has_tabular_children():
@@ -387,7 +387,7 @@ class FolderIO(Tabular[FolderOptions]):
         )
 
     # ==================================================================
-    # Merge helpers — used when options.match_by_names is set
+    # Merge helpers — used when options.match_by is set
     # ==================================================================
 
     def _merge_append(

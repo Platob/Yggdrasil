@@ -1174,7 +1174,7 @@ class Session(ABC):
             mode = Mode.UPSERT if eff.mode == Mode.UPSERT else Mode.APPEND
             options = FolderOptions(
                 mode=mode,
-                match_by_names=list(eff.request_by or ()) or None,
+                match_by=list(eff.request_by or ()) or None,
             )
             with cache:
                 cache.write_arrow_table(table, options=options)

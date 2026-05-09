@@ -258,28 +258,30 @@ class TestSelectInField:
 
 
 # ---------------------------------------------------------------------------
-# CastOptions.match_by / match_by_keys / match_by_fields
+# CastOptions.match_by / match_by_keys
 # ---------------------------------------------------------------------------
 
 
 class TestCastOptionsMatchBy:
-    def test_match_by_names_resolves_to_keys(self) -> None:
-        opts = CastOptions(match_by_names=["id", "tenant"])
+    def test_string_keys_coerced_to_fields(self) -> None:
+        opts = CastOptions(match_by=["id", "tenant"])
+        assert opts.match_by_keys == ["id", "tenant"]
+        assert all(isinstance(f, Field) for f in opts.match_by)
+
+    def test_field_keys_passthrough(self) -> None:
+        f = _id_field()
+        opts = CastOptions(match_by=[f])
+        assert opts.match_by_keys == ["id"]
+        assert opts.match_by[0] is f
+
+    def test_mixed_keys_normalized(self) -> None:
+        f = _id_field().with_alias("user_id")
+        opts = CastOptions(match_by=[f, "tenant"])
         assert opts.match_by_keys == ["id", "tenant"]
 
-    def test_match_by_fields_take_precedence(self) -> None:
-        f = _id_field()
-        opts = CastOptions(match_by=[f], match_by_names=["other"])
-        assert opts.match_by_keys == ["id"]
-
-    def test_match_by_keys_none_when_neither_set(self) -> None:
+    def test_match_by_keys_none_when_unset(self) -> None:
         assert CastOptions().match_by_keys is None
 
-    def test_match_by_fields_resolves_against_target_schema(self) -> None:
-        schema = Schema.from_(
-            pa.schema([("id", pa.int64()), ("name", pa.string())]),
-        )
-        opts = CastOptions(target_field=schema, match_by_names=["id"])
-        fields = opts.match_by_fields
-        assert fields is not None
-        assert [f.name for f in fields] == ["id"]
+    def test_empty_match_by_collapses_to_none(self) -> None:
+        assert CastOptions(match_by=[]).match_by is None
+        assert CastOptions(match_by=[]).match_by_keys is None

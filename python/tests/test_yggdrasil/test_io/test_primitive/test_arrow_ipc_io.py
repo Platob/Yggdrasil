@@ -184,7 +184,7 @@ class TestModes:
 
 
 class TestKeyedMerge:
-    """``options.match_by_names`` drives key-aware APPEND / UPSERT."""
+    """``options.match_by`` drives key-aware APPEND / UPSERT."""
 
     def test_append_with_keys_drops_incoming_duplicates(self, table) -> None:
         io = ArrowIPCIO()
@@ -195,7 +195,7 @@ class TestKeyedMerge:
         )
         io.write_arrow_batches(
             more.to_batches(),
-            options=ArrowIPCOptions(mode=Mode.APPEND, match_by_names=["id"]),
+            options=ArrowIPCOptions(mode=Mode.APPEND, match_by=["id"]),
         )
         loaded = io.read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2, 3, 4, 5]
@@ -210,7 +210,7 @@ class TestKeyedMerge:
         )
         io.write_arrow_batches(
             more.to_batches(),
-            options=ArrowIPCOptions(mode=Mode.UPSERT, match_by_names=["id"]),
+            options=ArrowIPCOptions(mode=Mode.UPSERT, match_by=["id"]),
         )
         loaded = io.read_arrow_table()
         # Surviving existing (id=1, 4) first, then all incoming.
@@ -224,7 +224,7 @@ class TestKeyedMerge:
         more = pa.table({"id": [3], "name": ["Z"], "v": [9.0]})
         io.write_arrow_batches(
             more.to_batches(),
-            options=ArrowIPCOptions(mode=Mode.MERGE, match_by_names=["id"]),
+            options=ArrowIPCOptions(mode=Mode.MERGE, match_by=["id"]),
         )
         loaded = io.read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2, 4, 3]
@@ -247,7 +247,7 @@ class TestKeyedMerge:
         io = ArrowIPCIO()
         io.write_arrow_batches(
             table.to_batches(),
-            options=ArrowIPCOptions(mode=Mode.UPSERT, match_by_names=["id"]),
+            options=ArrowIPCOptions(mode=Mode.UPSERT, match_by=["id"]),
         )
         assert io.read_arrow_table().equals(table)
 
@@ -263,7 +263,7 @@ class TestKeyedMerge:
         )
         io.write_arrow_batches(
             more.to_batches(),
-            options=ArrowIPCOptions(mode=Mode.APPEND, match_by_names=["a", "b"]),
+            options=ArrowIPCOptions(mode=Mode.APPEND, match_by=["a", "b"]),
         )
         loaded = io.read_arrow_table()
         assert loaded.column("a").to_pylist() == [1, 1, 2, 2]

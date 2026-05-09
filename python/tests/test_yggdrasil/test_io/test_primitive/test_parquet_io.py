@@ -130,7 +130,7 @@ class TestModes:
 
 
 class TestKeyedMerge:
-    """``options.match_by_names`` drives key-aware APPEND / UPSERT."""
+    """``options.match_by`` drives key-aware APPEND / UPSERT."""
 
     def test_append_with_keys_drops_incoming_duplicates(self, table) -> None:
         io = ParquetIO()
@@ -140,7 +140,7 @@ class TestKeyedMerge:
         )
         io.write_arrow_batches(
             more.to_batches(),
-            options=ParquetOptions(mode=Mode.APPEND, match_by_names=["id"]),
+            options=ParquetOptions(mode=Mode.APPEND, match_by=["id"]),
         )
         loaded = io.read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2, 3, 4, 5]
@@ -154,7 +154,7 @@ class TestKeyedMerge:
         )
         io.write_arrow_batches(
             more.to_batches(),
-            options=ParquetOptions(mode=Mode.UPSERT, match_by_names=["id"]),
+            options=ParquetOptions(mode=Mode.UPSERT, match_by=["id"]),
         )
         loaded = io.read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 4, 2, 3, 5]
@@ -164,10 +164,10 @@ class TestKeyedMerge:
         io = ParquetIO()
         io.write_arrow_table(table)
         more = pa.table({"id": [3], "name": ["Z"], "v": [9.0]})
-        # Default Mode.AUTO + match_by_names → UPSERT semantics.
+        # Default Mode.AUTO + match_by → UPSERT semantics.
         io.write_arrow_batches(
             more.to_batches(),
-            options=ParquetOptions(match_by_names=["id"]),
+            options=ParquetOptions(match_by=["id"]),
         )
         loaded = io.read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2, 4, 3]
