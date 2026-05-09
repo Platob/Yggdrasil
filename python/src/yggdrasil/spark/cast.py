@@ -45,7 +45,7 @@ import pyspark.sql.types as T
 
 from yggdrasil.arrow.cast import (
     any_to_arrow_table,
-    rechunk_arrow_batches_by_byte_size,
+    rechunk_arrow_batches,
 )
 from yggdrasil.data.cast import register_converter
 from yggdrasil.data.options import CastOptions
@@ -128,7 +128,7 @@ def any_to_spark_dataframe(
         return spark.createDataFrame([], schema=opts.merged_schema.to_spark_schema())
 
     arrow_table = any_to_arrow_table(obj, options=opts)
-    rechunked = list(rechunk_arrow_batches_by_byte_size(
+    rechunked = list(rechunk_arrow_batches(
         arrow_table.to_batches(),
         byte_size=_SPARK_ARROW_BATCH_BYTE_LIMIT,
         memory_pool=opts.arrow_memory_pool,

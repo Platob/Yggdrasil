@@ -80,7 +80,7 @@ __all__ = [
     "cast_arrow_tabular",
     "cast_arrow_record_batch_reader",
     "default_arrow_scalar",
-    "rechunk_arrow_batches_by_byte_size",
+    "rechunk_arrow_batches",
 ]
 
 logger = logging.getLogger(__name__)
@@ -225,7 +225,7 @@ def get_arrow_nbytes(obj: Any, default: int = 0) -> int:
     return default
 
 
-def rechunk_arrow_batches_by_byte_size(
+def rechunk_arrow_batches(
     batches: Iterable[pa.RecordBatch],
     *,
     byte_size: int | None = None,
