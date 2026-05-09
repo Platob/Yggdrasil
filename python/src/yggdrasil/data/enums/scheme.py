@@ -67,6 +67,7 @@ _PATH_CLASS_TARGETS: dict[str, tuple[str, str]] = {
     "dbfs+dbfs":      ("yggdrasil.databricks.fs.dbfs_path", "DBFSPath"),
     "dbfs+volume":    ("yggdrasil.databricks.fs.volume_path", "VolumePath"),
     "dbfs+workspace": ("yggdrasil.databricks.fs.workspace_path", "WorkspacePath"),
+    "dbfs+table":     ("yggdrasil.databricks.sql.table", "Table"),
     "s3":             ("yggdrasil.aws.fs.path", "S3Path"),
     "http":           ("yggdrasil.io.http_.path", "HTTPPath"),
     "https":          ("yggdrasil.io.http_.path", "HTTPPath"),
@@ -97,6 +98,9 @@ _SCHEME_ALIASES: dict[str, str] = {
     "dbfs+workspace": "dbfs+workspace",
     "workspace":      "dbfs+workspace",
     "ws":             "dbfs+workspace",
+    "dbfs+table":     "dbfs+table",
+    "table":          "dbfs+table",
+    "uc+table":       "dbfs+table",
     "s3":             "s3",
     "s3a":            "s3",
     "s3n":            "s3",
@@ -140,6 +144,14 @@ class Scheme(str, Enum):
     DATABRICKS_DBFS      = "dbfs+dbfs"
     DATABRICKS_VOLUME    = "dbfs+volume"
     DATABRICKS_WORKSPACE = "dbfs+workspace"
+
+    #: Unity Catalog table addressed as a logical Holder /
+    #: :class:`Tabular` —
+    #: ``dbfs+table://[creds@]host/<catalog>/<schema>/<table>?…``.
+    #: Reads / writes route through the active SQL engine
+    #: (:class:`SQLEngine`); credentials and other ``DatabricksClient``
+    #: knobs ride along the URL the same way :attr:`DATABRICKS` does.
+    DATABRICKS_TABLE     = "dbfs+table"
 
     # ------------------------------------------------------------------
     # Coercion
