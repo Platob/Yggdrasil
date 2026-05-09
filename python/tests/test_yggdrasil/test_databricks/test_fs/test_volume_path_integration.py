@@ -85,6 +85,14 @@ class TestVolumePathIntegration(DatabricksIntegrationCase):
         path._invalidate_stat_cache()
         self.assertIs(path._stat_uncached().kind, IOKind.MISSING)
 
+    def test_open_context(self):
+        with (self.root / "context.txt").open("wb") as f:
+            f.write(b"hello context")
+
+        with (self.root / "context.txt").open("rb") as f:
+            content = f.read()
+            self.assertEqual(content, b"hello context")
+
     def test_staging_path_round_trip(self) -> None:
         """:meth:`VolumePath.staging_path` is the SQL-engine helper —
         check that the minted path actually round-trips against the
