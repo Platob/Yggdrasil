@@ -12,7 +12,7 @@ read-modify-rewrite scheme.
 from __future__ import annotations
 
 import io as _stdio
-from typing import ClassVar, Iterator
+from typing import Any, ClassVar, Iterator
 
 from yggdrasil.data.enums import Scheme
 from yggdrasil.io.io_stats import IOStats, IOKind
@@ -257,10 +257,16 @@ class WorkspacePath(DatabricksPath):
         return n
 
     def _upload(self, payload: bytes) -> None:
+        # ``format`` defaults to ``ImportFormat.SOURCE`` in the Databricks
+        # SDK, which routes through the notebook importer — non-notebook
+        # bytes then fail with ``BadRequest: The zip archive contains
+        # no items``. ``AUTO`` lets the server inspect the extension and
+        # content to decide between workspace file and notebook.
         self._call_ensuring_parents(
             self.workspace.workspace.upload,
             path=self.api_path,
             content=_stdio.BytesIO(payload),
+            format=_import_format_auto(),
             overwrite=True,
         )
         self._invalidate_stat_cache()
@@ -312,3 +318,17 @@ def _looks_like_protected_parent(exc: BaseException) -> bool:
     leaf the caller actually wants is independent of the protected
     ancestor — treat as non-fatal."""
     return "is protected" in str(exc).lower()
+
+
+def _import_format_auto() -> Any:
+    """Resolve the SDK's ``ImportFormat.AUTO`` enum, falling back to a string.
+
+    The Databricks SDK accepts the enum or the literal ``"AUTO"``;
+    the string fallback keeps the helper usable in test environments
+    that mock the workspace client without the SDK installed.
+    """
+    try:
+        from databricks.sdk.service.workspace import ImportFormat
+        return ImportFormat.AUTO
+    except Exception:
+        return "AUTO"

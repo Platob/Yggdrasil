@@ -222,12 +222,10 @@ class TestVolumeAutoCreate:
         workspace.volumes.create.assert_not_called()
         assert workspace.files.upload.call_count == 2
 
-    def test_volume_missing_blind_creates_catalog_schema_volume(
-        self, workspace,
-    ) -> None:
-        # Both upload and parent ``create_directory`` fail NotFound,
-        # so the volume must not exist — fall through to blind
-        # catalog / schema / managed-volume creates.
+    def test_volume_missing_only_creates_volume(self, workspace) -> None:
+        # Common case: catalog + schema already exist, only the volume
+        # is missing. After a NotFound on upload + create_directory,
+        # we should try ``volumes.create`` first and stop there.
         uploads = [NotFound("Volume does not exist"), None]
         create_dirs = [NotFound("does not exist"), None]
 
@@ -251,15 +249,14 @@ class TestVolumeAutoCreate:
         )
         p.write_bytes(b"payload")
 
-        # No probes — straight to creates.
         workspace.catalogs.get.assert_not_called()
         workspace.schemas.get.assert_not_called()
         workspace.volumes.read.assert_not_called()
 
-        workspace.catalogs.create.assert_called_once_with(name="cat")
-        workspace.schemas.create.assert_called_once_with(
-            name="sch", catalog_name="cat",
-        )
+        # Volume created first; catalog/schema untouched because volume
+        # create succeeded.
+        workspace.catalogs.create.assert_not_called()
+        workspace.schemas.create.assert_not_called()
         vol_kwargs = workspace.volumes.create.call_args.kwargs
         assert vol_kwargs["catalog_name"] == "cat"
         assert vol_kwargs["schema_name"] == "sch"
@@ -267,7 +264,97 @@ class TestVolumeAutoCreate:
         vt = vol_kwargs["volume_type"]
         assert getattr(vt, "name", str(vt)).upper() == "MANAGED"
 
-    def test_already_exists_swallowed_by_blind_creates(self, workspace) -> None:
+    def test_schema_missing_creates_schema_then_volume(
+        self, workspace,
+    ) -> None:
+        # Schema is also missing — first ``volumes.create`` fails
+        # NotFound, then ``schemas.create`` succeeds, then volume create
+        # is retried. Catalog should not be touched.
+        uploads = [NotFound("Volume does not exist"), None]
+        create_dirs = [NotFound("does not exist"), None]
+        volume_creates = [NotFound("Schema does not exist"), None]
+
+        def upload(**_kwargs):
+            r = uploads.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        def create_directory(_path):
+            r = create_dirs.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        def volumes_create(**_kwargs):
+            r = volume_creates.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        workspace.files.upload.side_effect = upload
+        workspace.files.create_directory.side_effect = create_directory
+        workspace.volumes.create.side_effect = volumes_create
+
+        p = VolumePath(
+            "/Volumes/cat/sch/vol/sub/file.bin", workspace=workspace,
+        )
+        p.write_bytes(b"payload")
+
+        workspace.catalogs.create.assert_not_called()
+        workspace.schemas.create.assert_called_once_with(
+            name="sch", catalog_name="cat",
+        )
+        assert workspace.volumes.create.call_count == 2
+
+    def test_catalog_missing_creates_full_chain(self, workspace) -> None:
+        # Both schema and catalog are missing — volume.create then
+        # schema.create both fail NotFound, falling through to catalog
+        # → schema → volume creation.
+        uploads = [NotFound("Volume does not exist"), None]
+        create_dirs = [NotFound("does not exist"), None]
+        volume_creates = [NotFound("Schema does not exist"), None]
+        schema_creates = [NotFound("Catalog does not exist"), None]
+
+        def upload(**_kwargs):
+            r = uploads.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        def create_directory(_path):
+            r = create_dirs.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        def volumes_create(**_kwargs):
+            r = volume_creates.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        def schemas_create(**_kwargs):
+            r = schema_creates.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        workspace.files.upload.side_effect = upload
+        workspace.files.create_directory.side_effect = create_directory
+        workspace.volumes.create.side_effect = volumes_create
+        workspace.schemas.create.side_effect = schemas_create
+
+        p = VolumePath(
+            "/Volumes/cat/sch/vol/sub/file.bin", workspace=workspace,
+        )
+        p.write_bytes(b"payload")
+
+        workspace.catalogs.create.assert_called_once_with(name="cat")
+        assert workspace.schemas.create.call_count == 2
+        assert workspace.volumes.create.call_count == 2
+
+    def test_already_exists_swallowed(self, workspace) -> None:
         # Volume create races with another caller — ``AlreadyExists``
         # is treated as success, no retry storm.
         uploads = [NotFound("Volume does not exist"), None]
@@ -290,14 +377,16 @@ class TestVolumeAutoCreate:
 
         workspace.files.upload.side_effect = upload
         workspace.files.create_directory.side_effect = create_directory
-        workspace.catalogs.create.side_effect = AlreadyExists()
-        workspace.schemas.create.side_effect = AlreadyExists()
         workspace.volumes.create.side_effect = AlreadyExists()
 
         p = VolumePath(
             "/Volumes/cat/sch/vol/sub/file.bin", workspace=workspace,
         )
         p.write_bytes(b"payload")  # should not raise
+
+        # Volume.create raised AlreadyExists → no schema/catalog touch.
+        workspace.catalogs.create.assert_not_called()
+        workspace.schemas.create.assert_not_called()
 
     def test_propagates_when_not_a_volume_path(self, workspace) -> None:
         # Path too shallow to address a volume — auto-create can't help,
