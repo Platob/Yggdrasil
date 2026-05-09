@@ -22,7 +22,7 @@ chunk.
 """
 from __future__ import annotations
 
-from typing import Iterable, Iterator
+from typing import TYPE_CHECKING, Iterable, Iterator, Sequence
 
 import pyarrow as pa
 
@@ -32,20 +32,50 @@ from yggdrasil.data.enums.mode import Mode, ModeLike
 from ._typing import ArrowTabular
 from .cast import rechunk_arrow_batches, rechunk_arrow_table
 
+if TYPE_CHECKING:
+    from yggdrasil.data.data_field import Field
+
 __all__ = ["upsert_arrow_batches", "upsert_arrow_tabular"]
+
+
+def _resolve_match_by_keys(
+    match_by: "Sequence[str | Field] | None",
+) -> list[str]:
+    """Normalize a ``match_by`` argument to a flat ``list[str]`` of column names.
+
+    Accepts the historic plain-string list, the new
+    :class:`yggdrasil.data.Field` list, or a mix. Field entries
+    contribute :attr:`Field.name`; the alias / position fallbacks
+    are handled by the per-frame ``select_in_*`` consumers, not the
+    raw key-list used by the dedup hash.
+    """
+    if not match_by:
+        return []
+    keys: list[str] = []
+    for item in match_by:
+        if isinstance(item, str):
+            keys.append(item)
+        elif hasattr(item, "name"):
+            keys.append(item.name)
+        else:
+            raise TypeError(
+                f"match_by entry must be a column name or a Field, "
+                f"got {type(item).__name__}: {item!r}"
+            )
+    return keys
 
 
 def upsert_arrow_tabular(
     left: ArrowTabular,
     right: ArrowTabular,
-    match_by_names: list[str],
+    match_by: "Sequence[str | Field]",
     mode: ModeLike,
     *,
     row_size: int | None = None,
     byte_size: int | None = None,
     memory_pool: pa.MemoryPool | None = None,
 ) -> ArrowTabular:
-    """Upsert ``right`` into ``left``, matching rows by ``match_by_names``.
+    """Upsert ``right`` into ``left``, matching rows by ``match_by``.
 
     Parameters
     ----------
@@ -54,11 +84,15 @@ def upsert_arrow_tabular(
         cast onto ``left``'s schema before concatenation, so any extra
         columns on ``right`` are dropped and shared columns are
         coerced to ``left``'s dtypes.
-    match_by_names
-        One or more column names — present on both operands — that
-        identify a row. Nested key types (``struct`` / ``list`` /
-        ``map`` / union) are supported via a Python-set fallback; flat
-        keys take a vectorized left-anti join.
+    match_by
+        One or more column references — names (``str``) or
+        :class:`yggdrasil.data.Field` instances — present on both
+        operands and identifying a row. Field entries contribute
+        their :attr:`Field.name`; per-frame alias / position
+        fallbacks live on the ``select_in_*`` side. Nested key
+        types (``struct`` / ``list`` / ``map`` / union) are
+        supported via a Python-set fallback; flat keys take a
+        vectorized left-anti join.
     mode
         :attr:`Mode.APPEND` keeps ``left`` for matching keys and only
         appends rows from ``right`` whose keys are not in ``left``. Any
@@ -92,14 +126,14 @@ def upsert_arrow_tabular(
             "upsert_arrow_tabular: 'right' must be a pyarrow Table or "
             f"RecordBatch, got {type(right).__name__}."
         )
-    if not match_by_names:
+    keys = _resolve_match_by_keys(match_by)
+    if not keys:
         raise ValueError(
-            "upsert_arrow_tabular: 'match_by_names' must contain at "
-            "least one column name to match on."
+            "upsert_arrow_tabular: 'match_by' must contain at least "
+            "one column name (or Field) to match on."
         )
 
     resolved_mode = Mode.from_(mode)
-    keys = list(match_by_names)
 
     left_names = list(left.schema.names)
     right_names = list(right.schema.names)
@@ -107,7 +141,7 @@ def upsert_arrow_tabular(
     missing_right = [n for n in keys if n not in right_names]
     if missing_left or missing_right:
         raise ValueError(
-            "upsert_arrow_tabular: match_by_names not found — missing "
+            "upsert_arrow_tabular: match_by columns not found — missing "
             f"in left: {missing_left}; missing in right: {missing_right}. "
             f"Available left: {left_names}, right: {right_names}."
         )
@@ -156,7 +190,7 @@ def upsert_arrow_tabular(
 def upsert_arrow_batches(
     left: Iterable[pa.RecordBatch],
     right: Iterable[pa.RecordBatch],
-    match_by_names: list[str],
+    match_by: "Sequence[str | Field] | None",
     mode: ModeLike,
     *,
     schema: pa.Schema | None = None,
@@ -186,12 +220,22 @@ def upsert_arrow_batches(
         ``right``'s batches are projected onto ``left``'s schema before
         emission, so extra columns are dropped and shared columns are
         coerced.
-    match_by_names
-        One or more shared column names that identify a row. Nested key
-        types work transparently — keys are materialized to hashable
-        Python values for set membership.
+    match_by
+        Column references — names (``str``) or
+        :class:`yggdrasil.data.Field` instances — present on both
+        operands and identifying a row. Field entries contribute
+        their :attr:`Field.name`; alias / position fallbacks live
+        on the ``select_in_*`` side and don't bleed into the dedup
+        hash. Nested key types work transparently — keys are
+        materialized to hashable Python values for set membership.
+        ``None`` / empty degrades to a plain key-less concatenation
+        (``left`` first, then ``right``) so callers can wire the
+        same dispatch through whether or not they have keys to
+        dedup on; alignment to ``left``'s schema is still applied.
     mode
-        Same grammar as :func:`upsert_arrow_tabular`.
+        Same grammar as :func:`upsert_arrow_tabular`. Ignored when
+        ``match_by`` is empty — without keys, every mode collapses to
+        "concat ``left`` then ``right``".
     schema
         Optional output schema override. When omitted, the schema is
         taken from the first ``left`` batch (or the first ``right``
@@ -208,19 +252,16 @@ def upsert_arrow_batches(
     pa.RecordBatch
         The merged stream. Empty (zero-row) batches are dropped.
     """
-    if not match_by_names:
-        raise ValueError(
-            "upsert_arrow_batches: 'match_by_names' must contain at "
-            "least one column name to match on."
-        )
+    keys = _resolve_match_by_keys(match_by)
 
-    resolved_mode = Mode.from_(mode)
-    keys = list(match_by_names)
-
-    if resolved_mode is Mode.APPEND:
-        merged = _upsert_batches_append(left, right, keys, schema)
+    if not keys:
+        merged = _concat_batches(left, right, schema)
     else:
-        merged = _upsert_batches_overwrite(left, right, keys, schema)
+        resolved_mode = Mode.from_(mode)
+        if resolved_mode is Mode.APPEND:
+            merged = _upsert_batches_append(left, right, keys, schema)
+        else:
+            merged = _upsert_batches_overwrite(left, right, keys, schema)
 
     if (row_size and row_size > 0) or (byte_size and byte_size > 0):
         yield from rechunk_arrow_batches(
@@ -231,6 +272,34 @@ def upsert_arrow_batches(
         )
         return
     yield from merged
+
+
+def _concat_batches(
+    left: Iterable[pa.RecordBatch],
+    right: Iterable[pa.RecordBatch],
+    schema: pa.Schema | None,
+) -> Iterator[pa.RecordBatch]:
+    """Key-less concatenation: yield ``left`` then ``right``.
+
+    Used when ``match_by`` is empty — there's nothing to dedup
+    against, so the merge collapses to "stream both sides through".
+    ``right`` is still aligned to the output schema (anchored on
+    ``left``'s first batch when no explicit ``schema`` is given) so
+    shape mismatches surface as cast errors here rather than at the
+    write boundary.
+    """
+    out_schema = schema
+    for batch in left:
+        if out_schema is None:
+            out_schema = batch.schema
+        if batch.num_rows:
+            yield batch
+    for batch in right:
+        if out_schema is None:
+            out_schema = batch.schema
+        batch = _align_batch_to_schema(batch, out_schema)
+        if batch.num_rows:
+            yield batch
 
 
 def _upsert_batches_append(
@@ -323,7 +392,7 @@ def _ensure_keys(schema: pa.Schema, keys: list[str], side: str) -> None:
     missing = [n for n in keys if n not in schema.names]
     if missing:
         raise ValueError(
-            f"upsert_arrow_batches: match_by_names not found on {side} "
+            f"upsert_arrow_batches: match_by columns not found on {side} "
             f"batch — missing: {missing}. Available: {list(schema.names)}."
         )
 

@@ -30,6 +30,13 @@ if TYPE_CHECKING:
 __all__ = ["CsvIO", "CsvOptions"]
 
 
+#: Modes that may need to read existing bytes and merge with the
+#: incoming stream. APPEND, UPSERT and MERGE all share the dispatch;
+#: APPEND keeps the byte-level fast path when no key dedup is asked
+#: for and the buffer isn't compressed.
+_MERGE_MODES = frozenset({Mode.APPEND, Mode.UPSERT, Mode.MERGE})
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class CsvOptions(CastOptions):
     """:class:`CastOptions` extended with CSV-specific knobs."""
@@ -153,13 +160,34 @@ class CsvIO(IO[bytes, CsvOptions]):
           configured header behavior.
         - **APPEND** — seek to EOF, write **without** a header
           (unless the buffer was empty, in which case collapse to
-          OVERWRITE-with-header semantics).
+          OVERWRITE-with-header semantics). When
+          ``options.match_by_keys`` is set, falls back to
+          read-modify-rewrite so the key-aware dedup can run.
+        - **UPSERT / MERGE** — read existing, merge against incoming
+          via :func:`upsert_arrow_batches` (with ``match_by``
+          driving the per-row dedup), rewrite via OVERWRITE. Without
+          ``match_by`` collapses to plain APPEND — CSV has no
+          row-level identity at this layer.
         - **IGNORE** — skip when non-empty.
         - **ERROR_IF_EXISTS** — raise when non-empty.
-        - **UPSERT / MERGE** — degrade to APPEND. CSV has no key
-          model worth honoring at this layer.
         """
-        action = self._resolve_action(options.mode)
+        # Mode resolution. AUTO picks UPSERT when ``match_by``
+        # is set or APPEND otherwise — APPEND keeps the byte-level
+        # fast path on uncompressed buffers, UPSERT triggers a
+        # read-modify-rewrite. TRUNCATE collapses to OVERWRITE;
+        # APPEND / UPSERT / MERGE keep their identity for the merge
+        # branch; IGNORE / ERROR_IF_EXISTS guard the buffer.
+        mode = options.mode
+        if mode is Mode.AUTO:
+            action = Mode.UPSERT if options.match_by_keys else Mode.APPEND
+        elif mode is Mode.TRUNCATE:
+            action = Mode.OVERWRITE
+        elif mode in _MERGE_MODES or mode in (
+            Mode.IGNORE, Mode.ERROR_IF_EXISTS, Mode.OVERWRITE,
+        ):
+            action = mode
+        else:
+            action = Mode.OVERWRITE
 
         if action is Mode.IGNORE:
             if self.size > 0:
@@ -184,21 +212,36 @@ class CsvIO(IO[bytes, CsvOptions]):
             return
 
         codec = self._codec()
+        match_by = list(options.match_by_keys or ())
+        # Byte-append is only safe for plain APPEND, uncompressed,
+        # without a key-aware merge to run. Anything else has to do
+        # the full read-modify-rewrite dance.
         is_append_uncompressed = (
-            action is Mode.APPEND and self.size > 0 and codec is None
+            action is Mode.APPEND
+            and self.size > 0
+            and codec is None
+            and not match_by
         )
-        is_append_compressed = (
-            action is Mode.APPEND and self.size > 0 and codec is not None
+        needs_rewrite = (
+            action in _MERGE_MODES
+            and self.size > 0
+            and not is_append_uncompressed
         )
 
-        if is_append_compressed:
-            # Codec'd buffer can't be appended to byte-wise; fall
-            # back to read-modify-rewrite via OVERWRITE chained with
-            # the existing batches.
+        if needs_rewrite:
+            from yggdrasil.arrow.ops import upsert_arrow_batches
+
             existing = list(self._read_arrow_batches(options))
-            chained = iter([*existing, first, *iterator])
+            incoming: Iterator[pa.RecordBatch] = iter([first, *iterator])
+            merged = upsert_arrow_batches(
+                iter(existing),
+                incoming,
+                options.match_by_keys,
+                Mode.APPEND if action is Mode.APPEND else Mode.UPSERT,
+                memory_pool=options.arrow_memory_pool,
+            )
             return self._write_arrow_batches(
-                chained, dataclasses.replace(options, mode=Mode.OVERWRITE),
+                merged, dataclasses.replace(options, mode=Mode.OVERWRITE),
             )
 
         schema = first.schema
@@ -231,19 +274,6 @@ class CsvIO(IO[bytes, CsvOptions]):
                 for batch in iterator:
                     if batch.num_rows > 0:
                         writer.write_batch(batch)
-
-    def _resolve_action(self, mode: Mode) -> Mode:
-        if mode is Mode.AUTO or mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:
-            return Mode.OVERWRITE
-        if mode is Mode.APPEND:
-            return Mode.APPEND
-        if mode is Mode.IGNORE:
-            return Mode.IGNORE
-        if mode is Mode.ERROR_IF_EXISTS:
-            return Mode.ERROR_IF_EXISTS
-        if mode is Mode.UPSERT or mode is Mode.MERGE:
-            return Mode.APPEND
-        return Mode.OVERWRITE
 
     # ==================================================================
     # Native engine overrides

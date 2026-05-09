@@ -32,6 +32,13 @@ if TYPE_CHECKING:
 __all__ = ["NDJsonIO", "NDJsonOptions"]
 
 
+#: Modes that may need to read existing bytes and merge with the
+#: incoming stream. APPEND keeps the byte-level fast path when no
+#: key dedup is asked for and the buffer isn't compressed; UPSERT /
+#: MERGE always trigger the read-modify-rewrite path.
+_MERGE_MODES = frozenset({Mode.APPEND, Mode.UPSERT, Mode.MERGE})
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class NDJsonOptions(CastOptions):
     """:class:`CastOptions` extended with NDJSON-specific knobs."""
@@ -126,10 +133,30 @@ class NDJsonIO(IO[bytes, NDJsonOptions]):
 
         OVERWRITE truncates and writes from scratch.
         APPEND seeks to EOF and writes — concatenation is a valid
-        NDJSON append. IGNORE / ERROR_IF_EXISTS guard non-empty
-        buffers.
+        NDJSON append on uncompressed buffers without ``match_by``.
+        With ``match_by`` set, or under :data:`Mode.UPSERT` /
+        :data:`Mode.MERGE`, the existing payload is read back and
+        merged via :func:`yggdrasil.arrow.ops.upsert_arrow_batches`
+        before a single rewrite. IGNORE / ERROR_IF_EXISTS guard
+        non-empty buffers.
         """
-        action = self._resolve_action(options.mode)
+        # Mode resolution. AUTO picks UPSERT when ``match_by``
+        # is set or APPEND otherwise — APPEND keeps the byte-level
+        # fast path on uncompressed buffers, UPSERT triggers a
+        # read-modify-rewrite. TRUNCATE collapses to OVERWRITE;
+        # APPEND / UPSERT / MERGE keep their identity for the merge
+        # branch; IGNORE / ERROR_IF_EXISTS guard the buffer.
+        mode = options.mode
+        if mode is Mode.AUTO:
+            action = Mode.UPSERT if options.match_by_keys else Mode.APPEND
+        elif mode is Mode.TRUNCATE:
+            action = Mode.OVERWRITE
+        elif mode in _MERGE_MODES or mode in (
+            Mode.IGNORE, Mode.ERROR_IF_EXISTS, Mode.OVERWRITE,
+        ):
+            action = mode
+        else:
+            action = Mode.OVERWRITE
 
         if action is Mode.IGNORE:
             if self.size > 0:
@@ -145,21 +172,35 @@ class NDJsonIO(IO[bytes, NDJsonOptions]):
             action = Mode.OVERWRITE
 
         codec = self._codec()
+        match_by = list(options.match_by_keys or ())
+        # Byte-append is only safe for plain APPEND, uncompressed,
+        # without a key-aware merge. Anything else has to do the
+        # full read-modify-rewrite dance.
         is_append_uncompressed = (
-            action is Mode.APPEND and self.size > 0 and codec is None
+            action is Mode.APPEND
+            and self.size > 0
+            and codec is None
+            and not match_by
         )
-        is_append_compressed = (
-            action is Mode.APPEND and self.size > 0 and codec is not None
+        needs_rewrite = (
+            action in _MERGE_MODES
+            and self.size > 0
+            and not is_append_uncompressed
         )
 
-        if is_append_compressed:
-            # Codec'd buffer — read existing batches, chain new ones,
-            # rewrite via OVERWRITE so the gzip frame is produced
-            # whole.
+        if needs_rewrite:
+            from yggdrasil.arrow.ops import upsert_arrow_batches
+
             existing = list(self._read_arrow_batches(options))
-            chained = iter([*existing, *batches])
+            merged = upsert_arrow_batches(
+                iter(existing),
+                iter(batches),
+                options.match_by_keys,
+                Mode.APPEND if action is Mode.APPEND else Mode.UPSERT,
+                memory_pool=options.arrow_memory_pool,
+            )
             return self._write_arrow_batches(
-                chained, dataclasses.replace(options, mode=Mode.OVERWRITE),
+                merged, dataclasses.replace(options, mode=Mode.OVERWRITE),
             )
 
         line_term = options.line_ending.encode(options.encoding)
@@ -191,19 +232,6 @@ class NDJsonIO(IO[bytes, NDJsonOptions]):
                     ).encode(options.encoding)
                     sink.write(line)
                     sink.write(line_term)
-
-    def _resolve_action(self, mode: Mode) -> Mode:
-        if mode is Mode.AUTO or mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:
-            return Mode.OVERWRITE
-        if mode is Mode.APPEND:
-            return Mode.APPEND
-        if mode is Mode.IGNORE:
-            return Mode.IGNORE
-        if mode is Mode.ERROR_IF_EXISTS:
-            return Mode.ERROR_IF_EXISTS
-        if mode is Mode.UPSERT or mode is Mode.MERGE:
-            return Mode.APPEND
-        return Mode.OVERWRITE
 
     # ==================================================================
     # Native engine overrides

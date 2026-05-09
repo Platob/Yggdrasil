@@ -471,13 +471,16 @@ class YGGFolderIO(FolderIO):
         # match-by set before delegating; if nothing useful remains,
         # null out the field so the leaf write skips the merge path.
         leaf_options = options
-        if options.match_by_names:
+        if options.match_by:
+            # Filter out partition columns — they're encoded in the
+            # folder layout and aren't visible at the leaf, so they
+            # can't drive a per-leaf merge.
             sub_match = [
-                m for m in options.match_by_names if m not in partition_names
+                f for f in options.match_by if f.name not in partition_names
             ]
-            if sub_match != list(options.match_by_names):
+            if len(sub_match) != len(options.match_by):
                 leaf_options = dataclasses.replace(
-                    options, match_by_names=sub_match or None,
+                    options, match_by=sub_match or None,
                 )
 
         for key_tuple, sub_batches in groups.items():

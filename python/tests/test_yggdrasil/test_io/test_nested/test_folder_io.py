@@ -294,7 +294,7 @@ class TestMergeByName:
         folder.write_arrow_table(
             pa.table({"id": [2, 4], "v": ["B", "D"]}),
             options=FolderOptions(
-                mode=Mode.APPEND, match_by_names=["id"],
+                mode=Mode.APPEND, match_by=["id"],
             ),
         )
         # Existing rows untouched (id=2 keeps "b"); only id=4 added.
@@ -310,7 +310,7 @@ class TestMergeByName:
         folder.write_arrow_table(
             pa.table({"id": [2, 4], "v": ["B", "D"]}),
             options=FolderOptions(
-                mode=Mode.UPSERT, match_by_names=["id"],
+                mode=Mode.UPSERT, match_by=["id"],
             ),
         )
         out = folder.read_arrow_table().sort_by("id")

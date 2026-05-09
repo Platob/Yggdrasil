@@ -21,7 +21,9 @@ from yggdrasil.data.base_meta import (
     _normalize_metadata,
     _to_bytes,
 )
-from yggdrasil.data.constants import DEFAULT_VALUE_KEY, DEFAULT_FIELD_NAME
+from yggdrasil.data.constants import (
+    ALIAS_KEY, DEFAULT_VALUE_KEY, DEFAULT_FIELD_NAME, POSITION_KEY,
+)
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.parser import ParsedDataType
 from yggdrasil.data.enums import Mode
@@ -372,7 +374,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         return hash((self.name, self.dtype, self.nullable, meta_key))
 
     @classmethod
-    def make_default_field(
+    def default(
         cls,
         name: str = "",
         dtype: DataType = ObjectType(),
@@ -381,6 +383,15 @@ class Field(BaseMetadata, BaseChildrenFields):
         tags: dict[bytes, bytes] | None = None,
         default: Any = None,
     ):
+        """Build a default-typed Field (``ObjectType()`` unless overridden).
+
+        Convenience constructor for the "I just have a name" path —
+        callers passing a plain string into APIs that expect a
+        :class:`Field` (e.g. ``CastOptions(match_by=["id"])``) land
+        here. The instance-side ``default`` accessor was renamed to
+        :attr:`default_value` so this name was free for the
+        constructor.
+        """
         return cls(
             name=name,
             dtype=dtype,
@@ -417,7 +428,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         ]
         if self.has_default:
             try:
-                tokens.append(f"default={self.default!r}")
+                tokens.append(f"default={self.default_value!r}")
             except Exception:
                 # Default decoding can fail for malformed metadata —
                 # don't let a bad default break repr.
@@ -666,11 +677,191 @@ class Field(BaseMetadata, BaseChildrenFields):
     # ==================================================================
 
     @property
+    def alias(self) -> str:
+        """Alternate name for this field — falls back to :attr:`name`.
+
+        Stored in :attr:`metadata` under :data:`ALIAS_KEY`. Used by
+        :meth:`select_in` (and the engine-specific ``select_in_*``
+        helpers) to resolve a column from a frame whose schema
+        labels it differently than :attr:`name` — common when a
+        source table has been renamed, or when a field carries
+        both a wire name and a friendly name.
+
+        Always returns a string: when no alias is configured the
+        getter returns :attr:`name` so downstream lookups don't
+        have to fork on ``None``. Use :attr:`has_alias` to tell
+        "configured alias" from "name fallback".
+
+        ``Field`` is a frozen dataclass — mutating the alias goes
+        through :meth:`with_alias` (immutable copy) or
+        :meth:`set_alias` (in-place dict mutation, same shape as
+        the rest of the metadata setters).
+        """
+        if self.metadata:
+            value = self.metadata.get(ALIAS_KEY)
+            if value is not None:
+                return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+        return self.name
+
+    @property
+    def has_alias(self) -> bool:
+        """Whether an explicit alias is set in :attr:`metadata`.
+
+        Distinguishes "alias configured" from the
+        :attr:`alias` → :attr:`name` fallback so callers that care
+        (schema diffs, nested-cast lookup precedence) can branch on
+        the real bit.
+        """
+        return bool(self.metadata and self.metadata.get(ALIAS_KEY))
+
+    def set_alias(self, value: str | None) -> "Field":
+        """Set / clear :attr:`alias` on *self* in place.
+
+        Frozen-dataclass property setters trip the auto-generated
+        ``__setattr__`` (cpython #44477), so the alias write path
+        is a method instead. Returns ``self`` so calls chain.
+
+        Normalization rules:
+
+        * ``value == self.name`` → no-op. Storing the canonical name
+          in the alias slot is meaningless — :attr:`alias` already
+          falls back to :attr:`name`.
+        * Field has no name yet (empty or unset) → promote the
+          incoming value to :attr:`name` instead of stashing it in
+          metadata, so the field gets a usable identity in one
+          step.
+        * Otherwise → record under :data:`ALIAS_KEY`.
+        """
+        if value is None or value == self.name:
+            if not self.metadata or ALIAS_KEY not in self.metadata:
+                return self
+            self.metadata.pop(ALIAS_KEY, None)
+            if not self.metadata:
+                object.__setattr__(self, "metadata", None)
+            self._on_metadata_mutated()
+            return self
+        if not self.name:
+            object.__setattr__(self, "name", value)
+            if self.metadata and ALIAS_KEY in self.metadata:
+                self.metadata.pop(ALIAS_KEY, None)
+                if not self.metadata:
+                    object.__setattr__(self, "metadata", None)
+            self._on_metadata_mutated()
+            return self
+        if self.metadata is None:
+            object.__setattr__(self, "metadata", {})
+        self.metadata[ALIAS_KEY] = value.encode("utf-8")
+        self._on_metadata_mutated()
+        return self
+
+    @property
+    def position(self) -> int | None:
+        """Optional 0-based index this field claims in a parent schema.
+
+        Stored in :attr:`metadata` under :data:`POSITION_KEY`. Used
+        by :meth:`select_in_field` (and the engine-specific
+        ``select_in_*`` helpers) as the last-resort fallback when
+        neither :attr:`name` nor :attr:`alias` matches a child name
+        in the receiving schema — the receiver's
+        ``children_fields[position]`` (or column at ``position``)
+        is then resolved by name and used.
+
+        ``None`` (the default) leaves position-based lookup
+        disabled, matching the historical name/alias-only resolver.
+        """
+        if not self.metadata:
+            return None
+        value = self.metadata.get(POSITION_KEY)
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            try:
+                return int(value.decode("utf-8"))
+            except ValueError:
+                return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def set_position(self, value: int | None) -> "Field":
+        """Set / clear :attr:`position` on *self* in place.
+
+        Negative values are rejected — positions are forward
+        indices into the parent schema; if you need a
+        last-element fallback, resolve it before calling.
+        """
+        if value is None:
+            if not self.metadata or POSITION_KEY not in self.metadata:
+                return self
+            self.metadata.pop(POSITION_KEY, None)
+            if not self.metadata:
+                object.__setattr__(self, "metadata", None)
+            self._on_metadata_mutated()
+            return self
+        if not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"Field.position must be a non-negative int (got {value!r})."
+            )
+        if self.metadata is None:
+            object.__setattr__(self, "metadata", {})
+        self.metadata[POSITION_KEY] = str(value).encode("utf-8")
+        self._on_metadata_mutated()
+        return self
+
+    def with_position(self, position: int | None) -> "Field":
+        """Return a copy of this field with :attr:`position` set / cleared."""
+        if position == self.position:
+            return self
+        if position is not None and (not isinstance(position, int) or position < 0):
+            raise ValueError(
+                f"Field.position must be a non-negative int (got {position!r})."
+            )
+        metadata = dict(self.metadata) if self.metadata else {}
+        if position is None:
+            metadata.pop(POSITION_KEY, None)
+        else:
+            metadata[POSITION_KEY] = str(position).encode("utf-8")
+        return self.copy(metadata=metadata or None)
+
+    def with_alias(self, alias: str | None) -> "Field":
+        """Return a copy of this field with :attr:`alias` set / cleared.
+
+        Mirrors :meth:`with_default` — immutable shape for callers
+        that don't want to mutate the existing instance. Same
+        normalization rules as :meth:`set_alias`: no-op on
+        ``alias == self.name``; promote to :attr:`name` when the
+        receiver has no name yet.
+        """
+        if alias is None or alias == self.name:
+            if not self.has_alias:
+                return self
+            metadata = dict(self.metadata)
+            metadata.pop(ALIAS_KEY, None)
+            return self.copy(metadata=metadata or None)
+        if not self.name:
+            metadata = dict(self.metadata) if self.metadata else {}
+            metadata.pop(ALIAS_KEY, None)
+            return self.copy(name=alias, metadata=metadata or None)
+        metadata = dict(self.metadata) if self.metadata else {}
+        metadata[ALIAS_KEY] = alias.encode("utf-8")
+        return self.copy(metadata=metadata)
+
+    @property
     def has_default(self) -> bool:
         return self.metadata.get(DEFAULT_VALUE_KEY) is not None if self.metadata else False
 
     @property
-    def default(self):
+    def default_value(self):
+        """Field's default Python value (or the dtype-level default).
+
+        Reads :data:`DEFAULT_VALUE_KEY` from :attr:`metadata` first;
+        falls back to ``self.dtype.default_pyobj`` when the metadata
+        slot is unset. Renamed from ``default`` so the constructor
+        classmethod :meth:`Field.default` can take that name —
+        ``field.default`` would otherwise shadow it via descriptor
+        lookup.
+        """
         if self.metadata is not None:
             default = self.metadata.get(DEFAULT_VALUE_KEY)
 
@@ -1067,7 +1258,7 @@ class Field(BaseMetadata, BaseChildrenFields):
             # defaults to :class:`ObjectType` so the column is typed
             # but un-pinned; callers that care can pass a Field /
             # ``pa.Field`` instead.
-            new_field = Field.make_default_field(name=field, **kwargs)
+            new_field = Field.default(name=field, **kwargs)
         else:
             new_field = Field.from_any(field, **kwargs)
 
@@ -1627,6 +1818,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         owner: type | None = None,
     ) -> "Field":
         default = None
+        # ``value`` is a ``dataclasses.Field`` here — its ``default``
+        # is the stdlib attribute, not our renamed ``default_value``.
         if value.default is not None:
             default = value.default
         elif value.default_factory is not None:  # type: ignore[attr-defined]
@@ -2771,6 +2964,257 @@ class Field(BaseMetadata, BaseChildrenFields):
         return self.finalize_spark(casted)
 
     # ==================================================================
+    # Select — pull this field out of a frame and cast in one shot
+    # ==================================================================
+    #
+    # ``select_in_*`` is the read-side companion to ``cast_*``. Where
+    # ``cast_*`` takes a column / frame the caller already extracted,
+    # ``select_in_*`` resolves the column from a frame whose schema
+    # may differ — checking :attr:`name` first, falling back to
+    # :attr:`alias` — and casts the result to ``self.dtype`` so the
+    # output is shape-stable regardless of which name resolved.
+    #
+    # Miss policy is one knob: ``default: Any = ...``. Leaving it as
+    # the ellipsis sentinel raises ``KeyError`` on miss (matching
+    # candidates and available column names included). Passing any
+    # other value (a literal, a typed pa.Array, ``None``, another
+    # Field for the schema variant) returns that value as-is.
+
+    def _resolve_column_name(
+        self,
+        available: Iterable[str] | None,
+        *,
+        raise_error: bool = True,
+    ) -> str | None:
+        """Pick the column name to use when selecting from a frame.
+
+        Tries :attr:`name` first, then :attr:`alias` if set, against
+        ``available`` (any iterable of column names). Returns the
+        winning string. With ``raise_error=False`` returns ``None``
+        instead of raising on a miss — useful for "best effort"
+        callers that want to skip absent fields.
+        """
+        names = list(available or ())
+        if self.name and self.name in names:
+            return self.name
+        # ``alias`` falls back to ``name`` — only worth a second
+        # lookup when the user actually configured one.
+        if self.has_alias and self.alias in names:
+            return self.alias
+        # Last-resort positional fallback: when the field carries a
+        # configured ``position`` and that index is in range,
+        # resolve to the column at that index. Lets callers carry
+        # "this is the third column" intent through a schema diff
+        # where names rotate.
+        position = self.position
+        if position is not None and 0 <= position < len(names):
+            return names[position]
+        if not raise_error:
+            return None
+        candidates = [self.name]
+        if self.has_alias:
+            candidates.append(self.alias)
+        if position is not None:
+            candidates.append(f"[{position}]")
+        raise KeyError(
+            f"Field {self.name!r} not found — looked for "
+            f"{candidates!r}. Available columns: {names}"
+        )
+
+    def select_in_arrow_tabular(
+        self,
+        table: "pa.Table | pa.RecordBatch",
+        options: "CastOptions | None" = None,
+        default_scalar: "pa.Scalar | None" = None,
+        *,
+        default: Any = ...,
+        **more,
+    ) -> "pa.Array | pa.ChunkedArray | None":
+        """Pull this field's column out of *table* and cast it.
+
+        Returns ``pa.ChunkedArray`` for a :class:`pa.Table` and
+        ``pa.Array`` for a :class:`pa.RecordBatch` — whatever the
+        underlying engine hands back from :meth:`column`.
+
+        On miss:
+
+        * ``default is ...`` (sentinel, default) → raise
+          ``KeyError``.
+        * any other value → returned as-is (caller decides shape —
+          e.g. ``pa.nulls(table.num_rows, type)`` for a length-
+          matched null array, ``None`` to skip silently).
+        """
+        column_name = self._resolve_column_name(
+            table.schema.names, raise_error=default is ...,
+        )
+        if column_name is None:
+            return default
+        return self.cast_arrow_array(
+            table.column(column_name),
+            options=options, default_scalar=default_scalar, **more,
+        )
+
+    def select_in_arrow(
+        self,
+        obj: Any,
+        options: "CastOptions | None" = None,
+        default_scalar: "pa.Scalar | None" = None,
+        *,
+        default: Any = ...,
+        **more,
+    ) -> Any:
+        """Generic Arrow dispatcher for :meth:`select_in_arrow_tabular`.
+
+        Table / RecordBatch → :meth:`select_in_arrow_tabular`.
+        Array / ChunkedArray → :meth:`cast_arrow_array` (no name to
+        resolve, same shape as the cast side; ``default`` is moot).
+        """
+        if isinstance(obj, (pa.Table, pa.RecordBatch)):
+            return self.select_in_arrow_tabular(
+                obj, options=options, default_scalar=default_scalar,
+                default=default, **more,
+            )
+        if isinstance(obj, (pa.Array, pa.ChunkedArray)):
+            return self.cast_arrow_array(
+                obj, options=options, default_scalar=default_scalar, **more,
+            )
+        raise TypeError(
+            f"Field.select_in_arrow: expected pa.Table / pa.RecordBatch / "
+            f"pa.Array / pa.ChunkedArray, got {type(obj).__name__}"
+        )
+
+    def select_in_polars_frame(
+        self,
+        df: "polars.DataFrame",
+        options: "CastOptions | None" = None,
+        default_scalar: Any = None,
+        *,
+        default: Any = ...,
+        **more,
+    ) -> "polars.Series | None":
+        """Pull this field's column out of *df* as a cast :class:`pl.Series`.
+
+        ``default`` follows the same convention as
+        :meth:`select_in_arrow_tabular` — ellipsis raises, any
+        other value is returned as-is on miss.
+        """
+        column_name = self._resolve_column_name(
+            df.columns, raise_error=default is ...,
+        )
+        if column_name is None:
+            return default
+        return self.cast_polars_series(
+            df.get_column(column_name),
+            options=options, default_scalar=default_scalar, **more,
+        )
+
+    def select_in_polars_lazy_frame(
+        self,
+        lf: "polars.LazyFrame",
+        options: "CastOptions | None" = None,
+        default_scalar: Any = None,
+        *,
+        default: Any = ...,
+        **more,
+    ) -> "polars.Expr | None":
+        """Project this field out of a :class:`pl.LazyFrame` as an Expr.
+
+        Returns a :class:`pl.Expr` ready for ``lf.with_columns`` /
+        ``lf.select`` so the caller can keep composing without
+        forcing a collect. Mirrors the polars idiom of "Series for
+        eager, Expr for lazy".
+
+        ``default`` follows the same convention — ellipsis raises,
+        any other value is returned as-is.
+        """
+        pl = get_polars()
+        column_name = self._resolve_column_name(
+            lf.collect_schema().names(), raise_error=default is ...,
+        )
+        if column_name is None:
+            return default
+        # Lazy projections work on Expr, not Series — there's no
+        # source dtype to peek at, so the registered cast pipeline's
+        # ``need_cast`` would trip. The polars-native ``.cast()`` is
+        # the right primitive here: it composes downstream and the
+        # planner can fold it away when the input dtype already
+        # matches.
+        polars_dtype = self.dtype.to_polars()
+        return pl.col(column_name).cast(polars_dtype).alias(self.name)
+
+    def select_in(
+        self,
+        obj: Any,
+        options: "CastOptions | None" = None,
+        default_scalar: Any = None,
+        *,
+        default: Any = ...,
+        **more,
+    ) -> Any:
+        """Top-level select dispatcher — pick a column out of any frame.
+
+        Routes by engine: pyarrow Table/RecordBatch/Array/ChunkedArray
+        → :meth:`select_in_arrow`; polars DataFrame →
+        :meth:`select_in_polars_frame`; polars LazyFrame →
+        :meth:`select_in_polars_lazy_frame`. Anything else raises
+        ``TypeError``. Field-shaped containers (Field with a struct
+        dtype, Schema) go through :meth:`select_in_field`.
+        """
+        if isinstance(obj, Field):
+            return self.select_in_field(obj, default=default)
+        if isinstance(obj, (pa.Table, pa.RecordBatch, pa.Array, pa.ChunkedArray)):
+            return self.select_in_arrow(
+                obj, options=options, default_scalar=default_scalar,
+                default=default, **more,
+            )
+        ns, _name = ObjectSerde.module_and_name(obj)
+        if ns.startswith("polars"):
+            pl = get_polars()
+            if isinstance(obj, pl.DataFrame):
+                return self.select_in_polars_frame(
+                    obj, options=options, default_scalar=default_scalar,
+                    default=default, **more,
+                )
+            if isinstance(obj, pl.LazyFrame):
+                return self.select_in_polars_lazy_frame(
+                    obj, options=options, default_scalar=default_scalar,
+                    default=default, **more,
+                )
+        raise TypeError(
+            f"Field.select_in: unsupported frame type {type(obj).__name__}. "
+            "Supported: Field/Schema, pa.Table / pa.RecordBatch / pa.Array / "
+            "pa.ChunkedArray, pl.DataFrame, pl.LazyFrame."
+        )
+
+    def select_in_field(
+        self,
+        other: "Field",
+        *,
+        default: "Field | Any" = ...,
+    ) -> "Field | None":
+        """Find this field by :attr:`name` / :attr:`alias` inside *other*.
+
+        ``other`` is anything carrying ``children_fields`` — a
+        :class:`Field` whose dtype is a struct / list / map, or a
+        :class:`Schema` (which is a Field subclass). Returns the
+        matching child Field, or ``default`` on miss (ellipsis
+        sentinel raises).
+        """
+        children = list(other.children_fields)
+        names = [f.name for f in children]
+        column_name = self._resolve_column_name(
+            names, raise_error=default is ...,
+        )
+        if column_name is None:
+            return default
+        return next(f for f in children if f.name == column_name)
+
+    #: Schema is a :class:`Field` subclass, so :meth:`select_in_field`
+    #: handles both. ``select_in_schema`` is a readability alias for
+    #: callers reaching across a Schema specifically.
+    select_in_schema = select_in_field
+
+    # ==================================================================
     # Fill — null-only dispatch (no cast), mirrors the cast dispatcher
     # ==================================================================
     #
@@ -2911,7 +3355,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         default_scalar: Any = None,
     ):
         if default_scalar is None and self.has_default:
-            default_scalar = self.default
+            default_scalar = self.default_value
 
         return self.dtype.fill_polars_array_nulls(
             series,
@@ -2926,7 +3370,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         default_scalar: Any = None,
     ):
         if default_scalar is None and self.has_default:
-            default_scalar = self.default
+            default_scalar = self.default_value
 
         return self.dtype.fill_pandas_series_nulls(
             series,
@@ -2941,7 +3385,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         default_scalar: pa.Scalar | None = None,
     ) -> "ps.Column":
         if default_scalar is None:
-            default_scalar = self.default
+            default_scalar = self.default_value
 
         return self.dtype.fill_spark_column_nulls(
             column,
@@ -2978,7 +3422,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         name: str | None = None,
     ):
         return self.dtype.default_polars_series(
-            value=self.default,
+            value=self.default_value,
             nullable=self.nullable,
             size=size,
             name=self.name if name is None else name,
@@ -2986,7 +3430,7 @@ class Field(BaseMetadata, BaseChildrenFields):
 
     def default_polars_expr(self, alias: str | None = None):
         return self.dtype.default_polars_expr(
-            value=self.default, nullable=self.nullable,
+            value=self.default_value, nullable=self.nullable,
             alias=alias or self.name
         )
 
@@ -2998,7 +3442,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         name: str | None = None,
     ):
         return self.dtype.default_pandas_series(
-            value=self.default,
+            value=self.default_value,
             nullable=self.nullable,
             size=size,
             index=index,
@@ -3006,7 +3450,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         )
 
     def default_spark_column(self, alias: str | None = None):
-        s = self.dtype.default_spark_column(value=self.default, nullable=self.nullable)
+        s = self.dtype.default_spark_column(value=self.default_value, nullable=self.nullable)
         return s.alias(alias) if alias else s.alias(self.name)
 
     # ==================================================================

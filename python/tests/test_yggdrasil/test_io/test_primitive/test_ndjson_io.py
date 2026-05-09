@@ -84,6 +84,34 @@ class TestModes:
         assert lines == ['{"id":1,"name":"a"}', '{"id": 2, "name": "b"}']
 
 
+class TestKeyedMerge:
+    """``options.match_by`` drives key-aware APPEND / UPSERT."""
+
+    def test_append_with_keys_drops_incoming_duplicates(self, table) -> None:
+        io = NDJsonIO()
+        io.write_arrow_table(table)
+        more = pa.table({"id": [2, 4], "name": ["X", "d"]})
+        io.write_arrow_batches(
+            more.to_batches(),
+            options=NDJsonOptions(mode=Mode.APPEND, match_by=["id"]),
+        )
+        loaded = io.read_arrow_table()
+        assert loaded.column("id").to_pylist() == [1, 2, 3, 4]
+        assert loaded.column("name").to_pylist() == ["a", "b", "c", "d"]
+
+    def test_upsert_with_keys_replaces_existing(self, table) -> None:
+        io = NDJsonIO()
+        io.write_arrow_table(table)
+        more = pa.table({"id": [2, 4], "name": ["X", "d"]})
+        io.write_arrow_batches(
+            more.to_batches(),
+            options=NDJsonOptions(mode=Mode.UPSERT, match_by=["id"]),
+        )
+        loaded = io.read_arrow_table()
+        assert loaded.column("id").to_pylist() == [1, 3, 2, 4]
+        assert loaded.column("name").to_pylist() == ["a", "c", "X", "d"]
+
+
 class TestExternalWriterPattern:
 
     def test_python_json_appender(self, tmp_path) -> None:

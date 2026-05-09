@@ -183,6 +183,110 @@ class TestModes:
         assert io.read_arrow_table().equals(table)
 
 
+class TestKeyedMerge:
+    """``options.match_by`` drives key-aware APPEND / UPSERT."""
+
+    def test_append_with_keys_drops_incoming_duplicates(self, table) -> None:
+        io = ArrowIPCIO()
+        io.write_arrow_table(table)
+        # Rows id=2, 3 collide with existing → dropped; id=5 is new.
+        more = pa.table(
+            {"id": [2, 3, 5], "name": ["X", "Y", "e"], "v": [-1.0, -2.0, 4.5]}
+        )
+        io.write_arrow_batches(
+            more.to_batches(),
+            options=ArrowIPCOptions(mode=Mode.APPEND, match_by=["id"]),
+        )
+        loaded = io.read_arrow_table()
+        assert loaded.column("id").to_pylist() == [1, 2, 3, 4, 5]
+        # Existing rows win for the colliding keys.
+        assert loaded.column("name").to_pylist() == ["a", "b", "c", "d", "e"]
+
+    def test_upsert_with_keys_replaces_existing(self, table) -> None:
+        io = ArrowIPCIO()
+        io.write_arrow_table(table)
+        more = pa.table(
+            {"id": [2, 3, 5], "name": ["X", "Y", "e"], "v": [-1.0, -2.0, 4.5]}
+        )
+        io.write_arrow_batches(
+            more.to_batches(),
+            options=ArrowIPCOptions(mode=Mode.UPSERT, match_by=["id"]),
+        )
+        loaded = io.read_arrow_table()
+        # Surviving existing (id=1, 4) first, then all incoming.
+        assert loaded.column("id").to_pylist() == [1, 4, 2, 3, 5]
+        assert loaded.column("name").to_pylist() == ["a", "d", "X", "Y", "e"]
+        assert loaded.column("v").to_pylist() == [0.5, 3.5, -1.0, -2.0, 4.5]
+
+    def test_merge_behaves_like_upsert(self, table) -> None:
+        io = ArrowIPCIO()
+        io.write_arrow_table(table)
+        more = pa.table({"id": [3], "name": ["Z"], "v": [9.0]})
+        io.write_arrow_batches(
+            more.to_batches(),
+            options=ArrowIPCOptions(mode=Mode.MERGE, match_by=["id"]),
+        )
+        loaded = io.read_arrow_table()
+        assert loaded.column("id").to_pylist() == [1, 2, 4, 3]
+        assert loaded.column("name").to_pylist() == ["a", "b", "d", "Z"]
+
+    def test_upsert_without_keys_falls_back_to_append(self, table) -> None:
+        io = ArrowIPCIO()
+        io.write_arrow_table(table)
+        more = pa.table({"id": [2], "name": ["X"], "v": [-1.0]})
+        io.write_arrow_batches(
+            more.to_batches(), options=ArrowIPCOptions(mode=Mode.UPSERT),
+        )
+        # No keys → degrades to plain concatenation; the duplicate id=2
+        # row is appended as-is.
+        loaded = io.read_arrow_table()
+        assert loaded.column("id").to_pylist() == [1, 2, 3, 4, 2]
+        assert loaded.column("name").to_pylist() == ["a", "b", "c", "d", "X"]
+
+    def test_upsert_with_keys_into_empty_writes_payload(self, table) -> None:
+        io = ArrowIPCIO()
+        io.write_arrow_batches(
+            table.to_batches(),
+            options=ArrowIPCOptions(mode=Mode.UPSERT, match_by=["id"]),
+        )
+        assert io.read_arrow_table().equals(table)
+
+    def test_append_with_composite_keys(self) -> None:
+        base = pa.table(
+            {"a": [1, 1, 2], "b": ["x", "y", "x"], "v": [10, 20, 30]}
+        )
+        io = ArrowIPCIO()
+        io.write_arrow_table(base)
+        more = pa.table(
+            # (1, "x") collides → dropped under APPEND; (2, "y") is new.
+            {"a": [1, 2], "b": ["x", "y"], "v": [-1, 40]}
+        )
+        io.write_arrow_batches(
+            more.to_batches(),
+            options=ArrowIPCOptions(mode=Mode.APPEND, match_by=["a", "b"]),
+        )
+        loaded = io.read_arrow_table()
+        assert loaded.column("a").to_pylist() == [1, 1, 2, 2]
+        assert loaded.column("b").to_pylist() == ["x", "y", "x", "y"]
+        assert loaded.column("v").to_pylist() == [10, 20, 30, 40]
+
+    def test_upsert_with_field_typed_match_by(self, table) -> None:
+        from yggdrasil.data import Field
+        io = ArrowIPCIO()
+        io.write_arrow_table(table)
+        more = pa.table({"id": [3], "name": ["Z"], "v": [9.0]})
+        # Field-typed match_by — the IO derives the key name list via
+        # ``options.match_by_keys``.
+        id_field = Field.from_(pa.field("id", pa.int64()))
+        io.write_arrow_batches(
+            more.to_batches(),
+            options=ArrowIPCOptions(mode=Mode.UPSERT, match_by=[id_field]),
+        )
+        loaded = io.read_arrow_table()
+        assert loaded.column("id").to_pylist() == [1, 2, 4, 3]
+        assert loaded.column("name").to_pylist() == ["a", "b", "d", "Z"]
+
+
 class TestExternalWriterPattern:
     """`with path.open() as b: pyarrow.ipc.RecordBatchFileWriter(b, ...)` flow."""
 

@@ -98,7 +98,7 @@ class StructType(NestedType):
 
     def default_pyobj(self, nullable: bool) -> Any:
         return None if nullable else {
-            f.name: f.default
+            f.name: f.default_value
             for f in self.fields
         }
 
