@@ -115,6 +115,34 @@ class TestModes:
             )
 
 
+class TestKeyedMerge:
+    """``options.match_by_names`` drives key-aware APPEND / UPSERT."""
+
+    def test_append_with_keys_drops_incoming_duplicates(self, table) -> None:
+        io = CsvIO()
+        io.write_arrow_table(table)
+        more = pa.table({"id": [2, 4], "name": ["X", "d"]})
+        io.write_arrow_batches(
+            more.to_batches(),
+            options=CsvOptions(mode=Mode.APPEND, match_by_names=["id"]),
+        )
+        loaded = io.read_arrow_table()
+        assert loaded.column("id").to_pylist() == [1, 2, 3, 4]
+        assert loaded.column("name").to_pylist() == ["a", "b", "c", "d"]
+
+    def test_upsert_with_keys_replaces_existing(self, table) -> None:
+        io = CsvIO()
+        io.write_arrow_table(table)
+        more = pa.table({"id": [2, 4], "name": ["X", "d"]})
+        io.write_arrow_batches(
+            more.to_batches(),
+            options=CsvOptions(mode=Mode.UPSERT, match_by_names=["id"]),
+        )
+        loaded = io.read_arrow_table()
+        assert loaded.column("id").to_pylist() == [1, 3, 2, 4]
+        assert loaded.column("name").to_pylist() == ["a", "c", "X", "d"]
+
+
 class TestDelimiter:
 
     def test_tsv_round_trip(self, table) -> None:

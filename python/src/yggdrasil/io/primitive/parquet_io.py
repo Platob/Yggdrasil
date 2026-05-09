@@ -45,6 +45,14 @@ if TYPE_CHECKING:
 __all__ = ["ParquetIO", "ParquetOptions"]
 
 
+#: Modes that read existing bytes, merge with the incoming stream,
+#: and rewrite the file in one shot. Parquet's footer covers every
+#: row group, so APPEND, UPSERT and MERGE all share the same
+#: read-modify-rewrite shape — only the per-row dedup strategy
+#: differs.
+_MERGE_MODES = frozenset({Mode.APPEND, Mode.UPSERT, Mode.MERGE})
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class ParquetOptions(CastOptions):
     """:class:`CastOptions` extended with Parquet-specific knobs."""
@@ -151,14 +159,40 @@ class ParquetIO(IO[bytes, ParquetOptions]):
         - **OVERWRITE / AUTO / TRUNCATE** — single
           :class:`pq.ParquetWriter` session over the buffer
           (truncated to zero before the writer opens).
-        - **APPEND / UPSERT / MERGE** — read existing batches, chain
-          incoming, recurse with OVERWRITE. Parquet's footer covers
-          every row group, so a partial append still requires a full
-          rewrite.
+        - **APPEND** — read existing batches, merge with incoming,
+          recurse with OVERWRITE. With ``options.match_by_names`` set
+          incoming rows whose key tuple already exists are dropped
+          (existing wins); without keys the streams are concatenated.
+        - **UPSERT / MERGE** — same read-modify-rewrite, but with
+          ``match_by_names`` set existing rows whose key matches the
+          incoming stream are dropped (incoming wins). Without keys
+          this collapses to plain APPEND — Parquet has no row-level
+          identity at this layer.
         - **IGNORE** — skip when non-empty.
         - **ERROR_IF_EXISTS** — raise when non-empty.
+
+        Key-aware merges are powered by
+        :func:`yggdrasil.arrow.ops.upsert_arrow_batches`.
         """
-        action = self._resolve_action(options.mode)
+        # Mode resolution. AUTO picks UPSERT when ``match_by_names``
+        # is set (incoming wins on key conflict) or APPEND otherwise
+        # — Parquet has no in-place append, so both end up doing the
+        # same read-modify-rewrite, but the semantics line up with
+        # what the caller was asking for. TRUNCATE collapses to
+        # OVERWRITE; APPEND / UPSERT / MERGE keep their identity for
+        # the merge branch below; IGNORE / ERROR_IF_EXISTS guard the
+        # buffer.
+        mode = options.mode
+        if mode is Mode.AUTO:
+            action = Mode.UPSERT if options.match_by_names else Mode.APPEND
+        elif mode is Mode.TRUNCATE:
+            action = Mode.OVERWRITE
+        elif mode in _MERGE_MODES or mode in (
+            Mode.IGNORE, Mode.ERROR_IF_EXISTS, Mode.OVERWRITE,
+        ):
+            action = mode
+        else:
+            action = Mode.OVERWRITE
 
         if action is Mode.IGNORE:
             if self.size > 0:
@@ -182,11 +216,20 @@ class ParquetIO(IO[bytes, ParquetOptions]):
         if first is None:
             return
 
-        if action is Mode.APPEND and self.size > 0:
+        if action in _MERGE_MODES and self.size > 0:
+            from yggdrasil.arrow.ops import upsert_arrow_batches
+
             existing = list(self._read_arrow_batches(options))
-            chained = iter([*existing, first, *iterator])
+            incoming: Iterator[pa.RecordBatch] = iter([first, *iterator])
+            merged = upsert_arrow_batches(
+                iter(existing),
+                incoming,
+                options.match_by_names,
+                Mode.APPEND if action is Mode.APPEND else Mode.UPSERT,
+                memory_pool=options.arrow_memory_pool,
+            )
             return self._write_arrow_batches(
-                chained, dataclasses.replace(options, mode=Mode.OVERWRITE),
+                merged, dataclasses.replace(options, mode=Mode.OVERWRITE),
             )
 
         # OVERWRITE — drive the writer against the IO's
@@ -210,26 +253,6 @@ class ParquetIO(IO[bytes, ParquetOptions]):
                 for batch in iterator:
                     if batch.num_rows > 0:
                         writer.write_batch(batch, row_group_size=options.row_group_size)
-
-    def _resolve_action(self, mode: Mode) -> Mode:
-        """Pick the disposition for a write call.
-
-        Parquet has no native append story (one footer per file),
-        so :data:`Mode.AUTO` resolves to :data:`Mode.OVERWRITE` and
-        :data:`Mode.UPSERT` / :data:`Mode.MERGE` degrade to
-        :data:`Mode.APPEND` (which still triggers a full rewrite).
-        """
-        if mode is Mode.AUTO or mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:
-            return Mode.OVERWRITE
-        if mode is Mode.APPEND:
-            return Mode.APPEND
-        if mode is Mode.IGNORE:
-            return Mode.IGNORE
-        if mode is Mode.ERROR_IF_EXISTS:
-            return Mode.ERROR_IF_EXISTS
-        if mode is Mode.UPSERT or mode is Mode.MERGE:
-            return Mode.APPEND
-        return Mode.OVERWRITE
 
     # ==================================================================
     # Native engine overrides — push reads to format-aware scanners

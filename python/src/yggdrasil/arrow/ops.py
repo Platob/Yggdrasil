@@ -156,7 +156,7 @@ def upsert_arrow_tabular(
 def upsert_arrow_batches(
     left: Iterable[pa.RecordBatch],
     right: Iterable[pa.RecordBatch],
-    match_by_names: list[str],
+    match_by_names: list[str] | None,
     mode: ModeLike,
     *,
     schema: pa.Schema | None = None,
@@ -189,9 +189,15 @@ def upsert_arrow_batches(
     match_by_names
         One or more shared column names that identify a row. Nested key
         types work transparently — keys are materialized to hashable
-        Python values for set membership.
+        Python values for set membership. ``None`` / empty degrades to
+        a plain key-less concatenation (``left`` first, then ``right``)
+        so callers can wire the same dispatch through whether or not
+        they have keys to dedup on; alignment to ``left``'s schema is
+        still applied.
     mode
-        Same grammar as :func:`upsert_arrow_tabular`.
+        Same grammar as :func:`upsert_arrow_tabular`. Ignored when
+        ``match_by_names`` is empty — without keys, every mode collapses
+        to "concat ``left`` then ``right``".
     schema
         Optional output schema override. When omitted, the schema is
         taken from the first ``left`` batch (or the first ``right``
@@ -208,19 +214,16 @@ def upsert_arrow_batches(
     pa.RecordBatch
         The merged stream. Empty (zero-row) batches are dropped.
     """
-    if not match_by_names:
-        raise ValueError(
-            "upsert_arrow_batches: 'match_by_names' must contain at "
-            "least one column name to match on."
-        )
+    keys = list(match_by_names or ())
 
-    resolved_mode = Mode.from_(mode)
-    keys = list(match_by_names)
-
-    if resolved_mode is Mode.APPEND:
-        merged = _upsert_batches_append(left, right, keys, schema)
+    if not keys:
+        merged = _concat_batches(left, right, schema)
     else:
-        merged = _upsert_batches_overwrite(left, right, keys, schema)
+        resolved_mode = Mode.from_(mode)
+        if resolved_mode is Mode.APPEND:
+            merged = _upsert_batches_append(left, right, keys, schema)
+        else:
+            merged = _upsert_batches_overwrite(left, right, keys, schema)
 
     if (row_size and row_size > 0) or (byte_size and byte_size > 0):
         yield from rechunk_arrow_batches(
@@ -231,6 +234,34 @@ def upsert_arrow_batches(
         )
         return
     yield from merged
+
+
+def _concat_batches(
+    left: Iterable[pa.RecordBatch],
+    right: Iterable[pa.RecordBatch],
+    schema: pa.Schema | None,
+) -> Iterator[pa.RecordBatch]:
+    """Key-less concatenation: yield ``left`` then ``right``.
+
+    Used when ``match_by_names`` is empty — there's nothing to dedup
+    against, so the merge collapses to "stream both sides through".
+    ``right`` is still aligned to the output schema (anchored on
+    ``left``'s first batch when no explicit ``schema`` is given) so
+    shape mismatches surface as cast errors here rather than at the
+    write boundary.
+    """
+    out_schema = schema
+    for batch in left:
+        if out_schema is None:
+            out_schema = batch.schema
+        if batch.num_rows:
+            yield batch
+    for batch in right:
+        if out_schema is None:
+            out_schema = batch.schema
+        batch = _align_batch_to_schema(batch, out_schema)
+        if batch.num_rows:
+            yield batch
 
 
 def _upsert_batches_append(

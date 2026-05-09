@@ -43,6 +43,13 @@ if TYPE_CHECKING:
 __all__ = ["ArrowIPCIO", "ArrowIPCOptions"]
 
 
+#: Modes that read existing bytes, merge with the incoming stream,
+#: and rewrite the file in one shot. APPEND, UPSERT and MERGE all
+#: share the same read-modify-rewrite shape — only the per-row
+#: dedup strategy differs.
+_MERGE_MODES = frozenset({Mode.APPEND, Mode.UPSERT, Mode.MERGE})
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class ArrowIPCOptions(CastOptions):
     """:class:`CastOptions` extended with IPC-specific knobs.
@@ -134,25 +141,51 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
         - **OVERWRITE / AUTO / TRUNCATE** — single
           :class:`pa.ipc.RecordBatchFileWriter` session straight into
           the buffer (truncated to zero before the writer opens).
-        - **APPEND** — read existing batches, chain the incoming
+        - **APPEND** — read existing batches, merge with the incoming
           iterator, recurse with OVERWRITE. The IPC file format has
           one footer for all batches; partial appends would require
-          rewriting the footer anyway.
+          rewriting the footer anyway. With ``match_by_names`` set,
+          incoming rows whose key tuple already exists on disk are
+          dropped (existing values win); without keys, the incoming
+          stream is concatenated as-is.
+        - **UPSERT / MERGE** — same read-modify-rewrite shape as
+          APPEND, but with ``match_by_names`` set the existing rows
+          whose key tuple is present in the incoming stream are
+          dropped (incoming values win). Without keys this is
+          undefined at the IPC file level and degrades to plain
+          APPEND — pass ``options.match_by_names=[...]`` to get
+          actual upsert semantics.
         - **IGNORE** — skip when the buffer is non-empty.
         - **ERROR_IF_EXISTS** — raise when the buffer is non-empty.
 
-        UPSERT is not meaningful at the IPC file level (no key
-        semantics) and falls back to APPEND behavior with a logged
-        note from the merge layer.
+        Key-aware merges are powered by
+        :func:`yggdrasil.arrow.ops.upsert_arrow_batches`, which
+        streams the existing side through and only buffers the
+        smaller of the two key sets needed to drive the dedup.
         """
+        # AUTO picks the most useful mode from context:
+        # ``match_by_names`` set → UPSERT (incoming wins on key
+        # conflict); otherwise APPEND. This keeps the historical
+        # "default = grow the file" behaviour while letting callers
+        # opt into key-aware writes purely via ``match_by_names``.
         action = options.mode
+        if action is Mode.AUTO:
+            action = Mode.UPSERT if options.match_by_names else Mode.APPEND
+        elif action is Mode.TRUNCATE:
+            action = Mode.OVERWRITE
+
+        # ``self.size`` is the durable buffer size; ``is_empty()``
+        # would only see "no bytes left to read at the cursor" and
+        # would mis-fire after an earlier write parked the cursor at
+        # EOF. APPEND-into-recently-written is the canonical case.
+        has_existing = self.size > 0
 
         if action is Mode.IGNORE:
-            if not self.is_empty():
+            if has_existing:
                 return None
             action = Mode.OVERWRITE
         elif action is Mode.ERROR_IF_EXISTS:
-            if self.is_dirty():
+            if has_existing:
                 raise FileExistsError(
                     f"{type(self).__name__} buffer is non-empty "
                     f"({self.size} bytes); refusing to overwrite under "
@@ -171,24 +204,31 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
         if first is None:
             return None
 
-        is_empty = self.is_empty()
+        if action in _MERGE_MODES and has_existing:
+            # Read existing batches, merge with the incoming iter, then
+            # recurse with OVERWRITE. The merge is delegated to
+            # :func:`upsert_arrow_batches`, which centralizes the
+            # key-aware dedup *and* the keyless ``match_by_names is
+            # None`` fallback (plain concat) — so we don't fork on
+            # ``options.match_by_names`` here. Existing batches are
+            # materialized because we're about to truncate the same
+            # buffer they were read from.
+            from yggdrasil.arrow.ops import upsert_arrow_batches
 
-        if action is Mode.UPSERT and not is_empty:
-            upsert_options = options.check_target(self.collect_schema(options))
-            raise NotImplementedError
-        if action is Mode.APPEND and not is_empty:
-            # Read the existing batches, then chain the incoming iter,
-            # then recurse with OVERWRITE. Batches are lazily walked
-            # so this doesn't materialize the full table — but the
-            # rewrite still re-encodes everything.
-            append_options = options.check_target(self.collect_schema(options))
+            rewrite_options = options.check_target(self.collect_schema(options))
             existing = list(self._read_arrow_batches(options))
-            chained = append_options.cast_arrow_batch_iterator(
-                iter([*existing, first, *iterator])
+            incoming: Iterator[pa.RecordBatch] = iter([first, *iterator])
+            merged = upsert_arrow_batches(
+                iter(existing),
+                incoming,
+                options.match_by_names,
+                Mode.APPEND if action is Mode.APPEND else Mode.UPSERT,
+                memory_pool=options.arrow_memory_pool,
             )
+            chained = rewrite_options.cast_arrow_batch_iterator(merged)
             return self._write_arrow_batches(
                 chained,
-                append_options.copy(
+                rewrite_options.copy(
                     mode=Mode.OVERWRITE,
                     # remove already applied since cast_arrow_batch_iterator does it
                     target=None,

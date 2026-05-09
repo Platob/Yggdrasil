@@ -129,6 +129,51 @@ class TestModes:
             )
 
 
+class TestKeyedMerge:
+    """``options.match_by_names`` drives key-aware APPEND / UPSERT."""
+
+    def test_append_with_keys_drops_incoming_duplicates(self, table) -> None:
+        io = ParquetIO()
+        io.write_arrow_table(table)
+        more = pa.table(
+            {"id": [2, 3, 5], "name": ["X", "Y", "e"], "v": [-1.0, -2.0, 4.5]}
+        )
+        io.write_arrow_batches(
+            more.to_batches(),
+            options=ParquetOptions(mode=Mode.APPEND, match_by_names=["id"]),
+        )
+        loaded = io.read_arrow_table()
+        assert loaded.column("id").to_pylist() == [1, 2, 3, 4, 5]
+        assert loaded.column("name").to_pylist() == ["a", "b", "c", "d", "e"]
+
+    def test_upsert_with_keys_replaces_existing(self, table) -> None:
+        io = ParquetIO()
+        io.write_arrow_table(table)
+        more = pa.table(
+            {"id": [2, 3, 5], "name": ["X", "Y", "e"], "v": [-1.0, -2.0, 4.5]}
+        )
+        io.write_arrow_batches(
+            more.to_batches(),
+            options=ParquetOptions(mode=Mode.UPSERT, match_by_names=["id"]),
+        )
+        loaded = io.read_arrow_table()
+        assert loaded.column("id").to_pylist() == [1, 4, 2, 3, 5]
+        assert loaded.column("name").to_pylist() == ["a", "d", "X", "Y", "e"]
+
+    def test_auto_with_keys_acts_as_upsert(self, table) -> None:
+        io = ParquetIO()
+        io.write_arrow_table(table)
+        more = pa.table({"id": [3], "name": ["Z"], "v": [9.0]})
+        # Default Mode.AUTO + match_by_names → UPSERT semantics.
+        io.write_arrow_batches(
+            more.to_batches(),
+            options=ParquetOptions(match_by_names=["id"]),
+        )
+        loaded = io.read_arrow_table()
+        assert loaded.column("id").to_pylist() == [1, 2, 4, 3]
+        assert loaded.column("name").to_pylist() == ["a", "b", "d", "Z"]
+
+
 class TestCompression:
 
     @pytest.mark.parametrize("codec", ["snappy", "gzip", "zstd", "lz4"])
