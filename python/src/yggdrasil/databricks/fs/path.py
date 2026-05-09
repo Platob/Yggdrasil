@@ -271,15 +271,53 @@ class DatabricksPath(RemotePath):
     def _call(self, func, *args, **kwargs):
         """Invoke *func(*args, **kwargs)* under the standard retry policy.
 
-        Transient errors (BadRequest, InternalError, throttling,
-        5xx, connect timeouts) get up to 4 retries with 1 / 2 / 4 /
-        8 s sleeps. Permission errors get exactly one retry to
-        absorb credential-refresh races. Anything else (NotFound,
-        AlreadyExists, deterministic SDK errors) propagates.
+        Transient errors (InternalError, throttling, 5xx, connect
+        timeouts) get up to 4 retries with 1 / 2 / 4 / 8 s sleeps.
+        Permission errors get exactly one retry to absorb
+        credential-refresh races. Anything else (NotFound,
+        AlreadyExists, deterministic ``BadRequest`` messages like
+        "Folder X is protected") propagates immediately.
         """
         if self._retry_sleep is not None:
             return retry_sdk_call(func, *args, sleep=self._retry_sleep, **kwargs)
         return retry_sdk_call(func, *args, **kwargs)
+
+    def _call_ensuring_parents(self, func, *args, **kwargs):
+        """Like :meth:`_call`, but auto-creates missing parents on NotFound.
+
+        Used by mutating ops (``upload``, ``mkdirs``, ``create_directory``)
+        where the request can fail purely because an intermediate
+        directory — or, for Volume paths, the Unity Catalog volume
+        itself — does not exist yet. On the first NotFound-shaped
+        failure we hand off to :meth:`_ensure_parents` (subclass hook
+        for catalog/schema/volume creation, then a recursive parent
+        ``mkdir``) and retry exactly once. Other errors propagate.
+        """
+        try:
+            return self._call(func, *args, **kwargs)
+        except Exception as exc:
+            if not _looks_like_parent_missing(exc):
+                raise
+            if not self._ensure_parents():
+                raise
+            return self._call(func, *args, **kwargs)
+
+    def _ensure_parents(self) -> bool:
+        """Best-effort create of every directory above *self*.
+
+        Returns ``True`` if any creation actually happened (so the
+        caller knows a retry is worth attempting). Subclasses extend
+        this — :class:`VolumePath` first creates the catalog / schema
+        / managed volume, then recurses into ``parent.mkdir``.
+        """
+        parent = self.parent
+        if parent.url == self.url:
+            return False
+        try:
+            parent._mkdir(parents=True, exist_ok=True)
+            return True
+        except Exception:
+            return False
 
     # ==================================================================
     # Sibling paths inherit the same workspace client
@@ -334,3 +372,36 @@ class DatabricksPath(RemotePath):
     def __repr__(self) -> str:
         marker = ", temporary=True" if self.temporary else ""
         return f"{type(self).__name__}({self.full_path()!r}{marker})"
+
+
+# ---------------------------------------------------------------------------
+# Error duck-typing — module-private; subclasses keep their own variants
+# ---------------------------------------------------------------------------
+
+
+_PARENT_MISSING_NAMES = frozenset({
+    "NotFound", "ResourceDoesNotExist", "FileNotFoundError",
+})
+
+_PARENT_MISSING_MESSAGES = (
+    "does not exist",
+    "no such file or directory",
+    "no such directory",
+    "parent directory",
+    "path does not exist",
+)
+
+
+def _looks_like_parent_missing(exc: BaseException) -> bool:
+    """True when *exc* looks like ``parent dir / volume not found``.
+
+    Both ``NotFound``-typed errors and ``BadRequest``/etc. carrying a
+    "does not exist" message qualify — the Databricks SDK isn't fully
+    consistent about which class it raises for missing-parent cases.
+    """
+    if type(exc).__name__ in _PARENT_MISSING_NAMES:
+        return True
+    if isinstance(exc, FileNotFoundError):
+        return True
+    msg = str(exc).lower()
+    return any(pat in msg for pat in _PARENT_MISSING_MESSAGES)

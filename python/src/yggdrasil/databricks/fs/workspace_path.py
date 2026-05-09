@@ -24,6 +24,13 @@ from .path import DatabricksPath
 __all__ = ["WorkspacePath"]
 
 
+# Process-wide cache of resolved usernames, keyed by ``id`` of the
+# bound workspace client. One ``current_user.me()`` round-trip per
+# client; cleared implicitly when the client is garbage-collected
+# (the next caller gets a fresh ``id`` from the allocator).
+_USER_NAME_CACHE: dict[int, str] = {}
+
+
 class WorkspacePath(DatabricksPath):
     """Path under ``/Workspace/...`` via the Workspace API."""
 
@@ -36,11 +43,65 @@ class WorkspacePath(DatabricksPath):
 
     def full_path(self) -> str:
         p = (self.url.path or "").lstrip("/")
-        return "/Workspace/" + p if p else "/Workspace"
+        rendered = "/Workspace/" + p if p else "/Workspace"
+        return self._resolve_me(rendered)
 
     @property
     def api_path(self) -> str:
         return self.full_path()
+
+    # ------------------------------------------------------------------
+    # ``<me>`` placeholder resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_me(self, path: str) -> str:
+        """Substitute ``<me>`` segments with the current user's name.
+
+        Lets callers write portable shapes like
+        ``/Workspace/Users/<me>/scratch`` and have them resolve to
+        ``/Workspace/Users/<actual.user@example.com>/scratch`` on the
+        bound workspace client. The lookup is cached per workspace
+        client (one ``current_user.me()`` round-trip per session),
+        and the placeholder is matched as a *segment* — substrings
+        that happen to contain ``<me>`` won't be touched.
+        """
+        if "<me>" not in path:
+            return path
+        parts = path.split("/")
+        if "<me>" not in parts:
+            return path
+        username = self._current_user_name()
+        if not username:
+            return path
+        return "/".join(username if seg == "<me>" else seg for seg in parts)
+
+    def _current_user_name(self) -> str:
+        """Return the bound workspace client's current user name (cached).
+
+        Cache is process-wide, keyed by ``id(workspace)``, so every
+        :class:`WorkspacePath` derived from the same client reuses a
+        single ``current_user.me()`` round-trip. Returns an empty
+        string when the lookup fails or the SDK gives back a non-str
+        username (e.g. a :class:`MagicMock` in tests) —
+        :meth:`_resolve_me` then leaves the placeholder untouched
+        rather than masking the real error at every callsite.
+        """
+        ws = self.workspace
+        key = id(ws)
+        cached = _USER_NAME_CACHE.get(key)
+        if cached is not None:
+            return cached
+        try:
+            info = ws.current_user.me()
+        except Exception:
+            return ""
+        name = getattr(info, "user_name", None) or getattr(
+            info, "userName", None,
+        )
+        if not isinstance(name, str) or not name:
+            return ""
+        _USER_NAME_CACHE[key] = name
+        return name
 
     # ==================================================================
     # Stat
@@ -114,8 +175,16 @@ class WorkspacePath(DatabricksPath):
         try:
             self._call(self.workspace.workspace.mkdirs, self.api_path)
         except Exception as exc:
-            if not exist_ok and _looks_like_already_exists(exc):
-                raise
+            if _looks_like_already_exists(exc):
+                if not exist_ok:
+                    raise
+                return
+            if _looks_like_protected_parent(exc):
+                # Hitting a protected ancestor (e.g. ``/Workspace/Users``)
+                # is fine if the leaf already landed — fall through and
+                # let downstream ops succeed.
+                return
+            raise
 
     def _remove_file(self, missing_ok: bool = True) -> None:
         try:
@@ -188,7 +257,7 @@ class WorkspacePath(DatabricksPath):
         return n
 
     def _upload(self, payload: bytes) -> None:
-        self._call(
+        self._call_ensuring_parents(
             self.workspace.workspace.upload,
             path=self.api_path,
             content=_stdio.BytesIO(payload),
@@ -232,4 +301,14 @@ def _looks_like_not_found(exc: BaseException) -> bool:
 
 def _looks_like_already_exists(exc: BaseException) -> bool:
     name = type(exc).__name__
-    return name in ("AlreadyExists", "ResourceAlreadyExists", "FileExistsError")
+    if name in ("AlreadyExists", "ResourceAlreadyExists", "FileExistsError"):
+        return True
+    return "already exists" in str(exc).lower()
+
+
+def _looks_like_protected_parent(exc: BaseException) -> bool:
+    """``mkdirs`` can fail with ``BadRequest: Folder X is protected`` when
+    an ancestor (typically ``/Workspace/Users``) refuses creation. The
+    leaf the caller actually wants is independent of the protected
+    ancestor — treat as non-fatal."""
+    return "is protected" in str(exc).lower()

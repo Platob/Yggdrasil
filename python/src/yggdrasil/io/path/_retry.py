@@ -60,6 +60,21 @@ _TRANSIENT_STATUSES = frozenset({429, 500, 502, 503, 504})
 #: HTTP status codes treated as permission errors.
 _PERMISSION_STATUSES = frozenset({401, 403})
 
+#: Substrings that mark an otherwise-transient error (e.g. ``BadRequest``)
+#: as deterministic — retrying will never succeed. Matched
+#: case-insensitively against ``str(exc)``. Keep tight: only patterns
+#: that uniquely identify a "the request itself is wrong" failure
+#: belong here.
+_DETERMINISTIC_MESSAGE_PATTERNS = (
+    "is protected",                 # /Workspace/Users/<protected>
+    "does not exist",               # missing catalog/schema/volume
+    "no items",                     # empty zip on workspace upload
+    "already exists",
+    "is not empty",
+    "must be absolute",
+    "invalid path",
+)
+
 #: AWS / SDK error codes treated as transient.
 _TRANSIENT_CODES = frozenset({
     "InternalError", "InternalServerError", "BadRequest",
@@ -96,10 +111,20 @@ def _error_code(exc: BaseException) -> str:
     return ""
 
 
+def _has_deterministic_message(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(pat in msg for pat in _DETERMINISTIC_MESSAGE_PATTERNS)
+
+
 def is_transient(exc: BaseException) -> bool:
     """True when *exc* should be retried as a transient backend error."""
     if isinstance(exc, (TimeoutError, ConnectionError)):
         return True
+    if _has_deterministic_message(exc):
+        # Catches things like ``BadRequest: Folder Users is protected`` /
+        # ``BadRequest: The zip archive contains no items.`` — retrying
+        # those just burns sleeps before the same deterministic failure.
+        return False
     if type(exc).__name__ in _TRANSIENT_NAMES:
         return True
     if _http_status(exc) in _TRANSIENT_STATUSES:

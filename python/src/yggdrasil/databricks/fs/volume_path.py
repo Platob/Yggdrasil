@@ -159,12 +159,105 @@ class VolumePath(DatabricksPath):
                 yield from child._ls(recursive=True)
 
     # ==================================================================
+    # Parent / volume auto-creation
+    # ==================================================================
+
+    def _split_volume(self) -> Optional[tuple[str, str, str]]:
+        """``/cat/sch/vol/...`` → ``("cat", "sch", "vol")`` or ``None``.
+
+        Returns ``None`` when the URL path has fewer than three
+        segments (i.e. it doesn't address a volume at all — typically
+        a stat probe at ``/Volumes`` itself or a malformed path).
+        """
+        parts = (self.url.path or "/").lstrip("/").split("/")
+        parts = [p for p in parts if p]
+        if len(parts) < 3:
+            return None
+        return parts[0], parts[1], parts[2]
+
+    def _ensure_parents(self) -> bool:
+        """Recovery hook for ``_call_ensuring_parents`` after NotFound.
+
+        Cheap-path first: if *self* lives strictly below the volume
+        root, try a single ``files.create_directory`` on the parent
+        — that's the common case where only a sub-directory was
+        missing. Only if that call also fails NotFound (which
+        indicates the volume itself doesn't exist) do we fall back
+        to :meth:`_ensure_volume` and a parent ``mkdir`` retry. No
+        upfront ``catalogs.get`` / ``schemas.get`` / ``volumes.read``
+        probes — blind creates swallow ``AlreadyExists`` so the
+        idempotent path costs at most three SDK calls.
+        """
+        triple = self._split_volume()
+        if triple is None:
+            return False
+
+        parent = self.parent
+        pparts = [p for p in (parent.url.path or "/").lstrip("/").split("/") if p]
+        has_subdir = len(pparts) > 3  # parent strictly below ``/cat/sch/vol``
+
+        if has_subdir:
+            try:
+                self._call(
+                    self.workspace.files.create_directory, parent.api_path,
+                )
+                return True
+            except Exception as exc:
+                if _looks_like_already_exists(exc):
+                    return True
+                if not _looks_like_not_found(exc):
+                    raise
+                # Parent missing because volume itself is missing —
+                # fall through to volume creation.
+
+        self._ensure_volume()
+
+        if has_subdir:
+            try:
+                self._call(
+                    self.workspace.files.create_directory, parent.api_path,
+                )
+            except Exception as exc:
+                if not _looks_like_already_exists(exc):
+                    raise
+        return True
+
+    def _ensure_volume(self) -> bool:
+        """Blind-create catalog / schema / managed volume.
+
+        Each step swallows ``AlreadyExists`` so re-runs are free.
+        Returns ``True`` if at least one ``create`` actually landed
+        (so the caller knows something changed).
+        """
+        triple = self._split_volume()
+        if triple is None:
+            return False
+        catalog, schema, volume = triple
+        ws = self.workspace
+
+        created = _safe_create(lambda: ws.catalogs.create(name=catalog))
+        created = _safe_create(
+            lambda: ws.schemas.create(name=schema, catalog_name=catalog),
+        ) or created
+        created = _safe_create(
+            lambda: ws.volumes.create(
+                catalog_name=catalog,
+                schema_name=schema,
+                name=volume,
+                volume_type=_managed_volume_type(),
+            ),
+        ) or created
+        return created
+
+    # ==================================================================
     # Mutators
     # ==================================================================
 
     def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
         try:
-            self._call(self.workspace.files.create_directory, self.api_path)
+            self._call_ensuring_parents(
+                self.workspace.files.create_directory, self.api_path,
+            )
         except Exception as exc:
             if not exist_ok and _looks_like_already_exists(exc):
                 raise
@@ -232,7 +325,7 @@ class VolumePath(DatabricksPath):
         return n
 
     def _upload(self, payload: bytes) -> None:
-        self._call(
+        self._call_ensuring_parents(
             self.workspace.files.upload,
             file_path=self.api_path,
             contents=_stdio.BytesIO(payload),
@@ -282,14 +375,43 @@ def _mtime(info) -> float:
 
 def _looks_like_not_found(exc: BaseException) -> bool:
     name = type(exc).__name__
-    return name in (
-        "NotFound", "ResourceDoesNotExist", "FileNotFoundError",
-    ) or isinstance(exc, FileNotFoundError)
+    if name in ("NotFound", "ResourceDoesNotExist", "FileNotFoundError"):
+        return True
+    if isinstance(exc, FileNotFoundError):
+        return True
+    return "does not exist" in str(exc).lower()
 
 
 def _looks_like_already_exists(exc: BaseException) -> bool:
     name = type(exc).__name__
-    return name in ("AlreadyExists", "ResourceAlreadyExists", "FileExistsError")
+    if name in ("AlreadyExists", "ResourceAlreadyExists", "FileExistsError"):
+        return True
+    return "already exists" in str(exc).lower()
+
+
+def _safe_create(create: Any) -> bool:
+    """Run *create()*; treat ``AlreadyExists`` as success (idempotent)."""
+    try:
+        create()
+    except Exception as exc:
+        if _looks_like_already_exists(exc):
+            return False
+        raise
+    return True
+
+
+def _managed_volume_type() -> Any:
+    """Resolve the SDK's ``VolumeType.MANAGED`` enum, falling back to a string.
+
+    The Databricks SDK accepts the enum or the literal ``"MANAGED"``;
+    the string fallback keeps the helper usable in test environments
+    that mock the workspace client without the SDK installed.
+    """
+    try:
+        from databricks.sdk.service.catalog import VolumeType
+        return VolumeType.MANAGED
+    except Exception:
+        return "MANAGED"
 
 
 def _staging_clean_part(value: str) -> str:
