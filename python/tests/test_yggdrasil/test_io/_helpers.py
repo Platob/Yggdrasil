@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass, field
+from typing import Any
 
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
@@ -53,7 +53,6 @@ def make_response(
     )
 
 
-@dataclass
 class StubSession(Session):
     """Concrete Session double that returns canned responses.
 
@@ -61,8 +60,16 @@ class StubSession(Session):
     the network was — or was not — touched.
     """
 
-    _queue: list[Response] = field(default_factory=list, init=False, repr=False)
-    calls: list[PreparedRequest] = field(default_factory=list, init=False, repr=False)
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        if getattr(self, "_initialized", False):
+            # Reset the per-test queue/calls so cached singletons
+            # (same ``base_url``) don't bleed state across tests.
+            self._queue = []
+            self.calls = []
+            return
+        super().__init__(*args, **kwargs)
+        self._queue: list[Response] = []
+        self.calls: list[PreparedRequest] = []
 
     def queue(self, *responses: Response) -> "StubSession":
         self._queue.extend(responses)
