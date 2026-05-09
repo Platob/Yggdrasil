@@ -371,6 +371,166 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
         arrow_table = self.engine.execute(prepared).to_arrow_table()
         self.assertEqual(arrow_table.column("id").to_pylist(), [1, 2, 3])
 
+    def test_engine_execute_api_mode_with_external_tables(self) -> None:
+        """``engine.execute(external_tables=..., engine="api")`` stages
+        an Arrow table to a temporary volume and substitutes ``{alias}``
+        with ``parquet.`<full>`` in the statement text — same path the
+        warehouse-only ``WarehousePreparedStatement.prepare`` exercises,
+        but driven from the engine entry point so the
+        ``engine="api"`` branch picks it up explicitly.
+        """
+        data = pa.table(
+            {
+                "id": pa.array([100, 200, 300], type=pa.int64()),
+                "label": pa.array(["p", "q", "r"], type=pa.string()),
+            }
+        )
+        result = self.engine.execute(
+            "SELECT id, label FROM {ext} ORDER BY id",
+            external_tables={"ext": data},
+            engine="api",
+        )
+        try:
+            arrow_table = result.to_arrow_table()
+            self.assertEqual(arrow_table.num_rows, 3)
+            self.assertEqual(
+                arrow_table.column("id").to_pylist(), [100, 200, 300],
+            )
+            self.assertEqual(
+                arrow_table.column("label").to_pylist(), ["p", "q", "r"],
+            )
+        finally:
+            result.statement.clear_temporary_resources()
+
+    def test_engine_execute_spark_mode_with_arrow_external_tables(self) -> None:
+        """``engine.execute(external_tables=..., engine="spark")``
+        registers the Arrow table as a Spark temp view and substitutes
+        ``{alias}`` with the view name. No volume staging happens — the
+        Spark path does not need to round-trip through Parquet.
+        """
+        try:
+            import pyspark  # noqa: F401
+        except ImportError:
+            self.skipTest("pyspark is not installed in this environment")
+
+        data = pa.table(
+            {
+                "id": pa.array([7, 8, 9], type=pa.int64()),
+                "label": pa.array(["s", "t", "u"], type=pa.string()),
+            }
+        )
+        result = self.engine.execute(
+            "SELECT id, label FROM {ext} ORDER BY id",
+            external_tables={"ext": data},
+            engine="spark",
+        )
+        try:
+            self.assertIsNotNone(result.statement.external_data)
+            self.assertIn("ext", result.statement.external_data)
+            # Spark fills in text_value with the temp-view name during
+            # ``start``; it is non-None and is *not* the volume parquet
+            # form the warehouse path produces.
+            view_text = result.statement.external_data["ext"].text_value
+            self.assertIsNotNone(view_text)
+            self.assertFalse(view_text.startswith("parquet.`"))
+
+            arrow_table = result.to_arrow_table()
+            self.assertEqual(arrow_table.num_rows, 3)
+            self.assertEqual(arrow_table.column("id").to_pylist(), [7, 8, 9])
+            self.assertEqual(
+                arrow_table.column("label").to_pylist(), ["s", "t", "u"],
+            )
+        finally:
+            result.clear_temporary_resources()
+
+    def test_engine_execute_spark_mode_with_volume_path_external_tables(self) -> None:
+        """A pre-existing :class:`VolumePath` passed via
+        ``external_tables`` on the Spark path is text-substituted as
+        ``parquet.`<full>`` — Spark reads parquet by path, no temp view
+        registered."""
+        try:
+            import pyspark  # noqa: F401
+        except ImportError:
+            self.skipTest("pyspark is not installed in this environment")
+
+        from yggdrasil.databricks.fs import VolumePath
+
+        data = pa.table(
+            {
+                "id": pa.array([42, 43], type=pa.int64()),
+                "label": pa.array(["m", "n"], type=pa.string()),
+            }
+        )
+        # Stage the volume up-front via the new factory shortcut so the
+        # caller can hand the engine a ready-to-read VolumePath.
+        path = VolumePath.staging_path(
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+            resource_name="engine_spark_volume",
+            tabular=data,
+        )
+        try:
+            result = self.engine.execute(
+                "SELECT id, label FROM {ext} ORDER BY id",
+                external_tables={"ext": path},
+                engine="spark",
+            )
+            try:
+                self.assertIn("ext", result.statement.external_data or {})
+                self.assertTrue(
+                    result.statement.external_data["ext"].text_value.startswith(
+                        "parquet.`"
+                    )
+                )
+                arrow_table = result.to_arrow_table()
+                self.assertEqual(
+                    arrow_table.column("id").to_pylist(), [42, 43],
+                )
+                self.assertEqual(
+                    arrow_table.column("label").to_pylist(), ["m", "n"],
+                )
+            finally:
+                result.clear_temporary_resources()
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_volume_path_staging_path_writes_tabular_in_one_call(self) -> None:
+        """``VolumePath.staging_path(tabular=...)`` mints the path
+        *and* writes the supplied tabular as Parquet — replaces the
+        previous two-step ``staging_path(...)`` followed by
+        ``as_media(PARQUET).write_table(...)`` pattern."""
+        from yggdrasil.databricks.fs import VolumePath
+
+        data = pa.table(
+            {
+                "id": pa.array([1, 2, 3], type=pa.int64()),
+                "label": pa.array(["a", "b", "c"], type=pa.string()),
+            }
+        )
+        path = VolumePath.staging_path(
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+            resource_name="staging_factory",
+            tabular=data,
+        )
+        try:
+            # File exists with the written bytes (size > 0).
+            self.assertGreater(path.size, 0)
+
+            # And the warehouse can read it back as a parquet table —
+            # that's the contract callers depend on.
+            arrow_table = self.engine.execute(
+                "SELECT id, label FROM parquet.`%s` ORDER BY id"
+                % path.full_path()
+            ).to_arrow_table()
+            self.assertEqual(arrow_table.num_rows, 3)
+            self.assertEqual(arrow_table.column("id").to_pylist(), [1, 2, 3])
+            self.assertEqual(
+                arrow_table.column("label").to_pylist(), ["a", "b", "c"],
+            )
+        finally:
+            path.unlink(missing_ok=True)
+
     def test_engine_drop_missing_table_is_no_op(self) -> None:
         """``drop_table`` on a name that was never created should not
         raise — UC's DROP TABLE IF EXISTS contract."""
