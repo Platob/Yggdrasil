@@ -605,9 +605,9 @@ class CastOptions:
             instance = cls(**clean)
         else:
             instance = options.copy(**clean)
-        if not source is ...:
+        if source is not ...:
             instance = instance.check_source(obj=source)
-        if not target is ...:
+        if target is not ...:
             instance = instance.check_target(obj=target)
         return instance
 
