@@ -150,6 +150,7 @@ The only hard runtime dependency of `ygg` is `pyarrow` (`>=20`). Base installs m
 - **Comments describe weirdness, not syntax.** Version quirks, engine edge cases, schema invariants, compatibility hacks — yes. `# loop through fields` — no.
 - **Type hints must match runtime.** If a method can return `None`, annotate `| None`.
 - **Keyword-only arguments** are preferred for ambiguous options.
+- **Use `...` (Ellipsis) as the unset / missing sentinel.** When you need to distinguish "caller didn't pass this" from "caller passed `None`" — keyword defaults, `dict.get(key, ...)` to tell missing from `None`, lazy-init cache slots — reach for the built-in `...` singleton instead of a private `_UNSET = object()` / `_MISSING = object()` per module. Reads cleanly (`if cached is not ...:`), avoids per-module sentinel proliferation, and is a real singleton across pickle boundaries. Only allocate a private sentinel when `...` is itself a legitimate value in the domain.
 
 ## Release & CI
 

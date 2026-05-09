@@ -149,6 +149,15 @@ class Tabular(ABC, Generic[O]):
         """
         super().__init__(**kwargs)
         self.tabular_parent: "Tabular | None" = tabular_parent
+        # Per-instance schema cache. ``...`` means "not yet collected";
+        # populated lazily by :meth:`collect_schema`, updated by every
+        # writer path with the schema it just wrote, and dropped by
+        # :meth:`close` so the next reopen re-collects from the source.
+        # Named ``_schema_cache`` (not ``_schema``) so subclasses that
+        # already own a ``_schema`` attribute (YGGFolderIO's bound
+        # partition schema, ArrowTabular's stamped read schema)
+        # don't collide.
+        self._schema_cache: "Schema | Any" = ...
 
     # ==================================================================
     # Parent / child linkage
@@ -470,11 +479,22 @@ class Tabular(ABC, Generic[O]):
         """Consume Arrow record batches and persist them."""
 
     # ==================================================================
-    # Schema inspection
+    # Schema inspection — per-instance cache
     # ==================================================================
 
     def collect_schema(self, options: "O | None" = None, **kwargs: Any) -> Schema:
-        return self._collect_schema(self.check_options(options, overrides=locals()))
+        """Return this Tabular's :class:`Schema`, caching the first hit.
+
+        Subsequent calls reuse :attr:`_schema_cache` without touching
+        the underlying source. :meth:`close` drops the cache; writers
+        refresh it via :meth:`_persist_schema` so a write followed by
+        a read sees the new shape without a re-collect.
+        """
+        if self._schema_cache is not ...:
+            return self._schema_cache
+        schema = self._collect_schema(self.check_options(options, overrides=locals()))
+        self._persist_schema(schema)
+        return schema
 
     def _collect_schema(self, options: O) -> Schema:
         """First batch's schema by default; merged across batches when
@@ -492,6 +512,56 @@ class Tabular(ABC, Generic[O]):
                 Schema.from_arrow(batch.schema), inplace=True,
             )
         return schema
+
+    def _persist_schema(self, schema: "Schema | None") -> None:
+        """Stamp *schema* into the per-instance cache (writer hook).
+
+        Writers call this after the bytes hit the sink so the next
+        :meth:`collect_schema` returns the freshly-written shape
+        instead of replaying the source. ``None`` and an empty schema
+        are accepted but ignored — they would shadow whatever the
+        cache held without telling readers anything new.
+        """
+        if schema is None:
+            return
+        self._schema_cache = schema
+
+    def _clear_schema_cache(self) -> None:
+        """Drop the per-instance schema cache.
+
+        Called from :meth:`close` (so reopening re-collects from the
+        source) and from any path that mutates the underlying bytes
+        in a way the writers can't describe (truncate, clear).
+        """
+        self._schema_cache = ...
+
+    # ==================================================================
+    # Lifecycle hook — clears the schema cache on close
+    # ==================================================================
+
+    def close(self, force: bool = False) -> None:
+        """Drop the schema cache and forward to any cooperative ``close``.
+
+        Tabular itself has no resources to release — the schema cache
+        is the only state it owns. Subclasses that mix Tabular with a
+        lifecycle (``Disposable``-derived ``IO``, holders, …) inherit
+        this hook through cooperative ``super().close()``; pure
+        Tabular subclasses without a lifecycle peer get a harmless
+        no-op forward.
+        """
+        self._clear_schema_cache()
+        sup_close = getattr(super(), "close", None)
+        if callable(sup_close):
+            sup_close(force=force)
+
+    def _commit_metadata(self) -> None:
+        """Sync written metadata (size, mtime, media_type) to the backing.
+
+        Hook for backends with persistent IO metadata. Default no-op —
+        subclasses with a holder (``IO``) override to refresh
+        :class:`IOStats` once at the end of a bulk write rather than
+        per batch. Driven by :attr:`CastOptions.sync_metadata`.
+        """
 
     # ==================================================================
     # Static helpers
@@ -706,9 +776,20 @@ class Tabular(ABC, Generic[O]):
         options: "O | None" = None,
         **kwargs: Any,
     ) -> None:
-        self._write_arrow_batches(
-            batches, self.check_options(options, overrides=locals()),
-        )
+        options = self.check_options(options, overrides=locals())
+        # Peek the first batch to refresh the schema cache before
+        # the iterator is drained by the leaf writer.
+        iterator = iter(batches)
+        first = next(iterator, None)
+        if first is None:
+            if options.sync_metadata:
+                self._commit_metadata()
+            return
+        self._persist_schema(Schema.from_arrow(first.schema))
+        import itertools as _it
+        self._write_arrow_batches(_it.chain([first], iterator), options)
+        if options.sync_metadata:
+            self._commit_metadata()
 
     def write_arrow_table(
         self, table: pa.Table, options: "O | None" = None, **kwargs: Any,
@@ -718,11 +799,22 @@ class Tabular(ABC, Generic[O]):
         )
 
     def _write_arrow_table(self, table: pa.Table, options: O) -> None:
+        # Cache the schema up front — readers that hit collect_schema
+        # between the write and the final metadata commit see the
+        # newly-written shape without re-collecting.
+        self._persist_schema(Schema.from_arrow(table.schema))
         row_size = getattr(options, "row_size", None) or None
+        # Defer per-batch metadata commits to a single end-of-write
+        # call (one ``_touch_stat`` instead of one per batch).
+        inner = options.copy(sync_metadata=False) if options.sync_metadata else options
+        if row_size:
+            inner = inner.check_source(table).copy(row_size=None)
         self._write_arrow_batches(
             table.to_batches(max_chunksize=row_size),
-            options.check_source(table).copy(row_size=None) if row_size else options,
+            inner,
         )
+        if options.sync_metadata:
+            self._commit_metadata()
 
     # ==================================================================
     # Polars
@@ -794,11 +886,20 @@ class Tabular(ABC, Generic[O]):
         else:
             chunks = iter((frame,))
 
+        # Polars schemas convert losslessly to Arrow on the head batch
+        # — peek one and stamp it so readers don't have to wait for
+        # the whole frame to drain.
+        head_schema = frame.head(0).to_arrow().schema
+        self._persist_schema(Schema.from_arrow(head_schema))
+
         def gen() -> Iterator[pa.RecordBatch]:
             for f in chunks:
                 yield from f.to_arrow().to_batches()
 
-        self._write_arrow_batches(gen(), options)
+        inner = options.copy(sync_metadata=False) if options.sync_metadata else options
+        self._write_arrow_batches(gen(), inner)
+        if options.sync_metadata:
+            self._commit_metadata()
 
     # ==================================================================
     # Pandas
@@ -965,12 +1066,17 @@ class Tabular(ABC, Generic[O]):
         chunk_size = max(1, getattr(options, "row_size", None) or 1024)
         chunk_rows: "list[dict]" = []
         chunk_schema: "pa.Schema | None" = None
+        # Per-batch sub-call defers metadata commits; we commit once
+        # below if the caller asked for it.
+        inner = options.copy(sync_metadata=False) if options.sync_metadata else options
 
         def _flush() -> None:
             if not chunk_rows:
                 return
             batch = pa.RecordBatch.from_pylist(chunk_rows, schema=chunk_schema)
-            self._write_arrow_batches([batch], options)
+            if chunk_schema is not None:
+                self._persist_schema(Schema.from_arrow(chunk_schema))
+            self._write_arrow_batches([batch], inner)
             chunk_rows.clear()
 
         for rec in records:
@@ -988,6 +1094,8 @@ class Tabular(ABC, Generic[O]):
             if len(chunk_rows) >= chunk_size:
                 _flush()
         _flush()
+        if options.sync_metadata:
+            self._commit_metadata()
 
     # ==================================================================
     # ``to_*`` aliases — pandas-style spelling for the ``read_*`` surface.

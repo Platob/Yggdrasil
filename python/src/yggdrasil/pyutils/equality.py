@@ -3,13 +3,15 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, Iterable, Tuple
 
-_MISSING = object()
-
-
 __all__ = [
     "dicts_equal",
     "dict_diff"
 ]
+
+
+# ``...`` (Ellipsis) is the project-wide "missing key" sentinel — see
+# the convention note in ``AGENTS.md`` / ``CLAUDE.md``. Distinguishes
+# "key not in dict" from "key present with value None".
 
 
 def _normalize(obj: Any) -> Any:
@@ -59,15 +61,15 @@ def dicts_equal(
         keys = set(a.keys()) | set(b.keys())
 
     for k in keys:
-        av = a.get(k, _MISSING)
-        bv = b.get(k, _MISSING)
+        av = a.get(k, ...)
+        bv = b.get(k, ...)
 
         if treat_missing_as_none:
-            if av is _MISSING and bv is None:
+            if av is ... and bv is None:
                 continue
-            if bv is _MISSING and av is None:
+            if bv is ... and av is None:
                 continue
-            if av is _MISSING and bv is _MISSING:
+            if av is ... and bv is ...:
                 continue
 
         if not _equal(av, bv, float_tol=float_tol):
@@ -91,17 +93,17 @@ def dict_diff(
 
     out: Dict[str, Tuple[Any, Any]] = {}
     for k in keys:
-        av = a.get(k, _MISSING)
-        bv = b.get(k, _MISSING)
+        av = a.get(k, ...)
+        bv = b.get(k, ...)
 
         if treat_missing_as_none:
-            if av is _MISSING and bv is None:
+            if av is ... and bv is None:
                 continue
-            if bv is _MISSING and av is None:
+            if bv is ... and av is None:
                 continue
-            if av is _MISSING and bv is _MISSING:
+            if av is ... and bv is ...:
                 continue
 
         if not _equal(av, bv, float_tol=float_tol):
-            out[k] = (None if av is _MISSING else av, None if bv is _MISSING else bv)
+            out[k] = (None if av is ... else av, None if bv is ... else bv)
     return out

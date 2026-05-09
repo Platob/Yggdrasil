@@ -1132,12 +1132,38 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
     def close(self, force: bool = False) -> None:
         """Close the IO; closes the holder iff :attr:`owns_holder`.
 
-        Resets the cursor to byte 0 so a subsequent reopen / borrow
-        starts at the beginning rather than wherever the previous
-        transaction left off.
+        Preserves the cursor position across the close. A reopen on
+        the same instance lands at the byte the previous transaction
+        left off — callers that want a fresh start ``seek(0)``
+        explicitly. (The historical behavior — silently resetting to
+        byte 0 inside ``close`` — broke the ArrowIPC append flow,
+        where a writer opens the buffer in append mode at EOF, drains
+        bytes, and a subsequent read needs to start from byte 0 only
+        because the reader explicitly seeks there.)
         """
-        self._pos = 0
         super().close(force=force)
+
+    def _commit_metadata(self) -> None:
+        """Refresh the holder's :class:`IOStats` after a bulk write.
+
+        Bulk writers route through ``options.sync_metadata=False`` for
+        the inner per-batch call so each ``write_mv`` skips its
+        post-write ``_touch_stat``. This single call at the end stamps
+        a fresh ``mtime`` and flushes any buffered backend state — one
+        ``time.time()`` (and one optional flush) per write op instead
+        of one per batch.
+        """
+        holder = getattr(self, "_holder", None)
+        if holder is None:
+            return
+        try:
+            holder.touch_mtime()
+        except AttributeError:
+            pass
+        try:
+            holder.flush()
+        except Exception:
+            pass
 
     # ==================================================================
     # Convenience drains
