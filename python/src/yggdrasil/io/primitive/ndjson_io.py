@@ -148,7 +148,7 @@ class NDJsonIO(IO[bytes, NDJsonOptions]):
         # branch; IGNORE / ERROR_IF_EXISTS guard the buffer.
         mode = options.mode
         if mode is Mode.AUTO:
-            action = Mode.UPSERT if options.match_by_names else Mode.APPEND
+            action = Mode.UPSERT if options.match_by_keys else Mode.APPEND
         elif mode is Mode.TRUNCATE:
             action = Mode.OVERWRITE
         elif mode in _MERGE_MODES or mode in (
@@ -172,7 +172,7 @@ class NDJsonIO(IO[bytes, NDJsonOptions]):
             action = Mode.OVERWRITE
 
         codec = self._codec()
-        match_by = list(options.match_by_names or ())
+        match_by = list(options.match_by_keys or ())
         # Byte-append is only safe for plain APPEND, uncompressed,
         # without a key-aware merge. Anything else has to do the
         # full read-modify-rewrite dance.
@@ -195,7 +195,7 @@ class NDJsonIO(IO[bytes, NDJsonOptions]):
             merged = upsert_arrow_batches(
                 iter(existing),
                 iter(batches),
-                options.match_by_names,
+                options.match_by_keys,
                 Mode.APPEND if action is Mode.APPEND else Mode.UPSERT,
                 memory_pool=options.arrow_memory_pool,
             )

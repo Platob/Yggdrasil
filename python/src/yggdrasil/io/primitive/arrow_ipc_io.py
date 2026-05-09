@@ -153,7 +153,7 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
           whose key tuple is present in the incoming stream are
           dropped (incoming values win). Without keys this is
           undefined at the IPC file level and degrades to plain
-          APPEND — pass ``options.match_by_names=[...]`` to get
+          APPEND — pass ``options.match_by_keys=[...]`` to get
           actual upsert semantics.
         - **IGNORE** — skip when the buffer is non-empty.
         - **ERROR_IF_EXISTS** — raise when the buffer is non-empty.
@@ -170,7 +170,7 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
         # opt into key-aware writes purely via ``match_by_names``.
         action = options.mode
         if action is Mode.AUTO:
-            action = Mode.UPSERT if options.match_by_names else Mode.APPEND
+            action = Mode.UPSERT if options.match_by_keys else Mode.APPEND
         elif action is Mode.TRUNCATE:
             action = Mode.OVERWRITE
 
@@ -210,7 +210,7 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
             # :func:`upsert_arrow_batches`, which centralizes the
             # key-aware dedup *and* the keyless ``match_by_names is
             # None`` fallback (plain concat) — so we don't fork on
-            # ``options.match_by_names`` here. Existing batches are
+            # ``options.match_by_keys`` here. Existing batches are
             # materialized because we're about to truncate the same
             # buffer they were read from.
             from yggdrasil.arrow.ops import upsert_arrow_batches
@@ -221,7 +221,7 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
             merged = upsert_arrow_batches(
                 iter(existing),
                 incoming,
-                options.match_by_names,
+                options.match_by_keys,
                 Mode.APPEND if action is Mode.APPEND else Mode.UPSERT,
                 memory_pool=options.arrow_memory_pool,
             )

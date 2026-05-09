@@ -161,7 +161,7 @@ class CsvIO(IO[bytes, CsvOptions]):
         - **APPEND** — seek to EOF, write **without** a header
           (unless the buffer was empty, in which case collapse to
           OVERWRITE-with-header semantics). When
-          ``options.match_by_names`` is set, falls back to
+          ``options.match_by_keys`` is set, falls back to
           read-modify-rewrite so the key-aware dedup can run.
         - **UPSERT / MERGE** — read existing, merge against incoming
           via :func:`upsert_arrow_batches` (with ``match_by_names``
@@ -179,7 +179,7 @@ class CsvIO(IO[bytes, CsvOptions]):
         # branch; IGNORE / ERROR_IF_EXISTS guard the buffer.
         mode = options.mode
         if mode is Mode.AUTO:
-            action = Mode.UPSERT if options.match_by_names else Mode.APPEND
+            action = Mode.UPSERT if options.match_by_keys else Mode.APPEND
         elif mode is Mode.TRUNCATE:
             action = Mode.OVERWRITE
         elif mode in _MERGE_MODES or mode in (
@@ -212,7 +212,7 @@ class CsvIO(IO[bytes, CsvOptions]):
             return
 
         codec = self._codec()
-        match_by = list(options.match_by_names or ())
+        match_by = list(options.match_by_keys or ())
         # Byte-append is only safe for plain APPEND, uncompressed,
         # without a key-aware merge to run. Anything else has to do
         # the full read-modify-rewrite dance.
@@ -236,7 +236,7 @@ class CsvIO(IO[bytes, CsvOptions]):
             merged = upsert_arrow_batches(
                 iter(existing),
                 incoming,
-                options.match_by_names,
+                options.match_by_keys,
                 Mode.APPEND if action is Mode.APPEND else Mode.UPSERT,
                 memory_pool=options.arrow_memory_pool,
             )

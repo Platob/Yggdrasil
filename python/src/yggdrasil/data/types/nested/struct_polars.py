@@ -67,7 +67,18 @@ def cast_polars_struct_expr(
     fields: list[Any] = []
 
     for i, target_child in enumerate(target_type.children_fields):
-        source_child = source_type.field_by(name=target_child.name, index=i, raise_error=False)
+        # Lookup precedence: target.name (with name-or-positional
+        # shortcut) → target.alias — same shape as the arrow struct
+        # cast so a target schema can rename a single source struct
+        # child via ``alias`` without a parallel polars-only rename
+        # pass.
+        source_child = source_type.field_by(
+            name=target_child.name, index=i, raise_error=False,
+        )
+        if source_child is None and target_child.has_alias:
+            source_child = source_type.field_by(
+                name=target_child.alias, raise_error=False,
+            )
 
         if source_child is None:
             child_expr = target_child.default_polars_expr(alias=target_child.name)

@@ -1,4 +1,5 @@
 TAG_PREFIX = b"t:"
 DBX_META_PREFIX = b"databricks:"
 DEFAULT_VALUE_KEY = b"default"
+ALIAS_KEY = b"alias"
 DEFAULT_FIELD_NAME = ""

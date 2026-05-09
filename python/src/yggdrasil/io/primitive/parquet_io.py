@@ -160,7 +160,7 @@ class ParquetIO(IO[bytes, ParquetOptions]):
           :class:`pq.ParquetWriter` session over the buffer
           (truncated to zero before the writer opens).
         - **APPEND** — read existing batches, merge with incoming,
-          recurse with OVERWRITE. With ``options.match_by_names`` set
+          recurse with OVERWRITE. With ``options.match_by_keys`` set
           incoming rows whose key tuple already exists are dropped
           (existing wins); without keys the streams are concatenated.
         - **UPSERT / MERGE** — same read-modify-rewrite, but with
@@ -184,7 +184,7 @@ class ParquetIO(IO[bytes, ParquetOptions]):
         # buffer.
         mode = options.mode
         if mode is Mode.AUTO:
-            action = Mode.UPSERT if options.match_by_names else Mode.APPEND
+            action = Mode.UPSERT if options.match_by_keys else Mode.APPEND
         elif mode is Mode.TRUNCATE:
             action = Mode.OVERWRITE
         elif mode in _MERGE_MODES or mode in (
@@ -224,7 +224,7 @@ class ParquetIO(IO[bytes, ParquetOptions]):
             merged = upsert_arrow_batches(
                 iter(existing),
                 incoming,
-                options.match_by_names,
+                options.match_by_keys,
                 Mode.APPEND if action is Mode.APPEND else Mode.UPSERT,
                 memory_pool=options.arrow_memory_pool,
             )

@@ -270,6 +270,22 @@ class TestKeyedMerge:
         assert loaded.column("b").to_pylist() == ["x", "y", "x", "y"]
         assert loaded.column("v").to_pylist() == [10, 20, 30, 40]
 
+    def test_upsert_with_field_typed_match_by(self, table) -> None:
+        from yggdrasil.data import Field
+        io = ArrowIPCIO()
+        io.write_arrow_table(table)
+        more = pa.table({"id": [3], "name": ["Z"], "v": [9.0]})
+        # Field-typed match_by — the IO derives the key name list via
+        # ``options.match_by_keys``.
+        id_field = Field.from_(pa.field("id", pa.int64()))
+        io.write_arrow_batches(
+            more.to_batches(),
+            options=ArrowIPCOptions(mode=Mode.UPSERT, match_by=[id_field]),
+        )
+        loaded = io.read_arrow_table()
+        assert loaded.column("id").to_pylist() == [1, 2, 4, 3]
+        assert loaded.column("name").to_pylist() == ["a", "b", "d", "Z"]
+
 
 class TestExternalWriterPattern:
     """`with path.open() as b: pyarrow.ipc.RecordBatchFileWriter(b, ...)` flow."""
