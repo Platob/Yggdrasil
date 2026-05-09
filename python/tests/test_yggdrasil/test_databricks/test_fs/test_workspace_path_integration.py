@@ -32,12 +32,15 @@ class TestWorkspacePathIntegration(DatabricksIntegrationCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        base = os.environ.get("DATABRICKS_INTEGRATION_WORKSPACE_DIR", "").strip()
+        base = os.environ.get(
+            "DATABRICKS_INTEGRATION_WORKSPACE_DIR",
+            "/Workspace/Users/<me>/integration"
+        ).strip()
         if not base:
             raise unittest.SkipTest(
                 "DATABRICKS_INTEGRATION_WORKSPACE_DIR is not set — skipping. "
                 "Export it to a writable Workspace directory, e.g. "
-                "/Workspace/Users/<me>/integration."
+                f"/Workspace/Users/<me>/integration."
             )
         cls.base_root = base.rstrip("/")
         cls.root = WorkspacePath(

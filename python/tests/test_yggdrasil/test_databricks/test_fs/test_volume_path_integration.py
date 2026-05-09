@@ -34,7 +34,10 @@ class TestVolumePathIntegration(DatabricksIntegrationCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        base = os.environ.get("DATABRICKS_INTEGRATION_VOLUME_DIR", "").strip()
+        base = os.environ.get(
+            "DATABRICKS_INTEGRATION_VOLUME_DIR",
+            "/Volumes/trading/unittest/unittest/scratch"
+        ).strip()
         if not base:
             raise unittest.SkipTest(
                 "DATABRICKS_INTEGRATION_VOLUME_DIR is not set — skipping. "
