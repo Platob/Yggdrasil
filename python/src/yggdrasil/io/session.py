@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any,  Iterator, Mapping, Optional
 
 import pyarrow as pa
 
-from yggdrasil.arrow.cast import rechunk_arrow_batches_by_byte_size
+from yggdrasil.arrow.cast import rechunk_arrow_batches
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.dataclasses.waiting import (
     DEFAULT_WAITING_CONFIG,
@@ -1899,7 +1899,7 @@ class Session(ABC):
                     for resp in session.send_many(iter(partition_requests), send_config):
                         yield resp.to_arrow_batch(parse=False)
 
-                yield from rechunk_arrow_batches_by_byte_size(
+                yield from rechunk_arrow_batches(
                     _row_batches(),
                     byte_size=_SPARK_RESPONSE_BATCH_BYTE_LIMIT,
                 )

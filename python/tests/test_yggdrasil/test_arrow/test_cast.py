@@ -14,7 +14,7 @@ Covers the four conversion families exposed by the module:
   :func:`cast_arrow_array`, :func:`cast_arrow_tabular`,
   :func:`cast_arrow_record_batch_reader`, plus the byte-accounting
   helpers :func:`get_arrow_nbytes` and
-  :func:`rechunk_arrow_batches_by_byte_size`.
+  :func:`rechunk_arrow_batches`.
 
 Engine-specific imports go through optional helpers — pandas / polars
 tests skip cleanly when those engines are not installed.
@@ -36,7 +36,7 @@ from yggdrasil.arrow.cast import (
     cast_arrow_scalar,
     cast_arrow_tabular,
     get_arrow_nbytes,
-    rechunk_arrow_batches_by_byte_size,
+    rechunk_arrow_batches,
 )
 from yggdrasil.arrow.tests import ArrowTestCase
 from yggdrasil.data.options import CastOptions
@@ -270,35 +270,35 @@ class TestRechunker(ArrowTestCase):
 
     def test_passthrough_when_no_knobs(self) -> None:
         b = self._batch(4)
-        out = list(rechunk_arrow_batches_by_byte_size([b]))
+        out = list(rechunk_arrow_batches([b]))
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0].num_rows, 4)
 
     def test_row_size_only_slices_in_place(self) -> None:
         b = self._batch(7)
-        out = list(rechunk_arrow_batches_by_byte_size([b], row_size=3))
+        out = list(rechunk_arrow_batches([b], row_size=3))
         self.assertEqual([x.num_rows for x in out], [3, 3, 1])
 
     def test_row_size_drops_empty_batches(self) -> None:
         empty = self.record_batch({"a": []})
         b = self._batch(3)
-        out = list(rechunk_arrow_batches_by_byte_size([empty, b], row_size=2))
+        out = list(rechunk_arrow_batches([empty, b], row_size=2))
         self.assertEqual([x.num_rows for x in out], [2, 1])
 
     def test_byte_size_emits_chunks(self) -> None:
         b = self._batch(10)
-        out = list(rechunk_arrow_batches_by_byte_size([b], byte_size=8))
+        out = list(rechunk_arrow_batches([b], byte_size=8))
         self.assertEqual(sum(x.num_rows for x in out), 10)
         self.assertGreater(len(out), 1)
 
     def test_byte_and_row_caps_pick_minimum(self) -> None:
         b = self._batch(10)
-        out = list(rechunk_arrow_batches_by_byte_size([b], byte_size=10_000, row_size=4))
+        out = list(rechunk_arrow_batches([b], byte_size=10_000, row_size=4))
         self.assertEqual([x.num_rows for x in out], [4, 4, 2])
 
     def test_concat_buffers_under_target(self) -> None:
         small = [self._batch(1) for _ in range(5)]
-        out = list(rechunk_arrow_batches_by_byte_size(small, byte_size=10_000))
+        out = list(rechunk_arrow_batches(small, byte_size=10_000))
         self.assertEqual(sum(x.num_rows for x in out), 5)
 
 

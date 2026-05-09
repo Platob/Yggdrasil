@@ -17,7 +17,7 @@ Streaming entry points (span batch boundaries):
 * :func:`cast_arrow_batch_iterator` — per-batch tabular cast over an
   iterable of ``pa.RecordBatch``, with optional streamed rechunking
   keyed on :attr:`CastOptions.byte_size`.
-* :func:`rechunk_arrow_batches_by_byte_size` — re-exported from
+* :func:`rechunk_arrow_batches` — re-exported from
   :mod:`yggdrasil.arrow.cast` (lives there because it's a pure pyarrow
   util with no struct-cast coupling); kept here for back-compat with
   existing import paths.
@@ -278,12 +278,12 @@ def cast_arrow_batch_iterator(
     the bound options are reused for every subsequent batch.
 
     Sizing knobs ``options.row_size`` and ``options.byte_size`` drive
-    output rechunking via :func:`rechunk_arrow_batches_by_byte_size`.
+    output rechunking via :func:`rechunk_arrow_batches`.
     When neither is set, casted batches pass through unchanged.
 
     :raises TypeError: if any item is not a :class:`pa.RecordBatch`.
     """
-    from yggdrasil.arrow.cast import rechunk_arrow_batches_by_byte_size
+    from yggdrasil.arrow.cast import rechunk_arrow_batches
 
     iterator = iter(batches)
 
@@ -314,7 +314,7 @@ def cast_arrow_batch_iterator(
         yield from _cast_stream()
         return
 
-    yield from rechunk_arrow_batches_by_byte_size(
+    yield from rechunk_arrow_batches(
         _cast_stream(),
         byte_size=bound.byte_size,
         row_size=bound.row_size,
@@ -322,7 +322,7 @@ def cast_arrow_batch_iterator(
     )
 
 
-# ``rechunk_arrow_batches_by_byte_size`` lives in
+# ``rechunk_arrow_batches`` lives in
 # :mod:`yggdrasil.arrow.cast` (pure-pyarrow util with no struct-cast
 # coupling). It's imported lazily inside
 # :func:`cast_arrow_batch_iterator` to break the circular chain

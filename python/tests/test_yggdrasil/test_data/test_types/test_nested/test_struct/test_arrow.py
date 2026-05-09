@@ -10,7 +10,7 @@ Three layers under test:
   level.
 * **Streaming** — :func:`cast_arrow_batch_iterator` flattens
   per-batch tabular cast over an iterator and hands the cast stream
-  to :func:`rechunk_arrow_batches_by_byte_size`, which honours
+  to :func:`rechunk_arrow_batches`, which honours
   ``byte_size`` (target bytes per batch) and ``row_size`` (hard cap
   on rows per batch).
 """
@@ -23,7 +23,7 @@ from yggdrasil.data import Field, Schema
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.types import IntegerType
 from yggdrasil.data.types.nested.array import ArrayType
-from yggdrasil.arrow.cast import rechunk_arrow_batches_by_byte_size
+from yggdrasil.arrow.cast import rechunk_arrow_batches
 from yggdrasil.data.types.nested.struct import (
     StructType,
     cast_arrow_batch_iterator,
@@ -423,7 +423,7 @@ class TestRechunk:
         schema = source_tabular_schema.to_arrow_schema()
         inputs = [_batch([{"a": i, "b": "x"}], schema) for i in range(3)]
 
-        out = list(rechunk_arrow_batches_by_byte_size(iter(inputs)))
+        out = list(rechunk_arrow_batches(iter(inputs)))
 
         assert out == inputs
 
@@ -434,7 +434,7 @@ class TestRechunk:
         schema = source_tabular_schema.to_arrow_schema()
         inputs = [_batch([{"a": i, "b": "x"}], schema) for i in range(3)]
 
-        out = list(rechunk_arrow_batches_by_byte_size(iter(inputs), byte_size=0))
+        out = list(rechunk_arrow_batches(iter(inputs), byte_size=0))
 
         assert out == inputs
 
@@ -452,7 +452,7 @@ class TestRechunk:
         target = bytes_per_row * 10
 
         out = list(
-            rechunk_arrow_batches_by_byte_size(iter([big]), byte_size=target)
+            rechunk_arrow_batches(iter([big]), byte_size=target)
         )
 
         assert len(out) > 1
@@ -469,7 +469,7 @@ class TestRechunk:
         target = inputs[0].nbytes * 5
 
         out = list(
-            rechunk_arrow_batches_by_byte_size(iter(inputs), byte_size=target)
+            rechunk_arrow_batches(iter(inputs), byte_size=target)
         )
 
         assert len(out) < len(inputs)
@@ -484,7 +484,7 @@ class TestRechunk:
         one = _batch([{"a": 1, "b": "x"}], schema)
 
         out = list(
-            rechunk_arrow_batches_by_byte_size(
+            rechunk_arrow_batches(
                 iter([empty, one, empty]),
                 byte_size=one.nbytes * 100,
             )
@@ -500,7 +500,7 @@ class TestRechunk:
         big = _batch([{"a": i, "b": "x"} for i in range(13)], schema)
 
         out = list(
-            rechunk_arrow_batches_by_byte_size(iter([big]), row_size=5)
+            rechunk_arrow_batches(iter([big]), row_size=5)
         )
 
         assert [b.num_rows for b in out] == [5, 5, 3]
@@ -515,7 +515,7 @@ class TestRechunk:
         one = _batch([{"a": 1, "b": "x"}], schema)
 
         out = list(
-            rechunk_arrow_batches_by_byte_size(
+            rechunk_arrow_batches(
                 iter([empty, one, empty]),
                 row_size=10,
             )
@@ -536,7 +536,7 @@ class TestRechunk:
         row_cap = 5
 
         out = list(
-            rechunk_arrow_batches_by_byte_size(
+            rechunk_arrow_batches(
                 iter(inputs),
                 byte_size=big_byte_target,
                 row_size=row_cap,

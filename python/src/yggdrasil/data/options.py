@@ -856,9 +856,9 @@ class CastOptions:
             if not self.byte_size and not self.row_size:
                 return batches
             from yggdrasil.arrow.cast import (
-                rechunk_arrow_batches_by_byte_size,
+                rechunk_arrow_batches,
             )
-            return rechunk_arrow_batches_by_byte_size(
+            return rechunk_arrow_batches(
                 batches,
                 byte_size=self.byte_size,
                 row_size=self.row_size,

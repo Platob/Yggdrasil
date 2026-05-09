@@ -312,7 +312,7 @@ class FolderIO(Tabular[FolderOptions]):
 
         ``options.byte_size`` / ``options.row_size`` route the actual
         bytes-to-disk write through
-        :func:`rechunk_arrow_batches_by_byte_size`, so the
+        :func:`rechunk_arrow_batches`, so the
         bin-packing applies regardless of which mode picked the
         rows. Setting both knobs unset keeps the legacy
         "one part file per write call" shape.
@@ -359,9 +359,9 @@ class FolderIO(Tabular[FolderOptions]):
         row_size = getattr(options, "row_size", None) or 0
 
         if byte_size > 0 or row_size > 0:
-            from yggdrasil.arrow.cast import rechunk_arrow_batches_by_byte_size
+            from yggdrasil.arrow.cast import rechunk_arrow_batches
 
-            rechunked = rechunk_arrow_batches_by_byte_size(
+            rechunked = rechunk_arrow_batches(
                 batches,
                 byte_size=byte_size or None,
                 row_size=row_size or None,
