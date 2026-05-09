@@ -52,7 +52,7 @@ class TestConstruction:
         assert p.api_path == "/Volumes/cat/sch/vol/data.parquet"
 
     def test_url_form(self, workspace) -> None:
-        p = VolumePath("volumes:///cat/sch/vol/x", workspace=workspace)
+        p = VolumePath("dbfs+volume:///cat/sch/vol/x", workspace=workspace)
         assert p.full_path() == "/Volumes/cat/sch/vol/x"
 
 

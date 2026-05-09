@@ -53,7 +53,6 @@ class TestSchemeRegistration:
 
     def test_alias_resolution(self) -> None:
         assert URLBased.for_scheme("dbfs+table") is Table
-        assert URLBased.for_scheme("table") is Table
 
 
 # ---------------------------------------------------------------------------

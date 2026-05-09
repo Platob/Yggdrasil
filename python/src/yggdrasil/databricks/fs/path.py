@@ -8,10 +8,11 @@ abstract :class:`Path` hooks (``_stat``, ``_ls``, ``_mkdir``,
 
 The base owns:
 
-- **Legacy POSIX coercion** — strings like ``/dbfs/...``,
+- **POSIX coercion** — strings like ``/dbfs/...``,
   ``/Workspace/...``, ``/Volumes/...`` are pre-coerced into the
-  canonical ``dbfs://`` / ``workspace://`` / ``volumes://`` URL form
-  so callers don't have to know the URL syntax.
+  canonical ``dbfs+dbfs://`` / ``dbfs+workspace://`` /
+  ``dbfs+volume://`` URL form so callers don't have to know the URL
+  syntax.
 - **Workspace-client binding** — :attr:`workspace` is whatever the
   caller injected, typically a ``databricks.sdk.WorkspaceClient``
   in production or a :class:`unittest.mock.Mock` in tests. No
@@ -165,15 +166,6 @@ class DatabricksPath(RemotePath):
                 ) else str(target_scheme)
                 if not url.scheme:
                     url = url.with_scheme(target_token)
-                elif url.scheme != target_token:
-                    # Collapse legacy aliases (``volumes://`` for
-                    # ``dbfs+volume://``, ``workspace://`` for
-                    # ``dbfs+workspace://``, ``dbfs://`` for
-                    # ``dbfs+dbfs://``) onto the canonical compound
-                    # form so the URL round-trips cleanly.
-                    resolved = Scheme.from_(url.scheme, default=None)
-                    if resolved is target_scheme:
-                        url = url.with_scheme(target_token)
 
         super().__init__(data=data, url=url, temporary=temporary, **kwargs)
 
@@ -193,9 +185,9 @@ class DatabricksPath(RemotePath):
         - ``dbfs+dbfs://``, ``dbfs+volume://``, ``dbfs+workspace://``
           — the compound :class:`Scheme` form, dispatched by URL
           scheme alone.
-        - ``dbfs://`` — legacy / un-qualified family URL. Dispatched
-          by the URL path's leading namespace: ``/Volumes/...``
-          →  :class:`VolumePath`, ``/Workspace/...`` →
+        - ``dbfs://`` — un-qualified family URL. Dispatched by the
+          URL path's leading namespace: ``/Volumes/...`` →
+          :class:`VolumePath`, ``/Workspace/...`` →
           :class:`WorkspacePath`, anything else → :class:`DBFSPath`.
 
         Concrete subclasses (DBFSPath / VolumePath / WorkspacePath)
@@ -216,7 +208,7 @@ class DatabricksPath(RemotePath):
             return VolumePath(url=u, **kwargs)
         if scheme == Scheme.DATABRICKS_WORKSPACE.value:
             return WorkspacePath(url=u, **kwargs)
-        # Legacy ``dbfs://`` family URL — peek at the path. The
+        # Un-qualified ``dbfs://`` family URL — peek at the path. The
         # surface subclasses each carry their own POSIX prefix
         # (``/dbfs/``, ``/Volumes/``, ``/Workspace/``) which they
         # re-attach in :meth:`full_path`, so the URL path we hand

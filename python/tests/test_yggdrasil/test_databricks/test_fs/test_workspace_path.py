@@ -59,7 +59,7 @@ class TestConstruction:
         assert p.api_path == "/Workspace/Users/me/notebook.py"
 
     def test_url_form(self, workspace) -> None:
-        p = WorkspacePath("workspace:///Users/me/x", workspace=workspace)
+        p = WorkspacePath("dbfs+workspace:///Users/me/x", workspace=workspace)
         assert p.full_path() == "/Workspace/Users/me/x"
 
 

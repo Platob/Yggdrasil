@@ -178,11 +178,11 @@ class VolumePath(DatabricksPath):
             if not child_path:
                 continue
             # The Files API returns canonical ``/Volumes/<cat>/<sch>/<vol>/...``
-            # POSIX paths; route through the constructor so the same legacy
+            # POSIX paths; route through the constructor so the same POSIX
             # coercion that built ``self`` (``/Volumes/...`` →
-            # ``volumes:///...``) builds the child. Earlier code did
+            # ``dbfs+volume:///...``) builds the child. Earlier code did
             # ``child_path.lstrip('/Volumes')`` which strips the *character
-            # set* ``/Volumes`` and then yielded ``volumes://<cat>/...``,
+            # set* ``/Volumes`` and then yielded ``dbfs+volume://<cat>/...``,
             # which URL-parses ``<cat>`` as a host and drops it.
             child = type(self)(
                 child_path,

@@ -1,9 +1,9 @@
 """Centralized URL-scheme enum for :class:`URLBased` dispatch.
 
 Across Yggdrasil, anything addressable by a URL — a filesystem
-path (``file://``, ``s3://``, ``dbfs://``, ``volumes://``), an
-in-memory buffer (``mem://``), a workspace object
-(``workspace://``), an HTTP endpoint (``http://`` / ``https://``)
+path (``file://``, ``s3://``, ``dbfs://``, ``dbfs+volume://``), an
+in-memory buffer (``mem://``), a Databricks workspace object
+(``dbfs+workspace://``), an HTTP endpoint (``http://`` / ``https://``)
 — exposes itself as a :class:`yggdrasil.io.url.URLBased` subclass.
 That base owns a single registry keyed by :class:`Scheme`, and
 ``URLBased.from_url(url)`` dispatches to the concrete subclass for
@@ -19,7 +19,8 @@ returned.
 The enum exposes:
 
 * canonical members for every shipped backend (``FILE``, ``MEMORY``,
-  ``DBFS``, ``VOLUMES``, ``WORKSPACE``, ``S3``, ``HTTP``, ``HTTPS``);
+  ``DBFS``, ``DATABRICKS_VOLUME``, ``DATABRICKS_WORKSPACE``, ``S3``,
+  ``HTTP``, ``HTTPS``);
 * :meth:`from_` — forgiving coercion (string / :class:`Scheme` /
   ``None``) with alias support (``"file://"`` / ``"FILE"`` /
   ``"s3a"`` all land on the right member);
@@ -91,16 +92,8 @@ _SCHEME_ALIASES: dict[str, str] = {
     "dbfs":           "dbfs",
     "dbfs+dbfs":      "dbfs+dbfs",
     "dbfs+volume":    "dbfs+volume",
-    "dbfs+volumes":   "dbfs+volume",
-    "volumes":        "dbfs+volume",
-    "volume":         "dbfs+volume",
-    "uc":             "dbfs+volume",
     "dbfs+workspace": "dbfs+workspace",
-    "workspace":      "dbfs+workspace",
-    "ws":             "dbfs+workspace",
     "dbfs+table":     "dbfs+table",
-    "table":          "dbfs+table",
-    "uc+table":       "dbfs+table",
     "s3":             "s3",
     "s3a":            "s3",
     "s3n":            "s3",
@@ -166,8 +159,7 @@ class Scheme(str, Enum):
         * :class:`Scheme` (returned as-is);
         * a scheme string — case-insensitive, trailing ``://`` and
           whitespace tolerated, common aliases (``"s3a"`` → :attr:`S3`,
-          ``"local"`` → :attr:`FILE`, ``"volume"`` → :attr:`VOLUMES`,
-          ``"memory"`` → :attr:`MEMORY`);
+          ``"local"`` → :attr:`FILE`, ``"memory"`` → :attr:`MEMORY`);
         * ``None`` — returns *default* if supplied, else raises.
 
         ``default`` swallows unknown / unparseable input. Without it,

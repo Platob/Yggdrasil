@@ -8,8 +8,8 @@ The enum centralizes the URL-scheme tokens every Yggdrasil
   ``Scheme.DATABRICKS_VOLUME == "dbfs+volume"``);
 * the Databricks family uses the compound ``dbfs+<surface>``
   convention — the bare ``dbfs`` scheme is the abstract dispatcher;
-* :meth:`from_` accepts canonical tokens, common aliases
-  (``"s3a"`` / ``"local"`` / ``"volume"`` / ``"workspace"``),
+* :meth:`from_` accepts canonical tokens, the small set of common
+  aliases (``"s3a"`` / ``"local"`` / ``"memory"`` / ``"databricks"``),
   case-insensitive input, and a trailing ``://``;
 * :meth:`path_class` lazy-imports the matching :class:`URLBased`
   subclass and triggers the registration side-effect;
@@ -63,13 +63,7 @@ class TestFrom:
             ("DBFS", Scheme.DBFS),
             ("dbfs+dbfs", Scheme.DATABRICKS_DBFS),
             ("dbfs+volume", Scheme.DATABRICKS_VOLUME),
-            ("dbfs+volumes", Scheme.DATABRICKS_VOLUME),
-            ("volumes", Scheme.DATABRICKS_VOLUME),
-            ("volume", Scheme.DATABRICKS_VOLUME),
-            ("uc", Scheme.DATABRICKS_VOLUME),
             ("dbfs+workspace", Scheme.DATABRICKS_WORKSPACE),
-            ("workspace", Scheme.DATABRICKS_WORKSPACE),
-            ("ws", Scheme.DATABRICKS_WORKSPACE),
             ("s3", Scheme.S3),
             ("s3a", Scheme.S3),
             ("s3n", Scheme.S3),
@@ -101,8 +95,10 @@ class TestFrom:
     def test_is_valid(self) -> None:
         assert Scheme.is_valid("dbfs")
         assert Scheme.is_valid("dbfs+volume")
-        assert Scheme.is_valid("workspace")
+        assert Scheme.is_valid("dbfs+workspace")
         assert Scheme.is_valid("s3a")
+        assert not Scheme.is_valid("workspace")  # legacy alias dropped
+        assert not Scheme.is_valid("volumes")  # legacy alias dropped
         assert not Scheme.is_valid("redis")
         assert not Scheme.is_valid(None)
 
