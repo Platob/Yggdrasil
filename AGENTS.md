@@ -632,6 +632,44 @@ Changes here must preserve:
 - Arrow / Parquet / JSON / IPC compatibility
 - typed IO semantics
 
+### Fail fast on remote resources, retry the real call — don't pre-check
+Every call to a remote resource (HTTP, Databricks Files / SQL / Workspace,
+S3, MongoDB, Spark cluster, …) costs latency, quota, and a chance to fail
+on its own. Treat them as expensive.
+
+Rules:
+- **Do the operation, handle the error.** Don't gate a `download` /
+  `upload` / `delete` / `read_bytes` on a preceding `exists()` /
+  `stat()` / `get_metadata()` / `HEAD` probe. The probe doubles the
+  latency, races against concurrent writers, and lies under eventual
+  consistency. Catch `NotFound` / `404` / `FileNotFoundError` from the
+  real call instead.
+- **One round trip per intent.** If you need both "does this exist" and
+  the bytes, just fetch the bytes and treat `NotFound` as "no". If you
+  need both stat and listing, list and read the entry — don't stat each
+  child. Use `_call_ensuring_parents` (or its equivalent) to lazily
+  recover from missing-parent errors instead of `mkdir -p` on every
+  write.
+- **Retry is for transience, not correctness.** Wrap the operation in
+  the existing retry policy (`retry_sdk_call`, `_call`, the HTTP send
+  retry config) to absorb 5xx / throttling / connect timeouts. Do not
+  use a retry loop to paper over a precondition you could just have
+  let the server enforce.
+- **Fail fast on deterministic errors.** `NotFound`, `AlreadyExists`,
+  `PermissionDenied`, `BadRequest` with a stable message — propagate
+  immediately. Retrying these wastes the user's time and burns quota.
+- **Cache only what's safe to cache.** Stat / metadata results have a
+  TTL (see `RemotePath._STAT_CACHE`); reuse them across the same op
+  instead of re-issuing the call. Invalidate after mutations
+  (`_invalidate_stat_cache`).
+- **No probe-then-act loops.** `if path.exists(): path.read_bytes()` is
+  a bug pattern, not a safety net — between the two calls another
+  client can delete or rotate the object. Read it, catch the miss.
+
+When extending a remote integration, count the round trips your change
+adds and justify each one. The default budget is **one** for the
+intended action, plus at most one parent-recovery retry.
+
 ---
 
 ## Databricks guidance

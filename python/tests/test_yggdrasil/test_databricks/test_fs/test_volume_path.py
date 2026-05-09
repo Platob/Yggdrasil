@@ -138,6 +138,27 @@ class TestMutators:
         )
 
 
+class TestListing:
+
+    def test_iterdir_preserves_catalog(self, workspace) -> None:
+        # ``list_directory_contents`` returns canonical
+        # ``/Volumes/<cat>/<sch>/<vol>/...`` paths; the catalog
+        # segment must round-trip through child construction.
+        workspace.files.list_directory_contents.return_value = [
+            SimpleNamespace(path="/Volumes/trading/sch/vol/folder/a.bin",
+                            is_directory=False),
+            SimpleNamespace(path="/Volumes/trading/sch/vol/folder/sub",
+                            is_directory=True),
+        ]
+        p = VolumePath("/Volumes/trading/sch/vol/folder", workspace=workspace)
+        children = list(p.iterdir())
+        assert [c.full_path() for c in children] == [
+            "/Volumes/trading/sch/vol/folder/a.bin",
+            "/Volumes/trading/sch/vol/folder/sub",
+        ]
+        assert all(isinstance(c, VolumePath) for c in children)
+
+
 class TestStagingPath:
 
     def test_default_layout(self, workspace) -> None:
