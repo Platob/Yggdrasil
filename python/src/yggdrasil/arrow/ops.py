@@ -2,7 +2,10 @@
 
 Currently exposes :func:`upsert_arrow_tabular`, which combines two
 ``pa.Table`` / ``pa.RecordBatch`` operands keyed by one or more shared
-columns. The match semantics are governed by :class:`Mode`:
+columns, and :func:`upsert_arrow_batches`, the streaming counterpart
+that accepts two ``pa.RecordBatch`` iterables and yields the merged
+batches without materializing both sides as Tables. The match
+semantics are governed by :class:`Mode`:
 
 - :attr:`Mode.APPEND` — keep ``left`` intact for matching keys; only
   append rows from ``right`` whose keys are absent from ``left``.
@@ -19,15 +22,17 @@ chunk.
 """
 from __future__ import annotations
 
+from typing import Iterable, Iterator
+
 import pyarrow as pa
 
 from yggdrasil.data.enums.jointype import JoinType
 from yggdrasil.data.enums.mode import Mode, ModeLike
 
 from ._typing import ArrowTabular
-from .cast import rechunk_arrow_table
+from .cast import rechunk_arrow_batches, rechunk_arrow_table
 
-__all__ = ["upsert_arrow_tabular"]
+__all__ = ["upsert_arrow_batches", "upsert_arrow_tabular"]
 
 
 def upsert_arrow_tabular(
@@ -146,6 +151,196 @@ def upsert_arrow_tabular(
     if out_is_table:
         return result
     return _table_to_record_batch(result)
+
+
+def upsert_arrow_batches(
+    left: Iterable[pa.RecordBatch],
+    right: Iterable[pa.RecordBatch],
+    match_by_names: list[str],
+    mode: ModeLike,
+    *,
+    schema: pa.Schema | None = None,
+    row_size: int | None = None,
+    byte_size: int | None = None,
+    memory_pool: pa.MemoryPool | None = None,
+) -> Iterator[pa.RecordBatch]:
+    """Streaming upsert over two ``pa.RecordBatch`` iterables.
+
+    Tuned to avoid concatenating either side into a single Table:
+
+    - :attr:`Mode.APPEND` — only ``left``'s key tuples are buffered (a
+      Python set of hashable rows). ``left`` batches stream through
+      untouched while their keys accumulate; ``right`` is then streamed
+      batch-by-batch and filtered against the seen keys.
+    - upsert-like modes (anything other than ``APPEND``) — ``right`` is
+      drained first and held as a list of batches (kept separate, not
+      concatenated) so its keys can drive the ``left`` filter; ``left``
+      is streamed batch-by-batch, then the buffered ``right`` is emitted
+      so its values win on conflicts.
+
+    Parameters
+    ----------
+    left, right
+        Iterables of ``pa.RecordBatch`` (e.g. a generator, a
+        ``pa.RecordBatchReader``, or ``pa.Table.to_batches()``).
+        ``right``'s batches are projected onto ``left``'s schema before
+        emission, so extra columns are dropped and shared columns are
+        coerced.
+    match_by_names
+        One or more shared column names that identify a row. Nested key
+        types work transparently — keys are materialized to hashable
+        Python values for set membership.
+    mode
+        Same grammar as :func:`upsert_arrow_tabular`.
+    schema
+        Optional output schema override. When omitted, the schema is
+        taken from the first ``left`` batch (or the first ``right``
+        batch when ``left`` is empty).
+    row_size, byte_size
+        Optional output chunking caps. When set, the result is piped
+        through :func:`rechunk_arrow_batches` before yielding.
+    memory_pool
+        Forwarded to :func:`rechunk_arrow_batches` for buffered
+        ``pa.concat_batches`` calls.
+
+    Yields
+    ------
+    pa.RecordBatch
+        The merged stream. Empty (zero-row) batches are dropped.
+    """
+    if not match_by_names:
+        raise ValueError(
+            "upsert_arrow_batches: 'match_by_names' must contain at "
+            "least one column name to match on."
+        )
+
+    resolved_mode = Mode.from_(mode)
+    keys = list(match_by_names)
+
+    if resolved_mode is Mode.APPEND:
+        merged = _upsert_batches_append(left, right, keys, schema)
+    else:
+        merged = _upsert_batches_overwrite(left, right, keys, schema)
+
+    if (row_size and row_size > 0) or (byte_size and byte_size > 0):
+        yield from rechunk_arrow_batches(
+            merged,
+            row_size=row_size,
+            byte_size=byte_size,
+            memory_pool=memory_pool,
+        )
+        return
+    yield from merged
+
+
+def _upsert_batches_append(
+    left: Iterable[pa.RecordBatch],
+    right: Iterable[pa.RecordBatch],
+    keys: list[str],
+    schema: pa.Schema | None,
+) -> Iterator[pa.RecordBatch]:
+    out_schema = schema
+    seen: set = set()
+    for batch in left:
+        _ensure_keys(batch.schema, keys, "left")
+        if out_schema is None:
+            out_schema = batch.schema
+        seen.update(_hashable_key_rows(batch, keys))
+        if batch.num_rows:
+            yield batch
+    for batch in right:
+        _ensure_keys(batch.schema, keys, "right")
+        if out_schema is None:
+            # left was empty — anchor on right's first batch schema.
+            out_schema = batch.schema
+        batch = _align_batch_to_schema(batch, out_schema)
+        if not batch.num_rows:
+            continue
+        rows = _hashable_key_rows(batch, keys)
+        mask = pa.array([r not in seen for r in rows], type=pa.bool_())
+        filtered = batch.filter(mask)
+        if filtered.num_rows:
+            yield filtered
+
+
+def _upsert_batches_overwrite(
+    left: Iterable[pa.RecordBatch],
+    right: Iterable[pa.RecordBatch],
+    keys: list[str],
+    schema: pa.Schema | None,
+) -> Iterator[pa.RecordBatch]:
+    # Drain right first so its keys can drive left's filter. Batches
+    # stay separate; we never concatenate the buffer into a Table.
+    right_buffer: list[pa.RecordBatch] = []
+    for batch in right:
+        _ensure_keys(batch.schema, keys, "right")
+        right_buffer.append(batch)
+
+    out_schema = schema
+    aligned_right: list[pa.RecordBatch] | None = None
+    seen: set = set()
+
+    def _materialize_right() -> list[pa.RecordBatch]:
+        nonlocal aligned_right
+        if aligned_right is not None:
+            return aligned_right
+        target = out_schema
+        result: list[pa.RecordBatch] = []
+        for rb in right_buffer:
+            ar = _align_batch_to_schema(rb, target) if target is not None else rb
+            if ar.num_rows:
+                seen.update(_hashable_key_rows(ar, keys))
+            result.append(ar)
+        aligned_right = result
+        return aligned_right
+
+    for batch in left:
+        _ensure_keys(batch.schema, keys, "left")
+        if out_schema is None:
+            out_schema = batch.schema
+        if aligned_right is None:
+            _materialize_right()
+        if not batch.num_rows:
+            continue
+        rows = _hashable_key_rows(batch, keys)
+        mask = pa.array([r not in seen for r in rows], type=pa.bool_())
+        filtered = batch.filter(mask)
+        if filtered.num_rows:
+            yield filtered
+
+    if aligned_right is None:
+        # left was empty — anchor schema on right's first batch (if any).
+        if out_schema is None and right_buffer:
+            out_schema = right_buffer[0].schema
+        _materialize_right()
+
+    for rb in aligned_right:
+        if rb.num_rows:
+            yield rb
+
+
+def _ensure_keys(schema: pa.Schema, keys: list[str], side: str) -> None:
+    missing = [n for n in keys if n not in schema.names]
+    if missing:
+        raise ValueError(
+            f"upsert_arrow_batches: match_by_names not found on {side} "
+            f"batch — missing: {missing}. Available: {list(schema.names)}."
+        )
+
+
+def _align_batch_to_schema(
+    batch: pa.RecordBatch, target: pa.Schema
+) -> pa.RecordBatch:
+    """Project ``batch`` onto ``target`` — reorder, drop extras, cast types."""
+    if batch.schema.names != target.names:
+        batch = batch.select(target.names)
+    if batch.schema.equals(target):
+        return batch
+    arrays = [
+        batch.column(i).cast(target.field(i).type)
+        for i in range(target.num_fields)
+    ]
+    return pa.RecordBatch.from_arrays(arrays, schema=target)
 
 
 def _upsert_via_join(
