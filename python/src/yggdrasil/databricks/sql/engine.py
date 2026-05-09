@@ -45,8 +45,15 @@ import pyarrow as pa
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.executor import StatementExecutor
+from yggdrasil.io.tabular import Tabular
 from yggdrasil.io.tabular.execution.expr import Predicate
-from yggdrasil.data.statement import PreparedStatement, StatementResult, StatementBatch
+from yggdrasil.data.statement import (
+    ExternalStatementData,
+    PreparedStatement,
+    StatementResult,
+    StatementBatch,
+)
+from yggdrasil.databricks.fs import VolumePath
 from yggdrasil.databricks.warehouse import (
     SQLWarehouse,
     WarehousePreparedStatement,
@@ -70,12 +77,88 @@ if TYPE_CHECKING:
     import polars
     import pyspark
     from pyspark.sql import SparkSession
-    from yggdrasil.databricks.fs import VolumePath
 
 __all__ = ["SQLEngine"]
 
 
 _DEFAULT_WAREHOUSE_RECHECK_S = 30
+
+
+def _coerce_external_tables_for_spark(
+    external_tables: Optional[Mapping[str, Any]],
+) -> Optional[dict[str, ExternalStatementData]]:
+    """Normalize engine-level ``external_tables`` for the Spark path.
+
+    Mirrors :meth:`WarehousePreparedStatement.check_external_data`'s
+    permissiveness — accepts the same value shapes the warehouse path
+    does so a single ``external_tables=`` argument works in either
+    mode without coercion at the call site:
+
+    - :class:`VolumePath` → text-substituted as
+      ``parquet.\\`<full_path>\\``` (Spark reads parquet by path).
+    - :class:`ExternalStatementData` → passed through (key is taken
+      from the mapping key on collisions).
+    - :class:`Tabular` → bound for temp-view registration at
+      :meth:`SparkStatementResult.start` time.
+    - ``str`` → ``text_value`` only (caller already staged it
+      somewhere; we just substitute).
+    - ``(tabular, text_value)`` tuple → both fields set.
+    - Anything else (``pa.Table``, polars / pandas / pyspark frames,
+      list-of-dicts, ...) → wrapped in :class:`ArrowTabular` so the
+      Spark side has a real :class:`Tabular` to register, matching the
+      warehouse side which would have staged the same value as
+      Parquet.
+    """
+    if not external_tables:
+        return None
+
+    from yggdrasil.io.tabular import ArrowTabular
+    from yggdrasil.arrow.cast import any_to_arrow_table
+
+    out: dict[str, ExternalStatementData] = {}
+    for alias, value in external_tables.items():
+        if isinstance(value, ExternalStatementData):
+            entry = value
+            if entry.text_key != alias:
+                entry = ExternalStatementData(
+                    alias, tabular=entry.tabular, text_value=entry.text_value,
+                )
+            out[alias] = entry
+            continue
+        if isinstance(value, VolumePath):
+            out[alias] = ExternalStatementData(
+                alias,
+                text_value=WarehousePreparedStatement.volume_path_text_value(value),
+            )
+            continue
+        if isinstance(value, Tabular):
+            out[alias] = ExternalStatementData(alias, tabular=value)
+            continue
+        if isinstance(value, str):
+            out[alias] = ExternalStatementData(alias, text_value=value)
+            continue
+        if isinstance(value, tuple) and len(value) == 2:
+            tabular, text_value = value
+            out[alias] = ExternalStatementData(
+                alias, tabular=tabular, text_value=text_value,
+            )
+            continue
+
+        # Raw frame: wrap so the Spark register-views step has a real
+        # :class:`Tabular`. ``any_to_arrow_table`` handles pa.Table,
+        # polars / pandas / pyspark frames, list-of-dicts, etc.
+        try:
+            arrow = any_to_arrow_table(value)
+        except Exception as e:
+            raise TypeError(
+                f"external_tables[{alias!r}]: cannot bind {type(value).__name__} "
+                f"to Spark — accepts VolumePath, ExternalStatementData, Tabular, "
+                f"str, (tabular, text_value), or any frame any_to_arrow_table "
+                f"can convert: {e}"
+            ) from e
+        out[alias] = ExternalStatementData(alias, tabular=ArrowTabular(arrow))
+
+    return out or None
 
 
 def _apply_retry_to_warehouse_statement(
@@ -298,10 +381,29 @@ class SQLEngine(DatabricksService, StatementExecutor):
 
         if engine_choice == "spark":
             session = spark_session or self.spark.resolve_session(create=True)
+
+            # Carry forward any ``external_data`` already on the input
+            # statement so a caller-prepared SparkPreparedStatement keeps
+            # its bindings; ``external_tables`` from this call layers on
+            # top (last write wins on alias collisions).
+            if isinstance(statement, PreparedStatement):
+                text = statement.text
+                merged: dict[str, ExternalStatementData] = (
+                    dict(statement.external_data) if statement.external_data else {}
+                )
+            else:
+                text = str(statement).strip()
+                merged = {}
+
+            new_external = _coerce_external_tables_for_spark(external_tables)
+            if new_external:
+                merged.update(new_external)
+
             prepared = SparkPreparedStatement(
-                text=str(statement.text if hasattr(statement, "text") else statement).strip(),
+                text=text,
                 spark_session=session,
                 row_limit=row_limit,
+                external_data=merged or None,
             )
             if retry is not None:
                 logger.debug(

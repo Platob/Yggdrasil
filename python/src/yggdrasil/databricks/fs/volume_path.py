@@ -97,6 +97,7 @@ class VolumePath(DatabricksPath):
         client: Any = None,
         workspace: Any = None,
         max_lifetime: Optional[float] = None,
+        tabular: Any = None,
     ) -> "VolumePath":
         """Mint a fresh Parquet staging file under
         ``/Volumes/<cat>/<sch>/tmp/.sql/<cat>/<sch>/<resource>/part-...``.
@@ -115,6 +116,15 @@ class VolumePath(DatabricksPath):
         ``max_lifetime`` is accepted for backwards compatibility —
         external sweepers honour it via the ``part-{epoch_ms}-...``
         filename convention.
+
+        ``tabular`` — optional :class:`Tabular` (or anything
+        :meth:`Tabular.write_table` accepts: ``pa.Table`` / pandas /
+        polars / pyspark frames, list of dicts, ...).  When supplied,
+        the data is written to the freshly-minted path as Parquet
+        before returning, so a single call yields a populated staging
+        file ready to reference from SQL.  Cleanup matches the
+        ``temporary`` flag: a write failure unlinks the path when
+        ``temporary=True``.
         """
         del max_lifetime  # filename carries the timestamp; unused here
 
@@ -130,11 +140,28 @@ class VolumePath(DatabricksPath):
         leaf = f"part-{epoch_ms}-{seed}.parquet"
         path = f"/{cat}/{sch}/tmp/.sql/{cat}/{sch}/{tbl}/{leaf}"
 
-        return cls(
+        staged = cls(
             url=URL(scheme=cls.scheme, path=path),
             workspace=workspace,
             temporary=temporary,
         )
+        if tabular is None:
+            return staged
+
+        # Local imports — keep optional engine deps off the import path
+        # for a plain ``staging_path()`` call that doesn't write.
+        from yggdrasil.data.enums import MediaTypes
+
+        try:
+            staged.as_media(media_type=MediaTypes.PARQUET).write_table(tabular)
+        except Exception:
+            if temporary:
+                try:
+                    staged.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            raise
+        return staged
 
     # ==================================================================
     # Listing
@@ -151,11 +178,11 @@ class VolumePath(DatabricksPath):
             if not child_path:
                 continue
             # The Files API returns canonical ``/Volumes/<cat>/<sch>/<vol>/...``
-            # POSIX paths; route through the constructor so the same legacy
+            # POSIX paths; route through the constructor so the same POSIX
             # coercion that built ``self`` (``/Volumes/...`` →
-            # ``volumes:///...``) builds the child. Earlier code did
+            # ``dbfs+volume:///...``) builds the child. Earlier code did
             # ``child_path.lstrip('/Volumes')`` which strips the *character
-            # set* ``/Volumes`` and then yielded ``volumes://<cat>/...``,
+            # set* ``/Volumes`` and then yielded ``dbfs+volume://<cat>/...``,
             # which URL-parses ``<cat>`` as a host and drops it.
             child = type(self)(
                 child_path,

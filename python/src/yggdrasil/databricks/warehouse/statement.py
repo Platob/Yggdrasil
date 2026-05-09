@@ -65,7 +65,7 @@ from yggdrasil.data.statement import (
 )
 from yggdrasil.databricks.sql.exceptions import SQLError
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
-from yggdrasil.data.enums import MimeType, MimeTypes, MediaTypes
+from yggdrasil.data.enums import MimeType, MimeTypes
 from yggdrasil.io.tabular import Tabular
 from ..fs import VolumePath, DatabricksPath
 from ..sql.types import parse_databricks_field
@@ -317,36 +317,25 @@ class WarehousePreparedStatement(PreparedStatement):
     ) -> VolumePath:
         """Stage tabular ``value`` to a fresh Parquet volume.  Override
         in subclasses for custom file formats / staging policies.
+
+        Single-shot through :meth:`VolumePath.staging_path` with
+        ``tabular=`` — that factory handles the Parquet write *and*
+        unlinks the path on write failure when ``temporary=True``, so
+        we don't repeat the cleanup here.
         """
         try:
-            path = VolumePath.staging_path(
+            return VolumePath.staging_path(
                 catalog_name=catalog_name,
                 schema_name=schema_name,
                 resource_name=resource_name or alias,
                 temporary=temporary,
+                tabular=value,
             )
         except Exception as e:
-            raise RuntimeError(
-                f"Failed to allocate staging volume for external_data[{alias!r}]: {e}"
-            ) from e
-
-        try:
-            path.as_media(media_type=MediaTypes.PARQUET).write_table(value)
-        except Exception as e:
-            if temporary:
-                try:
-                    path.unlink(missing_ok=True)
-                except Exception:
-                    logger.debug(
-                        "Could not clean up staging path %r after stage failure",
-                        path, exc_info=True,
-                    )
             raise RuntimeError(
                 f"Failed to stage external_data[{alias!r}] "
                 f"({type(value).__name__}) as Parquet: {e}"
             ) from e
-
-        return path
 
     # ------------------------------------------------------------------
     # Coercion / preparation

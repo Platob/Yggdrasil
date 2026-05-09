@@ -3,8 +3,10 @@
 
 Importing this package wires every concrete subclass into the
 :class:`yggdrasil.io.holder.Holder` scheme registry so
-``Holder(url="dbfs://...")`` / ``volumes://...`` / ``workspace://...``
-all dispatch to the right Path class.
+``Holder(url="dbfs+dbfs://...")`` / ``dbfs+volume://...`` /
+``dbfs+workspace://...`` all dispatch to the right Path class.
+The un-qualified ``dbfs://`` family URL is also supported and
+dispatched by the leading namespace in the URL path.
 """
 
 from __future__ import annotations
