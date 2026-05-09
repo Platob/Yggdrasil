@@ -103,7 +103,8 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
         with self.arrow_input_stream() as v:
             reader = ipc.RecordBatchFileReader(v)
             for i in range(reader.num_record_batches):
-                yield reader.get_batch(i)
+                batch = reader.get_batch(i)
+                yield options.cast_arrow_tabular(batch)
 
     def _collect_schema(self, options: ArrowIPCOptions) -> Schema:
         """Read the schema straight from the IPC footer.
@@ -144,14 +145,14 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
         semantics) and falls back to APPEND behavior with a logged
         note from the merge layer.
         """
-        action = self._resolve_action(options.mode)
+        action = options.mode
 
         if action is Mode.IGNORE:
-            if self.size > 0:
-                return
+            if not self.is_empty():
+                return None
             action = Mode.OVERWRITE
         elif action is Mode.ERROR_IF_EXISTS:
-            if self.size > 0:
+            if self.is_dirty():
                 raise FileExistsError(
                     f"{type(self).__name__} buffer is non-empty "
                     f"({self.size} bytes); refusing to overwrite under "
@@ -165,63 +166,56 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
             # Empty payload + OVERWRITE → an empty file with the
             # caller's schema (if any) is preferable to leaving stale
             # bytes; truncate and bail.
-            self.seek(0)
             self.truncate(0)
-            return
+            return None
         if first is None:
-            return
+            return None
 
-        if action is Mode.APPEND and self.size > 0:
+        is_empty = self.is_empty()
+
+        if action is Mode.UPSERT and not is_empty:
+            upsert_options = options.check_target(self.collect_schema(options))
+            raise NotImplementedError
+        if action is Mode.APPEND and not is_empty:
             # Read the existing batches, then chain the incoming iter,
             # then recurse with OVERWRITE. Batches are lazily walked
             # so this doesn't materialize the full table — but the
             # rewrite still re-encodes everything.
+            append_options = options.check_target(self.collect_schema(options))
             existing = list(self._read_arrow_batches(options))
-            chained = iter([*existing, first, *iterator])
+            chained = append_options.cast_arrow_batch_iterator(
+                iter([*existing, first, *iterator])
+            )
             return self._write_arrow_batches(
-                chained, dataclasses.replace(options, mode=Mode.OVERWRITE),
+                chained,
+                append_options.copy(
+                    mode=Mode.OVERWRITE,
+                    # remove already applied since cast_arrow_batch_iterator does it
+                    target=None,
+                    row_size=None,
+                    byte_size=None
+                ),
             )
 
         # OVERWRITE path — drive the writer against the IO's
         # :meth:`arrow_output_stream`, which yields a
         # :class:`pa.BufferOutputStream` and bulk-commits the encoded
         # bytes (with codec compression when set) on context exit.
-        schema = first.schema
+        write_options = options.check_source(first.schema)
+        first_casted = write_options.cast_arrow_tabular(first)
 
         with self.arrow_output_stream() as sink:
             with ipc.RecordBatchFileWriter(
-                sink, schema, options=options.to_writer_options(),
+                sink,
+                write_options.merged_schema.to_arrow_schema(),
+                options=options.to_writer_options(),
             ) as writer:
-                if first.num_rows > 0:
-                    writer.write_batch(first)
+                if first_casted.num_rows > 0:
+                    writer.write_batch(first_casted)
+
                 for batch in iterator:
-                    if batch.num_rows > 0:
-                        writer.write_batch(batch)
+                    casted_batch = write_options.cast_arrow_tabular(batch)
+                    if casted_batch.num_rows > 0:
+                        writer.write_batch(casted_batch)
 
-    # ==================================================================
-    # Helpers
-    # ==================================================================
-
-    def _resolve_action(self, mode: Mode) -> Mode:
-        """Pick the disposition for a write call.
-
-        :data:`Mode.AUTO` resolves to :data:`Mode.OVERWRITE` here —
-        the IPC file format has no incremental-write story, so
-        "let the writer pick" means "rewrite from scratch."
-        :data:`Mode.UPSERT` / :data:`Mode.MERGE` degrade to
-        :data:`Mode.APPEND`; they need a key the IPC file format
-        doesn't carry.
-        """
-        if mode is Mode.AUTO or mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:
-            return Mode.OVERWRITE
-        if mode is Mode.APPEND:
-            return Mode.APPEND
-        if mode is Mode.IGNORE:
-            return Mode.IGNORE
-        if mode is Mode.ERROR_IF_EXISTS:
-            return Mode.ERROR_IF_EXISTS
-        if mode is Mode.UPSERT or mode is Mode.MERGE:
-            # No key semantics at the IPC layer — closest honest
-            # behavior is APPEND.
-            return Mode.APPEND
-        return Mode.OVERWRITE
+        return None

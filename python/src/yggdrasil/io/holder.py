@@ -593,6 +593,9 @@ class Holder(Tabular[O], Disposable):
     def size(self) -> int:
         """Current visible size in bytes."""
 
+    def is_empty(self):
+        return self.size == 0
+
     # ------------------------------------------------------------------
     # IOStats — built fresh from holder-owned slots
     # ------------------------------------------------------------------

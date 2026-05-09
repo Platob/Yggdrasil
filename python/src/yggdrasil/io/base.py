@@ -487,6 +487,12 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         """Whether closing self also closes the holder."""
         return self._owns_holder
 
+    def remaining_bytes(self) -> int:
+        return self.holder.size - self.tell()
+
+    def is_empty(self):
+        return self.remaining_bytes() == 0
+
     # ==================================================================
     # Disposable lifecycle — apply mode side effects, acquire the holder
     # ==================================================================
