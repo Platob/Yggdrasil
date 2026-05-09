@@ -15,8 +15,8 @@ from databricks.sdk.config import Config
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.dataclasses import WaitingConfigArg, WaitingConfig, ExpiringDict
 from yggdrasil.io.bytes_io import BytesIO
-from yggdrasil.data.enums import MimeTypes
-from yggdrasil.io.url import URL
+from yggdrasil.data.enums import MimeTypes, Scheme
+from yggdrasil.io.url import URL, URLBased
 from yggdrasil.version import __version__ as ygg_version
 
 if TYPE_CHECKING:
@@ -81,9 +81,21 @@ def env_field(
 
 
 @dataclass
-class DatabricksClient:
+class DatabricksClient(URLBased):
     """
     Thin wrapper around databricks.sdk.config.Config.
+
+    URL-addressable through the :class:`URLBased` base: ``cls.scheme``
+    is :attr:`Scheme.DATABRICKS` (``dbks``), so a single
+    ``dbks://[client_id[:secret]@]<host>[?profile=...&account_id=...]``
+    URL round-trips a client through :meth:`from_url` /
+    :meth:`to_url`. The userinfo carries the credential — a bare
+    ``:<token>@`` for a PAT, ``<client_id>:<client_secret>@`` for an
+    OAuth service principal — and the query string carries every
+    other ``DatabricksClient`` field that ``__init__`` accepts.
+    Sensitive fields (``host``, ``token``, ``client_id``,
+    ``client_secret``) are kept out of the query so they don't get
+    duplicated when the URL is logged or persisted.
 
     Public state is intentionally minimal:
       - config: Config
@@ -102,6 +114,9 @@ class DatabricksClient:
     forced to ``"runtime"`` — DBR's notebook-scoped auth is short-lived,
     identity-correct, and the right default in that environment.
     """
+
+    # URLBased registration: ``dbks://`` URLs route to this class.
+    scheme: ClassVar[Scheme] = Scheme.DATABRICKS
 
     # Databricks / generic
     host: Optional[str] = env_field("DATABRICKS_HOST", repr_=True)
@@ -300,12 +315,8 @@ class DatabricksClient:
         self._session_token = snap
 
     # -------------------------------------------------------------------------
-    # URLResource
+    # URLBased — round-trip through ``dbks://`` URLs
     # -------------------------------------------------------------------------
-
-    @classmethod
-    def url_scheme(cls) -> str:
-        return "dbks"
 
     @property
     def base_url(self):
@@ -323,6 +334,20 @@ class DatabricksClient:
         return self.base_url.with_path("/explore/data")
 
     def to_url(self, scheme: str | None = None) -> URL:
+        """Render this client as a ``dbks://...`` URL.
+
+        Pack everything ``__init__`` would need to rebuild the client
+        into the URL: the workspace host as the URL host, the
+        credential (PAT or OAuth client_id/secret) as userinfo, and
+        every other non-default field as query items. Sensitive
+        fields (``host``, ``token``, ``client_id``,
+        ``client_secret``) are intentionally kept *out* of the query
+        so they don't get duplicated alongside the userinfo.
+
+        ``scheme`` overrides :attr:`scheme` for callers that want a
+        different URL scheme (e.g. ``"https"`` for the bare workspace
+        URL); defaults to :attr:`Scheme.DATABRICKS`.
+        """
         query: dict[str, Any] = {}
         keys = [
             f.name
@@ -346,50 +371,78 @@ class DatabricksClient:
 
         return (
             self.base_url
-            .with_scheme(scheme or self.url_scheme())
+            .with_scheme(scheme or type(self).scheme.value)
             .with_query_items(query)
             .with_user_password(user=user, password=password)
         )
+
+    @classmethod
+    def from_url(cls: Type[TC], url: "URL | str", **kwargs: Any) -> TC:
+        """Build a client from a ``dbks://...`` URL.
+
+        Reads:
+
+        - the workspace host from ``url.host`` (preferred) or a
+          ``host=`` query param;
+        - credentials from ``url.userinfo`` —
+          ``<client_id>:<client_secret>@`` for OAuth, ``:<token>@``
+          (or anything-as-password) for a PAT;
+        - every other init field of :class:`DatabricksClient` from
+          the query string (``profile``, ``auth_type``,
+          ``account_id``, ``workspace_id``, ``http_timeout_seconds``,
+          …).
+
+        ``kwargs`` overrides anything the URL provides so callers can
+        layer programmatic overrides on top of a parsed URL without
+        an extra ``replace`` call.
+        """
+        u = URL.from_(url)
+
+        parsed: dict[str, Any] = {}
+        for key, value in u.query_items():
+            parsed[key] = value
+
+        host = parsed.pop("host", None) or (
+            f"https://{u.host}/" if u.host else None
+        )
+        if not host:
+            raise ValueError(
+                f"Host is required for {cls.__name__} URL: {u!r}. "
+                f"Pass it as the URL host (``dbks://workspace.example/``) "
+                f"or as a ``host=`` query item."
+            )
+
+        user, password = u.user, u.password
+        if user and password:
+            parsed["client_id"] = user
+            parsed["client_secret"] = password
+        elif password:
+            parsed["token"] = password
+
+        # Caller-supplied ``kwargs`` win over URL-derived values.
+        merged = {"host": host, **parsed, **kwargs}
+        return cls(**merged)
+
+    #: Legacy alias for :meth:`from_url`. Kept so existing callers
+    #: (notably :class:`DatabricksService.from_parsed_url`) keep
+    #: working without an audit pass.
+    from_parsed_url = from_url
 
     @classmethod
     def parse(cls, obj: Any):
         if isinstance(obj, cls):
             return obj
         elif isinstance(obj, URL):
-            return cls.from_parsed_url(obj)
+            return cls.from_url(obj)
         elif isinstance(obj, str):
             url = URL.from_str(obj, default_scheme="https")
-            return cls.from_parsed_url(url)
+            return cls.from_url(url)
         elif isinstance(obj, dict):
             return cls(**obj)
         else:
             raise ValueError(
                 f"Cannot parse {cls.__name__} from object of type {type(obj)}: {obj!r}"
             )
-
-    @classmethod
-    def from_parsed_url(cls: Type[TC], url: URL) -> TC:
-        if not url.path:
-            raise ValueError(f"Invalid path for {cls.__name__}: {url!r}")
-
-        kwargs = {}
-        for key, value in url.query_items():
-            kwargs[key] = value
-
-        host = kwargs.pop("host", None) or (f"https://{url.host}/" if url.host else None)
-
-        if not host:
-            raise ValueError(f"Host is required for {cls.__name__} URL: {url!r}")
-
-        user, password = url.user, url.password
-
-        if user and password:
-            kwargs["client_id"] = user
-            kwargs["client_secret"] = password
-        elif password:
-            kwargs["token"] = password
-
-        return cls(host=host, **kwargs)
 
     # -------------------------------------------------------------------------
     # Singleton helpers

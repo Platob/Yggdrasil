@@ -59,6 +59,7 @@ _PATH_CLASS_CACHE: dict[str, type] = {}
 _PATH_CLASS_TARGETS: dict[str, tuple[str, str]] = {
     "file":           ("yggdrasil.io.path.local_path", "LocalPath"),
     "mem":            ("yggdrasil.io.memory", "Memory"),
+    "dbks":           ("yggdrasil.databricks.client", "DatabricksClient"),
     # ``dbfs://`` resolves to the abstract Databricks dispatcher —
     # :class:`DatabricksPath` inspects the URL and forwards to the
     # concrete subclass (DBFS surface, Volumes, Workspace).
@@ -84,6 +85,8 @@ _SCHEME_ALIASES: dict[str, str] = {
     "local":          "file",
     "mem":            "mem",
     "memory":         "mem",
+    "dbks":           "dbks",
+    "databricks":     "dbks",
     "dbfs":           "dbfs",
     "dbfs+dbfs":      "dbfs+dbfs",
     "dbfs+volume":    "dbfs+volume",
@@ -118,10 +121,16 @@ class Scheme(str, Enum):
     HTTP   = "http"
     HTTPS  = "https"
 
-    #: Databricks family root — ``dbfs://`` URLs route to the
-    #: abstract :class:`DatabricksPath` dispatcher, which inspects
-    #: the URL and forwards to the right concrete subclass (DBFS
-    #: surface, Volumes, Workspace).
+    #: Databricks workspace / account aggregator URL —
+    #: ``dbks://[user[:secret]@]<host>[?...]`` round-trips a
+    #: :class:`DatabricksClient`'s host, credentials, and config knobs
+    #: through a single URL.
+    DATABRICKS           = "dbks"
+
+    #: Databricks filesystem family root — ``dbfs://`` URLs route to
+    #: the abstract :class:`DatabricksPath` dispatcher, which
+    #: inspects the URL and forwards to the right concrete subclass
+    #: (DBFS surface, Volumes, Workspace).
     DBFS                 = "dbfs"
 
     #: Concrete scheme for the DBFS surface itself (``dbfs+dbfs://``).
