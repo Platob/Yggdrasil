@@ -983,7 +983,7 @@ class WarehouseStatementBatch(StatementBatch):
     on the configured ``parallel`` thread pool.
     """
 
-    external_volume_paths: dict[str, VolumePath]
+    external_volume_paths: Optional[dict[str, VolumePath]]
 
     def __init__(
         self,
@@ -1003,7 +1003,7 @@ class WarehouseStatementBatch(StatementBatch):
 
         # Effective alias map for this statement: batch-wide + per-statement
         # (per-statement wins on collision).
-        effective: dict[str, VolumePath] = dict(self.external_volume_paths)
+        effective: dict[str, VolumePath] = dict(self.external_volume_paths or {})
         if stmt.external_volume_paths:
             effective.update(stmt.external_volume_paths)
         if not effective:
@@ -1027,7 +1027,12 @@ class WarehouseStatementBatch(StatementBatch):
         # Per-statement scratch first (each result owns its statement).
         super().clear_temporary_resources()
 
-        # Batch-wide scratch second.
+        # Batch-wide scratch second.  Idempotent: callers (wait() then
+        # retry(), raise_for_status() then retry(), ...) may invoke this
+        # more than once, so bail out once we've already cleared.
+        if not self.external_volume_paths:
+            return self
+
         for alias, path in list(self.external_volume_paths.items()):
             if getattr(path, "temporary", False):
                 try:
