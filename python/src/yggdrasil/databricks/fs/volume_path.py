@@ -150,8 +150,15 @@ class VolumePath(DatabricksPath):
             child_path = getattr(info, "path", None)
             if not child_path:
                 continue
+            # The Files API returns canonical ``/Volumes/<cat>/<sch>/<vol>/...``
+            # POSIX paths; route through the constructor so the same legacy
+            # coercion that built ``self`` (``/Volumes/...`` →
+            # ``volumes:///...``) builds the child. Earlier code did
+            # ``child_path.lstrip('/Volumes')`` which strips the *character
+            # set* ``/Volumes`` and then yielded ``volumes://<cat>/...``,
+            # which URL-parses ``<cat>`` as a host and drops it.
             child = type(self)(
-                url=URL.from_(f"volumes://{child_path.lstrip('/Volumes').lstrip('/')}"),
+                child_path,
                 workspace=self._workspace,
             )
             yield child
