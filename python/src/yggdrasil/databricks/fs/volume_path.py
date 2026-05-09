@@ -26,6 +26,7 @@ import os
 import time
 from typing import Any, ClassVar, Iterator, Optional
 
+from yggdrasil.data.enums import Scheme
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 
@@ -38,7 +39,7 @@ __all__ = ["VolumePath"]
 class VolumePath(DatabricksPath):
     """Path under ``/Volumes/<cat>/<sch>/<vol>/...`` via the Files API."""
 
-    scheme: ClassVar[str] = "volumes"
+    scheme: ClassVar[Scheme] = Scheme.DATABRICKS_VOLUME
     namespace_prefix: ClassVar[str] = "/Volumes/"
 
     # ==================================================================

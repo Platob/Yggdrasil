@@ -47,12 +47,15 @@ from yggdrasil.io.tabular.execution.expr.backends.sql import Dialect, to_sql as 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema as DataSchema
 from yggdrasil.data.statement import PreparedStatement, StatementResult
-from yggdrasil.databricks.client import DatabricksResource
+from yggdrasil.databricks.client import DatabricksClient, DatabricksResource
 from yggdrasil.dataclasses.expiring import Expiring, RefreshResult
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io import URL
+from yggdrasil.io.holder import Holder
+from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.io.tabular import Tabular, O
+from yggdrasil.data.enums import Scheme
 from yggdrasil.io.primitive import ParquetIO
 from yggdrasil.data.enums import MimeTypes, MimeType, MediaType
 from yggdrasil.data.enums.mode import ModeLike, Mode
@@ -1011,8 +1014,22 @@ def _build_ygg_properties(
 # Table — per-table resource
 # ===========================================================================
 
-class Table(DatabricksResource, Tabular[CastOptions]):
-    """A single Unity Catalog table — DDL, DML, schema, storage helpers."""
+class Table(DatabricksResource, Holder):
+    """A single Unity Catalog table — DDL, DML, schema, storage helpers.
+
+    Registers under :attr:`Scheme.DATABRICKS_TABLE` (``dbfs+table://``)
+    so a URL of the shape
+    ``dbfs+table://[creds@]host/<catalog>/<schema>/<table>?…`` round-trips
+    a Table through :meth:`from_url` / :meth:`to_url`. Reads and writes
+    flow through the active :class:`SQLEngine` via the existing
+    :class:`Tabular` hooks (``_read_arrow_batches`` /
+    ``_write_arrow_batches``); the byte-level :class:`Holder`
+    primitives are intentionally not implemented because a SQL table
+    is not a positional byte buffer — callers should use the Tabular
+    surface (``read_arrow_table`` / ``write_arrow_table`` / …).
+    """
+
+    scheme: ClassVar[Scheme] = Scheme.DATABRICKS_TABLE
 
     @classmethod
     def options_class(cls) -> type[CastOptions]:
@@ -1028,12 +1045,34 @@ class Table(DatabricksResource, Tabular[CastOptions]):
         infos: TableInfo | None = None,
         infos_fetched_at: float | None = None,
         columns: list[Column] | None = None,
+        url: URL | None = None,
+        temporary: bool = False,
     ):
         if service is None:
             from .tables import Tables
             service = Tables.current()
 
-        super().__init__(service=service)
+        # Build a canonical ``dbfs+table://...`` URL so :class:`Holder`
+        # has a real URL to bind ``self._url`` to. The host comes from
+        # the underlying client (when available) so the URL alone
+        # round-trips through :meth:`from_url`.
+        if url is None:
+            host = ""
+            try:
+                base = service.client.base_url
+                host = base.host or ""
+            except Exception:
+                host = ""
+            path_parts = [
+                p for p in (catalog_name, schema_name, table_name) if p
+            ]
+            url = URL(
+                scheme=type(self).scheme.value,
+                host=host,
+                path="/" + "/".join(path_parts) if path_parts else "/",
+            )
+
+        super().__init__(service=service, url=url, temporary=temporary)
         self.catalog_name = catalog_name
         self.schema_name = schema_name
         # Unity Catalog caps identifiers at 255 chars. Normalize once at the
@@ -1082,8 +1121,148 @@ class Table(DatabricksResource, Tabular[CastOptions]):
                 data: Any | None = None) -> "Tabular":
         return self
 
-    def stat(self):
-        return self._stats
+    # ------------------------------------------------------------------
+    # Holder primitives — Table is *logical*, not byte-shaped.
+    # The Tabular surface (``read_arrow_table`` / ``write_arrow_table``
+    # / …) is the supported way to move rows; the byte-level
+    # primitives raise so a misuse fails loudly with a hint at the
+    # right surface.
+    # ------------------------------------------------------------------
+
+    @property
+    def is_memory(self) -> bool:
+        return False
+
+    @property
+    def is_local_path(self) -> bool:
+        return False
+
+    @property
+    def is_remote_path(self) -> bool:
+        # The table is *logical* — neither local nor remote in the
+        # filesystem sense. The Databricks-side identity lives in the
+        # warehouse, not at a file URL we can hand to ``is_remote_path``.
+        return False
+
+    @property
+    def size(self) -> int:
+        # A SQL table has no positional byte size. Return 0 so
+        # ``BytesIO(holder=table)``-style code sees an empty buffer
+        # instead of crashing; the byte primitives still raise on
+        # actual read/write attempts.
+        return 0
+
+    def stat(self) -> IOStats:
+        return self._stat()
+
+    def _stat(self) -> IOStats:
+        return IOStats(
+            size=0, mtime=0.0, kind=IOKind.MISSING,
+            media_type=type(self).default_media_type(),
+        )
+
+    def _read_mv(self, n: int, pos: int) -> memoryview:
+        raise NotImplementedError(
+            f"{type(self).__name__} is a logical Unity Catalog table, "
+            f"not a positional byte buffer. Use the Tabular surface "
+            f"(``read_arrow_table()``, ``read_pandas_frame()``, etc.) "
+            f"to materialize rows."
+        )
+
+    def _write_mv(self, data: memoryview, pos: int) -> int:
+        raise NotImplementedError(
+            f"{type(self).__name__} is a logical Unity Catalog table, "
+            f"not a positional byte buffer. Use ``insert(...)`` / "
+            f"``write_arrow_table(...)`` to write rows."
+        )
+
+    def reserve(self, n: int) -> None:
+        # No capacity layer to pre-grow; honor the contract by
+        # rejecting only nonsense inputs.
+        if n < 0:
+            raise ValueError(f"reserve size must be >= 0, got {n!r}")
+
+    def truncate(self, n: int) -> int:
+        raise NotImplementedError(
+            f"{type(self).__name__}.truncate is byte-shaped and does "
+            f"not apply to a SQL table. Use ``insert(..., mode='overwrite')`` "
+            f"or ``execute('TRUNCATE TABLE ...')`` for the SQL equivalent."
+        )
+
+    def _clear(self) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__}._clear is byte-shaped and does "
+            f"not apply to a SQL table. Use ``execute('DROP TABLE ...')`` "
+            f"or ``insert(..., mode='overwrite')`` for the SQL equivalent."
+        )
+
+    # ------------------------------------------------------------------
+    # URLBased — ``dbfs+table://[creds@]host/<cat>/<sch>/<tbl>``
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_url(cls, url: "URL | str", **kwargs: Any) -> "Table":
+        """Build a :class:`Table` from a ``dbfs+table://...`` URL.
+
+        Reads the catalog / schema / table from the URL path
+        (``/catalog/schema/table``) and, when ``service`` is not
+        passed in *kwargs*, infers the underlying
+        :class:`DatabricksClient` from the URL via
+        :meth:`DatabricksClient.from_url` — userinfo carries the PAT
+        / OAuth secret, the URL host is the workspace, and remaining
+        query items are forwarded as DatabricksClient init kwargs.
+        Then a :class:`Tables` service is built on top of that
+        client.
+
+        Caller-supplied ``service`` / ``catalog_name`` /
+        ``schema_name`` / ``table_name`` overrides anything the URL
+        provided.
+        """
+        u = URL.from_(url)
+        path = (u.path or "/").strip("/")
+        parts = path.split("/") if path else []
+        cat = parts[0] if len(parts) > 0 else None
+        sch = parts[1] if len(parts) > 1 else None
+        tbl = parts[2] if len(parts) > 2 else None
+
+        service = kwargs.pop("service", None)
+        if service is None:
+            client = kwargs.pop("client", None)
+            if client is None:
+                # Coerce the URL through ``DatabricksClient.from_url``
+                # so the same userinfo / host / query knobs that work
+                # on ``dbks://`` work on ``dbfs+table://`` too.
+                client = DatabricksClient.from_url(u)
+            from .tables import Tables
+            service = Tables(client=client)
+        else:
+            kwargs.pop("client", None)
+
+        return cls(
+            service=service,
+            catalog_name=kwargs.pop("catalog_name", None) or cat,
+            schema_name=kwargs.pop("schema_name", None) or sch,
+            table_name=kwargs.pop("table_name", None) or tbl,
+            **kwargs,
+        )
+
+    def to_url(self) -> URL:
+        """Render this Table as a ``dbfs+table://...`` URL.
+
+        Layers the table's ``/catalog/schema/table`` path on top of
+        :meth:`DatabricksClient.to_url` so credentials / profile /
+        account_id ride along the same URL — symmetric with
+        :meth:`from_url`.
+        """
+        try:
+            client_url = self.client.to_url(scheme=type(self).scheme.value)
+        except Exception:
+            # No usable client — fall back to a bare logical URL.
+            client_url = URL(scheme=type(self).scheme.value)
+        path_parts = [
+            p for p in (self.catalog_name, self.schema_name, self.table_name) if p
+        ]
+        return client_url.with_path("/" + "/".join(path_parts) if path_parts else "/")
 
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
         options = options.with_source(source=self.collect_schema())
@@ -1161,7 +1340,14 @@ class Table(DatabricksResource, Tabular[CastOptions]):
         return self.table_name
 
     @property
-    def url(self) -> URL:
+    def explore_url(self) -> URL:
+        """Workspace UI deep-link for this table (``/explore/data/...``).
+
+        Mirrors :attr:`Catalog.explore_url` / :attr:`Schema.explore_url`.
+        The canonical addressable URL for this table lives on
+        :attr:`url` (inherited from :class:`Holder`); ``explore_url``
+        is the human-friendly Catalog Explorer link.
+        """
         return (
             self.client.base_url
             .with_path(f"/explore/data/{self.catalog_name}/{self.schema_name}/{self.table_name}")

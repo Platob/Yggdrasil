@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 from typing import ClassVar, Iterator
 
+from yggdrasil.data.enums import Scheme
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 
@@ -30,7 +31,7 @@ _DBFS_CHUNK = 1 * 1024 * 1024
 class DBFSPath(DatabricksPath):
     """Path under ``/dbfs/...`` via the DBFS SDK API."""
 
-    scheme: ClassVar[str] = "dbfs"
+    scheme: ClassVar[Scheme] = Scheme.DATABRICKS_DBFS
     namespace_prefix: ClassVar[str] = "/dbfs/"
 
     # ==================================================================

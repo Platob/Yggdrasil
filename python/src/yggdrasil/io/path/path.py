@@ -94,15 +94,15 @@ class Path(Holder, os.PathLike, ABC):
             # Holder.__new__ dispatches on scheme; force LocalPath for
             # the no-scheme path case so callers don't accidentally
             # land on :class:`Memory`.
-            from yggdrasil.io.holder import _HOLDER_SCHEMES
             scheme = url.scheme
             if scheme:
-                target = _HOLDER_SCHEMES.get(scheme)
-                if target is None:
+                from yggdrasil.io.url import URLBased
+                try:
+                    target = URLBased.for_scheme(scheme)
+                except (ValueError, ImportError) as exc:
                     raise ValueError(
-                        f"Unknown scheme {scheme!r} for Path.from_({obj!r}). "
-                        f"Registered: {sorted(_HOLDER_SCHEMES)}."
-                    )
+                        f"Unknown scheme {scheme!r} for Path.from_({obj!r})."
+                    ) from exc
                 return target(url=url, **kwargs)
             from yggdrasil.io.path.local_path import LocalPath
             return LocalPath(url=url, **kwargs)

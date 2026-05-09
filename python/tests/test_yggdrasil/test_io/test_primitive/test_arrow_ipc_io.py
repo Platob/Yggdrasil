@@ -129,6 +129,33 @@ class TestHolderBacked:
         reader = ArrowIPCIO(holder=mem, owns_holder=False)
         assert reader.read_arrow_table().equals(table)
 
+    def test_idle_write_restores_cursor(self, table) -> None:
+        """A write on an *idle* (un-opened) IO must not leave the
+        cursor parked at EOF — callers that build a leaf via
+        ``IO(holder=h, owns_holder=False)`` and call ``write_arrow_table``
+        without entering the IO see ``tell() == 0`` afterwards. While
+        the IO is opened (``with`` / :meth:`open`) the caller owns the
+        cursor and the bulk-commit path moves it to EOF.
+
+        Uses a :class:`Memory` holder so the bytes flow through the
+        IO's :meth:`_commit_format_payload` (the only path where the
+        cursor actually moves); local-path holders take the OSFile
+        direct-write fast path which never touches the cursor.
+        """
+        idle = ArrowIPCIO(holder=Memory(), owns_holder=False)
+        assert not idle._acquired
+        assert idle.tell() == 0
+        idle.write_arrow_table(table)
+        assert idle.size > 0
+        # Cursor is restored — the IO still looks fresh.
+        assert idle.tell() == 0
+
+        with ArrowIPCIO(holder=Memory(), owns_holder=False) as opened:
+            opened.write_arrow_table(table)
+            # While opened the cursor follows the bytes — same as a
+            # raw ``write_bytes`` would.
+            assert opened.tell() == opened.size
+
 
 class TestModes:
 

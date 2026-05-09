@@ -742,6 +742,16 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
                 except Exception:
                     pass
 
+        # When the IO is idle (not entered via ``with`` / :meth:`open`),
+        # the cursor is implementation scratch — callers don't see it,
+        # and a one-shot ``write_arrow_table`` shouldn't leave ``tell()``
+        # parked at EOF on a buffer that's still un-acquired. Snapshot
+        # ``_pos`` here and restore it on the way out so the next
+        # idle-mode call (a fresh read, another write) starts from the
+        # same cursor it observed before. While the IO is opened the
+        # caller owns the cursor — leave it where the write landed.
+        restore_pos = self._pos if not self._acquired else None
+
         n = len(view)
         if append:
             self.seek(0, 2)  # SEEK_END
@@ -750,6 +760,9 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
             self.truncate(0)
         if n > 0:
             self.write_bytes(view)
+
+        if restore_pos is not None:
+            self._pos = min(restore_pos, self.size)
         return n
 
     @property
@@ -1561,14 +1574,21 @@ class _ArrowInputStreamContext:
 class _ArrowOutputStreamContext:
     """Writer-side companion for :meth:`IO.arrow_output_stream`.
 
-    Yields a :class:`pa.BufferOutputStream` so format encoders
+    Yields a :class:`pa.NativeFile` so format encoders
     (:class:`pa.ipc.RecordBatchFileWriter`,
     :func:`pa.parquet.ParquetWriter`, :func:`pa.csv.CSVWriter`, …) can
-    write against a pure-Arrow in-memory sink. On a clean exit, the
-    accumulated bytes are bulk-committed to the parent IO through
-    :meth:`IO._commit_format_payload`, which handles codec
-    compression (when the holder's media type carries one) and the
-    overwrite-vs-append disposition.
+    stream directly into the cheapest available sink:
+
+    - **Local-path holder, no codec** → :func:`pyarrow.OSFile` opened
+      against the holder's filesystem path. The encoder writes pages
+      straight to disk; no Python-side copy through an in-memory
+      buffer. ``append=False`` truncates first; ``append=True`` opens
+      with ``"ab"``.
+    - **Anything else** (in-memory holder, remote path, codec-tagged
+      buffer) → :class:`pa.BufferOutputStream`. On clean exit the
+      accumulated bytes are bulk-committed to the parent IO through
+      :meth:`IO._commit_format_payload`, which handles codec
+      compression and the overwrite-vs-append disposition.
 
     On exception the sink is closed and the parent is left untouched
     — the caller's prior payload is not overwritten by a half-written
@@ -1578,15 +1598,54 @@ class _ArrowOutputStreamContext:
     def __init__(self, parent: "IO", *, append: bool = False) -> None:
         self._parent = parent
         self._append = bool(append)
-        self._sink: "pa.BufferOutputStream | None" = None
+        self._sink: "pa.NativeFile | None" = None
+        # ``True`` when the sink writes straight to a local file —
+        # nothing left to commit on exit; ``False`` when the sink is
+        # an in-memory buffer that still needs a commit.
+        self._direct: bool = False
 
-    def __enter__(self) -> "pa.BufferOutputStream":
+    def __enter__(self) -> "pa.NativeFile":
+        parent = self._parent
+        if parent._codec() is None:
+            holder = parent._holder
+            if holder is not None and getattr(holder, "is_local_path", False):
+                full_path = getattr(holder, "full_path", None)
+                if callable(full_path):
+                    try:
+                        path_str = full_path()
+                        # ``OSFile`` doesn't accept ``"ab"`` directly;
+                        # we open in ``"wb"`` and seek to EOF for
+                        # append, matching :meth:`_commit_format_payload`'s
+                        # disposition.
+                        if self._append:
+                            self._sink = pa.OSFile(path_str, "ab")
+                        else:
+                            self._sink = pa.OSFile(path_str, "wb")
+                        self._direct = True
+                        # Local writes bypass the Python-side cursor, so
+                        # invalidate the holder's cached stat — the next
+                        # ``size`` / ``mtime`` probe re-reads from disk.
+                        invalidate = getattr(
+                            holder, "_invalidate_stat_cache", None,
+                        )
+                        if callable(invalidate):
+                            invalidate()
+                        return self._sink
+                    except Exception:
+                        # Fall through to the in-memory path; OSFile
+                        # failures (sandbox, missing parent dir, mode
+                        # mismatch) shouldn't break the write.
+                        self._sink = None
+                        self._direct = False
         self._sink = pa.BufferOutputStream()
+        self._direct = False
         return self._sink
 
     def __exit__(self, exc_type, exc, tb) -> None:
         sink = self._sink
         self._sink = None
+        direct = self._direct
+        self._direct = False
         if sink is None:
             return
         if exc_type is not None:
@@ -1594,6 +1653,20 @@ class _ArrowOutputStreamContext:
                 sink.close()
             except Exception:
                 pass
+            return
+        if direct:
+            # Bytes already on disk — just close the file handle and
+            # invalidate the cached stat one more time so the next
+            # reader sees the post-write size.
+            try:
+                sink.close()
+            except Exception:
+                pass
+            holder = self._parent._holder
+            if holder is not None:
+                invalidate = getattr(holder, "_invalidate_stat_cache", None)
+                if callable(invalidate):
+                    invalidate()
             return
         try:
             payload = sink.getvalue()

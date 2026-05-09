@@ -14,6 +14,7 @@ from __future__ import annotations
 import io as _stdio
 from typing import ClassVar, Iterator
 
+from yggdrasil.data.enums import Scheme
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 
@@ -26,7 +27,7 @@ __all__ = ["WorkspacePath"]
 class WorkspacePath(DatabricksPath):
     """Path under ``/Workspace/...`` via the Workspace API."""
 
-    scheme: ClassVar[str] = "workspace"
+    scheme: ClassVar[Scheme] = Scheme.DATABRICKS_WORKSPACE
     namespace_prefix: ClassVar[str] = "/Workspace/"
 
     # ==================================================================

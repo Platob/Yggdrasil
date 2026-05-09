@@ -59,7 +59,7 @@ import threading
 import time
 from typing import Any, ClassVar, Iterator
 
-from yggdrasil.data.enums import Mode
+from yggdrasil.data.enums import Mode, Scheme
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.path import Path
 from yggdrasil.io.io_stats import IOKind, IOStats
@@ -295,7 +295,7 @@ class LocalPath(Path):
     write do not.
     """
 
-    scheme: ClassVar[str] = "file"
+    scheme: ClassVar[Scheme] = Scheme.FILE
 
     __slots__ = ("_fd",)
 

@@ -23,7 +23,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional
 
-from yggdrasil.data.enums import Mode
+from yggdrasil.data.enums import Mode, Scheme
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.io.path import RemotePath
@@ -52,7 +52,7 @@ class HTTPPath(RemotePath):
 
     __slots__ = ("_session",)
 
-    scheme: ClassVar[str] = "https"
+    scheme: ClassVar[Scheme] = Scheme.HTTPS
 
     #: URL schemes accepted on input. Both keep their original spelling
     #: (unlike :class:`S3Path` which normalizes ``s3a`` / ``s3n`` to
@@ -223,11 +223,11 @@ class HTTPPath(RemotePath):
 
 
 # Register the ``http`` scheme alongside ``https`` so plain-HTTP URLs
-# also dispatch here. The :class:`Holder.__init_subclass__` hook only
-# registers the single :attr:`scheme` ClassVar; HTTP is the only scheme
-# pair in the codebase where a single backend serves two scheme spellings,
-# so we slot the alias in directly rather than introducing a multi-scheme
+# also dispatch here. :meth:`URLBased.__init_subclass__` only registers
+# the single :attr:`scheme` ClassVar; HTTP is the only scheme pair in
+# the codebase where a single backend serves two scheme spellings, so
+# we slot the alias in directly rather than introducing a multi-scheme
 # registration mechanism nothing else needs.
-from yggdrasil.io.holder import _HOLDER_SCHEMES as _HTTP_SCHEMES
-_HTTP_SCHEMES.setdefault("http", HTTPPath)
+from yggdrasil.io.url import _URL_BASED_REGISTRY as _HTTP_SCHEMES
+_HTTP_SCHEMES.setdefault(Scheme.HTTP, HTTPPath)
 del _HTTP_SCHEMES
