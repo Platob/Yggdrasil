@@ -78,19 +78,11 @@ def cast_arrow_struct_array(
 
     children: list[pa.Array] = []
 
-    for i, target_child in enumerate(target_type.children_fields):
-        # Lookup precedence mirrors the tabular struct cast:
-        # target.name (with name-or-positional shortcut) →
-        # target.alias. Lets target schemas declare an alias to pull
-        # a differently-named source column without a manual rename
-        # pass.
-        source_child = source_type.field_by(
-            name=target_child.name, index=i, raise_error=False,
-        )
-        if source_child is None and target_child.has_alias:
-            source_child = source_type.field_by(
-                name=target_child.alias, raise_error=False,
-            )
+    for target_child in target_type.children_fields:
+        # See the tabular variant for the rationale — single-method
+        # name-then-alias lookup against the source struct's
+        # children.
+        source_child = target_child.select_in_field(source_type, default=None)
 
         if source_child is None:
             children.append(
@@ -240,19 +232,13 @@ def cast_arrow_tabular(
     target_arrays: list[pa.Array] = []
     num_rows = data.num_rows
 
-    for i, target_field in enumerate(target_schema.children_fields):
-        # Lookup precedence: target.name (with the legacy
-        # name-or-positional shortcut from ``field_by(name=, index=)``)
-        # → target.alias. The alias step lets a target schema rename
-        # source columns without forcing the caller to pre-project
-        # the frame.
-        source_field = source_schema.field_by(
-            name=target_field.name, index=i, raise_error=False,
-        )
-        if source_field is None and target_field.has_alias:
-            source_field = source_schema.field_by(
-                name=target_field.alias, raise_error=False,
-            )
+    for target_field in target_schema.children_fields:
+        # ``select_in_field`` walks ``source_schema.children_fields``
+        # by name → alias and returns the matching child (or the
+        # ``default`` sentinel on miss). One method, one rule —
+        # mirrors what callers get on the read side via
+        # ``select_in_arrow_tabular``.
+        source_field = target_field.select_in_field(source_schema, default=None)
 
         if source_field is None:
             casted = target_field.default_arrow_array(

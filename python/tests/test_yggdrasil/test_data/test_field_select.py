@@ -68,6 +68,51 @@ class TestAlias:
 
 
 # ---------------------------------------------------------------------------
+# Field.position
+# ---------------------------------------------------------------------------
+
+
+class TestPosition:
+    def test_default_is_none(self) -> None:
+        assert _id_field().position is None
+
+    def test_set_position(self) -> None:
+        f = _id_field()
+        f.set_position(2)
+        assert f.position == 2
+
+    def test_set_position_clear(self) -> None:
+        f = _id_field()
+        f.set_position(2)
+        f.set_position(None)
+        assert f.position is None
+
+    def test_with_position_returns_copy(self) -> None:
+        f = _id_field()
+        g = f.with_position(1)
+        assert f.position is None
+        assert g.position == 1
+
+    def test_negative_position_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            _id_field().set_position(-1)
+
+    def test_position_used_as_fallback_in_arrow(self) -> None:
+        t = pa.table({"a": [10, 20, 30], "b": ["x", "y", "z"]})
+        # Field name doesn't match any column; alias none; position
+        # picks column index 1 → "b".
+        f = Field.from_(pa.field("c", pa.string())).with_position(1)
+        out = f.select_in_arrow_tabular(t)
+        assert out.to_pylist() == ["x", "y", "z"]
+
+    def test_position_used_as_fallback_in_field(self) -> None:
+        schema = Field.from_(pa.schema([("a", pa.int64()), ("b", pa.string())]))
+        f = Field.from_(pa.field("c", pa.string())).with_position(1)
+        matched = f.select_in_field(schema)
+        assert matched is not None and matched.name == "b"
+
+
+# ---------------------------------------------------------------------------
 # select_in_arrow_tabular
 # ---------------------------------------------------------------------------
 
@@ -89,16 +134,16 @@ class TestSelectInArrowTabular:
         with pytest.raises(KeyError, match="Field 'id' not found"):
             _id_field().select_in_arrow_tabular(t)
 
-    def test_missing_returns_none_with_raise_error_false(self) -> None:
+    def test_missing_returns_default_when_provided(self) -> None:
         t = pa.table({"name": ["a", "b", "c"]})
-        out = _id_field().select_in_arrow_tabular(t, raise_error=False)
+        out = _id_field().select_in_arrow_tabular(t, default=None)
         assert out is None
 
-    def test_return_default_synthesizes_null_array(self) -> None:
+    def test_default_can_be_a_typed_array(self) -> None:
         t = pa.table({"name": ["a", "b", "c"]})
-        out = _id_field().select_in_arrow_tabular(t, return_default=True)
-        assert out.to_pylist() == [None, None, None]
-        assert pa.types.is_int64(out.type)
+        sentinel = pa.nulls(t.num_rows, type=pa.int64())
+        out = _id_field().select_in_arrow_tabular(t, default=sentinel)
+        assert out is sentinel
 
     def test_record_batch_returns_array(self) -> None:
         rb = pa.record_batch({"id": [1, 2], "name": ["a", "b"]})
@@ -176,8 +221,9 @@ class TestSelectInPolars:
     def test_polars_frame_default(self) -> None:
         import polars as pl
         df = pl.DataFrame({"name": ["a", "b", "c"]})
-        s = _id_field().select_in_polars_frame(df, return_default=True)
-        assert s.to_list() == [None, None, None]
+        sentinel = pl.Series("id", [None, None, None], dtype=pl.Int64)
+        out = _id_field().select_in_polars_frame(df, default=sentinel)
+        assert out is sentinel
 
 
 # ---------------------------------------------------------------------------
@@ -204,10 +250,10 @@ class TestSelectInField:
         with pytest.raises(KeyError):
             _id_field().select_in_field(schema)
 
-    def test_missing_returns_default_self(self) -> None:
+    def test_missing_returns_default_when_provided(self) -> None:
         schema = Field.from_(pa.schema([("name", pa.string())]))
         f = _id_field()
-        out = f.select_in_field(schema, return_default=True)
+        out = f.select_in_field(schema, default=f)
         assert out is f
 
 
