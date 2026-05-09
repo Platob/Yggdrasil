@@ -55,7 +55,10 @@ class TestSparkDtype:
         )
 
         assert isinstance(rebuilt, ArrayType)
-        assert rebuilt.item_field.dtype.type_id == DataTypeId.INTEGER
+        # Spark ``LongType`` is unambiguously 64-bit; the rebuilt dtype
+        # must preserve that width rather than collapse to the abstract
+        # ``INTEGER`` family tag.
+        assert rebuilt.item_field.dtype.type_id == DataTypeId.INT64
         assert rebuilt.item_field.nullable is False
 
     def test_handles_spark_type_only_for_array(self, spark) -> None:  # noqa: F811

@@ -25,7 +25,7 @@ from ._helpers import normalize_map_like
 pytest.importorskip("pyspark")
 
 from yggdrasil.spark.tests import spark  # noqa: E402,F401
-from yggdrasil.spark.cast import spark_dataframe_to_arrow  # noqa: E402
+from yggdrasil.spark.cast import spark_dataframe_to_arrow, spark_dataframe_to_pandas  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +102,7 @@ class TestSparkMapColumn:
 
         rows = [
             normalize_map_like(v)
-            for v in result.toPandas()["target_map"].tolist()
+            for v in spark_dataframe_to_pandas(result)["target_map"].tolist()
         ]
         assert rows == [{"a": "1", "b": "2"}, {"x": "3"}, None]
 
@@ -174,7 +174,7 @@ class TestSparkStructColumnToMap:
 
         rows = [
             normalize_map_like(v)
-            for v in result.toPandas()["target_map"].tolist()
+            for v in spark_dataframe_to_pandas(result)["target_map"].tolist()
         ]
         assert rows == [
             {"a": "1", "b": "2", "c": "3"},

@@ -58,6 +58,7 @@ __all__ = [
     "cast_spark_column",
     "cast_spark_dataframe",
     "spark_dataframe_to_arrow",
+    "spark_dataframe_to_pandas",
 ]
 
 #: Cap on per-batch Arrow size handed to ``createDataFrame``. 128 MiB matches
@@ -123,6 +124,16 @@ def spark_dataframe_to_arrow(df: "pyspark_sql.DataFrame") -> pa.Table:
     # arrow.pyspark for the duration of the collect so we use the
     # plain row-based path, then restore the previous setting.
     return pa.Table.from_pandas(_to_pandas_no_arrow(df), preserve_index=False)
+
+
+def spark_dataframe_to_pandas(df: "pyspark_sql.DataFrame"):
+    """Public alias for :func:`_to_pandas_no_arrow`.
+
+    Same JVM-Arrow-bypass behavior; exposed so tests and callers that
+    just want a pandas DataFrame don't have to round-trip through Arrow
+    or hand-roll the same conf-toggle dance.
+    """
+    return _to_pandas_no_arrow(df)
 
 
 def _to_pandas_no_arrow(df: "pyspark_sql.DataFrame"):
