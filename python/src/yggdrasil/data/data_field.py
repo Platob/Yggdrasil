@@ -497,6 +497,51 @@ class Field(BaseMetadata, BaseChildrenFields):
     # Dunder / identity
     # ==================================================================
 
+    def __new__(cls, *args: Any, **kwargs: Any):
+        """Allocate the Field instance, redirecting struct dtypes to :class:`Schema`.
+
+        ``Field(name=..., dtype=struct_t)`` returns a :class:`Schema`
+        — a struct-shaped field IS a schema, so callers that hand us
+        a :class:`StructType` get the schema-flavoured surface
+        (header repr, ``inner_fields`` mapping, struct-aware merges)
+        without having to know to call :class:`Schema` instead. Only
+        plain ``Field`` calls redirect; explicit ``Schema(...)`` and
+        any other subclass go through normal allocation (so
+        ``Schema(inner_fields=...)`` keeps its own constructor shape).
+        """
+        if cls is Field:
+            # Pull dtype out of either positional or kwargs to match
+            # Field.__init__'s ``(name, dtype, ...)`` signature.
+            dtype = kwargs.get("dtype")
+            if dtype is None and len(args) >= 2:
+                dtype = args[1]
+            if dtype is not None:
+                try:
+                    resolved = DataType.from_any(dtype)
+                except Exception:
+                    resolved = None
+                if resolved is not None and resolved.type_id is DataTypeId.STRUCT:
+                    Schema = schema_class()
+                    instance = object.__new__(Schema)
+                    # Python's ``type.__call__`` follows up with
+                    # ``Schema.__init__(instance, *args, **kwargs)``,
+                    # which loops through ``Field.__init__`` again —
+                    # the idempotent-init guard there short-circuits
+                    # the second pass once we've stamped the slots.
+                    name = kwargs.get("name") if "name" in kwargs else (args[0] if args else "")
+                    Field.__init__(
+                        instance,
+                        name=name,
+                        dtype=resolved,
+                        nullable=kwargs.get("nullable", True),
+                        metadata=kwargs.get("metadata"),
+                        tags=kwargs.get("tags"),
+                        default=kwargs.get("default"),
+                        parent=kwargs.get("parent"),
+                    )
+                    return instance
+        return object.__new__(cls)
+
     def __init__(
         self,
         name: str,
@@ -507,7 +552,25 @@ class Field(BaseMetadata, BaseChildrenFields):
         default: Any = None,
         parent: "Field | None" = None,
     ) -> None:
-        resolved_dtype = DataType.from_any(dtype)
+        # Idempotent re-init guard for the ``Field.__new__`` struct
+        # redirect: when ``__new__`` returns a fully-initialized
+        # :class:`Schema`, Python still calls ``Schema.__init__`` on
+        # it (which loops back through ``Field.__init__``) with the
+        # original args. Detecting that case here keeps us from
+        # re-running ``DataType.from_any`` and re-stamping the cache
+        # slots a second time.
+        try:
+            existing = self.dtype
+        except AttributeError:
+            existing = None
+        if existing is not None:
+            resolved_dtype = (
+                dtype if isinstance(dtype, DataType) else DataType.from_any(dtype)
+            )
+            if existing == resolved_dtype and self.name == name:
+                return
+        else:
+            resolved_dtype = DataType.from_any(dtype)
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "dtype", resolved_dtype)
         object.__setattr__(self, "nullable", bool(nullable))

@@ -867,6 +867,11 @@ Specifically avoid:
 
 If a piece of code only exists to support a future hypothetical, it is dead weight today. Cut it.
 
+### Prefer `...` (Ellipsis) as the unset / missing sentinel
+When you need to distinguish "caller didn't pass this" from "caller passed `None`" — keyword-arg defaults, `dict.get(key, ...)` to tell missing from `None`, lazy-init cache slots — use the built-in `...` (`Ellipsis`) singleton instead of allocating a private `_UNSET = object()` / `_MISSING = object()` per module.
+
+Why: it is a true singleton, has no other meaning in feature code, reads cleanly (`if cached is not ...:`), avoids per-module sentinel proliferation, and serializes / pickles deterministically across process boundaries. Reserve a private sentinel only when `...` itself is a legitimate value in the domain you're filtering.
+
 ### Prefer boring reliability
 This library sits on integration boundaries.
 Stable and obvious beats clever and fragile.

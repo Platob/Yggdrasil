@@ -97,10 +97,10 @@ __all__ = [
 ]
 
 
-# Sentinel for the merged_field / merged_schema caches. ``None`` is a
-# valid computed result (no source and no target → no merge), so we
-# can't use it to mean "not yet computed".
-_UNSET: Any = object()
+# ``...`` (Ellipsis) is the project-wide "unset" sentinel — see the
+# convention note in ``AGENTS.md`` / ``CLAUDE.md``. ``None`` is a
+# valid computed merge result, so we can't use it to mean
+# "not yet computed".
 
 
 def _struct_of_objects(columns: "Iterable[str]") -> "Schema":
@@ -192,9 +192,6 @@ class CastOptions:
     #: :meth:`__post_init__` so callers can still pass plain key
     #: names — the Field-typed shape is the canonical surface.
     match_by: list["Field"] | None = None
-    with_io: bool = True
-    seek_source: bool = False
-    reset_seek: bool = False
     read_seek: int | None = None
     write_seek: int | None = None
     #: Row-level predicate. Evaluated by every IO that reads tabular
@@ -279,27 +276,40 @@ class CastOptions:
     # cheaper than the SQL ``NOT EXISTS`` plan.
     safe_merge: bool = False
 
-    # --- Memoization slots ---------------------------------------------
-    # ``merged_field`` and ``merged_schema`` are read repeatedly by every
-    # cast / fill / alias entry point on this class — once per dispatch
-    # call, often dozens of times across a single batch pipeline. The
-    # underlying ``Field.merge_with`` walks the full struct tree on each
-    # call. ``CastOptions`` is frozen, so the inputs to those merges
+    # --- Metadata sync after writes -------------------------------------
+    # When True (the default), a writer commits the holder-side IO
+    # metadata (size, mtime, media_type) once the operation finishes.
+    # Bulk writers (``_write_arrow_table``, ``_write_polars_frame``,
+    # ``_write_records``) flip this to False on the per-batch sub-call
+    # and run a single ``_commit_metadata`` at the end so multi-batch
+    # writes don't pay the stat-refresh cost on every batch. Set to
+    # False at the call site to suppress the final commit too — for
+    # callers that intend to chain another write before any reader sees
+    # the result.
+    sync_metadata: bool = True
+
+    # --- Memoization slot ----------------------------------------------
+    # ``merged_field`` is read repeatedly by every cast / fill / alias
+    # entry point on this class — once per dispatch call, often dozens
+    # of times across a single batch pipeline. The underlying
+    # ``Field.merge_with`` walks the full struct tree on each call.
+    # ``CastOptions`` is frozen, so the inputs to that merge
     # (``source_field``, ``target_field``, ``schema_mode``) cannot
-    # change for a given instance — making the result safe to cache for
+    # change for a given instance — the result is safe to cache for
     # the lifetime of the options object.
     #
-    # ``init=False`` keeps the slots out of the constructor signature
-    # (callers should never set the cache directly); ``compare=False``
-    # keeps two functionally identical CastOptions equal regardless of
-    # which one happened to have its cache warmed; ``repr=False`` keeps
-    # the cache out of the dataclass-generated repr (the custom repr
-    # below also skips non-repr fields).
+    # ``merged_schema`` returns the same object: now that
+    # :class:`StructField` *is* a :class:`Field`, the merged result
+    # for struct sides already satisfies the Schema interface — one
+    # cache slot covers both views.
+    #
+    # ``init=False`` keeps the slot out of the constructor signature;
+    # ``compare=False`` keeps two functionally identical CastOptions
+    # equal regardless of which one happened to have its cache warmed;
+    # ``repr=False`` keeps the cache out of the dataclass-generated
+    # repr (the custom repr below also skips non-repr fields).
     _merged_field_cache: Any = dataclasses.field(
-        default=_UNSET, init=False, repr=False, compare=False
-    )
-    _merged_schema_cache: Any = dataclasses.field(
-        default=_UNSET, init=False, repr=False, compare=False
+        default=..., init=False, repr=False, compare=False
     )
 
     # ==================================================================
@@ -371,7 +381,7 @@ class CastOptions:
     @property
     def merged_field(self) -> Field | None:
         cached = self._merged_field_cache
-        if cached is not _UNSET:
+        if cached is not ...:
             return cached
         if self.source_field and self.target_field:
             result = self.target_field.merge_with(
@@ -384,17 +394,18 @@ class CastOptions:
 
     @property
     def merged_schema(self) -> Schema | None:
-        cached = self._merged_schema_cache
-        if cached is not _UNSET:
-            return cached
-        if self.source_field and self.target_field:
-            result = self.target_schema.merge_with(
-                self.source_schema, mode=self.schema_mode
-            )
-        else:
-            result = self.target_schema or self.source_schema
-        object.__setattr__(self, "_merged_schema_cache", result)
-        return result
+        """The :attr:`merged_field` projected as a :class:`Schema`.
+
+        Mutualized through :attr:`merged_field` — a single
+        ``merge_with`` walk feeds both views. Non-struct merges are
+        lifted into a single-child struct via :meth:`Field.to_schema`
+        so the schema-shape contract holds for every caller (cast
+        pipelines, ``empty_table`` builders, tabular planners).
+        """
+        merged = self.merged_field
+        if merged is None:
+            return None
+        return merged.to_schema()
 
     def select_source_column_names(self) -> list[str] | None:
         """The source field's column names, if a source field is bound."""
@@ -701,12 +712,11 @@ class CastOptions:
 
         if copy:
             # ``replace`` drops init=False fields back to their
-            # defaults, which clears the merged_* caches for free.
+            # defaults, which clears the merged_field cache for free.
             return dataclasses.replace(self, source_field=source)
         object.__setattr__(self, "source_field", source)
-        # In-place edit invalidates whatever the merged_* caches held.
-        object.__setattr__(self, "_merged_field_cache", _UNSET)
-        object.__setattr__(self, "_merged_schema_cache", _UNSET)
+        # In-place edit invalidates whatever the merged_field cache held.
+        object.__setattr__(self, "_merged_field_cache", ...)
         return self
 
     def with_target(self: T, target: "Field", copy: bool = True) -> T:
@@ -719,8 +729,7 @@ class CastOptions:
         if copy:
             return dataclasses.replace(self, target_field=target)
         object.__setattr__(self, "target_field", target)
-        object.__setattr__(self, "_merged_field_cache", _UNSET)
-        object.__setattr__(self, "_merged_schema_cache", _UNSET)
+        object.__setattr__(self, "_merged_field_cache", ...)
         return self
 
     # ==================================================================

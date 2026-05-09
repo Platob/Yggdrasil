@@ -67,7 +67,10 @@ K = TypeVar("K")
 V = TypeVar("V")
 _IntLike = Union[int, str]
 
-_MISSING = object()
+# ``...`` (Ellipsis) is the project-wide "missing / unset" sentinel
+# — see the convention note in ``AGENTS.md`` / ``CLAUDE.md``. Used as
+# a kwarg default and as a ``dict.get(...)`` miss marker so callers
+# can distinguish "key absent" from "key present with value None".
 
 # 15 minutes expressed in nanoseconds — the background-purge check interval.
 _PURGE_INTERVAL_NS: int = 15 * 60 * 1_000_000_000
@@ -522,7 +525,7 @@ class ExpiringDict(Generic[K, V]):
         Compute absolute expiry from a per-call TTL override or fall back to
         the instance default.  Returns ``None`` if no TTL is set.
         """
-        if ttl is _MISSING:
+        if ttl is ...:
             ns = self._default_ttl_ns
         else:
             ns = self._parse_ttl(ttl)
@@ -595,7 +598,7 @@ class ExpiringDict(Generic[K, V]):
         self,
         key: K,
         value: V,
-        ttl: Any = _MISSING,
+        ttl: Any = ...,
     ) -> None:
         """Insert or overwrite *key*.
 
@@ -616,7 +619,7 @@ class ExpiringDict(Generic[K, V]):
 
     def get(self, key: K, default: Any = None) -> Optional[V]:
         """Return value for *key*, or *default* if missing / expired."""
-        refresher_key: Any = _MISSING  # sentinel: _MISSING → don't run refresher
+        refresher_key: Any = ...  # sentinel: ... → don't run refresher
         evicted: List[Tuple[K, V]] = []
 
         with self._lock:
@@ -640,7 +643,7 @@ class ExpiringDict(Generic[K, V]):
         self._maybe_schedule_purge()
 
         # Expired key — try refresher if configured
-        if refresher_key is not _MISSING and self._refresher is not None:
+        if refresher_key is not ... and self._refresher is not None:
             try:
                 rr = self._refresher(refresher_key)
             except Exception:
@@ -657,15 +660,15 @@ class ExpiringDict(Generic[K, V]):
         return result
 
     def __getitem__(self, key: K) -> V:
-        val = self.get(key, _MISSING)
-        if val is _MISSING:
+        val = self.get(key, ...)
+        if val is ...:
             raise KeyError(key)
         return val  # type: ignore[return-value]
 
     def __delitem__(self, key: K) -> None:
         with self._lock:
-            entry = self._store.pop(key, _MISSING)
-        if entry is _MISSING:
+            entry = self._store.pop(key, ...)
+        if entry is ...:
             raise KeyError(key)
         # entry is the (value, expires_at) tuple here.
         value, _ = entry  # type: ignore[misc]
@@ -673,8 +676,8 @@ class ExpiringDict(Generic[K, V]):
 
     def pop(self, key: K, *args) -> V:
         with self._lock:
-            entry = self._store.pop(key, _MISSING)
-        if entry is _MISSING:
+            entry = self._store.pop(key, ...)
+        if entry is ...:
             if args:
                 return args[0]
             raise KeyError(key)
@@ -688,7 +691,7 @@ class ExpiringDict(Generic[K, V]):
         return value
 
     def __contains__(self, key: object) -> bool:
-        return self.get(key, _MISSING) is not _MISSING  # type: ignore[arg-type]
+        return self.get(key, ...) is not ...  # type: ignore[arg-type]
 
     def __len__(self) -> int:
         with self._lock:
@@ -710,7 +713,7 @@ class ExpiringDict(Generic[K, V]):
     def set_many(
         self,
         mapping: Dict[K, V],
-        ttl: Any = _MISSING,
+        ttl: Any = ...,
     ) -> None:
         """Atomically insert multiple key-value pairs sharing a TTL.
 
@@ -728,7 +731,7 @@ class ExpiringDict(Generic[K, V]):
     def update(
         self,
         other: Union[Dict[K, V], "ExpiringDict[K, V]", None] = None,
-        ttl: Any = _MISSING,
+        ttl: Any = ...,
         **kwargs: V,
     ) -> None:
         """
@@ -753,7 +756,7 @@ class ExpiringDict(Generic[K, V]):
             Additional key-value pairs merged after *other*, using *ttl* /
             the instance default.
         """
-        explicit_ttl = ttl is not _MISSING
+        explicit_ttl = ttl is not ...
 
         # Snapshot source outside our lock to avoid lock-ordering deadlocks
         if isinstance(other, ExpiringDict):
@@ -781,7 +784,7 @@ class ExpiringDict(Generic[K, V]):
                     if explicit_ttl:
                         exp = self._expires_at_ns(ttl)
                     elif src_exp is None:
-                        exp = self._expires_at_ns(_MISSING)
+                        exp = self._expires_at_ns(...)
                     else:
                         remaining_ns = src_exp - snapshot_ts
                         exp = now_utc_ns() + remaining_ns
@@ -821,8 +824,8 @@ class ExpiringDict(Generic[K, V]):
         evicted: List[Tuple[K, V]] = []
         with self._lock:
             for key in keys:
-                entry = self._store.pop(key, _MISSING)
-                if entry is not _MISSING:
+                entry = self._store.pop(key, ...)
+                if entry is not ...:
                     value, _ = entry  # type: ignore[misc]
                     evicted.append((key, value))
         self._notify_evicted(evicted)
@@ -913,7 +916,7 @@ class ExpiringDict(Generic[K, V]):
 
     # ── refresh / touch ───────────────────────────────────────
 
-    def refresh_key(self, key: K, ttl: Any = _MISSING) -> bool:
+    def refresh_key(self, key: K, ttl: Any = ...) -> bool:
         """
         Reset the TTL of an existing, live key.
         Returns ``True`` if key existed and was refreshed, ``False`` otherwise.
@@ -938,7 +941,7 @@ class ExpiringDict(Generic[K, V]):
         self,
         key: K,
         default: Union[V, Callable[[], V]],
-        ttl: Any = _MISSING,
+        ttl: Any = ...,
     ) -> V:
         """
         Return the live value for *key*; if missing/expired, store *default*
