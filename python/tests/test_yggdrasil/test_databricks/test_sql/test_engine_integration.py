@@ -24,6 +24,7 @@ workspace.
 
 from __future__ import annotations
 
+import concurrent.futures as cf
 import os
 import secrets
 from typing import ClassVar
@@ -38,16 +39,20 @@ from yggdrasil.databricks.sql.table import Table
 from .. import DatabricksIntegrationCase
 
 
-__all__ = ["TestSQLEngineIntegration"]
+__all__ = [
+    "TestSQLEngineIntegration",
+    "TestSQLMergeStrategy",
+    "TestSQLConcurrentWrites",
+]
 
 
-class TestSQLEngineIntegration(DatabricksIntegrationCase):
-    """Round-trip the SQL engine and per-table API against a real workspace.
+class _SQLIntegrationBase(DatabricksIntegrationCase):
+    """Shared fixture + helpers for the SQL integration suites.
 
-    Catalog / schema default to ``trading.unittest``; the suite
-    auto-creates them on first miss using ``ensure_created`` so the
-    tests work against a clean workspace as well as one where the
-    fixture is already provisioned.
+    Not collected by pytest (no ``Test`` prefix). Provisions
+    ``trading.unittest`` once per concrete subclass via
+    ``ensure_created``, registers minted tables for class-level
+    cleanup, and exposes small builders for sample schemas / data.
     """
 
     catalog_name: ClassVar[str]
@@ -163,6 +168,10 @@ class TestSQLEngineIntegration(DatabricksIntegrationCase):
         if not table.exists:
             table.ensure_created(definition)
         return table
+
+
+class TestSQLEngineIntegration(_SQLIntegrationBase):
+    """Engine + table CRUD against a real workspace."""
 
     # ------------------------------------------------------------------
     # Catalog / schema lifecycle
@@ -300,3 +309,468 @@ class TestSQLEngineIntegration(DatabricksIntegrationCase):
 
         # ``drop_table`` swallows the NotFound and returns cleanly.
         self.engine.drop_table(ghost, raise_error=False)
+
+
+# =====================================================================
+# MERGE strategy
+# =====================================================================
+
+
+class TestSQLMergeStrategy(_SQLIntegrationBase):
+    """Each save-mode + ``match_by`` combination through ``Table.insert``.
+
+    Reuses the catalog/schema fixture and per-test cleanup from
+    :class:`TestSQLEngineIntegration` and adds a small helper to
+    seed a fresh table with a known initial row set. The expected
+    DML each branch generates is documented inline in
+    ``yggdrasil.databricks.sql.table._build_dml_statements``; this
+    suite verifies the *observable* outcome (row counts + values).
+    """
+
+    @staticmethod
+    def _initial_data() -> pa.Table:
+        """Three rows with keys 1/2/3 — the seed every test starts from."""
+        return pa.table(
+            {
+                "id": pa.array([1, 2, 3], type=pa.int64()),
+                "label": pa.array(["alpha", "beta", "gamma"], type=pa.string()),
+                "amount": pa.array([10.0, 20.0, 30.0], type=pa.float64()),
+            }
+        )
+
+    def _seed(self, prefix: str) -> Table:
+        """Build a unique table, create it, and seed with ``_initial_data``."""
+        data = self._initial_data()
+        table = self._unique_table(prefix)
+        self._ensure_table(table, data.schema)
+        # OVERWRITE so the seed is deterministic regardless of any
+        # auto-create state the helper may have left behind.
+        table.insert(data, mode=Mode.OVERWRITE)
+        return table
+
+    def _read_rows(self, table: Table) -> list[dict]:
+        return self.engine.execute(
+            f"SELECT id, label, amount FROM {table.full_name(safe=True)} ORDER BY id"
+        ).to_arrow_table().to_pylist()
+
+    # ------------------------------------------------------------------
+    # MERGE — full UPSERT (update matching, insert new)
+    # ------------------------------------------------------------------
+
+    def test_merge_upsert_updates_matching_and_inserts_new(self) -> None:
+        """``Mode.UPSERT`` + ``match_by=['id']`` → MERGE INTO with both
+        WHEN MATCHED UPDATE and WHEN NOT MATCHED INSERT branches. Rows
+        with overlapping keys take the source values; new keys land."""
+        table = self._seed("merge_upsert")
+
+        update = pa.table(
+            {
+                # id=2 overlaps (must be updated); id=4 is new (must be inserted).
+                "id": pa.array([2, 4], type=pa.int64()),
+                "label": pa.array(["beta-2", "delta"], type=pa.string()),
+                "amount": pa.array([200.0, 40.0], type=pa.float64()),
+            }
+        )
+        table.insert(update, mode=Mode.UPSERT, match_by=["id"])
+
+        rows = self._read_rows(table)
+        self.assertEqual(
+            rows,
+            [
+                {"id": 1, "label": "alpha", "amount": 10.0},
+                {"id": 2, "label": "beta-2", "amount": 200.0},
+                {"id": 3, "label": "gamma", "amount": 30.0},
+                {"id": 4, "label": "delta", "amount": 40.0},
+            ],
+        )
+
+    def test_merge_alias_matches_upsert(self) -> None:
+        """``Mode.MERGE`` is treated as a synonym for ``UPSERT`` —
+        same MERGE-with-update branch."""
+        table = self._seed("merge_alias")
+
+        update = pa.table(
+            {
+                "id": pa.array([1], type=pa.int64()),
+                "label": pa.array(["alpha-merged"], type=pa.string()),
+                "amount": pa.array([100.0], type=pa.float64()),
+            }
+        )
+        table.insert(update, mode=Mode.MERGE, match_by=["id"])
+
+        rows = self._read_rows(table)
+        self.assertEqual(rows[0], {"id": 1, "label": "alpha-merged", "amount": 100.0})
+        self.assertEqual(len(rows), 3)
+
+    # ------------------------------------------------------------------
+    # MERGE — INSERT-ONLY branches
+    # ------------------------------------------------------------------
+
+    def test_merge_append_with_match_by_skips_existing_keys(self) -> None:
+        """``Mode.APPEND`` + ``match_by`` → MERGE WHEN NOT MATCHED INSERT
+        only; rows whose key already exists are dropped silently."""
+        table = self._seed("merge_append_keyed")
+
+        update = pa.table(
+            {
+                # id=2 already exists → skipped; id=5 is new → inserted.
+                "id": pa.array([2, 5], type=pa.int64()),
+                "label": pa.array(["beta-DROPPED", "epsilon"], type=pa.string()),
+                "amount": pa.array([999.0, 50.0], type=pa.float64()),
+            }
+        )
+        table.insert(update, mode=Mode.APPEND, match_by=["id"])
+
+        rows = self._read_rows(table)
+        # Original beta still wins because APPEND+match_by never updates.
+        self.assertEqual(rows[1], {"id": 2, "label": "beta", "amount": 20.0})
+        self.assertEqual(
+            rows[-1], {"id": 5, "label": "epsilon", "amount": 50.0}
+        )
+        self.assertEqual(len(rows), 4)
+
+    def test_merge_auto_with_match_by_skips_existing_keys(self) -> None:
+        """``Mode.AUTO`` + ``match_by`` behaves the same as APPEND —
+        insert-only MERGE."""
+        table = self._seed("merge_auto_keyed")
+
+        update = pa.table(
+            {
+                "id": pa.array([3, 6], type=pa.int64()),
+                "label": pa.array(["gamma-DROPPED", "zeta"], type=pa.string()),
+                "amount": pa.array([999.0, 60.0], type=pa.float64()),
+            }
+        )
+        table.insert(update, mode=Mode.AUTO, match_by=["id"])
+
+        rows = self._read_rows(table)
+        self.assertEqual(rows[2], {"id": 3, "label": "gamma", "amount": 30.0})
+        self.assertEqual(rows[-1], {"id": 6, "label": "zeta", "amount": 60.0})
+        self.assertEqual(len(rows), 4)
+
+    # ------------------------------------------------------------------
+    # TRUNCATE + match_by → keyed DELETE then INSERT
+    # ------------------------------------------------------------------
+
+    def test_truncate_with_match_by_deletes_matching_then_inserts(self) -> None:
+        table = self._seed("merge_truncate_keyed")
+
+        update = pa.table(
+            {
+                # Wipe id=1 and id=3 (matched by key) and re-insert with new values.
+                # id=2 is untouched because the source doesn't carry that key.
+                "id": pa.array([1, 3], type=pa.int64()),
+                "label": pa.array(["alpha-v2", "gamma-v2"], type=pa.string()),
+                "amount": pa.array([11.0, 33.0], type=pa.float64()),
+            }
+        )
+        table.insert(update, mode=Mode.TRUNCATE, match_by=["id"])
+
+        rows = self._read_rows(table)
+        self.assertEqual(
+            rows,
+            [
+                {"id": 1, "label": "alpha-v2", "amount": 11.0},
+                {"id": 2, "label": "beta", "amount": 20.0},
+                {"id": 3, "label": "gamma-v2", "amount": 33.0},
+            ],
+        )
+
+    def test_truncate_without_match_by_wipes_table(self) -> None:
+        """Plain ``Mode.TRUNCATE`` without keys: full TRUNCATE + INSERT."""
+        table = self._seed("merge_truncate_full")
+
+        replacement = pa.table(
+            {
+                "id": pa.array([99], type=pa.int64()),
+                "label": pa.array(["only"], type=pa.string()),
+                "amount": pa.array([0.0], type=pa.float64()),
+            }
+        )
+        table.insert(replacement, mode=Mode.TRUNCATE)
+
+        rows = self._read_rows(table)
+        self.assertEqual(rows, [{"id": 99, "label": "only", "amount": 0.0}])
+
+    # ------------------------------------------------------------------
+    # safe_merge=True — sidestep MERGE entirely (DELETE+INSERT semantics)
+    # ------------------------------------------------------------------
+
+    def test_safe_merge_upsert_round_trip(self) -> None:
+        """``safe_merge=True`` + UPSERT runs keyed DELETE + INSERT
+        instead of MERGE; outcome is identical for non-overlapping
+        writers."""
+        table = self._seed("safe_merge_upsert")
+
+        update = pa.table(
+            {
+                "id": pa.array([2, 4], type=pa.int64()),
+                "label": pa.array(["beta-safe", "delta-safe"], type=pa.string()),
+                "amount": pa.array([222.0, 44.0], type=pa.float64()),
+            }
+        )
+        table.insert(
+            update, mode=Mode.UPSERT, match_by=["id"], safe_merge=True,
+        )
+
+        rows = self._read_rows(table)
+        self.assertEqual(
+            rows,
+            [
+                {"id": 1, "label": "alpha", "amount": 10.0},
+                {"id": 2, "label": "beta-safe", "amount": 222.0},
+                {"id": 3, "label": "gamma", "amount": 30.0},
+                {"id": 4, "label": "delta-safe", "amount": 44.0},
+            ],
+        )
+
+    def test_safe_merge_append_uses_anti_join_insert(self) -> None:
+        """``safe_merge=True`` + APPEND runs ``INSERT ... WHERE NOT
+        EXISTS`` against the target — same observable result as the
+        native MERGE insert-only branch."""
+        table = self._seed("safe_merge_append")
+
+        update = pa.table(
+            {
+                "id": pa.array([1, 7], type=pa.int64()),
+                "label": pa.array(["alpha-DROPPED", "eta"], type=pa.string()),
+                "amount": pa.array([999.0, 70.0], type=pa.float64()),
+            }
+        )
+        table.insert(
+            update, mode=Mode.APPEND, match_by=["id"], safe_merge=True,
+        )
+
+        rows = self._read_rows(table)
+        # id=1 untouched; id=7 added.
+        self.assertEqual(rows[0], {"id": 1, "label": "alpha", "amount": 10.0})
+        self.assertEqual(rows[-1], {"id": 7, "label": "eta", "amount": 70.0})
+        self.assertEqual(len(rows), 4)
+
+    # ------------------------------------------------------------------
+    # Multi-key match_by
+    # ------------------------------------------------------------------
+
+    def test_merge_upsert_composite_key(self) -> None:
+        """``match_by`` accepts multiple columns — MERGE ON joins on the
+        full key tuple."""
+        table = self._unique_table("merge_composite")
+        seed = pa.table(
+            {
+                "tenant": pa.array(["a", "a", "b"], type=pa.string()),
+                "id": pa.array([1, 2, 1], type=pa.int64()),
+                "value": pa.array([10.0, 20.0, 100.0], type=pa.float64()),
+            }
+        )
+        self._ensure_table(table, seed.schema)
+        table.insert(seed, mode=Mode.OVERWRITE)
+
+        update = pa.table(
+            {
+                # (a, 2) overlaps → updated; (b, 2) is new → inserted.
+                "tenant": pa.array(["a", "b"], type=pa.string()),
+                "id": pa.array([2, 2], type=pa.int64()),
+                "value": pa.array([222.0, 200.0], type=pa.float64()),
+            }
+        )
+        table.insert(update, mode=Mode.UPSERT, match_by=["tenant", "id"])
+
+        rows = self.engine.execute(
+            f"SELECT tenant, id, value FROM {table.full_name(safe=True)} "
+            "ORDER BY tenant, id"
+        ).to_arrow_table().to_pylist()
+        self.assertEqual(
+            rows,
+            [
+                {"tenant": "a", "id": 1, "value": 10.0},
+                {"tenant": "a", "id": 2, "value": 222.0},
+                {"tenant": "b", "id": 1, "value": 100.0},
+                {"tenant": "b", "id": 2, "value": 200.0},
+            ],
+        )
+
+
+# =====================================================================
+# Concurrent writes
+# =====================================================================
+
+
+class TestSQLConcurrentWrites(_SQLIntegrationBase):
+    """Drive the same Delta target from N threads at once.
+
+    Delta serializes commits at the table level — each writer that
+    races a successful commit retries against the latest snapshot, so
+    the final state must match a serial run of the same workload.
+    These tests assert that contract through the public ``insert``
+    surface: no lost rows on disjoint appends, no duplicate keys on
+    overlapping upserts.
+    """
+
+    PARALLELISM: ClassVar[int] = 4
+    ROWS_PER_WRITER: ClassVar[int] = 25
+
+    @staticmethod
+    def _writer_chunk(writer_id: int, n: int, *, key_offset: int = 0) -> pa.Table:
+        """Build a deterministic chunk for *writer_id*.
+
+        ``key_offset`` lets two writers either own disjoint keys
+        (offset = writer_id * n) or share keys (offset = 0).
+        """
+        ids = list(range(key_offset, key_offset + n))
+        return pa.table(
+            {
+                "id": pa.array(ids, type=pa.int64()),
+                "writer": pa.array([writer_id] * n, type=pa.int32()),
+                "amount": pa.array(
+                    [float(writer_id * 1000 + i) for i in range(n)],
+                    type=pa.float64(),
+                ),
+            }
+        )
+
+    @staticmethod
+    def _empty_schema() -> pa.Schema:
+        return pa.schema(
+            [
+                pa.field("id", pa.int64(), nullable=False),
+                pa.field("writer", pa.int32()),
+                pa.field("amount", pa.float64()),
+            ]
+        )
+
+    def _run_in_parallel(self, fn, args_iter):
+        """Run ``fn`` concurrently and re-raise the first exception."""
+        with cf.ThreadPoolExecutor(max_workers=self.PARALLELISM) as pool:
+            futures = [pool.submit(fn, *args) for args in args_iter]
+            for fut in cf.as_completed(futures):
+                fut.result()  # surface exceptions from the workers
+
+    # ------------------------------------------------------------------
+    # Disjoint appends — no row should be lost
+    # ------------------------------------------------------------------
+
+    def test_concurrent_appends_disjoint_keys_preserve_all_rows(self) -> None:
+        table = self._unique_table("concurrent_append")
+        self._ensure_table(table, self._empty_schema())
+
+        def append(writer_id: int) -> None:
+            chunk = self._writer_chunk(
+                writer_id,
+                self.ROWS_PER_WRITER,
+                key_offset=writer_id * self.ROWS_PER_WRITER,
+            )
+            table.insert(chunk, mode=Mode.APPEND)
+
+        self._run_in_parallel(
+            append, [(i,) for i in range(self.PARALLELISM)],
+        )
+
+        count = self.engine.execute(
+            f"SELECT COUNT(*) AS n FROM {table.full_name(safe=True)}"
+        ).to_arrow_table().column("n")[0].as_py()
+        self.assertEqual(count, self.PARALLELISM * self.ROWS_PER_WRITER)
+
+        per_writer = self.engine.execute(
+            f"SELECT writer, COUNT(*) AS n FROM {table.full_name(safe=True)} "
+            "GROUP BY writer ORDER BY writer"
+        ).to_arrow_table().to_pylist()
+        self.assertEqual(
+            per_writer,
+            [{"writer": i, "n": self.ROWS_PER_WRITER} for i in range(self.PARALLELISM)],
+        )
+
+    # ------------------------------------------------------------------
+    # Overlapping upserts — final state has one row per key
+    # ------------------------------------------------------------------
+
+    def test_concurrent_upserts_overlapping_keys_no_duplicates(self) -> None:
+        """Every writer upserts the same key range. After all commits
+        land, every key must be present exactly once and the surviving
+        ``writer`` value is one of the writer ids in [0, PARALLELISM)."""
+        table = self._unique_table("concurrent_upsert")
+        self._ensure_table(table, self._empty_schema())
+
+        # Seed so the first MERGE has a non-empty target — exercises the
+        # WHEN MATCHED branch on at least one writer.
+        seed = self._writer_chunk(-1, self.ROWS_PER_WRITER, key_offset=0)
+        table.insert(seed, mode=Mode.OVERWRITE)
+
+        def upsert(writer_id: int) -> None:
+            chunk = self._writer_chunk(
+                writer_id, self.ROWS_PER_WRITER, key_offset=0,
+            )
+            table.insert(chunk, mode=Mode.UPSERT, match_by=["id"])
+
+        self._run_in_parallel(
+            upsert, [(i,) for i in range(self.PARALLELISM)],
+        )
+
+        rows = self.engine.execute(
+            f"SELECT id, writer FROM {table.full_name(safe=True)} ORDER BY id"
+        ).to_arrow_table().to_pylist()
+
+        self.assertEqual(len(rows), self.ROWS_PER_WRITER)
+        self.assertEqual(
+            [r["id"] for r in rows], list(range(self.ROWS_PER_WRITER)),
+        )
+        valid_writers = set(range(self.PARALLELISM))
+        for r in rows:
+            self.assertIn(
+                r["writer"], valid_writers,
+                f"row {r!r} kept writer={r['writer']!r} which never wrote",
+            )
+
+    # ------------------------------------------------------------------
+    # Mixed APPEND + UPSERT — neither writer should lose rows
+    # ------------------------------------------------------------------
+
+    def test_concurrent_mixed_append_and_upsert(self) -> None:
+        """One writer appends a disjoint key range; another upserts an
+        overlapping range. After both commit, the appender's keys are
+        all present and the upsert range has exactly one row per key."""
+        table = self._unique_table("concurrent_mixed")
+        self._ensure_table(table, self._empty_schema())
+
+        # Seed with keys [0, ROWS_PER_WRITER) so the upsert path has
+        # something to update.
+        seed = self._writer_chunk(0, self.ROWS_PER_WRITER, key_offset=0)
+        table.insert(seed, mode=Mode.OVERWRITE)
+
+        def appender() -> None:
+            chunk = self._writer_chunk(
+                100, self.ROWS_PER_WRITER,
+                key_offset=10 * self.ROWS_PER_WRITER,
+            )
+            table.insert(chunk, mode=Mode.APPEND)
+
+        def upserter() -> None:
+            chunk = self._writer_chunk(
+                200, self.ROWS_PER_WRITER, key_offset=0,
+            )
+            table.insert(chunk, mode=Mode.UPSERT, match_by=["id"])
+
+        with cf.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(appender), pool.submit(upserter)]
+            for fut in cf.as_completed(futures):
+                fut.result()
+
+        # Total rows = original seed (all upserted in place) + appended chunk.
+        count = self.engine.execute(
+            f"SELECT COUNT(*) AS n FROM {table.full_name(safe=True)}"
+        ).to_arrow_table().column("n")[0].as_py()
+        self.assertEqual(count, 2 * self.ROWS_PER_WRITER)
+
+        # Upsert range survived as a single row per key, all written by 200.
+        upserted = self.engine.execute(
+            f"SELECT writer FROM {table.full_name(safe=True)} "
+            f"WHERE id < {self.ROWS_PER_WRITER}"
+        ).to_arrow_table().column("writer").to_pylist()
+        self.assertEqual(len(upserted), self.ROWS_PER_WRITER)
+        self.assertTrue(all(w == 200 for w in upserted))
+
+        # Append range fully landed.
+        appended = self.engine.execute(
+            f"SELECT COUNT(*) AS n FROM {table.full_name(safe=True)} "
+            f"WHERE id >= {10 * self.ROWS_PER_WRITER}"
+        ).to_arrow_table().column("n")[0].as_py()
+        self.assertEqual(appended, self.ROWS_PER_WRITER)
