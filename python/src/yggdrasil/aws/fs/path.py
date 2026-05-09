@@ -48,6 +48,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterator, Optional
 
+from yggdrasil.data.enums import Scheme
 from yggdrasil.io.path import RemotePath
 from yggdrasil.io.path._retry import retry_sdk_call
 from yggdrasil.io.io_stats import IOStats, IOKind
@@ -84,7 +85,7 @@ class S3Path(RemotePath):
 
     __slots__ = ("_client", "_retry_sleep")
 
-    scheme: ClassVar[str] = "s3"
+    scheme: ClassVar[Scheme] = Scheme.S3
 
     #: URL schemes accepted on input; always normalized to ``s3``.
     _ACCEPTED_SCHEMES: ClassVar[frozenset[str]] = frozenset({"s3", "s3a", "s3n"})

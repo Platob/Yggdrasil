@@ -50,8 +50,9 @@ import mmap
 import os
 import tempfile
 import time
-from typing import Any, Optional, Union
+from typing import Any, ClassVar, Optional, Union
 
+from yggdrasil.data.enums import Scheme
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.io_stats import IOKind, IOStats
 
@@ -133,6 +134,8 @@ class Memory(Holder):
     opening is the performant path.** The choice is the caller's, not
     the holder's, even if direct access is less performant.
     """
+
+    scheme: ClassVar[Scheme] = Scheme.MEMORY
 
     __slots__ = (
         "_buf",

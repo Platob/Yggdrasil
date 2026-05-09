@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, ClassVar, Optional, Tuple
 
+from yggdrasil.data.enums import Scheme
 from yggdrasil.io.path import RemotePath
 from yggdrasil.io.path._retry import retry_sdk_call
 from yggdrasil.io.url import URL
@@ -51,11 +52,12 @@ __all__ = ["DatabricksPath"]
 
 #: Map POSIX namespace prefix → canonical URL scheme. Keys are the
 #: leading directory the user types (case-insensitive); values are the
-#: scheme each subclass registers under.
+#: scheme each subclass registers under (the ``dbfs+<surface>``
+#: convention — see :class:`Scheme`).
 _POSIX_NAMESPACES: dict[str, str] = {
-    "dbfs": "dbfs",
-    "Volumes": "volumes",
-    "Workspace": "workspace",
+    "dbfs":      Scheme.DATABRICKS_DBFS.value,
+    "Volumes":   Scheme.DATABRICKS_VOLUME.value,
+    "Workspace": Scheme.DATABRICKS_WORKSPACE.value,
 }
 
 
@@ -107,11 +109,21 @@ def _coerce_to_url_str(value: Any) -> Any:
 
 
 class DatabricksPath(RemotePath):
-    """Abstract :class:`RemotePath` for Databricks namespaces."""
+    """Abstract :class:`RemotePath` for Databricks namespaces.
+
+    Registers under :attr:`Scheme.DBFS` (the ``dbfs://`` family root)
+    and acts as the dispatcher: :meth:`from_url` inspects the URL and
+    forwards to the right concrete subclass (DBFS, Volumes,
+    Workspace) based on the compound ``dbfs+<surface>://`` scheme,
+    or — for the legacy un-prefixed ``dbfs://`` form — on the URL
+    path's leading namespace (``/Volumes/...`` →
+    :class:`VolumePath`, ``/Workspace/...`` → :class:`WorkspacePath`,
+    everything else → :class:`DBFSPath`).
+    """
 
     __slots__ = ("_workspace", "_retry_sleep")
 
-    scheme: ClassVar[str] = ""
+    scheme: ClassVar[Scheme] = Scheme.DBFS
 
     #: Canonical POSIX prefix for the legacy string shape
     #: (``/dbfs/``, ``/Workspace/``, ``/Volumes/``). Empty on the
@@ -146,13 +158,88 @@ class DatabricksPath(RemotePath):
             data = None
         if url is not None:
             url = URL.from_(url)
-            if not url.scheme and self.scheme:
-                url = url.with_scheme(self.scheme)
+            target_scheme = self.scheme
+            if target_scheme is not None:
+                target_token = target_scheme.value if isinstance(
+                    target_scheme, Scheme,
+                ) else str(target_scheme)
+                if not url.scheme:
+                    url = url.with_scheme(target_token)
+                elif url.scheme != target_token:
+                    # Collapse legacy aliases (``volumes://`` for
+                    # ``dbfs+volume://``, ``workspace://`` for
+                    # ``dbfs+workspace://``, ``dbfs://`` for
+                    # ``dbfs+dbfs://``) onto the canonical compound
+                    # form so the URL round-trips cleanly.
+                    resolved = Scheme.from_(url.scheme, default=None)
+                    if resolved is target_scheme:
+                        url = url.with_scheme(target_token)
 
         super().__init__(data=data, url=url, temporary=temporary, **kwargs)
 
         self._workspace = workspace
         self._retry_sleep: Optional[Callable[[float], None]] = retry_sleep
+
+    # ==================================================================
+    # URLBased dispatch — ``dbfs://`` resolves here and forwards
+    # ==================================================================
+
+    @classmethod
+    def from_url(cls, url: "URL | str", **kwargs: Any) -> "DatabricksPath":
+        """Construct the right concrete subclass from a Databricks URL.
+
+        Two URL shapes are supported:
+
+        - ``dbfs+dbfs://``, ``dbfs+volume://``, ``dbfs+workspace://``
+          — the compound :class:`Scheme` form, dispatched by URL
+          scheme alone.
+        - ``dbfs://`` — legacy / un-qualified family URL. Dispatched
+          by the URL path's leading namespace: ``/Volumes/...``
+          →  :class:`VolumePath`, ``/Workspace/...`` →
+          :class:`WorkspacePath`, anything else → :class:`DBFSPath`.
+
+        Concrete subclasses (DBFSPath / VolumePath / WorkspacePath)
+        bypass the dispatcher and forward straight to ``cls(url=url)``.
+        """
+        u = URL.from_(url)
+        if cls is not DatabricksPath:
+            return cls(url=u, **kwargs)
+
+        from .dbfs_path import DBFSPath
+        from .volume_path import VolumePath
+        from .workspace_path import WorkspacePath
+
+        scheme = (u.scheme or "").lower()
+        if scheme == Scheme.DATABRICKS_DBFS.value:
+            return DBFSPath(url=u, **kwargs)
+        if scheme == Scheme.DATABRICKS_VOLUME.value:
+            return VolumePath(url=u, **kwargs)
+        if scheme == Scheme.DATABRICKS_WORKSPACE.value:
+            return WorkspacePath(url=u, **kwargs)
+        # Legacy ``dbfs://`` family URL — peek at the path. The
+        # surface subclasses each carry their own POSIX prefix
+        # (``/dbfs/``, ``/Volumes/``, ``/Workspace/``) which they
+        # re-attach in :meth:`full_path`, so the URL path we hand
+        # them must be the *suffix* below that prefix.
+        raw_path = u.path or "/"
+        path = raw_path.lstrip("/")
+        head = path.split("/", 1)[0] if path else ""
+        rest = path[len(head) + 1:] if "/" in path else ""
+        suffix = "/" + rest if rest else "/"
+        if head == "Volumes":
+            return VolumePath(
+                url=u.with_scheme(Scheme.DATABRICKS_VOLUME.value)._replace(path=suffix),
+                **kwargs,
+            )
+        if head == "Workspace":
+            return WorkspacePath(
+                url=u.with_scheme(Scheme.DATABRICKS_WORKSPACE.value)._replace(path=suffix),
+                **kwargs,
+            )
+        return DBFSPath(
+            url=u.with_scheme(Scheme.DATABRICKS_DBFS.value),
+            **kwargs,
+        )
 
     # ==================================================================
     # Workspace client binding

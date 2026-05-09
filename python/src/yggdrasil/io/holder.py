@@ -47,7 +47,7 @@ from yggdrasil.disposable import Disposable
 from yggdrasil.io.tabular.base import O, Tabular
 
 from .io_stats import IOStats, IOKind
-from .url import URL
+from .url import URL, URLBased
 
 if TYPE_CHECKING:
     from yggdrasil.io.bytes_io import BytesIO
@@ -59,7 +59,6 @@ PathLike = Union[str, "os.PathLike[str]", pathlib.PurePath]
 
 
 _COPY_CHUNK = 1024 * 1024
-_HOLDER_SCHEMES: dict[str, type[Holder]] = {}
 
 
 def _resolve_pos(pos: int, size: int) -> int:
@@ -103,33 +102,25 @@ def _resolve_subclass(
         scheme = url_obj.scheme or scheme
 
     if scheme:
-        existing = _HOLDER_SCHEMES.get(scheme)
-        if existing is not None:
-            return existing
-        # Cold dispatch: the backend module hasn't been imported yet
-        # (so ``__init_subclass__`` hasn't registered it into
-        # ``_HOLDER_SCHEMES``). :class:`PathScheme` knows the
-        # ``module → class`` shape for every shipped backend; ask it
-        # to resolve, which lazy-imports the module as a side effect.
-        from yggdrasil.data.enums import PathScheme
         try:
-            return PathScheme.resolve(scheme)
+            return URLBased.for_scheme(scheme)
         except (ValueError, ImportError) as exc:
             raise ValueError(f"Unknown scheme '{scheme}'") from exc
 
     if path is not None:
-        # Resolve the path's URL scheme via the registry (file:// →
-        # LocalPath, s3:// → S3Path, …). The abstract :class:`Path`
-        # itself isn't instantiable, so a missing scheme falls back to
-        # LocalPath — that's the only path-shaped backend that's
-        # always available.
+        # Resolve the path's URL scheme via the URLBased registry
+        # (file:// → LocalPath, s3:// → S3Path, …). The abstract
+        # :class:`Path` itself isn't instantiable, so a missing scheme
+        # falls back to LocalPath — that's the only path-shaped backend
+        # that's always available.
         from .path.local_path import LocalPath
         url_obj = URL.from_(path)
         scheme_from_path = url_obj.scheme
         if scheme_from_path:
-            existing = _HOLDER_SCHEMES.get(scheme_from_path)
-            if existing is not None:
-                return existing
+            try:
+                return URLBased.for_scheme(scheme_from_path)
+            except (ValueError, ImportError):
+                pass
         return LocalPath
 
     if isinstance(data, Holder):
@@ -140,7 +131,7 @@ def _resolve_subclass(
     return Memory
 
 
-class Holder(Tabular[O], Disposable):
+class Holder(URLBased, Tabular[O], Disposable):
     """Position-addressable byte holder + :class:`Disposable` lifecycle
     + :class:`Tabular` view of its bytes.
 
@@ -176,7 +167,10 @@ class Holder(Tabular[O], Disposable):
     built on :meth:`truncate`).
     """
 
-    scheme: ClassVar[str] = ""
+    #: Inherited from :class:`URLBased`. ``None`` on the abstract base
+    #: — concrete subclasses override with ``Scheme.X`` and let
+    #: :meth:`URLBased.__init_subclass__` register them in the
+    #: cross-cutting :data:`_URL_BASED_REGISTRY`.
 
     __slots__ = (
         "_url",
@@ -186,19 +180,24 @@ class Holder(Tabular[O], Disposable):
         "temporary",
     )
 
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        super().__init_subclass__(**kwargs)
+    # ------------------------------------------------------------------
+    # URLBased — round-trip through a :class:`URL`
+    # ------------------------------------------------------------------
 
-        scheme = cls.scheme
+    @classmethod
+    def from_url(cls, url: "URL | str", **kwargs: Any) -> "Holder":
+        """Construct a holder of *cls* from *url*.
 
-        if scheme:
-            existing = _HOLDER_SCHEMES.get(scheme)
-            if existing is not None and existing is not cls:
-                raise RuntimeError(
-                    f"Duplicate scheme '{scheme}' for {cls.__name__} "
-                    f"(already registered to {existing.__name__})"
-                )
-            _HOLDER_SCHEMES[scheme] = cls
+        Concrete subclasses inherit this default, which forwards to
+        ``cls(url=url, **kwargs)``. Backends that need extra
+        construction knobs (sessions, workspace clients) override
+        with their own forwarding shape.
+        """
+        return cls(url=URL.from_(url), **kwargs)
+
+    def to_url(self) -> "URL":
+        """The canonical :class:`URL` that addresses this holder."""
+        return self.url
 
     def __repr__(self) -> str:
         opened = "open" if self.opened else "closed"

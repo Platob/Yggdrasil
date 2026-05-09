@@ -82,7 +82,7 @@ _ChildT = TypeVar("_ChildT", bound="Tabular")
 # Process-wide registry mapping :class:`MimeType` name → concrete
 # :class:`Tabular` subclass. Populated by :meth:`Tabular.__init_subclass__`
 # when a subclass declares :attr:`Tabular.mime_type`. Mirror of
-# :data:`yggdrasil.io.holder._HOLDER_SCHEMES` — same shape, same
+# :data:`yggdrasil.io.url._URL_BASED_REGISTRY` — same shape, same
 # rules: declarative class-level discriminator, populated at import
 # time, looked up by the factory classmethods.
 _TABULAR_REGISTRY: "dict[str, type[Tabular]]" = {}
