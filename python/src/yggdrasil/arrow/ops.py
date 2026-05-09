@@ -21,10 +21,11 @@ from __future__ import annotations
 
 import pyarrow as pa
 
+from yggdrasil.data.enums.jointype import JoinType
 from yggdrasil.data.enums.mode import Mode, ModeLike
 
 from ._typing import ArrowTabular
-from .cast import rechunk_arrow_batches
+from .cast import rechunk_arrow_table
 
 __all__ = ["upsert_arrow_tabular"]
 
@@ -135,15 +136,12 @@ def upsert_arrow_tabular(
         # Explicit chunking forces a Table return — a RecordBatch can't
         # carry multiple chunks. Hand off to the cast-side rechunker so
         # row/byte caps stay consistent across the codebase.
-        rechunked = list(
-            rechunk_arrow_batches(
-                result.to_batches(),
-                row_size=row_size,
-                byte_size=byte_size,
-                memory_pool=memory_pool,
-            )
+        return rechunk_arrow_table(
+            result,
+            row_size=row_size,
+            byte_size=byte_size,
+            memory_pool=memory_pool,
         )
-        return pa.Table.from_batches(rechunked, schema=result.schema)
 
     if out_is_table:
         return result
@@ -159,11 +157,11 @@ def _upsert_via_join(
     """Vectorized path — used when every key column is a flat type."""
     if mode is Mode.APPEND:
         new_rows = right_t.join(
-            left_t.select(keys), keys=keys, join_type="left anti",
+            left_t.select(keys), keys=keys, join_type=JoinType.LEFT_ANTI.arrow,
         ).select(left_t.schema.names)
         return pa.concat_tables([left_t, new_rows])
     keep_rows = left_t.join(
-        right_t.select(keys), keys=keys, join_type="left anti",
+        right_t.select(keys), keys=keys, join_type=JoinType.LEFT_ANTI.arrow,
     ).select(left_t.schema.names)
     return pa.concat_tables([keep_rows, right_t])
 

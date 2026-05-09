@@ -81,6 +81,7 @@ __all__ = [
     "cast_arrow_record_batch_reader",
     "default_arrow_scalar",
     "rechunk_arrow_batches",
+    "rechunk_arrow_table",
 ]
 
 logger = logging.getLogger(__name__)
@@ -350,6 +351,50 @@ def rechunk_arrow_batches(
             yield from _slice_to_target(combined)
         else:
             yield combined
+
+
+def rechunk_arrow_table(
+    table: pa.Table,
+    *,
+    byte_size: int | None = None,
+    row_size: int | None = None,
+    memory_pool: pa.MemoryPool | None = None,
+) -> pa.Table:
+    """Re-chunk *table* to ~``byte_size`` bytes / ``row_size`` rows per chunk.
+
+    Thin :class:`pa.Table`-shaped wrapper over
+    :func:`rechunk_arrow_batches` — runs ``table.to_batches()`` through
+    the same streaming chunker and rebuilds a :class:`pa.Table` from
+    the result. Schema (including metadata) is preserved end-to-end so
+    callers can drop this in front of any sink that prefers a
+    particular chunk shape without losing field annotations.
+
+    Both knobs are optional:
+
+    * Neither set → returned table is the input (no copy).
+    * ``row_size`` only → chunks contain at most ``row_size`` rows;
+      zero-copy slices.
+    * ``byte_size`` only → chunks target ~``byte_size`` bytes via the
+      per-segment bytes/row ratio.
+    * Both set → ``byte_size`` drives the row target; ``row_size``
+      caps it.
+
+    See :func:`rechunk_arrow_batches` for the underlying algorithm.
+    """
+    has_byte = bool(byte_size and byte_size > 0)
+    has_row = bool(row_size and row_size > 0)
+    if not has_byte and not has_row:
+        return table
+
+    batches = list(
+        rechunk_arrow_batches(
+            table.to_batches(),
+            byte_size=byte_size,
+            row_size=row_size,
+            memory_pool=memory_pool,
+        )
+    )
+    return pa.Table.from_batches(batches, schema=table.schema)
 
 
 # ---------------------------------------------------------------------------
