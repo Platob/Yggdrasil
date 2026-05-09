@@ -156,6 +156,6 @@ class TestDefaultPropagation:
         out = left.merge_with(right)
 
         assert out.has_default is True
-        assert out.default == 123
+        assert out.default_value == 123
         assert out.metadata is not None
         assert out.metadata[b"comment"] == b"rhs"

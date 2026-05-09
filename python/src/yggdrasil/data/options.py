@@ -341,7 +341,7 @@ class CastOptions:
                 self, "match_by",
                 [
                     item if isinstance(item, Field)
-                    else Field.make_default_field(name=item) if isinstance(item, str)
+                    else Field.default(name=item) if isinstance(item, str)
                     else Field.from_(item)
                     for item in self.match_by
                 ],

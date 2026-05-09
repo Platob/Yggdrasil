@@ -374,7 +374,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         return hash((self.name, self.dtype, self.nullable, meta_key))
 
     @classmethod
-    def make_default_field(
+    def default(
         cls,
         name: str = "",
         dtype: DataType = ObjectType(),
@@ -383,6 +383,15 @@ class Field(BaseMetadata, BaseChildrenFields):
         tags: dict[bytes, bytes] | None = None,
         default: Any = None,
     ):
+        """Build a default-typed Field (``ObjectType()`` unless overridden).
+
+        Convenience constructor for the "I just have a name" path —
+        callers passing a plain string into APIs that expect a
+        :class:`Field` (e.g. ``CastOptions(match_by=["id"])``) land
+        here. The instance-side ``default`` accessor was renamed to
+        :attr:`default_value` so this name was free for the
+        constructor.
+        """
         return cls(
             name=name,
             dtype=dtype,
@@ -419,7 +428,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         ]
         if self.has_default:
             try:
-                tokens.append(f"default={self.default!r}")
+                tokens.append(f"default={self.default_value!r}")
             except Exception:
                 # Default decoding can fail for malformed metadata —
                 # don't let a bad default break repr.
@@ -843,7 +852,16 @@ class Field(BaseMetadata, BaseChildrenFields):
         return self.metadata.get(DEFAULT_VALUE_KEY) is not None if self.metadata else False
 
     @property
-    def default(self):
+    def default_value(self):
+        """Field's default Python value (or the dtype-level default).
+
+        Reads :data:`DEFAULT_VALUE_KEY` from :attr:`metadata` first;
+        falls back to ``self.dtype.default_pyobj`` when the metadata
+        slot is unset. Renamed from ``default`` so the constructor
+        classmethod :meth:`Field.default` can take that name —
+        ``field.default`` would otherwise shadow it via descriptor
+        lookup.
+        """
         if self.metadata is not None:
             default = self.metadata.get(DEFAULT_VALUE_KEY)
 
@@ -1240,7 +1258,7 @@ class Field(BaseMetadata, BaseChildrenFields):
             # defaults to :class:`ObjectType` so the column is typed
             # but un-pinned; callers that care can pass a Field /
             # ``pa.Field`` instead.
-            new_field = Field.make_default_field(name=field, **kwargs)
+            new_field = Field.default(name=field, **kwargs)
         else:
             new_field = Field.from_any(field, **kwargs)
 
@@ -1800,6 +1818,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         owner: type | None = None,
     ) -> "Field":
         default = None
+        # ``value`` is a ``dataclasses.Field`` here — its ``default``
+        # is the stdlib attribute, not our renamed ``default_value``.
         if value.default is not None:
             default = value.default
         elif value.default_factory is not None:  # type: ignore[attr-defined]
@@ -3335,7 +3355,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         default_scalar: Any = None,
     ):
         if default_scalar is None and self.has_default:
-            default_scalar = self.default
+            default_scalar = self.default_value
 
         return self.dtype.fill_polars_array_nulls(
             series,
@@ -3350,7 +3370,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         default_scalar: Any = None,
     ):
         if default_scalar is None and self.has_default:
-            default_scalar = self.default
+            default_scalar = self.default_value
 
         return self.dtype.fill_pandas_series_nulls(
             series,
@@ -3365,7 +3385,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         default_scalar: pa.Scalar | None = None,
     ) -> "ps.Column":
         if default_scalar is None:
-            default_scalar = self.default
+            default_scalar = self.default_value
 
         return self.dtype.fill_spark_column_nulls(
             column,
@@ -3402,7 +3422,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         name: str | None = None,
     ):
         return self.dtype.default_polars_series(
-            value=self.default,
+            value=self.default_value,
             nullable=self.nullable,
             size=size,
             name=self.name if name is None else name,
@@ -3410,7 +3430,7 @@ class Field(BaseMetadata, BaseChildrenFields):
 
     def default_polars_expr(self, alias: str | None = None):
         return self.dtype.default_polars_expr(
-            value=self.default, nullable=self.nullable,
+            value=self.default_value, nullable=self.nullable,
             alias=alias or self.name
         )
 
@@ -3422,7 +3442,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         name: str | None = None,
     ):
         return self.dtype.default_pandas_series(
-            value=self.default,
+            value=self.default_value,
             nullable=self.nullable,
             size=size,
             index=index,
@@ -3430,7 +3450,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         )
 
     def default_spark_column(self, alias: str | None = None):
-        s = self.dtype.default_spark_column(value=self.default, nullable=self.nullable)
+        s = self.dtype.default_spark_column(value=self.default_value, nullable=self.nullable)
         return s.alias(alias) if alias else s.alias(self.name)
 
     # ==================================================================

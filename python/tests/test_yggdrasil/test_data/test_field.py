@@ -27,7 +27,7 @@ class TestFieldDefault:
         f = f.with_default(7)
 
         assert f.has_default is True
-        assert f.default == 7
+        assert f.default_value == 7
         assert f.default_arrow_scalar.as_py() == 7
 
 

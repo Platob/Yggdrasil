@@ -68,7 +68,7 @@ class ArrayType(NestedType):
         elif self.list_size < 0:
             raise ValueError("list_size must be non-negative")
 
-        return [self.item_field.default for _ in range(self.list_size)]
+        return [self.item_field.default_value for _ in range(self.list_size)]
 
     def equals(
         self,

@@ -72,7 +72,7 @@ class TestFactoryAndInit:
         out = Field("value", pa.int64(), default=7)
 
         assert out.has_default is True
-        assert out.default == 7
+        assert out.default_value == 7
 
     def test_copy_overrides_named_attributes_only(self) -> None:
         src = Field(
@@ -180,7 +180,7 @@ class TestFromDataclass:
         assert out.name == "value"
         assert isinstance(out.dtype, IntegerType)
         assert out.nullable is True
-        assert out.default is None
+        assert out.default_value is None
 
 
 # ---------------------------------------------------------------------------
