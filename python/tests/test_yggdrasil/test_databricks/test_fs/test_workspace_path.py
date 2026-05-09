@@ -158,6 +158,42 @@ class TestListing:
         ]
 
 
+class TestParentRetry:
+    """Upload / mkdirs should auto-mkdir the parent on NotFound and
+    swallow ``Folder X is protected`` messages from a protected
+    ancestor."""
+
+    def test_upload_creates_parent_on_not_found(self, workspace) -> None:
+        attempts = [NotFound("does not exist"), None]
+
+        def upload(**_kwargs):
+            r = attempts.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        workspace.workspace.upload.side_effect = upload
+        p = WorkspacePath(
+            "/Workspace/Users/me/run-1/sub/file.txt", workspace=workspace,
+        )
+        p.write_bytes(b"abc")
+        # Parent directory should have been created.
+        workspace.workspace.mkdirs.assert_called_with(
+            "/Workspace/Users/me/run-1/sub",
+        )
+        assert workspace.workspace.upload.call_count == 2
+
+    def test_mkdirs_protected_ancestor_is_non_fatal(self, workspace) -> None:
+        workspace.workspace.mkdirs.side_effect = type(
+            "BadRequest", (Exception,), {},
+        )("Folder Users is protected")
+        p = WorkspacePath(
+            "/Workspace/Users/me/run-1/listing", workspace=workspace,
+        )
+        # Should not raise.
+        p.mkdir(parents=True, exist_ok=True)
+
+
 class TestRetryPolicy:
 
     @pytest.fixture

@@ -114,8 +114,16 @@ class WorkspacePath(DatabricksPath):
         try:
             self._call(self.workspace.workspace.mkdirs, self.api_path)
         except Exception as exc:
-            if not exist_ok and _looks_like_already_exists(exc):
-                raise
+            if _looks_like_already_exists(exc):
+                if not exist_ok:
+                    raise
+                return
+            if _looks_like_protected_parent(exc):
+                # Hitting a protected ancestor (e.g. ``/Workspace/Users``)
+                # is fine if the leaf already landed — fall through and
+                # let downstream ops succeed.
+                return
+            raise
 
     def _remove_file(self, missing_ok: bool = True) -> None:
         try:
@@ -188,7 +196,7 @@ class WorkspacePath(DatabricksPath):
         return n
 
     def _upload(self, payload: bytes) -> None:
-        self._call(
+        self._call_ensuring_parents(
             self.workspace.workspace.upload,
             path=self.api_path,
             content=_stdio.BytesIO(payload),
@@ -232,4 +240,14 @@ def _looks_like_not_found(exc: BaseException) -> bool:
 
 def _looks_like_already_exists(exc: BaseException) -> bool:
     name = type(exc).__name__
-    return name in ("AlreadyExists", "ResourceAlreadyExists", "FileExistsError")
+    if name in ("AlreadyExists", "ResourceAlreadyExists", "FileExistsError"):
+        return True
+    return "already exists" in str(exc).lower()
+
+
+def _looks_like_protected_parent(exc: BaseException) -> bool:
+    """``mkdirs`` can fail with ``BadRequest: Folder X is protected`` when
+    an ancestor (typically ``/Workspace/Users``) refuses creation. The
+    leaf the caller actually wants is independent of the protected
+    ancestor — treat as non-fatal."""
+    return "is protected" in str(exc).lower()
