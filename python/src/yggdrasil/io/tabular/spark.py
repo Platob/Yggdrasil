@@ -153,12 +153,14 @@ class SparkTabular(Tabular[CastOptions]):
         return self._stats
 
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
-        # Forces a driver-side collect via ``df.toArrow()``. Loud
-        # rather than silent — the call site is the one asking for
-        # Arrow batches off a Spark holder.
+        # Forces a driver-side collect via ``df.toArrow()`` (or the
+        # PySpark 3.x fallback in :func:`spark_dataframe_to_arrow`).
+        # Loud rather than silent — the call site is the one asking
+        # for Arrow batches off a Spark holder.
         if self._frame is None:
             return
-        arrow_table = self._frame.toArrow()
+        from yggdrasil.spark.cast import spark_dataframe_to_arrow
+        arrow_table = spark_dataframe_to_arrow(self._frame)
         for batch in arrow_table.to_batches(max_chunksize=options.row_size):
             yield options.cast_arrow_tabular(batch)
 

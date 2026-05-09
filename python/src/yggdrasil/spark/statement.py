@@ -15,17 +15,19 @@ warehouse statements in the same batch.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Literal, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Literal, Mapping, Optional
 
 import pyarrow as pa
 
 from yggdrasil.data import Schema
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.statement import (
+    ExternalStatementData,
     PreparedStatement,
     StatementResult,
     StatementBatch,
 )
+from yggdrasil.io.tabular import Tabular
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.tabular.base import O
@@ -80,9 +82,12 @@ class SparkPreparedStatement(PreparedStatement):
         retry: Optional[WaitingConfigArg] = None,
         spark_session: Optional["SparkSession"] = None,
         row_limit: Optional[int] = None,
+        external_data: Optional[
+            Mapping[str, "ExternalStatementData | Tabular | str | tuple"]
+        ] = None,
         **kwargs: Any,
     ):
-        super().__init__(text=text, key=key, retry=retry)
+        super().__init__(text=text, key=key, retry=retry, external_data=external_data)
         self.spark_session = spark_session
         self.row_limit = row_limit
 
@@ -124,6 +129,12 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
         # base class is not frozen so this is fine.
         self._started: bool = False
         self._failure: Optional[BaseException] = None
+        # Tracks (session, view_name) tuples for every temp view registered
+        # by ``_register_external_views`` so ``clear_temporary_resources``
+        # can drop them on the same session.  Keyed by the
+        # ``ExternalStatementData.text_key`` so re-registration on retry
+        # replaces rather than leaks.
+        self._temp_views: dict[str, tuple["SparkSession", str]] = {}
 
     def _collect_schema(self, options: CastOptions) -> Schema:
         if self._cached_schema is None:
@@ -333,7 +344,11 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
             session = PyEnv.spark_session(create=True, import_error=True)
 
         try:
-            df = session.sql(self.statement.text)
+            self._register_external_views(session)
+            text = PreparedStatement.apply_external_substitution(
+                self.statement.text, self.statement.external_data,
+            )
+            df = session.sql(text)
             row_limit = self.statement.row_limit
             if row_limit:
                 df = df.limit(row_limit)
@@ -341,12 +356,103 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
         except BaseException as exc:
             self._failure = exc
             self._started = True
+            # Drop any views we registered before the failure so a retry
+            # can re-register cleanly without leaking session-scoped state.
+            self.clear_temporary_resources()
             if raise_error:
                 raise
             return self
 
         self._started = True
         return self
+
+    # -------------------------------------------------------------------------
+    # External-data temp views
+    # -------------------------------------------------------------------------
+
+    def _register_external_views(self, session: "SparkSession") -> None:
+        """Materialize each :class:`ExternalStatementData` as a temp view.
+
+        ``text_value`` is taken as the view name when set; otherwise we
+        derive one from ``text_key`` and a per-result suffix to avoid
+        clashing across concurrent statements in the same session.  The
+        substituted SQL references the view by name, and
+        :meth:`clear_temporary_resources` drops every view registered here
+        from the same session.
+
+        Tabulars whose ``read_spark_frame`` returns nothing useful raise
+        loudly — silent skips would leave ``{key}`` placeholders in the
+        SQL and Spark would complain about undefined relations.
+        """
+        external_data = self.statement.external_data
+        if not external_data:
+            return
+
+        for key, entry in external_data.items():
+            if entry.tabular is None:
+                # Caller already pinned ``text_value`` to a concrete
+                # SQL fragment (existing table, file path, ...); nothing
+                # to register.  Substitution still fires from
+                # apply_external_substitution.
+                if not entry.text_value:
+                    raise ValueError(
+                        f"ExternalStatementData[{key!r}]: tabular is None and "
+                        f"text_value is empty; cannot materialize a temp view"
+                    )
+                continue
+
+            view_name = entry.text_value or self._mint_temp_view_name(key)
+            # Route through the registered converter so non-Spark tabulars
+            # (ArrowTabular, polars/pandas wrappers, ...) get a real
+            # DataFrame back instead of falling through the base
+            # ``read_spark_frame`` Arrow short-circuit, which doesn't pass
+            # a schema to ``createDataFrame`` and chokes on Arrow tables.
+            from yggdrasil.spark.cast import any_to_spark_dataframe
+            df = any_to_spark_dataframe(entry.tabular, CastOptions())
+            df.createOrReplaceTempView(view_name)
+            entry.text_value = view_name
+            self._temp_views[key] = (session, view_name)
+
+    def _mint_temp_view_name(self, key: str) -> str:
+        """Build a session-unique temp view name for ``key``.
+
+        Spark temp views live in the session catalog, so concurrent
+        statements that register the same alias would clobber each other.
+        Suffixing with the statement key keeps them disjoint.
+        """
+        # Statement keys come from ``_new_key``: ``<usec>-<hex>``; the
+        # hyphen would break unquoted identifiers, so swap it out.
+        suffix = self.key.replace("-", "_") if self.key else ""
+        return f"_ygg_ext_{key}_{suffix}" if suffix else f"_ygg_ext_{key}"
+
+    def clear_temporary_resources(self) -> None:
+        """Drop every temp view registered by :meth:`_register_external_views`.
+
+        Idempotent — safe to call from ``start``'s failure path, from the
+        batch teardown loop, or from a caller that wants to release
+        session-side scratch eagerly.  Failures while dropping a view are
+        logged and swallowed so a transient session disconnect doesn't
+        mask the real error.
+        """
+        if self._temp_views:
+            for key, (session, view_name) in list(self._temp_views.items()):
+                try:
+                    session.catalog.dropTempView(view_name)
+                except Exception:
+                    logger.debug(
+                        "Failed to drop temp view %r (key=%r); continuing.",
+                        view_name, key, exc_info=True,
+                    )
+            self._temp_views.clear()
+        # Reset materialized text_value so a subsequent start() re-registers
+        # under a fresh view name (and a fresh session if the caller swapped
+        # one in via ``start(spark_session=...)``).
+        external_data = self.statement.external_data
+        if external_data:
+            for entry in external_data.values():
+                if entry.tabular is not None:
+                    entry.text_value = None
+        super().clear_temporary_resources()
 
     def cancel(self) -> "SparkStatementResult":
         """No-op: Spark SQL is synchronous, there is nothing to cancel.

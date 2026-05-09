@@ -467,7 +467,8 @@ def _spark_to_arrow(obj: Any, options: CastOptions) -> tuple[pa.Table, CastOptio
     if options.target_field is not None and options.need_cast():
         obj = options.cast_spark(obj)
 
-    return obj.toArrow(), options.copy(target_field=None)
+    from yggdrasil.spark.cast import spark_dataframe_to_arrow
+    return spark_dataframe_to_arrow(obj), options.copy(target_field=None)
 
 
 # ---------------------------------------------------------------------------

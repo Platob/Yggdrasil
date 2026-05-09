@@ -675,9 +675,12 @@ class DynamicFrame:
                 self.to_local_iterator(),
                 options=CastOptions(byte_size=byte_size, safe=False),
             )
+        from yggdrasil.spark.cast import spark_dataframe_to_arrow
         if target is not None and target is not self.schema:
-            return self.cast(target, byte_size=byte_size).df.toArrow()
-        return self.df.toArrow()
+            return spark_dataframe_to_arrow(
+                self.cast(target, byte_size=byte_size).df,
+            )
+        return spark_dataframe_to_arrow(self.df)
 
     def toPandas(
         self,

@@ -57,10 +57,16 @@ from databricks.sdk.service.sql import (
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.data import Schema, schema
 from yggdrasil.data.options import CastOptions
-from yggdrasil.data.statement import PreparedStatement, StatementResult, StatementBatch
+from yggdrasil.data.statement import (
+    ExternalStatementData,
+    PreparedStatement,
+    StatementResult,
+    StatementBatch,
+)
 from yggdrasil.databricks.sql.exceptions import SQLError
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
 from yggdrasil.data.enums import MimeType, MimeTypes, MediaTypes
+from yggdrasil.io.tabular import Tabular
 from ..fs import VolumePath, DatabricksPath
 from ..sql.types import parse_databricks_field
 
@@ -179,9 +185,12 @@ class WarehousePreparedStatement(PreparedStatement):
         row_limit: Optional[int] = None,
         parameters: Optional[List[StatementParameterListItem]] = None,
         external_volume_paths: Optional[dict[str, VolumePath]] = None,
+        external_data: Optional[
+            Mapping[str, "ExternalStatementData | Tabular | str | tuple"]
+        ] = None,
         **kwargs: Any,
     ):
-        super().__init__(text, key=key, retry=retry)
+        super().__init__(text, key=key, retry=retry, external_data=external_data)
         self.warehouse_id = warehouse_id
         self.warehouse_name = warehouse_name
         self.catalog_name = catalog_name
@@ -218,6 +227,11 @@ class WarehousePreparedStatement(PreparedStatement):
         - tabular data (Arrow / polars / pandas / list / dict) — staged as
           Parquet onto a fresh :meth:`VolumePath.staging_path` under the
           supplied ``catalog_name`` / ``schema_name``.
+        - an :class:`ExternalStatementData` wrapping either of the above —
+          the underlying value is unwrapped and processed as if passed
+          directly.  ``text_value``-only entries (no tabular bound) are
+          skipped here; they're substituted via
+          :attr:`PreparedStatement.external_data` by the batch coercer.
 
         Returns a fresh ``dict[str, VolumePath]``; never mutates input.
         Empty / ``None`` input returns ``{}``.
@@ -234,6 +248,14 @@ class WarehousePreparedStatement(PreparedStatement):
         out: dict[str, VolumePath] = {}
         for alias, value in external_data.items():
             cls._validate_alias(alias)
+
+            # Unwrap ExternalStatementData: ``text_value``-only entries
+            # need no staging here; entries with a tabular bound get
+            # processed exactly like a raw tabular value.
+            if isinstance(value, ExternalStatementData):
+                if value.tabular is None:
+                    continue
+                value = value.tabular
 
             if isinstance(value, VolumePath):
                 out[alias] = value
@@ -259,6 +281,16 @@ class WarehousePreparedStatement(PreparedStatement):
             )
 
         return out
+
+    @staticmethod
+    def volume_path_text_value(path: VolumePath) -> str:
+        """Build the SQL fragment that references *path* in a query.
+
+        Single source of truth for the ``parquet.\\`<full>\\``` form used
+        by :meth:`WarehouseStatementBatch._coerce`; reusing this helper
+        keeps text-substitution and cleanup pointing at the same string.
+        """
+        return f"parquet.`{path.full_path()}`"
 
     @staticmethod
     def _validate_alias(alias: Any) -> None:
@@ -362,6 +394,39 @@ class WarehousePreparedStatement(PreparedStatement):
             ext_paths.update(external_volume_paths)
         ext_paths.update(staged)
 
+        # ---- Generic external-data registry ----
+        # Mirror every staged / supplied path into the base
+        # ``external_data`` map with a pre-baked ``text_value``, and merge
+        # any caller-supplied :class:`ExternalStatementData` entries (which
+        # may carry their own ``text_value`` for already-baked SQL
+        # fragments — e.g. an existing table reference).  Substitution at
+        # batch coerce time reads ``external_data`` first, then falls back
+        # to ``external_volume_paths`` for entries that didn't get mirrored.
+        ext_data: dict[str, ExternalStatementData] = dict(prepared.external_data or {})
+        if external_data:
+            for alias, value in external_data.items():
+                if isinstance(value, ExternalStatementData):
+                    # Caller-built entry: preserve text_value as-is when
+                    # set; otherwise materialize from the staged path
+                    # below.
+                    if value.text_value:
+                        ext_data[alias] = ExternalStatementData(
+                            alias,
+                            tabular=value.tabular,
+                            text_value=value.text_value,
+                        )
+                    elif value.tabular is None:
+                        raise ValueError(
+                            f"external_data[{alias!r}]: ExternalStatementData "
+                            f"has neither tabular nor text_value"
+                        )
+        for alias, path in ext_paths.items():
+            ext_data[alias] = ExternalStatementData(
+                alias,
+                tabular=ext_data.get(alias).tabular if alias in ext_data else None,
+                text_value=cls.volume_path_text_value(path),
+            )
+
         # ---- Parameters: list or mapping ----
         new_params: list[StatementParameterListItem] = list(prepared.parameters or [])
         if parameters:
@@ -403,6 +468,7 @@ class WarehousePreparedStatement(PreparedStatement):
                 setattr(prepared, k, v)
 
         prepared.external_volume_paths = ext_paths or None
+        prepared.external_data = ext_data or None
         return prepared
 
     # ------------------------------------------------------------------
@@ -455,20 +521,28 @@ class WarehousePreparedStatement(PreparedStatement):
     # ------------------------------------------------------------------
 
     def clear_temporary_resources(self) -> None:
-        """Unlink any temporary staged volumes and clear the registry."""
-        if not self.external_volume_paths:
-            return
-        for alias, path in self.external_volume_paths.items():
-            if getattr(path, "temporary", False):
-                try:
-                    Job.make(path.unlink, missing_ok=True).fire_and_forget()
-                except Exception:
-                    logger.exception(
-                        "Failed to unlink temporary staged volume %r (alias=%r); continuing.",
-                        path, alias,
-                    )
+        """Unlink any temporary staged volumes and clear the registry.
 
-        self.external_volume_paths = None
+        Idempotent: safe to call repeatedly.  Mirrors the per-batch
+        contract — the legacy ``external_volume_paths`` is the single
+        source of truth for paths to unlink; ``external_data`` is only
+        cleared to release tabular references so a re-prepared statement
+        re-stages cleanly.
+        """
+        if self.external_volume_paths:
+            for alias, path in self.external_volume_paths.items():
+                if getattr(path, "temporary", False):
+                    try:
+                        Job.make(path.unlink, missing_ok=True).fire_and_forget()
+                    except Exception:
+                        logger.exception(
+                            "Failed to unlink temporary staged volume %r (alias=%r); continuing.",
+                            path, alias,
+                        )
+            self.external_volume_paths = None
+
+        if self.external_data:
+            self.external_data = None
 
 
 def _mapping_to_parameter_list(
@@ -1001,20 +1075,37 @@ class WarehouseStatementBatch(StatementBatch):
     def _coerce(self, statement: "WarehousePreparedStatement | str") -> WarehousePreparedStatement:
         stmt = WarehousePreparedStatement.from_(statement)
 
-        # Effective alias map for this statement: batch-wide + per-statement
-        # (per-statement wins on collision).
-        effective: dict[str, VolumePath] = dict(self.external_volume_paths or {})
-        if stmt.external_volume_paths:
-            effective.update(stmt.external_volume_paths)
+        # Build the effective substitution map.  Three sources, in
+        # increasing precedence:
+        #   1. batch-wide ``external_volume_paths`` (legacy)
+        #   2. per-statement ``external_volume_paths`` (legacy)
+        #   3. per-statement ``external_data`` (new generic registry)
+        # Generic entries win because :meth:`WarehousePreparedStatement.prepare`
+        # already mirrors any staged path into ``external_data`` with a
+        # pre-baked ``text_value``, so the two sources stay consistent;
+        # callers who skipped ``prepare`` (built the statement directly
+        # with ``external_volume_paths``) still get substitution.
+        effective: dict[str, str] = {}
+        for alias, path in (self.external_volume_paths or {}).items():
+            effective[alias] = WarehousePreparedStatement.volume_path_text_value(path)
+        for alias, path in (stmt.external_volume_paths or {}).items():
+            effective[alias] = WarehousePreparedStatement.volume_path_text_value(path)
+        for alias, entry in (stmt.external_data or {}).items():
+            if entry.text_value is None:
+                raise ValueError(
+                    f"WarehousePreparedStatement.external_data[{alias!r}] "
+                    f"has no text_value; call prepare() first or set it manually"
+                )
+            effective[alias] = entry.text_value
+
         if not effective:
             return stmt
 
         # Substitute on a copy — never mutate the caller's statement.
         rewritten_text = stmt.text
-        for alias, path in effective.items():
+        for alias, text_value in effective.items():
             rewritten_text = rewritten_text.replace(
-                "{%s}" % alias,
-                f"parquet.`{path.full_path()}`",
+                "{%s}" % alias, text_value,
             )
         if rewritten_text == stmt.text:
             return stmt

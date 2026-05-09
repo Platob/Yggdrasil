@@ -38,7 +38,7 @@ import time
 from abc import abstractmethod
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Iterable, Iterator, Literal, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Iterable, Iterator, Literal, Mapping, Optional, TypeVar
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
@@ -54,6 +54,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "BatchConcatMode",
+    "ExternalStatementData",
     "PreparedStatement",
     "StatementBatch",
     "StatementResult",
@@ -77,6 +78,146 @@ _SQL_QUERY_LEAD_RE = re.compile(
     r"(?:SELECT|WITH|VALUES|TABLE|FROM)\b",
     re.IGNORECASE,
 )
+
+
+# ---------------------------------------------------------------------------
+# ExternalStatementData
+# ---------------------------------------------------------------------------
+
+
+# ``{name}``-style placeholder must be a plain identifier — keeps
+# ``str.replace`` substitution unambiguous and rules out anything that
+# would need quoting in SQL.
+_EXTERNAL_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+class ExternalStatementData:
+    """A tabular binding that a statement carries alongside its SQL text.
+
+    Lets a :class:`PreparedStatement` reference data by a placeholder
+    name (``{text_key}``) which an engine resolves to a concrete
+    expression at submit time.  Three fields:
+
+    - ``text_key`` — the placeholder identifier; ``{text_key}`` in the
+      statement text is replaced with ``text_value`` on submit.
+    - ``text_value`` — the SQL fragment substituted into the text.  May
+      be ``None`` initially: engines that materialize the binding
+      (Spark registers a temporary view, the warehouse stages a
+      Parquet volume) fill it in before substitution.  Pre-set this
+      yourself when you've already arranged the storage (e.g. an
+      existing :class:`VolumePath` you wrote to up front).
+    - ``tabular`` — the data the placeholder represents.  Engines pull
+      a frame off it via :meth:`Tabular.read_spark_frame` /
+      :meth:`Tabular.read_arrow_batches` to register / stage it.
+
+    Plain value object — engines treat it as mutable scratch and may
+    rewrite ``text_value`` during materialization.
+    """
+
+    __slots__ = ("text_key", "text_value", "tabular")
+
+    text_key: str
+    text_value: Optional[str]
+    tabular: Optional[Tabular]
+
+    def __init__(
+        self,
+        text_key: str,
+        tabular: Optional[Tabular] = None,
+        *,
+        text_value: Optional[str] = None,
+    ) -> None:
+        if not isinstance(text_key, str) or not text_key:
+            raise ValueError(
+                f"ExternalStatementData.text_key must be a non-empty string; "
+                f"got {text_key!r}"
+            )
+        if not _EXTERNAL_KEY_RE.match(text_key):
+            raise ValueError(
+                f"ExternalStatementData.text_key {text_key!r} is not a valid "
+                f"identifier; must match [A-Za-z_][A-Za-z0-9_]*"
+            )
+        if tabular is None and not text_value:
+            raise ValueError(
+                f"ExternalStatementData[{text_key!r}]: at least one of "
+                f"tabular or text_value must be supplied"
+            )
+        self.text_key = text_key
+        self.tabular = tabular
+        self.text_value = text_value if text_value else None
+
+    def __repr__(self) -> str:
+        return (
+            f"ExternalStatementData(text_key={self.text_key!r}, "
+            f"text_value={self.text_value!r}, tabular={self.tabular!r})"
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ExternalStatementData):
+            return NotImplemented
+        return (
+            self.text_key == other.text_key
+            and self.text_value == other.text_value
+            and self.tabular is other.tabular
+        )
+
+    @classmethod
+    def from_(
+        cls,
+        value: "ExternalStatementData | Tabular | str | tuple",
+        *,
+        text_key: Optional[str] = None,
+    ) -> "ExternalStatementData":
+        """Coerce ``value`` into an :class:`ExternalStatementData`.
+
+        - Already an instance → pass-through (``text_key`` ignored).
+        - :class:`Tabular` → bind under the supplied ``text_key``.
+        - ``str`` → ``text_value`` only (no tabular, caller staged it).
+        - ``(tabular, text_value)`` tuple → both fields set.
+
+        Raises ``ValueError`` when ``text_key`` is required but missing.
+        """
+        if isinstance(value, ExternalStatementData):
+            return value
+        if text_key is None:
+            raise ValueError(
+                "ExternalStatementData.from_: text_key is required when "
+                "coercing a non-ExternalStatementData value"
+            )
+        if isinstance(value, Tabular):
+            return cls(text_key, tabular=value)
+        if isinstance(value, str):
+            return cls(text_key, tabular=None, text_value=value)
+        if isinstance(value, tuple) and len(value) == 2:
+            tabular, text_value = value
+            return cls(text_key, tabular=tabular, text_value=text_value)
+        raise TypeError(
+            f"Cannot coerce {type(value).__name__} to ExternalStatementData"
+        )
+
+
+def _coerce_external_data(
+    external_data: Optional[Mapping[str, "ExternalStatementData | Tabular | str | tuple"]],
+) -> Optional[dict[str, ExternalStatementData]]:
+    """Normalize an ``external_data`` mapping into ``{key: entry}``."""
+    if not external_data:
+        return None
+    if not isinstance(external_data, Mapping):
+        raise TypeError(
+            f"external_data must be a mapping; got {type(external_data).__name__}"
+        )
+    out: dict[str, ExternalStatementData] = {}
+    for key, value in external_data.items():
+        entry = ExternalStatementData.from_(value, text_key=key)
+        # If the caller used a different text_key inside an explicit
+        # ExternalStatementData, the dict key wins — substitution is
+        # driven by the dict key everywhere downstream.
+        if entry.text_key != key:
+            entry = ExternalStatementData(
+                key, tabular=entry.tabular, text_value=entry.text_value,
+            )
+        out[key] = entry
+    return out or None
 
 
 # ---------------------------------------------------------------------------
@@ -109,12 +250,17 @@ class PreparedStatement(Disposable):
 
     text: str = ""
     retry: Optional[WaitingConfig] = None
+    external_data: Optional[dict[str, ExternalStatementData]] = None
 
     def __init__(
         self,
         text: str = "",
         key: Optional[str] = None,
         retry: Optional[WaitingConfigArg] = None,
+        *,
+        external_data: Optional[
+            Mapping[str, "ExternalStatementData | Tabular | str | tuple"]
+        ] = None,
     ):
         Disposable.__init__(self)
         self.text = str(text) if text else ""
@@ -124,6 +270,7 @@ class PreparedStatement(Disposable):
         # (= not retryable) and only run from_ when the caller actually
         # passed something.
         self.retry = WaitingConfig.from_(retry) if retry is not None else None
+        self.external_data = _coerce_external_data(external_data)
 
     @property
     def retryable(self) -> bool:
@@ -196,7 +343,10 @@ class PreparedStatement(Disposable):
             return cls.from_(statement.statement)
         # Cross-class coercion — copy text + key from another PreparedStatement.
         if isinstance(statement, PreparedStatement):
-            return cls(statement.text, key=statement.key)
+            coerced = cls(statement.text, key=statement.key)
+            if statement.external_data:
+                coerced.external_data = dict(statement.external_data)
+            return coerced
         raise TypeError(f"Cannot prepare {statement!r} as {cls.__name__}.")
 
     @classmethod
@@ -206,6 +356,33 @@ class PreparedStatement(Disposable):
         their typed fields.
         """
         return cls.from_(statement)
+
+    @staticmethod
+    def apply_external_substitution(
+        text: str,
+        external_data: Optional[Mapping[str, ExternalStatementData]],
+    ) -> str:
+        """Substitute every ``{text_key}`` in ``text`` with its ``text_value``.
+
+        Engine-agnostic: the caller (Spark / warehouse / ...) is
+        responsible for filling in each entry's ``text_value`` (registering
+        a temp view, staging a Parquet volume, ...) before invoking this.
+        Entries whose ``text_value`` is still ``None`` raise — better to
+        fail loudly than silently leave an unsubstituted placeholder in
+        the SQL.
+        """
+        if not external_data:
+            return text
+        rewritten = text
+        for key, entry in external_data.items():
+            if entry.text_value is None:
+                raise ValueError(
+                    f"ExternalStatementData[{key!r}].text_value is unset; "
+                    f"the engine must materialize the binding before "
+                    f"applying substitution"
+                )
+            rewritten = rewritten.replace("{%s}" % key, entry.text_value)
+        return rewritten
 
     def clear_temporary_resources(self) -> None:
         """Release per-statement scratch (staged volumes, temp views, ...).

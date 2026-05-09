@@ -24,6 +24,7 @@ from yggdrasil.data.types.primitive import IntegerType
 pytest.importorskip("pyspark")
 
 from yggdrasil.spark.tests import spark  # noqa: E402,F401
+from yggdrasil.spark.cast import spark_dataframe_to_arrow  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +101,7 @@ class TestSparkCast:
             ).alias("target_array")
         )
 
-        rows = result.toArrow()["target_array"].to_pylist()
+        rows = spark_dataframe_to_arrow(result)["target_array"].to_pylist()
         assert rows == [["1", "2"], ["3", None], None]
 
     def test_target_none_returns_input_column(

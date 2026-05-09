@@ -296,6 +296,81 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
         # ``_infos`` from the in-memory handle that just dropped itself.
         self.assertFalse(self.engine.table(table.full_name()).exists)
 
+    # ------------------------------------------------------------------
+    # external_data — the generic ExternalStatementData binding
+    # ------------------------------------------------------------------
+
+    def test_execute_with_arrow_external_data_round_trips(self) -> None:
+        """A tabular passed via ``external_tables`` is staged as a
+        temporary Parquet volume and the ``{alias}`` placeholder in the
+        statement text is rewritten to point at it.  The same pathway
+        also populates the new generic
+        :attr:`PreparedStatement.external_data` registry — exercised
+        below by inspecting the prepared statement after execution.
+        """
+        from yggdrasil.databricks.warehouse.statement import (
+            WarehousePreparedStatement,
+        )
+
+        data = pa.table(
+            {
+                "id": pa.array([10, 20, 30], type=pa.int64()),
+                "label": pa.array(["x", "y", "z"], type=pa.string()),
+            }
+        )
+        prepared = WarehousePreparedStatement.prepare(
+            "SELECT id, label FROM {ext} ORDER BY id",
+            external_data={"ext": data},
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+        )
+        # Both registries are populated by ``prepare``: the legacy
+        # ``external_volume_paths`` (a real staged path) and the generic
+        # ``external_data`` (text_value pre-baked from that path).
+        self.assertIn("ext", prepared.external_volume_paths or {})
+        self.assertIn("ext", prepared.external_data or {})
+        self.assertTrue(
+            prepared.external_data["ext"].text_value.startswith("parquet.`")
+        )
+
+        try:
+            arrow_table = self.engine.execute(prepared).to_arrow_table()
+            self.assertEqual(arrow_table.num_rows, 3)
+            self.assertEqual(arrow_table.column("id").to_pylist(), [10, 20, 30])
+            self.assertEqual(
+                arrow_table.column("label").to_pylist(), ["x", "y", "z"],
+            )
+        finally:
+            prepared.clear_temporary_resources()
+
+    def test_execute_with_external_statement_data_text_value(self) -> None:
+        """An :class:`ExternalStatementData` with a pre-baked
+        ``text_value`` (here a ``VALUES`` clause) is substituted
+        verbatim — no staging round-trip, no warehouse volume created.
+        """
+        from yggdrasil.data.statement import ExternalStatementData
+        from yggdrasil.databricks.warehouse.statement import (
+            WarehousePreparedStatement,
+        )
+
+        prepared = WarehousePreparedStatement.prepare(
+            "SELECT id FROM {src} ORDER BY id",
+            external_data={
+                "src": ExternalStatementData(
+                    "src", text_value="(VALUES (1), (2), (3)) AS t(id)",
+                ),
+            },
+        )
+        # No staging happened — only the generic registry is populated.
+        self.assertIsNone(prepared.external_volume_paths)
+        self.assertEqual(
+            prepared.external_data["src"].text_value,
+            "(VALUES (1), (2), (3)) AS t(id)",
+        )
+
+        arrow_table = self.engine.execute(prepared).to_arrow_table()
+        self.assertEqual(arrow_table.column("id").to_pylist(), [1, 2, 3])
+
     def test_engine_drop_missing_table_is_no_op(self) -> None:
         """``drop_table`` on a name that was never created should not
         raise — UC's DROP TABLE IF EXISTS contract."""

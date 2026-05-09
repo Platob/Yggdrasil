@@ -25,6 +25,7 @@ from ._helpers import normalize_nested
 pytest.importorskip("pyspark")
 
 from yggdrasil.spark.tests import spark  # noqa: E402,F401
+from yggdrasil.spark.cast import spark_dataframe_to_arrow  # noqa: E402
 
 
 def _read_struct_column(frame, column: str) -> list:
@@ -169,7 +170,7 @@ class TestCastListColumn:
 
         rows = [
             normalize_nested(v)
-            for v in result.toArrow()["target_struct"].to_pylist()
+            for v in spark_dataframe_to_arrow(result)["target_struct"].to_pylist()
         ]
         assert rows == [
             {"first": 1, "second": "2", "third": 3},
@@ -204,7 +205,7 @@ class TestCastListColumn:
 
         rows = [
             normalize_nested(v)
-            for v in result.toArrow()["target_struct"].to_pylist()
+            for v in spark_dataframe_to_arrow(result)["target_struct"].to_pylist()
         ]
         assert rows == [
             {"first": 1, "second": None, "third": None},

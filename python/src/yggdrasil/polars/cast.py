@@ -99,7 +99,8 @@ def any_to_polars_dataframe(
         import pyspark.sql as pyspark_sql
 
         if isinstance(obj, pyspark_sql.DataFrame):
-            df = pl.from_arrow(obj.toArrow())
+            from yggdrasil.spark.cast import spark_dataframe_to_arrow
+            df = pl.from_arrow(spark_dataframe_to_arrow(obj))
         else:
             df = pl.DataFrame(obj)
     else:
