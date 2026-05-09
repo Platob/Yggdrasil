@@ -84,14 +84,14 @@ __all__ = ["SQLEngine"]
 _DEFAULT_WAREHOUSE_RECHECK_S = 30
 
 
-def _coerce_external_tables_for_spark(
-    external_tables: Optional[Mapping[str, Any]],
+def _coerce_external_data_for_spark(
+    external_data: Optional[Mapping[str, Any]],
 ) -> Optional[dict[str, ExternalStatementData]]:
-    """Normalize engine-level ``external_tables`` for the Spark path.
+    """Normalize engine-level ``external_data`` for the Spark path.
 
     Mirrors :meth:`WarehousePreparedStatement.check_external_data`'s
     permissiveness — accepts the same value shapes the warehouse path
-    does so a single ``external_tables=`` argument works in either
+    does so a single ``external_data=`` argument works in either
     mode without coercion at the call site:
 
     - :class:`VolumePath` → text-substituted as
@@ -109,14 +109,14 @@ def _coerce_external_tables_for_spark(
       warehouse side which would have staged the same value as
       Parquet.
     """
-    if not external_tables:
+    if not external_data:
         return None
 
     from yggdrasil.io.tabular import ArrowTabular
     from yggdrasil.arrow.cast import any_to_arrow_table
 
     out: dict[str, ExternalStatementData] = {}
-    for alias, value in external_tables.items():
+    for alias, value in external_data.items():
         if isinstance(value, ExternalStatementData):
             entry = value
             if entry.text_key != alias:
@@ -151,7 +151,7 @@ def _coerce_external_tables_for_spark(
             arrow = any_to_arrow_table(value)
         except Exception as e:
             raise TypeError(
-                f"external_tables[{alias!r}]: cannot bind {type(value).__name__} "
+                f"external_data[{alias!r}]: cannot bind {type(value).__name__} "
                 f"to Spark — accepts VolumePath, ExternalStatementData, Tabular, "
                 f"str, (tabular, text_value), or any frame any_to_arrow_table "
                 f"can convert: {e}"
@@ -350,7 +350,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         warehouse_name: str | None = None,
         byte_limit: int | None = None,
         spark_session: Optional["SparkSession"] = None,
-        external_tables: Mapping[str, "VolumePath | Any"] | None = None,
+        external_data: Mapping[str, "VolumePath | Any"] | None = None,
         parameters: Mapping[str, Any] | None = None,
         # Result-level retry policy — forwarded to
         # WarehousePreparedStatement.prepare on the warehouse path.
@@ -367,7 +367,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         # Already-started result with no rebinding requested → just wait.
         if isinstance(statement, StatementResult):
             already_running = (
-                external_tables is None
+                external_data is None
                 and parameters is None
                 and getattr(statement, "started", statement.done)
             )
@@ -384,7 +384,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
 
             # Carry forward any ``external_data`` already on the input
             # statement so a caller-prepared SparkPreparedStatement keeps
-            # its bindings; ``external_tables`` from this call layers on
+            # its bindings; ``external_data`` from this call layers on
             # top (last write wins on alias collisions).
             if isinstance(statement, PreparedStatement):
                 text = statement.text
@@ -395,7 +395,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
                 text = str(statement).strip()
                 merged = {}
 
-            new_external = _coerce_external_tables_for_spark(external_tables)
+            new_external = _coerce_external_data_for_spark(external_data)
             if new_external:
                 merged.update(new_external)
 
@@ -414,7 +414,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
             prepared = WarehousePreparedStatement.prepare(
                 statement,
                 parameters=parameters,
-                external_data=external_tables,
+                external_data=external_data,
                 catalog_name=catalog_name,
                 schema_name=schema_name,
                 warehouse_id=warehouse_id,

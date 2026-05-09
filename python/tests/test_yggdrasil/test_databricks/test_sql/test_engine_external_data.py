@@ -1,9 +1,9 @@
-"""Unit tests for ``_coerce_external_tables_for_spark``.
+"""Unit tests for ``_coerce_external_data_for_spark``.
 
-The helper normalizes ``external_tables`` into per-alias
+The helper normalizes ``external_data`` into per-alias
 :class:`ExternalStatementData` entries that the Spark execution path
 can register / substitute.  It mirrors the warehouse path's permissive
-input contract so a single ``external_tables=`` argument works in
+input contract so a single ``external_data=`` argument works in
 either mode without coercion at the call site.
 
 These tests do *not* require Databricks credentials — they exercise
@@ -18,12 +18,12 @@ import pyarrow as pa
 from yggdrasil.data.enums import Scheme
 from yggdrasil.data.statement import ExternalStatementData
 from yggdrasil.databricks.fs.volume_path import VolumePath
-from yggdrasil.databricks.sql.engine import _coerce_external_tables_for_spark
+from yggdrasil.databricks.sql.engine import _coerce_external_data_for_spark
 from yggdrasil.io.tabular import ArrowTabular
 from yggdrasil.io.url import URL
 
 
-class TestCoerceExternalTablesForSpark(unittest.TestCase):
+class TestCoerceExternalDataForSpark(unittest.TestCase):
 
     def _vp(self, path: str = "/cat/sch/vol/foo.parquet") -> VolumePath:
         return VolumePath(url=URL(scheme=Scheme.DATABRICKS_VOLUME, path=path))
@@ -33,10 +33,10 @@ class TestCoerceExternalTablesForSpark(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_none_input_returns_none(self) -> None:
-        self.assertIsNone(_coerce_external_tables_for_spark(None))
+        self.assertIsNone(_coerce_external_data_for_spark(None))
 
     def test_empty_mapping_returns_none(self) -> None:
-        self.assertIsNone(_coerce_external_tables_for_spark({}))
+        self.assertIsNone(_coerce_external_data_for_spark({}))
 
     # ------------------------------------------------------------------
     # VolumePath → text-substitute as parquet.`<full>`
@@ -44,7 +44,7 @@ class TestCoerceExternalTablesForSpark(unittest.TestCase):
 
     def test_volume_path_substitutes_as_parquet_path(self) -> None:
         vp = self._vp("/cat/sch/vol/data.parquet")
-        out = _coerce_external_tables_for_spark({"alias": vp})
+        out = _coerce_external_data_for_spark({"alias": vp})
         self.assertIsNotNone(out)
         entry = out["alias"]
         self.assertEqual(entry.text_key, "alias")
@@ -61,7 +61,7 @@ class TestCoerceExternalTablesForSpark(unittest.TestCase):
         entry = ExternalStatementData(
             "alias", text_value="(VALUES (1)) AS t(id)",
         )
-        out = _coerce_external_tables_for_spark({"alias": entry})
+        out = _coerce_external_data_for_spark({"alias": entry})
         self.assertIs(out["alias"], entry)
 
     def test_external_statement_data_rebinds_when_key_differs(self) -> None:
@@ -69,7 +69,7 @@ class TestCoerceExternalTablesForSpark(unittest.TestCase):
         ``text_key`` doesn't match the dict key, the dict key wins —
         substitution is driven by the key everywhere downstream."""
         entry = ExternalStatementData("orig", text_value="t1")
-        out = _coerce_external_tables_for_spark({"alias": entry})
+        out = _coerce_external_data_for_spark({"alias": entry})
         self.assertIsNot(out["alias"], entry)
         self.assertEqual(out["alias"].text_key, "alias")
         self.assertEqual(out["alias"].text_value, "t1")
@@ -81,7 +81,7 @@ class TestCoerceExternalTablesForSpark(unittest.TestCase):
     def test_tabular_is_bound_directly(self) -> None:
         data = pa.table({"id": [1, 2, 3]})
         tabular = ArrowTabular(data)
-        out = _coerce_external_tables_for_spark({"alias": tabular})
+        out = _coerce_external_data_for_spark({"alias": tabular})
         self.assertIs(out["alias"].tabular, tabular)
         self.assertIsNone(out["alias"].text_value)
 
@@ -90,7 +90,7 @@ class TestCoerceExternalTablesForSpark(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_string_is_text_value(self) -> None:
-        out = _coerce_external_tables_for_spark(
+        out = _coerce_external_data_for_spark(
             {"alias": "(VALUES (1), (2)) AS t(id)"},
         )
         self.assertIsNone(out["alias"].tabular)
@@ -105,7 +105,7 @@ class TestCoerceExternalTablesForSpark(unittest.TestCase):
     def test_tuple_pair_sets_both_fields(self) -> None:
         data = pa.table({"id": [1]})
         tabular = ArrowTabular(data)
-        out = _coerce_external_tables_for_spark(
+        out = _coerce_external_data_for_spark(
             {"alias": (tabular, "view_x")},
         )
         self.assertIs(out["alias"].tabular, tabular)
@@ -118,13 +118,13 @@ class TestCoerceExternalTablesForSpark(unittest.TestCase):
 
     def test_raw_arrow_table_is_wrapped_in_arrow_tabular(self) -> None:
         data = pa.table({"id": [10, 20, 30]})
-        out = _coerce_external_tables_for_spark({"alias": data})
+        out = _coerce_external_data_for_spark({"alias": data})
         self.assertIsInstance(out["alias"].tabular, ArrowTabular)
         self.assertIsNone(out["alias"].text_value)
 
     def test_raw_record_batch_is_wrapped_in_arrow_tabular(self) -> None:
         batch = pa.record_batch([pa.array([1, 2])], names=["id"])
-        out = _coerce_external_tables_for_spark({"alias": batch})
+        out = _coerce_external_data_for_spark({"alias": batch})
         self.assertIsInstance(out["alias"].tabular, ArrowTabular)
 
     def test_unsupported_value_raises_typeerror_with_context(self) -> None:
@@ -132,7 +132,7 @@ class TestCoerceExternalTablesForSpark(unittest.TestCase):
             pass
 
         with self.assertRaises(TypeError) as ctx:
-            _coerce_external_tables_for_spark({"alias": WeirdNotAFrame()})
+            _coerce_external_data_for_spark({"alias": WeirdNotAFrame()})
         msg = str(ctx.exception)
         self.assertIn("alias", msg)
         self.assertIn("WeirdNotAFrame", msg)
@@ -143,7 +143,7 @@ class TestCoerceExternalTablesForSpark(unittest.TestCase):
 
     def test_multi_alias_mapping_coerces_each_value(self) -> None:
         vp = self._vp("/c/s/v/x.parquet")
-        out = _coerce_external_tables_for_spark(
+        out = _coerce_external_data_for_spark(
             {
                 "vol": vp,
                 "raw": pa.table({"a": [1]}),

@@ -301,7 +301,7 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
     # ------------------------------------------------------------------
 
     def test_execute_with_arrow_external_data_round_trips(self) -> None:
-        """A tabular passed via ``external_tables`` is staged as a
+        """A tabular passed via ``external_data`` is staged as a
         temporary Parquet volume and the ``{alias}`` placeholder in the
         statement text is rewritten to point at it.  The same pathway
         also populates the new generic
@@ -371,8 +371,8 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
         arrow_table = self.engine.execute(prepared).to_arrow_table()
         self.assertEqual(arrow_table.column("id").to_pylist(), [1, 2, 3])
 
-    def test_engine_execute_api_mode_with_external_tables(self) -> None:
-        """``engine.execute(external_tables=..., engine="api")`` stages
+    def test_engine_execute_api_mode_with_external_data(self) -> None:
+        """``engine.execute(external_data=..., engine="api")`` stages
         an Arrow table to a temporary volume and substitutes ``{alias}``
         with ``parquet.`<full>`` in the statement text — same path the
         warehouse-only ``WarehousePreparedStatement.prepare`` exercises,
@@ -387,7 +387,7 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
         )
         result = self.engine.execute(
             "SELECT id, label FROM {ext} ORDER BY id",
-            external_tables={"ext": data},
+            external_data={"ext": data},
             engine="api",
         )
         try:
@@ -402,8 +402,8 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
         finally:
             result.statement.clear_temporary_resources()
 
-    def test_engine_execute_spark_mode_with_arrow_external_tables(self) -> None:
-        """``engine.execute(external_tables=..., engine="spark")``
+    def test_engine_execute_spark_mode_with_arrow_external_data(self) -> None:
+        """``engine.execute(external_data=..., engine="spark")``
         registers the Arrow table as a Spark temp view and substitutes
         ``{alias}`` with the view name. No volume staging happens — the
         Spark path does not need to round-trip through Parquet.
@@ -421,7 +421,7 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
         )
         result = self.engine.execute(
             "SELECT id, label FROM {ext} ORDER BY id",
-            external_tables={"ext": data},
+            external_data={"ext": data},
             engine="spark",
         )
         try:
@@ -443,9 +443,9 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
         finally:
             result.clear_temporary_resources()
 
-    def test_engine_execute_spark_mode_with_volume_path_external_tables(self) -> None:
+    def test_engine_execute_spark_mode_with_volume_path_external_data(self) -> None:
         """A pre-existing :class:`VolumePath` passed via
-        ``external_tables`` on the Spark path is text-substituted as
+        ``external_data`` on the Spark path is text-substituted as
         ``parquet.`<full>`` — Spark reads parquet by path, no temp view
         registered."""
         try:
@@ -472,7 +472,7 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
         try:
             result = self.engine.execute(
                 "SELECT id, label FROM {ext} ORDER BY id",
-                external_tables={"ext": path},
+                external_data={"ext": path},
                 engine="spark",
             )
             try:
