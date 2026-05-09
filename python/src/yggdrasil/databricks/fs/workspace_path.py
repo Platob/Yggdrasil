@@ -178,13 +178,16 @@ class WorkspacePath(DatabricksPath):
             if _looks_like_already_exists(exc):
                 if not exist_ok:
                     raise
+                self._invalidate_stat_cache()
                 return
             if _looks_like_protected_parent(exc):
                 # Hitting a protected ancestor (e.g. ``/Workspace/Users``)
                 # is fine if the leaf already landed — fall through and
                 # let downstream ops succeed.
+                self._invalidate_stat_cache()
                 return
             raise
+        self._invalidate_stat_cache()
 
     def _remove_file(self, missing_ok: bool = True) -> None:
         try:
