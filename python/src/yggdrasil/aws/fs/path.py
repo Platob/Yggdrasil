@@ -340,6 +340,7 @@ class S3Path(RemotePath):
                 if missing_ok:
                     return
                 raise
+            self._invalidate_stat_cache()
             return
 
         prefix = self.key

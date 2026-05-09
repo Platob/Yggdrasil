@@ -298,6 +298,7 @@ class VolumePath(DatabricksPath):
         except Exception as exc:
             if not exist_ok and _looks_like_already_exists(exc):
                 raise
+        self._invalidate_stat_cache()
 
     def _remove_file(self, missing_ok: bool = True) -> None:
         try:
