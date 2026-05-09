@@ -386,6 +386,24 @@ class TestAnonymize:
         assert "token" not in (anonymized.query or "")
         assert "keep" in (anonymized.query or "")
 
+    def test_repr_redacts_userinfo(self):
+        u = URL.from_str("https://alice:pw@example.com/")
+        r = repr(u)
+        assert "alice" not in r
+        assert "pw" not in r
+        assert "<redacted>" in r
+
+    def test_repr_redacts_sensitive_query(self):
+        u = URL.from_str("https://e.com/?token=abc&keep=1")
+        r = repr(u)
+        assert "abc" not in r
+        assert "keep=1" in r
+
+    def test_str_keeps_original(self):
+        s = "https://alice:pw@example.com/?token=abc"
+        assert "alice:pw" in str(URL.from_str(s))
+        assert "token=abc" in str(URL.from_str(s))
+
 
 # ---------------------------------------------------------------------------
 # Conversions
