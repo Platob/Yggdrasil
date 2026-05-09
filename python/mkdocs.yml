@@ -196,7 +196,7 @@ nav:
       - Browse: reference/
 
 exclude_docs: |
-  README.md
+  /README.md
   _scripts/*
 
 watch:
