@@ -351,23 +351,38 @@ class StatementResult(Tabular, Generic[PS]):
         except Exception:
             logger.exception("clear_temporary_resources failed during raise_for_status; continuing.")
 
-        # Auto-promote known-transient failures: install a retry
-        # WaitingConfig on the underlying statement, once per result.
-        # When the caller never calls retry() the behavior is unchanged
-        # (they just get the exception); when they do, the promoted
-        # config means retry() will actually run.
-        if not self._auto_retry_promoted and self._is_transient_failure():
-            self._auto_retry_promoted = True
-            if self.statement.retry is None:
-                cfg = self.default_retry() or WaitingConfig.default()
-                logger.info(
-                    "Auto-promoting statement %r to retryable: transient "
-                    "failure detected (%s).",
-                    self.key, self._failure_message()[:200],
-                )
-                self.statement.retry = cfg
-
+        self._auto_promote_transient_retry()
         return self._raise_for_status()
+
+    def _auto_promote_transient_retry(self) -> bool:
+        """Install a retry :class:`WaitingConfig` on a transient failure.
+
+        Idempotent and side-effect-only when the failure either isn't
+        transient or has already been promoted.  Returns ``True`` once a
+        retry config is in place (whether installed now or already set
+        by the caller), so batch-level callers can decide whether to
+        drive :meth:`retry` for this result.
+
+        Hoisted out of :meth:`raise_for_status` so :class:`StatementBatch`
+        can promote without first having to swallow the per-result
+        exception just to flip ``retryable``.
+        """
+        if not self.failed:
+            return self.statement.retry is not None
+        if self._auto_retry_promoted:
+            return self.statement.retry is not None
+        if not self._is_transient_failure():
+            return self.statement.retry is not None
+        self._auto_retry_promoted = True
+        if self.statement.retry is None:
+            cfg = self.default_retry() or WaitingConfig.default()
+            logger.info(
+                "Auto-promoting statement %r to retryable: transient "
+                "failure detected (%s).",
+                self.key, self._failure_message()[:200],
+            )
+            self.statement.retry = cfg
+        return self.statement.retry is not None
 
     @abstractmethod
     def _raise_for_status(self) -> None:
@@ -884,6 +899,24 @@ class StatementBatch(Generic[PS, SR]):
             except Exception:
                 logger.exception("refresh_status failed for %r before retry; continuing.", key)
 
+        # Auto-promote transient failures on the batch path: callers
+        # that drive batch.retry() (e.g. the warehouse DML helper for
+        # MERGE / DELETE+INSERT under Delta concurrent-append races)
+        # never invoke per-result raise_for_status before retrying, so
+        # ``retryable`` would otherwise stay False and the retry would
+        # be skipped.  Promoting here keeps the same one-shot, sticky
+        # semantics as raise_for_status — non-transient failures and
+        # already-retryable statements pass through untouched.
+        for key, result in self.results.items():
+            if not result.failed:
+                continue
+            try:
+                result._auto_promote_transient_retry()
+            except Exception:
+                logger.exception(
+                    "auto-promote transient retry failed for %r; continuing.", key,
+                )
+
         targets = {
             key: result
             for key, result in self.results.items()
@@ -947,11 +980,36 @@ class StatementBatch(Generic[PS, SR]):
         return self
 
     def raise_for_status(self) -> "StatementBatch":
-        for key, result in self.results.items():
+        """Surface the latest backend failure directly — no generic wrapper.
+
+        Walks ``self.results`` in submission order; with one or more
+        failed items, propagates the *last* failed result's typed
+        backend exception (e.g. :class:`SQLError` with the full
+        ``DELTA_CONCURRENT_APPEND`` payload) so the caller sees the
+        actual error instead of a wrapped ``RuntimeError("Batch item
+        ... failed.")``.  Earlier failures are logged via
+        :meth:`StatementResult.raise_for_status` so their diagnostics
+        aren't swallowed by the one we re-raise.
+        """
+        failed_keys = [key for key, result in self.results.items() if result.failed]
+        if not failed_keys:
+            return self
+
+        last_key = failed_keys[-1]
+        # Surface preceding failures through the logger so the user
+        # still sees them when several items in the batch failed.
+        for key in failed_keys[:-1]:
             try:
-                result.raise_for_status()
-            except Exception as exc:
-                raise RuntimeError(f"Batch item {key!r} failed.") from exc
+                self.results[key].raise_for_status()
+            except Exception:
+                logger.exception(
+                    "Batch item %r failed; superseded by a later batch failure.",
+                    key,
+                )
+        # Re-raise the latest failure directly so the typed backend
+        # exception (and its message) is what bubbles up.
+        logger.debug("Re-raising backend failure from batch item %r.", last_key)
+        self.results[last_key].raise_for_status()
         return self
 
     # -------------------------------------------------------------------------

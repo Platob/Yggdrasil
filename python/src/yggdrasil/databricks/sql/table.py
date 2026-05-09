@@ -262,11 +262,21 @@ def _execute_dml(
     :class:`WaitingConfig`) still fire inside
     :class:`SparkPreparedStatement` / :class:`WarehousePreparedStatement`,
     but the table layer no longer second-guesses them.
+
+    On a failed batch we route through :meth:`StatementBatch.retry`
+    rather than :meth:`raise_for_status` so a transient Delta
+    concurrent-append (a race between sibling MERGE / DELETE + INSERT
+    writers on overlapping keys) gets auto-promoted and retried
+    instead of bubbling straight up.  Non-transient failures still
+    surface — ``batch.retry`` re-raises through ``raise_for_status``
+    once the budget is exhausted or the failure isn't retryable.
     """
     batch = sql_engine.execute_many(
         statements, wait=wait, raise_error=False, engine=engine_name,
     )
-    if raise_error:
+    if raise_error and batch.failed:
+        batch.retry(wait=wait, raise_error=True)
+    elif raise_error:
         batch.raise_for_status()
     return batch
 
