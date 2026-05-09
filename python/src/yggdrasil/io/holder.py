@@ -104,9 +104,18 @@ def _resolve_subclass(
 
     if scheme:
         existing = _HOLDER_SCHEMES.get(scheme)
-        if existing is None:
-            raise ValueError(f"Unknown scheme '{scheme}'")
-        return existing
+        if existing is not None:
+            return existing
+        # Cold dispatch: the backend module hasn't been imported yet
+        # (so ``__init_subclass__`` hasn't registered it into
+        # ``_HOLDER_SCHEMES``). :class:`PathScheme` knows the
+        # ``module → class`` shape for every shipped backend; ask it
+        # to resolve, which lazy-imports the module as a side effect.
+        from yggdrasil.data.enums import PathScheme
+        try:
+            return PathScheme.resolve(scheme)
+        except (ValueError, ImportError) as exc:
+            raise ValueError(f"Unknown scheme '{scheme}'") from exc
 
     if path is not None:
         # Resolve the path's URL scheme via the registry (file:// →
