@@ -7,8 +7,7 @@ import logging
 import threading
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any,  Iterator, Mapping, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Mapping, Optional
 
 import pyarrow as pa
 
@@ -251,29 +250,54 @@ def _lookup_local_responses(
     return out
 
 
-@dataclass
 class Session(ABC):
-    base_url: Optional[URL] = None
-    verify: bool = True
-    pool_maxsize: int = 10
-    send_headers: Optional[dict[str, str]] = field(default=None, repr=False)
-    waiting: WaitingConfig = field(
-        default=DEFAULT_WAITING_CONFIG,
-        repr=False,
-        compare=False,
-        hash=False,
-    )
+    # Singleton cache keyed by ``(class, normalized base_url string)``. A
+    # ``Session`` constructed with a ``base_url`` is intentionally shared so
+    # the connection pool, cookie jar, and any other per-host state survive
+    # across the call sites that re-spell the same URL. ``base_url=None``
+    # callers always get a fresh instance — there is no canonical key.
+    _singleton_cache: ClassVar[dict[tuple[type, str], "Session"]] = {}
+    _singleton_lock: ClassVar[threading.Lock] = threading.Lock()
 
-    _lock: threading.RLock = field(default=None, init=False, repr=False, compare=False)
-    _job_pool: JobPoolExecutor = field(default=None, init=False, repr=False, compare=False)
+    def __new__(
+        cls,
+        base_url: Optional[URL | str] = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> "Session":
+        if not base_url:
+            return super().__new__(cls)
+        key_url = base_url if isinstance(base_url, URL) else URL.from_(base_url)
+        key = (cls, key_url.to_string())
+        with cls._singleton_lock:
+            cached = cls._singleton_cache.get(key)
+            if cached is not None:
+                return cached
+            instance = super().__new__(cls)
+            cls._singleton_cache[key] = instance
+            return instance
 
-    def __post_init__(self) -> None:
-        if self.base_url:
-            self.base_url = URL.from_(self.base_url)
-        if self._lock is None:
-            self._lock = threading.RLock()
-        if self.pool_maxsize <= 0:
-            self.pool_maxsize = 8
+    def __init__(
+        self,
+        base_url: Optional[URL | str] = None,
+        verify: bool = True,
+        pool_maxsize: int = 10,
+        send_headers: Optional[dict[str, str]] = None,
+        waiting: WaitingConfig = DEFAULT_WAITING_CONFIG,
+    ) -> None:
+        # Singleton-cached instances are re-entered on every constructor call
+        # (Python always invokes ``__init__`` after ``__new__``); skip the
+        # second pass so we don't drop the live connection pool / cookies.
+        if getattr(self, "_initialized", False):
+            return
+        self.base_url = URL.from_(base_url) if base_url else None
+        self.verify = verify
+        self.pool_maxsize = pool_maxsize if pool_maxsize and pool_maxsize > 0 else 8
+        self.send_headers = send_headers
+        self.waiting = waiting
+        self._lock = threading.RLock()
+        self._job_pool: Optional[JobPoolExecutor] = None
+        self._initialized = True
 
     def __enter__(self) -> "Session":
         return self
@@ -298,6 +322,7 @@ class Session(ABC):
         self.__dict__.update(state)
         self._lock = threading.RLock()
         self._job_pool = None
+        self._initialized = True
 
     @property
     def job_pool(self) -> JobPoolExecutor:
