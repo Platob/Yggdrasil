@@ -277,14 +277,13 @@ class Path(Holder, os.PathLike, ABC):
                 pass
         return self
 
-    def as_media(self) -> "Any":
+    def as_media(self, media_type: "Any" = None) -> "Any":
         """Wrap this path in the :class:`Tabular` leaf for its media type.
 
-        Resolution: peek the holder's :class:`MediaType` (path
-        extension first, magic-byte sniff second) → look up the
-        registered :class:`Tabular` subclass → instantiate it bound
-        to this path. Useful as a one-liner for callers that just
-        want "give me the parquet view of this path".
+        Resolution: explicit ``media_type`` first, else the holder's
+        :class:`MediaType` (path extension, magic-byte sniff, or
+        content-type header). The resolved class is looked up in the
+        :class:`Tabular` registry and instantiated bound to this path.
 
         Raises :class:`KeyError` when the path's media type isn't
         registered as a tabular format.
@@ -293,7 +292,7 @@ class Path(Holder, os.PathLike, ABC):
         # mime_type on import.
         import yggdrasil.io.primitive  # noqa: F401
         from yggdrasil.io.tabular.base import Tabular
-        return Tabular.for_holder(self)
+        return Tabular.for_holder(self, media_type=media_type)
 
     # ==================================================================
     # open(mode) — returns a BytesIO bound to self

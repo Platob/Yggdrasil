@@ -469,6 +469,16 @@ class WarehousePreparedStatement(PreparedStatement):
 
         prepared.external_volume_paths = ext_paths or None
         prepared.external_data = ext_data or None
+
+        # Bake placeholder substitution into the text now so the
+        # single-statement submit path (which doesn't go through
+        # WarehouseStatementBatch._coerce) reaches the SDK with valid
+        # SQL.  Idempotent: re-prepare on an already-substituted
+        # statement is a no-op since the placeholders are gone.
+        if ext_data:
+            prepared.text = cls.apply_external_substitution(
+                prepared.text, ext_data,
+            )
         return prepared
 
     # ------------------------------------------------------------------
