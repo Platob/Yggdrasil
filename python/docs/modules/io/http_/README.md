@@ -151,10 +151,3 @@ for r in responses:
 print(rows)
 ```
 
----
-
-## 8) When to use `yggdrasil.requests.YGGSession` instead
-
-Use `yggdrasil.io.http_.HTTPSession` for modern features (prepared requests, cache options, typed response conversions, batch dispatch).
-
-Use `yggdrasil.requests.YGGSession` only when you want a minimal retry-only wrapper and do not need the richer IO/session features.

@@ -135,19 +135,6 @@ print(u.with_query_items({"q": 2, "lang": "en"}).to_string())
 
 `URL` is immutable. Mutate via `with_*` methods that return a new instance.
 
-## Legacy retry-only session
-
-`yggdrasil.requests.YGGSession` exists for back-compat. Use `HTTPSession` for new code.
-
-```python
-from yggdrasil.requests import YGGSession
-
-legacy = YGGSession(num_retry=3)
-print(legacy.get("https://example.com", timeout=10).status_code)
-```
-
-There's also `yggdrasil.requests.MSALSession` for Azure scenarios.
-
 ## Observability fields
 
 Tooling downstream relies on the request/response models preserving:

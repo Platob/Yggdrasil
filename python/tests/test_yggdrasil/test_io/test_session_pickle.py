@@ -18,7 +18,6 @@ import threading
 import pytest
 
 from yggdrasil.io.http_ import HTTPSession
-from yggdrasil.io.http_.cookies import Cookies
 from yggdrasil.io.session import Session
 from yggdrasil.io.url import URL
 
@@ -165,7 +164,7 @@ class TestHTTPSessionPickle:
         )
 
     def test_http_pool_rebuilt_on_fresh_instance(self) -> None:
-        s = HTTPSession(user_agent="ua")  # no base_url -> fresh instance path
+        s = HTTPSession(headers={"X-Tag": "ua"})  # no base_url -> fresh instance path
         clone = pickle.loads(pickle.dumps(s))
         assert clone is not s
         assert clone._http_pool is not None
@@ -178,27 +177,12 @@ class TestHTTPSessionPickle:
         state = s.__getstate__()
         assert "_http_pool" not in state
 
-    def test_browser_mode_attrs_survive(self) -> None:
-        # These were silently dropped by the old explicit-allowlist
-        # __getstate__ — the generic version preserves them.
-        s = HTTPSession(
-            user_agent="MyAgent/1.0",
-            accept="text/plain",
-            accept_language="fr-FR",
-            accept_encoding="identity",
-            ua_seed=42,
-            cookies={"sid": "abc"},
-        )
+    def test_headers_survive_pickle(self) -> None:
+        s = HTTPSession(headers={"X-Tag": "v1", "Authorization": "Bearer x"})
         clone = pickle.loads(pickle.dumps(s))
         # Different identity (no base_url -> not a singleton)
         assert clone is not s
-        assert clone.user_agent == "MyAgent/1.0"
-        assert clone.accept == "text/plain"
-        assert clone.accept_language == "fr-FR"
-        assert clone.accept_encoding == "identity"
-        assert clone.ua_seed == 42
-        assert isinstance(clone._cookies, Cookies)
-        assert clone._cookies.get("sid") == "abc"
+        assert clone.headers == {"X-Tag": "v1", "Authorization": "Bearer x"}
 
     def test_singleton_preserves_live_pool(self) -> None:
         s1 = HTTPSession(base_url="https://example.com")

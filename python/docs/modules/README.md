@@ -13,7 +13,6 @@ Hand-written, copy-paste-friendly pages for the most-used surfaces. The auto-gen
 
 - [io](io/README.md) — `BytesIO`, `URL`, `SendConfig`/`SendManyConfig`.
 - [io.http_](io/http_/README.md) — `HTTPSession`, prepared requests, batch dispatch.
-- [requests](requests/README.md) — legacy `YGGSession` and MSAL variant.
 
 ## Databricks
 

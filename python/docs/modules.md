@@ -27,7 +27,6 @@ Engines register their converters **on import** — pull them in once at startup
 |---|---|---|
 | `yggdrasil.io` | `BytesIO`, `URL`, `SendConfig`/`SendManyConfig`, codecs, media types | [io](modules/io/README.md) |
 | `yggdrasil.io.http_` | `HTTPSession` (preferred client) | [http_](modules/io/http_/README.md) |
-| `yggdrasil.requests` | Legacy `YGGSession` and MSAL variant | [requests](modules/requests/README.md) |
 
 ## Databricks
 

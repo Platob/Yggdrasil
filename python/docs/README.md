@@ -151,7 +151,7 @@ def normalize_options(options=None, *, target_field=None) -> CastOptions:
 
 - **Casting:** `yggdrasil.data.cast`, `yggdrasil.arrow`, `yggdrasil.dataclasses`
 - **Engines:** `yggdrasil.polars`, `yggdrasil.pandas`, `yggdrasil.spark`
-- **IO / HTTP:** `yggdrasil.io`, `yggdrasil.io.http_`, `yggdrasil.requests`
+- **IO / HTTP:** `yggdrasil.io`, `yggdrasil.io.http_`
 - **Databricks:** `yggdrasil.databricks.*`
 - **Utilities:** `yggdrasil.pyutils`, `yggdrasil.concurrent`, `yggdrasil.environ`, `yggdrasil.pickle`, `yggdrasil.mongo`, `yggdrasil.mongoengine`, `yggdrasil.fastapi`
 

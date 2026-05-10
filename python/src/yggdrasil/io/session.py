@@ -294,7 +294,7 @@ class Session(ABC):
         base_url: Optional[URL | str] = None,
         verify: bool = True,
         pool_maxsize: int = 10,
-        send_headers: Optional[dict[str, str]] = None,
+        headers: Optional[dict[str, str]] = None,
         waiting: WaitingConfig = DEFAULT_WAITING_CONFIG,
         *,
         key: str = "",
@@ -308,7 +308,7 @@ class Session(ABC):
         self.key = key
         self.verify = verify
         self.pool_maxsize = pool_maxsize if pool_maxsize and pool_maxsize > 0 else 8
-        self.send_headers = send_headers
+        self.headers = headers
         self.waiting = waiting
         self._lock = threading.RLock()
         self._job_pool: Optional[JobPoolExecutor] = None
@@ -357,18 +357,18 @@ class Session(ABC):
 
     @property
     def x_api_key(self) -> Optional[str]:
-        if self.send_headers:
-            return self.send_headers.get("X-API-Key")
+        if self.headers:
+            return self.headers.get("X-API-Key")
         return None
 
     @x_api_key.setter
     def x_api_key(self, value: Optional[str]) -> None:
-        if self.send_headers is None:
-            self.send_headers = {}
+        if self.headers is None:
+            self.headers = {}
         if value is None:
-            self.send_headers.pop("X-API-Key", None)
+            self.headers.pop("X-API-Key", None)
         else:
-            self.send_headers["X-API-Key"] = value
+            self.headers["X-API-Key"] = value
 
     def _request_log_id(self, request: PreparedRequest) -> str:
         try:
