@@ -350,12 +350,19 @@ class PreparedRequest:
         self._session: "Session | None" = None
         # Memoization for the deterministic projection — hashes,
         # url-struct, arrow_values dict. Invalidated when
-        # :meth:`_state_token` shifts (method/url/headers/buffer
-        # identity or size changed, or :meth:`_invalidate_cache`
-        # bumped the version).
+        # :meth:`_state_token` shifts (method, URL identity, header
+        # / buffer ``id`` + ``len`` + byte length changed) or
+        # :meth:`_invalidate_cache` was called by an in-place setter.
         self._cache: dict[str, Any] = {}
         self._cache_token: tuple = ()
-        self._state_version: int = 0
+        # Cheap byte-length stats keyed by ``id``+``len`` of the source
+        # so they double as fingerprint inputs in :meth:`_state_token`
+        # — catching in-place same-count header overwrites that change
+        # only individual values, without paying for an xxh3 digest.
+        # Layout: ``(id_seen, length)`` for the URL slot and
+        # ``(id_seen, count_seen, length)`` for the header slot.
+        self._url_length_cache: tuple[int, int] | None = None
+        self._header_length_cache: tuple[int, int, int] | None = None
 
     @property
     def sender(self) -> UserInfo | None:
@@ -396,7 +403,8 @@ class PreparedRequest:
         self._session = None
         self._cache = {}
         self._cache_token = ()
-        self._state_version = 0
+        self._url_length_cache = None
+        self._header_length_cache = None
 
     # ------------------------------------------------------------------
     # Memoization — cheap fingerprint check, refresh on change
@@ -406,25 +414,28 @@ class PreparedRequest:
         """Cheap fingerprint of the inputs that drive every cached
         derivation (hashes, url struct, arrow_values).
 
-        ``id(headers)`` / ``id(buffer)`` plus ``len`` / ``size`` covers
+        ``id(headers)`` / ``id(buffer)`` plus ``len`` / ``size`` cover
         the common mutations: dict swap, dict resize, buffer swap,
-        body resize. In-place same-size header overwrites slip
-        through, so the public ``authorization`` / ``x_api_key``
-        setters and :meth:`update_headers` bump :attr:`_state_version`
-        via :meth:`_invalidate_cache` — that bump shows up here so
-        downstream caches (e.g. the response's, which mixes this
-        token in) refresh too.
+        body resize. The byte-length stats (:attr:`url_length`,
+        :attr:`header_length`, :attr:`body_length`) catch in-place
+        value rewrites where the dict object and entry count don't
+        change — only their contents. The public ``authorization``
+        / ``x_api_key`` setters and :meth:`update_headers` still
+        call :meth:`_invalidate_cache` to drop the byte-length stat
+        cache, so the very narrow "same-length value rotation"
+        case still recomputes.
         """
         headers = self.headers
         buffer = self.buffer
         return (
-            self._state_version,
             self.method,
             self.url,
+            self.url_length,
             id(headers),
             len(headers) if headers else 0,
+            self.header_length,
             id(buffer),
-            buffer.size if buffer is not None else -1,
+            self.body_length,
         )
 
     def _cached(self, name: str, compute: Callable[[], Any]) -> Any:
@@ -441,15 +452,20 @@ class PreparedRequest:
     def _invalidate_cache(self) -> None:
         """Drop every memoized derivation — call after any in-place
         mutation that the :meth:`_state_token` fingerprint can't see
-        (e.g. overwriting an existing header with a same-key value).
+        (overwriting a header with a same-length value on the same
+        dict object: ``id(headers)``, ``len(headers)``, and
+        :attr:`header_length` all stay constant).
 
-        Bumps :attr:`_state_version` so downstream consumers that
-        embed this request's token in their own (e.g.
-        :class:`Response`) detect the change on their next access.
+        Clears the byte-length stat caches alongside the memo so
+        :meth:`_state_token` re-derives them on the next call.
+        Downstream consumers that embed this request's token in their
+        own (e.g. :class:`Response`) pick up the shift through their
+        own re-derived stats.
         """
         self._cache.clear()
         self._cache_token = ()
-        self._state_version += 1
+        self._url_length_cache = None
+        self._header_length_cache = None
 
     # ------------------------------------------------------------------
     # Session attachment — used by Spark broadcast on the worker side
@@ -846,6 +862,55 @@ class PreparedRequest:
     @property
     def body_size(self) -> int:
         return self.buffer.size if self.buffer is not None else 0
+
+    @property
+    def body_length(self) -> int:
+        """Alias for :attr:`body_size` — symmetry with the other cheap
+        byte-length stats (:attr:`url_length`, :attr:`header_length`)
+        so callers can reach for one consistent name when fingerprinting.
+        """
+        return self.body_size
+
+    @property
+    def url_length(self) -> int:
+        """Byte length of the rendered URL — cached against the URL
+        object's identity so a re-read is one ``is`` check.
+
+        Folded into :meth:`_state_token` so a URL swap (which already
+        changes ``self.url`` itself) produces a synchronized stat
+        update without a second ``to_string`` walk per call.
+        """
+        url = self.url
+        cached = self._url_length_cache
+        if cached is not None and cached[0] == id(url):
+            return cached[1]
+        length = len(url.to_string()) if url is not None else 0
+        self._url_length_cache = (id(url), length)
+        return length
+
+    @property
+    def header_length(self) -> int:
+        """Total byte length of header keys + values.
+
+        Cheap fingerprint that catches in-place value rewrites
+        ``id(headers)`` + ``len(headers)`` would miss — e.g. an API
+        key rotated to a value of a different length. Cached against
+        ``(id(headers), len(headers))`` so an unchanged dict is one
+        identity comparison plus one ``len``.
+        """
+        headers = self.headers
+        count = len(headers) if headers else 0
+        cached = self._header_length_cache
+        if cached is not None and cached[0] == id(headers) and cached[1] == count:
+            return cached[2]
+        if not headers:
+            length = 0
+        else:
+            length = 0
+            for k, v in headers.items():
+                length += len(str(k)) + len(str(v))
+        self._header_length_cache = (id(headers), count, length)
+        return length
 
     @property
     def body_hash(self) -> int:

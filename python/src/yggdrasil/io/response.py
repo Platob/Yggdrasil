@@ -515,13 +515,13 @@ class Response(Tabular[CastOptions]):
         "_session",
         "_cache",
         "_cache_token",
-        "_state_version",
+        "_header_length_cache",
     )
 
     # Instance attributes that don't survive pickling — excluded by
     # ``__getstate__`` and reset by ``__setstate__``. Subclasses extend.
     _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset(
-        {"_session", "_cache", "_cache_token", "_state_version"}
+        {"_session", "_cache", "_cache_token", "_header_length_cache"}
     )
 
     def __init__(
@@ -550,12 +550,17 @@ class Response(Tabular[CastOptions]):
         self._session: "Session | None" = None
         # Memoization for the deterministic projection — hashes,
         # arrow_values dict. Invalidated when :meth:`_state_token`
-        # shifts (status / headers / buffer identity or size changed,
-        # or the embedded request's own state shifted, or
-        # :meth:`_invalidate_cache` bumped the version).
+        # shifts (status / headers / buffer identity or size /
+        # byte length changed, or the embedded request's own state
+        # shifted). :meth:`_invalidate_cache` drops the cache for
+        # mutations that the fingerprint can't see (a same-length
+        # in-place value rotation on the same dict object).
         self._cache: dict[str, Any] = {}
         self._cache_token: tuple = ()
-        self._state_version: int = 0
+        # Byte-length stat cached against ``(id(headers), len(headers))``
+        # so :meth:`_state_token` catches in-place value rewrites the
+        # ``id`` + ``len`` pair would otherwise miss.
+        self._header_length_cache: tuple[int, int, int] | None = None
 
     # ------------------------------------------------------------------
     # Holder access — :attr:`buffer` IS the durable :class:`Holder`.
@@ -661,7 +666,7 @@ class Response(Tabular[CastOptions]):
         self._session = None
         self._cache = {}
         self._cache_token = ()
-        self._state_version = 0
+        self._header_length_cache = None
 
     # ------------------------------------------------------------------
     # Memoization — cheap fingerprint check, refresh on change
@@ -673,18 +678,21 @@ class Response(Tabular[CastOptions]):
 
         Includes the embedded request's :meth:`_state_token` so a
         mutation upstream (e.g. an ``authorization`` swap) invalidates
-        the response-level cache too.
+        the response-level cache too. The byte-length stats
+        (:attr:`header_length`, :attr:`body_length`) sit alongside
+        ``id`` + ``len`` so a same-count in-place header rewrite still
+        shifts the token whenever the new value differs in length.
         """
         headers = self.headers
         buffer = self.buffer
         return (
-            self._state_version,
             self.request._state_token(),
             self.status_code,
             id(headers),
             len(headers) if headers else 0,
+            self.header_length,
             id(buffer),
-            buffer.size if buffer is not None else -1,
+            self.body_length,
         )
 
     def _cached(self, name: str, compute: Callable[[], Any]) -> Any:
@@ -700,14 +708,17 @@ class Response(Tabular[CastOptions]):
 
     def _invalidate_cache(self) -> None:
         """Drop every memoized derivation — call after any in-place
-        mutation that the :meth:`_state_token` fingerprint can't see.
+        mutation the :meth:`_state_token` fingerprint can't see.
 
-        Bumps :attr:`_state_version` so any container holding this
-        response's token sees the change.
+        Clears the byte-length stat cache too: an in-place value
+        rewrite on the same dict object keeps ``id(headers)`` /
+        ``len(headers)`` constant, so without this drop the stat
+        would re-serve a stale length and the token would falsely
+        match.
         """
         self._cache.clear()
         self._cache_token = ()
-        self._state_version += 1
+        self._header_length_cache = None
 
     # ------------------------------------------------------------------
     # Session attachment
@@ -985,6 +996,37 @@ class Response(Tabular[CastOptions]):
     @property
     def body_size(self) -> int:
         return self.buffer.size if self.buffer is not None else 0
+
+    @property
+    def body_length(self) -> int:
+        """Alias for :attr:`body_size` — symmetry with the request-side
+        stat so the two fingerprints share a name.
+        """
+        return self.body_size
+
+    @property
+    def header_length(self) -> int:
+        """Total byte length of header keys + values.
+
+        Cheap fingerprint that catches in-place value rewrites that
+        ``id(headers)`` + ``len(headers)`` would miss. Cached against
+        ``(id(headers), len(headers))`` and dropped by
+        :meth:`_invalidate_cache`, so an unchanged dict is one
+        identity comparison plus one ``len``.
+        """
+        headers = self.headers
+        count = len(headers) if headers else 0
+        cached = self._header_length_cache
+        if cached is not None and cached[0] == id(headers) and cached[1] == count:
+            return cached[2]
+        if not headers:
+            length = 0
+        else:
+            length = 0
+            for k, v in headers.items():
+                length += len(str(k)) + len(str(v))
+        self._header_length_cache = (id(headers), count, length)
+        return length
 
     @property
     def body_hash(self) -> int:
