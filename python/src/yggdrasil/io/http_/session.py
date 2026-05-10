@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 from itertools import takewhile
-from typing import Any, Mapping, Optional
+from typing import Optional
 
 import urllib3
 
@@ -11,8 +11,6 @@ from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.dataclasses.waiting import DEFAULT_WAITING_CONFIG
 from yggdrasil.data.enums import MediaTypes
-from yggdrasil.io import BytesIO
-from yggdrasil.io.holder import Holder
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.primitive import ArrowIPCIO
 from yggdrasil.io.url import URL
@@ -93,10 +91,14 @@ class _TieredRetry(urllib3.Retry):
 class HTTPSession(Session):
     """HTTP/HTTPS session backed by a ``urllib3`` connection pool.
 
-    Per-request headers are driven entirely by :attr:`headers` (the
-    session-wide default mapping) plus the optional ``headers=`` kwarg on
-    :meth:`get` / :meth:`head` / :meth:`post`. No User-Agent generator,
-    cookie jar, or browser-emulation layering is built in.
+    Inherits the verb methods (``get`` / ``post`` / ``put`` / ``patch`` /
+    ``delete`` / ``head`` / ``options`` / ``request``) from
+    :class:`~yggdrasil.io.session.Session`; URL resolution and query-param
+    handling live on :class:`~yggdrasil.io.url.URL` and
+    :meth:`Session.prepare_request`. Per-request headers are
+    :attr:`headers` (session default) merged with the per-call ``headers=``
+    kwarg. No User-Agent generator, cookie jar, or browser-emulation
+    layering is built in.
     """
 
     def __init__(
@@ -180,153 +182,22 @@ class HTTPSession(Session):
         return self._http_pool
 
     # ------------------------------------------------------------------
-    # Header construction
+    # Pre-send hook
     # ------------------------------------------------------------------
 
-    def _build_request_headers(
-        self,
-        request: PreparedRequest,
-    ) -> Optional[dict[str, str]]:
-        """Return the headers dict to merge into *request* before sending.
+    def _prepare_request(self, request: PreparedRequest) -> PreparedRequest:
+        """Stamp ``sent_at`` and merge :attr:`headers` into *request*.
 
-        Subclasses may override this to inject per-request headers without
-        replacing the entire :attr:`headers` mapping.  The default
-        implementation returns :attr:`headers` unchanged.
+        Session headers win on conflicts so transport-level concerns
+        (Authorization, X-API-Key) can't be overridden by stale per-call
+        headers.
         """
-        return self.headers
-
-    def _merge_headers(
-        self,
-        extra: Optional[Mapping[str, str]] = None,
-    ) -> dict[str, str]:
-        """Merge :attr:`headers` with the per-request *extra* mapping."""
-        headers: dict[str, str] = {}
+        request.sent_at = dt.datetime.now(dt.timezone.utc)
         if self.headers:
-            headers.update(self.headers)
-        if extra:
-            headers.update(extra)
-        return headers
-
-    # ------------------------------------------------------------------
-    # URL / params helpers
-    # ------------------------------------------------------------------
-
-    def _resolve_url(self, url: URL | str) -> URL:
-        """Resolve *url* to an absolute :class:`~yggdrasil.io.url.URL`.
-
-        Resolution rules: absolute URLs pass through; relative paths
-        (``"/x"``, ``"./x"``, ``"../x"``, ``"x"``, ``"x/y"``) join against
-        :attr:`base_url`; ``//host`` protocol-relative gets ``https:``;
-        a first-segment-with-dot like ``"example.com/x"`` gets ``https://``;
-        Windows drive-letter paths raise.
-        """
-        if isinstance(url, URL):
-            if url.is_absolute:
-                return url
-            if self.base_url:
-                return self.base_url.join(url.to_string())
-            return url
-
-        s = str(url).strip()
-        if not s:
-            raise ValueError("URL must not be empty.")
-
-        if s.startswith(("https://", "http://")):
-            return URL.from_(s)
-
-        if s.startswith("//"):
-            return URL.from_("https:" + s)
-
-        if s.startswith(("/", "./", "../")):
-            if self.base_url:
-                return self.base_url.join(s)
-            raise ValueError(
-                f"Cannot resolve path-relative URL {s!r}: no base_url is set on "
-                "this session. Set base_url or pass a full URL."
-            )
-
-        if len(s) >= 3 and s[0].isalpha() and s[1] == ":" and s[2] in ("/", "\\"):
-            raise ValueError(
-                f"URL looks like a local Windows path, not an HTTP URL: {s!r}. "
-                "Pass a full URL with scheme (e.g. 'https://host/path')."
-            )
-
-        first_seg = s.split("/", 1)[0] if "/" in s else s
-        if "." in first_seg and not first_seg.startswith("."):
-            return URL.from_("https://" + s)
-
-        if self.base_url:
-            return self.base_url.join(s)
-
-        raise ValueError(
-            f"Cannot resolve relative URL {s!r}: no base_url is set on this "
-            "session. Set base_url (e.g. HTTPSession(base_url='https://api.example.com')) "
-            "or pass a full URL."
-        )
-
-    @staticmethod
-    def _apply_params(url: URL, params: Mapping[str, Any]) -> URL:
-        return url.add_params(params)
-
-    # ------------------------------------------------------------------
-    # HTTP verbs
-    # ------------------------------------------------------------------
-
-    def get(
-        self,
-        url: URL | str,
-        *,
-        params: Optional[Mapping[str, Any]] = None,
-        headers: Optional[Mapping[str, str]] = None,
-        config: SendConfig | Mapping[str, Any] | None = None,
-        **send_kwargs: Any,
-    ) -> HTTPResponse:
-        """Issue a ``GET`` to *url*.
-
-        Headers are :attr:`headers` merged with the per-call *headers*
-        mapping (the latter wins on conflicts).
-        """
-        resolved = self._resolve_url(url)
-        if params:
-            resolved = self._apply_params(resolved, params)
-        request = PreparedRequest.prepare("GET", resolved, headers=self._merge_headers(headers))
-        return self.send(request, config=config, **send_kwargs)  # type: ignore[return-value]
-
-    def head(
-        self,
-        url: URL | str,
-        *,
-        params: Optional[Mapping[str, Any]] = None,
-        headers: Optional[Mapping[str, str]] = None,
-        config: SendConfig | Mapping[str, Any] | None = None,
-        **send_kwargs: Any,
-    ) -> HTTPResponse:
-        """Issue a ``HEAD`` to *url*. See :meth:`get` for header merging."""
-        resolved = self._resolve_url(url)
-        if params:
-            resolved = self._apply_params(resolved, params)
-        request = PreparedRequest.prepare("HEAD", resolved, headers=self._merge_headers(headers))
-        return self.send(request, config=config, **send_kwargs)  # type: ignore[return-value]
-
-    def post(
-        self,
-        url: URL | str,
-        *,
-        params: Optional[Mapping[str, Any]] = None,
-        body: Optional[Any] = None,
-        json: Optional[Any] = None,
-        headers: Optional[Mapping[str, str]] = None,
-        config: SendConfig | Mapping[str, Any] | None = None,
-        **send_kwargs: Any,
-    ) -> HTTPResponse:
-        """Issue a ``POST`` to *url*. See :meth:`get` for header merging."""
-        resolved = self._resolve_url(url)
-        if params:
-            resolved = self._apply_params(resolved, params)
-        request = PreparedRequest.prepare(
-            "POST", resolved, headers=self._merge_headers(headers), body=body, json=json
-        )
-        return self.send(request, config=config, **send_kwargs)  # type: ignore[return-value]
+            if request.headers is None:
+                request.headers = {}
+            request.headers.update(self.headers)
+        return request
 
     # ------------------------------------------------------------------
     # Transport
@@ -338,11 +209,6 @@ class HTTPSession(Session):
         config: SendConfig,
     ) -> HTTPResponse:
         wait_cfg = self.waiting if config.wait is None else config.wait
-
-        request = request.prepare_to_send(
-            sent_at=None,
-            headers=self._build_request_headers(request),
-        )
 
         raw_resp = self.http_pool.request(
             method=request.method,

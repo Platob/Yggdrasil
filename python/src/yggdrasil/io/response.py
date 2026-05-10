@@ -301,14 +301,6 @@ _HOP_BY_HOP: frozenset[str] = frozenset({
 # Arrow schemas
 # ---------------------------------------------------------------------------
 
-_RESPONSE_SCHEMA_JSON_TAGS: dict[str, str] = {
-    "domain": "http",
-    "entity": "response",
-    "layer": "bronze",
-    "namespace": "yggdrasil.io.response",
-}
-
-
 RESPONSE_SCHEMA = schema(
     fields=[],
     metadata={
@@ -323,7 +315,12 @@ RESPONSE_SCHEMA = schema(
         "primary_key": ["hash", "body_size"],
         "partition_by": ["partition_key"],
     },
-    tags=_RESPONSE_SCHEMA_JSON_TAGS,
+    tags={
+        "domain": "http",
+        "entity": "response",
+        "layer": "bronze",
+        "namespace": "yggdrasil.io.response",
+    },
 )
 
 # Unnest the request schema directly into the response schema with a
@@ -332,56 +329,18 @@ RESPONSE_SCHEMA = schema(
 # Arrow) can predicate-push and column-prune against without having
 # to crack the struct open. ``_pkl`` is intentionally skipped — the
 # response carries its own pickle slot and a per-request blob would
-# duplicate the same bytes.
-_REQUEST_FIELD_NAMES_FOR_UNNEST: tuple[str, ...] = tuple(
-    f.name for f in REQUEST_SCHEMA.children_fields if f.name != "_pkl"
-)
-
-# Tags that must NOT cross over from REQUEST_SCHEMA. The
-# response-level schema has its own ``partition_key`` (which already
-# carries ``partition_by``) and its own composite ``primary_key`` —
-# leaking those flags onto the unnested ``request_*`` fields would
-# add a redundant partition column to the on-disk Hive layout and
-# duplicate the primary-key declaration.
-_REQUEST_TAG_DROP: frozenset[bytes] = frozenset({
-    b"partition_by",
-    b"primary_key",
-    # ``Field.tags`` lives in metadata under a ``t:`` prefix — drop
-    # both spellings so an autotag() call on the unnested field
-    # doesn't re-stamp the schema-level partition / primary-key
-    # markers we want only on the response side.
-    b"t:partition_by",
-    b"t:primary_key",
-})
-
-
-def _decode_meta_kv(value: Any) -> Any:
-    if isinstance(value, (bytes, bytearray)):
-        return bytes(value).decode("utf-8")
-    return value
-
-
-for _req_field_name in _REQUEST_FIELD_NAMES_FOR_UNNEST:
-    _src_field = REQUEST_SCHEMA[_req_field_name]
-    _src_meta = dict(_src_field.metadata or {})
-    _existing_comment = _src_meta.get(b"comment") or _src_meta.get("comment")
-    _comment_str = _decode_meta_kv(_existing_comment)
-    _src_meta_clean: dict[str, Any] = {}
-    for _k, _v in _src_meta.items():
-        # Skip schema-level partitioning / primary-key flags inherited
-        # from the request — they belong to the response's own columns.
-        _k_bytes = _k.encode("utf-8") if isinstance(_k, str) else bytes(_k)
-        if _k_bytes in _REQUEST_TAG_DROP:
-            continue
-        _src_meta_clean[_decode_meta_kv(_k)] = _decode_meta_kv(_v)
-    if _comment_str:
-        _src_meta_clean["comment"] = f"[request] {_comment_str}"
-    RESPONSE_SCHEMA[f"request_{_req_field_name}"] = schema_field(
-        f"request_{_req_field_name}",
-        _src_field.arrow_type,
-        nullable=_src_field.nullable,
-        metadata=_src_meta_clean,
-    ).autotag()
+# duplicate the same bytes. Schema-level partition_by / primary_key
+# flags inherited from REQUEST_SCHEMA.autotag() get cleared on the
+# unnested copies — those flags belong to the response's own columns.
+for _req_field in REQUEST_SCHEMA.children_fields:
+    if _req_field.name == "_pkl":
+        continue
+    _copied = _req_field.copy(name=f"request_{_req_field.name}")
+    _copied.with_partition_by(False, inplace=True)
+    _copied.with_primary_key(False, inplace=True)
+    if _req_field.comment:
+        _copied.metadata[b"comment"] = f"[request] {_req_field.comment}".encode("utf-8")
+    RESPONSE_SCHEMA[_copied.name] = _copied.autotag()
 
 RESPONSE_SCHEMA["receiver"] = schema_field(
     "receiver",
