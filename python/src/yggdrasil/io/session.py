@@ -1209,12 +1209,14 @@ class Session(ABC):
         Returns the raw `Response` stream — caller decides what to do with
         ok/error responses (yield them, persist them, raise).
         """
-        # Local cache writes happen here; remote writes are mutualised in
-        # `_persist_remote` so we strip per-request remote configs from the
-        # copies handed to the workers.
+        # Both local and remote writes are mutualised — workers only run
+        # the network call. Local writes are bulk-upserted by
+        # `_backfill_local_cache` and remote writes by `_persist_remote`,
+        # so per-request cache configs are stripped from the copies handed
+        # to the workers to avoid the per-response fan-out.
         miss_send_config = config.to_send_config(
             with_remote_cache=False,
-            with_local_cache=True,
+            with_local_cache=False,
             with_spark=False,
             raise_error=False,
         )
@@ -1224,7 +1226,7 @@ class Session(ABC):
             (
                 Job.make(
                     self._send,
-                    r.copy(remote_cache_config=None),
+                    r.copy(remote_cache_config=None, local_cache_config=None),
                     miss_send_config,
                 )
                 for r in misses
@@ -1346,47 +1348,6 @@ class Session(ABC):
                 "Local cache optimize skipped for %s: %s",
                 getattr(cache, "path", cache), exc,
             )
-
-    def _optimize_local_after_misses(
-        self,
-        responses: "list[Response]",
-        url_to_local_cfg: Mapping[str, CacheConfig],
-        session_local_cfg: CacheConfig,
-    ) -> None:
-        """Compact the local cache for partitions stage 3 just wrote.
-
-        Stage 3's per-worker ``_send`` writes responses one at a
-        time, so a batch of N misses fanning out to M partitions
-        leaves up to N small files spread across those M leaves.
-        Group the responses by their effective local cache, then
-        run a single :meth:`_optimize_cache_partitions` per cache
-        — that bounds the post-batch small-file count without
-        pretending the writes themselves were bulk.
-        """
-        if not responses:
-            return
-
-        groups: dict[str, tuple["FolderIO", CacheConfig, list[Response]]] = {}
-        for response in responses:
-            if not response.ok:
-                continue
-            url_key = str(response.request.url) if response.request else None
-            eff = url_to_local_cfg.get(url_key) if url_key else None
-            if eff is None:
-                eff = session_local_cfg
-            if not eff.local_cache_enabled:
-                continue
-            if not getattr(eff, "optimize_on_write", True):
-                continue
-            pkey = str(eff.local_cache_folder(session=self))
-            slot = groups.get(pkey)
-            if slot is None:
-                groups[pkey] = (eff.local_cache(session=self), eff, [response])
-            else:
-                slot[2].append(response)
-
-        for cache, eff, group_responses in groups.values():
-            self._optimize_cache_partitions(cache, eff, group_responses)
 
     def _persist_remote(
         self,
@@ -1820,15 +1781,17 @@ class Session(ABC):
                     self._persist_remote(
                         new_hits, url_to_remote_cfg, session_remote_cfg,
                     )
-                # Compact only the partitions stage 3 actually
-                # wrote. Stage 3 fans out per-worker writes that each
-                # land one new small file per touched partition;
-                # without this call a high-miss batch would steadily
-                # fragment the local cache. The pruned optimize is
-                # bounded by ``len(distinct partition_keys)`` and
-                # never visits cold partitions.
+                # Stage 3 workers no longer write the local cache per
+                # response; bulk-upsert the new hits in one write per
+                # effective cache root. ``_backfill_local_cache``
+                # groups responses by their per-request local config,
+                # writes the table in UPSERT mode (or APPEND when the
+                # config asks for it), and triggers a pruned optimize
+                # bounded by the touched partitions — same end state
+                # as the prior per-worker write + post-batch optimize,
+                # but with one bulk write per cache root.
                 if isinstance(new_hits, list) and new_hits:
-                    self._optimize_local_after_misses(
+                    self._backfill_local_cache(
                         new_hits, url_to_local_cfg, session_local_cfg,
                     )
 
