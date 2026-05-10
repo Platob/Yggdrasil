@@ -267,8 +267,23 @@ class YGGFolderIO(FolderIO):
             return
 
         prune = options.prune_values or {}
+        predicate = getattr(options, "predicate", None)
         for part_path, part_kv in self._iter_partitions(parts, prune):
-            sub = FolderIO(path=part_path)
+            # Stamp the leaf folder with the partition KV as
+            # ``static_values`` so the predicate-prune helper can
+            # short-circuit subtrees whose KV makes the predicate
+            # provably false. ``options.prune_values`` already does
+            # the explicit-IN form; ``matches_static`` covers
+            # arbitrary :class:`Predicate` shapes the session passes
+            # through ``options.predicate`` (e.g. the cache flow's
+            # ``partition_key.is_in([...]) & received_at >= t``).
+            sub = FolderIO(
+                path=part_path,
+                tabular_parent=self,
+                static_values=part_kv,
+            )
+            if not sub.matches_static(predicate):
+                continue
             for batch in sub._read_arrow_batches(options):
                 yield self._stamp_partitions(batch, part_kv, parts)
 
@@ -486,7 +501,15 @@ class YGGFolderIO(FolderIO):
         for key_tuple, sub_batches in groups.items():
             kv = dict(zip(partition_names, key_tuple))
             target = self._ensure_partition_dir(parts, kv)
-            sub = FolderIO(path=target)
+            # Seed the per-partition folder with the kv as
+            # ``static_values`` — every leaf minted underneath
+            # inherits ``{partition_col: value}`` via the parent
+            # chain, so future reads / matches against this leaf
+            # don't have to re-derive the kv from the directory
+            # name.
+            sub = FolderIO(
+                path=target, tabular_parent=self, static_values=kv,
+            )
             sub._write_arrow_batches(
                 sub_batches,
                 # The leaf write picks the right Tabular leaf via
@@ -596,6 +619,15 @@ class YGGFolderIO(FolderIO):
             # columns can't be evaluated here (the non-partition columns
             # aren't in this row's schema), so they fall through to the
             # row-level filter inside the partition.
+            #
+            # Inlined rather than routed through
+            # :meth:`Tabular.matches_static` because delete needs a
+            # tristate (definite-True → drop conj from residual,
+            # definite-False → prune subtree, undecidable → prune
+            # subtree to avoid over-deleting on eval bugs).
+            # ``matches_static`` is read-shaped (undecidable → True,
+            # i.e. "include the leaf"), and would risk wholesale
+            # deletes if reused here.
             kv_table = pa.Table.from_pydict({k: [v] for k, v in kv.items()})
 
             residual: "list[Any]" = []
@@ -623,7 +655,13 @@ class YGGFolderIO(FolderIO):
                 continue
 
             residual_pred = _and_combine(residual)
-            sub = FolderIO(path=leaf_path)
+            # Seed the per-partition folder with the kv so the
+            # row-level delete (and any future static-values
+            # consumer) sees the partition constants without
+            # re-deriving them from the directory name.
+            sub = FolderIO(
+                path=leaf_path, tabular_parent=self, static_values=kv,
+            )
             deleted += sub._delete(residual_pred, FolderOptions())
             self.invalidate_listing(leaf_path)
         return deleted

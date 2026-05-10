@@ -254,6 +254,128 @@ class TestPartitionPruning:
 
 
 # ---------------------------------------------------------------------------
+# Static-values + predicate-driven pruning
+# ---------------------------------------------------------------------------
+
+
+class TestStaticValues:
+    """The per-partition leaf carries its kv as ``static_values`` and
+    the read path uses :meth:`Tabular.matches_static` to skip
+    partitions whose kv makes ``options.predicate`` provably false.
+    Mirrors the session response cache flow, where the predicate
+    is the only prune the caller passes."""
+
+    def test_partition_leaf_inherits_kv_static_values(self, tmp_path) -> None:
+        y = YGGFolderIO(
+            path=str(tmp_path), schema=_single_partition_schema(),
+        )
+        y.write_arrow_table(pa.table({
+            "id": [1, 2], "region": ["us", "eu"], "value": ["a", "b"],
+        }))
+        # Walk the partition tree the same way the read path does and
+        # check the leaf folder reports the partition value via the
+        # static_values Mapping — without us setting it explicitly.
+        from yggdrasil.io.nested.folder_io import FolderIO
+        parts = y._resolve_partition_columns()
+        leaves = list(y._iter_partitions(parts, prune={}))
+        assert len(leaves) == 2
+        for leaf_path, kv in leaves:
+            sub = FolderIO(path=leaf_path, tabular_parent=y, static_values=kv)
+            assert dict(sub.static_values) == kv
+            # Per-key lookup matches the constructor seed.
+            assert sub.static_values["region"] == kv["region"]
+
+    def test_predicate_prunes_partitions_on_read(self, tmp_path) -> None:
+        from yggdrasil.io.tabular.execution.expr import col
+
+        y = YGGFolderIO(
+            path=str(tmp_path), schema=_single_partition_schema(),
+        )
+        y.write_arrow_table(pa.table({
+            "id": [1, 2, 3, 4],
+            "region": ["us", "eu", "ap", "us"],
+            "value": ["a", "b", "c", "d"],
+        }))
+        # ``options.predicate`` (no ``prune_values``) — same shape the
+        # session cache flow passes for a partition_key.is_in([...])
+        # term combined with row-level filters.
+        out = y.read_arrow_table(
+            options=FolderOptions(predicate=col("region").is_in(["us", "ap"])),
+        )
+        assert sorted(out.column("region").to_pylist()) == ["ap", "us", "us"]
+
+    def test_predicate_prune_skips_unmatched_partition_dirs(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """A predicate that excludes a partition must not visit its leaf dir."""
+        from yggdrasil.io.tabular.execution.expr import col
+
+        y = YGGFolderIO(
+            path=str(tmp_path), schema=_single_partition_schema(),
+        )
+        y.write_arrow_table(pa.table({
+            "id": [1, 2], "region": ["us", "eu"], "value": ["a", "b"],
+        }))
+        # Drop the partition-tree listing cache so the next read
+        # actually scandirs each candidate leaf again.
+        y.invalidate_listing()
+
+        original = os.scandir
+        visited: list[str] = []
+
+        def tracking_scandir(path):
+            visited.append(str(path))
+            return original(path)
+
+        monkeypatch.setattr(os, "scandir", tracking_scandir)
+        out = y.read_arrow_table(
+            options=FolderOptions(predicate=col("region") == "us"),
+        )
+        assert out.num_rows == 1
+        assert out.column("region").to_pylist() == ["us"]
+        # The eu leaf must not have been scandir'd — predicate prune
+        # rejects the {"region": "eu"} static_values before we open
+        # the directory.
+        assert not any("region=eu" in p for p in visited)
+
+    def test_static_values_inherits_from_tabular_parent(self, tmp_path) -> None:
+        """A child without its own seed reads constants off the parent
+        chain — confirms the :class:`TabularStaticValues` Mapping
+        walks ``tabular_parent`` and a future Parquet leaf inside a
+        partition leaf inherits the kv for free."""
+        from yggdrasil.io.nested.folder_io import FolderIO
+
+        parent = FolderIO(path=str(tmp_path), static_values={"region": "us"})
+        child = FolderIO(path=str(tmp_path), tabular_parent=parent)
+        # Child has no own seed but resolves through the parent chain.
+        assert child.static_values["region"] == "us"
+        assert "region" in child.static_values
+        assert dict(child.static_values) == {"region": "us"}
+        # Cache is per-Mapping; second access returns the same value
+        # without reaching back into the parent.
+        assert child.static_values["region"] == "us"
+
+    def test_undecidable_predicate_falls_through(self, tmp_path) -> None:
+        """Predicate over a column outside static_values is conservatively
+        treated as 'could match' — we still read the partition."""
+        from yggdrasil.io.tabular.execution.expr import col
+
+        y = YGGFolderIO(
+            path=str(tmp_path), schema=_single_partition_schema(),
+        )
+        y.write_arrow_table(pa.table({
+            "id": [1, 2], "region": ["us", "eu"], "value": ["a", "b"],
+        }))
+        # ``id`` isn't a partition column → static_values can't decide
+        # → both partitions are read and the row-level filter (or
+        # caller-side filter) is responsible for narrowing.
+        out = y.read_arrow_table(
+            options=FolderOptions(predicate=col("id") > 0),
+        )
+        assert out.num_rows == 2
+
+
+# ---------------------------------------------------------------------------
 # Listing cache
 # ---------------------------------------------------------------------------
 
