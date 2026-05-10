@@ -30,8 +30,8 @@ class DataTypeId(IntEnum):
     * ``60–69``  — temporal (``DATE`` / ``TIME`` / ``TIMESTAMP`` /
       ``DURATION``).
     * ``70–79``  — bytes (``BINARY`` / ``STRING``).
-    * ``80–99``  — extensions (``DICTIONARY`` / ``ENUM`` / ``UNION`` /
-      ``SJSON`` / ``BJSON``).
+    * ``80–99``  — extensions (``DICTIONARY`` / ``ENUM`` /
+      ``STR_ENUM`` / ``INT_ENUM`` / ``UNION`` / ``SJSON`` / ``BJSON``).
     * ``100+``   — nested (``ARRAY`` / ``MAP`` / ``STRUCT``).
     """
 
@@ -89,6 +89,8 @@ class DataTypeId(IntEnum):
     UNION = 83
     SJSON = 84  # JSON encoded as a UTF-8 string (text JSON)
     BJSON = 85  # JSON encoded as bytes (binary / packed JSON)
+    STR_ENUM = 86  # str-valued enum (subclass of ENUM)
+    INT_ENUM = 87  # int-valued enum (subclass of ENUM)
 
     # ── Nested ───────────────────────────────────────────────────────────
     ARRAY = 100
@@ -149,6 +151,15 @@ class DataTypeId(IntEnum):
         # paths to recognize a "JSON column" without caring whether the
         # bytes are UTF-8 text or a binary packing.
         return self.value in (84, 85)
+
+    @property
+    def is_dictionary_like(self) -> bool:
+        # ``DICTIONARY`` / ``ENUM`` / ``STR_ENUM`` / ``INT_ENUM`` all
+        # share the dict-encoded categorical contract (fixed value-set
+        # with int32 indices on the Arrow side, ``pl.Enum`` on Polars).
+        # Used by the cast pipeline to short-circuit re-encoding when
+        # the source already carries the right shape.
+        return self.value in (80, 82, 86, 87)
 
     @property
     def is_nested(self) -> bool:

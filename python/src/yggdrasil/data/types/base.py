@@ -83,6 +83,10 @@ __all__ = [
     "TimeType",
     "TimestampType",
     "DurationType",
+    "DictionaryType",
+    "EnumType",
+    "StrEnumType",
+    "IntEnumType",
     "NestedType",
     "ArrayType",
     "MapType",
@@ -596,6 +600,7 @@ class DataType(BaseChildrenFields, ABC):
 
     @classmethod
     def from_parsed(cls, parsed: ParsedDataType) -> "DataType":
+        from .enums import DictionaryType, EnumType, IntEnumType, StrEnumType
         from .nested import ArrayType, MapType, StructType
         from .primitive import (
             BinaryType,
@@ -607,6 +612,7 @@ class DataType(BaseChildrenFields, ABC):
             FloatingPointType,
             IntegerType,
             NullType,
+            PrimitiveType,
             SJsonType,
             StringType,
             TimeType,
@@ -703,8 +709,28 @@ class DataType(BaseChildrenFields, ABC):
 
         if parsed.type_id == DataTypeId.ENUM:
             if meta.literals:
-                return cls.from_pytype(_literal_values_to_hint(meta.literals))
-            return StringType()
+                literals = tuple(meta.literals)
+                if all(isinstance(v, str) for v in literals):
+                    return StrEnumType(categories=literals)
+                if all(
+                    isinstance(v, int) and not isinstance(v, bool)
+                    for v in literals
+                ):
+                    return IntEnumType(categories=literals)
+                value_hint = _literal_values_to_hint(literals)
+                value_type = cls.from_pytype(value_hint)
+                if not isinstance(value_type, PrimitiveType):
+                    value_type = StringType()
+                return EnumType(value_type=value_type, categories=literals)
+            return EnumType()
+
+        if parsed.type_id == DataTypeId.STR_ENUM:
+            literals = tuple(meta.literals or ())
+            return StrEnumType(categories=literals)
+
+        if parsed.type_id == DataTypeId.INT_ENUM:
+            literals = tuple(meta.literals or ())
+            return IntEnumType(categories=literals)
 
         if parsed.type_id == DataTypeId.UNION:
             if not parsed.variants:
@@ -721,9 +747,16 @@ class DataType(BaseChildrenFields, ABC):
             return StringType()
 
         if parsed.type_id == DataTypeId.DICTIONARY:
+            value_dtype: PrimitiveType | None = None
             if parsed.value_type is not None:
-                return cls.from_parsed(parsed.value_type)
-            return StringType()
+                value_resolved = cls.from_parsed(parsed.value_type)
+                if isinstance(value_resolved, PrimitiveType):
+                    value_dtype = value_resolved
+            return DictionaryType(
+                value_type=value_dtype if value_dtype is not None else StringType(),
+                categories=(),
+                ordered=bool(meta.ordered),
+            )
 
         if parsed.type_id == DataTypeId.SJSON:
             return SJsonType()
@@ -880,10 +913,7 @@ class DataType(BaseChildrenFields, ABC):
             return DurationType(unit="us")
 
         if _safe_issubclass(hint, enum.Enum):
-            members = list(hint)
-            if not members:
-                return StringType()
-            return cls.from_pytype(type(members[0].value))
+            return EnumType.from_pyenum(hint)
 
         # Scalar subclass fallbacks — for user-defined types that
         # inherit from builtins (e.g. `class Mass(float): ...`).
@@ -1974,3 +2004,4 @@ from .primitive import (
     UInt32Type,
     UInt64Type,
 )
+from .enums import DictionaryType, EnumType, IntEnumType, StrEnumType
