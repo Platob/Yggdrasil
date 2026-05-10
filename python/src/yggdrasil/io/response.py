@@ -512,13 +512,17 @@ class Response(Tabular[CastOptions]):
         "buffer",
         "received_at",
         "_receiver",
-        "_id_cache",
         "_session",
+        "_cache",
+        "_cache_token",
+        "_state_version",
     )
 
     # Instance attributes that don't survive pickling — excluded by
     # ``__getstate__`` and reset by ``__setstate__``. Subclasses extend.
-    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({"_session"})
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset(
+        {"_session", "_cache", "_cache_token", "_state_version"}
+    )
 
     def __init__(
         self,
@@ -543,8 +547,15 @@ class Response(Tabular[CastOptions]):
 
         _ensure_media_headers(self.headers, self.buffer)
 
-        self._id_cache: int | None = None
         self._session: "Session | None" = None
+        # Memoization for the deterministic projection — hashes,
+        # arrow_values dict. Invalidated when :meth:`_state_token`
+        # shifts (status / headers / buffer identity or size changed,
+        # or the embedded request's own state shifted, or
+        # :meth:`_invalidate_cache` bumped the version).
+        self._cache: dict[str, Any] = {}
+        self._cache_token: tuple = ()
+        self._state_version: int = 0
 
     # ------------------------------------------------------------------
     # Holder access — :attr:`buffer` IS the durable :class:`Holder`.
@@ -648,6 +659,55 @@ class Response(Tabular[CastOptions]):
         for name, value in state.items():
             setattr(self, name, value)
         self._session = None
+        self._cache = {}
+        self._cache_token = ()
+        self._state_version = 0
+
+    # ------------------------------------------------------------------
+    # Memoization — cheap fingerprint check, refresh on change
+    # ------------------------------------------------------------------
+
+    def _state_token(self) -> tuple:
+        """Cheap fingerprint of the inputs that drive every cached
+        derivation (hashes, arrow_values).
+
+        Includes the embedded request's :meth:`_state_token` so a
+        mutation upstream (e.g. an ``authorization`` swap) invalidates
+        the response-level cache too.
+        """
+        headers = self.headers
+        buffer = self.buffer
+        return (
+            self._state_version,
+            self.request._state_token(),
+            self.status_code,
+            id(headers),
+            len(headers) if headers else 0,
+            id(buffer),
+            buffer.size if buffer is not None else -1,
+        )
+
+    def _cached(self, name: str, compute: Callable[[], Any]) -> Any:
+        token = self._state_token()
+        if self._cache_token != token:
+            self._cache_token = token
+            self._cache.clear()
+        cached = self._cache.get(name, ...)
+        if cached is ...:
+            cached = compute()
+            self._cache[name] = cached
+        return cached
+
+    def _invalidate_cache(self) -> None:
+        """Drop every memoized derivation — call after any in-place
+        mutation that the :meth:`_state_token` fingerprint can't see.
+
+        Bumps :attr:`_state_version` so any container holding this
+        response's token sees the change.
+        """
+        self._cache.clear()
+        self._cache_token = ()
+        self._state_version += 1
 
     # ------------------------------------------------------------------
     # Session attachment
@@ -766,6 +826,7 @@ class Response(Tabular[CastOptions]):
         if normalize:
             _ensure_media_headers(self.headers, self.buffer)
 
+        self._invalidate_cache()
         return self
 
     def update_tags(
@@ -780,6 +841,7 @@ class Response(Tabular[CastOptions]):
         else:
             self.tags.update(_string_dict(tags))
 
+        self._invalidate_cache()
         return self
 
     # ------------------------------------------------------------------
@@ -815,6 +877,7 @@ class Response(Tabular[CastOptions]):
             self.headers.pop("Content-Encoding", None)
 
         self.headers["Content-Length"] = str(self.buffer.size)
+        self._invalidate_cache()
         return self
 
     @property
@@ -911,9 +974,13 @@ class Response(Tabular[CastOptions]):
     @property
     def partition_key(self) -> int:
         """xxh3_64 of the joined :meth:`partition_values` — int64 partition column."""
-        joined = "\x00".join(str(v) for v in self.partition_values().values())
         from .request import _xxh3_int64_str
-        return _xxh3_int64_str(joined)
+        return self._cached(
+            "partition_key",
+            lambda: _xxh3_int64_str(
+                "\x00".join(str(v) for v in self.partition_values().values())
+            ),
+        )
 
     @property
     def body_size(self) -> int:
@@ -928,74 +995,90 @@ class Response(Tabular[CastOptions]):
         """
         if self.buffer is None:
             return 0
-        return self.buffer.xxh3_int64()
+        return self._cached("body_hash", lambda: self.buffer.xxh3_int64())
 
     @property
     def hash(self) -> int:
         """Overall identity over (request.hash, status_code, headers, body)."""
-        return _compute_response_identity_hash(
-            request_hash=self.request.hash,
-            status_code=self.status_code,
-            headers=self.headers,
-            body=self.buffer,
+        return self._cached(
+            "hash",
+            lambda: _compute_response_identity_hash(
+                request_hash=self.request.hash,
+                status_code=self.status_code,
+                headers=self.headers,
+                body=self.buffer,
+            ),
         )
 
     @property
     def public_hash(self) -> int:
         """Cross-system identity stable across ``anonymize='remove'``."""
-        return _compute_response_identity_hash(
-            request_hash=self.request.public_hash,
-            status_code=self.status_code,
-            headers=normalize_headers(
-                self.headers or {},
-                is_request=False,
-                add_missing=False,
-                anonymize=True,
-                mode="remove",
+        return self._cached(
+            "public_hash",
+            lambda: _compute_response_identity_hash(
+                request_hash=self.request.public_hash,
+                status_code=self.status_code,
+                headers=normalize_headers(
+                    self.headers or {},
+                    is_request=False,
+                    add_missing=False,
+                    anonymize=True,
+                    mode="remove",
+                ),
+                body=self.buffer,
             ),
-            body=self.buffer,
         )
 
     # ------------------------------------------------------------------
     # Matching / projection
     # ------------------------------------------------------------------
 
+    def _arrow_value(self, key: str) -> Any:
+        """Compute a single :data:`RESPONSE_ARROW_SCHEMA` column on demand.
+
+        Used by :meth:`match_value` so the lookup pays for one column
+        instead of materializing every value via :attr:`arrow_values`.
+        ``request_<col>`` keys forward to :meth:`PreparedRequest._arrow_value`
+        on the embedded request — its own memoization takes care of
+        repeated lookups.
+        """
+        if key.startswith("request_"):
+            tail = key[len("request_"):]
+            return self.request._arrow_value(tail)
+        if key == "receiver":
+            return self._receiver.to_struct_dict() if self._receiver is not None else None
+        if key == "hash":
+            return self.hash
+        if key == "public_hash":
+            return self.public_hash
+        if key == "status_code":
+            return self.status_code
+        if key == "headers":
+            return self._cached("headers_value", lambda: _string_dict(self.headers))
+        if key == "tags":
+            return self._cached("tags_value", lambda: _string_dict(self.tags) or None)
+        if key == "body":
+            return self.buffer.to_bytes() if self.buffer is not None else None
+        if key == "body_size":
+            return self.body_size
+        if key == "body_hash":
+            return self.body_hash
+        if key == "received_at":
+            return self.received_at
+        if key == "partition_key":
+            return self.partition_key
+        if key == "_pkl":
+            # Placeholder for the optional pickle blob; populated by
+            # the pickle serializer, null on the structured path.
+            return None
+        raise KeyError(key)
+
     @property
     def arrow_values(self) -> dict[str, Any]:
-        body_bytes: bytes | None
-        body_hash: int
-        if self.buffer is not None:
-            body_bytes = self.buffer.to_bytes()
-            body_hash = self.buffer.xxh3_int64()
-        else:
-            body_bytes = None
-            body_hash = 0
+        return self._cached("arrow_values", self._build_arrow_values)
 
-        request_values = self.request.arrow_values
-        flat_request: dict[str, Any] = {
-            f"request_{k}": v
-            for k, v in request_values.items()
-            if k != "_pkl"
-        }
-
-        return {
-            **flat_request,
-            "receiver":      self._receiver.to_struct_dict() if self._receiver is not None else None,
-            "hash":          self.hash,
-            "public_hash":   self.public_hash,
-            "status_code":   self.status_code,
-            "headers":       _string_dict(self.headers),
-            "tags":          _string_dict(self.tags) or None,
-            "body":          body_bytes,
-            "body_size":     self.body_size,
-            "body_hash":     body_hash,
-            "received_at":   self.received_at,
-            "partition_key": self.partition_key,
-            # ``_pkl`` is a placeholder column populated externally by
-            # the pickle serializer; null here keeps the deterministic
-            # projection path side-effect-free.
-            "_pkl":          None,
-        }
+    def _build_arrow_values(self) -> dict[str, Any]:
+        return {name: self._arrow_value(name) for name in RESPONSE_ARROW_SCHEMA.names}
 
     def match_value(self, key: str) -> Any:
         # Dotted-path lookup walks the nested struct shape:
@@ -1007,33 +1090,34 @@ class Response(Tabular[CastOptions]):
             # nested struct shape; route through the embedded request.
             if head == "request":
                 return self.request.match_value(tail)
-            values = self.arrow_values
-            if head in values:
-                container = values[head]
-                cursor: Any = container
-                for part in tail.split("."):
-                    if isinstance(cursor, Mapping) and part in cursor:
-                        cursor = cursor[part]
-                    else:
-                        raise ValueError(
-                            f"Unsupported response match key: {key!r}. "
-                            f"Must be within: {RESPONSE_ARROW_SCHEMA.names!r}"
-                        )
-                return cursor
-            raise ValueError(
-                f"Unsupported response match key: {key!r}. "
-                f"Must be within: {RESPONSE_ARROW_SCHEMA.names!r}"
-            )
+            try:
+                container = self._arrow_value(head)
+            except KeyError:
+                raise ValueError(
+                    f"Unsupported response match key: {key!r}. "
+                    f"Must be within: {RESPONSE_ARROW_SCHEMA.names!r}"
+                )
+            cursor: Any = container
+            for part in tail.split("."):
+                if isinstance(cursor, Mapping) and part in cursor:
+                    cursor = cursor[part]
+                else:
+                    raise ValueError(
+                        f"Unsupported response match key: {key!r}. "
+                        f"Must be within: {RESPONSE_ARROW_SCHEMA.names!r}"
+                    )
+            return cursor
 
         # Top-level response columns win, including the unnested
-        # ``request_*`` ones populated by ``arrow_values``. Bare
+        # ``request_*`` ones served by :meth:`_arrow_value`. Bare
         # request-side keys (``method``, ``url``, ``public_url_hash``, …)
         # still fall through to the embedded request so the cache layer
         # can match-by request identity without rewriting every
         # ``request_by`` list with the ``request_`` prefix.
-        values = self.arrow_values
-        if key in values:
-            return values[key]
+        try:
+            return self._arrow_value(key)
+        except KeyError:
+            pass
         if hasattr(self, key) and key not in REQUEST_SCHEMA.names:
             return getattr(self, key)
         if key in REQUEST_SCHEMA.names:
