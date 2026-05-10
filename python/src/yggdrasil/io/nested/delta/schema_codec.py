@@ -127,10 +127,21 @@ def _arrow_type_to_spark(t: pa.DataType) -> Any:
     # Delta's wire vocabulary differs from DDL in two slots
     # (``INT`` / ``BIGINT``), so :data:`_DDL_HEAD_TO_DELTA` patches
     # those before the lowercase pass.
+    #
+    # Unsigned integers go through ``as_spark`` first so we *don't*
+    # widen them — ``uint8`` lands as ``byte`` (int8), ``uint64`` as
+    # ``long`` (int64). Values that don't fit the signed range round-
+    # trip via two's-complement when the parquet-write path casts
+    # ``uint`` → same-width signed (``DeltaIO._coerce_uints``); the
+    # Delta schema and the parquet payload then agree on width and
+    # signedness. The default ``as_spark`` widening (which would land
+    # ``uint64`` at ``DECIMAL(20, 0)``) costs storage and breaks the
+    # bit-identical round-trip property — keep ``self`` for ints by
+    # the as_spark override on :class:`IntegerType`.
     from yggdrasil.data.types.base import DataType
 
     try:
-        ddl = DataType.from_arrow_type(t).to_spark_name()
+        ddl = DataType.from_arrow_type(t).as_spark().to_spark_name()
     except Exception:
         # Unknown / unsupported → binary fallback. The intent is
         # "round-trips, doesn't crash"; a richer mapping can land

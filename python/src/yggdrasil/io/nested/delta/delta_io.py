@@ -67,9 +67,10 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import random
 import time
 import uuid
-from typing import Any, ClassVar, Iterable, Iterator, List, Optional
+from typing import Any, Callable, ClassVar, Iterable, Iterator, List, Optional
 
 import pyarrow as pa
 
@@ -107,7 +108,22 @@ from yggdrasil.io.nested.delta.schema_codec import (
 )
 from yggdrasil.io.nested.delta.snapshot import Snapshot
 
-__all__ = ["DeltaIO", "DeltaOptions"]
+__all__ = ["ConcurrentDeltaCommitError", "DeltaIO", "DeltaOptions"]
+
+
+class ConcurrentDeltaCommitError(RuntimeError):
+    """Raised when retries are exhausted on a Delta commit version race.
+
+    A commit conflicts when version ``N`` is taken by another writer
+    between the moment we resolve our snapshot and the moment we try
+    to atomically create ``_delta_log/<N>.json``. The retry loop
+    refreshes the log, re-bases the action set against the new HEAD,
+    and tries the next version up to
+    :attr:`DeltaOptions.commit_max_retries` times. This exception is
+    surfaced when that budget is exhausted — the caller can either
+    accept the loss (their write didn't land) or retry the whole
+    operation themselves with a longer budget.
+    """
 
 
 # Inline DVs are cheap to read but bloat the JSON commit. Above this
@@ -151,6 +167,20 @@ class DeltaOptions(FolderOptions):
     #: vector on the existing parquet rather than rewriting the file.
     #: Forces the protocol to declare the ``deletionVectors`` feature.
     delete_via_dv: bool = False
+    #: Maximum number of retries on a concurrent-commit version race.
+    #: The commit JSON is created with ``O_EXCL`` (or the remote
+    #: backend's equivalent) so a race fails fast with
+    #: :class:`FileExistsError`; we then refresh the log, rebuild the
+    #: action set against the new HEAD, and retry. Set to 0 to fail
+    #: fast on the first conflict.
+    commit_max_retries: int = 8
+    #: Base sleep (seconds) before the first retry; the actual delay
+    #: is ``base * 2**attempt + jitter``. Keeps tight conflict loops
+    #: from amplifying when many writers commit at once.
+    commit_retry_backoff: float = 0.05
+    #: Upper bound (seconds) on the per-attempt random jitter added to
+    #: the backoff. Stays small so the retry pause stays predictable.
+    commit_retry_jitter: float = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +419,28 @@ class DeltaIO(FolderIO):
     # Write path
     # ==================================================================
 
+    def _resolve_action(self, mode: Mode) -> Mode:
+        """Pick the disposition for a write call.
+
+        Overrides :meth:`FolderIO._resolve_action` to keep
+        :data:`Mode.UPSERT` / :data:`Mode.MERGE` as distinct actions —
+        the parent collapses both to ``APPEND`` because plain folders
+        don't have row-level identity, but Delta does (via
+        ``options.match_by_keys``), and the merge path here re-writes
+        the affected parquets so a key collision actually means
+        "incoming wins."
+        """
+        if mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:
+            return Mode.OVERWRITE
+        if mode is Mode.UPSERT or mode is Mode.MERGE:
+            return Mode.UPSERT
+        if mode is Mode.IGNORE:
+            return Mode.IGNORE
+        if mode is Mode.ERROR_IF_EXISTS:
+            return Mode.ERROR_IF_EXISTS
+        # AUTO / APPEND / anything unrecognised → APPEND.
+        return Mode.APPEND
+
     def _write_arrow_batches(
         self,
         batches: Iterable[pa.RecordBatch],
@@ -402,6 +454,11 @@ class DeltaIO(FolderIO):
           the prior snapshot, then ``add`` the freshly-written parquet
           parts. The new commit replaces the active set.
         - APPEND — emit only ``add``s. Existing files stay live.
+        - UPSERT / MERGE — key-aware: ``options.match_by_keys`` names
+          the columns to dedup on. Existing files that contain a
+          matching row get rewritten with the survivors (rows whose
+          keys aren't in the incoming set); incoming rows are written
+          as fresh parts. Without keys it collapses to APPEND.
         - IGNORE — skip when the table already has at least one
           active file.
         - ERROR_IF_EXISTS — raise when the table already has at least
@@ -410,11 +467,24 @@ class DeltaIO(FolderIO):
         On a brand-new table (no log directory yet), we write a
         ``protocol`` + ``metaData`` action ahead of the file ``add``s
         so the first commit is self-contained.
+
+        Concurrent writers
+        ------------------
+
+        The commit JSON is created with exclusive-create semantics
+        (``O_EXCL`` on local; the backend's equivalent on remote) so a
+        version race fails fast with :class:`FileExistsError`. The
+        retry loop refreshes the log, rebuilds the action set against
+        the new HEAD, and tries the next available version, up to
+        :attr:`DeltaOptions.commit_max_retries`. Pure APPEND retries
+        are cheap (only the version number changes); OVERWRITE re-
+        derives its ``remove`` set from the fresh snapshot; UPSERT
+        re-runs the affected-file detection so a concurrent commit
+        that touched the same file is correctly rebased over.
         """
         action = self._resolve_action(options.mode)
 
         snap = self.snapshot(fresh=True)
-        is_initial = snap.metadata is None
 
         if action is Mode.IGNORE and snap.active_files:
             return
@@ -424,92 +494,368 @@ class DeltaIO(FolderIO):
                 f"write under mode={options.mode!r}."
             )
 
-        # Materialize the batches once — we need to peek the first to
-        # build the metadata action (schema) before minting parquet
-        # parts, and we need to know the partition columns to route
-        # each row into the correct directory.
-        batch_iter = iter(batches)
-        first = next(batch_iter, None)
-        if first is None:
-            # No data and OVERWRITE → still legal: drop the active set.
-            if is_initial or action is not Mode.OVERWRITE:
-                return
+        # Materialize the stream once — UPSERT needs to walk it twice
+        # (once for keys, once for the incoming-data parquet write),
+        # OVERWRITE/APPEND only needs it once but the materialization
+        # cost is tiny next to the parquet write.
+        materialized: list[pa.RecordBatch] = list(batches)
 
-        # Resolve partition columns, target schema.
+        # An empty OVERWRITE on a populated table is still meaningful
+        # (drop the active set). Every other mode bails on no data.
+        if not materialized and (action is not Mode.OVERWRITE or snap.metadata is None):
+            return
+
+        if action is Mode.UPSERT:
+            self._commit_upsert(materialized, options=options, initial_snap=snap)
+            return
+
+        self._commit_simple(
+            materialized,
+            options=options,
+            initial_snap=snap,
+            action=action,
+        )
+
+    # ------------------------------------------------------------------
+    # Simple (APPEND / OVERWRITE) commit path with retry
+    # ------------------------------------------------------------------
+
+    def _commit_simple(
+        self,
+        materialized: "list[pa.RecordBatch]",
+        *,
+        options: DeltaOptions,
+        initial_snap: Snapshot,
+        action: Mode,
+    ) -> None:
+        """Commit an APPEND or OVERWRITE with concurrency-safe retries.
+
+        Parquet parts are written **once** up front (their filenames
+        carry a uuid, so they can't collide with any concurrent
+        writer). The retry loop only rebuilds the action list — for
+        APPEND that's a no-op besides the version bump, for OVERWRITE
+        the ``remove`` set is rederived against the fresh HEAD so a
+        concurrent append that landed in the meantime is correctly
+        replaced.
+        """
+        is_initial = initial_snap.metadata is None
+
+        # Resolve schema + partitioning. On the first commit the
+        # incoming batch's schema is the table's schema; on a follow-up
+        # we trust the table's recorded ``schemaString``.
         if is_initial:
-            target_schema = first.schema if first is not None else pa.schema([])
+            target_schema = materialized[0].schema if materialized else pa.schema([])
             partition_columns = list(self._infer_partition_columns(options))
         else:
             target_schema = (
-                spark_json_to_arrow_schema(snap.schema_string)
-                if snap.schema_string
-                else (first.schema if first is not None else pa.schema([]))
+                spark_json_to_arrow_schema(initial_snap.schema_string)
+                if initial_snap.schema_string
+                else (materialized[0].schema if materialized else pa.schema([]))
             )
-            partition_columns = snap.partition_columns
+            partition_columns = initial_snap.partition_columns
 
-        # Write the parquet parts.
+        # Write the new parquet parts once. Each filename is uuid-
+        # tagged, so the same set of adds can be committed at any
+        # eventual version without conflict.
         new_adds: list[AddFile] = []
-        if first is not None:
-            stream = _chain(first, batch_iter)
-            new_adds.extend(
+        if materialized:
+            new_adds = list(
                 self._write_parts(
-                    stream,
+                    iter(materialized),
                     partition_columns=partition_columns,
                     options=options,
                 )
             )
 
-        # Build the action list for this commit.
-        actions: list[DeltaAction] = []
+        def build(snap: Snapshot) -> "list[DeltaAction]":
+            actions: list[DeltaAction] = []
+            if snap.metadata is None:
+                actions.extend(
+                    self._initial_protocol_metadata(
+                        options=options,
+                        target_schema=target_schema,
+                        partition_columns=partition_columns,
+                    )
+                )
+            if action is Mode.OVERWRITE:
+                actions.extend(self._removes_for_snapshot(snap))
+            actions.extend(new_adds)
+            self._maybe_append_txn(actions, options)
+            actions.append(self._build_commit_info(options=options, mode=action))
+            return actions
 
-        if is_initial:
-            min_r, min_w, reader_features, writer_features = self._resolve_protocol(
-                options,
-                has_dv=False,
+        # Cleanup is a no-op for APPEND/OVERWRITE: the parquet parts
+        # we wrote are valid for any version we end up landing at, so
+        # we never delete them between attempts.
+        self._with_commit_retry(
+            build_actions=build,
+            cleanup=None,
+            options=options,
+            initial_snap=initial_snap,
+        )
+
+    # ------------------------------------------------------------------
+    # Upsert (key-aware merge) commit path with retry
+    # ------------------------------------------------------------------
+
+    def _commit_upsert(
+        self,
+        materialized: "list[pa.RecordBatch]",
+        *,
+        options: DeltaOptions,
+        initial_snap: Snapshot,
+    ) -> None:
+        """Key-aware upsert: incoming rows win on key collision.
+
+        Pipeline per attempt:
+
+        1. Walk the active set, find files whose contents include a
+           row whose key tuple appears in the incoming batches.
+        2. Rewrite each affected file with the surviving rows (key
+           NOT in incoming) into a fresh parquet, emit a ``remove``
+           for the old AddFile.
+        3. Append the incoming batches as a new parquet group.
+
+        Without ``options.match_by_keys`` we can't tell rows apart by
+        identity — fall back to plain APPEND so the call still does
+        something useful.
+        """
+        match_by = list(options.match_by_keys or ())
+        if not match_by:
+            self._commit_simple(
+                materialized,
+                options=options,
+                initial_snap=initial_snap,
+                action=Mode.APPEND,
             )
-            actions.append(
-                Protocol(
-                    min_reader_version=min_r,
-                    min_writer_version=min_w,
-                    reader_features=reader_features,
-                    writer_features=writer_features,
+            return
+
+        is_initial = initial_snap.metadata is None
+        if is_initial:
+            target_schema = materialized[0].schema if materialized else pa.schema([])
+            partition_columns = list(self._infer_partition_columns(options))
+        else:
+            target_schema = (
+                spark_json_to_arrow_schema(initial_snap.schema_string)
+                if initial_snap.schema_string
+                else (materialized[0].schema if materialized else pa.schema([]))
+            )
+            partition_columns = initial_snap.partition_columns
+
+        # The incoming-data parquets are deterministic (uuid-named) and
+        # safe across retries — write once.
+        incoming_adds: list[AddFile] = []
+        if materialized:
+            incoming_adds = list(
+                self._write_parts(
+                    iter(materialized),
+                    partition_columns=partition_columns,
+                    options=options,
                 )
             )
+
+        # Collect the set of incoming key tuples once. The set is
+        # invariant across retries (we don't re-evaluate the predicate
+        # against a different snapshot — we evaluate it against the
+        # incoming rows, which don't change).
+        incoming_keys = FolderIO._collect_keys_from_batches(materialized, match_by)
+
+        # Each retry attempt may produce a different rewrite set if a
+        # concurrent writer landed an add/remove in between. Track the
+        # rewrites so we can clean them up before the next attempt.
+        rewrite_state: dict[str, list[AddFile]] = {"current": []}
+
+        def build(snap: Snapshot) -> "list[DeltaAction]":
+            removes: list[RemoveFile] = []
+            rewrites: list[AddFile] = []
+            for add in list(snap.active_files.values()):
+                file_path = snap.resolve(add)
+                matched, survivors = self._partition_file_for_keys(
+                    file_path,
+                    add=add,
+                    match_by=match_by,
+                    incoming_keys=incoming_keys,
+                )
+                if not matched:
+                    continue
+                if survivors:
+                    survivor_batches = self._read_indexed_batches(
+                        leaf=ParquetIO(holder=file_path, owns_holder=False),
+                        indices=survivors,
+                        partition_columns=partition_columns,
+                        partition_values=dict(add.partition_values),
+                    )
+                    fresh = list(
+                        self._write_parts(
+                            iter(survivor_batches),
+                            partition_columns=partition_columns,
+                            options=options,
+                        )
+                    )
+                    rewrites.extend(fresh)
+                removes.append(self._build_remove(add))
+
+            # Stash for cleanup if the commit ends up retried.
+            rewrite_state["current"] = rewrites
+
+            actions: list[DeltaAction] = []
+            if snap.metadata is None:
+                actions.extend(
+                    self._initial_protocol_metadata(
+                        options=options,
+                        target_schema=target_schema,
+                        partition_columns=partition_columns,
+                    )
+                )
+            actions.extend(removes)
+            actions.extend(rewrites)
+            actions.extend(incoming_adds)
+            self._maybe_append_txn(actions, options)
+            actions.append(self._build_commit_info(options=options, mode=Mode.UPSERT))
+            return actions
+
+        def cleanup() -> None:
+            for add in rewrite_state["current"]:
+                try:
+                    (self.path / add.path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            rewrite_state["current"] = []
+
+        self._with_commit_retry(
+            build_actions=build,
+            cleanup=cleanup,
+            options=options,
+            initial_snap=initial_snap,
+        )
+
+    # ------------------------------------------------------------------
+    # Generic commit-with-retry loop
+    # ------------------------------------------------------------------
+
+    def _with_commit_retry(
+        self,
+        *,
+        build_actions: "Callable[[Snapshot], list[DeltaAction]]",
+        cleanup: "Optional[Callable[[], None]]",
+        options: DeltaOptions,
+        initial_snap: Snapshot,
+    ) -> None:
+        """Drive a commit through the version-race retry budget.
+
+        ``build_actions`` is called with the snapshot the next commit
+        rebases onto — the first attempt sees ``initial_snap``,
+        subsequent attempts see whatever fresh HEAD won the race. The
+        callable must produce a complete action list for that snapshot
+        (including ``protocol`` / ``metaData`` for an initial commit
+        and ``commitInfo`` at the tail).
+
+        ``cleanup`` (when provided) runs between failed attempts. The
+        UPSERT path uses it to delete rewrite parquets that won't
+        apply to the next snapshot; APPEND/OVERWRITE leave it as
+        ``None`` because their adds are valid at any version.
+        """
+        max_retries = max(0, int(options.commit_max_retries or 0))
+        last_exc: "Optional[FileExistsError]" = None
+        for attempt in range(max_retries + 1):
+            snap = initial_snap if attempt == 0 else self.snapshot(fresh=True)
+            actions = build_actions(snap)
+
+            next_version = (snap.version + 1) if snap.metadata is not None else 0
+            try:
+                self._commit_atomic(next_version, actions)
+            except FileExistsError as exc:
+                last_exc = exc
+                if cleanup is not None:
+                    cleanup()
+                self._log.invalidate()
+                self._snapshot = None
+                if attempt == max_retries:
+                    raise ConcurrentDeltaCommitError(
+                        f"Failed to commit Delta change at {self.path!s} "
+                        f"after {attempt + 1} attempts; concurrent writers "
+                        f"keep winning the version race. Increase "
+                        f"DeltaOptions.commit_max_retries (currently "
+                        f"{max_retries}) if your contention level is "
+                        f"genuinely this high."
+                    ) from last_exc
+                # Exponential backoff with jitter so coordinated retries
+                # don't lock-step against each other.
+                delay = float(options.commit_retry_backoff or 0.0) * (2**attempt)
+                jitter = float(options.commit_retry_jitter or 0.0)
+                if jitter > 0:
+                    delay += random.uniform(0, jitter)
+                if delay > 0:
+                    time.sleep(delay)
+                continue
+
+            self.refresh()
+
+            interval = int(options.checkpoint_interval or 0)
+            if interval > 0 and (next_version + 1) % interval == 0:
+                self._write_checkpoint(next_version, kind=options.checkpoint_kind)
+            return
+
+    # ------------------------------------------------------------------
+    # Action-list helpers shared by the simple + upsert paths
+    # ------------------------------------------------------------------
+
+    def _initial_protocol_metadata(
+        self,
+        *,
+        options: DeltaOptions,
+        target_schema: pa.Schema,
+        partition_columns: "List[str]",
+    ) -> "list[DeltaAction]":
+        """Build the protocol + metaData pair for a brand-new table."""
+        min_r, min_w, reader_features, writer_features = self._resolve_protocol(
+            options,
+            has_dv=False,
+        )
+        return [
+            Protocol(
+                min_reader_version=min_r,
+                min_writer_version=min_w,
+                reader_features=reader_features,
+                writer_features=writer_features,
+            ),
             # Delta convention: schemaString covers *all* columns,
             # partition columns included; only the parquet payload
             # drops them.
-            actions.append(
-                Metadata(
-                    id=str(uuid.uuid4()),
-                    schema_string=arrow_schema_to_spark_json(target_schema),
-                    partition_columns=partition_columns,
-                    created_time=int(time.time() * 1000),
-                )
-            )
+            Metadata(
+                id=str(uuid.uuid4()),
+                schema_string=arrow_schema_to_spark_json(target_schema),
+                partition_columns=partition_columns,
+                created_time=int(time.time() * 1000),
+            ),
+        ]
 
-        if action in (Mode.OVERWRITE, Mode.TRUNCATE):
-            actions.extend(self._removes_for_snapshot(snap))
-
-        actions.extend(new_adds)
-
+    def _maybe_append_txn(
+        self,
+        actions: "list[DeltaAction]",
+        options: DeltaOptions,
+    ) -> None:
         if options.txn_app_id is not None and options.txn_version is not None:
             actions.append(
                 Txn(app_id=options.txn_app_id, version=int(options.txn_version)),
             )
 
-        actions.append(self._build_commit_info(options=options, mode=action))
-
-        # Commit + maybe checkpoint.
-        next_version = (snap.version + 1) if not is_initial else 0
-        self._commit(next_version, actions)
-        self.refresh()
-
-        # Auto-checkpoint every N commits. ``next_version`` is the
-        # version we just minted; checkpoint when the *next* commit
-        # would land on a multiple of ``checkpoint_interval``.
-        interval = int(options.checkpoint_interval or 0)
-        if interval > 0 and (next_version + 1) % interval == 0:
-            self._write_checkpoint(next_version, kind=options.checkpoint_kind)
+    def _build_remove(
+        self,
+        add: AddFile,
+        *,
+        snap: "Optional[Snapshot]" = None,
+    ) -> RemoveFile:
+        ts = int(time.time() * 1000)
+        return RemoveFile(
+            path=add.path,
+            deletion_timestamp=ts,
+            data_change=True,
+            extended_file_metadata=True,
+            partition_values=dict(add.partition_values),
+            size=int(add.size),
+            deletion_vector=add.deletion_vector,
+        )
 
     # ==================================================================
     # Helpers — write path
@@ -602,6 +948,17 @@ class DeltaIO(FolderIO):
         Partitioned table → one parquet per (col, val, …) tuple, written
         under ``<col>=<val>/.../``. Hive convention: partition columns
         are dropped from the parquet payload.
+
+        Unsigned-integer columns are reinterpreted as their same-width
+        signed counterpart on the way in (``uint8`` → ``int8`` via
+        two's-complement, ``safe=False``). Delta has no native unsigned
+        types, and the schema codec already declares the column as a
+        signed primitive — the cast keeps the on-disk parquet payload
+        in sync with the declared :attr:`schemaString` without widening
+        storage. ``max(uint8)`` lands as ``-1``; reading the column
+        back yields the same signed value, and a caller that needs
+        the original unsigned interpretation casts ``int → uint`` at
+        the same width with ``safe=False`` to recover it.
         """
         # Bucket every batch by its partition-tuple. Materializing once
         # is unavoidable when we need a parquet-per-bucket — pyarrow
@@ -623,11 +980,14 @@ class DeltaIO(FolderIO):
             stem = f"part-{int(time.time() * 1000)}-{os.urandom(8).hex()}.parquet"
             file_path = target_dir / stem
 
-            # Drop partition columns from the parquet payload.
+            # Drop partition columns from the parquet payload, then flip
+            # any unsigned-integer payload columns to their signed
+            # counterparts.
             payload_batches: "list[pa.RecordBatch]" = []
             for sb in sub_batches:
                 drop = [c for c in partition_columns if c in sb.schema.names]
-                payload_batches.append(sb.drop_columns(drop) if drop else sb)
+                stripped = sb.drop_columns(drop) if drop else sb
+                payload_batches.append(_reinterpret_unsigned_as_signed(stripped))
 
             leaf = ParquetIO(holder=file_path, owns_holder=False)
             with leaf as opened:
@@ -663,15 +1023,25 @@ class DeltaIO(FolderIO):
     # Commit + checkpoint
     # ==================================================================
 
-    def _commit(self, version: int, actions: "Iterable[DeltaAction]") -> None:
-        """Write ``_delta_log/<version>.json``.
+    def _commit_atomic(
+        self,
+        version: int,
+        actions: "Iterable[DeltaAction]",
+    ) -> None:
+        """Atomically write ``_delta_log/<version>.json``.
 
-        Atomic by virtue of the underlying :class:`Path` — local
-        writes go through a staging file rename (see
-        :class:`LocalPath`), remote writes go through whatever
-        atomic-create primitive the backend exposes. We don't try to
-        coordinate concurrent writers here; that's a higher-level
-        concern (Delta's own ``commit-coordinator`` story).
+        Local paths use ``open(O_CREAT | O_EXCL)`` so two processes
+        racing on the same version see exactly one winner — the loser
+        gets :class:`FileExistsError`. Remote paths fall back to
+        check-then-write; the race window is small (one network
+        round trip) and the retry loop in :meth:`_with_commit_retry`
+        absorbs the rare case where both writers slip through.
+
+        Atomicity is the foundation of Delta's optimistic-concurrency
+        story: readers see commits land in version order, and a writer
+        that loses the race retries its action set at the next free
+        version. Writes that *would* clobber an existing version
+        always raise — never silently overwrite.
         """
         self._log.log_path.mkdir(parents=True, exist_ok=True)
         commit_path = self._log.log_path / format_commit_name(version)
@@ -688,6 +1058,43 @@ class DeltaIO(FolderIO):
             lines.append(line)
         body = ("\n".join(lines) + "\n").encode("utf-8")
 
+        if getattr(commit_path, "is_local_path", False):
+            full = commit_path.full_path()
+            # ``O_EXCL`` is the POSIX atomic-create primitive — the
+            # kernel guarantees nobody else can land on the same path
+            # between our open() and the write. Linux + macOS both
+            # honour it on local filesystems; a NFS mount older than
+            # v3 might not, but Delta isn't really supported there
+            # anyway.
+            fd = os.open(full, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            try:
+                # ``os.write`` may return short on huge buffers; loop
+                # until the whole body is on disk so a partial write
+                # can't leak past the close().
+                offset = 0
+                while offset < len(body):
+                    written = os.write(fd, body[offset:])
+                    if written <= 0:
+                        raise OSError(
+                            f"os.write returned {written} on "
+                            f"{full!r}; refusing to land a torn "
+                            f"commit JSON."
+                        )
+                    offset += written
+            finally:
+                os.close(fd)
+            return
+
+        # Remote path — the backend's :meth:`Path.open` doesn't
+        # uniformly support exclusive create. Best-effort: probe for
+        # an existing version, then write. The retry loop catches the
+        # race window because the next snapshot read picks up the
+        # competing commit.
+        if commit_path.exists():
+            raise FileExistsError(
+                f"Delta commit at version {version} already exists at "
+                f"{commit_path!s}; concurrent writer landed first."
+            )
         with commit_path.open("wb") as bio:
             bio.truncate(0)
             bio.write_bytes(body)
@@ -848,7 +1255,7 @@ class DeltaIO(FolderIO):
         )
 
         next_version = snap.version + 1
-        self._commit(next_version, new_actions)
+        self._commit_atomic(next_version, new_actions)
         self.refresh()
 
         interval = int(options.checkpoint_interval or 0)
@@ -926,6 +1333,64 @@ class DeltaIO(FolderIO):
         survivors: list[int] = [i for i in all_visible if i not in deleted_set]
         deleted: list[int] = [i for i in all_visible if i in deleted_set]
         return survivors, deleted
+
+    def _partition_file_for_keys(
+        self,
+        file_path: "Any",
+        *,
+        add: AddFile,
+        match_by: "List[str]",
+        incoming_keys: "set[tuple]",
+    ) -> "tuple[bool, list[int]]":
+        """Walk *file_path*, return ``(matched, survivor_indices)``.
+
+        ``matched`` is True iff at least one row in the file (after
+        applying any existing deletion vector) carries a key tuple
+        that appears in ``incoming_keys``. ``survivor_indices`` is the
+        absolute row indices that should *survive* the upsert — those
+        whose keys aren't in the incoming set, and that aren't already
+        masked by the file's existing DV. If ``matched`` is False the
+        caller skips the file entirely (no remove + no rewrite).
+
+        Files whose schema doesn't include every key column are
+        treated as un-matchable — there's no row in such a file whose
+        key could collide with an incoming row, so we leave them
+        alone.
+        """
+        sidecar_cache: dict[str, bytes] = {}
+        existing_dv = decode_deletion_vector(
+            add.deletion_vector,
+            table_root=self.path,
+            sidecar_cache=sidecar_cache,
+        )
+        already_masked = existing_dv.deleted_rows if existing_dv is not None else set()
+
+        leaf = ParquetIO(holder=file_path, owns_holder=False)
+        survivors: list[int] = []
+        matched = False
+        total = 0
+        with leaf as opened:
+            for batch in opened._read_arrow_batches(ParquetOptions()):
+                n = batch.num_rows
+                if n == 0:
+                    continue
+                if not all(c in batch.schema.names for c in match_by):
+                    # Schema mismatch — partition column or rename
+                    # drift. The file can't have a matching key, so
+                    # skip it entirely (won't appear in removes).
+                    total += n
+                    continue
+                cols = [batch.column(c).to_pylist() for c in match_by]
+                for i, key in enumerate(zip(*cols)):
+                    abs_idx = total + i
+                    if abs_idx in already_masked:
+                        continue
+                    if key in incoming_keys:
+                        matched = True
+                    else:
+                        survivors.append(abs_idx)
+                total += n
+        return matched, survivors
 
     def _read_indexed_batches(
         self,
@@ -1029,6 +1494,51 @@ def _coerce_partition(raw: "Optional[str]", arrow_type: pa.DataType) -> Any:
         return pa.scalar(raw).cast(arrow_type).as_py()
     except (pa.ArrowInvalid, pa.ArrowTypeError, ValueError):
         return raw
+
+
+#: pyarrow's :func:`pa.types.is_uintN` family doesn't expose a direct
+#: ``unsigned → signed`` shortcut, so we route through ``bit_width`` to
+#: pick the matching signed factory. The dict is small enough to inline,
+#: but extracting it keeps the cast loop readable and lints clean.
+_SIGNED_FOR_UINT_BITS = {
+    8: pa.int8,
+    16: pa.int16,
+    32: pa.int32,
+    64: pa.int64,
+}
+
+
+def _reinterpret_unsigned_as_signed(batch: pa.RecordBatch) -> pa.RecordBatch:
+    """Cast every unsigned-integer column to its same-width signed type.
+
+    ``safe=False`` triggers pyarrow's two's-complement reinterpretation:
+    the underlying bit pattern survives, only the type changes. So
+    ``uint8(255)`` arrives as ``int8(-1)``, ``uint64(2**63)`` as
+    ``int64(-2**63)``, etc. Pass-through when the batch holds no
+    unsigned columns — the common case for a freshly-built Arrow
+    table from a database read.
+    """
+    if not any(pa.types.is_unsigned_integer(f.type) for f in batch.schema):
+        return batch
+
+    new_arrays: list[pa.Array] = []
+    new_fields: list[pa.Field] = []
+    for i, field in enumerate(batch.schema):
+        if pa.types.is_unsigned_integer(field.type):
+            signed = _SIGNED_FOR_UINT_BITS[field.type.bit_width]()
+            new_arrays.append(batch.column(i).cast(signed, safe=False))
+            new_fields.append(
+                pa.field(
+                    field.name,
+                    signed,
+                    nullable=field.nullable,
+                    metadata=field.metadata,
+                )
+            )
+        else:
+            new_arrays.append(batch.column(i))
+            new_fields.append(field)
+    return pa.RecordBatch.from_arrays(new_arrays, schema=pa.schema(new_fields))
 
 
 def _split_batch(

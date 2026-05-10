@@ -42,7 +42,11 @@ from yggdrasil.io.nested.delta.checkpoint import (
     update_last_checkpoint,
     write_checkpoint,
 )
-from yggdrasil.io.nested.delta.delta_io import DeltaIO, DeltaOptions
+from yggdrasil.io.nested.delta.delta_io import (
+    ConcurrentDeltaCommitError,
+    DeltaIO,
+    DeltaOptions,
+)
 from yggdrasil.io.nested.delta.deletion_vector import (
     DeletionVector,
     decode_deletion_vector,
@@ -74,6 +78,7 @@ from yggdrasil.io.nested.delta.snapshot import Snapshot
 __all__ = [
     "AddFile",
     "CommitInfo",
+    "ConcurrentDeltaCommitError",
     "DeletionVector",
     "DeletionVectorDescriptor",
     "DeltaAction",
