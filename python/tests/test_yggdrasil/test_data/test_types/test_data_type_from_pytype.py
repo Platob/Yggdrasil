@@ -145,8 +145,17 @@ class TestComplexHints(ArrowTestCase):
         pa = self.pa
         dtype = DataType.from_pytype(_Side)
 
-        self.assertIsInstance(dtype, StringType)
-        self.assertEqual(dtype.to_arrow(), pa.string())
+        # str-valued Enum lifts to StrEnumType — preserves the member
+        # set and the originating class name without losing the
+        # categorical contract.
+        from yggdrasil.data.types import StrEnumType
+
+        self.assertIsInstance(dtype, StrEnumType)
+        self.assertEqual(dtype.name, "_Side")
+        self.assertEqual(dtype.categories, ("buy", "sell"))
+        self.assertEqual(
+            dtype.to_arrow(), pa.dictionary(pa.int32(), pa.string())
+        )
 
 
 # ---------------------------------------------------------------------------
