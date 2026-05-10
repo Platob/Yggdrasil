@@ -154,6 +154,7 @@ class HTTPSession(Session):
         accept_encoding: str = _BROWSER_ACCEPT_ENCODING,
         ua_seed: Optional[int] = None,
         cookies: Optional[Cookies | Mapping[str, str]] = None,
+        browser_mode: bool = False,
     ) -> None:
         if getattr(self, "_initialized", False):
             return
@@ -174,6 +175,13 @@ class HTTPSession(Session):
         # Browser-mode configuration. Stored verbatim; the actual
         # ``UserAgentGenerator`` / ``Cookies`` objects are created lazily on
         # first read so a plain transport-only session never pays for them.
+        # ``browser_mode`` gates whether the verb helpers (get/head/post/
+        # navigate/submit_form/follow_link) layer on User-Agent, Accept,
+        # Sec-Fetch-*, sec-ch-ua-*, Cookie, and Referer. Off by default —
+        # the verbs then send only ``send_headers`` plus per-call extras,
+        # which is what most API clients want. Each verb also accepts
+        # ``browser_mode=`` to override the session-level flag per call.
+        self.browser_mode: bool = browser_mode
         self.user_agent: Optional[str] = user_agent
         self.accept: str = accept
         self.accept_language: str = accept_language
@@ -453,16 +461,35 @@ class HTTPSession(Session):
         self,
         request_url: URL,
         extra: Optional[Mapping[str, str]] = None,
+        *,
+        browser_mode: Optional[bool] = None,
     ) -> dict[str, str]:
-        """Build the per-request browser header dict.
+        """Build the per-request header dict for a verb call.
 
-        Layering, lowest to highest precedence:
+        ``browser_mode`` (defaulting to :attr:`self.browser_mode` when
+        ``None``) controls whether the browser-emulation layer fires:
 
-        1. browser defaults (``User-Agent``, ``Accept`` family, ``Sec-Fetch-*``)
-        2. session-level :attr:`send_headers`
-        3. *extra* (the per-request ``headers=`` argument)
+        * **off (default):** only :attr:`send_headers` and *extra* are
+          merged. No User-Agent generator is touched, no Sec-Fetch-*,
+          sec-ch-ua-*, Cookie, or Referer is injected.
+        * **on:** layered lowest-to-highest as
+          (1) browser defaults (``User-Agent``, ``Accept`` family,
+          ``Sec-Fetch-*``, sec-ch-ua-*, Cookie, Referer),
+          (2) session-level :attr:`send_headers`,
+          (3) *extra* (the per-request ``headers=`` argument).
         """
-        headers: dict[str, str] = {
+        if browser_mode is None:
+            browser_mode = self.browser_mode
+
+        if not browser_mode:
+            headers: dict[str, str] = {}
+            if self.send_headers:
+                headers.update(self.send_headers)
+            if extra:
+                headers.update(extra)
+            return headers
+
+        headers = {
             "User-Agent": self.get_user_agent(),
             "Accept": self.accept,
             "Accept-Language": self.accept_language,
@@ -574,14 +601,21 @@ class HTTPSession(Session):
         *,
         params: Optional[Mapping[str, Any]] = None,
         headers: Optional[Mapping[str, str]] = None,
+        browser_mode: Optional[bool] = None,
         config: SendConfig | Mapping[str, Any] | None = None,
         **send_kwargs: Any,
     ) -> HTTPResponse:
-        """Issue a browser-style ``GET`` to *url*."""
+        """Issue a ``GET`` to *url*.
+
+        ``browser_mode`` overrides :attr:`self.browser_mode` for this call:
+        ``True`` adds the browser-emulation header set, ``False`` sends only
+        :attr:`send_headers` + *headers*. ``None`` (the default) follows
+        the session flag.
+        """
         resolved = self._resolve_url(url)
         if params:
             resolved = self._apply_params(resolved, params)
-        merged = self._build_browser_headers(resolved, headers)
+        merged = self._build_browser_headers(resolved, headers, browser_mode=browser_mode)
         request = PreparedRequest.prepare("GET", resolved, headers=merged)
         return self.send(request, config=config, **send_kwargs)  # type: ignore[return-value]
 
@@ -591,14 +625,15 @@ class HTTPSession(Session):
         *,
         params: Optional[Mapping[str, Any]] = None,
         headers: Optional[Mapping[str, str]] = None,
+        browser_mode: Optional[bool] = None,
         config: SendConfig | Mapping[str, Any] | None = None,
         **send_kwargs: Any,
     ) -> HTTPResponse:
-        """Issue a browser-style ``HEAD`` to *url*."""
+        """Issue a ``HEAD`` to *url*. See :meth:`get` for ``browser_mode``."""
         resolved = self._resolve_url(url)
         if params:
             resolved = self._apply_params(resolved, params)
-        merged = self._build_browser_headers(resolved, headers)
+        merged = self._build_browser_headers(resolved, headers, browser_mode=browser_mode)
         request = PreparedRequest.prepare("HEAD", resolved, headers=merged)
         return self.send(request, config=config, **send_kwargs)  # type: ignore[return-value]
 
@@ -610,14 +645,15 @@ class HTTPSession(Session):
         body: Optional[Any] = None,
         json: Optional[Any] = None,
         headers: Optional[Mapping[str, str]] = None,
+        browser_mode: Optional[bool] = None,
         config: SendConfig | Mapping[str, Any] | None = None,
         **send_kwargs: Any,
     ) -> HTTPResponse:
-        """Issue a browser-style ``POST`` to *url*."""
+        """Issue a ``POST`` to *url*. See :meth:`get` for ``browser_mode``."""
         resolved = self._resolve_url(url)
         if params:
             resolved = self._apply_params(resolved, params)
-        merged = self._build_browser_headers(resolved, headers)
+        merged = self._build_browser_headers(resolved, headers, browser_mode=browser_mode)
         request = PreparedRequest.prepare(
             "POST", resolved, headers=merged, body=body, json=json
         )
@@ -632,17 +668,23 @@ class HTTPSession(Session):
         body: Optional[Any] = None,
         json: Optional[Any] = None,
         headers: Optional[Mapping[str, str]] = None,
+        browser_mode: Optional[bool] = None,
         update_referrer: bool = True,
         update_cookies: bool = True,
         raise_error: bool = True,
         config: SendConfig | Mapping[str, Any] | None = None,
         **send_kwargs: Any,
     ) -> HTTPResponse:
-        """Navigate to *url*, optionally updating referrer and cookie jar."""
+        """Navigate to *url*, optionally updating referrer and cookie jar.
+
+        See :meth:`get` for ``browser_mode``. The referrer/cookie-jar
+        updates are independent of ``browser_mode`` — they fire whenever
+        the corresponding ``update_*`` flag is true.
+        """
         resolved = self._resolve_url(url)
         if params:
             resolved = self._apply_params(resolved, params)
-        merged = self._build_browser_headers(resolved, headers)
+        merged = self._build_browser_headers(resolved, headers, browser_mode=browser_mode)
         request = PreparedRequest.prepare(
             method, resolved, headers=merged, body=body, json=json
         )
@@ -666,6 +708,7 @@ class HTTPSession(Session):
         *,
         from_url: Optional[str] = None,
         headers: Optional[Mapping[str, str]] = None,
+        browser_mode: Optional[bool] = None,
         raise_error: bool = True,
         config: SendConfig | Mapping[str, Any] | None = None,
         **send_kwargs: Any,
@@ -677,6 +720,7 @@ class HTTPSession(Session):
             url,
             method="GET",
             headers=headers,
+            browser_mode=browser_mode,
             raise_error=raise_error,
             config=config,
             **send_kwargs,
@@ -689,6 +733,7 @@ class HTTPSession(Session):
         *,
         method: str = "POST",
         extra_headers: Optional[Mapping[str, str]] = None,
+        browser_mode: Optional[bool] = None,
         raise_error: bool = True,
         config: SendConfig | Mapping[str, Any] | None = None,
         **send_kwargs: Any,
@@ -705,7 +750,7 @@ class HTTPSession(Session):
             per_request.update(extra_headers)
 
         resolved = self._resolve_url(url)
-        merged = self._build_browser_headers(resolved, per_request)
+        merged = self._build_browser_headers(resolved, per_request, browser_mode=browser_mode)
         request = PreparedRequest.prepare(
             method, resolved, headers=merged, body=encoded
         )
