@@ -31,6 +31,7 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Tuple
 
+from yggdrasil.data.data_field import Field
 from yggdrasil.io.tabular.execution.expr import Expression, Predicate
 
 if TYPE_CHECKING:
@@ -56,14 +57,32 @@ __all__ = [
 def _to_polars(value: Any) -> Any:
     """Compile a stored selector / predicate to a polars-friendly value.
 
-    Yggdrasil :class:`Expression` nodes go through ``to_polars``;
-    everything else (column-name strings, polars / pyarrow native
-    expressions) passes through untouched. Round-tripping a polars
-    ``Expr`` through the AST can lose dtype information, so we only
-    lift the canonical-AST inputs.
+    Yggdrasil :class:`Expression` nodes go through ``to_polars``.
+    :class:`yggdrasil.data.data_field.Field` — the canonical
+    selector — is translated to ``pl.col(source).cast(target)
+    .alias(out_name)``, where the source-side label is
+    :attr:`Field.alias` (when distinct from :attr:`Field.name`)
+    and the cast target is :attr:`Field.dtype`. Everything else
+    (column-name strings, polars / pyarrow native expressions)
+    passes through untouched — round-tripping a polars ``Expr``
+    through the AST can lose dtype information, so we only lift
+    the canonical-AST / canonical-Field inputs.
     """
     if isinstance(value, Expression):
         return value.to_polars()
+    if isinstance(value, Field):
+        import polars as pl
+
+        source = value.alias if value.has_alias else value.name
+        expr = pl.col(source)
+        if value.dtype is not None and hasattr(value.dtype, "to_polars"):
+            try:
+                expr = expr.cast(value.dtype.to_polars())
+            except Exception:
+                pass
+        if value.name and value.name != source:
+            expr = expr.alias(value.name)
+        return expr
     return value
 
 

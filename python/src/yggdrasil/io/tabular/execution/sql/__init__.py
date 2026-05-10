@@ -51,9 +51,11 @@ them together:
   predicate AST. The ``where=`` kwarg accepts one and composes
   it with the SQL ``WHERE`` via AND, so a builder-side filter
   doesn't have to be re-stringified.
-- :class:`yggdrasil.data.expr.Selector` is the cross-engine
+- :class:`yggdrasil.data.data_field.Field` is the cross-engine
   projection. The ``select=`` kwarg accepts a list of names /
-  selectors / columns to apply on the way out.
+  Fields / columns to apply on the way out — the Field carries
+  the output name (and source-side :attr:`Field.alias` when
+  different) plus the cast-on-select :attr:`Field.dtype`.
 - :class:`yggdrasil.data.statement.StatementResult` is the
   lifecycle + Arrow-IO base.
 - :class:`yggdrasil.io.buffer.memory.ArrowTabular` is the
@@ -223,9 +225,9 @@ def sql(
         without re-stringifying.
     select
         Optional projection list applied **after** the SQL — a
-        sequence of column names, :class:`Selector`, or
-        :class:`Column` entries. Useful for renaming / casting on
-        the way out without touching the SQL text.
+        sequence of column names, :class:`yggdrasil.data.data_field.Field`,
+        or :class:`Column` entries. Useful for renaming / casting
+        on the way out without touching the SQL text.
     persist
         Where to land the materialized result. ``"memory"`` (the
         default) keeps it as :class:`ArrowTabular`. ``"path"``

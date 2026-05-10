@@ -3,15 +3,21 @@
 Public surface:
 
 - :class:`Expression`, :class:`Predicate` — abstract bases.
-- :class:`Column`, :class:`Selector`, :class:`Literal`,
-  :class:`Comparison`, :class:`Logical`, :class:`Not`,
-  :class:`Between`, :class:`InList`, :class:`IsNull`,
-  :class:`Like`, :class:`Cast`, :class:`Arithmetic` — concrete
-  node types.
-- :func:`col`, :func:`select`, :func:`lit`, :func:`all_of`,
-  :func:`any_of`, :func:`neg` — fluent factories.
+- :class:`Column`, :class:`Literal`, :class:`Comparison`,
+  :class:`Logical`, :class:`Not`, :class:`Between`,
+  :class:`InList`, :class:`IsNull`, :class:`Like`,
+  :class:`Cast`, :class:`Arithmetic` — concrete node types.
+- :func:`col`, :func:`lit`, :func:`all_of`, :func:`any_of`,
+  :func:`neg` — fluent factories.
 - :class:`CompareOp`, :class:`LogicalOp`, :class:`ArithmeticOp` —
   shared operator enums.
+
+Projections live on :class:`yggdrasil.data.data_field.Field`,
+which is the single canonical "selector" the tabular API
+accepts — no separate selector node lives here. Build a Field
+with the output :attr:`name`, optional :attr:`alias` for the
+source-side label, and target :attr:`dtype`, then pass it to
+``LazyTabular.select`` or a SQL ``statement.select`` list.
 
 Per-engine compilation lives under :mod:`yggdrasil.io.tabular.execution.expr.backends`:
 each backend ships ``to_<target>`` and (where introspection is
@@ -23,7 +29,7 @@ exposes them as instance and class methods (``to_python`` /
 directly.
 """
 
-from .builder import all_of, any_of, col, neg, select
+from .builder import all_of, any_of, col, neg
 from .nodes import (
     Arithmetic,
     ArithmeticOp,
@@ -41,7 +47,6 @@ from .nodes import (
     LogicalOp,
     Not,
     Predicate,
-    Selector,
     lit,
 )
 
@@ -62,11 +67,9 @@ __all__ = [
     "LogicalOp",
     "Not",
     "Predicate",
-    "Selector",
     "all_of",
     "any_of",
     "col",
     "lit",
     "neg",
-    "select",
 ]

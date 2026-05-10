@@ -68,9 +68,9 @@ class SqlPreparedStatement(PreparedStatement):
     without re-stringifying the predicate.
 
     The ``select`` slot accepts a list of column names or
-    :class:`Selector` projections to apply after the SQL ``SELECT``
-    runs — useful for renaming / casting on the way out without
-    mutating the SQL text.
+    :class:`yggdrasil.data.data_field.Field` projections to apply
+    after the SQL ``SELECT`` runs — useful for renaming / casting
+    on the way out without mutating the SQL text.
     """
 
     def __init__(

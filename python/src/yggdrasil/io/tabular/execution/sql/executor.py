@@ -13,9 +13,9 @@ Two backends, picked at runtime by what's installed:
   ``SELECT cols FROM <single source> [WHERE pred] [LIMIT n]``
   shape by lifting the predicate to our :class:`Expression` AST,
   rendering it back to a :class:`pyarrow.compute.Expression` for
-  pushdown, and projecting via :class:`Selector`. Anything beyond
-  that surface raises a clean "install polars" error so the user
-  gets a single-line fix.
+  pushdown, and projecting via :class:`yggdrasil.data.data_field.Field`.
+  Anything beyond that surface raises a clean "install polars"
+  error so the user gets a single-line fix.
 
 Both backends materialize the result into a :class:`Tabular`
 holder (:class:`ArrowTabular` by default, :class:`ParquetIO`
@@ -38,8 +38,8 @@ from yggdrasil.io.tabular.execution.expr import (
     Expression,
     Logical,
     LogicalOp,
-    Selector,
 )
+from yggdrasil.data.data_field import Field
 from yggdrasil.data.executor import StatementExecutor
 from yggdrasil.io.tabular import Tabular
 from yggdrasil.io.tabular import ArrowTabular
@@ -303,33 +303,34 @@ class PolarsSqlExecutor(SqlExecutor):
 def _selector_to_polars(spec: Any) -> Any:
     """Translate a projection entry to a polars expression.
 
-    Strings → bare column reference. :class:`Selector` →
-    cast-on-select with rename. Anything else falls through to
-    :meth:`Expression.to_polars` so a builder-side
-    ``col(...).alias("...")`` chain works directly.
+    Strings → bare column reference. :class:`Field` →
+    cast-on-select with rename — :attr:`Field.alias` (when
+    different from :attr:`Field.name`) is the source-side label
+    and :attr:`Field.name` is the projected output name; the
+    target dtype comes from :attr:`Field.dtype`. Anything else
+    falls through to :meth:`Expression.to_polars` so a builder-
+    side ``col(...).alias("...")`` chain works directly.
     """
     import polars as pl
 
     if isinstance(spec, str):
         return pl.col(spec)
-    if isinstance(spec, Selector):
-        expr = pl.col(spec.name)
-        if spec.target_field is not None and hasattr(
-            spec.target_field, "to_polars",
-        ):
+    if isinstance(spec, Field):
+        source = spec.alias if spec.has_alias else spec.name
+        expr = pl.col(source)
+        if spec.dtype is not None and hasattr(spec.dtype, "to_polars"):
             try:
-                expr = expr.cast(spec.target_field.to_polars())
+                expr = expr.cast(spec.dtype.to_polars())
             except Exception:
                 pass
-        out = spec.projection_name
-        return expr.alias(out) if out and out != spec.name else expr
+        return expr.alias(spec.name) if spec.name and spec.name != source else expr
     if isinstance(spec, Column):
         return pl.col(spec.name)
     if isinstance(spec, Expression):
         return spec.to_polars()
     raise TypeError(
         f"Unsupported select entry {type(spec).__name__}: {spec!r}. "
-        "Pass column names, Selector, Column, or Expression."
+        "Pass column names, Field, Column, or Expression."
     )
 
 
@@ -508,7 +509,7 @@ def _apply_statement_select(
     table: pa.Table,
     select: "Iterable[Any]",
 ) -> pa.Table:
-    """Apply a Python-side ``select`` list (names / Selector / Column)."""
+    """Apply a Python-side ``select`` list (names / Field / Column)."""
     out_names: list[str] = []
     out_columns: list[Any] = []
     for spec in select:
@@ -516,16 +517,15 @@ def _apply_statement_select(
             out_names.append(spec)
             out_columns.append(table[spec])
             continue
-        if isinstance(spec, Selector):
-            col = table[spec.name]
-            if spec.target_field is not None and hasattr(
-                spec.target_field, "to_arrow",
-            ):
+        if isinstance(spec, Field):
+            source = spec.alias if spec.has_alias else spec.name
+            col = table[source]
+            if spec.dtype is not None and hasattr(spec.dtype, "to_arrow"):
                 try:
-                    col = col.cast(spec.target_field.to_arrow())
+                    col = col.cast(spec.dtype.to_arrow())
                 except Exception:
                     pass
-            out_names.append(spec.projection_name)
+            out_names.append(spec.name)
             out_columns.append(col)
             continue
         if isinstance(spec, Column):
@@ -534,7 +534,7 @@ def _apply_statement_select(
             continue
         raise TypeError(
             f"Unsupported select entry {type(spec).__name__}: {spec!r}. "
-            "Pass column names, Selector, or Column."
+            "Pass column names, Field, or Column."
         )
     return pa.Table.from_arrays(out_columns, names=out_names)
 
