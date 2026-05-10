@@ -54,7 +54,7 @@ import time
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar, List, Mapping, Optional, Union, TYPE_CHECKING
 
-from databricks.sdk.errors import DeadlineExceeded
+from databricks.sdk.errors import DeadlineExceeded, InternalError
 from databricks.sdk.service.sql import (
     Disposition,
     EndpointInfo,
@@ -64,7 +64,8 @@ from databricks.sdk.service.sql import (
 )
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data.executor import ExecutionOptions, StatementExecutor
-from yggdrasil.databricks.warehouse.wh_utils import safeEndpointInfo, _EDIT_ARG_NAMES, _jitter_sleep_seconds
+from yggdrasil.databricks.warehouse.wh_utils import safeEndpointInfo, _EDIT_ARG_NAMES, _jitter_sleep_seconds, \
+    serverless_sibling_spec, name_at_index, indexed_name_parts
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.pyutils.equality import dicts_equal
 
@@ -214,6 +215,11 @@ class SQLWarehouse(
             self.warehouse_id = found.warehouse_id
             self.warehouse_name = found.warehouse_name
             self._details = found._details
+        elif self.warehouse_id and not self.warehouse_name:
+            found = self.service.find_warehouse(warehouse_id=self.warehouse_id)
+            self.warehouse_id = found.warehouse_id
+            self.warehouse_name = found.warehouse_name
+            self._details = found._details
 
     def __call__(
         self,
@@ -225,10 +231,10 @@ class SQLWarehouse(
             return self
         if warehouse_id == self.warehouse_id or warehouse_name == self.warehouse_name:
             return self
+
         return self.service.find_warehouse(
             warehouse_id=warehouse_id,
             warehouse_name=warehouse_name,
-            raise_error=True,
         )
 
     def __repr__(self) -> str:
@@ -360,6 +366,52 @@ class SQLWarehouse(
     # ------------------------------------------------------------------
     # Update
     # ------------------------------------------------------------------
+    def get_or_create_sibling(self, index: int) -> "SQLWarehouse":
+        """Return the sibling warehouse at absolute ``[index]``, creating it if missing.
+
+        ``index`` is absolute against this warehouse's base name (suffix
+        stripped).  Examples for current name ``"wh [3]"``:
+
+        - ``get_or_create_sibling(1)`` → ``"wh"``      (unsuffixed original)
+        - ``get_or_create_sibling(3)`` → ``self``      (same warehouse)
+        - ``get_or_create_sibling(5)`` → ``"wh [5]"``  (find or create serverless)
+
+        Created siblings are serverless (cloned spec via
+        :func:`serverless_sibling_spec`).  ``self`` is **not** mutated.
+        """
+        if index < 1:
+            raise ValueError(f"sibling index must be >= 1, got {index}")
+
+        base, current_idx = indexed_name_parts(self.warehouse_name or "")
+        if not base:
+            raise ValueError(
+                f"cannot derive sibling base from {self.warehouse_name!r}"
+            )
+
+        if index == current_idx:
+            return self
+
+        target_name = name_at_index(self.warehouse_name, index)
+
+        # `find_warehouse(default=None)` returns None on miss; `create=False`
+        # so we don't trigger the service's plain-create path (which would
+        # ignore our serverless / cloned-spec intent).
+        existing = self.service.find_warehouse(
+            warehouse_name=target_name,
+            create=False,
+            default=None,
+        )
+        if existing is not None:
+            return existing
+
+        LOGGER.info(
+            "Sibling %r not found; creating serverless sibling of %r",
+            target_name, self.warehouse_name,
+        )
+        spec = serverless_sibling_spec(self.details, name=target_name)
+        spec["permissions"] = ["users"]
+        # spec contains `name` (or `warehouse_name`) plus the cloned + serverless-forced fields.
+        return self.service.create(**spec)
 
     def update(
         self,
@@ -545,8 +597,8 @@ class SQLWarehouse(
         sdk_client = self.client.workspace_client().statement_execution
 
         LOGGER.debug(
-            "Executing SQL on warehouse %s (%s):\n%s",
-            self.warehouse_name, target_wh_id, statement.text,
+            "%r executing:\n%s",
+            self, statement.text,
         )
 
         # Submission-level retry: distinct from result-level polling.
@@ -577,8 +629,8 @@ class SQLWarehouse(
         ).set_api_response(response)
 
         LOGGER.info(
-            "Executed %r on warehouse %s (%s)",
-            result, self.warehouse_name, target_wh_id,
+            "%r executed %r",
+            self, result,
         )
         return result
 
@@ -591,17 +643,25 @@ class SQLWarehouse(
         disposition: Disposition,
         format_: Format,
         submit_wait: WaitingConfig | None,
-        deadline: float | None,
+        deadline: float | None,  # kept for signature compat; unused now
     ):
-        """Inner retry loop for SDK ``execute_statement``.
+        """Submit with one busy retry, then serverless-sibling failover.
 
-        Retries on :class:`DeadlineExceeded` (warehouse busy/cold) until
-        the deadline is exhausted.  Distinct from result-level polling,
-        which the base ``wait()`` handles, and from :meth:`StatementResult.retry`,
-        which retries *terminal-failure* results rather than failed submissions.
+        Attempt sequence on :class:`DeadlineExceeded`:
+
+        1. First failure  → back off per ``submit_wait`` and retry on the
+           same warehouse once.
+        2. Second failure → :meth:`get_or_create_sibling` for the next
+           ``[idx]`` (serverless), submit there.  ``self`` is not mutated;
+           only the local ``target_wh_id`` is swapped.
+        3. Third failure  → raise.
         """
-        iteration = 0
+        target_wh_id = target_wh_id or self.warehouse_id
+        original_wh_id = target_wh_id
         started_at = time.monotonic()
+        attempt = 0  # 0=first try, 1=retry on original, 2=try on sibling
+        failed_over = False
+
         while True:
             try:
                 return sdk_client.execute_statement(
@@ -617,31 +677,96 @@ class SQLWarehouse(
                     catalog=statement.catalog_name,
                     schema=statement.schema_name,
                 )
-            except DeadlineExceeded:
-                remaining = (
-                    None if deadline is None
-                    else (deadline - time.monotonic())
-                )
-                if remaining is not None and remaining <= 0:
-                    LOGGER.error(
-                        "Submit deadline exceeded for warehouse %s (%s) "
-                        "after %.2fs and %d retries",
-                        self.warehouse_name, target_wh_id,
-                        time.monotonic() - started_at, iteration,
+            except (DeadlineExceeded, InternalError) as e:
+                if attempt == 0:
+                    sleep_for = _jitter_sleep_seconds(
+                        submit_wait, iteration=0, remaining=None,
                     )
-                    raise
+                    LOGGER.warning(
+                        "%r is busy; execute submit hit DeadlineExceeded. "
+                        "Retrying in %.2fs (attempt=1)",
+                        self, sleep_for,
+                    )
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+                    attempt = 1
+                    continue
 
-                sleep_for = _jitter_sleep_seconds(
-                    submit_wait, iteration=iteration, remaining=remaining,
+                if attempt == 1 and not failed_over:
+                    sibling = self._failover_to_sibling(
+                        busy_wh_id=original_wh_id,
+                        elapsed=time.monotonic() - started_at,
+                    )
+                    target_wh_id = sibling.warehouse_id
+                    failed_over = True
+                    attempt = 2
+                    continue
+
+                elapsed = time.monotonic() - started_at
+                LOGGER.error(
+                    "Submit failed after retry and sibling failover for %r "
+                    "(original=%s, sibling=%s, elapsed=%.2fs)",
+                    self, original_wh_id, target_wh_id, elapsed,
                 )
-                LOGGER.warning(
-                    "Warehouse %s (%s) is busy; execute submit hit DeadlineExceeded. "
-                    "Retrying in %.2fs (attempt=%d)",
-                    self.warehouse_name, target_wh_id, sleep_for, iteration + 1,
-                )
-                if sleep_for > 0:
-                    time.sleep(sleep_for)
-                iteration += 1
+                raise DeadlineExceeded(
+                    f"Submit deadline exceeded for {self.warehouse_name!r}: "
+                    f"original warehouse {original_wh_id} busy after retry, "
+                    f"sibling {target_wh_id} also returned DeadlineExceeded "
+                    f"(elapsed={elapsed:.2f}s, attempts={attempt + 1}). "
+                    f"Original cause: {e}"
+                ) from e
+
+    def _failover_to_sibling(
+        self,
+        *,
+        busy_wh_id: str,
+        elapsed: float,
+    ) -> "SQLWarehouse":
+        """Get-or-create the next-indexed sibling for submit failover.
+
+        Wraps :meth:`get_or_create_sibling` with diagnostic context — used
+        by :meth:`_submit_with_retry` after the original warehouse exhausts
+        its busy-retry budget.  Any failure here is re-raised as a
+        :class:`RuntimeError` chaining the original cause, so the caller
+        sees both *why we tried to fail over* and *why failover failed*.
+
+        Parameters
+        ----------
+        busy_wh_id:
+            The warehouse id we just gave up on — included in error
+            messages and logs for debuggability.
+        elapsed:
+            Seconds spent in the submit loop before failover, for logging.
+        """
+        _, current_idx = indexed_name_parts(self.warehouse_name or "")
+        sibling_idx = current_idx + 1
+
+        try:
+            sibling = self.get_or_create_sibling(sibling_idx)
+        except Exception as exc:
+            LOGGER.error(
+                "Failover failed: could not get-or-create sibling [%d] of %r "
+                "after original %s exhausted its submit retry (elapsed=%.2fs): %s",
+                sibling_idx,
+                self.warehouse_name,
+                busy_wh_id,
+                elapsed,
+                exc,
+            )
+            raise RuntimeError(
+                f"Could not fail over from busy warehouse "
+                f"{self.warehouse_name!r} ({busy_wh_id}): "
+                f"sibling [{sibling_idx}] could not be acquired ({exc})"
+            ) from exc
+
+        LOGGER.warning(
+            "Original warehouse %s still busy after retry; "
+            "failing over to sibling %r (%s) for this submit",
+            busy_wh_id,
+            sibling.warehouse_name,
+            sibling.warehouse_id,
+        )
+        return sibling
 
     # ------------------------------------------------------------------
     # Public execute() — back-compat shim over the typed pipeline

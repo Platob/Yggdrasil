@@ -12,7 +12,7 @@ Databricks SDK ``WarehousesAPI`` that handles:
 
 import dataclasses as dc
 import logging
-from typing import Optional, Sequence, Union, List, Iterator
+from typing import Optional, Sequence, Union, List, Iterator, Any
 
 from databricks.sdk.errors import ResourceDoesNotExist
 from databricks.sdk.service.sql import (
@@ -80,6 +80,9 @@ class Warehouses(DatabricksService):
     resource returned by this service.
     """
 
+    def __iter__(self):
+        yield from self.list_warehouses()
+
     # ------------------------------------------------------------------ #
     # Listing / finding
     # ------------------------------------------------------------------ #
@@ -101,7 +104,8 @@ class Warehouses(DatabricksService):
         warehouse_id: str | None = None,
         warehouse_name: str | None = None,
         find_default: bool = False,
-        raise_error: bool = True,
+        create: bool = True,
+        default: Any = ...,
     ) -> Optional["SQLWarehouse"]:
         """
         Resolve a warehouse by id or name.
@@ -116,8 +120,10 @@ class Warehouses(DatabricksService):
         find_default:
             When True and no id/name is given, fall back to
             :meth:`find_default`.
-        raise_error:
-            When True, raise :exc:`ResourceDoesNotExist` if not found.
+        create:
+            When True and id/name is given, create a new warehouse.
+        default:
+            When ..., raise :exc:`ResourceDoesNotExist` if not found.
 
         Returns
         -------
@@ -148,16 +154,28 @@ class Warehouses(DatabricksService):
                     return warehouse
 
             LOGGER.warning("find_warehouse: warehouse %r not found", warehouse_name)
-            if raise_error:
+
+            if create:
+                return self.create(
+                    name=warehouse_name,
+                    permissions=[
+                        WarehouseAccessControlRequest(
+                            group_name="users",
+                            permission_level=WarehousePermissionLevel.CAN_MANAGE,
+                        )
+                    ],
+                )
+
+            if default is ...:
                 raise ResourceDoesNotExist(f"Cannot find SQL warehouse {warehouse_name!r}")
-            return None
+            return default
 
         if find_default:
-            return self.find_default(raise_error=raise_error)
+            return self.find_default()
 
-        if raise_error:
+        if default is ...:
             raise ResourceDoesNotExist("Cannot find SQL warehouse, no parameters given")
-        return None
+        return default
 
     def find_default(self, raise_error: bool = True) -> Optional["SQLWarehouse"]:
         """
@@ -266,7 +284,7 @@ class Warehouses(DatabricksService):
         found = self.find_warehouse(
             warehouse_id=warehouse_id,
             warehouse_name=name,
-            raise_error=False,
+            default=None,
         )
 
         if found is not None:
@@ -393,7 +411,7 @@ class Warehouses(DatabricksService):
             details.warehouse_type = EndpointInfoWarehouseType.PRO
 
         if not details.auto_stop_mins:
-            if details.name == DEFAULT_ALL_PURPOSE_CLASSIC_NAME:
+            if not details.enable_serverless_compute:
                 details.auto_stop_mins = 30
 
         default_tags = self.client.default_tags(update=update)

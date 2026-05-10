@@ -269,7 +269,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
                 warehouse_id=warehouse_id,
                 warehouse_name=warehouse_name,
                 find_default=True,
-                raise_error=True,
             )
             return self.default_warehouse
 
