@@ -914,6 +914,84 @@ Why: it is a true singleton, has no other meaning in feature code, reads cleanly
 This library sits on integration boundaries.
 Stable and obvious beats clever and fragile.
 
+### Make objects picklable and hashable by default
+
+This library ships into Spark workers, multiprocessing pools, joblib jobs, FastAPI worker forks, Power Query bridges — every long-lived "client" / "session" / "service" / "config" / "path" / "schema" / "field" / "request" / "response" object will sooner or later cross a pickle boundary. **Design every new long-lived object so that pickle (and hash, where it makes sense) Just Work, the first time, with the same semantics in every process.**
+
+Concrete rules, in order of priority:
+
+1. **Pure-data configs are dataclasses with `unsafe_hash=True`.** Anything that describes "what to connect to / what to do" — `*Config`, `*Options`, `*Spec`, `Field`, `Schema`, `URL`, credential records — should be a frozen-or-`unsafe_hash` dataclass with `compare=False, hash=False` on the unhashable members (callables, mutable buffers, live handles). Hashable configs are what makes per-config singleton caches (rule 3) possible. If a field is genuinely identity-bearing but unhashable (e.g. a `dict` of options), normalize it into a `tuple` of items in `__post_init__` or expose a `_cache_key()` method that returns a hashable projection — don't push the burden onto every caller.
+
+2. **Live "client" / "session" / "service" objects are picklable too.** Pickling an object that owns a TCP connection pool, a boto session, or a thread pool is normal in this codebase — Spark workers do it on every partition. The contract is: pickling a live handle dehydrates it; unpickling rehydrates it lazily on first use. Use the generic state pattern from `yggdrasil.io.session.Session` / `yggdrasil.aws.AWSClient`:
+
+   ```python
+   _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
+       "_session", "_client_cache", "_lock", "_pool", ...
+   })
+
+   def __getstate__(self):
+       return {k: v for k, v in self.__dict__.items()
+               if k not in self._TRANSIENT_STATE_ATTRS}
+
+   def __setstate__(self, state):
+       if getattr(self, "_initialized", False):
+           return
+       self.__dict__.update(state)
+       # re-init the transient slots to their fresh defaults
+       self._session = None
+       self._client_cache = {}
+       ...
+       self._initialized = True
+   ```
+
+   Subclasses extend `_TRANSIENT_STATE_ATTRS` with `Base._TRANSIENT_STATE_ATTRS | frozenset({...})` and override `__setstate__` to chain to super and reset their own transients.
+
+3. **Singleton-cache by config in `__new__`.** When two callers build the same client / session / service with the same config, they must share the same in-process instance — otherwise the connection pool, cookie jar, boto-client cache, and per-instance lazy state get duplicated for nothing. Pattern:
+
+   ```python
+   _INSTANCES: ClassVar[dict[tuple[type, ConfigT], "Self"]] = {}
+   _INSTANCES_LOCK: ClassVar[threading.Lock] = threading.Lock()
+
+   def __new__(cls, config=None):
+       if config is None:
+           config = ConfigT()
+       key = (cls, config)
+       with cls._INSTANCES_LOCK:
+           cached = cls._INSTANCES.get(key)
+           if cached is not None:
+               return cached
+           inst = super().__new__(cls)
+           cls._INSTANCES[key] = inst
+           return inst
+
+   def __init__(self, config=None):
+       if getattr(self, "_initialized", False):
+           return  # idempotent — Python re-enters __init__ after cached __new__
+       ...
+       self._initialized = True
+
+   def __getnewargs__(self):
+       return (self.config,)  # collapse to live singleton on in-process unpickle
+   ```
+
+   `__getnewargs__` is what makes pickle round-trip preserve singleton identity within a process. The `_INSTANCES` dict is also the seam tests use to clear cross-test bleed (`Cls._INSTANCES.clear()` in an autouse fixture).
+
+4. **Hash and equality follow config, not identity.** Two clients built from equal configs must compare equal and hash equal so they collapse to the same `_INSTANCES` slot. Don't add `__hash__` based on `id(self)` — the singleton mechanism already gives you stable identity for free, and config-based equality lets configs flow into sets / dict keys / Spark `groupBy` keys without surprising the caller.
+
+5. **Test the round-trip every time.** Any new long-lived class gets at least these tests (mirrored on `test_session_pickle.py` / `test_aws/test_client_singleton.py`):
+
+   - same-config returns same instance (`a is b`),
+   - `__init__` is idempotent (mutate live, re-construct, mutation survives),
+   - in-process pickle collapses to live singleton (`pickle.loads(pickle.dumps(x)) is x`),
+   - cross-process pickle (drop `_INSTANCES`, then unpickle) restores config + transient slots correctly,
+   - transient attrs don't leak into `__getstate__`.
+
+   If you can't write the cross-process test cleanly, the design is wrong — fix the seam, don't skip the test.
+
+6. **Keep configs JSON-serializable when feasible.** A config that round-trips through `yggdrasil.pickle.json` (for HTTP payloads, FastAPI bodies, `to_url()` plumbing, debug dumps) is friendlier than one that only pickles. Limit non-JSON members (callables, live handles, file objects) to fields explicitly marked `compare=False, hash=False, repr=False` and document why they exist.
+
+When you can't make something picklable (a real socket, a live Spark JVM handle, a memory-mapped buffer larger than a pickle frame), say so explicitly: raise a clear `TypeError("X is not picklable; pass Y instead")` from `__reduce_ex__` so the failure surfaces at the right line instead of inside a Spark worker stack trace 30 minutes later.
+
 ---
 
 ## Skills guidance for coding agents

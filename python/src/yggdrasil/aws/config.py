@@ -114,13 +114,16 @@ def _env_factory(name: str):
     return factory
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(unsafe_hash=True)
 class AWSConfig:
     """Pure-data AWS session configuration.
 
     Holds every knob :class:`AWSClient` needs to mint a boto3
     :class:`Session`. Pickle-safe; no cached state. Equality and
-    hashing follow the field set.
+    hashing follow the field set — :attr:`refresher` is excluded
+    from both (callables aren't comparable), so two configs that
+    differ only in their refresher callback collapse to the same
+    :class:`AWSClient` singleton.
 
     Construction shapes:
 
