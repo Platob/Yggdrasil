@@ -21,6 +21,7 @@ from yggdrasil.dataclasses.waiting import (
 from yggdrasil.data.enums import Mode
 from .bytes_io import BytesIO
 from yggdrasil.io.nested import FolderIO, FolderOptions
+from .headers import Headers
 from .request import PreparedRequest
 from .response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
 from .response_batch import ResponseBatch
@@ -355,7 +356,7 @@ class Session(ABC):
         base_url: Optional[URL | str] = None,
         verify: bool = True,
         pool_maxsize: int = 10,
-        headers: Optional[dict[str, str]] = None,
+        headers: "Headers | Mapping[str, str] | None" = None,
         waiting: WaitingConfig = DEFAULT_WAITING_CONFIG,
         *,
         key: str = "",
@@ -369,7 +370,7 @@ class Session(ABC):
         self.key = key
         self.verify = verify
         self.pool_maxsize = pool_maxsize if pool_maxsize and pool_maxsize > 0 else 8
-        self.headers = headers
+        self.headers: Headers = Headers.from_(headers)
         self.waiting = waiting
         self._lock = threading.RLock()
         self._job_pool: Optional[JobPoolExecutor] = None
@@ -425,7 +426,7 @@ class Session(ABC):
     @x_api_key.setter
     def x_api_key(self, value: Optional[str]) -> None:
         if self.headers is None:
-            self.headers = {}
+            self.headers = Headers()
         if value is None:
             self.headers.pop("X-API-Key", None)
         else:

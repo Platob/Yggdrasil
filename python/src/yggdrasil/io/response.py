@@ -18,7 +18,7 @@ from yggdrasil.data.schema import schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
 from .base import IO
 from yggdrasil.data.enums import Codec, MediaType, MimeTypes
-from .headers import normalize_headers
+from .headers import Headers
 from .holder import Holder
 from .tabular.base import Tabular
 from yggdrasil.environ.userinfo import USERINFO_STRUCT, UserInfo
@@ -466,22 +466,30 @@ RESPONSE_ARROW_SCHEMA: pa.Schema = RESPONSE_SCHEMA.to_arrow_schema()
 def _compute_response_identity_hash(
     request_hash: int,
     status_code: int,
-    headers: Mapping[str, str] | None,
+    headers: "Headers | Mapping[str, str] | None",
     body: Holder | None,
 ) -> int:
+    """Mix (request_hash, status, headers, body) into one xxh3_64.
+
+    Each component arrives pre-digested where possible:
+    :attr:`PreparedRequest.hash` already collapses method / url /
+    headers / body upstream, :class:`Headers` caches
+    :attr:`canonical_bytes`, :class:`Holder` caches
+    :attr:`xxh3_64_digest`. The response identity is the request
+    digest mixed with the response-side bytes.
+    """
     import xxhash
     h = xxhash.xxh3_64()
     h.update(int(request_hash).to_bytes(8, "little", signed=True))
     h.update(b"\x00")
     h.update(int(status_code).to_bytes(4, "little", signed=False))
     h.update(b"\x00")
-    for k in sorted(headers or {}):
-        h.update(str(k).encode("utf-8"))
-        h.update(b"=")
-        h.update(str(headers[k]).encode("utf-8"))
-        h.update(b"\x00")
+    if headers is not None:
+        if not isinstance(headers, Headers):
+            headers = Headers.from_(headers)
+        h.update(headers.canonical_bytes)
     if body is not None:
-        h.update(body.xxh3_64().digest())
+        h.update(body.xxh3_64_digest)
     u = h.intdigest()
     return u if u < 2**63 else u - 2**64
 
@@ -515,13 +523,12 @@ class Response(Tabular[CastOptions]):
         "_session",
         "_cache",
         "_cache_token",
-        "_header_length_cache",
     )
 
     # Instance attributes that don't survive pickling — excluded by
     # ``__getstate__`` and reset by ``__setstate__``. Subclasses extend.
     _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset(
-        {"_session", "_cache", "_cache_token", "_header_length_cache"}
+        {"_session", "_cache", "_cache_token"}
     )
 
     def __init__(
@@ -537,7 +544,7 @@ class Response(Tabular[CastOptions]):
         super().__init__()
         self.request = request
         self.status_code = int(status_code)
-        self.headers = _string_dict(headers)
+        self.headers: Headers = Headers.from_(headers)
         self.tags = _string_dict(tags)
         self.received_at = any_to_datetime(received_at)
         self.buffer = _coerce_buffer(buffer)
@@ -550,17 +557,14 @@ class Response(Tabular[CastOptions]):
         self._session: "Session | None" = None
         # Memoization for the deterministic projection — hashes,
         # arrow_values dict. Invalidated when :meth:`_state_token`
-        # shifts (status / headers / buffer identity or size /
-        # byte length changed, or the embedded request's own state
-        # shifted). :meth:`_invalidate_cache` drops the cache for
-        # mutations that the fingerprint can't see (a same-length
-        # in-place value rotation on the same dict object).
+        # shifts (status / headers swap or :class:`Headers` version
+        # bump / buffer swap or size change, or the embedded
+        # request's own state shifted). :class:`Headers` already
+        # tracks its own mutations through ``version``, so the only
+        # blind spot is a same-content :class:`Headers` *swap* on
+        # the same response — :meth:`_invalidate_cache` covers that.
         self._cache: dict[str, Any] = {}
         self._cache_token: tuple = ()
-        # Byte-length stat cached against ``(id(headers), len(headers))``
-        # so :meth:`_state_token` catches in-place value rewrites the
-        # ``id`` + ``len`` pair would otherwise miss.
-        self._header_length_cache: tuple[int, int, int] | None = None
 
     # ------------------------------------------------------------------
     # Holder access — :attr:`buffer` IS the durable :class:`Holder`.
@@ -666,7 +670,10 @@ class Response(Tabular[CastOptions]):
         self._session = None
         self._cache = {}
         self._cache_token = ()
-        self._header_length_cache = None
+        # Re-coerce in case an old pickle carried ``headers`` as a
+        # plain dict — :class:`Headers.from_` is a no-op on an
+        # already-built instance.
+        self.headers = Headers.from_(self.headers)
 
     # ------------------------------------------------------------------
     # Memoization — cheap fingerprint check, refresh on change
@@ -676,12 +683,12 @@ class Response(Tabular[CastOptions]):
         """Cheap fingerprint of the inputs that drive every cached
         derivation (hashes, arrow_values).
 
-        Includes the embedded request's :meth:`_state_token` so a
-        mutation upstream (e.g. an ``authorization`` swap) invalidates
-        the response-level cache too. The byte-length stats
-        (:attr:`header_length`, :attr:`body_length`) sit alongside
-        ``id`` + ``len`` so a same-count in-place header rewrite still
-        shifts the token whenever the new value differs in length.
+        Trusts each inner object to track its own state: the embedded
+        request's :meth:`_state_token` rolls up its method / URL /
+        headers / body fingerprint; :class:`Headers` exposes
+        ``version`` for in-place tracking; :class:`Holder` is keyed
+        by ``id`` + size. No byte-length shadows — when the inner
+        object changes, the token shifts on its own.
         """
         headers = self.headers
         buffer = self.buffer
@@ -689,10 +696,9 @@ class Response(Tabular[CastOptions]):
             self.request._state_token(),
             self.status_code,
             id(headers),
-            len(headers) if headers else 0,
-            self.header_length,
+            headers.version if headers is not None else 0,
             id(buffer),
-            self.body_length,
+            buffer.size if buffer is not None else -1,
         )
 
     def _cached(self, name: str, compute: Callable[[], Any]) -> Any:
@@ -707,18 +713,13 @@ class Response(Tabular[CastOptions]):
         return cached
 
     def _invalidate_cache(self) -> None:
-        """Drop every memoized derivation — call after any in-place
-        mutation the :meth:`_state_token` fingerprint can't see.
-
-        Clears the byte-length stat cache too: an in-place value
-        rewrite on the same dict object keeps ``id(headers)`` /
-        ``len(headers)`` constant, so without this drop the stat
-        would re-serve a stale length and the token would falsely
-        match.
-        """
+        """Drop every memoized derivation — call after a value-equal
+        :class:`Headers` swap or any other mutation the inner-object
+        fingerprint can't see (none of the standard setters need
+        this; :class:`Headers` already bumps its own version on
+        in-place writes)."""
         self._cache.clear()
         self._cache_token = ()
-        self._header_length_cache = None
 
     # ------------------------------------------------------------------
     # Session attachment
@@ -788,7 +789,7 @@ class Response(Tabular[CastOptions]):
         receiver = _parse_receiver(obj)
 
         if normalize:
-            headers = normalize_headers(headers, body=buffer, is_request=False)
+            headers = Headers.from_(headers).normalized(body=buffer, is_request=False)
 
         _ensure_media_headers(headers, buffer)
 
@@ -998,37 +999,6 @@ class Response(Tabular[CastOptions]):
         return self.buffer.size if self.buffer is not None else 0
 
     @property
-    def body_length(self) -> int:
-        """Alias for :attr:`body_size` — symmetry with the request-side
-        stat so the two fingerprints share a name.
-        """
-        return self.body_size
-
-    @property
-    def header_length(self) -> int:
-        """Total byte length of header keys + values.
-
-        Cheap fingerprint that catches in-place value rewrites that
-        ``id(headers)`` + ``len(headers)`` would miss. Cached against
-        ``(id(headers), len(headers))`` and dropped by
-        :meth:`_invalidate_cache`, so an unchanged dict is one
-        identity comparison plus one ``len``.
-        """
-        headers = self.headers
-        count = len(headers) if headers else 0
-        cached = self._header_length_cache
-        if cached is not None and cached[0] == id(headers) and cached[1] == count:
-            return cached[2]
-        if not headers:
-            length = 0
-        else:
-            length = 0
-            for k, v in headers.items():
-                length += len(str(k)) + len(str(v))
-        self._header_length_cache = (id(headers), count, length)
-        return length
-
-    @property
     def body_hash(self) -> int:
         """xxh3_64 digest of the body bytes; 0 when body is absent.
 
@@ -1060,13 +1030,7 @@ class Response(Tabular[CastOptions]):
             lambda: _compute_response_identity_hash(
                 request_hash=self.request.public_hash,
                 status_code=self.status_code,
-                headers=normalize_headers(
-                    self.headers or {},
-                    is_request=False,
-                    add_missing=False,
-                    anonymize=True,
-                    mode="remove",
-                ),
+                headers=self.headers.anonymized(mode="remove"),
                 body=self.buffer,
             ),
         )
@@ -1194,8 +1158,7 @@ class Response(Tabular[CastOptions]):
         return self.__class__(
             request=self.request.anonymize(mode=mode),
             status_code=self.status_code,
-            headers=normalize_headers(
-                self.headers,
+            headers=self.headers.normalized(
                 is_request=False,
                 mode=mode,
                 body=self.body,
@@ -1433,7 +1396,7 @@ class Response(Tabular[CastOptions]):
         buffer = _coerce_buffer(body_bytes, media_type=pre_media)
 
         if normalize:
-            headers = normalize_headers(headers, body=buffer, is_request=False)
+            headers = Headers.from_(headers).normalized(body=buffer, is_request=False)
 
         out_class = cls
         if cls is Response and request.url.is_http:

@@ -178,6 +178,13 @@ class Holder(URLBased, Tabular[O], Disposable):
         "_mtime",
         "_media_type",
         "temporary",
+        # Cached payload digest. ``_xxh3_64_size`` / ``_xxh3_64_mtime``
+        # form the invalidation key — bumped together by
+        # :meth:`_touch_stat`, which every write path eventually flows
+        # through. ``-1`` means "never computed".
+        "_xxh3_64_cached",
+        "_xxh3_64_size",
+        "_xxh3_64_mtime",
     )
 
     # ------------------------------------------------------------------
@@ -294,6 +301,12 @@ class Holder(URLBased, Tabular[O], Disposable):
         # :class:`IOStats` on demand.
         self._size: int = int(stat.size) if stat is not None else 0
         self._mtime: float = float(stat.mtime) if stat is not None else 0.0
+        # Lazy xxh3_64 digest cache — paid on first call, valid until
+        # ``_size`` or ``_mtime`` shifts (every write goes through
+        # :meth:`_touch_stat`, which updates one or the other).
+        self._xxh3_64_cached: int = 0
+        self._xxh3_64_size: int = -1
+        self._xxh3_64_mtime: float = -1.0
         if stat is not None and stat.media_type is not None:
             self._media_type = stat.media_type
         else:
@@ -1039,7 +1052,14 @@ class Holder(URLBased, Tabular[O], Disposable):
         return self.read_bytes()
 
     def xxh3_64(self):
-        """Return an :class:`xxhash.xxh3_64` instance over the payload."""
+        """Return an :class:`xxhash.xxh3_64` instance over the payload.
+
+        Always rebuilds an updatable :class:`xxhash.xxh3_64` so callers
+        can keep mixing more bytes in if they want. The expensive
+        part — walking the payload — is short-circuited via the
+        cached digest; we just seed a fresh hasher with the cached
+        value's bytes when available.
+        """
         import xxhash
         return xxhash.xxh3_64(self.read_bytes())
 
@@ -1048,13 +1068,35 @@ class Holder(URLBased, Tabular[O], Disposable):
 
         ``xxh3_64`` produces an unsigned 64-bit value; downstream Arrow
         schemas pin the field as ``int64``, so the digest is wrapped
-        into signed range ``[-2**63, 2**63)``.
+        into signed range ``[-2**63, 2**63)``. Memoized against
+        ``(_size, _mtime)`` — which every write path bumps via
+        :meth:`_touch_stat` — so repeated reads pay the walk once.
         """
+        if (
+            self._xxh3_64_size != -1
+            and self._xxh3_64_size == self._size
+            and self._xxh3_64_mtime == self._mtime
+        ):
+            return self._xxh3_64_cached
         import xxhash
         v = xxhash.xxh3_64(self.read_bytes()).intdigest()
         if v >= 2 ** 63:
             v -= 2 ** 64
+        self._xxh3_64_cached = v
+        self._xxh3_64_size = self._size
+        self._xxh3_64_mtime = self._mtime
         return v
+
+    @property
+    def xxh3_64_digest(self) -> bytes:
+        """8-byte big-endian payload digest — equivalent to
+        ``xxh3_64().digest()`` but served from the cached
+        :meth:`xxh3_int64` so callers mixing the digest into a parent
+        hash don't re-walk the payload."""
+        v = self.xxh3_int64()
+        if v < 0:
+            v += 2 ** 64
+        return v.to_bytes(8, "big")
 
     # ------------------------------------------------------------------
     # Dunder

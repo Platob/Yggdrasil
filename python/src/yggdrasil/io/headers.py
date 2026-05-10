@@ -5,7 +5,7 @@ import platform
 import re
 import socket
 from dataclasses import dataclass, field
-from typing import ClassVar, Literal, Mapping, MutableMapping, Optional, Union
+from typing import Any, ClassVar, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional, Union
 
 from yggdrasil.data.enums import MimeTypes
 from yggdrasil.version import __version_info__, __version__
@@ -14,6 +14,7 @@ from .holder import Holder
 from yggdrasil.data.enums import Codec, MediaType
 
 __all__ = [
+    "Headers",
     "HeaderValue",
     "PromotedHeaders",
     "normalize_headers",
@@ -289,133 +290,452 @@ def _looks_like_token(value: str) -> bool:
 
 
 def normalize_headers(
-    headers: Mapping[HeaderValue, HeaderValue],
+    headers: "Headers | Mapping[HeaderValue, HeaderValue] | None",
     *,
     is_request: bool,
     add_missing: bool = True,
     mode: Literal["remove", "redact"] = "remove",
     anonymize: bool = False,
     body: Optional[Holder] = None,
-) -> MutableMapping[str, str]:
+) -> "Headers":
+    """Backwards-compatible thin wrapper around :meth:`Headers.normalized`.
+
+    The whole normalization vocabulary (canonical names, sensitive
+    detection, body-derived Content-* backfill, request defaults)
+    lives on :class:`Headers` so a single audit covers the whole
+    behaviour. This free function stays so existing callers
+    (``normalize_headers(some_dict, is_request=True)``) keep working
+    without rewriting every site.
     """
-    Normalize header names and optionally sanitize sensitive values.
+    return Headers.from_(headers).normalized(
+        is_request=is_request,
+        add_missing=add_missing,
+        mode=mode,
+        anonymize=anonymize,
+        body=body,
+    )
 
-    Behavior:
-    - canonicalizes recognized header names
-    - optionally removes or redacts sensitive values
-    - backfills Content-Type / Transfer-Encoding / Content-Length from `body`
-      when missing
+
+# Sentinel used by :class:`Headers` to tell "key absent" from "key
+# present with the same value" without paying for an extra ``in``
+# probe. ``object()`` would work; ``...`` is already the codebase's
+# blessed missing-arg singleton (see CLAUDE.md → "Use `...` as the
+# unset / missing sentinel").
+_MISSING: Any = ...
+
+
+class Headers(MutableMapping[str, str]):
+    """Mutable string-string mapping with versioned change tracking.
+
+    Acts as a drop-in replacement for the plain ``dict[str, str]``
+    that :class:`Session`, :class:`PreparedRequest`, and
+    :class:`Response` were using. Two reasons to specialize it:
+
+    - **Version counter.** Every mutation that actually changes the
+      contents bumps :attr:`version`. ``(id(headers), version)`` is a
+      tight cache fingerprint — ``id`` covers wholesale dict swaps,
+      ``version`` covers in-place mutations the ``id`` can't see (the
+      common case: ``headers["Authorization"] = new_token`` on the
+      same dict object).
+    - **Cached digests.** :attr:`byte_length` and :attr:`xxh3_64`
+      memoize against the version, so a request that hashes the same
+      headers ten times pays the walk once. Same-value writes
+      (``headers["Accept"] = "*/*"`` when it already is) short-circuit
+      without bumping the version, so re-applying defaults is free.
+
+    Keys and values are coerced to ``str`` on the way in. Lookups stay
+    case-sensitive — the canonical-name normalization sits in
+    :func:`normalize_headers`, separate from this container, so
+    callers that already speak in canonical names don't pay for a
+    second pass.
     """
-    out: MutableMapping[str, str] = {}
 
-    has_content_type = False
-    has_content_length = False
-    has_content_encoding = False
-    has_user_agent = False
-    has_host = False
-    accept_value = ""
-    accept_encoding_value = ""
+    __slots__ = (
+        "_data",
+        "_version",
+        "_byte_length",
+        "_byte_length_version",
+        "_xxh3_64",
+        "_xxh3_64_version",
+        "_canonical_bytes",
+        "_canonical_bytes_version",
+    )
 
-    for raw_name, raw_value in headers.items():
-        name, name_lower = _normalize_header_name(raw_name)
-        value = _to_text(raw_value)
+    def __init__(
+        self,
+        data: "Headers | Mapping[Any, Any] | Iterable[tuple[Any, Any]] | None" = None,
+    ) -> None:
+        self._data: dict[str, str] = {}
+        # ``_version`` starts at 0; the cache slots use ``-1`` so the
+        # first read is always a miss even when no mutation has fired.
+        self._version: int = 0
+        self._byte_length: int = 0
+        self._byte_length_version: int = -1
+        self._xxh3_64: int = 0
+        self._xxh3_64_version: int = -1
+        self._canonical_bytes: bytes = b""
+        self._canonical_bytes_version: int = -1
+        if data is None:
+            return
+        if isinstance(data, Headers):
+            self._data.update(data._data)
+            return
+        if isinstance(data, Mapping):
+            for k, v in data.items():
+                self._data[str(k)] = str(v)
+            return
+        for k, v in data:
+            self._data[str(k)] = str(v)
 
-        if name_lower == "content-type":
-            has_content_type = True
-        elif name_lower == "content-length":
-            has_content_length = True
-        elif name_lower == "content-encoding":
-            has_content_encoding = True
-        elif name_lower == "user-agent":
-            has_user_agent = True
-        elif name_lower == "host":
-            has_host = True
-        elif name_lower == "accept":
-            accept_value = value
-        elif name_lower == "accept-encoding":
-            accept_encoding_value = value
+    @classmethod
+    def from_(
+        cls,
+        arg: "Headers | Mapping[Any, Any] | Iterable[tuple[Any, Any]] | None" = None,
+    ) -> "Headers":
+        """Coerce *arg* to :class:`Headers` — passing an existing
+        instance through unchanged so callers can ``Headers.from_(x)``
+        regardless of what ``x`` is."""
+        if isinstance(arg, cls):
+            return arg
+        return cls(arg)
 
-        if name_lower == "authorization":
-            sanitized = _sanitize_authorization_value(
-                value,
-                mode=mode,
-                anonymize=anonymize,
+    # ------------------------------------------------------------------
+    # Mapping / MutableMapping protocol
+    # ------------------------------------------------------------------
+
+    def __getitem__(self, key: str) -> str:
+        return self._data[key]
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        sk = str(key)
+        sv = str(value)
+        existing = self._data.get(sk, _MISSING)
+        if existing is not _MISSING and existing == sv:
+            return
+        self._data[sk] = sv
+        self._version += 1
+
+    def __delitem__(self, key: str) -> None:
+        del self._data[key]
+        self._version += 1
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._data
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Headers):
+            return self._data == other._data
+        if isinstance(other, Mapping):
+            return self._data == dict(other)
+        return NotImplemented
+
+    def __ne__(self, other: object) -> bool:
+        eq = self.__eq__(other)
+        if eq is NotImplemented:
+            return NotImplemented
+        return not eq
+
+    def __repr__(self) -> str:
+        return f"Headers({self._data!r})"
+
+    def __bool__(self) -> bool:
+        return bool(self._data)
+
+    # MutableMapping mixins (``pop``, ``popitem``, ``setdefault``,
+    # ``__contains__``, ``keys``, ``items``, ``values``, ``get``,
+    # ``__eq__``) all route through the four primitives above —
+    # ``setdefault`` reaches ``__setitem__``, ``pop`` reaches
+    # ``__delitem__``, etc. — so version bumps stay consistent without
+    # us writing each method out by hand.
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        """Bulk update — same shape as :meth:`dict.update`.
+
+        We override the mixin so the version bumps once per actual
+        change rather than once per touched key, and so the no-op
+        early return matches :meth:`__setitem__`.
+        """
+        if not args and not kwargs:
+            return
+        if len(args) > 1:
+            raise TypeError(
+                f"update expected at most 1 positional argument, got {len(args)}"
             )
-        elif name_lower in SENSITIVE_HEADER_KEYS:
-            sanitized = _sanitize_sensitive_value(
-                value,
-                mode=mode,
-                anonymize=anonymize,
-            )
-        elif _looks_like_token(value):
-            sanitized = _sanitize_sensitive_value(
-                value,
-                mode=mode,
-                anonymize=anonymize,
-            )
-        else:
-            sanitized = value
-
-        if sanitized is not None:
-            out[name] = sanitized
-
-    if add_missing:
-        if body is not None:
-            media_type: Optional[MediaType] = None
-
-            if not has_content_type:
-                media_type = media_type or body.media_type
-                if media_type is not None:
-                    out["Content-Type"] = media_type.full_mime_type(concat_codec=False).value
-
-                    if not has_content_encoding:
-                        codec: Optional[Codec] = media_type.codec
-                        if codec is not None:
-                            out["Content-Encoding"] = codec.name
-
-            if not has_content_length:
-                out["Content-Length"] = str(body.size)
-
-        if is_request:
-            if not has_user_agent:
-                out["User-Agent"] = get_default_user_agent()
-
-            out.update(DEFAULT_HEADERS)
-
-            # Accept-Encoding per RFC 7231 §5.3.4 is a comma-separated
-            # preference list with optional q-values (e.g. "gzip, deflate,
-            # br, zstd" or "gzip;q=1.0, identity;q=0.5"). ``Codec.from_``
-            # parses a single codec only — feeding it a list raises.
-            # ``default=None`` lets us tolerate lists: the rewrite to
-            # ``codec.name`` only fires when the value is a single
-            # recognized codec; otherwise the caller's verbatim value
-            # already in ``out`` from the loop above is left alone.
-            single_accept_encoding_codec = (
-                Codec.from_(accept_encoding_value, default=None)
-                if accept_encoding_value
-                else None
-            )
-
-            if accept_value:
-                media_type = MediaType.from_(accept_value, codec=single_accept_encoding_codec)
-
-                out["Accept"] = "*/*" if media_type.mime_type == MimeTypes.OCTET_STREAM else media_type.mime_type.value
-
-                if media_type.codec and single_accept_encoding_codec is not None:
-                    out["Accept-Encoding"] = single_accept_encoding_codec.name
-
-            elif accept_encoding_value:
-                out["Accept"] = "*/*"
-
-                if single_accept_encoding_codec is not None:
-                    out["Accept-Encoding"] = single_accept_encoding_codec.name
-                # Multi-codec preference list / unrecognized value — keep
-                # the caller's exact string (already populated in ``out``).
-
+        merged: dict[str, str] = {}
+        if args:
+            other = args[0]
+            if isinstance(other, Headers):
+                merged.update(other._data)
+            elif isinstance(other, Mapping):
+                for k, v in other.items():
+                    merged[str(k)] = str(v)
             else:
-                out["Accept"] = "*/*"
+                for k, v in other:
+                    merged[str(k)] = str(v)
+        for k, v in kwargs.items():
+            merged[str(k)] = str(v)
+        for k, v in merged.items():
+            existing = self._data.get(k, _MISSING)
+            if existing is not _MISSING and existing == v:
+                continue
+            self._data[k] = v
+            self._version += 1
 
-    if has_host:
-        del out["Host"]
+    def clear(self) -> None:
+        if not self._data:
+            return
+        self._data.clear()
+        self._version += 1
 
-    return out
+    def copy(self) -> "Headers":
+        """Shallow copy as a fresh :class:`Headers` (version reset)."""
+        return Headers(self._data)
+
+    def to_dict(self) -> dict[str, str]:
+        """Snapshot as a plain ``dict`` — handy for code that needs
+        to mutate independently of the live container or hand the
+        contents to an API that only speaks ``dict``."""
+        return dict(self._data)
+
+    # ------------------------------------------------------------------
+    # Normalization / anonymization — centralized header vocabulary
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def canonical_name(name: HeaderValue) -> str:
+        """Canonical casing for *name* (e.g. ``content-type`` →
+        ``Content-Type``). Falls back to the caller's stripped form
+        when the header isn't in the registry."""
+        return _normalize_header_name(name)[0]
+
+    def anonymized(self, mode: Literal["remove", "redact"] = "remove") -> "Headers":
+        """Return a copy with sensitive values dropped/redacted.
+
+        Authorization scheme (``Bearer``, ``Basic``, …) is preserved
+        in ``redact`` mode; long token-shaped values are caught via
+        :func:`_looks_like_token` so unrecognized credential headers
+        still get sanitized. Names are canonicalized on the way out
+        so repeated normalize calls are idempotent.
+        """
+        out = Headers()
+        for raw_name, raw_value in self._data.items():
+            name, name_lower = _normalize_header_name(raw_name)
+            value = _to_text(raw_value)
+            if name_lower == "authorization":
+                sanitized = _sanitize_authorization_value(value, mode=mode, anonymize=True)
+            elif name_lower in SENSITIVE_HEADER_KEYS or _looks_like_token(value):
+                sanitized = _sanitize_sensitive_value(value, mode=mode, anonymize=True)
+            else:
+                sanitized = value
+            if sanitized is not None:
+                out[name] = sanitized
+        return out
+
+    def normalized(
+        self,
+        *,
+        is_request: bool,
+        add_missing: bool = True,
+        mode: Literal["remove", "redact"] = "remove",
+        anonymize: bool = False,
+        body: "Optional[Holder]" = None,
+    ) -> "Headers":
+        """Return a fresh :class:`Headers` with names canonicalized,
+        sensitive values optionally sanitized, and (when
+        ``add_missing``) request defaults / body-derived ``Content-*``
+        slots filled in.
+
+        This is the canonical normalize surface — :func:`normalize_headers`
+        is a thin wrapper that calls into this method so every
+        canonicalization site goes through one piece of code.
+        """
+        out = Headers()
+
+        has_content_type = False
+        has_content_length = False
+        has_content_encoding = False
+        has_user_agent = False
+        has_host = False
+        accept_value = ""
+        accept_encoding_value = ""
+
+        for raw_name, raw_value in self._data.items():
+            name, name_lower = _normalize_header_name(raw_name)
+            value = _to_text(raw_value)
+
+            if name_lower == "content-type":
+                has_content_type = True
+            elif name_lower == "content-length":
+                has_content_length = True
+            elif name_lower == "content-encoding":
+                has_content_encoding = True
+            elif name_lower == "user-agent":
+                has_user_agent = True
+            elif name_lower == "host":
+                has_host = True
+            elif name_lower == "accept":
+                accept_value = value
+            elif name_lower == "accept-encoding":
+                accept_encoding_value = value
+
+            if name_lower == "authorization":
+                sanitized = _sanitize_authorization_value(value, mode=mode, anonymize=anonymize)
+            elif name_lower in SENSITIVE_HEADER_KEYS or _looks_like_token(value):
+                sanitized = _sanitize_sensitive_value(value, mode=mode, anonymize=anonymize)
+            else:
+                sanitized = value
+
+            if sanitized is not None:
+                out[name] = sanitized
+
+        if add_missing:
+            if body is not None:
+                if not has_content_type:
+                    media_type = body.media_type
+                    if media_type is not None:
+                        out["Content-Type"] = media_type.full_mime_type(concat_codec=False).value
+                        if not has_content_encoding:
+                            codec = media_type.codec
+                            if codec is not None:
+                                out["Content-Encoding"] = codec.name
+                if not has_content_length:
+                    out["Content-Length"] = str(body.size)
+
+            if is_request:
+                if not has_user_agent:
+                    out["User-Agent"] = get_default_user_agent()
+
+                out.update(DEFAULT_HEADERS)
+
+                # Accept-Encoding per RFC 7231 §5.3.4 is a
+                # comma-separated preference list with optional
+                # q-values; ``Codec.from_(default=None)`` only
+                # rewrites when the value is a single recognized
+                # codec, otherwise the caller's verbatim value (still
+                # populated above) is left alone.
+                single_accept_encoding_codec = (
+                    Codec.from_(accept_encoding_value, default=None)
+                    if accept_encoding_value
+                    else None
+                )
+
+                if accept_value:
+                    media_type = MediaType.from_(accept_value, codec=single_accept_encoding_codec)
+                    out["Accept"] = (
+                        "*/*"
+                        if media_type.mime_type == MimeTypes.OCTET_STREAM
+                        else media_type.mime_type.value
+                    )
+                    if media_type.codec and single_accept_encoding_codec is not None:
+                        out["Accept-Encoding"] = single_accept_encoding_codec.name
+                elif accept_encoding_value:
+                    out["Accept"] = "*/*"
+                    if single_accept_encoding_codec is not None:
+                        out["Accept-Encoding"] = single_accept_encoding_codec.name
+                else:
+                    out["Accept"] = "*/*"
+
+        if has_host:
+            del out["Host"]
+
+        return out
+
+    # ------------------------------------------------------------------
+    # Versioned derivations — cached against ``_version``
+    # ------------------------------------------------------------------
+
+    @property
+    def version(self) -> int:
+        """Monotonically increasing counter — bumped on every mutation
+        that actually changes :meth:`__eq__`. Callers can stash
+        ``(id(headers), version)`` and re-check it later for an O(1)
+        "did anything change?" test."""
+        return self._version
+
+    @property
+    def byte_length(self) -> int:
+        """Total byte length of all keys + values. Memoized — pays
+        the walk once per :attr:`version` and serves an int the rest
+        of the time."""
+        if self._byte_length_version == self._version:
+            return self._byte_length
+        length = 0
+        for k, v in self._data.items():
+            length += len(k) + len(v)
+        self._byte_length = length
+        self._byte_length_version = self._version
+        return length
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        """Sorted ``key=value\\x00key=value\\x00…`` byte sequence —
+        the canonical wire form used by digest mixing. Order is
+        deterministic (sorted by key) so ``Headers({A:1, B:2})`` and
+        ``Headers({B:2, A:1})`` produce the same payload. Memoized
+        against :attr:`version` so each request pays the encode walk
+        once across :attr:`xxh3_64`, :attr:`PreparedRequest.hash`,
+        and :attr:`Response.hash`.
+        """
+        if self._canonical_bytes_version == self._version:
+            return self._canonical_bytes
+        if not self._data:
+            self._canonical_bytes = b""
+            self._canonical_bytes_version = self._version
+            return b""
+        parts: list[bytes] = []
+        for k in sorted(self._data):
+            parts.append(k.encode("utf-8"))
+            parts.append(b"=")
+            parts.append(self._data[k].encode("utf-8"))
+            parts.append(b"\x00")
+        self._canonical_bytes = b"".join(parts)
+        self._canonical_bytes_version = self._version
+        return self._canonical_bytes
+
+    @property
+    def xxh3_64(self) -> int:
+        """xxh3_64 digest over :attr:`canonical_bytes` — order-
+        independent (same pairs → same digest). Returns a signed
+        int64 to match the rest of the codebase's :func:`xxhash`
+        use. Memoized against :attr:`version`."""
+        if self._xxh3_64_version == self._version:
+            return self._xxh3_64
+        payload = self.canonical_bytes
+        if not payload:
+            self._xxh3_64 = 0
+            self._xxh3_64_version = self._version
+            return 0
+        import xxhash
+        u = xxhash.xxh3_64(payload).intdigest()
+        signed = u if u < 2**63 else u - 2**64
+        self._xxh3_64 = signed
+        self._xxh3_64_version = self._version
+        return signed
+
+    # ------------------------------------------------------------------
+    # Pickle / copy support
+    # ------------------------------------------------------------------
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Drop the cached digest slots — they re-derive cheaply on
+        # demand and shipping them across the pickle wire is just
+        # bytes for nothing. Carry the version forward so callers
+        # holding a pre-pickle ``(id, version)`` tuple don't see a
+        # phantom rewind on the receiving side.
+        return {"data": dict(self._data), "version": self._version}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self._data = dict(state.get("data", {}))
+        self._version = int(state.get("version", 0))
+        self._byte_length = 0
+        self._byte_length_version = -1
+        self._xxh3_64 = 0
+        self._xxh3_64_version = -1
+        self._canonical_bytes = b""
+        self._canonical_bytes_version = -1
