@@ -124,11 +124,30 @@ class TestSessionSingletonRoundTrip:
             "sessions without a base_url should never share identity on unpickle"
         )
 
-    def test_getnewargs_carries_base_url(self) -> None:
-        s = StubSession(base_url="https://api.example.com")
-        args = s.__getnewargs__()
+    def test_getnewargs_ex_carries_base_url_and_key(self) -> None:
+        s = StubSession(base_url="https://api.example.com", key="tenant-a")
+        args, kwargs = s.__getnewargs_ex__()
         assert args == (s.base_url,)
         assert isinstance(args[0], URL)
+        assert kwargs == {"key": "tenant-a"}
+
+    def test_distinct_keys_split_singletons(self) -> None:
+        a = StubSession(base_url="https://api.example.com", key="tenant-a")
+        b = StubSession(base_url="https://api.example.com", key="tenant-b")
+        same = StubSession(base_url="https://api.example.com", key="tenant-a")
+        assert a is not b, "different keys must yield different singletons"
+        assert a is same, "same (base_url, key) must collapse to one singleton"
+
+    def test_default_key_matches_no_key(self) -> None:
+        s1 = StubSession(base_url="https://api.example.com")
+        s2 = StubSession(base_url="https://api.example.com", key="")
+        assert s1 is s2, "default key='' must collapse with the no-key call"
+
+    def test_key_preserved_on_unpickle(self) -> None:
+        s = StubSession(base_url="https://api.example.com", key="tenant-a")
+        clone = pickle.loads(pickle.dumps(s))
+        assert clone is s
+        assert clone.key == "tenant-a"
 
 
 # ---------------------------------------------------------------------------
