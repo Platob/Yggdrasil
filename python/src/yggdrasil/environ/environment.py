@@ -784,7 +784,10 @@ class PyEnv:
                 return cls.spark_session(create=True, import_error=False)
             return None
 
-        if isinstance(obj, SparkSession):
+        SparkSession = cls._import_spark_session(
+            import_error=import_error, install_spark=False
+        )
+        if SparkSession is not None and isinstance(obj, SparkSession):
             if cls._SPARK_SESSION is MISSING:
                 cls._SPARK_SESSION = obj
             return obj
