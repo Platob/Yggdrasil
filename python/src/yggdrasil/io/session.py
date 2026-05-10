@@ -32,7 +32,7 @@ from yggdrasil.dataclasses.waiting import (
 )
 from yggdrasil.data.enums import Mode
 from .bytes_io import BytesIO
-from yggdrasil.io.nested import FolderIO, FolderOptions
+from yggdrasil.io.nested import FolderIO, FolderOptions, YGGFolderIO
 from .headers import Headers
 from .request import PreparedRequest
 from .response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
@@ -93,7 +93,7 @@ def _store_local_arrow_batch(
 
 
 def _request_partition_predicate(
-    cache: "FolderIO",
+    cache: "YGGFolderIO",
     requests: "list[PreparedRequest]",
 ) -> "Any | None":
     """Build a universal predicate pruning to the partitions in ``requests``.
