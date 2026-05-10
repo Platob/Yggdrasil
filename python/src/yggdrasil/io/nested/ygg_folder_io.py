@@ -261,28 +261,36 @@ class YGGFolderIO(FolderIO):
         self,
         options: FolderOptions,
     ) -> Iterator[pa.RecordBatch]:
+        # Self prune first — when this YGGFolderIO is itself nested
+        # under another partition tree (or was minted with a
+        # ``static_values`` seed), the predicate may be provably
+        # false against the inherited KV before we even list
+        # partitions. Same helper as :class:`FolderIO`, single
+        # consistent gate at every read level.
+        if self._should_prune_by_predicate(options):
+            return
+
         parts = self._resolve_partition_columns()
         if not parts:
             yield from super()._read_arrow_batches(options)
             return
 
         prune = options.prune_values or {}
-        predicate = getattr(options, "predicate", None)
         for part_path, part_kv in self._iter_partitions(parts, prune):
             # Stamp the leaf folder with the partition KV as
             # ``static_values`` so the predicate-prune helper can
             # short-circuit subtrees whose KV makes the predicate
             # provably false. ``options.prune_values`` already does
-            # the explicit-IN form; ``matches_static`` covers
-            # arbitrary :class:`Predicate` shapes the session passes
-            # through ``options.predicate`` (e.g. the cache flow's
-            # ``partition_key.is_in([...]) & received_at >= t``).
+            # the explicit-IN form; ``_should_prune_by_predicate``
+            # covers arbitrary :class:`Predicate` shapes the session
+            # passes through ``options.predicate`` (e.g. the cache
+            # flow's ``partition_key.is_in([...]) & received_at >= t``).
             sub = FolderIO(
                 path=part_path,
                 tabular_parent=self,
                 static_values=part_kv,
             )
-            if not sub.matches_static(predicate):
+            if sub._should_prune_by_predicate(options):
                 continue
             for batch in sub._read_arrow_batches(options):
                 yield self._stamp_partitions(batch, part_kv, parts)
