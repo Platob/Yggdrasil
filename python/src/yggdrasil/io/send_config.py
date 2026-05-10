@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
-import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -157,119 +156,6 @@ def _is_tabular_io(arg: Any) -> bool:
         callable(getattr(arg, "read_arrow_batches", None))
         and callable(getattr(arg, "write_arrow_batches", None))
     )
-
-
-# ---------------------------------------------------------------------------
-# Local cache stale-file sweep — once-per-day per cache root.
-# ---------------------------------------------------------------------------
-
-#: Files older than this (in seconds) get unlinked on the first
-#: :meth:`CacheConfig.local_cache` call per process per cache root,
-#: provided the sentinel says no other process has swept recently.
-_LOCAL_CACHE_TTL_SECONDS: float = 86_400.0  # 1 day
-
-#: Sentinel file written under ``{cache_root}/.ygg/`` after each
-#: sweep. Its mtime is the cross-process throttle: a sentinel
-#: younger than :data:`_LOCAL_CACHE_TTL_SECONDS` short-circuits the
-#: sweep so a parallel process / a quickly-restarted run doesn't
-#: re-walk the whole tree.
-_LOCAL_CACHE_SENTINEL_NAME: str = ".last_cleanup"
-
-#: In-process throttle: each cache root is swept at most once per
-#: Python run. The cross-process sentinel handles longer-lived
-#: deduplication; this set just keeps the per-call overhead at
-#: "one set lookup" after the first sweep.
-_LOCAL_CACHE_CLEANUP_LOCK = threading.Lock()
-_LOCAL_CACHE_CLEANUP_DONE: set[str] = set()
-
-
-def _clean_local_cache_once(root: Path) -> None:
-    """Unlink local-cache part files older than :data:`_LOCAL_CACHE_TTL_SECONDS`.
-
-    Mirrors the staging-directory sweep in
-    :mod:`yggdrasil.io.path.local_path`: opportunistic, best-effort,
-    bounded by the same ``part-{epoch_ms}-{seed}.{ext}`` filename
-    convention :meth:`FolderIO.make_child` mints. The epoch_ms
-    prefix in the filename is what we compare against the cutoff —
-    this is robust to filesystem mtime quirks (e.g. ``rsync``-ed
-    caches, container image bind mounts) where ``stat`` mtime
-    doesn't reflect when the cache entry was actually written.
-
-    Throttled twice on purpose:
-
-    * **In-process** via :data:`_LOCAL_CACHE_CLEANUP_DONE` — a
-      send_many burst calls :meth:`CacheConfig.local_cache` many
-      times and we don't want to re-stat the sentinel on every call.
-    * **Cross-process** via the
-      ``{root}/.ygg/.last_cleanup`` sentinel file — a sentinel
-      younger than :data:`_LOCAL_CACHE_TTL_SECONDS` means another
-      process already swept; skip without touching the tree.
-
-    Files that don't match the ``part-{epoch_ms}-...`` convention,
-    the ``.ygg/`` sidecar (schema, sentinel, future metadata), and
-    anything that fails to ``unlink`` (permission denied, race with
-    a concurrent writer) are left alone. Failures are swallowed —
-    cleanup must never break the cache call it piggy-backs on.
-    """
-    key = str(root)
-    if key in _LOCAL_CACHE_CLEANUP_DONE:
-        return
-    with _LOCAL_CACHE_CLEANUP_LOCK:
-        if key in _LOCAL_CACHE_CLEANUP_DONE:
-            return
-        _LOCAL_CACHE_CLEANUP_DONE.add(key)
-
-    now_s = time.time()
-    cutoff_ms = int((now_s - _LOCAL_CACHE_TTL_SECONDS) * 1000)
-
-    sentinel = root / ".ygg" / _LOCAL_CACHE_SENTINEL_NAME
-    try:
-        if sentinel.stat().st_mtime >= now_s - _LOCAL_CACHE_TTL_SECONDS:
-            return
-    except FileNotFoundError:
-        pass
-    except OSError:
-        # Unreadable sentinel — try the sweep anyway; the worst case
-        # is a wasted walk, the alternative is never sweeping.
-        pass
-
-    try:
-        if not root.exists():
-            return
-    except OSError:
-        return
-
-    try:
-        candidates: Iterable[Path] = root.rglob("part-*")
-    except OSError:
-        return
-
-    for path in candidates:
-        try:
-            if not path.is_file():
-                continue
-            # ``part-{epoch_ms}-{seed}.{ext}`` — split on the first
-            # two dashes; the seed/ext tail is irrelevant. Anything
-            # that doesn't parse is treated as opaque and skipped.
-            _, epoch_str, _tail = path.name.split("-", 2)
-            if int(epoch_str) >= cutoff_ms:
-                continue
-        except (OSError, ValueError, IndexError):
-            continue
-        try:
-            path.unlink()
-        except OSError:
-            continue
-
-    # Touch the sentinel last so a partial sweep (process killed
-    # mid-walk, permission denial halfway through) still gets
-    # retried by the next caller after the TTL elapses, rather than
-    # being recorded as a successful sweep.
-    try:
-        sentinel.parent.mkdir(parents=True, exist_ok=True)
-        sentinel.write_text(str(int(now_s)))
-    except OSError:
-        return
 
 
 def _folderio_for_local_cache(path: Path) -> "FolderIO":
@@ -670,18 +556,25 @@ class CacheConfig(_ConfigBase):
         session's ``base_url`` host/path (see :meth:`local_cache_folder`).
         """
         if self.is_local_tabular:
-            _clean_local_cache_once(self.local_cache_folder(session=session))
-            return self.tabular  # type: ignore[return-value]
+            folder = self.tabular  # type: ignore[assignment]
+        else:
+            folder = _folderio_for_local_cache(self.local_cache_folder(session=session))
+            # Cache the lazy-built FolderIO so repeated send_many()
+            # calls don't keep re-instantiating it. Frozen-dataclass
+            # safe via ``object.__setattr__``.
+            if self.tabular is None:
+                object.__setattr__(self, "tabular", folder)
 
-        root = self.local_cache_folder(session=session)
-        folder = _folderio_for_local_cache(root)
-        # Cache the lazy-built FolderIO so repeated send_many()
-        # calls don't keep re-instantiating it. Frozen-dataclass
-        # safe via ``object.__setattr__``.
-        if self.tabular is None:
-            object.__setattr__(self, "tabular", folder)
-        _clean_local_cache_once(root)
-        return folder
+        # Sweep stale part files (older than 1 day) at most once per
+        # day per cache root. The throttle (sentinel + in-process
+        # done-set) lives on :class:`YGGFolderIO` so any consumer of
+        # the protocol — not just the response cache — benefits.
+        # ``cleanup_stale_once`` is best-effort and never raises;
+        # non-YGG backends just don't expose it.
+        cleanup_once = getattr(folder, "cleanup_stale_once", None)
+        if callable(cleanup_once):
+            cleanup_once()
+        return folder  # type: ignore[return-value]
 
     def request_values(
         self,
