@@ -360,6 +360,30 @@ class Tabular(ABC, Generic[O]):
         except Exception:
             return True
 
+    def _should_prune_by_predicate(self, options: Any) -> bool:
+        """Return ``True`` iff ``options.predicate`` is provably false
+        against this Tabular's :attr:`static_values` — the caller may
+        skip the read entirely.
+
+        Thin wrapper around :meth:`matches_static`: pulls the predicate
+        off *options* (any object that exposes a ``predicate``
+        attribute; absence and ``None`` both mean "no prune") and
+        inverts the sense so an aggregator's read loop reads as
+        ``if self._should_prune_by_predicate(options): return``. The
+        inherited :class:`TabularStaticValues` parent chain does the
+        rest — a child folder under a Hive ``col=val/`` leaf inherits
+        the partition KV without anyone re-stamping it, so the prune
+        fires uniformly at every level the read recurses through.
+
+        Conservative on undecidables: a predicate over a column we
+        have no static value for returns ``False`` (no prune) and the
+        caller still reads. Same contract as :meth:`matches_static`.
+        """
+        predicate = getattr(options, "predicate", None)
+        if predicate is None:
+            return False
+        return not self.matches_static(predicate)
+
     # ==================================================================
     # Format registry — MediaType → Tabular subclass dispatch
     # ==================================================================

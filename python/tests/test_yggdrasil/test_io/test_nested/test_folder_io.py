@@ -431,3 +431,127 @@ class TestTabularBaseOptimize:
         assert leaf.optimize() == 0
         assert leaf.optimize(byte_size=1024) == 0
         assert leaf.optimize(byte_size=None, partitions={"x": [1]}) == 0
+
+
+class TestPredicatePrune:
+    """``FolderIO._read_arrow_batches`` short-circuits via
+    :meth:`Tabular._should_prune_by_predicate`: a folder whose
+    :attr:`static_values` (own seed or inherited from
+    :attr:`tabular_parent`) make ``options.predicate`` provably false
+    contributes zero rows; per-child the same check skips sub-folders /
+    leaves whose static surface decides the predicate negatively."""
+
+    def test_self_prune_skips_directory_walk(
+        self, tmp_path, table, monkeypatch,
+    ) -> None:
+        """A predicate provably false against the folder's own
+        static_values must not list the directory at all."""
+        from yggdrasil.io.tabular.execution.expr import col
+
+        ParquetIO(
+            holder=__class__._lp(tmp_path / "p.parquet"), owns_holder=False,
+        ).write_arrow_table(table)
+
+        # Folder claims region=us across every row it yields. A predicate
+        # that excludes us is provably false — no iterdir, no read.
+        folder = FolderIO(path=str(tmp_path), static_values={"region": "us"})
+
+        original = os.scandir
+        visited: list[str] = []
+
+        def tracking_scandir(path):
+            visited.append(str(path))
+            return original(path)
+
+        monkeypatch.setattr(os, "scandir", tracking_scandir)
+        out = folder.read_arrow_table(
+            options=FolderOptions(predicate=col("region") == "eu"),
+        )
+        assert out.num_rows == 0
+        # Self-prune fired before iter_children → no scandir of the folder.
+        assert not any(str(tmp_path) in p for p in visited)
+
+    def test_self_prune_admits_when_predicate_matches_static(
+        self, tmp_path, table,
+    ) -> None:
+        from yggdrasil.io.tabular.execution.expr import col
+
+        ParquetIO(
+            holder=__class__._lp(tmp_path / "p.parquet"), owns_holder=False,
+        ).write_arrow_table(table)
+        folder = FolderIO(path=str(tmp_path), static_values={"region": "us"})
+        out = folder.read_arrow_table(
+            options=FolderOptions(predicate=col("region") == "us"),
+        )
+        assert out.num_rows == table.num_rows
+
+    def test_undecidable_predicate_falls_through(self, tmp_path, table) -> None:
+        """A predicate over a column outside static_values is
+        conservatively treated as 'could match' — the read still
+        runs, leaving row-level filtering to downstream consumers."""
+        from yggdrasil.io.tabular.execution.expr import col
+
+        ParquetIO(
+            holder=__class__._lp(tmp_path / "p.parquet"), owns_holder=False,
+        ).write_arrow_table(table)
+        folder = FolderIO(path=str(tmp_path), static_values={"region": "us"})
+        out = folder.read_arrow_table(
+            options=FolderOptions(predicate=col("id") > 0),
+        )
+        assert out.num_rows == table.num_rows
+
+    def test_per_child_prune_skips_unmatched_subfolder(
+        self, tmp_path, table,
+    ) -> None:
+        """Sub-folders inherit static_values via the tabular_parent
+        chain; the per-child prune skips those whose KV makes the
+        predicate provably false without recursing into them."""
+        from yggdrasil.io.tabular.execution.expr import col
+
+        # Hand-roll a partition-shaped layout (no YGGFolderIO) so we
+        # exercise the FolderIO path directly: two sub-folders, each
+        # carrying its own static_values seed inherited from a parent
+        # FolderIO that mints them.
+        us_dir = tmp_path / "us"
+        eu_dir = tmp_path / "eu"
+        us_dir.mkdir()
+        eu_dir.mkdir()
+        ParquetIO(
+            holder=__class__._lp(us_dir / "p.parquet"), owns_holder=False,
+        ).write_arrow_table(table)
+        ParquetIO(
+            holder=__class__._lp(eu_dir / "p.parquet"), owns_holder=False,
+        ).write_arrow_table(table)
+
+        class _StaticFolderIO(FolderIO):
+            """FolderIO that stamps its sub-folder children with a
+            ``region`` seed derived from the directory name. Same
+            shape :class:`YGGFolderIO` uses to prune partitions, but
+            without the partition-schema ceremony — keeps this test
+            focused on the FolderIO-level prune."""
+
+            # ``None`` opts out of mime-type registration so the test
+            # subclass doesn't collide with :class:`FolderIO` for the
+            # ``inode/directory`` slot.
+            mime_type = None
+
+            def iter_children(self):
+                for child in super().iter_children():
+                    if isinstance(child, FolderIO):
+                        child._static_value_seed.setdefault(
+                            "region", child.path.name,
+                        )
+                    yield child
+
+        folder = _StaticFolderIO(path=str(tmp_path))
+        out = folder.read_arrow_table(
+            options=FolderOptions(predicate=col("region") == "us"),
+        )
+        # Only the us sub-folder's rows survive — the eu sub-folder
+        # was rejected at the per-child prune gate.
+        assert out.num_rows == table.num_rows
+
+    @staticmethod
+    def _lp(path):
+        from yggdrasil.io.path.local_path import LocalPath
+        return LocalPath(str(path))

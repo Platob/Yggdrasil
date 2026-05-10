@@ -287,8 +287,23 @@ class FolderIO(Tabular[FolderOptions]):
 
         Sub-folders recurse through their own
         :meth:`_read_arrow_batches`; leaf children read in turn.
+
+        Self + per-child predicate pruning runs through
+        :meth:`Tabular._should_prune_by_predicate`: when
+        ``options.predicate`` is provably false against the bound
+        :attr:`static_values` (own seed + inherited from
+        :attr:`tabular_parent`), the whole read is skipped without
+        opening the directory; per-child the same check skips
+        sub-folders / leaf files whose static surface decides the
+        predicate negatively. Children without a static surface fall
+        through unchanged (undecidable → read), so a vanilla folder
+        without partition KV behaves exactly as before.
         """
+        if self._should_prune_by_predicate(options):
+            return
         for child in self.iter_children():
+            if child._should_prune_by_predicate(options):
+                continue
             yield from child._read_arrow_batches(child.options_class()())
 
     def _write_arrow_batches(
