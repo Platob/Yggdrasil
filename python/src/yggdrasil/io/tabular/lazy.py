@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Iterator, Union
 
 import pyarrow as pa
 
+from yggdrasil.data.data_field import Field
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.io.tabular.base import Tabular
@@ -60,12 +61,16 @@ if TYPE_CHECKING:
 __all__ = ["LazyTabular"]
 
 
-# A "selector" is anything that fronts a column / column-expression: a
-# bare column name, a yggdrasil :class:`Expression`, or a backend-
-# native expression that ``Expression.from_`` could lift. We keep
-# strings as strings (column names, not SQL fragments) and yggdrasil
-# nodes as nodes; native exprs pass through.
-_SelectorIn = Union[str, Expression, Any]
+# A "selector" is anything that fronts a column / column-expression. The
+# canonical type is :class:`yggdrasil.data.data_field.Field` — its
+# :attr:`name` is the projected output name and :attr:`alias` (when
+# different) is the source-side label, so a single Field carries
+# rename + cast-on-select intent. For ergonomic call sites we also
+# accept a bare column-name string, a yggdrasil :class:`Expression`,
+# or a backend-native expression that ``Expression.from_`` could
+# lift. Strings stay strings (column names, not SQL fragments) and
+# yggdrasil nodes stay nodes; native exprs pass through.
+_SelectorIn = Union[str, Field, Expression, Any]
 
 
 def _coerce_keys(value: Any) -> "tuple[Any, ...]":
@@ -213,12 +218,23 @@ class LazyTabular(Tabular[CastOptions]):
         return self
 
     def select(self, *columns: _SelectorIn) -> "LazyTabular":
-        """Project to *columns*. Accepts column names or expressions."""
+        """Project to *columns*.
+
+        The canonical selector type is
+        :class:`yggdrasil.data.data_field.Field` — its
+        :attr:`name` is the projected output name and
+        :attr:`alias` (when set) is the source-side label, so a
+        single Field carries rename + cast-on-select. Bare column
+        names, yggdrasil :class:`Expression` nodes, and backend-
+        native (polars / pyarrow / pyspark) expressions are also
+        accepted.
+        """
         if not columns:
             raise ValueError(
                 "LazyTabular.select needs at least one column; got none. "
-                "Pass column names ('a', 'b'), yggdrasil expressions "
-                "(col('a').alias('x')), or polars / pyarrow expressions."
+                "Pass Fields (the canonical selector), column names "
+                "('a', 'b'), yggdrasil expressions (col('a').alias('x')), "
+                "or polars / pyarrow expressions."
             )
         return self._append_op(Select(tuple(columns)))
 

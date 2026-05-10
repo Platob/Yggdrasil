@@ -39,13 +39,11 @@ from yggdrasil.io.tabular.execution.expr import (
     LogicalOp,
     Not,
     Predicate,
-    Selector,
     all_of,
     any_of,
     col,
     lit,
     neg,
-    select,
 )
 from yggdrasil.io.tabular.execution.plan import (
     ExecutionPlan,
@@ -75,13 +73,11 @@ __all__ = [
     "LogicalOp",
     "Not",
     "Predicate",
-    "Selector",
     "all_of",
     "any_of",
     "col",
     "lit",
     "neg",
-    "select",
     # plan
     "ExecutionPlan",
     "PlanOp",

@@ -52,7 +52,6 @@ __all__ = [
     "Expression",
     "Predicate",
     "Column",
-    "Selector",
     "Literal",
     "Comparison",
     "Logical",
@@ -605,7 +604,12 @@ class Predicate(Expression):
 
 @dataclasses.dataclass(frozen=True, slots=True, eq=False)
 class Column(Expression):
-    """A reference to a column in the source frame.
+    """A reference to a column inside an expression tree.
+
+    Used as the leaf node for in-expression references
+    (``col("price") > 100``); projection / rename / cast-on-select
+    is the job of :class:`yggdrasil.data.data_field.Field`, which
+    is the canonical "selector" for the tabular API.
 
     ``field`` carries the typed :class:`Field` when known — backends
     that need engine-flavoured types (Spark casts, Arrow scalars)
@@ -620,62 +624,6 @@ class Column(Expression):
     @property
     def dtype(self) -> "DataType | None":
         return self.field.dtype if self.field is not None else None
-
-
-@dataclasses.dataclass(frozen=True, slots=True, eq=False)
-class Selector(Column):
-    """A :class:`Column` with projection metadata: rename + cast-on-select.
-
-    Where :class:`Column` is *just a reference*, :class:`Selector`
-    is *a projection*: it carries the rules a caller needs to
-    materialize this column on a target frame —
-
-    - ``output_name`` (default ``alias`` or ``name``) is what the
-      column should be called on the output side;
-    - ``target_field`` (default ``field``) is the typed
-      :class:`Field` the value should be cast into when the source
-      and target dtypes differ.
-
-    A bare :class:`Column` works as a passthrough Selector — read
-    paths can treat them the same way — but :class:`Selector` is
-    what callers reach for when they want to rename / cast in one
-    step:
-
-    .. code-block:: python
-
-        from yggdrasil.io.tabular.execution.expr import select
-
-        s = select("price", alias="price_usd").cast_to(usd_field)
-    """
-
-    output_name: "str | None" = None
-    target_field: "Field | None" = None
-
-    def with_output_name(self, name: str) -> "Selector":
-        return dataclasses.replace(self, output_name=name)
-
-    def cast_to(self, field: "Field") -> "Selector":
-        return dataclasses.replace(self, target_field=field)
-
-    @property
-    def projection_name(self) -> str:
-        """Effective name of the projected column on the output frame."""
-        if self.output_name is not None:
-            return self.output_name
-        if self.alias is not None:
-            return self.alias
-        return self.name
-
-    @property
-    def projection_field(self) -> "Field | None":
-        """Effective :class:`Field` for the projected column.
-
-        Falls back to ``self.field`` when no explicit
-        ``target_field`` was set, so a Selector built from a
-        Field-aware Column projects with the source typing
-        unchanged.
-        """
-        return self.target_field or self.field
 
 
 @dataclasses.dataclass(frozen=True, slots=True, eq=False)

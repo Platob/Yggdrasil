@@ -20,6 +20,13 @@ Example
 The factory accepts an optional :class:`Field` so backends that
 need typed literals (Spark casts, Arrow scalars) have everything
 they need without an extra dtype argument at call sites.
+
+Projections (rename + cast-on-select) live on
+:class:`yggdrasil.data.data_field.Field` directly — there's no
+separate selector node. Build a Field with the desired output
+:attr:`name`, optional :attr:`alias` for the source-side label,
+and target :attr:`dtype`, then pass it to ``LazyTabular.select``
+or the SQL executor's ``statement.select`` list.
 """
 
 from __future__ import annotations
@@ -32,14 +39,13 @@ from .nodes import (
     Logical,
     LogicalOp,
     Not,
-    Selector,
 )
 
 if TYPE_CHECKING:
     from yggdrasil.data.data_field import Field
 
 
-__all__ = ["col", "select", "neg", "all_of", "any_of"]
+__all__ = ["col", "neg", "all_of", "any_of"]
 
 
 def col(
@@ -57,30 +63,6 @@ def col(
     differences via the underlying name.
     """
     return Column(name=name, field=field, alias=alias)
-
-
-def select(
-    name: str,
-    *,
-    field: "Field | None" = None,
-    alias: "str | None" = None,
-    output_name: "str | None" = None,
-    target_field: "Field | None" = None,
-) -> Selector:
-    """Build a :class:`Selector` — a column reference with projection
-    metadata (output name + cast-on-select target).
-
-    For passthrough projections :func:`col` is enough; reach for
-    :func:`select` when the column needs to be renamed or
-    cast-into-a-target-Field as part of the projection.
-    """
-    return Selector(
-        name=name,
-        field=field,
-        alias=alias,
-        output_name=output_name,
-        target_field=target_field,
-    )
 
 
 def neg(expr: Expression) -> Not:
