@@ -40,7 +40,7 @@ Quick start
 from __future__ import annotations
 
 from .client import AWSClient, AWSResource, AWSService
-from .config import AWSConfig, AwsCredentials
+from .config import AWSConfig, AwsCredentials, DatabricksSQLCredentialsRefresher
 
 
 __all__ = [
@@ -49,4 +49,5 @@ __all__ = [
     "AWSResource",
     "AWSConfig",
     "AwsCredentials",
+    "DatabricksSQLCredentialsRefresher",
 ]

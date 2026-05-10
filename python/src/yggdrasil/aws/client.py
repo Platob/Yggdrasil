@@ -48,6 +48,7 @@ from typing import (
     Any,
     ClassVar,
     Optional,
+    Tuple,
     Type,
     TypeVar,
 )
@@ -90,7 +91,6 @@ _CURRENT_CLIENT_LOCK: threading.RLock = threading.RLock()
 # ===========================================================================
 
 
-@dataclasses.dataclass
 class AWSClient:
     """Top-level AWS client.
 
@@ -115,38 +115,93 @@ class AWSClient:
 
         >>> client.to_url()                    # aws://...
         >>> AWSClient.from_parsed_url(url)
+
+    Identity & singleton caching
+    ----------------------------
+
+    Instances are cached per ``(class, config)`` in :attr:`_INSTANCES`
+    so two callers that build a client with the same config share
+    one boto :class:`Session`, one connection pool, and one boto
+    :class:`BaseClient` cache. ``__init__`` is idempotent — Python
+    always invokes it after :meth:`__new__` returns the cached
+    instance, so the second pass skips reinitialization. Pickling
+    routes through :meth:`__getnewargs__` + :meth:`__setstate__` so
+    a client unpickled in the same process collapses to the live
+    singleton instead of cloning its session and pool.
     """
 
-    config: AWSConfig = dataclasses.field(default_factory=AWSConfig)
+    # Per-(cls, config) singleton cache. Two AWSClients built with the
+    # same config share the boto session, connection pool, and the
+    # per-service boto-client cache. Subclasses inherit this slot.
+    _INSTANCES: ClassVar[dict[Tuple[type, "AWSConfig"], "AWSClient"]] = {}
+    _INSTANCES_LOCK: ClassVar[threading.Lock] = threading.Lock()
 
-    # --- Cached lazy state, all init=False / repr=False / not-compared ----
+    # Instance attributes that don't survive pickling — excluded by the
+    # generic :meth:`__getstate__` and rebuilt by :meth:`__setstate__`.
+    # ``_session`` and ``_client_cache`` carry live boto handles; the
+    # rest are cheap rebuilds whose lazy state would just be wrong on
+    # the receiver side.
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
+        "_session", "_client_cache", "_s3", "_account_id", "_was_connected",
+    })
 
-    _session: Any = dataclasses.field(
-        default=None, init=False, repr=False, compare=False, hash=False,
-    )
-    _client_cache: dict = dataclasses.field(
-        default_factory=dict, init=False, repr=False, compare=False, hash=False,
-    )
-    _service_cache: dict = dataclasses.field(
-        default_factory=dict, init=False, repr=False, compare=False, hash=False,
-    )
-    _was_connected: bool = dataclasses.field(
-        default=False, init=False, repr=False, compare=False, hash=False,
-    )
+    def __new__(
+        cls: Type[TC],
+        config: Optional[AWSConfig] = None,
+    ) -> TC:
+        if config is None:
+            config = AWSConfig()
+        key = (cls, config)
+        with cls._INSTANCES_LOCK:
+            cached = cls._INSTANCES.get(key)
+            if cached is not None:
+                return cached  # type: ignore[return-value]
+            instance = super().__new__(cls)
+            cls._INSTANCES[key] = instance
+            return instance  # type: ignore[return-value]
+
+    def __init__(self, config: Optional[AWSConfig] = None) -> None:
+        # Singleton-cached instances are re-entered on every constructor
+        # call (Python always invokes __init__ after __new__); skip the
+        # second pass so the live session / boto-client cache survive.
+        if getattr(self, "_initialized", False):
+            return
+        self.config = config if config is not None else AWSConfig()
+        self._session: Any = None
+        self._client_cache: dict = {}
+        self._s3: Optional["S3Service"] = None
+        self._account_id: Optional[str] = None
+        self._was_connected: bool = False
+        self._initialized = True
 
     # ------------------------------------------------------------------
-    # Pickling — drop cached objects
+    # Pickling — drop cached handles, route unpickle through __new__
     # ------------------------------------------------------------------
+
+    def __getnewargs__(self):
+        # Route unpickling through __new__ so a client reconstructed in
+        # the same process with the same config collapses to the live
+        # singleton instead of cloning the boto session / pool.
+        return (self.config,)
 
     def __getstate__(self):
-        return {"config": self.config}
+        return {
+            k: v for k, v in self.__dict__.items()
+            if k not in self._TRANSIENT_STATE_ATTRS
+        }
 
     def __setstate__(self, state):
-        self.config = state["config"]
+        # __new__ may have returned a live singleton — leave its session,
+        # boto-client cache, and lazy service handles untouched.
+        if getattr(self, "_initialized", False):
+            return
+        self.__dict__.update(state)
         self._session = None
         self._client_cache = {}
-        self._service_cache = {}
+        self._s3 = None
+        self._account_id = None
         self._was_connected = False
+        self._initialized = True
 
     # ==================================================================
     # URL contract — mirrors DatabricksClient.url_scheme / to_url
@@ -256,6 +311,13 @@ class AWSClient:
 
         ``reset=True`` rebuilds; ``overrides`` are passed to a fresh
         :class:`AWSConfig`. Mirrors :meth:`DatabricksClient.current`.
+
+        Note: per-config singleton caching in :meth:`__new__` means a
+        rebuilt default landing on the same config still reuses the
+        live boto :class:`Session` / connection pool from the previous
+        ``current()``. Pass ``reset=True`` *and* drop the cached
+        instance via :meth:`AWSClient._INSTANCES.pop` if you need a
+        truly fresh boto handle.
         """
         global _CURRENT_CLIENT
 
@@ -322,7 +384,8 @@ class AWSClient:
         """
         self._session = None
         self._client_cache = {}
-        self._service_cache = {}
+        self._s3 = None
+        self._account_id = None
         self._was_connected = False
 
     # ==================================================================
@@ -384,32 +447,18 @@ class AWSClient:
     # Lazy-cached sub-service factories
     # ==================================================================
 
-    @staticmethod
-    def _lazy_property(
-        self: "AWSClient",
-        *,
-        cache_attr: str,
-        factory,
-    ):
-        """Internal: cached lazy-property pattern. Mirrors Databricks'
-        ``lazy_property``."""
-        cached = self._service_cache.get(cache_attr)
-        if cached is not None:
-            return cached
-        created = factory()
-        self._service_cache[cache_attr] = created
-        return created
-
     @property
     def s3(self) -> "S3Service":
-        """The :class:`S3Service` bound to this client. Lazy + cached."""
-        from .fs.service import S3Service
+        """The :class:`S3Service` bound to this client. Lazy + cached.
 
-        return self._lazy_property(
-            self,
-            cache_attr="s3",
-            factory=lambda: S3Service(client=self),
-        )
+        :class:`AWSService` subclasses are themselves singleton-cached
+        per ``(cls, client)`` — the local ``_s3`` slot just dodges the
+        ``_INSTANCES`` lookup on the hot path.
+        """
+        if self._s3 is None:
+            from .fs.service import S3Service
+            self._s3 = S3Service(client=self)
+        return self._s3
 
     # ==================================================================
     # Identity helper — useful for default tags / debugging
@@ -426,17 +475,15 @@ class AWSClient:
     def account_id(self) -> str:
         """Resolve the account ID via STS. Cached on the instance.
 
-        Not part of the dataclass field set on purpose: it's
+        Not part of the configured field set on purpose: it's
         derivable from credentials, and stamping it eagerly would
-        force a network call at construction.
+        force a network call at construction. The cached value is
+        excluded from pickling — the receiver re-resolves on demand.
         """
-        cached = self._service_cache.get("_account_id")
-        if cached is not None:
-            return cached
-        identity = self.caller_identity()
-        account_id = identity["Account"]
-        self._service_cache["_account_id"] = account_id
-        return account_id
+        if self._account_id is None:
+            identity = self.caller_identity()
+            self._account_id = identity["Account"]
+        return self._account_id
 
     @property
     def region(self) -> Optional[str]:
@@ -593,7 +640,6 @@ class AWSClient:
 # ===========================================================================
 
 
-@dataclasses.dataclass
 class AWSService(ABC):
     """Abstract base for AWS service objects.
 
@@ -612,15 +658,60 @@ class AWSService(ABC):
 
     Subclasses must define :attr:`service_name` (e.g. ``"s3"``).
     The default :meth:`client` resolves to
-    ``self.client.client(self.service_name())``.
+    ``self.client.client(self.service_name())``. Subclass-specific
+    state (caches, lazy handles) goes in :meth:`__init__` after the
+    ``super().__init__(client=client)`` call and is gated by the
+    inherited ``_initialized`` guard so the singleton's lazy state
+    survives idempotent re-entry from ``cls(client=...)``.
+
+    Identity & singleton caching
+    ----------------------------
+
+    Instances are cached per ``(class, client)`` in :attr:`_INSTANCES`,
+    so ``S3Service(client=c)`` always returns the same handle for a
+    given client. Pickling routes through :meth:`__getnewargs__` so
+    a service unpickled in the same process collapses to the live
+    singleton. Subclasses should add their non-picklable handles to
+    :attr:`_TRANSIENT_STATE_ATTRS` to keep the generic getstate clean.
     """
 
-    client: AWSClient = dataclasses.field(
-        default_factory=AWSClient.current,
-        repr=False,
-    )
+    # Per-(cls, client) singleton cache, mirrors AWSClient._INSTANCES.
+    # Subclasses inherit this slot — there's one shared dict across
+    # every AWSService subclass so the (cls, client) tuple disambiguates
+    # S3Service, DynamoService, etc. against the same underlying client.
+    _INSTANCES: ClassVar[dict[Tuple[type, "AWSClient"], "AWSService"]] = {}
+    _INSTANCES_LOCK: ClassVar[threading.Lock] = threading.Lock()
+
+    # Generic getstate excludes these attrs from the pickle payload.
+    # Subclasses extend by overriding the frozenset (use union with the
+    # base set to avoid losing the inherited transients).
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset()
 
     _current: ClassVar[Optional["AWSService"]] = None
+
+    def __new__(
+        cls: Type[TS],
+        client: Optional[AWSClient] = None,
+    ) -> TS:
+        if client is None:
+            client = AWSClient.current()
+        key = (cls, client)
+        with cls._INSTANCES_LOCK:
+            cached = cls._INSTANCES.get(key)
+            if cached is not None:
+                return cached  # type: ignore[return-value]
+            instance = super().__new__(cls)
+            cls._INSTANCES[key] = instance
+            return instance  # type: ignore[return-value]
+
+    def __init__(self, client: Optional[AWSClient] = None) -> None:
+        # Singleton-cached instances are re-entered on every constructor
+        # call (Python always invokes __init__ after __new__); skip the
+        # second pass so subclass-side caches survive.
+        if getattr(self, "_initialized", False):
+            return
+        self.client: AWSClient = client if client is not None else AWSClient.current()
+        self._initialized = True
 
     # ==================================================================
     # Subclass identity
@@ -720,14 +811,28 @@ class AWSService(ABC):
         return self.client.account_id
 
     # ==================================================================
-    # Pickling — drop nothing; service is just a (client) wrapper
+    # Pickling — generic state, route unpickle through __new__
     # ==================================================================
 
+    def __getnewargs__(self):
+        # Route unpickling through __new__ so a service reconstructed in
+        # the same process with the same client collapses to the live
+        # singleton instead of cloning subclass-side caches.
+        return (self.client,)
+
     def __getstate__(self):
-        return {"client": self.client}
+        return {
+            k: v for k, v in self.__dict__.items()
+            if k not in self._TRANSIENT_STATE_ATTRS
+        }
 
     def __setstate__(self, state):
-        self.client = state["client"]
+        # __new__ may have returned a live singleton — leave its caches
+        # untouched.
+        if getattr(self, "_initialized", False):
+            return
+        self.__dict__.update(state)
+        self._initialized = True
 
 
 # ===========================================================================

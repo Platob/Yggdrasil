@@ -25,16 +25,19 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from typing import Any, Callable, Mapping, Optional, TYPE_CHECKING, Union
+from types import MappingProxyType
+from typing import Any, Callable, ClassVar, Mapping, Optional, TYPE_CHECKING, Union
 
 if TYPE_CHECKING:
     from .client import AWSClient
+    from yggdrasil.databricks.client import DatabricksClient
 
 
 __all__ = [
     "AwsCredentials",
     "AWSConfig",
     "CredentialsRefresher",
+    "DatabricksSQLCredentialsRefresher",
 ]
 
 
@@ -114,13 +117,16 @@ def _env_factory(name: str):
     return factory
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(unsafe_hash=True)
 class AWSConfig:
     """Pure-data AWS session configuration.
 
     Holds every knob :class:`AWSClient` needs to mint a boto3
     :class:`Session`. Pickle-safe; no cached state. Equality and
-    hashing follow the field set.
+    hashing follow the field set — :attr:`refresher` is excluded
+    from both (callables aren't comparable), so two configs that
+    differ only in their refresher callback collapse to the same
+    :class:`AWSClient` singleton.
 
     Construction shapes:
 
@@ -213,6 +219,31 @@ class AWSConfig:
     """
 
     # ------------------------------------------------------------------
+    # Class-level defaults (override by subclassing or per-call kwargs)
+    # ------------------------------------------------------------------
+
+    # Default column-name aliases for credential rows pulled from a
+    # Databricks SQL table. Each canonical AwsCredentials field maps
+    # to the ordered tuple of column names the refresher will try in
+    # turn — first match wins. Lowercase Python casing comes first so
+    # the common "ops.aws_creds" shape works without a per-call
+    # ``columns=`` override; the AWS API JSON casing is the fallback
+    # for tables that mirror the STS response shape directly.
+    #
+    # Override per-call via :meth:`from_databricks_sql(columns=...)`,
+    # or globally by subclassing :class:`AWSConfig` and replacing the
+    # class var (subclasses inherit the singleton-by-config caching
+    # of :class:`AWSClient` for free).
+    DATABRICKS_SQL_CREDENTIAL_COLUMNS: ClassVar[Mapping[str, tuple[str, ...]]] = (
+        MappingProxyType({
+            "access_key_id":     ("access_key_id", "AccessKeyId"),
+            "secret_access_key": ("secret_access_key", "SecretAccessKey"),
+            "session_token":     ("session_token", "SessionToken"),
+            "expiration":        ("expiration", "Expiration"),
+        })
+    )
+
+    # ------------------------------------------------------------------
     # Coercion entry points
     # ------------------------------------------------------------------
 
@@ -286,6 +317,59 @@ class AWSConfig:
             region=region,
             endpoint_url=endpoint_url,
             refresher=refresher,
+            **kwargs,
+        )
+
+    @classmethod
+    def from_databricks_sql(
+        cls,
+        query: str,
+        *,
+        client: Optional["DatabricksClient"] = None,
+        region: Optional[str] = None,
+        endpoint_url: Optional[str] = None,
+        columns: Optional[Mapping[str, str]] = None,
+        **kwargs,
+    ) -> "AWSConfig":
+        """Build an AWSConfig that vends credentials from a Databricks SQL row.
+
+        ``query`` should return at least one row with the credential
+        columns. The first row's columns are mapped to
+        :class:`AwsCredentials` fields via
+        :attr:`DATABRICKS_SQL_CREDENTIAL_COLUMNS` (lowercase Python
+        names first, then the AWS STS JSON casing). Override per-call
+        with ``columns={"access_key_id": "MyAccessKey", ...}`` when
+        the table uses non-canonical names.
+
+        ``client`` defaults to :meth:`DatabricksClient.current` —
+        resolved lazily inside the refresher so the AWSConfig stays
+        constructible at module-import time without a live workspace.
+
+        Each botocore refresh cycle (~5 min before token expiry)
+        re-runs *query*, so the upstream process that maintains the
+        table just has to keep writing fresh STS responses. Example::
+
+            config = AWSConfig.from_databricks_sql(
+                "SELECT access_key_id, secret_access_key, session_token, "
+                "       expiration "
+                "FROM ops.aws_creds "
+                "WHERE role = 'reader' "
+                "ORDER BY issued_at DESC LIMIT 1",
+                region="us-east-1",
+            )
+            client = config.to_client()
+            client.s3_client().list_buckets()  # creds auto-refreshed
+        """
+        refresher = DatabricksSQLCredentialsRefresher(
+            query=query,
+            client=client,
+            columns=dict(columns) if columns else None,
+            column_aliases=dict(cls.DATABRICKS_SQL_CREDENTIAL_COLUMNS),
+        )
+        return cls.from_refresher(
+            refresher,
+            region=region,
+            endpoint_url=endpoint_url,
             **kwargs,
         )
 
@@ -374,3 +458,137 @@ def _refresher_to_metadata(
     if isinstance(raw, AwsCredentials):
         return dict(raw.to_botocore_metadata())
     return dict(raw)
+
+
+# ---------------------------------------------------------------------------
+# DatabricksSQLCredentialsRefresher — picklable refresher for SQL-vended creds
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class DatabricksSQLCredentialsRefresher:
+    """Refresher that re-runs a Databricks SQL query for fresh AWS credentials.
+
+    Picklable by design — closure-free so botocore can hand the
+    refresher to a Spark worker, a multiprocessing pool, or a
+    cross-process job runner without cloudpickle. Serialization
+    follows the project rule: the dataclass body holds plain
+    picklable fields, the :class:`DatabricksClient` (when explicitly
+    set) goes through its own URL-based round-trip, and the lazy
+    ``DatabricksClient.current()`` fallback is resolved inside
+    :meth:`__call__` so the refresher stays constructible at
+    module-import time without a live workspace.
+
+    Mapped to :class:`AwsCredentials` via *column_aliases* — each
+    canonical field tries the user-provided ``columns`` override
+    first, then walks the alias tuple in order. Per-call ``columns``
+    overrides win over the default
+    :attr:`AWSConfig.DATABRICKS_SQL_CREDENTIAL_COLUMNS`.
+    """
+
+    query: str
+    """SQL query that returns at least one row of credentials."""
+
+    client: Optional["DatabricksClient"] = None
+    """Workspace to query. ``None`` resolves to
+    :meth:`DatabricksClient.current` lazily on first call."""
+
+    columns: Optional[dict[str, str]] = None
+    """Per-call column-name overrides keyed by canonical field
+    (``access_key_id`` / ``secret_access_key`` / ``session_token`` /
+    ``expiration``). Wins over :attr:`column_aliases`."""
+
+    column_aliases: dict[str, tuple[str, ...]] = dataclasses.field(
+        default_factory=dict,
+    )
+    """Fallback alias tuples per canonical field. Populated from
+    :attr:`AWSConfig.DATABRICKS_SQL_CREDENTIAL_COLUMNS` by
+    :meth:`AWSConfig.from_databricks_sql`; pre-snapshotted so the
+    refresher survives a cross-process pickle without depending on
+    the receiver's class-var defaults."""
+
+    def __call__(self) -> AwsCredentials:
+        # Lazy import: DatabricksClient pulls in the databricks-sdk
+        # optional dep, plus the SQL stack. Keep the import inside
+        # __call__ — and skip it entirely when the caller supplied a
+        # client — so a pure-AWS install can construct (and even
+        # pickle) the refresher without the dep installed.
+        client = self.client
+        if client is None:
+            from yggdrasil.databricks.client import DatabricksClient
+            client = DatabricksClient.current()
+        rows = client.sql.execute(self.query).read_pylist()
+        if not rows:
+            raise RuntimeError(
+                "DatabricksSQLCredentialsRefresher returned no rows. "
+                f"Query: {self.query!r}. Confirm the table is populated "
+                "and the WHERE clause matches an existing row."
+            )
+
+        row = rows[0]
+        return AwsCredentials(
+            access_key_id=self._lookup(row, "access_key_id", required=True),
+            secret_access_key=self._lookup(row, "secret_access_key", required=True),
+            session_token=self._lookup(row, "session_token"),
+            expiration=self._stringify(self._lookup(row, "expiration")),
+        )
+
+    def _lookup(
+        self,
+        row: Mapping[str, Any],
+        canonical: str,
+        *,
+        required: bool = False,
+    ) -> Any:
+        """Resolve *canonical* against the row using overrides → aliases.
+
+        Per-call ``columns`` mapping wins over class-level aliases so
+        callers can quickly point at a non-canonical column without
+        subclassing.
+        """
+        if self.columns and canonical in self.columns:
+            name = self.columns[canonical]
+            if name in row:
+                return row[name]
+            if required:
+                raise KeyError(
+                    f"DatabricksSQLCredentialsRefresher: column "
+                    f"{name!r} (override for {canonical!r}) is missing "
+                    f"from the SQL row. Available: {list(row)!r}."
+                )
+            return None
+
+        for name in self.column_aliases.get(canonical, (canonical,)):
+            if name in row:
+                return row[name]
+
+        if required:
+            tried = self.column_aliases.get(canonical, (canonical,))
+            raise KeyError(
+                f"DatabricksSQLCredentialsRefresher: no column for "
+                f"{canonical!r} in SQL row. Tried {list(tried)!r}; "
+                f"available columns: {list(row)!r}. Pass "
+                f"columns={{{canonical!r}: '<your-column>'}} to "
+                f"AWSConfig.from_databricks_sql to override."
+            )
+        return None
+
+    @staticmethod
+    def _stringify(value: Any) -> Optional[str]:
+        """Coerce an expiration value to ISO-8601 string, leaving
+        ``None`` alone.
+
+        SQL ``TIMESTAMP`` columns surface as ``datetime`` objects via
+        the Arrow → pylist round-trip; botocore's
+        ``RefreshableCredentials`` wants the ``expiry_time`` slot as a
+        parseable string. Other AWS-shaped sources (STS responses)
+        already give us ISO strings, which pass through unchanged.
+        """
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        isoformat = getattr(value, "isoformat", None)
+        if callable(isoformat):
+            return isoformat()
+        return str(value)

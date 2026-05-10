@@ -38,8 +38,7 @@ hot code is free.
 
 from __future__ import annotations
 
-import dataclasses
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 from yggdrasil.aws.client import AWSClient, AWSService
 from yggdrasil.dataclasses.expiring import ExpiringDict
@@ -61,7 +60,6 @@ _LS_CACHE_TTL: float = 15.0
 _LS_CACHE_MAX: int = 256
 
 
-@dataclasses.dataclass
 class S3Service(AWSService):
     """Thin S3 service object — owns the boto S3 client.
 
@@ -74,11 +72,28 @@ class S3Service(AWSService):
     5–10 times pays one ListObjectsV2 instead of N.
     """
 
-    # ExpiringDict field — not part of the dataclass __init__; lazily
-    # created on first access so default S3Service() is cheap.
-    _ls_cache: ExpiringDict | None = dataclasses.field(
-        default=None, init=False, repr=False,
+    # ``_ls_cache`` is a per-instance live ExpiringDict — excluded from
+    # pickling so a snapshot doesn't drag a TTL-managed dict across
+    # process boundaries. The receiver re-builds on first access.
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = (
+        AWSService._TRANSIENT_STATE_ATTRS | frozenset({"_ls_cache"})
     )
+
+    def __init__(self, client: Optional[AWSClient] = None) -> None:
+        if getattr(self, "_initialized", False):
+            return
+        super().__init__(client=client)
+        self._ls_cache: Optional[ExpiringDict] = None
+
+    def __setstate__(self, state):
+        # On cross-process unpickle the transient _ls_cache slot is
+        # absent from the payload — re-create the attribute so the
+        # property's lazy build still works. The live-singleton path
+        # short-circuits via the inherited _initialized guard.
+        if getattr(self, "_initialized", False):
+            return
+        super().__setstate__(state)
+        self._ls_cache = None
 
     @classmethod
     def service_name(cls) -> str:
