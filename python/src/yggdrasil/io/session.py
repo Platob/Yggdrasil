@@ -259,6 +259,13 @@ class Session(ABC):
     _singleton_cache: ClassVar[dict[tuple[type, str], "Session"]] = {}
     _singleton_lock: ClassVar[threading.Lock] = threading.Lock()
 
+    # Instance attributes that don't survive pickling — excluded by
+    # ``__getstate__`` and rebuilt by ``__setstate__``. Subclasses extend
+    # this with their own non-picklable handles (e.g. connection pools).
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
+        "_lock", "_job_pool",
+    })
+
     def __new__(
         cls,
         base_url: Optional[URL | str] = None,
@@ -307,18 +314,23 @@ class Session(ABC):
             self._job_pool.shutdown(wait=True)
             self._job_pool = None
 
+    def __getnewargs__(self):
+        # Route unpickling through ``__new__`` so a session reconstructed with
+        # the same ``base_url`` collapses to the in-process singleton instead
+        # of cloning the connection pool / cookie jar.
+        return (self.base_url,)
+
     def __getstate__(self):
-        state = {
-            "base_url": self.base_url,
-            "verify": self.verify,
-            "pool_maxsize": self.pool_maxsize,
-            "send_headers": self.send_headers,
-            "waiting": self.waiting,
+        return {
+            k: v for k, v in self.__dict__.items()
+            if k not in self._TRANSIENT_STATE_ATTRS
         }
 
-        return state
-
     def __setstate__(self, state):
+        # ``__new__`` may have returned a live singleton — keep its
+        # in-flight state (pool, cookies, init-time config) untouched.
+        if getattr(self, "_initialized", False):
+            return
         self.__dict__.update(state)
         self._lock = threading.RLock()
         self._job_pool = None

@@ -185,18 +185,15 @@ class HTTPSession(Session):
         )
         self._ua_generator: Optional[UserAgentGenerator] = None
 
-    def __getstate__(self):
-        state = super().__getstate__()
-        state["_http_pool"] = True
-
-        return state
+    _TRANSIENT_STATE_ATTRS = Session._TRANSIENT_STATE_ATTRS | {"_http_pool"}
 
     def __setstate__(self, state):
+        # Singleton hit: ``Session.__setstate__`` returns early and the
+        # cached pool stays attached — skip the rebuild so we don't drop it.
+        if getattr(self, "_initialized", False):
+            return
         super().__setstate__(state)
-
-        self._http_pool = state.get("_http_pool", None)
-        if self._http_pool:
-            self._http_pool = self._build_http_pool()
+        self._http_pool = self._build_http_pool()
 
 
     def _build_retry(self) -> urllib3.Retry:
