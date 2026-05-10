@@ -654,7 +654,7 @@ class Session(ABC):
         )
         return self._send(request, cfg)
 
-    def _prepare_request(self, request: PreparedRequest) -> PreparedRequest:
+    def prepare_request_before_send(self, request: PreparedRequest) -> PreparedRequest:
         """Session-wide request hook fired once per outbound request.
 
         Default returns *request* unchanged. Subclasses override to inject
@@ -664,9 +664,14 @@ class Session(ABC):
         bypass it. Travels with the session into Spark workers via
         ``__getstate__`` / ``__setstate__``.
         """
+        request.sent_at = dt.datetime.now(dt.timezone.utc)
+        if self.headers:
+            if request.headers is None:
+                request.headers = {}
+            request.headers.update(self.headers)
         return request
 
-    def _prepare_response(self, response: Response) -> Response:
+    def prepare_response_after_received(self, response: Response) -> Response:
         """Session-wide response hook fired once per completed network send.
 
         Default returns *response* unchanged. Subclasses override to log,
@@ -716,10 +721,7 @@ class Session(ABC):
 
         # --- 2. Check remote cache (slower, SQL-based) ---
         # Skip when the effective config demands a forced refresh (UPSERT).
-        if (
-            effective_remote_cfg.remote_cache_enabled
-            and effective_remote_cfg.mode == Mode.APPEND
-        ):
+        if effective_remote_cfg.remote_cache_enabled:
             remote_response = self._load_remote_cached_response(
                 request,
                 effective_remote_cfg,
@@ -738,10 +740,10 @@ class Session(ABC):
                 return remote_response
 
         # --- 3. No cache hit — perform actual request ---
-        request = self._prepare_request(request)
+        request = self.prepare_request_before_send(request)
         LOGGER.debug("Sending %s %s", request.method, request.url)
         response = self._local_send(request, config=config)
-        response = self._prepare_response(response)
+        response = self.prepare_response_after_received(response)
         LOGGER.info("Sent %s %s", request.method, request.url)
 
         if local_cache is not None:
@@ -1701,8 +1703,9 @@ class Session(ABC):
         fully short-circuited on local cache still advertises the
         response schema for ``remote_hits`` / ``new_hits``.
         """
-        spark = config.spark_session
-        is_spark = spark is not None
+        is_spark = config.spark_session is not None and config.spark_session is not ...
+        spark = config.spark_session if is_spark else None
+
         session_remote_cfg = config.remote_cache
         # Build the session-level local cache's :class:`Tabular` once
         # at entry so the rest of the pipeline can reach for

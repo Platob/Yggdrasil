@@ -1058,19 +1058,6 @@ class Tabular(ABC, Generic[O]):
     def _read_polars_frame(self, options: O) -> "pl.DataFrame":
         return polars_module().from_arrow(self._read_arrow_table(options))  # type: ignore[return-value]
 
-    def read_polars_frames(
-        self, options: "O | None" = None, **kwargs: Any,
-    ) -> "Iterator[pl.DataFrame]":
-        """One Polars frame per Arrow batch — streaming."""
-        yield from self._read_polars_frames(
-            self.check_options(options, overrides=locals())
-        )
-
-    def _read_polars_frames(self, options: O) -> "Iterator[pl.DataFrame]":
-        pl = polars_module()
-        for batch in self._read_arrow_batches(options):
-            yield pl.from_arrow(batch, rechunk=False)  # type: ignore[misc]
-
     def scan_polars_frame(
         self, options: "O | None" = None, **kwargs: Any,
     ) -> "pl.LazyFrame":
@@ -1329,15 +1316,23 @@ class Tabular(ABC, Generic[O]):
     # ``to_*`` aliases — pandas-style spelling for the ``read_*`` surface.
     # ==================================================================
 
+    to_arrow = read_arrow_table
     to_arrow_batches = read_arrow_batches
     to_arrow_table = read_arrow_table
     to_arrow_batch_reader = read_arrow_batch_reader
     to_arrow_dataset = read_arrow_dataset
+
     to_table = read_table
+
+    to_polars = read_polars_frame
     to_polars_frame = read_polars_frame
-    to_polars_frames = read_polars_frames
+
+    to_pandas = read_pandas_frame
     to_pandas_frame = read_pandas_frame
+
+    to_spark = read_spark_frame
     to_spark_frame = read_spark_frame
+
     to_pylist = read_pylist
     to_pydict = read_pydict
     to_record_iterator = read_record_iterator

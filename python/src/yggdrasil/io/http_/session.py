@@ -23,21 +23,23 @@ from .response import HTTPResponse
 __all__ = ["HTTPSession"]
 
 
-# Backoff tuning. 429s get a longer, gentler schedule than 5xx because rate
-# limits often need real wall-clock time to clear; transient server errors
-# usually resolve faster.
-_RETRY_TOTAL = 6
-_RETRY_CONNECT = 3
-_RETRY_READ = 3
+# Backoff tuning. 429s still get a longer schedule than 5xx because rate
+# limits need wall-clock time to clear, but both schedules are tight:
+# we'd rather surface an error fast than mask a real outage with a
+# minute-long retry storm. Server-supplied Retry-After always wins over
+# the 429 schedule when present.
+_RETRY_TOTAL = 3
+_RETRY_CONNECT = 2
+_RETRY_READ = 2
 
-# 5xx schedule: 1, 2, 4, 8, 16, 32 (capped at backoff_max)
-_BACKOFF_5XX_FACTOR = 1.0
-_BACKOFF_5XX_MAX = 60.0
+# 5xx schedule: 0.5, 1, 2 (capped at backoff_max). Worst-case ~3.5s.
+_BACKOFF_5XX_FACTOR = 0.5
+_BACKOFF_5XX_MAX = 5.0
 
-# 429 schedule: 4, 8, 16, 32, 64, 128 (capped at backoff_max)
+# 429 schedule: 1, 2, 4 (capped at backoff_max). Worst-case ~7s.
 # Server-supplied Retry-After always wins over this when present.
-_BACKOFF_429_FACTOR = 4.0
-_BACKOFF_429_MAX = 300.0
+_BACKOFF_429_FACTOR = 1.0
+_BACKOFF_429_MAX = 5.0
 
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 
@@ -180,24 +182,6 @@ class HTTPSession(Session):
                 if self._http_pool is None:
                     self._http_pool = self._build_http_pool()
         return self._http_pool
-
-    # ------------------------------------------------------------------
-    # Pre-send hook
-    # ------------------------------------------------------------------
-
-    def _prepare_request(self, request: PreparedRequest) -> PreparedRequest:
-        """Stamp ``sent_at`` and merge :attr:`headers` into *request*.
-
-        Session headers win on conflicts so transport-level concerns
-        (Authorization, X-API-Key) can't be overridden by stale per-call
-        headers.
-        """
-        request.sent_at = dt.datetime.now(dt.timezone.utc)
-        if self.headers:
-            if request.headers is None:
-                request.headers = {}
-            request.headers.update(self.headers)
-        return request
 
     # ------------------------------------------------------------------
     # Transport
