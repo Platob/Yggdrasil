@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import itertools
 import logging
 import os
@@ -721,7 +722,10 @@ class Session(ABC):
 
         # --- 2. Check remote cache (slower, SQL-based) ---
         # Skip when the effective config demands a forced refresh (UPSERT).
-        if effective_remote_cfg.remote_cache_enabled:
+        if (
+            effective_remote_cfg.remote_cache_enabled
+            and effective_remote_cfg.mode != Mode.UPSERT
+        ):
             remote_response = self._load_remote_cached_response(
                 request,
                 effective_remote_cfg,

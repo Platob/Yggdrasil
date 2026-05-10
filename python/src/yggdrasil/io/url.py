@@ -431,7 +431,9 @@ class URL(os.PathLike):
         return self.to_string(encode=True)
 
     def __repr__(self):
-        return self.to_string(encode=False)
+        # Redact credentials/tokens so URLs are safe in logs and tracebacks.
+        # str(url) keeps the unredacted form for callers that need it.
+        return self.anonymize('redact').to_string(encode=False)
 
     def __eq__(self, other):
         if isinstance(other, URL):
