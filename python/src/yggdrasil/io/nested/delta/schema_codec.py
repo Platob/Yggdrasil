@@ -197,43 +197,29 @@ def _spark_type_to_arrow(t: Any) -> pa.DataType:
 
 
 def _spark_primitive_to_arrow(name: str) -> pa.DataType:
+    """Resolve a Spark/Delta primitive name to a pyarrow type.
+
+    Delegates to :meth:`DataType.from_str` — the canonical parser
+    already knows every Spark primitive (``long`` / ``short`` / ``byte``
+    / ``timestamp_ntz`` / ``decimal(p,s)`` / …). The two Delta-spec
+    quirks the canonical parser doesn't speak natively are handled
+    inline:
+
+    - ``void`` — Spark's name for the null type. The canonical parser
+      maps it to :class:`ObjectType` (large_binary), which is right
+      for free-form Python objects but not for Delta.
+    - Unknown / unmapped tokens fall back to ``string`` (the existing
+      "round-trips, doesn't crash" contract of this module).
+    """
+    from yggdrasil.data.types.base import DataType
+
     n = name.strip().lower()
-    if n == "string":
-        return pa.string()
-    if n == "long":
-        return pa.int64()
-    if n == "integer":
-        return pa.int32()
-    if n == "short":
-        return pa.int16()
-    if n == "byte":
-        return pa.int8()
-    if n == "double":
-        return pa.float64()
-    if n == "float":
-        return pa.float32()
-    if n == "boolean":
-        return pa.bool_()
-    if n == "binary":
-        return pa.binary()
-    if n == "date":
-        return pa.date32()
-    if n == "timestamp":
-        return pa.timestamp("us", tz="UTC")
-    if n == "timestamp_ntz":
-        return pa.timestamp("us")
-    if n in ("void", "null"):
+    if n == "void":
         return pa.null()
-    if n.startswith("decimal"):
-        # ``decimal(10,2)`` — best-effort parse; fall back to (38, 18)
-        # which is Spark's default unbounded.
-        try:
-            inner = n[n.index("(") + 1 : n.index(")")]
-            p, s = (int(x.strip()) for x in inner.split(","))
-            return pa.decimal128(p, s)
-        except Exception:
-            return pa.decimal128(38, 18)
-    return pa.string()
+    try:
+        return DataType.from_str(n).to_arrow()
+    except Exception:
+        return pa.string()
 
 
 # ---------------------------------------------------------------------------
