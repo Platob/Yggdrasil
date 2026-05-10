@@ -21,6 +21,7 @@ from yggdrasil.dataclasses.waiting import (
 from yggdrasil.data.enums import Mode
 from .bytes_io import BytesIO
 from yggdrasil.io.nested import FolderIO, FolderOptions
+from .headers import Headers
 from .request import PreparedRequest
 from .response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
 from .response_batch import ResponseBatch
@@ -114,6 +115,60 @@ def _request_partition_predicate(
     return expr
 
 
+def _request_match_by_predicate(
+    requests: "list[PreparedRequest]",
+    match_by: "tuple[str, ...]",
+) -> "Any | None":
+    """Push the per-request match-by tuple values down to the parquet reader.
+
+    For every match-by column whose runtime values are primitive (the
+    typical case — xxh3_64 hashes, status codes, methods, header
+    digests) we emit a single ``column.is_in([...])`` term so the reader
+    can drop entire row groups whose dictionary stats fall outside the
+    incoming set. Response columns win the name lookup; request-side
+    keys collapse to the flattened ``request_<col>`` form. Anything we
+    can't express (dotted paths, unknown columns, non-primitive values,
+    a single request that ``match_value`` raises on) is skipped — the
+    Python-side tuple match in :func:`_lookup_local_responses` is the
+    backstop.
+    """
+    from yggdrasil.io.tabular.execution.expr import col
+
+    expr: "Any | None" = None
+    for key in match_by:
+        if "." in key:
+            continue
+        if key in RESPONSE_ARROW_SCHEMA.names:
+            column_name = key
+        elif f"request_{key}" in RESPONSE_ARROW_SCHEMA.names:
+            column_name = f"request_{key}"
+        else:
+            continue
+        try:
+            raw = {r.match_value(key) for r in requests}
+        except Exception:
+            continue
+        has_null = None in raw
+        primitives: list[Any] = []
+        skip = False
+        for v in raw:
+            if v is None:
+                continue
+            if isinstance(v, bool) or isinstance(v, (int, float, str)):
+                primitives.append(v)
+            else:
+                skip = True
+                break
+        if skip or not primitives:
+            continue
+        primitives.sort(key=lambda v: (v is None, v))
+        term = col(column_name).is_in(primitives)
+        if has_null:
+            term = term | col(column_name).is_null()
+        expr = term if expr is None else (expr & term)
+    return expr
+
+
 def _request_body_hash_predicate(
     requests: "list[PreparedRequest]",
 ) -> "Any | None":
@@ -179,13 +234,17 @@ def _lookup_local_responses(
     """Bulk lookup by request-key tuple against a folder cache.
 
     One folder read per call. The read result is partition-pruned by
-    the input requests' ``partition_key`` set so we only walk leaves
-    whose endpoint bucket matches an incoming request — typically
+    the input requests' ``partition_key`` set, body-hash-pruned, and
+    match-by-pruned (each ``request_by`` column hits the reader as an
+    ``is_in`` term) so we only walk leaves whose endpoint bucket and
+    request-identity columns match an incoming request — typically
     one or two partitions for an endpoint-focused batch instead of
     the whole tree. Row-level filtering by request-key tuple +
-    received-window happens after. When several rows share a key
-    the latest one (max ``received_at``) wins, giving UPSERT-on-write
-    semantics for free.
+    received-window happens after on the streamed batches rather than
+    a materialized :class:`pa.Table`, so a noisy partition no longer
+    inflates driver memory. When several rows share a key the latest
+    one (max ``received_at``) wins, giving UPSERT-on-write semantics
+    for free.
     """
     if not requests:
         return {}
@@ -195,17 +254,17 @@ def _lookup_local_responses(
     from yggdrasil.io.tabular.execution.expr import col
     from yggdrasil.data.options import CastOptions
 
-    # Push the partition / body-hash / received-window prune as a
-    # single :class:`Predicate` so the parquet reader's
-    # row-group / Hive-partition pruning skips the matching files
-    # before any bytes hit the driver. Anything we can't express
-    # (corrupt expr, unsupported backend) collapses to a None
-    # predicate and the unfiltered read still runs — the universal
-    # ``apply_predicate`` step at the Tabular layer is the
-    # backstop that re-applies the filter on the materialised
-    # batches.
+    # Push the partition / match-by / body-hash / received-window prune
+    # as a single :class:`Predicate` so the parquet reader's row-group
+    # / Hive-partition pruning skips the matching files before any
+    # bytes hit the driver. Anything we can't express (corrupt expr,
+    # unsupported backend) collapses to a None predicate and the
+    # unfiltered read still runs — the universal ``apply_predicate``
+    # step at the Tabular layer is the backstop that re-applies the
+    # filter on the materialised batches.
     predicate = _combine_predicates(
         _request_partition_predicate(cache, requests),
+        _request_match_by_predicate(requests, match_by),
         _request_body_hash_predicate(requests),
         col("received_at") >= received_from if received_from is not None else None,
         col("received_at") < received_to if received_to is not None else None,
@@ -213,40 +272,43 @@ def _lookup_local_responses(
 
     options = CastOptions(predicate=predicate) if predicate is not None else None
 
-    try:
-        with cache:
-            table = cache.read_arrow_table(options=options)
-    except Exception:
-        # Corrupt leaf, race with a concurrent write, schema drift
-        # — fall through to "nothing matches" so callers progress
-        # to the next pipeline stage cleanly.
-        LOGGER.debug(
-            "Local response cache read failed under %s; treating as miss",
-            cache.path, exc_info=True,
-        )
-        return {}
-
-    if table.num_rows == 0:
-        return {}
-
     wanted: set[tuple] = {
         tuple(r.match_value(c) for c in match_by) for r in requests
     }
     out: dict[tuple, Response] = {}
     latest_at: dict[tuple, Any] = {}
-    for response in Response.from_arrow_tabular(table.to_batches()):
-        try:
-            key = tuple(response.match_value(c) for c in match_by)
-        except Exception:
-            continue
-        if key not in wanted:
-            continue
-        ts = response.received_at
-        existing = latest_at.get(key)
-        if existing is None or (ts is not None and ts >= existing):
-            out[key] = response
-            if ts is not None:
-                latest_at[key] = ts
+
+    try:
+        with cache:
+            # Stream batches from the partitioned folder rather than
+            # materializing a single Table — a hot endpoint partition
+            # can be hundreds of MB and we only need the rows whose
+            # match-by tuple is actually in ``wanted``.
+            batch_iter = cache.read_arrow_batches(options=options)
+            for response in Response.from_arrow_tabular(batch_iter):
+                try:
+                    key = tuple(response.match_value(c) for c in match_by)
+                except Exception:
+                    continue
+                if key not in wanted:
+                    continue
+                ts = response.received_at
+                existing = latest_at.get(key)
+                if existing is None or (ts is not None and ts >= existing):
+                    out[key] = response
+                    if ts is not None:
+                        latest_at[key] = ts
+    except Exception:
+        # Corrupt leaf, race with a concurrent write, schema drift
+        # — fall through to "nothing matches so far" so callers
+        # progress to the next pipeline stage cleanly. Anything
+        # already accepted before the failure is returned so a
+        # tail-end corruption doesn't poison earlier-good batches.
+        LOGGER.debug(
+            "Local response cache read failed under %s; treating remainder as miss",
+            cache.path, exc_info=True,
+        )
+
     return out
 
 
@@ -294,7 +356,7 @@ class Session(ABC):
         base_url: Optional[URL | str] = None,
         verify: bool = True,
         pool_maxsize: int = 10,
-        headers: Optional[dict[str, str]] = None,
+        headers: "Headers | Mapping[str, str] | None" = None,
         waiting: WaitingConfig = DEFAULT_WAITING_CONFIG,
         *,
         key: str = "",
@@ -308,7 +370,7 @@ class Session(ABC):
         self.key = key
         self.verify = verify
         self.pool_maxsize = pool_maxsize if pool_maxsize and pool_maxsize > 0 else 8
-        self.headers = headers
+        self.headers: Headers = Headers.from_(headers)
         self.waiting = waiting
         self._lock = threading.RLock()
         self._job_pool: Optional[JobPoolExecutor] = None
@@ -364,7 +426,7 @@ class Session(ABC):
     @x_api_key.setter
     def x_api_key(self, value: Optional[str]) -> None:
         if self.headers is None:
-            self.headers = {}
+            self.headers = Headers()
         if value is None:
             self.headers.pop("X-API-Key", None)
         else:

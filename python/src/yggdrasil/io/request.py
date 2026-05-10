@@ -18,7 +18,7 @@ from yggdrasil.data.enums import MediaType, MimeTypes
 from .base import IO
 from .bytes_io import BytesIO
 from yggdrasil.data.enums import GZIP, Codec, MimeType
-from .headers import normalize_headers
+from .headers import Headers
 from .holder import Holder
 from .memory import Memory
 from .url import URL, URL_STRUCT
@@ -335,7 +335,7 @@ class PreparedRequest:
     ) -> None:
         self.method = method or "GET"
         self.url = URL.from_(url)
-        self.headers = _string_dict(headers)
+        self.headers: Headers = Headers.from_(headers)
         self.tags = _string_dict(tags)
         self.sent_at = (
             any_to_datetime(sent_at) if sent_at
@@ -350,12 +350,11 @@ class PreparedRequest:
         self._session: "Session | None" = None
         # Memoization for the deterministic projection — hashes,
         # url-struct, arrow_values dict. Invalidated when
-        # :meth:`_state_token` shifts (method/url/headers/buffer
-        # identity or size changed, or :meth:`_invalidate_cache`
-        # bumped the version).
+        # :meth:`_state_token` shifts (method, URL identity, header
+        # / buffer ``id`` + ``len`` + byte length changed) or
+        # :meth:`_invalidate_cache` was called by an in-place setter.
         self._cache: dict[str, Any] = {}
         self._cache_token: tuple = ()
-        self._state_version: int = 0
 
     @property
     def sender(self) -> UserInfo | None:
@@ -396,7 +395,10 @@ class PreparedRequest:
         self._session = None
         self._cache = {}
         self._cache_token = ()
-        self._state_version = 0
+        # Re-coerce in case an old pickle carried ``headers`` as a
+        # plain dict — :class:`Headers.from_` is a no-op on an
+        # already-built instance, so the live path stays cheap.
+        self.headers = Headers.from_(self.headers)
 
     # ------------------------------------------------------------------
     # Memoization — cheap fingerprint check, refresh on change
@@ -406,23 +408,21 @@ class PreparedRequest:
         """Cheap fingerprint of the inputs that drive every cached
         derivation (hashes, url struct, arrow_values).
 
-        ``id(headers)`` / ``id(buffer)`` plus ``len`` / ``size`` covers
-        the common mutations: dict swap, dict resize, buffer swap,
-        body resize. In-place same-size header overwrites slip
-        through, so the public ``authorization`` / ``x_api_key``
-        setters and :meth:`update_headers` bump :attr:`_state_version`
-        via :meth:`_invalidate_cache` — that bump shows up here so
-        downstream caches (e.g. the response's, which mixes this
-        token in) refresh too.
+        We trust each inner object to track its own state:
+        :class:`URL` is value-equal so it identifies itself,
+        :class:`Headers` exposes a monotonic ``version`` (one int
+        compare beats walking the dict), and :class:`Holder` is
+        identified by ``id`` + size. No byte-length or stat shadows
+        on :class:`PreparedRequest` itself — the inner objects are
+        the source of truth.
         """
         headers = self.headers
         buffer = self.buffer
         return (
-            self._state_version,
             self.method,
             self.url,
             id(headers),
-            len(headers) if headers else 0,
+            headers.version if headers is not None else 0,
             id(buffer),
             buffer.size if buffer is not None else -1,
         )
@@ -439,17 +439,18 @@ class PreparedRequest:
         return cached
 
     def _invalidate_cache(self) -> None:
-        """Drop every memoized derivation — call after any in-place
-        mutation that the :meth:`_state_token` fingerprint can't see
-        (e.g. overwriting an existing header with a same-key value).
+        """Drop every memoized derivation.
 
-        Bumps :attr:`_state_version` so downstream consumers that
-        embed this request's token in their own (e.g.
-        :class:`Response`) detect the change on their next access.
+        :class:`Headers` already bumps its own ``version`` on every
+        mutation, so header rewrites flow through :meth:`_state_token`
+        without help. This entry point stays for the rare case where
+        callers swap :attr:`headers` for a fresh value-equal
+        :class:`Headers` (``id`` flips, contents identical) or mutate
+        a slot the fingerprint doesn't watch — clearing the memo
+        here forces a clean recompute on the next access.
         """
         self._cache.clear()
         self._cache_token = ()
-        self._state_version += 1
 
     # ------------------------------------------------------------------
     # Session attachment — used by Spark broadcast on the worker side
@@ -690,7 +691,10 @@ class PreparedRequest:
         return out_class(
             method=str(method),
             url=parsed_url,
-            headers=normalize_headers(out_headers, is_request=True, body=request_body) if normalize else out_headers,
+            headers=(
+                Headers.from_(out_headers).normalized(is_request=True, body=request_body)
+                if normalize else out_headers
+            ),
             tags=_string_dict(tags),
             buffer=request_body,
             sent_at=0,
@@ -770,7 +774,7 @@ class PreparedRequest:
     @authorization.setter
     def authorization(self, value: Optional[str]):
         if self.headers is None:
-            self.headers = {}
+            self.headers = Headers()
         if value is None:
             self.headers.pop("Authorization", None)
         else:
@@ -784,7 +788,7 @@ class PreparedRequest:
     @x_api_key.setter
     def x_api_key(self, value: Optional[str]):
         if self.headers is None:
-            self.headers = {}
+            self.headers = Headers()
         if value is None:
             self.headers.pop("X-API-Key", None)
         else:
@@ -803,7 +807,7 @@ class PreparedRequest:
     @accept_media_type.setter
     def accept_media_type(self, value: MediaType):
         if self.headers is None:
-            self.headers = {}
+            self.headers = Headers()
         self.headers["Accept"] = value.mime_type.value
         if value.codec:
             self.headers["Accept-Encoding"] = value.codec.name
@@ -897,33 +901,32 @@ class PreparedRequest:
         return self._cached("public_hash", lambda: self._compute_identity_hash(anonymize=True))
 
     def _compute_identity_hash(self, *, anonymize: bool = False) -> int:
+        """Mix (method, url, headers, body) into one xxh3_64 digest.
+
+        Each component arrives in its own pre-cached form:
+        :class:`URL` caches ``to_string()``, :class:`Headers` caches
+        :attr:`canonical_bytes`, :class:`Holder` caches
+        :attr:`xxh3_64_digest`. Repeat calls — common at the cache
+        layer where ``hash`` and ``public_hash`` both fire — pay one
+        xxh3 mix over already-bytes inputs.
+        """
         import xxhash
 
         if anonymize:
             url_str = self.url.anonymize(mode="remove").to_string()
-            headers = normalize_headers(
-                self.headers or {},
-                is_request=True,
-                add_missing=False,
-                anonymize=True,
-                mode="remove",
-            )
+            headers = self.headers.anonymized(mode="remove")
         else:
             url_str = self.url.to_string()
-            headers = self.headers or {}
+            headers = self.headers
 
         h = xxhash.xxh3_64()
         h.update(self.method.encode("utf-8"))
         h.update(b"\x00")
         h.update(url_str.encode("utf-8"))
         h.update(b"\x00")
-        for k in sorted(headers):
-            h.update(str(k).encode("utf-8"))
-            h.update(b"=")
-            h.update(str(headers[k]).encode("utf-8"))
-            h.update(b"\x00")
+        h.update(headers.canonical_bytes)
         if self.buffer is not None:
-            h.update(self.buffer.xxh3_64().digest())
+            h.update(self.buffer.xxh3_64_digest)
         u = h.intdigest()
         return u if u < 2**63 else u - 2**64
 
@@ -1096,19 +1099,18 @@ class PreparedRequest:
         if not headers:
             return self
 
-        next_headers: Mapping[str, str] = headers
+        next_headers: "Headers | Mapping[str, str]" = headers
         if normalize:
-            next_headers = normalize_headers(
-                headers,
+            next_headers = Headers.from_(headers).normalized(
                 is_request=True,
                 anonymize=False,
                 add_missing=False,
             )
 
         if not self.headers:
-            self.headers = _string_dict(next_headers)
+            self.headers = Headers.from_(next_headers)
         else:
-            self.headers.update(_string_dict(next_headers))
+            self.headers.update(next_headers)
 
         self._invalidate_cache()
         return self
@@ -1133,8 +1135,7 @@ class PreparedRequest:
             return self
 
         return self.copy(
-            headers=normalize_headers(
-                self.headers,
+            headers=self.headers.normalized(
                 is_request=True,
                 mode=mode,
                 body=self.body,
