@@ -656,6 +656,7 @@ class YGGFolderIO(FolderIO):
         *,
         target_media_type: "Any" = None,
         tolerance: float = FolderIO.OPTIMIZE_TOLERANCE,
+        partitions: "dict[str, Any] | None" = None,
         **kwargs: Any,
     ) -> int:
         """Compact each partition leaf's small parts.
@@ -670,6 +671,14 @@ class YGGFolderIO(FolderIO):
         - ``byte_size=N`` packs small parts into bundles near *N*
           bytes; parts within ``±tolerance`` of *N* (or already
           larger) are left untouched.
+        - ``partitions={col: (v1, v2, ...)}`` (or a single scalar /
+          set) restricts the walk to the matching ``col=val`` leaves
+          only. Same shape the read path consumes via
+          ``options.prune_values``, so the session's per-batch
+          compaction can compact just the ``partition_key=…`` leaves
+          a write actually touched without paying for a full-tree
+          walk. ``None`` (default) keeps the legacy "every leaf"
+          behaviour.
 
         Returns the total number of new part files written across
         every leaf. A no-schema :class:`YGGFolderIO` falls through to
@@ -690,8 +699,9 @@ class YGGFolderIO(FolderIO):
                 tolerance=tolerance,
             )
 
+        prune = partitions or {}
         compacted = 0
-        for leaf_path, _kv in self._iter_partitions(parts, prune={}):
+        for leaf_path, _kv in self._iter_partitions(parts, prune=prune):
             if not leaf_path.exists():
                 continue
             leaf = FolderIO(path=leaf_path)

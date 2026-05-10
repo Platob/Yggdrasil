@@ -412,6 +412,32 @@ class TestOptimize:
             ).write_arrow_table(table)
         assert y.optimize() == 1
 
+    def test_partitions_kwarg_scopes_compaction(self, tmp_path) -> None:
+        # Two partitions, two parts each — both need compacting.
+        y = YGGFolderIO(
+            path=str(tmp_path), schema=_single_partition_schema(),
+        )
+        for region in ("us", "eu"):
+            y.write_arrow_table(pa.table({
+                "id": [1], "region": [region], "value": ["a"],
+            }))
+            y.write_arrow_batches(
+                pa.table({
+                    "id": [2], "region": [region], "value": ["b"],
+                }).to_batches(),
+                options=FolderOptions(mode=Mode.APPEND),
+            )
+        us_dir, eu_dir = tmp_path / "region=us", tmp_path / "region=eu"
+        assert len([p for p in us_dir.iterdir() if p.name.startswith("part-")]) == 2
+        assert len([p for p in eu_dir.iterdir() if p.name.startswith("part-")]) == 2
+
+        # Restrict optimize to the ``us`` partition only — eu must
+        # stay untouched, so total compactions is 1 (us).
+        compacted = y.optimize(partitions={"region": ["us"]})
+        assert compacted == 1
+        assert len([p for p in us_dir.iterdir() if p.name.startswith("part-")]) == 1
+        assert len([p for p in eu_dir.iterdir() if p.name.startswith("part-")]) == 2
+
 
 # ---------------------------------------------------------------------------
 # Mode dispatch
