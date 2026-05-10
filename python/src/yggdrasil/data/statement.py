@@ -773,11 +773,17 @@ class StatementResult(Tabular, Generic[PS]):
             self.raise_for_status()
 
         # Successful terminal — drop any per-statement scratch (staged
-        # volumes, temp views) now that we don't need them.
-        try:
-            self.statement.clear_temporary_resources()
-        except Exception:
-            logger.exception("clear_temporary_resources failed after wait; continuing.")
+        # volumes, temp views) now that we don't need them. Failed
+        # results keep their scratch so a follow-up :meth:`retry` (or
+        # :meth:`StatementBatch.retry` after auto-promote) can re-run
+        # the statement against the same staged source; cleanup falls
+        # to :meth:`raise_for_status` (terminal failure) or to the end
+        # of the retry loop.
+        if not self.failed:
+            try:
+                self.statement.clear_temporary_resources()
+            except Exception:
+                logger.exception("clear_temporary_resources failed after wait; continuing.")
 
         return self
 
@@ -1045,7 +1051,14 @@ class StatementBatch(Generic[PS, SR]):
         if raise_error:
             self.raise_for_status()
 
-        self.clear_temporary_resources()
+        # Per-result :meth:`wait` already cleared scratch for every
+        # success. Skip failed ones — :meth:`retry` may re-run them
+        # against the same staged source, and unlinking it here would
+        # turn a transient failure into a non-recoverable PATH_NOT_FOUND
+        # on the retry attempt.
+        for key, result in self.results.items():
+            if not result.failed:
+                _safe(result.clear_temporary_resources, "clear_temporary_resources", key)
         return self
 
     def retry(

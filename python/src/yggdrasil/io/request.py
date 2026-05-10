@@ -673,21 +673,6 @@ class PreparedRequest:
             sender=new_sender,
         )
 
-    def prepare_to_send(
-        self,
-        sent_at: dt.datetime | dt.date | str | int | None = None,
-        headers: Optional[Mapping[str, str]] = None,
-    ) -> "PreparedRequest":
-        if self.headers is None:
-            self.headers = {}
-
-        if headers:
-            self.headers.update(_string_dict(headers))
-
-        self.sent_at = dt.datetime.now(dt.timezone.utc) if sent_at is None else any_to_datetime(sent_at)
-
-        return self
-
     @property
     def body(self) -> Optional[Holder]:
         return self.buffer
