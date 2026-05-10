@@ -1790,7 +1790,7 @@ class Table(DatabricksResource, Holder):
 
             if existing is None:
                 add_columns.append(
-                    f"`{data_field.name}` {data_field.dtype.to_databricks_ddl()}"
+                    f"`{data_field.name}` {data_field.dtype.to_spark_name()}"
                 )
                 continue
 
@@ -1805,8 +1805,8 @@ class Table(DatabricksResource, Holder):
                 current_name = data_field.name
 
             if update_dtype:
-                existing_ddl = existing.field.dtype.to_databricks_ddl()
-                new_ddl = data_field.dtype.to_databricks_ddl()
+                existing_ddl = existing.field.dtype.to_spark_name()
+                new_ddl = data_field.dtype.to_spark_name()
                 if existing_ddl != new_ddl:
                     type_statements.append(
                         f"{alter_table} ALTER COLUMN `{current_name}` "
@@ -1943,7 +1943,7 @@ class Table(DatabricksResource, Holder):
 
         for f in schema_info.children_fields:
             effective_fields.append(f)
-            column_definitions.append(f.to_databricks_ddl())
+            column_definitions.append(f.to_spark_name())
 
         any_invalid = any(_needs_column_mapping(f.name) for f in effective_fields)
         if column_mapping_mode is None:
@@ -2360,7 +2360,7 @@ class Table(DatabricksResource, Holder):
     @staticmethod
     def _field_to_column_info(f: Field, *, position: int) -> ColumnInfo:
         """Translate a :class:`Field` into a UC SDK :class:`ColumnInfo`."""
-        ddl = f.dtype.to_databricks_ddl()
+        ddl = f.dtype.to_spark_name()
         type_name = _column_type_name_from_ddl(ddl)
         comment_bytes = (f.metadata or {}).get(b"comment") if f.metadata else None
         comment = comment_bytes.decode("utf-8") if isinstance(comment_bytes, bytes) else None
@@ -2729,7 +2729,7 @@ class Table(DatabricksResource, Holder):
         columns = list(existing_schema.field_names())
         # Explicit per-column CAST to the target field's DDL coerces the
         # staged Parquet rows to the target table's schema. Mirrors the
-        # projection used by :meth:`sql_insert`. ``to_databricks_ddl``
+        # projection used by :meth:`sql_insert`. ``to_spark_name``
         # never emits ``NOT NULL`` on struct children, so the source
         # side is always nullable and matches the parquet reader's view
         # — Spark/Delta refuse the implicit cast otherwise
@@ -2737,7 +2737,7 @@ class Table(DatabricksResource, Holder):
         cast_projection = ", ".join(
             (
                 f"CAST({quote_ident(f.name)} AS "
-                f"{f.to_databricks_ddl(with_name=False, with_nullable=False, with_comment=False)})"
+                f"{f.to_spark_name(with_name=False, with_nullable=False, with_comment=False)})"
                 f" AS {quote_ident(f.name)}"
             )
             for f in existing_schema.fields
@@ -2805,7 +2805,7 @@ class Table(DatabricksResource, Holder):
                 extra_cast_proj = ", ".join(
                     (
                         f"CAST({quote_ident(f.name)} AS "
-                        f"{f.to_databricks_ddl(with_name=False, with_nullable=False, with_comment=False)})"
+                        f"{f.to_spark_name(with_name=False, with_nullable=False, with_comment=False)})"
                         f" AS {quote_ident(f.name)}"
                     )
                     for f in extra_schema.fields
@@ -3240,7 +3240,7 @@ class Table(DatabricksResource, Holder):
         cast_projection = ", ".join(
             (
                 f"CAST(raw_src.{quote_ident(f.name)} AS "
-                f"{f.to_databricks_ddl(with_name=False, with_nullable=False, with_comment=False)})"
+                f"{f.to_spark_name(with_name=False, with_nullable=False, with_comment=False)})"
                 f" AS {quote_ident(f.name)}"
             )
             for f in fields
@@ -3323,7 +3323,7 @@ class Table(DatabricksResource, Holder):
                 extra_cast_proj = ", ".join(
                     (
                         f"CAST(raw_src.{quote_ident(f.name)} AS "
-                        f"{f.to_databricks_ddl(with_name=False, with_nullable=False, with_comment=False)})"
+                        f"{f.to_spark_name(with_name=False, with_nullable=False, with_comment=False)})"
                         f" AS {quote_ident(f.name)}"
                     )
                     for f in extra_fields

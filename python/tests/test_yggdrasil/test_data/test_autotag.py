@@ -7,6 +7,7 @@ on decimals. Field-level autotag adds ``nullable``; schema-level
 autotag propagates per-field tags and pops table-scope metadata
 (``partition_by`` / ``cluster_by``) onto the matching fields.
 """
+
 from __future__ import annotations
 
 from yggdrasil.data.data_field import Field
@@ -24,7 +25,6 @@ from yggdrasil.data.types.primitive import (
     TimestampType,
 )
 
-
 # ---------------------------------------------------------------------------
 # DataType.autotag — base + subclass extensions
 # ---------------------------------------------------------------------------
@@ -40,20 +40,22 @@ class TestDataTypeAutotag:
         assert BinaryType(byte_size=16).autotag()[b"byte_size"] == b"16"
         assert b"byte_size" not in StringType().autotag()
 
-    def test_integer_carries_signed_flag(self) -> None:
-        # Specialized integer subclasses (``Int32Type``, ``UInt16Type``,
-        # ...) emit their own ``type_name`` so the tag carries width
-        # straight to downstream filters.
+    def test_specialized_integers_omit_redundant_signed_flag(self) -> None:
+        # Specialized fixed-width subclasses (``Int32Type``, ``UInt16Type``,
+        # ...) carry signedness in their ``type_name`` already
+        # (``int32`` vs ``uint32``), so the tag dict skips the
+        # redundant ``signed`` key. Only the abstract :class:`IntegerType`
+        # (``type_id=INTEGER``) — which has no fixed width / signedness
+        # — still emits ``signed``.
         signed = IntegerType(byte_size=4, signed=True).autotag()
         assert signed == {
             b"type_name": b"int32",
             b"byte_size": b"4",
-            b"signed": b"true",
         }
 
         unsigned = IntegerType(byte_size=2, signed=False).autotag()
         assert unsigned[b"type_name"] == b"uint16"
-        assert unsigned[b"signed"] == b"false"
+        assert b"signed" not in unsigned
 
     def test_float_carries_kind_and_size(self) -> None:
         # ``Float64Type`` here — see :meth:`FloatingPointType.__new__`.
@@ -169,7 +171,9 @@ class TestSchemaAutotag:
 
         id_tags = out["user_id"].tags or {}
         assert id_tags[b"type_name"] == b"int64"
-        assert id_tags[b"signed"] == b"true"
+        # ``signed`` is implied by the ``int64`` type_name on a
+        # specialized subclass; only the abstract IntegerType emits it.
+        assert b"signed" not in id_tags
         assert id_tags[b"nullable"] == b"false"
         assert id_tags[b"primary_key"] == b"true"
 

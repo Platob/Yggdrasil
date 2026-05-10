@@ -147,7 +147,7 @@ class TestDefaultsAndDdl:
     def test_databricks_ddl_uses_kv_types(
         self, int64_type, string_type
     ) -> None:
-        ddl = MapType.from_key_value(string_type, int64_type).to_databricks_ddl()
+        ddl = MapType.from_key_value(string_type, int64_type).to_spark_name()
 
         assert ddl.upper().startswith("MAP<")
         assert ddl.endswith(">")

@@ -16,6 +16,7 @@ The dispatch table at the bottom is the single source of truth for
 the redirect — ``__new__`` reads from it; ``IntegerType`` /
 ``UInt32Type`` / ... never see each other directly.
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -222,8 +223,14 @@ class IntegerType(NumericType):
     def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
         pl = get_polars()
         return dtype in {
-            pl.Int8, pl.Int16, pl.Int32, pl.Int64,
-            pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
+            pl.Int8,
+            pl.Int16,
+            pl.Int32,
+            pl.Int64,
+            pl.UInt8,
+            pl.UInt16,
+            pl.UInt32,
+            pl.UInt64,
         }
 
     @classmethod
@@ -247,12 +254,15 @@ class IntegerType(NumericType):
     @classmethod
     def handles_spark_type(cls, dtype: "pst.DataType") -> bool:
         spark = get_spark_sql()
-        return isinstance(dtype, (
-            spark.types.ByteType,
-            spark.types.ShortType,
-            spark.types.IntegerType,
-            spark.types.LongType,
-        ))
+        return isinstance(
+            dtype,
+            (
+                spark.types.ByteType,
+                spark.types.ShortType,
+                spark.types.IntegerType,
+                spark.types.LongType,
+            ),
+        )
 
     @classmethod
     def from_spark_type(cls, dtype: "pst.DataType") -> "IntegerType":
@@ -331,7 +341,7 @@ class IntegerType(NumericType):
         }
         return unsigned_factories[self._size]()
 
-    def to_databricks_ddl(self) -> str:
+    def to_spark_name(self) -> str:
         mapping = _INT_DDL_SIGNED if self.signed else _INT_DDL_UNSIGNED
         return mapping[self._size]
 
@@ -403,7 +413,15 @@ class IntegerType(NumericType):
 
     def autotag(self) -> dict[bytes, bytes]:
         tags = super().autotag()
-        tags[b"signed"] = b"true" if self.signed else b"false"
+        # Specialized fixed-width subclasses (``Int8Type`` … ``Int64Type``,
+        # ``UInt8Type`` … ``UInt64Type``) already encode signedness in
+        # their ``type_id`` (and the ``type_name`` tag the base class
+        # writes), so a ``signed`` tag would just be redundant noise.
+        # Only the abstract ``IntegerType`` (``type_id=INTEGER``)
+        # actually needs the flag, since its name alone doesn't pin
+        # the signedness.
+        if self.type_id is DataTypeId.INTEGER:
+            tags[b"signed"] = b"true" if self.signed else b"false"
         return tags
 
     def as_spark(self) -> "IntegerType":
@@ -573,10 +591,10 @@ class UInt64Type(IntegerType):
 
 
 _SPECIALIZED_INTEGER_TYPES: dict[tuple[int | None, bool], type[IntegerType]] = {
-    (1, True):  Int8Type,
-    (2, True):  Int16Type,
-    (4, True):  Int32Type,
-    (8, True):  Int64Type,
+    (1, True): Int8Type,
+    (2, True): Int16Type,
+    (4, True): Int32Type,
+    (8, True): Int64Type,
     (1, False): UInt8Type,
     (2, False): UInt16Type,
     (4, False): UInt32Type,

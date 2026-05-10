@@ -379,8 +379,8 @@ class ArrayType(NestedType):
             return self
         return ArrayType.from_item(polars_item)
 
-    def to_databricks_ddl(self) -> str:
-        return f"ARRAY<{self.item_field.dtype.to_databricks_ddl()}>"
+    def to_spark_name(self) -> str:
+        return f"ARRAY<{self.item_field.dtype.to_spark_name()}>"
 
     def to_dict(self) -> dict[str, Any]:
         base = super().to_dict()

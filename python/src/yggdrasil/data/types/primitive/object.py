@@ -126,7 +126,7 @@ class ObjectType(DataType):
         spark = get_spark_sql()
         return spark.types.BinaryType()
 
-    def to_databricks_ddl(self) -> str:
+    def to_spark_name(self) -> str:
         return "BINARY"
 
     def to_dict(self) -> dict[str, Any]:

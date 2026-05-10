@@ -22,7 +22,9 @@ from typing import (
     Optional,
     Union,
     get_args,
-    get_origin, AnyStr, )
+    get_origin,
+    AnyStr,
+)
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -180,18 +182,18 @@ DATA_TYPE_CLASSES: dict[int, type["DataType"]] = {}
 # ---------------------------------------------------------------------
 
 _INT_TYPE_ID_TO_PARAMS: dict[DataTypeId, tuple[int, bool]] = {
-    DataTypeId.INT8:   (1, True),
-    DataTypeId.INT16:  (2, True),
-    DataTypeId.INT32:  (4, True),
-    DataTypeId.INT64:  (8, True),
-    DataTypeId.UINT8:  (1, False),
+    DataTypeId.INT8: (1, True),
+    DataTypeId.INT16: (2, True),
+    DataTypeId.INT32: (4, True),
+    DataTypeId.INT64: (8, True),
+    DataTypeId.UINT8: (1, False),
     DataTypeId.UINT16: (2, False),
     DataTypeId.UINT32: (4, False),
     DataTypeId.UINT64: (8, False),
 }
 
 _FLOAT_TYPE_ID_TO_SIZE: dict[DataTypeId, int] = {
-    DataTypeId.FLOAT8:  1,
+    DataTypeId.FLOAT8: 1,
     DataTypeId.FLOAT16: 2,
     DataTypeId.FLOAT32: 4,
     DataTypeId.FLOAT64: 8,
@@ -238,8 +240,7 @@ class DataType(BaseChildrenFields, ABC):
         return self == other
 
     @classmethod
-    def class_type_id(cls) -> DataTypeId:
-        ...
+    def class_type_id(cls) -> DataTypeId: ...
 
     @property
     def type_id(self) -> DataTypeId:
@@ -368,10 +369,14 @@ class DataType(BaseChildrenFields, ABC):
 
     @staticmethod
     def _target_nullable(options: "CastOptions") -> bool:
-        return options.target_field.nullable if options.target_field is not None else True
+        return (
+            options.target_field.nullable if options.target_field is not None else True
+        )
 
     @staticmethod
-    def _matches_dict(value: dict[str, Any], type_id: DataTypeId, *aliases: str) -> bool:
+    def _matches_dict(
+        value: dict[str, Any], type_id: DataTypeId, *aliases: str
+    ) -> bool:
         if value.get("id") == int(type_id):
             return True
         name = str(value.get("name", "")).upper()
@@ -434,25 +439,8 @@ class DataType(BaseChildrenFields, ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def to_databricks_ddl(self) -> str:
+    def to_spark_name(self) -> str:
         raise NotImplementedError
-
-    def to_polars_flavor(self) -> "polars.DataType":
-        """Return the Polars-native counterpart for this object.
-
-        On ``DataType`` the counterpart is a Polars dtype; on ``Field`` /
-        ``Schema`` it's a ``pl.Field`` / ``pl.Schema``. The method name is
-        uniform across the three classes so callers can dispatch on whatever
-        Yggdrasil object they hold.
-        """
-        return self.to_polars()
-
-    def to_spark_flavor(self) -> "pst.DataType":
-        """Return the Spark-native counterpart for this object.
-
-        See :meth:`to_polars_flavor` for the shared contract.
-        """
-        return self.to_spark()
 
     def as_polars(self) -> "DataType":
         """Return a Polars-flavored :class:`DataType` for this type.
@@ -519,9 +507,7 @@ class DataType(BaseChildrenFields, ABC):
         Keys are bare (no ``t:`` prefix) — prefixing is handled by
         ``BaseMetadata.update_tags`` when these land on a Field.
         """
-        return {
-            b"type_name": self.type_id.name.lower().encode("utf-8")
-        }
+        return {b"type_name": self.type_id.name.lower().encode("utf-8")}
 
     # ==================================================================
     # Scalar conversion — Python / Arrow value coercion
@@ -655,18 +641,15 @@ class DataType(BaseChildrenFields, ABC):
                 byte_size=parsed.byte_size, precision=precision, scale=scale
             )
 
-        if parsed.type_id == DataTypeId.DATE or parsed.name in {
-            "dt.date", "date"
-        }:
+        if parsed.type_id == DataTypeId.DATE or parsed.name in {"dt.date", "date"}:
             return DateType()
 
-        if parsed.type_id == DataTypeId.TIME or parsed.name in {
-            "dt.time", "time"
-        }:
+        if parsed.type_id == DataTypeId.TIME or parsed.name in {"dt.time", "time"}:
             return TimeType(unit=meta.unit or "us")
 
         if parsed.type_id == DataTypeId.TIMESTAMP or parsed.name in {
-            "dt.datetime", "datetime"
+            "dt.datetime",
+            "datetime",
         }:
             tz = meta.timezone
             if tz in {"ntz", "without_time_zone"}:
@@ -678,7 +661,8 @@ class DataType(BaseChildrenFields, ABC):
             return TimestampType(unit=meta.unit or "us", tz=tz)
 
         if parsed.type_id == DataTypeId.DURATION or parsed.name in {
-            "dt.timedelta", "timedelta"
+            "dt.timedelta",
+            "timedelta",
         }:
             return DurationType(unit=meta.unit or "us")
 
@@ -712,10 +696,7 @@ class DataType(BaseChildrenFields, ABC):
         if parsed.type_id == DataTypeId.STRUCT:
             return StructType(
                 fields=[
-                    field_cls.from_parsed(
-                        child,
-                        name=child.name or f"f{i}"
-                    )
+                    field_cls.from_parsed(child, name=child.name or f"f{i}")
                     for i, child in enumerate(parsed.children)
                 ]
             )
@@ -799,9 +780,7 @@ class DataType(BaseChildrenFields, ABC):
                         return subclass.from_dict(value)
 
         if default is ...:
-            raise ValueError(
-                f"Cannot find a valid {cls.__name__} in: {value}"
-            )
+            raise ValueError(f"Cannot find a valid {cls.__name__} in: {value}")
 
         return default
 
@@ -1115,9 +1094,7 @@ class DataType(BaseChildrenFields, ABC):
                     name=f.name,
                     dtype=cls.from_any(f.type),
                     nullable=True,
-                ).with_metadata(
-                    default=f.default
-                )
+                ).with_metadata(default=f.default)
             )
 
         return StructType(fields=inner_fields)
@@ -1359,12 +1336,7 @@ class DataType(BaseChildrenFields, ABC):
     # ==================================================================
 
     @classmethod
-    def from_yggdrasil(
-        cls,
-        value: Any,
-        *,
-        cls_name: str | None = None
-    ) -> "DataType":
+    def from_yggdrasil(cls, value: Any, *, cls_name: str | None = None) -> "DataType":
         if hasattr(value, "dtype"):
             value = value.dtype
 
@@ -1374,6 +1346,7 @@ class DataType(BaseChildrenFields, ABC):
         for attr in ("collect_schema", "data_schema"):
             if hasattr(value, attr):
                 from yggdrasil.data.schema import Schema
+
                 data_schema = getattr(value, attr)
 
                 if callable(data_schema):
@@ -1385,6 +1358,7 @@ class DataType(BaseChildrenFields, ABC):
         for attr in ("collect_data_field", "data_field"):
             if hasattr(value, attr):
                 from yggdrasil.data.data_field import Field
+
                 data_field = getattr(value, attr)
 
                 if callable(data_field):
@@ -1570,7 +1544,9 @@ class DataType(BaseChildrenFields, ABC):
                     series.to_arrow(compat_level=pl.CompatLevel.newest()),
                     options,
                 )
-                casted = pl.Series(name=series.name, values=arrow, dtype=self.to_polars())
+                casted = pl.Series(
+                    name=series.name, values=arrow, dtype=self.to_polars()
+                )
 
             return casted
 
@@ -1820,11 +1796,7 @@ class DataType(BaseChildrenFields, ABC):
             logging.warning(e)
             return column
 
-        return (
-            F.when(column.isNull(), defaults)
-            .otherwise(column)
-            .cast(self.to_spark())
-        )
+        return F.when(column.isNull(), defaults).otherwise(column).cast(self.to_spark())
 
     # ==================================================================
     # Defaults — scalar + column / array factories

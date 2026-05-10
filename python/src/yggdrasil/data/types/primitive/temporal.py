@@ -480,7 +480,7 @@ class TemporalType(PrimitiveType, ABC):
 
     Holds shared fields (``unit`` / ``tz``) and cross-engine dispatch logic.
     Subclasses implement ``type_id``, the ``handles_*`` / ``from_*`` class
-    methods, and ``to_arrow`` / ``to_polars`` / ``to_spark`` / ``to_databricks_ddl``.
+    methods, and ``to_arrow`` / ``to_polars`` / ``to_spark`` / ``to_spark_name``.
     """
 
     unit: TimeUnit = TimeUnit.MICROSECOND
@@ -804,7 +804,7 @@ class DateType(TemporalType):
         spark = get_spark_sql()
         return spark.types.DateType()
 
-    def to_databricks_ddl(self) -> str:
+    def to_spark_name(self) -> str:
         return "DATE"
 
     def default_pyobj(self, nullable: bool) -> Any:
@@ -912,7 +912,7 @@ class TimeType(TemporalType):
 
         return StringType()
 
-    def to_databricks_ddl(self) -> str:
+    def to_spark_name(self) -> str:
         return "STRING"
 
     def default_pyobj(self, nullable: bool) -> Any:
@@ -1057,7 +1057,7 @@ class TimestampType(TemporalType):
             return TimestampType(unit=TimeUnit.MILLISECOND, tz=self.tz)
         return self
 
-    def to_databricks_ddl(self) -> str:
+    def to_spark_name(self) -> str:
         # Databricks ``TIMESTAMP`` is UTC-anchored — only emit it when the tz is
         # UTC-equivalent. Anything else (naive or a real non-UTC zone like
         # ``Europe/Paris``) drops to ``TIMESTAMP_NTZ`` so the wall-clock value
@@ -1202,7 +1202,7 @@ class DurationType(TemporalType):
             return DurationType(unit=TimeUnit.MILLISECOND)
         return self
 
-    def to_databricks_ddl(self) -> str:
+    def to_spark_name(self) -> str:
         return "BIGINT"
 
     def default_pyobj(self, nullable: bool) -> Any:

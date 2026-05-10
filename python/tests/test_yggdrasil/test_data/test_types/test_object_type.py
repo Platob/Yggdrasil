@@ -148,8 +148,8 @@ class TestObjectTypeSpark(unittest.TestCase):
 
 class TestObjectTypeDDL(unittest.TestCase):
 
-    def test_to_databricks_ddl_is_binary(self) -> None:
-        self.assertEqual(ObjectType().to_databricks_ddl(), "BINARY")
+    def test_to_spark_name_is_binary(self) -> None:
+        self.assertEqual(ObjectType().to_spark_name(), "BINARY")
 
 
 # ---------------------------------------------------------------------------

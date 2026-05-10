@@ -663,7 +663,7 @@ class View(DatabricksResource):
         for tbl, cols in zip(tables_list, per_table):
             exprs: list[str] = []
             for name in column_order:
-                ddl = unified[name].to_databricks_ddl()
+                ddl = unified[name].to_spark_name()
                 qname = quote_ident(name)
                 source = qname if name in cols else "NULL"
                 exprs.append(f"CAST({source} AS {ddl}) AS {qname}")

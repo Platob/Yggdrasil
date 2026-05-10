@@ -244,11 +244,11 @@ class StructType(NestedType):
             return self
         return StructType(fields=polars_fields)
 
-    def to_databricks_ddl(self) -> str:
+    def to_spark_name(self) -> str:
         fields_ddl = ", ".join(
             # Double any embedded backticks so Databricks/Spark parses the
             # backtick-quoted identifier correctly.
-            f"`{f.name.replace('`', '``')}`: {f.dtype.to_databricks_ddl()}"
+            f"`{f.name.replace('`', '``')}`: {f.dtype.to_spark_name()}"
             for f in self.fields
         )
         return f"STRUCT<{fields_ddl}>"

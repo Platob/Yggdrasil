@@ -164,7 +164,7 @@ def cast_spark_json_string_column(
     if target_field is None:
         return column
 
-    target_ddl = target_field.dtype.to_databricks_ddl()
+    target_ddl = target_field.dtype.to_spark_name()
 
     src_id = options.source_field.dtype.type_id
     if src_id == DataTypeId.BINARY or src_id == DataTypeId.BJSON:
