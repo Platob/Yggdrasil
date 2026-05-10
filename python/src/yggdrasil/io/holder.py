@@ -724,12 +724,25 @@ class Holder(URLBased, Tabular[O], Disposable):
             Disposable.open(self)
         return self
 
-    def open(self, mode: str = "rb+") -> "BytesIO":
-        """Acquire the holder and return a :class:`BytesIO` cursor.
+    def open(
+        self,
+        mode: ModeLike = "rb+",
+        *,
+        media_type: "MediaType | None" = None,
+        owns_holder: bool = False,
+        auto_open: bool = True,
+        **kwargs: Any,
+    ) -> "YIO":
+        """Acquire the holder and return a generic :class:`IO` cursor.
 
-        The default way to interact with a holder's bytes — and,
-        because :class:`BytesIO` IS-A :class:`Tabular`, the default
-        way to read it as Arrow record batches too. Pattern::
+        Dispatches to the format-specific :class:`IO` leaf via the
+        holder's stamped media type (or *media_type* override), so
+        ``LocalPath("data.parquet").open()`` lands on
+        :class:`ParquetIO`, ``LocalPath("data.csv").open()`` on
+        :class:`CsvIO`, and an unknown / no-media holder falls back
+        to a plain :class:`IO`.
+
+        Pattern::
 
             with LocalPath("/tmp/x.bin").open("wb") as bio:
                 bio.write(b"hello")
@@ -739,23 +752,23 @@ class Holder(URLBased, Tabular[O], Disposable):
                 table = bio.read_arrow_table()  # Tabular surface
             # path released here.
 
-        The returned cursor owns the close — when it closes, the
-        holder closes too. For multi-cursor / non-owning use,
-        construct :class:`BytesIO` directly with ``holder=`` and
-        leave ``owns_holder=False`` (the default)::
-
-            mem = Memory(b"shared bytes").acquire()
-            try:
-                c1 = BytesIO(holder=mem)  # borrow, own cursor
-                c2 = BytesIO(holder=mem)  # borrow, own cursor
-                ...
-            finally:
-                mem.close()
+        The default ``owns_holder=False`` returns a non-owning
+        cursor — closing the cursor leaves the holder open, so the
+        caller can mint multiple cursors against the same holder.
+        Pass ``owns_holder=True`` to transfer close-ownership of the
+        holder to the cursor (the cursor's close then also closes
+        the holder).
         """
-        from yggdrasil.io.bytes_io import BytesIO
+        from .base import IO as _IO
+
         self.acquire()
-        return BytesIO(
-            holder=self, owns_holder=True, mode=mode, auto_open=True,
+        return _IO.from_holder(
+            holder=self,
+            owns_holder=owns_holder,
+            mode=mode,
+            auto_open=auto_open,
+            media_type=self._media_type if media_type is None else media_type,
+            **kwargs,
         )
 
     def __enter__(self) -> "Holder":

@@ -87,7 +87,7 @@ class TestPreparedRequestPickle:
         assert clone.url.query == "q=1"
         assert clone.headers.get("X-Test") == "1"
         assert clone.tags.get("env") == "dev"
-        assert clone.buffer.getvalue() == b'{"k":"v"}'
+        assert clone.buffer.to_bytes() == b'{"k":"v"}'
         # Transient session reset to None for re-binding on the worker
         assert clone._session is None
 
@@ -124,7 +124,7 @@ class TestResponsePickle:
         assert clone.status_code == 201
         assert clone.headers.get("Content-Type") == "application/json"
         assert clone.tags.get("env") == "dev"
-        assert clone.buffer.getvalue() == b'{"ok":true}'
+        assert clone.buffer.to_bytes() == b'{"ok":true}'
         assert clone.request.url.host == "example.com"
         assert clone._session is None
 
@@ -155,6 +155,6 @@ class TestHTTPResponsePickle:
         clone = pickle.loads(pickle.dumps(hr))
         assert isinstance(clone, HTTPResponse)
         assert clone.status_code == 201
-        assert clone.buffer.getvalue() == b'{"ok":true}'
+        assert clone.buffer.to_bytes() == b'{"ok":true}'
         assert clone.request.url.host == "example.com"
         assert clone._session is None

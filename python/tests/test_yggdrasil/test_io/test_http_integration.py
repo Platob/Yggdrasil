@@ -537,10 +537,10 @@ class TestBodyParity:
         sent = s.calls[0]
         assert sent.buffer.to_bytes() == body
 
-    def test_response_buffer_is_bytes_io(self) -> None:
-        from yggdrasil.io.bytes_io import BytesIO
+    def test_response_buffer_is_holder(self) -> None:
+        from yggdrasil.io.holder import Holder
         r = make_response(body=b"abc")
-        assert isinstance(r.buffer, BytesIO)
+        assert isinstance(r.buffer, Holder)
         assert r.buffer.to_bytes() == b"abc"
 
 
@@ -573,8 +573,9 @@ class TestFromUrllib3:
 
         return _RawResp()
 
-    def test_from_urllib3_returns_tabular_buffer_for_json(self) -> None:
+    def test_from_urllib3_stamps_media_on_holder_for_json(self) -> None:
         import datetime as dt
+        from yggdrasil.io.holder import Holder
         from yggdrasil.io.http_.response import HTTPResponse
         from yggdrasil.io.primitive.json_io import JsonIO
 
@@ -588,15 +589,19 @@ class TestFromUrllib3:
             tags=None,
             received_at=dt.datetime.now(dt.timezone.utc),
         )
-        assert isinstance(resp.buffer, JsonIO)
+        # The buffer is a Holder; opening it via response.open() routes
+        # through the JsonIO leaf for the stamped media type.
+        assert isinstance(resp.buffer, Holder)
+        with resp.open(mode="rb") as bio:
+            assert isinstance(bio, JsonIO)
         resp.drain_urllib3(raw, stream=False)
         assert raw.released is True
         assert resp.buffer.to_bytes() == b'{"ok":true}'
         assert resp.json() == {"ok": True}
 
-    def test_from_urllib3_falls_back_to_bytes_io_on_unknown_media(self) -> None:
+    def test_from_urllib3_falls_back_to_holder_on_unknown_media(self) -> None:
         import datetime as dt
-        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.holder import Holder
         from yggdrasil.io.http_.response import HTTPResponse
 
         raw = self._make_raw(
@@ -609,8 +614,8 @@ class TestFromUrllib3:
             tags=None,
             received_at=dt.datetime.now(dt.timezone.utc),
         )
-        # Unknown media types must not crash — we fall back to BytesIO.
-        assert type(resp.buffer) is BytesIO
+        # Unknown media types must not crash — buffer stays a plain Holder.
+        assert isinstance(resp.buffer, Holder)
         resp.drain_urllib3(raw, stream=True)
         assert resp.buffer.to_bytes() == b"binary blob"
 

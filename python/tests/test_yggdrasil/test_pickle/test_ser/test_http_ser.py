@@ -417,14 +417,13 @@ class TestResponseRoundTrip:
         _assert_responses_equal(orig, r)
         assert r.request.method == "POST"
 
-    def test_buffer_subclass_preserved_for_known_media_type(self):
-        """Response buffer must come back as the registered leaf class.
-
-        Regression test: ``Response._from_arrow_cols`` previously
-        constructed a plain :class:`BytesIO` and only attached the
-        media type post-hoc, so the buffer class wasn't promoted to
-        the registered leaf (``JsonIO``, ``ParquetIO``, …).
+    def test_buffer_media_type_preserved_through_round_trip(self):
+        """Response buffer is a :class:`Holder`; the stamped media
+        type must survive Arrow round-trip so ``response.open()``
+        still dispatches to the registered leaf (``JsonIO``,
+        ``ParquetIO``, …) on the deserialized side.
         """
+        from yggdrasil.io.holder import Holder
         from yggdrasil.io.primitive import JsonIO
         from yggdrasil.data.enums.media_type import MediaType
         from yggdrasil.data.enums.mime_type import MimeTypes
@@ -440,12 +439,18 @@ class TestResponseRoundTrip:
             buffer=buf,
             received_at=_NOW,
         )
-        assert isinstance(orig.buffer, JsonIO)
+        assert isinstance(orig.buffer, Holder)
+        assert orig.buffer.media_type.mime_type == MimeTypes.JSON
+        with orig.open(mode="rb") as bio:
+            assert isinstance(bio, JsonIO)
 
         ser = ResponseSerialized.from_value(orig)
         r = ser.value
-        assert isinstance(r.buffer, JsonIO)
+        assert isinstance(r.buffer, Holder)
+        assert r.buffer.media_type.mime_type == MimeTypes.JSON
         assert r.buffer.to_bytes() == b'{"x":1}'
+        with r.open(mode="rb") as bio:
+            assert isinstance(bio, JsonIO)
 
 
 # ---------------------------------------------------------------------------

@@ -118,12 +118,16 @@ class TestReadWriteCycle:
 
 class TestOpenReturnsBytesIO:
 
-    def test_open_default_returns_bytes_io(self, tmp_path) -> None:
+    def test_open_default_returns_io(self, tmp_path) -> None:
+        from yggdrasil.io.base import IO
+
         p = tmp_path / "x.bin"
         p.write_bytes(b"hello")
         lp = LocalPath(str(p))
         with lp.open("rb") as bio:
-            assert isinstance(bio, BytesIO)
+            # Holder.open() returns a generic IO, dispatched to the
+            # format leaf when the holder's media type maps to one.
+            assert isinstance(bio, IO)
             assert bio.read() == b"hello"
 
     def test_open_writes_commit_to_disk(self, tmp_path) -> None:
@@ -235,9 +239,11 @@ class TestStagingTemporary:
     def test_anonymous_holder_clears_on_close(self) -> None:
         lp = LocalPath()
         path = lp.os_path
-        with lp.open("wb") as bio:
+        # owns_holder=True transfers close-ownership to the cursor, so
+        # closing the cursor closes the temporary holder and clears its
+        # staging file.
+        with lp.open("wb", owns_holder=True) as bio:
             bio.write(b"throwaway")
-        # close() runs the temporary clear.
         assert not pathlib.Path(path).exists()
 
     def test_directory_url_stages_child(self, tmp_path) -> None:

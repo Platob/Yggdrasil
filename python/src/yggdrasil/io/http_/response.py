@@ -6,7 +6,8 @@ from typing import TYPE_CHECKING, Mapping, Optional
 from urllib3 import BaseHTTPResponse
 
 from ..bytes_io import BytesIO
-from ..tabular import Tabular
+from ..holder import Holder
+from ..memory import Memory
 from ..request import PreparedRequest
 from ..response import Response, _ensure_media_headers, _media_type_from_headers
 
@@ -48,19 +49,15 @@ class HTTPResponse(Response):
         received_at: dt.datetime
     ) -> "HTTPResponse":
         # Pre-infer media type from the response's Content-Type /
-        # Content-Encoding so the buffer is constructed as the
-        # registered leaf (ParquetIO, JsonIO, ArrowIPCIO, …) up
-        # front. Once bytes land via drain_urllib3, callers get a
-        # tabular-ready buffer without an extra as_media() hop.
+        # Content-Encoding so the holder carries it from the start;
+        # downstream callers reach the registered leaf (ParquetIO,
+        # JsonIO, ArrowIPCIO, …) via ``BytesIO(holder=self.buffer)``
+        # without an extra format-detection hop.
         headers = dict(response.headers)
         pre_media = _media_type_from_headers(headers)
-        buffer_class = Tabular.class_for_media_type(pre_media, default=BytesIO)
-        buffer = (
-            buffer_class(media_type=pre_media)
-            if pre_media is not None
-            else buffer_class()
-        )
-        buffer.seek(0)
+        buffer: Holder = Memory()
+        if pre_media is not None:
+            buffer.media_type = pre_media
 
         return cls(
             request=request,
@@ -78,22 +75,19 @@ class HTTPResponse(Response):
         *,
         amt: int = 512 * 1024,
         release_conn: bool = True
-    ) -> BytesIO:
+    ) -> "HTTPResponse":
         buffer = self.buffer
 
         try:
-            if stream:
-                for chunk in response.stream(amt=amt):
-                    buffer.write(chunk)
-            else:
-                buffer.write(response.read())
+            with self.open(mode="wb") as bio:
+                if stream:
+                    for chunk in response.stream(amt=amt):
+                        bio.write(chunk)
+                else:
+                    bio.write(response.read())
         finally:
             if release_conn:
                 response.release_conn()
-
-        # Rewind so callers (to_polars, json_load, as_media, paginated
-        # combiners, …) read from byte 0 rather than from EOF.
-        buffer.seek(0)
 
         # Resync Content-Length (and Content-Type/Encoding) to the
         # post-drain buffer. ``Response.__init__`` ran while the buffer

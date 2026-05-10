@@ -32,6 +32,7 @@ import os
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar, Iterator, List, Tuple
 
+from yggdrasil.io.base import IO
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.data.enums import Mode
 from yggdrasil.io.holder import Holder
@@ -298,16 +299,22 @@ class Path(Holder, os.PathLike, ABC):
     # open(mode) — returns a BytesIO bound to self
     # ==================================================================
 
-    def open(self, mode: "Mode | str | None" = None) -> "BytesIO":
-        """Acquire the path and return a :class:`BytesIO` bound to it.
+    def open(
+        self,
+        mode: "Mode | str | None" = None,
+        **kwargs: Any,
+    ) -> "IO":
+        """Acquire the path and return an :class:`IO` cursor bound to it.
 
-        ``mode`` accepts a :class:`Mode` member, an alias string,
-        or a stdlib ``open()`` mode string. ``None`` falls through
-        to :meth:`Holder.open` which uses ``"rb+"``.
+        ``mode`` accepts a :class:`Mode` member, an alias string, or
+        a stdlib ``open()`` mode string. ``None`` falls through to
+        :meth:`Holder.open` which uses ``"rb+"``. Other keyword
+        arguments (``owns_holder``, ``media_type``, ``auto_open``,
+        …) ride through to :meth:`Holder.open`.
         """
         if mode is None:
-            return Holder.open(self)
-        return Holder.open(self, mode=Mode.from_(mode).os_mode)
+            return Holder.open(self, **kwargs)
+        return Holder.open(self, mode=Mode.from_(mode).os_mode, **kwargs)
 
     # ==================================================================
     # Pure-path API — all delegated to URL
