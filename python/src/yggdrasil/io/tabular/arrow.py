@@ -423,7 +423,7 @@ class ArrowTabular(Tabular[CastOptions]):
         if caller_owned:
             target_path = self._spill_path
         else:
-            from yggdrasil.io.bytes_io import _mint_spill_path
+            from yggdrasil.io.base import _mint_spill_path
 
             target_path = _mint_spill_path("arrow", self._spill_ttl)
 
