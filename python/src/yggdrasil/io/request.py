@@ -317,7 +317,9 @@ class PreparedRequest:
 
     # Instance attributes that don't survive pickling — excluded by
     # ``__getstate__`` and reset by ``__setstate__``. Subclasses extend.
-    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({"_session"})
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset(
+        {"_session", "_cache", "_cache_token"}
+    )
 
     def __init__(
         self,
@@ -346,6 +348,14 @@ class PreparedRequest:
             _coerce_userinfo(sender) if sender is not None else _default_sender()
         )
         self._session: "Session | None" = None
+        # Memoization for the deterministic projection — hashes,
+        # url-struct, arrow_values dict. Invalidated when
+        # :meth:`_state_token` shifts (method/url/headers/buffer
+        # identity or size changed, or :meth:`_invalidate_cache`
+        # bumped the version).
+        self._cache: dict[str, Any] = {}
+        self._cache_token: tuple = ()
+        self._state_version: int = 0
 
     @property
     def sender(self) -> UserInfo | None:
@@ -384,6 +394,62 @@ class PreparedRequest:
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
         self._session = None
+        self._cache = {}
+        self._cache_token = ()
+        self._state_version = 0
+
+    # ------------------------------------------------------------------
+    # Memoization — cheap fingerprint check, refresh on change
+    # ------------------------------------------------------------------
+
+    def _state_token(self) -> tuple:
+        """Cheap fingerprint of the inputs that drive every cached
+        derivation (hashes, url struct, arrow_values).
+
+        ``id(headers)`` / ``id(buffer)`` plus ``len`` / ``size`` covers
+        the common mutations: dict swap, dict resize, buffer swap,
+        body resize. In-place same-size header overwrites slip
+        through, so the public ``authorization`` / ``x_api_key``
+        setters and :meth:`update_headers` bump :attr:`_state_version`
+        via :meth:`_invalidate_cache` — that bump shows up here so
+        downstream caches (e.g. the response's, which mixes this
+        token in) refresh too.
+        """
+        headers = self.headers
+        buffer = self.buffer
+        return (
+            self._state_version,
+            self.method,
+            self.url,
+            id(headers),
+            len(headers) if headers else 0,
+            id(buffer),
+            buffer.size if buffer is not None else -1,
+        )
+
+    def _cached(self, name: str, compute: Callable[[], Any]) -> Any:
+        token = self._state_token()
+        if self._cache_token != token:
+            self._cache_token = token
+            self._cache.clear()
+        cached = self._cache.get(name, ...)
+        if cached is ...:
+            cached = compute()
+            self._cache[name] = cached
+        return cached
+
+    def _invalidate_cache(self) -> None:
+        """Drop every memoized derivation — call after any in-place
+        mutation that the :meth:`_state_token` fingerprint can't see
+        (e.g. overwriting an existing header with a same-key value).
+
+        Bumps :attr:`_state_version` so downstream consumers that
+        embed this request's token in their own (e.g.
+        :class:`Response`) detect the change on their next access.
+        """
+        self._cache.clear()
+        self._cache_token = ()
+        self._state_version += 1
 
     # ------------------------------------------------------------------
     # Session attachment — used by Spark broadcast on the worker side
@@ -709,6 +775,7 @@ class PreparedRequest:
             self.headers.pop("Authorization", None)
         else:
             self.headers["Authorization"] = str(value)
+        self._invalidate_cache()
 
     @property
     def x_api_key(self) -> Optional[str]:
@@ -722,6 +789,7 @@ class PreparedRequest:
             self.headers.pop("X-API-Key", None)
         else:
             self.headers["X-API-Key"] = str(value)
+        self._invalidate_cache()
 
     @property
     def accept_media_type(self) -> MediaType:
@@ -741,6 +809,7 @@ class PreparedRequest:
             self.headers["Accept-Encoding"] = value.codec.name
         else:
             self.headers.pop("Accept-Encoding", None)
+        self._invalidate_cache()
 
     @property
     def sent_at_timestamp(self) -> int:
@@ -767,8 +836,12 @@ class PreparedRequest:
     @property
     def partition_key(self) -> int:
         """xxh3_64 of the joined :meth:`partition_values` — int64 partition column."""
-        joined = "\x00".join(str(v) for v in self.partition_values().values())
-        return _xxh3_int64_str(joined)
+        return self._cached(
+            "partition_key",
+            lambda: _xxh3_int64_str(
+                "\x00".join(str(v) for v in self.partition_values().values())
+            ),
+        )
 
     @property
     def body_size(self) -> int:
@@ -783,20 +856,26 @@ class PreparedRequest:
         """
         if self.buffer is None:
             return 0
-        return self.buffer.xxh3_int64()
+        return self._cached("body_hash", lambda: self.buffer.xxh3_int64())  # type: ignore[union-attr]
 
     @property
     def private_url_hash(self) -> int:
         """xxh3_64 of (method, URL) exactly as captured (userinfo + full query)."""
-        return _xxh3_int64_str(f"{self.method}\x00{self.url.to_string()}")
+        return self._cached(
+            "private_url_hash",
+            lambda: _xxh3_int64_str(f"{self.method}\x00{self.url.to_string()}"),
+        )
 
     @property
     def public_url_hash(self) -> int:
         """xxh3_64 of (method, URL) after ``anonymize('remove')`` — userinfo and
         sensitive query params dropped, so this hash is stable across the
         cache's anonymize step. Method is mixed in so verbs don't collide."""
-        return _xxh3_int64_str(
-            f"{self.method}\x00{self.url.anonymize(mode='remove').to_string()}"
+        return self._cached(
+            "public_url_hash",
+            lambda: _xxh3_int64_str(
+                f"{self.method}\x00{self.url.anonymize(mode='remove').to_string()}"
+            ),
         )
 
     @property
@@ -808,14 +887,14 @@ class PreparedRequest:
         anonymization (drops userinfo / sensitive query params / sensitive
         headers).
         """
-        return self._compute_identity_hash(anonymize=False)
+        return self._cached("hash", lambda: self._compute_identity_hash(anonymize=False))
 
     @property
     def public_hash(self) -> int:
         """xxh3_64 over the anonymize='remove' projection of
         (method, url, headers, body) — the cross-system identity that
         survives cache anonymization."""
-        return self._compute_identity_hash(anonymize=True)
+        return self._cached("public_hash", lambda: self._compute_identity_hash(anonymize=True))
 
     def _compute_identity_hash(self, *, anonymize: bool = False) -> int:
         import xxhash
@@ -848,59 +927,93 @@ class PreparedRequest:
         u = h.intdigest()
         return u if u < 2**63 else u - 2**64
 
-    @property
-    def arrow_values(self) -> dict[str, Any]:
-        tags_v = dict(self.url.query_items())
-        if self.tags:
-            tags_v.update(_string_dict(self.tags))
+    def _arrow_value(self, key: str) -> Any:
+        """Compute a single :data:`REQUEST_ARROW_SCHEMA` column on demand.
 
-        return {
-            "hash":             self.hash,
-            "public_hash":      self.public_hash,
-            "method":           self.method,
-            "url":              _build_url_struct(self.url),
-            "sender":           self.sender.to_struct_dict() if self.sender is not None else None,
-            "private_url_hash": self.private_url_hash,
-            "public_url_hash":  self.public_url_hash,
-            "headers":          _string_dict(self.headers),
-            "tags":             tags_v,
-            "body":             self.buffer.to_bytes() if self.buffer is not None else None,
-            "body_size":        self.body_size,
-            "body_hash":        self.body_hash,
-            "sent_at":          self.sent_at,
-            "partition_key":    self.partition_key,
+        Used by :meth:`match_value` so the lookup pays for one column
+        instead of materializing every value via :attr:`arrow_values`.
+        Cached scalars (hashes, partition_key) hit the memoized
+        properties; the heavyweight columns (``url`` struct, ``tags``,
+        ``headers`` copy) are also memoized through :meth:`_cached` so
+        repeated single-key lookups don't rebuild them.
+        """
+        if key == "hash":
+            return self.hash
+        if key == "public_hash":
+            return self.public_hash
+        if key == "method":
+            return self.method
+        if key == "url":
+            return self._cached("url_struct", lambda: _build_url_struct(self.url))
+        if key == "sender":
+            sender = self.sender
+            return sender.to_struct_dict() if sender is not None else None
+        if key == "private_url_hash":
+            return self.private_url_hash
+        if key == "public_url_hash":
+            return self.public_url_hash
+        if key == "headers":
+            return self._cached("headers_value", lambda: _string_dict(self.headers))
+        if key == "tags":
+            return self._cached("tags_value", self._build_tags_value)
+        if key == "body":
+            return self.buffer.to_bytes() if self.buffer is not None else None
+        if key == "body_size":
+            return self.body_size
+        if key == "body_hash":
+            return self.body_hash
+        if key == "sent_at":
+            return self.sent_at
+        if key == "partition_key":
+            return self.partition_key
+        if key == "_pkl":
             # ``_pkl`` is a placeholder column populated externally by
             # the pickle serializer; the deterministic projection path
             # leaves it null so writers don't pay for a pickle dump
             # when the structured columns are enough.
-            "_pkl":             None,
-        }
+            return None
+        raise KeyError(key)
+
+    def _build_tags_value(self) -> dict[str, str]:
+        tags_v = dict(self.url.query_items())
+        if self.tags:
+            tags_v.update(_string_dict(self.tags))
+        return tags_v
+
+    @property
+    def arrow_values(self) -> dict[str, Any]:
+        return self._cached("arrow_values", self._build_arrow_values)
+
+    def _build_arrow_values(self) -> dict[str, Any]:
+        return {name: self._arrow_value(name) for name in REQUEST_ARROW_SCHEMA.names}
 
     def match_value(self, key: str) -> Any:
         # Support dotted paths (``url.path``, ``headers.content_type``)
         # alongside the flat top-level field names.
         if "." in key:
             head, _, tail = key.partition(".")
-            values = self.arrow_values
-            if head in values:
-                container = values[head]
-                if isinstance(container, Mapping):
-                    if tail in container:
-                        return container[tail]
-                    if "." in tail:
-                        # Nested deeper; recurse-by-mapping.
-                        sub_head, _, sub_tail = tail.partition(".")
-                        nested = container.get(sub_head)
-                        if isinstance(nested, Mapping) and sub_tail in nested:
-                            return nested[sub_tail]
-                raise ValueError(
-                    f"Unsupported request match key: {key!r}. "
-                    f"Must be within: {REQUEST_ARROW_SCHEMA.names!r}"
-                )
+            try:
+                container = self._arrow_value(head)
+            except KeyError:
+                container = None
+            if isinstance(container, Mapping):
+                if tail in container:
+                    return container[tail]
+                if "." in tail:
+                    # Nested deeper; recurse-by-mapping.
+                    sub_head, _, sub_tail = tail.partition(".")
+                    nested = container.get(sub_head)
+                    if isinstance(nested, Mapping) and sub_tail in nested:
+                        return nested[sub_tail]
+            raise ValueError(
+                f"Unsupported request match key: {key!r}. "
+                f"Must be within: {REQUEST_ARROW_SCHEMA.names!r}"
+            )
 
-        values = self.arrow_values
-        if key in values:
-            return values[key]
+        try:
+            return self._arrow_value(key)
+        except KeyError:
+            pass
         if hasattr(self, key):
             return getattr(self, key)
         # Accept the flattened ``request_<col>`` form too — same
@@ -910,8 +1023,10 @@ class PreparedRequest:
         # caller to strip the prefix before each match_value().
         if key.startswith("request_"):
             tail = key[len("request_"):]
-            if tail in values:
-                return values[tail]
+            try:
+                return self._arrow_value(tail)
+            except KeyError:
+                pass
             if hasattr(self, tail):
                 return getattr(self, tail)
         raise ValueError(
@@ -995,6 +1110,7 @@ class PreparedRequest:
         else:
             self.headers.update(_string_dict(next_headers))
 
+        self._invalidate_cache()
         return self
 
     def update_tags(
@@ -1009,6 +1125,7 @@ class PreparedRequest:
         else:
             self.tags.update(_string_dict(tags))
 
+        self._invalidate_cache()
         return self
 
     def anonymize(self, mode: Literal["remove", "redact"] = "remove") -> "PreparedRequest":
