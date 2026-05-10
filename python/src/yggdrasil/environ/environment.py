@@ -43,6 +43,7 @@ from typing import Any, Iterable, Sequence, TYPE_CHECKING, ClassVar
 
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.version import VersionInfo
+
 from .system_command import SystemCommand
 from .userinfo import UserInfo
 
@@ -709,8 +710,10 @@ class PyEnv:
     @classmethod
     def spark_session(
         cls,
-        create: bool = True,
-        import_error: bool = True,
+        obj: Any = None,
+        *,
+        create: bool = False,
+        import_error: bool = False,
         install_spark: bool = False,
         local_setup: bool = True,
         extra_config: dict[str, str] | None = None,
@@ -724,91 +727,125 @@ class PyEnv:
         4. Bootstrap a local session using ``yggdrasil.spark.setup`` utilities
            (winutils, JVM compat flags, etc.) when *local_setup* is True.
         5. Fall back to bare ``SparkSession.builder.getOrCreate()``.
-
-        Args:
-            create:       Whether to create a new session if none exists.
-            import_error: Raise ImportError when PySpark is missing and
-                          *install_spark* is False.
-            install_spark: Auto-install PySpark via pip if missing.
-            local_setup:  Use ``yggdrasil.spark.setup`` to handle winutils,
-                          Java compat flags, and sensible local defaults.
-                          Set to False if you manage the Spark env yourself.
-            extra_config: Additional Spark config key/value pairs forwarded
-                          to ``create_local_session`` when bootstrapping.
         """
-        if cls._SPARK_SESSION is MISSING:
-            # ------------------------------------------------------------------
-            # Ensure PySpark is importable
-            # ------------------------------------------------------------------
-            try:
-                from pyspark.sql import SparkSession
-            except ImportError:
-                if import_error and not install_spark:
-                    raise
+        # ------------------------------------------------------------------
+        # Explicit-argument dispatch
+        # ------------------------------------------------------------------
+        if obj is not None:
+            return cls._spark_session_from_obj(obj, import_error=import_error)
 
-                if install_spark:
-                    runtime_import_module(
-                        module_name="pyspark", pip_name="pyspark", install=True
-                    )
-                else:
-                    cls._SPARK_SESSION = None
-                    return cls._SPARK_SESSION
-            except Exception:
-                cls._SPARK_SESSION = None
-                return cls._SPARK_SESSION
+        # ------------------------------------------------------------------
+        # Cached session
+        # ------------------------------------------------------------------
+        if cls._SPARK_SESSION is not MISSING:
+            return cls._SPARK_SESSION
 
-            # ------------------------------------------------------------------
-            # Look for an already-active session
-            # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Ensure PySpark is importable
+        # ------------------------------------------------------------------
+        SparkSession = cls._import_spark_session(
+            import_error=import_error, install_spark=install_spark
+        )
+        if SparkSession is None:
+            cls._SPARK_SESSION = None
+            return None
+
+        # ------------------------------------------------------------------
+        # Resolve a session: active → bootstrap → bare builder → None
+        # ------------------------------------------------------------------
+        try:
+            active = SparkSession.getActiveSession()
+        except Exception:
             active = None
-            try:
-                from pyspark.sql import SparkSession
 
-                active = SparkSession.getActiveSession()
-            except Exception:
-                pass
+        if active is not None:
+            cls._SPARK_SESSION = active
+        elif create:
+            cls._SPARK_SESSION = cls._bootstrap_session(
+                SparkSession, local_setup=local_setup, extra_config=extra_config
+            )
+        else:
+            cls._SPARK_SESSION = None
 
-            if active is not None:
-                cls._SPARK_SESSION = active
-
-            elif create:
-                # ----------------------------------------------------------
-                # Bootstrap a local session, using the setup utilities so
-                # winutils / Java compat / Arrow optimizations are handled.
-                # ----------------------------------------------------------
-                if local_setup:
-                    try:
-                        from yggdrasil.spark.setup import (
-                            configure_java_compat,
-                            create_local_session,
-                            ensure_hadoop_home,
-                        )
-
-                        ensure_hadoop_home()
-                        configure_java_compat()
-                        cls._SPARK_SESSION = create_local_session(
-                            extra_config=extra_config,
-                        )
-                    except Exception:
-                        # If the setup utilities blow up (missing Java, network
-                        # issues, etc.), fall through to the bare builder so the
-                        # caller still gets *something* when possible.
-                        logger.warning(
-                            "PyEnv.spark_session: local setup bootstrap failed, "
-                            "falling back to bare SparkSession.builder",
-                            exc_info=True,
-                        )
-                        from pyspark.sql import SparkSession
-
-                        cls._SPARK_SESSION = SparkSession.builder.getOrCreate()
-                else:
-                    from pyspark.sql import SparkSession
-
-                    cls._SPARK_SESSION = SparkSession.builder.getOrCreate()
-
-            else:
-                cls._SPARK_SESSION = None
         return cls._SPARK_SESSION
+
+    @classmethod
+    def _spark_session_from_obj(
+        cls, obj: Any, *, import_error: bool
+    ) -> "SparkSession | None":
+        """Resolve `obj` argument forms: Ellipsis, bool, or a SparkSession."""
+        if obj is ...:
+            if cls.in_databricks():
+                return cls.spark_session(create=True, import_error=False)
+            return None
+
+        if isinstance(obj, bool):
+            if obj:
+                return cls.spark_session(create=True, import_error=False)
+            return None
+
+        if isinstance(obj, SparkSession):
+            if cls._SPARK_SESSION is MISSING:
+                cls._SPARK_SESSION = obj
+            return obj
+
+        raise TypeError(f"Invalid argument for spark_session: {obj!r}")
+
+    @classmethod
+    def _import_spark_session(
+        cls, *, import_error: bool, install_spark: bool
+    ) -> "type[SparkSession] | None":
+        """Import pyspark.sql.SparkSession, optionally pip-installing first."""
+        try:
+            from pyspark.sql import SparkSession
+            return SparkSession
+        except ImportError:
+            if not install_spark:
+                if import_error:
+                    raise
+                return None
+        except Exception:
+            return None
+
+        # install_spark path: install, then re-import
+        runtime_import_module(module_name="pyspark", pip_name="pyspark", install=True)
+        try:
+            from pyspark.sql import SparkSession
+            return SparkSession
+        except Exception:
+            if import_error:
+                raise
+            return None
+
+    @classmethod
+    def _bootstrap_session(
+        cls,
+        SparkSession: "type[SparkSession]",
+        *,
+        local_setup: bool,
+        extra_config: dict[str, str] | None,
+    ) -> "SparkSession":
+        """Create a local SparkSession, preferring yggdrasil.spark.setup helpers."""
+        if not local_setup:
+            return SparkSession.builder.getOrCreate()
+
+        try:
+            from yggdrasil.spark.setup import (
+                configure_java_compat,
+                create_local_session,
+                ensure_hadoop_home,
+            )
+
+            ensure_hadoop_home()
+            configure_java_compat()
+            return create_local_session(extra_config=extra_config)
+        except Exception:
+            logger.warning(
+                "PyEnv.spark_session: local setup bootstrap failed, "
+                "falling back to bare SparkSession.builder",
+                exc_info=True,
+            )
+            return SparkSession.builder.getOrCreate()
 
     @classmethod
     def set_spark_session(cls, spark_session: "SparkSession"):

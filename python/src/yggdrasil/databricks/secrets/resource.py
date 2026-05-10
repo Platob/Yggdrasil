@@ -315,15 +315,18 @@ class Secret(DatabricksResource):
 
         return built
 
-    def to_bytes(self) -> bytes:
+    def bvalue(self) -> bytes:
         if not self.b64:
             self.refresh()
 
         return base64.b64decode(self.b64) if self.b64 else b""
 
+    def svalue(self) -> str:
+        return self.bvalue().decode("utf-8")
+
     @property
     def object(self) -> Any:
-        bvalue = self.to_bytes()
+        bvalue = self.bvalue()
 
         if not bvalue:
             return None
@@ -341,6 +344,12 @@ class Secret(DatabricksResource):
             return float(bvalue)
 
         return bvalue
+
+    def mapvalue(self) -> Mapping[str, Any]:
+        parsed = self.object
+        if not isinstance(parsed, Mapping):
+            raise ValueError(f"Secret {self} is not a mapping")
+        return parsed
 
     def set_details(self, details: GetSecretResponse) -> "Secret":
         if isinstance(details, GetSecretResponse):

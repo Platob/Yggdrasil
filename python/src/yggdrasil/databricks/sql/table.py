@@ -2414,44 +2414,6 @@ class Table(DatabricksResource, Holder):
         self.table_name = new_name
         return self
 
-    # =========================================================================
-    # Spark / Delta integration
-    # =========================================================================
-
-    def delta_spark(
-        self,
-        spark_session: "SparkSession | None" = None,
-    ) -> "delta.tables.DeltaTable":  # noqa
-        from delta.tables import DeltaTable  # noqa
-
-        session = spark_session or PyEnv.spark_session(
-            create=True, import_error=True, install_spark=False,
-        )
-        return DeltaTable.forName(sparkSession=session, tableOrViewName=self.full_name(safe=True))
-
-    # =========================================================================
-    # Data I/O
-    # =========================================================================
-
-    def to_arrow_dataset(
-        self,
-        *,
-        filters: Optional[list[tuple[str, str, str]]] = None,
-        wait: WaitingConfigArg = True,
-    ):
-        statement = f"SELECT * FROM {self.full_name(safe=True)}"
-        if filters:
-            predicates = [_build_predicate(c, o, v) for c, o, v in filters]
-            statement += " WHERE " + " AND ".join(predicates)
-
-        result = self.sql.execute(
-            statement,
-            wait=wait,
-            catalog_name=self.catalog_name,
-            schema_name=self.schema_name,
-        )
-        return result.to_arrow_dataset()
-
     def insert(
         self,
         data: Any,

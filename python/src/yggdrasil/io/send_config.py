@@ -11,6 +11,7 @@ from yggdrasil.data.cast import any_to_datetime, any_to_timedelta
 from yggdrasil.dataclasses import DEFAULT_WAITING_CONFIG
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.data.enums import Mode
+from yggdrasil.environ import PyEnv
 from yggdrasil.io.request import REQUEST_ARROW_SCHEMA, PreparedRequest
 from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA
 
@@ -215,16 +216,10 @@ class _ConfigBase:
     @staticmethod
     def _check_mapping(values: MutableMapping[str, Any]):
         spark_session = values.get("spark_session")
-        if spark_session is not None and isinstance(spark_session, bool):
-            if spark_session:
-                from yggdrasil.environ import PyEnv
-
-                values["spark_session"] = PyEnv.spark_session(
-                    create=True,
-                    install_spark=False,
-                    import_error=True,
-                )
-            else:
+        if spark_session is not None:
+            try:
+                values["spark_session"] = PyEnv.spark_session(obj=spark_session)
+            except Exception:
                 values["spark_session"] = None
 
         wait = values.get("wait")
