@@ -1,6 +1,5 @@
 import logging
 import os
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterator, Optional, Sequence, Union
 
 from databricks.sdk.client_types import ClientType
@@ -21,7 +20,6 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-@dataclass
 class IAM(DatabricksService):
 
     @property
@@ -43,7 +41,6 @@ class IAM(DatabricksService):
         )
 
 
-@dataclass
 class IAMGroups(IAM):
 
     def create(
@@ -219,7 +216,6 @@ class IAMGroups(IAM):
                 raise
 
 
-@dataclass
 class IAMUsers(IAM):
 
     def create(

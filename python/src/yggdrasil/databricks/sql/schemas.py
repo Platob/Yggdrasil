@@ -28,13 +28,12 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
 from typing import Iterator, Optional, Union
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
 from databricks.sdk.service.catalog import SchemaInfo
 
-from yggdrasil.databricks.client import DatabricksService
+from yggdrasil.databricks.client import DatabricksClient, DatabricksService
 from yggdrasil.dataclasses.expiring import ExpiringDict
 
 from .catalog import Catalog
@@ -51,7 +50,6 @@ logger = logging.getLogger(__name__)
 _SCHEMA_INFO_CACHE: ExpiringDict[str, SchemaInfo] = ExpiringDict(default_ttl=300.0)
 
 
-@dataclass
 class Schemas(DatabricksService):
     """Collection-level service for Unity Catalog schemas.
 
@@ -76,8 +74,30 @@ class Schemas(DatabricksService):
                 ...
     """
 
-    catalog_name: str | None = None
-    schema_name: str | None = None
+    catalog_name: str | None
+    schema_name: str | None
+
+    def __init__(
+        self,
+        client: Optional[DatabricksClient] = None,
+        *,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+    ) -> None:
+        super().__init__(client=client)
+        self.catalog_name = catalog_name
+        self.schema_name = schema_name
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        state["catalog_name"] = self.catalog_name
+        state["schema_name"] = self.schema_name
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self.catalog_name = state.get("catalog_name")
+        self.schema_name = state.get("schema_name")
 
     # ── context rebind ────────────────────────────────────────────────────────
 

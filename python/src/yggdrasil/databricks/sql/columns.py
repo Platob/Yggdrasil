@@ -28,10 +28,9 @@ Typical usage::
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import Iterator, Optional, TYPE_CHECKING
 
-from yggdrasil.databricks.client import DatabricksService
+from yggdrasil.databricks.client import DatabricksClient, DatabricksService
 
 if TYPE_CHECKING:
     from .column import Column
@@ -42,7 +41,6 @@ __all__ = ["Columns"]
 logger = logging.getLogger(__name__)
 
 
-@dataclass
 class Columns(DatabricksService):
     """Collection-level service for Unity Catalog columns.
 
@@ -55,10 +53,40 @@ class Columns(DatabricksService):
             print(c.name)
     """
 
-    catalog_name: str | None = None
-    schema_name: str | None = None
-    table_name: str | None = None
-    column_name: str | None = None
+    catalog_name: str | None
+    schema_name: str | None
+    table_name: str | None
+    column_name: str | None
+
+    def __init__(
+        self,
+        client: Optional[DatabricksClient] = None,
+        *,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
+        column_name: str | None = None,
+    ) -> None:
+        super().__init__(client=client)
+        self.catalog_name = catalog_name
+        self.schema_name = schema_name
+        self.table_name = table_name
+        self.column_name = column_name
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        state["catalog_name"] = self.catalog_name
+        state["schema_name"] = self.schema_name
+        state["table_name"] = self.table_name
+        state["column_name"] = self.column_name
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self.catalog_name = state.get("catalog_name")
+        self.schema_name = state.get("schema_name")
+        self.table_name = state.get("table_name")
+        self.column_name = state.get("column_name")
 
     # -------------------------------------------------------------------------
     # Dict-like navigation — uses defaults on the service

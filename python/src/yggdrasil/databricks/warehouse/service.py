@@ -10,7 +10,6 @@ Databricks SDK ``WarehousesAPI`` that handles:
 - maintaining a short-lived in-process cache to avoid redundant API calls
 """
 
-import dataclasses as dc
 import logging
 from typing import Optional, Sequence, Union, List, Iterator
 
@@ -69,7 +68,6 @@ def get_cached_warehouse(
 # Service
 # ---------------------------------------------------------------------------
 
-@dc.dataclass
 class Warehouses(DatabricksService):
     """
     Collection-level SQL Warehouse management service.

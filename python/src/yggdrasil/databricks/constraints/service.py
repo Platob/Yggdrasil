@@ -27,7 +27,6 @@ instances:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional
 
 from databricks.sdk.errors import ResourceDoesNotExist
@@ -97,7 +96,6 @@ ORDER BY tc.constraint_name, kcu.ordinal_position
 # ============================================================================
 
 
-@dataclass
 class TableConstraints(DatabricksService):
     """CRUD over Unity Catalog table constraints, driven by :class:`Field`."""
 

@@ -20,13 +20,12 @@ Cache entries can be invalidated per-table via :meth:`Tables._invalidate`.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import Optional, Iterator, TYPE_CHECKING, Any
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
 from databricks.sdk.service.catalog import TableInfo
 
-from yggdrasil.databricks.client import DatabricksService
+from yggdrasil.databricks.client import DatabricksClient, DatabricksService
 from yggdrasil.databricks.sql.sql_utils import is_glob_pattern, name_matcher, quote_ident
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from .table import Table
@@ -47,7 +46,6 @@ logger = logging.getLogger(__name__)
 _TABLE_CACHE: ExpiringDict[str, Table] = ExpiringDict(default_ttl=300.0)
 
 
-@dataclass
 class Tables(DatabricksService):
     """Collection-level service for Unity Catalog tables.
 
@@ -60,9 +58,22 @@ class Tables(DatabricksService):
             ...
     """
 
-    catalog_name: str | None = None
-    schema_name: str | None = None
-    table_name: str | None = None
+    catalog_name: str | None
+    schema_name: str | None
+    table_name: str | None
+
+    def __init__(
+        self,
+        client: Optional[DatabricksClient] = None,
+        *,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
+    ) -> None:
+        super().__init__(client=client)
+        self.catalog_name = catalog_name
+        self.schema_name = schema_name
+        self.table_name = table_name
 
     def __call__(
         self,
@@ -99,12 +110,14 @@ class Tables(DatabricksService):
         state = super().__getstate__()
         state["catalog_name"] = self.catalog_name
         state["schema_name"] = self.schema_name
+        state["table_name"] = self.table_name
         return state
 
     def __setstate__(self, state):
-        object.__setattr__(self, "catalog_name", state["catalog_name"])
-        object.__setattr__(self, "schema_name", state["schema_name"])
         super().__setstate__(state)
+        self.catalog_name = state.get("catalog_name")
+        self.schema_name = state.get("schema_name")
+        self.table_name = state.get("table_name")
 
     # -------------------------------------------------------------------------
     # Dict-like navigation — uses catalog/schema defaults on the service

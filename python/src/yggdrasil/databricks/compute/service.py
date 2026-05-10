@@ -1,7 +1,6 @@
 import inspect
 import logging
 import re
-from dataclasses import dataclass
 from typing import Optional, MutableMapping, Sequence, Union, Any, TYPE_CHECKING, Iterator
 
 from databricks.sdk.errors import ResourceDoesNotExist, PermissionDenied
@@ -100,7 +99,6 @@ def _py_filter_tuple(python_version: Union[str, tuple[int, ...]]) -> tuple[int, 
     return int(python_version[0]), int(python_version[1])
 
 
-@dataclass
 class Compute(DatabricksService):
 
     @property
@@ -113,7 +111,6 @@ class Compute(DatabricksService):
         )
 
 
-@dataclass
 class Clusters(DatabricksService):
 
     # ------------------------------------------------------------------ #

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Union, Any, Optional
 
 from databricks.sdk.errors import ResourceDoesNotExist
@@ -17,7 +16,6 @@ __all__ = ["Secrets"]
 LOGGER = logging.getLogger(__name__)
 
 
-@dataclass
 class Secrets(DatabricksService):
 
     def __getitem__(self, item):

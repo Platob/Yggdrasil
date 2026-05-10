@@ -3,7 +3,7 @@ import os
 import re
 import time
 from abc import ABC
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import MISSING, dataclass, field, fields, replace
 from pathlib import Path
 from threading import RLock
 from typing import Optional, Any, Type, ClassVar, TypeVar, TYPE_CHECKING, Callable, Union
@@ -198,6 +198,133 @@ class DatabricksClient(URLBased):
         "auth_type",
     )
 
+    # Credential / config-source fields wiped on a DBR driver node. Notebook-
+    # scoped runtime auth is short-lived, identity-correct, and the right
+    # default in that environment — anything carried over biases the SDK
+    # toward the *sender's* identity.
+    _RUNTIME_DROP_FIELDS: ClassVar[tuple[str, ...]] = (
+        "token", "client_id", "client_secret", "token_audience",
+        "azure_client_secret", "azure_client_id", "azure_tenant_id",
+        "azure_use_msi", "azure_workspace_resource_id",
+        "google_credentials", "google_service_account",
+        "profile", "config_file",
+    )
+
+    # Process-wide singleton pool. Distinct subclasses (e.g. ``Workspace``)
+    # get their own sub-dict so they don't collide on identical kwargs.
+    _SINGLETONS: ClassVar[dict[type, dict[Any, "DatabricksClient"]]] = {}
+    _SINGLETONS_LOCK: ClassVar[RLock] = RLock()
+
+    # -------------------------------------------------------------------------
+    # Singleton dispatch
+    # -------------------------------------------------------------------------
+
+    def __new__(cls, *args: Any, **kwargs: Any):
+        """Return the per-process singleton for these init kwargs.
+
+        Two ``DatabricksClient(host=..., token=...)`` calls with the same
+        resolved init values share one instance — which is what makes the
+        cached SDK clients, Configs, and sub-service handles on this class
+        actually behave like caches across call sites.
+
+        Cache key uses the *resolved* init kwargs (positional and keyword
+        merged, missing fields filled from each field's default /
+        default_factory), so positional and keyword call shapes agree.
+        """
+        try:
+            resolved = cls._resolve_init_kwargs(args, kwargs)
+            key = cls._singleton_key(resolved)
+        except Exception:  # noqa: BLE001 - never block construction on key build
+            return super().__new__(cls)
+
+        with cls._SINGLETONS_LOCK:
+            pool = cls._SINGLETONS.setdefault(cls, {})
+            existing = pool.get(key)
+            if existing is not None:
+                # Wrapped __init__ (installed below) reads this flag and
+                # skips re-running the dataclass body so cached SDK
+                # clients / sub-services on the recycled instance survive.
+                object.__setattr__(existing, "_singleton_skip_init", True)
+                return existing
+
+            instance = super().__new__(cls)
+            object.__setattr__(instance, "_singleton_skip_init", False)
+            object.__setattr__(instance, "_singleton_key", key)
+            pool[key] = instance
+            return instance
+
+    @classmethod
+    def _init_fields(cls) -> tuple:
+        return tuple(f for f in fields(cls) if f.init)
+
+    @classmethod
+    def _resolve_init_kwargs(
+        cls, args: tuple, kwargs: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Merge positional+keyword args into a full {field_name: value} dict.
+
+        Missing fields are filled from each field's ``default`` /
+        ``default_factory`` (factories are evaluated *now* — that's how
+        env-bound defaults pick up the local environment, both at
+        construction time and again on the receiving host after unpickle).
+        """
+        init_fields = cls._init_fields()
+        resolved: dict[str, Any] = {}
+
+        for i, value in enumerate(args):
+            if i >= len(init_fields):
+                raise TypeError(
+                    f"{cls.__name__}.__init__ takes {len(init_fields)} positional "
+                    f"arguments at most, got {len(args)}."
+                )
+            resolved[init_fields[i].name] = value
+
+        for name, value in kwargs.items():
+            if name in resolved:
+                raise TypeError(
+                    f"{cls.__name__}.__init__ got multiple values for "
+                    f"argument {name!r}."
+                )
+            resolved[name] = value
+
+        for f in init_fields:
+            if f.name in resolved:
+                continue
+            if f.default is not MISSING:
+                resolved[f.name] = f.default
+            elif f.default_factory is not MISSING:  # type: ignore[misc]
+                resolved[f.name] = f.default_factory()  # type: ignore[misc]
+
+        return resolved
+
+    @staticmethod
+    def _hashable(value: Any) -> Any:
+        """Project ``value`` onto a hashable surrogate for the singleton key."""
+        if value is None or isinstance(value, (str, int, float, bool, bytes)):
+            return value
+        if isinstance(value, dict):
+            return ("__dict__",) + tuple(
+                sorted((k, DatabricksClient._hashable(v)) for k, v in value.items())
+            )
+        if isinstance(value, (list, tuple)):
+            return ("__seq__",) + tuple(DatabricksClient._hashable(v) for v in value)
+        if isinstance(value, (set, frozenset)):
+            return ("__set__",) + tuple(
+                sorted(DatabricksClient._hashable(v) for v in value)
+            )
+        try:
+            hash(value)
+            return value
+        except TypeError:
+            return ("__repr__", repr(value))
+
+    @classmethod
+    def _singleton_key(cls, resolved: dict[str, Any]) -> tuple:
+        return tuple(
+            (f.name, cls._hashable(resolved.get(f.name)))
+            for f in cls._init_fields()
+        )
+
     def __post_init__(self):
         if self.account_id:
             if not self.host:
@@ -211,58 +338,102 @@ class DatabricksClient(URLBased):
     # Serialization
     # -------------------------------------------------------------------------
 
+    def _compressed_init_kwargs(self) -> dict[str, Any]:
+        """Init-field overrides whose value differs from the local default.
+
+        For ``env_field`` defaults, the "local default" is the *current*
+        env-var lookup (factory re-evaluated at pickle time). That's what
+        gives the receiving side an env-adaptive rebuild: anything the
+        sender's environment already supplies is dropped, and anything
+        the sender set explicitly is carried through.
+        """
+        diff: dict[str, Any] = {}
+        for f in self._init_fields():
+            current = getattr(self, f.name)
+            if f.default is not MISSING:
+                local_default = f.default
+            elif f.default_factory is not MISSING:  # type: ignore[misc]
+                try:
+                    local_default = f.default_factory()  # type: ignore[misc]
+                except Exception:  # noqa: BLE001 - factory must not block pickle
+                    local_default = MISSING
+            else:
+                local_default = MISSING
+            if current != local_default:
+                diff[f.name] = current
+        return diff
+
     def __getstate__(self):
+        """Return a compressed, transport-safe view of this client.
+
+        Drops:
+          - SDK clients / Configs / lazy sub-service caches (they rebuild
+            on demand from the dataclass fields).
+          - Any init field whose value already matches the local default
+            so the receiving host re-resolves it from its own environment
+            (handles ``DATABRICKS_HOST`` / ``DATABRICKS_TOKEN`` /
+            ``DATABRICKS_CONFIG_PROFILE`` swap-outs without a manual edit).
+
+        Carries a best-effort session-token snapshot so an off-cluster
+        rehydrate can warm-start without re-running an interactive auth.
         """
-        Serialize for transport across processes / hosts.
+        state: dict[str, Any] = {"init": self._compressed_init_kwargs()}
 
-        Drops SDK clients, Configs, and lazy sub-service caches (they all
-        rebuild from the dataclass fields on demand). Captures a session
-        token snapshot from the live Config so the receiving side can warm
-        start without re-running an interactive or environment-bound auth.
-        """
-        state = self.__dict__.copy()
-
-        for key in self._TRANSIENT_STATE:
-            state.pop(key, None)
-
-        # Best-effort. We don't *construct* a Config here — pickling must
-        # never trigger a browser flow or network round-trip.
-        state["_session_token"] = self._snapshot_session_token()
+        snap = self._snapshot_session_token()
+        if snap:
+            state["session_token"] = snap
 
         return state
 
     def __setstate__(self, state):
-        """
-        Rehydrate after transport.
+        """Rehydrate from a :meth:`__getstate__` payload.
 
-        Inside a Databricks runtime (driver node), DBR's notebook-scoped
-        credentials win unconditionally: we force ``auth_type="runtime"``
-        and clear any sender-bound credential fields that would otherwise
-        bias ``_make_base_config`` toward the wrong path.
-
-        Off-cluster, the carried session token is restored onto ``self``
-        so the next ``make_config()`` call picks it up via the normal
-        field path — no Config exists yet at unpickle time.
+        Pickle reaches this path only when ``__reduce__`` is bypassed
+        (e.g. a subclass that reimplements ``__reduce__`` and delegates
+        to ``__getstate__`` /  ``__setstate__``). The normal pickle path
+        for :class:`DatabricksClient` flows through :meth:`__reduce__`,
+        which routes through :func:`_reconstruct_databricks_client` so
+        the singleton dispatch and DBR-runtime adaptation both fire.
         """
-        # Initialize transient slots so attribute access is safe even if
-        # the pickle pre-dates a field addition.
+        # ``__setstate__`` runs after ``cls.__new__(cls)`` — that's a
+        # no-arg call which our singleton ``__new__`` resolves to the
+        # *all-defaults* singleton. Mutate it in place to match the
+        # carried diff.
+        init = state.get("init", {}) if isinstance(state, dict) else {}
+        for name, value in init.items():
+            object.__setattr__(self, name, value)
+
+        # Initialize transient slots so attribute access is safe even
+        # when the pickle pre-dates a field addition.
         for key in self._TRANSIENT_STATE:
-            self.__dict__[key] = None
-        self.__dict__["_session_token"] = None
-
-        self.__dict__.update(state)
+            if key not in self.__dict__:
+                self.__dict__[key] = None
+        self.__dict__.setdefault("_session_token", None)
 
         if self.is_in_databricks_environment():
-            self.auth_type = "runtime"
-            self.token = None
-            self.client_id = None
-            self.client_secret = None
-            self.profile = None
-            self.config_file = None
-            self._session_token = None
+            self._adapt_for_runtime()
             return
 
-        self._restore_session_token(state.get("_session_token"))
+        if isinstance(state, dict):
+            self._restore_session_token(state.get("session_token"))
+
+    def __reduce__(self):
+        """Pickle entry point.
+
+        Routes unpickling through :func:`_reconstruct_databricks_client`
+        so the receiving side gets:
+
+          - singleton dispatch via :meth:`__new__` (one canonical
+            instance per resolved init-kwarg tuple per process);
+          - environment adaptation — when the receiving side is a
+            Databricks runtime, sender-bound credentials are dropped
+            and ``auth_type="runtime"`` wins;
+          - env-bound defaults re-resolved from the *local* environment
+            (anything the sender's env already supplied was dropped on
+            the way out by :meth:`_compressed_init_kwargs`).
+        """
+        state = self.__getstate__()
+        return (_reconstruct_databricks_client, (type(self), state))
 
     def _snapshot_session_token(self) -> Optional[dict[str, Any]]:
         """
@@ -292,6 +463,19 @@ class DatabricksClient(URLBased):
             pass
 
         return snap or None
+
+    def _adapt_for_runtime(self) -> None:
+        """Strip sender-bound credentials and force ``auth_type="runtime"``.
+
+        Called after rehydration on a Databricks driver node — DBR's
+        notebook-scoped auth is short-lived, identity-correct, and the
+        right default in that environment. Anything the sender shipped
+        would only bias :meth:`_make_base_config` toward the wrong path.
+        """
+        for name in self._RUNTIME_DROP_FIELDS:
+            object.__setattr__(self, name, None)
+        object.__setattr__(self, "auth_type", "runtime")
+        object.__setattr__(self, "_session_token", None)
 
     def _restore_session_token(self, snap: Optional[dict[str, Any]]) -> None:
         """
@@ -1192,6 +1376,64 @@ class DatabricksClient(URLBased):
         return session
 
 
+# Wrap the dataclass-generated ``__init__`` so a recycled singleton from
+# ``__new__`` skips the dataclass body (which would otherwise reset the
+# cached SDK clients / sub-services to their ``init=False`` defaults).
+_DATACLASS_INIT = DatabricksClient.__init__
+
+
+def _databricks_client_init(self, *args, **kwargs):
+    if getattr(self, "_singleton_skip_init", False):
+        object.__setattr__(self, "_singleton_skip_init", False)
+        return
+    _DATACLASS_INIT(self, *args, **kwargs)
+
+
+DatabricksClient.__init__ = _databricks_client_init
+
+
+def _reconstruct_databricks_client(
+    cls: Type["DatabricksClient"],
+    state: dict[str, Any],
+) -> "DatabricksClient":
+    """Pickle reconstructor for :class:`DatabricksClient`.
+
+    Drives the receiving-side adaptation:
+
+    - In a Databricks runtime, drop sender-bound credentials and force
+      ``auth_type="runtime"`` *before* singleton lookup so the resulting
+      cache key matches the runtime client we'd build natively.
+    - Off-cluster, route the carried session-token snapshot through
+      :meth:`DatabricksClient._restore_session_token`.
+    - Anything the sender's environment already supplied was dropped on
+      the way out, so :meth:`__init__` re-resolves env_field defaults
+      from the *local* environment automatically.
+    """
+    init_kwargs = dict(state.get("init", {}) if isinstance(state, dict) else {})
+
+    if cls.is_in_databricks_environment():
+        for name in cls._RUNTIME_DROP_FIELDS:
+            init_kwargs.pop(name, None)
+        init_kwargs["auth_type"] = "runtime"
+        init_kwargs = {
+            k: v for k, v in init_kwargs.items()
+            if k in DATABRICKS_CLIENT_INIT_NAMES
+        }
+        return cls(**init_kwargs)
+
+    init_kwargs = {
+        k: v for k, v in init_kwargs.items()
+        if k in DATABRICKS_CLIENT_INIT_NAMES
+    }
+    instance = cls(**init_kwargs)
+
+    snap = state.get("session_token") if isinstance(state, dict) else None
+    if snap:
+        instance._restore_session_token(snap)
+
+    return instance
+
+
 DATABRICKS_CLIENT_INIT_NAMES = frozenset(f.name for f in fields(DatabricksClient) if f.init)
 CHECKED_TMP_WORKSPACES: ExpiringDict[str, set[str]] = ExpiringDict()
 
@@ -1210,17 +1452,30 @@ def is_checked_tmp_path(host: str, base_path: str):
     return False
 
 
-@dataclass
 class DatabricksService(ABC):
-    client: DatabricksClient = field(
-        default_factory=DatabricksClient.current,
-        repr=False, compare=False, hash=False,
-    )
+    """Base class for collection-level Databricks services.
+
+    Plain class (no :func:`dataclass`): subclasses set whatever fields
+    they need in their own ``__init__`` and forward ``client=`` to
+    :meth:`DatabricksService.__init__`. The base only owns ``client``,
+    ``_current`` (the per-class default-instance pointer), and the
+    cross-process pickle path (``__getstate__`` / ``__setstate__``).
+    """
+
+    client: "DatabricksClient"
 
     _current: ClassVar[Optional["DatabricksService"]] = None
 
-    def __post_init__(self):
-        pass
+    def __init__(
+        self,
+        client: Optional["DatabricksClient"] = None,
+        **_kwargs: Any,
+    ) -> None:
+        # ``**_kwargs`` lets cooperative subclasses pass through extra
+        # init args without each one having to redeclare the ``client``
+        # signature; they consume their own kwargs first and forward
+        # the rest up here.
+        self.client = client if client is not None else DatabricksClient.current()
 
     def __getstate__(self):
         return {"client": self.client}

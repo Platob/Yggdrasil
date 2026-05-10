@@ -25,13 +25,12 @@ Cache entries can be invalidated per-view via
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import Iterable, Iterator, Optional, TYPE_CHECKING
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
 from databricks.sdk.service.catalog import TableInfo, TableType
 
-from yggdrasil.databricks.client import DatabricksService
+from yggdrasil.databricks.client import DatabricksClient, DatabricksService
 from yggdrasil.databricks.sql.sql_utils import is_glob_pattern, name_matcher, quote_ident
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.data.enums.mode import Mode, ModeLike
@@ -61,7 +60,6 @@ def _is_view_info(info: TableInfo) -> bool:
     return info.table_type in _VIEW_TABLE_TYPES
 
 
-@dataclass
 class Views(DatabricksService):
     """Collection-level service for Unity Catalog views.
 
@@ -74,9 +72,35 @@ class Views(DatabricksService):
             ...
     """
 
-    catalog_name: str | None = None
-    schema_name: str | None = None
-    view_name: str | None = None
+    catalog_name: str | None
+    schema_name: str | None
+    view_name: str | None
+
+    def __init__(
+        self,
+        client: Optional[DatabricksClient] = None,
+        *,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        view_name: str | None = None,
+    ) -> None:
+        super().__init__(client=client)
+        self.catalog_name = catalog_name
+        self.schema_name = schema_name
+        self.view_name = view_name
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        state["catalog_name"] = self.catalog_name
+        state["schema_name"] = self.schema_name
+        state["view_name"] = self.view_name
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self.catalog_name = state.get("catalog_name")
+        self.schema_name = state.get("schema_name")
+        self.view_name = state.get("view_name")
 
     # ── context rebind ────────────────────────────────────────────────────────
 
