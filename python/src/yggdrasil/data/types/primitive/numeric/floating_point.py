@@ -209,7 +209,7 @@ class FloatingPointType(NumericType):
             return FloatingPointType(byte_size=4)
         return self
 
-    def to_databricks_ddl(self) -> str:
+    def to_spark_name(self) -> str:
         return "DOUBLE" if self._size == 8 else "FLOAT"
 
     # ------------------------------------------------------------------

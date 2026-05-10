@@ -191,7 +191,7 @@ class TestDatabricksDdl:
         dtype = StructType(
             fields=[Field(name="plain", dtype=int64_type, nullable=True)]
         )
-        ddl = dtype.to_databricks_ddl()
+        ddl = dtype.to_spark_name()
 
         assert ddl.startswith("STRUCT<")
         assert ddl.endswith(">")
@@ -201,7 +201,7 @@ class TestDatabricksDdl:
         dtype = StructType(
             fields=[Field(name="we`ird", dtype=int64_type, nullable=True)]
         )
-        ddl = dtype.to_databricks_ddl()
+        ddl = dtype.to_spark_name()
 
         assert "`we``ird`:" in ddl
 

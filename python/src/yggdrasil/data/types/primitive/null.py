@@ -93,7 +93,7 @@ class NullType(PrimitiveType):
         spark = get_spark_sql()
         return spark.types.NullType()
 
-    def to_databricks_ddl(self) -> str:
+    def to_spark_name(self) -> str:
         return "VOID"
 
     # ------------------------------------------------------------------

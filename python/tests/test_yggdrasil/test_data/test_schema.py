@@ -20,6 +20,7 @@ Tests grouped by surface:
 * constructors — from_field, from_any_fields, from_any, from_,
   _coerce_other, _merge_metadata, from_path.
 """
+
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -35,7 +36,6 @@ from yggdrasil.data.types.nested import StructType
 from yggdrasil.data.types.primitive import IntegerType, StringType, TimestampType
 from yggdrasil.polars.tests import PolarsTestCase
 from yggdrasil.spark.tests import SparkTestCase
-
 
 # ---------------------------------------------------------------------------
 # Helpers — every test that builds a field ends up calling one of these.
@@ -529,7 +529,9 @@ class TestAutotag:
 
         id_tags = out["user_id"].tags or {}
         assert id_tags[b"type_name"] == b"int64"
-        assert id_tags[b"signed"] == b"true"
+        # Specialized integer subclasses encode signedness in their
+        # type_name; the redundant ``signed`` tag is suppressed.
+        assert b"signed" not in id_tags
         assert id_tags[b"nullable"] == b"false"
         assert id_tags[b"primary_key"] == b"true"
 
@@ -708,9 +710,7 @@ class TestFromPath:
             ],
             metadata={b"author": b"ygg"},
         )
-        table = pa.table(
-            {"x": [1, 2, 3], "s": ["a", "b", "c"]}, schema=arrow_schema
-        )
+        table = pa.table({"x": [1, 2, 3], "s": ["a", "b", "c"]}, schema=arrow_schema)
         path = tmp_path / "data.parquet"
         pq.write_table(table, path)
 

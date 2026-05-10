@@ -161,7 +161,7 @@ class DecimalType(NumericType):
         spark = get_spark_sql()
         return spark.types.DecimalType(self.precision, self.scale)
 
-    def to_databricks_ddl(self) -> str:
+    def to_spark_name(self) -> str:
         return f"DECIMAL({self.precision}, {self.scale})"
 
     def to_dict(self) -> dict[str, Any]:

@@ -327,8 +327,8 @@ class DictionaryType(PrimitiveType):
         # Degrade to the value type — the encoding is lost, values survive.
         return self.value_type.to_spark()
 
-    def to_databricks_ddl(self) -> str:
-        return self.value_type.to_databricks_ddl()
+    def to_spark_name(self) -> str:
+        return self.value_type.to_spark_name()
 
     # ------------------------------------------------------------------ dict
 

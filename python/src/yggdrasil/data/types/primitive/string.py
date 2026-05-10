@@ -114,7 +114,7 @@ class StringType(PrimitiveType):
         spark = get_spark_sql()
         return spark.types.StringType()
 
-    def to_databricks_ddl(self) -> str:
+    def to_spark_name(self) -> str:
         return "STRING"
 
     # ==================================================================

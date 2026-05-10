@@ -277,7 +277,7 @@ class SJsonType(StringType):
     # Exporters
     # ------------------------------------------------------------------
 
-    def to_databricks_ddl(self) -> str:
+    def to_spark_name(self) -> str:
         # Databricks has no native JSON DDL — store as STRING and rely
         # on ``from_json`` / ``to_json`` SQL helpers downstream.
         return "STRING"
@@ -388,7 +388,7 @@ class BJsonType(BinaryType):
     # Exporters
     # ------------------------------------------------------------------
 
-    def to_databricks_ddl(self) -> str:
+    def to_spark_name(self) -> str:
         return "BINARY"
 
     # ------------------------------------------------------------------

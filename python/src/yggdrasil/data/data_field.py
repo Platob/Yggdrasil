@@ -9,7 +9,20 @@ import types
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, is_dataclass
-from typing import TYPE_CHECKING, Any, Annotated, ClassVar, Optional, Union, get_args, get_origin, Iterator, Generator, AnyStr, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Annotated,
+    ClassVar,
+    Optional,
+    Union,
+    get_args,
+    get_origin,
+    Iterator,
+    Generator,
+    AnyStr,
+    overload,
+)
 
 import pyarrow as pa
 
@@ -22,7 +35,10 @@ from yggdrasil.data.base_meta import (
     _to_bytes,
 )
 from yggdrasil.data.constants import (
-    ALIAS_KEY, DEFAULT_VALUE_KEY, DEFAULT_FIELD_NAME, POSITION_KEY,
+    ALIAS_KEY,
+    DEFAULT_VALUE_KEY,
+    DEFAULT_FIELD_NAME,
+    POSITION_KEY,
 )
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.parser import ParsedDataType
@@ -252,8 +268,10 @@ def _peel_name_nullable(metadata: Any) -> tuple[Any, str | None, bool | None]:
     if not isinstance(metadata, Mapping):
         return metadata, None, None
     if (
-        b"name" not in metadata and "name" not in metadata
-        and b"nullable" not in metadata and "nullable" not in metadata
+        b"name" not in metadata
+        and "name" not in metadata
+        and b"nullable" not in metadata
+        and "nullable" not in metadata
     ):
         return metadata, None, None
 
@@ -263,7 +281,9 @@ def _peel_name_nullable(metadata: Any) -> tuple[Any, str | None, bool | None]:
         raw_name = cleaned.pop("name", None)
     name: str | None = None
     if raw_name is not None:
-        name = raw_name.decode("utf-8") if isinstance(raw_name, bytes) else str(raw_name)
+        name = (
+            raw_name.decode("utf-8") if isinstance(raw_name, bytes) else str(raw_name)
+        )
 
     raw_nullable = cleaned.pop(b"nullable", None)
     if raw_nullable is None:
@@ -283,6 +303,7 @@ def _peel_name_nullable(metadata: Any) -> tuple[Any, str | None, bool | None]:
 # ======================================================================
 # Public factory — `field(...)` shorthand constructor
 # ======================================================================
+
 
 def field(
     name: str,
@@ -312,9 +333,7 @@ class Field(BaseMetadata, BaseChildrenFields):
     # member, map key/value, list item, schema child). ``None`` for
     # top-level fields. Used by the cache layer to bubble
     # invalidations up the tree when a child mutates.
-    parent: "Field | None" = dataclasses.field(
-        default=None, repr=False, compare=False
-    )
+    parent: "Field | None" = dataclasses.field(default=None, repr=False, compare=False)
     # Lazily-populated engine-flavoured projections. Populated on
     # first access via :meth:`to_arrow_field` / :meth:`to_arrow_schema`
     # / :meth:`to_polars_field` / :meth:`to_pyspark_field`; cleared by
@@ -326,18 +345,10 @@ class Field(BaseMetadata, BaseChildrenFields):
     _arrow_schema: "pa.Schema | None" = dataclasses.field(
         default=None, repr=False, compare=False
     )
-    _polars_field: Any = dataclasses.field(
-        default=None, repr=False, compare=False
-    )
-    _polars_schema: Any = dataclasses.field(
-        default=None, repr=False, compare=False
-    )
-    _spark_field: Any = dataclasses.field(
-        default=None, repr=False, compare=False
-    )
-    _spark_schema: Any = dataclasses.field(
-        default=None, repr=False, compare=False
-    )
+    _polars_field: Any = dataclasses.field(default=None, repr=False, compare=False)
+    _polars_schema: Any = dataclasses.field(default=None, repr=False, compare=False)
+    _spark_field: Any = dataclasses.field(default=None, repr=False, compare=False)
+    _spark_schema: Any = dataclasses.field(default=None, repr=False, compare=False)
     # Cached ``{name: index}`` view of ``children_fields`` for O(1)
     # lookup in :meth:`field_by`. Built on demand by
     # :meth:`_ensure_field_name_map`; cleared whenever the dtype
@@ -368,9 +379,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         )
 
     def __hash__(self) -> int:
-        meta_key = (
-            tuple(sorted(self.metadata.items())) if self.metadata else None
-        )
+        meta_key = tuple(sorted(self.metadata.items())) if self.metadata else None
         return hash((self.name, self.dtype, self.nullable, meta_key))
 
     @classmethod
@@ -422,9 +431,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         case stays uncluttered.
         """
         tokens: list[str] = [
-            label
-            for tag, label in self._PRETTY_TAG_FLAGS
-            if self._tag_flag(tag)
+            label for tag, label in self._PRETTY_TAG_FLAGS if self._tag_flag(tag)
         ]
         if self.has_default:
             try:
@@ -528,7 +535,11 @@ class Field(BaseMetadata, BaseChildrenFields):
                     # which loops through ``Field.__init__`` again —
                     # the idempotent-init guard there short-circuits
                     # the second pass once we've stamped the slots.
-                    name = kwargs.get("name") if "name" in kwargs else (args[0] if args else "")
+                    name = (
+                        kwargs.get("name")
+                        if "name" in kwargs
+                        else (args[0] if args else "")
+                    )
                     Field.__init__(
                         instance,
                         name=name,
@@ -574,7 +585,11 @@ class Field(BaseMetadata, BaseChildrenFields):
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "dtype", resolved_dtype)
         object.__setattr__(self, "nullable", bool(nullable))
-        object.__setattr__(self, "metadata", _normalize_metadata(metadata, tags=tags, default_value=default))
+        object.__setattr__(
+            self,
+            "metadata",
+            _normalize_metadata(metadata, tags=tags, default_value=default),
+        )
         object.__setattr__(self, "parent", parent)
         # Initialize cache slots so the dataclass is fully populated
         # — accessing an unset slot would raise AttributeError.
@@ -622,10 +637,16 @@ class Field(BaseMetadata, BaseChildrenFields):
         schema embedded this field gets rebuilt next time it's
         requested.
         """
-        if self._arrow_field is None and self._arrow_schema is None and \
-                self._polars_field is None and self._polars_schema is None and \
-                self._spark_field is None and self._spark_schema is None and \
-                self._field_name_map is None and self._field_name_fold_map is None:
+        if (
+            self._arrow_field is None
+            and self._arrow_schema is None
+            and self._polars_field is None
+            and self._polars_schema is None
+            and self._spark_field is None
+            and self._spark_schema is None
+            and self._field_name_map is None
+            and self._field_name_fold_map is None
+        ):
             # Already clean — still cascade so dirty ancestors clear too.
             if cascade and self.parent is not None:
                 self.parent._invalidate_cache(cascade=True)
@@ -691,10 +712,7 @@ class Field(BaseMetadata, BaseChildrenFields):
             # matter, match children by name (reorder-tolerant); when
             # names don't, fall back to a positional walk so a renamed
             # column can still match its peer.
-            if (
-                self.type_id is DataTypeId.STRUCT
-                and other.type_id is DataTypeId.STRUCT
-            ):
+            if self.type_id is DataTypeId.STRUCT and other.type_id is DataTypeId.STRUCT:
                 self_children = self.children_fields
                 other_children = other.children_fields
                 if len(self_children) != len(other_children):
@@ -912,7 +930,9 @@ class Field(BaseMetadata, BaseChildrenFields):
 
     @property
     def has_default(self) -> bool:
-        return self.metadata.get(DEFAULT_VALUE_KEY) is not None if self.metadata else False
+        return (
+            self.metadata.get(DEFAULT_VALUE_KEY) is not None if self.metadata else False
+        )
 
     @property
     def default_value(self):
@@ -934,7 +954,9 @@ class Field(BaseMetadata, BaseChildrenFields):
             try:
                 default = json_module.loads(default, safe=False)
             except Exception as e:
-                raise ValueError(f"Could not parse default value {default!r} for {self!r}: {e}") from e
+                raise ValueError(
+                    f"Could not parse default value {default!r} for {self!r}: {e}"
+                ) from e
 
             return self.dtype.convert_pyobj(default, nullable=self.nullable, safe=False)
         return None
@@ -950,9 +972,13 @@ class Field(BaseMetadata, BaseChildrenFields):
             try:
                 default = json_module.loads(default, safe=False)
             except Exception as e:
-                raise ValueError(f"Could not parse default value {default!r} for {self!r}: {e}") from e
+                raise ValueError(
+                    f"Could not parse default value {default!r} for {self!r}: {e}"
+                ) from e
 
-            return self.dtype.convert_arrow_scalar(pa.scalar(default), nullable=self.nullable, safe=False)
+            return self.dtype.convert_arrow_scalar(
+                pa.scalar(default), nullable=self.nullable, safe=False
+            )
         return None
 
     @property
@@ -1126,9 +1152,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         return self.copy(name=name)
 
     def with_dtype(
-        self,
-        dtype: DataType | type[DataType] | pa.DataType,
-        inplace: bool = True
+        self, dtype: DataType | type[DataType] | pa.DataType, inplace: bool = True
     ) -> "Field":
         if dtype == self.dtype:
             return self
@@ -1160,11 +1184,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         inplace: bool = True,
     ):
         if metadata or tags or default is not None:
-            normalized = _normalize_metadata(
-                metadata,
-                tags=tags,
-                default_value=default
-            )
+            normalized = _normalize_metadata(metadata, tags=tags, default_value=default)
             # Skip the cache drop when the normalized payload is
             # byte-for-byte equal to what's already stored.
             if normalized == self.metadata:
@@ -1218,9 +1238,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         # both target the dtype slot — fail loudly when both arrive.
         if fields is not None:
             if dtype is not None:
-                raise TypeError(
-                    "Field.copy: pass either fields= or dtype=, not both"
-                )
+                raise TypeError("Field.copy: pass either fields= or dtype=, not both")
             children = [
                 f.copy() if isinstance(f, Field) else Field.from_any(f)
                 for f in _normalize_inner_fields(fields)
@@ -1399,7 +1417,10 @@ class Field(BaseMetadata, BaseChildrenFields):
         return target
 
     def _promote_to_struct_with(
-        self, new_field: "Field", *, inplace: bool,
+        self,
+        new_field: "Field",
+        *,
+        inplace: bool,
     ) -> "Field":
         """Rebuild ``self`` as a struct whose first child is its
         previous self.
@@ -1440,7 +1461,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         upcast: bool = False,
         merge_dtype: bool = True,
         merge_nullable: bool = True,
-        merge_metadata: bool = True
+        merge_metadata: bool = True,
     ):
         other = self.from_any(other)
         if self == other:
@@ -1658,7 +1679,9 @@ class Field(BaseMetadata, BaseChildrenFields):
             children=[Field.from_any(f) for f in fields],
             metadata=meta,
             name=embedded_name if embedded_name is not None else DEFAULT_FIELD_NAME,
-            nullable=bool(embedded_nullable) if embedded_nullable is not None else False,
+            nullable=(
+                bool(embedded_nullable) if embedded_nullable is not None else False
+            ),
         )
 
     # ==================================================================
@@ -1672,7 +1695,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         name: str = "",
         prefix: str = "",
         default: Any = ...,
-        name_limit: int = 256
+        name_limit: int = 256,
     ) -> "Field | None":
         if not fields:
             if default is ...:
@@ -1683,34 +1706,20 @@ class Field(BaseMetadata, BaseChildrenFields):
 
         fields = [cls.from_(_) for _ in fields]
         name = name or safe_constraint_name(
-            [_.name for _ in fields],
-            prefix=prefix,
-            limit=name_limit
+            [_.name for _ in fields], prefix=prefix, limit=name_limit
         )
 
         if len(fields) == 1:
             keep = fields[0].with_name(name)
         else:
-            keep = cls(
-                name=name,
-                dtype=StructType.from_fields(fields),
-                nullable=False
-            )
+            keep = cls(name=name, dtype=StructType.from_fields(fields), nullable=False)
 
-        return (
-            keep
-            .with_name(name=name)
-            .with_constraint_key(True)
-        )
+        return keep.with_name(name=name).with_constraint_key(True)
 
     @classmethod
     def from_any(
-        cls,
-        obj: Any,
-        *,
-        name: str | None = None,
-        metadata: dict | None = None
-    )-> "Field":
+        cls, obj: Any, *, name: str | None = None, metadata: dict | None = None
+    ) -> "Field":
         if isinstance(obj, cls):
             return obj
 
@@ -1721,11 +1730,7 @@ class Field(BaseMetadata, BaseChildrenFields):
             return cls.from_field(obj)
 
         if isinstance(obj, DataType):
-            return cls(
-                name=name or DEFAULT_FIELD_NAME,
-                dtype=obj,
-                metadata=metadata
-            )
+            return cls(name=name or DEFAULT_FIELD_NAME, dtype=obj, metadata=metadata)
 
         ns, _ = ObjectSerde.module_and_name(obj)
 
@@ -1746,6 +1751,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         # ``Field.from_any`` doesn't have to know about every Path subtype.
         if isinstance(obj, (pathlib.PurePath, os.PathLike)):
             from yggdrasil.io.url import URL
+
             if URL.is_pathish(obj):
                 try:
                     pc = path_class()
@@ -1780,12 +1786,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         raise TypeError(f"Cannot build Field from {type(obj).__name__}")
 
     @classmethod
-    def from_(
-        cls,
-        obj: Any,
-        *,
-        name: str | None = None
-    ) -> "Field":
+    def from_(cls, obj: Any, *, name: str | None = None) -> "Field":
         return cls.from_any(obj)
 
     @classmethod
@@ -1870,7 +1871,9 @@ class Field(BaseMetadata, BaseChildrenFields):
             name=name or hint.__name__,
             dtype=dtype,
             nullable=False if nullable is None else bool(nullable),
-            metadata=_normalize_metadata(metadata, tags=tags, default_value=default_value),
+            metadata=_normalize_metadata(
+                metadata, tags=tags, default_value=default_value
+            ),
         )
 
     @classmethod
@@ -2033,7 +2036,9 @@ class Field(BaseMetadata, BaseChildrenFields):
             )
         except Exception as e:
             if default is ...:
-                raise ValueError(f"Cannot build {cls.__name__} from dictionary: {e}") from e
+                raise ValueError(
+                    f"Cannot build {cls.__name__} from dictionary: {e}"
+                ) from e
             return default
 
     @classmethod
@@ -2082,18 +2087,16 @@ class Field(BaseMetadata, BaseChildrenFields):
             if isinstance(value, pa.DataType):
                 return cls.from_arrow_field(
                     pa.field(DEFAULT_FIELD_NAME, value, nullable=True, metadata=None),
-                    from_metadata=from_metadata
+                    from_metadata=from_metadata,
                 )
             if isinstance(value, (pa.Array, pa.ChunkedArray)):
                 nullable = value.null_count > 0 or len(value) == 0
 
                 return cls.from_arrow_field(
                     pa.field(
-                        DEFAULT_FIELD_NAME, value.type,
-                        nullable=nullable,
-                        metadata=None
+                        DEFAULT_FIELD_NAME, value.type, nullable=nullable, metadata=None
                     ),
-                    from_metadata=from_metadata
+                    from_metadata=from_metadata,
                 )
 
             if hasattr(value, "schema"):
@@ -2113,7 +2116,7 @@ class Field(BaseMetadata, BaseChildrenFields):
             if isinstance(value, pa.DataType):
                 return cls.from_arrow_field(
                     pa.field(DEFAULT_FIELD_NAME, value, nullable=True, metadata=None),
-                    from_metadata=from_metadata
+                    from_metadata=from_metadata,
                 )
             raise TypeError(f"Cannot build Field from {type(value).__name__}")
 
@@ -2133,7 +2136,9 @@ class Field(BaseMetadata, BaseChildrenFields):
 
         name = DEFAULT_FIELD_NAME
         if value.metadata:
-            name = value.metadata.get(b"name", DEFAULT_FIELD_NAME.encode()).decode("utf-8")
+            name = value.metadata.get(b"name", DEFAULT_FIELD_NAME.encode()).decode(
+                "utf-8"
+            )
 
         return cls(
             name=name,
@@ -2295,12 +2300,16 @@ class Field(BaseMetadata, BaseChildrenFields):
                     metadata=None,
                 )
             else:
-                raise TypeError(f"Cannot build {cls.__name__} from {type(obj).__name__}")
+                raise TypeError(
+                    f"Cannot build {cls.__name__} from {type(obj).__name__}"
+                )
 
         return cls.from_spark_field(obj, from_metadata=from_metadata)
 
     @classmethod
-    def from_spark_field(cls, value: "pst.StructField", from_metadata: bool = True) -> "Field":
+    def from_spark_field(
+        cls, value: "pst.StructField", from_metadata: bool = True
+    ) -> "Field":
         # Spark stores metadata as ``dict[str, Any]`` (a Java
         # ``Metadata`` view). The ``type_json`` round-trip blob — only
         # written for Map/Array dtypes by :meth:`to_pyspark_field` —
@@ -2321,7 +2330,9 @@ class Field(BaseMetadata, BaseChildrenFields):
             name=value.name,
             dtype=dtype,
             nullable=value.nullable,
-            metadata=_strip_internal_metadata(_normalize_metadata(value.metadata, tags=None)),
+            metadata=_strip_internal_metadata(
+                _normalize_metadata(value.metadata, tags=None)
+            ),
         )
 
     # ==================================================================
@@ -2346,10 +2357,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         )
 
         if self.metadata:
-            out["metadata"] = {
-                k.decode(): v.decode()
-                for k, v in self.metadata.items()
-            }
+            out["metadata"] = {k.decode(): v.decode() for k, v in self.metadata.items()}
 
         if dump_parent and self.parent is not None:
             out["parent"] = self.parent.to_dict(dump_parent=False)
@@ -2471,17 +2479,6 @@ class Field(BaseMetadata, BaseChildrenFields):
         object.__setattr__(self, "_polars_schema", built)
         return built
 
-    def to_polars_flavor(self) -> "polars.Field | polars.Schema":
-        """Polars-native counterpart for this field.
-
-        Struct-shaped fields project to a :class:`polars.Schema` (the
-        natural shape for a column collection); other dtypes project
-        to a :class:`polars.Field`.
-        """
-        if self.type_id is DataTypeId.STRUCT:
-            return self.to_polars_schema()
-        return self.to_polars_field()
-
     def to_pyspark_field(self) -> "pst.StructField":
         """Project to a Spark :class:`StructField`.
 
@@ -2500,14 +2497,8 @@ class Field(BaseMetadata, BaseChildrenFields):
 
         metadata = (
             {
-                (
-                    key.decode("utf-8")
-                    if isinstance(key, bytes)
-                    else str(key)
-                ): (
-                    value.decode("utf-8")
-                    if isinstance(value, bytes)
-                    else str(value)
+                (key.decode("utf-8") if isinstance(key, bytes) else str(key)): (
+                    value.decode("utf-8") if isinstance(value, bytes) else str(value)
                 )
                 for key, value in self.metadata.items()
             }
@@ -2515,8 +2506,8 @@ class Field(BaseMetadata, BaseChildrenFields):
             else {}
         )
         if self._needs_spark_type_json():
-            metadata[_TYPE_JSON_METADATA_KEY.decode("utf-8")] = (
-                self.dtype.to_json(to_bytes=False)
+            metadata[_TYPE_JSON_METADATA_KEY.decode("utf-8")] = self.dtype.to_json(
+                to_bytes=False
             )
         built = pyspark_sql.types.StructField(
             self.name,
@@ -2558,16 +2549,6 @@ class Field(BaseMetadata, BaseChildrenFields):
         built = pyspark_sql.types.StructType(fields)
         object.__setattr__(self, "_spark_schema", built)
         return built
-
-    def to_spark_flavor(self) -> "pst.StructField | pst.StructType":
-        """Spark-native counterpart for this field.
-
-        Struct-shaped fields project to a :class:`pyspark.sql.types.StructType`;
-        other dtypes project to a :class:`StructField`.
-        """
-        if self.type_id is DataTypeId.STRUCT:
-            return self.to_spark_schema()
-        return self.to_pyspark_field()
 
     def as_spark(self) -> "Field":
         """Return a Field whose ``dtype`` is Spark-compatible.
@@ -2638,7 +2619,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         dtype = self.dtype.to_struct(name=self.name)
         return Field(self.name, dtype, self.nullable, self.metadata)
 
-    def to_databricks_ddl(
+    def to_spark_name(
         self,
         *,
         with_name: bool = True,
@@ -2659,7 +2640,7 @@ class Field(BaseMetadata, BaseChildrenFields):
             dtype = DataType.from_arrow_type(self.arrow_type)
             if isinstance(dtype, type) and issubclass(dtype, DataType):
                 dtype = dtype()
-            sql_type = dtype.to_databricks_ddl()
+            sql_type = dtype.to_spark_name()
             return f"{name_str}{sql_type}{nullable_str}{comment_str}"
 
         if pa.types.is_struct(self.arrow_type):
@@ -2672,7 +2653,7 @@ class Field(BaseMetadata, BaseChildrenFields):
             # at the schema-rendering layer matches that and lets the
             # MERGE go through.
             struct_body = ", ".join(
-                Field.from_arrow(child).to_databricks_ddl(
+                Field.from_arrow(child).to_spark_name(
                     with_comment=False,
                     with_nullable=False,
                 )
@@ -2682,12 +2663,12 @@ class Field(BaseMetadata, BaseChildrenFields):
 
         if pa.types.is_map(self.arrow_type):
             map_type: pa.MapType = self.arrow_type
-            key_type = Field.from_arrow(map_type.key_field).to_databricks_ddl(
+            key_type = Field.from_arrow(map_type.key_field).to_spark_name(
                 with_name=False,
                 with_comment=False,
                 with_nullable=False,
             )
-            val_type = Field.from_arrow(map_type.item_field).to_databricks_ddl(
+            val_type = Field.from_arrow(map_type.item_field).to_spark_name(
                 with_name=False,
                 with_comment=False,
                 with_nullable=False,
@@ -2696,14 +2677,16 @@ class Field(BaseMetadata, BaseChildrenFields):
 
         if pa.types.is_list(self.arrow_type) or pa.types.is_large_list(self.arrow_type):
             list_type: pa.ListType = self.arrow_type
-            elem_type = Field.from_arrow(list_type.value_field).to_databricks_ddl(
+            elem_type = Field.from_arrow(list_type.value_field).to_spark_name(
                 with_name=False,
                 with_comment=False,
                 with_nullable=False,
             )
             return f"{name_str}ARRAY<{elem_type}>{nullable_str}{comment_str}"
 
-        raise TypeError(f"Cannot make Databricks DDL from nested type: {self.arrow_type}")
+        raise TypeError(
+            f"Cannot make Databricks DDL from nested type: {self.arrow_type}"
+        )
 
     # ==================================================================
     # Cast — top-level dispatch (`cast` / engine-level `cast_*`)
@@ -2945,7 +2928,9 @@ class Field(BaseMetadata, BaseChildrenFields):
         if self.dtype.type_id == DataTypeId.OBJECT:
             return series
         options = get_cast_options_class().check(options=options, **more)
-        casted = self.dtype.cast_polars_series(series, options=options.with_target(self))
+        casted = self.dtype.cast_polars_series(
+            series, options=options.with_target(self)
+        )
         return self.finalize_polars_series(casted, default_scalar=default_scalar)
 
     def cast_polars_expr(
@@ -2985,7 +2970,9 @@ class Field(BaseMetadata, BaseChildrenFields):
         if self.dtype.type_id == DataTypeId.OBJECT:
             return series
         options = get_cast_options_class().check(options=options, **more)
-        casted = self.dtype.cast_pandas_series(series, options=options.with_target(self))
+        casted = self.dtype.cast_pandas_series(
+            series, options=options.with_target(self)
+        )
         return self.finalize_pandas_series(casted, default_scalar=default_scalar)
 
     def cast_pandas_tabular(
@@ -3108,13 +3095,16 @@ class Field(BaseMetadata, BaseChildrenFields):
           matched null array, ``None`` to skip silently).
         """
         column_name = self._resolve_column_name(
-            table.schema.names, raise_error=default is ...,
+            table.schema.names,
+            raise_error=default is ...,
         )
         if column_name is None:
             return default
         return self.cast_arrow_array(
             table.column(column_name),
-            options=options, default_scalar=default_scalar, **more,
+            options=options,
+            default_scalar=default_scalar,
+            **more,
         )
 
     def select_in_arrow(
@@ -3134,12 +3124,18 @@ class Field(BaseMetadata, BaseChildrenFields):
         """
         if isinstance(obj, (pa.Table, pa.RecordBatch)):
             return self.select_in_arrow_tabular(
-                obj, options=options, default_scalar=default_scalar,
-                default=default, **more,
+                obj,
+                options=options,
+                default_scalar=default_scalar,
+                default=default,
+                **more,
             )
         if isinstance(obj, (pa.Array, pa.ChunkedArray)):
             return self.cast_arrow_array(
-                obj, options=options, default_scalar=default_scalar, **more,
+                obj,
+                options=options,
+                default_scalar=default_scalar,
+                **more,
             )
         raise TypeError(
             f"Field.select_in_arrow: expected pa.Table / pa.RecordBatch / "
@@ -3162,13 +3158,16 @@ class Field(BaseMetadata, BaseChildrenFields):
         other value is returned as-is on miss.
         """
         column_name = self._resolve_column_name(
-            df.columns, raise_error=default is ...,
+            df.columns,
+            raise_error=default is ...,
         )
         if column_name is None:
             return default
         return self.cast_polars_series(
             df.get_column(column_name),
-            options=options, default_scalar=default_scalar, **more,
+            options=options,
+            default_scalar=default_scalar,
+            **more,
         )
 
     def select_in_polars_lazy_frame(
@@ -3192,7 +3191,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         """
         pl = get_polars()
         column_name = self._resolve_column_name(
-            lf.collect_schema().names(), raise_error=default is ...,
+            lf.collect_schema().names(),
+            raise_error=default is ...,
         )
         if column_name is None:
             return default
@@ -3227,21 +3227,30 @@ class Field(BaseMetadata, BaseChildrenFields):
             return self.select_in_field(obj, default=default)
         if isinstance(obj, (pa.Table, pa.RecordBatch, pa.Array, pa.ChunkedArray)):
             return self.select_in_arrow(
-                obj, options=options, default_scalar=default_scalar,
-                default=default, **more,
+                obj,
+                options=options,
+                default_scalar=default_scalar,
+                default=default,
+                **more,
             )
         ns, _name = ObjectSerde.module_and_name(obj)
         if ns.startswith("polars"):
             pl = get_polars()
             if isinstance(obj, pl.DataFrame):
                 return self.select_in_polars_frame(
-                    obj, options=options, default_scalar=default_scalar,
-                    default=default, **more,
+                    obj,
+                    options=options,
+                    default_scalar=default_scalar,
+                    default=default,
+                    **more,
                 )
             if isinstance(obj, pl.LazyFrame):
                 return self.select_in_polars_lazy_frame(
-                    obj, options=options, default_scalar=default_scalar,
-                    default=default, **more,
+                    obj,
+                    options=options,
+                    default_scalar=default_scalar,
+                    default=default,
+                    **more,
                 )
         raise TypeError(
             f"Field.select_in: unsupported frame type {type(obj).__name__}. "
@@ -3266,7 +3275,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         children = list(other.children_fields)
         names = [f.name for f in children]
         column_name = self._resolve_column_name(
-            names, raise_error=default is ...,
+            names,
+            raise_error=default is ...,
         )
         if column_name is None:
             return default
@@ -3493,8 +3503,7 @@ class Field(BaseMetadata, BaseChildrenFields):
 
     def default_polars_expr(self, alias: str | None = None):
         return self.dtype.default_polars_expr(
-            value=self.default_value, nullable=self.nullable,
-            alias=alias or self.name
+            value=self.default_value, nullable=self.nullable, alias=alias or self.name
         )
 
     def default_pandas_series(
@@ -3513,7 +3522,9 @@ class Field(BaseMetadata, BaseChildrenFields):
         )
 
     def default_spark_column(self, alias: str | None = None):
-        s = self.dtype.default_spark_column(value=self.default_value, nullable=self.nullable)
+        s = self.dtype.default_spark_column(
+            value=self.default_value, nullable=self.nullable
+        )
         return s.alias(alias) if alias else s.alias(self.name)
 
     # ==================================================================
@@ -3853,7 +3864,9 @@ class Field(BaseMetadata, BaseChildrenFields):
         )
         return resolved
 
-    def setdefault(self, key: str, default: "Field | pa.Field | None" = None) -> "Field":
+    def setdefault(
+        self, key: str, default: "Field | pa.Field | None" = None
+    ) -> "Field":
         if not isinstance(key, str):
             raise TypeError(
                 f"Field.setdefault key must be str; got {type(key).__name__}"
@@ -3985,7 +3998,9 @@ class Field(BaseMetadata, BaseChildrenFields):
                 seen[f.name] = len(merged)
                 merged.append(f.copy())
         self._set_dtype_fields(merged)
-        object.__setattr__(self, "metadata", self._merge_metadata(self.metadata, other.metadata))
+        object.__setattr__(
+            self, "metadata", self._merge_metadata(self.metadata, other.metadata)
+        )
         if other.name and other.name != DEFAULT_FIELD_NAME:
             object.__setattr__(self, "name", other.name)
         return self
@@ -3994,7 +4009,9 @@ class Field(BaseMetadata, BaseChildrenFields):
         other = self._coerce_other(other)
         remove_names = {f.name for f in other.children_fields}
         return type(self)._make_struct(
-            children=[f.copy() for f in self.children_fields if f.name not in remove_names],
+            children=[
+                f.copy() for f in self.children_fields if f.name not in remove_names
+            ],
             metadata=dict(self.metadata) if self.metadata else None,
             name=self.name,
             nullable=self.nullable,
@@ -4021,10 +4038,10 @@ class Field(BaseMetadata, BaseChildrenFields):
     def __iand__(self, other: Any) -> "Field":
         other = self._coerce_other(other)
         keep_names = {f.name for f in other.children_fields}
-        self._set_dtype_fields(
-            f for f in self.children_fields if f.name in keep_names
+        self._set_dtype_fields(f for f in self.children_fields if f.name in keep_names)
+        object.__setattr__(
+            self, "metadata", self._merge_metadata(self.metadata, other.metadata)
         )
-        object.__setattr__(self, "metadata", self._merge_metadata(self.metadata, other.metadata))
         if other.name and other.name != DEFAULT_FIELD_NAME:
             object.__setattr__(self, "name", other.name)
         return self
@@ -4043,6 +4060,7 @@ class Field(BaseMetadata, BaseChildrenFields):
 # ======================================================================
 # Cast registry — `Any → Field` converter
 # ======================================================================
+
 
 @register_converter(Any, Field)
 def any_to_field(obj: Any, _: Any):

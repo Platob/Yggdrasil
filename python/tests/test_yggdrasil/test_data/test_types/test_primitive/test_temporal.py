@@ -529,11 +529,11 @@ class TestSparkTypes:
         assert isinstance(DurationType(unit="us").to_spark(), pst.LongType)
 
     def test_databricks_ddl_smoke(self) -> None:
-        assert TimestampType(tz="UTC").to_databricks_ddl() == "TIMESTAMP"
-        assert TimestampType(tz=None).to_databricks_ddl() == "TIMESTAMP_NTZ"
-        assert DateType().to_databricks_ddl() == "DATE"
-        assert TimeType().to_databricks_ddl() == "STRING"
-        assert DurationType().to_databricks_ddl() == "BIGINT"
+        assert TimestampType(tz="UTC").to_spark_name() == "TIMESTAMP"
+        assert TimestampType(tz=None).to_spark_name() == "TIMESTAMP_NTZ"
+        assert DateType().to_spark_name() == "DATE"
+        assert TimeType().to_spark_name() == "STRING"
+        assert DurationType().to_spark_name() == "BIGINT"
 
     def test_from_spark_round_trip_preserves_tz(self) -> None:
         original = TimestampType(unit="us", tz="UTC")

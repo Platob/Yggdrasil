@@ -484,8 +484,8 @@ class MapType(NestedType):
             keys_sorted=self.keys_sorted,
         )
 
-    def to_databricks_ddl(self) -> str:
-        return f"MAP<{self.key_field.dtype.to_databricks_ddl()}, {self.value_field.dtype.to_databricks_ddl()}>"
+    def to_spark_name(self) -> str:
+        return f"MAP<{self.key_field.dtype.to_spark_name()}, {self.value_field.dtype.to_spark_name()}>"
 
     def to_dict(self) -> dict[str, Any]:
         base = super(MapType, self).to_dict()

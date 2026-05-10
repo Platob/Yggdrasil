@@ -94,7 +94,7 @@ class BooleanType(PrimitiveType):
         spark = get_spark_sql()
         return spark.types.BooleanType()
 
-    def to_databricks_ddl(self) -> str:
+    def to_spark_name(self) -> str:
         return "BOOLEAN"
 
     # ------------------------------------------------------------------

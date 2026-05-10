@@ -83,43 +83,22 @@ def _arrow_field_to_spark(field: pa.Field) -> Dict[str, Any]:
     }
 
 
-def _arrow_type_to_spark(t: pa.DataType) -> Any:
-    # Primitives — group by intent (width / signedness / variant).
-    if pa.types.is_string(t) or pa.types.is_large_string(t):
-        return "string"
-    if pa.types.is_int64(t) or pa.types.is_uint64(t):
-        return "long"
-    if pa.types.is_int32(t) or pa.types.is_uint32(t):
-        return "integer"
-    if pa.types.is_int16(t) or pa.types.is_uint16(t):
-        return "short"
-    if pa.types.is_int8(t) or pa.types.is_uint8(t):
-        return "byte"
-    if pa.types.is_float64(t):
-        return "double"
-    if pa.types.is_float32(t):
-        return "float"
-    if pa.types.is_boolean(t):
-        return "boolean"
-    if (
-        pa.types.is_binary(t)
-        or pa.types.is_large_binary(t)
-        or pa.types.is_fixed_size_binary(t)
-    ):
-        return "binary"
-    if pa.types.is_date32(t) or pa.types.is_date64(t):
-        return "date"
-    if pa.types.is_timestamp(t):
-        # Delta distinguishes ``timestamp`` (with tz, stored as UTC)
-        # from ``timestamp_ntz`` (no zone). Arrow encodes the same
-        # split as the timestamp's ``tz`` attribute.
-        return "timestamp_ntz" if t.tz is None else "timestamp"
-    if pa.types.is_decimal(t):
-        return f"decimal({t.precision},{t.scale})"
-    if pa.types.is_null(t):
-        return "void"
+#: DDL → Delta schemaString primitive name. ``DataType.to_spark_name``
+#: produces the uppercase SQL DDL form (``BIGINT`` / ``INT`` / ``SHORT``
+#: / ``DECIMAL(p, s)`` / …); Delta's wire format is the lowercase
+#: ``typeName`` Spark uses inside ``StructType.json()``. Most heads
+#: are just lowercase, but the integer family renames (``INT`` →
+#: ``integer``, ``BIGINT`` → ``long``) so they need an explicit slot.
+_DDL_HEAD_TO_DELTA = {
+    "INT": "integer",
+    "BIGINT": "long",
+}
 
-    # Complex
+
+def _arrow_type_to_spark(t: pa.DataType) -> Any:
+    # Complex types stay JSON-shaped — they recurse through
+    # :func:`_arrow_type_to_spark` on their child types, so the
+    # canonical-name routing below kicks in for the leaves too.
     if (
         pa.types.is_list(t)
         or pa.types.is_large_list(t)
@@ -143,9 +122,34 @@ def _arrow_type_to_spark(t: pa.DataType) -> Any:
             "fields": [_arrow_field_to_spark(t.field(i)) for i in range(t.num_fields)],
         }
 
-    # Unknown / unsupported → binary fallback. The intent is "round-
-    # trips, doesn't crash"; a richer mapping can land later.
-    return "binary"
+    # Primitives — route through the canonical surface. ``to_spark_name``
+    # returns the SQL DDL form (``BIGINT`` / ``DECIMAL(10, 2)`` / …);
+    # Delta's wire vocabulary differs from DDL in two slots
+    # (``INT`` / ``BIGINT``), so :data:`_DDL_HEAD_TO_DELTA` patches
+    # those before the lowercase pass.
+    from yggdrasil.data.types.base import DataType
+
+    try:
+        ddl = DataType.from_arrow_type(t).to_spark_name()
+    except Exception:
+        # Unknown / unsupported → binary fallback. The intent is
+        # "round-trips, doesn't crash"; a richer mapping can land
+        # later if a real caller hits this.
+        return "binary"
+
+    paren = ddl.find("(")
+    if paren == -1:
+        head, tail = ddl, ""
+    else:
+        head, tail = ddl[:paren], ddl[paren:]
+    base = _DDL_HEAD_TO_DELTA.get(head, head.lower())
+    if not tail:
+        return base
+    # Decimal is the only parametric primitive Delta carries. Strip
+    # whitespace + lowercase the tail so ``DECIMAL(10, 2)`` ends up
+    # as ``decimal(10,2)`` — matches Spark's ``simpleString()`` and
+    # the schemaString shape every Delta engine writes.
+    return f"{base}{tail.replace(' ', '').lower()}"
 
 
 # ---------------------------------------------------------------------------

@@ -153,7 +153,7 @@ class TestDefaults:
 class TestDatabricksDdl:
 
     def test_wraps_inner_type_in_array(self) -> None:
-        ddl = ArrayType.from_item(StringType().to_field()).to_databricks_ddl()
+        ddl = ArrayType.from_item(StringType().to_field()).to_spark_name()
 
         assert ddl.upper().startswith("ARRAY<")
         assert ddl.endswith(">")
