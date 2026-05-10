@@ -699,11 +699,25 @@ class WarehouseStatementResult(StatementResult):
 
         from yggdrasil.databricks.warehouse.warehouse import SQLWarehouse
 
-        eff_wh_id = warehouse_id or self.statement.warehouse_id
-        eff_wh_name = warehouse_name or self.statement.warehouse_name
+        # Prefer the already-resolved executor across retries: the original
+        # submission resolves the dispatcher to a concrete warehouse, but
+        # ``self.statement.warehouse_id`` is never written back, so a naive
+        # ``SQLWarehouse(warehouse_id=None, warehouse_name=None)`` would
+        # submit without a warehouse_id and the SDK would 400 on the retry.
+        prior = self.executor
+        eff_wh_id = (
+            warehouse_id
+            or self.statement.warehouse_id
+            or (prior.warehouse_id if prior is not None else None)
+        )
+        eff_wh_name = (
+            warehouse_name
+            or self.statement.warehouse_name
+            or (prior.warehouse_name if prior is not None else None)
+        )
 
         if warehouse is None:
-            warehouse = SQLWarehouse(
+            warehouse = prior or SQLWarehouse(
                 warehouse_id=eff_wh_id,
                 warehouse_name=eff_wh_name,
             )
