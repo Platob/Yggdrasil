@@ -321,6 +321,23 @@ class TestArrowNbytes(ArrowTestCase):
         t = self.table({"a": [1, 2, 3]})
         self.assertGreater(get_arrow_nbytes(t), 0)
 
+    def test_string_view_returns_flat_default(self) -> None:
+        # ``.nbytes`` on a sliced view array over-counts (the variadic
+        # buffer is shared with the parent). The view branch returns a
+        # flat 1 MiB regardless of slice length.
+        from yggdrasil.arrow.cast import _VIEW_DEFAULT_NBYTES
+
+        sv = self.pa.array(["x" * 200] * 1000, type=self.pa.string_view())
+        self.assertEqual(get_arrow_nbytes(sv), _VIEW_DEFAULT_NBYTES)
+        self.assertEqual(get_arrow_nbytes(sv.slice(0, 1)), _VIEW_DEFAULT_NBYTES)
+
+    def test_chunked_view_recurses_per_chunk(self) -> None:
+        from yggdrasil.arrow.cast import _VIEW_DEFAULT_NBYTES
+
+        sv = self.pa.array(["x"], type=self.pa.string_view())
+        ca = self.pa.chunked_array([sv, sv, sv])
+        self.assertEqual(get_arrow_nbytes(ca), 3 * _VIEW_DEFAULT_NBYTES)
+
 
 class TestAnyToArrowScalar(ArrowTestCase):
     """Scalar entry points — Python value → ``pa.Scalar``."""

@@ -168,58 +168,179 @@ def _is_yggdrasil_tabular(obj: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 
+#: Saturating cap for size estimates. ``2**62`` is well within Python's
+#: arbitrary-precision int range yet larger than any realistic Arrow
+#: payload (a 4 EiB ceiling), so callers can sum many estimates without
+#: ever overflowing into pathological territory.
+_MAX_NBYTES = 1 << 62
+
+#: Flat byte estimate returned for view-typed arrays
+#: (``string_view`` / ``binary_view`` / list-view variants). ``.nbytes``
+#: on these arrays is unreliable (see :func:`get_arrow_nbytes`); rather
+#: than walk per-element to compute the real referenced size, we return
+#: a coarse 1 MiB constant. That's the same threshold the IPC writer
+#: uses to flip ``compression="auto"`` to LZ4, so a view-typed array
+#: lands on the compressed path by default — which is exactly what the
+#: data-density of these types warrants.
+_VIEW_DEFAULT_NBYTES = 1 << 20  # 1 MiB
+
+
+def _saturating_add(a: int, b: int) -> int:
+    """``a + b`` clamped to ``[0, _MAX_NBYTES]``.
+
+    Sum-of-children paths use this so a pathological input (millions
+    of chunks, capped children) cannot drift past
+    :data:`_MAX_NBYTES` and into territory that overflows downstream
+    integer fields (parquet row-group sizing, IPC body length, etc.).
+    """
+    if a < 0:
+        a = 0
+    if b < 0:
+        b = 0
+    s = a + b
+    return _MAX_NBYTES if s > _MAX_NBYTES else s
+
+
+def _is_view_type(arr_type: Any) -> bool:
+    """True if ``arr_type`` is one of the Arrow view types whose
+    ``.nbytes`` either raises or over-counts on slices.
+
+    Routes through ``pa.types.is_*_view`` when available (pyarrow
+    ≥ 17 exposes ``is_string_view`` / ``is_binary_view`` / list-view
+    helpers); falls back to a string match on ``str(arr_type)`` for
+    older builds and for list-view variants the helper module may
+    not enumerate.
+    """
+    types_mod = getattr(pa, "types", None)
+    if types_mod is not None:
+        for probe in (
+            "is_string_view",
+            "is_binary_view",
+            "is_list_view",
+            "is_large_list_view",
+        ):
+            fn = getattr(types_mod, probe, None)
+            if fn is None:
+                continue
+            try:
+                if fn(arr_type):
+                    return True
+            except Exception:
+                continue
+    # Last-resort textual match — covers exotic / future view types
+    # whose ``is_*`` helper isn't exposed yet.
+    try:
+        return "view" in str(arr_type).lower()
+    except Exception:
+        return False
+
+
 def get_arrow_nbytes(obj: Any, default: int = 0) -> int:
     """Best-effort byte size of an Arrow object.
 
-    ``obj.nbytes`` is the fast path but raises ``NotImplementedError``
-    on arrays containing variadic-buffer types (``string_view``,
-    ``binary_view``, list-view variants) in current pyarrow, because
-    there's no single accumulator for the variadic data buffers. We
-    fall back through:
+    ``obj.nbytes`` is the fast path but is unreliable for the Arrow
+    *view* types (``string_view``, ``binary_view``, list-view variants):
 
-    1. Container recursion — ``Table`` / ``RecordBatch`` over columns,
-       ``ChunkedArray`` over chunks.
-    2. Direct buffer walk — sum ``buf.size`` for every non-null buffer
-       returned by ``Array.buffers()``. For view types this naturally
-       picks up validity + views + variadic data buffers.
-    3. ``default`` — last resort, never raises.
+    * In older pyarrow it raises ``NotImplementedError`` outright.
+    * In newer pyarrow it returns the **physical** sum of buffer sizes,
+      which over-counts dramatically for sliced views — variadic data
+      buffers are shared with the parent and the slice's logical
+      payload may be a tiny fraction of what ``nbytes`` reports
+      (a 1-row slice of a 1k-row view array reports the full
+      variadic buffer, not the one referenced string).
 
-    Always returns an ``int``; never propagates exceptions from Arrow
-    internals (the caller is sizing batches for chunking, not doing
-    accounting — a slightly off estimate is fine, a crash is not).
+    Resolution order:
+
+    1. **Container recursion** — ``ChunkedArray`` over ``chunks``,
+       ``Table`` / ``RecordBatch`` over ``columns``. Recurse first so
+       view-typed children get the 1 MiB treatment per-chunk; the
+       container's own ``.nbytes`` would over-count slices.
+    2. **View-typed leaf** (string_view / binary_view, list-view
+       variants) — return a flat :data:`_VIEW_DEFAULT_NBYTES` (1 MiB)
+       per array. We deliberately do **not** scan the data
+       (no ``binary_length`` aggregation, no per-element walk) — the
+       caller uses this for chunking / threshold decisions, not
+       accounting, and a coarse "treat view arrays as ~1 MiB" is
+       enough to keep them on the compressed path.
+    3. ``obj.nbytes`` — used as-is for non-view leaves. Negative or
+       overflow-prone values are clamped to ``[0, _MAX_NBYTES]``.
+    4. **Buffer walk** — sum ``buf.size`` for every non-null buffer
+       returned by ``Array.buffers()``. Last resort for non-view
+       leaves whose ``nbytes`` raised.
+    5. ``default`` — never raises.
+
+    Always returns an ``int`` in ``[0, _MAX_NBYTES]``; never
+    propagates exceptions from Arrow internals (the caller is sizing
+    batches for chunking, not doing accounting — a slightly off
+    estimate is fine, a crash is not).
     """
     if obj is None:
         return default
 
+    # Container types: recurse into children before falling back to
+    # ``.nbytes``. Tables / RecordBatches expose ``.columns``;
+    # ChunkedArray exposes ``.chunks``. Recursing first lets a
+    # view-typed column / chunk hit the 1 MiB short-circuit per chunk
+    # rather than getting subsumed into a wrong (over-counted)
+    # container ``.nbytes``. Sum saturates at ``_MAX_NBYTES``.
+    chunks = getattr(obj, "chunks", None)
+    if chunks is not None:
+        try:
+            total = 0
+            for c in chunks:
+                total = _saturating_add(total, get_arrow_nbytes(c, default=default))
+                if total >= _MAX_NBYTES:
+                    break
+            return total
+        except Exception:
+            pass
+
+    columns = getattr(obj, "columns", None)
+    if columns is not None:
+        try:
+            total = 0
+            for c in columns:
+                total = _saturating_add(total, get_arrow_nbytes(c, default=default))
+                if total >= _MAX_NBYTES:
+                    break
+            return total
+        except Exception:
+            pass
+
+    arr_type = getattr(obj, "type", None)
+    if arr_type is not None and _is_view_type(arr_type):
+        return _VIEW_DEFAULT_NBYTES
+
     try:
-        return int(obj.nbytes)
+        nb = int(obj.nbytes)
+        if nb < 0:
+            nb = default
+        elif nb > _MAX_NBYTES:
+            nb = _MAX_NBYTES
+        return nb
     except (NotImplementedError, AttributeError, TypeError):
         pass
     except Exception:
         pass
 
-    # Container types: recurse into children. Tables / RecordBatches
-    # expose .columns; ChunkedArray exposes .chunks.
-    columns = getattr(obj, "columns", None)
-    if columns is not None:
-        try:
-            return sum(get_arrow_nbytes(c, default=default) for c in columns)
-        except Exception:
-            pass
-
-    chunks = getattr(obj, "chunks", None)
-    if chunks is not None:
-        try:
-            return sum(get_arrow_nbytes(c, default=default) for c in chunks)
-        except Exception:
-            pass
-
-    # Leaf array: walk every buffer. Handles view types (string_view /
-    # binary_view), which is the case .nbytes refuses to size.
+    # Leaf array fallback: walk every buffer. For view types this is a
+    # known over-counter (see the docstring) — the dedicated branch
+    # above runs first; this path is the last resort for non-view
+    # leaves whose ``.nbytes`` failed.
     buffers = getattr(obj, "buffers", None)
     if callable(buffers):
         try:
-            return sum(buf.size for buf in buffers() if buf is not None)
+            total = 0
+            for buf in buffers():
+                if buf is None:
+                    continue
+                sz = int(buf.size)
+                if sz <= 0:
+                    continue
+                total = _saturating_add(total, sz)
+                if total >= _MAX_NBYTES:
+                    break
+            return total
         except Exception:
             pass
 
