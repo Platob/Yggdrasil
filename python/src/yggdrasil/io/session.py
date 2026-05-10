@@ -251,12 +251,16 @@ def _lookup_local_responses(
 
 
 class Session(ABC):
-    # Singleton cache keyed by ``(class, normalized base_url string)``. A
-    # ``Session`` constructed with a ``base_url`` is intentionally shared so
-    # the connection pool, cookie jar, and any other per-host state survive
-    # across the call sites that re-spell the same URL. ``base_url=None``
-    # callers always get a fresh instance — there is no canonical key.
-    _singleton_cache: ClassVar[dict[tuple[type, str], "Session"]] = {}
+    # Singleton cache keyed by ``(class, normalized base_url string, key)``.
+    # A ``Session`` constructed with a ``base_url`` is intentionally shared
+    # so the connection pool, cookie jar, and any other per-host state
+    # survive across the call sites that re-spell the same URL. The ``key``
+    # tag splits same-URL singletons when callers need parallel sessions
+    # against one host (e.g. different credentials / tenants) — default ``""``
+    # keeps the historical "same URL → same instance" behavior.
+    # ``base_url=None`` callers always get a fresh instance — there is no
+    # canonical key.
+    _singleton_cache: ClassVar[dict[tuple[type, str, str], "Session"]] = {}
     _singleton_lock: ClassVar[threading.Lock] = threading.Lock()
 
     # Instance attributes that don't survive pickling — excluded by
@@ -270,18 +274,19 @@ class Session(ABC):
         cls,
         base_url: Optional[URL | str] = None,
         *args: Any,
+        key: str = "",
         **kwargs: Any,
     ) -> "Session":
         if not base_url:
             return super().__new__(cls)
         key_url = base_url if isinstance(base_url, URL) else URL.from_(base_url)
-        key = (cls, key_url.to_string())
+        cache_key = (cls, key_url.to_string(), key)
         with cls._singleton_lock:
-            cached = cls._singleton_cache.get(key)
+            cached = cls._singleton_cache.get(cache_key)
             if cached is not None:
                 return cached
             instance = super().__new__(cls)
-            cls._singleton_cache[key] = instance
+            cls._singleton_cache[cache_key] = instance
             return instance
 
     def __init__(
@@ -291,6 +296,8 @@ class Session(ABC):
         pool_maxsize: int = 10,
         send_headers: Optional[dict[str, str]] = None,
         waiting: WaitingConfig = DEFAULT_WAITING_CONFIG,
+        *,
+        key: str = "",
     ) -> None:
         # Singleton-cached instances are re-entered on every constructor call
         # (Python always invokes ``__init__`` after ``__new__``); skip the
@@ -298,6 +305,7 @@ class Session(ABC):
         if getattr(self, "_initialized", False):
             return
         self.base_url = URL.from_(base_url) if base_url else None
+        self.key = key
         self.verify = verify
         self.pool_maxsize = pool_maxsize if pool_maxsize and pool_maxsize > 0 else 8
         self.send_headers = send_headers
@@ -314,11 +322,13 @@ class Session(ABC):
             self._job_pool.shutdown(wait=True)
             self._job_pool = None
 
-    def __getnewargs__(self):
-        # Route unpickling through ``__new__`` so a session reconstructed with
-        # the same ``base_url`` collapses to the in-process singleton instead
-        # of cloning the connection pool / cookie jar.
-        return (self.base_url,)
+    def __getnewargs_ex__(self):
+        # Route unpickling through ``__new__`` so a session reconstructed
+        # with the same ``(base_url, key)`` collapses to the in-process
+        # singleton instead of cloning the connection pool / cookie jar.
+        # Use the ``_ex__`` variant so ``key`` reaches ``__new__`` as a
+        # keyword (it's keyword-only on the constructor).
+        return ((self.base_url,), {"key": self.key})
 
     def __getstate__(self):
         return {

@@ -147,6 +147,7 @@ class HTTPSession(Session):
         send_headers: Optional[dict[str, str]] = None,
         waiting: WaitingConfig = DEFAULT_WAITING_CONFIG,
         *,
+        key: str = "",
         user_agent: Optional[str] = None,
         accept: str = _BROWSER_ACCEPT,
         accept_language: str = "en-US,en;q=0.9",
@@ -166,6 +167,7 @@ class HTTPSession(Session):
             pool_maxsize=pool_maxsize,
             send_headers=send_headers,
             waiting=waiting,
+            key=key,
         )
         self._http_pool: Optional[urllib3.PoolManager] = self._build_http_pool()
 
