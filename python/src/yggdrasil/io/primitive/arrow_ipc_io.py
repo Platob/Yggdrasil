@@ -31,9 +31,10 @@ from typing import TYPE_CHECKING, ClassVar, Iterable, Iterator
 import pyarrow as pa
 import pyarrow.ipc as ipc
 
+from yggdrasil.arrow.cast import get_arrow_nbytes
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.data.enums import MimeTypes, Mode
+from yggdrasil.data.enums import ByteUnit, MimeTypes, Mode
 from yggdrasil.io.base import IO
 
 if TYPE_CHECKING:
@@ -54,21 +55,34 @@ _MERGE_MODES = frozenset({Mode.APPEND, Mode.UPSERT, Mode.MERGE})
 class ArrowIPCOptions(CastOptions):
     """:class:`CastOptions` extended with IPC-specific knobs.
 
-    Defaults match pyarrow's so an unparameterized ``ArrowIPCOptions()``
-    yields an uncompressed file with the default metadata version.
-    The most common knob to tweak is ``compression`` — ``"lz4"`` is
-    pyarrow's standard "fast and small enough" choice; ``"zstd"`` is
-    the slower-but-tighter alternative.
+    The most common knob to tweak is ``compression``. ``"auto"``
+    (the default) defers the codec choice to write time: pick
+    :data:`ArrowIPCIO.AUTO_COMPRESSION_CODEC` when the input is at
+    least :data:`ArrowIPCIO.AUTO_COMPRESSION_THRESHOLD` bytes, else
+    leave the file uncompressed (small payloads pay codec overhead
+    they won't recoup). Pass an explicit ``"lz4"`` / ``"zstd"`` /
+    ``None`` to bypass the heuristic.
     """
 
     use_threads: bool = True
-    compression: "str | None" = None  # "lz4" | "zstd" | None
+    compression: "str | None" = "auto"  # "auto" | "lz4" | "zstd" | None
     compression_level: "int | None" = None
     write_legacy_ipc_format: bool = False
 
-    def to_writer_options(self) -> "ipc.IpcWriteOptions":
+    def to_writer_options(
+        self, nbytes: "int | None" = None
+    ) -> "ipc.IpcWriteOptions":
+        compression = self.compression
+        if compression == "auto":
+            if (
+                nbytes is not None
+                and nbytes >= ArrowIPCIO.AUTO_COMPRESSION_THRESHOLD
+            ):
+                compression = ArrowIPCIO.AUTO_COMPRESSION_CODEC
+            else:
+                compression = None
         return ipc.IpcWriteOptions(
-            compression=self.compression,
+            compression=compression,
             use_legacy_format=self.write_legacy_ipc_format,
         )
 
@@ -84,6 +98,18 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
     """
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.ARROW_IPC
+
+    #: Threshold above which ``compression="auto"`` enables a codec.
+    #: 1 MiB is small enough to catch real working sets while leaving
+    #: tiny ad-hoc payloads (single-row control messages, schema-only
+    #: files) uncompressed where the codec overhead would dominate.
+    AUTO_COMPRESSION_THRESHOLD: ClassVar[int] = ByteUnit.MIB
+
+    #: Codec selected by ``compression="auto"`` once the threshold is
+    #: crossed. ``"lz4"`` matches pyarrow's "fast and small enough"
+    #: default; flip to ``"zstd"`` (or set ``compression`` explicitly)
+    #: for tighter compression at write-time CPU cost.
+    AUTO_COMPRESSION_CODEC: ClassVar[str] = "lz4"
 
     @classmethod
     def options_class(cls):
@@ -244,11 +270,18 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
         write_options = options.check_source(first.schema)
         first_casted = write_options.cast_arrow_tabular(first)
 
+        # ``compression="auto"`` resolves against the first batch's
+        # in-memory size — a representative proxy for the typical
+        # single-Table / single-batch payload. Iterators of many
+        # tiny batches will under-trigger and stay uncompressed; pass
+        # an explicit codec to force the choice.
+        nbytes_hint = get_arrow_nbytes(first_casted) if first_casted.num_rows > 0 else 0
+
         with self.arrow_output_stream() as sink:
             with ipc.RecordBatchFileWriter(
                 sink,
                 write_options.merged_schema.to_arrow_schema(),
-                options=options.to_writer_options(),
+                options=options.to_writer_options(nbytes_hint),
             ) as writer:
                 if first_casted.num_rows > 0:
                     writer.write_batch(first_casted)
