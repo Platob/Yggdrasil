@@ -48,6 +48,21 @@ from ._helpers import StubSession, make_request, make_response
 
 class TestRequestShape:
 
+    def test_multi_codec_accept_encoding_passes_through(self) -> None:
+        # RFC 7231 §5.3.4 — a real client (browser, urllib3 default,
+        # bespoke API client) sends Accept-Encoding as a comma-separated
+        # preference list. ``Codec.from_`` only parses single codecs;
+        # ``normalize_headers`` previously called it eagerly and raised
+        # ``ValueError: Cannot resolve Codec from non-codec MIME type
+        # 'gzip, deflate, br, zstd'`` for any such request.
+        from yggdrasil.io.request import PreparedRequest
+        req = PreparedRequest.prepare(
+            "POST",
+            "https://example.com/refresh",
+            headers={"Accept-Encoding": "gzip, deflate, br, zstd"},
+        )
+        assert req.headers.get("Accept-Encoding") == "gzip, deflate, br, zstd"
+
     def test_url_parsed(self) -> None:
         req = make_request("https://example.com/path?a=1")
         assert req.url.host == "example.com"

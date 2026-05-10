@@ -382,24 +382,35 @@ def normalize_headers(
 
             out.update(DEFAULT_HEADERS)
 
+            # Accept-Encoding per RFC 7231 §5.3.4 is a comma-separated
+            # preference list with optional q-values (e.g. "gzip, deflate,
+            # br, zstd" or "gzip;q=1.0, identity;q=0.5"). ``Codec.from_``
+            # parses a single codec only — feeding it a list raises.
+            # ``default=None`` lets us tolerate lists: the rewrite to
+            # ``codec.name`` only fires when the value is a single
+            # recognized codec; otherwise the caller's verbatim value
+            # already in ``out`` from the loop above is left alone.
+            single_accept_encoding_codec = (
+                Codec.from_(accept_encoding_value, default=None)
+                if accept_encoding_value
+                else None
+            )
+
             if accept_value:
-                codec = Codec.from_(accept_encoding_value) if accept_encoding_value else None
-                media_type = MediaType.from_(accept_value, codec=codec) if accept_value else None
+                media_type = MediaType.from_(accept_value, codec=single_accept_encoding_codec)
 
                 out["Accept"] = "*/*" if media_type.mime_type == MimeTypes.OCTET_STREAM else media_type.mime_type.value
 
-                if media_type.codec:
-                    out["Accept-Encoding"] = codec.name
+                if media_type.codec and single_accept_encoding_codec is not None:
+                    out["Accept-Encoding"] = single_accept_encoding_codec.name
 
             elif accept_encoding_value:
                 out["Accept"] = "*/*"
 
-                codec = Codec.from_(accept_encoding_value) if accept_encoding_value else None
-
-                if codec is None:
-                    raise ValueError(f"Invalid Accept-Encoding value: {accept_encoding_value}")
-
-                out["Accept-Encoding"] = codec.name
+                if single_accept_encoding_codec is not None:
+                    out["Accept-Encoding"] = single_accept_encoding_codec.name
+                # Multi-codec preference list / unrecognized value — keep
+                # the caller's exact string (already populated in ``out``).
 
             else:
                 out["Accept"] = "*/*"
