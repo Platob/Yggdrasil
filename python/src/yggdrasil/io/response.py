@@ -17,7 +17,6 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
 from .base import IO
-from .bytes_io import BytesIO
 from yggdrasil.data.enums import Codec, MediaType, MimeTypes
 from .headers import normalize_headers
 from .holder import Holder
@@ -129,7 +128,7 @@ def _is_probably_placeholder_content_type(value: str | None) -> bool:
 
 
 def _sniff_media_from_body(
-    body: BytesIO,
+    body: Holder,
     *,
     content_type: str | None,
     content_encoding: str | None,
@@ -165,7 +164,7 @@ def _media_type_from_headers(
 
 def _ensure_media_headers(
     headers: MutableMapping[str, str],
-    body: BytesIO,
+    body: Holder,
 ) -> MediaType:
     declared_type = _parse_content_type(headers)
     declared_encoding = _parse_content_encoding(headers)
@@ -193,7 +192,7 @@ def _ensure_media_headers(
 
     if body.media_type is None and not media.mime_type.is_any_bytes:
         try:
-            body.with_media_type(media, copy=False)
+            body.media_type = media
         except Exception:
             pass
 
@@ -218,18 +217,43 @@ def _parse_response_buffer(
     obj: Mapping[str, Any],
     *,
     media_type: MediaType | None = None,
-) -> BytesIO:
+) -> Holder:
     body = get_from_dict(obj, keys=("buffer", "body", "content", "data"), prefix=None)
-    if body is MISSING or body is None:
-        return BytesIO(media_type=media_type) if media_type is not None else BytesIO()
-    if isinstance(body, IO):
-        if media_type is not None and body.media_type is None:
-            try:
-                body.with_media_type(media_type, copy=False)
-            except Exception:
-                pass
-        return body
-    return BytesIO.from_(obj=body, media_type=media_type) if media_type is not None else BytesIO.from_(obj=body)
+    return _coerce_buffer(
+        None if body is MISSING else body,
+        media_type=media_type,
+    )
+
+
+def _coerce_buffer(
+    obj: Any,
+    *,
+    media_type: MediaType | None = None,
+) -> Holder:
+    """Normalize *obj* into a :class:`Holder` and stamp *media_type* if absent.
+
+    Accepts the shapes :class:`Response` / :class:`PreparedRequest`
+    constructors hand in: an existing :class:`Holder` (passed through),
+    an :class:`IO` cursor (the holder is borrowed), bytes-like input
+    (wrapped in a fresh :class:`Memory`), or ``None`` (empty Memory).
+    """
+    from .memory import Memory
+
+    if obj is None:
+        holder: Holder = Memory()
+    elif isinstance(obj, Holder):
+        holder = obj
+    elif isinstance(obj, IO):
+        holder = obj._holder
+    else:
+        holder = Holder.from_(obj)
+
+    if media_type is not None and holder.media_type is None:
+        try:
+            holder.media_type = media_type
+        except Exception:
+            pass
+    return holder
 
 
 def _parse_status_code(obj: Mapping[str, Any]) -> int:
@@ -484,7 +508,7 @@ def _compute_response_identity_hash(
     request_hash: int,
     status_code: int,
     headers: Mapping[str, str] | None,
-    body: BytesIO | None,
+    body: Holder | None,
 ) -> int:
     import xxhash
     h = xxhash.xxh3_64()
@@ -543,7 +567,7 @@ class Response(Tabular[CastOptions]):
         status_code: int,
         headers: MutableMapping[str, str],
         tags: MutableMapping[str, str],
-        buffer: BytesIO,
+        buffer: Holder,
         received_at: dt.datetime,
         receiver: Optional[UserInfo] = None,
     ) -> None:
@@ -553,7 +577,7 @@ class Response(Tabular[CastOptions]):
         self.headers = _string_dict(headers)
         self.tags = _string_dict(tags)
         self.received_at = any_to_datetime(received_at)
-        self.buffer = buffer if isinstance(buffer, IO) else BytesIO(buffer, copy=False)
+        self.buffer = _coerce_buffer(buffer)
         self._receiver: UserInfo | None = (
             _coerce_userinfo(receiver) if receiver is not None else _default_sender()
         )
@@ -564,27 +588,26 @@ class Response(Tabular[CastOptions]):
         self._session: "Session | None" = None
 
     # ------------------------------------------------------------------
-    # Holder access — the response's body lives on a :class:`Holder`;
-    # :attr:`buffer` is the long-lived cursor over it. :meth:`open`
-    # mints a fresh cursor for callers that want their own cursor
-    # lifetime instead of sharing the response's.
+    # Holder access — :attr:`buffer` IS the durable :class:`Holder`.
+    # :meth:`open` mints a fresh :class:`IO` cursor over it for
+    # callers that want their own cursor lifetime; the response
+    # itself keeps no cursor in slot.
     # ------------------------------------------------------------------
 
     @property
     def holder(self) -> Holder:
-        """The :class:`Holder` backing the response body."""
-        return self.buffer._holder
+        """The :class:`Holder` backing the response body — alias for :attr:`buffer`."""
+        return self.buffer
 
-    def open(self, mode: str = "rb+") -> BytesIO:
-        """Open a fresh :class:`BytesIO` cursor over the response's holder.
+    def open(self, mode: str = "rb+") -> IO:
+        """Open a fresh :class:`IO` cursor over the response's holder.
 
-        The returned cursor is non-owning: closing it does not close
-        the holder (the response keeps its own cursor in
-        :attr:`buffer`). Use this when you need an independent
-        cursor — for parallel reads, for a dedicated tabular leaf
-        via the holder's media type, etc.
+        Dispatches to the format-specific leaf via the holder's
+        media type (Parquet → :class:`ParquetIO`, CSV →
+        :class:`CsvIO`, …). The returned cursor is non-owning:
+        closing it does not close the underlying holder.
         """
-        return BytesIO(holder=self.holder, owns_holder=False, mode=mode)
+        return self.buffer.open(mode=mode, owns_holder=False)
 
     # ------------------------------------------------------------------
     # Tabular contract — yield the deterministic single-row metadata
@@ -602,7 +625,7 @@ class Response(Tabular[CastOptions]):
         if Tabular.class_for_media_type(
             self.media_type.mime_type, default=None,
         ) is not None:
-            with self.as_media() as b:
+            with self.open(mode="rb") as b:
                 for batch in b.read_arrow_batches():
                     yield options.cast_arrow_tabular(batch)
             return
@@ -824,7 +847,7 @@ class Response(Tabular[CastOptions]):
             self.headers = {}
 
         self.request.accept_media_type = value
-        self.buffer.with_media_type(value, copy=False)
+        self.buffer.media_type = value
         self.headers["Content-Type"] = value.mime_type.value
 
         if value.codec is not None:
@@ -853,11 +876,8 @@ class Response(Tabular[CastOptions]):
     # ------------------------------------------------------------------
 
     @property
-    def body(self) -> BytesIO:
+    def body(self) -> Holder:
         return self.buffer
-
-    def as_media(self, media_type: MediaType | None = None) -> BytesIO:
-        return self.buffer.as_media(media_type=media_type or self.media_type)
 
     @property
     def codec(self) -> Optional[Codec]:
@@ -866,10 +886,11 @@ class Response(Tabular[CastOptions]):
     @property
     def content(self) -> bytes:
         codec = self.codec
-        if codec is not None:
-            with self.buffer.decompress(codec=codec, copy=True) as b:
+        if codec is None:
+            return self.buffer.to_bytes()
+        with self.open(mode="rb") as bio:
+            with bio.decompress(codec=codec, copy=True) as b:
                 return b.to_bytes()
-        return self.buffer.to_bytes()
 
     @property
     def text(self) -> str:
@@ -881,10 +902,11 @@ class Response(Tabular[CastOptions]):
         *,
         media_type: Optional[MediaType] = None,
     ) -> Any:
-        return self.buffer.json_load(
-            media_type=media_type or self.media_type,
-            orient=orient
-        )
+        with self.open(mode="rb") as bio:
+            return bio.json_load(
+                media_type=media_type or self.media_type,
+                orient=orient,
+            )
 
     # ------------------------------------------------------------------
     # Status helpers
@@ -1110,7 +1132,7 @@ class Response(Tabular[CastOptions]):
         **options: Any
     ) -> Iterator[pa.RecordBatch]:
         if parse:
-            with self.as_media() as b:
+            with self.open(mode="rb") as b:
                 yield from b.read_arrow_batches(**options)
             return
 
@@ -1162,7 +1184,8 @@ class Response(Tabular[CastOptions]):
         **media_options: Any,
     ):
         if parse:
-            yield from self.as_media().read_polars_frames(lazy=lazy, **media_options)
+            with self.open(mode="rb") as b:
+                yield from b.read_polars_frames(lazy=lazy, **media_options)
         else:
             yield pl.from_arrow(self.to_arrow_batch(parse=False))
 
@@ -1176,8 +1199,8 @@ class Response(Tabular[CastOptions]):
         from yggdrasil.lazy_imports import polars as _pl
 
         if parse:
-            mio = self.buffer.as_media(media_type=self.media_type)
-            return mio.read_polars_frame(lazy=lazy, **media_options)
+            with self.open(mode="rb") as mio:
+                return mio.read_polars_frame(lazy=lazy, **media_options)
 
         return _pl.from_arrow(self.to_arrow_batch(parse=False))
 
@@ -1322,12 +1345,7 @@ class Response(Tabular[CastOptions]):
 
         body_bytes = get("body")
         pre_media = _media_type_from_headers(headers)
-        if body_bytes is None:
-            buffer = BytesIO(media_type=pre_media) if pre_media is not None else BytesIO()
-        elif pre_media is not None:
-            buffer = BytesIO(body_bytes, copy=False, media_type=pre_media)
-        else:
-            buffer = BytesIO(body_bytes, copy=False)
+        buffer = _coerce_buffer(body_bytes, media_type=pre_media)
 
         if normalize:
             headers = normalize_headers(headers, body=buffer, is_request=False)

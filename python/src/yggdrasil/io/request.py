@@ -19,6 +19,8 @@ from .base import IO
 from .bytes_io import BytesIO
 from yggdrasil.data.enums import GZIP, Codec, MimeType
 from .headers import normalize_headers
+from .holder import Holder
+from .memory import Memory
 from .url import URL, URL_STRUCT
 
 if TYPE_CHECKING:
@@ -274,6 +276,23 @@ def _default_sender() -> UserInfo | None:
         return None
 
 
+def _coerce_request_buffer(obj: Any) -> Optional[Holder]:
+    """Normalize a request buffer-shaped input into a :class:`Holder`.
+
+    Returns ``None`` when *obj* is ``None`` (no body). Accepts an
+    existing :class:`Holder` (passed through), an :class:`IO` cursor
+    (the holder is borrowed), or anything :meth:`Holder.from_`
+    understands (bytes, file-like, path-shaped).
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, Holder):
+        return obj
+    if isinstance(obj, IO):
+        return obj._holder
+    return Holder.from_(obj)
+
+
 def _coerce_userinfo(value: Any) -> UserInfo | None:
     """Best-effort cast of ``value`` to :class:`UserInfo`."""
     if value is None:
@@ -306,7 +325,7 @@ class PreparedRequest:
         url: URL,
         headers: MutableMapping[str, str],
         tags: MutableMapping[str, str],
-        buffer: Optional[BytesIO],
+        buffer: Optional[Holder],
         sent_at: Optional[dt.datetime],
         local_cache_config: Optional["CacheConfig"] = None,
         remote_cache_config: Optional["CacheConfig"] = None,
@@ -320,11 +339,7 @@ class PreparedRequest:
             any_to_datetime(sent_at) if sent_at
             else dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)
         )
-        self.buffer = (
-            BytesIO.from_(buffer)
-            if buffer is not None and not isinstance(buffer, IO)
-            else buffer
-        )
+        self.buffer: Optional[Holder] = _coerce_request_buffer(buffer)
         self.local_cache_config = local_cache_config
         self.remote_cache_config = remote_cache_config
         self._sender: UserInfo | None = (
@@ -546,11 +561,11 @@ class PreparedRequest:
         return _string_dict(tags if isinstance(tags, Mapping) else None)
 
     @staticmethod
-    def _parse_buffer(obj: Mapping[str, Any]) -> Optional[BytesIO]:
+    def _parse_buffer(obj: Mapping[str, Any]) -> Optional[Holder]:
         buffer = get_from_dict(obj, keys=("buffer", "body", "content", "data"), prefix=None)
         if buffer is MISSING or buffer is None:
             return None
-        return BytesIO.from_(buffer)
+        return _coerce_request_buffer(buffer)
 
     @staticmethod
     def _parse_sent_at_timestamp(obj: Mapping[str, Any]) -> dt.datetime:
@@ -579,17 +594,22 @@ class PreparedRequest:
         parsed_url = URL.from_(url, normalize=normalize)
         out_headers: dict[str, str] = _string_dict(headers)
 
-        request_body: Optional[BytesIO] = None
+        request_body: Optional[Holder] = None
         if body is not None:
-            request_body = BytesIO(body, copy=False)
+            request_body = Holder.from_(body)
         elif json is not None:
-            request_body = BytesIO(json_module.dumps(json).encode("utf-8"), copy=False)
+            request_body = Memory(binary=json_module.dumps(json).encode("utf-8"))
             out_headers["Content-Type"] = MimeTypes.JSON.value
 
-            if compress_threshold and request_body.size > compress_threshold:
-                request_body = request_body.compress(codec=compress_codec)
-                if compress_codec is not None:
-                    out_headers["Content-Encoding"] = compress_codec.name
+            if (
+                compress_threshold
+                and compress_codec is not None
+                and request_body.size > compress_threshold
+            ):
+                with BytesIO(holder=request_body, owns_holder=False) as src:
+                    compressed = compress_codec.compress(src)
+                request_body = compressed._holder
+                out_headers["Content-Encoding"] = compress_codec.name
 
         if request_body is not None:
             out_headers["Content-Length"] = str(request_body.size)
@@ -619,7 +639,7 @@ class PreparedRequest:
         method: str | None = None,
         url: URL | str | None = None,
         headers: Optional[Mapping[str, str]] = None,
-        buffer: Optional[BytesIO] = ...,
+        buffer: Optional[Holder] = ...,
         tags: Optional[Mapping[str, str]] = None,
         sent_at: int | None = None,
         local_cache_config: Optional["CacheConfig"] = ...,
@@ -634,7 +654,7 @@ class PreparedRequest:
         if buffer is ...:
             new_buffer = self.buffer
             if copy_buffer and new_buffer is not None:
-                new_buffer = BytesIO.from_(new_buffer.to_bytes())
+                new_buffer = Memory(binary=new_buffer.to_bytes())
         else:
             new_buffer = buffer
 
@@ -669,26 +689,24 @@ class PreparedRequest:
         return self
 
     @property
-    def body(self) -> Optional[BytesIO]:
+    def body(self) -> Optional[Holder]:
         return self.buffer
 
     @property
-    def holder(self):
-        """The :class:`Holder` backing the request body, or ``None``."""
-        if self.buffer is None:
-            return None
-        return self.buffer._holder
+    def holder(self) -> Optional[Holder]:
+        """The :class:`Holder` backing the request body — alias for :attr:`buffer`."""
+        return self.buffer
 
-    def open(self, mode: str = "rb+") -> Optional[BytesIO]:
-        """Open a fresh :class:`BytesIO` cursor over the request's holder.
+    def open(self, mode: str = "rb+") -> Optional[IO]:
+        """Open a fresh :class:`IO` cursor over the request's holder.
 
-        Returns ``None`` when the request has no body. The returned
-        cursor is non-owning: closing it does not close the holder
-        (the request keeps its own cursor in :attr:`buffer`).
+        Returns ``None`` when the request has no body. Dispatches to
+        the format-specific leaf via the holder's media type. The
+        returned cursor is non-owning.
         """
         if self.buffer is None:
             return None
-        return BytesIO(holder=self.buffer._holder, owns_holder=False, mode=mode)
+        return self.buffer.open(mode=mode, owns_holder=False)
 
     @property
     def content_length(self) -> int:
@@ -949,7 +967,7 @@ class PreparedRequest:
                 for k, val in sorted(v.items()):
                     buff.write(str(k).encode("utf-8"))
                     buff.write(str(val).encode("utf-8"))
-            elif isinstance(v, IO):
+            elif isinstance(v, (IO, Holder)):
                 buff.write(v.xxh3_64().digest())
             elif v is None:
                 buff.write(b"0")

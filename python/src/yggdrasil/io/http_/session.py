@@ -12,6 +12,8 @@ from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.dataclasses.waiting import DEFAULT_WAITING_CONFIG
 from yggdrasil.data.enums import MediaTypes
 from yggdrasil.io import BytesIO
+from yggdrasil.io.holder import Holder
+from yggdrasil.io.memory import Memory
 from yggdrasil.io.primitive import ArrowIPCIO
 from yggdrasil.io.url import URL
 
@@ -264,14 +266,7 @@ class HTTPSession(Session):
 
     @staticmethod
     def _apply_params(url: URL, params: Mapping[str, Any]) -> URL:
-        for key, value in params.items():
-            key_s = str(key)
-            if isinstance(value, (list, tuple)):
-                for v in value:
-                    url = url.add_query_item(key_s, str(v), replace=False)
-            else:
-                url = url.add_query_item(key_s, str(value), replace=False)
-        return url
+        return url.add_params(params)
 
     # ------------------------------------------------------------------
     # HTTP verbs
@@ -352,7 +347,7 @@ class HTTPSession(Session):
         raw_resp = self.http_pool.request(
             method=request.method,
             url=request.url.to_string(),
-            body=request.buffer,
+            body=request.buffer.to_bytes() if request.buffer is not None else None,
             headers=request.headers,
             timeout=wait_cfg.timeout_urllib3,
             preload_content=False,
@@ -397,17 +392,17 @@ class HTTPSession(Session):
         stream: bool,
         raise_error: bool,
     ) -> tuple[int, HTTPResponse]:
-        page_url = request.url.add_query_item("page", str(page_num), replace=True)
+        page_url = request.url.add_param("page", str(page_num), replace=True)
 
         page_request = request.copy(
             url=page_url,
-            buffer=BytesIO(body_seed) if body_seed is not None else None,
+            buffer=Memory(binary=body_seed) if body_seed is not None else None,
         )
 
         raw_resp = self.http_pool.request(
             method=page_request.method,
             url=page_url.to_string(),
-            body=page_request.buffer,
+            body=page_request.buffer.to_bytes() if page_request.buffer is not None else None,
             headers=page_request.headers,
             timeout=wait_cfg.timeout_urllib3,
             preload_content=not stream,
@@ -488,15 +483,16 @@ class HTTPSession(Session):
 
         final_df = pl.concat(frames, how="diagonal_relaxed", rechunk=True)
 
-        new_buffer = ArrowIPCIO(media_type=MediaTypes.ARROW_IPC)
-        new_buffer.write_arrow_table(
-            final_df.to_arrow(compat_level=pl.CompatLevel.newest()),
-            compression="zstd",
-        )
-        new_buffer.seek(0)
+        new_holder = Memory()
+        new_holder.media_type = MediaTypes.ARROW_IPC
+        with ArrowIPCIO(holder=new_holder, owns_holder=False, mode="wb") as new_buffer:
+            new_buffer.write_arrow_table(
+                final_df.to_arrow(compat_level=pl.CompatLevel.newest()),
+                compression="zstd",
+            )
 
         result.buffer.close()
-        result.buffer = new_buffer
+        result.buffer = new_holder
         result.set_media_type(MediaTypes.ARROW_IPC)
 
         result.update_tags({

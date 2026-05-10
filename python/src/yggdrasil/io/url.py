@@ -1460,7 +1460,7 @@ class URL(os.PathLike):
             out.setdefault(key, []).append(value)
         return out
 
-    def add_query_item(
+    def add_param(
         self,
         key: str,
         value: str | None | Sequence[str | None],
@@ -1503,6 +1503,32 @@ class URL(os.PathLike):
         items.extend((key_text, v) for v in new_values)
         items.sort(key=lambda item: (item[0], item[1]))
         return self.with_query(urlencode(items, doseq=True))
+
+    def add_params(
+        self,
+        params: Mapping[str, Any] | Iterable[tuple[str, Any]],
+        *,
+        replace: bool = False,
+    ) -> URL:
+        """Add or replace multiple ``(key, value)`` pairs in one shot.
+
+        Values follow the same rules as :meth:`add_param`: a scalar
+        becomes a single pair, a ``list`` / ``tuple`` of scalars
+        expands one pair per element. ``replace=True`` clears every
+        listed key before appending; the default ``False`` appends.
+
+        Equivalent to looping with :meth:`add_param`, but builds a
+        single :class:`URL` rather than copying once per key.
+        """
+        if isinstance(params, Mapping):
+            iterator: Iterable[tuple[str, Any]] = params.items()
+        else:
+            iterator = params
+
+        url = self
+        for key, value in iterator:
+            url = url.add_param(key, value, replace=replace)
+        return url
 
     def with_query_items(
         self,

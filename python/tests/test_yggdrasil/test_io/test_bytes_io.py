@@ -537,9 +537,9 @@ class TestAsMedia:
         assert df["x"].to_list() == [1, 2]
         assert df["y"].to_list() == ["a", "b"]
 
-    def test_response_as_media_returns_typed_leaf(self) -> None:
-        """Pinned regression — Response.as_media() used to fail for
-        the same reason as to_polars.
+    def test_response_open_dispatches_to_typed_leaf(self) -> None:
+        """``Response.open()`` routes through :meth:`Holder.open`, which
+        dispatches to the format leaf via the holder's media type.
         """
         import datetime as dt
 
@@ -556,8 +556,8 @@ class TestAsMedia:
             buffer=b'{"x": 1}',  # type: ignore[arg-type]
             received_at=dt.datetime.fromtimestamp(0, tz=dt.timezone.utc),
         )
-        mio = r.as_media()
-        assert isinstance(mio, JsonIO)
+        with r.open(mode="rb") as mio:
+            assert isinstance(mio, JsonIO)
 
 
 class TestArrowStreams:

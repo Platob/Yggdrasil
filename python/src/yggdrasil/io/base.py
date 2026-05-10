@@ -473,6 +473,47 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
                 f"str/PurePath/URL. Got {obj!r}."
             ) from exc
 
+    @classmethod
+    def from_holder(
+        cls,
+        holder: "Holder",
+        *,
+        owns_holder: bool = False,
+        mode: ModeLike = "rb+",
+        media_type: Any = None,
+        auto_open: bool = True,
+        **kwargs: Any,
+    ) -> "IO":
+        """Construct an IO over *holder*, dispatching to the format leaf.
+
+        Resolves the format-specific :class:`IO` leaf via *media_type*
+        (when given) or the holder's stamped ``stat().media_type``, and
+        returns an instance of that leaf bound to *holder*. When no
+        leaf can be resolved, falls back to ``cls`` itself — so
+        ``IO.from_holder(h)`` returns a plain :class:`IO`,
+        ``BytesIO.from_holder(h)`` a :class:`BytesIO`.
+
+        With *auto_open=True* (the default) the returned cursor is
+        already acquired, so the caller can immediately read/write
+        without entering a ``with`` block. Set *auto_open=False* to
+        defer the acquire to the caller's ``with`` / :meth:`acquire`.
+
+        *owns_holder=True* hands close-ownership of *holder* to the
+        returned cursor — closing the cursor closes the holder. The
+        default ``False`` keeps the holder's lifetime in the caller's
+        hands; the returned cursor is a non-owning borrow.
+        """
+        instance = cls(
+            holder=holder,
+            owns_holder=owns_holder,
+            mode=mode,
+            media_type=media_type,
+            **kwargs,
+        )
+        if auto_open and not instance._acquired:
+            Disposable.open(instance)
+        return instance
+
     # ==================================================================
     # Identity / state
     # ==================================================================

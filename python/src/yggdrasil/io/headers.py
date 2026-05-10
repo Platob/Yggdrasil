@@ -10,7 +10,7 @@ from typing import ClassVar, Literal, Mapping, MutableMapping, Optional, Union
 from yggdrasil.data.enums import MimeTypes
 from yggdrasil.version import __version_info__, __version__
 
-from .bytes_io import BytesIO
+from .holder import Holder
 from yggdrasil.data.enums import Codec, MediaType
 
 __all__ = [
@@ -295,7 +295,7 @@ def normalize_headers(
     add_missing: bool = True,
     mode: Literal["remove", "redact"] = "remove",
     anonymize: bool = False,
-    body: Optional[BytesIO] = None,
+    body: Optional[Holder] = None,
 ) -> MutableMapping[str, str]:
     """
     Normalize header names and optionally sanitize sensitive values.

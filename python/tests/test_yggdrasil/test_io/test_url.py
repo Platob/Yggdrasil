@@ -239,14 +239,14 @@ class TestQueryHelpers:
         u = URL.from_str("https://e.com/?a=1&b=2")
         assert u.query_items() == (("a", "1"), ("b", "2"))
 
-    def test_add_query_item_replaces_by_default(self):
+    def test_add_param_replaces_by_default(self):
         u = URL.from_str("https://e.com/?a=1")
-        new = u.add_query_item("a", "2")
+        new = u.add_param("a", "2")
         assert new.query == "a=2"
 
-    def test_add_query_item_can_keep_existing(self):
+    def test_add_param_can_keep_existing(self):
         u = URL.from_str("https://e.com/?a=1")
-        new = u.add_query_item("a", "2", replace=False)
+        new = u.add_param("a", "2", replace=False)
         # parse_qsl + sort puts both pairs in order
         items = sorted(new.query_items())
         assert items == [("a", "1"), ("a", "2")]
