@@ -91,7 +91,7 @@ class _TieredRetry(urllib3.Retry):
 class HTTPSession(Session):
     """HTTP/HTTPS session backed by a ``urllib3`` connection pool.
 
-    Per-request headers are driven entirely by :attr:`send_headers` (the
+    Per-request headers are driven entirely by :attr:`headers` (the
     session-wide default mapping) plus the optional ``headers=`` kwarg on
     :meth:`get` / :meth:`head` / :meth:`post`. No User-Agent generator,
     cookie jar, or browser-emulation layering is built in.
@@ -102,7 +102,7 @@ class HTTPSession(Session):
         base_url: Optional[URL | str] = None,
         verify: bool = True,
         pool_maxsize: int = 10,
-        send_headers: Optional[dict[str, str]] = None,
+        headers: Optional[dict[str, str]] = None,
         waiting: WaitingConfig = DEFAULT_WAITING_CONFIG,
         *,
         key: str = "",
@@ -117,7 +117,7 @@ class HTTPSession(Session):
             base_url=base_url,
             verify=verify,
             pool_maxsize=pool_maxsize,
-            send_headers=send_headers,
+            headers=headers,
             waiting=waiting,
             key=key,
         )
@@ -188,19 +188,19 @@ class HTTPSession(Session):
         """Return the headers dict to merge into *request* before sending.
 
         Subclasses may override this to inject per-request headers without
-        replacing the entire :attr:`send_headers` mapping.  The default
-        implementation returns :attr:`send_headers` unchanged.
+        replacing the entire :attr:`headers` mapping.  The default
+        implementation returns :attr:`headers` unchanged.
         """
-        return self.send_headers
+        return self.headers
 
     def _merge_headers(
         self,
         extra: Optional[Mapping[str, str]] = None,
     ) -> dict[str, str]:
-        """Merge :attr:`send_headers` with the per-request *extra* mapping."""
+        """Merge :attr:`headers` with the per-request *extra* mapping."""
         headers: dict[str, str] = {}
-        if self.send_headers:
-            headers.update(self.send_headers)
+        if self.headers:
+            headers.update(self.headers)
         if extra:
             headers.update(extra)
         return headers
@@ -288,7 +288,7 @@ class HTTPSession(Session):
     ) -> HTTPResponse:
         """Issue a ``GET`` to *url*.
 
-        Headers are :attr:`send_headers` merged with the per-call *headers*
+        Headers are :attr:`headers` merged with the per-call *headers*
         mapping (the latter wins on conflicts).
         """
         resolved = self._resolve_url(url)

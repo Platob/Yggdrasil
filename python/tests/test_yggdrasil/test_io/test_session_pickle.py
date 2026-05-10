@@ -164,7 +164,7 @@ class TestHTTPSessionPickle:
         )
 
     def test_http_pool_rebuilt_on_fresh_instance(self) -> None:
-        s = HTTPSession(send_headers={"X-Tag": "ua"})  # no base_url -> fresh instance path
+        s = HTTPSession(headers={"X-Tag": "ua"})  # no base_url -> fresh instance path
         clone = pickle.loads(pickle.dumps(s))
         assert clone is not s
         assert clone._http_pool is not None
@@ -177,12 +177,12 @@ class TestHTTPSessionPickle:
         state = s.__getstate__()
         assert "_http_pool" not in state
 
-    def test_send_headers_survive_pickle(self) -> None:
-        s = HTTPSession(send_headers={"X-Tag": "v1", "Authorization": "Bearer x"})
+    def test_headers_survive_pickle(self) -> None:
+        s = HTTPSession(headers={"X-Tag": "v1", "Authorization": "Bearer x"})
         clone = pickle.loads(pickle.dumps(s))
         # Different identity (no base_url -> not a singleton)
         assert clone is not s
-        assert clone.send_headers == {"X-Tag": "v1", "Authorization": "Bearer x"}
+        assert clone.headers == {"X-Tag": "v1", "Authorization": "Bearer x"}
 
     def test_singleton_preserves_live_pool(self) -> None:
         s1 = HTTPSession(base_url="https://example.com")
