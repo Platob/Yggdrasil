@@ -4,10 +4,21 @@ from __future__ import annotations
 
 import itertools
 import logging
+import os
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Mapping, Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ClassVar,
+    Iterator,
+    Mapping,
+    Optional,
+    Sequence,
+)
 
 import pyarrow as pa
 
@@ -833,7 +844,14 @@ class Session(ABC):
         request: PreparedRequest,
         session_cfg: CacheConfig,
     ) -> CacheConfig:
-        return request.local_cache_config or session_cfg
+        # Prebuild the per-request override the same way
+        # :meth:`_send_many_batches` prebuilds the session-level
+        # config — so the downstream code can reach ``eff.tabular``
+        # uniformly without a ``local_cache(session=...)`` dance.
+        # ``prebuild`` is idempotent and skips remote-only / disabled
+        # configs.
+        cfg = request.local_cache_config or session_cfg
+        return cfg.prebuild(session=self)
 
     def _effective_remote_cfg(
         self,
@@ -894,14 +912,16 @@ class Session(ABC):
         # cache root takes one folder read instead of one per
         # request — that's the whole point of the partitioned
         # layout. UPSERT-mode and disabled requests fall straight
-        # to misses without touching the cache.
+        # to misses without touching the cache. ``eff.tabular`` is
+        # prebuilt by :meth:`_effective_local_cfg`, so the group key
+        # mirrors the remote side (``tabular.full_name(safe=True)``).
         cfg_groups: dict[str, tuple[CacheConfig, list[PreparedRequest]]] = {}
         for req in batch:
             eff = self._effective_local_cfg(req, session_local_cfg)
             if not eff.local_cache_enabled or eff.mode == Mode.UPSERT:
                 misses.append(req)
                 continue
-            pkey = str(eff.local_cache_folder(session=self))
+            pkey = str(eff.tabular.path)
             slot = cfg_groups.get(pkey)
             if slot is None:
                 cfg_groups[pkey] = (eff, [req])
@@ -909,7 +929,7 @@ class Session(ABC):
                 slot[1].append(req)
 
         for pkey, (eff, group_reqs) in cfg_groups.items():
-            cache = eff.local_cache(session=self)
+            cache = eff.tabular
             match_by = tuple(eff.request_by or ()) or ("public_url_hash",)
             looked_up = _lookup_local_responses(
                 cache, group_reqs,
@@ -1209,12 +1229,14 @@ class Session(ABC):
         Returns the raw `Response` stream — caller decides what to do with
         ok/error responses (yield them, persist them, raise).
         """
-        # Local cache writes happen here; remote writes are mutualised in
-        # `_persist_remote` so we strip per-request remote configs from the
-        # copies handed to the workers.
+        # Both local and remote writes are mutualised — workers only run
+        # the network call. Local writes are bulk-upserted by
+        # `_backfill_local_cache` and remote writes by `_persist_remote`,
+        # so per-request cache configs are stripped from the copies handed
+        # to the workers to avoid the per-response fan-out.
         miss_send_config = config.to_send_config(
             with_remote_cache=False,
-            with_local_cache=True,
+            with_local_cache=False,
             with_spark=False,
             raise_error=False,
         )
@@ -1224,7 +1246,7 @@ class Session(ABC):
             (
                 Job.make(
                     self._send,
-                    r.copy(remote_cache_config=None),
+                    r.copy(remote_cache_config=None, local_cache_config=None),
                     miss_send_config,
                 )
                 for r in misses
@@ -1236,6 +1258,79 @@ class Session(ABC):
             raise_error=True,
         ):
             yield result.result
+
+    @staticmethod
+    def _enable_fair_spark_scheduler(spark: "SparkSession") -> None:
+        """Best-effort switch the Spark session into FAIR scheduling.
+
+        Stage 4 in Spark mode submits one Spark job per remote-cache
+        insert; concurrent inserts (e.g. when several requests carry
+        per-table remote configs, or when the local-cache writeback
+        runs alongside the remote insert) all want share-the-cluster
+        semantics rather than the default FIFO queue, where a slow
+        insert blocks every other job behind it.
+
+        ``spark.scheduler.mode`` is normally a SparkContext-level
+        setting; some Spark builds will accept the runtime
+        ``conf.set`` and apply it to subsequent jobs, others reject
+        it. Either way this is non-fatal — we don't want a managed
+        cluster's scheduler policy to break the request flow.
+        """
+        if spark is None:
+            return
+        try:
+            spark.conf.set("spark.scheduler.mode", "FAIR")
+        except Exception as exc:
+            LOGGER.debug(
+                "Could not switch Spark scheduler to FAIR: %s", exc,
+            )
+
+    @staticmethod
+    def _run_concurrently(
+        tasks: "Sequence[Callable[[], Any]]",
+        *,
+        max_workers: "int | None" = None,
+        thread_name_prefix: str = "ygg-session",
+    ) -> None:
+        """Run *tasks* in parallel, re-raising the first failure.
+
+        Used by the cache-write path (``_backfill_local_cache``,
+        ``_persist_remote``, stage 4) to fan out independent inserts
+        across threads so a batch that targets several remote tables
+        or local cache roots doesn't pay for a head-to-tail
+        serialization. ``ThreadPoolExecutor`` is used unconditionally
+        because the work is I/O-bound (SQL statements, disk writes,
+        Spark job submissions) — GIL contention is not the
+        bottleneck.
+
+        - 0 tasks → no-op.
+        - 1 task  → run inline (skip pool / thread-spawn overhead).
+        - N tasks → spawn ``min(N, max_workers or os.cpu_count())``
+          workers, wait for all, then propagate the first captured
+          exception so the caller sees the same failure shape it
+          would have under the old sequential loop.
+        """
+        if not tasks:
+            return
+        if len(tasks) == 1:
+            tasks[0]()
+            return
+
+        workers = min(len(tasks), max_workers or (os.cpu_count() or 4))
+        first_exc: "BaseException | None" = None
+        with ThreadPoolExecutor(
+            max_workers=max(workers, 1),
+            thread_name_prefix=thread_name_prefix,
+        ) as pool:
+            futures = [pool.submit(task) for task in tasks]
+            for fut in futures:
+                try:
+                    fut.result()
+                except BaseException as exc:
+                    if first_exc is None:
+                        first_exc = exc
+        if first_exc is not None:
+            raise first_exc
 
     def _backfill_local_cache(
         self,
@@ -1255,6 +1350,10 @@ class Session(ABC):
         response — collapsing N small writes into one
         partition-routed write per root, with FolderIO's auto-prune
         path handling the merge when the config is in UPSERT mode.
+        Distinct cache roots write concurrently — the per-root
+        :class:`FolderIO` instances don't share file handles, so a
+        batch fanning out to several local caches doesn't have to
+        serialize the disk writes head-to-tail.
         """
         groups: dict[str, tuple["FolderIO", "CacheConfig", list[Response]]] = {}
         for response in responses:
@@ -1264,19 +1363,27 @@ class Session(ABC):
                 eff = session_local_cfg
             if not eff.local_cache_enabled:
                 continue
-            # Store the response unchanged; matching uses the
-            # ``public_*`` hash columns at lookup time.
-            pkey = str(eff.local_cache_folder(session=self))
+            # ``eff.tabular`` is prebuilt by
+            # :meth:`_effective_local_cfg` / :meth:`_send_many_batches`,
+            # so the group key and the cache handle come from the
+            # same source — symmetric to the remote-side
+            # ``tabular.full_name(safe=True)`` grouping in
+            # :meth:`_persist_remote`.
+            pkey = str(eff.tabular.path)
             slot = groups.get(pkey)
             if slot is None:
-                groups[pkey] = (eff.local_cache(session=self), eff, [response])
+                groups[pkey] = (eff.tabular, eff, [response])
             else:
                 slot[2].append(response)
 
-        for cache, eff, group_responses in groups.values():
+        def _write_one(
+            cache: "FolderIO",
+            eff: "CacheConfig",
+            group_responses: "list[Response]",
+        ) -> None:
             ok_responses = [r for r in group_responses if r.ok]
             if not ok_responses:
-                continue
+                return
             table = pa.Table.from_batches([
                 r.to_arrow_batch(parse=False) for r in ok_responses
             ])
@@ -1288,6 +1395,20 @@ class Session(ABC):
             with cache:
                 cache.write_arrow_table(table, options=options)
             self._optimize_cache_partitions(cache, eff, ok_responses)
+            # Stale-part sweep is the writer's responsibility — the
+            # backend (:class:`YGGFolderIO`) self-throttles via
+            # :attr:`cleanup_due` and dispatches sync vs. async based
+            # on ``eff.wait``. Backends without a cleanup concept
+            # short-circuit on the base no-op.
+            cache.cleanup(wait=eff.wait)
+
+        self._run_concurrently(
+            [
+                lambda c=cache, e=eff, r=group_responses: _write_one(c, e, r)
+                for cache, eff, group_responses in groups.values()
+            ],
+            thread_name_prefix="ygg-local-cache-write",
+        )
 
     def _optimize_cache_partitions(
         self,
@@ -1347,47 +1468,6 @@ class Session(ABC):
                 getattr(cache, "path", cache), exc,
             )
 
-    def _optimize_local_after_misses(
-        self,
-        responses: "list[Response]",
-        url_to_local_cfg: Mapping[str, CacheConfig],
-        session_local_cfg: CacheConfig,
-    ) -> None:
-        """Compact the local cache for partitions stage 3 just wrote.
-
-        Stage 3's per-worker ``_send`` writes responses one at a
-        time, so a batch of N misses fanning out to M partitions
-        leaves up to N small files spread across those M leaves.
-        Group the responses by their effective local cache, then
-        run a single :meth:`_optimize_cache_partitions` per cache
-        — that bounds the post-batch small-file count without
-        pretending the writes themselves were bulk.
-        """
-        if not responses:
-            return
-
-        groups: dict[str, tuple["FolderIO", CacheConfig, list[Response]]] = {}
-        for response in responses:
-            if not response.ok:
-                continue
-            url_key = str(response.request.url) if response.request else None
-            eff = url_to_local_cfg.get(url_key) if url_key else None
-            if eff is None:
-                eff = session_local_cfg
-            if not eff.local_cache_enabled:
-                continue
-            if not getattr(eff, "optimize_on_write", True):
-                continue
-            pkey = str(eff.local_cache_folder(session=self))
-            slot = groups.get(pkey)
-            if slot is None:
-                groups[pkey] = (eff.local_cache(session=self), eff, [response])
-            else:
-                slot[2].append(response)
-
-        for cache, eff, group_responses in groups.values():
-            self._optimize_cache_partitions(cache, eff, group_responses)
-
     def _persist_remote(
         self,
         responses: list[Response],
@@ -1399,7 +1479,11 @@ class Session(ABC):
         Responses are bucketed by the full write-group key
         (table, mode, match_by, wait, anonymize) so that distinct per-request
         configs targeting the same table never get collapsed onto a single
-        insert with the wrong parameters.
+        insert with the wrong parameters. Distinct write groups (i.e.
+        distinct remote tables / modes) run their inserts concurrently
+        — the underlying SQL clients are thread-safe per-statement, so
+        a batch fanning out to several remote tables doesn't have to
+        serialize the network round trips head-to-tail.
         """
         groups: dict[tuple, tuple[CacheConfig, list[Response]]] = {}
         for response in responses:
@@ -1423,7 +1507,11 @@ class Session(ABC):
                 groups[gkey] = (eff, [])
             groups[gkey][1].append(response)
 
-        for (_, mode, _, _, _), (cfg, group_responses) in groups.items():
+        def _insert_one(
+            mode: "Mode",
+            cfg: "CacheConfig",
+            group_responses: "list[Response]",
+        ) -> None:
             LOGGER.debug(
                 "%s %s response(s) in remote cache %s",
                 "Upserting" if mode == Mode.UPSERT else "Persisting",
@@ -1445,6 +1533,14 @@ class Session(ABC):
                     "public_hash":   batches["public_hash"],
                 },
             )
+
+        self._run_concurrently(
+            [
+                lambda m=gkey[1], c=cfg, r=group_responses: _insert_one(m, c, r)
+                for gkey, (cfg, group_responses) in groups.items()
+            ],
+            thread_name_prefix="ygg-remote-cache-insert",
+        )
 
     def _mirror_local_hits_to_remote(
         self,
@@ -1608,9 +1704,25 @@ class Session(ABC):
         spark = config.spark_session
         is_spark = spark is not None
         session_remote_cfg = config.remote_cache
-        session_local_cfg = config.local_cache
+        # Build the session-level local cache's :class:`Tabular` once
+        # at entry so the rest of the pipeline can reach for
+        # ``cfg.tabular`` symmetrically with the remote side. The
+        # session-aware path (``base_url`` host/path → cache root)
+        # only resolves correctly when we have ``self`` in scope, so
+        # the prebuild has to happen here rather than at config-build
+        # time. ``prebuild`` is idempotent and a no-op on
+        # already-built / disabled / remote configs.
+        session_local_cfg = config.local_cache.prebuild(session=self)
 
         if is_spark:
+            # FAIR scheduling lets the concurrent stage-4 inserts
+            # (and any upstream Spark jobs the cache flow kicks off)
+            # share executor slots instead of queueing strictly FIFO
+            # behind whichever job won the race. ``spark.conf.set``
+            # is best-effort: some Spark builds reject runtime
+            # changes to scheduler-mode and we don't want a managed
+            # cluster's policy to fail the request flow.
+            self._enable_fair_spark_scheduler(spark)
             # Spark mode has no driver-side thread pool to scale the
             # default against — fall back to ``max_batch_size`` (or
             # 1024) so each chunk maps to one ``mapInArrow`` scatter
@@ -1816,21 +1928,42 @@ class Session(ABC):
                         new_hits, session_remote_cfg, spark=spark,
                     )
             else:
+                # Remote and local writebacks touch independent
+                # backends — different tables / different folders —
+                # so run them concurrently rather than head-to-tail.
+                # Each side is itself parallel-per-table /
+                # parallel-per-cache-root; this top-level fan-out
+                # just lets the local disk writes overlap with the
+                # remote network round trips.
+                stage4: "list[Callable[[], Any]]" = []
                 if new_hits:
-                    self._persist_remote(
-                        new_hits, url_to_remote_cfg, session_remote_cfg,
+                    stage4.append(
+                        lambda: self._persist_remote(
+                            new_hits,
+                            url_to_remote_cfg,
+                            session_remote_cfg,
+                        )
                     )
-                # Compact only the partitions stage 3 actually
-                # wrote. Stage 3 fans out per-worker writes that each
-                # land one new small file per touched partition;
-                # without this call a high-miss batch would steadily
-                # fragment the local cache. The pruned optimize is
-                # bounded by ``len(distinct partition_keys)`` and
-                # never visits cold partitions.
+                # Stage 3 workers no longer write the local cache per
+                # response; bulk-upsert the new hits in one write per
+                # effective cache root. ``_backfill_local_cache``
+                # groups responses by their per-request local config,
+                # writes the table in UPSERT mode (or APPEND when the
+                # config asks for it), and triggers a pruned optimize
+                # bounded by the touched partitions — same end state
+                # as the prior per-worker write + post-batch optimize,
+                # but with one bulk write per cache root.
                 if isinstance(new_hits, list) and new_hits:
-                    self._optimize_local_after_misses(
-                        new_hits, url_to_local_cfg, session_local_cfg,
+                    stage4.append(
+                        lambda: self._backfill_local_cache(
+                            new_hits,
+                            url_to_local_cfg,
+                            session_local_cfg,
+                        )
                     )
+                self._run_concurrently(
+                    stage4, thread_name_prefix="ygg-stage4",
+                )
 
             yield ResponseBatch(
                 local_hits=local_hits,

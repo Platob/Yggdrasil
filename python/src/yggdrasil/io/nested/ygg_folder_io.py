@@ -39,11 +39,12 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import queue
 import shutil
 import threading
 import time
 import urllib.parse
-from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Iterator
 
 import pyarrow as pa
@@ -148,7 +149,28 @@ class YGGFolderIO(FolderIO):
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.YGG_FOLDER
 
-    __slots__ = ("_schema", "_listing_cache")
+    #: Auto-compact the partitions a write just touched. ``True`` runs
+    #: a pruned :meth:`optimize` over the inserted leaves at the end
+    #: of every :meth:`_write_arrow_batches` call so a high-fanout
+    #: bulk insert never leaves a fragmented small-file tail behind.
+    #: A leaf with fewer than two parts skips the rewrite path
+    #: cheaply, so the per-write cost is dominated by the touched-leaf
+    #: count, not by the number of rows. Disable for caches with an
+    #: external OPTIMIZE owner.
+    OPTIMIZE_ON_WRITE: ClassVar[bool] = True
+
+    #: Cap on the number of partition leaves written in parallel
+    #: during a single :meth:`_write_arrow_batches` call. ``None``
+    #: defers to the instance / ``os.cpu_count()`` fallback. Set to
+    #: ``1`` to force the legacy sequential per-leaf write.
+    MAX_WRITE_PARTITIONS_PARALLEL: ClassVar["int | None"] = None
+
+    __slots__ = (
+        "_schema",
+        "_listing_cache",
+        "optimize_on_write",
+        "max_write_partitions_parallel",
+    )
 
     def __init__(
         self,
@@ -159,6 +181,8 @@ class YGGFolderIO(FolderIO):
         listing_ttl: float = _LISTING_TTL_SECONDS,
         listing_max: int = _LISTING_MAX,
         tabular_parent: "Any | None" = None,
+        optimize_on_write: "bool | None" = None,
+        max_write_partitions_parallel: "int | None" = None,
     ) -> None:
         super().__init__(data, path=path, tabular_parent=tabular_parent)
         # Load the schema from the .ygg/.schema sidecar when the
@@ -174,6 +198,18 @@ class YGGFolderIO(FolderIO):
         self._listing_cache: "ExpiringDict[str, tuple[str, ...]]" = ExpiringDict(
             default_ttl=listing_ttl,
             max_size=listing_max,
+        )
+        self.optimize_on_write: bool = (
+            self.OPTIMIZE_ON_WRITE if optimize_on_write is None
+            else bool(optimize_on_write)
+        )
+        cap = (
+            self.MAX_WRITE_PARTITIONS_PARALLEL
+            if max_write_partitions_parallel is None
+            else max_write_partitions_parallel
+        )
+        self.max_write_partitions_parallel: "int | None" = (
+            None if cap is None else max(int(cap), 1)
         )
 
     # ==================================================================
@@ -478,6 +514,11 @@ class YGGFolderIO(FolderIO):
         parts = self._resolve_partition_columns()
         if not parts:
             super()._write_arrow_batches(batches, options)
+            # No partition tree to walk — the unpartitioned path
+            # writes a single new part directly under ``self.path``,
+            # so a one-leaf compaction is enough to keep the small-
+            # file count bounded across repeated bulk inserts.
+            self._auto_optimize_leaves((self.path,))
             return
 
         action = self._resolve_action(options.mode)
@@ -487,28 +528,7 @@ class YGGFolderIO(FolderIO):
         if action is Mode.OVERWRITE and self.path.exists():
             self._clear_partition_tree()
 
-        # Group every batch's rows by their partition value tuple
-        # and route each group into its own ``col=val/...`` subdir.
-        # Multiple batches that share a partition stack into one
-        # part file per write call (one MakeChild per partition).
-        groups: "dict[tuple, list[pa.RecordBatch]]" = defaultdict(list)
         partition_names = [f.name for f in parts]
-
-        for batch in batches:
-            if batch.num_rows == 0:
-                continue
-            for key, sub_batch in self._partition_groups(batch, partition_names):
-                # Drop partition columns from the stored payload —
-                # Hive readers reconstruct them from the directory
-                # name, and storing them again wastes bytes.
-                inner = sub_batch.drop_columns(
-                    [c for c in partition_names if c in sub_batch.schema.names]
-                )
-                if inner.num_rows > 0:
-                    groups[key].append(inner)
-
-        if not groups:
-            return
 
         # Partition columns are constant within a partition (encoded
         # in the directory name and dropped from the per-leaf payload),
@@ -517,9 +537,6 @@ class YGGFolderIO(FolderIO):
         # null out the field so the leaf write skips the merge path.
         leaf_options = options
         if options.match_by:
-            # Filter out partition columns — they're encoded in the
-            # folder layout and aren't visible at the leaf, so they
-            # can't drive a per-leaf merge.
             sub_match = [
                 f for f in options.match_by if f.name not in partition_names
             ]
@@ -528,25 +545,108 @@ class YGGFolderIO(FolderIO):
                     options, match_by=sub_match or None,
                 )
 
-        for key_tuple, sub_batches in groups.items():
-            kv = dict(zip(partition_names, key_tuple))
-            target = self._ensure_partition_dir(parts, kv)
+        # Streamed parallel dispatch: every distinct partition key
+        # mints its own bounded-blocking queue + writer thread. The
+        # writer drains the queue as a single iterator handed to
+        # ``FolderIO._write_arrow_batches``, so the leaf opens
+        # exactly one part file per call regardless of how many
+        # input batches contribute rows to it. The producer (this
+        # method) splits each input batch by partition value and
+        # pushes the per-leaf sub-batches as soon as they're built —
+        # so we never accumulate the full input on the driver, and
+        # leaves with disjoint inputs write concurrently.
+        queues: "dict[tuple, queue.Queue]" = {}
+        touched: "list[Path]" = []
+        sentinel = object()
+        max_workers = (
+            self.max_write_partitions_parallel
+            if self.max_write_partitions_parallel is not None
+            else max(os.cpu_count() or 4, 1)
+        )
+
+        def _writer(
+            target_path: "Path",
+            kv: "dict[str, Any]",
+            q: "queue.Queue",
+        ) -> None:
+            def _drain() -> "Iterator[pa.RecordBatch]":
+                while True:
+                    item = q.get()
+                    if item is sentinel:
+                        return
+                    yield item
+
             # Seed the per-partition folder with the kv as
             # ``static_values`` — every leaf minted underneath
             # inherits ``{partition_col: value}`` via the parent
             # chain, so future reads / matches against this leaf
-            # don't have to re-derive the kv from the directory
-            # name.
+            # don't have to re-derive the kv from the directory name.
             sub = FolderIO(
-                path=target, tabular_parent=self, static_values=kv,
+                path=target_path, tabular_parent=self, static_values=kv,
             )
-            sub._write_arrow_batches(
-                sub_batches,
-                # The leaf write picks the right Tabular leaf via
-                # ``child_extension`` (defaults to arrow IPC).
-                leaf_options,
-            )
+            sub._write_arrow_batches(_drain(), leaf_options)
+
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="ygg-partition-write",
+        ) as pool:
+            futures: "list[Future]" = []
+            try:
+                for batch in batches:
+                    if batch.num_rows == 0:
+                        continue
+                    for key, sub_batch in self._partition_groups(
+                        batch, partition_names,
+                    ):
+                        # Drop partition columns from the stored
+                        # payload — Hive readers reconstruct them
+                        # from the directory name, and storing them
+                        # again wastes bytes.
+                        inner = sub_batch.drop_columns(
+                            [
+                                c for c in partition_names
+                                if c in sub_batch.schema.names
+                            ]
+                        )
+                        if inner.num_rows == 0:
+                            continue
+                        q = queues.get(key)
+                        if q is None:
+                            kv = dict(zip(partition_names, key))
+                            target = self._ensure_partition_dir(parts, kv)
+                            touched.append(target)
+                            q = queue.Queue()
+                            queues[key] = q
+                            futures.append(pool.submit(_writer, target, kv, q))
+                        q.put(inner)
+            finally:
+                # Always sentinel the leaf queues so the writers
+                # exit cleanly — without this, ``shutdown(wait=True)``
+                # at context exit would block on a pending
+                # ``queue.get`` if the producer raised mid-stream.
+                for q in queues.values():
+                    q.put(sentinel)
+
+            # Surface the first worker exception (the pool's
+            # context exit waits for the rest regardless, so all
+            # writers are guaranteed to have finished by the time
+            # we return either way).
+            for fut in futures:
+                fut.result()
+
+        if not touched:
+            return
+
+        for target in touched:
             self.invalidate_listing(target)
+
+        # Compact only the leaves this write actually touched, once
+        # the whole input stream is durable. Each writer emitted
+        # exactly one new part per leaf, so unless prior writes
+        # left fragments behind there's nothing to coalesce, and
+        # ``_compact_parts`` short-circuits on leaves with fewer
+        # than two parts.
+        self._auto_optimize_leaves(touched)
 
     @staticmethod
     def _partition_groups(
@@ -718,6 +818,50 @@ class YGGFolderIO(FolderIO):
     # Optimize — compact small parts per partition
     # ==================================================================
 
+    def _auto_optimize_leaves(self, leaves: "Iterable[Path]") -> None:
+        """Compact every leaf in *leaves* — best-effort.
+
+        Called from :meth:`_write_arrow_batches` once the new parts
+        are durable. Each leaf is compacted in isolation via
+        :meth:`FolderIO._optimize_walk` with the legacy
+        ``byte_size=None`` shape (everything-into-one). A failure on
+        one leaf must not surface as a write error — the data is
+        already on disk and a future scheduled OPTIMIZE will pick up
+        the slack — so every per-leaf exception is swallowed.
+
+        ``self.optimize_on_write`` gates the whole pass; setting it
+        to ``False`` lets an external OPTIMIZE owner take over
+        without disabling the cache itself.
+        """
+        if not self.optimize_on_write:
+            return
+
+        from yggdrasil.data.enums import MediaTypes
+
+        seen: "set[str]" = set()
+        for leaf_path in leaves:
+            key = str(leaf_path)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                if not leaf_path.exists():
+                    continue
+            except Exception:
+                continue
+            try:
+                FolderIO(path=leaf_path)._optimize_walk(
+                    leaf_path,
+                    byte_size=None,
+                    target_media_type=MediaTypes.ARROW_IPC,
+                    tolerance=FolderIO.OPTIMIZE_TOLERANCE,
+                )
+            except Exception:
+                # Compaction is best-effort — small files just stay
+                # in place until the next OPTIMIZE pass.
+                continue
+            self.invalidate_listing(leaf_path)
+
     def optimize(
         self,
         byte_size: "int | None" = None,
@@ -791,6 +935,65 @@ class YGGFolderIO(FolderIO):
     @property
     def _cleanup_sentinel_path(self) -> "Path":
         return self._metadata_dir / _CLEANUP_SENTINEL_FILENAME
+
+    @property
+    def cleanup_due(self) -> bool:
+        """True iff a cleanup pass is overdue for this cache root.
+
+        Mirrors the throttle logic in :meth:`cleanup_stale_once`:
+
+        - already-swept-in-this-process roots stay ``False`` for the
+          rest of the run (the in-process throttle is keyed by
+          absolute path);
+        - otherwise, the on-disk ``.ygg/.last_cleanup`` sentinel's
+          mtime is compared against ``now - CLEANUP_TTL_SECONDS``.
+
+        Surface for writers that want to gate the call without
+        incurring the ``cleanup_stale`` walk: read the property,
+        decide to call :meth:`cleanup` (or skip), and the throttle
+        cost stays at one ``stat`` per probe.
+        """
+        key = str(self.path)
+        if key in _CLEANUP_DONE:
+            return False
+        try:
+            last_mtime = self._cleanup_sentinel_path.mtime
+        except OSError:
+            last_mtime = 0.0
+        if not last_mtime:
+            return True
+        return last_mtime < time.time() - self.CLEANUP_TTL_SECONDS
+
+    def cleanup(self, wait: "Any" = False) -> int:
+        """Sweep stale parts on this cache root, throttled by TTL.
+
+        Wraps :meth:`cleanup_stale_once` with sync / async dispatch
+        controlled by *wait*:
+
+        - falsy (the default — ``False``, ``None``, an empty
+          :class:`yggdrasil.dataclasses.waiting.WaitingConfig`):
+          fire-and-forget on a daemon thread. Returns ``0`` because
+          the count isn't known when the call returns.
+        - truthy (``True``, a positive timeout, a non-zero
+          ``WaitingConfig``): block on the sweep and return the
+          number of files unlinked.
+
+        The pre-flight :attr:`cleanup_due` check short-circuits both
+        modes when the sentinel says the sweep was done recently
+        enough — so a writer that calls ``tabular.cleanup(wait)``
+        every batch only pays for one ``stat`` per call after the
+        first sweep.
+        """
+        if not self.cleanup_due:
+            return 0
+        if wait:
+            return self.cleanup_stale_once()
+        threading.Thread(
+            target=self.cleanup_stale_once,
+            name=f"ygg-cleanup-{self.path.name}",
+            daemon=True,
+        ).start()
+        return 0
 
     def cleanup_stale(self, ttl_seconds: "float | None" = None) -> int:
         """Unlink ``part-*`` files older than *ttl_seconds*. Returns the count.

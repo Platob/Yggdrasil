@@ -554,27 +554,52 @@ class CacheConfig(_ConfigBase):
 
         Pass *session* so the lazy default path picks up the
         session's ``base_url`` host/path (see :meth:`local_cache_folder`).
+
+        Stale-part cleanup is decoupled from the build now: writers
+        call :meth:`Tabular.cleanup` after a successful insert and
+        the backend decides whether anything is due — cf.
+        :meth:`prebuild` for the session-time prebuild contract.
         """
         if self.is_local_tabular:
-            folder = self.tabular  # type: ignore[assignment]
-        else:
-            folder = _folderio_for_local_cache(self.local_cache_folder(session=session))
-            # Cache the lazy-built FolderIO so repeated send_many()
-            # calls don't keep re-instantiating it. Frozen-dataclass
-            # safe via ``object.__setattr__``.
-            if self.tabular is None:
-                object.__setattr__(self, "tabular", folder)
-
-        # Sweep stale part files (older than 1 day) at most once per
-        # day per cache root. The throttle (sentinel + in-process
-        # done-set) lives on :class:`YGGFolderIO` so any consumer of
-        # the protocol — not just the response cache — benefits.
-        # ``cleanup_stale_once`` is best-effort and never raises;
-        # non-YGG backends just don't expose it.
-        cleanup_once = getattr(folder, "cleanup_stale_once", None)
-        if callable(cleanup_once):
-            cleanup_once()
+            return self.tabular  # type: ignore[return-value]
+        folder = _folderio_for_local_cache(self.local_cache_folder(session=session))
+        # Cache the lazy-built FolderIO so repeated send_many()
+        # calls don't keep re-instantiating it. Frozen-dataclass
+        # safe via ``object.__setattr__``.
+        if self.tabular is None:
+            object.__setattr__(self, "tabular", folder)
         return folder  # type: ignore[return-value]
+
+    def prebuild(self, session: "Session | None" = None) -> "CacheConfig":
+        """Materialise :attr:`tabular` for local-cache configs.
+
+        After this call the session-level cache flow can reach for
+        ``cfg.tabular`` regardless of whether the cache is local or
+        remote — symmetric to remote configs which always ship with
+        a prebuilt ``tabular`` (a :class:`Table` or other registered
+        :class:`Tabular`). Lets the local- and remote-side helpers
+        in :class:`Session` share the same group-by-cache shape:
+        ``str(cfg.tabular.path)`` for the disk cache, and
+        ``cfg.tabular.full_name(safe=True)`` for the remote table.
+
+        No-op when:
+
+        - :attr:`tabular` is already set (already prebuilt or
+          remote);
+        - :attr:`local_cache_enabled` is False (mode disables the
+          cache, no ``received_*`` window, etc).
+
+        Returns ``self`` so callers can chain
+        ``cfg.prebuild(session)`` at the entry of
+        :meth:`Session._send_many_batches`.
+        """
+        if self.tabular is not None:
+            return self
+        if not self.local_cache_enabled:
+            return self
+        folder = _folderio_for_local_cache(self.local_cache_folder(session=session))
+        object.__setattr__(self, "tabular", folder)
+        return self
 
     def request_values(
         self,

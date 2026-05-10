@@ -444,8 +444,13 @@ class TestListingCache:
 class TestOptimize:
 
     def test_compacts_multiple_parts(self, tmp_path) -> None:
+        # Disable the auto-compact-on-write so the two appends below
+        # actually leave two parts behind for the manual optimize
+        # call to compact.
         y = YGGFolderIO(
-            path=str(tmp_path), schema=_single_partition_schema(),
+            path=str(tmp_path),
+            schema=_single_partition_schema(),
+            optimize_on_write=False,
         )
         y.write_arrow_table(pa.table({
             "id": [1], "region": ["us"], "value": ["a"],
@@ -474,8 +479,13 @@ class TestOptimize:
         assert y.optimize() == 0
 
     def test_byte_size_skips_close_to_target(self, tmp_path) -> None:
+        # Two distinct parts are needed to exercise the byte-size
+        # decision; disable the auto-compact-on-write that would
+        # otherwise collapse them after the second append.
         y = YGGFolderIO(
-            path=str(tmp_path), schema=_single_partition_schema(),
+            path=str(tmp_path),
+            schema=_single_partition_schema(),
+            optimize_on_write=False,
         )
         y.write_arrow_table(pa.table({
             "id": [1], "region": ["us"], "value": ["a"],
@@ -536,8 +546,12 @@ class TestOptimize:
 
     def test_partitions_kwarg_scopes_compaction(self, tmp_path) -> None:
         # Two partitions, two parts each — both need compacting.
+        # Disable the auto-compact-on-write so the per-region
+        # appends actually accumulate two parts before optimize runs.
         y = YGGFolderIO(
-            path=str(tmp_path), schema=_single_partition_schema(),
+            path=str(tmp_path),
+            schema=_single_partition_schema(),
+            optimize_on_write=False,
         )
         for region in ("us", "eu"):
             y.write_arrow_table(pa.table({
@@ -559,6 +573,191 @@ class TestOptimize:
         assert compacted == 1
         assert len([p for p in us_dir.iterdir() if p.name.startswith("part-")]) == 1
         assert len([p for p in eu_dir.iterdir() if p.name.startswith("part-")]) == 2
+
+    def test_auto_optimize_on_write_compacts_touched_partitions(
+        self, tmp_path,
+    ) -> None:
+        # Default ``optimize_on_write=True`` must collapse multiple
+        # appends into a single part per touched leaf, leaving
+        # untouched partitions alone. Two regions written twice each
+        # — both leaves should hold one part after the second
+        # append, with no manual ``optimize`` call.
+        y = YGGFolderIO(
+            path=str(tmp_path), schema=_single_partition_schema(),
+        )
+        for region in ("us", "eu"):
+            y.write_arrow_table(pa.table({
+                "id": [1], "region": [region], "value": ["a"],
+            }))
+            y.write_arrow_batches(
+                pa.table({
+                    "id": [2], "region": [region], "value": ["b"],
+                }).to_batches(),
+                options=FolderOptions(mode=Mode.APPEND),
+            )
+
+        us_dir, eu_dir = tmp_path / "region=us", tmp_path / "region=eu"
+        assert len([p for p in us_dir.iterdir() if p.name.startswith("part-")]) == 1
+        assert len([p for p in eu_dir.iterdir() if p.name.startswith("part-")]) == 1
+        # Data integrity preserved across the auto-compaction.
+        out = y.read_arrow_table()
+        assert sorted(out.column("id").to_pylist()) == [1, 1, 2, 2]
+        assert sorted(out.column("region").to_pylist()) == ["eu", "eu", "us", "us"]
+
+    def test_auto_optimize_disabled_leaves_parts_in_place(
+        self, tmp_path,
+    ) -> None:
+        # Opting out keeps the per-write parts visible — proves the
+        # default-on path isn't a global toggle.
+        y = YGGFolderIO(
+            path=str(tmp_path),
+            schema=_single_partition_schema(),
+            optimize_on_write=False,
+        )
+        y.write_arrow_table(pa.table({
+            "id": [1], "region": ["us"], "value": ["a"],
+        }))
+        y.write_arrow_batches(
+            pa.table({"id": [2], "region": ["us"], "value": ["b"]}).to_batches(),
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+        us_dir = tmp_path / "region=us"
+        assert len([p for p in us_dir.iterdir() if p.name.startswith("part-")]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Streamed parallel partitioned writes
+# ---------------------------------------------------------------------------
+
+
+class TestStreamedParallelWrite:
+
+    def test_streamed_input_does_not_materialize_full_input(
+        self, tmp_path,
+    ) -> None:
+        # Hand the writer a generator that yields one batch per region
+        # and asserts at most one batch lives outside its leaf queue at
+        # a time — the streaming dispatch should consume each batch as
+        # soon as it's produced rather than buffering the whole stream.
+        y = YGGFolderIO(
+            path=str(tmp_path),
+            schema=_single_partition_schema(),
+            max_write_partitions_parallel=2,
+        )
+
+        regions = [f"r{i:02d}" for i in range(8)]
+        produced: "list[str]" = []
+
+        def stream():
+            for region in regions:
+                produced.append(region)
+                yield pa.table({
+                    "id": [1, 2],
+                    "region": [region, region],
+                    "value": ["a", "b"],
+                }).to_batches()[0]
+
+        y.write_arrow_batches(stream(), options=FolderOptions(mode=Mode.APPEND))
+
+        assert produced == regions
+        # Every region got its own leaf with exactly one part (the
+        # auto-optimize-on-write pass collapses any straggler).
+        for region in regions:
+            leaf = tmp_path / f"region={region}"
+            parts = [p for p in leaf.iterdir() if p.name.startswith("part-")]
+            assert len(parts) == 1
+        # Round-trip preserves every row.
+        out = y.read_arrow_table()
+        assert sorted(out.column("region").to_pylist()) == sorted(
+            r for r in regions for _ in range(2)
+        )
+        assert sorted(out.column("id").to_pylist()) == sorted([1, 2] * len(regions))
+
+    def test_parallelism_does_not_corrupt_disjoint_leaves(
+        self, tmp_path,
+    ) -> None:
+        # Many distinct partition keys arriving in interleaved batches
+        # must each end up with their own rows, not cross-contaminate.
+        y = YGGFolderIO(
+            path=str(tmp_path),
+            schema=_single_partition_schema(),
+            max_write_partitions_parallel=4,
+        )
+
+        regions = [f"r{i:02d}" for i in range(16)]
+        ids_per_region = {r: [i, i + 100, i + 200] for i, r in enumerate(regions)}
+
+        def stream():
+            # Interleave: a single batch contains rows from every
+            # region, repeated three times. The dispatch must split
+            # each batch and route every row to the correct leaf.
+            for repeat in range(3):
+                rows_region: "list[str]" = []
+                rows_id: "list[int]" = []
+                rows_value: "list[str]" = []
+                for r in regions:
+                    rows_region.append(r)
+                    rows_id.append(ids_per_region[r][repeat])
+                    rows_value.append(f"v{repeat}")
+                yield pa.table({
+                    "id": rows_id,
+                    "region": rows_region,
+                    "value": rows_value,
+                }).to_batches()[0]
+
+        y.write_arrow_batches(stream(), options=FolderOptions(mode=Mode.APPEND))
+
+        out = y.read_arrow_table()
+        rows_by_region: "dict[str, list[int]]" = {}
+        for region, row_id in zip(
+            out.column("region").to_pylist(),
+            out.column("id").to_pylist(),
+        ):
+            rows_by_region.setdefault(region, []).append(row_id)
+        for r in regions:
+            assert sorted(rows_by_region[r]) == sorted(ids_per_region[r])
+
+    def test_worker_exception_is_surfaced(self, tmp_path) -> None:
+        # A failure in the leaf write must propagate out of the
+        # streaming dispatch — not get swallowed by the queue / pool.
+        y = YGGFolderIO(
+            path=str(tmp_path), schema=_single_partition_schema(),
+        )
+
+        # Schema mismatch on the leaf payload — region column carries
+        # a value, but the rest of the schema is empty so the leaf
+        # write surface raises during encoding.
+        bad_schema = pa.schema([
+            pa.field("region", pa.string()),
+            pa.field("payload", pa.struct([("inner", pa.int64())])),
+        ])
+        bad_table = pa.table(
+            {
+                "region": ["us"],
+                # Nested null — pyarrow.ipc rejects writing a struct
+                # array with a null whose child schema doesn't match
+                # any future merge target.
+                "payload": pa.array([None], type=pa.struct([("inner", pa.int64())])),
+            },
+            schema=bad_schema,
+        )
+        # First write succeeds (single value).
+        y.write_arrow_table(bad_table)
+        # Second write with an explicit broken iterator raises.
+        def boom():
+            yield pa.table({
+                "id": [1], "region": ["us"], "value": ["a"],
+            }).to_batches()[0]
+            raise RuntimeError("producer exploded")
+
+        try:
+            y.write_arrow_batches(
+                boom(), options=FolderOptions(mode=Mode.APPEND),
+            )
+        except RuntimeError as exc:
+            assert "producer exploded" in str(exc)
+        else:
+            raise AssertionError("producer exception was swallowed")
 
 
 # ---------------------------------------------------------------------------
