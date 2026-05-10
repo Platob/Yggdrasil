@@ -114,11 +114,20 @@ _FROM_ANY_NS_DISPATCH: tuple[tuple[str, str], ...] = (
 
 
 def _safe_issubclass(obj: object, class_or_tuple: object) -> bool:
-    return (
-        isinstance(obj, type)
-        and issubclass(obj, class_or_tuple)
-        or obj is class_or_tuple
-    )
+    if obj is class_or_tuple:
+        return True
+    if not isinstance(obj, type):
+        return False
+    # Parameterised generics (``tuple[int, ...]``, ``list[int]``,
+    # PEP 585) override ``__class__`` to ``type`` so ``isinstance(g,
+    # type)`` returns True, but ``issubclass`` then raises ``TypeError:
+    # arg 1 must be a class`` because the generic itself isn't a real
+    # class. Catch and treat as "not a subclass" — the caller's normal
+    # path is to fall through to ``get_origin`` / ``get_args``.
+    try:
+        return issubclass(obj, class_or_tuple)  # type: ignore[arg-type]
+    except TypeError:
+        return False
 
 
 def _strip_annotated(hint: object) -> object:

@@ -45,6 +45,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import time
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Iterator
 
 import pyarrow as pa
@@ -113,6 +114,7 @@ class FolderIO(Tabular[FolderOptions]):
         *,
         path: Any = None,
         tabular_parent: "Tabular | None" = None,
+        static_values: "Mapping[str, Any] | None" = None,
         **kwargs: Any,
     ) -> None:
         """Bind to a folder path. No I/O.
@@ -120,9 +122,18 @@ class FolderIO(Tabular[FolderOptions]):
         ``data`` and ``path`` accept the same shape; ``path`` wins
         when both are supplied. ``tabular_parent`` rides through to
         the :class:`Tabular` slot — set by the enclosing folder when
-        it yields this one as a child.
+        it yields this one as a child. ``static_values`` rides
+        through too: an aggregator (e.g. :class:`YGGFolderIO`)
+        minting a per-partition leaf seeds the kv here so every
+        descendant inherits the partition constants via the
+        :attr:`Tabular.static_values` parent chain — no extra
+        per-batch stamping needed to assert the column equality.
         """
-        super().__init__(tabular_parent=tabular_parent, **kwargs)
+        super().__init__(
+            tabular_parent=tabular_parent,
+            static_values=static_values,
+            **kwargs,
+        )
 
         raw = path if path is not None else data
         if raw is None:

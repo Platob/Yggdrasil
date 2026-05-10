@@ -5,7 +5,9 @@ import io
 import ipaddress
 import uuid
 import zipfile
-from datetime import UTC, date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
+
+UTC = timezone.utc
 from decimal import Decimal
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
