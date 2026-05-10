@@ -936,6 +936,65 @@ class YGGFolderIO(FolderIO):
     def _cleanup_sentinel_path(self) -> "Path":
         return self._metadata_dir / _CLEANUP_SENTINEL_FILENAME
 
+    @property
+    def cleanup_due(self) -> bool:
+        """True iff a cleanup pass is overdue for this cache root.
+
+        Mirrors the throttle logic in :meth:`cleanup_stale_once`:
+
+        - already-swept-in-this-process roots stay ``False`` for the
+          rest of the run (the in-process throttle is keyed by
+          absolute path);
+        - otherwise, the on-disk ``.ygg/.last_cleanup`` sentinel's
+          mtime is compared against ``now - CLEANUP_TTL_SECONDS``.
+
+        Surface for writers that want to gate the call without
+        incurring the ``cleanup_stale`` walk: read the property,
+        decide to call :meth:`cleanup` (or skip), and the throttle
+        cost stays at one ``stat`` per probe.
+        """
+        key = str(self.path)
+        if key in _CLEANUP_DONE:
+            return False
+        try:
+            last_mtime = self._cleanup_sentinel_path.mtime
+        except OSError:
+            last_mtime = 0.0
+        if not last_mtime:
+            return True
+        return last_mtime < time.time() - self.CLEANUP_TTL_SECONDS
+
+    def cleanup(self, wait: "Any" = False) -> int:
+        """Sweep stale parts on this cache root, throttled by TTL.
+
+        Wraps :meth:`cleanup_stale_once` with sync / async dispatch
+        controlled by *wait*:
+
+        - falsy (the default — ``False``, ``None``, an empty
+          :class:`yggdrasil.dataclasses.waiting.WaitingConfig`):
+          fire-and-forget on a daemon thread. Returns ``0`` because
+          the count isn't known when the call returns.
+        - truthy (``True``, a positive timeout, a non-zero
+          ``WaitingConfig``): block on the sweep and return the
+          number of files unlinked.
+
+        The pre-flight :attr:`cleanup_due` check short-circuits both
+        modes when the sentinel says the sweep was done recently
+        enough — so a writer that calls ``tabular.cleanup(wait)``
+        every batch only pays for one ``stat`` per call after the
+        first sweep.
+        """
+        if not self.cleanup_due:
+            return 0
+        if wait:
+            return self.cleanup_stale_once()
+        threading.Thread(
+            target=self.cleanup_stale_once,
+            name=f"ygg-cleanup-{self.path.name}",
+            daemon=True,
+        ).start()
+        return 0
+
     def cleanup_stale(self, ttl_seconds: "float | None" = None) -> int:
         """Unlink ``part-*`` files older than *ttl_seconds*. Returns the count.
 

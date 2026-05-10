@@ -844,7 +844,14 @@ class Session(ABC):
         request: PreparedRequest,
         session_cfg: CacheConfig,
     ) -> CacheConfig:
-        return request.local_cache_config or session_cfg
+        # Prebuild the per-request override the same way
+        # :meth:`_send_many_batches` prebuilds the session-level
+        # config — so the downstream code can reach ``eff.tabular``
+        # uniformly without a ``local_cache(session=...)`` dance.
+        # ``prebuild`` is idempotent and skips remote-only / disabled
+        # configs.
+        cfg = request.local_cache_config or session_cfg
+        return cfg.prebuild(session=self)
 
     def _effective_remote_cfg(
         self,
@@ -905,14 +912,16 @@ class Session(ABC):
         # cache root takes one folder read instead of one per
         # request — that's the whole point of the partitioned
         # layout. UPSERT-mode and disabled requests fall straight
-        # to misses without touching the cache.
+        # to misses without touching the cache. ``eff.tabular`` is
+        # prebuilt by :meth:`_effective_local_cfg`, so the group key
+        # mirrors the remote side (``tabular.full_name(safe=True)``).
         cfg_groups: dict[str, tuple[CacheConfig, list[PreparedRequest]]] = {}
         for req in batch:
             eff = self._effective_local_cfg(req, session_local_cfg)
             if not eff.local_cache_enabled or eff.mode == Mode.UPSERT:
                 misses.append(req)
                 continue
-            pkey = str(eff.local_cache_folder(session=self))
+            pkey = str(eff.tabular.path)
             slot = cfg_groups.get(pkey)
             if slot is None:
                 cfg_groups[pkey] = (eff, [req])
@@ -920,7 +929,7 @@ class Session(ABC):
                 slot[1].append(req)
 
         for pkey, (eff, group_reqs) in cfg_groups.items():
-            cache = eff.local_cache(session=self)
+            cache = eff.tabular
             match_by = tuple(eff.request_by or ()) or ("public_url_hash",)
             looked_up = _lookup_local_responses(
                 cache, group_reqs,
@@ -1354,12 +1363,16 @@ class Session(ABC):
                 eff = session_local_cfg
             if not eff.local_cache_enabled:
                 continue
-            # Store the response unchanged; matching uses the
-            # ``public_*`` hash columns at lookup time.
-            pkey = str(eff.local_cache_folder(session=self))
+            # ``eff.tabular`` is prebuilt by
+            # :meth:`_effective_local_cfg` / :meth:`_send_many_batches`,
+            # so the group key and the cache handle come from the
+            # same source — symmetric to the remote-side
+            # ``tabular.full_name(safe=True)`` grouping in
+            # :meth:`_persist_remote`.
+            pkey = str(eff.tabular.path)
             slot = groups.get(pkey)
             if slot is None:
-                groups[pkey] = (eff.local_cache(session=self), eff, [response])
+                groups[pkey] = (eff.tabular, eff, [response])
             else:
                 slot[2].append(response)
 
@@ -1382,6 +1395,12 @@ class Session(ABC):
             with cache:
                 cache.write_arrow_table(table, options=options)
             self._optimize_cache_partitions(cache, eff, ok_responses)
+            # Stale-part sweep is the writer's responsibility — the
+            # backend (:class:`YGGFolderIO`) self-throttles via
+            # :attr:`cleanup_due` and dispatches sync vs. async based
+            # on ``eff.wait``. Backends without a cleanup concept
+            # short-circuit on the base no-op.
+            cache.cleanup(wait=eff.wait)
 
         self._run_concurrently(
             [
@@ -1685,7 +1704,15 @@ class Session(ABC):
         spark = config.spark_session
         is_spark = spark is not None
         session_remote_cfg = config.remote_cache
-        session_local_cfg = config.local_cache
+        # Build the session-level local cache's :class:`Tabular` once
+        # at entry so the rest of the pipeline can reach for
+        # ``cfg.tabular`` symmetrically with the remote side. The
+        # session-aware path (``base_url`` host/path → cache root)
+        # only resolves correctly when we have ``self`` in scope, so
+        # the prebuild has to happen here rather than at config-build
+        # time. ``prebuild`` is idempotent and a no-op on
+        # already-built / disabled / remote configs.
+        session_local_cfg = config.local_cache.prebuild(session=self)
 
         if is_spark:
             # FAIR scheduling lets the concurrent stage-4 inserts

@@ -144,18 +144,88 @@ def test_cleanup_stale_once_in_process_dedup(tmp_path: Path) -> None:
     assert new_old.exists()
 
 
-def test_cache_config_local_cache_triggers_sweep(tmp_path: Path) -> None:
+def test_writer_cleanup_triggers_sweep(tmp_path: Path) -> None:
+    # Cleanup is now the writer's responsibility — the cache flow in
+    # :class:`Session` calls ``tabular.cleanup(wait=...)`` after each
+    # successful insert. ``cleanup(wait=True)`` runs synchronously
+    # so the assertion can read the result without races.
     old_ms = int((time.time() - _DEFAULT_CLEANUP_TTL_SECONDS - 60) * 1000)
     old = _make_part(tmp_path / "partition_key=1", old_ms)
 
     cfg = CacheConfig.check_arg(tmp_path)
-    cfg.local_cache(session=None)
+    folder = cfg.local_cache(session=None)
+    # local_cache no longer triggers cleanup on its own — the file
+    # is still around until the writer explicitly asks for a sweep.
+    assert old.exists()
+    folder.cleanup(wait=True)
 
     assert not old.exists()
     assert (tmp_path / ".ygg" / _CLEANUP_SENTINEL_FILENAME).is_file()
+
+
+def test_writer_cleanup_async_dispatch(tmp_path: Path) -> None:
+    import threading
+
+    old_ms = int((time.time() - _DEFAULT_CLEANUP_TTL_SECONDS - 60) * 1000)
+    old = _make_part(tmp_path / "partition_key=1", old_ms)
+
+    cfg = CacheConfig.check_arg(tmp_path)
+    folder = cfg.local_cache(session=None)
+    # ``wait=False`` (the default) hands the sweep off to a daemon
+    # thread; the call itself returns 0 because the count isn't
+    # known yet. Joining every non-main thread that mentions the
+    # cache root in its name is a robust way to wait without a
+    # sleep loop.
+    assert folder.cleanup(wait=False) == 0
+    for thread in threading.enumerate():
+        if thread is threading.current_thread():
+            continue
+        if not thread.name.startswith("ygg-cleanup-"):
+            continue
+        thread.join(timeout=2.0)
+    assert not old.exists()
+
+
+def test_cleanup_due_property_reflects_sentinel(tmp_path: Path) -> None:
+    folder = _folderio(tmp_path, partitioned=True)
+    # No sentinel yet → due.
+    assert folder.cleanup_due is True
+    folder.cleanup(wait=True)
+    # Fresh sentinel → not due. The in-process throttle short-
+    # circuits, but even without it the sentinel mtime is current.
+    assert folder.cleanup_due is False
 
 
 def test_cleanup_stale_on_missing_path_is_a_no_op(tmp_path: Path) -> None:
     folder = _folderio(tmp_path / "does-not-exist", partitioned=False)
     assert folder.cleanup_stale() == 0
     assert folder.cleanup_stale_once() == 0
+
+
+def test_prebuild_materialises_tabular_for_local_cache(tmp_path: Path) -> None:
+    # Configs built from a Path arg already carry a FolderIO — but
+    # configs built from a received-window only carry the window
+    # until prebuild runs. After ``cfg.prebuild(session=None)`` the
+    # tabular slot is populated symmetrically with remote configs.
+    import datetime as dt
+
+    cfg = CacheConfig.check_arg(dt.timedelta(hours=1))
+    assert cfg.tabular is None
+    assert cfg.local_cache_enabled
+    cfg.prebuild(session=None)
+    assert cfg.tabular is not None
+    # Idempotent — second call reuses the same instance.
+    folder_first = cfg.tabular
+    cfg.prebuild(session=None)
+    assert cfg.tabular is folder_first
+
+
+def test_prebuild_skips_disabled_and_remote_configs(tmp_path: Path) -> None:
+    # Mode=UPSERT disables the local cache; prebuild must not
+    # materialise a folder there or downstream code would write
+    # to a path the user never asked for.
+    from yggdrasil.data.enums import Mode
+
+    cfg = CacheConfig.check_arg({"mode": Mode.UPSERT})
+    cfg.prebuild(session=None)
+    assert cfg.tabular is None

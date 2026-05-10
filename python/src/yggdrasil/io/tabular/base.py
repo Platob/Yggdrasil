@@ -509,6 +509,31 @@ class Tabular(ABC, Generic[O]):
         return cls.options_class().check(options, **kwargs)
 
     # ==================================================================
+    # Cleanup hook — backend-specific GC of stale state
+    # ==================================================================
+
+    def cleanup(self, wait: "Any" = False) -> int:
+        """Garbage-collect stale state on this backend.
+
+        Default no-op (returns ``0``) — single-file leaves and
+        warehouse-backed tables don't have a sweep concept the
+        client owns. :class:`yggdrasil.io.nested.ygg_folder_io.YGGFolderIO`
+        overrides this to unlink stale ``part-*`` files, throttled by
+        TTL.
+
+        ``wait`` controls sync vs async dispatch on backends that
+        support it: a truthy :class:`yggdrasil.dataclasses.waiting.WaitingConfig`
+        (or ``True`` / a positive timeout) blocks until the sweep
+        finishes; a falsy value (the default) hands the work off to a
+        background thread. Backends without an async path treat both
+        the same.
+
+        Returns the number of files / rows removed when known; ``0``
+        for fire-and-forget async dispatch or a no-op backend.
+        """
+        return 0
+
+    # ==================================================================
     # Compaction hook
     # ==================================================================
 
