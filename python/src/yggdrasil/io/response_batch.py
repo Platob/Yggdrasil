@@ -302,6 +302,11 @@ class ResponseBatch:
         """
         return [k for k in self._local_responses if k != DEFAULT_LOCAL_PATH_KEY]
 
+    def local_responses(self) -> Iterator[Response]:
+        """Flat list of every local response, in registration order."""
+        for holder in self._local_responses.values():
+            yield from Response.from_records(holder.read_records())
+
     @property
     def remote_hits(self) -> dict[str, Tabular]:
         """Per-table remote-cache holders, keyed by cache-table full name.
@@ -326,6 +331,11 @@ class ResponseBatch:
         cache table.
         """
         return [k for k in self._remote_responses if k != DEFAULT_REMOTE_TABLE_KEY]
+
+    def remote_responses(self) -> Iterator[Response]:
+        """Flat list of every remote response, in registration order."""
+        for holder in self._remote_responses.values():
+            yield from Response.from_records(holder.read_records())
 
     @property
     def new_hits(self) -> Tabular:
