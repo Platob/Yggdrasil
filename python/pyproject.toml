@@ -64,6 +64,7 @@ dev = [
 ]
 
 http = [
+  "urllib3",
   "xxhash",
 ]
 
