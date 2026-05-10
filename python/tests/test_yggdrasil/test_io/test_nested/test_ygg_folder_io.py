@@ -444,8 +444,13 @@ class TestListingCache:
 class TestOptimize:
 
     def test_compacts_multiple_parts(self, tmp_path) -> None:
+        # Disable the auto-compact-on-write so the two appends below
+        # actually leave two parts behind for the manual optimize
+        # call to compact.
         y = YGGFolderIO(
-            path=str(tmp_path), schema=_single_partition_schema(),
+            path=str(tmp_path),
+            schema=_single_partition_schema(),
+            optimize_on_write=False,
         )
         y.write_arrow_table(pa.table({
             "id": [1], "region": ["us"], "value": ["a"],
@@ -474,8 +479,13 @@ class TestOptimize:
         assert y.optimize() == 0
 
     def test_byte_size_skips_close_to_target(self, tmp_path) -> None:
+        # Two distinct parts are needed to exercise the byte-size
+        # decision; disable the auto-compact-on-write that would
+        # otherwise collapse them after the second append.
         y = YGGFolderIO(
-            path=str(tmp_path), schema=_single_partition_schema(),
+            path=str(tmp_path),
+            schema=_single_partition_schema(),
+            optimize_on_write=False,
         )
         y.write_arrow_table(pa.table({
             "id": [1], "region": ["us"], "value": ["a"],
@@ -536,8 +546,12 @@ class TestOptimize:
 
     def test_partitions_kwarg_scopes_compaction(self, tmp_path) -> None:
         # Two partitions, two parts each — both need compacting.
+        # Disable the auto-compact-on-write so the per-region
+        # appends actually accumulate two parts before optimize runs.
         y = YGGFolderIO(
-            path=str(tmp_path), schema=_single_partition_schema(),
+            path=str(tmp_path),
+            schema=_single_partition_schema(),
+            optimize_on_write=False,
         )
         for region in ("us", "eu"):
             y.write_arrow_table(pa.table({
@@ -559,6 +573,56 @@ class TestOptimize:
         assert compacted == 1
         assert len([p for p in us_dir.iterdir() if p.name.startswith("part-")]) == 1
         assert len([p for p in eu_dir.iterdir() if p.name.startswith("part-")]) == 2
+
+    def test_auto_optimize_on_write_compacts_touched_partitions(
+        self, tmp_path,
+    ) -> None:
+        # Default ``optimize_on_write=True`` must collapse multiple
+        # appends into a single part per touched leaf, leaving
+        # untouched partitions alone. Two regions written twice each
+        # — both leaves should hold one part after the second
+        # append, with no manual ``optimize`` call.
+        y = YGGFolderIO(
+            path=str(tmp_path), schema=_single_partition_schema(),
+        )
+        for region in ("us", "eu"):
+            y.write_arrow_table(pa.table({
+                "id": [1], "region": [region], "value": ["a"],
+            }))
+            y.write_arrow_batches(
+                pa.table({
+                    "id": [2], "region": [region], "value": ["b"],
+                }).to_batches(),
+                options=FolderOptions(mode=Mode.APPEND),
+            )
+
+        us_dir, eu_dir = tmp_path / "region=us", tmp_path / "region=eu"
+        assert len([p for p in us_dir.iterdir() if p.name.startswith("part-")]) == 1
+        assert len([p for p in eu_dir.iterdir() if p.name.startswith("part-")]) == 1
+        # Data integrity preserved across the auto-compaction.
+        out = y.read_arrow_table()
+        assert sorted(out.column("id").to_pylist()) == [1, 1, 2, 2]
+        assert sorted(out.column("region").to_pylist()) == ["eu", "eu", "us", "us"]
+
+    def test_auto_optimize_disabled_leaves_parts_in_place(
+        self, tmp_path,
+    ) -> None:
+        # Opting out keeps the per-write parts visible — proves the
+        # default-on path isn't a global toggle.
+        y = YGGFolderIO(
+            path=str(tmp_path),
+            schema=_single_partition_schema(),
+            optimize_on_write=False,
+        )
+        y.write_arrow_table(pa.table({
+            "id": [1], "region": ["us"], "value": ["a"],
+        }))
+        y.write_arrow_batches(
+            pa.table({"id": [2], "region": ["us"], "value": ["b"]}).to_batches(),
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+        us_dir = tmp_path / "region=us"
+        assert len([p for p in us_dir.iterdir() if p.name.startswith("part-")]) == 2
 
 
 # ---------------------------------------------------------------------------

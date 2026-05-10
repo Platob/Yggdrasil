@@ -148,7 +148,17 @@ class YGGFolderIO(FolderIO):
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.YGG_FOLDER
 
-    __slots__ = ("_schema", "_listing_cache")
+    #: Auto-compact the partitions a write just touched. ``True`` runs
+    #: a pruned :meth:`optimize` over the inserted leaves at the end
+    #: of every :meth:`_write_arrow_batches` call so a high-fanout
+    #: bulk insert never leaves a fragmented small-file tail behind.
+    #: A leaf with fewer than two parts skips the rewrite path
+    #: cheaply, so the per-write cost is dominated by the touched-leaf
+    #: count, not by the number of rows. Disable for caches with an
+    #: external OPTIMIZE owner.
+    OPTIMIZE_ON_WRITE: ClassVar[bool] = True
+
+    __slots__ = ("_schema", "_listing_cache", "optimize_on_write")
 
     def __init__(
         self,
@@ -159,6 +169,7 @@ class YGGFolderIO(FolderIO):
         listing_ttl: float = _LISTING_TTL_SECONDS,
         listing_max: int = _LISTING_MAX,
         tabular_parent: "Any | None" = None,
+        optimize_on_write: "bool | None" = None,
     ) -> None:
         super().__init__(data, path=path, tabular_parent=tabular_parent)
         # Load the schema from the .ygg/.schema sidecar when the
@@ -174,6 +185,10 @@ class YGGFolderIO(FolderIO):
         self._listing_cache: "ExpiringDict[str, tuple[str, ...]]" = ExpiringDict(
             default_ttl=listing_ttl,
             max_size=listing_max,
+        )
+        self.optimize_on_write: bool = (
+            self.OPTIMIZE_ON_WRITE if optimize_on_write is None
+            else bool(optimize_on_write)
         )
 
     # ==================================================================
@@ -478,6 +493,11 @@ class YGGFolderIO(FolderIO):
         parts = self._resolve_partition_columns()
         if not parts:
             super()._write_arrow_batches(batches, options)
+            # No partition tree to walk — the unpartitioned path
+            # writes a single new part directly under ``self.path``,
+            # so a one-leaf compaction is enough to keep the small-
+            # file count bounded across repeated bulk inserts.
+            self._auto_optimize_leaves((self.path,))
             return
 
         action = self._resolve_action(options.mode)
@@ -528,6 +548,7 @@ class YGGFolderIO(FolderIO):
                     options, match_by=sub_match or None,
                 )
 
+        touched: "list[Path]" = []
         for key_tuple, sub_batches in groups.items():
             kv = dict(zip(partition_names, key_tuple))
             target = self._ensure_partition_dir(parts, kv)
@@ -547,6 +568,13 @@ class YGGFolderIO(FolderIO):
                 leaf_options,
             )
             self.invalidate_listing(target)
+            touched.append(target)
+
+        # Compact only the leaves this write actually touched.
+        # ``_compact_parts`` is a no-op for a leaf with fewer than
+        # two parts, so a single-batch insert into a fresh partition
+        # pays only for one ``iterdir`` per leaf.
+        self._auto_optimize_leaves(touched)
 
     @staticmethod
     def _partition_groups(
@@ -717,6 +745,50 @@ class YGGFolderIO(FolderIO):
     # ==================================================================
     # Optimize — compact small parts per partition
     # ==================================================================
+
+    def _auto_optimize_leaves(self, leaves: "Iterable[Path]") -> None:
+        """Compact every leaf in *leaves* — best-effort.
+
+        Called from :meth:`_write_arrow_batches` once the new parts
+        are durable. Each leaf is compacted in isolation via
+        :meth:`FolderIO._optimize_walk` with the legacy
+        ``byte_size=None`` shape (everything-into-one). A failure on
+        one leaf must not surface as a write error — the data is
+        already on disk and a future scheduled OPTIMIZE will pick up
+        the slack — so every per-leaf exception is swallowed.
+
+        ``self.optimize_on_write`` gates the whole pass; setting it
+        to ``False`` lets an external OPTIMIZE owner take over
+        without disabling the cache itself.
+        """
+        if not self.optimize_on_write:
+            return
+
+        from yggdrasil.data.enums import MediaTypes
+
+        seen: "set[str]" = set()
+        for leaf_path in leaves:
+            key = str(leaf_path)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                if not leaf_path.exists():
+                    continue
+            except Exception:
+                continue
+            try:
+                FolderIO(path=leaf_path)._optimize_walk(
+                    leaf_path,
+                    byte_size=None,
+                    target_media_type=MediaTypes.ARROW_IPC,
+                    tolerance=FolderIO.OPTIMIZE_TOLERANCE,
+                )
+            except Exception:
+                # Compaction is best-effort — small files just stay
+                # in place until the next OPTIMIZE pass.
+                continue
+            self.invalidate_listing(leaf_path)
 
     def optimize(
         self,
