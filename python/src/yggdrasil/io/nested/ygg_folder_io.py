@@ -39,11 +39,12 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import queue
 import shutil
 import threading
 import time
 import urllib.parse
-from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Iterator
 
 import pyarrow as pa
@@ -158,7 +159,18 @@ class YGGFolderIO(FolderIO):
     #: external OPTIMIZE owner.
     OPTIMIZE_ON_WRITE: ClassVar[bool] = True
 
-    __slots__ = ("_schema", "_listing_cache", "optimize_on_write")
+    #: Cap on the number of partition leaves written in parallel
+    #: during a single :meth:`_write_arrow_batches` call. ``None``
+    #: defers to the instance / ``os.cpu_count()`` fallback. Set to
+    #: ``1`` to force the legacy sequential per-leaf write.
+    MAX_WRITE_PARTITIONS_PARALLEL: ClassVar["int | None"] = None
+
+    __slots__ = (
+        "_schema",
+        "_listing_cache",
+        "optimize_on_write",
+        "max_write_partitions_parallel",
+    )
 
     def __init__(
         self,
@@ -170,6 +182,7 @@ class YGGFolderIO(FolderIO):
         listing_max: int = _LISTING_MAX,
         tabular_parent: "Any | None" = None,
         optimize_on_write: "bool | None" = None,
+        max_write_partitions_parallel: "int | None" = None,
     ) -> None:
         super().__init__(data, path=path, tabular_parent=tabular_parent)
         # Load the schema from the .ygg/.schema sidecar when the
@@ -189,6 +202,14 @@ class YGGFolderIO(FolderIO):
         self.optimize_on_write: bool = (
             self.OPTIMIZE_ON_WRITE if optimize_on_write is None
             else bool(optimize_on_write)
+        )
+        cap = (
+            self.MAX_WRITE_PARTITIONS_PARALLEL
+            if max_write_partitions_parallel is None
+            else max_write_partitions_parallel
+        )
+        self.max_write_partitions_parallel: "int | None" = (
+            None if cap is None else max(int(cap), 1)
         )
 
     # ==================================================================
@@ -507,28 +528,7 @@ class YGGFolderIO(FolderIO):
         if action is Mode.OVERWRITE and self.path.exists():
             self._clear_partition_tree()
 
-        # Group every batch's rows by their partition value tuple
-        # and route each group into its own ``col=val/...`` subdir.
-        # Multiple batches that share a partition stack into one
-        # part file per write call (one MakeChild per partition).
-        groups: "dict[tuple, list[pa.RecordBatch]]" = defaultdict(list)
         partition_names = [f.name for f in parts]
-
-        for batch in batches:
-            if batch.num_rows == 0:
-                continue
-            for key, sub_batch in self._partition_groups(batch, partition_names):
-                # Drop partition columns from the stored payload —
-                # Hive readers reconstruct them from the directory
-                # name, and storing them again wastes bytes.
-                inner = sub_batch.drop_columns(
-                    [c for c in partition_names if c in sub_batch.schema.names]
-                )
-                if inner.num_rows > 0:
-                    groups[key].append(inner)
-
-        if not groups:
-            return
 
         # Partition columns are constant within a partition (encoded
         # in the directory name and dropped from the per-leaf payload),
@@ -537,9 +537,6 @@ class YGGFolderIO(FolderIO):
         # null out the field so the leaf write skips the merge path.
         leaf_options = options
         if options.match_by:
-            # Filter out partition columns — they're encoded in the
-            # folder layout and aren't visible at the leaf, so they
-            # can't drive a per-leaf merge.
             sub_match = [
                 f for f in options.match_by if f.name not in partition_names
             ]
@@ -548,32 +545,107 @@ class YGGFolderIO(FolderIO):
                     options, match_by=sub_match or None,
                 )
 
+        # Streamed parallel dispatch: every distinct partition key
+        # mints its own bounded-blocking queue + writer thread. The
+        # writer drains the queue as a single iterator handed to
+        # ``FolderIO._write_arrow_batches``, so the leaf opens
+        # exactly one part file per call regardless of how many
+        # input batches contribute rows to it. The producer (this
+        # method) splits each input batch by partition value and
+        # pushes the per-leaf sub-batches as soon as they're built —
+        # so we never accumulate the full input on the driver, and
+        # leaves with disjoint inputs write concurrently.
+        queues: "dict[tuple, queue.Queue]" = {}
         touched: "list[Path]" = []
-        for key_tuple, sub_batches in groups.items():
-            kv = dict(zip(partition_names, key_tuple))
-            target = self._ensure_partition_dir(parts, kv)
+        sentinel = object()
+        max_workers = (
+            self.max_write_partitions_parallel
+            if self.max_write_partitions_parallel is not None
+            else max(os.cpu_count() or 4, 1)
+        )
+
+        def _writer(
+            target_path: "Path",
+            kv: "dict[str, Any]",
+            q: "queue.Queue",
+        ) -> None:
+            def _drain() -> "Iterator[pa.RecordBatch]":
+                while True:
+                    item = q.get()
+                    if item is sentinel:
+                        return
+                    yield item
+
             # Seed the per-partition folder with the kv as
             # ``static_values`` — every leaf minted underneath
             # inherits ``{partition_col: value}`` via the parent
             # chain, so future reads / matches against this leaf
-            # don't have to re-derive the kv from the directory
-            # name.
+            # don't have to re-derive the kv from the directory name.
             sub = FolderIO(
-                path=target, tabular_parent=self, static_values=kv,
+                path=target_path, tabular_parent=self, static_values=kv,
             )
-            sub._write_arrow_batches(
-                sub_batches,
-                # The leaf write picks the right Tabular leaf via
-                # ``child_extension`` (defaults to arrow IPC).
-                leaf_options,
-            )
-            self.invalidate_listing(target)
-            touched.append(target)
+            sub._write_arrow_batches(_drain(), leaf_options)
 
-        # Compact only the leaves this write actually touched.
-        # ``_compact_parts`` is a no-op for a leaf with fewer than
-        # two parts, so a single-batch insert into a fresh partition
-        # pays only for one ``iterdir`` per leaf.
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="ygg-partition-write",
+        ) as pool:
+            futures: "list[Future]" = []
+            try:
+                for batch in batches:
+                    if batch.num_rows == 0:
+                        continue
+                    for key, sub_batch in self._partition_groups(
+                        batch, partition_names,
+                    ):
+                        # Drop partition columns from the stored
+                        # payload — Hive readers reconstruct them
+                        # from the directory name, and storing them
+                        # again wastes bytes.
+                        inner = sub_batch.drop_columns(
+                            [
+                                c for c in partition_names
+                                if c in sub_batch.schema.names
+                            ]
+                        )
+                        if inner.num_rows == 0:
+                            continue
+                        q = queues.get(key)
+                        if q is None:
+                            kv = dict(zip(partition_names, key))
+                            target = self._ensure_partition_dir(parts, kv)
+                            touched.append(target)
+                            q = queue.Queue()
+                            queues[key] = q
+                            futures.append(pool.submit(_writer, target, kv, q))
+                        q.put(inner)
+            finally:
+                # Always sentinel the leaf queues so the writers
+                # exit cleanly — without this, ``shutdown(wait=True)``
+                # at context exit would block on a pending
+                # ``queue.get`` if the producer raised mid-stream.
+                for q in queues.values():
+                    q.put(sentinel)
+
+            # Surface the first worker exception (the pool's
+            # context exit waits for the rest regardless, so all
+            # writers are guaranteed to have finished by the time
+            # we return either way).
+            for fut in futures:
+                fut.result()
+
+        if not touched:
+            return
+
+        for target in touched:
+            self.invalidate_listing(target)
+
+        # Compact only the leaves this write actually touched, once
+        # the whole input stream is durable. Each writer emitted
+        # exactly one new part per leaf, so unless prior writes
+        # left fragments behind there's nothing to coalesce, and
+        # ``_compact_parts`` short-circuits on leaves with fewer
+        # than two parts.
         self._auto_optimize_leaves(touched)
 
     @staticmethod
