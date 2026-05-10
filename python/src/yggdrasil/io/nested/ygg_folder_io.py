@@ -40,6 +40,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import shutil
+import threading
 import time
 import urllib.parse
 from collections import defaultdict
@@ -88,6 +89,27 @@ _METADATA_DIR_NAME: str = ".ygg"
 #: can reconstruct the partition tags / nested types without
 #: inferring from a part file's footer.
 _SCHEMA_FILENAME: str = ".schema"
+
+#: Sentinel filename inside :data:`_METADATA_DIR_NAME` recording the
+#: epoch of the last successful :meth:`YGGFolderIO.cleanup_stale`
+#: sweep. Its mtime is the cross-process throttle for
+#: :meth:`YGGFolderIO.cleanup_stale_once` — younger than the TTL
+#: means a sibling process already swept; skip the walk.
+_CLEANUP_SENTINEL_FILENAME: str = ".last_cleanup"
+
+#: Default TTL (seconds) for :meth:`YGGFolderIO.cleanup_stale`.
+#: Files whose ``part-{epoch_ms}-...`` prefix is older than this
+#: are unlinked. Mirrors ``_STAGING_TTL_SECONDS`` in
+#: :mod:`yggdrasil.io.path.local_path`.
+_DEFAULT_CLEANUP_TTL_SECONDS: float = 86_400.0  # 1 day
+
+#: In-process throttle for :meth:`YGGFolderIO.cleanup_stale_once`:
+#: each ``str(path)`` is swept at most once per Python run. The
+#: sentinel file handles longer-lived (cross-process) deduplication;
+#: this set just keeps the per-call overhead at one set lookup
+#: after the first sweep.
+_CLEANUP_LOCK = threading.Lock()
+_CLEANUP_DONE: set[str] = set()
 
 
 def _quote(value: Any) -> str:
@@ -759,6 +781,165 @@ class YGGFolderIO(FolderIO):
             )
             self.invalidate_listing(leaf_path)
         return compacted
+
+    # ==================================================================
+    # Cleanup — unlink stale part files older than TTL
+    # ==================================================================
+
+    CLEANUP_TTL_SECONDS: ClassVar[float] = _DEFAULT_CLEANUP_TTL_SECONDS
+
+    @property
+    def _cleanup_sentinel_path(self) -> "Path":
+        return self._metadata_dir / _CLEANUP_SENTINEL_FILENAME
+
+    def cleanup_stale(self, ttl_seconds: "float | None" = None) -> int:
+        """Unlink ``part-*`` files older than *ttl_seconds*. Returns the count.
+
+        File-age comparison uses the ``part-{epoch_ms}-{seed}.{ext}``
+        filename convention :meth:`FolderIO.make_child` mints — the
+        epoch_ms prefix is what we compare against the cutoff. This
+        is robust to filesystem mtime quirks (rsync'd caches, bind-
+        mounted images, ``cp -p`` round-trips) where ``stat`` mtime
+        doesn't reflect when the entry was actually written.
+
+        Walks the partition tree via :meth:`_iter_partitions` when a
+        schema is bound, otherwise walks :attr:`path` directly. The
+        ``.ygg/`` sidecar (schema, sentinel, future metadata) is
+        always skipped.
+
+        Best-effort: every OS error encountered while listing or
+        unlinking is swallowed so a permission denial / race with a
+        concurrent writer never breaks the surrounding call. The
+        listing cache is invalidated for every directory we touched.
+
+        :param ttl_seconds: minimum age (in seconds) for a file to
+            be unlinked. ``None`` uses :attr:`CLEANUP_TTL_SECONDS`.
+        :returns: number of files unlinked.
+        """
+        ttl = self.CLEANUP_TTL_SECONDS if ttl_seconds is None else float(ttl_seconds)
+        try:
+            if not self.path.exists():
+                return 0
+        except OSError:
+            return 0
+
+        cutoff_ms = int((time.time() - ttl) * 1000)
+        deleted = 0
+        touched: set[str] = set()
+
+        for leaf in self._iter_cleanup_leaves():
+            try:
+                children = list(leaf.iterdir())
+            except OSError:
+                continue
+            for child in children:
+                name = child.name
+                if not name.startswith("part-"):
+                    continue
+                try:
+                    if not child.is_file():
+                        continue
+                    # ``part-{epoch_ms}-{seed}.{ext}`` — split on the
+                    # first two dashes; seed/ext tail is irrelevant.
+                    _, epoch_str, _tail = name.split("-", 2)
+                    if int(epoch_str) >= cutoff_ms:
+                        continue
+                except (OSError, ValueError, IndexError):
+                    continue
+                try:
+                    child.unlink()
+                except OSError:
+                    continue
+                deleted += 1
+                touched.add(str(leaf))
+
+        for directory_key in touched:
+            # Don't construct a fresh Path for invalidate; the cache
+            # is keyed by the string form, and ``invalidate_listing``
+            # walks back up through parents until ``self.path``.
+            self._listing_cache.pop(directory_key, None)
+        if touched:
+            self._listing_cache.pop(str(self.path), None)
+        return deleted
+
+    def cleanup_stale_once(self, ttl_seconds: "float | None" = None) -> int:
+        """:meth:`cleanup_stale`, throttled to once per *ttl_seconds*.
+
+        Two-layer throttle, same shape as the staging-directory
+        sweep in :mod:`yggdrasil.io.path.local_path`:
+
+        * **In-process** — :data:`_CLEANUP_DONE` records every path
+          already swept by this Python run. Subsequent calls return
+          immediately; a send_many burst that calls
+          :meth:`CacheConfig.local_cache` repeatedly only pays for
+          one sentinel stat plus one set lookup.
+        * **Cross-process** — ``{path}/.ygg/.last_cleanup`` is
+          written after each sweep. A sentinel younger than *ttl*
+          short-circuits the walk: a parallel process / a quickly-
+          restarted run shares the throttle.
+
+        Sentinel is touched *after* the sweep, so a partial sweep
+        (process killed mid-walk, permission denial halfway through)
+        gets retried by the next caller after the TTL elapses
+        rather than being recorded as a successful sweep.
+
+        Returns the number of files unlinked, or ``0`` when the
+        sweep was throttled. Never raises.
+        """
+        ttl = self.CLEANUP_TTL_SECONDS if ttl_seconds is None else float(ttl_seconds)
+        key = str(self.path)
+        if key in _CLEANUP_DONE:
+            return 0
+        with _CLEANUP_LOCK:
+            if key in _CLEANUP_DONE:
+                return 0
+            _CLEANUP_DONE.add(key)
+
+        sentinel = self._cleanup_sentinel_path
+        now_s = time.time()
+        try:
+            last_mtime = sentinel.mtime
+        except OSError:
+            last_mtime = 0.0
+        if last_mtime and last_mtime >= now_s - ttl:
+            return 0
+
+        try:
+            deleted = self.cleanup_stale(ttl)
+        except Exception:
+            # Defensive: ``cleanup_stale`` already swallows OSErrors,
+            # but a bug in a Path subclass shouldn't poison the cache
+            # call piggy-backing on the sweep.
+            return 0
+
+        # Touch the sentinel last so a partial sweep retries on
+        # the next call after TTL, rather than being marked done.
+        try:
+            self._metadata_dir.mkdir(parents=True, exist_ok=True)
+            with sentinel.open(mode="wb") as bio:
+                bio.write(str(int(now_s)).encode("ascii"))
+        except OSError:
+            pass
+        return deleted
+
+    def _iter_cleanup_leaves(self) -> "Iterator[Path]":
+        """Directories that may contain ``part-*`` files.
+
+        Partitioned tree → every ``col=val/.../`` leaf via
+        :meth:`_iter_partitions`. Unpartitioned (or schema-less)
+        tree → just :attr:`path`. The ``.ygg/`` sidecar is never
+        a partition leaf (its name doesn't match the ``col=val``
+        pattern), so the walker skips it for free.
+        """
+        parts = self._resolve_partition_columns()
+        if not parts:
+            yield self.path
+            return
+        try:
+            for leaf_path, _kv in self._iter_partitions(parts, prune={}):
+                yield leaf_path
+        except OSError:
+            return
 
     # ==================================================================
     # Repr

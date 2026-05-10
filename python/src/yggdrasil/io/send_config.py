@@ -556,15 +556,25 @@ class CacheConfig(_ConfigBase):
         session's ``base_url`` host/path (see :meth:`local_cache_folder`).
         """
         if self.is_local_tabular:
-            return self.tabular  # type: ignore[return-value]
+            folder = self.tabular  # type: ignore[assignment]
+        else:
+            folder = _folderio_for_local_cache(self.local_cache_folder(session=session))
+            # Cache the lazy-built FolderIO so repeated send_many()
+            # calls don't keep re-instantiating it. Frozen-dataclass
+            # safe via ``object.__setattr__``.
+            if self.tabular is None:
+                object.__setattr__(self, "tabular", folder)
 
-        folder = _folderio_for_local_cache(self.local_cache_folder(session=session))
-        # Cache the lazy-built FolderIO so repeated send_many()
-        # calls don't keep re-instantiating it. Frozen-dataclass
-        # safe via ``object.__setattr__``.
-        if self.tabular is None:
-            object.__setattr__(self, "tabular", folder)
-        return folder
+        # Sweep stale part files (older than 1 day) at most once per
+        # day per cache root. The throttle (sentinel + in-process
+        # done-set) lives on :class:`YGGFolderIO` so any consumer of
+        # the protocol — not just the response cache — benefits.
+        # ``cleanup_stale_once`` is best-effort and never raises;
+        # non-YGG backends just don't expose it.
+        cleanup_once = getattr(folder, "cleanup_stale_once", None)
+        if callable(cleanup_once):
+            cleanup_once()
+        return folder  # type: ignore[return-value]
 
     def request_values(
         self,
