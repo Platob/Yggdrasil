@@ -5,7 +5,7 @@ import base64
 import datetime as dt
 import json as json_module
 from dataclasses import MISSING
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional
 
 import pyarrow as pa
 
@@ -296,6 +296,10 @@ class PreparedRequest:
     owning :class:`Session` (``_prepare_request`` / ``_prepare_response``).
     """
 
+    # Instance attributes that don't survive pickling — excluded by
+    # ``__getstate__`` and reset by ``__setstate__``. Subclasses extend.
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({"_session"})
+
     def __init__(
         self,
         method: str,
@@ -354,12 +358,13 @@ class PreparedRequest:
         return self.url.to_string()
 
     def __getstate__(self) -> dict[str, Any]:
-        # Drop the transient session back-reference so requests stay
-        # cleanly picklable for cross-executor transport. Re-bind on the
-        # worker via :meth:`attach_session`.
-        state = self.__dict__.copy()
-        state.pop("_session", None)
-        return state
+        # Generic: every ``__dict__`` entry except the transient set
+        # (``_session``) survives. Re-bind the session on the worker
+        # via :meth:`attach_session`.
+        return {
+            k: v for k, v in self.__dict__.items()
+            if k not in self._TRANSIENT_STATE_ATTRS
+        }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)

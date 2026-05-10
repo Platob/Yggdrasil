@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import warnings
 from dataclasses import MISSING
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional
 
 import polars as pl
 import pyarrow as pa
@@ -533,6 +533,10 @@ class Response(Tabular[CastOptions]):
         "_session",
     )
 
+    # Instance attributes that don't survive pickling — excluded by
+    # ``__getstate__`` and reset by ``__setstate__``. Subclasses extend.
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({"_session"})
+
     def __init__(
         self,
         request: PreparedRequest,
@@ -642,11 +646,21 @@ class Response(Tabular[CastOptions]):
         return self.__repr__()
 
     def __getstate__(self) -> dict[str, Any]:
-        return {
-            name: getattr(self, name)
-            for name in self.__slots__
-            if name != "_session"
-        }
+        # Walk every ``__slots__`` declaration in the MRO so subclasses
+        # like :class:`HTTPResponse` (own slots ``()``) still emit the
+        # parent's fields. Skip the transient set and any slot the
+        # instance never assigned.
+        transients = self._TRANSIENT_STATE_ATTRS
+        state: dict[str, Any] = {}
+        for cls in type(self).__mro__:
+            for name in getattr(cls, "__slots__", ()):
+                if name in transients or name in state:
+                    continue
+                try:
+                    state[name] = getattr(self, name)
+                except AttributeError:
+                    continue
+        return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         for name, value in state.items():
