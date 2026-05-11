@@ -232,6 +232,8 @@ def cast_arrow_tabular(
     target_arrays: list[pa.Array] = []
     num_rows = data.num_rows
 
+    from yggdrasil.exceptions import CastError
+
     for target_field in target_schema.children_fields:
         # ``select_in_field`` walks ``source_schema.children_fields``
         # by name → alias and returns the matching child (or the
@@ -247,13 +249,26 @@ def cast_arrow_tabular(
             )
         else:
             source_array = data.column(source_field.name)
-            casted = target_field.cast_arrow_array(
-                source_array,
-                options=options.copy(
+            try:
+                casted = target_field.cast_arrow_array(
+                    source_array,
+                    options=options.copy(
+                        source_field=source_field,
+                        target_field=target_field,
+                    ),
+                )
+            except CastError:
+                # Inner cast already wrapped — propagate without
+                # re-wrapping so the original failing leaf field stays
+                # named in the message.
+                raise
+            except Exception as exc:
+                raise CastError(
+                    str(exc),
                     source_field=source_field,
                     target_field=target_field,
-                ),
-            )
+                    original=exc,
+                ) from exc
 
         target_arrays.append(casted)
 
