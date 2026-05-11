@@ -86,7 +86,14 @@ def _local_cache(tmp_path: Path, **overrides: Any) -> CacheConfig:
 
 
 def _wait_for_readable(cache: CacheConfig, *, timeout: float = 3.0) -> bool:
-    """Poll until the cache reads back a non-empty Arrow table."""
+    """Poll until the cache reads back a non-empty Arrow table.
+
+    Picks up both layouts the session writes through: the
+    partitioned ``col=val/...`` tree (legacy bulk path) and the
+    flat per-``public_hash`` fast-path files at the cache root.
+    """
+    from pathlib import Path as _P
+
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -96,6 +103,17 @@ def _wait_for_readable(cache: CacheConfig, *, timeout: float = 3.0) -> bool:
             if table.num_rows > 0:
                 return True
         except Exception:
+            pass
+        try:
+            root = _P(str(cache.tabular.path))
+            if root.exists() and any(
+                p.is_file()
+                and p.suffix == ".arrow"
+                and not p.name.startswith(".")
+                for p in root.iterdir()
+            ):
+                return True
+        except OSError:
             pass
         time.sleep(0.05)
     return False
