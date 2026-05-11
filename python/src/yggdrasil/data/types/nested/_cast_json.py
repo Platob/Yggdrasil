@@ -9,10 +9,12 @@ from __future__ import annotations
 import datetime as _dt
 import decimal as _decimal
 import json
+import re
 from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.json as paj
 
 from yggdrasil.data.types.base import DataType
 from yggdrasil.data.types.id import DataTypeId
@@ -20,6 +22,20 @@ from yggdrasil.data.types.support import get_polars, get_spark_sql
 
 if TYPE_CHECKING:
     from yggdrasil.data.options import CastOptions
+
+
+# PyArrow's JSON parser emits errors like ``JSON parse error: ... in row 5``.
+# We extract the row index to surface a row-pointing message without
+# re-walking the rows in Python.
+_PYARROW_JSON_ROW_RE = re.compile(r"in row (\d+)\b")
+
+# Reused string scalars for the NDJSON wrapper.  Allocated once at module
+# import so each cast call doesn't rebuild them.
+_NDJSON_PREFIX = pa.scalar('{"v":', type=pa.string())
+_NDJSON_SUFFIX = pa.scalar("}", type=pa.string())
+_NDJSON_EMPTY_SEP = pa.scalar("", type=pa.string())
+_NDJSON_LINE_SEP = pa.scalar("\n", type=pa.string())
+_NDJSON_NULL = pa.scalar("null", type=pa.string())
 
 
 __all__ = [
@@ -98,15 +114,25 @@ def cast_arrow_json_string_array(
 ) -> pa.Array:
     """Parse a string/binary Arrow array as JSON into the target arrow type.
 
-    Strict mode (``options.safe=True``, the default) attempts a single
-    C-level ``json.loads`` on a comma-joined blob and, on failure,
-    re-walks the rows to raise an :class:`pa.ArrowInvalid` that points
-    at the offending row index and value preview.
+    The hot path stays inside the C++ runtime: rows are wrapped as
+    ``{"v":<row>}`` via Arrow compute, joined with newlines into a
+    single NDJSON buffer, and decoded in one ``pyarrow.json.read_json``
+    call against an ``explicit_schema`` that names the target type.
+    No per-row Python loop runs on success.
 
-    Permissive mode (``options.safe=False``) parses each row
-    independently and decodes invalid JSON — or rows that don't fit
-    the target arrow type — to ``None``, mirroring
-    ``pc.cast(safe=False)`` semantics.
+    Strict mode (``options.safe=True``, the default) re-raises any
+    parse failure as :class:`pa.ArrowInvalid`, enriched with the row
+    index PyArrow reports plus a value preview pulled from the source
+    array.
+
+    Permissive mode (``options.safe=False``) falls back to per-row
+    Python decoding *only* when the vectorised pass fails, so bad
+    rows can null-out individually instead of failing the batch.
+
+    Map targets — ``pa.map_(...)`` — bypass the NDJSON path because
+    PyArrow's JSON reader cannot emit ``map`` arrays directly; for
+    those we go straight to the Python path, which builds the map
+    via ``pa.array(list_of_dicts, type=map_type)``.
     """
     target_field = options.target_field
     if target_field is None:
@@ -120,29 +146,166 @@ def cast_arrow_json_string_array(
     if len(normalized) == 0:
         return pa.array([], type=target_arrow_type)
 
+    if _pyarrow_json_supports_target(target_arrow_type):
+        try:
+            return _vectorized_parse_json(
+                normalized, target_arrow_type, memory_pool=memory_pool,
+            )
+        except (pa.ArrowInvalid, pa.ArrowTypeError) as exc:
+            if options.safe:
+                raise _enrich_pyarrow_json_error(exc, normalized) from exc
+            # Permissive: drop into per-row fallback so bad rows null
+            # out individually instead of failing the whole batch.
+        except pa.ArrowNotImplementedError:
+            # Predicate should already filter unsupported targets;
+            # treat any leakage as a signal to use the Python path.
+            pass
+
+    return _parse_via_python(
+        normalized, target_arrow_type, memory_pool=memory_pool, safe=options.safe,
+    )
+
+
+def _pyarrow_json_supports_target(t: pa.DataType) -> bool:
+    """Does ``pyarrow.json.read_json`` know how to materialise ``t``?
+
+    PyArrow's reader handles primitives, structs, list/large_list and
+    fixed-size lists, but not ``map``.  We recurse so a ``map`` buried
+    inside a struct or list also routes to the Python fallback.
+    """
+    if pa.types.is_map(t):
+        return False
+    if pa.types.is_list(t) or pa.types.is_large_list(t):
+        return _pyarrow_json_supports_target(t.value_type)
+    if pa.types.is_fixed_size_list(t):
+        return _pyarrow_json_supports_target(t.value_type)
+    if pa.types.is_struct(t):
+        return all(
+            _pyarrow_json_supports_target(t.field(i).type)
+            for i in range(t.num_fields)
+        )
+    return True
+
+
+def _vectorized_parse_json(
+    normalized: pa.Array,
+    target_arrow_type: pa.DataType,
+    memory_pool: pa.MemoryPool | None = None,
+) -> pa.Array:
+    """Decode every row in a single C++ NDJSON pass.
+
+    Steps stay inside Arrow compute / C++ kernels:
+
+    1. ``fill_null`` swaps null entries for the literal ``null``.
+    2. ``replace_substring_regex`` collapses any embedded ``\\r\\n``
+       (which would otherwise split NDJSON records mid-row).  Valid
+       JSON strings cannot legally contain literal newlines — only
+       ``\\n`` escapes — so this only normalises framing whitespace.
+    3. ``binary_join_element_wise`` wraps each row as ``{"v":<row>}``.
+    4. A one-element ``list<string>`` plus ``binary_join`` glues all
+       rows together with ``\\n`` separators into a single NDJSON
+       buffer accessible as Arrow raw bytes.
+    5. ``pyarrow.json.read_json`` parses the buffer against an
+       ``explicit_schema`` declaring the target type for ``v``.
+
+    The only Python crossings are the function calls themselves — no
+    per-row iteration.
+    """
+    n = len(normalized)
+
+    filled = pc.fill_null(normalized, _NDJSON_NULL)
+    cleaned = pc.replace_substring_regex(filled, r"[\r\n]+", " ")
+
+    wrapped = pc.binary_join_element_wise(
+        _NDJSON_PREFIX, cleaned, _NDJSON_SUFFIX, _NDJSON_EMPTY_SEP,
+    )
+
+    list_arr = pa.ListArray.from_arrays(
+        pa.array([0, n], pa.int32()),
+        wrapped,
+    )
+    joined = pc.binary_join(list_arr, _NDJSON_LINE_SEP)
+    # Underlying utf-8 bytes of the single concatenated scalar — no
+    # Python string round-trip needed.
+    buffer = joined.buffers()[2]
+
+    schema = pa.schema([pa.field("v", target_arrow_type)])
+    table = paj.read_json(
+        pa.BufferReader(buffer),
+        parse_options=paj.ParseOptions(
+            explicit_schema=schema,
+            unexpected_field_behavior="ignore",
+        ),
+        read_options=paj.ReadOptions(use_threads=True),
+    )
+    column = table.column("v")
+    if isinstance(column, pa.ChunkedArray):
+        column = column.combine_chunks()
+    return column
+
+
+def _enrich_pyarrow_json_error(
+    exc: BaseException,
+    normalized: pa.Array,
+) -> pa.ArrowInvalid:
+    """Promote a raw pyarrow.json error to a row-pointing ArrowInvalid.
+
+    The pyarrow message already names the failing row (``... in row N``);
+    we lift that index out via regex, pluck the offending source value
+    with an Arrow scalar lookup (no Python loop) and append a truncated
+    preview plus the standard ``safe=False`` hint.
+    """
+    msg = str(exc)
+    match = _PYARROW_JSON_ROW_RE.search(msg)
+    if match is None:
+        return pa.ArrowInvalid(
+            f"Invalid JSON: {msg}. "
+            f"Pass safe=False on CastOptions to coerce bad rows to null."
+        )
+
+    idx = int(match.group(1))
+    preview: Any = None
+    if 0 <= idx < len(normalized):
+        scalar = normalized[idx]
+        if scalar.is_valid:
+            value = scalar.as_py()
+            preview = value if len(value) <= 120 else value[:117] + "..."
+
+    return pa.ArrowInvalid(
+        f"Invalid JSON at row {idx}: {msg}. "
+        f"Value: {preview!r}. "
+        f"Pass safe=False on CastOptions to coerce bad rows to null."
+    )
+
+
+def _parse_via_python(
+    normalized: pa.Array,
+    target_arrow_type: pa.DataType,
+    memory_pool: pa.MemoryPool | None,
+    safe: bool,
+) -> pa.Array:
+    """Python-side fallback for targets pyarrow.json cannot emit (maps)
+    and for permissive-mode batches that need per-row null-on-failure.
+
+    Strict mode keeps the fast single-blob ``json.loads`` path and only
+    drops to per-row on failure to surface a row-pointing error.
+    """
     pylist = normalized.to_pylist()
 
-    if options.safe:
+    if safe:
         try:
             blob = "[" + ",".join(
                 "null" if s is None else s for s in pylist
             ) + "]"
             parsed = json.loads(blob)
         except json.JSONDecodeError:
-            # Re-walk per-row so the raised error names the offending
-            # row index and shows a preview of the bad value.
             parsed = _parse_json_rows_strict(pylist)
-
         return pa.array(parsed, type=target_arrow_type, memory_pool=memory_pool)
 
     parsed = _parse_json_rows_permissive(pylist)
     try:
         return pa.array(parsed, type=target_arrow_type, memory_pool=memory_pool)
     except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError, ValueError):
-        # Target-type coercion can still fail row-by-row (e.g. a parsed
-        # object missing a required nested field). In permissive mode
-        # we null those rows out one at a time instead of failing the
-        # whole batch.
         return _build_arrow_per_row(parsed, target_arrow_type, memory_pool)
 
 

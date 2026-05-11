@@ -495,36 +495,35 @@ def _resolve_dispatch_targets(
     return out
 
 
-def _build_cast_projection(
+def _build_column_projection(
     fields: "Iterable[Field]",
     *,
     source_alias: "str | None" = None,
 ) -> str:
-    """Build a SQL ``CAST(<expr> AS <ddl>) AS <name>`` projection list.
+    """Build a plain column-reference projection list for INSERT/MERGE.
 
-    Each :class:`Field` contributes one term where ``<src>`` is the
-    bare quoted column name (when *source_alias* is ``None``) or
-    ``alias.colname`` (when set). The DDL fragment comes from
-    :meth:`Field.to_spark_name` with the name / nullable / comment
-    sections suppressed so only the type is emitted — ``to_spark_name``
-    never appends ``NOT NULL`` on struct children that way, which
-    matches the nullable shape of staged Parquet reads and keeps
-    Delta MERGE from rejecting the implicit cast
-    (``DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION``).
+    Each :class:`Field` contributes one bare (or alias-qualified)
+    quoted column reference — no per-column ``CAST(... AS <ddl>)``
+    wrapper.  The data has already been aligned to the target schema
+    upstream: ``arrow_insert`` writes through
+    :meth:`CastOptions.cast_arrow_tabular` before staging,
+    ``spark_insert`` aligns the DataFrame via
+    :func:`any_to_spark_dataframe`, and the warehouse INSERT itself
+    performs implicit coercion at the column boundary, so the engine
+    accepts the rows as-is.  Skipping the explicit CAST keeps the SQL
+    short — important for wide / deeply nested schemas where the
+    spelled-out DDL bloated statements past the warehouse text
+    limits — and avoids paying for redundant per-column validation.
 
     Used by :meth:`Table.arrow_insert`, :meth:`Table.spark_insert`,
-    and :meth:`Table.sql_insert` (with ``source_alias="raw_src"`` for
-    the latter) so the INSERT itself carries the target schema even
-    when the source side already happens to align.
+    and :meth:`Table.sql_insert` (the latter passes
+    ``source_alias="raw_src"`` so columns resolve against the wrapped
+    user query).
     """
     parts: list[str] = []
     for f in fields:
         col = quote_ident(f.name)
-        src = f"{source_alias}.{col}" if source_alias else col
-        ddl = f.to_spark_name(
-            with_name=False, with_nullable=False, with_comment=False,
-        )
-        parts.append(f"CAST({src} AS {ddl}) AS {col}")
+        parts.append(f"{source_alias}.{col}" if source_alias else col)
     return ", ".join(parts)
 
 
@@ -2722,11 +2721,12 @@ class Table(DatabricksResource, Holder):
             prune_predicates.append(_wrap_user_predicate(where, target_alias="T"))
 
         columns = list(existing_schema.field_names())
-        # Explicit per-column CAST projection coerces the staged
-        # Parquet rows to the target table's schema. Mirrors
-        # :meth:`spark_insert` / :meth:`sql_insert`.
-        cast_projection = _build_cast_projection(existing_schema.fields)
-        source_sql = f"SELECT {cast_projection} FROM {{{_ALIAS_TMPSRC}}}"
+        # Plain column projection — the staged Parquet was already
+        # cast to the target schema in :meth:`CastOptions.cast_arrow_tabular`
+        # before the write, and the warehouse INSERT applies the
+        # column-boundary coercion on top.  No per-column CAST needed.
+        source_projection = _build_column_projection(existing_schema.fields)
+        source_sql = f"SELECT {source_projection} FROM {{{_ALIAS_TMPSRC}}}"
 
         sql_texts = _build_dml_statements(
             target_location=target_location,
@@ -2786,11 +2786,11 @@ class Table(DatabricksResource, Holder):
                 extra_target.create(data, mode=schema_mode)
                 extra_schema = extra_target.collect_schema()
                 extra_columns = list(extra_schema.field_names())
-                extra_cast_proj = _build_cast_projection(extra_schema.fields)
+                extra_projection = _build_column_projection(extra_schema.fields)
                 where_frag = _render_source_predicate(predicate)
                 where_clause = f"\nWHERE {where_frag}" if where_frag else ""
                 extra_source_sql = (
-                    f"SELECT {extra_cast_proj} FROM {{{_ALIAS_TMPSRC}}}"
+                    f"SELECT {extra_projection} FROM {{{_ALIAS_TMPSRC}}}"
                     f"{where_clause}"
                 )
                 extra_texts = _build_dml_statements(
@@ -2949,12 +2949,11 @@ class Table(DatabricksResource, Holder):
 
         columns = list(existing_schema.field_names())
         cols_quoted = ", ".join(quote_ident(c) for c in columns)
-        # Explicit per-column CAST projection coerces the view rows
-        # to the target table's schema even when the DataFrame
-        # already happens to align — defensive against Spark
-        # promoting nullable→NOT NULL inside a struct.
-        cast_projection = _build_cast_projection(existing_schema.fields)
-        source_sql = f"SELECT {cast_projection} FROM {quote_ident(view_name)}"
+        # Plain column projection — :func:`any_to_spark_dataframe`
+        # already aligned the DataFrame to the target schema, and the
+        # INSERT itself applies the column-boundary coercion, so the
+        # SQL stays free of per-column CASTs.
+        source_sql = f"SELECT {cols_quoted} FROM {quote_ident(view_name)}"
 
         # The DataFrame anti-join already dedup'd; emit a plain INSERT
         # so we don't pay for the SQL-side NOT EXISTS twice.
@@ -3032,14 +3031,15 @@ class Table(DatabricksResource, Holder):
                         extra_target.create(data, mode=schema_mode)
                         extra_schema = extra_target.collect_schema()
                         extra_columns = list(extra_schema.field_names())
-                        # Same CAST projection as the primary INSERT —
-                        # each dispatch target may have its own column
-                        # types, so the cast is per-target.
-                        extra_cast_proj = _build_cast_projection(extra_schema.fields)
+                        # Plain column projection — same reasoning as
+                        # the primary spark_insert source SQL.
+                        extra_cols_quoted = ", ".join(
+                            quote_ident(c) for c in extra_columns
+                        )
                         where_frag = _render_source_predicate(predicate)
                         where_clause = f" WHERE {where_frag}" if where_frag else ""
                         extra_source_sql = (
-                            f"SELECT {extra_cast_proj} "
+                            f"SELECT {extra_cols_quoted} "
                             f"FROM {quote_ident(view_name)}{where_clause}"
                         )
                         extra_texts = _build_dml_statements(
@@ -3220,9 +3220,9 @@ class Table(DatabricksResource, Holder):
         if match_by == "auto":
             match_by = [f.name for f in existing_schema.primary_fields] or None
 
-        cast_projection = _build_cast_projection(fields, source_alias="raw_src")
+        source_projection = _build_column_projection(fields, source_alias="raw_src")
         source_sql = (
-            f"SELECT {cast_projection} FROM (\n{source_prepared.text}\n) AS raw_src"
+            f"SELECT {source_projection} FROM (\n{source_prepared.text}\n) AS raw_src"
         )
 
         prune_predicates: list[str] = []
@@ -3296,13 +3296,13 @@ class Table(DatabricksResource, Holder):
                 extra_schema = extra_target.collect_schema()
                 extra_fields = list(extra_schema.fields)
                 extra_columns = [f.name for f in extra_fields]
-                extra_cast_proj = _build_cast_projection(
+                extra_projection = _build_column_projection(
                     extra_fields, source_alias="raw_src",
                 )
                 where_frag = _render_source_predicate(predicate)
                 where_clause = f"\nWHERE {where_frag}" if where_frag else ""
                 extra_source_sql = (
-                    f"SELECT {extra_cast_proj} "
+                    f"SELECT {extra_projection} "
                     f"FROM (\n{source_prepared.text}\n) AS raw_src{where_clause}"
                 )
                 extra_texts = _build_dml_statements(
