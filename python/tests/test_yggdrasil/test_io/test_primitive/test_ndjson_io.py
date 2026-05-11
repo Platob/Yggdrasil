@@ -54,6 +54,38 @@ class TestEmpty:
         assert list(NDJsonIO().read_arrow_batches()) == []
 
 
+class TestTargetSchemaCast:
+    """``target_field`` reshapes batches on read and write. With no
+    target bound the path is a passthrough — covered by
+    :class:`TestRoundTrip`."""
+
+    def _target_field(self):
+        from yggdrasil.data.data_field import Field
+        return Field.from_(pa.schema([
+            pa.field("id", pa.int64()),
+            pa.field("v", pa.float64()),
+        ]))
+
+    def test_read_casts_to_target_schema(self) -> None:
+        io = NDJsonIO()
+        io.write_arrow_table(pa.table({
+            "id": ["1", "2"], "v": ["1.5", "2.5"],
+        }))
+        casted = io.read_arrow_table(target_field=self._target_field())
+        assert casted.schema.field("id").type == pa.int64()
+        assert casted.schema.field("v").type == pa.float64()
+
+    def test_write_casts_to_target_schema(self) -> None:
+        io = NDJsonIO()
+        io.write_arrow_table(
+            pa.table({"id": ["1", "2"], "v": ["1.5", "2.5"]}),
+            target_field=self._target_field(),
+        )
+        raw = io.read_arrow_table()
+        assert raw.schema.field("id").type == pa.int64()
+        assert raw.schema.field("v").type == pa.float64()
+
+
 class TestModes:
 
     def test_overwrite(self, table) -> None:

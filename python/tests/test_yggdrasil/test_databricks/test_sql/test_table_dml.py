@@ -31,9 +31,13 @@ from __future__ import annotations
 
 import pytest
 
+import pyarrow as pa
+
 from yggdrasil.data.enums import Mode
+from yggdrasil.data.schema import Schema
 from yggdrasil.databricks.sql.table import (
     _build_anti_join_insert,
+    _build_cast_projection,
     _build_delete_insert_statements,
     _build_dml_statements,
 )
@@ -451,6 +455,104 @@ class TestNoMergeFallbackMachinery:
         assert hasattr(_t, "_build_anti_join_insert")
         assert hasattr(_t, "_execute_dml")
         assert hasattr(_t, "_spark_filter_existing_keys")
+
+
+# ---------------------------------------------------------------------------
+# _build_cast_projection — schema-on-INSERT projection list
+# ---------------------------------------------------------------------------
+
+
+def _schema(*pairs: tuple[str, "pa.DataType"]) -> Schema:
+    return Schema.from_arrow(pa.schema([pa.field(n, t) for n, t in pairs]))
+
+
+class TestBuildCastProjection:
+    """The CAST projection is what carries the target schema onto the
+    INSERT statement. ``arrow_insert`` / ``spark_insert`` /
+    ``sql_insert`` all funnel through here, so pin the shape."""
+
+    def test_unaliased_emits_bare_quoted_column_name(self) -> None:
+        sql = _build_cast_projection(
+            _schema(("id", pa.int64()), ("v", pa.float64())).fields,
+        )
+        assert sql == "CAST(`id` AS BIGINT) AS `id`, CAST(`v` AS DOUBLE) AS `v`"
+
+    def test_source_alias_qualifies_left_side_only(self) -> None:
+        sql = _build_cast_projection(
+            _schema(("id", pa.int64()), ("v", pa.float64())).fields,
+            source_alias="raw_src",
+        )
+        # Source side gets the alias; the AS target stays unqualified.
+        assert sql == (
+            "CAST(raw_src.`id` AS BIGINT) AS `id`, "
+            "CAST(raw_src.`v` AS DOUBLE) AS `v`"
+        )
+
+    def test_empty_fields_returns_empty_string(self) -> None:
+        assert _build_cast_projection(_schema().fields) == ""
+
+    def test_special_characters_in_name_are_quoted(self) -> None:
+        sql = _build_cast_projection(_schema(("a b", pa.string())).fields)
+        # Backtick quoting protects spaces / reserved words; DDL stays
+        # name-free so the cast never re-emits the identifier inline.
+        assert sql == "CAST(`a b` AS STRING) AS `a b`"
+
+    def test_ddl_omits_nullable_and_comment(self) -> None:
+        # Nullable / comment in the source schema must NOT leak into
+        # the CAST DDL — Delta MERGE refuses ``CAST(... AS x NOT NULL)``
+        # inside a struct (``DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION``).
+        schema = Schema.from_arrow(pa.schema([
+            pa.field("id", pa.int64(), nullable=False),
+        ]))
+        sql = _build_cast_projection(schema.fields)
+        assert "NOT NULL" not in sql
+        assert "COMMENT" not in sql
+
+    def test_nested_struct_renders_inner_types(self) -> None:
+        inner = pa.struct([
+            pa.field("k", pa.int32()),
+            pa.field("name", pa.string()),
+        ])
+        sql = _build_cast_projection(_schema(("payload", inner)).fields)
+        # Struct inner types come through to_spark_name; nullable on
+        # the children stays off so the cast is permissive.
+        assert sql.startswith("CAST(`payload` AS STRUCT<")
+        assert "`k` INT" in sql
+        assert "`name` STRING" in sql
+        assert sql.endswith(" AS `payload`")
+        assert "NOT NULL" not in sql
+
+
+class TestSparkInsertSQLProjection:
+    """Pin the shape of the source projection used by spark_insert /
+    arrow_insert. Validates the helper through the call sites — if
+    the helper changes contract here, the SQL generators need to
+    change too."""
+
+    def test_view_projection_uses_cast_per_column(self) -> None:
+        # Reconstruct what spark_insert emits: ``SELECT <cast_proj>
+        # FROM <view>``. The full method needs a Spark session; this
+        # verifies the projection helper plugs into a plain SELECT.
+        schema = _schema(("id", pa.int64()), ("v", pa.float64()))
+        proj = _build_cast_projection(schema.fields)
+        sql = f"SELECT {proj} FROM `_yg_src`"
+        assert "CAST(`id` AS BIGINT) AS `id`" in sql
+        assert "CAST(`v` AS DOUBLE) AS `v`" in sql
+
+    def test_staging_projection_is_unqualified(self) -> None:
+        # arrow_insert reads the staged Parquet through an external-data
+        # placeholder; the projection therefore must NOT prefix columns.
+        schema = _schema(("id", pa.int64()))
+        proj = _build_cast_projection(schema.fields)
+        assert "raw_src." not in proj
+
+    def test_sql_insert_projection_is_qualified(self) -> None:
+        # sql_insert wraps the user's source query as ``... AS raw_src``;
+        # the projection must qualify the source side so the column
+        # reference resolves against the wrapper alias.
+        schema = _schema(("id", pa.int64()))
+        proj = _build_cast_projection(schema.fields, source_alias="raw_src")
+        assert proj.startswith("CAST(raw_src.`id` AS BIGINT)")
 
 
 # ---------------------------------------------------------------------------
