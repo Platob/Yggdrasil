@@ -127,6 +127,15 @@ class CsvIO(IO[bytes, CsvOptions]):
         self,
         options: CsvOptions,
     ) -> Iterator[pa.RecordBatch]:
+        """Stream Arrow record batches out of the CSV reader.
+
+        Each batch is funneled through :meth:`CastOptions.cast_arrow_tabular`
+        so a bound ``target_field`` reshapes the rows to the caller's
+        schema before they leave the reader — useful when the CSV's
+        inferred types (everything looks like a string until pyarrow
+        sniffs) need to be coerced to a stricter target. When no
+        target is bound the cast is a passthrough.
+        """
         if self.size == 0:
             return
         with self.arrow_input_stream() as v:
@@ -138,7 +147,7 @@ class CsvIO(IO[bytes, CsvOptions]):
             )
             try:
                 for batch in reader:
-                    yield batch
+                    yield options.cast_arrow_tabular(batch)
             finally:
                 reader.close()
 
@@ -244,36 +253,46 @@ class CsvIO(IO[bytes, CsvOptions]):
                 merged, dataclasses.replace(options, mode=Mode.OVERWRITE),
             )
 
-        schema = first.schema
+        # Bind the first batch's schema as the source so
+        # :attr:`CastOptions.merged_schema` resolves to the writer
+        # schema even when no target_field is set; each batch is
+        # cast through :meth:`cast_arrow_tabular` so a bound target
+        # reshapes the rows to the caller's schema before the
+        # encoder sees them.
+        cast_opts = options.check_source(first.schema)
+        first_casted = cast_opts.cast_arrow_tabular(first)
+        schema = cast_opts.merged_schema.to_arrow_schema()
 
         if is_append_uncompressed:
             # Append path: drive the CSVWriter against the IO's
             # :meth:`arrow_output_stream` in append mode, which seeks
             # to EOF and writes the encoded batch on context exit.
-            write_options = pa_csv.WriteOptions(
+            csv_write_options = pa_csv.WriteOptions(
                 include_header=False, delimiter=options.delimiter,
             )
             with self.arrow_output_stream(append=True) as sink:
                 with pa_csv.CSVWriter(
-                    sink, schema, write_options=write_options,
+                    sink, schema, write_options=csv_write_options,
                 ) as writer:
-                    if first.num_rows > 0:
-                        writer.write_batch(first)
+                    if first_casted.num_rows > 0:
+                        writer.write_batch(first_casted)
                     for batch in iterator:
-                        if batch.num_rows > 0:
-                            writer.write_batch(batch)
+                        casted = cast_opts.cast_arrow_tabular(batch)
+                        if casted.num_rows > 0:
+                            writer.write_batch(casted)
             return
 
-        write_options = options.to_write_options()
+        csv_write_options = options.to_write_options()
         with self.arrow_output_stream() as sink:
             with pa_csv.CSVWriter(
-                sink, schema, write_options=write_options,
+                sink, schema, write_options=csv_write_options,
             ) as writer:
-                if first.num_rows > 0:
-                    writer.write_batch(first)
+                if first_casted.num_rows > 0:
+                    writer.write_batch(first_casted)
                 for batch in iterator:
-                    if batch.num_rows > 0:
-                        writer.write_batch(batch)
+                    casted = cast_opts.cast_arrow_tabular(batch)
+                    if casted.num_rows > 0:
+                        writer.write_batch(casted)
 
     # ==================================================================
     # Native engine overrides

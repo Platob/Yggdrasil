@@ -495,6 +495,39 @@ def _resolve_dispatch_targets(
     return out
 
 
+def _build_cast_projection(
+    fields: "Iterable[Field]",
+    *,
+    source_alias: "str | None" = None,
+) -> str:
+    """Build a SQL ``CAST(<expr> AS <ddl>) AS <name>`` projection list.
+
+    Each :class:`Field` contributes one term where ``<src>`` is the
+    bare quoted column name (when *source_alias* is ``None``) or
+    ``alias.colname`` (when set). The DDL fragment comes from
+    :meth:`Field.to_spark_name` with the name / nullable / comment
+    sections suppressed so only the type is emitted — ``to_spark_name``
+    never appends ``NOT NULL`` on struct children that way, which
+    matches the nullable shape of staged Parquet reads and keeps
+    Delta MERGE from rejecting the implicit cast
+    (``DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION``).
+
+    Used by :meth:`Table.arrow_insert`, :meth:`Table.spark_insert`,
+    and :meth:`Table.sql_insert` (with ``source_alias="raw_src"`` for
+    the latter) so the INSERT itself carries the target schema even
+    when the source side already happens to align.
+    """
+    parts: list[str] = []
+    for f in fields:
+        col = quote_ident(f.name)
+        src = f"{source_alias}.{col}" if source_alias else col
+        ddl = f.to_spark_name(
+            with_name=False, with_nullable=False, with_comment=False,
+        )
+        parts.append(f"CAST({src} AS {ddl}) AS {col}")
+    return ", ".join(parts)
+
+
 def _render_source_predicate(predicate: "Predicate | None") -> str:
     """Render a source-side ``WHERE`` fragment for a dispatch predicate.
 
@@ -2689,21 +2722,10 @@ class Table(DatabricksResource, Holder):
             prune_predicates.append(_wrap_user_predicate(where, target_alias="T"))
 
         columns = list(existing_schema.field_names())
-        # Explicit per-column CAST to the target field's DDL coerces the
-        # staged Parquet rows to the target table's schema. Mirrors the
-        # projection used by :meth:`sql_insert`. ``to_spark_name``
-        # never emits ``NOT NULL`` on struct children, so the source
-        # side is always nullable and matches the parquet reader's view
-        # — Spark/Delta refuse the implicit cast otherwise
-        # (``DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION``).
-        cast_projection = ", ".join(
-            (
-                f"CAST({quote_ident(f.name)} AS "
-                f"{f.to_spark_name(with_name=False, with_nullable=False, with_comment=False)})"
-                f" AS {quote_ident(f.name)}"
-            )
-            for f in existing_schema.fields
-        )
+        # Explicit per-column CAST projection coerces the staged
+        # Parquet rows to the target table's schema. Mirrors
+        # :meth:`spark_insert` / :meth:`sql_insert`.
+        cast_projection = _build_cast_projection(existing_schema.fields)
         source_sql = f"SELECT {cast_projection} FROM {{{_ALIAS_TMPSRC}}}"
 
         sql_texts = _build_dml_statements(
@@ -2764,14 +2786,7 @@ class Table(DatabricksResource, Holder):
                 extra_target.create(data, mode=schema_mode)
                 extra_schema = extra_target.collect_schema()
                 extra_columns = list(extra_schema.field_names())
-                extra_cast_proj = ", ".join(
-                    (
-                        f"CAST({quote_ident(f.name)} AS "
-                        f"{f.to_spark_name(with_name=False, with_nullable=False, with_comment=False)})"
-                        f" AS {quote_ident(f.name)}"
-                    )
-                    for f in extra_schema.fields
-                )
+                extra_cast_proj = _build_cast_projection(extra_schema.fields)
                 where_frag = _render_source_predicate(predicate)
                 where_clause = f"\nWHERE {where_frag}" if where_frag else ""
                 extra_source_sql = (
@@ -2934,7 +2949,12 @@ class Table(DatabricksResource, Holder):
 
         columns = list(existing_schema.field_names())
         cols_quoted = ", ".join(quote_ident(c) for c in columns)
-        source_sql = f"SELECT {cols_quoted} FROM {quote_ident(view_name)}"
+        # Explicit per-column CAST projection coerces the view rows
+        # to the target table's schema even when the DataFrame
+        # already happens to align — defensive against Spark
+        # promoting nullable→NOT NULL inside a struct.
+        cast_projection = _build_cast_projection(existing_schema.fields)
+        source_sql = f"SELECT {cast_projection} FROM {quote_ident(view_name)}"
 
         # The DataFrame anti-join already dedup'd; emit a plain INSERT
         # so we don't pay for the SQL-side NOT EXISTS twice.
@@ -3012,13 +3032,14 @@ class Table(DatabricksResource, Holder):
                         extra_target.create(data, mode=schema_mode)
                         extra_schema = extra_target.collect_schema()
                         extra_columns = list(extra_schema.field_names())
-                        extra_cols_quoted = ", ".join(
-                            quote_ident(c) for c in extra_columns
-                        )
+                        # Same CAST projection as the primary INSERT —
+                        # each dispatch target may have its own column
+                        # types, so the cast is per-target.
+                        extra_cast_proj = _build_cast_projection(extra_schema.fields)
                         where_frag = _render_source_predicate(predicate)
                         where_clause = f" WHERE {where_frag}" if where_frag else ""
                         extra_source_sql = (
-                            f"SELECT {extra_cols_quoted} "
+                            f"SELECT {extra_cast_proj} "
                             f"FROM {quote_ident(view_name)}{where_clause}"
                         )
                         extra_texts = _build_dml_statements(
@@ -3199,14 +3220,7 @@ class Table(DatabricksResource, Holder):
         if match_by == "auto":
             match_by = [f.name for f in existing_schema.primary_fields] or None
 
-        cast_projection = ", ".join(
-            (
-                f"CAST(raw_src.{quote_ident(f.name)} AS "
-                f"{f.to_spark_name(with_name=False, with_nullable=False, with_comment=False)})"
-                f" AS {quote_ident(f.name)}"
-            )
-            for f in fields
-        )
+        cast_projection = _build_cast_projection(fields, source_alias="raw_src")
         source_sql = (
             f"SELECT {cast_projection} FROM (\n{source_prepared.text}\n) AS raw_src"
         )
@@ -3282,13 +3296,8 @@ class Table(DatabricksResource, Holder):
                 extra_schema = extra_target.collect_schema()
                 extra_fields = list(extra_schema.fields)
                 extra_columns = [f.name for f in extra_fields]
-                extra_cast_proj = ", ".join(
-                    (
-                        f"CAST(raw_src.{quote_ident(f.name)} AS "
-                        f"{f.to_spark_name(with_name=False, with_nullable=False, with_comment=False)})"
-                        f" AS {quote_ident(f.name)}"
-                    )
-                    for f in extra_fields
+                extra_cast_proj = _build_cast_projection(
+                    extra_fields, source_alias="raw_src",
                 )
                 where_frag = _render_source_predicate(predicate)
                 where_clause = f"\nWHERE {where_frag}" if where_frag else ""

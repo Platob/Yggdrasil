@@ -69,6 +69,42 @@ class TestEmpty:
         assert CsvIO().collect_schema() == Schema.empty()
 
 
+class TestTargetSchemaCast:
+    """``target_field`` reshapes every batch on read and write so the
+    encoder/decoder sees the caller's schema. Without a target the
+    code path is a passthrough — covered by :class:`TestRoundTrip`."""
+
+    def _target_field(self):
+        from yggdrasil.data.data_field import Field
+        return Field.from_(pa.schema([
+            pa.field("id", pa.int64()),
+            pa.field("v", pa.float64()),
+        ]))
+
+    def test_read_casts_to_target_schema(self) -> None:
+        # CSV always carries text bytes; the reader infers types from
+        # column values, so an explicit target lets the caller pin a
+        # narrower or wider type.
+        io = CsvIO()
+        io.write_arrow_table(pa.table({
+            "id": ["1", "2", "3"], "v": ["1.5", "2.5", "3.5"],
+        }))
+        casted = io.read_arrow_table(target_field=self._target_field())
+        assert casted.schema.field("id").type == pa.int64()
+        assert casted.schema.field("v").type == pa.float64()
+
+    def test_write_casts_to_target_schema(self) -> None:
+        # The casted values are what get persisted as text.
+        io = CsvIO()
+        io.write_arrow_table(
+            pa.table({"id": ["1", "2"], "v": ["1.5", "2.5"]}),
+            target_field=self._target_field(),
+        )
+        raw = io.read_arrow_table()
+        assert raw.schema.field("id").type == pa.int64()
+        assert raw.schema.field("v").type == pa.float64()
+
+
 class TestModes:
 
     def test_overwrite_replaces(self, table) -> None:

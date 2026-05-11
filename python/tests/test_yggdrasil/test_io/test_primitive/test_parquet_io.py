@@ -72,6 +72,52 @@ class TestEmpty:
         assert ParquetIO().collect_schema() == Schema.empty()
 
 
+class TestTargetSchemaCast:
+    """``target_field`` flows through the read/write paths and casts
+    every batch on its way through the encoder/decoder. With no target
+    bound the path is a passthrough — covered by :class:`TestRoundTrip`."""
+
+    def _target_field(self):
+        from yggdrasil.data.data_field import Field
+        return Field.from_(pa.schema([
+            pa.field("id", pa.int64()),
+            pa.field("v", pa.float64()),
+        ]))
+
+    def test_read_casts_to_target_schema(self) -> None:
+        # Write as strings, read with a numeric target — the reader
+        # should cast each batch on the way out.
+        io = ParquetIO()
+        io.write_arrow_table(pa.table({
+            "id": ["1", "2", "3"], "v": ["1.5", "2.5", "3.5"],
+        }))
+        casted = io.read_arrow_table(target_field=self._target_field())
+        assert casted.schema.field("id").type == pa.int64()
+        assert casted.schema.field("v").type == pa.float64()
+        assert casted.column("id").to_pylist() == [1, 2, 3]
+        assert casted.column("v").to_pylist() == [1.5, 2.5, 3.5]
+
+    def test_write_casts_to_target_schema(self) -> None:
+        # Write strings with a numeric target — the file itself
+        # should carry the target schema, not the source.
+        io = ParquetIO()
+        io.write_arrow_table(
+            pa.table({"id": ["1", "2"], "v": ["1.5", "2.5"]}),
+            target_field=self._target_field(),
+        )
+        # Read without a target so we see exactly what was persisted.
+        raw = io.read_arrow_table()
+        assert raw.schema.field("id").type == pa.int64()
+        assert raw.schema.field("v").type == pa.float64()
+
+    def test_no_target_is_passthrough(self) -> None:
+        # Empty options round-trip preserves the source schema.
+        original = pa.table({"id": [1, 2], "v": [1.5, 2.5]})
+        io = ParquetIO()
+        io.write_arrow_table(original)
+        assert io.read_arrow_table().equals(original)
+
+
 class TestHolderBacked:
 
     def test_local_path_round_trip(self, tmp_path, table) -> None:
