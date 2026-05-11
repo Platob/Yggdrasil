@@ -1089,23 +1089,28 @@ class Tabular(ABC, Generic[O]):
 
         # Push the target cast into polars before the zero-copy
         # :func:`pl.DataFrame.to_arrow` hand-off. The rust engine fuses
-        # cast + projection (numerics, temporals, nested) into one pass;
-        # the downstream per-batch ``cast_arrow_tabular`` then only has
-        # to reconcile arrow-level shape differences polars can't express
-        # natively (e.g. ``large_string`` ↔ ``string`` round-trips). We
-        # don't pre-bind ``source_field`` here — polars's arrow bridge
-        # may pick a slightly different physical type than the yggdrasil
-        # target declares (``large_string`` is the canonical one), and
-        # the downstream cast handles the final reconciliation in one
-        # cheap kernel call.
+        # cast + projection (numerics, temporals, nested) into one pass.
+        # After polars's cast, run a single :meth:`pa.Table.cast` per
+        # chunk to reconcile the canonical arrow physical-type mismatches
+        # polars can't express (``large_string`` ↔ ``string``, …) — one
+        # whole-table cast is cheaper than per-batch dispatch through
+        # the yggdrasil :class:`Field` walk, and binding source = target
+        # afterwards collapses the per-batch ``cast_arrow_tabular`` to
+        # its bypass.
         target_field = getattr(options, "target_field", None)
+        target_arrow_schema: "pa.Schema | None" = None
         if target_field is not None:
             try:
                 frame = options.cast_polars_tabular(frame)
             except Exception:
                 # Polars cast couldn't express the target shape — fall
                 # back to per-batch arrow cast downstream.
-                pass
+                target_field = None
+            else:
+                merged = options.merged_field
+                if merged is not None:
+                    target_arrow_schema = merged.to_arrow_schema()
+                    options = options.with_source(merged, copy=True)
 
         row_size = getattr(options, "row_size", None) or 0
         byte_size = getattr(options, "byte_size", None) or 0
@@ -1124,12 +1129,31 @@ class Tabular(ABC, Generic[O]):
         # Polars schemas convert losslessly to Arrow on the head batch
         # — peek one and stamp it so readers don't have to wait for
         # the whole frame to drain.
-        head_schema = frame.head(0).to_arrow().schema
+        head_schema = (
+            target_arrow_schema
+            if target_arrow_schema is not None
+            else frame.head(0).to_arrow().schema
+        )
         self._persist_schema(Schema.from_arrow(head_schema))
 
         def gen() -> Iterator[pa.RecordBatch]:
             for f in chunks:
-                yield from f.to_arrow().to_batches()
+                chunk_table = f.to_arrow()
+                if (
+                    target_arrow_schema is not None
+                    and chunk_table.schema != target_arrow_schema
+                ):
+                    try:
+                        chunk_table = chunk_table.cast(
+                            target_arrow_schema, safe=False,
+                        )
+                    except (pa.ArrowInvalid, pa.ArrowTypeError,
+                            pa.ArrowNotImplementedError):
+                        # Final reconciliation will run inside the per-batch
+                        # path — drop the pre-cast and let the cast pipeline
+                        # handle it.
+                        pass
+                yield from chunk_table.to_batches()
 
         inner = options.copy(sync_metadata=False) if options.sync_metadata else options
         self._write_arrow_batches(gen(), inner)
