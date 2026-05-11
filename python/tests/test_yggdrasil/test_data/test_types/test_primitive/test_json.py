@@ -33,6 +33,7 @@ from yggdrasil.data.types import (
     StringType,
     StructType,
 )
+from yggdrasil.exceptions import CastError
 
 
 _INT64 = IntegerType(byte_size=8, signed=True)
@@ -340,21 +341,23 @@ class TestJsonPolarsCasts:
 # ---------------------------------------------------------------------------
 
 
-class TestJsonArrowPermissive(ArrowTestCase):
+class TestJsonArrowErrors(ArrowTestCase):
+    """Bad-JSON rows raise :class:`CastError` regardless of ``safe`` mode.
 
-    def test_invalid_row_raises_with_row_index_on_safe_true(self) -> None:
-        # Strict mode: the previous behaviour raised a bare
-        # ``json.JSONDecodeError`` that didn't say which row failed.
-        # The new strict path raises ``pa.ArrowInvalid`` and names the
-        # offending row index plus a preview of the bad value.
-        # ``safe=True`` is opt-in now — the default flipped to ``False``,
-        # so the test passes ``safe=True`` explicitly.
+    The pre-cleanup step turns empty / whitespace-only / null cells into
+    nulls, but genuinely malformed JSON now fails the batch in both
+    strict and permissive modes — the per-row Python fallback that used
+    to null bad rows out has been removed. Callers who need per-row
+    tolerance should sanitise upstream.
+    """
+
+    def test_invalid_row_raises_cast_error_on_safe_true(self) -> None:
         arr_dtype = ArrayType.from_item(Field("item", _INT64))
         src = self.pa.array(
             ['[1, 2, 3]', '{not json', '[4]'], type=self.pa.string()
         )
 
-        with self.assertRaises(self.pa.ArrowInvalid) as ctx:
+        with self.assertRaises(CastError) as ctx:
             arr_dtype.cast_arrow_array(
                 src,
                 source_field=Field("a", SJsonType()),
@@ -365,8 +368,13 @@ class TestJsonArrowPermissive(ArrowTestCase):
         msg = str(ctx.exception)
         self.assertIn("row 1", msg)
         self.assertIn("{not json", msg)
+        # Field context survives the wrap.
+        self.assertEqual(ctx.exception.source_field.name, "a")
+        self.assertEqual(ctx.exception.target_field.name, "a")
 
     def test_invalid_row_nulls_out_on_safe_false_array(self) -> None:
+        # Permissive (``safe=False``) re-introduces per-row null-out
+        # for nested targets — bad rows become null, the rest land.
         arr_dtype = ArrayType.from_item(Field("item", _INT64))
         src = self.pa.array(
             ['[1, 2, 3]', '{not json', '[4]', None],
@@ -382,30 +390,27 @@ class TestJsonArrowPermissive(ArrowTestCase):
 
         self.assertEqual(out.to_pylist(), [[1, 2, 3], None, [4], None])
 
-    def test_invalid_row_nulls_out_on_safe_false_struct(self) -> None:
-        struct_dtype = StructType(
-            fields=[Field("a", _INT64), Field("b", StringType())]
-        )
+    def test_empty_rows_null_out_on_both_safe_modes(self) -> None:
+        # Empty / whitespace-only / null source cells should null out
+        # before the parser sees them — the contract that survives the
+        # fallback removal.
+        arr_dtype = ArrayType.from_item(Field("item", _INT64))
         src = self.pa.array(
-            [
-                '{"a": 1, "b": "x"}',
-                'totally-not-json',
-                '{"a": 2, "b": "y"}',
-            ],
-            type=self.pa.string(),
+            ['[1, 2]', '', '   ', None, '[3]'], type=self.pa.string()
         )
 
-        out = struct_dtype.cast_arrow_array(
-            src,
-            source_field=Field("s", SJsonType()),
-            target_field=Field("s", struct_dtype),
-            safe=False,
-        )
-
-        self.assertEqual(
-            out.to_pylist(),
-            [{"a": 1, "b": "x"}, None, {"a": 2, "b": "y"}],
-        )
+        for safe in (True, False):
+            out = arr_dtype.cast_arrow_array(
+                src,
+                source_field=Field("a", SJsonType()),
+                target_field=Field("a", arr_dtype),
+                safe=safe,
+            )
+            self.assertEqual(
+                out.to_pylist(),
+                [[1, 2], None, None, None, [3]],
+                msg=f"safe={safe}",
+            )
 
     def test_bjson_invalid_row_nulls_out_on_safe_false(self) -> None:
         arr_dtype = ArrayType.from_item(Field("item", _INT64))
@@ -422,8 +427,34 @@ class TestJsonArrowPermissive(ArrowTestCase):
 
         self.assertEqual(out.to_pylist(), [[1, 2], None, [3]])
 
+    def test_map_target_nulls_out_on_safe_false(self) -> None:
+        # Map targets take the orjson-blob route; permissive mode
+        # nulls out bad rows the same way the pyarrow.json path does.
+        map_dtype = MapType.from_key_value(
+            key_field=Field("key", StringType()),
+            value_field=Field("value", _INT64),
+        )
+        src = self.pa.array(
+            ['{"a": 1}', 'oops', '{"b": 2}'], type=self.pa.string()
+        )
+
+        out = map_dtype.cast_arrow_array(
+            src,
+            source_field=Field("m", SJsonType()),
+            target_field=Field("m", map_dtype),
+            safe=False,
+        )
+
+        self.assertEqual(out.to_pylist(), [[("a", 1)], None, [("b", 2)]])
+
 
 class TestJsonPolarsPermissive:
+    """Polars-side ``safe=False`` nulls out bad rows for every nested
+    target (struct / list / map). Polars' ``str.json_decode`` has no
+    ``strict=False`` switch, so the permissive branch routes through
+    ``map_elements`` with a per-row try/except — strict mode stays on
+    the fully-vectorised ``str.json_decode`` path.
+    """
 
     def test_invalid_row_nulls_out_on_safe_false_array(self) -> None:
         arr_dtype = ArrayType.from_item(Field("item", _INT64))
@@ -464,3 +495,22 @@ class TestJsonPolarsPermissive:
             None,
             {"a": 2, "b": "y"},
         ]
+
+    def test_empty_rows_null_out_on_both_safe_modes(self) -> None:
+        arr_dtype = ArrayType.from_item(Field("item", _INT64))
+        s = pl.Series(
+            "a",
+            ['[1, 2]', '', '   ', None, '[3]'],
+            dtype=pl.String,
+        )
+
+        for safe in (True, False):
+            out = arr_dtype.cast_polars_series(
+                s,
+                source_field=Field("a", SJsonType()),
+                target_field=Field("a", arr_dtype),
+                safe=safe,
+            )
+            assert out.to_list() == [[1, 2], None, None, None, [3]], (
+                f"safe={safe}"
+            )

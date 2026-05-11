@@ -35,11 +35,14 @@ class TestSafeDefaultIsFalse(ArrowTestCase):
         self.assertTrue(CastOptions(safe=True).safe)
 
 
-class TestBadJsonRowsNullOutByDefault(ArrowTestCase):
-    """Reproduces the user-reported failure: a string column being cast
-    to a JSON-shaped nested target used to fail the whole batch on the
-    first malformed row. The default behaviour now nulls out bad rows
-    so the rest of the batch lands."""
+class TestStringToNestedRequiresJsonDeclaration(ArrowTestCase):
+    """Raw ``string`` / ``binary`` columns are no longer auto-parsed as
+    JSON when the target is a nested type — callers must surface the
+    column as :class:`SJsonType` / :class:`BJsonType` for JSON intent
+    to fire. The cast otherwise raises a :class:`CastError` naming the
+    failing column on both ends, so logs point straight at the source
+    of trouble.
+    """
 
     def _schemas(self):
         pa = self.pa
@@ -60,7 +63,10 @@ class TestBadJsonRowsNullOutByDefault(ArrowTestCase):
         ])
         return src, tgt
 
-    def test_default_permissive_nulls_bad_rows(self) -> None:
+    def test_plain_string_to_nested_raises_cast_error(self) -> None:
+        # Even on permissive mode, ``string`` → ``list<struct>`` raises
+        # because the source isn't declared as JSON. The error names the
+        # failing column on both ends.
         pa = self.pa
         src, tgt = self._schemas()
         tbl = pa.table(
@@ -71,42 +77,47 @@ class TestBadJsonRowsNullOutByDefault(ArrowTestCase):
             source_field=Field.from_arrow(src),
             target_field=Field.from_arrow(tgt),
         )
-        out = opts.cast_arrow_tabular(tbl)
+        with self.assertRaises(CastError) as ctx:
+            opts.cast_arrow_tabular(tbl)
 
-        self.assertEqual(out.num_rows, 3)
-        self.assertEqual(out.column("id").to_pylist(), [1, 2, 3])
-        # Bad rows null out, the good row keeps its structured value.
-        rows = out.column("payload").to_pylist()
-        self.assertIsNone(rows[0])
-        self.assertEqual(rows[1], [{"a": 1, "b": "x"}])
-        self.assertIsNone(rows[2])
+        err = ctx.exception
+        self.assertEqual(err.source_field.name, "payload")
+        self.assertEqual(err.target_field.name, "payload")
+        # The error message points at the SJsonType / BJsonType escape
+        # hatch so callers know what to do.
+        self.assertIn("SJsonType", str(err))
 
-    def test_strict_safe_true_raises_cast_error(self) -> None:
+    def test_sjson_source_decodes_valid_rows_and_raises_on_bad(self) -> None:
+        # Surface ``payload`` as SJSON and the JSON decoder fires.
+        # Empty / null cells null out (pre-cleanup); a genuinely bad
+        # row raises CastError with row context.
+        from yggdrasil.data import Schema
+        from yggdrasil.data.types import IntegerType, SJsonType
+
         pa = self.pa
-        src, tgt = self._schemas()
+        _, tgt = self._schemas()
         tbl = pa.table(
-            {"id": [1], "payload": ["pypsa"]},
-            schema=src,
+            {"id": [1, 2, 3], "payload": ['[{"a": 1, "b": "x"}]', "", "nope"]},
         )
+
+        source_field = Schema(
+            inner_fields=[
+                Field(name="id", dtype=IntegerType(byte_size=8, signed=True), nullable=True),
+                Field(name="payload", dtype=SJsonType(), nullable=True),
+            ]
+        )
+
         opts = CastOptions(
-            source_field=Field.from_arrow(src),
+            source_field=source_field,
             target_field=Field.from_arrow(tgt),
             safe=True,
         )
         with self.assertRaises(CastError) as ctx:
             opts.cast_arrow_tabular(tbl)
-
         err = ctx.exception
-        # Source / target fields are accessible programmatically.
-        self.assertIsNotNone(err.source_field)
-        self.assertIsNotNone(err.target_field)
         self.assertEqual(err.source_field.name, "payload")
-        self.assertEqual(err.target_field.name, "payload")
-        # Message mentions the failing column on both ends.
-        msg = str(err)
-        self.assertIn("payload: string", msg)
-        self.assertIn("payload: list<", msg)
-        self.assertIn("pypsa", msg)
+        # Row 2 ("nope") is the failing row.
+        self.assertIn("row 2", str(err))
 
 
 class TestCastErrorBackCompat(ArrowTestCase):

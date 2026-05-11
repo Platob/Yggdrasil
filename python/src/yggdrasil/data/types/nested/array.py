@@ -11,6 +11,7 @@ import pyarrow.types as pat
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.support import get_pandas, get_polars, get_spark_sql
 from yggdrasil.data.enums import Mode
+from yggdrasil.exceptions import CastError
 from yggdrasil.lazy_imports import field_class
 from ._cast_json import (
     cast_arrow_json_string_array,
@@ -347,8 +348,12 @@ class ArrayType(NestedType):
                 )
 
             else:
-                raise pa.ArrowInvalid(
-                    f"Cannot cast {options.source_field} to {options.target_field}"
+                raise CastError(
+                    f"no converter from {options.source_field.dtype.type_id.name} "
+                    f"to ARRAY. For string / binary payloads carrying JSON, "
+                    f"declare the source field as SJsonType / BJsonType.",
+                    source_field=options.source_field,
+                    target_field=options.target_field,
                 )
 
         return array

@@ -136,6 +136,54 @@ Bad:
 raise KeyError("field not found")
 ```
 
+### Prefer :class:`CastError` for any cast failure
+
+Any failure inside a value / array / series / column / tabular cast
+must surface as :class:`yggdrasil.exceptions.CastError`, **not** a raw
+`pa.ArrowInvalid` / `ValueError` / `TypeError` / polars
+`ComputeError`. `CastError` carries the `source_field` and
+`target_field` Field instances and renders them on a single line
+(`cast price: string -> price: float64 failed: …`) so multi-column
+writes point straight at the offending column. It subclasses
+`pa.ArrowInvalid` (which is itself a `ValueError`) so every existing
+`except pa.ArrowInvalid` / `except ValueError` handler keeps catching
+it — there is no caller cost.
+
+Rules:
+- Every dispatch fall-through (`else: raise …` at the bottom of a
+  `_cast_*` method) raises `CastError`, not `pa.ArrowInvalid`. Bind
+  `source_field=options.source_field` and `target_field=options.target_field`
+  so the message names both ends.
+- Wrapping an underlying parse / decode failure: pass it through as
+  `original=exc` so callers can still reach the raw exception and the
+  `raise … from exc` chain is preserved.
+- Engine-side leaks (pyarrow.json `ArrowInvalid`, polars `ComputeError`,
+  spark `Py4JJavaError`) get caught at the seam (`Field.cast_arrow_array`,
+  `cast_polars_series`, `cast_spark_column`, the per-engine `_cast_*`
+  helpers) and re-raised as `CastError`. The seam already exists in
+  `data_field.py` and the nested cast dispatchers — extend it, don't
+  reinvent it.
+- Reason text follows the standard "what failed + valid alternative"
+  shape: `"no converter from STRING to STRUCT. For string / binary
+  payloads carrying JSON, declare the source field as SJsonType /
+  BJsonType."` — never just `"cast failed"`.
+
+Good:
+```python
+raise CastError(
+    f"no converter from {options.source_field.dtype.type_id.name} to STRUCT. "
+    f"For string / binary payloads carrying JSON, declare the source field "
+    f"as SJsonType / BJsonType.",
+    source_field=options.source_field,
+    target_field=options.target_field,
+)
+```
+
+Bad:
+```python
+raise pa.ArrowInvalid(f"Cannot cast {options.source_field} to {options.target_field}")
+```
+
 ### Gen Z style guidance for comments and errors
 Yes, you can use a Gen Z tone, but do it with restraint.
 The library still needs to feel professional and stable.

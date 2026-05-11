@@ -13,6 +13,7 @@ from yggdrasil.data.types.nested import NestedType
 from yggdrasil.data.types.support import get_pandas, get_polars, get_spark_sql
 from yggdrasil.environ.importlib import cached_from_import
 from yggdrasil.data.enums import Mode
+from yggdrasil.exceptions import CastError
 from yggdrasil.lazy_imports import field_class, struct_type_class
 from ._cast_json import (
     cast_arrow_json_string_array,
@@ -307,8 +308,12 @@ class MapType(NestedType):
                 )
 
             else:
-                raise pa.ArrowInvalid(
-                    f"Cannot cast {options.source_field} to {options.target_field}"
+                raise CastError(
+                    f"no converter from {options.source_field.dtype.type_id.name} "
+                    f"to MAP. For string / binary payloads carrying JSON, "
+                    f"declare the source field as SJsonType / BJsonType.",
+                    source_field=options.source_field,
+                    target_field=options.target_field,
                 )
         return array
 

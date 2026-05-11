@@ -27,6 +27,7 @@ import pyarrow as pa
 from yggdrasil.data.enums import Mode
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.nested import NestedType
+from yggdrasil.exceptions import CastError
 from yggdrasil.data.types.nested._cast_json import (
     cast_arrow_json_string_array,
     cast_polars_json_string_expr,
@@ -372,8 +373,12 @@ class StructType(NestedType):
             return cast_arrow_list_array(array, options)
 
         else:
-            raise pa.ArrowInvalid(
-                f"Cannot cast {options.source_field} to {options.target_field}"
+            raise CastError(
+                f"no converter from {options.source_field.dtype.type_id.name} "
+                f"to STRUCT. For string / binary payloads carrying JSON, "
+                f"declare the source field as SJsonType / BJsonType.",
+                source_field=options.source_field,
+                target_field=options.target_field,
             )
 
     def _cast_arrow_tabular(
