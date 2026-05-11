@@ -2,6 +2,7 @@
 """HTTP response model with Arrow, Polars, pandas, and ASGI serialisation."""
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import warnings
 from dataclasses import MISSING
@@ -42,9 +43,31 @@ if TYPE_CHECKING:
 
 __all__ = [
     "Response",
+    "ResponseOptions",
     "RESPONSE_SCHEMA",
     "RESPONSE_ARROW_SCHEMA",
 ]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ResponseOptions(CastOptions):
+    """:class:`CastOptions` for tabular reads off a :class:`Response`.
+
+    ``parse`` toggles how :meth:`Response._read_arrow_batches` (and the
+    engine fan-out derived from it) treats the response body:
+
+    * ``True`` (default) — when the body's media type maps to a
+      registered :class:`Tabular` leaf (Parquet, CSV, NDJSON, Arrow
+      IPC, …), open the body and yield its parsed batches. Falls back
+      to the deterministic single-row metadata projection when no
+      tabular leaf claims the media type, preserving the historical
+      auto-parse-when-possible behaviour.
+    * ``False`` — always yield the deterministic metadata projection
+      that matches :data:`RESPONSE_ARROW_SCHEMA`, regardless of the
+      body's media type.
+    """
+
+    parse: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +521,7 @@ def _compute_response_identity_hash(
 # Response dataclass
 # ---------------------------------------------------------------------------
 
-class Response(Tabular[CastOptions]):
+class Response(Tabular["ResponseOptions"]):
     """HTTP response model — paired with the originating :class:`PreparedRequest`.
 
     Implements :class:`Tabular` over the deterministic metadata
@@ -510,7 +533,15 @@ class Response(Tabular[CastOptions]):
     surface — :class:`BytesIO` dispatches to the right format leaf
     via the holder's media type — or call the existing
     :meth:`to_arrow_batches` with ``parse=True``.
+
+    The Tabular dispatch flips the same ``parse`` knob through
+    :class:`ResponseOptions` — pass ``parse=False`` to force the
+    metadata projection even when the body would otherwise auto-parse.
     """
+
+    @classmethod
+    def options_class(cls) -> "type[ResponseOptions]":
+        return ResponseOptions
 
     __slots__ = (
         "request",
@@ -595,13 +626,15 @@ class Response(Tabular[CastOptions]):
     # with ``parse=True``.
     # ------------------------------------------------------------------
 
-    def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
-        # Parse the body when its declared mime resolves to a
-        # registered tabular leaf (Parquet, CSV, NDJSON, Arrow IPC, …);
-        # otherwise fall back to the deterministic single-row metadata
-        # projection that matches :data:`RESPONSE_ARROW_SCHEMA`
-        # (envelope mime :attr:`MimeTypes.HTTP_RESPONSE`).
-        if Tabular.class_for_media_type(
+    def _read_arrow_batches(self, options: "ResponseOptions") -> Iterator[pa.RecordBatch]:
+        # ``options.parse`` (default ``True``) opts in to body parsing
+        # when its declared mime resolves to a registered tabular leaf
+        # (Parquet, CSV, NDJSON, Arrow IPC, …). When ``parse`` is
+        # False, or no tabular leaf claims the media type, fall back
+        # to the deterministic single-row metadata projection that
+        # matches :data:`RESPONSE_ARROW_SCHEMA` (envelope mime
+        # :attr:`MimeTypes.HTTP_RESPONSE`).
+        if options.parse and Tabular.class_for_media_type(
             self.media_type.mime_type, default=None,
         ) is not None:
             with self.open(mode="rb") as b:
@@ -613,7 +646,7 @@ class Response(Tabular[CastOptions]):
     def _write_arrow_batches(
         self,
         batches: Iterable[pa.RecordBatch],
-        options: CastOptions,
+        options: "ResponseOptions",
     ) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} is read-only. To persist a "
