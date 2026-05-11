@@ -17,6 +17,19 @@ The :class:`Holder` byte primitives map onto these:
 The catalog-management surface (grants, volume metadata, staging
 factories) lives in dedicated modules; this class covers the
 filesystem contract.
+
+Native storage fast path
+------------------------
+
+For S3-backed volumes the SDK's Files API is just a translation
+layer over the underlying object store. :meth:`storage_location`,
+:meth:`temporary_credentials`, :meth:`aws`, and :meth:`s3_path`
+expose the volume's UC-vended S3 storage directly so callers can
+bypass ``workspace.files`` entirely — the resulting :class:`S3Path`
+carries a botocore :class:`RefreshableCredentials`-backed session
+that re-invokes :meth:`temporary_credentials` on every near-expiry
+refresh cycle. One fewer hop per read / write, no Unity Catalog
+quota burn for the bulk transfer.
 """
 
 from __future__ import annotations
@@ -24,7 +37,7 @@ from __future__ import annotations
 import io as _stdio
 import os
 import time
-from typing import Any, ClassVar, Iterator, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional
 
 from yggdrasil.data.enums import Scheme
 from yggdrasil.io.io_stats import IOStats, IOKind
@@ -33,14 +46,35 @@ from yggdrasil.io.url import URL
 from .path import DatabricksPath
 
 
+if TYPE_CHECKING:
+    from yggdrasil.aws.client import AWSClient
+    from yggdrasil.aws.fs.path import S3Path
+
+
 __all__ = ["VolumePath"]
 
 
 class VolumePath(DatabricksPath):
     """Path under ``/Volumes/<cat>/<sch>/<vol>/...`` via the Files API."""
 
+    __slots__ = ("_volume_info", "_storage_location")
+
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_VOLUME
     namespace_prefix: ClassVar[str] = "/Volumes/"
+
+    def __init__(
+        self,
+        data: Any = None,
+        *,
+        url: "URL | None" = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(data=data, url=url, **kwargs)
+        # Per-instance caches for the SDK's ``VolumeInfo`` (rarely
+        # changes) and the volume's root storage URL — both populated
+        # lazily by :meth:`volume_info` / :meth:`storage_location`.
+        self._volume_info: Any = None
+        self._storage_location: Optional[str] = None
 
     # ==================================================================
     # Path rendering
@@ -81,6 +115,178 @@ class VolumePath(DatabricksPath):
     @property
     def size(self) -> int:
         return int(self._stat().size)
+
+    # ==================================================================
+    # Unity Catalog volume metadata — storage location + temp creds
+    # ==================================================================
+
+    def _split_volume(self) -> Optional[tuple[str, str, str]]:
+        """``/cat/sch/vol/...`` → ``("cat", "sch", "vol")`` or ``None``.
+
+        Returns ``None`` when the URL path has fewer than three
+        segments (i.e. it doesn't address a volume at all — typically
+        a stat probe at ``/Volumes`` itself or a malformed path).
+        """
+        parts = (self.url.path or "/").lstrip("/").split("/")
+        parts = [p for p in parts if p]
+        if len(parts) < 3:
+            return None
+        return parts[0], parts[1], parts[2]
+
+    def volume_info(self, refresh: bool = False) -> Any:
+        """Return the SDK's :class:`VolumeInfo` for this volume.
+
+        Cached on the instance — Unity Catalog volume metadata (root
+        ``storage_location``, ``volume_id``, ``volume_type``) is stable
+        for the volume's lifetime, so we only ever issue the
+        ``volumes.read`` call once unless ``refresh=True`` is passed.
+
+        Raises :class:`ValueError` when the URL path doesn't address a
+        volume (no ``/cat/sch/vol`` prefix).
+        """
+        if self._volume_info is not None and not refresh:
+            return self._volume_info
+        triple = self._split_volume()
+        if triple is None:
+            raise ValueError(
+                f"{type(self).__name__}.volume_info requires a path under "
+                f"/Volumes/<cat>/<sch>/<vol>/... — got {self.full_path()!r}."
+            )
+        catalog, schema, volume = triple
+        full_name = f"{catalog}.{schema}.{volume}"
+        info = self._call(self.workspace.volumes.read, full_name)
+        self._volume_info = info
+        # Snapshot the storage location too — every credential vend
+        # and ``s3_path`` build needs it, and re-reading the same
+        # field from the cached ``VolumeInfo`` is pure dict access.
+        storage = getattr(info, "storage_location", None)
+        if storage:
+            self._storage_location = str(storage)
+        return info
+
+    def storage_location(self, refresh: bool = False) -> str:
+        """Volume's backing storage URL (e.g. ``s3://bucket/__unitystorage/...``).
+
+        Resolved through :meth:`volume_info`; raises
+        :class:`ValueError` when the SDK doesn't return a storage
+        location (managed volumes always do; external volumes may
+        return ``None`` while the metastore is still finalizing
+        registration).
+        """
+        if self._storage_location is not None and not refresh:
+            return self._storage_location
+        self.volume_info(refresh=refresh)
+        if not self._storage_location:
+            raise ValueError(
+                f"{type(self).__name__}: volume has no storage_location yet. "
+                f"Volume info: {self._volume_info!r}."
+            )
+        return self._storage_location
+
+    def temporary_credentials(
+        self,
+        *,
+        operation: Any = None,
+    ) -> Any:
+        """Vend temporary cloud credentials for this volume.
+
+        Wraps ``temporary_volume_credentials.generate_temporary_volume_credentials``
+        — Unity Catalog issues short-lived AWS / Azure / GCP creds
+        scoped to the volume's storage root.
+
+        ``operation`` accepts a :class:`VolumeOperation` enum, a
+        :class:`Mode` / mode-like string (``"read"`` / ``"overwrite"`` /
+        ``"append"`` / …), or ``None``. ``None`` defaults to
+        ``READ_VOLUME``; read-only modes map to ``READ_VOLUME``,
+        everything else to ``WRITE_VOLUME``.
+        """
+        op = _resolve_volume_operation(operation)
+        info = self.volume_info()
+        volume_id = getattr(info, "volume_id", None)
+        if not volume_id:
+            raise ValueError(
+                f"{type(self).__name__}: volume_info has no volume_id; "
+                f"cannot vend temporary credentials. Info: {info!r}."
+            )
+        return self._call(
+            self.workspace.temporary_volume_credentials
+            .generate_temporary_volume_credentials,
+            volume_id=volume_id,
+            operation=op,
+        )
+
+    def aws(
+        self,
+        *,
+        operation: Any = None,
+        region: Optional[str] = None,
+    ) -> "AWSClient":
+        """Return an :class:`AWSClient` whose credentials self-refresh
+        from :meth:`temporary_credentials`.
+
+        Mirrors :meth:`Table.aws` — every signing request that runs
+        after the token's near-expiry window re-invokes
+        :meth:`temporary_credentials` and rotates the underlying creds
+        in place. No caller-side refresh dance.
+
+        ``region`` is optional — when omitted, botocore resolves it
+        from env / config / instance metadata. Pass it explicitly when
+        the volume sits in a non-default region.
+        """
+        from yggdrasil.aws.config import AwsCredentials
+        from yggdrasil.lazy_imports import aws_config_class
+
+        def _refresh() -> AwsCredentials:
+            creds = self.temporary_credentials(operation=operation)
+            aws = creds.aws_temp_credentials
+            if aws is None:
+                raise RuntimeError(
+                    f"{type(self).__name__}.aws(): "
+                    f"temporary_volume_credentials returned no "
+                    f"``aws_temp_credentials`` — the volume is likely "
+                    f"backed by Azure or GCP, not S3. Use "
+                    f"``temporary_credentials()`` directly to inspect "
+                    f"the issued credential shape."
+                )
+            expiration = getattr(creds, "expiration_time", None)
+            return AwsCredentials(
+                access_key_id=aws.access_key_id,
+                secret_access_key=aws.secret_access_key,
+                session_token=aws.session_token,
+                expiration=_iso_or_str(expiration),
+            )
+
+        return (
+            aws_config_class()
+            .from_refresher(_refresh, region=region)
+            .to_client()
+        )
+
+    def s3_path(
+        self,
+        *,
+        operation: Any = None,
+        region: Optional[str] = None,
+    ) -> "S3Path":
+        """Return an :class:`S3Path` over the volume's S3 storage.
+
+        Joins this path's sub-volume tail (``/sub/dir/file.parquet``)
+        onto the volume's :meth:`storage_location` so reads and writes
+        bypass the SDK's Files API and go directly against S3 —
+        cheaper on Unity Catalog quota and faster on the wire. The
+        returned :class:`S3Path` carries an :class:`AWSClient` whose
+        credentials auto-refresh via :meth:`aws`, so long-running
+        transfers survive STS token rotation.
+
+        Only S3-backed volumes are supported by this fast path; an
+        Azure / GCP volume raises :class:`RuntimeError` from
+        :meth:`aws` (the credential record carries a different shape).
+        """
+        storage_root = self.storage_location().rstrip("/")
+        tail = _sub_volume_tail(self.url.path or "/")
+        target = storage_root + tail if tail else storage_root
+        aws_client = self.aws(operation=operation, region=region)
+        return aws_client.s3.path(target, temporary=self.temporary)
 
     # ==================================================================
     # SQL staging factory
@@ -195,19 +401,6 @@ class VolumePath(DatabricksPath):
     # ==================================================================
     # Parent / volume auto-creation
     # ==================================================================
-
-    def _split_volume(self) -> Optional[tuple[str, str, str]]:
-        """``/cat/sch/vol/...`` → ``("cat", "sch", "vol")`` or ``None``.
-
-        Returns ``None`` when the URL path has fewer than three
-        segments (i.e. it doesn't address a volume at all — typically
-        a stat probe at ``/Volumes`` itself or a malformed path).
-        """
-        parts = (self.url.path or "/").lstrip("/").split("/")
-        parts = [p for p in parts if p]
-        if len(parts) < 3:
-            return None
-        return parts[0], parts[1], parts[2]
 
     def _ensure_parents(self) -> bool:
         """Recovery hook for ``_call_ensuring_parents`` after NotFound.
@@ -428,6 +621,75 @@ class VolumePath(DatabricksPath):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _sub_volume_tail(path: str) -> str:
+    """Strip the ``/cat/sch/vol`` prefix off a volume-relative URL path.
+
+    ``/cat/sch/vol/sub/dir/x.parquet`` → ``"/sub/dir/x.parquet"``.
+    ``/cat/sch/vol``                    → ``""``.
+
+    Used to map a :class:`VolumePath` URL onto the volume's S3
+    storage root — the storage location already carries the catalog
+    / schema / volume coordinates, so the sub-volume tail is the
+    only part we need to append.
+    """
+    parts = [p for p in path.split("/") if p]
+    if len(parts) < 3:
+        return ""
+    return "/" + "/".join(parts[3:]) if len(parts) > 3 else ""
+
+
+def _iso_or_str(value: Any) -> Optional[str]:
+    """Coerce an expiration timestamp into the ISO-8601 string botocore
+    wants for ``RefreshableCredentials``' ``expiry_time``.
+
+    The SDK returns ``expiration_time`` as a ``datetime`` (or
+    ms-since-epoch ``int`` on some shapes); botocore accepts either an
+    ISO string or a datetime, but normalizing to ISO keeps the
+    refresher's return shape consistent with
+    :class:`AwsCredentials.expiration`.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):
+        # SDK responses occasionally carry ms-since-epoch — convert
+        # to a UTC isoformat so botocore can parse it.
+        import datetime as _dt
+        return _dt.datetime.fromtimestamp(
+            float(value) / 1000.0, tz=_dt.timezone.utc,
+        ).isoformat()
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        return isoformat()
+    return str(value)
+
+
+def _resolve_volume_operation(operation: Any) -> Any:
+    """Map a caller-supplied operation hint to a :class:`VolumeOperation`.
+
+    Accepts the SDK enum (passes through), a :class:`Mode` /
+    mode-like string (``"read"`` / ``"overwrite"`` / …, normalized
+    via :meth:`Mode.from_`), or ``None`` (defaults to
+    ``READ_VOLUME``). Anything :meth:`Mode.from_` recognizes as a
+    read-only mode (``AUTO`` / ``READ_ONLY``) collapses to
+    ``READ_VOLUME``; everything else is a write and gets
+    ``WRITE_VOLUME``.
+    """
+    from databricks.sdk.service.catalog import VolumeOperation
+
+    if isinstance(operation, VolumeOperation):
+        return operation
+    if operation is None:
+        return VolumeOperation.READ_VOLUME
+
+    from yggdrasil.data.enums.mode import Mode
+    mode = Mode.from_(operation, default=Mode.AUTO)
+    if mode in (Mode.AUTO, Mode.READ_ONLY):
+        return VolumeOperation.READ_VOLUME
+    return VolumeOperation.WRITE_VOLUME
 
 
 def _mtime(info) -> float:

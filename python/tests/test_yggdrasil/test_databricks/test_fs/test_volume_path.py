@@ -459,3 +459,215 @@ class TestRetryPolicy:
         )
         assert p.size == 2
         assert recorded == [1.0]
+
+
+# ---------------------------------------------------------------------------
+# Native S3 storage fast path — storage_location + temporary_credentials + s3_path
+# ---------------------------------------------------------------------------
+
+
+def _volume_info(
+    *,
+    catalog: str = "cat",
+    schema: str = "sch",
+    name: str = "vol",
+    volume_id: str = "volume-uuid-0001",
+    storage_location: str = "s3://my-bucket/__unitystorage/cat/sch/vol",
+):
+    return SimpleNamespace(
+        catalog_name=catalog,
+        schema_name=schema,
+        name=name,
+        volume_id=volume_id,
+        volume_type="MANAGED",
+        storage_location=storage_location,
+        full_name=f"{catalog}.{schema}.{name}",
+        access_point=None,
+    )
+
+
+def _aws_creds_response(
+    *,
+    access_key_id: str = "AKIA-test",
+    secret_access_key: str = "secret-test",
+    session_token: str = "session-test",
+):
+    import datetime as _dt
+    return SimpleNamespace(
+        aws_temp_credentials=SimpleNamespace(
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            session_token=session_token,
+            access_point=None,
+        ),
+        expiration_time=_dt.datetime(2030, 1, 1, tzinfo=_dt.timezone.utc),
+        url=None,
+        azure_aad=None,
+        azure_user_delegation_sas=None,
+        gcp_oauth_token=None,
+        r2_temp_credentials=None,
+    )
+
+
+class TestVolumeInfoCaching:
+
+    def test_volume_info_caches_after_first_read(self, workspace) -> None:
+        workspace.volumes.read.return_value = _volume_info()
+        p = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        first = p.volume_info()
+        second = p.volume_info()
+        assert first is second
+        workspace.volumes.read.assert_called_once_with("cat.sch.vol")
+
+    def test_volume_info_refresh_forces_reread(self, workspace) -> None:
+        workspace.volumes.read.side_effect = [_volume_info(), _volume_info()]
+        p = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        p.volume_info()
+        p.volume_info(refresh=True)
+        assert workspace.volumes.read.call_count == 2
+
+    def test_storage_location_resolves_from_volume_info(self, workspace) -> None:
+        workspace.volumes.read.return_value = _volume_info(
+            storage_location="s3://bkt/__unitystorage/c/s/v",
+        )
+        p = VolumePath("/Volumes/c/s/v/sub/y.parquet", workspace=workspace)
+        assert p.storage_location() == "s3://bkt/__unitystorage/c/s/v"
+
+    def test_storage_location_caches_independently_of_volume_info(
+        self, workspace,
+    ) -> None:
+        workspace.volumes.read.return_value = _volume_info()
+        p = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        p.storage_location()
+        p.storage_location()
+        # One read call drives both — the value is snapshotted onto
+        # ``_storage_location`` and the second call returns the cached
+        # string without re-touching ``VolumeInfo``.
+        workspace.volumes.read.assert_called_once()
+
+    def test_storage_location_missing_raises(self, workspace) -> None:
+        workspace.volumes.read.return_value = _volume_info(storage_location=None)
+        p = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        with pytest.raises(ValueError, match="storage_location"):
+            p.storage_location()
+
+
+class TestTemporaryCredentials:
+
+    def test_vends_via_volume_id(self, workspace) -> None:
+        workspace.volumes.read.return_value = _volume_info(volume_id="vid-42")
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen.return_value = _aws_creds_response()
+
+        p = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        resp = p.temporary_credentials(operation="read")
+        assert resp.aws_temp_credentials.access_key_id == "AKIA-test"
+
+        # Call kwargs must include the volume_id from VolumeInfo plus
+        # the SDK enum (READ_VOLUME for read-only modes).
+        from databricks.sdk.service.catalog import VolumeOperation
+        gen.assert_called_once()
+        kwargs = gen.call_args.kwargs
+        assert kwargs["volume_id"] == "vid-42"
+        assert kwargs["operation"] is VolumeOperation.READ_VOLUME
+
+    def test_write_operation_maps_to_write_volume(self, workspace) -> None:
+        workspace.volumes.read.return_value = _volume_info()
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen.return_value = _aws_creds_response()
+        p = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        p.temporary_credentials(operation="overwrite")
+
+        from databricks.sdk.service.catalog import VolumeOperation
+        assert gen.call_args.kwargs["operation"] is VolumeOperation.WRITE_VOLUME
+
+    def test_missing_volume_id_raises(self, workspace) -> None:
+        workspace.volumes.read.return_value = _volume_info(volume_id=None)
+        p = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        with pytest.raises(ValueError, match="volume_id"):
+            p.temporary_credentials()
+
+
+class TestAWSAndS3Path:
+
+    def test_aws_returns_refreshable_client(self, workspace) -> None:
+        workspace.volumes.read.return_value = _volume_info()
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen.return_value = _aws_creds_response()
+
+        p = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        aws = p.aws(operation="read", region="us-east-1")
+
+        # Snapshot creds bound to the AWSConfig — these came from the
+        # initial refresher call. The refresher itself is wired into
+        # the config so botocore can re-invoke it on token expiry.
+        assert aws.config.access_key_id == "AKIA-test"
+        assert aws.config.region == "us-east-1"
+        assert aws.config.has_refresher()
+
+    def test_aws_refresher_rotates_credentials(self, workspace) -> None:
+        # The refresher is the same callable on every cycle — botocore
+        # would re-invoke it via the config. We invoke it manually here
+        # to prove fresh creds flow through on every call.
+        workspace.volumes.read.return_value = _volume_info()
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen.side_effect = [
+            _aws_creds_response(access_key_id="AKIA-1"),
+            _aws_creds_response(access_key_id="AKIA-2"),
+        ]
+        p = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        aws = p.aws(operation="read")
+        # First call seeded the config; invoke the refresher once more.
+        refreshed = aws.config.refresher()
+        assert refreshed.access_key_id == "AKIA-2"
+
+    def test_aws_raises_for_non_s3_volume(self, workspace) -> None:
+        workspace.volumes.read.return_value = _volume_info()
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        # Azure-style response — no ``aws_temp_credentials``.
+        gen.return_value = SimpleNamespace(
+            aws_temp_credentials=None,
+            azure_aad=SimpleNamespace(aad_token="token"),
+            azure_user_delegation_sas=None,
+            gcp_oauth_token=None,
+            r2_temp_credentials=None,
+            expiration_time=None,
+            url=None,
+        )
+        p = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        with pytest.raises(RuntimeError, match="aws_temp_credentials"):
+            p.aws(operation="read")
+
+    def test_s3_path_joins_storage_with_subvolume_tail(self, workspace) -> None:
+        workspace.volumes.read.return_value = _volume_info(
+            storage_location="s3://my-bucket/__unitystorage/cat/sch/vol",
+        )
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen.return_value = _aws_creds_response()
+
+        p = VolumePath(
+            "/Volumes/cat/sch/vol/sub/dir/file.parquet", workspace=workspace,
+        )
+        s3 = p.s3_path(operation="read", region="us-east-1")
+
+        from yggdrasil.aws.fs.path import S3Path
+        assert isinstance(s3, S3Path)
+        assert s3.full_path() == (
+            "s3://my-bucket/__unitystorage/cat/sch/vol/sub/dir/file.parquet"
+        )
+
+    def test_s3_path_at_volume_root(self, workspace) -> None:
+        workspace.volumes.read.return_value = _volume_info(
+            storage_location="s3://b/__unitystorage/c/s/v/",
+        )
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen.return_value = _aws_creds_response()
+
+        p = VolumePath("/Volumes/c/s/v", workspace=workspace)
+        s3 = p.s3_path()
+        # No sub-volume tail to append; storage root drives the URL.
+        # ``S3Path`` strips the trailing slash on canonical rendering
+        # (the canonical S3 key has no trailing slash).
+        assert s3.full_path() == "s3://b/__unitystorage/c/s/v"
+        assert s3.bucket == "b"
+        assert s3.key == "__unitystorage/c/s/v"
