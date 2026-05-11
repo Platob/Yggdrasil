@@ -30,6 +30,20 @@ def reset_remote_stat_cache():
     RemotePath._STAT_CACHE.clear()
 
 
+@pytest.fixture(autouse=True)
+def reset_volume_credentials_refresher_singletons():
+    # ``VolumeCredentialsRefresher`` is a process-wide singleton keyed
+    # by ``(volume_id, operation)``. Tests reuse the same volume_id /
+    # operation pair across cases — without an explicit reset the
+    # singleton from a prior test (along with its cached AWSClient)
+    # would survive into the next, masking refresher behavior the new
+    # test is trying to assert.
+    from yggdrasil.databricks.fs.volume_path import VolumeCredentialsRefresher
+    VolumeCredentialsRefresher._INSTANCES.clear()
+    yield
+    VolumeCredentialsRefresher._INSTANCES.clear()
+
+
 @pytest.fixture
 def workspace():
     return MagicMock()
@@ -671,3 +685,132 @@ class TestAWSAndS3Path:
         assert s3.full_path() == "s3://b/__unitystorage/c/s/v"
         assert s3.bucket == "b"
         assert s3.key == "__unitystorage/c/s/v"
+
+
+# ---------------------------------------------------------------------------
+# Process-wide singleton refresher
+# ---------------------------------------------------------------------------
+
+
+class TestCredentialsRefresherSingleton:
+
+    def test_same_volume_same_operation_collapses_to_one_refresher(
+        self, workspace,
+    ) -> None:
+        from yggdrasil.databricks.fs.volume_path import VolumeCredentialsRefresher
+        workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen.return_value = _aws_creds_response()
+
+        # Two distinct VolumePath instances pointing at the same volume.
+        p1 = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        p2 = VolumePath("/Volumes/cat/sch/vol/y", workspace=workspace)
+        r1 = p1.credentials_refresher(operation="read")
+        r2 = p2.credentials_refresher(operation="read")
+        assert isinstance(r1, VolumeCredentialsRefresher)
+        assert r1 is r2
+
+    def test_different_operation_yields_different_refresher(
+        self, workspace,
+    ) -> None:
+        workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen.return_value = _aws_creds_response()
+
+        p = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        r_read = p.credentials_refresher(operation="read")
+        r_write = p.credentials_refresher(operation="overwrite")
+        assert r_read is not r_write
+
+    def test_different_volume_id_yields_different_refresher(
+        self, workspace,
+    ) -> None:
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen.return_value = _aws_creds_response()
+
+        workspace.volumes.read.return_value = _volume_info(
+            name="v1", volume_id="vid-A",
+        )
+        p1 = VolumePath("/Volumes/cat/sch/v1/x", workspace=workspace)
+        r1 = p1.credentials_refresher(operation="read")
+
+        workspace.volumes.read.return_value = _volume_info(
+            name="v2", volume_id="vid-B",
+        )
+        p2 = VolumePath("/Volumes/cat/sch/v2/x", workspace=workspace)
+        r2 = p2.credentials_refresher(operation="read")
+        assert r1 is not r2
+
+    def test_aws_client_shared_through_refresher(self, workspace) -> None:
+        workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen.return_value = _aws_creds_response()
+
+        p1 = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        p2 = VolumePath("/Volumes/cat/sch/vol/y", workspace=workspace)
+        # Same volume + operation + region → same AWSClient instance.
+        c1 = p1.aws(operation="read", region="us-east-1")
+        c2 = p2.aws(operation="read", region="us-east-1")
+        assert c1 is c2
+
+    def test_aws_client_cached_per_region(self, workspace) -> None:
+        workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen.return_value = _aws_creds_response()
+
+        p = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        r = p.credentials_refresher(operation="read")
+        c_us = r.aws_client(region="us-east-1")
+        c_eu = r.aws_client(region="eu-central-1")
+        c_us_again = r.aws_client(region="us-east-1")
+        assert c_us is c_us_again
+        assert c_us is not c_eu
+
+    def test_workspace_rebound_on_repeat_construction(self, workspace) -> None:
+        workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen.return_value = _aws_creds_response()
+
+        # First binding uses ``workspace`` (fixture-provided).
+        p1 = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        r1 = p1.credentials_refresher(operation="read")
+        assert r1.workspace is workspace
+
+        # Second binding with a different workspace must refresh the
+        # singleton's ref so subsequent refresh cycles use the new
+        # auth context.
+        workspace_b = MagicMock()
+        workspace_b.volumes.read.return_value = _volume_info(volume_id="vid-A")
+        workspace_b.temporary_volume_credentials.generate_temporary_volume_credentials.return_value = _aws_creds_response()
+        p2 = VolumePath("/Volumes/cat/sch/vol/y", workspace=workspace_b)
+        r2 = p2.credentials_refresher(operation="read")
+        assert r2 is r1
+        assert r2.workspace is workspace_b
+
+    def test_pickle_collapses_to_live_singleton(self, workspace) -> None:
+        import pickle
+        workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen.return_value = _aws_creds_response()
+
+        p = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        r = p.credentials_refresher(operation="read")
+        # In-process pickle round-trip must collapse to the same
+        # singleton (no duplicate boto session, no duplicate refresh).
+        loaded = pickle.loads(pickle.dumps(r))
+        assert loaded is r
+
+    def test_refresher_call_returns_canonical_credentials(self, workspace) -> None:
+        from yggdrasil.aws.config import AwsCredentials
+        workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen.return_value = _aws_creds_response(
+            access_key_id="AKIA-direct", secret_access_key="secret-direct",
+        )
+
+        p = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        r = p.credentials_refresher(operation="read")
+        out = r()
+        assert isinstance(out, AwsCredentials)
+        assert out.access_key_id == "AKIA-direct"
+        assert out.secret_access_key == "secret-direct"

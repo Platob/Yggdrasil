@@ -36,8 +36,9 @@ from __future__ import annotations
 
 import io as _stdio
 import os
+import threading
 import time
-from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional, Tuple
 
 from yggdrasil.data.enums import Scheme
 from yggdrasil.io.io_stats import IOStats, IOKind
@@ -48,10 +49,11 @@ from .path import DatabricksPath
 
 if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
+    from yggdrasil.aws.config import AwsCredentials
     from yggdrasil.aws.fs.path import S3Path
 
 
-__all__ = ["VolumePath"]
+__all__ = ["VolumePath", "VolumeCredentialsRefresher"]
 
 
 class VolumePath(DatabricksPath):
@@ -215,6 +217,39 @@ class VolumePath(DatabricksPath):
             operation=op,
         )
 
+    def credentials_refresher(
+        self,
+        *,
+        operation: Any = None,
+    ) -> "VolumeCredentialsRefresher":
+        """Return the process-wide singleton refresher for this volume.
+
+        Keyed by ``(volume_id, operation)`` — every :class:`VolumePath`
+        instance pointing at the same UC volume and asking for the
+        same op collapses to one refresher. That refresher caches its
+        :class:`AWSClient` per region, so the boto session,
+        :class:`RefreshableCredentials`, and STS vending are shared
+        across every reader / writer on the volume in this process.
+
+        The bound workspace client is updated on each call — the
+        latest live handle wins so subsequent refresh cycles use the
+        freshest auth context (useful when callers rotate workspace
+        clients between sessions).
+        """
+        op = _resolve_volume_operation(operation)
+        info = self.volume_info()
+        volume_id = getattr(info, "volume_id", None)
+        if not volume_id:
+            raise ValueError(
+                f"{type(self).__name__}: volume_info has no volume_id; "
+                f"cannot mint a credentials refresher. Info: {info!r}."
+            )
+        return VolumeCredentialsRefresher(
+            volume_id=volume_id,
+            operation=op,
+            workspace=self.workspace,
+        )
+
     def aws(
         self,
         *,
@@ -224,43 +259,20 @@ class VolumePath(DatabricksPath):
         """Return an :class:`AWSClient` whose credentials self-refresh
         from :meth:`temporary_credentials`.
 
-        Mirrors :meth:`Table.aws` — every signing request that runs
-        after the token's near-expiry window re-invokes
-        :meth:`temporary_credentials` and rotates the underlying creds
-        in place. No caller-side refresh dance.
+        Routes through :meth:`credentials_refresher` — every
+        ``VolumePath`` on the same ``(volume_id, operation)`` shares
+        one refresher and, via that refresher's per-region cache, one
+        :class:`AWSClient`. Every signing request that runs after the
+        token's near-expiry window re-invokes the refresher and
+        rotates the underlying creds in place. No caller-side refresh
+        dance, and the STS vend is paid once per refresh cycle no
+        matter how many callers are reading the volume concurrently.
 
         ``region`` is optional — when omitted, botocore resolves it
         from env / config / instance metadata. Pass it explicitly when
         the volume sits in a non-default region.
         """
-        from yggdrasil.aws.config import AwsCredentials
-        from yggdrasil.lazy_imports import aws_config_class
-
-        def _refresh() -> AwsCredentials:
-            creds = self.temporary_credentials(operation=operation)
-            aws = creds.aws_temp_credentials
-            if aws is None:
-                raise RuntimeError(
-                    f"{type(self).__name__}.aws(): "
-                    f"temporary_volume_credentials returned no "
-                    f"``aws_temp_credentials`` — the volume is likely "
-                    f"backed by Azure or GCP, not S3. Use "
-                    f"``temporary_credentials()`` directly to inspect "
-                    f"the issued credential shape."
-                )
-            expiration = getattr(creds, "expiration_time", None)
-            return AwsCredentials(
-                access_key_id=aws.access_key_id,
-                secret_access_key=aws.secret_access_key,
-                session_token=aws.session_token,
-                expiration=_iso_or_str(expiration),
-            )
-
-        return (
-            aws_config_class()
-            .from_refresher(_refresh, region=region)
-            .to_client()
-        )
+        return self.credentials_refresher(operation=operation).aws_client(region=region)
 
     def s3_path(
         self,
@@ -616,6 +628,225 @@ class VolumePath(DatabricksPath):
 
     def _clear(self) -> None:
         self._remove_file(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# VolumeCredentialsRefresher — process-wide singleton, keyed by (volume_id, op)
+# ---------------------------------------------------------------------------
+
+
+class VolumeCredentialsRefresher:
+    """Process-wide singleton refresher for a Unity Catalog volume.
+
+    Keyed by ``(volume_id, operation)``: every caller asking for a
+    refreshable credential vending session against the same UC volume
+    and operation collapses to *one* refresher instance. Through that
+    refresher's per-region :class:`AWSClient` cache, the boto session,
+    :class:`RefreshableCredentials`, connection pool, and STS vending
+    cycle are all shared too — one ``generate_temporary_volume_credentials``
+    round trip per refresh window no matter how many readers / writers
+    are touching the volume concurrently.
+
+    Identity rules (mirrors :class:`AWSClient`):
+
+    - Same ``(volume_id, operation)`` → same instance in the process
+      (cached on the class-level :attr:`_INSTANCES` dict, guarded by
+      :attr:`_INSTANCES_LOCK`).
+    - ``__init__`` is idempotent — Python invokes it on every
+      constructor call, but the singleton guard re-uses live state.
+    - Pickling routes through :meth:`__getnewargs__` /
+      :meth:`__setstate__` so a refresher unpickled in the same
+      process collapses back to the live singleton; the workspace
+      handle is transient and not transported.
+
+    The bound workspace client is mutable — every constructor call
+    updates :attr:`workspace` with the freshest one, so STS refreshes
+    that happen after a workspace rotation pick up the new auth
+    context. Pass ``None`` to leave the existing handle in place.
+    """
+
+    # Class-level singleton registry. Two refreshers with the same
+    # (volume_id, operation) collapse to one instance; the live AWS
+    # client cache hangs off that instance so multiple paths share
+    # both the credential vend and the boto session.
+    _INSTANCES: ClassVar[
+        "dict[Tuple[type, str, Any], VolumeCredentialsRefresher]"
+    ] = {}
+    _INSTANCES_LOCK: ClassVar[threading.Lock] = threading.Lock()
+
+    # Slots covering both the identity fields (compared) and the
+    # transient runtime state (workspace + per-region AWS clients).
+    __slots__ = (
+        "volume_id",
+        "operation",
+        "workspace",
+        "_client_cache",
+        "_client_cache_lock",
+        "_initialized",
+    )
+
+    def __new__(
+        cls,
+        volume_id: str,
+        operation: Any,
+        workspace: Any = None,
+    ) -> "VolumeCredentialsRefresher":
+        key = (cls, str(volume_id), operation)
+        with cls._INSTANCES_LOCK:
+            existing = cls._INSTANCES.get(key)
+            if existing is not None:
+                # Re-bind the latest workspace handle so a follow-up
+                # refresh cycle uses the freshest auth context — a
+                # stale ref would silently 401 once the workspace
+                # client's underlying creds expired.
+                if workspace is not None:
+                    existing.workspace = workspace
+                return existing
+            instance = super().__new__(cls)
+            cls._INSTANCES[key] = instance
+            return instance
+
+    def __init__(
+        self,
+        volume_id: str,
+        operation: Any,
+        workspace: Any = None,
+    ) -> None:
+        # Idempotent init — Python always calls __init__ after __new__
+        # returns the cached instance. Skip the second pass so the
+        # live ``_client_cache`` survives.
+        if getattr(self, "_initialized", False):
+            if workspace is not None:
+                self.workspace = workspace
+            return
+        self.volume_id: str = str(volume_id)
+        self.operation: Any = operation
+        self.workspace: Any = workspace
+        # Per-region AWSClient cache. One client per region per
+        # refresher — the cache key is the requested region (which can
+        # legitimately be ``None``, letting botocore resolve via env).
+        self._client_cache: "dict[Optional[str], AWSClient]" = {}
+        self._client_cache_lock: threading.Lock = threading.Lock()
+        self._initialized = True
+
+    # ------------------------------------------------------------------
+    # Pickling — survive cross-process transport via the singleton cache
+    # ------------------------------------------------------------------
+
+    def __getnewargs__(self) -> "Tuple[Any, ...]":
+        return (self.volume_id, self.operation)
+
+    def __getstate__(self) -> dict[str, Any]:
+        # ``workspace`` and the AWSClient cache are transient — the
+        # receiver re-binds the workspace via the next VolumePath
+        # construction, and the client cache is rebuilt lazily.
+        return {"volume_id": self.volume_id, "operation": self.operation}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        # ``__new__`` may have returned the live singleton — leave its
+        # workspace ref and client cache untouched.
+        if getattr(self, "_initialized", False):
+            return
+        self.volume_id = state["volume_id"]
+        self.operation = state["operation"]
+        self.workspace = None
+        self._client_cache = {}
+        self._client_cache_lock = threading.Lock()
+        self._initialized = True
+
+    # ------------------------------------------------------------------
+    # Identity
+    # ------------------------------------------------------------------
+
+    def __hash__(self) -> int:
+        return hash((type(self), self.volume_id, self.operation))
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, VolumeCredentialsRefresher):
+            return NotImplemented
+        return (
+            self.volume_id == other.volume_id
+            and self.operation == other.operation
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(volume_id={self.volume_id!r}, "
+            f"operation={self.operation!r})"
+        )
+
+    # ------------------------------------------------------------------
+    # Refresh — invoked by botocore's RefreshableCredentials hook
+    # ------------------------------------------------------------------
+
+    def with_workspace(self, workspace: Any) -> "VolumeCredentialsRefresher":
+        """Replace the bound workspace client. Returns *self*."""
+        self.workspace = workspace
+        return self
+
+    def __call__(self) -> "AwsCredentials":
+        from yggdrasil.aws.config import AwsCredentials
+
+        if self.workspace is None:
+            from yggdrasil.lazy_imports import databricks_client_class
+            self.workspace = (
+                databricks_client_class().current().workspace_client()
+            )
+        resp = (
+            self.workspace.temporary_volume_credentials
+            .generate_temporary_volume_credentials(
+                volume_id=self.volume_id,
+                operation=self.operation,
+            )
+        )
+        aws = getattr(resp, "aws_temp_credentials", None)
+        if aws is None:
+            raise RuntimeError(
+                f"{type(self).__name__}: temporary credentials for "
+                f"volume_id={self.volume_id!r} carry no "
+                f"``aws_temp_credentials`` — the volume is likely "
+                f"backed by Azure or GCP, not S3. Inspect the raw "
+                f"response via VolumePath.temporary_credentials() "
+                f"to read the right credential shape."
+            )
+        return AwsCredentials(
+            access_key_id=aws.access_key_id,
+            secret_access_key=aws.secret_access_key,
+            session_token=aws.session_token,
+            expiration=_iso_or_str(getattr(resp, "expiration_time", None)),
+        )
+
+    # ------------------------------------------------------------------
+    # AWSClient binding — one client per (refresher, region)
+    # ------------------------------------------------------------------
+
+    def aws_client(self, *, region: Optional[str] = None) -> "AWSClient":
+        """Return the cached :class:`AWSClient` for this refresher / region.
+
+        First call seeds a botocore :class:`RefreshableCredentials`
+        backed session by invoking ``self()`` once; subsequent calls
+        with the same *region* return the same live client (and
+        therefore share the connection pool, boto-client cache, and
+        in-flight refresh state). The refresher is wired in as the
+        config's ``refresher`` field — botocore re-invokes ``self()``
+        on every near-expiry cycle.
+
+        Different *region* values mint different clients (one per
+        region key, ``None`` included), since boto region is a
+        per-client concern.
+        """
+        with self._client_cache_lock:
+            existing = self._client_cache.get(region)
+            if existing is not None:
+                return existing
+            from yggdrasil.lazy_imports import aws_config_class
+            client = (
+                aws_config_class()
+                .from_refresher(self, region=region)
+                .to_client()
+            )
+            self._client_cache[region] = client
+            return client
 
 
 # ---------------------------------------------------------------------------
