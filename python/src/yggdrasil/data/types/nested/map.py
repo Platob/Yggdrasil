@@ -8,11 +8,6 @@ from typing import TYPE_CHECKING, Any, Callable
 import pyarrow as pa
 import pyarrow.compute as pc
 
-try:
-    import numpy as np
-except ImportError:
-    np = None
-
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.nested import NestedType
 from yggdrasil.data.types.support import get_pandas, get_polars, get_spark_sql
@@ -591,27 +586,86 @@ def _string_key_source_field() -> "Field":
     return _STRING_KEY_SOURCE_FIELD
 
 
+def _struct_to_map_layout(
+    null_mask: pa.BooleanArray,
+    *,
+    row_count: int,
+    child_count: int,
+) -> tuple[pa.Array, pa.Array]:
+    """Vectorised build of (take_indices, offsets) for struct → map.
+
+    ``keys_child_major`` and ``values_child_major`` hold the per-child
+    arrays concatenated in c-major layout (length ``row_count *
+    child_count``).  The output map wants entries in row-major order,
+    with null parent rows contributing zero entries.
+
+    *Offsets* — ``child_count`` per non-null row, ``0`` per null row,
+    cumulative-summed and prepended with ``0``.  Pure
+    ``pyarrow.compute`` (``if_else`` + ``cumulative_sum`` +
+    ``concat_arrays``).
+
+    *Take indices* — for each non-null row ``r`` and each child
+    ``c ∈ [0, N)``, emit ``c * row_count + r``.  Polars handles the
+    outer product without per-row Python: ``int_range`` and
+    ``filter`` lift the valid row indices, ``gather`` selects them
+    by ``i // N``, and the closed-form ``i % N * row_count +
+    row_at(i)`` produces the final flat int64 array.
+    """
+    import polars as pl
+
+    valid_mask = pc.invert(null_mask)
+
+    counts = pc.if_else(
+        valid_mask,
+        pa.scalar(child_count, type=pa.int32()),
+        pa.scalar(0, type=pa.int32()),
+    )
+    cumsum = pc.cumulative_sum(counts)
+    if isinstance(cumsum, pa.ChunkedArray):
+        cumsum = cumsum.combine_chunks()
+    offsets = pa.concat_arrays(
+        [pa.array([0], type=pa.int32()), cumsum.cast(pa.int32())],
+    )
+
+    valid_rows_pl = (
+        pl.int_range(0, row_count, dtype=pl.Int64, eager=True)
+        .filter(pl.from_arrow(valid_mask))
+    )
+    n_valid = valid_rows_pl.len()
+    if n_valid == 0:
+        return pa.array([], type=pa.int64()), offsets
+
+    total = n_valid * child_count
+    i = pl.int_range(0, total, dtype=pl.Int64, eager=True)
+    c_part = i % child_count
+    row_idx = i // child_count
+    row_part = valid_rows_pl.gather(row_idx)
+    take_pl = c_part * row_count + row_part
+    take_indices = take_pl.to_arrow().cast(pa.int64())
+    return take_indices, offsets
+
+
 def _cast_pandas_via_arrow(
     series: "pd.Series",
     options: "CastOptions",
     caster: Callable[[pa.Array, "CastOptions"], pa.Array | pa.ChunkedArray],
 ) -> "pd.Series":
-    pd = get_pandas()
-
+    # Round-trip pandas <-> Arrow without per-row Python materialisation:
+    # ``pa.array(series, from_pandas=True, type=...)`` consumes the Series
+    # via the pandas → Arrow C bridge, and ``Array.to_pandas()`` rebuilds
+    # the Series on the way out — no ``.tolist()`` / ``.to_pylist()`` hop
+    # in either direction.
     source_arrow_type = options.source_field.dtype.to_arrow()
-    source_array = pa.array(
-        series.tolist(),
-        type=source_arrow_type,
-        from_pandas=True,
-    )
+    source_array = pa.array(series, type=source_arrow_type, from_pandas=True)
     casted = caster(source_array, options)
 
     if isinstance(casted, pa.ChunkedArray):
-        values = casted.to_pylist()
-    else:
-        values = casted.to_pylist()
+        casted = casted.combine_chunks()
 
-    return pd.Series(values, index=series.index, name=options.target_field.name, dtype="object")
+    result = casted.to_pandas()
+    result.index = series.index
+    result.name = options.target_field.name
+    return result
 
 
 def cast_arrow_map_array(
@@ -825,37 +879,11 @@ def cast_arrow_struct_array_to_map(
     keys_child_major = pa.concat_arrays(key_arrays, memory_pool=options.arrow_memory_pool)
     values_child_major = pa.concat_arrays(value_arrays, memory_pool=options.arrow_memory_pool)
 
-    if np is not None:
-        row_mask = np.asarray(array.is_null().to_numpy(zero_copy_only=False), dtype=bool)
-        valid_rows = np.flatnonzero(~row_mask)
-
-        if len(valid_rows) == 0:
-            take_indices = pa.array([], type=pa.int64())
-        else:
-            base = np.arange(child_count, dtype=np.int64)[:, None] * row_count
-            reordered = (base + valid_rows[None, :]).T.reshape(-1)
-            take_indices = pa.array(reordered, type=pa.int64())
-
-        counts = np.where(row_mask, 0, child_count).astype(np.int32, copy=False)
-        offsets_np = np.empty(row_count + 1, dtype=np.int32)
-        offsets_np[0] = 0
-        np.cumsum(counts, out=offsets_np[1:])
-        offsets = pa.array(offsets_np, type=pa.int32())
-    else:
-        null_mask = array.is_null().to_pylist()
-
-        take_list: list[int] = []
-        offsets_list: list[int] = [0]
-        running = 0
-        for row_idx, is_null in enumerate(null_mask):
-            if not is_null:
-                running += child_count
-                for c in range(child_count):
-                    take_list.append(c * row_count + row_idx)
-            offsets_list.append(running)
-
-        take_indices = pa.array(take_list, type=pa.int64())
-        offsets = pa.array(offsets_list, type=pa.int32())
+    take_indices, offsets = _struct_to_map_layout(
+        array.is_null(),
+        row_count=row_count,
+        child_count=child_count,
+    )
 
     flat_keys = pc.take(keys_child_major, take_indices, memory_pool=options.arrow_memory_pool)
     flat_values = pc.take(values_child_major, take_indices, memory_pool=options.arrow_memory_pool)

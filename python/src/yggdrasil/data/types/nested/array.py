@@ -579,11 +579,20 @@ def cast_arrow_list_array(
             type=options.target_field.dtype.to_arrow(),
         )
 
+    # Slicing a ListArray keeps the offsets buffer pointing at the parent's
+    # absolute positions and the null bitmap carrying a slice offset.
+    # ``pa.ListArray.from_arrays(offsets=..., mask=...)`` rejects that
+    # combination with "Null bitmap with offsets slice not supported."
+    # Rebase the offsets to start at 0 (vectorised ``pc.subtract``) and
+    # slice the flat values to match — all inside Arrow compute kernels,
+    # no per-row work — before any item-cast or rebuild.
+    src_offsets, src_values = _rebased_list_offsets_and_values(array)
+
     if source_arrow_type.value_type == target_arrow_type.value_type:
-        target_values = array.values
+        target_values = src_values
     else:
         target_values = target_type.item_field.cast_arrow_array(
-            array.values,
+            src_values,
             options=options.copy(source_field=source_type.item_field),
         )
 
@@ -601,16 +610,44 @@ def cast_arrow_list_array(
 
     if target_type.large:
         return pa.LargeListArray.from_arrays(
-            offsets=array.offsets,
+            offsets=src_offsets,
             values=target_values,
             mask=array.is_null(),
         )
 
     return pa.ListArray.from_arrays(
-        offsets=array.offsets,
+        offsets=src_offsets,
         values=target_values,
         mask=array.is_null(),
     )
+
+
+def _rebased_list_offsets_and_values(
+    array: "pa.ListArray | pa.LargeListArray",
+) -> tuple[pa.Array, pa.Array]:
+    """Return offsets rebased to start at 0 plus values sliced to match.
+
+    ``pa.ListArray.from_arrays`` (and the LargeList variant) refuses an
+    offsets array whose first entry is non-zero when combined with a
+    sliced null bitmap.  This helper rebases the offsets via
+    ``pc.subtract`` (one C++ kernel call) and slices the flat values so
+    the rebuilt list still points at the same logical rows.  Slice-free
+    inputs short-circuit (no compute call, no copy).
+    """
+    import pyarrow.compute as pc
+
+    offsets = array.offsets
+    if len(offsets) == 0:
+        return offsets, array.values
+
+    first = offsets[0].as_py()
+    last = offsets[-1].as_py()
+    if first == 0:
+        return offsets, array.values
+
+    rebased = pc.subtract(offsets, first)
+    sliced_values = array.values.slice(first, last - first)
+    return rebased, sliced_values
 
 
 def cast_arrow_map_array_to_list(
@@ -751,22 +788,23 @@ def _cast_pandas_via_arrow(
     options: "CastOptions",
     caster,
 ) -> "pd.Series":
-    pd = get_pandas()
-
+    # Round-trip pandas <-> Arrow without per-row Python materialisation:
+    # ``pa.array(series, from_pandas=True, type=...)`` consumes the Series
+    # via the pandas → Arrow C bridge, and ``Array.to_pandas()`` rebuilds
+    # the Series on the way out — no ``.tolist()`` / ``.to_pylist()`` hop
+    # in either direction.  Nested cells surface as numpy.ndarray (lists)
+    # or dict (structs) — the natural pyarrow → pandas mapping.
     source_arrow_type = options.source_field.dtype.to_arrow()
-    source_array = pa.array(
-        series.tolist(),
-        type=source_arrow_type,
-        from_pandas=True,
-    )
+    source_array = pa.array(series, type=source_arrow_type, from_pandas=True)
     casted = caster(source_array, options)
 
     if isinstance(casted, pa.ChunkedArray):
-        values = casted.to_pylist()
-    else:
-        values = casted.to_pylist()
+        casted = casted.combine_chunks()
 
-    return pd.Series(values, index=series.index, name=options.target_field.name, dtype="object")
+    result = casted.to_pandas()
+    result.index = series.index
+    result.name = options.target_field.name
+    return result
 
 
 def cast_pandas_list_series(

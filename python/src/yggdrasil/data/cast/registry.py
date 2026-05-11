@@ -560,9 +560,6 @@ def convert_to_python_iterable(
     """
     Convert `value` into list/set with recursive casting.
 
-    Special case: if `value` is a pyarrow container (Array/ChunkedArray/Table/RecordBatch),
-    we try to cast it to an Arrow field inferred from the element hint, then call `.to_pylist()`.
-
     Fast path: when the element hint is ``Any`` / ``object`` we skip the
     per-element ``convert()`` call and materialize the container directly
     from the iterator, which avoids a pure-Python loop with a function

@@ -1,23 +1,41 @@
 """Pandas cast helpers for :class:`StructType` targets.
 
-Pandas struct values are Python dicts in object-dtype columns —
-there's no first-class struct type, so the helpers do row-by-row
-conversion via :func:`pd.Series.map`.
+Pandas has no first-class struct type, so struct/list values flow
+through Arrow (or Polars) under the hood and surface as Python-object
+cells in the resulting Series.  The public helpers in this module pick
+the fastest path that can complete the cast end-to-end:
 
-* :func:`cast_pandas_struct_series` — dict → struct: per-target-child
-  extraction, recurse into the child cast, then rebuild row dicts.
-* :func:`cast_pandas_list_series` — list/tuple → struct by positional
-  index; out-of-bounds is None.
-* :func:`cast_pandas_tabular` — DataFrame column rebuild against the
-  merged schema.
+1. **PyArrow round-trip.**  Treat the pandas Series / DataFrame as
+   Arrow input via ``pa.array(..., from_pandas=True)`` / ``pa.Table.
+   from_pandas``, dispatch to the Arrow cast helpers, and surface back
+   through ``Array.to_pandas()`` / ``Table.to_pandas()``.  No per-row
+   Python loop, no ``to_pylist`` materialisation hop.
+2. **Polars round-trip.**  When the Arrow path rejects the source
+   shape (mixed-schema dicts, list-of-mixed-dtype, …), fall back to
+   ``pl.from_pandas`` → :func:`cast_polars_tabular` / expression cast
+   → ``to_pandas``.  Polars accepts a slightly different set of
+   object-dtype inputs than Arrow.
+3. **Column-by-column.**  Last-resort path that casts each column /
+   child through its own engine (Arrow or Polars) and reassembles the
+   pandas frame / object Series.  This is the only path that touches
+   row-shaped Python values, and it only runs when both vectorised
+   paths above fail.
+
+The arrow→polars→columnwise chain mirrors the wider repo rule "no
+Python ``for`` over data" — anything reachable from a real caller
+should land on (1) or (2).  (3) stays as the documented fallback for
+shapes pyarrow and polars both reject.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import pyarrow as pa
+
 from yggdrasil.data.types.id import DataTypeId
-from yggdrasil.data.types.support import get_pandas
+from yggdrasil.data.types.support import get_pandas, get_polars
+from yggdrasil.exceptions import CastError
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -34,20 +52,146 @@ __all__ = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Series-shaped fallback chain — pyarrow → polars → column-by-column
+# ---------------------------------------------------------------------------
+
+
+def _series_via_arrow(series: "pd.Series", options: "CastOptions") -> "pd.Series":
+    """Round-trip *series* through Arrow using the target field's caster.
+
+    Raises whatever the Arrow path raises — callers wrap this in a
+    try/except as the first strategy in the fallback chain.  Output is
+    rebuilt via ``Array.to_pandas()`` so the Arrow → pandas hop stays
+    inside the C bridge (struct cells surface as dicts, list cells as
+    numpy arrays — the standard pyarrow mapping).
+    """
+    source_arrow_type = options.source_field.dtype.to_arrow()
+    source_array = pa.array(series, type=source_arrow_type, from_pandas=True)
+
+    casted = options.target_field.dtype.cast_arrow_array(source_array, options=options)
+    if isinstance(casted, pa.ChunkedArray):
+        casted = casted.combine_chunks()
+
+    result = casted.to_pandas()
+    result.index = series.index
+    result.name = options.target_field.name
+    return result
+
+
+def _series_via_polars(series: "pd.Series", options: "CastOptions") -> "pd.Series":
+    """Round-trip *series* through Polars using the target field's caster.
+
+    Raises whatever Polars raises — callers wrap this in a try/except
+    as the second strategy in the fallback chain.
+    """
+    pl = get_polars()
+    pl_series = pl.from_pandas(series)
+
+    casted_pl = options.target_field.dtype.cast_polars_series(pl_series, options=options)
+
+    if hasattr(casted_pl, "to_pandas"):
+        result = casted_pl.to_pandas()
+    else:  # pl.Expr — degenerate; resolve via DataFrame and pull the series back.
+        df = pl.DataFrame({series.name: pl_series}).select(casted_pl.alias(series.name))
+        result = df.to_pandas()[series.name]
+
+    result.index = series.index
+    result.name = options.target_field.name
+    return result
+
+
+def _run_pandas_series_fallback_chain(
+    series: "pd.Series",
+    options: "CastOptions",
+    *,
+    columnwise: "Any",
+) -> "pd.Series":
+    """Run the pyarrow → polars → column-by-column cast chain for a Series.
+
+    Each strategy is tried in order; failures are collected so that if
+    every path rejects, the surfaced :class:`CastError` carries the
+    full provenance (source field, target field, and the original
+    pyarrow / polars exception that triggered the fallback).  Any path
+    that succeeds returns its cast Series directly.
+    """
+    failures: list[BaseException] = []
+
+    try:
+        return _series_via_arrow(series, options)
+    except CastError:
+        raise
+    except Exception as exc:
+        failures.append(exc)
+
+    try:
+        return _series_via_polars(series, options)
+    except CastError:
+        raise
+    except Exception as exc:
+        failures.append(exc)
+
+    try:
+        return columnwise(series, options)
+    except CastError:
+        raise
+    except Exception as exc:
+        reason = (
+            "; ".join(
+                f"{path}={type(err).__name__}: {err}"
+                for path, err in zip(("pyarrow", "polars", "columnwise"), failures + [exc])
+            )
+        )
+        raise CastError(
+            f"all pandas cast strategies failed ({reason})",
+            source_field=options.source_field,
+            target_field=options.target_field,
+            original=exc,
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Struct → struct (series)
+# ---------------------------------------------------------------------------
+
+
 def cast_pandas_struct_series(
     series: "pd.Series",
     options: "CastOptions",
 ) -> "pd.Series":
-    pd = get_pandas()
-
     if not options.need_cast(series):
         return series
 
     if options.target_field is None:
         return series
     elif options.source_field.dtype.type_id != DataTypeId.STRUCT:
-        raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
+        raise CastError(
+            f"source is {options.source_field.dtype} — expected struct",
+            source_field=options.source_field,
+            target_field=options.target_field,
+        )
 
+    return _run_pandas_series_fallback_chain(
+        series,
+        options,
+        columnwise=_struct_series_columnwise,
+    )
+
+
+def _struct_series_columnwise(
+    series: "pd.Series",
+    options: "CastOptions",
+) -> "pd.Series":
+    """Per-target-child cast that survives heterogeneous dict shapes.
+
+    Each child column lands as a pandas Series, cast through its own
+    ``cast_pandas_series`` (Arrow/Polars under the hood for primitive
+    children).  Row reassembly goes through
+    :func:`_reassemble_object_series` — a one-shot
+    ``pa.StructArray.from_arrays`` plus ``Array.to_pandas()`` — so the
+    dict-cell materialisation stays inside the Arrow → pandas C bridge.
+    """
+    pd = get_pandas()
     source_field: "Field" = options.source_field
     source_type: "StructType" = source_field.dtype
     target_type: "StructType" = options.target_field.dtype
@@ -90,36 +234,56 @@ def cast_pandas_struct_series(
             ),
         )
 
-    rows: list[dict[str, Any] | None] = []
+    return _reassemble_object_series(
+        out_cols,
+        target_type.children_fields,
+        normalized,
+        series_index=series.index,
+        series_name=options.target_field.name,
+    )
 
-    for row_idx in range(num_rows):
-        src_row = normalized.iloc[row_idx]
-        if src_row is None:
-            rows.append(None)
-            continue
 
-        row: dict[str, Any] = {}
-        for target_child in target_type.children_fields:
-            row[target_child.name] = out_cols[target_child.name].iloc[row_idx]
-        rows.append(row)
-
-    return pd.Series(rows, index=series.index, name=options.target_field.name, dtype="object")
+# ---------------------------------------------------------------------------
+# Array → struct (series)
+# ---------------------------------------------------------------------------
 
 
 def cast_pandas_list_series(
     series: "pd.Series",
     options: "CastOptions",
 ) -> "pd.Series":
-    pd = get_pandas()
-
     if not options.need_cast(series):
         return series
 
     if options.target_field is None:
         return series
     elif options.source_field.dtype.type_id != DataTypeId.ARRAY:
-        raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
+        raise CastError(
+            f"source is {options.source_field.dtype} — expected list",
+            source_field=options.source_field,
+            target_field=options.target_field,
+        )
 
+    return _run_pandas_series_fallback_chain(
+        series,
+        options,
+        columnwise=_list_series_columnwise,
+    )
+
+
+def _list_series_columnwise(
+    series: "pd.Series",
+    options: "CastOptions",
+) -> "pd.Series":
+    """Per-target-child cast that survives heterogeneous list-of-mixed-row shapes.
+
+    Each positional child lands as a pandas Series, cast through its
+    own ``cast_pandas_series`` (Arrow / Polars under the hood). Row
+    reassembly goes through :func:`_reassemble_object_series` — one
+    ``pa.StructArray.from_arrays`` + ``Array.to_pandas()`` pass, no
+    Python ``for`` over rows.
+    """
+    pd = get_pandas()
     source_field: "Field" = options.source_field
     source_type: "ArrayType" = source_field.dtype
     target_type: "StructType" = options.target_field.dtype
@@ -139,7 +303,6 @@ def cast_pandas_list_series(
         raise TypeError(f"Unsupported list-like pandas value: {type(value)!r}")
 
     normalized = series.map(normalize_row)
-    num_rows = len(series)
     out_cols: dict[str, pd.Series] = {}
 
     for i, target_child in enumerate(target_type.children_fields):
@@ -155,20 +318,65 @@ def cast_pandas_list_series(
             ),
         )
 
-    rows: list[dict[str, Any] | None] = []
+    return _reassemble_object_series(
+        out_cols,
+        target_type.children_fields,
+        normalized,
+        series_index=series.index,
+        series_name=options.target_field.name,
+    )
 
-    for row_idx in range(num_rows):
-        src_row = normalized.iloc[row_idx]
-        if src_row is None:
-            rows.append(None)
-            continue
 
-        row: dict[str, Any] = {}
-        for target_child in target_type.children_fields:
-            row[target_child.name] = out_cols[target_child.name].iloc[row_idx]
-        rows.append(row)
+def _reassemble_object_series(
+    out_cols: "dict[str, pd.Series]",
+    children_fields: "list[Field]",
+    null_marker: "pd.Series",
+    series_index: "pd.Index",
+    series_name: str,
+) -> "pd.Series":
+    """Pack per-child casted Series into a pandas object Series of dicts.
 
-    return pd.Series(rows, index=series.index, name=options.target_field.name, dtype="object")
+    Wraps the per-child Series as one ``pa.StructArray`` (each column
+    → Arrow array, no per-row Python work) and lets Arrow's
+    ``Array.to_pandas()`` produce the Python-dict cells through the
+    Arrow → pandas C bridge.  Null parent rows mask to ``None`` via
+    ``StructArray.from_arrays(mask=...)`` — no post-processing loop.
+    """
+    pd = get_pandas()
+    num_rows = len(series_index)
+    if num_rows == 0:
+        return pd.Series([], index=series_index, name=series_name, dtype="object")
+
+    target_names = [c.name for c in children_fields]
+    child_arrays: list[pa.Array] = []
+    for child in children_fields:
+        col = out_cols[child.name]
+        try:
+            arr = pa.array(col, from_pandas=True)
+        except Exception:
+            # Object cells that don't round-trip through Arrow (mixed
+            # nested Python objects, etc.) — fall back to Arrow's
+            # type-free inference path which is what would happen
+            # without ``from_pandas=True``.
+            arr = pa.array(col)
+        child_arrays.append(arr)
+
+    null_mask_arr = pa.array(null_marker.isna(), type=pa.bool_(), from_pandas=True)
+
+    struct_arr = pa.StructArray.from_arrays(
+        child_arrays,
+        names=target_names,
+        mask=null_mask_arr,
+    )
+    result = struct_arr.to_pandas()
+    result.index = series_index
+    result.name = series_name
+    return result
+
+
+# ---------------------------------------------------------------------------
+# DataFrame-shaped fallback chain
+# ---------------------------------------------------------------------------
 
 
 def cast_pandas_tabular(
@@ -178,11 +386,99 @@ def cast_pandas_tabular(
     pd = get_pandas()
 
     if not isinstance(data, pd.DataFrame):
-        raise TypeError(f"Unsupported tabular type: {type(data)!r}")
+        raise CastError(
+            f"unsupported tabular type {type(data).__name__}",
+            source_field=options.source_field,
+            target_field=options.target_field,
+        )
 
     if not options.need_cast(data, check_names=True):
         return data
 
+    failures: list[BaseException] = []
+
+    # Strategy 1 — pyarrow Table round-trip.  Single ``Table.from_pandas``
+    # → ``cast_arrow_tabular`` → ``to_pandas`` keeps every column inside
+    # Arrow for the cast pass.
+    try:
+        return _tabular_via_arrow(data, options)
+    except CastError:
+        raise
+    except Exception as exc:
+        failures.append(exc)
+
+    # Strategy 2 — polars DataFrame round-trip.  Same shape via
+    # ``pl.from_pandas`` → :func:`cast_polars_tabular` → ``to_pandas``.
+    # Useful when pyarrow rejects an object-dtype column shape Polars
+    # happily ingests.
+    try:
+        return _tabular_via_polars(data, options)
+    except CastError:
+        raise
+    except Exception as exc:
+        failures.append(exc)
+
+    # Strategy 3 — column-by-column.  Each column flows through its own
+    # ``cast_pandas_series`` (which itself runs the
+    # pyarrow→polars→columnwise chain).  ``cast_pandas_series`` already
+    # wraps its own failures in ``CastError`` carrying the per-column
+    # field provenance, so any failure here propagates with the correct
+    # leaf identified — no extra wrap needed.
+    try:
+        return _tabular_columnwise(data, options)
+    except CastError:
+        raise
+    except Exception as exc:
+        reason = (
+            "; ".join(
+                f"{path}={type(err).__name__}: {err}"
+                for path, err in zip(("pyarrow", "polars", "columnwise"), failures + [exc])
+            )
+        )
+        raise CastError(
+            f"all pandas tabular cast strategies failed ({reason})",
+            source_field=options.source_field,
+            target_field=options.target_field,
+            original=exc,
+        ) from exc
+
+
+def _tabular_via_arrow(
+    data: "pd.DataFrame",
+    options: "CastOptions",
+) -> "pd.DataFrame":
+    preserve_index = bool(data.index.name)
+    arrow_table = pa.Table.from_pandas(data, preserve_index=preserve_index)
+    target_dtype = options.target_field.dtype
+    casted_table = target_dtype.cast_arrow_tabular(arrow_table, options=options)
+    result = casted_table.to_pandas()
+    if preserve_index and data.index.name in result.columns:
+        result = result.set_index(data.index.name)
+    else:
+        result.index = data.index
+    return result
+
+
+def _tabular_via_polars(
+    data: "pd.DataFrame",
+    options: "CastOptions",
+) -> "pd.DataFrame":
+    pl = get_polars()
+    pl_df = pl.from_pandas(data)
+    target_dtype = options.target_field.dtype
+    casted_pl = target_dtype.cast_polars_tabular(pl_df, options=options)
+    if hasattr(casted_pl, "collect"):
+        casted_pl = casted_pl.collect()
+    result = casted_pl.to_pandas()
+    result.index = data.index
+    return result
+
+
+def _tabular_columnwise(
+    data: "pd.DataFrame",
+    options: "CastOptions",
+) -> "pd.DataFrame":
+    pd = get_pandas()
     source_schema = options.source_schema
     target_schema = options.merged_schema
 

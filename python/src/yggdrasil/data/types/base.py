@@ -1659,7 +1659,13 @@ class DataType(BaseChildrenFields, ABC):
             try:
                 arrow = pa.Array.from_pandas(series)
             except Exception:
-                arrow = pa.array(series.tolist(), from_pandas=True)
+                # Fall back to the typed pandas → Arrow bridge with the
+                # target's Arrow type as a hint — still consumes the
+                # Series directly (no ``.tolist()`` row walk).
+                target_arrow_type = self.to_arrow()
+                arrow = pa.array(
+                    series, type=target_arrow_type, from_pandas=True,
+                )
 
             casted = self._cast_arrow_array(arrow, options).to_pandas(types_mapper=None)
 
