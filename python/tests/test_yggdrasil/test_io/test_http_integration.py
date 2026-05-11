@@ -1,8 +1,9 @@
 """HTTP send pipeline integration tests.
 
 These tests exercise the :class:`Session` pipeline end-to-end with
-a stubbed transport (no real network) and a partitioned local
-cache backed by :class:`YGGFolderIO`. The shape:
+a stubbed transport (no real network) and the URL-mirrored fast-path
+local cache (one ``.arrow`` per request ``public_hash`` under the
+cache root). The shape:
 
     request ──► local-cache lookup
               └► remote-cache lookup (skipped here)
@@ -16,7 +17,7 @@ The tests pin:
   body / status / headers round-trip through the response;
 * a cache hit short-circuits the network and the stub session
   records zero calls;
-* writeback persists the response into the partitioned folder so a
+* writeback persists the response under the URL-mirrored tree so a
   subsequent identical request reads from disk;
 * request shaping — ``public_url_hash``, ``body_hash``,
   ``partition_key`` are stable + URL-anonymized;
@@ -28,15 +29,17 @@ The tests pin:
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pyarrow as pa
 import pytest
 
 from yggdrasil.data.enums import Mode
-from yggdrasil.io.nested.ygg_folder_io import YGGFolderIO
-from yggdrasil.io.path.local_path import LocalPath
-from yggdrasil.io.response import RESPONSE_SCHEMA
 from yggdrasil.io.send_config import CacheConfig, SendConfig
+from yggdrasil.io.session import (
+    _local_fast_path_relative,
+    _store_fast_path_arrow_batch,
+)
 
 from ._helpers import StubSession, make_request, make_response
 
@@ -180,21 +183,17 @@ class TestSessionSend:
 
 
 # ---------------------------------------------------------------------------
-# Local cache integration via YGGFolderIO
+# Local cache integration via the URL-mirrored fast-path tree
 # ---------------------------------------------------------------------------
 
 
 class TestLocalCacheIntegration:
 
     def _cache(self, tmp_path) -> CacheConfig:
-        folder = YGGFolderIO(
-            path=LocalPath(str(tmp_path)),
-            schema=RESPONSE_SCHEMA,
-        )
-        return CacheConfig(tabular=folder, mode=Mode.APPEND)
+        return CacheConfig(path=str(tmp_path), mode=Mode.APPEND)
 
     def _wait_for_dir(self, root, *, timeout: float = 2.0) -> bool:
-        """Poll *root* for any partition subdir landing within *timeout*."""
+        """Poll *root* for any subdir landing within *timeout*."""
         import time as _time
         deadline = _time.monotonic() + timeout
         while _time.monotonic() < deadline:
@@ -204,35 +203,19 @@ class TestLocalCacheIntegration:
         return False
 
     def _wait_for_readable(self, cache, *, timeout: float = 3.0) -> bool:
-        """Poll until the cache reads back a non-empty Arrow table.
+        """Poll until any non-hidden ``.arrow`` file lands in the cache tree.
 
-        Writeback fires on a daemon thread; the partition dir may
-        appear before the parquet file is fully flushed. Retry the
-        read until it succeeds with rows or the deadline passes.
-        Picks up both layouts the session writes through: the
-        partitioned ``col=val/...`` tree (legacy bulk path) and the
-        per-``public_hash`` fast-path files nested under the
-        URL-mirrored tree (``<METHOD>/<host>/<seg>/.../<hex>.arrow``).
+        Writeback fires on a daemon thread; the file may not be on
+        disk immediately after :meth:`Session.send` returns.
         """
         import time as _time
-        from pathlib import Path as _P
 
         deadline = _time.monotonic() + timeout
+        root = Path(cache.path)
         while _time.monotonic() < deadline:
             try:
-                cache.tabular.invalidate_listing()
-                with cache.tabular:
-                    table = cache.tabular.read_arrow_table()
-                if table.num_rows > 0:
-                    return True
-            except Exception:
-                pass
-            try:
-                root = _P(str(cache.tabular.path))
                 if root.exists() and any(
-                    p.is_file()
-                    and p.suffix == ".arrow"
-                    and not p.name.startswith(".")
+                    p.is_file() and not p.name.startswith(".")
                     for p in root.rglob("*.arrow")
                 ):
                     return True
@@ -244,15 +227,17 @@ class TestLocalCacheIntegration:
     def _prepopulate(
         self, cache: CacheConfig, response,
     ) -> None:
-        """Synchronously seed the cache with one response row.
+        """Synchronously seed the fast-path file for *response*.
 
         Bypasses the session's fire-and-forget writeback so the
         test can assert read-side behavior without racing against
         a background thread.
         """
-        batch = response.to_arrow_batch(parse=False)
-        cache.tabular.write_arrow_batches([batch], options=None)
-        cache.tabular.invalidate_listing()
+        req = response.request
+        rel = _local_fast_path_relative(req.method, req.url, req.public_hash)
+        _store_fast_path_arrow_batch(
+            cache.path, rel, response.to_arrow_batch(parse=False),
+        )
 
     def test_writeback_persists_response(self, tmp_path) -> None:
         s = StubSession()
@@ -289,16 +274,6 @@ class TestLocalCacheIntegration:
         assert len(s.calls) == 1
         assert out.json() == {"network": True}
 
-    def test_cache_partitions_match_response_schema(self, tmp_path) -> None:
-        """The folder's partition columns mirror RESPONSE_SCHEMA's tags."""
-        cache = self._cache(tmp_path)
-        folder = cache.tabular
-        expected = [
-            f.name for f in RESPONSE_SCHEMA.fields
-            if f._tag_flag(b"partition_by")
-        ]
-        assert folder.partition_columns == expected
-
     def test_cache_hit_distinct_url_does_not_match(self, tmp_path) -> None:
         """A cached row for /a must not satisfy a request for /b."""
         s = StubSession()
@@ -327,13 +302,9 @@ class TestLocalCacheIntegration:
         """A row outside [received_from, received_to) is ignored on read."""
         import datetime as dt
         s = StubSession()
-        folder = YGGFolderIO(
-            path=LocalPath(str(tmp_path)),
-            schema=RESPONSE_SCHEMA,
-        )
         old = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
         cache = CacheConfig(
-            tabular=folder,
+            path=str(tmp_path),
             mode=Mode.APPEND,
             received_from=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
             received_to=dt.datetime(2030, 1, 1, tzinfo=dt.timezone.utc),
@@ -352,13 +323,7 @@ class TestLocalCacheIntegration:
     def test_upsert_mode_skips_lookup_and_refetches(self, tmp_path) -> None:
         """UPSERT bypasses the read, always going to the network."""
         s = StubSession()
-        cache = CacheConfig(
-            tabular=YGGFolderIO(
-                path=LocalPath(str(tmp_path)),
-                schema=RESPONSE_SCHEMA,
-            ),
-            mode=Mode.UPSERT,
-        )
+        cache = CacheConfig(path=str(tmp_path), mode=Mode.UPSERT)
         req = make_request("https://example.com/x")
         self._prepopulate(
             cache, make_response(request=req, body=b'{"cached":true}'),
@@ -386,13 +351,7 @@ class TestLocalCacheIntegration:
         # win, forcing a network fetch.
         empty_dir = tmp_path / "alt"
         empty_dir.mkdir()
-        req_cache = CacheConfig(
-            tabular=YGGFolderIO(
-                path=LocalPath(str(empty_dir)),
-                schema=RESPONSE_SCHEMA,
-            ),
-            mode=Mode.APPEND,
-        )
+        req_cache = CacheConfig(path=str(empty_dir), mode=Mode.APPEND)
         req = make_request("https://example.com/x").copy(
             local_cache_config=req_cache,
         )
@@ -424,12 +383,11 @@ class TestLocalCacheIntegration:
 class TestCacheConfigCoercion:
     """``CacheConfig.check_arg`` accepts a few convenience shapes."""
 
-    def test_check_arg_path_builds_local_folder(self, tmp_path) -> None:
-        from yggdrasil.io.nested.folder_io import FolderIO
-
+    def test_check_arg_path_sets_local_path(self, tmp_path) -> None:
         cfg = CacheConfig.check_arg(tmp_path)
-        assert cfg.is_local_tabular is True
-        assert isinstance(cfg.tabular, FolderIO)
+        assert cfg.is_local is True
+        assert cfg.is_remote is False
+        assert cfg.path == str(tmp_path)
         assert cfg.local_cache_enabled is True
         assert str(cfg.local_cache_folder()) == str(tmp_path)
 
@@ -481,17 +439,11 @@ class TestLocalCacheFolderPerHost:
             path.parts[-4:] == ("response", "api.example.com", "v1", "markets")
         )
 
-    def test_explicit_tabular_overrides_default(self, tmp_path) -> None:
+    def test_explicit_path_overrides_default(self, tmp_path) -> None:
         from yggdrasil.io.url import URL
         s = StubSession(base_url=URL.from_("https://api.example.com/"))
-        cache = CacheConfig(
-            tabular=YGGFolderIO(
-                path=LocalPath(str(tmp_path)),
-                schema=RESPONSE_SCHEMA,
-            ),
-            mode=Mode.APPEND,
-        )
-        # Explicit FolderIO wins — host derivation is for the
+        cache = CacheConfig(path=str(tmp_path), mode=Mode.APPEND)
+        # Explicit ``path`` wins — host derivation is for the
         # auto-built default only.
         assert str(cache.local_cache_folder(session=s)) == str(tmp_path)
 
@@ -637,35 +589,3 @@ class TestFromUrllib3:
         assert resp.buffer.to_bytes() == b"binary blob"
 
 
-# ---------------------------------------------------------------------------
-# Predicate helpers used by the cache
-# ---------------------------------------------------------------------------
-
-
-class TestPartitionPrunePredicate:
-    """The session builds an ``options.prune_values`` from request batches.
-
-    We don't drive the session directly here (that would re-test the
-    StubSession path); we exercise the helper that turns a list of
-    requests into the partition-IN map :class:`YGGFolderIO` reads.
-    """
-
-    def test_partition_predicate_collects_unique_keys(self) -> None:
-        # ``partition_key`` is the response's partition column; on the
-        # request side the same value is computed from the request URL,
-        # so we just check we can extract a tuple from a batch of
-        # requests.
-        from yggdrasil.io.session import _request_partition_predicate
-        cache = YGGFolderIO(
-            path=LocalPath("/tmp/none"),  # path isn't read here
-            schema=RESPONSE_SCHEMA,
-        )
-        reqs = [
-            make_request("https://example.com/a"),
-            make_request("https://example.com/b"),
-            make_request("https://example.com/a"),  # dupe
-        ]
-        expr = _request_partition_predicate(cache, reqs)
-        # The helper builds a Predicate ANDed over partition columns;
-        # we just assert it produced something rather than None.
-        assert expr is not None
