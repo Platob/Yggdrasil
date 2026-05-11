@@ -1087,6 +1087,26 @@ class Tabular(ABC, Generic[O]):
         if frame.height == 0:
             return
 
+        # Push the target cast into polars before the zero-copy
+        # :func:`pl.DataFrame.to_arrow` hand-off. The rust engine fuses
+        # cast + projection (numerics, temporals, nested) into one pass;
+        # the downstream per-batch ``cast_arrow_tabular`` then only has
+        # to reconcile arrow-level shape differences polars can't express
+        # natively (e.g. ``large_string`` ↔ ``string`` round-trips). We
+        # don't pre-bind ``source_field`` here — polars's arrow bridge
+        # may pick a slightly different physical type than the yggdrasil
+        # target declares (``large_string`` is the canonical one), and
+        # the downstream cast handles the final reconciliation in one
+        # cheap kernel call.
+        target_field = getattr(options, "target_field", None)
+        if target_field is not None:
+            try:
+                frame = options.cast_polars_tabular(frame)
+            except Exception:
+                # Polars cast couldn't express the target shape — fall
+                # back to per-batch arrow cast downstream.
+                pass
+
         row_size = getattr(options, "row_size", None) or 0
         byte_size = getattr(options, "byte_size", None) or 0
         if row_size > 0:
@@ -1145,7 +1165,45 @@ class Tabular(ABC, Generic[O]):
         is_default_range = (
             isinstance(frame.index, pd.RangeIndex) and frame.index.name is None
         )
-        table = pa.Table.from_pandas(frame, preserve_index=not is_default_range)
+        preserve_index = not is_default_range
+
+        # Fast path: when a target schema is bound on ``options``, feed it
+        # straight to :func:`pa.Table.from_pandas` so the C++ bridge does
+        # type-driven conversion in one pass instead of inferring types
+        # (slow for object-dtype + nested columns) and then re-casting per
+        # batch downstream. After the table lands in target shape, bind
+        # ``source_field`` so the per-batch ``cast_arrow_tabular`` collapses
+        # to its bypass branch.
+        target_field = getattr(options, "target_field", None)
+        if (
+            target_field is not None
+            and not preserve_index
+            and isinstance(frame, pd.DataFrame)
+        ):
+            merged = options.merged_field
+            if merged is not None:
+                target_names = [f.name for f in merged.children_fields]
+                if target_names and all(name in frame.columns for name in target_names):
+                    try:
+                        table = pa.Table.from_pandas(
+                            frame,
+                            schema=merged.to_arrow_schema(),
+                            preserve_index=False,
+                        )
+                    except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError,
+                            TypeError, ValueError, KeyError):
+                        # Fall through to the inference path — the caller's
+                        # frame doesn't line up cleanly with the target
+                        # (mixed object cells, conflicting dtypes, etc.)
+                        # and the regular cast layer will sort it out.
+                        pass
+                    else:
+                        self._write_arrow_table(
+                            table, options.with_source(merged, copy=True),
+                        )
+                        return
+
+        table = pa.Table.from_pandas(frame, preserve_index=preserve_index)
         self._write_arrow_table(table, options)
 
     # ==================================================================

@@ -253,6 +253,12 @@ class ParquetIO(IO[bytes, ParquetOptions]):
         first_casted = write_options.cast_arrow_tabular(first)
         schema = write_options.merged_schema.to_arrow_schema()
 
+        # If the first batch came back as the same object the cast was a
+        # full bypass (source schema already matched the target). The
+        # batches downstream share the same source schema, so the cast
+        # will keep bypassing — skip the per-batch dispatch entirely.
+        bypass = first_casted is first
+
         with self.arrow_output_stream() as sink:
             with pq.ParquetWriter(
                 sink,
@@ -264,10 +270,15 @@ class ParquetIO(IO[bytes, ParquetOptions]):
             ) as writer:
                 if first_casted.num_rows > 0:
                     writer.write_batch(first_casted, row_group_size=options.row_group_size)
-                for batch in iterator:
-                    casted = write_options.cast_arrow_tabular(batch)
-                    if casted.num_rows > 0:
-                        writer.write_batch(casted, row_group_size=options.row_group_size)
+                if bypass:
+                    for batch in iterator:
+                        if batch.num_rows > 0:
+                            writer.write_batch(batch, row_group_size=options.row_group_size)
+                else:
+                    for batch in iterator:
+                        casted = write_options.cast_arrow_tabular(batch)
+                        if casted.num_rows > 0:
+                            writer.write_batch(casted, row_group_size=options.row_group_size)
 
     # ==================================================================
     # Native engine overrides — push reads to format-aware scanners
