@@ -12,6 +12,7 @@ batches and infers types from the head of the file.
 from __future__ import annotations
 
 import dataclasses
+import itertools as _it
 import json
 from typing import TYPE_CHECKING, ClassVar, Iterable, Iterator
 
@@ -106,6 +107,13 @@ class NDJsonIO(IO[bytes, NDJsonOptions]):
         self,
         options: NDJsonOptions,
     ) -> Iterator[pa.RecordBatch]:
+        """Stream Arrow record batches out of the NDJSON reader.
+
+        Each batch is funneled through :meth:`CastOptions.cast_arrow_tabular`
+        so a bound ``target_field`` reshapes the rows to the caller's
+        schema before they leave the reader. When no target is bound
+        the cast is a passthrough.
+        """
         if self.size == 0:
             return
         with self.arrow_input_stream() as v:
@@ -116,7 +124,7 @@ class NDJsonIO(IO[bytes, NDJsonOptions]):
             )
             try:
                 for batch in reader:
-                    yield batch
+                    yield options.cast_arrow_tabular(batch)
             finally:
                 reader.close()
 
@@ -213,6 +221,16 @@ class NDJsonIO(IO[bytes, NDJsonOptions]):
             and self.pread(1, self.size - 1) != b"\n"
         )
 
+        # Peek the first batch to bind a source schema so a bound
+        # ``target_field`` reshapes the rows through
+        # :meth:`cast_arrow_tabular` before each row is serialized —
+        # passthrough when no target is bound.
+        iterator = iter(batches)
+        first = next(iterator, None)
+        cast_opts = (
+            options.check_source(first.schema) if first is not None else options
+        )
+
         # Drive the per-row writes through the IO's
         # :meth:`arrow_output_stream`, which yields a
         # :class:`pa.BufferOutputStream`; pyarrow's sink coalesces
@@ -222,8 +240,11 @@ class NDJsonIO(IO[bytes, NDJsonOptions]):
         with self.arrow_output_stream(append=is_append_uncompressed) as sink:
             if needs_newline_prefix:
                 sink.write(line_term)
-            for batch in batches:
-                for row in batch.to_pylist():
+            if first is None:
+                return
+            for batch in _it.chain([first], iterator):
+                casted = cast_opts.cast_arrow_tabular(batch)
+                for row in casted.to_pylist():
                     line = json.dumps(
                         row,
                         ensure_ascii=options.ensure_ascii,

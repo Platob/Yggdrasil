@@ -130,6 +130,11 @@ class ParquetIO(IO[bytes, ParquetOptions]):
         ``options.row_size`` (when set) becomes the Parquet
         ``batch_size`` — otherwise pyarrow's default of 65536 rows
         per batch.
+
+        Each batch is funneled through :meth:`CastOptions.cast_arrow_tabular`
+        so a bound ``target_field`` reshapes the rows to the caller's
+        schema before they leave the reader. When no target is bound
+        the cast is a passthrough — same byte cost as the legacy path.
         """
         if self.size == 0:
             return
@@ -141,7 +146,7 @@ class ParquetIO(IO[bytes, ParquetOptions]):
                     batch_size=batch_size,
                     use_threads=options.use_threads,
                 ):
-                    yield batch
+                    yield options.cast_arrow_tabular(batch)
 
     # ==================================================================
     # Write path
@@ -237,7 +242,16 @@ class ParquetIO(IO[bytes, ParquetOptions]):
         # :class:`pa.BufferOutputStream` and bulk-commits the encoded
         # bytes (with codec compression when the holder's MediaType
         # carries one) on context exit.
-        schema = first.schema
+        #
+        # Bind the first batch's schema as the source so
+        # :attr:`CastOptions.merged_schema` resolves to the writer
+        # schema even when no target_field is set; each batch is
+        # cast through :meth:`cast_arrow_tabular` so a bound target
+        # reshapes the rows to the caller's schema before the
+        # encoder sees them.
+        write_options = options.check_source(first.schema)
+        first_casted = write_options.cast_arrow_tabular(first)
+        schema = write_options.merged_schema.to_arrow_schema()
 
         with self.arrow_output_stream() as sink:
             with pq.ParquetWriter(
@@ -248,11 +262,12 @@ class ParquetIO(IO[bytes, ParquetOptions]):
                 use_dictionary=options.use_dictionary,
                 write_statistics=options.write_statistics,
             ) as writer:
-                if first.num_rows > 0:
-                    writer.write_batch(first, row_group_size=options.row_group_size)
+                if first_casted.num_rows > 0:
+                    writer.write_batch(first_casted, row_group_size=options.row_group_size)
                 for batch in iterator:
-                    if batch.num_rows > 0:
-                        writer.write_batch(batch, row_group_size=options.row_group_size)
+                    casted = write_options.cast_arrow_tabular(batch)
+                    if casted.num_rows > 0:
+                        writer.write_batch(casted, row_group_size=options.row_group_size)
 
     # ==================================================================
     # Native engine overrides — push reads to format-aware scanners

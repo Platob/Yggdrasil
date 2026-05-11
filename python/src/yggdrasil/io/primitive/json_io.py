@@ -88,6 +88,13 @@ class JsonIO(IO[bytes, JsonOptions]):
         self,
         options: JsonOptions,
     ) -> Iterator[pa.RecordBatch]:
+        """Yield Arrow record batches from the JSON payload.
+
+        Each batch is funneled through :meth:`CastOptions.cast_arrow_tabular`
+        so a bound ``target_field`` reshapes the rows to the caller's
+        schema before they leave the reader. When no target is bound
+        the cast is a passthrough.
+        """
         if self.size == 0:
             return
 
@@ -113,10 +120,14 @@ class JsonIO(IO[bytes, JsonOptions]):
                 parsed = json.loads(data.decode(options.encoding))
                 if isinstance(parsed, list):
                     if parsed:
-                        yield pa.RecordBatch.from_pylist(parsed)
+                        yield options.cast_arrow_tabular(
+                            pa.RecordBatch.from_pylist(parsed)
+                        )
                     return
                 if isinstance(parsed, dict):
-                    yield pa.RecordBatch.from_pylist([parsed])
+                    yield options.cast_arrow_tabular(
+                        pa.RecordBatch.from_pylist([parsed])
+                    )
                     return
                 raise ValueError(
                     f"{type(self).__name__}: expected a JSON array of objects "
@@ -132,7 +143,7 @@ class JsonIO(IO[bytes, JsonOptions]):
             )
             try:
                 for batch in reader:
-                    yield batch
+                    yield options.cast_arrow_tabular(batch)
             finally:
                 reader.close()
 
@@ -182,11 +193,17 @@ class JsonIO(IO[bytes, JsonOptions]):
                 chained, dataclasses.replace(options, mode=Mode.OVERWRITE),
             )
 
+        # Bind the first batch's schema as the source so
+        # :meth:`cast_arrow_tabular` reshapes each batch to a bound
+        # ``target_field`` before it gets serialized — passthrough
+        # when no target is set.
+        cast_opts = options.check_source(first.schema)
+
         # Materialize all batches into one pylist; it's a JSON array
         # so the whole document goes out at once.
-        rows: list[dict] = list(first.to_pylist())
+        rows: list[dict] = list(cast_opts.cast_arrow_tabular(first).to_pylist())
         for batch in iterator:
-            rows.extend(batch.to_pylist())
+            rows.extend(cast_opts.cast_arrow_tabular(batch).to_pylist())
 
         text = json.dumps(
             rows,

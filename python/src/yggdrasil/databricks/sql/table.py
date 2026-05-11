@@ -2934,7 +2934,23 @@ class Table(DatabricksResource, Holder):
 
         columns = list(existing_schema.field_names())
         cols_quoted = ", ".join(quote_ident(c) for c in columns)
-        source_sql = f"SELECT {cols_quoted} FROM {quote_ident(view_name)}"
+        # Explicit per-column CAST to the target field's DDL coerces
+        # the view rows to the target table's schema. Mirrors the
+        # projection used by :meth:`arrow_insert` / :meth:`sql_insert`
+        # so the INSERT itself carries the schema even when the
+        # underlying DataFrame already happens to align — defensive
+        # against Spark's planner promoting nullable→NOT NULL inside
+        # a struct (Delta MERGE refuses the implicit cast otherwise:
+        # ``DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION``).
+        cast_projection = ", ".join(
+            (
+                f"CAST({quote_ident(f.name)} AS "
+                f"{f.to_spark_name(with_name=False, with_nullable=False, with_comment=False)})"
+                f" AS {quote_ident(f.name)}"
+            )
+            for f in existing_schema.fields
+        )
+        source_sql = f"SELECT {cast_projection} FROM {quote_ident(view_name)}"
 
         # The DataFrame anti-join already dedup'd; emit a plain INSERT
         # so we don't pay for the SQL-side NOT EXISTS twice.
@@ -3012,13 +3028,21 @@ class Table(DatabricksResource, Holder):
                         extra_target.create(data, mode=schema_mode)
                         extra_schema = extra_target.collect_schema()
                         extra_columns = list(extra_schema.field_names())
-                        extra_cols_quoted = ", ".join(
-                            quote_ident(c) for c in extra_columns
+                        # Same CAST projection as the primary INSERT —
+                        # each dispatch target may have its own column
+                        # types, so the cast is per-target.
+                        extra_cast_proj = ", ".join(
+                            (
+                                f"CAST({quote_ident(f.name)} AS "
+                                f"{f.to_spark_name(with_name=False, with_nullable=False, with_comment=False)})"
+                                f" AS {quote_ident(f.name)}"
+                            )
+                            for f in extra_schema.fields
                         )
                         where_frag = _render_source_predicate(predicate)
                         where_clause = f" WHERE {where_frag}" if where_frag else ""
                         extra_source_sql = (
-                            f"SELECT {extra_cols_quoted} "
+                            f"SELECT {extra_cast_proj} "
                             f"FROM {quote_ident(view_name)}{where_clause}"
                         )
                         extra_texts = _build_dml_statements(
