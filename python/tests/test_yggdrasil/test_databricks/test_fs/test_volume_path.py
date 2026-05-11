@@ -814,3 +814,105 @@ class TestCredentialsRefresherSingleton:
         assert isinstance(out, AwsCredentials)
         assert out.access_key_id == "AKIA-direct"
         assert out.secret_access_key == "secret-direct"
+
+
+class TestVolumeInfoNotFoundRecovery:
+
+    def test_creates_volume_on_not_found_then_re_reads(self, workspace) -> None:
+        # First ``volumes.read`` raises NotFound; the recovery path
+        # creates the volume (via ``_ensure_volume``) and retries.
+        first_call = {"done": False}
+
+        def read(full_name):
+            if not first_call["done"]:
+                first_call["done"] = True
+                raise NotFound("Volume cat.sch.vol does not exist")
+            return _volume_info()
+
+        workspace.volumes.read.side_effect = read
+        workspace.volumes.create.return_value = SimpleNamespace(
+            volume_id="volume-uuid-0001",
+        )
+
+        p = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        info = p.volume_info()
+        assert info.volume_id == "volume-uuid-0001"
+        assert workspace.volumes.read.call_count == 2
+        # The create call should have run with the volume coordinates
+        # parsed from the path.
+        create_kwargs = workspace.volumes.create.call_args.kwargs
+        assert create_kwargs["catalog_name"] == "cat"
+        assert create_kwargs["schema_name"] == "sch"
+        assert create_kwargs["name"] == "vol"
+
+    def test_recovery_also_creates_missing_schema(self, workspace) -> None:
+        # Volume create itself fails with NotFound first (schema
+        # missing); ``_ensure_volume`` then walks up and creates the
+        # schema before retrying. The final ``volumes.read`` succeeds.
+        read_outcomes = [NotFound("missing"), _volume_info(volume_id="vid")]
+
+        def read(full_name):
+            outcome = read_outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        create_outcomes = [
+            NotFound("schema does not exist"),
+            SimpleNamespace(volume_id="vid"),
+        ]
+
+        def create(**kwargs):
+            outcome = create_outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        workspace.volumes.read.side_effect = read
+        workspace.volumes.create.side_effect = create
+
+        p = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        info = p.volume_info()
+        assert info.volume_id == "vid"
+        # Schema must have been created during recovery — the volume
+        # create's NotFound told ``_ensure_volume`` to walk one rung
+        # up the UC hierarchy before retrying.
+        workspace.schemas.create.assert_called_once()
+
+    def test_propagates_other_errors_unchanged(self, workspace) -> None:
+        # PermissionDenied is deterministic — the recovery path must
+        # not swallow it.
+        workspace.volumes.read.side_effect = PermissionDenied("nope")
+        p = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        with pytest.raises(PermissionDenied):
+            p.volume_info()
+        workspace.volumes.create.assert_not_called()
+
+    def test_temporary_credentials_inherits_create_on_not_found(
+        self, workspace,
+    ) -> None:
+        # ``temporary_credentials`` calls ``volume_info`` first, so
+        # the create-on-NotFound flow surfaces transparently — the
+        # caller gets back the AWS creds without ever seeing a
+        # NotFound.
+        read_calls = {"n": 0}
+
+        def read(full_name):
+            read_calls["n"] += 1
+            if read_calls["n"] == 1:
+                raise NotFound("missing")
+            return _volume_info(volume_id="vid-after-create")
+
+        workspace.volumes.read.side_effect = read
+        workspace.volumes.create.return_value = SimpleNamespace(
+            volume_id="vid-after-create",
+        )
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen.return_value = _aws_creds_response()
+
+        p = VolumePath("/Volumes/cat/sch/vol/x", workspace=workspace)
+        resp = p.temporary_credentials(operation="read")
+        assert resp.aws_temp_credentials.access_key_id == "AKIA-test"
+        workspace.volumes.create.assert_called_once()
+        gen.assert_called_once()
+        assert gen.call_args.kwargs["volume_id"] == "vid-after-create"

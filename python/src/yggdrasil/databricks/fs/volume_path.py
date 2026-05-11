@@ -143,6 +143,16 @@ class VolumePath(DatabricksPath):
         for the volume's lifetime, so we only ever issue the
         ``volumes.read`` call once unless ``refresh=True`` is passed.
 
+        If the underlying ``volumes.read`` raises :class:`NotFound`
+        (or a ``BadRequest``-shaped "does not exist" — UC isn't fully
+        consistent here), the missing pieces of catalog / schema /
+        volume are created on demand via :meth:`_ensure_volume` and
+        the read is retried exactly once. Subsequent failures
+        propagate. This is the only place the credentials path
+        auto-creates a volume, so ``temporary_credentials`` /
+        ``aws`` / ``s3_path`` all inherit the "first-touch creates"
+        behavior for free.
+
         Raises :class:`ValueError` when the URL path doesn't address a
         volume (no ``/cat/sch/vol`` prefix).
         """
@@ -156,7 +166,20 @@ class VolumePath(DatabricksPath):
             )
         catalog, schema, volume = triple
         full_name = f"{catalog}.{schema}.{volume}"
-        info = self._call(self.workspace.volumes.read, full_name)
+        try:
+            info = self._call(self.workspace.volumes.read, full_name)
+        except Exception as exc:
+            if not _looks_like_not_found(exc):
+                raise
+            # Volume (and possibly its catalog / schema) doesn't
+            # exist yet — let ``_ensure_volume`` create the missing
+            # pieces, then re-read. ``_ensure_volume`` swallows
+            # ``AlreadyExists`` on each rung so concurrent creators
+            # don't fight, and only raises if both the create AND
+            # the parent-walking failed.
+            if not self._ensure_volume():
+                raise
+            info = self._call(self.workspace.volumes.read, full_name)
         self._volume_info = info
         # Snapshot the storage location too — every credential vend
         # and ``s3_path`` build needs it, and re-reading the same
