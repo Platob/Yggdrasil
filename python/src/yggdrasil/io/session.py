@@ -92,6 +92,91 @@ def _store_local_arrow_batch(
     )
 
 
+def _local_fast_path_filename(public_hash: int) -> str:
+    """Deterministic filename for the per-request fast-path cache entry.
+
+    ``public_hash`` is the request's xxh3_64 over the anonymized
+    ``(method, url, headers, body)`` projection — strong enough to
+    stand in as the standalone cache key. Folded to its unsigned
+    16-hex form so the entry lands at ``<cache_root>/<hex>.arrow``
+    regardless of sign.
+    """
+    return f"{public_hash & 0xFFFFFFFFFFFFFFFF:016x}.arrow"
+
+
+def _store_fast_path_arrow_batch(
+    cache_root_str: str,
+    public_hash: int,
+    batch: pa.RecordBatch,
+) -> None:
+    """Persist *batch* to the per-request fast-path file straight under
+    *cache_root_str*.
+
+    Bypasses :class:`FolderIO` entirely: one Arrow IPC stream per
+    request ``public_hash``, flat under the cache root. Tmp + atomic
+    ``os.replace`` keeps a partial write from being read mid-flush
+    by a concurrent fast-path reader. The cache root is passed as a
+    string so the fire-and-forget :class:`Job` pickles cheaply
+    across worker boundaries (no live Path / FolderIO state).
+    """
+    import pathlib
+
+    root = pathlib.Path(cache_root_str)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+
+    final = root / _local_fast_path_filename(public_hash)
+    tmp = root / f".{final.name}.{os.urandom(4).hex()}.tmp"
+    try:
+        sink = pa.BufferOutputStream()
+        with pa.ipc.new_stream(sink, batch.schema) as writer:
+            writer.write_batch(batch)
+        tmp.write_bytes(sink.getvalue().to_pybytes())
+        os.replace(tmp, final)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _read_fast_path_arrow_batch(
+    cache_root: Any, public_hash: int,
+) -> "pa.RecordBatch | None":
+    """Read the per-request fast-path file written for *public_hash*.
+
+    Returns ``None`` when the file is missing, empty, or otherwise
+    unreadable so the caller can fall through to the bulk-lookup
+    path without a special error case (corrupt entry, race with a
+    concurrent rewrite, schema drift, …).
+    """
+    import pathlib
+
+    file_path = (
+        pathlib.Path(os.fspath(cache_root))
+        / _local_fast_path_filename(public_hash)
+    )
+    try:
+        payload = file_path.read_bytes()
+    except OSError:
+        return None
+    if not payload:
+        return None
+    try:
+        reader = pa.ipc.open_stream(pa.BufferReader(payload))
+        batches = [b for b in reader if b.num_rows > 0]
+    except Exception:
+        return None
+    if not batches:
+        return None
+    if len(batches) == 1:
+        return batches[0]
+    chunks = pa.Table.from_batches(batches).combine_chunks().to_batches()
+    return chunks[0] if chunks else None
+
+
 def _request_partition_predicate(
     cache: "FolderIO",
     requests: "list[PreparedRequest]",
@@ -263,6 +348,55 @@ def _lookup_local_responses(
     if not cache.path.exists():
         return {}
 
+    out: dict[tuple, Response] = {}
+    latest_at: dict[tuple, Any] = {}
+
+    # Fast-path probe: each request whose ``public_hash`` has a
+    # deterministic ``<cache_root>/<hex>.arrow`` entry resolves on
+    # one ``stat`` + IPC decode, no partition walk. Requests that
+    # miss the fast path fall through to the partitioned read
+    # below, so legacy UUID-named parts still resolve.
+    remaining: list[PreparedRequest] = []
+    for req in requests:
+        try:
+            public_hash = req.public_hash
+        except Exception:
+            public_hash = None
+        if public_hash is None:
+            remaining.append(req)
+            continue
+        batch = _read_fast_path_arrow_batch(cache.path, public_hash)
+        if batch is None:
+            remaining.append(req)
+            continue
+        try:
+            req_key = tuple(req.match_value(c) for c in match_by)
+        except Exception:
+            remaining.append(req)
+            continue
+        for resp in Response.from_arrow_tabular(batch):
+            try:
+                resp_key = tuple(resp.match_value(c) for c in match_by)
+            except Exception:
+                continue
+            if resp_key != req_key:
+                continue
+            ts = resp.received_at
+            if received_from is not None and ts is not None and ts < received_from:
+                continue
+            if received_to is not None and ts is not None and ts >= received_to:
+                continue
+            existing = latest_at.get(resp_key)
+            if existing is None or (ts is not None and ts >= existing):
+                out[resp_key] = resp
+                if ts is not None:
+                    latest_at[resp_key] = ts
+
+    if not remaining:
+        return out
+
+    requests = remaining
+
     from yggdrasil.io.tabular.execution.expr import col
     from yggdrasil.data.options import CastOptions
 
@@ -287,8 +421,6 @@ def _lookup_local_responses(
     wanted: set[tuple] = {
         tuple(r.match_value(c) for c in match_by) for r in requests
     }
-    out: dict[tuple, Response] = {}
-    latest_at: dict[tuple, Any] = {}
 
     try:
         with cache:
@@ -457,13 +589,34 @@ class Session(ABC):
     ) -> Optional[Response]:
         """Resolve a single request against the partitioned local cache.
 
-        Routes through :func:`_lookup_local_responses` — one folder
-        read, partition-pruned by the request's own values, then
-        row-filtered by the ``request_by`` tuple and the configured
-        received-window.
+        Tries the per-``public_hash`` fast-path file first (one
+        ``stat`` + Arrow IPC decode, no partition walk); falls back
+        to :func:`_lookup_local_responses` on miss / corrupt entry —
+        one folder read, partition-pruned by the request's own
+        values, then row-filtered by the ``request_by`` tuple and
+        the configured received-window. Legacy caches that only
+        carry partitioned UUID-named parts still resolve through
+        the fallback.
         """
-        match_by = tuple(cache_cfg.request_by or ()) or ("public_url_hash",)
         cache = cache_cfg.local_cache(session=self)
+
+        try:
+            public_hash = request.public_hash
+        except Exception:
+            public_hash = None
+        if public_hash is not None:
+            batch = _read_fast_path_arrow_batch(cache.path, public_hash)
+            if batch is not None:
+                for resp in Response.from_arrow_tabular(batch):
+                    if not cache_cfg.filter_response(resp, request=request):
+                        continue
+                    LOGGER.debug(
+                        "Found local %s %s under %s (fast path)",
+                        request.method, request.url, cache.path,
+                    )
+                    return resp
+
+        match_by = tuple(cache_cfg.request_by or ()) or ("public_url_hash",)
         looked = _lookup_local_responses(
             cache, [request],
             match_by=match_by,
@@ -516,9 +669,31 @@ class Session(ABC):
         # remain stable whether the lookup carries the original
         # request or an anonymized one. Build the Arrow batch on
         # the caller's thread while the buffer is still live; the
-        # partitioned write goes through fire-and-forget so the
-        # caller doesn't block on disk IO.
+        # write itself goes through fire-and-forget so the caller
+        # doesn't block on disk IO.
         batch = response.to_arrow_batch(parse=False)
+
+        # Fast path: one Arrow IPC file per ``public_hash`` straight
+        # under the cache root. Skips the FolderIO partition tree so
+        # the matching read pays one ``stat`` + IPC decode instead
+        # of a partition walk + parquet read + row filter. Falls back
+        # to the partitioned write when ``public_hash`` is unavailable
+        # for any reason (the bulk lookup remains the backstop on the
+        # read side).
+        public_hash: int | None = None
+        try:
+            req = response.request
+            if req is not None:
+                public_hash = req.public_hash
+        except Exception:
+            public_hash = None
+        if public_hash is not None:
+            Job.make(
+                _store_fast_path_arrow_batch,
+                os.fspath(cache.path), public_hash, batch,
+            ).fire_and_forget()
+            return
+
         Job.make(_store_local_arrow_batch, cache, batch).fire_and_forget()
 
     def _load_remote_cached_response(

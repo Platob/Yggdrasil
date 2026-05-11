@@ -209,8 +209,13 @@ class TestLocalCacheIntegration:
         Writeback fires on a daemon thread; the partition dir may
         appear before the parquet file is fully flushed. Retry the
         read until it succeeds with rows or the deadline passes.
+        Picks up both layouts the session writes through: the
+        partitioned ``col=val/...`` tree (legacy bulk path) and the
+        flat per-``public_hash`` fast-path files at the cache root.
         """
         import time as _time
+        from pathlib import Path as _P
+
         deadline = _time.monotonic() + timeout
         while _time.monotonic() < deadline:
             try:
@@ -220,6 +225,17 @@ class TestLocalCacheIntegration:
                 if table.num_rows > 0:
                     return True
             except Exception:
+                pass
+            try:
+                root = _P(str(cache.tabular.path))
+                if root.exists() and any(
+                    p.is_file()
+                    and p.suffix == ".arrow"
+                    and not p.name.startswith(".")
+                    for p in root.iterdir()
+                ):
+                    return True
+            except OSError:
                 pass
             _time.sleep(0.05)
         return False
