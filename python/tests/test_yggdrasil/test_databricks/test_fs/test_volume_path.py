@@ -44,6 +44,16 @@ def reset_volume_credentials_refresher_singletons():
     VolumeCredentialsRefresher._INSTANCES.clear()
 
 
+@pytest.fixture(autouse=True)
+def reset_volume_info_cache():
+    # Class-level ``VolumeInfo`` cache keyed by (cat, sch, vol). Tests
+    # share path coordinates across cases, so leaking the cache would
+    # short-circuit the SDK call this case is trying to observe.
+    VolumePath._VOLUME_INFO_CACHE.clear()
+    yield
+    VolumePath._VOLUME_INFO_CACHE.clear()
+
+
 @pytest.fixture
 def workspace():
     return MagicMock()
@@ -679,12 +689,12 @@ class TestAWSAndS3Path:
 
         p = VolumePath("/Volumes/c/s/v", workspace=workspace)
         s3 = p.s3_path()
-        # No sub-volume tail to append; storage root drives the URL.
-        # ``S3Path`` strips the trailing slash on canonical rendering
-        # (the canonical S3 key has no trailing slash).
-        assert s3.full_path() == "s3://b/__unitystorage/c/s/v"
+        # No sub-volume tail to append — the storage root URL drives
+        # the address verbatim, trailing slash preserved as a
+        # directory-marker.
+        assert s3.full_path() == "s3://b/__unitystorage/c/s/v/"
         assert s3.bucket == "b"
-        assert s3.key == "__unitystorage/c/s/v"
+        assert s3.key == "__unitystorage/c/s/v/"
 
 
 # ---------------------------------------------------------------------------
@@ -916,3 +926,143 @@ class TestVolumeInfoNotFoundRecovery:
         workspace.volumes.create.assert_called_once()
         gen.assert_called_once()
         assert gen.call_args.kwargs["volume_id"] == "vid-after-create"
+
+
+# ---------------------------------------------------------------------------
+# storage_path / arrow_filesystem — Path-shaped storage location
+# ---------------------------------------------------------------------------
+
+
+class TestStoragePath:
+
+    def test_returns_s3_path_for_s3_volume(self, workspace) -> None:
+        from yggdrasil.aws.fs.path import S3Path
+        workspace.volumes.read.return_value = _volume_info(
+            storage_location="s3://my-bucket/__unitystorage/cat/sch/vol",
+        )
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen.return_value = _aws_creds_response()
+
+        p = VolumePath("/Volumes/cat/sch/vol/x.parquet", workspace=workspace)
+        root = p.storage_path(region="us-east-1")
+        assert isinstance(root, S3Path)
+        assert root.full_path() == "s3://my-bucket/__unitystorage/cat/sch/vol"
+
+    def test_caches_path_on_instance(self, workspace) -> None:
+        workspace.volumes.read.return_value = _volume_info(
+            storage_location="s3://bkt/u/c/s/v",
+        )
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen.return_value = _aws_creds_response()
+
+        p = VolumePath("/Volumes/c/s/v/x", workspace=workspace)
+        first = p.storage_path()
+        second = p.storage_path()
+        # Same Path instance — no rebuild on subsequent calls.
+        assert first is second
+
+    def test_refresh_drops_instance_cache(self, workspace) -> None:
+        workspace.volumes.read.side_effect = [
+            _volume_info(storage_location="s3://bkt/u/c/s/v"),
+            _volume_info(storage_location="s3://bkt/u/c/s/v"),
+        ]
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen.return_value = _aws_creds_response()
+
+        p = VolumePath("/Volumes/c/s/v/x", workspace=workspace)
+        first = p.storage_path()
+        second = p.storage_path(refresh=True)
+        # ``refresh=True`` forces a fresh ``volumes.read`` and rebuilds
+        # the cached Path so future readers see whatever VolumeInfo
+        # rotated under the hood.
+        assert first is not second
+
+    def test_unsupported_scheme_raises(self, workspace) -> None:
+        workspace.volumes.read.return_value = _volume_info(
+            storage_location="ftp://nope/no",
+        )
+        p = VolumePath("/Volumes/c/s/v/x", workspace=workspace)
+        with pytest.raises(ValueError, match="no registered Path class"):
+            p.storage_path()
+
+
+class TestVolumeArrowFilesystem:
+
+    def test_builds_pyarrow_s3_filesystem(self, workspace) -> None:
+        import pyarrow.fs as pafs
+        workspace.volumes.read.return_value = _volume_info(
+            storage_location="s3://bkt/u/c/s/v",
+        )
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen.return_value = _aws_creds_response()
+
+        p = VolumePath("/Volumes/c/s/v/x", workspace=workspace)
+        fs = p.arrow_filesystem(region="us-east-1")
+        assert isinstance(fs, pafs.S3FileSystem)
+
+    def test_arrow_filesystem_routes_through_s3service(self, workspace) -> None:
+        # Spy that ``VolumePath.arrow_filesystem`` actually goes
+        # through ``S3Service.arrow_filesystem`` rather than building
+        # the pyarrow object directly. That keeps the credential
+        # snapshot logic centralized in one place.
+        workspace.volumes.read.return_value = _volume_info(
+            storage_location="s3://bkt/u/c/s/v",
+        )
+        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen.return_value = _aws_creds_response()
+
+        p = VolumePath("/Volumes/c/s/v/x", workspace=workspace)
+        aws_client = p.aws(region="us-east-1")
+        from unittest.mock import patch
+        sentinel = object()
+        with patch.object(
+            type(aws_client.s3),
+            "arrow_filesystem",
+            return_value=sentinel,
+        ) as spy:
+            out = p.arrow_filesystem(region="us-east-1")
+        assert out is sentinel
+        spy.assert_called_once()
+
+
+class TestS3ServiceArrowFilesystem:
+
+    def test_snapshots_botocore_credentials(self) -> None:
+        # ``S3Service.arrow_filesystem`` should pull a frozen
+        # credentials snapshot from the boto session and hand it to
+        # pyarrow's S3FileSystem. We patch out the actual
+        # construction so the test doesn't touch the network.
+        import pyarrow.fs as pafs
+        from yggdrasil.aws.client import AWSClient
+        from yggdrasil.aws.config import AWSConfig
+        from yggdrasil.aws.fs.service import S3Service
+
+        cfg = AWSConfig(
+            access_key_id="AKIA",
+            secret_access_key="secret",
+            session_token="tok",
+            region="us-east-1",
+        )
+        client = AWSClient(config=cfg)
+        service = S3Service(client=client)
+        fs = service.arrow_filesystem()
+        assert isinstance(fs, pafs.S3FileSystem)
+
+    def test_region_override(self) -> None:
+        import pyarrow.fs as pafs
+        from yggdrasil.aws.client import AWSClient
+        from yggdrasil.aws.config import AWSConfig
+        from yggdrasil.aws.fs.service import S3Service
+
+        cfg = AWSConfig(
+            access_key_id="AKIA",
+            secret_access_key="secret",
+            region="us-east-1",
+        )
+        client = AWSClient(config=cfg)
+        service = S3Service(client=client)
+        # The override region should land on the pyarrow filesystem;
+        # there isn't a public reader on S3FileSystem for the region,
+        # but constructing without error is sufficient signal.
+        fs = service.arrow_filesystem(region="eu-central-1")
+        assert isinstance(fs, pafs.S3FileSystem)

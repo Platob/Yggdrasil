@@ -59,10 +59,21 @@ __all__ = ["VolumePath", "VolumeCredentialsRefresher"]
 class VolumePath(DatabricksPath):
     """Path under ``/Volumes/<cat>/<sch>/<vol>/...`` via the Files API."""
 
-    __slots__ = ("_volume_info", "_storage_location")
+    __slots__ = ("_volume_info", "_storage_path")
 
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_VOLUME
     namespace_prefix: ClassVar[str] = "/Volumes/"
+
+    #: Process-wide :class:`VolumeInfo` cache keyed by
+    #: ``(catalog, schema, volume)``. Unity Catalog volume metadata
+    #: (storage_location, volume_id, volume_type) is stable for the
+    #: volume's lifetime, so the very first :meth:`volume_info` call
+    #: against a given triple pays the SDK round trip and every
+    #: subsequent ``VolumePath`` on the same volume reads from this
+    #: cache. Lock-guarded so concurrent constructions don't race the
+    #: SDK call.
+    _VOLUME_INFO_CACHE: ClassVar["dict[Tuple[str, str, str], Any]"] = {}
+    _VOLUME_INFO_CACHE_LOCK: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(
         self,
@@ -72,11 +83,20 @@ class VolumePath(DatabricksPath):
         **kwargs: Any,
     ) -> None:
         super().__init__(data=data, url=url, **kwargs)
-        # Per-instance caches for the SDK's ``VolumeInfo`` (rarely
-        # changes) and the volume's root storage URL — both populated
-        # lazily by :meth:`volume_info` / :meth:`storage_location`.
+        # Per-instance pointer into the shared
+        # :attr:`_VOLUME_INFO_CACHE`. ``None`` until
+        # :meth:`volume_info` populates it; once set it aliases the
+        # class-level cached entry, so the instance's view stays
+        # consistent with every other :class:`VolumePath` on the
+        # same volume.
         self._volume_info: Any = None
-        self._storage_location: Optional[str] = None
+        # Cached :class:`Path` (typically :class:`S3Path`) at the
+        # volume's root storage location. Resolved lazily by
+        # :meth:`storage_path` — once built it carries the
+        # auto-refreshing :class:`AWSClient` session, so reusing the
+        # cached instance keeps the boto pool and the credential
+        # vending session shared across calls.
+        self._storage_path: Any = None
 
     # ==================================================================
     # Path rendering
@@ -138,10 +158,17 @@ class VolumePath(DatabricksPath):
     def volume_info(self, refresh: bool = False) -> Any:
         """Return the SDK's :class:`VolumeInfo` for this volume.
 
-        Cached on the instance — Unity Catalog volume metadata (root
-        ``storage_location``, ``volume_id``, ``volume_type``) is stable
-        for the volume's lifetime, so we only ever issue the
-        ``volumes.read`` call once unless ``refresh=True`` is passed.
+        Lookups go through the process-wide
+        :attr:`_VOLUME_INFO_CACHE`, keyed by
+        ``(catalog, schema, volume)`` — every :class:`VolumePath`
+        instance on the same volume in this process reads from the
+        same cached info, so only the very first construction pays
+        the ``volumes.read`` SDK round trip. The per-instance slot
+        snapshots the cached entry once populated so subsequent
+        ``self._volume_info`` reads stay a single attribute hop.
+
+        Pass ``refresh=True`` to force a fresh SDK call and overwrite
+        both caches (e.g. after an external schema migration).
 
         If the underlying ``volumes.read`` raises :class:`NotFound`
         (or a ``BadRequest``-shaped "does not exist" — UC isn't fully
@@ -150,8 +177,8 @@ class VolumePath(DatabricksPath):
         the read is retried exactly once. Subsequent failures
         propagate. This is the only place the credentials path
         auto-creates a volume, so ``temporary_credentials`` /
-        ``aws`` / ``s3_path`` all inherit the "first-touch creates"
-        behavior for free.
+        ``aws`` / ``s3_path`` / ``arrow_filesystem`` all inherit the
+        "first-touch creates" behavior for free.
 
         Raises :class:`ValueError` when the URL path doesn't address a
         volume (no ``/cat/sch/vol`` prefix).
@@ -165,6 +192,17 @@ class VolumePath(DatabricksPath):
                 f"/Volumes/<cat>/<sch>/<vol>/... — got {self.full_path()!r}."
             )
         catalog, schema, volume = triple
+
+        # Class-level cache — prefer it whenever available so two
+        # ``VolumePath`` instances on the same volume share a single
+        # SDK round trip. ``refresh=True`` skips the cache entirely
+        # and overwrites the entry after the fresh read lands.
+        if not refresh:
+            cached = self._VOLUME_INFO_CACHE.get(triple)
+            if cached is not None:
+                self._adopt_volume_info(cached)
+                return cached
+
         full_name = f"{catalog}.{schema}.{volume}"
         try:
             info = self._call(self.workspace.volumes.read, full_name)
@@ -180,33 +218,119 @@ class VolumePath(DatabricksPath):
             if not self._ensure_volume():
                 raise
             info = self._call(self.workspace.volumes.read, full_name)
-        self._volume_info = info
-        # Snapshot the storage location too — every credential vend
-        # and ``s3_path`` build needs it, and re-reading the same
-        # field from the cached ``VolumeInfo`` is pure dict access.
-        storage = getattr(info, "storage_location", None)
-        if storage:
-            self._storage_location = str(storage)
+
+        # Publish to the process-wide cache under the lock so
+        # concurrent constructions converge on one entry. ``setdefault``
+        # would be racy with the eager refresh case — we want the
+        # latest read to win when ``refresh=True``.
+        with self._VOLUME_INFO_CACHE_LOCK:
+            self._VOLUME_INFO_CACHE[triple] = info
+        self._adopt_volume_info(info, refresh=refresh)
         return info
 
-    def storage_location(self, refresh: bool = False) -> str:
-        """Volume's backing storage URL (e.g. ``s3://bucket/__unitystorage/...``).
+    def _adopt_volume_info(self, info: Any, *, refresh: bool = False) -> None:
+        """Mirror ``info`` onto the per-instance slot.
 
-        Resolved through :meth:`volume_info`; raises
-        :class:`ValueError` when the SDK doesn't return a storage
-        location (managed volumes always do; external volumes may
-        return ``None`` while the metastore is still finalizing
+        Kept separate from :meth:`volume_info` so cache-hit and
+        cache-miss paths share one snapshot routine. Also drops the
+        per-instance ``_storage_path`` cache when ``refresh=True``,
+        so the next :meth:`storage_path` call rebuilds against the
+        fresh ``VolumeInfo``.
+        """
+        self._volume_info = info
+        if refresh:
+            self._storage_path = None
+
+    def storage_location(self, refresh: bool = False) -> str:
+        """Volume's backing storage URL string (e.g. ``s3://bucket/...``).
+
+        Pure read from :meth:`volume_info` — no AWS auth resolution,
+        no Path construction. Use this when you only need the URL
+        rendering for logging / config plumbing; reach for
+        :meth:`storage_path` when you'll do actual I/O against the
+        location (it carries the auto-refreshing client).
+
+        Raises :class:`ValueError` when the SDK doesn't return a
+        storage location (managed volumes always do; external volumes
+        may return ``None`` while the metastore is still finalizing
         registration).
         """
-        if self._storage_location is not None and not refresh:
-            return self._storage_location
-        self.volume_info(refresh=refresh)
-        if not self._storage_location:
+        info = self.volume_info(refresh=refresh)
+        raw = getattr(info, "storage_location", None)
+        if not raw:
             raise ValueError(
                 f"{type(self).__name__}: volume has no storage_location yet. "
-                f"Volume info: {self._volume_info!r}."
+                f"Volume info: {info!r}."
             )
-        return self._storage_location
+        return str(raw)
+
+    def storage_path(
+        self,
+        *,
+        operation: Any = None,
+        region: Optional[str] = None,
+        refresh: bool = False,
+    ) -> Any:
+        """Return the volume's root storage :class:`Path`.
+
+        Resolves the volume's ``storage_location`` URL (via
+        :meth:`volume_info`) and dispatches to the right
+        :class:`URLBased` :class:`Path` subclass — :class:`S3Path`
+        for ``s3://``, :class:`AzureBlobPath` for ``abfss://`` (when
+        registered), etc. The returned :class:`Path` is cached on
+        the instance and carries the auto-refreshing
+        :class:`AWSClient` session minted via
+        :meth:`credentials_refresher` so reads / writes through it
+        survive STS token rotation without caller-side rebinding.
+
+        ``operation`` and ``region`` are forwarded to :meth:`aws` to
+        bind the right credential scope and S3 region. ``refresh``
+        forces a re-resolution (drops the cached :class:`Path` and
+        re-reads :class:`VolumeInfo`).
+
+        Raises :class:`ValueError` when the SDK doesn't return a
+        storage location yet.
+        """
+        if self._storage_path is not None and not refresh:
+            return self._storage_path
+
+        info = self.volume_info(refresh=refresh)
+        raw = getattr(info, "storage_location", None)
+        if not raw:
+            raise ValueError(
+                f"{type(self).__name__}: volume has no storage_location yet. "
+                f"Volume info: {info!r}."
+            )
+
+        url = URL.from_(str(raw))
+        scheme = (url.scheme or "").lower()
+        if scheme in ("s3", "s3a", "s3n"):
+            # Route through the shared :class:`AWSClient` so the
+            # boto session + refreshable credentials follow the same
+            # singleton that :meth:`aws` returns. We bind the
+            # ``client=`` directly (S3Path stores it on ``_client``)
+            # so every sibling built off this root reuses one boto
+            # session.
+            from yggdrasil.aws.fs.path import S3Path
+            aws_client = self.aws(operation=operation, region=region)
+            storage_path = S3Path(url=url, client=aws_client.s3.boto_client)
+        else:
+            # Azure / GCS / etc. — fall back to ``URLBased`` dispatch.
+            # The path won't carry refreshable Databricks creds, but
+            # it'll still address the right object store; callers can
+            # plug in their own credential refresh strategy.
+            from yggdrasil.io.url import URLBased
+            try:
+                target = URLBased.for_scheme(scheme)
+            except (ValueError, ImportError) as exc:
+                raise ValueError(
+                    f"{type(self).__name__}: storage_location scheme "
+                    f"{scheme!r} has no registered Path class. URL: {raw!r}."
+                ) from exc
+            storage_path = target.from_url(url)
+
+        self._storage_path = storage_path
+        return storage_path
 
     def temporary_credentials(
         self,
@@ -306,22 +430,68 @@ class VolumePath(DatabricksPath):
         """Return an :class:`S3Path` over the volume's S3 storage.
 
         Joins this path's sub-volume tail (``/sub/dir/file.parquet``)
-        onto the volume's :meth:`storage_location` so reads and writes
+        onto the cached :meth:`storage_path` so reads and writes
         bypass the SDK's Files API and go directly against S3 —
         cheaper on Unity Catalog quota and faster on the wire. The
-        returned :class:`S3Path` carries an :class:`AWSClient` whose
-        credentials auto-refresh via :meth:`aws`, so long-running
-        transfers survive STS token rotation.
+        returned :class:`S3Path` shares the boto client that
+        :meth:`storage_path` minted via the singleton
+        :class:`AWSClient`, so credentials auto-refresh and the boto
+        session is reused across every reader / writer on the
+        volume.
 
         Only S3-backed volumes are supported by this fast path; an
-        Azure / GCP volume raises :class:`RuntimeError` from
-        :meth:`aws` (the credential record carries a different shape).
+        Azure / GCP volume raises :class:`ValueError` from
+        :meth:`storage_path` when it can't dispatch to an
+        :class:`S3Path`.
         """
-        storage_root = self.storage_location().rstrip("/")
+        root = self.storage_path(operation=operation, region=region)
+        from yggdrasil.aws.fs.path import S3Path
+        if not isinstance(root, S3Path):
+            raise ValueError(
+                f"{type(self).__name__}.s3_path requires an S3-backed "
+                f"volume; got {type(root).__name__} at {root.full_path()!r}."
+            )
         tail = _sub_volume_tail(self.url.path or "/")
-        target = storage_root + tail if tail else storage_root
+        if not tail:
+            target_url = root.url
+        else:
+            target_url = root.url.joinpath(tail.lstrip("/"))
+        # Reuse the boto client the storage root is bound to so every
+        # S3Path on this volume shares the same auto-refreshing session.
+        return S3Path(
+            url=target_url,
+            client=root._client,
+            temporary=self.temporary,
+        )
+
+    def arrow_filesystem(
+        self,
+        *,
+        operation: Any = None,
+        region: Optional[str] = None,
+    ) -> Any:
+        """Build a :class:`pyarrow.fs.S3FileSystem` for this volume.
+
+        Routes through the cached :meth:`storage_path` so the
+        filesystem inherits the same :class:`AWSClient` (and its
+        auto-refreshing boto session) as direct :class:`S3Path` I/O.
+        Credentials are sourced via the centralized
+        :meth:`S3Service.arrow_filesystem` so any future tweak to
+        the pyarrow filesystem construction (custom endpoint, retry
+        strategy, …) lives in one place.
+
+        Returns a fresh pyarrow filesystem snapshot bound to the
+        currently-vended STS token. For long-running operations,
+        call this once per refresh window (botocore will rotate the
+        underlying creds in the meantime, so the snapshot stays
+        valid until the token expires).
+        """
+        # Ensure the volume's storage path is resolved (and the
+        # underlying AWSClient session is live) before snapshotting
+        # credentials.
+        self.storage_path(operation=operation, region=region)
         aws_client = self.aws(operation=operation, region=region)
-        return aws_client.s3.path(target, temporary=self.temporary)
+        return aws_client.s3.arrow_filesystem(region=region)
 
     # ==================================================================
     # SQL staging factory

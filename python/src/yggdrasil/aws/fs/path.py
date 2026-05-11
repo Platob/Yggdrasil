@@ -206,6 +206,153 @@ class S3Path(RemotePath):
         return S3Path(url=url, client=self._client)
 
     # ==================================================================
+    # PyArrow filesystem fast path
+    # ==================================================================
+
+    def arrow_filesystem(
+        self,
+        *,
+        region: Optional[str] = None,
+        **overrides: Any,
+    ) -> Any:
+        """Return a :class:`pyarrow.fs.S3FileSystem` for this path's bucket.
+
+        Delegates to :meth:`S3Service.arrow_filesystem` so the
+        credential snapshot logic lives in one place — every call
+        site (raw ``S3Path``, ``VolumePath.arrow_filesystem``, the
+        tabular fast path below) sees the same auth surface.
+
+        For the pyarrow filesystem to know which bucket it's
+        talking to you also need :attr:`arrow_uri` — pyarrow's
+        S3FileSystem takes ``"bucket/key"`` strings, not full
+        ``s3://`` URLs.
+        """
+        from yggdrasil.aws.fs.service import S3Service
+        if isinstance(self._client, S3Service):
+            service: S3Service = self._client
+        else:
+            service = S3Service.current()
+        return service.arrow_filesystem(region=region, **overrides)
+
+    @property
+    def arrow_uri(self) -> str:
+        """``bucket/key`` form expected by ``pyarrow.fs.S3FileSystem``.
+
+        pyarrow's filesystem-aware readers (``pq.ParquetFile``,
+        ``pa.ipc.open_file``, …) take a ``bucket/key`` path string
+        paired with the filesystem object — not a full ``s3://`` URL.
+        This property renders that form once so the fast-path call
+        sites stay readable.
+        """
+        return f"{self.bucket}/{self.key}"
+
+    def _arrow_fs_supports_format(self) -> bool:
+        """True when this path's media type has a pyarrow filesystem reader.
+
+        Parquet and Arrow IPC both stream through
+        :class:`pyarrow.fs.S3FileSystem` natively — predicate
+        pushdown, columnar projection, and chunked reads land
+        without buffering the whole object in Python. Other formats
+        (CSV, JSON, XLSX) either don't support the filesystem
+        argument or aren't faster through it, so they fall back to
+        the base ``Holder._read_arrow_batches`` BytesIO path.
+        """
+        mt = self._media_type
+        if mt is None:
+            return False
+        mime = getattr(mt, "mime_type", None)
+        name = getattr(mime, "name", None) or getattr(mt, "name", None)
+        if not isinstance(name, str):
+            return False
+        return name.upper() in {"PARQUET", "ARROW_IPC", "ARROW_FEATHER"}
+
+    def _read_arrow_batches(self, options):
+        """PyArrow-native fast path for parquet / IPC; fall back otherwise.
+
+        When the holder's media type can stream through
+        :class:`pyarrow.fs.S3FileSystem` (parquet, Arrow IPC), read
+        directly via pyarrow's filesystem-aware reader — pyarrow
+        handles range reads, columnar projection, and predicate
+        pushdown without buffering the full object. Everything else
+        falls back to :meth:`Holder._read_arrow_batches` which
+        downloads via boto and dispatches to the format leaf over a
+        :class:`BytesIO` view.
+        """
+        if not self._arrow_fs_supports_format():
+            yield from super()._read_arrow_batches(options)
+            return
+        from yggdrasil.io.primitive.parquet_io import ParquetOptions
+
+        fs = self.arrow_filesystem()
+        uri = self.arrow_uri
+        # Resolve format-specific options shape so callers passing a
+        # generic ``CastOptions`` still pick up parquet defaults
+        # (batch_size, use_threads).
+        opts = ParquetOptions.from_(options) if not isinstance(
+            options, ParquetOptions,
+        ) else options
+        import pyarrow.parquet as pq
+        batch_size = int(opts.row_size or 65536)
+        with fs.open_input_file(uri) as src:
+            with pq.ParquetFile(src) as pf:
+                for batch in pf.iter_batches(
+                    batch_size=batch_size,
+                    use_threads=opts.use_threads,
+                ):
+                    yield opts.cast_arrow_tabular(batch)
+
+    def _write_arrow_batches(self, batches, options):
+        """PyArrow-native fast path for parquet; fall back otherwise.
+
+        For parquet writes, stream batches through pyarrow's
+        :class:`pq.ParquetWriter` against the S3FileSystem — no
+        intermediate Python buffer, the writer multipart-uploads as
+        batches land. Other formats fall back to the base
+        ``Holder._write_arrow_batches`` which routes through the
+        format leaf's BytesIO-backed writer.
+        """
+        if not self._arrow_fs_supports_format():
+            super()._write_arrow_batches(batches, options)
+            return
+        from yggdrasil.io.primitive.parquet_io import ParquetOptions
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        fs = self.arrow_filesystem()
+        uri = self.arrow_uri
+        opts = ParquetOptions.from_(options) if not isinstance(
+            options, ParquetOptions,
+        ) else options
+
+        # Drain the first batch so we know the schema before opening
+        # the writer (parquet wants a schema up front).
+        it = iter(batches)
+        try:
+            first = next(it)
+        except StopIteration:
+            # No data — write an empty file with no schema; mirrors
+            # the parquet leaf's behavior so reading-back yields zero
+            # batches without crashing on missing schema.
+            with fs.open_output_stream(uri) as sink:
+                sink.write(b"")
+            self._invalidate_stat_cache()
+            return
+
+        schema = first.schema
+        with fs.open_output_stream(uri) as sink:
+            with pq.ParquetWriter(
+                sink,
+                schema,
+                compression=opts.compression,
+                use_dictionary=opts.use_dictionary,
+                write_statistics=opts.write_statistics,
+            ) as writer:
+                writer.write_batch(first)
+                for batch in it:
+                    writer.write_batch(batch)
+        self._invalidate_stat_cache()
+
+    # ==================================================================
     # Stat — uncached probe
     # ==================================================================
 

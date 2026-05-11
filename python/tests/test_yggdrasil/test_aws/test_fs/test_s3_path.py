@@ -494,3 +494,62 @@ class TestRetryPolicy:
         with pytest.raises(ValueError, match="not retryable"):
             p.write_bytes(b"x")
         assert recorded == []
+
+
+# ---------------------------------------------------------------------------
+# PyArrow filesystem fast path
+# ---------------------------------------------------------------------------
+
+
+class TestArrowFilesystem:
+
+    def test_arrow_uri_renders_bucket_key(self, client) -> None:
+        p = S3Path("s3://my-bucket/path/to/file.parquet", client=client)
+        assert p.arrow_uri == "my-bucket/path/to/file.parquet"
+
+    def test_arrow_filesystem_returns_pyarrow_s3fs(self) -> None:
+        import pyarrow.fs as pafs
+        from yggdrasil.aws.client import AWSClient
+        from yggdrasil.aws.config import AWSConfig
+        from yggdrasil.aws.fs.service import S3Service
+
+        # Build a real AWSClient with static creds and bind an
+        # S3Path to its boto client. ``arrow_filesystem`` should
+        # snapshot the boto session and hand back pyarrow's S3FS.
+        cfg = AWSConfig(
+            access_key_id="AKIA",
+            secret_access_key="secret",
+            region="us-east-1",
+        )
+        aws = AWSClient(config=cfg)
+        # Build through S3Service.path so the boto client wiring is
+        # the same as production. Pass-through ``service`` lives on
+        # ``_client`` thanks to ``S3Service.path``'s constructor.
+        service = S3Service(client=aws)
+        p = service.path("s3://b/k")
+        fs = p.arrow_filesystem()
+        assert isinstance(fs, pafs.S3FileSystem)
+
+    def test_arrow_fs_supports_format_parquet(self, client) -> None:
+        from yggdrasil.data.enums.media_type import MediaTypes
+        p = S3Path("s3://b/k.parquet", client=client)
+        # Stamping the media type explicitly to dodge the URL-based
+        # inference (which would also resolve to PARQUET via the
+        # ``.parquet`` extension).
+        p._media_type = MediaTypes.PARQUET
+        assert p._arrow_fs_supports_format()
+
+    def test_arrow_fs_supports_format_skips_json(self, client) -> None:
+        # JSON has no pyarrow-native ``open_input_file`` reader that
+        # beats the BytesIO path, so the fast-path predicate must
+        # report False and ``_read_arrow_batches`` falls back to the
+        # format leaf via ``self.open()``.
+        from yggdrasil.data.enums.media_type import MediaTypes
+        p = S3Path("s3://b/k.json", client=client)
+        p._media_type = MediaTypes.JSON
+        assert not p._arrow_fs_supports_format()
+
+    def test_unknown_media_type_falls_back(self, client) -> None:
+        p = S3Path("s3://b/k", client=client)
+        p._media_type = None
+        assert not p._arrow_fs_supports_format()
