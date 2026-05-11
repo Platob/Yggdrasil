@@ -183,6 +183,63 @@ class TestCastBenchmarkRegression(ArrowTestCase):
         out = tgt.cast_arrow_array(arr, source_field=src)
         self.assertEqual(len(out), n)
 
+    def test_list_element_dtype_path(self) -> None:
+        n = _regression_rows()
+        arr = pa.array(
+            [[i, i + 1] for i in range(n)],
+            type=pa.list_(pa.field("item", pa.int32())),
+        )
+        src = Field.from_arrow(pa.field(
+            "x", pa.list_(pa.field("item", pa.int32())),
+        ))
+        tgt = Field.from_arrow(pa.field(
+            "x", pa.list_(pa.field("item", pa.int64())),
+        ))
+        out = tgt.cast_arrow_array(arr, source_field=src)
+        self.assertEqual(len(out), n)
+        self.assertEqual(out.type.value_type, pa.int64())
+
+    def test_list_of_struct_element_path(self) -> None:
+        n = _regression_rows()
+        flat_struct = pa.StructArray.from_arrays(
+            [
+                pa.array(range(n), type=pa.int32()),
+                pa.array(["x"] * n, type=pa.string()),
+            ],
+            names=["a", "b"],
+        )
+        offsets = pa.array(list(range(n + 1)), type=pa.int32())
+        list_arr = pa.ListArray.from_arrays(offsets, flat_struct)
+        src = Field.from_arrow(pa.field(
+            "x", pa.list_(pa.field("item", flat_struct.type)),
+        ))
+        tgt = Field.from_arrow(pa.field(
+            "x", pa.list_(pa.field("item", pa.struct([
+                pa.field("a", pa.int64()),
+                pa.field("b", pa.string()),
+            ]))),
+        ))
+        out = tgt.cast_arrow_array(list_arr, source_field=src)
+        self.assertEqual(len(out), n)
+
+    def test_nested_struct_value_path(self) -> None:
+        n = _regression_rows()
+        inner_list = pa.ListArray.from_arrays(
+            pa.array(list(range(n + 1)), type=pa.int32()),
+            pa.array(range(n), type=pa.int32()),
+        )
+        struct_arr = pa.StructArray.from_arrays(
+            [inner_list, pa.array(["k"] * n, type=pa.string())],
+            names=["inner_list", "name"],
+        )
+        src = Field.from_arrow(pa.field("row", struct_arr.type))
+        tgt = Field.from_arrow(pa.field("row", pa.struct([
+            pa.field("inner_list", pa.list_(pa.field("item", pa.int64()))),
+            pa.field("name", pa.string()),
+        ])))
+        out = tgt.cast_arrow_array(struct_arr, source_field=src)
+        self.assertEqual(len(out), n)
+
 
 # ---------------------------------------------------------------------------
 # Benchmark mode — opt-in
@@ -410,6 +467,404 @@ class TestCastBenchmarks(ArrowTestCase):
 
         ms, _ = _time_cast(legacy_path)
         report.add("legacy (to_pylist + Python comp) ", ms)
+        report.flush()
+
+    # -- list element-dtype change (ListArray rebuild) -----------------
+
+    def test_list_element_dtype_cast(self) -> None:
+        """``cast_arrow_list_array`` (in :mod:`nested.array`) handles
+        list-shape preserved casts where only the element dtype changes
+        — widen / narrow primitives, str→int, list<int>→list<str>.
+
+        The vectorised path lifts ``array.values`` once, casts the flat
+        buffer in a single ``cast_arrow_array`` call, and rebuilds the
+        list with the original ``array.offsets`` and ``array.is_null()``
+        mask. No per-row Python crossings — every value-side op stays
+        inside Arrow compute.
+        """
+        n = self.n_rows
+        rnd = random.Random(3)
+        lengths = [rnd.choice([0, 1, 2, 3, 4, 5]) for _ in range(n)]
+        flat_vals = [rnd.randint(-1000, 1000) for _ in range(sum(lengths))]
+        arr_py: list[list[int] | None] = []
+        idx = 0
+        for j, L in enumerate(lengths):
+            if j % 73 == 0:
+                arr_py.append(None)
+            else:
+                arr_py.append(flat_vals[idx:idx + L])
+            idx += L
+        arr = pa.array(arr_py, type=pa.list_(pa.field("item", pa.int32())))
+
+        widen_src = Field.from_arrow(pa.field(
+            "x", pa.list_(pa.field("item", pa.int32())),
+        ))
+        widen_tgt = Field.from_arrow(pa.field(
+            "x", pa.list_(pa.field("item", pa.int64())),
+        ))
+        str_tgt = Field.from_arrow(pa.field(
+            "x", pa.list_(pa.field("item", pa.string())),
+        ))
+
+        report = _BenchReport(
+            f"list element dtype cast (n={self.n_rows}) — "
+            f"nested.array:cast_arrow_list_array"
+        )
+
+        ms, _ = _time_cast(
+            lambda: widen_tgt.cast_arrow_array(arr, source_field=widen_src),
+        )
+        report.add("list<int32> -> list<int64>", ms)
+
+        ms, _ = _time_cast(
+            lambda: str_tgt.cast_arrow_array(arr, source_field=widen_src),
+        )
+        report.add("list<int32> -> list<string>", ms)
+
+        # Chunked input — same vectorised path runs per chunk.
+        ca = pa.chunked_array(
+            [arr.slice(k * (n // 4), n // 4) for k in range(4)],
+            type=arr.type,
+        )
+        ms, _ = _time_cast(
+            lambda c=ca: widen_tgt.cast_arrow_array(c, source_field=widen_src),
+        )
+        report.add("ChunkedArray k=4 -> list<int64>", ms)
+        report.flush()
+
+    # -- list<struct> element-of-struct cast ---------------------------
+
+    def test_list_of_struct_element_cast(self) -> None:
+        """Cast a ``list<struct<a:int32,b:string>>`` to a target where
+        the struct child widens — ``list<struct<a:int64,b:string>>``.
+
+        Stresses the ``ListArray`` rebuild plus the nested struct cast
+        on the flat values buffer.  This is the hottest shape in
+        nested ingest (e.g. event payloads, line-items inside an
+        invoice) and the path that benefits most from the vectorised
+        struct rebuild — every value-side op stays inside Arrow
+        compute kernels.
+        """
+        n = self.n_rows
+        rnd = random.Random(4)
+        lengths = [rnd.choice([1, 2, 3]) for _ in range(n)]
+        total = sum(lengths)
+        flat_a = pa.array(
+            [rnd.randint(-1000, 1000) for _ in range(total)], type=pa.int32(),
+        )
+        flat_b = pa.array(
+            ["".join(rnd.choices(string.ascii_lowercase, k=4)) for _ in range(total)],
+            type=pa.string(),
+        )
+        flat_struct = pa.StructArray.from_arrays(
+            [flat_a, flat_b], names=["a", "b"],
+        )
+        offsets = [0]
+        for L in lengths:
+            offsets.append(offsets[-1] + L)
+        list_arr = pa.ListArray.from_arrays(
+            pa.array(offsets, type=pa.int32()),
+            flat_struct,
+        )
+
+        src = Field.from_arrow(pa.field(
+            "x", pa.list_(pa.field("item", flat_struct.type)),
+        ))
+        tgt_inner = pa.struct([
+            pa.field("a", pa.int64()),
+            pa.field("b", pa.string()),
+        ])
+        tgt = Field.from_arrow(pa.field(
+            "x", pa.list_(pa.field("item", tgt_inner)),
+        ))
+
+        report = _BenchReport(
+            f"list<struct> element cast (n={self.n_rows}) — "
+            f"nested.array:cast_arrow_list_array"
+        )
+
+        ms, _ = _time_cast(
+            lambda: tgt.cast_arrow_array(list_arr, source_field=src),
+        )
+        report.add("list<struct<int32,str>> -> list<struct<int64,str>>", ms)
+
+        # Identity cast — should short-circuit via type equality on the
+        # ListArray rebuild path.
+        ms, _ = _time_cast(
+            lambda: src.cast_arrow_array(list_arr, source_field=src),
+        )
+        report.add("identity list<struct> cast (short-circuit)         ", ms)
+        report.flush()
+
+    # -- nested struct values (struct of list / list of struct) --------
+
+    def test_nested_struct_value_cast(self) -> None:
+        """Deeper-than-one struct casts that show how the per-leaf
+        ``Field.cast_arrow_array`` wrap unfolds against realistic
+        nested shapes.
+
+        Two patterns mirror real wire shapes:
+
+        * ``struct<inner_list: list<int32>, name: string>`` →
+          widen the list element and the outer struct survives the
+          rebuild with one ``StructArray.from_arrays`` call.
+        * ``struct<row: struct<a:int32, items: list<struct<x,y>>>>``
+          (an "envelope around a line-item list") — exercises the
+          recursive ``cast_arrow_struct_array`` → ``cast_arrow_list_array``
+          → ``cast_arrow_struct_array`` chain.  Each layer should
+          stay vectorised; the benchmark surfaces it.
+        """
+        n = self.n_rows
+        rnd = random.Random(5)
+
+        # Pattern A — struct<inner_list, name>
+        lengths = [rnd.choice([0, 1, 2, 3]) for _ in range(n)]
+        flat_inner = pa.array(
+            [rnd.randint(0, 1000) for _ in range(sum(lengths))], type=pa.int32(),
+        )
+        offsets_a = [0]
+        for L in lengths:
+            offsets_a.append(offsets_a[-1] + L)
+        inner_list = pa.ListArray.from_arrays(
+            pa.array(offsets_a, type=pa.int32()),
+            flat_inner,
+        )
+        name_col = pa.array(
+            ["".join(rnd.choices(string.ascii_lowercase, k=5)) for _ in range(n)],
+            type=pa.string(),
+        )
+        struct_a = pa.StructArray.from_arrays(
+            [inner_list, name_col], names=["inner_list", "name"],
+        )
+        src_a = Field.from_arrow(pa.field("row", struct_a.type))
+        tgt_a_type = pa.struct([
+            pa.field("inner_list", pa.list_(pa.field("item", pa.int64()))),
+            pa.field("name", pa.string()),
+        ])
+        tgt_a = Field.from_arrow(pa.field("row", tgt_a_type))
+
+        # Pattern B — struct<row: struct<a, items: list<struct<x,y>>>>
+        # — an "envelope" with an inner line-item list.
+        item_count = n  # one item per row to keep flat sizes balanced
+        x_col = pa.array(
+            [rnd.randint(-100, 100) for _ in range(item_count)], type=pa.int32(),
+        )
+        y_col = pa.array(
+            [rnd.random() for _ in range(item_count)], type=pa.float64(),
+        )
+        items_inner = pa.StructArray.from_arrays(
+            [x_col, y_col], names=["x", "y"],
+        )
+        items_offsets = pa.array(list(range(n + 1)), type=pa.int32())
+        items_list = pa.ListArray.from_arrays(items_offsets, items_inner)
+        a_col = pa.array(
+            [rnd.randint(0, 1_000_000) for _ in range(n)], type=pa.int32(),
+        )
+        inner_struct = pa.StructArray.from_arrays(
+            [a_col, items_list], names=["a", "items"],
+        )
+        env_struct = pa.StructArray.from_arrays(
+            [inner_struct], names=["row"],
+        )
+        src_b = Field.from_arrow(pa.field("envelope", env_struct.type))
+        tgt_items_inner = pa.struct([
+            pa.field("x", pa.int64()),
+            pa.field("y", pa.float64()),
+        ])
+        tgt_b_type = pa.struct([
+            pa.field("row", pa.struct([
+                pa.field("a", pa.int64()),
+                pa.field("items", pa.list_(pa.field("item", tgt_items_inner))),
+            ])),
+        ])
+        tgt_b = Field.from_arrow(pa.field("envelope", tgt_b_type))
+
+        report = _BenchReport(
+            f"nested struct value cast (n={self.n_rows}) — "
+            f"struct_arrow.py:cast_arrow_struct_array"
+        )
+
+        ms, _ = _time_cast(
+            lambda: tgt_a.cast_arrow_array(struct_a, source_field=src_a),
+        )
+        report.add("struct<list<int32>, str> -> widen list<int64>     ", ms)
+
+        ms, _ = _time_cast(
+            lambda: tgt_b.cast_arrow_array(env_struct, source_field=src_b),
+        )
+        report.add("struct<struct<int32, list<struct<x,y>>>> widen all", ms)
+        report.flush()
+
+    # -- pandas-side casts ---------------------------------------------
+
+    def test_pandas_tabular_cast(self) -> None:
+        """``cast_pandas_tabular`` (struct_pandas.py) routes the cast
+        through the pyarrow→polars→columnwise fallback chain so the
+        primary path stays inside vectorised Arrow kernels.
+
+        The benchmark surfaces the Arrow path (the only one a healthy
+        primitive DataFrame should hit) plus the polars round-trip and
+        the columnwise reassembly fallback so a regression in any
+        layer is visible.
+        """
+        import pandas as pd
+
+        n = self.n_rows
+        rnd = random.Random(7)
+        df = pd.DataFrame({
+            "i": [rnd.randint(-1_000_000, 1_000_000) for _ in range(n)],
+            "v": [rnd.uniform(-1, 1) for _ in range(n)],
+            "t": ["".join(rnd.choices(string.ascii_lowercase, k=6)) for _ in range(n)],
+        })
+
+        src = Field.from_arrow(pa.schema([
+            pa.field("i", pa.int64()),
+            pa.field("v", pa.float64()),
+            pa.field("t", pa.string()),
+        ]))
+        tgt = Field.from_arrow(pa.schema([
+            pa.field("i", pa.int32()),
+            pa.field("v", pa.float32()),
+            pa.field("t", pa.string()),
+        ]))
+
+        report = _BenchReport(
+            f"pandas tabular cast (n={self.n_rows}) — "
+            f"struct_pandas.py:cast_pandas_tabular"
+        )
+
+        ms, _ = _time_cast(
+            lambda: tgt.cast_pandas(df, source_field=src),
+        )
+        report.add("primitive widen+narrow (pyarrow fast path)", ms)
+        report.flush()
+
+    def test_pandas_struct_series_cast(self) -> None:
+        """Pandas Series of dicts → struct cast.
+
+        Pandas has no native struct dtype, so the values sit in an
+        object-Series and the cast has to push them through pyarrow
+        (or polars) without a per-row Python loop. The pyarrow path
+        round-trips via ``pa.array(series, from_pandas=True, type=...)``
+        → ``cast`` → ``to_pylist`` — the Python-dict materialisation
+        is the genuine endpoint, but the *cast* itself stays in
+        vectorised Arrow.
+        """
+        import pandas as pd
+
+        n = self.n_rows
+        rnd = random.Random(8)
+        rows = [
+            {"a": rnd.randint(0, 1_000), "b": rnd.choice(["x", "y", "z"])}
+            if rnd.random() > 0.05 else None
+            for _ in range(n)
+        ]
+        series = pd.Series(rows, name="payload", dtype="object")
+
+        src_struct = pa.struct([
+            pa.field("a", pa.int64()),
+            pa.field("b", pa.string()),
+        ])
+        tgt_struct = pa.struct([
+            pa.field("a", pa.int32()),
+            pa.field("b", pa.string()),
+        ])
+        src = Field.from_arrow(pa.field("payload", src_struct))
+        tgt = Field.from_arrow(pa.field("payload", tgt_struct))
+
+        report = _BenchReport(
+            f"pandas struct series cast (n={self.n_rows}) — "
+            f"struct_pandas.py:cast_pandas_struct_series"
+        )
+
+        ms, _ = _time_cast(
+            lambda: tgt.cast_pandas_series(series, source_field=src),
+        )
+        report.add("dict-Series widen child a (pyarrow path)", ms)
+        report.flush()
+
+    def test_pandas_list_series_cast(self) -> None:
+        """Pandas Series of lists → struct cast.
+
+        Same shape as the struct-series benchmark but the source is a
+        list-of-values: each row's positional ``i``-th element lands
+        in the ``c{i}`` field of the target struct.  Vectorised path
+        rebuilds via Arrow's ``pc.take``; columnwise fallback only
+        fires on shapes pyarrow rejects.
+        """
+        import pandas as pd
+
+        n = self.n_rows
+        rnd = random.Random(9)
+        rows = [
+            [rnd.randint(0, 1_000), rnd.randint(0, 1_000), rnd.randint(0, 1_000)]
+            if rnd.random() > 0.05 else None
+            for _ in range(n)
+        ]
+        series = pd.Series(rows, name="payload", dtype="object")
+
+        src = Field.from_arrow(pa.field(
+            "payload", pa.list_(pa.field("item", pa.int64())),
+        ))
+        tgt = Field.from_arrow(pa.field("payload", pa.struct([
+            pa.field("c0", pa.int32()),
+            pa.field("c1", pa.int32()),
+            pa.field("c2", pa.int32()),
+        ])))
+
+        report = _BenchReport(
+            f"pandas list series cast (n={self.n_rows}) — "
+            f"struct_pandas.py:cast_pandas_list_series"
+        )
+
+        ms, _ = _time_cast(
+            lambda: tgt.cast_pandas_series(series, source_field=src),
+        )
+        report.add("list-Series -> struct<c0,c1,c2> (pyarrow path)", ms)
+        report.flush()
+
+    def test_pandas_nested_struct_value_cast(self) -> None:
+        """Pandas DataFrame with a nested struct/list column → cast.
+
+        Mirrors ``test_nested_struct_value_cast`` from the Arrow suite
+        but exercises the pandas entry: the column is an object-Series
+        of dicts (nested ``inner_list`` list-of-int + ``name`` string),
+        and the cast widens the inner list dtype.
+        """
+        import pandas as pd
+
+        n = self.n_rows
+        rnd = random.Random(10)
+        rows = [
+            {
+                "inner_list": [rnd.randint(0, 1_000) for _ in range(rnd.choice([0, 1, 2, 3]))],
+                "name": "".join(rnd.choices(string.ascii_lowercase, k=4)),
+            }
+            if rnd.random() > 0.05 else None
+            for _ in range(n)
+        ]
+        series = pd.Series(rows, name="row", dtype="object")
+
+        src_struct = pa.struct([
+            pa.field("inner_list", pa.list_(pa.field("item", pa.int32()))),
+            pa.field("name", pa.string()),
+        ])
+        tgt_struct = pa.struct([
+            pa.field("inner_list", pa.list_(pa.field("item", pa.int64()))),
+            pa.field("name", pa.string()),
+        ])
+        src = Field.from_arrow(pa.field("row", src_struct))
+        tgt = Field.from_arrow(pa.field("row", tgt_struct))
+
+        report = _BenchReport(
+            f"pandas nested struct value cast (n={self.n_rows}) — "
+            f"struct_pandas.py:cast_pandas_struct_series"
+        )
+
+        ms, _ = _time_cast(
+            lambda: tgt.cast_pandas_series(series, source_field=src),
+        )
+        report.add("struct<list<int32>, str> -> widen list<int64>", ms)
         report.flush()
 
     # -- Databricks-style concat + cast --------------------------------

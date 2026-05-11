@@ -44,7 +44,12 @@ class TestCastPandasListSeries:
         )
 
         assert out.name == "target_array"
-        assert out.tolist() == [["1", "2"], ["3", None], None]
+        # ``casted.to_pandas()`` surfaces list cells as numpy object arrays
+        # — the standard pyarrow → pandas mapping.  Normalise to Python
+        # lists before comparing so this stays a value contract, not a
+        # numpy-vs-list contract.
+        materialised = [None if v is None else list(v) for v in out]
+        assert materialised == [["1", "2"], ["3", None], None]
 
     def test_preserves_index_and_index_name(
         self,
