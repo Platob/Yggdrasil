@@ -246,13 +246,14 @@ class WorkspacePath(DatabricksPath):
         if pos == 0:
             payload = bytes(data)
         else:
+            # Single ``workspace.download`` round trip — no preceding
+            # ``get_status`` probe. The Workspace API delivers the
+            # whole object on any download call, so asking for
+            # "to EOF" is no more expensive than a sized read.
             try:
-                existing_size = int(self._stat().size)
-            except Exception:
-                existing_size = 0
-            existing = (
-                bytes(self._read_mv(existing_size, 0)) if existing_size else b""
-            )
+                existing = bytes(self._read_mv(-1, 0))
+            except FileNotFoundError:
+                existing = b""
             if pos > len(existing):
                 existing = existing + b"\x00" * (pos - len(existing))
             payload = existing[:pos] + bytes(data) + existing[pos + n:]
@@ -277,18 +278,20 @@ class WorkspacePath(DatabricksPath):
     def truncate(self, n: int) -> int:
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
-        try:
-            existing_size = int(self._stat().size)
-        except Exception:
-            existing_size = 0
         if n == 0:
             self._upload(b"")
             return 0
-        if n <= existing_size:
-            head = bytes(self._read_mv(n, 0))
+        # Single ``workspace.download`` round trip — no preceding
+        # ``get_status``. A missing target surfaces as zero bytes and
+        # we upload a fresh zero-padded head.
+        try:
+            existing = bytes(self._read_mv(-1, 0))
+        except FileNotFoundError:
+            existing = b""
+        if n <= len(existing):
+            head = existing[:n]
         else:
-            existing = bytes(self._read_mv(existing_size, 0)) if existing_size else b""
-            head = existing + b"\x00" * (n - existing_size)
+            head = existing + b"\x00" * (n - len(existing))
         self._upload(head)
         return n
 

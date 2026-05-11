@@ -127,20 +127,22 @@ class TestStat:
 class TestRead:
 
     def test_full_object_read(self, workspace) -> None:
-        workspace.dbfs.get_status.return_value = SimpleNamespace(
-            is_dir=False, file_size=5, modification_time=0,
-        )
+        # Aggressive whole-file read: no precondition ``get_status``
+        # probe — the SDK call gets the full chunk budget and the
+        # short page tells us EOF. Saves one round trip per cold read.
         workspace.dbfs.read.return_value = SimpleNamespace(
             data=base64.b64encode(b"hello").decode(),
         )
         p = DBFSPath("/dbfs/x", workspace=workspace)
         assert p.read_bytes() == b"hello"
+        workspace.dbfs.get_status.assert_not_called()
         workspace.dbfs.read.assert_called_once()
-        # SDK call uses ``path``, ``offset``, ``length``.
         call = workspace.dbfs.read.call_args.kwargs
         assert call["path"] == "/x"
         assert call["offset"] == 0
-        assert call["length"] == 5
+        # Chunk budget is the SDK's 1 MiB cap; the server returns a
+        # short page on EOF, which is how we know we're done.
+        assert call["length"] == 1 * 1024 * 1024
 
     def test_chunked_read(self, workspace) -> None:
         # 1.5 MiB file — needs two chunks.

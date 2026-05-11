@@ -169,3 +169,51 @@ class S3Service(AWSService):
         from yggdrasil.aws.fs.path import S3Path
 
         return S3Path(obj, service=self, temporary=temporary)
+
+    # ------------------------------------------------------------------
+    # PyArrow filesystem — centralized credential snapshot
+    # ------------------------------------------------------------------
+
+    def arrow_filesystem(
+        self,
+        *,
+        region: Optional[str] = None,
+        **overrides: Any,
+    ) -> Any:
+        """Build a :class:`pyarrow.fs.S3FileSystem` from this service's creds.
+
+        Central credential point for every caller that wants pyarrow's
+        native S3 filesystem (parquet streaming, IPC, CSV
+        scanners, …). The boto :class:`Session` underneath holds the
+        live :class:`RefreshableCredentials` — we snapshot the current
+        access key / secret / session token here and hand them to
+        pyarrow. The snapshot is valid for the lifetime of the STS
+        token; long-running consumers should rebuild the filesystem
+        once per refresh window (call this method again after a token
+        rotation).
+
+        ``region`` overrides the client's configured region (useful
+        when a bucket sits in a different region than the default).
+        ``**overrides`` flow straight to :class:`pyarrow.fs.S3FileSystem`
+        so callers can tune ``request_timeout`` / ``proxy_options`` /
+        ``retry_strategy`` / ``endpoint_override`` without subclassing.
+        """
+        from pyarrow.fs import S3FileSystem
+
+        # Snapshot the live credentials from the boto session. With a
+        # ``RefreshableCredentials``-backed session this returns the
+        # currently-vended STS token; botocore would refresh it
+        # near-expiry inside ``get_frozen_credentials()``.
+        creds = self.client.session.get_credentials()
+        if creds is None:
+            # No credentials configured — let pyarrow walk its own
+            # default chain (env / config / instance metadata).
+            return S3FileSystem(region=region or self.client.region, **overrides)
+        frozen = creds.get_frozen_credentials()
+        return S3FileSystem(
+            access_key=frozen.access_key,
+            secret_key=frozen.secret_key,
+            session_token=frozen.token,
+            region=region or self.client.region,
+            **overrides,
+        )

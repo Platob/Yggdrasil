@@ -802,31 +802,29 @@ class Holder(URLBased, Tabular[O], Disposable):
     def _read_arrow_batches(self, options: O) -> Iterator[pa.RecordBatch]:
         """Stream batches from a borrowed cursor on the dispatched leaf.
 
-        The :class:`BytesIO` constructor dispatches to the right
-        format leaf (ParquetIO / XlsxIO / CsvIO / …) using this
-        holder's :class:`MediaType`. We re-home *options* onto the
-        leaf's options class so format-specific knobs (sheet name,
-        delimiter, …) survive the hop, then read directly against
-        the durable holder — the IO is a pure cursor and format
-        leaves like :class:`XlsxIO` manage their own scoped views
-        via ``_format_view``.
+        Routes through :meth:`open` so the same format-leaf dispatch
+        (ParquetIO / XlsxIO / CsvIO / …) and ``acquire`` / ``release``
+        accounting that drives explicit ``with holder.open() as bio:``
+        usage handles the contextual read too. Options are re-homed
+        onto the leaf's options class so format-specific knobs (sheet
+        name, delimiter, …) survive the hop.
         """
-        from yggdrasil.io.bytes_io import BytesIO
-        bio = BytesIO(holder=self, owns_holder=False)
-        try:
+        with self.open(mode="rb") as bio:
             leaf_options = type(bio).check_options(options=options)
             yield from bio._read_arrow_batches(leaf_options)
-        finally:
-            bio.close()
 
     def _write_arrow_batches(
         self,
         batches: "Iterable[pa.RecordBatch]",
         options: O,
     ) -> None:
-        """Write batches via the dispatched leaf in a contextual transaction."""
-        from yggdrasil.io.bytes_io import BytesIO
-        with BytesIO(holder=self, owns_holder=False, mode="wb") as bio:
+        """Write batches via :meth:`open` on the dispatched leaf.
+
+        Mirrors :meth:`_read_arrow_batches` — one open / dispatch /
+        close cycle handles every format leaf, no separate
+        ``BytesIO(...)`` allocation path to keep in sync.
+        """
+        with self.open(mode="wb") as bio:
             leaf_options = type(bio).check_options(options=options)
             bio._write_arrow_batches(batches, leaf_options)
 

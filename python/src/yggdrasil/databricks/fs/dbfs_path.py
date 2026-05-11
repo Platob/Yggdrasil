@@ -134,18 +134,28 @@ class DBFSPath(DatabricksPath):
     def _read_mv(self, n: int, pos: int) -> memoryview:
         """Range read via chunked ``dbfs.read``.
 
-        ``Holder.read_mv`` already normalized ``(n, pos)`` into a
-        non-negative window. We loop the SDK's 1 MiB cap until the
-        window is filled (or the SDK returns short, signalling EOF).
+        Loops the SDK's 1 MiB cap until the window is filled, or a
+        short page signals EOF. ``n < 0`` means "read to EOF" — the
+        loop keeps issuing chunk-sized requests with no upper bound
+        and stops on the first short page. The aggressive ``_bread``
+        path leans on this so a whole-file read costs one
+        ``ceil(size / 1 MiB)``-chunk round-trip burst, no preceding
+        ``get_status`` probe.
         """
         if n == 0:
             return memoryview(b"")
 
         out = bytearray()
         offset = pos
-        remaining = n
-        while remaining > 0:
-            chunk_size = min(_DBFS_CHUNK, remaining)
+        to_eof = n < 0
+        while True:
+            if to_eof:
+                chunk_size = _DBFS_CHUNK
+            else:
+                remaining = n - len(out)
+                if remaining <= 0:
+                    break
+                chunk_size = min(_DBFS_CHUNK, remaining)
             try:
                 resp = self._call(
                     self.workspace.dbfs.read,
@@ -165,7 +175,6 @@ class DBFSPath(DatabricksPath):
                 break
             out.extend(decoded)
             offset += len(decoded)
-            remaining -= len(decoded)
             if len(decoded) < chunk_size:
                 # Short page = EOF.
                 break
@@ -174,10 +183,11 @@ class DBFSPath(DatabricksPath):
     def _write_mv(self, data: memoryview, pos: int) -> int:
         """Splice via download → in-memory splice → re-upload.
 
-        DBFS has no positional-write API; the only honest answer is
+        DBFS has no positional-write API; a positional write has to be
         a read-modify-write at the file granularity. The hot path
-        is ``pos == 0`` with whole-file writes, where we skip the
-        download.
+        (``pos == 0``) skips the download entirely. For ``pos > 0`` we
+        issue a single read-to-EOF (no preceding ``get_status``) and
+        let :class:`FileNotFoundError` translate to "no bytes here yet".
         """
         n = len(data)
         if n == 0:
@@ -187,12 +197,8 @@ class DBFSPath(DatabricksPath):
             payload = bytes(data)
         else:
             try:
-                existing_size = int(self._stat().size)
-            except Exception:
-                existing_size = 0
-            if existing_size:
-                existing = bytes(self._read_mv(existing_size, 0))
-            else:
+                existing = bytes(self._read_mv(-1, 0))
+            except FileNotFoundError:
                 existing = b""
             if pos > len(existing):
                 existing = existing + b"\x00" * (pos - len(existing))
@@ -219,20 +225,23 @@ class DBFSPath(DatabricksPath):
     def truncate(self, n: int) -> int:
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
-        try:
-            existing_size = int(self._stat().size)
-        except Exception:
-            existing_size = 0
 
         if n == 0:
             self._stream_upload(b"")
             self._invalidate_stat_cache()
             return 0
-        if n <= existing_size:
-            head = bytes(self._read_mv(n, 0))
+
+        # Single read-to-EOF — no preceding ``get_status`` probe. A
+        # missing object is the natural "nothing to truncate" case;
+        # let it surface as zero existing bytes.
+        try:
+            existing = bytes(self._read_mv(-1, 0))
+        except FileNotFoundError:
+            existing = b""
+        if n <= len(existing):
+            head = existing[:n]
         else:
-            existing = bytes(self._read_mv(existing_size, 0)) if existing_size else b""
-            head = existing + b"\x00" * (n - existing_size)
+            head = existing + b"\x00" * (n - len(existing))
         self._stream_upload(head)
         self._invalidate_stat_cache()
         return n
