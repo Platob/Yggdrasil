@@ -207,9 +207,10 @@ def _extract_list_positions(
     zero-or-null slot for positions beyond it.
 
     Anything exotic (union-typed list, future Arrow list variant we
-    don't recognise) falls back to the legacy ``to_pylist`` walk.  Keep
-    that fallback comment honest: it stays slow precisely because it's
-    the long tail of shapes we don't expect on the hot path.
+    don't recognise) routes through Polars: ``pl.from_arrow`` lifts the
+    array, ``list.get(i, null_on_oob=True)`` extracts position ``i``
+    per row, and ``to_arrow()`` hands the result back.  Still
+    vectorised — no ``to_pylist`` walk.
     """
     n = len(array)
     if num_positions == 0:
@@ -256,18 +257,17 @@ def _extract_list_positions(
         return out
 
     # Long-tail fallback: unfamiliar list shape (custom subclass,
-    # future Arrow variant). Keep the original ``to_pylist`` walk so
-    # behaviour stays correct; the fast paths above cover everything
-    # we ship today.
-    values_py = array.to_pylist()
-    out = []
-    for i in range(num_positions):
-        extracted_py = [
-            None if row is None or i >= len(row) else row[i]
-            for row in values_py
-        ]
-        out.append(pa.array(extracted_py, memory_pool=memory_pool))
-    return out
+    # future Arrow variant). Route through Polars so the per-position
+    # extraction stays vectorised — ``list.get(i, null_on_oob=True)``
+    # propagates parent nulls and out-of-bounds positions as null
+    # without a Python crossing.
+    import polars as pl
+
+    series_pl = pl.from_arrow(array)
+    return [
+        series_pl.list.get(i, null_on_oob=True).to_arrow()
+        for i in range(num_positions)
+    ]
 
 
 def cast_arrow_tabular(

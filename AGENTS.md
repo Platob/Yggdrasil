@@ -452,6 +452,52 @@ The shape of an acceptable per-row fallback already exists at
 per-row only when that raises in permissive mode. Mirror that
 pattern; don't invent a new one.
 
+### 6a. Never materialise heavy data via `to_pylist` / `to_list` / `tolist`
+
+`pa.Array.to_pylist()`, `pl.Series.to_list()`, and
+`pd.Series.tolist()` / `np.ndarray.tolist()` all walk every cell into
+a Python object — same per-row cost as a Python `for` loop, just
+hidden inside C code. **Do not use them in any data-shaped path**
+(cast helpers, frame converters, batch readers, type inference, hot
+inner loops). The fact that pyarrow's `to_pylist` runs in C is not a
+licence: building 1 M Python ints / dicts / lists allocates 1 M
+PyObjects, and the GC churn alone dominates the next operation.
+
+When you need to leave Arrow / Polars / pandas, ride the engine's own
+zero-copy bridge instead:
+
+| Need                                       | Use this                              |
+| ------------------------------------------ | ------------------------------------- |
+| Arrow → pandas Series                      | `Array.to_pandas()` (works for nested types — struct cells surface as dicts, list cells as numpy arrays, no per-row hop) |
+| Arrow → polars Series                      | `pl.from_arrow(arr)` (zero-copy)      |
+| Arrow → numpy (numeric only)               | `Array.to_numpy(zero_copy_only=True)` |
+| Pandas → Arrow                             | `pa.array(series, from_pandas=True)`  |
+| Polars → Arrow                             | `series.to_arrow()` (zero-copy)       |
+| Pandas → Polars                            | `pl.from_pandas(df)`                  |
+| Build a struct from per-child arrays       | `pa.StructArray.from_arrays(arrs, names=..., mask=...).to_pandas()` — one C-bridge pass |
+
+Limited exemptions — and only these — keep `to_pylist` / `to_list`:
+
+1. **Documented per-row fallback** for shapes vectorised engines
+   genuinely can't emit (e.g. the permissive `_cast_json.py` path that
+   runs after `pyarrow.json.read_json` rejects the row). Comment why
+   no vectorised path applies and gate it behind the strict/permissive
+   knob.
+2. **Genuine row endpoint** — the workload IS "yield one Python
+   row to a downstream sink": ndjson writers, kafka producers,
+   mongo inserts, JSON HTTP responses, xlsx row writers,
+   `Tabular.to_pylist` / `iter_pylist` API methods, pickle one-shot
+   serialization. The cost is paid for the user, not in a hot
+   transform pipeline.
+3. **Diagnostics-only paths** — test assertion formatters, debug
+   logging, `repr` output. These run at human scale (KB-MB), never
+   on workload data.
+
+If a new call site doesn't fit one of those three buckets, find the
+vectorised form first. Same goes for `series.tolist()` /
+`df.values.tolist()` / numpy `arr.tolist()` — those are the same
+trap dressed in different syntax.
+
 ---
 
 ## Public API design rules

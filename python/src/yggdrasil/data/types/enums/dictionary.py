@@ -294,6 +294,11 @@ class DictionaryType(PrimitiveType):
                 f"DictionaryType value_type must be primitive, got "
                 f"{value_type!r}"
             )
+        # ``categories`` is bounded type metadata (the enum's domain —
+        # cardinality is the dictionary's category count, not the array's
+        # length), so the to_pylist here is type-construction, not a
+        # data-path materialisation.  Runs once per ``from_arrow_array``
+        # call against a small (≤ thousands of entries) dictionary buffer.
         return cls(
             value_type=value_type,
             categories=tuple(array.dictionary.to_pylist()),
@@ -335,6 +340,9 @@ class DictionaryType(PrimitiveType):
         except AttributeError:
             cats_series = None
         if cats_series is not None:
+            # Same shape as ``from_arrow_array``: ``categories`` is
+            # bounded enum metadata, not row-shaped data — the to_list
+            # crossing is type-construction.
             try:
                 categories = tuple(cats_series.to_list())
             except AttributeError:
@@ -532,7 +540,7 @@ class DictionaryType(PrimitiveType):
             src_dict = array.dictionary
             if (
                 src_dict.type == self.value_type.to_arrow()
-                and src_dict.to_pylist() == list(self.categories)
+                and src_dict.equals(self._categories_arrow())
             ):
                 if array.type.index_type == pa.int32():
                     return self.fill_arrow_array_nulls(
