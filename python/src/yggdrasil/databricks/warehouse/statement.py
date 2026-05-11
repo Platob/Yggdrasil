@@ -55,7 +55,7 @@ from databricks.sdk.service.sql import (
 )
 
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
-from yggdrasil.data import Schema, schema
+from yggdrasil.data import Schema
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.statement import (
     ExternalStatementData,
@@ -83,6 +83,20 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_BYTE_SIZE = 32 * 1024 * 1024
+
+
+def _empty_arrow_batches(arrow_schema: pa.Schema) -> Iterator[pa.RecordBatch]:
+    """Yield a single zero-row :class:`pa.RecordBatch` matching *arrow_schema*.
+
+    Used to keep schema information flowing through ``_read_arrow_batches``
+    when a warehouse statement returns no rows — without this, the
+    iterator stays empty and ``read_arrow_table`` collapses to a
+    schema-less empty table.
+    """
+    yield pa.RecordBatch.from_arrays(
+        [pa.array([], type=f.type) for f in arrow_schema],
+        schema=arrow_schema,
+    )
 
 DONE_STATES = {
     StatementState.CANCELED,
@@ -909,11 +923,13 @@ class WarehouseStatementResult(StatementResult):
                 b"engine": b"databricks-sql",
                 b"statement_id": (self.statement_id or "").encode(),
             }
-            if manifest is None:
-                return schema([], metadata=metadata)
-
+            # ``manifest.schema`` is ``Optional[ResultSchema]`` in the SDK
+            # — guard both layers so we don't AttributeError when the
+            # backend skips the schema (e.g. DDL with no result set).
+            result_schema = getattr(manifest, "schema", None) if manifest is not None else None
+            columns = getattr(result_schema, "columns", None) if result_schema is not None else None
             self._cached_schema = Schema.from_any_fields(
-                [parse_databricks_field(c) for c in (manifest.schema.columns or [])],
+                [parse_databricks_field(c) for c in (columns or [])],
                 metadata=metadata,
             )
         return self._cached_schema
@@ -1019,9 +1035,10 @@ class WarehouseStatementResult(StatementResult):
         pending: List[pa.RecordBatch] = []
         pending_bytes = 0
         arrow_schema: Optional[pa.Schema] = None
+        yielded_any = False
 
         def flush() -> Iterator[pa.RecordBatch]:
-            nonlocal pending, pending_bytes
+            nonlocal pending, pending_bytes, yielded_any
             if not pending:
                 return
 
@@ -1030,6 +1047,7 @@ class WarehouseStatementResult(StatementResult):
             )
             pending = []
             pending_bytes = 0
+            yielded_any = True
             yield casted
 
         for batch in raw_batches():
@@ -1041,6 +1059,16 @@ class WarehouseStatementResult(StatementResult):
                 yield from flush()
 
         yield from flush()
+
+        if not yielded_any:
+            # Empty result set — yield a single zero-row batch carrying
+            # the warehouse-known schema so downstream consumers don't
+            # collapse to a schema-less empty iterator. ``read_arrow_table``
+            # and friends would otherwise fall back to ``Schema.empty()``
+            # because the caller's ``CastOptions`` doesn't have the
+            # target schema bound.
+            schema_for_empty = options.merged_schema or self._collect_schema(options)
+            yield from _empty_arrow_batches(schema_for_empty.to_arrow_schema())
 
     def _write_arrow_batches(self, batches: Iterable[pa.RecordBatch], options: CastOptions) -> None:
         raise NotImplementedError("Cannot write to Databricks SQL")
