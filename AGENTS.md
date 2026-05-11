@@ -407,6 +407,51 @@ Prefer:
 But correctness and user-visible behavior come first.
 Python fallback behavior is canonical.
 
+### 6. Never loop over data rows in Python
+
+Python `for` loops over Arrow / Polars / pandas / Spark values are the
+single biggest performance trap in this codebase. A loop over 1 M rows
+is 1 M Python frames; the same work in a vectorised kernel runs in
+microseconds.
+
+Reach for vectorised primitives in this order **before** considering a
+Python loop:
+
+1. **pyarrow.compute kernels** — `pc.cast`, `pc.if_else`,
+   `pc.list_element`, `pc.binary_join_element_wise`,
+   `pc.replace_substring_regex`, `pc.fill_null`, `pc.equal`,
+   `pc.is_in`, `pc.greater`, ... These stay inside the C++ runtime
+   and don't cross a Python frame per row.
+2. **pyarrow.json / pyarrow.csv** vectorised readers when the
+   workload is "decode N rows of `<format>` into a typed Arrow
+   array". See `_cast_json.py:_vectorized_parse_json` for the
+   one-pass NDJSON shape.
+3. **Polars expressions** — `pl.col(...).str.json_decode`,
+   `.str.contains`, `.cast`, `.list.eval`,
+   `pl.when(...).then(...).otherwise(...)`. The next-best vectorised
+   fallback when pyarrow.compute doesn't cover the op. Build a
+   polars Series / LazyFrame, run the expression, hand the result
+   back to Arrow via `.to_arrow()`.
+4. **Numpy ufuncs** for numerical work on numpy-backed buffers.
+
+Only after those exhaust their coverage is a Python loop acceptable,
+and even then **only as an explicitly-documented fallback path** —
+permissive per-row null-on-failure, or the rare case where pyarrow.json
+genuinely can't emit the target type (e.g. `map` arrays). Comment why
+the vectorised path doesn't cover the case and what the fallback's
+cost is.
+
+Same rule applies to `array.to_pylist()` followed by a Python
+comprehension — that's the same trap with one less line. Look for a
+vectorised expression first; reach for `to_pylist` only when
+materialising into Python objects is the genuine endpoint (e.g. JSON
+encoding via `json.dumps`).
+
+The shape of an acceptable per-row fallback already exists at
+`_cast_json.py:_parse_via_python` — vectorised C++ NDJSON first,
+per-row only when that raises in permissive mode. Mirror that
+pattern; don't invent a new one.
+
 ---
 
 ## Public API design rules

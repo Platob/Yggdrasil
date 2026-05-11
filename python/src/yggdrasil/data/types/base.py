@@ -1497,6 +1497,19 @@ class DataType(BaseChildrenFields, ABC):
     ) -> pa.ChunkedArray:
         if options.need_cast(array, self):
             chunks = [self._cast_arrow_array(chunk, options) for chunk in array.chunks]
+            # Identity short-circuit: if every per-chunk cast returned
+            # the same array object it was handed (subclass override
+            # decided no work was needed for that chunk), skip the
+            # ``pa.chunked_array`` rebuild and hand back the original.
+            # Saves an O(num_chunks) constructor pass on partial-cast
+            # paths where the per-chunk dispatch already knows the
+            # types align (e.g. some subclasses short-circuit on a
+            # source-flag check that ``need_cast`` can't see at the
+            # ChunkedArray level).
+            if chunks and all(
+                c is orig for c, orig in zip(chunks, array.chunks)
+            ):
+                return array
             chunk_type = chunks[0].type if chunks else self.to_arrow()
             return pa.chunked_array(chunks, type=chunk_type)
         return array

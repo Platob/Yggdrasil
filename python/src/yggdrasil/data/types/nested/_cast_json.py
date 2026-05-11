@@ -12,9 +12,15 @@ import json
 import re
 from typing import TYPE_CHECKING, Any
 
+import orjson
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.json as paj
+
+# ``orjson.JSONDecodeError`` subclasses :class:`json.JSONDecodeError`, so
+# anything that does ``except json.JSONDecodeError`` keeps catching the
+# orjson failures too — including the ``msg`` / ``lineno`` / ``colno``
+# attributes we use for row-pointing error messages downstream.
 
 from yggdrasil.data.types.base import DataType
 from yggdrasil.data.types.id import DataTypeId
@@ -84,7 +90,14 @@ def _arrow_to_utf8(
     memory_pool: pa.MemoryPool | None = None,
 ) -> pa.Array:
     if isinstance(array, pa.ChunkedArray):
-        array = array.combine_chunks()
+        # ``combine_chunks`` copies every chunk into a fresh contiguous
+        # buffer — needed for the NDJSON path downstream, but a waste
+        # when the input is already a single chunk. Unwrap zero-copy
+        # in that case.
+        if array.num_chunks == 1:
+            array = array.chunks[0]
+        else:
+            array = array.combine_chunks()
 
     src_type = array.type
     if (
@@ -297,7 +310,7 @@ def _parse_via_python(
             blob = "[" + ",".join(
                 "null" if s is None else s for s in pylist
             ) + "]"
-            parsed = json.loads(blob)
+            parsed = orjson.loads(blob)
         except json.JSONDecodeError:
             parsed = _parse_json_rows_strict(pylist)
         return pa.array(parsed, type=target_arrow_type, memory_pool=memory_pool)
@@ -315,7 +328,7 @@ def _parse_json_rows_strict(pylist: list[str | None]) -> list[Any]:
         if blob is None:
             continue
         try:
-            out[idx] = json.loads(blob)
+            out[idx] = orjson.loads(blob)
         except json.JSONDecodeError as exc:
             preview = blob if len(blob) <= 120 else blob[:117] + "..."
             raise pa.ArrowInvalid(
@@ -333,7 +346,7 @@ def _parse_json_rows_permissive(pylist: list[str | None]) -> list[Any]:
         if blob is None:
             continue
         try:
-            out[idx] = json.loads(blob)
+            out[idx] = orjson.loads(blob)
         except (json.JSONDecodeError, ValueError):
             out[idx] = None
     return out
@@ -391,7 +404,7 @@ def _polars_json_decode_permissive(value: Any) -> Any:
     if value is None:
         return None
     try:
-        return json.loads(value)
+        return orjson.loads(value)
     except (json.JSONDecodeError, ValueError, TypeError):
         return None
 
@@ -489,7 +502,12 @@ def cast_arrow_json_encode_array(
     memory_pool = options.arrow_memory_pool
 
     if isinstance(array, pa.ChunkedArray):
-        array = array.combine_chunks()
+        # Single-chunk inputs unwrap zero-copy — combine_chunks would
+        # otherwise allocate + copy the full nested buffer for nothing.
+        if array.num_chunks == 1:
+            array = array.chunks[0]
+        else:
+            array = array.combine_chunks()
 
     if len(array) == 0:
         return pa.array([], type=target_arrow_type)

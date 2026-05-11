@@ -347,6 +347,8 @@ class TestJsonArrowPermissive(ArrowTestCase):
         # ``json.JSONDecodeError`` that didn't say which row failed.
         # The new strict path raises ``pa.ArrowInvalid`` and names the
         # offending row index plus a preview of the bad value.
+        # ``safe=True`` is opt-in now — the default flipped to ``False``,
+        # so the test passes ``safe=True`` explicitly.
         arr_dtype = ArrayType.from_item(Field("item", _INT64))
         src = self.pa.array(
             ['[1, 2, 3]', '{not json', '[4]'], type=self.pa.string()
@@ -357,6 +359,7 @@ class TestJsonArrowPermissive(ArrowTestCase):
                 src,
                 source_field=Field("a", SJsonType()),
                 target_field=Field("a", arr_dtype),
+                safe=True,
             )
 
         msg = str(ctx.exception)

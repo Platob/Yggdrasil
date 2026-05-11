@@ -161,7 +161,8 @@ class CastOptions:
 
     * ``source_field`` / ``target_field`` = ``None`` → no cast
       coercion. :meth:`cast` returns inputs unchanged.
-    * ``safe`` = ``True`` → strict overflow/truncation/null semantics.
+    * ``safe`` = ``False`` → permissive cast: bad rows / overflow
+      become null. Strict semantics are opt-in via ``safe=True``.
     * ``mode`` / ``schema_mode`` = :attr:`Mode.AUTO` → writer
       picks the appropriate behaviour from context.
     * ``row_size`` / ``byte_size`` = ``None`` → no batch caps; readers
@@ -171,7 +172,14 @@ class CastOptions:
 
     source_field: "Field | None" = None
     target_field: "Field | None" = None
-    safe: bool = True
+    #: ``False`` by default: bad rows / overflow / out-of-range values
+    #: become null instead of raising. The wider data plane (CSV-from-web,
+    #: JSON-from-API, Spark joins on partial frames) is messy enough that
+    #: a strict cast is almost never what the caller actually wants — they
+    #: want to land the rows they can and surface the ones they couldn't.
+    #: Flip to ``True`` at the call site to opt into strict semantics
+    #: (overflow / parse / type-mismatch → raise).
+    safe: bool = False
     mode: Mode = Mode.AUTO
     schema_mode: Mode = Mode.IGNORE
     row_size: int | None = None
@@ -865,10 +873,16 @@ class CastOptions:
         Otherwise delegates to :meth:`Field.cast`, which handles engine
         detection (pyarrow/polars/pandas/spark + iterable fallback) and
         shape dispatch (tabular vs array/series/column/expr).
+
+        Dispatch is keyed on :attr:`target_field` (not
+        :attr:`merged_field`) — the caller asked for the target shape,
+        not a reconciled middle ground.  Source-side metadata still
+        flows through via ``options=self`` for the inner cast paths
+        that need it.
         """
         if self.target_field is None:
             return obj
-        return self.merged_field.cast(obj, options=self)
+        return self.target_field.cast(obj, options=self)
 
     # ---- pyarrow -----------------------------------------------------
 
@@ -876,19 +890,19 @@ class CastOptions:
         """Cast any pyarrow object — delegates to :meth:`Field.cast_arrow`."""
         if self.target_field is None:
             return obj
-        return self.merged_field.cast_arrow(obj, options=self)
+        return self.target_field.cast_arrow(obj, options=self)
 
     def cast_arrow_array(self, array: Any) -> Any:
         """Cast a :class:`pa.Array` or :class:`pa.ChunkedArray`."""
         if self.target_field is None:
             return array
-        return self.merged_field.cast_arrow_array(array, options=self)
+        return self.target_field.cast_arrow_array(array, options=self)
 
     def cast_arrow_tabular(self, table: Any) -> Any:
         """Cast a :class:`pa.Table` or :class:`pa.RecordBatch`."""
         if self.target_field is None:
             return table
-        return self.merged_field.cast_arrow_tabular(table, options=self)
+        return self.target_field.cast_arrow_tabular(table, options=self)
 
     def cast_arrow_batch_iterator(self, batches: Any) -> Any:
         """Cast a stream of :class:`pa.RecordBatch` and rechunk by ``byte_size`` / ``row_size``.
@@ -913,19 +927,19 @@ class CastOptions:
                 row_size=self.row_size,
                 memory_pool=self.arrow_memory_pool,
             )
-        return self.merged_field.cast_arrow_batch_iterator(batches, options=self)
+        return self.target_field.cast_arrow_batch_iterator(batches, options=self)
 
     def fill_arrow_nulls(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Engine-level null fill — delegates to :meth:`Field.fill_arrow`."""
         if self.target_field is None:
             return obj
-        return self.merged_field.fill_arrow(obj, default_scalar=default_scalar)
+        return self.target_field.fill_arrow(obj, default_scalar=default_scalar)
 
     def fill_arrow_array_nulls(self, array: Any, *, default_scalar: Any = None) -> Any:
         """Narrow null fill for a :class:`pa.Array` / :class:`pa.ChunkedArray`."""
         if self.target_field is None:
             return array
-        return self.merged_field.fill_arrow_array_nulls(
+        return self.target_field.fill_arrow_array_nulls(
             array, default_scalar=default_scalar
         )
 
@@ -935,13 +949,13 @@ class CastOptions:
         """Cast any polars object — delegates to :meth:`Field.cast_polars`."""
         if self.target_field is None:
             return obj
-        return self.merged_field.cast_polars(obj, options=self)
+        return self.target_field.cast_polars(obj, options=self)
 
     def cast_polars_series(self, series: Any, *, default_scalar: Any = None) -> Any:
         """Cast a :class:`pl.Series`."""
         if self.target_field is None:
             return series
-        return self.merged_field.cast_polars_series(
+        return self.target_field.cast_polars_series(
             series, options=self, default_scalar=default_scalar
         )
 
@@ -953,7 +967,7 @@ class CastOptions:
         """
         if self.target_field is None:
             return expr
-        return self.merged_field.cast_polars_expr(
+        return self.target_field.cast_polars_expr(
             expr, options=self, default_scalar=default_scalar
         )
 
@@ -961,13 +975,13 @@ class CastOptions:
         """Cast a :class:`pl.DataFrame` or :class:`pl.LazyFrame`."""
         if self.target_field is None:
             return data
-        return self.merged_field.cast_polars_tabular(data, options=self)
+        return self.target_field.cast_polars_tabular(data, options=self)
 
     def fill_polars_nulls(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Engine-level polars null fill — delegates to :meth:`Field.fill_polars`."""
         if self.target_field is None:
             return obj
-        return self.merged_field.fill_polars(obj, default_scalar=default_scalar)
+        return self.target_field.fill_polars(obj, default_scalar=default_scalar)
 
     def polars_alias(self, obj: Any) -> Any:
         """Rename a polars Series/Expr to the target name — no-op if matching.
@@ -977,7 +991,7 @@ class CastOptions:
         """
         if self.target_field is None:
             return obj
-        return self.merged_field.polars_alias(obj)
+        return self.target_field.polars_alias(obj)
 
     # ---- pandas ------------------------------------------------------
 
@@ -985,13 +999,13 @@ class CastOptions:
         """Cast any pandas object — delegates to :meth:`Field.cast_pandas`."""
         if self.target_field is None:
             return obj
-        return self.merged_field.cast_pandas(obj, options=self)
+        return self.target_field.cast_pandas(obj, options=self)
 
     def fill_pandas_nulls(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Engine-level pandas null fill — delegates to :meth:`Field.fill_pandas`."""
         if self.target_field is None:
             return obj
-        return self.merged_field.fill_pandas(obj, default_scalar=default_scalar)
+        return self.target_field.fill_pandas(obj, default_scalar=default_scalar)
 
     # ---- spark -------------------------------------------------------
 
@@ -999,31 +1013,31 @@ class CastOptions:
         """Cast any spark object — delegates to :meth:`Field.cast_spark`."""
         if self.target_field is None:
             return obj
-        return self.merged_field.cast_spark(obj, options=self)
+        return self.target_field.cast_spark(obj, options=self)
 
     def cast_spark_tabular(self, obj: Any) -> Any:
         """Cast any spark object — delegates to :meth:`Field.cast_spark`."""
         if self.target_field is None:
             return obj
-        return self.merged_field.cast_spark_tabular(obj, options=self)
+        return self.target_field.cast_spark_tabular(obj, options=self)
 
     def cast_spark_column(self, obj: Any) -> Any:
         """Cast any spark object — delegates to :meth:`Field.cast_spark`."""
         if self.target_field is None:
             return obj
-        return self.merged_field.cast_spark_column(obj, options=self)
+        return self.target_field.cast_spark_column(obj, options=self)
 
     def fill_spark_nulls(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Engine-level spark null fill — delegates to :meth:`Field.fill_spark`."""
         if self.target_field is None:
             return obj
-        return self.merged_field.fill_spark(obj, default_scalar=default_scalar)
+        return self.target_field.fill_spark(obj, default_scalar=default_scalar)
 
     def spark_alias(self, obj: Any) -> Any:
         """Rename a Spark Column to the target name — delegates to :meth:`Field.spark_alias`."""
         if self.target_field is None:
             return obj
-        return self.merged_field.spark_alias(obj)
+        return self.target_field.spark_alias(obj)
 
     # ==================================================================
     # Dunders
