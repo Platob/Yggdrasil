@@ -98,8 +98,15 @@ def cast_arrow_json_string_array(
 ) -> pa.Array:
     """Parse a string/binary Arrow array as JSON into the target arrow type.
 
-    Uses one C-level ``json.loads`` on a comma-joined blob (so no per-row
-    Python iteration) followed by ``pa.array`` with the target type.
+    Strict mode (``options.safe=True``, the default) attempts a single
+    C-level ``json.loads`` on a comma-joined blob and, on failure,
+    re-walks the rows to raise an :class:`pa.ArrowInvalid` that points
+    at the offending row index and value preview.
+
+    Permissive mode (``options.safe=False``) parses each row
+    independently and decodes invalid JSON — or rows that don't fit
+    the target arrow type — to ``None``, mirroring
+    ``pc.cast(safe=False)`` semantics.
     """
     target_field = options.target_field
     if target_field is None:
@@ -113,13 +120,77 @@ def cast_arrow_json_string_array(
     if len(normalized) == 0:
         return pa.array([], type=target_arrow_type)
 
-    null_literal = pa.scalar("null", type=pa.string())
-    filled = pc.fill_null(normalized, null_literal)
+    pylist = normalized.to_pylist()
 
-    blob = "[" + ",".join(filled.to_pylist()) + "]"
-    parsed = json.loads(blob)
+    if options.safe:
+        try:
+            blob = "[" + ",".join(
+                "null" if s is None else s for s in pylist
+            ) + "]"
+            parsed = json.loads(blob)
+        except json.JSONDecodeError:
+            # Re-walk per-row so the raised error names the offending
+            # row index and shows a preview of the bad value.
+            parsed = _parse_json_rows_strict(pylist)
 
-    return pa.array(parsed, type=target_arrow_type, memory_pool=memory_pool)
+        return pa.array(parsed, type=target_arrow_type, memory_pool=memory_pool)
+
+    parsed = _parse_json_rows_permissive(pylist)
+    try:
+        return pa.array(parsed, type=target_arrow_type, memory_pool=memory_pool)
+    except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError, ValueError):
+        # Target-type coercion can still fail row-by-row (e.g. a parsed
+        # object missing a required nested field). In permissive mode
+        # we null those rows out one at a time instead of failing the
+        # whole batch.
+        return _build_arrow_per_row(parsed, target_arrow_type, memory_pool)
+
+
+def _parse_json_rows_strict(pylist: list[str | None]) -> list[Any]:
+    out: list[Any] = [None] * len(pylist)
+    for idx, blob in enumerate(pylist):
+        if blob is None:
+            continue
+        try:
+            out[idx] = json.loads(blob)
+        except json.JSONDecodeError as exc:
+            preview = blob if len(blob) <= 120 else blob[:117] + "..."
+            raise pa.ArrowInvalid(
+                f"Invalid JSON at row {idx}: {exc.msg} "
+                f"(line {exc.lineno}, column {exc.colno}). "
+                f"Value: {preview!r}. "
+                f"Pass safe=False on CastOptions to coerce bad rows to null."
+            ) from exc
+    return out
+
+
+def _parse_json_rows_permissive(pylist: list[str | None]) -> list[Any]:
+    out: list[Any] = [None] * len(pylist)
+    for idx, blob in enumerate(pylist):
+        if blob is None:
+            continue
+        try:
+            out[idx] = json.loads(blob)
+        except (json.JSONDecodeError, ValueError):
+            out[idx] = None
+    return out
+
+
+def _build_arrow_per_row(
+    parsed: list[Any],
+    target_arrow_type: pa.DataType,
+    memory_pool: pa.MemoryPool | None,
+) -> pa.Array:
+    cells: list[Any] = [None] * len(parsed)
+    for idx, value in enumerate(parsed):
+        if value is None:
+            continue
+        try:
+            pa.array([value], type=target_arrow_type, memory_pool=memory_pool)
+            cells[idx] = value
+        except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError, ValueError):
+            cells[idx] = None
+    return pa.array(cells, type=target_arrow_type, memory_pool=memory_pool)
 
 
 def cast_polars_json_string_expr(
@@ -139,7 +210,27 @@ def cast_polars_json_string_expr(
     if src_id == DataTypeId.BINARY or src_id == DataTypeId.BJSON or src_dtype == pl.Binary:
         expr = expr.cast(pl.String)
 
+    if not options.safe:
+        # Polars ``json_decode`` raises on any row it can't parse; the
+        # permissive contract is per-row null-on-failure. Route through
+        # ``map_elements`` with a per-row try/except so bad rows null
+        # out instead of failing the whole frame.
+        return expr.map_elements(
+            _polars_json_decode_permissive,
+            return_dtype=target_polars_type,
+            skip_nulls=True,
+        )
+
     return expr.str.json_decode(target_polars_type)
+
+
+def _polars_json_decode_permissive(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
 
 
 def cast_polars_json_string_series(
@@ -170,6 +261,12 @@ def cast_spark_json_string_column(
     if src_id == DataTypeId.BINARY or src_id == DataTypeId.BJSON:
         column = column.cast("string")
 
+    # Spark's ``from_json`` defaults to PERMISSIVE (bad records null
+    # out). Strict (``options.safe=True``) opts into FAILFAST so the
+    # behaviour matches the Arrow / Polars strict paths — a malformed
+    # record fails the query instead of silently nulling.
+    if options.safe:
+        return F.from_json(column, target_ddl, {"mode": "FAILFAST"})
     return F.from_json(column, target_ddl)
 
 

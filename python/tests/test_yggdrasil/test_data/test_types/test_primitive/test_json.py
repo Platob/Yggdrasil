@@ -333,3 +333,131 @@ class TestJsonPolarsCasts:
         )
 
         assert out.to_list() == [[1, 2], [3]]
+
+
+# ---------------------------------------------------------------------------
+# Flexible (safe=False) decode — bad rows null out instead of raising
+# ---------------------------------------------------------------------------
+
+
+class TestJsonArrowPermissive(ArrowTestCase):
+
+    def test_invalid_row_raises_with_row_index_on_safe_true(self) -> None:
+        # Strict mode: the previous behaviour raised a bare
+        # ``json.JSONDecodeError`` that didn't say which row failed.
+        # The new strict path raises ``pa.ArrowInvalid`` and names the
+        # offending row index plus a preview of the bad value.
+        arr_dtype = ArrayType.from_item(Field("item", _INT64))
+        src = self.pa.array(
+            ['[1, 2, 3]', '{not json', '[4]'], type=self.pa.string()
+        )
+
+        with self.assertRaises(self.pa.ArrowInvalid) as ctx:
+            arr_dtype.cast_arrow_array(
+                src,
+                source_field=Field("a", SJsonType()),
+                target_field=Field("a", arr_dtype),
+            )
+
+        msg = str(ctx.exception)
+        self.assertIn("row 1", msg)
+        self.assertIn("{not json", msg)
+
+    def test_invalid_row_nulls_out_on_safe_false_array(self) -> None:
+        arr_dtype = ArrayType.from_item(Field("item", _INT64))
+        src = self.pa.array(
+            ['[1, 2, 3]', '{not json', '[4]', None],
+            type=self.pa.string(),
+        )
+
+        out = arr_dtype.cast_arrow_array(
+            src,
+            source_field=Field("a", SJsonType()),
+            target_field=Field("a", arr_dtype),
+            safe=False,
+        )
+
+        self.assertEqual(out.to_pylist(), [[1, 2, 3], None, [4], None])
+
+    def test_invalid_row_nulls_out_on_safe_false_struct(self) -> None:
+        struct_dtype = StructType(
+            fields=[Field("a", _INT64), Field("b", StringType())]
+        )
+        src = self.pa.array(
+            [
+                '{"a": 1, "b": "x"}',
+                'totally-not-json',
+                '{"a": 2, "b": "y"}',
+            ],
+            type=self.pa.string(),
+        )
+
+        out = struct_dtype.cast_arrow_array(
+            src,
+            source_field=Field("s", SJsonType()),
+            target_field=Field("s", struct_dtype),
+            safe=False,
+        )
+
+        self.assertEqual(
+            out.to_pylist(),
+            [{"a": 1, "b": "x"}, None, {"a": 2, "b": "y"}],
+        )
+
+    def test_bjson_invalid_row_nulls_out_on_safe_false(self) -> None:
+        arr_dtype = ArrayType.from_item(Field("item", _INT64))
+        src = self.pa.array(
+            [b"[1,2]", b"not-json", b"[3]"], type=self.pa.binary()
+        )
+
+        out = arr_dtype.cast_arrow_array(
+            src,
+            source_field=Field("a", BJsonType()),
+            target_field=Field("a", arr_dtype),
+            safe=False,
+        )
+
+        self.assertEqual(out.to_pylist(), [[1, 2], None, [3]])
+
+
+class TestJsonPolarsPermissive:
+
+    def test_invalid_row_nulls_out_on_safe_false_array(self) -> None:
+        arr_dtype = ArrayType.from_item(Field("item", _INT64))
+        s = pl.Series(
+            "a",
+            ['[1, 2]', '{nope', '[3]', None],
+            dtype=pl.String,
+        )
+
+        out = arr_dtype.cast_polars_series(
+            s,
+            source_field=Field("a", SJsonType()),
+            target_field=Field("a", arr_dtype),
+            safe=False,
+        )
+
+        assert out.to_list() == [[1, 2], None, [3], None]
+
+    def test_invalid_row_nulls_out_on_safe_false_struct(self) -> None:
+        struct_dtype = StructType(
+            fields=[Field("a", _INT64), Field("b", StringType())]
+        )
+        s = pl.Series(
+            "s",
+            ['{"a": 1, "b": "x"}', 'not json', '{"a": 2, "b": "y"}'],
+            dtype=pl.String,
+        )
+
+        out = struct_dtype.cast_polars_series(
+            s,
+            source_field=Field("s", SJsonType()),
+            target_field=Field("s", struct_dtype),
+            safe=False,
+        )
+
+        assert out.to_list() == [
+            {"a": 1, "b": "x"},
+            None,
+            {"a": 2, "b": "y"},
+        ]
