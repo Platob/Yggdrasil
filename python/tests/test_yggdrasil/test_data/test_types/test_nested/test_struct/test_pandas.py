@@ -151,3 +151,134 @@ class TestCastTabular:
 
         assert list(result.columns) == ["b", "c", "a"]
         assert len(result) == 0
+
+
+# ---------------------------------------------------------------------------
+# Tabular cast — tricky column dtypes
+#
+# Pandas has no native struct / decimal / tz-timestamp dtype the way
+# Arrow does, so the rebuild dips through pyarrow on the canonical
+# path. The assertions stay shape-only (column order, per-row values
+# after a normalize pass) since exact pandas dtypes drift between
+# pyarrow / numpy backends.
+# ---------------------------------------------------------------------------
+
+
+class TestCastTabularTrickyTypes:
+    @staticmethod
+    def _build_frame(source_schema: Schema) -> "pd.DataFrame":
+        from datetime import datetime, timezone
+        from decimal import Decimal
+
+        # Build via pyarrow so the source pandas frame actually carries
+        # decimal / tz-timestamp / struct cells (object dtype on the
+        # pandas side) instead of pandas' default coercions.
+        import pyarrow as pa
+
+        arrow_schema = source_schema.to_arrow_schema()
+        table = pa.Table.from_pylist(
+            [
+                {
+                    "drop_me": 99,
+                    "amount": Decimal("1.23"),
+                    "ts": datetime(2024, 1, 1, tzinfo=timezone.utc),
+                    "nested": {"x": 10, "y": "a"},
+                    "items": [{"x": 1, "y": "a"}, {"x": 2, "y": "b"}],
+                    "name": "row-1",
+                },
+                {
+                    "drop_me": 100,
+                    "amount": Decimal("4.56"),
+                    "ts": datetime(2024, 6, 30, 12, 30, tzinfo=timezone.utc),
+                    "nested": {"x": 20, "y": "b"},
+                    "items": [{"x": 3, "y": "c"}],
+                    "name": "row-2",
+                },
+            ],
+            schema=arrow_schema,
+        )
+        return table.to_pandas()
+
+    def test_reorders_selects_and_preserves_tricky_dtypes(
+        self,
+        tricky_source_schema: Schema,
+        tricky_target_schema: Schema,
+    ) -> None:
+        from decimal import Decimal
+
+        frame = self._build_frame(tricky_source_schema)
+
+        options = CastOptions(
+            source_field=tricky_source_schema,
+            target_field=tricky_target_schema,
+        )
+
+        result = cast_pandas_tabular(frame, options)
+
+        # Column order matches target schema; ``drop_me`` is selected
+        # out; ``missing`` is appended with null cells.
+        assert list(result.columns) == [
+            "ts",
+            "amount",
+            "items",
+            "nested",
+            "name",
+            "missing",
+        ]
+        assert len(result) == 2
+
+        first = {
+            k: normalize_nested(v)
+            for k, v in result.iloc[0].to_dict().items()
+        }
+        # Nested struct children swapped (y before x) and list<struct>
+        # children swapped too.
+        assert first["nested"] == {"y": "a", "x": 10}
+        assert first["items"] == [{"y": "a", "x": 1}, {"y": "b", "x": 2}]
+        assert first["amount"] == Decimal("1.23")
+        assert first["missing"] is None
+
+        second_nested = normalize_nested(result.iloc[1]["nested"])
+        assert second_nested == {"y": "b", "x": 20}
+        assert normalize_nested(result.iloc[1]["amount"]) == Decimal("4.56")
+
+    def test_widens_integer_dtype_during_reorder(self, string_type) -> None:
+        from yggdrasil.data.types import IntegerType
+
+        int32 = IntegerType(byte_size=4, signed=True)
+        int64 = IntegerType(byte_size=8, signed=True)
+
+        source = Schema(
+            inner_fields=[
+                Field(name="small", dtype=int32, nullable=True),
+                Field(name="label", dtype=string_type, nullable=True),
+            ]
+        )
+        target = Schema(
+            inner_fields=[
+                Field(name="label", dtype=string_type, nullable=True),
+                Field(name="small", dtype=int64, nullable=True),
+            ]
+        )
+
+        frame = pd.DataFrame(
+            {
+                "small": pd.Series([1, 2, 3], dtype="int32"),
+                "label": pd.Series(["a", "b", "c"], dtype="object"),
+            }
+        )
+
+        result = cast_pandas_tabular(
+            frame, CastOptions(source_field=source, target_field=target)
+        )
+
+        assert list(result.columns) == ["label", "small"]
+        rows = [
+            {k: normalize_nested(v) for k, v in row.items()}
+            for row in result.to_dict(orient="records")
+        ]
+        assert rows == [
+            {"label": "a", "small": 1},
+            {"label": "b", "small": 2},
+            {"label": "c", "small": 3},
+        ]

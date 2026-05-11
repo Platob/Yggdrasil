@@ -39,4 +39,13 @@ def normalize_nested(value: Any) -> Any:
         return {k: normalize_nested(v) for k, v in value.items()}
     if isinstance(value, list):
         return [normalize_nested(v) for v in value]
+    # Pandas surfaces a list<struct> cell from the pyarrow round-trip
+    # as a numpy object array of dicts; coerce to a plain list so
+    # equality assertions don't trip pandas/numpy truthiness rules.
+    if (
+        type(value).__name__ == "ndarray"
+        and hasattr(value, "tolist")
+        and getattr(value, "ndim", 0) == 1
+    ):
+        return [normalize_nested(v) for v in value.tolist()]
     return _normalize_scalar(value)

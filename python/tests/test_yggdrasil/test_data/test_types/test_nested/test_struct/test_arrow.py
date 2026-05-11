@@ -294,6 +294,201 @@ class TestCastTabular:
 
 
 # ---------------------------------------------------------------------------
+# Tabular casts — tricky column dtypes.
+#
+# Cover the column shapes that historically slip past a "reorder by
+# name" sweep: fixed-precision decimal, timestamp with a non-naive
+# timezone, a nested struct whose children themselves swap order, and a
+# list<struct> whose inner struct children also swap order. The same
+# fixtures back the Pandas / Polars / Spark equivalents so divergences
+# show up as one engine failing a peer's assertion.
+# ---------------------------------------------------------------------------
+
+
+class TestCastTabularTrickyTypes:
+    def _build_table(
+        self, source_schema: Schema, as_record_batch: bool = False
+    ):
+        from datetime import datetime, timezone
+        from decimal import Decimal
+
+        arrow_schema = source_schema.to_arrow_schema()
+        rows = [
+            {
+                "drop_me": 99,
+                "amount": Decimal("1.23"),
+                "ts": datetime(2024, 1, 1, tzinfo=timezone.utc),
+                "nested": {"x": 10, "y": "a"},
+                "items": [{"x": 1, "y": "a"}, {"x": 2, "y": "b"}],
+                "name": "row-1",
+            },
+            {
+                "drop_me": 100,
+                "amount": Decimal("4.56"),
+                "ts": datetime(2024, 6, 30, 12, 30, tzinfo=timezone.utc),
+                "nested": {"x": 20, "y": "b"},
+                "items": [{"x": 3, "y": "c"}],
+                "name": "row-2",
+            },
+            {
+                "drop_me": None,
+                "amount": None,
+                "ts": None,
+                "nested": None,
+                "items": None,
+                "name": None,
+            },
+        ]
+        if as_record_batch:
+            return pa.RecordBatch.from_pylist(rows, schema=arrow_schema)
+        return pa.Table.from_pylist(rows, schema=arrow_schema)
+
+    def test_table_reorders_selects_and_preserves_tricky_dtypes(
+        self,
+        tricky_source_schema: Schema,
+        tricky_target_schema: Schema,
+    ) -> None:
+        table = self._build_table(tricky_source_schema)
+
+        options = CastOptions(
+            source_field=tricky_source_schema,
+            target_field=tricky_target_schema,
+        )
+
+        result = cast_arrow_tabular(table, options)
+
+        # Column order matches the target schema and ``drop_me`` is gone.
+        assert result.column_names == [
+            "ts",
+            "amount",
+            "items",
+            "nested",
+            "name",
+            "missing",
+        ]
+        # Tricky dtypes survive the rebuild without precision / tz loss.
+        assert result.schema == tricky_target_schema.to_arrow_schema()
+        assert result.schema.field("amount").type == pa.decimal128(10, 2)
+        assert result.schema.field("ts").type == pa.timestamp("us", tz="UTC")
+        # Nested children also reordered (y before x).
+        assert [f.name for f in result.schema.field("nested").type] == ["y", "x"]
+        assert [
+            f.name for f in result.schema.field("items").type.value_type
+        ] == ["y", "x"]
+
+        rows = result.to_pylist()
+        # Inner struct rows came through with swapped child order — and
+        # the ``missing`` column is filled with nulls because no source
+        # field maps to it.
+        assert rows[0]["nested"] == {"y": "a", "x": 10}
+        assert rows[0]["items"] == [{"y": "a", "x": 1}, {"y": "b", "x": 2}]
+        assert rows[0]["missing"] is None
+        assert rows[1]["nested"] == {"y": "b", "x": 20}
+        # Final row is all-null source → result row is null per column.
+        assert rows[2]["nested"] is None
+        assert rows[2]["items"] is None
+        assert rows[2]["amount"] is None
+        assert rows[2]["ts"] is None
+
+    def test_record_batch_path_matches_table_path(
+        self,
+        tricky_source_schema: Schema,
+        tricky_target_schema: Schema,
+    ) -> None:
+        # Both code paths share the per-column rebuild — confirm
+        # RecordBatch input → RecordBatch output and the same row data.
+        batch = self._build_table(tricky_source_schema, as_record_batch=True)
+        options = CastOptions(
+            source_field=tricky_source_schema,
+            target_field=tricky_target_schema,
+        )
+
+        result = cast_arrow_tabular(batch, options)
+
+        assert isinstance(result, pa.RecordBatch)
+        assert result.schema == tricky_target_schema.to_arrow_schema()
+        assert result.to_pylist() == cast_arrow_tabular(
+            self._build_table(tricky_source_schema), options
+        ).to_pylist()
+
+    def test_widens_integer_dtype_during_reorder(
+        self,
+        string_type,
+    ) -> None:
+        # int32 source column must cast to int64 inside the same call
+        # that reorders columns — the per-column dtype cast and the
+        # column rebuild have to compose.
+        from yggdrasil.data.types import IntegerType
+
+        int32 = IntegerType(byte_size=4, signed=True)
+        int64 = IntegerType(byte_size=8, signed=True)
+
+        source = Schema(
+            inner_fields=[
+                Field(name="small", dtype=int32, nullable=True),
+                Field(name="label", dtype=string_type, nullable=True),
+            ]
+        )
+        target = Schema(
+            inner_fields=[
+                Field(name="label", dtype=string_type, nullable=True),
+                Field(name="small", dtype=int64, nullable=True),
+            ]
+        )
+
+        table = pa.table(
+            {
+                "small": pa.array([1, 2, 3], type=pa.int32()),
+                "label": pa.array(["a", "b", "c"], type=pa.string()),
+            }
+        )
+
+        result = cast_arrow_tabular(
+            table, CastOptions(source_field=source, target_field=target)
+        )
+
+        assert result.column_names == ["label", "small"]
+        assert result.schema.field("small").type == pa.int64()
+        assert result.to_pylist() == [
+            {"label": "a", "small": 1},
+            {"label": "b", "small": 2},
+            {"label": "c", "small": 3},
+        ]
+
+    def test_resolves_target_alias_to_source_column(self, string_type) -> None:
+        # Source carries the legacy name ``old_amount``; target asks for
+        # ``amount`` with the old name configured as an alias. The Arrow
+        # tabular cast resolves via ``Field.select_in_field`` which walks
+        # name → alias, so the renamed column must come through.
+        from yggdrasil.data.types import IntegerType
+
+        int64 = IntegerType(byte_size=8, signed=True)
+
+        amount = Field(name="amount", dtype=int64, nullable=True).with_alias(
+            "old_amount"
+        )
+        source = Schema(
+            inner_fields=[
+                Field(name="old_amount", dtype=int64, nullable=True),
+                Field(name="name", dtype=string_type, nullable=True),
+            ]
+        )
+        target = Schema(inner_fields=[amount, Field(name="name", dtype=string_type, nullable=True)])
+
+        table = pa.table({"old_amount": [10, 20], "name": ["x", "y"]})
+
+        result = cast_arrow_tabular(
+            table, CastOptions(source_field=source, target_field=target)
+        )
+
+        assert result.column_names == ["amount", "name"]
+        assert result.to_pylist() == [
+            {"amount": 10, "name": "x"},
+            {"amount": 20, "name": "y"},
+        ]
+
+
+# ---------------------------------------------------------------------------
 # Streaming entry point — cast + rechunk in one call.
 # ---------------------------------------------------------------------------
 

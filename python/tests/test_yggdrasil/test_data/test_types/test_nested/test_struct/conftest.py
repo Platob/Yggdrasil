@@ -5,7 +5,11 @@ import pyarrow as pa
 import pytest
 
 from yggdrasil.data import DataType, Field, Schema
-from yggdrasil.data.types import IntegerType
+from yggdrasil.data.types import (
+    DecimalType,
+    IntegerType,
+    TimestampType,
+)
 from yggdrasil.data.types.nested.array import ArrayType
 from yggdrasil.data.types.nested.map import MapType
 from yggdrasil.data.types.nested.struct import StructType
@@ -139,5 +143,115 @@ def target_tabular_schema(int64_type: IntegerType, string_type) -> Schema:
             Field(name="b", dtype=string_type, nullable=True),
             Field(name="c", dtype=int64_type, nullable=True),
             Field(name="a", dtype=int64_type, nullable=True),
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tricky-type schemas.
+#
+# These exercise the tabular cast on column shapes that are easy to get
+# wrong: fixed-precision decimal (precision + scale must survive the
+# rebuild), timestamp with a non-naive timezone (tz string must travel),
+# a nested struct column whose own children also need reordering, and a
+# list<struct> column (the list wrapper must not flatten the inner
+# struct's children when they swap order).
+#
+# Same source/target pair drives every engine's test class so callers
+# can compare cast behaviour across Arrow / Polars / Pandas / Spark
+# against one fixture without re-declaring the schemas.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def decimal_type() -> DecimalType:
+    return DecimalType(precision=10, scale=2)
+
+
+@pytest.fixture
+def timestamp_utc_type() -> TimestampType:
+    # us / UTC keeps it readable across Arrow + Polars + Spark; ns would
+    # truncate on the Spark path.
+    return DataType.from_arrow_type(pa.timestamp("us", tz="UTC"))
+
+
+@pytest.fixture
+def nested_struct_source_dtype(int64_type, string_type) -> StructType:
+    return StructType(
+        fields=[
+            Field(name="x", dtype=int64_type, nullable=True),
+            Field(name="y", dtype=string_type, nullable=True),
+        ]
+    )
+
+
+@pytest.fixture
+def nested_struct_target_dtype(int64_type, string_type) -> StructType:
+    # Children swap order: the cast must reorder them inside every row.
+    return StructType(
+        fields=[
+            Field(name="y", dtype=string_type, nullable=True),
+            Field(name="x", dtype=int64_type, nullable=True),
+        ]
+    )
+
+
+@pytest.fixture
+def list_of_struct_source_dtype(nested_struct_source_dtype) -> ArrayType:
+    return ArrayType.from_item(
+        Field(name="item", dtype=nested_struct_source_dtype, nullable=True)
+    )
+
+
+@pytest.fixture
+def list_of_struct_target_dtype(nested_struct_target_dtype) -> ArrayType:
+    return ArrayType.from_item(
+        Field(name="item", dtype=nested_struct_target_dtype, nullable=True)
+    )
+
+
+@pytest.fixture
+def tricky_source_schema(
+    int64_type: IntegerType,
+    string_type,
+    decimal_type: DecimalType,
+    timestamp_utc_type: TimestampType,
+    nested_struct_source_dtype: StructType,
+    list_of_struct_source_dtype: ArrayType,
+) -> Schema:
+    return Schema(
+        inner_fields=[
+            # ``drop_me`` is absent from the target → must be selected
+            # out of the result.
+            Field(name="drop_me", dtype=int64_type, nullable=True),
+            Field(name="amount", dtype=decimal_type, nullable=True),
+            Field(name="ts", dtype=timestamp_utc_type, nullable=True),
+            Field(name="nested", dtype=nested_struct_source_dtype, nullable=True),
+            Field(name="items", dtype=list_of_struct_source_dtype, nullable=True),
+            Field(name="name", dtype=string_type, nullable=True),
+        ]
+    )
+
+
+@pytest.fixture
+def tricky_target_schema(
+    int64_type: IntegerType,
+    string_type,
+    decimal_type: DecimalType,
+    timestamp_utc_type: TimestampType,
+    nested_struct_target_dtype: StructType,
+    list_of_struct_target_dtype: ArrayType,
+) -> Schema:
+    return Schema(
+        inner_fields=[
+            # Reordered + ``drop_me`` removed + ``missing`` appended.
+            # ``nested`` and ``items`` re-declare with swapped child order
+            # so the cast also has to descend into each row.
+            Field(name="ts", dtype=timestamp_utc_type, nullable=True),
+            Field(name="amount", dtype=decimal_type, nullable=True),
+            Field(name="items", dtype=list_of_struct_target_dtype, nullable=True),
+            Field(name="nested", dtype=nested_struct_target_dtype, nullable=True),
+            Field(name="name", dtype=string_type, nullable=True),
+            Field(name="missing", dtype=int64_type, nullable=True),
         ]
     )

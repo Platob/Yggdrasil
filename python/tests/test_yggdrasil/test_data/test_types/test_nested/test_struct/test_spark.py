@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.data import Field
+from yggdrasil.data import Field, Schema
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.types.nested.struct import (
     cast_spark_list_column,
     cast_spark_map_column,
     cast_spark_struct_column,
+    cast_spark_tabular,
 )
 from ._helpers import normalize_nested
 
@@ -211,4 +212,130 @@ class TestCastListColumn:
             {"first": 1, "second": None, "third": None},
             {"first": 2, "second": "3", "third": None},
             {"first": 4, "second": "5", "third": 6},
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Tabular cast — tricky column dtypes
+#
+# Spark's ``cast_spark_tabular`` emits a ``select(*cols)`` in target
+# field order, building per-column expressions that descend into
+# struct / list<struct> children. The assertions below pin column
+# order, that absent target columns get null fills, and that nested /
+# list<struct> children also swap order inside every row.
+# ---------------------------------------------------------------------------
+
+
+class TestCastTabularTrickyTypes:
+    def test_dataframe_reorders_selects_and_preserves_tricky_dtypes(
+        self,
+        spark,  # noqa: F811
+        tricky_source_schema: Schema,
+        tricky_target_schema: Schema,
+    ) -> None:
+        from datetime import datetime, timezone
+        from decimal import Decimal
+
+        # Spark takes the source schema as DDL; build it from the
+        # yggdrasil Schema so the test stays in lockstep with the
+        # fixture's column order / dtype intent.
+        source_ddl = ", ".join(
+            f"{f.name} {f.dtype.to_spark().simpleString()}"
+            for f in tricky_source_schema.children_fields
+        )
+
+        frame = spark.createDataFrame(
+            [
+                (
+                    99,
+                    Decimal("1.23"),
+                    datetime(2024, 1, 1, tzinfo=timezone.utc),
+                    {"x": 10, "y": "a"},
+                    [{"x": 1, "y": "a"}, {"x": 2, "y": "b"}],
+                    "row-1",
+                ),
+                (
+                    100,
+                    Decimal("4.56"),
+                    datetime(2024, 6, 30, 12, 30, tzinfo=timezone.utc),
+                    {"x": 20, "y": "b"},
+                    [{"x": 3, "y": "c"}],
+                    "row-2",
+                ),
+            ],
+            schema=source_ddl,
+        )
+
+        options = CastOptions(
+            source_field=tricky_source_schema,
+            target_field=tricky_target_schema,
+        )
+
+        result = cast_spark_tabular(frame, options)
+
+        assert result.columns == [
+            "ts",
+            "amount",
+            "items",
+            "nested",
+            "name",
+            "missing",
+        ]
+
+        rows = [
+            {k: normalize_nested(v) for k, v in row.asDict(recursive=True).items()}
+            for row in result.collect()
+        ]
+        # Nested struct children swapped (y before x) and list<struct>
+        # children swapped too; ``missing`` filled with null.
+        assert rows[0]["nested"] == {"y": "a", "x": 10}
+        assert rows[0]["items"] == [{"y": "a", "x": 1}, {"y": "b", "x": 2}]
+        assert rows[0]["missing"] is None
+        assert rows[0]["amount"] == Decimal("1.23")
+        assert rows[1]["nested"] == {"y": "b", "x": 20}
+
+    def test_widens_integer_dtype_during_reorder(
+        self,
+        spark,  # noqa: F811
+        string_type,
+    ) -> None:
+        from yggdrasil.data.types import IntegerType
+
+        int32 = IntegerType(byte_size=4, signed=True)
+        int64 = IntegerType(byte_size=8, signed=True)
+
+        source = Schema(
+            inner_fields=[
+                Field(name="small", dtype=int32, nullable=True),
+                Field(name="label", dtype=string_type, nullable=True),
+            ]
+        )
+        target = Schema(
+            inner_fields=[
+                Field(name="label", dtype=string_type, nullable=True),
+                Field(name="small", dtype=int64, nullable=True),
+            ]
+        )
+
+        frame = spark.createDataFrame(
+            [(1, "a"), (2, "b"), (3, "c")],
+            schema="small int, label string",
+        )
+
+        result = cast_spark_tabular(
+            frame, CastOptions(source_field=source, target_field=target)
+        )
+
+        assert result.columns == ["label", "small"]
+        # int64 surface — Spark uses LongType.
+        small_dtype = next(
+            f.dataType for f in result.schema.fields if f.name == "small"
+        )
+        assert small_dtype.simpleString() == "bigint"
+
+        rows = [r.asDict(recursive=True) for r in result.collect()]
+        assert rows == [
+            {"label": "a", "small": 1},
+            {"label": "b", "small": 2},
+            {"label": "c", "small": 3},
         ]
