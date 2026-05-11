@@ -13,6 +13,12 @@ The base owns:
   canonical ``dbfs+dbfs://`` / ``dbfs+workspace://`` /
   ``dbfs+volume://`` URL form so callers don't have to know the URL
   syntax.
+- **Subclass dispatch** — :meth:`__new__`, :meth:`from_`, and
+  :meth:`from_url` all route ``DatabricksPath(...)`` calls to the
+  right concrete subclass (DBFS / Volumes / Workspace / Unity
+  Catalog :class:`Table`) based on the URL scheme or the POSIX
+  namespace in the path. Construction via the abstract base
+  "just works" — no need for callers to pick a subclass up front.
 - **Workspace-client binding** — :attr:`workspace` is whatever the
   caller injected, typically a ``databricks.sdk.WorkspaceClient``
   in production or a :class:`unittest.mock.Mock` in tests. No
@@ -104,6 +110,109 @@ def _coerce_to_url_str(value: Any) -> Any:
     return value
 
 
+# ---------------------------------------------------------------------------
+# Subclass dispatch — shared by ``__new__`` / ``from_`` / ``from_url``
+# ---------------------------------------------------------------------------
+
+
+def _strip_dbfs_family_prefix(url: "URL") -> "URL":
+    """Rewrite an un-qualified ``dbfs://`` URL into its concrete shape.
+
+    ``dbfs:///Volumes/cat/sch/vol/x`` → ``dbfs+volume:///cat/sch/vol/x``
+    ``dbfs:///Workspace/Users/me/x``  → ``dbfs+workspace:///Users/me/x``
+    ``dbfs:///path``                  → ``dbfs+dbfs:///path``
+
+    Any URL whose scheme is already a compound ``dbfs+<surface>`` (or
+    something unrelated) is returned unchanged. Used by both the
+    :class:`Holder`-level dispatch (``__new__`` / ``from_url``) so the
+    leading namespace becomes part of the scheme rather than the path.
+    """
+    scheme = (url.scheme or "").lower()
+    if scheme != Scheme.DBFS.value:
+        return url
+    raw_path = url.path or "/"
+    path = raw_path.lstrip("/")
+    head = path.split("/", 1)[0] if path else ""
+    rest = path[len(head) + 1:] if "/" in path else ""
+    suffix = "/" + rest if rest else "/"
+    if head == "Volumes":
+        return url.with_scheme(Scheme.DATABRICKS_VOLUME.value)._replace(path=suffix)
+    if head == "Workspace":
+        return url.with_scheme(Scheme.DATABRICKS_WORKSPACE.value)._replace(path=suffix)
+    # Everything else stays under DBFS — flip the scheme but keep the
+    # path verbatim so ``dbfs:///tmp/x`` and ``dbfs+dbfs:///tmp/x``
+    # produce identical paths.
+    return url.with_scheme(Scheme.DATABRICKS_DBFS.value)
+
+
+def _resolve_databricks_subclass(
+    *,
+    data: Any = None,
+    url: "URL | None" = None,
+) -> Tuple[type, "URL | None"]:
+    """Pick the concrete subclass for a Databricks-family URL/string.
+
+    Returns ``(target_class, normalized_url)``. The normalized URL has
+    the un-qualified ``dbfs://`` family prefix expanded into a concrete
+    ``dbfs+<surface>://`` form (or is ``None`` when no URL information
+    is available and the caller intends to fall through to a default
+    subclass).
+
+    Dispatch order:
+
+    1. Explicit ``url=`` keyword.
+    2. ``data`` already shaped like a :class:`URL`.
+    3. ``data`` is a POSIX string (``/Volumes/...`` / ``/Workspace/...`` /
+       ``/dbfs/...``) — coerced into a URL via :func:`_coerce_to_url_str`.
+    4. ``data`` is a ``dbfs[+...]://`` URL string.
+
+    Unknown shapes fall back to :class:`DBFSPath` — the DBFS surface
+    is the historical home of ``dbfs://`` URLs that don't carry a
+    leading namespace.
+    """
+    from .dbfs_path import DBFSPath
+    from .volume_path import VolumePath
+    from .workspace_path import WorkspacePath
+
+    candidate: "URL | None" = url
+    if candidate is None and isinstance(data, URL):
+        candidate = data
+    elif candidate is None and isinstance(data, str):
+        coerced = _coerce_to_url_str(data)
+        if isinstance(coerced, str) and "://" in coerced:
+            try:
+                candidate = URL.from_(coerced)
+            except Exception:
+                candidate = None
+
+    if candidate is None:
+        return DBFSPath, None
+
+    candidate = _strip_dbfs_family_prefix(candidate)
+    scheme = (candidate.scheme or "").lower()
+
+    if scheme == Scheme.DATABRICKS_VOLUME.value:
+        return VolumePath, candidate
+    if scheme == Scheme.DATABRICKS_WORKSPACE.value:
+        return WorkspacePath, candidate
+    if scheme == Scheme.DATABRICKS_DBFS.value:
+        return DBFSPath, candidate
+    if scheme == Scheme.DATABRICKS_TABLE.value:
+        # :class:`Table` lives in ``yggdrasil.databricks.sql.table``
+        # and is *not* a :class:`DatabricksPath` subclass — it's a
+        # logical Unity Catalog resource on the same ``dbfs+...``
+        # family. The dispatcher still surfaces it here so callers
+        # that go through ``DatabricksPath(...)`` don't have to know
+        # the SQL module exists.
+        from yggdrasil.databricks.sql.table import Table
+        return Table, candidate
+
+    # Unknown scheme (or empty) — let the caller's intended class
+    # decide. DBFSPath is the safe default for the un-qualified
+    # ``dbfs://`` family root.
+    return DBFSPath, candidate
+
+
 # ===========================================================================
 # DatabricksPath
 # ===========================================================================
@@ -132,8 +241,62 @@ class DatabricksPath(RemotePath):
     namespace_prefix: ClassVar[Optional[str]] = None
 
     # ==================================================================
-    # Construction
+    # Construction — dispatch on the abstract base, allocate on subclasses
     # ==================================================================
+
+    def __new__(
+        cls,
+        data: Any = None,
+        *,
+        url: "URL | None" = None,
+        **kwargs: Any,
+    ):
+        """Allocate the right concrete subclass when called on the base.
+
+        ``DatabricksPath`` itself is abstract: instantiating it directly
+        would fail on the abstract :class:`Path` hooks. Instead, peek at
+        the inputs, pick the concrete subclass, and forward there. Python
+        will call :meth:`__init__` on the returned instance using its
+        actual class — so ``DatabricksPath("/Volumes/cat/sch/vol/x")``
+        ends up running :meth:`VolumePath.__init__` with the original
+        args.
+
+        For a Unity Catalog :class:`Table` (which is *not* a
+        :class:`DatabricksPath` subclass) we fully construct via
+        :meth:`Table.from_url`; the returned object is not a
+        :class:`DatabricksPath`, so Python skips the auto-``__init__``
+        pass after ``__new__``.
+
+        On a concrete subclass (``DBFSPath`` / ``VolumePath`` /
+        ``WorkspacePath``) this short-circuits to ``object.__new__`` so
+        the normal allocation path is preserved.
+        """
+        if cls is not DatabricksPath:
+            return super().__new__(cls)
+
+        target, normalized = _resolve_databricks_subclass(data=data, url=url)
+        # When dispatching to a DatabricksPath subclass, hand back
+        # control to Python so the subclass's ``__init__`` fires with
+        # the caller's original (data, url, **kwargs). Coerce ``data``
+        # to ``None`` once we've folded its information into the URL,
+        # so the subclass init doesn't double-parse it.
+        if isinstance(target, type) and issubclass(target, DatabricksPath):
+            if normalized is not None:
+                data = None
+                url = normalized
+            return target.__new__(target, data=data, url=url, **kwargs)
+
+        # Off-family target (Unity Catalog :class:`Table`) — construct
+        # eagerly via ``from_url`` so the returned object is fully
+        # initialized. Python won't auto-call ``__init__`` because the
+        # result isn't a :class:`DatabricksPath` instance.
+        if normalized is None:
+            raise TypeError(
+                f"{cls.__name__} cannot dispatch to {target.__name__} "
+                f"without a URL or recognizable data shape; "
+                f"got data={data!r}, url={url!r}."
+            )
+        return target.from_url(normalized, **kwargs)
 
     def __init__(
         self,
@@ -141,6 +304,7 @@ class DatabricksPath(RemotePath):
         *,
         url: URL | None = None,
         workspace: Any = None,
+        client: Any = None,
         temporary: bool = False,
         retry_sleep: Optional[Callable[[float], None]] = None,
         **kwargs: Any,
@@ -159,6 +323,11 @@ class DatabricksPath(RemotePath):
             data = None
         if url is not None:
             url = URL.from_(url)
+            # Un-qualified ``dbfs://`` family URLs whose path leads with
+            # ``/Volumes/`` / ``/Workspace/`` belong to a concrete
+            # surface — rewrite once so the URL path is the *suffix*
+            # below the namespace prefix that ``full_path()`` re-adds.
+            url = _strip_dbfs_family_prefix(url)
             target_scheme = self.scheme
             if target_scheme is not None:
                 target_token = target_scheme.value if isinstance(
@@ -169,6 +338,19 @@ class DatabricksPath(RemotePath):
 
         super().__init__(data=data, url=url, temporary=temporary, **kwargs)
 
+        # Either a workspace SDK client or a :class:`DatabricksClient`
+        # aggregator may seed the path; the aggregator's
+        # ``workspace_client()`` is a cheap accessor (cached on the
+        # aggregator) so we can resolve eagerly when ``workspace`` was
+        # not explicitly passed. Conflicting injections fail loudly —
+        # the caller picked two different sources of truth.
+        if workspace is not None and client is not None:
+            raise ValueError(
+                f"{type(self).__name__}: pass workspace= or client=, not both "
+                f"(got workspace={workspace!r}, client={client!r})."
+            )
+        if workspace is None and client is not None:
+            workspace = client.workspace_client()
         self._workspace = workspace
         self._retry_sleep: Optional[Callable[[float], None]] = retry_sleep
 
@@ -180,11 +362,16 @@ class DatabricksPath(RemotePath):
     def from_url(cls, url: "URL | str", **kwargs: Any) -> "DatabricksPath":
         """Construct the right concrete subclass from a Databricks URL.
 
-        Two URL shapes are supported:
+        Four URL shapes are supported on :class:`DatabricksPath`
+        itself:
 
         - ``dbfs+dbfs://``, ``dbfs+volume://``, ``dbfs+workspace://``
           — the compound :class:`Scheme` form, dispatched by URL
           scheme alone.
+        - ``dbfs+table://[creds@]host/<cat>/<sch>/<tbl>?…`` — Unity
+          Catalog logical table; dispatches to
+          :class:`yggdrasil.databricks.sql.table.Table` (not a
+          :class:`DatabricksPath`, but on the same scheme family).
         - ``dbfs://`` — un-qualified family URL. Dispatched by the
           URL path's leading namespace: ``/Volumes/...`` →
           :class:`VolumePath`, ``/Workspace/...`` →
@@ -197,41 +384,40 @@ class DatabricksPath(RemotePath):
         if cls is not DatabricksPath:
             return cls(url=u, **kwargs)
 
-        from .dbfs_path import DBFSPath
-        from .volume_path import VolumePath
-        from .workspace_path import WorkspacePath
+        target, normalized = _resolve_databricks_subclass(url=u)
+        if normalized is None:
+            normalized = u
+        return target.from_url(normalized, **kwargs)
 
-        scheme = (u.scheme or "").lower()
-        if scheme == Scheme.DATABRICKS_DBFS.value:
-            return DBFSPath(url=u, **kwargs)
-        if scheme == Scheme.DATABRICKS_VOLUME.value:
-            return VolumePath(url=u, **kwargs)
-        if scheme == Scheme.DATABRICKS_WORKSPACE.value:
-            return WorkspacePath(url=u, **kwargs)
-        # Un-qualified ``dbfs://`` family URL — peek at the path. The
-        # surface subclasses each carry their own POSIX prefix
-        # (``/dbfs/``, ``/Volumes/``, ``/Workspace/``) which they
-        # re-attach in :meth:`full_path`, so the URL path we hand
-        # them must be the *suffix* below that prefix.
-        raw_path = u.path or "/"
-        path = raw_path.lstrip("/")
-        head = path.split("/", 1)[0] if path else ""
-        rest = path[len(head) + 1:] if "/" in path else ""
-        suffix = "/" + rest if rest else "/"
-        if head == "Volumes":
-            return VolumePath(
-                url=u.with_scheme(Scheme.DATABRICKS_VOLUME.value)._replace(path=suffix),
-                **kwargs,
-            )
-        if head == "Workspace":
-            return WorkspacePath(
-                url=u.with_scheme(Scheme.DATABRICKS_WORKSPACE.value)._replace(path=suffix),
-                **kwargs,
-            )
-        return DBFSPath(
-            url=u.with_scheme(Scheme.DATABRICKS_DBFS.value),
-            **kwargs,
-        )
+    @classmethod
+    def from_(cls, obj: Any, **kwargs: Any) -> "DatabricksPath":
+        """Coerce *obj* (string / URL / :class:`Path` / dict) into the
+        right concrete subclass.
+
+        On the abstract :class:`DatabricksPath`, this is the friendly
+        entry point: POSIX strings like ``/Volumes/cat/sch/vol/x`` are
+        coerced through :func:`_coerce_to_url_str` and routed by
+        scheme to :class:`VolumePath` / :class:`WorkspacePath` /
+        :class:`DBFSPath`, while compound ``dbfs+...://`` URLs
+        dispatch by scheme alone (including ``dbfs+table://`` →
+        :class:`Table`). On a concrete subclass, the call returns an
+        instance of that subclass without redispatching — the standard
+        :meth:`Path.from_` contract.
+        """
+        if isinstance(obj, DatabricksPath):
+            if cls is DatabricksPath or isinstance(obj, cls):
+                return obj
+            obj = obj.url
+
+        # POSIX-string fast path — convert ``/Volumes/...`` etc. into a
+        # canonical ``dbfs+volume://...`` URL up front so the rest of
+        # the pipeline sees a real scheme.
+        if isinstance(obj, str):
+            obj = _coerce_to_url_str(obj)
+
+        if cls is DatabricksPath:
+            return cls.from_url(URL.from_(obj), **kwargs)
+        return cls(url=URL.from_(obj), **kwargs)
 
     # ==================================================================
     # Workspace client binding
@@ -331,15 +517,51 @@ class DatabricksPath(RemotePath):
         if n < 0:
             raise ValueError(f"reserve size must be >= 0, got {n!r}")
 
+    def read_mv(self, n: int, pos: int) -> memoryview:
+        """Range read with an aggressive whole-file fast path.
+
+        The base :meth:`Holder.read_mv` runs ``self.size`` (an
+        :meth:`_stat` probe) to convert ``n < 0`` into a concrete byte
+        count and to bounds-check the requested window. On Databricks
+        backends that probe costs a Unity Catalog / Workspace round
+        trip every read — wasted for ``read_bytes()`` /
+        ``read_arrow_table()`` and other "give me everything" calls,
+        because each backend's :meth:`_read_mv` already handles EOF
+        natively (chunked-until-short-page on DBFS, full-object
+        download on Volumes / Workspace).
+
+        Whole-file shape (``n < 0`` and ``pos == 0``) skips the size
+        probe entirely. Partial / positional reads keep the base
+        bounds check so out-of-range windows still raise.
+        """
+        if n < 0 and pos == 0:
+            # ``FileNotFoundError`` propagates — semantics match the
+            # base ``Holder.read_mv`` which would raise on a stat
+            # probe against a missing object. The :meth:`_bread`
+            # fallback (used by base ``Path`` methods like
+            # :meth:`truncate`) is the only place that swallows it
+            # into an empty buffer.
+            return self._read_mv(-1, 0)
+        return super().read_mv(n, pos)
+
     def _bread(self, n: int, pos: int, mode):  # pragma: no cover - thin shim
-        """Fallback whole-file read into a fresh :class:`BytesIO`."""
+        """Fallback whole-file read into a fresh :class:`BytesIO`.
+
+        Aggressive path: ``n`` is forwarded straight to :meth:`_read_mv`,
+        which handles ``n < 0`` as "read to EOF". The previous version
+        gated this on a ``_stat()`` probe to compute the size — that's
+        one extra round trip per ``read_bytes`` / Arrow open on every
+        Databricks surface, and the backends each download the whole
+        object anyway. Catching :class:`FileNotFoundError` on the real
+        call gives the same "missing → empty buffer" semantics without
+        the precondition.
+        """
         from yggdrasil.io.bytes_io import BytesIO
         del mode
-        size = n if n >= 0 else max(0, int(self._stat().size) - pos)
-        if size <= 0:
+        if n == 0:
             return BytesIO()
         try:
-            data = bytes(self._read_mv(size, pos))
+            data = bytes(self._read_mv(n, pos))
         except FileNotFoundError:
             data = b""
         return BytesIO(data)

@@ -376,13 +376,15 @@ class VolumePath(DatabricksPath):
         if pos == 0:
             payload = bytes(data)
         else:
+            # Positional write: pull the existing blob in a single
+            # ``files.download`` round trip (no preceding
+            # ``get_metadata`` probe). Volumes downloads the whole
+            # object regardless of the requested window, so asking
+            # for "to EOF" is free.
             try:
-                existing_size = int(self._stat().size)
-            except Exception:
-                existing_size = 0
-            existing = (
-                bytes(self._read_mv(existing_size, 0)) if existing_size else b""
-            )
+                existing = bytes(self._read_mv(-1, 0))
+            except FileNotFoundError:
+                existing = b""
             if pos > len(existing):
                 existing = existing + b"\x00" * (pos - len(existing))
             payload = existing[:pos] + bytes(data) + existing[pos + n:]
@@ -401,18 +403,21 @@ class VolumePath(DatabricksPath):
     def truncate(self, n: int) -> int:
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
-        try:
-            existing_size = int(self._stat().size)
-        except Exception:
-            existing_size = 0
         if n == 0:
             self._upload(b"")
             return 0
-        if n <= existing_size:
-            head = bytes(self._read_mv(n, 0))
+        # One ``files.download`` round trip — skip the ``get_metadata``
+        # probe and read the whole object. A missing target collapses
+        # to "no existing bytes" and we upload a fresh zero-padded
+        # head of size ``n``.
+        try:
+            existing = bytes(self._read_mv(-1, 0))
+        except FileNotFoundError:
+            existing = b""
+        if n <= len(existing):
+            head = existing[:n]
         else:
-            existing = bytes(self._read_mv(existing_size, 0)) if existing_size else b""
-            head = existing + b"\x00" * (n - existing_size)
+            head = existing + b"\x00" * (n - len(existing))
         self._upload(head)
         return n
 
