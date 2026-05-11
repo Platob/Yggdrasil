@@ -168,3 +168,116 @@ class TestCastErrorMessageShape(ArrowTestCase):
         original = ValueError("inner")
         err = CastError("outer", original=original)
         self.assertIs(err.original, original)
+
+
+class TestNestedCastErrorPropagation(ArrowTestCase):
+    """A leaf failure deep inside a nested target binds the *leaf* field.
+
+    The wrap on :meth:`Field.cast_arrow_array` is the single seam — every
+    nested rebuild (struct → struct children, list → struct by index,
+    map → struct via map_lookup, tabular per-column) funnels through it
+    before hitting the dtype-level cast. So the leaf cast wraps first
+    with its own field, and the outer call sees a ``CastError`` that it
+    re-raises unchanged (instead of clobbering the context with the
+    outer wrapper field).
+    """
+
+    def test_struct_child_leaf_failure(self) -> None:
+        # struct → struct with an inner string→int that fails.
+        pa = self.pa
+        src = pa.schema([
+            pa.field("row", pa.struct([
+                pa.field("kept", pa.string()),
+                pa.field("bad",  pa.string()),
+            ])),
+        ])
+        tgt = pa.schema([
+            pa.field("row", pa.struct([
+                pa.field("kept", pa.string()),
+                pa.field("bad",  pa.int64()),
+            ])),
+        ])
+        tbl = pa.table(
+            {"row": [{"kept": "ok", "bad": "not-a-number"}]}, schema=src,
+        )
+        opts = CastOptions(
+            source_field=Field.from_arrow(src),
+            target_field=Field.from_arrow(tgt),
+            safe=True,
+        )
+        with self.assertRaises(CastError) as ctx:
+            opts.cast_arrow_tabular(tbl)
+
+        # The leaf is what got bound — not the outer ``row`` field.
+        self.assertEqual(ctx.exception.target_field.name, "bad")
+        self.assertIn("bad: string", str(ctx.exception))
+        self.assertIn("bad: int64", str(ctx.exception))
+
+    def test_list_of_struct_leaf_failure(self) -> None:
+        pa = self.pa
+        src = pa.schema([
+            pa.field("payload", pa.list_(pa.struct([
+                pa.field("count", pa.string()),
+            ]))),
+        ])
+        tgt = pa.schema([
+            pa.field("payload", pa.list_(pa.struct([
+                pa.field("count", pa.int64()),
+            ]))),
+        ])
+        tbl = pa.table({"payload": [[{"count": "bad"}]]}, schema=src)
+        opts = CastOptions(
+            source_field=Field.from_arrow(src),
+            target_field=Field.from_arrow(tgt),
+            safe=True,
+        )
+        with self.assertRaises(CastError) as ctx:
+            opts.cast_arrow_tabular(tbl)
+        self.assertEqual(ctx.exception.target_field.name, "count")
+
+    def test_deeply_nested_leaf_failure(self) -> None:
+        # struct → struct → struct: the innermost leaf is what gets bound.
+        pa = self.pa
+        src = pa.schema([
+            pa.field("outer", pa.struct([
+                pa.field("inner", pa.struct([
+                    pa.field("val", pa.string()),
+                ])),
+            ])),
+        ])
+        tgt = pa.schema([
+            pa.field("outer", pa.struct([
+                pa.field("inner", pa.struct([
+                    pa.field("val", pa.int64()),
+                ])),
+            ])),
+        ])
+        tbl = pa.table(
+            {"outer": [{"inner": {"val": "abc"}}]}, schema=src,
+        )
+        opts = CastOptions(
+            source_field=Field.from_arrow(src),
+            target_field=Field.from_arrow(tgt),
+            safe=True,
+        )
+        with self.assertRaises(CastError) as ctx:
+            opts.cast_arrow_tabular(tbl)
+        # Bound to the deepest leaf, not the outer ``outer`` / ``inner``
+        # wrappers.
+        self.assertEqual(ctx.exception.target_field.name, "val")
+        self.assertIn("val: string", str(ctx.exception))
+        self.assertIn("val: int64", str(ctx.exception))
+
+    def test_cast_arrow_array_direct_wraps(self) -> None:
+        # Direct :meth:`Field.cast_arrow_array` call (no tabular shell)
+        # also wraps — same code path, same field context.
+        pa = self.pa
+        src_field = Field.from_arrow(pa.field("amount", pa.string()))
+        tgt_field = Field.from_arrow(pa.field("amount", pa.int64()))
+        arr = pa.array(["nope"], type=pa.string())
+        with self.assertRaises(CastError) as ctx:
+            tgt_field.cast_arrow_array(
+                arr, source_field=src_field, safe=True,
+            )
+        self.assertEqual(ctx.exception.target_field.name, "amount")
+        self.assertIsNotNone(ctx.exception.original)

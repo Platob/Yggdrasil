@@ -43,6 +43,7 @@ from yggdrasil.data.constants import (
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.parser import ParsedDataType
 from yggdrasil.data.enums import Mode
+from yggdrasil.exceptions import CastError
 from yggdrasil.lazy_imports import path_class, schema_class, pandas_module
 from yggdrasil.pickle.serde import ObjectSerde
 from .cast.registry import register_converter
@@ -2879,7 +2880,26 @@ class Field(BaseMetadata, BaseChildrenFields):
         if self.dtype.type_id == DataTypeId.OBJECT:
             return array
         options = get_cast_options_class().check(options=options, **more)
-        casted = self.dtype.cast_arrow_array(array, options=options.with_target(self))
+        scoped = options.with_target(self)
+        # Wrap any inner failure in CastError carrying the *current*
+        # field as the target.  Nested rebuilds (struct / list / map
+        # children, tabular per-column) all funnel through this method
+        # before they reach the dtype-level cast, so one wrap here gets
+        # us per-leaf context for every shape — without an explicit
+        # try/except at each nested call site.  An already-wrapped
+        # CastError (from a deeper leaf) propagates unchanged so the
+        # innermost failing field stays named.
+        try:
+            casted = self.dtype.cast_arrow_array(array, options=scoped)
+        except CastError:
+            raise
+        except Exception as exc:
+            raise CastError(
+                str(exc),
+                source_field=scoped.source_field,
+                target_field=self,
+                original=exc,
+            ) from exc
         return self.finalize_arrow_array(casted, default_scalar=default_scalar)
 
     def cast_arrow_tabular(
@@ -2891,9 +2911,25 @@ class Field(BaseMetadata, BaseChildrenFields):
         if self.dtype.type_id == DataTypeId.OBJECT:
             return table
         options = get_cast_options_class().check(options=options, **more)
-        casted = self.to_struct().dtype.cast_arrow_tabular(
-            table, options=options.with_target(self)
-        )
+        scoped = options.with_target(self)
+        # Same wrap shape as :meth:`cast_arrow_array` — covers a
+        # tabular-level failure that doesn't originate inside one of
+        # the per-column casts (schema-mismatch, missing column, etc.).
+        # Per-column failures already raise CastError from the inner
+        # ``cast_arrow_array`` wrap above; we re-raise those unchanged.
+        try:
+            casted = self.to_struct().dtype.cast_arrow_tabular(
+                table, options=scoped,
+            )
+        except CastError:
+            raise
+        except Exception as exc:
+            raise CastError(
+                str(exc),
+                source_field=scoped.source_field,
+                target_field=self,
+                original=exc,
+            ) from exc
         # Tabular finalize is identity — per-column finalize already
         # ran inside the struct walk. Kept for shape symmetry.
         return self.finalize_arrow(casted)
