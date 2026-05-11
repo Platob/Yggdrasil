@@ -42,6 +42,7 @@ Coverage:
 from __future__ import annotations
 
 import datetime as dt
+import os
 import time
 from pathlib import Path
 from typing import Any, Iterator
@@ -56,10 +57,13 @@ from yggdrasil.io.response import RESPONSE_SCHEMA, Response
 from yggdrasil.io.send_config import CacheConfig
 from yggdrasil.io.session import (
     Session,
+    _FAST_PATH_SEGMENT_MAX_BYTES,
     _combine_predicates,
+    _local_fast_path_relative,
     _lookup_local_responses,
     _request_body_hash_predicate,
     _request_match_by_predicate,
+    _safe_fast_path_segment,
 )
 
 from ._helpers import StubSession, make_request, make_response
@@ -90,7 +94,8 @@ def _wait_for_readable(cache: CacheConfig, *, timeout: float = 3.0) -> bool:
 
     Picks up both layouts the session writes through: the
     partitioned ``col=val/...`` tree (legacy bulk path) and the
-    flat per-``public_hash`` fast-path files at the cache root.
+    per-``public_hash`` fast-path files nested under the
+    URL-mirrored tree (``<METHOD>/<host>/<seg>/.../<hex>.arrow``).
     """
     from pathlib import Path as _P
 
@@ -110,7 +115,7 @@ def _wait_for_readable(cache: CacheConfig, *, timeout: float = 3.0) -> bool:
                 p.is_file()
                 and p.suffix == ".arrow"
                 and not p.name.startswith(".")
-                for p in root.iterdir()
+                for p in root.rglob("*.arrow")
             ):
                 return True
         except OSError:
@@ -242,6 +247,102 @@ class TestPredicateHelpers:
         expr = _request_body_hash_predicate([empty])
         assert expr is not None
         assert "isnull" in repr(expr).lower()
+
+
+# ---------------------------------------------------------------------------
+# Fast-path URL-mirrored layout (_local_fast_path_relative)
+# ---------------------------------------------------------------------------
+
+
+class TestFastPathLocalLayout:
+
+    def test_layout_mirrors_method_host_and_path(self) -> None:
+        req = make_request("https://api.example.com/v1/users/42", method="GET")
+        rel = _local_fast_path_relative(req.method, req.url, req.public_hash)
+        parts = rel.split(os.sep)
+        # Expected: GET / api.example.com / v1 / users / 42 / <16hex>.arrow
+        assert parts[:5] == ["GET", "api.example.com", "v1", "users", "42"]
+        assert parts[-1].endswith(".arrow")
+        assert len(parts[-1]) == len("0123456789abcdef.arrow")
+
+    def test_leaf_filename_is_public_hash_hex(self) -> None:
+        req = make_request("https://example.com/x")
+        rel = _local_fast_path_relative(req.method, req.url, req.public_hash)
+        leaf = rel.rsplit(os.sep, 1)[-1]
+        expected = f"{req.public_hash & 0xFFFFFFFFFFFFFFFF:016x}.arrow"
+        assert leaf == expected
+
+    def test_root_path_yields_method_and_host_only(self) -> None:
+        req = make_request("https://example.com/", method="POST")
+        rel = _local_fast_path_relative(req.method, req.url, req.public_hash)
+        parts = rel.split(os.sep)
+        # No real path segments between host and the .arrow leaf.
+        assert parts[0] == "POST"
+        assert parts[1] == "example.com"
+        assert parts[-1].endswith(".arrow")
+        assert len(parts) == 3
+
+    def test_distinct_paths_land_in_distinct_dirs(self) -> None:
+        a = make_request("https://example.com/api/users")
+        b = make_request("https://example.com/api/orders")
+        rel_a = _local_fast_path_relative(a.method, a.url, a.public_hash)
+        rel_b = _local_fast_path_relative(b.method, b.url, b.public_hash)
+        assert rel_a.rsplit(os.sep, 1)[0] != rel_b.rsplit(os.sep, 1)[0]
+
+    def test_same_path_different_query_share_dir_not_file(self) -> None:
+        a = make_request("https://example.com/api/items?id=1")
+        b = make_request("https://example.com/api/items?id=2")
+        rel_a = _local_fast_path_relative(a.method, a.url, a.public_hash)
+        rel_b = _local_fast_path_relative(b.method, b.url, b.public_hash)
+        # Same directory tree (URL path mirrors), distinct leaf files
+        # because public_hash mixes query string in.
+        assert rel_a.rsplit(os.sep, 1)[0] == rel_b.rsplit(os.sep, 1)[0]
+        assert rel_a != rel_b
+
+    def test_long_segment_is_hashed(self) -> None:
+        long_seg = "x" * 256
+        req = make_request(f"https://example.com/api/{long_seg}/end")
+        rel = _local_fast_path_relative(req.method, req.url, req.public_hash)
+        parts = rel.split(os.sep)
+        # The "api", "end", and method/host parts stay short; the rogue
+        # segment should be folded under the per-segment byte cap.
+        for p in parts:
+            assert len(p.encode("utf-8")) <= max(
+                _FAST_PATH_SEGMENT_MAX_BYTES, len("0123456789abcdef.arrow"),
+            )
+        # And the folded segment must still distinguish two long but
+        # different tokens at the same position.
+        other = make_request(f"https://example.com/api/{'y' * 256}/end")
+        rel_other = _local_fast_path_relative(
+            other.method, other.url, other.public_hash,
+        )
+        assert rel != rel_other
+
+    def test_unsafe_chars_are_replaced(self) -> None:
+        # Backslashes and reserved chars should never appear as path
+        # separators in the result — they must be sanitized.
+        out = _safe_fast_path_segment('a\\b:c*d?e"f<g>h|i')
+        assert "\\" not in out
+        assert ":" not in out
+        assert "*" not in out
+        assert "?" not in out
+        assert '"' not in out
+        assert "<" not in out
+        assert ">" not in out
+        assert "|" not in out
+
+    def test_empty_segment_normalizes_to_placeholder(self) -> None:
+        # ``""`` and ``"   "`` would otherwise produce an empty
+        # directory name; the helper has to fall back to a sentinel.
+        assert _safe_fast_path_segment("") == "_"
+        assert _safe_fast_path_segment("   ") in {"_", " "}  # rstrip→empty→"_"
+
+    def test_method_defaults_when_missing(self) -> None:
+        # Defensive: a request without an explicit method should still
+        # produce a valid relative path (the leaf hex tells uniqueness).
+        url = make_request("https://example.com/x").url
+        rel = _local_fast_path_relative(None, url, 0xDEADBEEF)
+        assert rel.split(os.sep)[0] == "GET"
 
 
 # ---------------------------------------------------------------------------

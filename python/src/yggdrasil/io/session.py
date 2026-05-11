@@ -6,6 +6,7 @@ import datetime as dt
 import itertools
 import logging
 import os
+import re
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -92,43 +93,111 @@ def _store_local_arrow_batch(
     )
 
 
-def _local_fast_path_filename(public_hash: int) -> str:
-    """Deterministic filename for the per-request fast-path cache entry.
+# Per-segment cap when mirroring URL paths into the on-disk fast-path
+# tree. Most filesystems allow 255 bytes per filename, but URL segments
+# can carry tokens (signed query payloads, opaque ids, base64 blobs)
+# that blow past that limit on their own. 80 bytes is a conservative
+# upper bound that still leaves plenty of headroom for the ``<hex>``
+# suffix appended when a segment has to be folded into its xxh3 digest.
+_FAST_PATH_SEGMENT_MAX_BYTES: int = 80
 
-    ``public_hash`` is the request's xxh3_64 over the anonymized
-    ``(method, url, headers, body)`` projection — strong enough to
-    stand in as the standalone cache key. Folded to its unsigned
-    16-hex form so the entry lands at ``<cache_root>/<hex>.arrow``
-    regardless of sign.
+# Filesystem-hostile chars in a single segment: NUL + control chars,
+# the path separators on every OS we ship to, and the Windows-reserved
+# set. Everything else (incl. unicode, ``.``, ``-``, ``_``, ``%``) is
+# kept as-is so an operator browsing the cache can read the URL back.
+_FAST_PATH_UNSAFE_RE = re.compile(r'[\x00-\x1f/\\:*?"<>|]+')
+
+
+def _safe_fast_path_segment(
+    seg: str, *, max_bytes: int = _FAST_PATH_SEGMENT_MAX_BYTES,
+) -> str:
+    """Sanitize one URL segment for use as a cache directory name.
+
+    Replaces NUL / control chars and the filesystem-reserved set with
+    a single ``_`` so the result is a legal directory entry on every
+    supported OS. When the sanitized segment's UTF-8 length exceeds
+    *max_bytes* the segment is folded to a short readable prefix plus
+    the xxh3_64 hex of the *original* token — the prefix stays human
+    grep-able while the digest restores uniqueness for the directory.
+    The leaf ``<public_hash>.arrow`` filename still carries the full
+    request identity, so collisions on a sanitized segment only group
+    sibling entries under the same parent, never overwrite them.
     """
-    return f"{public_hash & 0xFFFFFFFFFFFFFFFF:016x}.arrow"
+    import xxhash
+
+    if not seg:
+        return "_"
+    safe = _FAST_PATH_UNSAFE_RE.sub("_", seg).strip(" .")
+    if not safe:
+        safe = "_"
+    encoded = safe.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return safe
+    digest = xxhash.xxh3_64(seg.encode("utf-8")).hexdigest()  # 16 hex chars
+    # Reserve room for ``-<digest>``; clip on a byte boundary so we
+    # never split a multi-byte UTF-8 character mid-encoding.
+    head_budget = max_bytes - len(digest) - 1
+    if head_budget <= 0:
+        return digest
+    head = encoded[:head_budget].decode("utf-8", errors="ignore").rstrip(" .")
+    return f"{head}-{digest}" if head else digest
+
+
+def _local_fast_path_relative(
+    method: "str | None",
+    url: "URL | None",
+    public_hash: int,
+) -> str:
+    """Build the per-request fast-path file location under the cache root.
+
+    Mirrors the request's URL structure on disk — ``<METHOD>/<host>/<seg>/.../<hex>.arrow``
+    — so an operator can ``ls`` the cache tree and see which endpoints are
+    populated, while still keying the leaf file by the full request
+    ``public_hash`` (xxh3_64 over anonymized method+url+headers+body) so
+    requests that share a path but differ on query / body / headers
+    don't overwrite each other. Each directory segment is sanitized via
+    :func:`_safe_fast_path_segment`, which folds segments longer than
+    ``_FAST_PATH_SEGMENT_MAX_BYTES`` to ``<prefix>-<xxh3_64hex>`` so a
+    rogue token can't bust the 255-byte filename limit on any FS.
+    Returns a relative ``os.sep``-joined string so the fire-and-forget
+    :class:`Job` payload stays a plain string across worker boundaries.
+    """
+    parts: list[str] = [_safe_fast_path_segment((method or "GET").upper())]
+    if url is not None:
+        host = (url.host or "").lower()
+        if host:
+            parts.append(_safe_fast_path_segment(host))
+        for raw in (url.path or "").strip("/").split("/"):
+            if raw:
+                parts.append(_safe_fast_path_segment(raw))
+    parts.append(f"{public_hash & 0xFFFFFFFFFFFFFFFF:016x}.arrow")
+    return os.path.join(*parts)
 
 
 def _store_fast_path_arrow_batch(
     cache_root_str: str,
-    public_hash: int,
+    rel_path: str,
     batch: pa.RecordBatch,
 ) -> None:
-    """Persist *batch* to the per-request fast-path file straight under
-    *cache_root_str*.
+    """Persist *batch* to the per-request fast-path file under *cache_root_str*.
 
-    Bypasses :class:`FolderIO` entirely: one Arrow IPC stream per
-    request ``public_hash``, flat under the cache root. Tmp + atomic
-    ``os.replace`` keeps a partial write from being read mid-flush
-    by a concurrent fast-path reader. The cache root is passed as a
-    string so the fire-and-forget :class:`Job` pickles cheaply
-    across worker boundaries (no live Path / FolderIO state).
+    *rel_path* is the precomputed URL-mirrored location (see
+    :func:`_local_fast_path_relative`) — strings only, so the
+    fire-and-forget :class:`Job` pickles cheaply. Bypasses
+    :class:`FolderIO` entirely: one Arrow IPC stream per request
+    ``public_hash``, parent dirs created on demand. Tmp + atomic
+    ``os.replace`` keeps a partial write from being read mid-flush by
+    a concurrent fast-path reader.
     """
     import pathlib
 
-    root = pathlib.Path(cache_root_str)
+    final = pathlib.Path(cache_root_str) / rel_path
     try:
-        root.mkdir(parents=True, exist_ok=True)
+        final.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
         return
 
-    final = root / _local_fast_path_filename(public_hash)
-    tmp = root / f".{final.name}.{os.urandom(4).hex()}.tmp"
+    tmp = final.parent / f".{final.name}.{os.urandom(4).hex()}.tmp"
     try:
         sink = pa.BufferOutputStream()
         with pa.ipc.new_stream(sink, batch.schema) as writer:
@@ -143,9 +212,9 @@ def _store_fast_path_arrow_batch(
 
 
 def _read_fast_path_arrow_batch(
-    cache_root: Any, public_hash: int,
+    cache_root: Any, rel_path: str,
 ) -> "pa.RecordBatch | None":
-    """Read the per-request fast-path file written for *public_hash*.
+    """Read the per-request fast-path file at *rel_path* under *cache_root*.
 
     Returns ``None`` when the file is missing, empty, or otherwise
     unreadable so the caller can fall through to the bulk-lookup
@@ -154,10 +223,7 @@ def _read_fast_path_arrow_batch(
     """
     import pathlib
 
-    file_path = (
-        pathlib.Path(os.fspath(cache_root))
-        / _local_fast_path_filename(public_hash)
-    )
+    file_path = pathlib.Path(os.fspath(cache_root)) / rel_path
     try:
         payload = file_path.read_bytes()
     except OSError:
@@ -365,7 +431,8 @@ def _lookup_local_responses(
         if public_hash is None:
             remaining.append(req)
             continue
-        batch = _read_fast_path_arrow_batch(cache.path, public_hash)
+        rel_path = _local_fast_path_relative(req.method, req.url, public_hash)
+        batch = _read_fast_path_arrow_batch(cache.path, rel_path)
         if batch is None:
             remaining.append(req)
             continue
@@ -605,7 +672,10 @@ class Session(ABC):
         except Exception:
             public_hash = None
         if public_hash is not None:
-            batch = _read_fast_path_arrow_batch(cache.path, public_hash)
+            rel_path = _local_fast_path_relative(
+                request.method, request.url, public_hash,
+            )
+            batch = _read_fast_path_arrow_batch(cache.path, rel_path)
             if batch is not None:
                 for resp in Response.from_arrow_tabular(batch):
                     if not cache_cfg.filter_response(resp, request=request):
@@ -688,9 +758,14 @@ class Session(ABC):
         except Exception:
             public_hash = None
         if public_hash is not None:
+            rel_path = _local_fast_path_relative(
+                req.method if req is not None else None,
+                req.url if req is not None else None,
+                public_hash,
+            )
             Job.make(
                 _store_fast_path_arrow_batch,
-                os.fspath(cache.path), public_hash, batch,
+                os.fspath(cache.path), rel_path, batch,
             ).fire_and_forget()
             return
 

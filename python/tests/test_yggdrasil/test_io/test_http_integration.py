@@ -211,7 +211,8 @@ class TestLocalCacheIntegration:
         read until it succeeds with rows or the deadline passes.
         Picks up both layouts the session writes through: the
         partitioned ``col=val/...`` tree (legacy bulk path) and the
-        flat per-``public_hash`` fast-path files at the cache root.
+        per-``public_hash`` fast-path files nested under the
+        URL-mirrored tree (``<METHOD>/<host>/<seg>/.../<hex>.arrow``).
         """
         import time as _time
         from pathlib import Path as _P
@@ -232,7 +233,7 @@ class TestLocalCacheIntegration:
                     p.is_file()
                     and p.suffix == ".arrow"
                     and not p.name.startswith(".")
-                    for p in root.iterdir()
+                    for p in root.rglob("*.arrow")
                 ):
                     return True
             except OSError:
