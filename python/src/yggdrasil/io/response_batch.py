@@ -479,13 +479,12 @@ class ResponseBatch:
                     return True
         return False
 
-    @property
     def responses(self) -> list[Response]:
         """Flat list of every response, local → remote → new.
 
         Python mode only — raises if any holder is Spark-backed.
         """
-        return list(self)
+        return self.iter_responses()
 
     def iter_responses(self):
         for holder in self._holders():
