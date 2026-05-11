@@ -319,6 +319,99 @@ class TestCastBenchmarks(ArrowTestCase):
         report.add("widen inner.a int32->int64", ms)
         report.flush()
 
+    # -- list<item> -> struct<...> positional extraction ---------------
+
+    def test_list_to_struct_cast(self) -> None:
+        """``cast_arrow_list_array`` is the list -> struct positional
+        cast — used when the wider data plane lands a list-shaped column
+        that the target schema declares as a struct with N children.
+
+        The path was a per-row Python walk (``to_pylist`` + comprehension
+        per child). The vectorised replacement uses ``pc.take`` over the
+        flat values buffer with a ``list_value_length`` mask — pure C++
+        kernels, no Python crossings.
+
+        Numbers (compared to the legacy baseline below) measure the
+        gap; on a 250 k-row input the vectorised path is typically
+        an order of magnitude faster.
+        """
+        n = self.n_rows
+        # Build a list<int32> source of varying row lengths so the
+        # short-list mask actually has work to do.
+        rnd = random.Random(2)
+        lengths = [rnd.choice([1, 2, 3, 4]) for _ in range(n)]
+        flat = [rnd.randint(0, 1000) for _ in range(sum(lengths))]
+        # Punch a few null parents in so parent-null propagation
+        # actually fires in the benchmark.
+        offsets = [0]
+        for L in lengths:
+            offsets.append(offsets[-1] + L)
+        arr = pa.ListArray.from_arrays(
+            pa.array(offsets, type=pa.int32()),
+            pa.array(flat, type=pa.int32()),
+        )
+        # Null out every 53rd parent row.
+        mask = pa.array(
+            [i % 53 != 0 for i in range(n)], type=pa.bool_(),
+        )
+        arr = arr.filter(mask).cast(pa.list_(pa.field("item", pa.int32())))
+        # Note: filter shrinks length; rebuild a full-length array
+        # by re-padding via nulls. Simpler: build via pa.array(...)
+        # directly with explicit list-of-list-or-None.
+        arr_py: list[list[int] | None] = []
+        idx = 0
+        for j, L in enumerate(lengths):
+            if j % 53 == 0:
+                arr_py.append(None)
+            else:
+                arr_py.append(flat[idx:idx + L])
+            idx += L
+        arr = pa.array(
+            arr_py, type=pa.list_(pa.field("item", pa.int32())),
+        )
+
+        target_struct = pa.struct([
+            pa.field("c0", pa.int32()),
+            pa.field("c1", pa.int32()),
+            pa.field("c2", pa.int32()),
+        ])
+        src = Field.from_arrow(pa.field(
+            "x", pa.list_(pa.field("item", pa.int32())),
+        ))
+        tgt = Field.from_arrow(pa.field("x", target_struct))
+
+        report = _BenchReport(
+            f"list<int32> -> struct<c0,c1,c2> cast (n={self.n_rows}) — "
+            f"struct_arrow.py:cast_arrow_list_array"
+        )
+        ms, _ = _time_cast(
+            lambda: tgt.cast_arrow_array(arr, source_field=src),
+        )
+        report.add("vectorised (pc.take + offsets)   ", ms)
+
+        # Legacy path — preserved here in the benchmark so we can prove
+        # the speedup directly. Mirrors the previous implementation:
+        # ``to_pylist`` + per-row Python list comprehension per child.
+        def legacy_path() -> pa.StructArray:
+            values_py = arr.to_pylist()
+            children = []
+            target_fields = list(target_struct)
+            for i, _child in enumerate(target_fields):
+                extracted_py = [
+                    None if row is None or i >= len(row) else row[i]
+                    for row in values_py
+                ]
+                extracted = pa.array(extracted_py, type=pa.int32())
+                children.append(extracted)
+            return pa.StructArray.from_arrays(
+                children, fields=list(target_struct),
+                mask=arr.is_null(),
+            )
+
+        ms, _ = _time_cast(legacy_path)
+        report.add("legacy (to_pylist + Python comp) ", ms)
+        report.flush()
+
     # -- Databricks-style concat + cast --------------------------------
 
     def test_databricks_concat_then_cast_pattern(self) -> None:

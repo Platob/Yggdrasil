@@ -160,34 +160,114 @@ def cast_arrow_list_array(
     source_type: "ArrayType" = source_field.dtype
     target_type: "StructType" = options.target_field.dtype
 
-    values_py = array.to_pylist()
-    children: list[pa.Array] = []
+    target_children = target_type.children_fields
+    memory_pool = options.arrow_memory_pool
 
-    for i, target_child in enumerate(target_type.children_fields):
+    children: list[pa.Array] = _extract_list_positions(
+        array, len(target_children), memory_pool,
+    )
+
+    casted_children: list[pa.Array] = []
+    for target_child, extracted in zip(target_children, children):
+        casted_children.append(
+            target_child.cast_arrow_array(
+                extracted,
+                options=options.copy(
+                    source_field=source_type.item_field,
+                    target_field=target_child,
+                ),
+            )
+        )
+
+    return pa.StructArray.from_arrays(
+        casted_children,
+        fields=[f.to_arrow_field() for f in target_type.fields],
+        mask=array.is_null() if isinstance(array, pa.Array) else None,
+        memory_pool=memory_pool,
+    )
+
+
+def _extract_list_positions(
+    array: pa.Array,
+    num_positions: int,
+    memory_pool: "pa.MemoryPool | None",
+) -> list[pa.Array]:
+    """Extract positions ``0..num_positions-1`` from every row of *array*.
+
+    Vectorised path: for ``ListArray`` / ``LargeListArray`` we use the
+    flat ``values`` buffer + ``offsets`` to compute the absolute index
+    of each ``(row, position)`` cell, mask out positions that overflow
+    a row's actual length (or fall inside a null parent), and run a
+    single ``pc.take`` per position. No per-row Python crossings, no
+    ``to_pylist`` materialisation — see CLAUDE.md "Never loop over data
+    rows in Python."
+
+    ``FixedSizeListArray`` is the rare uniform-shape case; we use
+    ``pc.list_element`` for positions inside the fixed size and emit a
+    zero-or-null slot for positions beyond it.
+
+    Anything exotic (union-typed list, future Arrow list variant we
+    don't recognise) falls back to the legacy ``to_pylist`` walk.  Keep
+    that fallback comment honest: it stays slow precisely because it's
+    the long tail of shapes we don't expect on the hot path.
+    """
+    n = len(array)
+    if num_positions == 0:
+        return []
+
+    if isinstance(array, (pa.ListArray, pa.LargeListArray)):
+        offsets = array.offsets
+        # ``lengths`` is null where the parent row is null, so the
+        # ``pc.greater(lengths, i)`` mask below already encodes both
+        # "parent null" and "list shorter than i+1 items" in one pass.
+        lengths = pc.list_value_length(array)
+        # Absolute start of each row inside the flat values buffer.
+        # ``offsets`` has length n+1; we want the first n entries
+        # (start-of-row, not start-of-next-row).
+        starts = offsets.slice(0, n)
+        values = array.values
+
+        out: list[pa.Array] = []
+        for i in range(num_positions):
+            has_element = pc.greater(lengths, i)
+            flat_idx = pc.add(starts, i)
+            safe_idx = pc.if_else(has_element, flat_idx, None)
+            out.append(pc.take(values, safe_idx))
+        return out
+
+    if isinstance(array, pa.FixedSizeListArray):
+        list_size = array.type.list_size
+        out = []
+        for i in range(num_positions):
+            if i < list_size:
+                extracted = pc.list_element(array, i)
+                # ``list_element`` doesn't propagate parent nulls on
+                # FixedSizeListArray — apply the parent mask explicitly
+                # so a null parent stays null in the child.
+                if array.null_count > 0:
+                    extracted = pc.if_else(
+                        pc.is_valid(array), extracted, None,
+                    )
+                out.append(extracted)
+            else:
+                out.append(
+                    pa.nulls(n, type=array.type.value_type, memory_pool=memory_pool)
+                )
+        return out
+
+    # Long-tail fallback: unfamiliar list shape (custom subclass,
+    # future Arrow variant). Keep the original ``to_pylist`` walk so
+    # behaviour stays correct; the fast paths above cover everything
+    # we ship today.
+    values_py = array.to_pylist()
+    out = []
+    for i in range(num_positions):
         extracted_py = [
             None if row is None or i >= len(row) else row[i]
             for row in values_py
         ]
-        extracted = pa.array(
-            extracted_py,
-            memory_pool=options.arrow_memory_pool,
-        )
-
-        casted = target_child.cast_arrow_array(
-            extracted,
-            options=options.copy(
-                source_field=source_type.item_field,
-                target_field=target_child,
-            ),
-        )
-        children.append(casted)
-
-    return pa.StructArray.from_arrays(
-        children,
-        fields=[f.to_arrow_field() for f in target_type.fields],
-        mask=array.is_null() if isinstance(array, pa.Array) else None,
-        memory_pool=options.arrow_memory_pool,
-    )
+        out.append(pa.array(extracted_py, memory_pool=memory_pool))
+    return out
 
 
 def cast_arrow_tabular(
