@@ -107,10 +107,9 @@ def _wait_for_readable(cache: CacheConfig, *, timeout: float = 3.0) -> bool:
         try:
             root = _P(str(cache.tabular.path))
             if root.exists() and any(
-                p.is_file()
-                and p.suffix == ".arrow"
-                and not p.name.startswith(".")
-                for p in root.iterdir()
+                not any(part.startswith(".") for part in p.relative_to(root).parts)
+                for p in root.rglob("*.arrow")
+                if p.is_file()
             ):
                 return True
         except OSError:
