@@ -71,6 +71,18 @@ def _file_meta(size: int, mtime_ms: int = 0):
     )
 
 
+def _op_token(op) -> str:
+    """Normalize the *operation* argument the SDK was called with.
+
+    The production code passes either a :class:`VolumeOperation` enum
+    (when the SDK exposes one) or the literal string ``"READ_VOLUME"``
+    / ``"WRITE_VOLUME"`` (older SDK fallback). Tests compare against
+    the wire token; ``.value`` / ``.name`` collapse the enum, and a
+    bare string flows through unchanged.
+    """
+    return getattr(op, "value", None) or getattr(op, "name", None) or str(op)
+
+
 class TestConstruction:
 
     def test_legacy_posix_string(self, workspace, client) -> None:
@@ -591,12 +603,15 @@ class TestTemporaryCredentials:
         assert resp.aws_temp_credentials.access_key_id == "AKIA-test"
 
         # Call kwargs must include the volume_id from VolumeInfo plus
-        # the SDK enum (READ_VOLUME for read-only modes).
-        from databricks.sdk.service.catalog import VolumeOperation
+        # the operation token (READ_VOLUME for read-only modes).
+        # ``VolumeOperation`` isn't a stable import across SDK versions
+        # (older SDKs don't expose it at all), so compare against the
+        # wire token via ``.value`` / ``.name`` / str() instead of the
+        # enum identity.
         gen.assert_called_once()
         kwargs = gen.call_args.kwargs
         assert kwargs["volume_id"] == "vid-42"
-        assert kwargs["operation"] is VolumeOperation.READ_VOLUME
+        assert _op_token(kwargs["operation"]) == "READ_VOLUME"
 
     def test_write_operation_maps_to_write_volume(self, workspace, client) -> None:
         workspace.volumes.read.return_value = _volume_info()
@@ -605,8 +620,7 @@ class TestTemporaryCredentials:
         p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
         p.temporary_credentials(operation="overwrite")
 
-        from databricks.sdk.service.catalog import VolumeOperation
-        assert gen.call_args.kwargs["operation"] is VolumeOperation.WRITE_VOLUME
+        assert _op_token(gen.call_args.kwargs["operation"]) == "WRITE_VOLUME"
 
     def test_missing_volume_id_raises(self, workspace, client) -> None:
         workspace.volumes.read.return_value = _volume_info(volume_id=None)
