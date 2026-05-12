@@ -53,6 +53,20 @@ TS = TypeVar("TS", bound="DatabricksService")
 _ALLOWED = re.compile(r"^[\d \w\+\-=\.:/@]*$")  # noqa
 _SANITIZE = re.compile(r"[^\d \w\+\-=\.:/@]+")  # noqa
 
+# Cache the collapse-repeats regex per ``repl`` so ``safe_tag_value`` doesn't
+# pay ``re.escape`` + ``re.compile`` on every dirty input. Real workloads only
+# ever pass the default ``"-"``, but keep the mapping general for the rare
+# caller that overrides it.
+_SAFE_TAG_COLLAPSE_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def _safe_tag_collapse(repl: str) -> re.Pattern[str]:
+    pattern = _SAFE_TAG_COLLAPSE_CACHE.get(repl)
+    if pattern is None:
+        pattern = re.compile(re.escape(repl) + r"{2,}")
+        _SAFE_TAG_COLLAPSE_CACHE[repl] = pattern
+    return pattern
+
 
 def getenv(name: str) -> Optional[str]:
     v = os.getenv(name)
@@ -349,15 +363,7 @@ class DatabricksClient(URLBased):
         URL); defaults to :attr:`Scheme.DATABRICKS`.
         """
         query: dict[str, Any] = {}
-        keys = [
-            f.name
-            for f in fields(self)
-            if f.init and f.name not in (
-                "host", "token", "client_id", "client_secret"
-            )
-        ]
-
-        for key in keys:
+        for key in _TO_URL_QUERY_KEYS:
             value = getattr(self, key)
             if value is not None:
                 query[key] = value
@@ -904,7 +910,7 @@ class DatabricksClient(URLBased):
 
         # collapse repeated repl and trim edges
         if repl:
-            s = re.sub(re.escape(repl) + r"{2,}", repl, s).strip(repl + " ")
+            s = _safe_tag_collapse(repl).sub(repl, s).strip(repl + " ")
 
         return s
 
@@ -1275,6 +1281,13 @@ class DatabricksClient(URLBased):
 
 
 DATABRICKS_CLIENT_INIT_NAMES = frozenset(f.name for f in fields(DatabricksClient) if f.init)
+# Fields that ``to_url`` emits as query items: every init field except the
+# credentials / host that already ride in the URL host + userinfo. Computed
+# once at import so the hot path doesn't walk ``fields(self)`` per call.
+_TO_URL_QUERY_KEYS: tuple[str, ...] = tuple(
+    name for name in (f.name for f in fields(DatabricksClient) if f.init)
+    if name not in ("host", "token", "client_id", "client_secret")
+)
 CHECKED_TMP_WORKSPACES: ExpiringDict[str, set[str]] = ExpiringDict()
 
 
@@ -1282,7 +1295,10 @@ def is_checked_tmp_path(host: str, base_path: str):
     existing = CHECKED_TMP_WORKSPACES.get(host)
 
     if existing is None:
-        CHECKED_TMP_WORKSPACES[host] = set(base_path)
+        # Seed with the path itself — ``set(base_path)`` would iterate the
+        # string into a set of characters, defeating the cache and forcing
+        # every other call to re-walk the Volumes listing.
+        CHECKED_TMP_WORKSPACES[host] = {base_path}
         return False
 
     if base_path in existing:
