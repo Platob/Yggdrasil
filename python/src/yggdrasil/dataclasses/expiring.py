@@ -398,6 +398,22 @@ class ExpiringDict(Generic[K, V]):
     ``copy.deepcopy``, and ``joblib``.
     """
 
+    # ``ExpiringDict`` is the cache primitive behind every Databricks
+    # SDK / MSAL singleton in the codebase, so per-call overhead on the
+    # hot path matters. Slots cut the per-attribute __dict__ lookup
+    # (``self._store`` etc.) down to a slot descriptor read, which
+    # shows up as a measurable shave on ``get`` / ``set``.
+    __slots__ = (
+        "_default_ttl_ns",
+        "_max_size",
+        "_refresher",
+        "_on_evict",
+        "_store",
+        "_lock",
+        "_last_purge_ns",
+        "_purge_pending",
+    )
+
     # ── construction ─────────────────────────────────────────
 
     def __init__(
@@ -608,10 +624,30 @@ class ExpiringDict(Generic[K, V]):
         Fires ``on_evict`` for any entry that was capacity-evicted to
         make room or whose key got overwritten.
         """
+        # Fast-path the dominant call shape: default-TTL set on a cache
+        # without ``on_evict`` or ``max_size``. That covers every
+        # singleton-style cache (MSAL, Databricks SDK ``_INSTANCES``)
+        # and the vast majority of warehouse / catalog caches that
+        # don't bound their size. Skipping ``_expires_at_ns`` /
+        # ``_put_locked`` / ``_notify_evicted`` overhead saves a
+        # function call + an empty-list allocation on every set.
+        default_ttl_ns = self._default_ttl_ns
+        if (
+            ttl is ...
+            and self._on_evict is None
+            and self._max_size is None
+        ):
+            exp = None if default_ttl_ns is None else now_utc_ns() + default_ttl_ns
+            with self._lock:
+                self._store[key] = (value, exp)
+            if default_ttl_ns is not None:
+                self._maybe_schedule_purge()
+            return
         exp = self._expires_at_ns(ttl)
         with self._lock:
             evicted = self._put_locked(key, value, exp)
-        self._notify_evicted(evicted)
+        if evicted:
+            self._notify_evicted(evicted)
         self._maybe_schedule_purge()
 
     def __setitem__(self, key: K, value: V) -> None:
@@ -619,15 +655,39 @@ class ExpiringDict(Generic[K, V]):
 
     def get(self, key: K, default: Any = None) -> Optional[V]:
         """Return value for *key*, or *default* if missing / expired."""
-        # Hot-path fast return — keep the body small enough that the
-        # bytecode interpreter doesn't have to walk evict/refresher
-        # branches on every cache hit. The full eviction + refresher
-        # path stays below in the slow branch.
+        # Lock-free hot path. ``dict.get`` is a single C call, atomic
+        # under the CPython GIL, and the tuple it returns is immutable
+        # — so a concurrent eviction either lands before our read (we
+        # see ``None``) or after (we see the soon-to-be-evicted value,
+        # same outcome a barely-earlier reader would see). For caches
+        # where a stale-by-a-microsecond read is fine (Databricks SDK
+        # warehouse / table catalogs, MSAL singletons, the rest), this
+        # collapses get-hit cost to one dict lookup + one wall-clock
+        # read, no ``RLock`` traffic.
+        entry = self._store.get(key)
+        default_ttl_ns = self._default_ttl_ns
+        if entry is not None:
+            value, expires_at = entry
+            if expires_at is None or now_utc_ns() < expires_at:
+                if default_ttl_ns is not None:
+                    self._maybe_schedule_purge()
+                return value
+        elif self._refresher is None:
+            # Miss without a refresher to repopulate — no lock needed.
+            # Subsequent ``set`` from another thread is fine: a future
+            # ``get`` will see it via the same lock-free read.
+            if default_ttl_ns is not None:
+                self._maybe_schedule_purge()
+            return default
+
+        # Slow path — expired entry, or miss with a refresher to invoke.
+        # Take the lock and re-check so a concurrent ``set`` between
+        # the lock-free read above and the lock acquire below isn't
+        # dropped on the floor (refresher writers also race here).
         with self._lock:
             entry = self._store.get(key)
             if entry is None:
-                # Miss — no purge needed if there's nothing to expire.
-                if self._default_ttl_ns is not None:
+                if default_ttl_ns is not None:
                     self._maybe_schedule_purge()
                 if self._refresher is None:
                     return default
@@ -635,14 +695,8 @@ class ExpiringDict(Generic[K, V]):
                 evicted: List[Tuple[K, V]] = []
             else:
                 value, expires_at = entry
-                # Inline ``_is_expired`` so the no-TTL path
-                # (``expires_at is None``) is one branch + one return,
-                # without an extra method call.
                 if expires_at is None or now_utc_ns() < expires_at:
-                    # Hot path. Purge scheduling only matters when
-                    # entries can expire; skip the wall-clock read
-                    # entirely for non-expiring stores.
-                    if self._default_ttl_ns is not None:
+                    if default_ttl_ns is not None:
                         self._maybe_schedule_purge()
                     return value
                 # Expired — drop, set up the eviction-callback
@@ -651,9 +705,9 @@ class ExpiringDict(Generic[K, V]):
                 evicted = [(key, value)]
                 refresher_key = key
 
-        result = default
         # Fire the eviction callback for the expired-on-read drop, if any.
-        self._notify_evicted(evicted)
+        if evicted:
+            self._notify_evicted(evicted)
 
         # Check purge interval on every get (lock-free fast path)
         self._maybe_schedule_purge()
@@ -670,12 +724,23 @@ class ExpiringDict(Generic[K, V]):
                 exp = created + rr.ttl_ns
             with self._lock:
                 evicted = self._put_locked(refresher_key, rr.value, exp)
-            self._notify_evicted(evicted)
+            if evicted:
+                self._notify_evicted(evicted)
             return rr.value
 
-        return result
+        return default
 
     def __getitem__(self, key: K) -> V:
+        # Inlined version of ``get(key, ...)`` so the dunder doesn't
+        # pay an extra Python frame on every ``cache[key]`` access.
+        # Same lock-free fast path as ``get``.
+        entry = self._store.get(key)
+        if entry is not None:
+            value, expires_at = entry
+            if expires_at is None or now_utc_ns() < expires_at:
+                if self._default_ttl_ns is not None:
+                    self._maybe_schedule_purge()
+                return value
         val = self.get(key, ...)
         if val is ...:
             raise KeyError(key)
@@ -707,7 +772,15 @@ class ExpiringDict(Generic[K, V]):
         return value
 
     def __contains__(self, key: object) -> bool:
-        return self.get(key, ...) is not ...  # type: ignore[arg-type]
+        # Lock-free fast path mirroring ``get`` — avoids the extra
+        # Python call into ``get`` and the sentinel comparison on every
+        # ``key in cache`` test (used heavily by SDK schema/table
+        # negative-lookup paths).
+        entry = self._store.get(key)  # type: ignore[arg-type]
+        if entry is None:
+            return False
+        _, expires_at = entry
+        return expires_at is None or now_utc_ns() < expires_at
 
     def __len__(self) -> int:
         with self._lock:
@@ -966,6 +1039,17 @@ class ExpiringDict(Generic[K, V]):
         Fires ``on_evict`` if a previously-stored expired entry got
         replaced — the old value is leaving the cache.
         """
+        # Lock-free fast path for the hit case — same rationale as
+        # ``get``. ``get_or_set`` is the workhorse of every "build it
+        # once, cache it forever" pattern (Databricks SDK schema /
+        # table / catalog caches), so the hit case dominates by orders
+        # of magnitude over the miss case.
+        entry = self._store.get(key)
+        if entry is not None:
+            value, expires_at = entry
+            if expires_at is None or now_utc_ns() < expires_at:
+                return value
+
         evicted: List[Tuple[K, V]] = []
         with self._lock:
             entry = self._store.get(key)
@@ -979,7 +1063,8 @@ class ExpiringDict(Generic[K, V]):
             value = default() if callable(default) else default
             exp = self._expires_at_ns(ttl)
             evicted.extend(self._put_locked(key, value, exp))
-        self._notify_evicted(evicted)
+        if evicted:
+            self._notify_evicted(evicted)
         self._maybe_schedule_purge()
         return value
 

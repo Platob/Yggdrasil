@@ -38,6 +38,12 @@ from yggdrasil.data.types.primitive import (
 )
 from yggdrasil.data.types.nested import StructType
 
+try:
+    import polars as pl
+    HAS_POLARS = True
+except ImportError:  # pragma: no cover - bench-only optional path
+    HAS_POLARS = False
+
 
 # ---------------------------------------------------------------------------
 # Shared fixtures.
@@ -333,6 +339,96 @@ def scenarios(repeat: int) -> list[dict]:
         lambda: F_STRUCT.copy(),
         repeat=repeat, inner=2_000,
     ))
+
+    # Polars projections — optional, skipped without polars installed.
+    # Mirrors the Arrow scenarios above so the construction / from-* /
+    # to-* / round-trip costs stay visible per engine.
+    if HAS_POLARS:
+        # Warm caches once before the timing loop — to_polars_field /
+        # to_polars_schema cache the polars output on the Field, so the
+        # production cost after the first call is what we measure.
+        F_FLAT.to_polars_field()
+        F_STRUCT.to_polars_field()
+        F_STRUCT.to_polars_schema()
+        results.append(_time_one(
+            "to_polars_field: F_FLAT (warm cache)",
+            lambda: F_FLAT.to_polars_field(),
+            repeat=repeat, inner=500_000,
+        ))
+        results.append(_time_one(
+            "to_polars_field: F_STRUCT (warm cache)",
+            lambda: F_STRUCT.to_polars_field(),
+            repeat=repeat, inner=500_000,
+        ))
+        results.append(_time_one(
+            "to_polars_schema: F_STRUCT (warm cache)",
+            lambda: F_STRUCT.to_polars_schema(),
+            repeat=repeat, inner=500_000,
+        ))
+        # Cold projection — common in pipelines that build fields
+        # per-batch (e.g. polars LazyFrame schema collection).
+        results.append(_time_one(
+            "to_polars_field: fresh Field (cold)",
+            lambda: Field(
+                "id", INT_DT, nullable=False
+            ).to_polars_field(),
+            repeat=repeat, inner=10_000,
+        ))
+        results.append(_time_one(
+            "to_polars_schema: fresh struct Field (cold)",
+            lambda: Field("row", STRUCT_DT).to_polars_schema(),
+            repeat=repeat, inner=2_000,
+        ))
+
+        # from_polars_* — Polars Field / Schema / Series → Field.
+        PL_SCHEMA = F_STRUCT.to_polars_schema()
+        PL_FIELD_FLAT = pl.Field("id", pl.Int64())
+        PL_SERIES_INT = pl.Series("id", [1, 2, 3], dtype=pl.Int64)
+        PL_SERIES_STR = pl.Series("name", ["a", "b", None], dtype=pl.Utf8)
+
+        results.append(_time_one(
+            "from_polars_field: pl.Field (flat)",
+            lambda: Field.from_polars_field(PL_FIELD_FLAT),
+            repeat=repeat, inner=10_000,
+        ))
+        results.append(_time_one(
+            "from_polars_schema: pl.Schema (struct)",
+            lambda: Field.from_polars_schema(PL_SCHEMA),
+            repeat=repeat, inner=2_000,
+        ))
+        results.append(_time_one(
+            "from_polars_series: pl.Series (int)",
+            lambda: Field.from_polars_series(PL_SERIES_INT),
+            repeat=repeat, inner=20_000,
+        ))
+        results.append(_time_one(
+            "from_polars_series: pl.Series (str w/ nulls)",
+            lambda: Field.from_polars_series(PL_SERIES_STR),
+            repeat=repeat, inner=20_000,
+        ))
+        results.append(_time_one(
+            "from_polars: pl.Schema (dispatched)",
+            lambda: Field.from_polars(PL_SCHEMA),
+            repeat=repeat, inner=2_000,
+        ))
+        results.append(_time_one(
+            "from_polars: pl.Series (dispatched)",
+            lambda: Field.from_polars(PL_SERIES_INT),
+            repeat=repeat, inner=10_000,
+        ))
+        results.append(_time_one(
+            "from_any: pl.Schema (cross-engine dispatch)",
+            lambda: Field.from_any(PL_SCHEMA),
+            repeat=repeat, inner=2_000,
+        ))
+
+        # as_polars — same-shape no-op when dtype is already
+        # polars-compatible (the common case for primitive fields).
+        results.append(_time_one(
+            "as_polars: F_FLAT (already polars-compatible)",
+            lambda: F_FLAT.as_polars(),
+            repeat=repeat, inner=200_000,
+        ))
 
     # Dict / repr / pretty_format.
     results.append(_time_one(

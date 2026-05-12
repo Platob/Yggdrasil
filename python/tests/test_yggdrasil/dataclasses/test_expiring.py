@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 from yggdrasil.dataclasses.expiring import (
     Expiring, ExpiringDict, RefreshResult,
@@ -395,18 +396,22 @@ class TestEDPurgeScheduling(unittest.TestCase):
         """`_purge_pending` becomes True when a background purge is claimed."""
         d = ExpiringDict(default_ttl=10.0)
         d._last_purge_ns = now_utc_ns() - self._PURGE_NS - 1
-        # Prevent the Job from actually firing so we can inspect _purge_pending
-        original = d._background_purge
+        # Prevent the Job from actually firing so we can inspect _purge_pending.
+        # ``ExpiringDict`` carries ``__slots__`` (so the cache primitive
+        # itself stays cheap), which means per-instance method monkey-
+        # patching is rejected — patch the class-level descriptor and
+        # bind back to the instance inside the stub.
+        original = ExpiringDict._background_purge
         fired = []
-        def stub():
+        def stub(self_):
             fired.append(1)
-            original()
-        d._background_purge = stub
-        d._maybe_schedule_purge()
-        # Immediately after claiming: pending is True (may flip False quickly)
-        # After stub runs: pending goes back to False
-        time.sleep(0.15)
-        self.assertFalse(d._purge_pending)   # background thread clears it
+            original(self_)
+        with mock.patch.object(ExpiringDict, "_background_purge", stub):
+            d._maybe_schedule_purge()
+            # Immediately after claiming: pending is True (may flip False quickly)
+            # After stub runs: pending goes back to False
+            time.sleep(0.15)
+            self.assertFalse(d._purge_pending)   # background thread clears it
         self.assertEqual(len(fired), 1)
 
     def test_maybe_schedule_purge_no_double_fire(self):
@@ -415,20 +420,20 @@ class TestEDPurgeScheduling(unittest.TestCase):
         d._last_purge_ns = now_utc_ns() - self._PURGE_NS - 1
 
         fire_count = []
-        original = d._background_purge
+        original = ExpiringDict._background_purge
         lock = threading.Lock()
-        def counting_purge():
+        def counting_purge(self_):
             with lock:
                 fire_count.append(1)
-            original()
-        d._background_purge = counting_purge
+            original(self_)
 
-        threads = [threading.Thread(target=d._maybe_schedule_purge) for _ in range(30)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        time.sleep(0.2)  # let background daemon finish
+        with mock.patch.object(ExpiringDict, "_background_purge", counting_purge):
+            threads = [threading.Thread(target=d._maybe_schedule_purge) for _ in range(30)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            time.sleep(0.2)  # let background daemon finish
 
         self.assertEqual(sum(fire_count), 1,
                          "_background_purge must fire exactly once")
