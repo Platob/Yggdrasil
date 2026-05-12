@@ -105,3 +105,59 @@ class TestDefaultPandasSeries:
 
         assert len(series) == 3
         assert series.isna().all()
+
+
+class TestPandasListViewBridge:
+    """Pandas accepts list_view via ``Array.to_pandas`` (it surfaces as
+    an object Series of numpy arrays). The arrow-backed cast pipeline
+    routes the same list_view → list normalisation we apply on the
+    Arrow side, so the cast survives and the resulting Series is
+    drop-in usable.
+    """
+
+    def test_list_view_struct_arrow_to_pandas_round_trip(self) -> None:
+        import pyarrow as pa
+        from yggdrasil.data.data_field import Field as F
+        from yggdrasil.data.types.nested import StructType
+        from yggdrasil.data.types.nested.array import cast_arrow_list_array
+        from yggdrasil.data.types.primitive import IntegerType, StringType as ST
+
+        items_per_row, rows = 12, 16
+        struct_t = pa.struct([
+            ("id", pa.int64()), ("name", pa.string()),
+            ("amt", pa.float64()),
+        ])
+        payload = [
+            None if (r % 5 == 0) else [
+                {"id": r * items_per_row + k, "name": f"r{r}-k{k}", "amt": 1.0 * k}
+                for k in range(items_per_row)
+            ]
+            for r in range(rows)
+        ]
+        src_view = pa.array(payload, type=pa.list_view(struct_t))
+
+        # 1) Cast list_view -> list (so pandas can consume it).
+        list_target = F(
+            "rows",
+            ArrayType.from_item(F(
+                "item",
+                StructType(fields=(
+                    F("id", IntegerType(byte_size=4, signed=True)),
+                    F("name", ST()),
+                    F("amt", IntegerType(byte_size=8, signed=True)),
+                )),
+            )),
+        )
+        as_list = cast_arrow_list_array(
+            src_view, CastOptions(target=list_target),
+        )
+
+        # 2) pandas materialises list cells as object/numpy values; we
+        #    only need the cell shape + sentinel-null contract to hold.
+        series = as_list.to_pandas()
+        assert len(series) == rows
+        assert series.iloc[0] is None
+        cell = series.iloc[1]
+        assert len(cell) == items_per_row
+        assert cell[0]["id"] == 1 * items_per_row + 0
+        assert cell[0]["name"] == "r1-k0"
