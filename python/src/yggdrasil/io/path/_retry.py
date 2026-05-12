@@ -180,13 +180,12 @@ def retry_sdk_call(
             if is_transient(exc):
                 if transient_attempt >= max_transient_retries:
                     raise
-                wait = base_sleep * (2 ** transient_attempt)
                 LOGGER.info(
                     "Transient error from %s (attempt %d/%d); sleeping %.1fs: %s",
                     getattr(func, "__name__", func),
-                    transient_attempt + 1, max_transient_retries, wait, exc,
+                    transient_attempt + 1, max_transient_retries, base_sleep, exc,
                 )
-                sleep(wait)
+                sleep(base_sleep)
                 transient_attempt += 1
                 continue
             raise

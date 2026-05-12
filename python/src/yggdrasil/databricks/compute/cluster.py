@@ -176,7 +176,7 @@ class Cluster(DatabricksResource):
             object.__setattr__(self, "_details", found._details)
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(url={self.url()})"
+        return f"{self.__class__.__name__}({self.url()!r})"
 
     def __str__(self) -> str:
         return self.url().to_string()

@@ -710,7 +710,7 @@ class VolumePath(DatabricksPath):
         except Exception as exc:
             if not exist_ok and _looks_like_already_exists(exc):
                 raise
-        self._invalidate_stat_cache()
+        self._seed_stat_cache(IOStats(kind=IOKind.DIRECTORY))
 
     def _remove_file(self, missing_ok: bool = True) -> None:
         try:
@@ -743,11 +743,22 @@ class VolumePath(DatabricksPath):
             if _looks_like_not_found(exc):
                 raise FileNotFoundError(self.full_path()) from exc
             raise
+
         body = getattr(response, "contents", None) or response
         try:
             data = body.read()
         except AttributeError:
             data = bytes(body)
+
+        if not self._stat_cached:
+            self._seed_stat_cache(stats=IOStats(
+                size=len(data),
+                kind=IOKind.FILE,
+                mtime=_mtime(getattr(response, "last_modified_time", None)),
+            ))
+        else:
+            self._stat_cached.size = len(data)
+
         if pos:
             data = data[pos:]
         if n > 0:
@@ -783,7 +794,11 @@ class VolumePath(DatabricksPath):
             contents=_stdio.BytesIO(payload),
             overwrite=True,
         )
-        self._invalidate_stat_cache()
+        self._seed_stat_cache(IOStats(
+            size=len(payload),
+            kind=IOKind.FILE,
+            mtime=time.time(),
+        ))
 
     def truncate(self, n: int) -> int:
         if n < 0:

@@ -32,7 +32,7 @@ class SQLError(DatabricksError):
         )
 
     def __repr__(self):
-        return f"SqlStatementError(url={self.url!r}, message={self.message!r})"
+        return f"SqlStatementError({self.url!r}, message={self.message!r})"
 
     @classmethod
     def from_statement(cls, stmt: "StatementResult") -> "SQLError":

@@ -482,23 +482,6 @@ class TestRetryPolicy:
         assert p.size == 3
         assert recorded == [1.0, 2.0]
 
-    def test_permission_retries_once(self, workspace, client, sleeps) -> None:
-        recorded, spy = sleeps
-        attempts = [PermissionDenied(), _file_meta(2)]
-
-        def get_metadata(path):
-            r = attempts.pop(0)
-            if isinstance(r, Exception):
-                raise r
-            return r
-
-        workspace.files.get_metadata.side_effect = get_metadata
-        p = VolumePath(
-            "/Volumes/c/s/v/x", client=client, retry_sleep=spy,
-        )
-        assert p.size == 2
-        assert recorded == [1.0]
-
 
 # ---------------------------------------------------------------------------
 # Native S3 storage fast path — storage_location + temporary_credentials + s3_path

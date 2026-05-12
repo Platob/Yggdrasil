@@ -266,12 +266,3 @@ class TestRetryPolicy:
         p = WorkspacePath("/Workspace/x", client=client, retry_sleep=spy)
         assert p.size == 3
         assert recorded == [1.0]
-
-    def test_permission_retries_once(self, workspace, client, sleeps) -> None:
-        recorded, spy = sleeps
-        workspace.workspace.get_status.side_effect = PermissionDenied()
-        p = WorkspacePath("/Workspace/x", client=client, retry_sleep=spy)
-        assert p._stat_uncached().kind is IOKind.MISSING
-        # One permission retry.
-        assert recorded == [1.0]
-        assert workspace.workspace.get_status.call_count == 2

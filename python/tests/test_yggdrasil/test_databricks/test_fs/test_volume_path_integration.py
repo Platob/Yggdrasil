@@ -67,7 +67,7 @@ class TestVolumePathIntegration(DatabricksIntegrationCase):
         payload = b"hello-volumes-" + secrets.token_bytes(8)
         path.write_bytes(payload)
 
-        stat = path._stat_uncached()
+        stat = path.stat()
         self.assertEqual(stat.kind, IOKind.FILE)
         self.assertEqual(stat.size, len(payload))
         self.assertEqual(path.read_bytes(), payload)

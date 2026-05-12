@@ -42,7 +42,9 @@ class RemotePath(Path):
     else (predicate pins, stat caching) is inherited from this base.
     """
 
-    __slots__ = ()
+    __slots__ = (
+        "_stat_cached"
+    )
 
     #: Process-wide cache shared across every :class:`RemotePath`
     #: subclass. URL is canonical and unique across schemes, so
@@ -54,6 +56,10 @@ class RemotePath(Path):
         default_ttl=30.0,
         max_size=4096,
     )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._stat_cached: IOStats | None = None
 
     # ------------------------------------------------------------------
     # Backing-shape predicates
@@ -82,6 +88,9 @@ class RemotePath(Path):
         delegates to :meth:`_stat_uncached` and caches the result.
         Subclasses override :meth:`_stat_uncached`, never this.
         """
+        if self._stat_cached is not None:
+            return self._stat_cached
+
         key = str(self.url)
         hit = self._STAT_CACHE.get(key)
         if hit is not None:
@@ -96,6 +105,7 @@ class RemotePath(Path):
 
     def _invalidate_stat_cache(self) -> None:
         """Drop this path's cached entry. Call after writes / deletes."""
+        self._stat_cached = None
         self._STAT_CACHE.pop(str(self.url), None)
 
     # ------------------------------------------------------------------
@@ -124,4 +134,5 @@ class RemotePath(Path):
         Databricks ``dbutils.fs.ls`` returns size). The next
         :meth:`_stat` call on the warmed path is a local hit.
         """
+        self._stat_cached = stats
         self._STAT_CACHE.set(str(self.url), stats)

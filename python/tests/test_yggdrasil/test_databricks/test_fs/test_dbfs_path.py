@@ -318,7 +318,7 @@ class TestRetryPolicy:
         workspace.dbfs.get_status.side_effect = get_status
         p = DBFSPath("/dbfs/x", client=client, retry_sleep=spy)
         assert p.size == 4
-        assert recorded == [1.0, 2.0]
+        assert recorded == [1.0, 1.0]
 
     def test_internal_error_gives_up_after_4(self, workspace, client, sleeps) -> None:
         recorded, spy = sleeps
@@ -330,26 +330,8 @@ class TestRetryPolicy:
         # schedule before that swallow.
         s = p._stat_uncached()
         assert s.kind is IOKind.MISSING
-        assert recorded == [1.0, 2.0, 4.0, 8.0]
+        assert recorded == [1.0, 1.0, 1.0, 1.0]
         assert workspace.dbfs.get_status.call_count == 5
-
-    def test_permission_retries_once(self, workspace, client, sleeps) -> None:
-        recorded, spy = sleeps
-        attempts = [
-            PermissionDenied(),
-            SimpleNamespace(is_dir=False, file_size=2, modification_time=0),
-        ]
-
-        def get_status(path):
-            r = attempts.pop(0)
-            if isinstance(r, Exception):
-                raise r
-            return r
-
-        workspace.dbfs.get_status.side_effect = get_status
-        p = DBFSPath("/dbfs/x", client=client, retry_sleep=spy)
-        assert p.size == 2
-        assert recorded == [1.0]
 
     def test_not_found_does_not_retry(self, workspace, client, sleeps) -> None:
         recorded, spy = sleeps

@@ -778,7 +778,7 @@ class WarehouseStatementResult(StatementResult):
 
     def __repr__(self) -> str:
         if self.started:
-            return f"WarehouseStatementResult(url='{self.monitoring_url}')"
+            return f"WarehouseStatementResult({self.monitoring_url!r})"
         return f"WarehouseStatementResult(text={self.statement.text!r})"
 
     def __str__(self) -> str:
