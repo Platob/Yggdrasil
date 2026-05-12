@@ -31,9 +31,9 @@ def table() -> pa.Table:
 @pytest.fixture(autouse=True)
 def reset_remote_stat_cache():
     from yggdrasil.io.path.remote_path import RemotePath
-    RemotePath._STAT_CACHE.clear()
+    RemotePath._INSTANCES.clear()
     yield
-    RemotePath._STAT_CACHE.clear()
+    RemotePath._INSTANCES.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -264,10 +264,10 @@ class TestParquetOverDBFS:
         ParquetIO(holder=dbfs, owns_holder=False).write_arrow_table(table)
         assert store["buf"].startswith(b"PAR1")
 
-        # Stat cache is invalidated by the write; the reader's first
-        # head call sees the freshly committed size.
-        from yggdrasil.io.path.remote_path import RemotePath
-        RemotePath._STAT_CACHE.clear()
+        # Drop the post-write stat cache so the reader's first probe
+        # exercises the real ``get_status`` path against the freshly
+        # committed buffer.
+        dbfs._invalidate_stat_cache()
         loaded = ParquetIO(holder=dbfs, owns_holder=False).read_arrow_table()
         assert loaded.equals(table)
 
@@ -285,8 +285,7 @@ class TestCsvOverDBFS:
         dbfs = DBFSPath("/dbfs/data.csv", workspace=ws)
 
         CsvIO(holder=dbfs, owns_holder=False).write_arrow_table(table)
-        from yggdrasil.io.path.remote_path import RemotePath
-        RemotePath._STAT_CACHE.clear()
+        dbfs._invalidate_stat_cache()
         loaded = CsvIO(holder=dbfs, owns_holder=False).read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2, 3]
 
@@ -327,7 +326,6 @@ class TestArrowIPCOverVolume:
 
         vol = VolumePath("/Volumes/c/s/v/data.arrow", workspace=ws)
         ArrowIPCIO(holder=vol, owns_holder=False).write_arrow_table(table)
-        from yggdrasil.io.path.remote_path import RemotePath
-        RemotePath._STAT_CACHE.clear()
+        vol._invalidate_stat_cache()
         loaded = ArrowIPCIO(holder=vol, owns_holder=False).read_arrow_table()
         assert loaded.equals(table)

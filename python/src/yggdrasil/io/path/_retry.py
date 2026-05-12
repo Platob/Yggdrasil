@@ -1,8 +1,8 @@
 """Generic retry wrapper for remote-path SDK calls.
 
 Only **transient backend errors** (InternalError, BadRequest, 500/503,
-socket timeouts) are retried — up to 4 times with incremental sleep
-(1 s, 2 s, 4 s, 8 s).
+socket timeouts) are retried — up to 4 times with a flat 1 s sleep
+between attempts.
 
 Permission errors (PermissionDenied / 401 / 403, expired tokens, …)
 **fail fast**: they're deterministic from the caller's point of view
@@ -158,11 +158,12 @@ def retry_sdk_call(
 ) -> _T:
     """Call *func(*args, **kwargs)* with the Databricks/AWS retry policy.
 
-    Sleep schedule for transient errors: ``base_sleep * 2**attempt``
-    seconds (1, 2, 4, 8 by default). Permission errors **fail fast**
-    — they're deterministic from the SDK's perspective and any
-    recovery (self-grant, owner takeover, …) belongs in a
-    higher-level handler.
+    Sleeps a flat ``base_sleep`` seconds between transient retries (no
+    exponential backoff — transient SDK errors recover fast on a
+    healthy backend, and a long ceiling just stalls the caller).
+    Permission errors **fail fast** — they're deterministic from the
+    SDK's perspective and any recovery (self-grant, owner takeover,
+    …) belongs in a higher-level handler.
 
     The *sleep* callable is injected so tests can pass a no-op or a
     spy. The default is :func:`time.sleep`.

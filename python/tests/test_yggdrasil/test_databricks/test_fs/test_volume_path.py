@@ -25,9 +25,9 @@ class PermissionDenied(Exception):
 @pytest.fixture(autouse=True)
 def reset_remote_stat_cache():
     from yggdrasil.io.path.remote_path import RemotePath
-    RemotePath._STAT_CACHE.clear()
+    RemotePath._INSTANCES.clear()
     yield
-    RemotePath._STAT_CACHE.clear()
+    RemotePath._INSTANCES.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -480,7 +480,7 @@ class TestRetryPolicy:
             "/Volumes/c/s/v/x", client=client, retry_sleep=spy,
         )
         assert p.size == 3
-        assert recorded == [1.0, 2.0]
+        assert recorded == [1.0, 1.0]
 
 
 # ---------------------------------------------------------------------------

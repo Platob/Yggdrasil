@@ -55,9 +55,9 @@ def _make_paginator(pages: list[dict]) -> Any:
 @pytest.fixture(autouse=True)
 def reset_remote_stat_cache():
     from yggdrasil.io.path.remote_path import RemotePath
-    RemotePath._STAT_CACHE.clear()
+    RemotePath._INSTANCES.clear()
     yield
-    RemotePath._STAT_CACHE.clear()
+    RemotePath._INSTANCES.clear()
 
 
 @pytest.fixture
@@ -381,19 +381,19 @@ class TestStatCaching:
         assert first is second
         assert client.head_object.call_count == 1
 
-    def test_invalidate_after_write(self, client) -> None:
+    def test_write_seeds_post_write_size(self, client) -> None:
         # Initial probe → 5 bytes.
         client.head_object.return_value = {"ContentLength": 5, "LastModified": None}
         client.list_objects_v2.return_value = {"KeyCount": 0}
         client.get_object.return_value = {"Body": _Body(b"abcde")}
         p = S3Path("s3://b/k", client=client)
         assert p.size == 5
-        # Truncate must invalidate the cache so the next probe sees
-        # the new size.
-        client.head_object.return_value = {"ContentLength": 2, "LastModified": None}
+        # ``truncate`` re-uploads via ``put_object``, which seeds the
+        # stat cache with the post-write size — the next ``size``
+        # lookup hits the seeded entry, no second ``HeadObject``.
         p.truncate(2)
         assert p.size == 2
-        assert client.head_object.call_count == 2
+        assert client.head_object.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -402,8 +402,8 @@ class TestStatCaching:
 
 
 class TestRetryPolicy:
-    """Transient SDK errors retry up to 4 times with 1 / 2 / 4 / 8 s
-    sleeps; permission errors retry exactly once with a 1 s sleep;
+    """Transient SDK errors retry up to 4 times with a flat 1 s sleep
+    between attempts; permission errors fail fast (no retry);
     deterministic errors (NotFound, etc.) propagate immediately."""
 
     @pytest.fixture
@@ -431,8 +431,8 @@ class TestRetryPolicy:
         client.head_object.side_effect = head_object
         p = S3Path("s3://b/k", client=client, retry_sleep=spy)
         assert p.size == 7
-        # Two transient retries → two sleep calls of 1s and 2s.
-        assert recorded == [1.0, 2.0]
+        # Two transient retries → two flat 1 s sleeps.
+        assert recorded == [1.0, 1.0]
         assert client.head_object.call_count == 3
 
     def test_transient_gives_up_after_4_retries(self, client, sleeps) -> None:
@@ -441,38 +441,19 @@ class TestRetryPolicy:
         p = S3Path("s3://b/k", client=client, retry_sleep=spy)
         with pytest.raises(Exception):
             p.stat()
-        # 4 retries fired (1, 2, 4, 8 s) before giving up; 5 head calls total.
-        assert recorded == [1.0, 2.0, 4.0, 8.0]
+        # 4 retries fired (flat 1 s each) before giving up; 5 head calls total.
+        assert recorded == [1.0, 1.0, 1.0, 1.0]
         assert client.head_object.call_count == 5
 
-    def test_permission_retries_once(self, client, sleeps) -> None:
-        recorded, spy = sleeps
-        responses = [
-            _client_error("AccessDenied", 403),
-            {"ContentLength": 4, "LastModified": None},
-        ]
-
-        def head_object(**kwargs):
-            r = responses.pop(0)
-            if isinstance(r, Exception):
-                raise r
-            return r
-
-        client.head_object.side_effect = head_object
-        p = S3Path("s3://b/k", client=client, retry_sleep=spy)
-        assert p.size == 4
-        # One permission retry → one 1s sleep.
-        assert recorded == [1.0]
-
-    def test_permission_gives_up_after_one_retry(self, client, sleeps) -> None:
+    def test_permission_fails_fast(self, client, sleeps) -> None:
         recorded, spy = sleeps
         client.head_object.side_effect = _client_error("AccessDenied", 403)
         p = S3Path("s3://b/k", client=client, retry_sleep=spy)
         with pytest.raises(Exception):
             p.stat()
-        # One retry, then give up — 2 head calls total.
-        assert recorded == [1.0]
-        assert client.head_object.call_count == 2
+        # Permission errors are deterministic; no retry, no sleep.
+        assert recorded == []
+        assert client.head_object.call_count == 1
 
     def test_not_found_does_not_retry(self, client, sleeps) -> None:
         recorded, spy = sleeps

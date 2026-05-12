@@ -46,9 +46,11 @@ Filesystem surface
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterator, Optional
 
 from yggdrasil.data.enums import Scheme
+from yggdrasil.data.enums.media_type import MediaType
 from yggdrasil.io.path import RemotePath
 from yggdrasil.io.path._retry import retry_sdk_call
 from yggdrasil.io.io_stats import IOStats, IOKind
@@ -377,6 +379,7 @@ class S3Path(RemotePath):
                 mtime=_mtime_from_response(response),
                 kind=IOKind.FILE,
                 mode=0,
+                media_type=_media_type_from_response(response),
             )
 
         # No object at the exact key — probe whether it's a prefix.
@@ -570,6 +573,31 @@ class S3Path(RemotePath):
                     close()
                 except Exception:
                     pass
+
+        # Seed the stat cache from the response when S3 hands us the
+        # canonical total. ``Content-Range: bytes <a>-<b>/<total>`` is
+        # present on every successful ranged GET; ``<total>`` is the
+        # object's full size, independent of the requested window.
+        # The next ``size`` / ``exists`` lookup on this singleton path
+        # becomes a local hit — no separate ``HeadObject`` round trip.
+        total = _content_range_total(response)
+        if total is not None:
+            mtime = _mtime_from_response(response)
+            media_type = _media_type_from_response(response)
+            if self._stat_cached is None:
+                self._seed_stat_cache(IOStats(
+                    size=total,
+                    kind=IOKind.FILE,
+                    mtime=mtime,
+                    media_type=media_type,
+                ))
+            else:
+                self._stat_cached.size = total
+                if mtime:
+                    self._stat_cached.mtime = mtime
+                if media_type is not None and self._stat_cached.media_type is None:
+                    self._stat_cached.media_type = media_type
+
         return memoryview(data or b"")
 
     def _write_mv(self, data: memoryview, pos: int) -> int:
@@ -604,7 +632,12 @@ class S3Path(RemotePath):
             self.client.put_object,
             Bucket=self.bucket, Key=self.key, Body=payload,
         )
-        self._invalidate_stat_cache()
+        self._seed_stat_cache(IOStats(
+            size=len(payload),
+            kind=IOKind.FILE,
+            mtime=time.time(),
+            media_type=self._media_type,
+        ))
         return n
 
     def _existing_size_or_zero(self) -> int:
@@ -640,7 +673,12 @@ class S3Path(RemotePath):
             self.client.put_object,
             Bucket=self.bucket, Key=self.key, Body=payload,
         )
-        self._invalidate_stat_cache()
+        self._seed_stat_cache(IOStats(
+            size=len(payload),
+            kind=IOKind.FILE,
+            mtime=time.time(),
+            media_type=self._media_type,
+        ))
         return n
 
     def reserve(self, n: int) -> None:
@@ -687,7 +725,12 @@ class S3Path(RemotePath):
             self.client.put_object(
                 Bucket=self.bucket, Key=self.key, Body=payload,
             )
-            self._invalidate_stat_cache()
+            self._seed_stat_cache(IOStats(
+                size=len(payload),
+                kind=IOKind.FILE,
+                mtime=time.time(),
+                media_type=self._media_type,
+            ))
             return len(payload)
         return self._write_mv(memoryview(payload), pos)
 
@@ -737,6 +780,40 @@ def _is_invalid_range(exc: BaseException) -> bool:
         if code == "InvalidRange" or status == 416:
             return True
     return False
+
+
+def _content_range_total(response: Any) -> "int | None":
+    """Extract the full-object size from an S3 ranged-GET response.
+
+    Boto surfaces the ``Content-Range`` response header verbatim as
+    ``ContentRange`` on the response dict — format ``bytes 0-99/200``
+    where ``200`` is the canonical object size. Returns ``None`` when
+    the header is absent (whole-object GETs leave it off) or when the
+    total slot is ``*`` (rare; means the size was unknown to S3).
+    """
+    content_range = response.get("ContentRange") if isinstance(response, dict) else None
+    if not content_range or "/" not in content_range:
+        return None
+    suffix = content_range.split("/", 1)[1].strip()
+    if not suffix.isdigit():
+        return None
+    return int(suffix)
+
+
+def _media_type_from_response(response: Any) -> "MediaType | None":
+    """Resolve a :class:`MediaType` from an S3 GET/HEAD response.
+
+    S3 surfaces the object's MIME type in the ``ContentType`` field
+    (when the upload set one, or when ``inferred-content-type`` is
+    enabled on the bucket). Returns ``None`` when the field is absent
+    or unparseable — the caller falls back to URL-extension inference.
+    """
+    if not isinstance(response, dict):
+        return None
+    content_type = response.get("ContentType")
+    if not content_type:
+        return None
+    return MediaType.from_(content_type, default=None)
 
 
 def _mtime_from_response(response: Any) -> float:

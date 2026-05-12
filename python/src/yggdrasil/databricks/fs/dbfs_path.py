@@ -11,6 +11,7 @@ path Just Works.
 from __future__ import annotations
 
 import base64
+import time
 from typing import ClassVar, Iterator
 
 from yggdrasil.data.enums import Scheme
@@ -101,7 +102,7 @@ class DBFSPath(DatabricksPath):
         except Exception as exc:
             if not exist_ok and _looks_like_already_exists(exc):
                 raise
-        self._invalidate_stat_cache()
+        self._seed_stat_cache(IOStats(kind=IOKind.DIRECTORY))
 
     def _remove_file(self, missing_ok: bool = True) -> None:
         try:
@@ -146,6 +147,7 @@ class DBFSPath(DatabricksPath):
         out = bytearray()
         offset = pos
         to_eof = n < 0
+        hit_eof = False
         while True:
             if to_eof:
                 chunk_size = _DBFS_CHUNK
@@ -167,15 +169,30 @@ class DBFSPath(DatabricksPath):
                 raise
             data = getattr(resp, "data", None)
             if not data:
+                hit_eof = True
                 break
             decoded = base64.b64decode(data)
             if not decoded:
+                hit_eof = True
                 break
             out.extend(decoded)
             offset += len(decoded)
             if len(decoded) < chunk_size:
                 # Short page = EOF.
+                hit_eof = True
                 break
+        # When we started at pos 0 and rode the read past EOF, the
+        # final offset IS the file size — seed the stat cache so the
+        # next ``size`` / ``exists`` / ``is_file`` lookup is local.
+        if pos == 0 and hit_eof:
+            if self._stat_cached is None:
+                self._seed_stat_cache(IOStats(
+                    size=offset,
+                    kind=IOKind.FILE,
+                    media_type=self._media_type,
+                ))
+            else:
+                self._stat_cached.size = offset
         return memoryview(bytes(out))
 
     def _write_mv(self, data: memoryview, pos: int) -> int:
@@ -203,7 +220,6 @@ class DBFSPath(DatabricksPath):
             payload = existing[:pos] + bytes(data) + existing[pos + n:]
 
         self._stream_upload(payload)
-        self._invalidate_stat_cache()
         return n
 
     def _stream_upload(self, payload: bytes) -> None:
@@ -219,6 +235,16 @@ class DBFSPath(DatabricksPath):
                     fh.write(chunk)
                     offset += len(chunk)
         self._call(_do_upload)
+        # The upload just established the object's full size; seed
+        # the cache so the next ``size`` / ``exists`` lookup is local
+        # and any concurrent reader on the singleton path sees the
+        # post-write metadata without a fresh ``dbfs.get_status``.
+        self._seed_stat_cache(IOStats(
+            size=len(payload),
+            kind=IOKind.FILE,
+            mtime=time.time(),
+            media_type=self._media_type,
+        ))
 
     def truncate(self, n: int) -> int:
         if n < 0:
@@ -226,7 +252,6 @@ class DBFSPath(DatabricksPath):
 
         if n == 0:
             self._stream_upload(b"")
-            self._invalidate_stat_cache()
             return 0
 
         # Single read-to-EOF — no preceding ``get_status`` probe. A
@@ -241,7 +266,6 @@ class DBFSPath(DatabricksPath):
         else:
             head = existing + b"\x00" * (n - len(existing))
         self._stream_upload(head)
-        self._invalidate_stat_cache()
         return n
 
     def _clear(self) -> None:

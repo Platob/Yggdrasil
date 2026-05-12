@@ -264,11 +264,20 @@ class DatabricksPath(RemotePath):
         pass after ``__new__``.
 
         On a concrete subclass (``DBFSPath`` / ``VolumePath`` /
-        ``WorkspacePath``) this short-circuits to ``object.__new__`` so
-        the normal allocation path is preserved.
+        ``WorkspacePath``) the call forwards up the MRO so
+        :meth:`RemotePath.__new__` can apply its singleton-by-URL
+        cache before the eventual ``object.__new__`` allocation —
+        normalize the seed into a URL kwarg first so a POSIX-string
+        construction (``VolumePath("/Volumes/cat/sch/vol/x")``)
+        collapses to the same singleton as the URL-shaped one.
         """
         if cls is not DatabricksPath:
-            return super().__new__(cls)
+            if url is None and data is not None:
+                _, normalized = _resolve_databricks_subclass(data=data)
+                if normalized is not None:
+                    url = normalized
+                    data = None
+            return super().__new__(cls, data=data, url=url, **kwargs)
 
         target, normalized = _resolve_databricks_subclass(data=data, url=url)
         # When dispatching to a DatabricksPath subclass, hand back

@@ -6,31 +6,60 @@ GCS / SFTP / WebDAV) shares:
 1. **Predicate pins.** ``is_remote_path = True``, the other two
    ``False``. Concrete subclasses no longer reimplement these.
 
-2. **Stat cache.** Remote stat probes are slow and hot loops hammer
-   them — a Delta replay, a tight ``exists()`` poll, a folder listing
-   that re-stats each child. The cache is process-wide, keyed by URL,
-   and shared across every :class:`RemotePath` subclass so an
-   ``s3://`` and a ``dbfs:/`` of the same logical resource never
-   collide (different URLs).
+2. **Singleton-by-URL.** Two callers building a :class:`RemotePath`
+   with the same ``(cls, url)`` receive the **same** instance — and
+   therefore share one ``_stat_cached`` slot. Remote stat probes are
+   slow and hot loops hammer them (Delta replay, tight ``exists()``
+   poll, folder listing that re-stats each child); singleton paths
+   collapse those into one network call per URL, no separate cache
+   dict required. The :class:`ExpiringDict` cache is process-wide and
+   shared across every :class:`RemotePath` subclass — URLs are
+   canonical and unique across schemes, so an ``s3://`` and a
+   ``dbfs:/`` of the same logical resource never collide.
 
-Subclasses implement :meth:`_stat_uncached`; the base wraps it in the
-cache via :meth:`_stat`. Mutating ops (writes, deletes) must call
-:meth:`_invalidate_stat_cache` so follow-up reads see fresh metadata.
-Sister of :class:`yggdrasil.io.fs.local_path.LocalPath`: same
-:class:`Holder` substrate, different backing.
+Subclasses implement :meth:`_stat_uncached`; the base wraps it via
+:meth:`_stat` and stores the result on ``self._stat_cached``.
+Mutating ops (writes, deletes) must call :meth:`_invalidate_stat_cache`
+so follow-up reads see fresh metadata. Sister of
+:class:`yggdrasil.io.fs.local_path.LocalPath`: same :class:`Holder`
+substrate, different backing.
 """
 
 from __future__ import annotations
 
 from abc import abstractmethod
-from typing import ClassVar
+from typing import Any, ClassVar, Tuple
 
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.io.io_stats import IOStats
 from yggdrasil.io.path.path import Path
+from yggdrasil.io.url import URL
 
 
 __all__ = ["RemotePath"]
+
+
+def _extract_url_key(args: tuple, kwargs: dict) -> "str | None":
+    """Best-effort URL key from constructor args/kwargs.
+
+    ``__new__`` runs before ``__init__`` normalizes its inputs, so we
+    peek at whatever is already URL-shaped. Returns ``None`` when the
+    caller passed a raw string / pathlib object that only resolves
+    after ``__init__`` — those allocations skip the singleton cache
+    (typical entry points — :meth:`Path.from_`, :meth:`Path._from_url`,
+    :meth:`iterdir` — pass ``url=`` explicitly and hit the fast path).
+    """
+    url = kwargs.get("url")
+    if url is None and args:
+        seed = args[0]
+        if isinstance(seed, URL):
+            url = seed
+    if url is None:
+        return None
+    try:
+        return str(url)
+    except Exception:
+        return None
 
 
 class RemotePath(Path):
@@ -39,27 +68,56 @@ class RemotePath(Path):
     Subclasses pick a ``scheme`` (``s3``, ``dbfs``, …), implement the
     five :class:`Holder` primitives against their network client, and
     override :meth:`_stat_uncached` for the metadata probe. Everything
-    else (predicate pins, stat caching) is inherited from this base.
+    else (predicate pins, stat caching, singleton-by-URL) is inherited
+    from this base.
     """
 
-    __slots__ = (
-        "_stat_cached"
-    )
+    __slots__ = ("_stat_cached", "_initialized")
 
-    #: Process-wide cache shared across every :class:`RemotePath`
-    #: subclass. URL is canonical and unique across schemes, so
-    #: there's no collision risk between (e.g.) S3 and DBFS sharing
-    #: the same dict. 30s TTL, 4096-entry cap — short enough to dodge
-    #: stale reads in normal workflows, long enough to collapse the
-    #: dozen probes a single Delta replay makes against the same key.
-    _STAT_CACHE: ClassVar["ExpiringDict[str, IOStats]"] = ExpiringDict(
-        default_ttl=30.0,
+    #: Process-wide singleton cache shared across every
+    #: :class:`RemotePath` subclass. Keyed by ``(cls, str(url))`` so
+    #: subclasses with the same URL stay distinct (an ``S3Path`` and a
+    #: hypothetical ``S3SignedPath`` for the same key are still
+    #: different instances). ``default_ttl=None`` keeps entries for the
+    #: process lifetime; 4096-entry cap evicts least-recently-set when
+    #: full.
+    _INSTANCES: ClassVar["ExpiringDict[Tuple[type, str], RemotePath]"] = ExpiringDict(
+        default_ttl=None,
         max_size=4096,
     )
 
-    def __init__(self, *args, **kwargs):
+    # ------------------------------------------------------------------
+    # Singleton-by-URL construction
+    # ------------------------------------------------------------------
+
+    def __new__(cls, *args: Any, **kwargs: Any):
+        # Let the abstract-class dispatch chain (Holder.__new__ /
+        # DatabricksPath.__new__) settle on a concrete subclass first.
+        instance = super().__new__(cls, *args, **kwargs)
+        # Dispatch landed on a different class (e.g. ``DatabricksPath``
+        # forwarding to ``VolumePath``); that branch ran its own
+        # ``__new__`` and either cached or chose not to. Don't override.
+        if type(instance) is not cls:
+            return instance
+        key_url = _extract_url_key(args, kwargs)
+        if key_url is None:
+            return instance
+        key = (cls, key_url)
+        # ``get_or_set`` is atomic under :class:`ExpiringDict`'s lock —
+        # racing constructors collapse to the same singleton without an
+        # external mutex.
+        return cls._INSTANCES.get_or_set(key, lambda: instance)
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # Singleton-cached instances are re-entered on every constructor
+        # call (Python always invokes ``__init__`` after ``__new__``);
+        # skip the second pass so the live ``_stat_cached`` and any
+        # subclass-side state stay untouched.
+        if getattr(self, "_initialized", False):
+            return
         super().__init__(*args, **kwargs)
         self._stat_cached: IOStats | None = None
+        self._initialized = True
 
     # ------------------------------------------------------------------
     # Backing-shape predicates
@@ -84,19 +142,16 @@ class RemotePath(Path):
     def _stat(self) -> IOStats:
         """Cached :class:`IOStats` probe.
 
-        Looks up by ``str(self.url)`` in :data:`_STAT_CACHE`; on miss,
-        delegates to :meth:`_stat_uncached` and caches the result.
-        Subclasses override :meth:`_stat_uncached`, never this.
+        Singleton-by-URL means ``self._stat_cached`` is effectively a
+        process-wide entry for this URL: a peer constructed elsewhere
+        with the same URL shares this slot. On miss, delegates to
+        :meth:`_stat_uncached` and stores the result. Subclasses
+        override :meth:`_stat_uncached`, never this.
         """
         if self._stat_cached is not None:
             return self._stat_cached
-
-        key = str(self.url)
-        hit = self._STAT_CACHE.get(key)
-        if hit is not None:
-            return hit
         result = self._stat_uncached()
-        self._STAT_CACHE.set(key, result)
+        self._stat_cached = result
         return result
 
     @abstractmethod
@@ -106,7 +161,6 @@ class RemotePath(Path):
     def _invalidate_stat_cache(self) -> None:
         """Drop this path's cached entry. Call after writes / deletes."""
         self._stat_cached = None
-        self._STAT_CACHE.pop(str(self.url), None)
 
     # ------------------------------------------------------------------
     # Resize is a no-op on remote backends — the upload IS the resize
@@ -131,8 +185,8 @@ class RemotePath(Path):
 
         Useful for backends that learn metadata as a side-effect of a
         listing (S3 ``ListObjectsV2`` returns size + mtime per object,
-        Databricks ``dbutils.fs.ls`` returns size). The next
+        Databricks ``dbutils.fs.ls`` returns size) or a read/write
+        (the response body's length IS the file size). The next
         :meth:`_stat` call on the warmed path is a local hit.
         """
         self._stat_cached = stats
-        self._STAT_CACHE.set(str(self.url), stats)

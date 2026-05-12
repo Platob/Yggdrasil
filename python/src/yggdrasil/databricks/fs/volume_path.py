@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional, Tuple
 from databricks.sdk.service.catalog import VolumeOperation
 
 from yggdrasil.data.enums import Mode, ModeLike, Scheme
+from yggdrasil.data.enums.media_type import MediaType
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.path import Path
 from yggdrasil.io.url import URL
@@ -113,6 +114,7 @@ class VolumePath(DatabricksPath):
                 kind=IOKind.FILE,
                 size=int(getattr(info, "content_length", 0) or 0),
                 mtime=_mtime(info),
+                media_type=_media_type_from_response(info),
             )
         try:
             dir_info = self._call(files.get_directory_metadata, self.api_path)
@@ -750,14 +752,18 @@ class VolumePath(DatabricksPath):
         except AttributeError:
             data = bytes(body)
 
+        media_type = _media_type_from_response(response)
         if not self._stat_cached:
             self._seed_stat_cache(stats=IOStats(
                 size=len(data),
                 kind=IOKind.FILE,
                 mtime=_mtime(getattr(response, "last_modified_time", None)),
+                media_type=media_type,
             ))
         else:
             self._stat_cached.size = len(data)
+            if media_type is not None and self._stat_cached.media_type is None:
+                self._stat_cached.media_type = media_type
 
         if pos:
             data = data[pos:]
@@ -798,6 +804,7 @@ class VolumePath(DatabricksPath):
             size=len(payload),
             kind=IOKind.FILE,
             mtime=time.time(),
+            media_type=self._media_type,
         ))
 
     def truncate(self, n: int) -> int:
@@ -845,6 +852,25 @@ def _sub_volume_tail(path: str) -> str:
     if len(parts) < 3:
         return ""
     return "/" + "/".join(parts[3:]) if len(parts) > 3 else ""
+
+
+def _media_type_from_response(info) -> "MediaType | None":
+    """Resolve a :class:`MediaType` from a Files API response.
+
+    The SDK surfaces the object's MIME type as ``content_type``
+    (download responses) or via the metadata payload. Returns
+    ``None`` when the field is absent or doesn't map to a known
+    media type — the caller falls back to URL-extension inference.
+    """
+    if info is None:
+        return None
+    mime = (
+        getattr(info, "content_type", None)
+        or getattr(info, "mime_type", None)
+    )
+    if not mime:
+        return None
+    return MediaType.from_(mime, default=None)
 
 
 def _mtime(info) -> float:

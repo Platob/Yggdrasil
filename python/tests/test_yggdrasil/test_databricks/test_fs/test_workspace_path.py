@@ -25,9 +25,9 @@ class PermissionDenied(Exception):
 @pytest.fixture(autouse=True)
 def reset_remote_stat_cache():
     from yggdrasil.io.path.remote_path import RemotePath
-    RemotePath._STAT_CACHE.clear()
+    RemotePath._INSTANCES.clear()
     yield
-    RemotePath._STAT_CACHE.clear()
+    RemotePath._INSTANCES.clear()
 
 
 @pytest.fixture
