@@ -565,3 +565,17 @@ class TestCastOptionsSafeMerge:
     def test_set_via_constructor(self) -> None:
         from yggdrasil.data.options import CastOptions
         assert CastOptions(safe_merge=True).safe_merge is True
+
+    def test_sql_insert_threads_safe_merge_to_warehouse_fallback(self) -> None:
+        # Regression: ``sql_insert(safe_merge=...)`` used to reference
+        # ``safe_merge`` inside the warehouse fallback without threading
+        # it through, raising ``NameError`` whenever the warehouse path
+        # ran. Pin the kwarg on both signatures so the wiring stays
+        # intact.
+        import inspect
+        from yggdrasil.databricks.sql.table import Table
+
+        public = inspect.signature(Table.sql_insert).parameters
+        fallback = inspect.signature(Table._sql_insert_warehouse_fallback).parameters
+        assert "safe_merge" in public
+        assert "safe_merge" in fallback

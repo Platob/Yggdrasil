@@ -3128,6 +3128,7 @@ class Table(DatabricksResource, Holder):
             vacuum_hours=vacuum_hours,
             where=where, prune_by=prune_by, prune_values=prune_values,
             retry=retry,
+            safe_merge=safe_merge,
             table_dispatch=table_dispatch,
         )
 
@@ -3178,6 +3179,7 @@ class Table(DatabricksResource, Holder):
         prune_by: list[str] | str | None,
         prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
+        safe_merge: bool = False,
         table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
     ) -> None:
         """Warehouse fallback for :meth:`sql_insert`."""
