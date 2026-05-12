@@ -1,20 +1,27 @@
 # ============================================================================
 # publish.yml
 #
-# Builds and publishes the `ygg` pure-Python package to PyPI.
-# Versioned from the single source of truth: python/pyproject.toml.
+# Builds and publishes the `ygg` package to PyPI as a sdist + a matrix
+# of native wheels. Versioned from the single source of truth:
+# python/pyproject.toml.
 #
-# Pairs with publish-native.yml (which builds the `yggrs` Rust wheels at
-# the same version). Both workflows trigger on the same events and run
-# in parallel; `ygg` declares `yggrs==X.Y.Z` as a hard dependency, so a
-# release isn't usable until both have landed on PyPI. Order doesn't
-# matter — pip resolves the dep at install time.
+# `ygg` is no longer pure-Python: ``python/src/yggdrasil/io/_url.pyx``
+# (and any future ``.pyx`` siblings) compiles into a C extension at
+# build time. The sdist still ships the ``.pyx`` source so users
+# without pre-built wheels can build locally; the wheel matrix below
+# covers cpython 3.10–3.13 on linux x86_64 / aarch64, macos
+# arm64 / x86_64, and windows x86_64.
+#
+# Pairs with publish-native.yml (the `yggrs` Rust wheels, kept around
+# for transition; the URL hot path has migrated to Cython embedded in
+# `ygg` itself).
 #
 # Jobs
 # ----
 #   detect             → reads version, checks ygg on PyPI, decides
-#   build-python       → sdist + pure-Python wheel (uv / setuptools)
-#   publish-python     → uploads ygg dist to PyPI
+#   build-sdist        → ygg-X.Y.Z.tar.gz (with .pyx sources)
+#   build-wheels       → cibuildwheel matrix: linux/macos/windows × cp3{10..13}
+#   publish-python     → uploads sdist + every wheel to PyPI
 #   tag                → creates vX.Y.Z git tag + GitHub Release
 #   cleanup-previous   → opt-in: removes previous tag/release on
 #                        ``!cleanup-prev-release`` commit marker
@@ -43,10 +50,10 @@ on:
       - main
     paths:
       - "python/src/**"
+      - "python/setup.py"
       - "python/pyproject.toml"
       - "python/README.md"
       - "python/LICENSE"
-      - "rust/**"
       - ".github/workflows/publish.yml"
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
@@ -168,10 +175,10 @@ jobs:
           fi
 
   # --------------------------------------------------------------------------
-  # build-python — pure-Python sdist + wheel
+  # build-sdist — source distribution (contains .pyx for from-source installs)
   # --------------------------------------------------------------------------
-  build-python:
-    name: Build ygg (pure Python)
+  build-sdist:
+    name: Build ygg sdist
     runs-on: ubuntu-latest
     needs: detect
     if: needs.detect.outputs.should_publish == 'true'
@@ -184,37 +191,104 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          version: "latest"
+          python-version: "3.12"
+
+      - name: Build sdist
+        run: |
+          python -m pip install --upgrade build
+          python -m build --sdist --outdir dist/
+
+      - name: List sdist
+        run: ls -lh dist/
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: ygg-sdist-${{ needs.detect.outputs.version }}
+          path: python/dist/*.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # build-wheels — native wheel matrix via cibuildwheel
+  # --------------------------------------------------------------------------
+  #
+  # Each runner job spawns cibuildwheel which iterates over the cpython
+  # ABIs declared in ``[tool.cibuildwheel]`` (pyproject.toml). Linux
+  # aarch64 cross-builds via QEMU (slow but reliable); the other archs
+  # use native runners for the right host arch.
+  build-wheels:
+    name: Build ygg wheel (${{ matrix.target.os }}/${{ matrix.target.arch }})
+    runs-on: ${{ matrix.target.runner }}
+    needs: detect
+    if: needs.detect.outputs.should_publish == 'true'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { os: linux,   arch: x86_64,  runner: ubuntu-latest,  cibw_archs: "x86_64" }
+          - { os: linux,   arch: aarch64, runner: ubuntu-latest,  cibw_archs: "aarch64" }
+          - { os: windows, arch: x86_64,  runner: windows-latest, cibw_archs: "AMD64" }
+          - { os: macos,   arch: x86_64,  runner: macos-13,       cibw_archs: "x86_64" }
+          - { os: macos,   arch: arm64,   runner: macos-14,       cibw_archs: "arm64" }
+
+    defaults:
+      run:
+        working-directory: python
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Build sdist and wheel
-        run: uv build --no-sources
+      # Required for linux aarch64 cross-build only. ``docker/setup-qemu-action``
+      # binfmt-registers the foreign arch so the manylinux/musllinux
+      # cibuildwheel container can execute aarch64 binaries on an x86_64
+      # runner. No-op on other matrix legs.
+      - name: Set up QEMU (linux aarch64 only)
+        if: matrix.target.os == 'linux' && matrix.target.arch == 'aarch64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
-      - name: Verify dist contents
-        run: ls -lh dist/
+      - name: Build wheels (cibuildwheel)
+        uses: pypa/cibuildwheel@v2.21
+        env:
+          CIBW_ARCHS: ${{ matrix.target.cibw_archs }}
+        with:
+          package-dir: python
+          output-dir: python/wheelhouse
+          # The remaining knobs (build / skip / test-command /
+          # manylinux-image) live in ``[tool.cibuildwheel]`` so they
+          # stay in lockstep with the project metadata. Changing them
+          # here without updating pyproject would silently diverge.
 
-      - name: Upload python dist artifacts
+      - name: List wheels
+        run: ls -lh wheelhouse/
+
+      - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: python-dist-${{ needs.detect.outputs.version }}
-          path: python/dist/
+          name: ygg-wheels-${{ matrix.target.os }}-${{ matrix.target.arch }}-${{ needs.detect.outputs.version }}
+          path: python/wheelhouse/*.whl
           retention-days: 7
           if-no-files-found: error
 
   # --------------------------------------------------------------------------
-  # publish-python — upload ygg to PyPI
+  # publish-python — gather sdist + every wheel, upload to PyPI in one shot
   # --------------------------------------------------------------------------
   publish-python:
     name: Publish ygg to PyPI
     runs-on: ubuntu-latest
-    needs: [detect, build-python]
+    needs: [detect, build-sdist, build-wheels]
     if: needs.detect.outputs.should_publish == 'true'
 
     permissions:
@@ -226,11 +300,17 @@ jobs:
       url: https://pypi.org/project/ygg/${{ needs.detect.outputs.version }}/
 
     steps:
-      - name: Download python dist artifacts
+      - name: Download all ygg artifacts
         uses: actions/download-artifact@v4
         with:
-          name: python-dist-${{ needs.detect.outputs.version }}
+          # Pull every ``ygg-sdist-*`` + ``ygg-wheels-*`` artifact for this
+          # version into ``dist/`` (one upload step → one PyPI release).
+          pattern: ygg-*-${{ needs.detect.outputs.version }}
           path: dist/
+          merge-multiple: true
+
+      - name: List release dist contents
+        run: ls -lh dist/
 
       - name: Publish via trusted publishing (OIDC)
         if: vars.PYPI_TRUSTED_PUBLISHING == 'true'
@@ -258,6 +338,9 @@ jobs:
             echo "## ✅ Published \`ygg\` v${{ needs.detect.outputs.version }}"
             echo ""
             echo "🔗 https://pypi.org/project/ygg/${{ needs.detect.outputs.version }}/"
+            echo ""
+            echo "Uploaded:"
+            for f in dist/*; do echo "- \`$(basename "$f")\`"; done
           } >> "$GITHUB_STEP_SUMMARY"
 
   # --------------------------------------------------------------------------
@@ -296,11 +379,12 @@ jobs:
             echo "🏷️  Created and pushed tag $TAG"
           fi
 
-      - name: Download python dist artifacts
+      - name: Download all ygg artifacts
         uses: actions/download-artifact@v4
         with:
-          name: python-dist-${{ needs.detect.outputs.version }}
+          pattern: ygg-*-${{ needs.detect.outputs.version }}
           path: release/
+          merge-multiple: true
 
       - name: List release assets
         run: ls -lh release/
@@ -409,4 +493,3 @@ jobs:
             echo ""
             echo "Re-run with **force_publish = true** to override."
           } >> "$GITHUB_STEP_SUMMARY"
-

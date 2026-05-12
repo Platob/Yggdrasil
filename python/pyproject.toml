@@ -161,3 +161,47 @@ yggdrasil = ["py.typed"]
 
 [tool.uv]
 native-tls = true
+
+# ---------------------------------------------------------------------------
+# cibuildwheel — drives the native wheel matrix from publish.yml.
+# ---------------------------------------------------------------------------
+# Wheels are built per (cpython × platform) combination so a normal
+# ``pip install ygg`` lands the compiled ``yggdrasil/io/_url.so``
+# without needing a C toolchain on the user's machine. PyPy is skipped
+# (the codebase targets CPython-only fast paths through pyarrow / Cython);
+# 32-bit i686 wheels are skipped too — manylinux2014 + arm64 cover what
+# the data plane actually runs on. ``musllinux_*`` is left in for Alpine
+# / distroless containers.
+[tool.cibuildwheel]
+# Python ABI tags to build: cpython 3.10 through 3.13. Update when
+# pyproject's ``requires-python`` floor moves.
+build = "cp310-* cp311-* cp312-* cp313-*"
+skip = [
+  "pp*",        # PyPy — no compiled-extension contract we maintain
+  "*-win32",    # 32-bit windows, no real users
+  "*_i686",     # 32-bit linux likewise
+]
+# Smoke-test the freshly-built wheel by exercising the Cython kernel
+# through the matching Python module. Keeps the wheel honest before
+# upload (cibuildwheel does this in a clean per-wheel virtualenv).
+test-command = "python -c \"from yggdrasil.io.url import URL; assert URL.from_str('https://Example.com/p?b=2&a=1').host == 'example.com'\""
+build-verbosity = 1
+
+[tool.cibuildwheel.linux]
+# manylinux2014 covers every glibc the project supports; musllinux_1_2
+# covers Alpine / distroless. Both ABIs are produced for x86_64 and
+# aarch64 so containerised callers don't have to compile.
+manylinux-x86_64-image = "manylinux2014"
+manylinux-aarch64-image = "manylinux2014"
+musllinux-x86_64-image = "musllinux_1_2"
+musllinux-aarch64-image = "musllinux_1_2"
+archs = ["auto"]
+
+[tool.cibuildwheel.macos]
+# arm64 + x86_64 wheels — the GH Actions matrix picks the right runner
+# (macos-14 for arm64, macos-13 for x86_64) so cibuildwheel inherits
+# the host arch.
+archs = ["auto"]
+
+[tool.cibuildwheel.windows]
+archs = ["auto64"]
