@@ -101,6 +101,35 @@ class TestUrlParsing:
         assert p.url.scheme == "s3"
 
 
+class TestSingletonCache:
+    """``RemotePath.__new__`` collapses repeated constructions for the
+    same URL onto one cached instance.
+
+    The optimization reuses the URL parsed once for the cache key so
+    the subclass ``__init__`` doesn't re-parse, and the new pre-allocate
+    cache lookup short-circuits the ``Holder.__new__`` dispatch chain
+    entirely on warm hits.
+    """
+
+    def test_str_form_returns_same_instance(self, client) -> None:
+        a = S3Path("s3://bucket/key", client=client)
+        b = S3Path("s3://bucket/key", client=client)
+        assert a is b
+
+    def test_url_form_returns_same_instance_as_str_form(self, client) -> None:
+        from yggdrasil.io.url import URL
+        a = S3Path("s3://bucket/key", client=client)
+        b = S3Path(url=URL.from_("s3://bucket/key"), client=client)
+        assert a is b
+
+    def test_fresh_construction_drops_resolved_url_after_init(self, client) -> None:
+        # ``__new__`` stashes the parsed URL onto the new instance so
+        # subclass ``__init__`` doesn't re-parse. After init the slot
+        # is cleared so the parsed URL isn't kept alive twice.
+        p = S3Path("s3://bucket/key", client=client)
+        assert p._resolved_url is None
+
+
 class TestPredicates:
 
     def test_remote_path_pins(self, client) -> None:
@@ -159,14 +188,22 @@ class TestReadMv:
 
     def test_full_object_read(self, client) -> None:
         client.head_object.return_value = {"ContentLength": 5, "LastModified": None}
-        client.get_object.return_value = {"Body": _Body(b"hello")}
+        client.get_object.return_value = {
+            "Body": _Body(b"hello"),
+            "ContentLength": 5,
+        }
         p = S3Path("s3://b/k", client=client)
         assert p.read_bytes() == b"hello"
-        # Range header covers [0, size-1] inclusive.
+        # ``read_bytes()`` / ``read_mv(-1, 0)`` issues a single
+        # whole-object GET (no ``Range`` header) — the ``HeadObject``
+        # probe the base ``Holder.read_mv`` used to run is skipped
+        # because S3 surfaces the canonical size on the GET response
+        # and we seed the stat cache from there.
         kwargs = client.get_object.call_args.kwargs
         assert kwargs["Bucket"] == "b"
         assert kwargs["Key"] == "k"
-        assert kwargs["Range"] == "bytes=0-4"
+        assert "Range" not in kwargs
+        client.head_object.assert_not_called()
 
     def test_range_read(self, client) -> None:
         client.head_object.return_value = {"ContentLength": 100, "LastModified": None}

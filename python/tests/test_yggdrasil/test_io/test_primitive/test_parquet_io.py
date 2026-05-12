@@ -117,6 +117,56 @@ class TestTargetSchemaCast:
         io.write_arrow_table(original)
         assert io.read_arrow_table().equals(original)
 
+    def test_arrow_read_projects_to_target_subset(self, table) -> None:
+        # ``target`` carrying a strict subset of the file's columns
+        # should fan into the parquet reader as a ``columns=`` projection;
+        # the returned table carries exactly the target columns in target
+        # order.
+        io = ParquetIO()
+        io.write_arrow_table(table)
+        from yggdrasil.data.data_field import Field
+        target = Field.from_(pa.schema([
+            pa.field("v", pa.float64()),
+            pa.field("id", pa.int64()),
+        ]))
+        casted = io.read_arrow_table(target=target)
+        assert casted.column_names == ["v", "id"]
+        assert casted.column("id").to_pylist() == [1, 2, 3, 4]
+
+    def test_polars_read_applies_target_cast(self, table) -> None:
+        pl = pytest.importorskip("polars")
+        io = ParquetIO()
+        io.write_arrow_table(pa.table({
+            "id": ["1", "2", "3"], "v": ["1.5", "2.5", "3.5"],
+        }))
+        df = io.read_polars_frame(target=self._target_field())
+        assert df.columns == ["id", "v"]
+        assert df.schema["id"] == pl.Int64
+        assert df.schema["v"] == pl.Float64
+        assert df["id"].to_list() == [1, 2, 3]
+
+    def test_polars_scan_applies_target_cast(self, table) -> None:
+        pl = pytest.importorskip("polars")
+        io = ParquetIO()
+        io.write_arrow_table(pa.table({
+            "id": ["1", "2", "3"], "v": ["1.5", "2.5", "3.5"],
+        }))
+        lf = io.scan_polars_frame(target=self._target_field())
+        assert isinstance(lf, pl.LazyFrame)
+        df = lf.collect()
+        assert df.schema["id"] == pl.Int64
+        assert df.schema["v"] == pl.Float64
+
+    def test_pandas_read_applies_target_cast(self, table) -> None:
+        pytest.importorskip("pandas")
+        io = ParquetIO()
+        io.write_arrow_table(pa.table({
+            "id": ["1", "2", "3"], "v": ["1.5", "2.5", "3.5"],
+        }))
+        df = io.read_pandas_frame(target=self._target_field())
+        assert list(df.columns) == ["id", "v"]
+        assert df["id"].tolist() == [1, 2, 3]
+
 
 class TestHolderBacked:
 

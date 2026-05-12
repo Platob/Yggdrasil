@@ -86,18 +86,21 @@ class NDJsonIO(IO[bytes, NDJsonOptions]):
     # ==================================================================
 
     def _collect_schema(self, options: NDJsonOptions) -> Schema:
-        if self.size == 0:
+        if self.size_known and self.size == 0:
             return Schema.empty()
-        with self.arrow_input_stream() as v:
-            reader = pa_json.open_json(
-                v,
-                read_options=options.to_read_options(),
-                parse_options=options.to_parse_options(),
-            )
-            try:
-                return Schema.from_arrow(reader.schema)
-            finally:
-                reader.close()
+        try:
+            with self.arrow_input_stream() as v:
+                reader = pa_json.open_json(
+                    v,
+                    read_options=options.to_read_options(),
+                    parse_options=options.to_parse_options(),
+                )
+                try:
+                    return Schema.from_arrow(reader.schema)
+                finally:
+                    reader.close()
+        except (FileNotFoundError, pa.ArrowInvalid):
+            return Schema.empty()
 
     # ==================================================================
     # Read path
@@ -114,19 +117,29 @@ class NDJsonIO(IO[bytes, NDJsonOptions]):
         schema before they leave the reader. When no target is bound
         the cast is a passthrough.
         """
-        if self.size == 0:
+        if self.size_known and self.size == 0:
             return
-        with self.arrow_input_stream() as v:
-            reader = pa_json.open_json(
-                v,
-                read_options=options.to_read_options(),
-                parse_options=options.to_parse_options(),
-            )
+        try:
+            stream_ctx = self.arrow_input_stream()
+            stream = stream_ctx.__enter__()
+        except FileNotFoundError:
+            return
+        try:
+            try:
+                reader = pa_json.open_json(
+                    stream,
+                    read_options=options.to_read_options(),
+                    parse_options=options.to_parse_options(),
+                )
+            except pa.ArrowInvalid:
+                return
             try:
                 for batch in reader:
                     yield options.cast_arrow_tabular(batch)
             finally:
                 reader.close()
+        finally:
+            stream_ctx.__exit__(None, None, None)
 
     # ==================================================================
     # Write path
@@ -269,12 +282,12 @@ class NDJsonIO(IO[bytes, NDJsonOptions]):
         pl = polars_module()
         path = self._local_path_str()
         if path is not None:
-            return pl.scan_ndjson(path)
+            return options.cast_polars_tabular(pl.scan_ndjson(path))
         return super()._scan_polars_frame(options)
 
     def _read_polars_frame(self, options: NDJsonOptions) -> "pl.DataFrame":
         pl = polars_module()
         path = self._local_path_str()
         if path is not None:
-            return pl.read_ndjson(path)
+            return options.cast_polars_tabular(pl.read_ndjson(path))
         return super()._read_polars_frame(options)

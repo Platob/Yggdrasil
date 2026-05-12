@@ -475,11 +475,10 @@ class LocalPath(Path):
         merged in so the result is self-describing without a second
         lookup.
         """
-        media_type = (
-            self._media_type
-            if self._media_type is not None
-            else self.url.infer_media_type(default=None)
-        )
+        # ``self.media_type`` resolves the lazy ``_media_type`` slot —
+        # a path-only holder skips the URL-mime walk at construction
+        # and pays for it here on the first ``stat()`` instead.
+        media_type = self.media_type
         try:
             if self._fd >= 0:
                 st = os.fstat(self._fd)

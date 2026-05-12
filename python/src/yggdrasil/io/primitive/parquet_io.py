@@ -98,6 +98,32 @@ class ParquetIO(IO[bytes, ParquetOptions]):
             return None
         return full_path()
 
+    @staticmethod
+    def _projection_columns(
+        options: ParquetOptions,
+        available_names: "Iterable[str] | None",
+    ) -> "list[str] | None":
+        """Source-side column subset to push into the Parquet reader.
+
+        Returns ``None`` (read every column) when no target is bound,
+        when *available_names* is missing, or when the target asks for
+        every column already on disk. Otherwise the intersection of
+        target column names and *available_names*, preserving target
+        order — the reader emits columns in the order requested, so the
+        downstream :meth:`CastOptions.cast_arrow_tabular` lands on a
+        batch shaped close to the merged schema and skips re-ordering.
+        Columns the target asks for but the file doesn't carry are
+        silently dropped here; the cast will fill them with nulls.
+        """
+        target = options.target
+        if target is None or available_names is None:
+            return None
+        avail = available_names if isinstance(available_names, frozenset) else frozenset(available_names)
+        selected = [n for n in target.names if n in avail]
+        if not selected or len(selected) == len(avail):
+            return None
+        return selected
+
     # ==================================================================
     # Schema — cheap via footer
     # ==================================================================
@@ -108,12 +134,20 @@ class ParquetIO(IO[bytes, ParquetOptions]):
         Routes through :meth:`view` so the parent cursor isn't moved
         — :class:`pq.ParquetFile` seeks to the footer to parse it
         and would otherwise leave ``self._pos`` pointing at the file
-        end.
+        end. When the holder reports a known size (in-memory, or a
+        path with a warm stat cache) we short-circuit on empty; for
+        a cold remote path we attempt the read and translate
+        FileNotFound / "File too small" errors into an empty schema
+        rather than paying for an extra ``HeadObject`` /
+        ``get_metadata`` round trip up front.
         """
-        if self.size == 0:
+        if self.size_known and self.size == 0:
             return Schema.empty()
-        with self.arrow_input_stream() as v:
-            return Schema.from_arrow(pq.ParquetFile(v).schema_arrow)
+        try:
+            with self.arrow_input_stream() as v:
+                return Schema.from_arrow(pq.ParquetFile(v).schema_arrow)
+        except (FileNotFoundError, pa.ArrowInvalid):
+            return Schema.empty()
 
     # ==================================================================
     # Read path
@@ -131,22 +165,68 @@ class ParquetIO(IO[bytes, ParquetOptions]):
         ``batch_size`` — otherwise pyarrow's default of 65536 rows
         per batch.
 
-        Each batch is funneled through :meth:`CastOptions.cast_arrow_tabular`
-        so a bound ``target_field`` reshapes the rows to the caller's
-        schema before they leave the reader. When no target is bound
-        the cast is a passthrough — same byte cost as the legacy path.
+        When ``options.target`` is bound, the target column names are
+        pushed into :meth:`pq.ParquetFile.iter_batches` as a
+        ``columns=`` projection so the reader only decodes columns
+        the caller actually wants — the cast on the way out still
+        fills missing target columns from nulls. Each batch then
+        funnels through :meth:`CastOptions.cast_arrow_tabular` so a
+        bound ``target_field`` reshapes rows to the caller's schema.
+        When no target is bound the cast is a passthrough.
         """
-        if self.size == 0:
+        if self.size_known and self.size == 0:
             return
 
         batch_size = int(options.row_size or 65536)
-        with self.arrow_input_stream() as v:
-            with pq.ParquetFile(v) as pf:
+        try:
+            stream_ctx = self.arrow_input_stream()
+            stream = stream_ctx.__enter__()
+        except FileNotFoundError:
+            return
+        try:
+            try:
+                pf = pq.ParquetFile(stream)
+            except pa.ArrowInvalid:
+                # Empty or truncated payload — same end state as the
+                # ``size == 0`` short-circuit on the in-memory path.
+                return
+            with pf:
+                columns = self._projection_columns(options, pf.schema_arrow.names)
                 for batch in pf.iter_batches(
                     batch_size=batch_size,
                     use_threads=options.use_threads,
+                    columns=columns,
                 ):
                     yield options.cast_arrow_tabular(batch)
+        finally:
+            stream_ctx.__exit__(None, None, None)
+
+    def _read_arrow_table(self, options: ParquetOptions) -> pa.Table:
+        """Read the whole Parquet file as a :class:`pa.Table`.
+
+        Overrides the base class's ``iter_batches`` →
+        :func:`pa.Table.from_batches` shape with a single
+        :meth:`pq.ParquetFile.read` call. The C++ reader fans out
+        column decoding across :attr:`options.use_threads` worker
+        threads in one shot — meaningfully faster on multi-column
+        tables than streaming batch-by-batch and re-stitching on the
+        Python side. ``options.target`` still drives the projection
+        pushdown via :meth:`_projection_columns`.
+        """
+        if self.size_known and self.size == 0:
+            return super()._read_arrow_table(options)
+
+        try:
+            with self.arrow_input_stream() as v:
+                with pq.ParquetFile(v) as pf:
+                    columns = self._projection_columns(options, pf.schema_arrow.names)
+                    table = pf.read(
+                        columns=columns,
+                        use_threads=options.use_threads,
+                    )
+        except (FileNotFoundError, pa.ArrowInvalid):
+            return super()._read_arrow_table(options)
+        return options.cast_arrow_tabular(table)
 
     # ==================================================================
     # Write path
@@ -309,19 +389,46 @@ class ParquetIO(IO[bytes, ParquetOptions]):
         :meth:`view` — polars pulls the footer + planning bytes
         through the file-like at scan time and the view's cursor
         keeps the parent cursor untouched.
+
+        Bound ``options.target`` is applied via
+        :meth:`CastOptions.cast_polars_tabular` so the lazy frame is
+        already shaped to the caller's schema before ``.collect()`` —
+        polars merges the cast into its plan, so projection pushdown
+        still fires against the parquet file.
         """
         pl = polars_module()
         path = self._local_path_str()
         if path is not None:
-            return pl.scan_parquet(path)
-        with self.arrow_input_stream() as v:
-            return pl.scan_parquet(v)
+            lf = pl.scan_parquet(path)
+        else:
+            with self.arrow_input_stream() as v:
+                lf = pl.scan_parquet(v)
+        return options.cast_polars_tabular(lf)
 
     def _read_polars_frame(self, options: ParquetOptions) -> "pl.DataFrame":
-        """Native :func:`polars.read_parquet` eager frame."""
+        """Native :func:`polars.read_parquet` eager frame.
+
+        When ``options.target`` is bound, target column names are
+        pushed to polars as a ``columns=`` projection (intersected
+        with the parquet footer's column names so columns the target
+        adds — which the file doesn't carry — don't trip polars'
+        "column not in file" guard). The eager frame is then handed
+        to :meth:`CastOptions.cast_polars_tabular` for the value-level
+        coercion / fill.
+        """
         pl = polars_module()
         path = self._local_path_str()
+        columns: "list[str] | None" = None
+        if options.target is not None:
+            # Peek the footer once for the column-name intersection; the
+            # parquet metadata read is the same cheap call ``collect_schema``
+            # makes and dominates nothing in the read path.
+            with self.arrow_input_stream() as v:
+                schema_names = pq.ParquetFile(v).schema_arrow.names
+            columns = self._projection_columns(options, schema_names)
         if path is not None:
-            return pl.read_parquet(path, use_pyarrow=False)
-        with self.arrow_input_stream() as v:
-            return pl.read_parquet(v, use_pyarrow=False)
+            df = pl.read_parquet(path, columns=columns, use_pyarrow=False)
+        else:
+            with self.arrow_input_stream() as v:
+                df = pl.read_parquet(v, columns=columns, use_pyarrow=False)
+        return options.cast_polars_tabular(df)

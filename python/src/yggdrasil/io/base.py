@@ -192,7 +192,11 @@ def _resolve_format_target(
                 break
         if mt is None and holder is not None:
             try:
-                mt = getattr(holder.stat(), "media_type", None)
+                # Read the holder's stamped media_type directly instead
+                # of through :meth:`stat()` — a remote-backed holder's
+                # ``stat()`` is a network probe, but ``media_type``
+                # resolves from the URL extension cache without one.
+                mt = getattr(holder, "media_type", None)
             except Exception:
                 pass
 
@@ -637,7 +641,12 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         if holder is None:
             return None
         try:
-            mt = holder.stat().media_type
+            # Read the holder's stamped ``media_type`` directly — going
+            # through ``stat()`` would issue a network probe on every
+            # arrow_input_stream open for a remote-backed holder, just
+            # to extract the same value the lazy ``media_type`` slot
+            # already carries.
+            mt = holder.media_type
         except Exception:
             return None
         return getattr(mt, "codec", None) if mt is not None else None
@@ -811,6 +820,17 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         """Live size from the bound holder."""
         return self._active().size
 
+    @property
+    def size_known(self) -> bool:
+        """``True`` when reading :attr:`size` won't trigger a backend probe.
+
+        Forwards to :attr:`Holder.size_known`. Format leaves that
+        precheck ``size == 0`` to short-circuit on empty buffers
+        should guard the check on this predicate so a cold remote
+        path doesn't pay an extra round trip.
+        """
+        return self._active().size_known
+
     def __len__(self) -> int:
         return self.size
 
@@ -895,11 +915,12 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
     def media_type(self):
         """The buffer's :class:`MediaType`, or ``None``.
 
-        Convenience over ``self._holder.stat().media_type`` — same
-        thing the codec auto-handling reads.
+        Reads :attr:`Holder.media_type` directly — the URL-extension
+        cache is the source of truth and ``stat()`` would issue a
+        backend probe on remote holders for no extra information.
         """
         try:
-            return self._holder.stat().media_type
+            return self._holder.media_type
         except Exception:
             return None
 
@@ -940,7 +961,7 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         mt = MediaType.from_(media_type, default=None) if media_type is not None else None
         if mt is None:
             try:
-                mt = self._holder.stat().media_type
+                mt = self._holder.media_type
             except Exception:
                 mt = None
         if mt is None:

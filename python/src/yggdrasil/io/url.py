@@ -583,14 +583,14 @@ class URL(os.PathLike):
             # Root is its own parent (pathlib semantics) and also the
             # sensible answer when path is empty (the dataclass default
             # is "/", so "" shouldn't occur in practice but guard anyway).
-            return self._replace(path="/")
+            return self._replace_path("/")
         # Strip trailing slashes (``"a/b/c/" → "a/b/c"`` so we don't
         # peel off the empty tail and end up at the same path).
         stripped = path.rstrip("/")
         idx = stripped.rfind("/")
         if idx <= 0:
-            return self._replace(path="/")
-        return self._replace(path=stripped[:idx])
+            return self._replace_path("/")
+        return self._replace_path(stripped[:idx])
 
     @property
     def parents(self) -> tuple[URL, ...]:
@@ -1090,12 +1090,37 @@ class URL(os.PathLike):
         if not segments:
             return self
 
+        # Fast path: every segment is a non-empty plain string with no
+        # leading ``/`` (absolute reset), no embedded ``/`` (multi-
+        # segment string), and not the ``.`` / ``..`` traversal tokens
+        # that need pathlib's collapse semantics. This shape covers the
+        # bulk of real callers (``url / "subdir" / "file.csv"``,
+        # folder walks, registry lookups) and avoids
+        # :class:`PurePosixPath` construction + :func:`dataclasses.replace`
+        # — both meaningfully expensive in tight traversal loops.
+        all_plain = True
+        for s in segments:
+            if (
+                not isinstance(s, str)
+                or not s
+                or "/" in s
+                or s == "."
+                or s == ".."
+            ):
+                all_plain = False
+                break
+        if all_plain:
+            base = self.path or "/"
+            sep = "" if base.endswith("/") else "/"
+            new_path = base + sep + "/".join(segments)
+            return self._replace_path(new_path)
+
         base = PurePosixPath(self.path) if self.path else PurePosixPath("/")
         segments = [_join_segment(s) for s in segments]
         joined = str(base.joinpath(*segments))
         if segments and segments[-1].endswith("/") and not joined.endswith("/"):
             joined = joined + "/"
-        return self._replace(path=joined)
+        return self._replace_path(joined)
 
     # ------------------------------------------------------------------
     # Pattern matching and relative-path queries
@@ -1224,6 +1249,31 @@ class URL(os.PathLike):
 
     def _replace(self, **changes: Any) -> URL:
         return replace(self, **changes)
+
+    def _replace_path(self, path: str) -> URL:
+        """Clone with only :attr:`path` swapped — skips dataclass machinery.
+
+        The hot URL mutators (:meth:`parent`, :meth:`joinpath`,
+        :meth:`relative_to`) only ever rewrite the path, so the generic
+        :func:`dataclasses.replace` walk (kwarg dict build, field
+        enumeration, ``__post_init__`` re-run) is pure overhead. This
+        method copies the slots directly and resets the
+        :meth:`to_string` / :meth:`anonymize` memo slots so a follow-up
+        ``str(url)`` rebuilds against the new path.
+        """
+        new = object.__new__(URL)
+        setattr_ = object.__setattr__
+        setattr_(new, "scheme", self.scheme)
+        setattr_(new, "userinfo", self.userinfo)
+        setattr_(new, "host", self.host)
+        setattr_(new, "port", self.port)
+        setattr_(new, "path", path)
+        setattr_(new, "query", self.query)
+        setattr_(new, "fragment", self.fragment)
+        setattr_(new, "_str_enc", None)
+        setattr_(new, "_str_raw", None)
+        setattr_(new, "_anonymized", None)
+        return new
 
     @property
     def user(self) -> str | None:

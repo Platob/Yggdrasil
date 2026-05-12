@@ -816,7 +816,7 @@ class VolumePath(DatabricksPath):
             size=len(payload),
             kind=IOKind.FILE,
             mtime=time.time(),
-            media_type=self._media_type,
+            media_type=self.media_type,
         ))
 
     def truncate(self, n: int) -> int:

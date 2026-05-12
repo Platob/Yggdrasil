@@ -200,6 +200,30 @@ class TestJoinpath:
         with pytest.raises(TypeError):
             u.joinpath(42)  # type: ignore[arg-type]
 
+    def test_plain_string_fast_path_matches_pathlib(self):
+        # The plain-string fast path in :meth:`URL.joinpath` skips
+        # :class:`PurePosixPath` for the common ``url / 'sub' / 'file.ext'``
+        # shape. Cross-check the result against a path that goes through
+        # the pathlib branch (one segment carries an embedded ``/``) so
+        # the two implementations stay in lockstep.
+        u = URL.from_str("https://e.com/a/b")
+        fast = u.joinpath("sub", "file.csv")
+        slow = u.joinpath("sub/file.csv")
+        assert fast == slow == URL.from_str("https://e.com/a/b/sub/file.csv")
+
+    def test_trailing_slash_base_does_not_double_slash(self):
+        u = URL.from_str("https://e.com/a/")
+        joined = u.joinpath("b")
+        # The base already ends with ``/``; the fast path must not
+        # add a second separator.
+        assert joined.path == "/a/b"
+
+    def test_dot_segment_falls_back_to_pathlib(self):
+        # ``"."`` must collapse via :class:`PurePosixPath`; the fast
+        # path skips that and would otherwise produce ``/a/./b``.
+        u = URL.from_str("https://e.com/a")
+        assert u.joinpath(".", "b").path == "/a/b"
+
 
 # ---------------------------------------------------------------------------
 # Query / userinfo helpers

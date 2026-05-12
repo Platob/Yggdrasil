@@ -299,13 +299,14 @@ class Holder(URLBased, Tabular[O], Disposable):
         if stat is not None and stat.media_type is not None:
             self._media_type = stat.media_type
         else:
-            try:
-                self._media_type = (
-                    self._url.infer_media_type(default=None)
-                    if self._url is not None else None
-                )
-            except Exception:
-                self._media_type = None
+            # Defer the ``url.infer_media_type`` resolve to the first
+            # :attr:`media_type` read. Sibling-construction shapes
+            # (Path.parent / Path.joinpath / Path.parents) build a
+            # fresh holder per step and don't observe ``media_type``
+            # in between — paying for the mime walk on every step was
+            # the dominant cost of path traversal. ``...`` is the
+            # project-wide "not yet computed" sentinel.
+            self._media_type = ...
         self.temporary: bool = bool(temporary)
 
         # ``url=`` only fixes identity; payload-bearing seeds
@@ -603,6 +604,20 @@ class Holder(URLBased, Tabular[O], Disposable):
     def size(self) -> int:
         """Current visible size in bytes."""
 
+    @property
+    def size_known(self) -> bool:
+        """``True`` when reading :attr:`size` won't trigger a backend probe.
+
+        Always true for in-memory holders (size is a slot). Path
+        holders override to ``True`` only when their stat cache is
+        warm — callers that want to short-circuit on an empty buffer
+        (parquet / arrow IPC / CSV readers checking ``size == 0``)
+        can guard the check on this predicate so a cold remote path
+        doesn't pay a ``HeadObject`` / ``get_status`` / ``get_metadata``
+        round trip just to discover the file is non-empty.
+        """
+        return True
+
     def is_empty(self):
         return self.size == 0
 
@@ -687,8 +702,23 @@ class Holder(URLBased, Tabular[O], Disposable):
 
     @property
     def media_type(self):
-        """The holder's :class:`MediaType`, or ``None`` if unset."""
-        return self._media_type
+        """The holder's :class:`MediaType`, or ``None`` if unset.
+
+        Resolves lazily on first read: a fresh holder bound only by URL
+        carries the sentinel ``...`` in :attr:`_media_type` and runs
+        :meth:`URL.infer_media_type` here once, caching the result back
+        onto the slot. Subsequent reads (and pickling, IOStats
+        snapshots, codec dispatch, …) hit the cached value.
+        """
+        mt = self._media_type
+        if mt is ...:
+            url = self._url
+            try:
+                mt = url.infer_media_type(default=None) if url is not None else None
+            except Exception:
+                mt = None
+            self._media_type = mt
+        return mt
 
     @media_type.setter
     def media_type(self, value: Any) -> None:
@@ -769,7 +799,7 @@ class Holder(URLBased, Tabular[O], Disposable):
             owns_holder=owns_holder,
             mode=mode,
             auto_open=auto_open,
-            media_type=self._media_type if media_type is None else media_type,
+            media_type=self.media_type if media_type is None else media_type,
             **kwargs,
         )
 

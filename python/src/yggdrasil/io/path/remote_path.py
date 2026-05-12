@@ -51,8 +51,8 @@ __all__ = ["RemotePath"]
 _STAT_CACHE_TTL: float = 300.0
 
 
-def _extract_url_key(args: tuple, kwargs: dict) -> "str | None":
-    """Best-effort URL key from constructor args/kwargs.
+def _resolve_url_from_args(args: tuple, kwargs: dict) -> "URL | None":
+    """Best-effort :class:`URL` from constructor args/kwargs.
 
     ``__new__`` runs before ``__init__`` normalizes its inputs, so we
     peek at whatever is already URL-shaped — and try a best-effort
@@ -62,30 +62,36 @@ def _extract_url_key(args: tuple, kwargs: dict) -> "str | None":
     Returns ``None`` only when nothing parses cleanly; that path
     falls back to a fresh allocation rather than crashing
     construction.
+
+    The parsed URL is stashed onto the new instance as
+    :attr:`_resolved_url` so the eventual subclass ``__init__`` can
+    reuse it without re-parsing — round-trip costs roughly half on
+    string-shaped constructor calls.
     """
     url = kwargs.get("url")
-    if url is None and args:
+    if isinstance(url, URL):
+        return url
+    if url is not None:
+        try:
+            return URL.from_(url)
+        except Exception:
+            return None
+    if args:
         seed = args[0]
         if isinstance(seed, URL):
-            url = seed
-        elif isinstance(seed, (str, bytes)):
+            return seed
+        if isinstance(seed, (str, bytes)):
             try:
-                url = URL.from_(seed)
+                return URL.from_(seed)
             except Exception:
-                url = None
-        else:
-            # pathlib / os.PathLike fall through here. ``URL.from_``
-            # accepts ``__fspath__``-able objects.
-            try:
-                url = URL.from_(seed)
-            except Exception:
-                url = None
-    if url is None:
-        return None
-    try:
-        return str(url)
-    except Exception:
-        return None
+                return None
+        # pathlib / os.PathLike fall through here. ``URL.from_``
+        # accepts ``__fspath__``-able objects.
+        try:
+            return URL.from_(seed)
+        except Exception:
+            return None
+    return None
 
 
 class RemotePath(Path):
@@ -98,7 +104,17 @@ class RemotePath(Path):
     from this base.
     """
 
-    __slots__ = ("_stat_cached", "_stat_cached_at", "_initialized")
+    __slots__ = (
+        "_stat_cached",
+        "_stat_cached_at",
+        "_initialized",
+        # Parsed-URL stash populated by :meth:`__new__` so subclass
+        # ``__init__`` (S3Path, DBFSPath, VolumePath, …) doesn't
+        # re-parse the same string. Reset on the first ``__init__``
+        # pass so it doesn't keep a reference to the URL after the
+        # holder's own ``_url`` slot is populated.
+        "_resolved_url",
+    )
 
     #: Per-class freshness window for ``_stat_cached``. Subclasses can
     #: tighten or loosen the budget — e.g. a path on an append-only
@@ -134,22 +150,40 @@ class RemotePath(Path):
     # ------------------------------------------------------------------
 
     def __new__(cls, *args: Any, **kwargs: Any):
+        # Singleton fast path: look the cache up *before* falling
+        # through to ``super().__new__`` (Holder → URLBased → Disposable
+        # — each layer does some work, and on a warm hit we shouldn't
+        # pay for it). The cache lookup needs a parsed URL key, but
+        # ``URL.from_`` on a string is much cheaper than the full
+        # construction chain, so the trade is a clear win.
+        url_obj = _resolve_url_from_args(args, kwargs)
+        if url_obj is not None:
+            key = (cls, str(url_obj))
+            existing = cls._INSTANCES.get(key)
+            if existing is not None and type(existing) is cls:
+                return existing
+
         # Let the abstract-class dispatch chain (Holder.__new__ /
-        # DatabricksPath.__new__) settle on a concrete subclass first.
+        # DatabricksPath.__new__) settle on a concrete subclass.
         instance = super().__new__(cls, *args, **kwargs)
         # Dispatch landed on a different class (e.g. ``DatabricksPath``
         # forwarding to ``VolumePath``); that branch ran its own
         # ``__new__`` and either cached or chose not to. Don't override.
         if type(instance) is not cls:
             return instance
-        key_url = _extract_url_key(args, kwargs)
-        if key_url is None:
+        if url_obj is None:
             return instance
-        key = (cls, key_url)
+        # Stash the parsed URL onto the new instance so the subclass
+        # ``__init__`` reuses it instead of calling ``URL.from_(data)``
+        # a second time.
+        try:
+            object.__setattr__(instance, "_resolved_url", url_obj)
+        except AttributeError:
+            pass
         # ``get_or_set`` is atomic under :class:`ExpiringDict`'s lock —
         # racing constructors collapse to the same singleton without an
         # external mutex.
-        return cls._INSTANCES.get_or_set(key, lambda: instance)
+        return cls._INSTANCES.get_or_set((cls, str(url_obj)), lambda: instance)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         # Singleton-cached instances are re-entered on every constructor
@@ -166,6 +200,13 @@ class RemotePath(Path):
             super().__init__(*args, **kwargs)
             self._stat_cached: IOStats | None = None
             self._stat_cached_at: float = 0.0
+            # Drop the parsed-URL stash now that ``Holder.__init__`` has
+            # bound ``self._url`` — keeping the slot around just adds a
+            # dangling reference.
+            try:
+                object.__setattr__(self, "_resolved_url", None)
+            except AttributeError:
+                pass
             self._initialized = True
 
     # ------------------------------------------------------------------
@@ -187,6 +228,25 @@ class RemotePath(Path):
     # ------------------------------------------------------------------
     # Stat — cached probe, subclass implements the network call
     # ------------------------------------------------------------------
+
+    @property
+    def size_known(self) -> bool:
+        """``True`` only when the stat cache carries a fresh entry.
+
+        Lets ``ParquetIO`` / ``CsvIO`` / ``ArrowIPCIO`` skip a probe
+        round trip just to short-circuit on ``size == 0``: when the
+        cache is cold the format reader will trip its own EOF /
+        empty-file error which the caller catches and translates to
+        an empty schema. When the cache is warm the cheap ``size``
+        read fires unchanged.
+        """
+        cached = self._stat_cached
+        if cached is None:
+            return False
+        ttl = self.stat_cache_ttl
+        if ttl is None:
+            return True
+        return (time.monotonic() - self._stat_cached_at) <= ttl
 
     def _stat(self) -> IOStats:
         """Cached :class:`IOStats` probe.
