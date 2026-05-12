@@ -51,7 +51,7 @@ class TestPolarsDataFrameToArrow(PolarsTestCase, ArrowTestCase):
     def test_target_field_casts_int64_to_int32(self) -> None:
         df = self.df({"a": [1, 2, 3]})
         target = Schema.from_arrow(self.pa.schema([self.pa.field("a", self.pa.int32())]))
-        out = any_to_arrow_table(df, CastOptions(target_field=target))
+        out = any_to_arrow_table(df, CastOptions(target=target))
         self.assertEqual(out.schema.field("a").type, self.pa.int32())
         self.assertEqual(out["a"].to_pylist(), [1, 2, 3])
 
@@ -61,7 +61,7 @@ class TestPolarsDataFrameToArrow(PolarsTestCase, ArrowTestCase):
             self.pa.field("c", self.pa.bool_()),
             self.pa.field("a", self.pa.int64()),
         ]))
-        out = any_to_arrow_table(df, CastOptions(target_field=target))
+        out = any_to_arrow_table(df, CastOptions(target=target))
         self.assertEqual(out.column_names, ["c", "a"])
 
     def test_string_column(self) -> None:
@@ -76,7 +76,7 @@ class TestPolarsDataFrameToArrow(PolarsTestCase, ArrowTestCase):
         # would short-circuit).
         df = self.df({"a": [1.5, 2.5, 3.5]})
         target = Schema.from_arrow(self.pa.schema([self.pa.field("a", self.pa.int32())]))
-        out = any_to_arrow_table(df, CastOptions(target_field=target))
+        out = any_to_arrow_table(df, CastOptions(target=target))
         self.assertEqual(out.schema.field("a").type, self.pa.int32())
         self.assertEqual(out["a"].to_pylist(), [1, 2, 3])
 
@@ -101,7 +101,7 @@ class TestPolarsSeriesToArrow(PolarsTestCase, ArrowTestCase):
     def test_series_target_cast(self) -> None:
         s = self.series("vals", [1, 2, 3])
         target = Schema.from_arrow(self.pa.schema([self.pa.field("vals", self.pa.int16())]))
-        out = any_to_arrow_table(s, CastOptions(target_field=target))
+        out = any_to_arrow_table(s, CastOptions(target=target))
         self.assertEqual(out.schema.field("vals").type, self.pa.int16())
 
     def test_series_with_nulls(self) -> None:
@@ -120,13 +120,13 @@ class TestPolarsLazyFrameToArrow(PolarsTestCase, ArrowTestCase):
     def test_lazyframe_target_cast(self) -> None:
         lf = self.lazy({"a": [1, 2, 3]})
         target = Schema.from_arrow(self.pa.schema([self.pa.field("a", self.pa.int32())]))
-        out = any_to_arrow_table(lf, CastOptions(target_field=target))
+        out = any_to_arrow_table(lf, CastOptions(target=target))
         self.assertEqual(out.schema.field("a").type, self.pa.int32())
 
     def test_lazyframe_projection(self) -> None:
         lf = self.lazy({"a": [1, 2], "b": ["x", "y"], "c": [True, False]})
         target = Schema.from_arrow(self.pa.schema([self.pa.field("a", self.pa.int64())]))
-        out = any_to_arrow_table(lf, CastOptions(target_field=target))
+        out = any_to_arrow_table(lf, CastOptions(target=target))
         self.assertEqual(out.column_names, ["a"])
         self.assertEqual(out["a"].to_pylist(), [1, 2])
 
@@ -147,7 +147,7 @@ class TestPolarsLazyFrameToArrow(PolarsTestCase, ArrowTestCase):
     def test_lazyframe_streams_with_target_cast(self) -> None:
         lf = self.lazy({"a": list(range(5))})
         target = Schema.from_arrow(self.pa.schema([self.pa.field("a", self.pa.int32())]))
-        batches = list(any_to_arrow_batch_iterator(lf, CastOptions(target_field=target)))
+        batches = list(any_to_arrow_batch_iterator(lf, CastOptions(target=target)))
         for b in batches:
             self.assertEqual(b.schema.field("a").type, self.pa.int32())
 

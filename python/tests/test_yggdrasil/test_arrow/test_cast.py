@@ -83,7 +83,7 @@ class TestAnyToArrowTable(ArrowTestCase):
 
     def test_array_uses_target_field_name(self) -> None:
         target = Field.from_arrow(self.pa.field("count", self.pa.int32()))
-        out = any_to_arrow_table(self.pa.array([1, 2, 3]), CastOptions(target_field=target))
+        out = any_to_arrow_table(self.pa.array([1, 2, 3]), CastOptions(target=target))
         self.assertEqual(out.column_names, ["count"])
         self.assertEqual(out.schema.field("count").type, self.pa.int32())
 
@@ -127,13 +127,13 @@ class TestAnyToArrowTable(ArrowTestCase):
             self.pa.field("a", self.pa.int32()),
             self.pa.field("b", self.pa.string()),
         ]))
-        out = any_to_arrow_table(t, CastOptions(target_field=target))
+        out = any_to_arrow_table(t, CastOptions(target=target))
         self.assertEqual(out.schema.field("a").type, self.pa.int32())
 
     def test_column_projection_via_target_field(self) -> None:
         t = self._sample()
         target = Schema.from_arrow(self.pa.schema([self.pa.field("b", self.pa.string())]))
-        out = any_to_arrow_table(t, CastOptions(target_field=target))
+        out = any_to_arrow_table(t, CastOptions(target=target))
         self.assertEqual(out.column_names, ["b"])
 
     def test_pandas_dataframe(self) -> None:
@@ -348,18 +348,18 @@ class TestAnyToArrowScalar(ArrowTestCase):
 
     def test_target_field_drives_type(self) -> None:
         target = Field.from_arrow(self.pa.field("v", self.pa.int32()))
-        s = any_to_arrow_scalar(5, CastOptions(target_field=target))
+        s = any_to_arrow_scalar(5, CastOptions(target=target))
         self.assertEqual(s.type, self.pa.int32())
         self.assertEqual(s.as_py(), 5)
 
     def test_none_with_nullable_target_returns_null_scalar(self) -> None:
         target = Field.from_arrow(self.pa.field("v", self.pa.int32(), nullable=True))
-        s = any_to_arrow_scalar(None, CastOptions(target_field=target))
+        s = any_to_arrow_scalar(None, CastOptions(target=target))
         self.assertTrue(s.as_py() is None)
 
     def test_none_with_non_nullable_target_uses_default(self) -> None:
         target = Field.from_arrow(self.pa.field("v", self.pa.int32(), nullable=False))
-        s = any_to_arrow_scalar(None, CastOptions(target_field=target))
+        s = any_to_arrow_scalar(None, CastOptions(target=target))
         self.assertEqual(s.as_py(), 0)
 
     def test_none_without_target_returns_null(self) -> None:
@@ -369,7 +369,7 @@ class TestAnyToArrowScalar(ArrowTestCase):
     def test_existing_pa_scalar_routes_through_cast(self) -> None:
         target = Field.from_arrow(self.pa.field("v", self.pa.int32()))
         src = self.pa.scalar(7, type=self.pa.int64())
-        out = any_to_arrow_scalar(src, CastOptions(target_field=target))
+        out = any_to_arrow_scalar(src, CastOptions(target=target))
         self.assertEqual(out.type, self.pa.int32())
         self.assertEqual(out.as_py(), 7)
 
@@ -381,7 +381,7 @@ class TestAnyToArrowScalar(ArrowTestCase):
             BLUE = 2
 
         target = Field.from_arrow(self.pa.field("v", self.pa.int32()))
-        s = any_to_arrow_scalar(Color.RED, CastOptions(target_field=target))
+        s = any_to_arrow_scalar(Color.RED, CastOptions(target=target))
         self.assertEqual(s.as_py(), 1)
 
     def test_unsafe_construction_falls_back(self) -> None:
@@ -389,7 +389,7 @@ class TestAnyToArrowScalar(ArrowTestCase):
         # raises ArrowInvalid; the fallback drops the type hint.
         target = Field.from_arrow(self.pa.field("v", self.pa.int32()))
         try:
-            any_to_arrow_scalar("abc", CastOptions(target_field=target, safe=False))
+            any_to_arrow_scalar("abc", CastOptions(target=target, safe=False))
         except Exception:
             # The fallback attempt to cast "abc" → int32 may still raise
             # downstream; the goal here is that the *first* pa.scalar
@@ -409,7 +409,7 @@ class TestCastArrowScalar(ArrowTestCase):
     def test_cast_to_int32(self) -> None:
         src = self.pa.scalar(7, type=self.pa.int64())
         target = Field.from_arrow(self.pa.field("v", self.pa.int32()))
-        out = cast_arrow_scalar(src, CastOptions(target_field=target))
+        out = cast_arrow_scalar(src, CastOptions(target=target))
         self.assertEqual(out.type, self.pa.int32())
         self.assertEqual(out.as_py(), 7)
 
@@ -420,14 +420,14 @@ class TestCastArrowArray(ArrowTestCase):
     def test_array_cast(self) -> None:
         arr = self.pa.array([1, 2, 3], type=self.pa.int64())
         target = Field.from_arrow(self.pa.field("v", self.pa.int32()))
-        out = cast_arrow_array(arr, CastOptions(target_field=target))
+        out = cast_arrow_array(arr, CastOptions(target=target))
         self.assertEqual(out.type, self.pa.int32())
         self.assertEqual(out.to_pylist(), [1, 2, 3])
 
     def test_chunked_array_cast(self) -> None:
         ca = self.pa.chunked_array([[1, 2], [3]], type=self.pa.int64())
         target = Field.from_arrow(self.pa.field("v", self.pa.int32()))
-        out = cast_arrow_array(ca, CastOptions(target_field=target))
+        out = cast_arrow_array(ca, CastOptions(target=target))
         self.assertEqual(out.type, self.pa.int32())
         self.assertEqual(out.to_pylist(), [1, 2, 3])
 
@@ -438,19 +438,19 @@ class TestCastArrowTabular(ArrowTestCase):
     def test_table_cast_changes_type(self) -> None:
         t = self.table({"a": [1, 2, 3]})
         target = Schema.from_arrow(self.pa.schema([self.pa.field("a", self.pa.int32())]))
-        out = cast_arrow_tabular(t, CastOptions(target_field=target))
+        out = cast_arrow_tabular(t, CastOptions(target=target))
         self.assertEqual(out.schema.field("a").type, self.pa.int32())
 
     def test_record_batch_cast(self) -> None:
         rb = self.record_batch({"a": [1, 2, 3]})
         target = Schema.from_arrow(self.pa.schema([self.pa.field("a", self.pa.int32())]))
-        out = cast_arrow_tabular(rb, CastOptions(target_field=target))
+        out = cast_arrow_tabular(rb, CastOptions(target=target))
         self.assertEqual(out.schema.field("a").type, self.pa.int32())
 
     def test_skip_cast_when_schema_matches(self) -> None:
         t = self.table({"a": self.pa.array([1, 2], type=self.pa.int32())})
         target = Schema.from_arrow(self.pa.schema([self.pa.field("a", self.pa.int32())]))
-        out = cast_arrow_tabular(t, CastOptions(target_field=target))
+        out = cast_arrow_tabular(t, CastOptions(target=target))
         self.assertEqual(out.schema.field("a").type, self.pa.int32())
 
 
@@ -475,7 +475,7 @@ class TestCastArrowRecordBatchReader(ArrowTestCase):
         t = self.table({"a": [1, 2, 3]})
         rbr = self.pa.RecordBatchReader.from_batches(t.schema, iter(t.to_batches()))
         target = Schema.from_arrow(self.pa.schema([self.pa.field("a", self.pa.int32())]))
-        out = cast_arrow_record_batch_reader(rbr, CastOptions(target_field=target))
+        out = cast_arrow_record_batch_reader(rbr, CastOptions(target=target))
         self.assertEqual(out.schema.field("a").type, self.pa.int32())
 
 

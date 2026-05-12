@@ -30,11 +30,11 @@ def cast_pandas_series(
     This is now a thin wrapper around Field.cast_pandas_frame.
     """
     options = CastOptions.check(options)
-    if options.target_field is None and options.field_name is None:
+    if options.target is None and options.field_name is None:
         return _cast_pandas_series_impl(series, options=options)
 
     from yggdrasil.data.data_field import Field
-    target_field = Field.from_any(options.target_field or options.field_name)
+    target_field = Field.from_any(options.target or options.field_name)
     return target_field.cast_pandas_frame(series, options=options)
 
 
@@ -46,7 +46,7 @@ def _cast_pandas_series_impl(
     Cast a pandas Series to a target Arrow type using Arrow casting rules.
 
     The target type/field should be provided via `options` (e.g. options.merged_schema
-    or options.target_field, depending on how ArrowCastOptions is defined).
+    or options.target, depending on how ArrowCastOptions is defined).
 
     Arrow does:
       - type cast
@@ -76,11 +76,11 @@ def cast_pandas_dataframe(
     This is now a thin wrapper around Schema.cast_pandas_frame.
     """
     options = CastOptions.check(options)
-    if options.target_arrow_schema is None and options.target_field is None:
+    if options.target_arrow_schema is None and options.target is None:
         return _cast_pandas_dataframe_impl(dataframe, options=options)
 
     from yggdrasil.data.schema import Schema
-    target_schema = Schema.from_any(options.target_field or options.target_arrow_schema)
+    target_schema = Schema.from_any(options.target or options.target_arrow_schema)
     return target_schema.cast_pandas_frame(dataframe, options=options)
 
 

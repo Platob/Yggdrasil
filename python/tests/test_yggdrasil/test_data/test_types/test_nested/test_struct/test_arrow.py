@@ -61,8 +61,8 @@ class TestCastStructArray:
         )
 
         options = CastOptions(
-            source_field=source_struct_field,
-            target_field=target_struct_field,
+            source=source_struct_field,
+            target=target_struct_field,
         )
 
         result = cast_arrow_struct_array(array, options)
@@ -92,8 +92,8 @@ class TestCastStructArray:
         array = pa.array([{"a": 1, "b": "x"}], type=arrow_struct)
 
         options = CastOptions(
-            source_field=source_struct_field,
-            target_field=source_struct_field,
+            source=source_struct_field,
+            target=source_struct_field,
         )
         assert cast_arrow_struct_array(array, options) is array
 
@@ -115,7 +115,7 @@ class TestCastStructArray:
             nullable=True,
         )
 
-        options = CastOptions(source_field=source_field, target_field=None)
+        options = CastOptions(source=source_field, target=None)
         assert cast_arrow_struct_array(array, options) is array
 
     def test_rejects_non_struct_source(self) -> None:
@@ -143,7 +143,7 @@ class TestCastStructArray:
         )
 
         options = CastOptions(
-            source_field=source_field, target_field=target_field
+            source=source_field, target=target_field
         )
 
         with pytest.raises(pa.ArrowInvalid, match="Cannot cast"):
@@ -167,8 +167,8 @@ class TestCastMapArray:
         )
 
         options = CastOptions(
-            source_field=source_map_field,
-            target_field=target_struct_field,
+            source=source_map_field,
+            target=target_struct_field,
         )
 
         result = cast_arrow_map_array(array, options)
@@ -198,8 +198,8 @@ class TestCastListArray:
         )
 
         options = CastOptions(
-            source_field=source_list_field,
-            target_field=target_list_to_struct_field,
+            source=source_list_field,
+            target=target_list_to_struct_field,
         )
 
         result = cast_arrow_list_array(array, options)
@@ -231,8 +231,8 @@ class TestCastTabular:
         )
 
         options = CastOptions(
-            source_field=source_tabular_schema,
-            target_field=target_tabular_schema,
+            source=source_tabular_schema,
+            target=target_tabular_schema,
         )
 
         result = cast_arrow_tabular(table, options)
@@ -265,8 +265,8 @@ class TestCastTabular:
         )
 
         options = CastOptions(
-            source_field=source_tabular_schema,
-            target_field=target_tabular_schema,
+            source=source_tabular_schema,
+            target=target_tabular_schema,
         )
 
         result = cast_arrow_tabular(batch, options)
@@ -279,14 +279,14 @@ class TestCastTabular:
 
     def test_returns_input_when_target_is_none(self) -> None:
         table = pa.table({"a": [1, 2, 3]})
-        options = CastOptions(target_field=None)
+        options = CastOptions(target=None)
 
         assert cast_arrow_tabular(table, options) is table
 
     def test_rejects_non_table_input(self) -> None:
         options = CastOptions(
-            source_field=Schema(inner_fields=[]),
-            target_field=Schema(inner_fields=[]),
+            source=Schema(inner_fields=[]),
+            target=Schema(inner_fields=[]),
         )
 
         with pytest.raises(TypeError, match="Unsupported tabular type"):
@@ -311,8 +311,8 @@ class TestCastBatchIterator:
         ]
 
         options = CastOptions(
-            source_field=source_tabular_schema,
-            target_field=target_tabular_schema,
+            source=source_tabular_schema,
+            target=target_tabular_schema,
         )
 
         result = list(cast_arrow_batch_iterator(iter(batches), options))
@@ -336,8 +336,8 @@ class TestCastBatchIterator:
         inputs = [_batch([{"a": i, "b": "x"}], schema) for i in range(5)]
 
         options = CastOptions(
-            source_field=source_tabular_schema,
-            target_field=source_tabular_schema,
+            source=source_tabular_schema,
+            target=source_tabular_schema,
         )
 
         result = list(cast_arrow_batch_iterator(iter(inputs), options))
@@ -356,8 +356,8 @@ class TestCastBatchIterator:
         target_bytes = inputs[0].nbytes * 8
 
         options = CastOptions(
-            source_field=source_tabular_schema,
-            target_field=source_tabular_schema,
+            source=source_tabular_schema,
+            target=source_tabular_schema,
             byte_size=target_bytes,
         )
 
@@ -375,8 +375,8 @@ class TestCastBatchIterator:
         big = _batch([{"a": i, "b": "x"} for i in range(25)], schema)
 
         options = CastOptions(
-            source_field=source_tabular_schema,
-            target_field=source_tabular_schema,
+            source=source_tabular_schema,
+            target=source_tabular_schema,
             row_size=10,
         )
 
@@ -388,7 +388,7 @@ class TestCastBatchIterator:
         self,
         target_tabular_schema: Schema,
     ) -> None:
-        options = CastOptions(target_field=target_tabular_schema)
+        options = CastOptions(target=target_tabular_schema)
         assert list(cast_arrow_batch_iterator(iter([]), options)) == []
 
     def test_rejects_non_record_batch_items(self) -> None:
@@ -402,7 +402,7 @@ class TestCastBatchIterator:
     ) -> None:
         schema = source_tabular_schema.to_arrow_schema()
         good = _batch([{"a": 1, "b": "x"}], schema)
-        options = CastOptions(target_field=source_tabular_schema)
+        options = CastOptions(target=source_tabular_schema)
 
         gen = cast_arrow_batch_iterator(iter([good, "not-a-batch"]), options)
         next(gen)

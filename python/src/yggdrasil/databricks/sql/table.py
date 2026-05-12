@@ -999,7 +999,7 @@ def _build_ygg_properties(
     ).hexdigest()
 
     data_fields = [
-        f for f in schema_info.children_fields
+        f for f in schema_info.children
         if not getattr(f, "constraint_key", False)
     ]
 
@@ -1973,7 +1973,7 @@ class Table(DatabricksResource, Holder):
         cluster_by = schema_info.cluster_fields
         primary_keys = schema_info.primary_fields
 
-        for f in schema_info.children_fields:
+        for f in schema_info.children:
             effective_fields.append(f)
             column_definitions.append(f.to_spark_name())
 
@@ -2319,7 +2319,7 @@ class Table(DatabricksResource, Holder):
 
         effective_fields: list[Field] = []
         column_infos: list[ColumnInfo] = []
-        for position, f in enumerate(schema_info.children_fields):
+        for position, f in enumerate(schema_info.children):
             if f.constraint_key:
                 continue
             effective_fields.append(f)

@@ -4,7 +4,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import MISSING
 from difflib import get_close_matches
-from typing import Any, AnyStr, Mapping, TYPE_CHECKING, Union, Iterable
+from typing import Any, Mapping, TYPE_CHECKING, Union, Iterable
 
 import yggdrasil.pickle.json as json_module
 from yggdrasil.data.constants import TAG_PREFIX, DEFAULT_VALUE_KEY
@@ -14,7 +14,6 @@ if TYPE_CHECKING:
 
 
 __all__ = [
-    "BaseMetadata",
     "BaseChildrenFields",
     "_merge_metadata_and_tags",
     "_normalize_metadata",
@@ -95,156 +94,30 @@ def _merge_metadata_and_tags(
     return merged or None
 
 
-class BaseMetadata(ABC):
-    metadata: dict[bytes, bytes] | None
-
-    @abstractmethod
-    def _empty_tags(self) -> dict[bytes, bytes] | None:
-        """Return the subtype-specific empty value for tags."""
-
-    def _prefixed_metadata(self, prefix: bytes) -> dict[bytes, bytes]:
-        if not self.metadata:
-            return {}
-
-        return {
-            key[len(prefix):]: value
-            for key, value in self.metadata.items()
-            if key.startswith(prefix)
-        }
-
-    def _update_prefixed_metadata(
-        self,
-        prefix: bytes,
-        values: Mapping[bytes | str, bytes | str | object] | None,
-    ) -> None:
-        if not values:
-            return
-
-        if self.metadata is None:
-            object.__setattr__(self, "metadata", {})
-
-        self.metadata.update(
-            {
-                prefix + _to_bytes(key): _to_bytes(value)
-                for key, value in values.items()
-                if key and value is not None
-            }
-        )
-
-    def _tag_value(self, key: bytes | str) -> bytes | None:
-        if not self.metadata:
-            return None
-        return self.metadata.get(TAG_PREFIX + _to_bytes(key))
-
-    def _set_tag_value(self, key: bytes | str, value: Any | None) -> None:
-        if value is not None:
-            if not self.metadata:
-                object.__setattr__(self, "metadata", {})
-            self.metadata[TAG_PREFIX + _to_bytes(key)] = _to_bytes(value)
-            self._on_metadata_mutated()
-
-    def _unset_tag_value(self, key: bytes | str) -> None:
-        if not self.metadata:
-            return
-        self.metadata.pop(TAG_PREFIX + _to_bytes(key), None)
-        if not self.metadata:
-            object.__setattr__(self, "metadata", None)
-        self._on_metadata_mutated()
-
-    def _on_metadata_mutated(self) -> None:
-        """Hook called whenever this metadata holder's dict changes.
-
-        :class:`~yggdrasil.data.data_field.Field` overrides this to
-        clear its cached arrow / polars / spark projections (and
-        cascade to parents). Default is a no-op so non-Field metadata
-        holders pay nothing.
-        """
-        return None
-
-    def _tag_flag(self, key: bytes | str) -> bool:
-        value = self._tag_value(key)
-        return bool(value)
-
-    def _tag_text(self, key: bytes | str) -> str | None:
-        value = self._tag_value(key)
-        if not value:
-            return None
-        return value.decode("utf-8") if isinstance(value, bytes) else str(value)
-
-    @property
-    def tags(self) -> dict[bytes, bytes] | None:
-        tags = self._prefixed_metadata(TAG_PREFIX)
-        if tags:
-            return tags
-        return self._empty_tags()
-
-    @tags.setter
-    def tags(self, value: Mapping[AnyStr, AnyStr] | None):
-        self.update_tags(value)
-
-    def update_tags(self, value: Mapping[AnyStr, AnyStr] | None) -> None:
-        self._update_prefixed_metadata(TAG_PREFIX, value)
-
-    @property
-    def partition_by(self) -> bool:
-        return self._tag_flag(b"partition_by")
-
-    @property
-    def cluster_by(self) -> bool:
-        return self._tag_flag(b"cluster_by")
-
-    @property
-    def primary_key(self) -> bool:
-        return self._tag_flag(b"primary_key")
-
-    @property
-    def foreign_key(self) -> bool:
-        return self._tag_flag(b"foreign_key")
-
-    @property
-    def constraint_key(self) -> bool:
-        return self._tag_flag(b"constraint_key")
-
-    @property
-    def sorted(self) -> bool:
-        return self._tag_flag(b"sorted")
-
-    @property
-    def comment(self):
-        if not self.metadata:
-            return None
-
-        comment = self.metadata.get(b"comment") or self.metadata.get(b"description")
-
-        if comment:
-            return comment.decode('utf-8')
-        return None
-
-
 class BaseChildrenFields(ABC):
 
     def __getitem__(self, item):
         return self.field(item)
 
     def __iter__(self):
-        return iter(self.children_fields)
+        return iter(self.children)
 
     @property
     @abstractmethod
-    def children_fields(self) -> list["Field"]:
+    def children(self) -> list["Field"]:
         ...
 
     @property
     def primary_fields(self):
-        return [f for f in self.children_fields if f.primary_key]
+        return [f for f in self.children if f.primary_key]
 
     @property
     def partition_fields(self):
-        return [f for f in self.children_fields if f.partition_by]
+        return [f for f in self.children if f.partition_by]
 
     @property
     def cluster_fields(self):
-        return [f for f in self.children_fields if f.cluster_by]
+        return [f for f in self.children if f.cluster_by]
 
     # ------------------------------------------------------------------
     # Field lookup map — cached on Field, recomputed on miss elsewhere
@@ -253,7 +126,7 @@ class BaseChildrenFields(ABC):
     def _build_field_name_maps(
         self,
     ) -> tuple[dict[str, int], dict[str, int]]:
-        """Return ``(exact_map, casefold_map)`` over ``children_fields``.
+        """Return ``(exact_map, casefold_map)`` over ``children``.
 
         Both map field name → index. The exact map dispatches the
         common case (case-sensitive lookup); the casefold map is the
@@ -263,7 +136,7 @@ class BaseChildrenFields(ABC):
         """
         exact: dict[str, int] = {}
         fold: dict[str, int] = {}
-        for i, f in enumerate(self.children_fields):
+        for i, f in enumerate(self.children):
             exact.setdefault(f.name, i)
             fold.setdefault(f.name.casefold(), i)
         return exact, fold
@@ -311,11 +184,11 @@ class BaseChildrenFields(ABC):
         raise_error: bool = True,
     ) -> "Field":
         try:
-            return self.children_fields[index]
+            return self.children[index]
         except IndexError as e:
             if raise_error:
                 raise IndexError(
-                    f"Index {index} is out of range for array with {len(self.children_fields)} children"
+                    f"Index {index} is out of range for array with {len(self.children)} children"
                 ) from e
             return None
 
@@ -349,7 +222,7 @@ class BaseChildrenFields(ABC):
         name = name if name is not None else inferred_name
         index = index if index is not None else inferred_index
 
-        available_fields = self.children_fields
+        available_fields = self.children
         available_names = [f.name for f in available_fields]
 
         indexed_field = None
@@ -415,10 +288,10 @@ class BaseChildrenFields(ABC):
 
     @property
     def names(self):
-        return [f.name for f in self.children_fields]
+        return [f.name for f in self.children]
 
     def field_names(self) -> list[str]:
-        return [f.name for f in self.children_fields]
+        return [f.name for f in self.children]
 
     def select(
         self,
@@ -438,7 +311,7 @@ class BaseChildrenFields(ABC):
         * ``schema.select("price")`` — single identifier.
         * ``schema.select("price", "qty", 0)`` — multiple positionals.
         * ``schema.select(["price", "qty"])`` — single iterable.
-        * ``schema.select(other_schema.children_fields)`` — copy
+        * ``schema.select(other_schema.children)`` — copy
           a sibling's fields by name into this schema.
         * ``schema.select("price", ["qty", "ts"], 0)`` — mixed; each
           positional is itself flattened so iterables and scalars

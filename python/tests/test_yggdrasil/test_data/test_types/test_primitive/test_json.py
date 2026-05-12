@@ -150,8 +150,8 @@ class TestJsonArrowCasts(ArrowTestCase):
         sjson = SJsonType()
         out = sjson.cast_arrow_array(
             src,
-            source_field=Field("s", struct_dtype),
-            target_field=Field("s", sjson),
+            source=Field("s", struct_dtype),
+            target=Field("s", sjson),
         )
 
         self.assertEqual(out.type, self.pa.string())
@@ -169,8 +169,8 @@ class TestJsonArrowCasts(ArrowTestCase):
         bjson = BJsonType()
         out = bjson.cast_arrow_array(
             src,
-            source_field=Field("a", arr_dtype),
-            target_field=Field("a", bjson),
+            source=Field("a", arr_dtype),
+            target=Field("a", bjson),
         )
 
         self.assertEqual(out.type, self.pa.binary())
@@ -189,8 +189,8 @@ class TestJsonArrowCasts(ArrowTestCase):
         sjson = SJsonType()
         out = sjson.cast_arrow_array(
             src,
-            source_field=Field("m", map_dtype),
-            target_field=Field("m", sjson),
+            source=Field("m", map_dtype),
+            target=Field("m", sjson),
         )
 
         decoded = [json.loads(v) for v in out.to_pylist()]
@@ -206,8 +206,8 @@ class TestJsonArrowCasts(ArrowTestCase):
 
         out = struct_dtype.cast_arrow_array(
             src,
-            source_field=Field("s", SJsonType()),
-            target_field=Field("s", struct_dtype),
+            source=Field("s", SJsonType()),
+            target=Field("s", struct_dtype),
         )
 
         self.assertEqual(out.to_pylist(), [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}])
@@ -222,8 +222,8 @@ class TestJsonArrowCasts(ArrowTestCase):
 
         out = arr_dtype.cast_arrow_array(
             src,
-            source_field=Field("a", bjson),
-            target_field=Field("a", arr_dtype),
+            source=Field("a", bjson),
+            target=Field("a", arr_dtype),
         )
 
         self.assertEqual(out.to_pylist(), [[1, 2, 3], [4, 5], None])
@@ -237,8 +237,8 @@ class TestJsonArrowCasts(ArrowTestCase):
 
         out = map_dtype.cast_arrow_array(
             src,
-            source_field=Field("m", BJsonType()),
-            target_field=Field("m", map_dtype),
+            source=Field("m", BJsonType()),
+            target=Field("m", map_dtype),
         )
 
         self.assertEqual(
@@ -254,8 +254,8 @@ class TestJsonArrowCasts(ArrowTestCase):
         sjson = SJsonType()
         out = sjson.cast_arrow_array(
             src,
-            source_field=Field("s", StringType()),
-            target_field=Field("s", sjson),
+            source=Field("s", StringType()),
+            target=Field("s", sjson),
         )
 
         self.assertEqual(out.to_pylist(), ["hello", "world", None])
@@ -268,8 +268,8 @@ class TestJsonArrowCasts(ArrowTestCase):
 
         out = bjson.cast_arrow_array(
             src,
-            source_field=Field("j", sjson),
-            target_field=Field("j", bjson),
+            source=Field("j", sjson),
+            target=Field("j", bjson),
         )
 
         self.assertEqual(out.type, self.pa.binary())
@@ -300,8 +300,8 @@ class TestJsonPolarsCasts:
         sjson = SJsonType()
         out = sjson.cast_polars_series(
             s,
-            source_field=Field("s", struct_dtype),
-            target_field=Field("s", sjson),
+            source=Field("s", struct_dtype),
+            target=Field("s", sjson),
         )
 
         decoded = [json.loads(v) for v in out.to_list()]
@@ -316,8 +316,8 @@ class TestJsonPolarsCasts:
 
         out = struct_dtype.cast_polars_series(
             s,
-            source_field=Field("s", SJsonType()),
-            target_field=Field("s", struct_dtype),
+            source=Field("s", SJsonType()),
+            target=Field("s", struct_dtype),
         )
 
         assert out.to_list() == [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]
@@ -328,8 +328,8 @@ class TestJsonPolarsCasts:
 
         out = arr_dtype.cast_polars_series(
             s,
-            source_field=Field("a", BJsonType()),
-            target_field=Field("a", arr_dtype),
+            source=Field("a", BJsonType()),
+            target=Field("a", arr_dtype),
         )
 
         assert out.to_list() == [[1, 2], [3]]
@@ -357,8 +357,8 @@ class TestJsonArrowPermissive(ArrowTestCase):
         with self.assertRaises(self.pa.ArrowInvalid) as ctx:
             arr_dtype.cast_arrow_array(
                 src,
-                source_field=Field("a", SJsonType()),
-                target_field=Field("a", arr_dtype),
+                source=Field("a", SJsonType()),
+                target=Field("a", arr_dtype),
                 safe=True,
             )
 
@@ -375,8 +375,8 @@ class TestJsonArrowPermissive(ArrowTestCase):
 
         out = arr_dtype.cast_arrow_array(
             src,
-            source_field=Field("a", SJsonType()),
-            target_field=Field("a", arr_dtype),
+            source=Field("a", SJsonType()),
+            target=Field("a", arr_dtype),
             safe=False,
         )
 
@@ -397,8 +397,8 @@ class TestJsonArrowPermissive(ArrowTestCase):
 
         out = struct_dtype.cast_arrow_array(
             src,
-            source_field=Field("s", SJsonType()),
-            target_field=Field("s", struct_dtype),
+            source=Field("s", SJsonType()),
+            target=Field("s", struct_dtype),
             safe=False,
         )
 
@@ -415,8 +415,8 @@ class TestJsonArrowPermissive(ArrowTestCase):
 
         out = arr_dtype.cast_arrow_array(
             src,
-            source_field=Field("a", BJsonType()),
-            target_field=Field("a", arr_dtype),
+            source=Field("a", BJsonType()),
+            target=Field("a", arr_dtype),
             safe=False,
         )
 
@@ -435,8 +435,8 @@ class TestJsonPolarsPermissive:
 
         out = arr_dtype.cast_polars_series(
             s,
-            source_field=Field("a", SJsonType()),
-            target_field=Field("a", arr_dtype),
+            source=Field("a", SJsonType()),
+            target=Field("a", arr_dtype),
             safe=False,
         )
 
@@ -454,8 +454,8 @@ class TestJsonPolarsPermissive:
 
         out = struct_dtype.cast_polars_series(
             s,
-            source_field=Field("s", SJsonType()),
-            target_field=Field("s", struct_dtype),
+            source=Field("s", SJsonType()),
+            target=Field("s", struct_dtype),
             safe=False,
         )
 

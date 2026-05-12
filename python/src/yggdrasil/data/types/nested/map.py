@@ -99,7 +99,7 @@ class MapType(NestedType):
         return None if nullable else {}
 
     @property
-    def children_fields(self) -> list["Field"]:
+    def children(self) -> list["Field"]:
         return [self.item_field]
 
     @property
@@ -277,10 +277,10 @@ class MapType(NestedType):
         options = options.check_source(array).check_target(self)
 
         if options.need_cast(array, self):
-            source_type_id = options.source_field.dtype.type_id
+            source_type_id = options.source.dtype.type_id
 
             if source_type_id == DataTypeId.NULL or array.null_count == len(array):
-                return options.target_field.default_arrow_array(
+                return options.target.default_arrow_array(
                     size=len(array),
                     memory_pool=options.arrow_memory_pool,
                 )
@@ -308,7 +308,7 @@ class MapType(NestedType):
 
             else:
                 raise pa.ArrowInvalid(
-                    f"Cannot cast {options.source_field} to {options.target_field}"
+                    f"Cannot cast {options.source} to {options.target}"
                 )
         return array
 
@@ -324,10 +324,10 @@ class MapType(NestedType):
         pl = get_polars()
         options = options.check_source(series).check_target(self)
 
-        source_type_id = options.source_field.dtype.type_id
+        source_type_id = options.source.dtype.type_id
 
         if source_type_id == DataTypeId.NULL or series.null_count() == len(series):
-            return options.target_field.default_polars_series(size=len(series))
+            return options.target.default_polars_series(size=len(series))
 
         if is_json_string_source(source_type_id):
             # polars represents a Map as List<Struct<key, value>>, which
@@ -339,13 +339,13 @@ class MapType(NestedType):
                 arrow_input, options=options
             )
             return pl.from_arrow(arrow_output).rename(
-                options.target_field.name
+                options.target.name
             )
 
         expr = self._cast_polars_expr(
             pl.col(series.name),
             options=options,
-        ).alias(options.target_field.name)
+        ).alias(options.target.name)
 
         return pl.DataFrame({series.name: series}).select(expr).to_series()
 
@@ -356,15 +356,15 @@ class MapType(NestedType):
     ) -> Any:
         options = options.check_target(self)
 
-        source_type_id = options.source_field.dtype.type_id
+        source_type_id = options.source.dtype.type_id
 
         if source_type_id == DataTypeId.NULL:
-            return options.target_field.default_polars_expr(alias=options.target_field.name)
+            return options.target.default_polars_expr(alias=options.target.name)
 
         elif is_json_string_source(source_type_id):
             # JSON object → Map needs materialisation (see _cast_polars_series)
             raise TypeError(
-                f"Cannot cast {options.source_field} to {options.target_field} "
+                f"Cannot cast {options.source} to {options.target} "
                 "as an expression; use cast_polars_series for a JSON map source."
             )
 
@@ -379,7 +379,7 @@ class MapType(NestedType):
 
         else:
             raise TypeError(
-                f"Cannot cast {options.source_field} to {options.target_field}"
+                f"Cannot cast {options.source} to {options.target}"
             )
 
     def _cast_pandas_series(
@@ -389,10 +389,10 @@ class MapType(NestedType):
     ) -> "pd.Series":
         options = options.check_source(series).check_target(self)
 
-        source_type_id = options.source_field.dtype.type_id
+        source_type_id = options.source.dtype.type_id
 
         if source_type_id == DataTypeId.NULL or series.isna().all():
-            return options.target_field.default_pandas_series(size=len(series))
+            return options.target.default_pandas_series(size=len(series))
 
         elif is_json_string_source(source_type_id):
             return _cast_pandas_via_arrow(series, options, cast_arrow_json_string_array)
@@ -408,7 +408,7 @@ class MapType(NestedType):
 
         else:
             raise TypeError(
-                f"Cannot cast {options.source_field} to {options.target_field}"
+                f"Cannot cast {options.source} to {options.target}"
             )
 
     def _cast_spark_column(
@@ -418,10 +418,10 @@ class MapType(NestedType):
     ) -> Any:
         options = options.check_source(column).check_target(self)
 
-        source_type_id = options.source_field.dtype.type_id
+        source_type_id = options.source.dtype.type_id
 
         if source_type_id == DataTypeId.NULL:
-            return options.target_field.default_spark_column()
+            return options.target.default_spark_column()
 
         elif is_json_string_source(source_type_id):
             return cast_spark_json_string_column(column, options)
@@ -437,7 +437,7 @@ class MapType(NestedType):
 
         else:
             raise TypeError(
-                f"Cannot cast {options.source_field} to {options.target_field}"
+                f"Cannot cast {options.source} to {options.target}"
             )
 
     def _cast_spark_tabular(
@@ -655,7 +655,7 @@ def _cast_pandas_via_arrow(
     # via the pandas → Arrow C bridge, and ``Array.to_pandas()`` rebuilds
     # the Series on the way out — no ``.tolist()`` / ``.to_pylist()`` hop
     # in either direction.
-    source_arrow_type = options.source_field.dtype.to_arrow()
+    source_arrow_type = options.source.dtype.to_arrow()
     source_array = pa.array(series, type=source_arrow_type, from_pandas=True)
     casted = caster(source_array, options)
 
@@ -664,7 +664,7 @@ def _cast_pandas_via_arrow(
 
     result = casted.to_pandas()
     result.index = series.index
-    result.name = options.target_field.name
+    result.name = options.target.name
     return result
 
 
@@ -674,11 +674,11 @@ def cast_arrow_map_array(
 ) -> pa.MapArray | pa.ChunkedArray:
     options = options.check_source(array)
 
-    if options.target_field is None:
+    if options.target is None:
         return array
-    elif options.source_field.dtype.type_id != DataTypeId.MAP:
+    elif options.source.dtype.type_id != DataTypeId.MAP:
         raise pa.ArrowInvalid(
-            f"Cannot cast {options.source_field} to {options.target_field}"
+            f"Cannot cast {options.source} to {options.target}"
         )
 
     if isinstance(array, pa.ChunkedArray):
@@ -691,11 +691,11 @@ def cast_arrow_map_array(
         ]
         return pa.chunked_array(
             chunks,
-            type=options.target_field.dtype.to_arrow(),
+            type=options.target.dtype.to_arrow(),
         )
 
-    source_field: Field = options.source_field
-    target_field: Field = options.target_field
+    source_field: Field = options.source
+    target_field: Field = options.target
 
     source_type: MapType = source_field.dtype
     target_type: MapType = target_field.dtype
@@ -703,16 +703,16 @@ def cast_arrow_map_array(
     target_key_array = target_type.key_field.cast_arrow_array(
         array.keys,
         options=options.copy(
-            source_field=source_type.key_field,
-            target_field=target_type.key_field,
+            source=source_type.key_field,
+            target=target_type.key_field,
         ),
     )
 
     target_value_array = target_type.value_field.cast_arrow_array(
         array.items,
         options=options.copy(
-            source_field=source_type.value_field,
-            target_field=target_type.value_field,
+            source=source_type.value_field,
+            target=target_type.value_field,
         ),
     )
 
@@ -732,11 +732,11 @@ def cast_arrow_list_array_to_map(
 ) -> pa.MapArray | pa.ChunkedArray:
     options = options.check_source(array)
 
-    if options.target_field is None:
+    if options.target is None:
         return array
-    elif options.source_field.dtype.type_id != DataTypeId.ARRAY:
+    elif options.source.dtype.type_id != DataTypeId.ARRAY:
         raise pa.ArrowInvalid(
-            f"Cannot cast {options.source_field} to {options.target_field}"
+            f"Cannot cast {options.source} to {options.target}"
         )
 
     if isinstance(array, pa.ChunkedArray):
@@ -749,11 +749,11 @@ def cast_arrow_list_array_to_map(
         ]
         return pa.chunked_array(
             chunks,
-            type=options.target_field.dtype.to_arrow(),
+            type=options.target.dtype.to_arrow(),
         )
 
-    source_field: Field = options.source_field
-    target_field: Field = options.target_field
+    source_field: Field = options.source
+    target_field: Field = options.target
 
     source_type: ArrayType = source_field.dtype
     target_type: MapType = target_field.dtype
@@ -763,12 +763,12 @@ def cast_arrow_list_array_to_map(
 
     if source_item_dtype.type_id != DataTypeId.STRUCT:
         raise pa.ArrowInvalid(
-            f"Cannot cast {options.source_field} to {options.target_field}"
+            f"Cannot cast {options.source} to {options.target}"
         )
 
-    if len(source_item_dtype.children_fields) != 2:
+    if len(source_item_dtype.children) != 2:
         raise pa.ArrowInvalid(
-            f"Cannot cast {options.source_field} to {options.target_field}"
+            f"Cannot cast {options.source} to {options.target}"
         )
 
     source_key_field = source_item_dtype.field_at(0)
@@ -779,16 +779,16 @@ def cast_arrow_list_array_to_map(
     target_key_array = target_type.key_field.cast_arrow_array(
         values.field(source_key_field.name),
         options=options.copy(
-            source_field=source_key_field,
-            target_field=target_type.key_field,
+            source=source_key_field,
+            target=target_type.key_field,
         ),
     )
 
     target_value_array = target_type.value_field.cast_arrow_array(
         values.field(source_value_field.name),
         options=options.copy(
-            source_field=source_value_field,
-            target_field=target_type.value_field,
+            source=source_value_field,
+            target=target_type.value_field,
         ),
     )
 
@@ -808,11 +808,11 @@ def cast_arrow_struct_array_to_map(
 ) -> pa.MapArray | pa.ChunkedArray:
     options = options.check_source(array)
 
-    if options.target_field is None:
+    if options.target is None:
         return array
-    elif options.source_field.dtype.type_id != DataTypeId.STRUCT:
+    elif options.source.dtype.type_id != DataTypeId.STRUCT:
         raise pa.ArrowInvalid(
-            f"Cannot cast {options.source_field} to {options.target_field}"
+            f"Cannot cast {options.source} to {options.target}"
         )
 
     if isinstance(array, pa.ChunkedArray):
@@ -825,17 +825,17 @@ def cast_arrow_struct_array_to_map(
         ]
         return pa.chunked_array(
             chunks,
-            type=options.target_field.dtype.to_arrow(),
+            type=options.target.dtype.to_arrow(),
         )
 
-    source_field: Field = options.source_field
-    target_field: Field = options.target_field
+    source_field: Field = options.source
+    target_field: Field = options.target
 
     source_type: StructType = source_field.dtype
     target_type: MapType = target_field.dtype
 
     row_count = len(array)
-    child_count = len(source_type.children_fields)
+    child_count = len(source_type.children)
 
     if child_count == 0:
         offsets = pa.array([0] * (row_count + 1), type=pa.int32())
@@ -853,7 +853,7 @@ def cast_arrow_struct_array_to_map(
     key_arrays: list[pa.Array] = []
     value_arrays: list[pa.Array] = []
 
-    for child in source_type.children_fields:
+    for child in source_type.children:
         key_arr = pa.array(
             [child.name] * row_count,
             type=pa.string(),
@@ -862,15 +862,15 @@ def cast_arrow_struct_array_to_map(
         casted_key_arr = target_type.key_field.cast_arrow_array(
             key_arr,
             options=options.copy(
-                source_field=_string_key_source_field(),
-                target_field=target_type.key_field,
+                source=_string_key_source_field(),
+                target=target_type.key_field,
             ),
         )
         casted_value_arr = target_type.value_field.cast_arrow_array(
             array.field(child.name),
             options=options.copy(
-                source_field=child,
-                target_field=target_type.value_field,
+                source=child,
+                target=target_type.value_field,
             ),
         )
         key_arrays.append(casted_key_arr)
@@ -904,14 +904,14 @@ def cast_polars_map_expr(
 ) -> Any:
     pl = get_polars()
 
-    if options.target_field is None:
+    if options.target is None:
         return expr
-    elif options.source_field.dtype.type_id != DataTypeId.MAP:
-        raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
+    elif options.source.dtype.type_id != DataTypeId.MAP:
+        raise TypeError(f"Cannot cast {options.source} to {options.target}")
 
-    source_field: Field = options.source_field
+    source_field: Field = options.source
     source_type: "MapType" = source_field.dtype
-    target_type: MapType = options.target_field.dtype
+    target_type: MapType = options.target.dtype
 
     source_key_name = source_type.key_field.name
     source_value_name = source_type.value_field.name
@@ -922,15 +922,15 @@ def cast_polars_map_expr(
         target_type.key_field.cast_polars_expr(
             pl.element().struct.field(source_key_name),
             options=options.copy(
-                source_field=source_type.key_field,
-                target_field=target_type.key_field,
+                source=source_type.key_field,
+                target=target_type.key_field,
             ),
         ).alias(target_key_name),
         target_type.value_field.cast_polars_expr(
             pl.element().struct.field(source_value_name),
             options=options.copy(
-                source_field=source_type.value_field,
-                target_field=target_type.value_field,
+                source=source_type.value_field,
+                target=target_type.value_field,
             ),
         ).alias(target_value_name),
     ])
@@ -945,21 +945,21 @@ def cast_polars_list_expr_to_map(
 ) -> Any:
     pl = get_polars()
 
-    if options.target_field is None:
+    if options.target is None:
         return expr
-    elif options.source_field.dtype.type_id != DataTypeId.ARRAY:
-        raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
+    elif options.source.dtype.type_id != DataTypeId.ARRAY:
+        raise TypeError(f"Cannot cast {options.source} to {options.target}")
 
-    source_field: Field = options.source_field
-    target_field: Field = options.target_field
+    source_field: Field = options.source
+    target_field: Field = options.target
 
     source_type: ArrayType = source_field.dtype
     target_type: MapType = target_field.dtype
 
     source_item_dtype = source_type.item_field.dtype
 
-    if source_item_dtype.type_id != DataTypeId.STRUCT or len(source_item_dtype.children_fields) != 2:
-        raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
+    if source_item_dtype.type_id != DataTypeId.STRUCT or len(source_item_dtype.children) != 2:
+        raise TypeError(f"Cannot cast {options.source} to {options.target}")
 
     source_key_field = source_item_dtype.field_at(0)
     source_value_field = source_item_dtype.field_at(1)
@@ -971,15 +971,15 @@ def cast_polars_list_expr_to_map(
         target_type.key_field.cast_polars_expr(
             pl.element().struct.field(source_key_field.name),
             options=options.copy(
-                source_field=source_key_field,
-                target_field=target_type.key_field,
+                source=source_key_field,
+                target=target_type.key_field,
             ),
         ),
         target_type.value_field.cast_polars_expr(
             pl.element().struct.field(source_value_field.name),
             options=options.copy(
-                source_field=source_value_field,
-                target_field=target_type.value_field,
+                source=source_value_field,
+                target=target_type.value_field,
             ),
         ),
     ])
@@ -994,13 +994,13 @@ def cast_polars_struct_expr_to_map(
 ) -> Any:
     pl = get_polars()
 
-    if options.target_field is None:
+    if options.target is None:
         return expr
-    elif options.source_field.dtype.type_id != DataTypeId.STRUCT:
-        raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
+    elif options.source.dtype.type_id != DataTypeId.STRUCT:
+        raise TypeError(f"Cannot cast {options.source} to {options.target}")
 
-    source_field: Field = options.source_field
-    target_field: Field = options.target_field
+    source_field: Field = options.source
+    target_field: Field = options.target
 
     source_type: StructType = source_field.dtype
     target_type: MapType = target_field.dtype
@@ -1009,20 +1009,20 @@ def cast_polars_struct_expr_to_map(
     target_value_name = target_type.value_field.name
 
     entries = []
-    for child in source_type.children_fields:
+    for child in source_type.children:
         key_expr = target_type.key_field.cast_polars_expr(
             pl.lit(child.name),
             options=options.copy(
-                source_field=_string_key_source_field(),
-                target_field=target_type.key_field,
+                source=_string_key_source_field(),
+                target=target_type.key_field,
             ),
         )
 
         value_expr = target_type.value_field.cast_polars_expr(
             expr.struct.field(child.name),
             options=options.copy(
-                source_field=child,
-                target_field=target_type.value_field,
+                source=child,
+                target=target_type.value_field,
             ),
         )
 
@@ -1099,13 +1099,13 @@ def cast_spark_map_column(
 
     options = options.check_source(column)
 
-    if options.target_field is None:
+    if options.target is None:
         return column
-    elif options.source_field.dtype.type_id != DataTypeId.MAP:
-        raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
+    elif options.source.dtype.type_id != DataTypeId.MAP:
+        raise TypeError(f"Cannot cast {options.source} to {options.target}")
 
-    source_field: Field = options.source_field
-    target_field: Field = options.target_field
+    source_field: Field = options.source
+    target_field: Field = options.target
 
     source_type: MapType = source_field.dtype
     target_type: MapType = target_field.dtype
@@ -1117,8 +1117,8 @@ def cast_spark_map_column(
         lambda x: target_type.key_field.cast_spark_column(
             x[source_type.key_field.name],
             options=options.copy(
-                source_field=source_type.key_field,
-                target_field=target_type.key_field,
+                source=source_type.key_field,
+                target=target_type.key_field,
             ),
         ),
     )
@@ -1128,8 +1128,8 @@ def cast_spark_map_column(
         lambda x: target_type.value_field.cast_spark_column(
             x[source_type.value_field.name],
             options=options.copy(
-                source_field=source_type.value_field,
-                target_field=target_type.value_field,
+                source=source_type.value_field,
+                target=target_type.value_field,
             ),
         ),
     )
@@ -1150,21 +1150,21 @@ def cast_spark_list_column_to_map(
 
     options = options.check_source(column)
 
-    if options.target_field is None:
+    if options.target is None:
         return column
-    elif options.source_field.dtype.type_id != DataTypeId.ARRAY:
-        raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
+    elif options.source.dtype.type_id != DataTypeId.ARRAY:
+        raise TypeError(f"Cannot cast {options.source} to {options.target}")
 
-    source_field: Field = options.source_field
-    target_field: Field = options.target_field
+    source_field: Field = options.source
+    target_field: Field = options.target
 
     source_type: ArrayType = source_field.dtype
     target_type: MapType = target_field.dtype
 
     source_item_dtype = source_type.item_field.dtype
 
-    if source_item_dtype.type_id != DataTypeId.STRUCT or len(source_item_dtype.children_fields) != 2:
-        raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
+    if source_item_dtype.type_id != DataTypeId.STRUCT or len(source_item_dtype.children) != 2:
+        raise TypeError(f"Cannot cast {options.source} to {options.target}")
 
     source_key_field = source_item_dtype.field_at(0)
     source_value_field = source_item_dtype.field_at(1)
@@ -1174,8 +1174,8 @@ def cast_spark_list_column_to_map(
         lambda x: target_type.key_field.cast_spark_column(
             x[source_key_field.name],
             options=options.copy(
-                source_field=source_key_field,
-                target_field=target_type.key_field,
+                source=source_key_field,
+                target=target_type.key_field,
             ),
         ),
     )
@@ -1185,8 +1185,8 @@ def cast_spark_list_column_to_map(
         lambda x: target_type.value_field.cast_spark_column(
             x[source_value_field.name],
             options=options.copy(
-                source_field=source_value_field,
-                target_field=target_type.value_field,
+                source=source_value_field,
+                target=target_type.value_field,
             ),
         ),
     )
@@ -1207,13 +1207,13 @@ def cast_spark_struct_column_to_map(
 
     options = options.check_source(column)
 
-    if options.target_field is None:
+    if options.target is None:
         return column
-    elif options.source_field.dtype.type_id != DataTypeId.STRUCT:
-        raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
+    elif options.source.dtype.type_id != DataTypeId.STRUCT:
+        raise TypeError(f"Cannot cast {options.source} to {options.target}")
 
-    source_field: Field = options.source_field
-    target_field: Field = options.target_field
+    source_field: Field = options.source
+    target_field: Field = options.target
 
     source_type: StructType = source_field.dtype
     target_type: MapType = target_field.dtype
@@ -1222,22 +1222,22 @@ def cast_spark_struct_column_to_map(
         target_type.key_field.cast_spark_column(
             F.lit(child.name),
             options=options.copy(
-                source_field=_string_key_source_field(),
-                target_field=target_type.key_field,
+                source=_string_key_source_field(),
+                target=target_type.key_field,
             ),
         )
-        for child in source_type.children_fields
+        for child in source_type.children
     ])
 
     value_array = F.array(*[
         target_type.value_field.cast_spark_column(
             column[child.name],
             options=options.copy(
-                source_field=child,
-                target_field=target_type.value_field,
+                source=child,
+                target=target_type.value_field,
             ),
         )
-        for child in source_type.children_fields
+        for child in source_type.children
     ])
 
     casted = F.when(

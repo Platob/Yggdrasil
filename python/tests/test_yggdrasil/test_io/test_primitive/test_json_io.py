@@ -71,7 +71,7 @@ class TestTargetSchemaCast:
     def test_read_casts_array_to_target_schema(self) -> None:
         payload = json.dumps([{"id": "1", "v": "1.5"}, {"id": "2", "v": "2.5"}])
         io = JsonIO(payload.encode("utf-8"))
-        casted = io.read_arrow_table(target_field=self._target_field())
+        casted = io.read_arrow_table(target=self._target_field())
         assert casted.schema.field("id").type == pa.int64()
         assert casted.schema.field("v").type == pa.float64()
 
@@ -80,7 +80,7 @@ class TestTargetSchemaCast:
         # the cast still fires on that shape.
         payload = json.dumps({"id": "1", "v": "1.5"})
         io = JsonIO(payload.encode("utf-8"))
-        casted = io.read_arrow_table(target_field=self._target_field())
+        casted = io.read_arrow_table(target=self._target_field())
         assert casted.schema.field("id").type == pa.int64()
         assert casted.column("v").to_pylist() == [1.5]
 
@@ -88,7 +88,7 @@ class TestTargetSchemaCast:
         io = JsonIO()
         io.write_arrow_table(
             pa.table({"id": ["1", "2"], "v": ["1.5", "2.5"]}),
-            target_field=self._target_field(),
+            target=self._target_field(),
         )
         raw = io.read_arrow_table()
         assert raw.schema.field("id").type == pa.int64()

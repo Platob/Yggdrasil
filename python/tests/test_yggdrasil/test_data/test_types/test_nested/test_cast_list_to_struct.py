@@ -44,7 +44,7 @@ def _list_int_to_struct_3(self) -> tuple[Field, Field]:
 def _cast(self, arr, src, tgt):
     """Run the cast under test — returns a ``pa.StructArray``."""
     return CastOptions(
-        source_field=src, target_field=tgt,
+        source=src, target=tgt,
     ).cast_arrow_array(arr)
 
 

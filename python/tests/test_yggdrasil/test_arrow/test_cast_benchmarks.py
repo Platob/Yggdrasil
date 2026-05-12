@@ -160,7 +160,7 @@ class TestCastBenchmarkRegression(ArrowTestCase):
             pa.field("v", pa.float32()),
             pa.field("t", pa.string()),
         ]))
-        out = CastOptions(source_field=src, target_field=tgt).cast_arrow_tabular(rb)
+        out = CastOptions(source=src, target=tgt).cast_arrow_tabular(rb)
         self.assertEqual(out.num_rows, n)
 
     def test_chunked_identity_cast_path(self) -> None:
@@ -172,7 +172,7 @@ class TestCastBenchmarkRegression(ArrowTestCase):
         )
         tgt = Field.from_arrow(pa.field("x", pa.int64()))
         src = Field.from_arrow(pa.field("x", pa.int64()))
-        out = CastOptions(source_field=src, target_field=tgt).cast_arrow_array(ca)
+        out = CastOptions(source=src, target=tgt).cast_arrow_array(ca)
         self.assertEqual(len(out), n - (n % 4))
 
     def test_json_string_decode_path(self) -> None:
@@ -180,7 +180,7 @@ class TestCastBenchmarkRegression(ArrowTestCase):
         arr = _json_string_array(n)
         src = Field.from_arrow(pa.field("payload", pa.string()))
         tgt = Field.from_arrow(pa.field("payload", _list_of_struct_target()))
-        out = tgt.cast_arrow_array(arr, source_field=src)
+        out = tgt.cast_arrow_array(arr, source=src)
         self.assertEqual(len(out), n)
 
     def test_list_element_dtype_path(self) -> None:
@@ -195,7 +195,7 @@ class TestCastBenchmarkRegression(ArrowTestCase):
         tgt = Field.from_arrow(pa.field(
             "x", pa.list_(pa.field("item", pa.int64())),
         ))
-        out = tgt.cast_arrow_array(arr, source_field=src)
+        out = tgt.cast_arrow_array(arr, source=src)
         self.assertEqual(len(out), n)
         self.assertEqual(out.type.value_type, pa.int64())
 
@@ -219,7 +219,7 @@ class TestCastBenchmarkRegression(ArrowTestCase):
                 pa.field("b", pa.string()),
             ]))),
         ))
-        out = tgt.cast_arrow_array(list_arr, source_field=src)
+        out = tgt.cast_arrow_array(list_arr, source=src)
         self.assertEqual(len(out), n)
 
     def test_nested_struct_value_path(self) -> None:
@@ -237,7 +237,7 @@ class TestCastBenchmarkRegression(ArrowTestCase):
             pa.field("inner_list", pa.list_(pa.field("item", pa.int64()))),
             pa.field("name", pa.string()),
         ])))
-        out = tgt.cast_arrow_array(struct_arr, source_field=src)
+        out = tgt.cast_arrow_array(struct_arr, source=src)
         self.assertEqual(len(out), n)
 
 
@@ -276,12 +276,12 @@ class TestCastBenchmarks(ArrowTestCase):
         ]))
         # Identity: source = target. Hits the tabular bypass.
         ms, _ = _time_cast(
-            lambda: CastOptions(source_field=src, target_field=src).cast_arrow_tabular(rb),
+            lambda: CastOptions(source=src, target=src).cast_arrow_tabular(rb),
         )
         report.add("identity (source == target)", ms)
         # Widen i32→i64 + f64→f32.
         ms, _ = _time_cast(
-            lambda: CastOptions(source_field=src, target_field=widen).cast_arrow_tabular(rb),
+            lambda: CastOptions(source=src, target=widen).cast_arrow_tabular(rb),
         )
         report.add("widen i32->i64, narrow f64->f32", ms)
         report.flush()
@@ -294,7 +294,7 @@ class TestCastBenchmarks(ArrowTestCase):
         )
         src = Field.from_arrow(pa.field("x", pa.int64()))
         tgt = Field.from_arrow(pa.field("x", pa.int64()))
-        opts = CastOptions(source_field=src, target_field=tgt)
+        opts = CastOptions(source=src, target=tgt)
 
         flat = pa.array(range(self.n_rows), type=pa.int64())
         ms, _ = _time_cast(lambda: opts.cast_arrow_array(flat))
@@ -324,26 +324,26 @@ class TestCastBenchmarks(ArrowTestCase):
 
         # Clean input, single chunk.
         arr = _json_string_array(self.n_rows)
-        ms, _ = _time_cast(lambda: tgt.cast_arrow_array(arr, source_field=src))
+        ms, _ = _time_cast(lambda: tgt.cast_arrow_array(arr, source=src))
         report.add("flat Array, all valid             ", ms)
 
         # Single-chunk ChunkedArray: combine_chunks() should be skipped
         # by the unwrap fast path.
         ca1 = pa.chunked_array([arr], type=pa.string())
-        ms, _ = _time_cast(lambda c=ca1: tgt.cast_arrow_array(c, source_field=src))
+        ms, _ = _time_cast(lambda c=ca1: tgt.cast_arrow_array(c, source=src))
         report.add("ChunkedArray k=1, unwrap fast path", ms)
 
         # Multi-chunk: combine_chunks() unavoidable.
         chunk_size = self.n_rows // 4
         chunks = [arr.slice(k * chunk_size, chunk_size) for k in range(4)]
         ca = pa.chunked_array(chunks, type=pa.string())
-        ms, _ = _time_cast(lambda c=ca: tgt.cast_arrow_array(c, source_field=src))
+        ms, _ = _time_cast(lambda c=ca: tgt.cast_arrow_array(c, source=src))
         report.add("ChunkedArray k=4, all valid       ", ms)
 
         # Permissive on 5% bad rows — falls back to per-row Python.
         bad_arr = _json_string_array(self.n_rows, bad_rate=0.05)
         ms, _ = _time_cast(
-            lambda: tgt.cast_arrow_array(bad_arr, source_field=src, safe=False),
+            lambda: tgt.cast_arrow_array(bad_arr, source=src, safe=False),
         )
         report.add("flat Array, 5% bad, safe=False  ", ms)
         report.flush()
@@ -371,7 +371,7 @@ class TestCastBenchmarks(ArrowTestCase):
         ])
         tgt = Field.from_arrow(pa.field("row", tgt_type))
         ms, _ = _time_cast(
-            lambda: tgt.cast_arrow_array(outer, source_field=src),
+            lambda: tgt.cast_arrow_array(outer, source=src),
         )
         report.add("widen inner.a int32->int64", ms)
         report.flush()
@@ -442,7 +442,7 @@ class TestCastBenchmarks(ArrowTestCase):
             f"struct_arrow.py:cast_arrow_list_array"
         )
         ms, _ = _time_cast(
-            lambda: tgt.cast_arrow_array(arr, source_field=src),
+            lambda: tgt.cast_arrow_array(arr, source=src),
         )
         report.add("vectorised (pc.take + offsets)   ", ms)
 
@@ -512,12 +512,12 @@ class TestCastBenchmarks(ArrowTestCase):
         )
 
         ms, _ = _time_cast(
-            lambda: widen_tgt.cast_arrow_array(arr, source_field=widen_src),
+            lambda: widen_tgt.cast_arrow_array(arr, source=widen_src),
         )
         report.add("list<int32> -> list<int64>", ms)
 
         ms, _ = _time_cast(
-            lambda: str_tgt.cast_arrow_array(arr, source_field=widen_src),
+            lambda: str_tgt.cast_arrow_array(arr, source=widen_src),
         )
         report.add("list<int32> -> list<string>", ms)
 
@@ -527,7 +527,7 @@ class TestCastBenchmarks(ArrowTestCase):
             type=arr.type,
         )
         ms, _ = _time_cast(
-            lambda c=ca: widen_tgt.cast_arrow_array(c, source_field=widen_src),
+            lambda c=ca: widen_tgt.cast_arrow_array(c, source=widen_src),
         )
         report.add("ChunkedArray k=4 -> list<int64>", ms)
         report.flush()
@@ -584,14 +584,14 @@ class TestCastBenchmarks(ArrowTestCase):
         )
 
         ms, _ = _time_cast(
-            lambda: tgt.cast_arrow_array(list_arr, source_field=src),
+            lambda: tgt.cast_arrow_array(list_arr, source=src),
         )
         report.add("list<struct<int32,str>> -> list<struct<int64,str>>", ms)
 
         # Identity cast — should short-circuit via type equality on the
         # ListArray rebuild path.
         ms, _ = _time_cast(
-            lambda: src.cast_arrow_array(list_arr, source_field=src),
+            lambda: src.cast_arrow_array(list_arr, source=src),
         )
         report.add("identity list<struct> cast (short-circuit)         ", ms)
         report.flush()
@@ -685,12 +685,12 @@ class TestCastBenchmarks(ArrowTestCase):
         )
 
         ms, _ = _time_cast(
-            lambda: tgt_a.cast_arrow_array(struct_a, source_field=src_a),
+            lambda: tgt_a.cast_arrow_array(struct_a, source=src_a),
         )
         report.add("struct<list<int32>, str> -> widen list<int64>     ", ms)
 
         ms, _ = _time_cast(
-            lambda: tgt_b.cast_arrow_array(env_struct, source_field=src_b),
+            lambda: tgt_b.cast_arrow_array(env_struct, source=src_b),
         )
         report.add("struct<struct<int32, list<struct<x,y>>>> widen all", ms)
         report.flush()
@@ -734,7 +734,7 @@ class TestCastBenchmarks(ArrowTestCase):
         )
 
         ms, _ = _time_cast(
-            lambda: tgt.cast_pandas(df, source_field=src),
+            lambda: tgt.cast_pandas(df, source=src),
         )
         report.add("primitive widen+narrow (pyarrow fast path)", ms)
         report.flush()
@@ -778,7 +778,7 @@ class TestCastBenchmarks(ArrowTestCase):
         )
 
         ms, _ = _time_cast(
-            lambda: tgt.cast_pandas_series(series, source_field=src),
+            lambda: tgt.cast_pandas_series(series, source=src),
         )
         report.add("dict-Series widen child a (pyarrow path)", ms)
         report.flush()
@@ -818,7 +818,7 @@ class TestCastBenchmarks(ArrowTestCase):
         )
 
         ms, _ = _time_cast(
-            lambda: tgt.cast_pandas_series(series, source_field=src),
+            lambda: tgt.cast_pandas_series(series, source=src),
         )
         report.add("list-Series -> struct<c0,c1,c2> (pyarrow path)", ms)
         report.flush()
@@ -862,7 +862,7 @@ class TestCastBenchmarks(ArrowTestCase):
         )
 
         ms, _ = _time_cast(
-            lambda: tgt.cast_pandas_series(series, source_field=src),
+            lambda: tgt.cast_pandas_series(series, source=src),
         )
         report.add("struct<list<int32>, str> -> widen list<int64>", ms)
         report.flush()
@@ -899,7 +899,7 @@ class TestCastBenchmarks(ArrowTestCase):
             batches = [_numeric_batch(chunk_size) for _ in range(k)]
             ms, _ = _time_cast(
                 lambda b=batches: CastOptions(
-                    source_field=src, target_field=tgt,
+                    source=src, target=tgt,
                 ).cast_arrow_tabular(
                     pa.Table.from_batches(b).combine_chunks().to_batches()[0]
                 ),

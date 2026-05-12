@@ -149,7 +149,7 @@ class TestPandasSeriesBypass(PandasTestCase):
         # Force the cast to treat the source as NullType (this happens when
         # upstream metadata declares a null-typed source).
         s = pd.Series([None, None, None], name="x", dtype="object")
-        opts = CastOptions(source_field=Field(name="x", dtype=NullType(), nullable=True))
+        opts = CastOptions(source=Field(name="x", dtype=NullType(), nullable=True))
 
         out = _INT64.cast_pandas_series(s, opts)
 
@@ -319,7 +319,7 @@ class TestEngineTypeBypassArrow(ArrowTestCase):
             ]).dtype,
             nullable=target_field.nullable,
         )
-        opts = CastOptions(source_field=source_field, target_field=target_field)
+        opts = CastOptions(source=source_field, target=target_field)
 
         out = opts.cast_arrow_tabular(table)
 
@@ -379,7 +379,7 @@ class TestArrowViewFlatBypass(ArrowTestCase):
         # return the table unchanged (view layout preserved).
         flat_schema = pa.schema([pa.field("a", pa.string(), nullable=True)])
         target_field = Schema.from_arrow(flat_schema).to_field()
-        opts = CastOptions(target_field=target_field).check_source(
+        opts = CastOptions(target=target_field).check_source(
             obj=table, copy=True,
         )
 
@@ -418,7 +418,7 @@ class TestEngineTypeBypassPolars(PolarsTestCase):
             ]).dtype,
             nullable=target_field.nullable,
         )
-        opts = CastOptions(source_field=source_field, target_field=target_field)
+        opts = CastOptions(source=source_field, target=target_field)
 
         out = opts.cast_polars_tabular(df)
 

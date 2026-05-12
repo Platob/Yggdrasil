@@ -94,8 +94,8 @@ class TestCastSeries:
         out = cast_polars_list_series(
             series,
             CastOptions(
-                source_field=source_array_field,
-                target_field=target_array_field,
+                source=source_array_field,
+                target=target_array_field,
             ),
         )
 
@@ -118,8 +118,8 @@ class TestCastExpr:
             cast_polars_list_expr(
                 pl.col("source_array"),
                 CastOptions(
-                    source_field=source_array_field,
-                    target_field=target_array_field,
+                    source=source_array_field,
+                    target=target_array_field,
                 ),
             ).alias("target_array")
         )["target_array"]
@@ -134,7 +134,7 @@ class TestCastExpr:
 
         out = cast_polars_list_expr(
             expr,
-            CastOptions(source_field=source_array_field, target_field=None),
+            CastOptions(source=source_array_field, target=None),
         )
 
         assert out is expr

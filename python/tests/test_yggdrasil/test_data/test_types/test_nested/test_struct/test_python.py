@@ -45,7 +45,7 @@ class TestConstruction:
             Field(name="b", dtype=int64_type, nullable=True),
         )
         dtype = StructType(fields=fields)
-        assert dtype.children_fields == dtype.fields
+        assert dtype.children == dtype.fields
 
     def test_class_type_id_is_struct(self) -> None:
         assert StructType.class_type_id() == DataTypeId.STRUCT

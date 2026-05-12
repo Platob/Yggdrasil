@@ -267,8 +267,8 @@ class TestArrowCasts(ArrowTestCase):
     def _cast(self, dtype, src, source_dtype):
         return dtype.cast_arrow_array(
             src,
-            source_field=Field("v", source_dtype),
-            target_field=Field("v", dtype),
+            source=Field("v", source_dtype),
+            target=Field("v", dtype),
         )
 
     def test_string_to_dictionary_encodes_and_nulls_unknowns(self) -> None:
@@ -388,8 +388,8 @@ class TestPolarsCasts:
         s = pl.Series("v", ["a", "b", "unknown", None], dtype=pl.String)
         out = target.cast_polars_series(
             s,
-            source_field=Field("v", StringType()),
-            target_field=Field("v", target),
+            source=Field("v", StringType()),
+            target=Field("v", target),
         )
         assert out.to_list() == ["a", "b", None, None]
         assert isinstance(out.dtype, pl.Enum)

@@ -122,7 +122,7 @@ class IntegerType(NumericType):
         options: "CastOptions",
     ) -> pa.Array:
         if options.need_cast(array, self):
-            src_type = options.source_field.to_arrow_type()
+            src_type = options.source.to_arrow_type()
             tgt_type = self.to_arrow()
 
             if (
@@ -178,7 +178,7 @@ class IntegerType(NumericType):
     ):
         if options.need_cast(expr, self):
             pl = get_polars()
-            source_field = options.source_field
+            source_field = options.source
             src_dtype = (
                 source_field.dtype.to_polars() if source_field is not None else None
             )

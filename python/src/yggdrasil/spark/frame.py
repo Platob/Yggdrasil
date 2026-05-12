@@ -70,7 +70,7 @@ def _typed_cast(
     byte_size: int,
 ) -> Iterator[pa.RecordBatch]:
     """Cast batched Python objects into Arrow batches matching ``schema``."""
-    options = CastOptions(target_field=schema, safe=False, byte_size=byte_size)
+    options = CastOptions(target=schema, safe=False, byte_size=byte_size)
 
     def _tables() -> Iterator[pa.Table]:
         for group in objects_per_batch:
@@ -204,7 +204,7 @@ class DynamicFrame:
         schema = Schema.from_any(schema)
         table = any_to_arrow_table(
             items,
-            options=CastOptions(target_field=schema, safe=False, byte_size=byte_size),
+            options=CastOptions(target=schema, safe=False, byte_size=byte_size),
         )
         return cls(df=spark_session.createDataFrame(table), schema=schema)
 

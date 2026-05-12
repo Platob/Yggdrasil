@@ -355,7 +355,7 @@ RESPONSE_SCHEMA = schema(
 # duplicate the same bytes. Schema-level partition_by / primary_key
 # flags inherited from REQUEST_SCHEMA.autotag() get cleared on the
 # unnested copies — those flags belong to the response's own columns.
-for _req_field in REQUEST_SCHEMA.children_fields:
+for _req_field in REQUEST_SCHEMA.children:
     if _req_field.name == "_pkl":
         continue
     _copied = _req_field.copy(name=f"request_{_req_field.name}")

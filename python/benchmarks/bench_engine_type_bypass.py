@@ -162,7 +162,7 @@ def _semantic_source_field(target_field: Field) -> Field:
     from yggdrasil.data.types.primitive import StringType
 
     new_children = []
-    for ch in target_field.children_fields:
+    for ch in target_field.children:
         dtype = SJsonType() if isinstance(ch.dtype, StringType) else ch.dtype
         new_children.append(
             Field(name=ch.name, dtype=dtype, nullable=ch.nullable)
@@ -178,11 +178,11 @@ def bench_arrow(rows: int, repeat: int) -> list[dict]:
     # ``_bind_source`` before dispatching. Without it the cast routes
     # through the ``src is None`` early-return, which would mask both
     # the engine-level bypass and the existing children-equality bypass.
-    opts_match = CastOptions(target_field=target_field).check_source(
+    opts_match = CastOptions(target=target_field).check_source(
         obj=_build_arrow_match(rows),
         copy=True,
     )
-    opts_cast = CastOptions(target_field=target_field).check_source(
+    opts_cast = CastOptions(target=target_field).check_source(
         obj=_build_arrow_cast(rows),
         copy=True,
     )
@@ -191,8 +191,8 @@ def bench_arrow(rows: int, repeat: int) -> list[dict]:
     # "differ", engine equality says "same". Exercises the new bypass
     # without the existing children-Field shortcut firing.
     opts_semantic = CastOptions(
-        target_field=target_field,
-        source_field=_semantic_source_field(target_field),
+        target=target_field,
+        source=_semantic_source_field(target_field),
     )
 
     table_match = _build_arrow_match(rows)
@@ -227,10 +227,10 @@ def bench_polars(rows: int, repeat: int) -> list[dict]:
     df_match = pl.from_arrow(_build_arrow_match(rows))
     df_cast = pl.from_arrow(_build_arrow_cast(rows))
 
-    opts_match = CastOptions(target_field=target_field).check_source(
+    opts_match = CastOptions(target=target_field).check_source(
         obj=df_match, copy=True,
     )
-    opts_cast = CastOptions(target_field=target_field).check_source(
+    opts_cast = CastOptions(target=target_field).check_source(
         obj=df_cast, copy=True,
     )
 
@@ -260,7 +260,7 @@ def bench_spark(rows: int, repeat: int) -> list[dict]:
         return [{"label": f"spark/skipped ({exc.__class__.__name__})", "best": 0.0, "median": 0.0, "mean": 0.0}]
 
     target_field = Schema.from_arrow(_build_arrow_schema()).to_field()
-    options = CastOptions(target_field=target_field)
+    options = CastOptions(target=target_field)
 
     df_match = spark.createDataFrame(_build_arrow_match(rows).to_pandas())
     df_cast = spark.createDataFrame(_build_arrow_cast(rows).to_pandas())

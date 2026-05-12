@@ -41,7 +41,7 @@ class TestObjectTypeIdentity(unittest.TestCase):
         self.assertEqual(ObjectType().type_id, DataTypeId.OBJECT)
 
     def test_children_fields_is_empty(self) -> None:
-        self.assertEqual(ObjectType().children_fields, [])
+        self.assertEqual(ObjectType().children, [])
 
     def test_repr(self) -> None:
         self.assertEqual(repr(ObjectType()), "ObjectType()")

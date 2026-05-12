@@ -69,7 +69,7 @@ class NumericType(PrimitiveType, ABC):
 
     @staticmethod
     def _source_type_id(options: "CastOptions") -> DataTypeId | None:
-        sf = options.source_field
+        sf = options.source
         return sf.dtype.type_id if sf is not None else None
 
     def merge_with(

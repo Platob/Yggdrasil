@@ -103,7 +103,7 @@ class StructType(NestedType):
         }
 
     @property
-    def children_fields(self) -> tuple["Field"]:
+    def children(self) -> tuple["Field"]:
         return self.fields
 
     @classmethod
@@ -351,10 +351,10 @@ class StructType(NestedType):
     ) -> pa.StructArray | pa.ChunkedArray:
         options = options.check_source(array).check_target(self)
 
-        source_type_id = options.source_field.dtype.type_id
+        source_type_id = options.source.dtype.type_id
 
         if source_type_id == DataTypeId.NULL or array.null_count == len(array):
-            return options.target_field.default_arrow_array(
+            return options.target.default_arrow_array(
                 size=len(array),
                 memory_pool=options.arrow_memory_pool,
             )
@@ -373,7 +373,7 @@ class StructType(NestedType):
 
         else:
             raise pa.ArrowInvalid(
-                f"Cannot cast {options.source_field} to {options.target_field}"
+                f"Cannot cast {options.source} to {options.target}"
             )
 
     def _cast_arrow_tabular(
@@ -406,13 +406,13 @@ class StructType(NestedType):
         pl = get_polars()
         options = options.check_source(series).check_target(self)
 
-        if options.source_field.dtype.type_id == DataTypeId.NULL or series.null_count() == len(series):
-            return options.target_field.default_polars_series(size=len(series))
+        if options.source.dtype.type_id == DataTypeId.NULL or series.null_count() == len(series):
+            return options.target.default_polars_series(size=len(series))
 
         expr = self._cast_polars_expr(
             pl.col(series.name),
             options=options,
-        ).alias(options.target_field.name)
+        ).alias(options.target.name)
         return pl.DataFrame({series.name: series}).select(expr).to_series()
 
     def _cast_polars_expr(
@@ -422,10 +422,10 @@ class StructType(NestedType):
     ) -> Any:
         options = options.check_target(self)
 
-        source_type_id = options.source_field.dtype.type_id
+        source_type_id = options.source.dtype.type_id
 
         if source_type_id == DataTypeId.NULL:
-            return options.target_field.default_polars_expr(alias=options.target_field.name)
+            return options.target.default_polars_expr(alias=options.target.name)
 
         elif is_json_string_source(source_type_id):
             return cast_polars_json_string_expr(expr, options)
@@ -441,7 +441,7 @@ class StructType(NestedType):
 
         else:
             raise TypeError(
-                f"Cannot cast {options.source_field} to {options.target_field}"
+                f"Cannot cast {options.source} to {options.target}"
             )
 
     def _cast_polars_tabular(
@@ -461,10 +461,10 @@ class StructType(NestedType):
     ) -> "pd.Series":
         options = options.check_source(series).check_target(self)
 
-        source_type_id = options.source_field.dtype.type_id
+        source_type_id = options.source.dtype.type_id
 
         if source_type_id == DataTypeId.NULL or series.isna().all():
-            return options.target_field.default_pandas_series(size=len(series))
+            return options.target.default_pandas_series(size=len(series))
 
         elif is_json_string_source(source_type_id):
             from .array import _cast_pandas_via_arrow
@@ -479,7 +479,7 @@ class StructType(NestedType):
 
         else:
             raise TypeError(
-                f"Cannot cast {options.source_field} to {options.target_field}"
+                f"Cannot cast {options.source} to {options.target}"
             )
 
     def _cast_pandas_tabular(
@@ -496,10 +496,10 @@ class StructType(NestedType):
     ) -> Any:
         options = options.check_source(column).check_target(self)
 
-        source_type_id = options.source_field.dtype.type_id
+        source_type_id = options.source.dtype.type_id
 
         if source_type_id == DataTypeId.NULL:
-            return options.target_field.default_spark_column()
+            return options.target.default_spark_column()
 
         elif is_json_string_source(source_type_id):
             return cast_spark_json_string_column(column, options)
@@ -515,7 +515,7 @@ class StructType(NestedType):
 
         else:
             raise TypeError(
-                f"Cannot cast {options.source_field} to {options.target_field}"
+                f"Cannot cast {options.source} to {options.target}"
             )
 
     def _cast_spark_tabular(

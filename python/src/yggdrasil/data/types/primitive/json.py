@@ -134,7 +134,7 @@ def _cast_arrow_to_json(
     from ..nested._cast_json import cast_arrow_json_encode_array
 
     options = options.check_source(array).check_target(self)
-    source_id = options.source_field.dtype.type_id
+    source_id = options.source.dtype.type_id
 
     if source_id.is_nested:
         return cast_arrow_json_encode_array(array, options=options)
@@ -153,7 +153,7 @@ def _cast_polars_to_json_series(
     from ..nested._cast_json import cast_polars_json_encode_series
 
     options = options.check_source(series).check_target(self)
-    source_id = options.source_field.dtype.type_id
+    source_id = options.source.dtype.type_id
 
     if source_id.is_nested:
         return cast_polars_json_encode_series(series, options=options)
@@ -167,7 +167,7 @@ def _cast_polars_to_json_expr(
     options: "CastOptions",
 ) -> Any:
     options = options.check_target(self)
-    source_id = options.source_field.dtype.type_id
+    source_id = options.source.dtype.type_id
 
     if source_id.is_nested:
         # Polars has ``Expr.struct.json_encode`` for structs, but no
@@ -196,7 +196,7 @@ def _cast_spark_to_json_column(
     from ..nested._cast_json import cast_spark_json_encode_column
 
     options = options.check_source(column).check_target(self)
-    source_id = options.source_field.dtype.type_id
+    source_id = options.source.dtype.type_id
 
     if source_id.is_nested:
         return cast_spark_json_encode_column(column, options=options)

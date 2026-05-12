@@ -226,7 +226,7 @@ class TestSignFlipCastEngine(unittest.TestCase):
         tgt = Field("x", IntegerType(byte_size=8, signed=True))
         arr = pa.array([(1 << 64) - 1, 0, 100], type=pa.uint64())
 
-        casted = tgt.cast_arrow_array(arr, source_field=src)
+        casted = tgt.cast_arrow_array(arr, source=src)
 
         self.assertEqual(casted.type, pa.int64())
         self.assertEqual(casted.to_pylist(), [-1, 0, 100])
@@ -238,7 +238,7 @@ class TestSignFlipCastEngine(unittest.TestCase):
         tgt = Field("x", IntegerType(byte_size=8, signed=False))
         arr = pa.array([-1, 0, 100], type=pa.int64())
 
-        casted = tgt.cast_arrow_array(arr, source_field=src)
+        casted = tgt.cast_arrow_array(arr, source=src)
 
         self.assertEqual(casted.type, pa.uint64())
         self.assertEqual(casted.to_pylist(), [(1 << 64) - 1, 0, 100])
@@ -269,7 +269,7 @@ class TestSignFlipCastEngine(unittest.TestCase):
         tgt = Field("x", IntegerType(byte_size=8, signed=True))
         series = pl.Series("x", [(1 << 64) - 1, 0, 100], dtype=pl.UInt64)
 
-        casted = tgt.cast_polars_series(series, source_field=src)
+        casted = tgt.cast_polars_series(series, source=src)
 
         self.assertEqual(casted.dtype, pl.Int64)
         self.assertEqual(casted.to_list(), [-1, 0, 100])

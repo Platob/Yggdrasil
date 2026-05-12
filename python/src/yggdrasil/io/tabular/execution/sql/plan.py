@@ -297,7 +297,7 @@ class Scan(PlanNode):
             return CastOptions(predicate=self.predicate)
         if narrowed is None:
             return CastOptions(predicate=self.predicate)
-        return CastOptions(predicate=self.predicate, target_field=narrowed)
+        return CastOptions(predicate=self.predicate, target=narrowed)
 
 
 # ---------------------------------------------------------------------------
@@ -702,7 +702,7 @@ def _narrow_schema(full: Any, projection: "Sequence[str]") -> Any:
 
     Lazy import of :class:`Schema` keeps the cold path on this module
     cheap. Used by :meth:`Scan._build_options` to thread per-Scan
-    column projection through :class:`CastOptions.target_field`.
+    column projection through :class:`CastOptions.target`.
     """
     from yggdrasil.data.schema import Schema
 

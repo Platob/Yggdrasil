@@ -568,7 +568,7 @@ class DataType(BaseChildrenFields, ABC):
     @staticmethod
     def _target_nullable(options: "CastOptions") -> bool:
         return (
-            options.target_field.nullable if options.target_field is not None else True
+            options.target.nullable if options.target is not None else True
         )
 
     @staticmethod

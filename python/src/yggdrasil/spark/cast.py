@@ -185,7 +185,7 @@ def any_to_spark_field(
     field: pa.Field,
     options: Optional[CastOptions] = None,
 ) -> T.StructField:
-    return options.check_source(field).merged_field.to_pyspark_field()
+    return options.check_source(field).merged.to_pyspark_field()
 
 
 @register_converter(Any, T.StructType)

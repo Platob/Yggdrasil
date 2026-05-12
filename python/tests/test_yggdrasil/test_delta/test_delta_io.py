@@ -48,7 +48,7 @@ class TestRoundTrip(DeltaTestCase):
             "val": ["a", "b", "c", "d"],
         })
         d.write_arrow_table(
-            t, options=DeltaOptions(target_field=_partition_schema())
+            t, options=DeltaOptions(target=_partition_schema())
         )
         snap = d.snapshot(fresh=True)
         self.assertEqual(snap.partition_columns, ["region"])
@@ -151,7 +151,7 @@ class TestPartitionPruning(DeltaTestCase):
                 "region": ["us", "us", "eu", "ap"],
                 "val": ["a", "b", "c", "d"],
             }),
-            options=DeltaOptions(target_field=_partition_schema()),
+            options=DeltaOptions(target=_partition_schema()),
         )
 
     def test_prune_to_single_value(self) -> None:

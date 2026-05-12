@@ -235,7 +235,32 @@ class WaitingConfig:
             if remaining <= 0:
                 raise TimeoutError(f"Timed out waiting after {self.timeout:.3f}s")
 
+            # Slow-window cadence: once we're past the 5s fast window,
+            # callers usually don't need sub-second polling — bump the
+            # cadence to the minimum slow-window interval (5s) so we
+            # don't hammer the backend with low-value polls. Skip the
+            # bump for callers with a tighter ``max_interval`` cap,
+            # since that's an explicit "stay under this".
+            if elapsed >= _FAST_WINDOW_SECONDS:
+                slow_cadence = _SLOW_WINDOW_INTERVAL
+                if self.max_interval > 0:
+                    slow_cadence = min(slow_cadence, self.max_interval)
+                sleep_s = max(sleep_s, slow_cadence)
+
+            # Always cap to remaining so we don't oversleep past the
+            # deadline — better to undershoot and let the next loop
+            # observe the timeout than to land past it.
+            sleep_s = min(sleep_s, remaining)
+
         time.sleep(sleep_s)
 
 
 DEFAULT_WAITING_CONFIG = WaitingConfig()
+
+
+# Threshold past which :meth:`WaitingConfig.sleep` switches from the
+# fast (per-iteration computed) cadence to a slow polling cadence —
+# saves cycles for long-running waits where sub-second poll resolution
+# stops being useful.
+_FAST_WINDOW_SECONDS = 5.0
+_SLOW_WINDOW_INTERVAL = 5.0

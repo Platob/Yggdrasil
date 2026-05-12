@@ -29,7 +29,6 @@ import pyarrow as pa
 import yggdrasil.pickle.json as json_module
 from yggdrasil.data.base_meta import (
     BaseChildrenFields,
-    BaseMetadata,
     _merge_metadata_and_tags,
     _normalize_metadata,
     _to_bytes,
@@ -39,6 +38,7 @@ from yggdrasil.data.constants import (
     DEFAULT_VALUE_KEY,
     DEFAULT_FIELD_NAME,
     POSITION_KEY,
+    TAG_PREFIX,
 )
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.parser import ParsedDataType
@@ -325,7 +325,7 @@ def field(
 
 
 @dataclass(frozen=True, slots=True, init=False, repr=False, eq=False)
-class Field(BaseMetadata, BaseChildrenFields):
+class Field(BaseChildrenFields):
     name: str
     dtype: DataType
     nullable: bool = True
@@ -350,7 +350,7 @@ class Field(BaseMetadata, BaseChildrenFields):
     _polars_schema: Any = dataclasses.field(default=None, repr=False, compare=False)
     _spark_field: Any = dataclasses.field(default=None, repr=False, compare=False)
     _spark_schema: Any = dataclasses.field(default=None, repr=False, compare=False)
-    # Cached ``{name: index}`` view of ``children_fields`` for O(1)
+    # Cached ``{name: index}`` view of ``children`` for O(1)
     # lookup in :meth:`field_by`. Built on demand by
     # :meth:`_ensure_field_name_map`; cleared whenever the dtype
     # changes (which is the only way the children change).
@@ -619,12 +619,12 @@ class Field(BaseMetadata, BaseChildrenFields):
     def _adopt_children(self) -> None:
         """Stamp ``self`` as the parent of every child :class:`Field`.
 
-        Walks ``self.dtype.children_fields`` (the dtype-level view of
+        Walks ``self.dtype.children`` (the dtype-level view of
         children — works for struct, map, and array). Idempotent:
         calling it on a field whose children already point at ``self``
         is a no-op assignment.
         """
-        for child in self.dtype.children_fields:
+        for child in self.dtype.children:
             if isinstance(child, Field) and child.parent is not self:
                 object.__setattr__(child, "parent", self)
 
@@ -730,8 +730,8 @@ class Field(BaseMetadata, BaseChildrenFields):
             # names don't, fall back to a positional walk so a renamed
             # column can still match its peer.
             if self.type_id is DataTypeId.STRUCT and other.type_id is DataTypeId.STRUCT:
-                self_children = self.children_fields
-                other_children = other.children_fields
+                self_children = self.children
+                other_children = other.children
                 if len(self_children) != len(other_children):
                     return False
                 if check_names:
@@ -861,7 +861,7 @@ class Field(BaseMetadata, BaseChildrenFields):
         ``select_in_*`` helpers) as the last-resort fallback when
         neither :attr:`name` nor :attr:`alias` matches a child name
         in the receiving schema — the receiver's
-        ``children_fields[position]`` (or column at ``position``)
+        ``children[position]`` (or column at ``position``)
         is then resolved by name and used.
 
         ``None`` (the default) leaves position-based lookup
@@ -1003,8 +1003,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         return self.dtype.type_id
 
     @property
-    def children_fields(self) -> list["Field"]:
-        return self.dtype.children_fields
+    def children(self) -> list["Field"]:
+        return self.dtype.children
 
     @property
     def arrow_type(self) -> pa.DataType:
@@ -1014,6 +1014,117 @@ class Field(BaseMetadata, BaseChildrenFields):
         return {}
 
     # ==================================================================
+    # Metadata + tags
+    # ==================================================================
+    # Inlined from the former ``BaseMetadata`` mixin — :class:`Field`
+    # was the only consumer, so the indirection was pure noise.
+    # Tag accessors all funnel through ``self.metadata`` (a
+    # ``bytes → bytes`` dict whose tag entries are prefixed with
+    # :data:`TAG_PREFIX`).
+
+    def _prefixed_metadata(self, prefix: bytes) -> dict[bytes, bytes]:
+        if not self.metadata:
+            return {}
+        return {
+            key[len(prefix):]: value
+            for key, value in self.metadata.items()
+            if key.startswith(prefix)
+        }
+
+    def _update_prefixed_metadata(
+        self,
+        prefix: bytes,
+        values: Mapping[bytes | str, bytes | str | object] | None,
+    ) -> None:
+        if not values:
+            return
+        if self.metadata is None:
+            object.__setattr__(self, "metadata", {})
+        self.metadata.update(
+            {
+                prefix + _to_bytes(key): _to_bytes(value)
+                for key, value in values.items()
+                if key and value is not None
+            }
+        )
+
+    def _tag_value(self, key: bytes | str) -> bytes | None:
+        if not self.metadata:
+            return None
+        return self.metadata.get(TAG_PREFIX + _to_bytes(key))
+
+    def _set_tag_value(self, key: bytes | str, value: Any | None) -> None:
+        if value is not None:
+            if not self.metadata:
+                object.__setattr__(self, "metadata", {})
+            self.metadata[TAG_PREFIX + _to_bytes(key)] = _to_bytes(value)
+            self._on_metadata_mutated()
+
+    def _unset_tag_value(self, key: bytes | str) -> None:
+        if not self.metadata:
+            return
+        self.metadata.pop(TAG_PREFIX + _to_bytes(key), None)
+        if not self.metadata:
+            object.__setattr__(self, "metadata", None)
+        self._on_metadata_mutated()
+
+    def _tag_flag(self, key: bytes | str) -> bool:
+        return bool(self._tag_value(key))
+
+    def _tag_text(self, key: bytes | str) -> str | None:
+        value = self._tag_value(key)
+        if not value:
+            return None
+        return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+
+    @property
+    def tags(self) -> dict[bytes, bytes] | None:
+        tags = self._prefixed_metadata(TAG_PREFIX)
+        if tags:
+            return tags
+        return self._empty_tags()
+
+    @tags.setter
+    def tags(self, value: "Mapping[AnyStr, AnyStr] | None") -> None:
+        self.update_tags(value)
+
+    def update_tags(self, value: "Mapping[AnyStr, AnyStr] | None") -> None:
+        self._update_prefixed_metadata(TAG_PREFIX, value)
+
+    @property
+    def partition_by(self) -> bool:
+        return self._tag_flag(b"partition_by")
+
+    @property
+    def cluster_by(self) -> bool:
+        return self._tag_flag(b"cluster_by")
+
+    @property
+    def primary_key(self) -> bool:
+        return self._tag_flag(b"primary_key")
+
+    @property
+    def foreign_key(self) -> bool:
+        return self._tag_flag(b"foreign_key")
+
+    @property
+    def constraint_key(self) -> bool:
+        return self._tag_flag(b"constraint_key")
+
+    @property
+    def sorted(self) -> bool:
+        return self._tag_flag(b"sorted")
+
+    @property
+    def comment(self) -> str | None:
+        if not self.metadata:
+            return None
+        raw = self.metadata.get(b"comment") or self.metadata.get(b"description")
+        if raw:
+            return raw.decode("utf-8")
+        return None
+
+    # ==================================================================
     # Schema-shaped views — meaningful when ``self.dtype`` is a struct;
     # quietly empty otherwise so callers don't have to type-check first.
     # ==================================================================
@@ -1021,12 +1132,12 @@ class Field(BaseMetadata, BaseChildrenFields):
     @property
     def fields(self) -> list["Field"]:
         """Children excluding constraint-only fields."""
-        return [f for f in self.children_fields if not f.constraint_key]
+        return [f for f in self.children if not f.constraint_key]
 
     @property
     def inner_fields(self) -> "OrderedDict[str, Field]":
         """Compat view of the children as an ordered ``{name: field}`` map."""
-        return OrderedDict((f.name, f) for f in self.children_fields)
+        return OrderedDict((f.name, f) for f in self.children)
 
     @property
     def arrow_fields(self) -> list[pa.Field]:
@@ -1042,10 +1153,10 @@ class Field(BaseMetadata, BaseChildrenFields):
 
     @property
     def constraints(self) -> list["Field"]:
-        return [f for f in self.children_fields if f.constraint_key]
+        return [f for f in self.children if f.constraint_key]
 
     def is_empty(self) -> bool:
-        return len(self.children_fields) == 0
+        return len(self.children) == 0
 
     @classmethod
     def empty(
@@ -1367,14 +1478,14 @@ class Field(BaseMetadata, BaseChildrenFields):
         target = self if inplace else self.copy()
 
         existing_idx: "int | None" = None
-        for i, c in enumerate(target.children_fields):
+        for i, c in enumerate(target.children):
             if c.name == new_field.name:
                 existing_idx = i
                 break
 
         if existing_idx is None:
             # No collision — APPEND-style, IGNORE/ERROR are no-ops here.
-            new_children = list(target.children_fields)
+            new_children = list(target.children)
             new_children.append(new_field)
             target._set_dtype_fields(new_children)
             return target
@@ -1393,20 +1504,20 @@ class Field(BaseMetadata, BaseChildrenFields):
             # with the same name. Struct lookups by name will hit the
             # first match (preserves the existing entry's identity);
             # downstream consumers that care can dedupe.
-            new_children = list(target.children_fields)
+            new_children = list(target.children)
             new_children.append(new_field)
             target._set_dtype_fields(new_children)
             return target
         if action is Mode.UPSERT or action is Mode.MERGE:
-            existing = target.children_fields[existing_idx]
+            existing = target.children[existing_idx]
             merged = existing.merge_with(new_field, inplace=False)
-            new_children = list(target.children_fields)
+            new_children = list(target.children)
             new_children[existing_idx] = merged
             target._set_dtype_fields(new_children)
             return target
 
         # AUTO / OVERWRITE / TRUNCATE → replace.
-        new_children = list(target.children_fields)
+        new_children = list(target.children)
         new_children[existing_idx] = new_field
         target._set_dtype_fields(new_children)
         return target
@@ -1589,7 +1700,7 @@ class Field(BaseMetadata, BaseChildrenFields):
             cluster_by_names = self._pop_field_name_list(b"cluster_by")
 
             new_fields: list[Field] = []
-            for f in self.children_fields:
+            for f in self.children:
                 if primary_key_names and f.name in primary_key_names:
                     f.with_primary_key(True, inplace=True)
                 if partition_by_names and f.name in partition_by_names:
@@ -1676,7 +1787,7 @@ class Field(BaseMetadata, BaseChildrenFields):
             return f
         struct_field = f.to_struct()
         return cls._make_struct(
-            children=struct_field.children_fields,
+            children=struct_field.children,
             metadata=struct_field.metadata,
             name=struct_field.name,
             nullable=struct_field.nullable,
@@ -2626,7 +2737,7 @@ class Field(BaseMetadata, BaseChildrenFields):
             final_metadata.update(new_metadata)
 
         return Schema(
-            inner_fields=base.children_fields,
+            inner_fields=base.children,
             metadata=final_metadata or None,
             name=base.name if base.name != DEFAULT_FIELD_NAME else None,
             nullable=base.nullable,
@@ -2912,8 +3023,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         except Exception as exc:
             raise CastError(
                 str(exc),
-                source_field=scoped.source_field,
-                target_field=self,
+                source=scoped.source,
+                target=self,
                 original=exc,
             ) from exc
         return self.finalize_arrow_array(casted, default_scalar=default_scalar)
@@ -2942,8 +3053,8 @@ class Field(BaseMetadata, BaseChildrenFields):
         except Exception as exc:
             raise CastError(
                 str(exc),
-                source_field=scoped.source_field,
-                target_field=self,
+                source=scoped.source,
+                target=self,
                 original=exc,
             ) from exc
         # Tabular finalize is identity — per-column finalize already
@@ -3634,7 +3745,7 @@ class Field(BaseMetadata, BaseChildrenFields):
 
         new_fields: list[Field] = []
         replaced = False
-        for existing in self.children_fields:
+        for existing in self.children:
             if existing.name == key:
                 new_fields.append(f)
                 replaced = True
@@ -3647,14 +3758,14 @@ class Field(BaseMetadata, BaseChildrenFields):
     def __delitem__(self, key: int | str) -> None:
         resolved = self.field(key)
         self._set_dtype_fields(
-            f for f in self.children_fields if f.name != resolved.name
+            f for f in self.children if f.name != resolved.name
         )
 
     def __iter__(self) -> Iterator[str]:
-        return iter(f.name for f in self.children_fields)
+        return iter(f.name for f in self.children)
 
     def __len__(self) -> int:
-        return len(self.children_fields)
+        return len(self.children)
 
     def __contains__(self, key: object) -> bool:
         return self.field(key, raise_error=False) is not None
@@ -3696,7 +3807,7 @@ class Field(BaseMetadata, BaseChildrenFields):
                 raise KeyError(key)
             return default
         self._set_dtype_fields(
-            f for f in self.children_fields if f.name != resolved.name
+            f for f in self.children if f.name != resolved.name
         )
         return resolved
 
@@ -3718,20 +3829,20 @@ class Field(BaseMetadata, BaseChildrenFields):
         f = Field.from_any(default)
         if f.name != key:
             f = f.copy(name=key)
-        self._set_dtype_fields(list(self.children_fields) + [f])
+        self._set_dtype_fields(list(self.children) + [f])
         return f
 
     def keys(self) -> list[str]:
-        return [f.name for f in self.children_fields]
+        return [f.name for f in self.children]
 
     def values(self) -> list["Field"]:
-        return list(self.children_fields)
+        return list(self.children)
 
     def items(self) -> list[tuple[str, "Field"]]:
-        return [(f.name, f) for f in self.children_fields]
+        return [(f.name, f) for f in self.children]
 
     def popitem(self, last: bool = True) -> tuple[str, "Field"]:
-        fields = list(self.children_fields)
+        fields = list(self.children)
         if not fields:
             raise KeyError("popitem(): field is empty")
         idx = -1 if last else 0
@@ -3806,9 +3917,9 @@ class Field(BaseMetadata, BaseChildrenFields):
     def __add__(self, other: Any) -> "Field":
         other = self._coerce_other(other)
         merged: "OrderedDict[str, Field]" = OrderedDict(
-            (f.name, f.copy()) for f in self.children_fields
+            (f.name, f.copy()) for f in self.children
         )
-        for f in other.children_fields:
+        for f in other.children:
             merged[f.name] = f.copy()
         return type(self)._make_struct(
             children=merged.values(),
@@ -3825,9 +3936,9 @@ class Field(BaseMetadata, BaseChildrenFields):
 
     def __iadd__(self, other: Any) -> "Field":
         other = self._coerce_other(other)
-        merged = list(self.children_fields)
+        merged = list(self.children)
         seen = {f.name: i for i, f in enumerate(merged)}
-        for f in other.children_fields:
+        for f in other.children:
             if f.name in seen:
                 merged[seen[f.name]] = f.copy()
             else:
@@ -3843,10 +3954,10 @@ class Field(BaseMetadata, BaseChildrenFields):
 
     def __sub__(self, other: Any) -> "Field":
         other = self._coerce_other(other)
-        remove_names = {f.name for f in other.children_fields}
+        remove_names = {f.name for f in other.children}
         return type(self)._make_struct(
             children=[
-                f.copy() for f in self.children_fields if f.name not in remove_names
+                f.copy() for f in self.children if f.name not in remove_names
             ],
             metadata=dict(self.metadata) if self.metadata else None,
             name=self.name,
@@ -3855,17 +3966,17 @@ class Field(BaseMetadata, BaseChildrenFields):
 
     def __isub__(self, other: Any) -> "Field":
         other = self._coerce_other(other)
-        remove_names = {f.name for f in other.children_fields}
+        remove_names = {f.name for f in other.children}
         self._set_dtype_fields(
-            f for f in self.children_fields if f.name not in remove_names
+            f for f in self.children if f.name not in remove_names
         )
         return self
 
     def __and__(self, other: Any) -> "Field":
         other = self._coerce_other(other)
-        keep_names = {f.name for f in other.children_fields}
+        keep_names = {f.name for f in other.children}
         return type(self)._make_struct(
-            children=[f.copy() for f in self.children_fields if f.name in keep_names],
+            children=[f.copy() for f in self.children if f.name in keep_names],
             metadata=self._merge_metadata(self.metadata, other.metadata),
             name=self._rhs_wins_name(self, other),
             nullable=self.nullable or other.nullable,
@@ -3873,8 +3984,8 @@ class Field(BaseMetadata, BaseChildrenFields):
 
     def __iand__(self, other: Any) -> "Field":
         other = self._coerce_other(other)
-        keep_names = {f.name for f in other.children_fields}
-        self._set_dtype_fields(f for f in self.children_fields if f.name in keep_names)
+        keep_names = {f.name for f in other.children}
+        self._set_dtype_fields(f for f in self.children if f.name in keep_names)
         object.__setattr__(
             self, "metadata", self._merge_metadata(self.metadata, other.metadata)
         )

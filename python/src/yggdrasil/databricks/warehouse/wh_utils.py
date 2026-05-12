@@ -1,20 +1,17 @@
 import inspect
 import os
-import random
 import re
 from dataclasses import fields
-from typing import Union, Any, Type, Optional, TypeVar
+from typing import Union, Any, Optional, Type, TypeVar
 
 from databricks.sdk.service.sql import (
     EndpointInfo,
     EndpointInfoWarehouseType,
     GetWarehouseResponse, GetWarehouseResponseWarehouseType, WarehousesAPI,
 )
-from yggdrasil.dataclasses import WaitingConfig
 
 __all__ = [
     "safeGetWarehouseResponse", "safeEndpointInfo",
-    "_jitter_sleep_seconds",
     "DEFAULT_ALL_PURPOSE_CLASSIC_NAME",
     "DEFAULT_ALL_PURPOSE_SERVERLESS_NAME",
     "_EDIT_ARG_NAMES", "_CREATE_ARG_NAMES",
@@ -89,24 +86,6 @@ def _copy_common_fields(src: Any, dst_cls: Type[T], *, skip: set[str] = frozense
         for name in dst_field_names
         if name not in skip
     }
-
-
-def _jitter_sleep_seconds(
-    wait: WaitingConfig,
-    *,
-    iteration: int,
-    remaining: Optional[float],
-) -> float:
-    """Exponential backoff with full jitter, capped by remaining deadline."""
-    base = float(wait.interval or 1.0)
-    backoff = max(float(wait.backoff or 1.0), 1.0)
-    delay = base * (backoff ** iteration)
-    if wait.max_interval:
-        delay = min(delay, float(wait.max_interval))
-    delay = random.uniform(0.0, delay)
-    if remaining is not None:
-        delay = min(delay, max(0.0, remaining))
-    return max(0.0, delay)
 
 
 # Matches a trailing " [<int>]" suffix. Captures the base name and the index.

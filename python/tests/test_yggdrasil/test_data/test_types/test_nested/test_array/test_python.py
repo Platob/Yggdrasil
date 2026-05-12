@@ -72,7 +72,7 @@ class TestIdentity:
     def test_children_fields_is_just_the_item_field(self) -> None:
         dtype = ArrayType.from_item(StringType().to_field())
 
-        children = dtype.children_fields
+        children = dtype.children
         assert len(children) == 1
         assert children[0].name == ""
 

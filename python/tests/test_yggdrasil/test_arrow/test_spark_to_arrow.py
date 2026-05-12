@@ -56,7 +56,7 @@ class TestSparkDataFrameToArrow(SparkTestCase, ArrowTestCase):
     def test_target_field_casts_int_to_int32(self) -> None:
         df = self.df([(1,), (2,), (3,)], schema=["a"])
         target = Schema.from_arrow(self.pa.schema([self.pa.field("a", self.pa.int32())]))
-        out = any_to_arrow_table(df, CastOptions(target_field=target))
+        out = any_to_arrow_table(df, CastOptions(target=target))
         self.assertEqual(out.schema.field("a").type, self.pa.int32())
         self.assertEqual(out["a"].to_pylist(), [1, 2, 3])
 
@@ -66,7 +66,7 @@ class TestSparkDataFrameToArrow(SparkTestCase, ArrowTestCase):
             self.pa.field("c", self.pa.bool_()),
             self.pa.field("a", self.pa.int64()),
         ]))
-        out = any_to_arrow_table(df, CastOptions(target_field=target))
+        out = any_to_arrow_table(df, CastOptions(target=target))
         self.assertEqual(out.column_names, ["c", "a"])
 
     def test_record_batch_path(self) -> None:
@@ -88,7 +88,7 @@ class TestSparkDataFrameToArrow(SparkTestCase, ArrowTestCase):
     def test_batch_iterator_with_target_cast(self) -> None:
         df = self.df([(i,) for i in range(5)], schema=["a"])
         target = Schema.from_arrow(self.pa.schema([self.pa.field("a", self.pa.int32())]))
-        batches = list(any_to_arrow_batch_iterator(df, CastOptions(target_field=target)))
+        batches = list(any_to_arrow_batch_iterator(df, CastOptions(target=target)))
         self.assertEqual(sum(b.num_rows for b in batches), 5)
         for b in batches:
             self.assertEqual(b.schema.field("a").type, self.pa.int32())
