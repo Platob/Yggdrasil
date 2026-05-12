@@ -61,15 +61,12 @@ def cast_polars_struct_expr(
         raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
 
     source_field: "Field" = options.source_field
-    source_type: "StructType" = source_field.dtype
     target_type: "StructType" = options.target_field.dtype
 
     fields: list[Any] = []
 
-    for target_child in target_type.children_fields:
-        # Single-method name-then-alias lookup — see the arrow
-        # struct cast for rationale.
-        source_child = target_child.select_in_field(source_type, default=None)
+    for i, target_child in enumerate(target_type.children_fields):
+        source_child = source_field.field(name=target_child.name, index=i, raise_error=None)
 
         if source_child is None:
             child_expr = target_child.default_polars_expr(alias=target_child.name)

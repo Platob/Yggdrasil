@@ -5,6 +5,7 @@ import math
 import re
 import time
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from typing import Any, Iterator, Optional
 
 from .registry import register_converter
@@ -45,6 +46,7 @@ __all__ = [
     "truncate_datetime",
     "truncate_datetime_value",
     "iter_datetime_ranges",
+    "parse_http_date"
 ]
 
 
@@ -88,6 +90,39 @@ _RE_ISO_DURATION = re.compile(
     r")?$",
     re.IGNORECASE,
 )
+_RE_HTTP_ASCTIME = re.compile(
+    r"^[A-Za-z]{3}\s+(?P<mon>[A-Za-z]{3})\s+(?P<day>\d{1,2})\s+"
+    r"(?P<H>\d{2}):(?P<M>\d{2}):(?P<S>\d{2})\s+(?P<year>\d{4})$"
+)
+_ASCTIME_MONTHS = {m: i for i, m in enumerate(
+    ("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"), 1)}
+
+
+def parse_http_date(value: str) -> dt.datetime | None:
+    # IMF-fixdate + RFC 850 via stdlib
+    if "," in value and value.endswith("GMT"):
+        try:
+            parsed = parsedate_to_datetime(value)
+        except (ValueError, TypeError):
+            parsed = None
+        if parsed is not None:
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=_UTC)
+
+    # asctime form — stdlib doesn't handle it
+    m = _RE_HTTP_ASCTIME.match(value)
+    if m is None:
+        return None
+    month = _ASCTIME_MONTHS.get(m.group("mon"))
+    if month is None:
+        return None
+    try:
+        return _DATETIME(
+            int(m.group("year")), month, int(m.group("day")),
+            int(m.group("H")), int(m.group("M")), int(m.group("S")),
+            tzinfo=_UTC,
+        )
+    except ValueError:
+        return None
 
 _STRPTIME_FORMATS = (
     "%Y-%m-%d %H:%M%z",

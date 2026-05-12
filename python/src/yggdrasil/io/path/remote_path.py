@@ -214,10 +214,13 @@ class RemotePath(Path):
     def _stat_uncached(self) -> IOStats:
         """Backend-specific :class:`IOStats` probe. One network call."""
 
-    def _invalidate_stat_cache(self) -> None:
+    def _invalidate_stat_cache(self, remove_global: bool = True) -> None:
         """Drop this path's cached entry. Call after writes / deletes."""
         self._stat_cached = None
         self._stat_cached_at = 0.0
+
+        if remove_global:
+            self._INSTANCES.pop((type(self), str(self.url)), None)
 
     # ------------------------------------------------------------------
     # Resize is a no-op on remote backends — the upload IS the resize

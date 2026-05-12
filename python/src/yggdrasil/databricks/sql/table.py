@@ -1313,7 +1313,7 @@ class Table(DatabricksResource, Holder):
             safe_char + name + safe_char
             for name in options.column_names or [c.name for c in self.columns]
         )
-        query = f"SELECT {names}"
+        query = f"SELECT {names} FROM {self.full_name(safe=True)}"
         # The unified ``predicate`` on CastOptions becomes a SQL
         # ``WHERE`` so the warehouse drops non-matching rows before
         # they reach the cast pipeline. Pushdown is the whole point —
@@ -2696,25 +2696,10 @@ class Table(DatabricksResource, Holder):
 
         prune_values = prune_values or {}
         output_data: "Tabular | None" = None
-        with ParquetIO() as buffer:
-            buffer.write_table(data, cast_options)
-            buffer.seek(0)
-            if prune_by:
-                prune_values = _collect_prune_values_polars(buffer, prune_by)
-                logger.debug(
-                    "Arrow pruning %s -> %s",
-                    prune_by, {k: len(v) for k, v in prune_values.items()},
-                )
-            buffer.seek(0)
-            staging.write_stream(buffer)
-            # Capture the staged payload as a ArrowTabular before
-            # the buffer is cleared.  Read straight off the spilled
-            # Parquet so the holder shares the same row chunking the
-            # warehouse will see.
-            if return_data:
-                from yggdrasil.io.tabular import ArrowTabular
-                buffer.seek(0)
-                output_data = ArrowTabular(buffer.read_arrow_table())
+        staging.write_table(data, cast_options)
+        if return_data:
+            from yggdrasil.io.tabular import ArrowTabular
+            output_data = ArrowTabular(staging.read_arrow_table())
 
         prune_predicates = _build_prune_predicates(prune_values, target_alias="T") if prune_values else []
         if where is not None:

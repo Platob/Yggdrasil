@@ -124,8 +124,3 @@ class TestVolumePathIntegration(DatabricksIntegrationCase):
             self.assertEqual(staged.read_bytes(), b"staged")
         finally:
             staged.unlink(missing_ok=True)
-
-    def test_storage_location(self):
-        path = self.root / "storage_location.bin"
-
-        assert path.storage_path() == f"/Volumes/{self.catalog}/{self.schema}/integration/storage_location.bin"

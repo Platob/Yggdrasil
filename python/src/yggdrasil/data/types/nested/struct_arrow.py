@@ -79,11 +79,11 @@ def cast_arrow_struct_array(
 
     children: list[pa.Array] = []
 
-    for target_child in target_type.children_fields:
+    for i, target_child in enumerate(target_type.children_fields):
         # See the tabular variant for the rationale — single-method
         # name-then-alias lookup against the source struct's
         # children.
-        source_child = target_child.select_in_field(source_type, default=None)
+        source_child = target_child.field(name=target_child.name, index=i, raise_error=False)
 
         if source_child is None:
             children.append(
@@ -310,14 +310,6 @@ def cast_arrow_tabular(
     source_schema = options.source_schema
     target_schema = options.merged_schema
 
-    # Engine-level fast bypass — yggdrasil Field/DataType can encode
-    # detail (semantic subclass, extension metadata) that the
-    # underlying ``pa.Schema`` does not carry. When the source pyarrow
-    # schema already equals the target engine schema, rebuilding the
-    # table is pure metadata churn; skip it. The per-field probe also
-    # treats view/flat layout pairs as compatible so a ``string_view``
-    # column survives a cast to a ``string`` target without being
-    # materialized into a fresh flat buffer.
     target_arrow_schema = target_schema.to_arrow_schema()
     if data.schema.equals(target_arrow_schema, check_metadata=False):
         return data
@@ -337,13 +329,8 @@ def cast_arrow_tabular(
     target_arrays: list[pa.Array] = []
     num_rows = data.num_rows
 
-    for target_field in target_schema.children_fields:
-        # ``select_in_field`` walks ``source_schema.children_fields``
-        # by name → alias and returns the matching child (or the
-        # ``default`` sentinel on miss). One method, one rule —
-        # mirrors what callers get on the read side via
-        # ``select_in_arrow_tabular``.
-        source_field = target_field.select_in_field(source_schema, default=None)
+    for i, target_field in enumerate(target_schema.children_fields):
+        source_field = source_schema.field(name=target_field.name, index=i, raise_error=False)
 
         if source_field is None:
             casted = target_field.default_arrow_array(

@@ -1005,17 +1005,7 @@ class Tabular(ABC, Generic[O]):
         **kwargs: Any,
     ) -> None:
         options = self.check_options(options, overrides=locals())
-        # Peek the first batch to refresh the schema cache before
-        # the iterator is drained by the leaf writer.
-        iterator = iter(batches)
-        first = next(iterator, None)
-        if first is None:
-            if options.sync_metadata:
-                self._commit_metadata()
-            return
-        self._persist_schema(Schema.from_arrow(first.schema))
-        import itertools as _it
-        self._write_arrow_batches(_it.chain([first], iterator), options)
+        self._write_arrow_batches(batches, options)
         if options.sync_metadata:
             self._commit_metadata()
 
@@ -1027,20 +1017,18 @@ class Tabular(ABC, Generic[O]):
         )
 
     def _write_arrow_table(self, table: pa.Table, options: O) -> None:
-        # Cache the schema up front — readers that hit collect_schema
-        # between the write and the final metadata commit see the
-        # newly-written shape without re-collecting.
-        self._persist_schema(Schema.from_arrow(table.schema))
-        row_size = getattr(options, "row_size", None) or None
-        # Defer per-batch metadata commits to a single end-of-write
-        # call (one ``_touch_stat`` instead of one per batch).
-        inner = options.copy(sync_metadata=False) if options.sync_metadata else options
-        if row_size:
-            inner = inner.check_source(table).copy(row_size=None)
+        casted = options.cast_arrow_tabular(table)
+
         self._write_arrow_batches(
-            table.to_batches(max_chunksize=row_size),
-            inner,
+            casted.to_batches(),
+            options.copy(
+                target=None,
+                sync_metadata=False,
+                row_size=None,
+                byte_size=None,
+            ),
         )
+
         if options.sync_metadata:
             self._commit_metadata()
 
@@ -1082,81 +1070,17 @@ class Tabular(ABC, Generic[O]):
         self, frame: "pl.DataFrame | pl.LazyFrame", options: O,
     ) -> None:
         pl = polars_module()
-        if isinstance(frame, pl.LazyFrame):
-            frame = frame.collect()
+
+        casted = options.cast_polars_tabular(frame)
+
+        if isinstance(casted, pl.LazyFrame):
+            casted = casted.collect()
+
         if frame.height == 0:
             return
 
-        # Push the target cast into polars before the zero-copy
-        # :func:`pl.DataFrame.to_arrow` hand-off. The rust engine fuses
-        # cast + projection (numerics, temporals, nested) into one pass.
-        # After polars's cast, run a single :meth:`pa.Table.cast` per
-        # chunk to reconcile the canonical arrow physical-type mismatches
-        # polars can't express (``large_string`` ↔ ``string``, …) — one
-        # whole-table cast is cheaper than per-batch dispatch through
-        # the yggdrasil :class:`Field` walk, and binding source = target
-        # afterwards collapses the per-batch ``cast_arrow_tabular`` to
-        # its bypass.
-        target_field = getattr(options, "target_field", None)
-        target_arrow_schema: "pa.Schema | None" = None
-        if target_field is not None:
-            try:
-                frame = options.cast_polars_tabular(frame)
-            except Exception:
-                # Polars cast couldn't express the target shape — fall
-                # back to per-batch arrow cast downstream.
-                target_field = None
-            else:
-                merged = options.merged_field
-                if merged is not None:
-                    target_arrow_schema = merged.to_arrow_schema()
-                    options = options.with_source(merged, copy=True)
+        self._write_arrow_table(casted.to_arrow(compat_level=pl.CompatLevel.newest()), options)
 
-        row_size = getattr(options, "row_size", None) or 0
-        byte_size = getattr(options, "byte_size", None) or 0
-        if row_size > 0:
-            chunks: "Iterator[pl.DataFrame]" = frame.iter_slices(n_rows=row_size)
-        elif byte_size > 0:
-            total = frame.estimated_size(unit="b")
-            if total == 0:
-                chunks = iter((frame,))
-            else:
-                rows_per_chunk = max(1, int(frame.height * byte_size / total))
-                chunks = frame.iter_slices(n_rows=rows_per_chunk)
-        else:
-            chunks = iter((frame,))
-
-        # Polars schemas convert losslessly to Arrow on the head batch
-        # — peek one and stamp it so readers don't have to wait for
-        # the whole frame to drain.
-        head_schema = (
-            target_arrow_schema
-            if target_arrow_schema is not None
-            else frame.head(0).to_arrow().schema
-        )
-        self._persist_schema(Schema.from_arrow(head_schema))
-
-        def gen() -> Iterator[pa.RecordBatch]:
-            for f in chunks:
-                chunk_table = f.to_arrow()
-                if (
-                    target_arrow_schema is not None
-                    and chunk_table.schema != target_arrow_schema
-                ):
-                    try:
-                        chunk_table = chunk_table.cast(
-                            target_arrow_schema, safe=False,
-                        )
-                    except (pa.ArrowInvalid, pa.ArrowTypeError,
-                            pa.ArrowNotImplementedError):
-                        # Final reconciliation will run inside the per-batch
-                        # path — drop the pre-cast and let the cast pipeline
-                        # handle it.
-                        pass
-                yield from chunk_table.to_batches()
-
-        inner = options.copy(sync_metadata=False) if options.sync_metadata else options
-        self._write_arrow_batches(gen(), inner)
         if options.sync_metadata:
             self._commit_metadata()
 
@@ -1180,55 +1104,17 @@ class Tabular(ABC, Generic[O]):
         options: "O | None" = None,
         **kwargs: Any,
     ) -> None:
-        self._write_pandas_frame(
-            frame, self.check_options(options, overrides=locals()),
-        )
+        self._write_pandas_frame(frame, self.check_options(options, overrides=locals()))
 
     def _write_pandas_frame(self, frame: "pandas.DataFrame", options: O) -> None:
-        import pandas as pd
-        is_default_range = (
-            isinstance(frame.index, pd.RangeIndex) and frame.index.name is None
-        )
-        preserve_index = not is_default_range
-
-        # Fast path: when a target schema is bound on ``options``, feed it
-        # straight to :func:`pa.Table.from_pandas` so the C++ bridge does
-        # type-driven conversion in one pass instead of inferring types
-        # (slow for object-dtype + nested columns) and then re-casting per
-        # batch downstream. After the table lands in target shape, bind
-        # ``source_field`` so the per-batch ``cast_arrow_tabular`` collapses
-        # to its bypass branch.
-        target_field = getattr(options, "target_field", None)
-        if (
-            target_field is not None
-            and not preserve_index
-            and isinstance(frame, pd.DataFrame)
-        ):
-            merged = options.merged_field
-            if merged is not None:
-                target_names = [f.name for f in merged.children_fields]
-                if target_names and all(name in frame.columns for name in target_names):
-                    try:
-                        table = pa.Table.from_pandas(
-                            frame,
-                            schema=merged.to_arrow_schema(),
-                            preserve_index=False,
-                        )
-                    except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError,
-                            TypeError, ValueError, KeyError):
-                        # Fall through to the inference path — the caller's
-                        # frame doesn't line up cleanly with the target
-                        # (mixed object cells, conflicting dtypes, etc.)
-                        # and the regular cast layer will sort it out.
-                        pass
-                    else:
-                        self._write_arrow_table(
-                            table, options.with_source(merged, copy=True),
-                        )
-                        return
-
-        table = pa.Table.from_pandas(frame, preserve_index=preserve_index)
-        self._write_arrow_table(table, options)
+        include_index = bool(frame.index.names)
+        try:
+            casted = pa.Table.from_pandas(frame, preserve_index=include_index)
+            self._write_arrow_table(casted, options)
+        except:
+            pl = polars_module()
+            casted = pl.from_pandas(frame, include_index=include_index)
+            self._write_polars_frame(casted, options)
 
     # ==================================================================
     # Spark — driver-side materialize, no streaming spill

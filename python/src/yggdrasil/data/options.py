@@ -646,9 +646,13 @@ class CastOptions:
         }
         replaced = dataclasses.replace(self, **clean)
         if source is not ... and source is not None:
-            replaced = replaced.with_source(source)
+            replaced = replaced.with_source(source, copy=False)
+        elif source is None:
+            replaced = replaced.with_source(None, copy=False)
         if target is not ... and target is not None:
-            replaced = replaced.with_target(target)
+            replaced = replaced.with_target(target, copy=False)
+        elif target is None:
+            replaced = replaced.with_target(None, copy=False)
         return replaced
 
     def check_source(
@@ -713,6 +717,13 @@ class CastOptions:
         don't bypass it here because going through ``replace`` gets
         the normalization for free.
         """
+        if source is None:
+            if copy:
+                return self.copy(source=None, copy=copy)
+            object.__setattr__(self, "source_field", None)
+            object.__setattr__(self, "_merged_field_cache", ...)
+            return self
+
         source = field_class().from_(source)
 
         if source == self.source_field:
@@ -729,6 +740,13 @@ class CastOptions:
 
     def with_target(self: T, target: "Field", copy: bool = True) -> T:
         """Return a copy with *field* as the new target field."""
+        if target is None:
+            if copy:
+                return self.copy(target=None, copy=copy)
+            object.__setattr__(self, "target_field", None)
+            object.__setattr__(self, "_merged_field_cache", ...)
+            return self
+
         target = field_class().from_(target)
 
         if target == self.target_field:
@@ -918,9 +936,7 @@ class CastOptions:
         if self.target_field is None:
             if not self.byte_size and not self.row_size:
                 return batches
-            from yggdrasil.arrow.cast import (
-                rechunk_arrow_batches,
-            )
+            from yggdrasil.arrow.cast import rechunk_arrow_batches
             return rechunk_arrow_batches(
                 batches,
                 byte_size=self.byte_size,

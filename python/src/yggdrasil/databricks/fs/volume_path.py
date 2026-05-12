@@ -38,10 +38,12 @@ import io as _stdio
 import os
 import threading
 import time
+import datetime as dt
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional, Tuple
 
 from databricks.sdk.service.catalog import VolumeOperation
 
+from yggdrasil.data.cast import any_to_datetime
 from yggdrasil.data.enums import Mode, ModeLike, Scheme
 from yggdrasil.data.enums.media_type import MediaType
 from yggdrasil.io.io_stats import IOStats, IOKind
@@ -753,15 +755,21 @@ class VolumePath(DatabricksPath):
             data = bytes(body)
 
         media_type = _media_type_from_response(response)
+        try:
+            mtime = parse_http_date(response.last_modified) if response.last_modified else None
+        except Exception:
+            mtime = None
+        mtime = mtime.timestamp() if mtime else time.time()
         if not self._stat_cached:
             self._seed_stat_cache(stats=IOStats(
                 size=len(data),
                 kind=IOKind.FILE,
-                mtime=_mtime(getattr(response, "last_modified_time", None)),
+                mtime=mtime,
                 media_type=media_type,
             ))
         else:
             self._stat_cached.size = len(data)
+            self._stat_cached.mtime = mtime
             if media_type is not None and self._stat_cached.media_type is None:
                 self._stat_cached.media_type = media_type
             # Re-stamp the TTL — this download IS the freshest size we
@@ -878,11 +886,13 @@ def _media_type_from_response(info) -> "MediaType | None":
 
 
 def _mtime(info) -> float:
-    val = getattr(info, "last_modified", None) or getattr(info, "modification_time", None)
+    val = getattr(info, "last_modified", None) or getattr(info, "modification_time", None) or getattr(info, "last_modified_time", None)
+
     if val is None:
         return 0.0
+
     try:
-        return float(val.timestamp())
+        return float(any_to_datetime(val, tz=dt.datetime.utc).timestamp())
     except Exception:
         try:
             return float(val) / 1000.0
