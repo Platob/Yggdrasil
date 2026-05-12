@@ -27,6 +27,7 @@ substrate, different backing.
 
 from __future__ import annotations
 
+import time
 from abc import abstractmethod
 from typing import Any, ClassVar, Tuple
 
@@ -37,6 +38,16 @@ from yggdrasil.io.url import URL
 
 
 __all__ = ["RemotePath"]
+
+
+#: Default freshness window for a seeded :class:`IOStats` entry.
+#: Beyond this, :meth:`RemotePath._stat` discards the cached entry
+#: and re-issues the backend probe. Five minutes matches the
+#: lifetime of a typical Databricks / S3 credential refresh cycle —
+#: long enough to collapse the dozen probes a Delta replay makes
+#: against the same key, short enough that a stale entry doesn't
+#: outlive a meaningful change to the underlying object.
+_STAT_CACHE_TTL: float = 300.0
 
 
 def _extract_url_key(args: tuple, kwargs: dict) -> "str | None":
@@ -72,7 +83,14 @@ class RemotePath(Path):
     from this base.
     """
 
-    __slots__ = ("_stat_cached", "_initialized")
+    __slots__ = ("_stat_cached", "_stat_cached_at", "_initialized")
+
+    #: Per-class freshness window for ``_stat_cached``. Subclasses can
+    #: tighten or loosen the budget — e.g. a path on an append-only
+    #: object store could push this higher; an interactive notebook
+    #: surface could drop it. ``None`` disables the TTL check (the
+    #: entry lives until ``_invalidate_stat_cache`` drops it).
+    stat_cache_ttl: ClassVar["float | None"] = _STAT_CACHE_TTL
 
     #: Process-wide singleton cache shared across every
     #: :class:`RemotePath` subclass. Keyed by ``(cls, str(url))`` so
@@ -117,6 +135,7 @@ class RemotePath(Path):
             return
         super().__init__(*args, **kwargs)
         self._stat_cached: IOStats | None = None
+        self._stat_cached_at: float = 0.0
         self._initialized = True
 
     # ------------------------------------------------------------------
@@ -144,14 +163,21 @@ class RemotePath(Path):
 
         Singleton-by-URL means ``self._stat_cached`` is effectively a
         process-wide entry for this URL: a peer constructed elsewhere
-        with the same URL shares this slot. On miss, delegates to
-        :meth:`_stat_uncached` and stores the result. Subclasses
-        override :meth:`_stat_uncached`, never this.
+        with the same URL shares this slot. Entries expire after
+        :attr:`stat_cache_ttl` seconds — past the budget we re-issue
+        :meth:`_stat_uncached` instead of handing back a stale
+        snapshot. On miss (or expiry), delegates to
+        :meth:`_stat_uncached` and stores the fresh result.
+        Subclasses override :meth:`_stat_uncached`, never this.
         """
-        if self._stat_cached is not None:
-            return self._stat_cached
+        cached = self._stat_cached
+        if cached is not None:
+            ttl = self.stat_cache_ttl
+            if ttl is None or (time.time() - self._stat_cached_at) <= ttl:
+                return cached
         result = self._stat_uncached()
         self._stat_cached = result
+        self._stat_cached_at = time.time()
         return result
 
     @abstractmethod
@@ -161,6 +187,7 @@ class RemotePath(Path):
     def _invalidate_stat_cache(self) -> None:
         """Drop this path's cached entry. Call after writes / deletes."""
         self._stat_cached = None
+        self._stat_cached_at = 0.0
 
     # ------------------------------------------------------------------
     # Resize is a no-op on remote backends — the upload IS the resize
@@ -186,7 +213,10 @@ class RemotePath(Path):
         Useful for backends that learn metadata as a side-effect of a
         listing (S3 ``ListObjectsV2`` returns size + mtime per object,
         Databricks ``dbutils.fs.ls`` returns size) or a read/write
-        (the response body's length IS the file size). The next
-        :meth:`_stat` call on the warmed path is a local hit.
+        (the response body's length IS the file size). Stamps the
+        cache time so the entry observes the same TTL budget as one
+        produced by :meth:`_stat_uncached`. The next :meth:`_stat`
+        call on the warmed path is a local hit.
         """
         self._stat_cached = stats
+        self._stat_cached_at = time.time()
