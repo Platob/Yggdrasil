@@ -22,7 +22,7 @@ class WaitingConfig:
     interval: float = 0.5
     backoff: float = 1.5
     max_interval: float = 10.0
-    retries: int = 8
+    retries: int = 4
 
     def __getstate__(self) -> dict:
         return {

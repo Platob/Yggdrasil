@@ -190,21 +190,6 @@ class PostgresStatementResult(StatementResult[PostgresPreparedStatement]):
 
     _PREPARED_STATEMENT_CLASS: ClassVar[type[PostgresPreparedStatement]] = PostgresPreparedStatement
 
-    # Pattern fragments for transient Postgres failures that warrant
-    # an automatic retry promotion. Postgres only surfaces a small
-    # set of these — serialization failures, deadlocks, transient
-    # connection drops — but the retry loop matters when we run
-    # concurrent writes against the same table.
-    _TRANSIENT_ERROR_PATTERNS = (
-        r"serialization_failure",
-        r"deadlock_detected",
-        r"could not serialize access",
-        r"connection (?:reset|refused|closed)",
-        r"server closed the connection unexpectedly",
-        r"terminating connection due to administrator command",
-        r"the database system is starting up",
-    )
-
     def __init__(
         self,
         statement: PostgresPreparedStatement,

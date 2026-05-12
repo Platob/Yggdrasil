@@ -62,16 +62,6 @@ class _StubResult(StatementResult[_StubStatement]):
         self._failed = False
         self._done = False
 
-    # ----- transient detection ------------------------------------------------
-
-    _TRANSIENT_ERROR_PATTERNS = (
-        r"DELTA_CONCURRENT_APPEND",
-        r"Please retry the operation",
-    )
-
-    def _failure_message(self) -> str:
-        return self.failure_message if self._failed else ""
-
     # ----- lifecycle ----------------------------------------------------------
 
     def _compute_state(self) -> State:

@@ -304,15 +304,6 @@ class MongoStatementResult(StatementResult[MongoCommand]):
 
     _PREPARED_STATEMENT_CLASS: ClassVar[type[MongoCommand]] = MongoCommand
 
-    _TRANSIENT_ERROR_PATTERNS = (
-        r"NotPrimary",
-        r"NetworkError",
-        r"ConnectionFailure",
-        r"AutoReconnect",
-        r"ExceededTimeLimit",
-        r"WriteConflict",
-    )
-
     def __init__(
         self,
         statement: MongoCommand,

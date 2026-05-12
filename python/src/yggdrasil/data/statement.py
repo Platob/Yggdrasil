@@ -431,28 +431,6 @@ class StatementResult(Tabular, Generic[PS]):
     def default_media_type(cls) -> MimeType:
         return MimeTypes.STATEMENT_RESULT
 
-    # ------------------------------------------------------------------
-    # Transient-failure auto-promote
-    # ------------------------------------------------------------------
-    #
-    # Some failures are *known* to be retry-friendly even when the
-    # caller didn't think to mark the statement retryable.  The
-    # canonical example is a Delta concurrent-append conflict, which is
-    # just a write race — retrying always makes sense.
-    #
-    # When ``raise_for_status`` sees one of these patterns in the
-    # backend failure message, it flips ``statement.retryable=True`` on
-    # the fly so the caller's ``StatementResult.retry()`` loop will pick
-    # the failure up.  The promotion is sticky for the lifetime of this
-    # result (won't double-promote on subsequent retry attempts that
-    # re-fail the same way).
-    #
-    # Subclasses override ``_TRANSIENT_ERROR_PATTERNS`` with their own
-    # list of regex fragments.  Empty by default — no auto-promote.
-
-    _TRANSIENT_ERROR_PATTERNS: ClassVar[tuple[str, ...]] = ()
-    _transient_pattern_re: ClassVar[Optional["re.Pattern[str]"]] = None
-    _auto_retry_promoted: bool = False
     _state_snapshot: Optional[State] = None
 
     def __init__(
@@ -469,12 +447,7 @@ class StatementResult(Tabular, Generic[PS]):
         self.key = key or self.statement.key
         self._cached_schema: Optional[Schema] = None
         self.num_try = num_try or 0
-        self._auto_retry_promoted = False
         self._state_snapshot = None
-        # ``_persisted_data`` (Optional[Tabular]) is initialised by
-        # the :class:`Tabular` base ``__init__``; subclasses populate
-        # it via :meth:`persist` to expose the materialised result
-        # through the standard cache path.
         super().__init__(**kwargs)
 
     # -------------------------------------------------------------------------
@@ -516,12 +489,6 @@ class StatementResult(Tabular, Generic[PS]):
         ``started`` accesses inside the block re-use the snapshotted
         value. Re-entrant: nested ``state_snapshot()`` blocks reuse
         the outer pin.
-
-        Use when a code path checks several state-derived predicates
-        before deciding what to do (cancel, raise_for_status,
-        ``_auto_promote_transient_retry``, ...). Don't use inside a
-        polling loop — the whole point of :meth:`wait` is to refresh
-        each iteration.
         """
         if self._state_snapshot is not None:
             yield self._state_snapshot
@@ -597,83 +564,11 @@ class StatementResult(Tabular, Generic[PS]):
             except Exception:
                 logger.exception("clear_temporary_resources failed during raise_for_status; continuing.")
 
-            self._auto_promote_transient_retry()
             return self._raise_for_status()
-
-    def _auto_promote_transient_retry(self) -> bool:
-        """Install a retry :class:`WaitingConfig` on a transient failure.
-
-        Idempotent and side-effect-only when the failure either isn't
-        transient or has already been promoted.  Returns ``True`` once a
-        retry config is in place (whether installed now or already set
-        by the caller), so batch-level callers can decide whether to
-        drive :meth:`retry` for this result.
-
-        Hoisted out of :meth:`raise_for_status` so :class:`StatementBatch`
-        can promote without first having to swallow the per-result
-        exception just to flip ``retryable``.
-        """
-        with self.state_snapshot():
-            if not self.failed:
-                return self.statement.retry is not None
-            if self._auto_retry_promoted:
-                return self.statement.retry is not None
-            if not self._is_transient_failure():
-                return self.statement.retry is not None
-        self._auto_retry_promoted = True
-        if self.statement.retry is None:
-            cfg = self.default_retry() or WaitingConfig.default()
-            logger.info(
-                "Auto-promoting statement %r to retryable: transient "
-                "failure detected (%s).",
-                self.key, self._failure_message()[:200],
-            )
-            self.statement.retry = cfg
-        return self.statement.retry is not None
 
     @abstractmethod
     def _raise_for_status(self) -> None:
         """Subclass hook: raise the backend-specific failure."""
-
-    # -- transient-detection helpers (subclasses override _failure_message
-    # and optionally _TRANSIENT_ERROR_PATTERNS) ----------------------------
-
-    @classmethod
-    def _transient_re(cls) -> Optional["re.Pattern[str]"]:
-        """Compiled alternation of :attr:`_TRANSIENT_ERROR_PATTERNS`.
-
-        Returns ``None`` when the subclass declares no patterns (skips
-        the regex search entirely).  Cached per-class via the
-        ``_transient_pattern_re`` ClassVar.
-        """
-        if not cls._TRANSIENT_ERROR_PATTERNS:
-            return None
-        if cls._transient_pattern_re is None:
-            cls._transient_pattern_re = re.compile(
-                "|".join(f"(?:{p})" for p in cls._TRANSIENT_ERROR_PATTERNS),
-                re.IGNORECASE | re.DOTALL,
-            )
-        return cls._transient_pattern_re
-
-    def _failure_message(self) -> str:
-        """Best-effort string of the backend failure for pattern matching.
-
-        Default returns ``""`` — base class doesn't know how to extract
-        backend-specific error details.  Subclasses override.
-        """
-        return ""
-
-    def _is_transient_failure(self) -> bool:
-        """Whether the current failure matches a known-transient pattern."""
-        if not self.failed:
-            return False
-        rx = self._transient_re()
-        if rx is None:
-            return False
-        message = self._failure_message()
-        if not message:
-            return False
-        return bool(rx.search(message))
 
     def clear_temporary_resources(self) -> None:
         """Sweep per-statement scratch — does NOT touch result-level state.
@@ -686,20 +581,6 @@ class StatementResult(Tabular, Generic[PS]):
     # -------------------------------------------------------------------------
     # Retry
     # -------------------------------------------------------------------------
-
-    @classmethod
-    def default_retry(cls) -> Optional[WaitingConfig]:
-        """Auto-promote default :class:`WaitingConfig` for transient failures.
-
-        Returned by :meth:`raise_for_status` when a transient pattern
-        matches and the statement isn't already retryable.  Subclasses
-        override to tune the policy for their backend; ``None`` disables
-        auto-promote entirely.
-
-        Default returns :meth:`WaitingConfig.default` — modest backoff,
-        20-minute deadline, 8 retries.
-        """
-        return WaitingConfig.default()
 
     @property
     def retryable(self) -> bool:
@@ -744,49 +625,14 @@ class StatementResult(Tabular, Generic[PS]):
         ``start()`` still counts toward the budget.  Extra ``**kwargs``
         are forwarded to ``start()``.
         """
-        cfg = self.statement.retry
-        if cfg is None:
-            raise RuntimeError(f"Statement {self.key!r} is not retryable.")
-
+        cfg = self.statement.retry or WaitingConfig.default()
         total_tries = max(1, cfg.total_try_count)
-        loop_started = time.time()
 
         while self.num_try < total_tries:
-            attempt_index = self.num_try  # 0-based for sleep calc
-            if attempt_index > 0:
-                # WaitingConfig.sleep raises TimeoutError when the deadline
-                # has elapsed.  We treat that as "budget exhausted" and
-                # fall through to raise_for_status — same outcome as
-                # running out of attempts.
-                try:
-                    cfg.sleep(iteration=attempt_index - 1, start=loop_started)
-                except TimeoutError:
-                    logger.debug(
-                        "Retry deadline elapsed for %r after %d attempt(s).",
-                        self.key, self.num_try,
-                    )
-                    break
-
             self.num_try += 1
-            try:
-                self.start(reset=True, wait=wait, raise_error=False, **kwargs)
-            except Exception:
-                logger.exception(
-                    "start() raised on retry attempt %d/%d for %r; continuing.",
-                    self.num_try, total_tries, self.key,
-                )
-                # Force a status refresh so the loop can decide based on
-                # backend state rather than just the exception.
-                try:
-                    self.refresh_status()
-                except Exception:
-                    logger.exception(
-                        "refresh_status failed after start() raised; will retry if budget remains.",
-                    )
-
-            with self.state_snapshot() as snap:
-                if snap.is_done and not snap.is_failed:
-                    return self
+            self.start(reset=True, wait=wait, raise_error=False, **kwargs)
+            if self.state.is_succeeded:
+                return self
 
         # Exhausted budget.  Surface the latest failure if asked.
         if raise_error:
@@ -826,10 +672,12 @@ class StatementResult(Tabular, Generic[PS]):
 
         iteration = 0
         start = time.time()
+        state = self.state
 
-        while not self.done:
+        while not state.is_done:
             wait_cfg.sleep(iteration=iteration, start=start)
             iteration += 1
+            state = self.state
 
         if raise_error:
             self.raise_for_status()
@@ -1143,24 +991,6 @@ class StatementBatch(Generic[PS, SR]):
                 result.refresh_status()
             except Exception:
                 logger.exception("refresh_status failed for %r before retry; continuing.", key)
-
-        # Auto-promote transient failures on the batch path: callers
-        # that drive batch.retry() (e.g. the warehouse DML helper for
-        # MERGE / DELETE+INSERT under Delta concurrent-append races)
-        # never invoke per-result raise_for_status before retrying, so
-        # ``retryable`` would otherwise stay False and the retry would
-        # be skipped.  Promoting here keeps the same one-shot, sticky
-        # semantics as raise_for_status — non-transient failures and
-        # already-retryable statements pass through untouched.
-        for key, result in self.results.items():
-            if not result.failed:
-                continue
-            try:
-                result._auto_promote_transient_retry()
-            except Exception:
-                logger.exception(
-                    "auto-promote transient retry failed for %r; continuing.", key,
-                )
 
         targets = {
             key: result

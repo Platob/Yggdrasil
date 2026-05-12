@@ -1910,10 +1910,6 @@ class Session(ABC):
 
         if cfg.mode != Mode.UPSERT:
             table_name = cfg.tabular.full_name(safe=True)
-            # Restrict the SELECT DISTINCT to the partitions actually
-            # in play — ``partition_key`` is the table's partition
-            # column so the engine prunes the existing-rows scan
-            # before reading any data files.
             try:
                 wanted_partitions = [
                     row["partition_key"]
@@ -1934,9 +1930,6 @@ class Session(ABC):
                         f"FROM {table_name}"
                     )
             except Exception as exc:
-                # Table doesn't exist yet — nothing to dedup against; the
-                # downstream `cfg.tabular.insert` handles creation. Match the
-                # error-string sniff used by `_lookup_remote_table`.
                 if "TABLE_OR_VIEW_NOT_FOUND" not in str(exc):
                     raise
                 existing_df = None
@@ -1958,7 +1951,6 @@ class Session(ABC):
             mode=cfg.mode,
             match_by=cfg.sql_match_by or None,
             wait=cfg.wait,
-            prune_by=["partition_key", "public_hash"],
             spark_session=spark,
         )
 

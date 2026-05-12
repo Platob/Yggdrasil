@@ -878,58 +878,6 @@ class WarehouseStatementResult(StatementResult):
         sdk = self._response.status.state
         return _SDK_TO_STATE.get(sdk, State.PENDING) if sdk is not None else State.PENDING
 
-    # ------------------------------------------------------------------
-    # Transient-failure detection (overrides base)
-    # ------------------------------------------------------------------
-    #
-    # The auto-promote machinery lives on :class:`StatementResult`; this
-    # subclass only declares Databricks-specific patterns and tells the
-    # base how to read the failure message off a StatementResponse.
-    #
-    # Most entries are Delta concurrency error codes — they're write-
-    # races, idempotent retries always make sense.  ``Please retry the
-    # operation`` is the catch-all sentinel Databricks adds to several
-    # transient conditions.
-
-    _TRANSIENT_ERROR_PATTERNS: ClassVar[tuple[str, ...]] = (
-        # Delta concurrent-append conflicts (partitioned tables w/o RLC,
-        # MERGE on overlapping partitions, etc.)
-        r"DELTA_CONCURRENT_APPEND",
-        r"ConcurrentAppendException",
-        # Generic Delta concurrency family — any of these are retry-safe
-        # for idempotent writers.
-        r"DELTA_CONCURRENT_DELETE_READ",
-        r"DELTA_CONCURRENT_DELETE_DELETE",
-        r"DELTA_CONCURRENT_WRITE",
-        r"DELTA_METADATA_CHANGED",
-        # Plain "please retry the operation" — Databricks emits this on
-        # several transient conditions and it's a clear signal.
-        r"Please retry the operation",
-    )
-
-    def _failure_message(self) -> str:
-        """Read the backend failure off the cached StatementResponse.
-
-        Pulls ``error_code`` and ``message`` off ``response.status.error``
-        (SDK-typed) and falls back to the bare state name.  Returns ``""``
-        when nothing is available — base ``_is_transient_failure`` then
-        skips the regex search.
-        """
-        if self._response is None:
-            return ""
-        status = getattr(self._response, "status", None)
-        if status is None:
-            return ""
-        error = getattr(status, "error", None)
-        if error is None:
-            return status.state.value if status.state else ""
-        # SDK ServiceError carries error_code + message; either may match.
-        parts = [
-            getattr(error, "error_code", None),
-            getattr(error, "message", None),
-        ]
-        return " ".join(str(p) for p in parts if p)
-
     def _raise_for_status(self) -> None:
         # Auto-promote happens in the base raise_for_status() before this
         # hook fires (inside its ``state_snapshot`` block — this access
@@ -1040,7 +988,6 @@ class WarehouseStatementResult(StatementResult):
 
         row_size = options.row_size
         byte_size = options.byte_size or _DEFAULT_BYTE_SIZE
-        max_chunksize = row_size if row_size else None
 
         def fetch_batches(url: str) -> Iterator[pa.RecordBatch]:
             resp = http.request("GET", url, preload_content=True)
@@ -1101,12 +1048,6 @@ class WarehouseStatementResult(StatementResult):
         yield from flush()
 
         if not yielded_any:
-            # Empty result set — yield a single zero-row batch carrying
-            # the warehouse-known schema so downstream consumers don't
-            # collapse to a schema-less empty iterator. ``read_arrow_table``
-            # and friends would otherwise fall back to ``Schema.empty()``
-            # because the caller's ``CastOptions`` doesn't have the
-            # target schema bound.
             schema_for_empty = options.with_target(self._collect_schema(options)).merged_schema
             yield from _empty_arrow_batches(schema_for_empty.to_arrow_schema())
 
