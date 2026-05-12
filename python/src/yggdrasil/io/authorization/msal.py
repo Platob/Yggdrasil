@@ -16,6 +16,8 @@ except ImportError:
     ConfidentialClientApplication = msal_mod.ConfidentialClientApplication
     PublicClientApplication = msal_mod.PublicClientApplication
 
+from yggdrasil.dataclasses.expiring import ExpiringDict
+
 from .base import Authorization
 
 
@@ -121,8 +123,14 @@ class MSALAuth(Authorization):
     # Per-(cls, cache_key) singleton cache. Subclasses inherit the slot.
     # The ``cls`` component lets a subclass with different defaults stay
     # distinct from the base even for an identical config tuple.
-    _INSTANCES: ClassVar[dict[Tuple[type, _CacheKey], "MSALAuth"]] = {}
-    _INSTANCES_LOCK: ClassVar[threading.Lock] = threading.Lock()
+    # ``ExpiringDict`` owns its own internal lock and an atomic
+    # ``get_or_set`` — no external mutex needed, and a TTL can be wired
+    # in later (e.g. drop unused configs after N hours) without touching
+    # this site. ``default_ttl=None`` keeps entries for the process
+    # lifetime; per-token expiry lives inside the singleton itself.
+    _INSTANCES: ClassVar[ExpiringDict[Tuple[type, _CacheKey], "MSALAuth"]] = ExpiringDict(
+        default_ttl=None
+    )
 
     # Live MSAL application handle and the per-instance refresh lock
     # aren't picklable — drop them on ``__getstate__`` and rebuild on
@@ -141,13 +149,11 @@ class MSALAuth(Authorization):
     ) -> "MSALAuth":
         cache_key = _resolve_config(tenant_id, client_id, client_secret, authority, scopes)
         key = (cls, cache_key)
-        with cls._INSTANCES_LOCK:
-            cached = cls._INSTANCES.get(key)
-            if cached is not None:
-                return cached
-            instance = super().__new__(cls)
-            cls._INSTANCES[key] = instance
-            return instance
+        # ExpiringDict.get_or_set is atomic under its own internal lock:
+        # two callers racing the same config either both observe the
+        # winner's instance or one of them runs the factory once and
+        # the other sees it via the cache — no external mutex needed.
+        return cls._INSTANCES.get_or_set(key, lambda: object.__new__(cls))
 
     def __init__(
         self,
