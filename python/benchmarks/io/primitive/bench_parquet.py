@@ -31,6 +31,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import pyarrow as pa
+
+from yggdrasil.data.data_field import Field
 from yggdrasil.data.options import CastOptions
 from yggdrasil.io.primitive.parquet_io import ParquetIO
 
@@ -73,6 +76,41 @@ def scenarios(repeat: int) -> list[dict]:
             CastOptions(row_size=8_000)
         )),
         repeat=repeat, inner=50,
+    ))
+
+    # Projection pushdown — bound ``target`` carrying a 2-column subset
+    # should fan into the parquet reader as ``columns=`` and skip 4 of
+    # the 6 columns on disk. Same payload as the unprojected scenario
+    # above so the speedup is purely the projection.
+    target_two_cols = Field.from_(
+        pa.schema([pa.field("id", pa.int64()), pa.field("v", pa.float64())])
+    )
+    wide_sink = ParquetIO(b"")
+    wide_sink.write_arrow_table(wide_table(10_000))
+    wide_sink.seek(0)
+    wide_payload = wide_sink.read()
+    wide_target_4_of_32 = Field.from_(
+        pa.schema([pa.field(f"c{i:02d}", pa.int64()) for i in range(4)])
+    )
+    out.append(time_one(
+        "parquet: read_arrow_table flat 50k target=2/6 cols",
+        lambda: ParquetIO(payload).read_arrow_table(target=target_two_cols),
+        repeat=repeat, inner=200,
+    ))
+    out.append(time_one(
+        "parquet: read_arrow_table wide 10k target=4/32 cols",
+        lambda: ParquetIO(wide_payload).read_arrow_table(target=wide_target_4_of_32),
+        repeat=repeat, inner=200,
+    ))
+    out.append(time_one(
+        "parquet: read_polars_frame wide 10k target=4/32 cols",
+        lambda: ParquetIO(wide_payload).read_polars_frame(target=wide_target_4_of_32),
+        repeat=repeat, inner=200,
+    ))
+    out.append(time_one(
+        "parquet: read_pandas_frame wide 10k target=4/32 cols",
+        lambda: ParquetIO(wide_payload).read_pandas_frame(target=wide_target_4_of_32),
+        repeat=repeat, inner=200,
     ))
 
     return out

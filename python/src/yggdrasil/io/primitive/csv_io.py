@@ -457,22 +457,24 @@ class CsvIO(IO[bytes, CsvOptions]):
         pl = polars_module()
         path = self._local_path_str()
         if path is not None:
-            return pl.scan_csv(
+            lf = pl.scan_csv(
                 path,
                 separator=options.delimiter,
                 has_header=options.has_header,
                 quote_char=options.quote_char,
             )
+            return options.cast_polars_tabular(lf)
         return super()._scan_polars_frame(options)
 
     def _read_polars_frame(self, options: CsvOptions) -> "pl.DataFrame":
         pl = polars_module()
         path = self._local_path_str()
         if path is not None:
-            return pl.read_csv(
+            df = pl.read_csv(
                 path,
                 separator=options.delimiter,
                 has_header=options.has_header,
                 quote_char=options.quote_char,
             )
+            return options.cast_polars_tabular(df)
         return super()._read_polars_frame(options)

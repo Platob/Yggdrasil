@@ -269,12 +269,12 @@ class NDJsonIO(IO[bytes, NDJsonOptions]):
         pl = polars_module()
         path = self._local_path_str()
         if path is not None:
-            return pl.scan_ndjson(path)
+            return options.cast_polars_tabular(pl.scan_ndjson(path))
         return super()._scan_polars_frame(options)
 
     def _read_polars_frame(self, options: NDJsonOptions) -> "pl.DataFrame":
         pl = polars_module()
         path = self._local_path_str()
         if path is not None:
-            return pl.read_ndjson(path)
+            return options.cast_polars_tabular(pl.read_ndjson(path))
         return super()._read_polars_frame(options)
