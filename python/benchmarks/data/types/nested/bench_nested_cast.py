@@ -1,44 +1,40 @@
-"""Benchmark :class:`DataType` cast kernels — primitive + nested, every engine.
+"""Benchmark nested :class:`DataType` cast kernels — arrow / polars / pandas.
 
-What this covers
-----------------
+Mirrors the source tree: lives next to
+``yggdrasil/data/types/nested``. Covers ``ArrayType``, ``MapType``,
+and ``StructType`` casts plus the deeply-nested combinations that
+real warehouse / JSON-ingest shapes carry:
 
-Each :class:`DataType` exposes per-engine cast entry points
-(``cast_arrow_array``, ``cast_polars_series``, ``cast_pandas_series``).
-This file measures them directly — bypassing
-:meth:`CastOptions.cast_arrow_tabular` etc. — so the per-kernel cost
-shows up without the tabular dispatch overhead the
-``bench_cast`` / ``bench_cast_data`` files include.
+* ``list<int>``, ``map<str, int>``, flat ``struct``
+* ``list<struct>``, ``map<str, list<int>>``
+* deep ``struct{address, tags, attrs, decimal}``
 
 Three shapes per type:
 
-* **MATCH** — source already matches target; the engine-type bypass
-  fires and the call returns the input unchanged.
-* **WIDEN** — source narrower than target (e.g. int32 → int64);
-  the kernel actually casts.
-* **NARROW** — source wider than target (e.g. float64 → float32);
-  exercises the lossy-cast path.
+* **MATCH** — source matches target; engine-type bypass fires.
+* **CAST** — source diverges by one inner type (e.g. inner ``int32`` →
+  ``int64``); the per-element cast kernel fires.
 
-The headline cases are the nested ones — :class:`StructType`,
-:class:`ArrayType`, :class:`MapType` — across every engine **except
-Spark**, which builds a session per call and isn't worth the cost in
-a per-kernel micro-bench (the tabular suite covers Spark already).
+Spark is intentionally omitted — the per-call SparkSession overhead
+dominates the kernel measurement. The tabular bench covers Spark
+through its frame layer.
 
 Usage::
 
-    PYTHONPATH=src python benchmarks/bench_datatype_cast.py
-    PYTHONPATH=src python benchmarks/bench_datatype_cast.py --repeat 7
+    PYTHONPATH=src python benchmarks/data/types/nested/bench_nested_cast.py
+    PYTHONPATH=src python benchmarks/data/types/nested/bench_nested_cast.py --repeat 7
 """
 from __future__ import annotations
 
 import argparse
 import statistics
 import time
+from decimal import Decimal
 from typing import Callable
 
 import pyarrow as pa
 
-from yggdrasil.data import Field, Schema
+from yggdrasil.data import Field
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.types.nested import ArrayType, MapType, StructType
 from yggdrasil.data.types.primitive import (
@@ -47,29 +43,17 @@ from yggdrasil.data.types.primitive import (
     FloatingPointType,
     IntegerType,
     StringType,
-    TimestampType,
 )
-
-
-# ---------------------------------------------------------------------------
-# Fixtures — typed Fields and the matching source / mismatch arrays.
-# ---------------------------------------------------------------------------
 
 
 ROWS = 10_000
 
-# Targets — Field objects so cast options carry both type + name.
-F_INT64 = Field("v", IntegerType(byte_size=8, signed=True), nullable=False)
-F_INT32 = Field("v", IntegerType(byte_size=4, signed=True), nullable=False)
-F_F32 = Field("v", FloatingPointType(byte_size=4))
-F_F64 = Field("v", FloatingPointType(byte_size=8))
-F_STR = Field("v", StringType())
-F_TS = Field("v", TimestampType(unit="us", tz="UTC"))
-F_DEC = Field("v", DecimalType(precision=18, scale=2))
 
-# Nested targets — schemas that mix primitive and nested. These are the
-# shapes that matter most in tabular pipelines (the per-batch struct
-# cast lives on the cast hot path).
+# ---------------------------------------------------------------------------
+# Field targets.
+# ---------------------------------------------------------------------------
+
+
 F_LIST_INT = Field(
     "arr",
     ArrayType.from_item(Field("item", IntegerType(byte_size=8, signed=True))),
@@ -90,11 +74,6 @@ F_STRUCT = Field(
         Field("active", BooleanType()),
     )),
 )
-
-# Deeper nested shapes — list-of-struct, map<str, list<int>>,
-# struct-of-struct + nested array + nested map. These mirror the
-# real-world warehouse schemas tabular casts hit (JSON-ingested
-# rows, Delta nested columns, Mongo documents).
 F_LIST_OF_STRUCT = Field(
     "rows",
     ArrayType.from_item(Field(
@@ -136,46 +115,26 @@ F_DEEP_STRUCT = Field(
 
 
 # ---------------------------------------------------------------------------
-# Source arrays — pyarrow originals; converted to polars/pandas inline.
+# Source arrays — MATCH (same shape as target) + CAST (one inner type widened).
 # ---------------------------------------------------------------------------
 
 
 def _build_sources() -> dict[str, pa.Array]:
-    arr_int64 = pa.array(range(ROWS), type=pa.int64())
-    arr_int32 = pa.array(range(ROWS), type=pa.int32())
-    arr_f64 = pa.array([1.5] * ROWS, type=pa.float64())
-    arr_f32 = pa.array([1.5] * ROWS, type=pa.float32())
-    arr_str = pa.array(["x"] * ROWS, type=pa.string())
-    arr_ts_utc = pa.array([0] * ROWS, type=pa.timestamp("us", tz="UTC"))
-    arr_ts_naive = pa.array([0] * ROWS, type=pa.timestamp("us"))
-    arr_int_for_str = pa.array(range(ROWS), type=pa.int32())
-
-    # Nested sources — same shape as the targets so MATCH stays in
-    # the engine-type bypass; the WIDEN variants shift one inner
-    # type so the cast kernel actually runs.
     list_match = pa.array([[i] for i in range(ROWS)], type=pa.list_(pa.int64()))
     list_widen = pa.array([[i] for i in range(ROWS)], type=pa.list_(pa.int32()))
 
-    map_match = pa.array(
-        [[("k", i)] for i in range(ROWS)],
-        type=pa.map_(pa.string(), pa.int64()),
-    )
-    map_widen = pa.array(
-        [[("k", i)] for i in range(ROWS)],
-        type=pa.map_(pa.string(), pa.int32()),
-    )
+    map_match = pa.array([[("k", i)] for i in range(ROWS)],
+                         type=pa.map_(pa.string(), pa.int64()))
+    map_widen = pa.array([[("k", i)] for i in range(ROWS)],
+                         type=pa.map_(pa.string(), pa.int32()))
 
     struct_match_type = pa.struct([
-        ("id", pa.int64()),
-        ("name", pa.string()),
-        ("amount", pa.float64()),
-        ("active", pa.bool_()),
+        ("id", pa.int64()), ("name", pa.string()),
+        ("amount", pa.float64()), ("active", pa.bool_()),
     ])
     struct_widen_type = pa.struct([
-        ("id", pa.int32()),
-        ("name", pa.string()),
-        ("amount", pa.float32()),
-        ("active", pa.bool_()),
+        ("id", pa.int32()), ("name", pa.string()),
+        ("amount", pa.float32()), ("active", pa.bool_()),
     ])
     struct_payload = [
         {"id": i, "name": "x", "amount": 1.5, "active": True}
@@ -184,63 +143,46 @@ def _build_sources() -> dict[str, pa.Array]:
     struct_match = pa.array(struct_payload, type=struct_match_type)
     struct_widen = pa.array(struct_payload, type=struct_widen_type)
 
-    # list<struct> — array of {k: str, v: int}.
     list_of_struct_type = pa.list_(pa.struct([("k", pa.string()), ("v", pa.int64())]))
     list_of_struct_widen_type = pa.list_(pa.struct([("k", pa.string()), ("v", pa.int32())]))
     list_of_struct_payload = [[{"k": "x", "v": i}] for i in range(ROWS)]
     list_of_struct_match = pa.array(list_of_struct_payload, type=list_of_struct_type)
     list_of_struct_widen = pa.array(list_of_struct_payload, type=list_of_struct_widen_type)
 
-    # map<str, list<int>>.
     map_str_list_type = pa.map_(pa.string(), pa.list_(pa.int64()))
     map_str_list_widen_type = pa.map_(pa.string(), pa.list_(pa.int32()))
     map_str_list_payload = [[("k", [i, i + 1])] for i in range(ROWS)]
     map_str_list_match = pa.array(map_str_list_payload, type=map_str_list_type)
     map_str_list_widen = pa.array(map_str_list_payload, type=map_str_list_widen_type)
 
-    # deep struct — nested struct + array + map, plus decimal scalar.
     deep_struct_type = pa.struct([
-        ("id", pa.int64()),
-        ("name", pa.string()),
+        ("id", pa.int64()), ("name", pa.string()),
         ("amount", pa.decimal128(18, 2)),
         ("address", pa.struct([
-            ("street", pa.string()),
-            ("city", pa.string()),
-            ("zip", pa.string()),
+            ("street", pa.string()), ("city", pa.string()), ("zip", pa.string()),
         ])),
         ("tags", pa.list_(pa.string())),
         ("attrs", pa.map_(pa.string(), pa.string())),
     ])
     deep_struct_widen_type = pa.struct([
-        ("id", pa.int32()),
-        ("name", pa.string()),
+        ("id", pa.int32()), ("name", pa.string()),
         ("amount", pa.decimal128(18, 2)),
         ("address", pa.struct([
-            ("street", pa.string()),
-            ("city", pa.string()),
-            ("zip", pa.string()),
+            ("street", pa.string()), ("city", pa.string()), ("zip", pa.string()),
         ])),
         ("tags", pa.list_(pa.string())),
         ("attrs", pa.map_(pa.string(), pa.string())),
     ])
-    from decimal import Decimal as _D
     deep_struct_payload = [
-        {
-            "id": i, "name": "x", "amount": _D("1.50"),
-            "address": {"street": "1", "city": "x", "zip": "00"},
-            "tags": ["a", "b"], "attrs": [("k", "v")],
-        }
+        {"id": i, "name": "x", "amount": Decimal("1.50"),
+         "address": {"street": "1", "city": "x", "zip": "00"},
+         "tags": ["a", "b"], "attrs": [("k", "v")]}
         for i in range(ROWS)
     ]
     deep_struct_match = pa.array(deep_struct_payload, type=deep_struct_type)
     deep_struct_widen = pa.array(deep_struct_payload, type=deep_struct_widen_type)
 
     return {
-        "int64": arr_int64, "int32": arr_int32,
-        "f64": arr_f64, "f32": arr_f32,
-        "str": arr_str,
-        "ts_utc": arr_ts_utc, "ts_naive": arr_ts_naive,
-        "int_for_str": arr_int_for_str,
         "list_match": list_match, "list_widen": list_widen,
         "map_match": map_match, "map_widen": map_widen,
         "struct_match": struct_match, "struct_widen": struct_widen,
@@ -254,7 +196,7 @@ def _build_sources() -> dict[str, pa.Array]:
 
 
 # ---------------------------------------------------------------------------
-# Timing helpers
+# Timing helpers.
 # ---------------------------------------------------------------------------
 
 
@@ -283,7 +225,7 @@ def _fmt(r: dict) -> str:
     elif r["best"] >= 1e-3:
         scale, unit = 1e3, "ms"
     return (
-        f"{r['label']:<64s}  "
+        f"{r['label']:<70s}  "
         f"best={r['best']*scale:8.2f} {unit}  "
         f"median={r['median']*scale:8.2f} {unit}  "
         f"mean={r['mean']*scale:8.2f} {unit}"
@@ -291,11 +233,11 @@ def _fmt(r: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Engine adapters — same arrays projected into polars / pandas.
+# Engine adapters.
 # ---------------------------------------------------------------------------
 
 
-def _to_polars_series(arr: pa.Array) -> "object | None":
+def _to_polars_series(arr: pa.Array):
     try:
         import polars as pl
     except ImportError:
@@ -306,7 +248,7 @@ def _to_polars_series(arr: pa.Array) -> "object | None":
         return None
 
 
-def _to_pandas_series(arr: pa.Array) -> "object | None":
+def _to_pandas_series(arr: pa.Array):
     try:
         import pandas as pd  # noqa: F401
     except ImportError:
@@ -317,26 +259,12 @@ def _to_pandas_series(arr: pa.Array) -> "object | None":
         return None
 
 
-# ---------------------------------------------------------------------------
-# Scenario builders — one block per (target, source) pair, three engines.
-# ---------------------------------------------------------------------------
-
-
-def _block(
-    label_prefix: str,
-    target: Field,
-    arr_match: pa.Array,
-    arr_cast: pa.Array,
-    *,
-    repeat: int,
-    inner: int,
-) -> list[dict]:
-    """Run MATCH and CAST against arrow / polars / pandas for one type."""
+def _block(label_prefix: str, target: Field, arr_match: pa.Array, arr_cast: pa.Array,
+           *, repeat: int, inner: int) -> list[dict]:
     opts = CastOptions(target=target)
     dtype = target.dtype
     out: list[dict] = []
 
-    # Arrow — always present (pyarrow is a hard runtime dep).
     out.append(_time_one(
         f"arrow: {label_prefix} MATCH rows={ROWS}",
         lambda: dtype.cast_arrow_array(arr_match, opts),
@@ -348,7 +276,6 @@ def _block(
         repeat=repeat, inner=inner,
     ))
 
-    # Polars
     pl_match = _to_polars_series(arr_match)
     pl_cast = _to_polars_series(arr_cast)
     if pl_match is not None and pl_cast is not None:
@@ -364,12 +291,9 @@ def _block(
                 repeat=repeat, inner=inner,
             ))
         except Exception as e:
-            out.append({
-                "label": f"polars: {label_prefix} SKIPPED ({type(e).__name__})",
-                "best": 0.0, "median": 0.0, "mean": 0.0,
-            })
+            out.append({"label": f"polars: {label_prefix} SKIPPED ({type(e).__name__})",
+                        "best": 0.0, "median": 0.0, "mean": 0.0})
 
-    # Pandas
     pd_match = _to_pandas_series(arr_match)
     pd_cast = _to_pandas_series(arr_cast)
     if pd_match is not None and pd_cast is not None:
@@ -385,90 +309,37 @@ def _block(
                 repeat=repeat, inner=inner,
             ))
         except Exception as e:
-            out.append({
-                "label": f"pandas: {label_prefix} SKIPPED ({type(e).__name__})",
-                "best": 0.0, "median": 0.0, "mean": 0.0,
-            })
+            out.append({"label": f"pandas: {label_prefix} SKIPPED ({type(e).__name__})",
+                        "best": 0.0, "median": 0.0, "mean": 0.0})
 
     return out
-
-
-# ---------------------------------------------------------------------------
-# Aggregator
-# ---------------------------------------------------------------------------
 
 
 def scenarios(repeat: int) -> list[dict]:
     s = _build_sources()
     out: list[dict] = []
-
-    # Primitives — int / float / string / timestamp / decimal.
-    out.extend(_block(
-        "int64 (match int64 / cast int32→)", F_INT64, s["int64"], s["int32"],
-        repeat=repeat, inner=500,
-    ))
-    out.extend(_block(
-        "int32 (match int32 / cast int64→)", F_INT32, s["int32"], s["int64"],
-        repeat=repeat, inner=500,
-    ))
-    out.extend(_block(
-        "float64 (match f64 / cast f32→)", F_F64, s["f64"], s["f32"],
-        repeat=repeat, inner=500,
-    ))
-    out.extend(_block(
-        "float32 (match f32 / cast f64→)", F_F32, s["f32"], s["f64"],
-        repeat=repeat, inner=500,
-    ))
-    out.extend(_block(
-        "string (match str / cast int→)", F_STR, s["str"], s["int_for_str"],
-        repeat=repeat, inner=200,
-    ))
-    out.extend(_block(
-        "ts UTC (match ts_utc / cast naive→)", F_TS, s["ts_utc"], s["ts_naive"],
-        repeat=repeat, inner=500,
-    ))
-
-    # Nested — list, map, struct.
-    out.extend(_block(
-        "list<int64> (match / cast list<int32>→)",
-        F_LIST_INT, s["list_match"], s["list_widen"],
-        repeat=repeat, inner=200,
-    ))
-    out.extend(_block(
-        "map<str,int64> (match / cast map<str,int32>→)",
-        F_MAP_STR_INT, s["map_match"], s["map_widen"],
-        repeat=repeat, inner=200,
-    ))
-    out.extend(_block(
-        "struct (match / cast int32+f32→)",
-        F_STRUCT, s["struct_match"], s["struct_widen"],
-        repeat=repeat, inner=200,
-    ))
-    out.extend(_block(
-        "list<struct> (match / cast inner int32→)",
-        F_LIST_OF_STRUCT,
-        s["list_of_struct_match"], s["list_of_struct_widen"],
-        repeat=repeat, inner=100,
-    ))
-    out.extend(_block(
-        "map<str,list<int>> (match / cast inner int32→)",
-        F_MAP_STR_LIST,
-        s["map_str_list_match"], s["map_str_list_widen"],
-        repeat=repeat, inner=100,
-    ))
-    out.extend(_block(
-        "deep struct{addr,tags,attrs,decimal} (match / cast id int32→)",
-        F_DEEP_STRUCT,
-        s["deep_struct_match"], s["deep_struct_widen"],
-        repeat=repeat, inner=100,
-    ))
-
+    out.extend(_block("list<int64> (match / cast list<int32>→)",
+                      F_LIST_INT, s["list_match"], s["list_widen"],
+                      repeat=repeat, inner=200))
+    out.extend(_block("map<str,int64> (match / cast map<str,int32>→)",
+                      F_MAP_STR_INT, s["map_match"], s["map_widen"],
+                      repeat=repeat, inner=200))
+    out.extend(_block("struct (match / cast int32+f32→)",
+                      F_STRUCT, s["struct_match"], s["struct_widen"],
+                      repeat=repeat, inner=200))
+    out.extend(_block("list<struct> (match / cast inner int32→)",
+                      F_LIST_OF_STRUCT,
+                      s["list_of_struct_match"], s["list_of_struct_widen"],
+                      repeat=repeat, inner=100))
+    out.extend(_block("map<str,list<int>> (match / cast inner int32→)",
+                      F_MAP_STR_LIST,
+                      s["map_str_list_match"], s["map_str_list_widen"],
+                      repeat=repeat, inner=100))
+    out.extend(_block("deep struct{addr,tags,attrs,decimal} (match / cast id int32→)",
+                      F_DEEP_STRUCT,
+                      s["deep_struct_match"], s["deep_struct_widen"],
+                      repeat=repeat, inner=100))
     return out
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -478,7 +349,7 @@ def main() -> None:
     args = ap.parse_args()
 
     print(f"# repeat={args.repeat}  rows={ROWS}")
-    print(f"# {'label':<64s}  {'best':>14s}  {'median':>16s}  {'mean':>14s}")
+    print(f"# {'label':<70s}  {'best':>14s}  {'median':>16s}  {'mean':>14s}")
     for row in scenarios(args.repeat):
         print(_fmt(row))
 
