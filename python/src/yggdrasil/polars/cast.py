@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
 from typing import Any, Optional, Union
 
 import polars as pl
 import pyarrow as pa
 
-from yggdrasil.arrow.cast import cast_arrow_tabular
+from yggdrasil.arrow.cast import cast_arrow_tabular, rechunk_arrow_batches
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.cast.registry import register_converter
 from yggdrasil.pickle.serde import ObjectSerde
@@ -17,7 +18,11 @@ __all__ = [
     "cast_polars_lazyframe",
     "any_to_polars_dataframe",
     "polars_dataframe_to_arrow_table",
+    "rechunk_polars_frames",
+    "rechunk_polars_frame",
 ]
+
+PolarsFrame = Union[pl.DataFrame, pl.LazyFrame]
 
 
 @register_converter(pl.Series, pl.Series)
@@ -134,3 +139,81 @@ def polars_dataframe_to_arrow_table(
         )
 
     return cast_arrow_tabular(df.to_arrow(), opts)
+
+
+def _polars_frame_to_batches(frame: PolarsFrame) -> Iterator[pa.RecordBatch]:
+    if isinstance(frame, pl.LazyFrame):
+        frame = frame.collect()
+    # ``DataFrame.to_arrow`` is zero-copy; the resulting table's batches
+    # share buffers with the polars frame.
+    yield from frame.to_arrow().to_batches()
+
+
+def rechunk_polars_frames(
+    frames: Iterable[PolarsFrame],
+    *,
+    byte_size: int | None = None,
+    row_size: int | None = None,
+    lazy: bool = False,
+    memory_pool: pa.MemoryPool | None = None,
+) -> Iterator[PolarsFrame]:
+    """Stream-coalesce/slice polars frames to ~``byte_size`` / ``row_size`` chunks.
+
+    Thin polars-shaped wrapper over
+    :func:`yggdrasil.arrow.cast.rechunk_arrow_batches` — each input frame is
+    converted to Arrow record batches (zero-copy via ``DataFrame.to_arrow``),
+    fed through the shared rechunker, and yielded back as polars frames.
+
+    Parameters
+    ----------
+    frames :
+        Iterable of ``pl.DataFrame`` / ``pl.LazyFrame``. ``LazyFrame`` inputs
+        are ``collect()``-ed on demand; sizing decisions need materialized
+        data.
+    byte_size, row_size :
+        Same semantics as :func:`rechunk_arrow_batches` — neither set is
+        passthrough, ``row_size`` slices, ``byte_size`` coalesces, both caps
+        the row target.
+    lazy :
+        Emit ``pl.LazyFrame`` chunks instead of ``pl.DataFrame``.
+    memory_pool :
+        Forwarded to :func:`rechunk_arrow_batches` for buffered concats.
+
+    See :func:`yggdrasil.arrow.cast.rechunk_arrow_batches` for the underlying
+    algorithm.
+    """
+    def _batches() -> Iterator[pa.RecordBatch]:
+        for frame in frames:
+            yield from _polars_frame_to_batches(frame)
+
+    rechunked = rechunk_arrow_batches(
+        _batches(),
+        byte_size=byte_size,
+        row_size=row_size,
+        memory_pool=memory_pool,
+    )
+    for batch in rechunked:
+        df = pl.from_arrow(batch)
+        yield df.lazy() if lazy else df
+
+
+def rechunk_polars_frame(
+    frame: PolarsFrame,
+    *,
+    byte_size: int | None = None,
+    row_size: int | None = None,
+    lazy: bool = False,
+    memory_pool: pa.MemoryPool | None = None,
+) -> Iterator[PolarsFrame]:
+    """Re-chunk a single polars frame; convenience for the common one-frame case.
+
+    Equivalent to ``rechunk_polars_frames([frame], ...)``. ``LazyFrame``
+    input is ``collect()``-ed before chunking.
+    """
+    return rechunk_polars_frames(
+        [frame],
+        byte_size=byte_size,
+        row_size=row_size,
+        lazy=lazy,
+        memory_pool=memory_pool,
+    )
