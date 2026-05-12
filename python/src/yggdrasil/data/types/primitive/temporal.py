@@ -246,6 +246,42 @@ def _is_temporal_target(target: "pa.DataType") -> bool:
     )
 
 
+def _pc_cast_equivalent_to_polars(
+    src_type: "pa.DataType", target: "pa.DataType"
+) -> bool:
+    """True when ``pc.cast(src → target)`` produces the same result as the
+    polars route — letting us skip the Arrow → polars → Arrow round-trip.
+
+    The polars detour exists for exactly two semantic features:
+
+    * **ISO-8601 string parsing** via polars' chrono parser (and its
+      coalesce-of-formats fallback for Excel / CSV shapes).
+    * **Wall-clock tz reinterpret** for naive ↔ aware transitions and
+      cross-tz conversion (``replace_time_zone`` / ``convert_time_zone``).
+
+    Pyarrow's ``pc.cast`` does not reproduce either: it rejects naive →
+    aware outright (needs ``assume_timezone``), and aware → naive goes
+    through UTC rather than keeping the wall clock. So we only fast-
+    path same-family casts where neither feature applies — pure unit
+    conversion with matching tz, or tz-free families (date / time /
+    duration). Cross-tz, naive↔aware, and string sources stay on the
+    polars route.
+    """
+    # Same-tz timestamp: pure unit conversion. Different tz (including
+    # naive↔aware) needs polars' wall-clock semantics.
+    if pa.types.is_timestamp(src_type) and pa.types.is_timestamp(target):
+        return src_type.tz == target.tz
+    # Tz-free families — pyarrow handles unit conversion natively with
+    # the same semantics polars would produce.
+    if pa.types.is_duration(src_type) and pa.types.is_duration(target):
+        return True
+    if pa.types.is_date(src_type) and pa.types.is_date(target):
+        return True
+    if pa.types.is_time(src_type) and pa.types.is_time(target):
+        return True
+    return False
+
+
 def arrow_cast(
     array: "pa.Array | pa.ChunkedArray",
     target: "pa.DataType",
@@ -258,11 +294,25 @@ def arrow_cast(
     Arrow array. Polars' native chrono parser handles ISO-8601 strings,
     unit conversion, and wall-clock tz reinterpret in one pass.
 
-    Falls back to ``pc.cast`` only when polars can't represent the target
-    (second-precision Datetime / Duration) or the target is non-temporal.
+    Falls back to ``pc.cast`` when:
+
+    * the target is non-temporal,
+    * polars can't represent the target (second-precision
+      Datetime / Duration), or
+    * the cast is a same-family unit conversion where pyarrow's cast
+      semantics already match polars (no tz reinterpret, no string
+      parsing) — see :func:`_pc_cast_equivalent_to_polars`.
     """
     # Non-temporal or polars-incompatible target — direct Arrow cast.
     if not _is_temporal_target(target) or not _arrow_target_fits_polars(target):
+        return pc.cast(array, target, safe=safe)
+
+    # Fast path: same-family cast where pyarrow's native ``pc.cast``
+    # produces the same result as the polars round-trip. Skip building a
+    # polars Series + going through ``cast_polars_array_to_temporal`` +
+    # the back-conversion — saves the lion's share of cost on the
+    # ``timestamp(us)→timestamp(ms)`` / duration / date / time hot paths.
+    if _pc_cast_equivalent_to_polars(array.type, target):
         return pc.cast(array, target, safe=safe)
 
     pl = polars_module()
@@ -538,7 +588,16 @@ class TemporalType(PrimitiveType, ABC):
         )
 
     def _cast_pandas_series(self, series: Any, options: "CastOptions") -> Any:
-        """Pandas path rides on Arrow."""
+        """Pandas path rides on Arrow.
+
+        MATCH bypass: skip the ``pa.Array.from_pandas → cast → to_pandas``
+        round-trip when the Series's dtype already corresponds to the
+        target Arrow type. Without this, even a no-op cast pays the full
+        Arrow conversion cost on both sides — measurable on tabular
+        ingest where the same Schema is enforced batch after batch.
+        """
+        if not options.need_cast(series, self):
+            return series
         arrow = pa.Array.from_pandas(series)
         casted = self._cast_arrow_array(arrow, options)
         return casted.to_pandas()
