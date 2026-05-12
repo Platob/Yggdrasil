@@ -17,6 +17,7 @@ from ...environ.pip_settings import PipIndexSettings
 
 if TYPE_CHECKING:
     from .cluster import Cluster
+    from .instance_pool import InstancePools
 
 __all__ = [
     "Compute",
@@ -110,6 +111,17 @@ class Compute(DatabricksService):
             cache_attr="_clusters",
             factory=lambda: Clusters(client=self.client),
             use_cache=True
+        )
+
+    @property
+    def instance_pools(self) -> "InstancePools":
+        from .instance_pool import InstancePools
+
+        return self.client.lazy_property(
+            self,
+            cache_attr="_instance_pools",
+            factory=lambda: InstancePools(client=self.client),
+            use_cache=True,
         )
 
 
