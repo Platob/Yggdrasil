@@ -1438,13 +1438,21 @@ class DatabricksService(ABC):
 class DatabricksResource(ABC):
 
     def __getstate__(self):
-        state = super().__getstate__()
+        # ``object.__getstate__`` only exists in Python 3.11+, but the
+        # project floor is 3.10 (per ``CLAUDE.md``). Build the state dict
+        # explicitly from ``__dict__`` so calling ``super().__getstate__()``
+        # in subclasses (Table, Cluster, ...) works regardless of runtime.
+        # ``service`` is already in ``__dict__`` after ``__init__`` but
+        # we restate it so slot-based subclasses can still rely on it.
+        state = dict(getattr(self, "__dict__", {}) or {})
         state["service"] = self.service
         return state
 
     def __setstate__(self, state):
-        object.__setattr__(self, "service", state["service"])
-        super().__setstate__(state)
+        # Same reason: ``object.__setstate__`` isn't reliable on 3.10.
+        # Restore the full instance dict; subclasses that override are
+        # free to ``super().__setstate__(state)`` to inherit this behavior.
+        self.__dict__.update(state)
 
     def __init__(self, service=None, *args, **kwargs):
         self.service = DatabricksService.current() if service is None else service
