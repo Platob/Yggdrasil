@@ -53,7 +53,7 @@ class TestArrowCache(ArrowTestCase):
         # Mutate a child in place; its ``parent`` is the root field
         # (stamped by ``_adopt_children`` during root.__init__), so the
         # cascading invalidation should clear ``cached_schema``.
-        child = parent.children_fields[0]
+        child = parent.children[0]
         child.with_name("renamed", inplace=True)
         rebuilt = parent.to_arrow_schema()
         self.assertIsNot(cached_schema, rebuilt)
@@ -62,7 +62,7 @@ class TestArrowCache(ArrowTestCase):
     def test_public_invalidate_cache_cascades(self) -> None:
         parent = _build_struct()
         cached_parent = parent.to_arrow_schema()
-        child = parent.children_fields[0]
+        child = parent.children[0]
         cached_child = child.to_arrow_field()
         child.invalidate_cache()
         # Both child and parent rebuild fresh instances.
@@ -72,7 +72,7 @@ class TestArrowCache(ArrowTestCase):
     def test_invalidate_cache_without_cascade_keeps_parent_cached(self) -> None:
         parent = _build_struct()
         cached_parent = parent.to_arrow_schema()
-        child = parent.children_fields[0]
+        child = parent.children[0]
         cached_child = child.to_arrow_field()
         child.invalidate_cache(cascade=False)
         # Child rebuilds but parent keeps its cached schema.
@@ -99,7 +99,7 @@ class TestPolarsCache(ArrowTestCase):
             self.skipTest("polars not installed")
         parent = _build_struct()
         cached = parent.to_polars_schema()
-        parent.children_fields[1].with_name("b_renamed", inplace=True)
+        parent.children[1].with_name("b_renamed", inplace=True)
         rebuilt = parent.to_polars_schema()
         self.assertIsNot(cached, rebuilt)
         self.assertIn("b_renamed", rebuilt)
@@ -124,7 +124,7 @@ class TestSparkCache(ArrowTestCase):
             self.skipTest("pyspark not installed")
         parent = _build_struct()
         cached = parent.to_spark_schema()
-        parent.children_fields[0].with_nullable(False, inplace=True)
+        parent.children[0].with_nullable(False, inplace=True)
         rebuilt = parent.to_spark_schema()
         self.assertIsNot(cached, rebuilt)
         # Spark StructField carries the nullable flag — the rebuilt

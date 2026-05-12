@@ -5,7 +5,7 @@ isn't installed. Coverage:
 
 * Dtype probes — ``to_spark`` / ``from_spark_type`` / ``handles_spark_type``.
 * Compute — ``cast_spark_list_column`` against a real DataFrame.
-* Short-circuit — ``target_field=None`` is a passthrough.
+* Short-circuit — ``target=None`` is a passthrough.
 * Rejections — non-array source raises.
 """
 from __future__ import annotations
@@ -98,8 +98,8 @@ class TestSparkCast:
             cast_spark_list_column(
                 F.col("source_array"),
                 CastOptions(
-                    source_field=source_array_field,
-                    target_field=target_array_field,
+                    source=source_array_field,
+                    target=target_array_field,
                 ),
             ).alias("target_array")
         )
@@ -118,7 +118,7 @@ class TestSparkCast:
 
         out = cast_spark_list_column(
             column,
-            CastOptions(source_field=source_array_field, target_field=None),
+            CastOptions(source=source_array_field, target=None),
         )
 
         assert out is column
@@ -135,7 +135,7 @@ class TestSparkCast:
             cast_spark_list_column(
                 F.col("anything"),
                 CastOptions(
-                    source_field=source_map_field,
-                    target_field=target_array_field,
+                    source=source_map_field,
+                    target=target_array_field,
                 ),
             )

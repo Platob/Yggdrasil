@@ -66,16 +66,16 @@ def _series_via_arrow(series: "pd.Series", options: "CastOptions") -> "pd.Series
     inside the C bridge (struct cells surface as dicts, list cells as
     numpy arrays — the standard pyarrow mapping).
     """
-    source_arrow_type = options.source_field.dtype.to_arrow()
+    source_arrow_type = options.source.dtype.to_arrow()
     source_array = pa.array(series, type=source_arrow_type, from_pandas=True)
 
-    casted = options.target_field.dtype.cast_arrow_array(source_array, options=options)
+    casted = options.target.dtype.cast_arrow_array(source_array, options=options)
     if isinstance(casted, pa.ChunkedArray):
         casted = casted.combine_chunks()
 
     result = casted.to_pandas()
     result.index = series.index
-    result.name = options.target_field.name
+    result.name = options.target.name
     return result
 
 
@@ -88,7 +88,7 @@ def _series_via_polars(series: "pd.Series", options: "CastOptions") -> "pd.Serie
     pl = get_polars()
     pl_series = pl.from_pandas(series)
 
-    casted_pl = options.target_field.dtype.cast_polars_series(pl_series, options=options)
+    casted_pl = options.target.dtype.cast_polars_series(pl_series, options=options)
 
     if hasattr(casted_pl, "to_pandas"):
         result = casted_pl.to_pandas()
@@ -97,7 +97,7 @@ def _series_via_polars(series: "pd.Series", options: "CastOptions") -> "pd.Serie
         result = df.to_pandas()[series.name]
 
     result.index = series.index
-    result.name = options.target_field.name
+    result.name = options.target.name
     return result
 
 
@@ -144,8 +144,8 @@ def _run_pandas_series_fallback_chain(
         )
         raise CastError(
             f"all pandas cast strategies failed ({reason})",
-            source_field=options.source_field,
-            target_field=options.target_field,
+            source=options.source,
+            target=options.target,
             original=exc,
         ) from exc
 
@@ -162,13 +162,13 @@ def cast_pandas_struct_series(
     if not options.need_cast(series):
         return series
 
-    if options.target_field is None:
+    if options.target is None:
         return series
-    elif options.source_field.dtype.type_id != DataTypeId.STRUCT:
+    elif options.source.dtype.type_id != DataTypeId.STRUCT:
         raise CastError(
-            f"source is {options.source_field.dtype} — expected struct",
-            source_field=options.source_field,
-            target_field=options.target_field,
+            f"source is {options.source.dtype} — expected struct",
+            source=options.source,
+            target=options.target,
         )
 
     return _run_pandas_series_fallback_chain(
@@ -192,9 +192,9 @@ def _struct_series_columnwise(
     dict-cell materialisation stays inside the Arrow → pandas C bridge.
     """
     pd = get_pandas()
-    source_field: "Field" = options.source_field
+    source_field: "Field" = options.source
     source_type: "StructType" = source_field.dtype
-    target_type: "StructType" = options.target_field.dtype
+    target_type: "StructType" = options.target.dtype
 
     def normalize_row(value: Any) -> dict[str, Any] | None:
         if value is None or (pd.isna(value) if not isinstance(value, dict) else False):
@@ -211,7 +211,7 @@ def _struct_series_columnwise(
     num_rows = len(series)
     out_cols: dict[str, pd.Series] = {}
 
-    for i, target_child in enumerate(target_type.children_fields):
+    for i, target_child in enumerate(target_type.children):
         source_child = source_type.field_by(
             name=target_child.name,
             index=i,
@@ -229,17 +229,17 @@ def _struct_series_columnwise(
         out_cols[target_child.name] = target_child.cast_pandas_series(
             extracted,
             options=options.copy(
-                source_field=source_child,
-                target_field=target_child,
+                source=source_child,
+                target=target_child,
             ),
         )
 
     return _reassemble_object_series(
         out_cols,
-        target_type.children_fields,
+        target_type.children,
         normalized,
         series_index=series.index,
-        series_name=options.target_field.name,
+        series_name=options.target.name,
     )
 
 
@@ -255,13 +255,13 @@ def cast_pandas_list_series(
     if not options.need_cast(series):
         return series
 
-    if options.target_field is None:
+    if options.target is None:
         return series
-    elif options.source_field.dtype.type_id != DataTypeId.ARRAY:
+    elif options.source.dtype.type_id != DataTypeId.ARRAY:
         raise CastError(
-            f"source is {options.source_field.dtype} — expected list",
-            source_field=options.source_field,
-            target_field=options.target_field,
+            f"source is {options.source.dtype} — expected list",
+            source=options.source,
+            target=options.target,
         )
 
     return _run_pandas_series_fallback_chain(
@@ -284,9 +284,9 @@ def _list_series_columnwise(
     Python ``for`` over rows.
     """
     pd = get_pandas()
-    source_field: "Field" = options.source_field
+    source_field: "Field" = options.source
     source_type: "ArrayType" = source_field.dtype
-    target_type: "StructType" = options.target_field.dtype
+    target_type: "StructType" = options.target.dtype
 
     def normalize_row(value: Any) -> list[Any] | None:
         if value is None:
@@ -305,7 +305,7 @@ def _list_series_columnwise(
     normalized = series.map(normalize_row)
     out_cols: dict[str, pd.Series] = {}
 
-    for i, target_child in enumerate(target_type.children_fields):
+    for i, target_child in enumerate(target_type.children):
         extracted = normalized.map(
             lambda row, idx=i: None if row is None or idx >= len(row) else row[idx]
         )
@@ -313,23 +313,23 @@ def _list_series_columnwise(
         out_cols[target_child.name] = target_child.cast_pandas_series(
             extracted,
             options=options.copy(
-                source_field=source_type.item_field,
-                target_field=target_child,
+                source=source_type.item_field,
+                target=target_child,
             ),
         )
 
     return _reassemble_object_series(
         out_cols,
-        target_type.children_fields,
+        target_type.children,
         normalized,
         series_index=series.index,
-        series_name=options.target_field.name,
+        series_name=options.target.name,
     )
 
 
 def _reassemble_object_series(
     out_cols: "dict[str, pd.Series]",
-    children_fields: "list[Field]",
+    children: "list[Field]",
     null_marker: "pd.Series",
     series_index: "pd.Index",
     series_name: str,
@@ -347,9 +347,9 @@ def _reassemble_object_series(
     if num_rows == 0:
         return pd.Series([], index=series_index, name=series_name, dtype="object")
 
-    target_names = [c.name for c in children_fields]
+    target_names = [c.name for c in children]
     child_arrays: list[pa.Array] = []
-    for child in children_fields:
+    for child in children:
         col = out_cols[child.name]
         try:
             arr = pa.array(col, from_pandas=True)
@@ -388,8 +388,8 @@ def cast_pandas_tabular(
     if not isinstance(data, pd.DataFrame):
         raise CastError(
             f"unsupported tabular type {type(data).__name__}",
-            source_field=options.source_field,
-            target_field=options.target_field,
+            source=options.source,
+            target=options.target,
         )
 
     if not options.need_cast(data, check_names=True):
@@ -437,8 +437,8 @@ def cast_pandas_tabular(
         )
         raise CastError(
             f"all pandas tabular cast strategies failed ({reason})",
-            source_field=options.source_field,
-            target_field=options.target_field,
+            source=options.source,
+            target=options.target,
             original=exc,
         ) from exc
 
@@ -449,7 +449,7 @@ def _tabular_via_arrow(
 ) -> "pd.DataFrame":
     preserve_index = bool(data.index.name)
     arrow_table = pa.Table.from_pandas(data, preserve_index=preserve_index)
-    target_dtype = options.target_field.dtype
+    target_dtype = options.target.dtype
     casted_table = target_dtype.cast_arrow_tabular(arrow_table, options=options)
     result = casted_table.to_pandas()
     if preserve_index and data.index.name in result.columns:
@@ -465,7 +465,7 @@ def _tabular_via_polars(
 ) -> "pd.DataFrame":
     pl = get_polars()
     pl_df = pl.from_pandas(data)
-    target_dtype = options.target_field.dtype
+    target_dtype = options.target.dtype
     casted_pl = target_dtype.cast_polars_tabular(pl_df, options=options)
     if hasattr(casted_pl, "collect"):
         casted_pl = casted_pl.collect()
@@ -479,13 +479,13 @@ def _tabular_columnwise(
     options: "CastOptions",
 ) -> "pd.DataFrame":
     pd = get_pandas()
-    source_schema = options.source_schema
+    source_schema = options.source
     target_schema = options.merged_schema
 
     out: dict[str, pd.Series] = {}
     num_rows = len(data)
 
-    for i, target_field in enumerate(target_schema.children_fields):
+    for i, target_field in enumerate(target_schema.children):
         source_field = source_schema.field_by(
             name=target_field.name,
             index=i,
@@ -498,8 +498,8 @@ def _tabular_columnwise(
             casted = target_field.cast_pandas_series(
                 data[source_field.name],
                 options=options.copy(
-                    source_field=source_field,
-                    target_field=target_field,
+                    source=source_field,
+                    target=target_field,
                 ),
             )
 

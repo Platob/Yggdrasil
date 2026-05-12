@@ -94,8 +94,8 @@ class TestSparkMapColumn:
             cast_spark_map_column(
                 F.col("source_map"),
                 CastOptions(
-                    source_field=source_map_field,
-                    target_field=target_map_field,
+                    source=source_map_field,
+                    target=target_map_field,
                 ),
             ).alias("target_map")
         )
@@ -130,8 +130,8 @@ class TestSparkListColumnToMap:
             cast_spark_list_column_to_map(
                 F.col("source_entries"),
                 CastOptions(
-                    source_field=source_list_of_struct_field,
-                    target_field=target_map_field,
+                    source=source_list_of_struct_field,
+                    target=target_map_field,
                 ),
             ).alias("target_map")
         )
@@ -166,8 +166,8 @@ class TestSparkStructColumnToMap:
             cast_spark_struct_column_to_map(
                 F.col("source_struct"),
                 CastOptions(
-                    source_field=source_struct_to_map_field,
-                    target_field=target_map_field,
+                    source=source_struct_to_map_field,
+                    target=target_map_field,
                 ),
             ).alias("target_map")
         )

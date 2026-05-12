@@ -14,10 +14,9 @@ allocating a frozen dataclass, normalizing a target field, running
 
 This benchmark targets the construction / coercion / copy paths that
 fire whether or not any real data is touched, plus the cached
-property accessors (``merged_field``, ``column_names``,
-``target_schema``) that pipelines walk repeatedly. It does **not**
-measure the per-engine cast kernels — see ``bench_engine_type_bypass``
-for those.
+property accessors (``merged_field``, ``column_names``) that pipelines
+walk repeatedly. It does **not** measure the per-engine cast kernels
+— see ``bench_engine_type_bypass`` for those.
 
 Usage::
 
@@ -118,21 +117,21 @@ def scenarios(repeat: int) -> list[dict]:
     # the full Field tree.
     results.append(_time_one(
         "construct: CastOptions(target=pa.Schema)",
-        lambda: CastOptions(target_field=PA_SCHEMA),
+        lambda: CastOptions(target=PA_SCHEMA),
         repeat=repeat, inner=5_000,
     ))
 
     # 3. Single-field target — common for column-level cast pipelines.
     results.append(_time_one(
         "construct: CastOptions(target=pa.Field)",
-        lambda: CastOptions(target_field=PA_FIELD),
+        lambda: CastOptions(target=PA_FIELD),
         repeat=repeat, inner=10_000,
     ))
 
     # 4. Bare dtype — single-column-cast shape (Field/Schema not needed).
     results.append(_time_one(
         "construct: CastOptions(target=pa.DataType)",
-        lambda: CastOptions(target_field=PA_DTYPE),
+        lambda: CastOptions(target=PA_DTYPE),
         repeat=repeat, inner=20_000,
     ))
 
@@ -145,7 +144,7 @@ def scenarios(repeat: int) -> list[dict]:
     ))
 
     # 6. .check(existing) — passthrough. Fastest possible path.
-    existing = CastOptions(target_field=PA_SCHEMA)
+    existing = CastOptions(target=PA_SCHEMA)
     results.append(_time_one(
         "check: CastOptions.check(existing) passthrough",
         lambda: CastOptions.check(existing),
@@ -159,7 +158,7 @@ def scenarios(repeat: int) -> list[dict]:
         repeat=repeat, inner=5_000,
     ))
 
-    # 8. .check(pa.Schema) — schema coerced to target_field.
+    # 8. .check(pa.Schema) — schema coerced to target.
     results.append(_time_one(
         "check: CastOptions.check(pa.Schema)",
         lambda: CastOptions.check(PA_SCHEMA),
@@ -167,7 +166,7 @@ def scenarios(repeat: int) -> list[dict]:
     ))
 
     # 9. .check(dict) — caller passed kwargs as a mapping.
-    cfg = {"target_field": PA_SCHEMA, "safe": True, "row_size": 1024}
+    cfg = {"target": PA_SCHEMA, "safe": True, "row_size": 1024}
     results.append(_time_one(
         "check: CastOptions.check(dict)",
         lambda: CastOptions.check(cfg),
@@ -176,7 +175,7 @@ def scenarios(repeat: int) -> list[dict]:
 
     # 10. .copy() — pure clone. Hit by every with_source / with_target
     # when the caller didn't opt into in-place edits.
-    opts_full = CastOptions(target_field=PA_SCHEMA, source_field=PA_SCHEMA)
+    opts_full = CastOptions(target=PA_SCHEMA, source=PA_SCHEMA)
     results.append(_time_one(
         "copy: opts.copy() no overrides",
         lambda: opts_full.copy(),
@@ -203,7 +202,7 @@ def scenarios(repeat: int) -> list[dict]:
 
     # 13. merged_field — cached on the instance; subsequent reads are
     # what the cast pipeline actually pays for once the cache warms up.
-    opts_both = CastOptions(source_field=PA_SCHEMA, target_field=PA_SCHEMA)
+    opts_both = CastOptions(source=PA_SCHEMA, target=PA_SCHEMA)
     _ = opts_both.merged_field  # warm the slot
     results.append(_time_one(
         "prop: opts.merged_field cached read",
@@ -218,11 +217,15 @@ def scenarios(repeat: int) -> list[dict]:
         repeat=repeat, inner=200_000,
     ))
 
-    # 15. target_schema — goes through Field.to_schema.
-    opts_t = CastOptions(target_field=PA_SCHEMA)
+    # 15. target attribute — direct slot read. Replaces the old
+    # cached ``target_schema`` property: since :class:`Schema` is a
+    # subclass of :class:`StructField`, the same Field-shaped slot
+    # serves both "give me the column-ish thing" and "give me a
+    # Schema-shaped view" callers.
+    opts_t = CastOptions(target=PA_SCHEMA)
     results.append(_time_one(
-        "prop: opts.target_schema",
-        lambda: opts_t.target_schema,
+        "prop: opts.target",
+        lambda: opts_t.target,
         repeat=repeat, inner=200_000,
     ))
 

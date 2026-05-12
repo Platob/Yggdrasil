@@ -312,9 +312,9 @@ class MongoCollection(Tabular):
         """
         if self._cached_schema is not None:
             return self._cached_schema
-        if options.target_schema is not None:
-            self._cached_schema = options.target_schema
-            self._cached_schema_arrow = options.target_schema.to_arrow_schema()
+        if options.target is not None:
+            self._cached_schema = options.target
+            self._cached_schema_arrow = options.target.to_arrow_schema()
             return self._cached_schema
         sample_size = options.row_size or 100
         cursor = self.collection.find(limit=int(sample_size))
@@ -366,7 +366,7 @@ class MongoCollection(Tabular):
         )
 
     def _target_arrow_schema(self, options: O) -> Optional[pa.Schema]:
-        target = options.target_schema or options.merged_schema
+        target = options.target or options.merged_schema
         if target is None:
             return None
         return target.to_arrow_schema()

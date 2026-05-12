@@ -70,7 +70,7 @@ class TestIdentity:
     ) -> None:
         dtype = MapType.from_key_value(string_type, int64_type)
 
-        children = dtype.children_fields
+        children = dtype.children
         assert len(children) == 1
         assert children[0].name == "entries"
         assert isinstance(children[0].dtype, StructType)

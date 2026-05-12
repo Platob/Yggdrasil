@@ -43,8 +43,8 @@ class TestMapSeries:
         out = cast_pandas_map_series(
             series,
             CastOptions(
-                source_field=source_map_field,
-                target_field=target_map_field,
+                source=source_map_field,
+                target=target_map_field,
             ),
         )
 
@@ -76,8 +76,8 @@ class TestListSeriesToMap:
         out = cast_pandas_list_series_to_map(
             series,
             CastOptions(
-                source_field=source_list_of_struct_field,
-                target_field=target_map_field,
+                source=source_list_of_struct_field,
+                target=target_map_field,
             ),
         )
 
@@ -109,8 +109,8 @@ class TestStructSeriesToMap:
         out = cast_pandas_struct_series_to_map(
             series,
             CastOptions(
-                source_field=source_struct_to_map_field,
-                target_field=target_map_field,
+                source=source_struct_to_map_field,
+                target=target_map_field,
             ),
         )
 

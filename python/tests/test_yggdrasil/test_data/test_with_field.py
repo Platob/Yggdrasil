@@ -37,7 +37,7 @@ class TestAutoPromote:
         ret = prim.with_field(Field(name="name", dtype=StringType()))
         assert ret is prim  # inplace
         assert isinstance(prim.dtype, StructType)
-        assert [f.name for f in prim.children_fields] == ["age", "name"]
+        assert [f.name for f in prim.children] == ["age", "name"]
 
     def test_primitive_keeps_top_level_identity(self) -> None:
         prim = Field(
@@ -49,7 +49,7 @@ class TestAutoPromote:
         assert prim.name == "trade"
         assert prim.nullable is False
         # The wrapped previous self is the first child.
-        original_child = prim.children_fields[0]
+        original_child = prim.children[0]
         assert original_child.name == "trade"
         assert isinstance(original_child.dtype, Float64Type)
         assert original_child.metadata == {b"unit": b"usd"}
@@ -69,7 +69,7 @@ class TestAutoPromote:
         # synthesize a Field via ``Field.from_any``.
         prim = Field(name="seed", dtype=StringType())
         prim.with_field("price")
-        assert "price" in [f.name for f in prim.children_fields]
+        assert "price" in [f.name for f in prim.children]
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +88,7 @@ class TestStructCollisions:
     def test_first_write_appends(self) -> None:
         s = self._struct()
         s.with_field(Field(name="price", dtype=Float64Type()))
-        assert [f.name for f in s.children_fields] == ["id", "name", "price"]
+        assert [f.name for f in s.children] == ["id", "name", "price"]
 
     def test_default_mode_replaces_collision(self) -> None:
         s = self._struct()
@@ -96,7 +96,7 @@ class TestStructCollisions:
         s.with_field(Field(name="id", dtype=StringType()))
         assert isinstance(s.field("id").dtype, StringType)
         # No duplicate child.
-        assert [f.name for f in s.children_fields] == ["id", "name"]
+        assert [f.name for f in s.children] == ["id", "name"]
 
     def test_overwrite_mode_replaces(self) -> None:
         s = self._struct()
@@ -125,7 +125,7 @@ class TestStructCollisions:
         # ``Mode.APPEND`` honestly appends — duplicate names allowed
         # at the children level (Arrow Struct supports this).
         s.with_field(Field(name="id", dtype=StringType()), mode=Mode.APPEND)
-        names = [f.name for f in s.children_fields]
+        names = [f.name for f in s.children]
         assert names.count("id") == 2
 
     def test_upsert_mode_merges_dtype(self) -> None:
@@ -144,7 +144,7 @@ class TestStructCollisions:
         merged = s.field("id")
         assert merged.metadata.get(b"role") == b"identifier"
         # Still one entry.
-        assert [f.name for f in s.children_fields].count("id") == 1
+        assert [f.name for f in s.children].count("id") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +159,7 @@ class TestModeAlias:
         s.with_field("a")
         s.with_field("a", mode="overwrite")
         # No duplicate, AUTO collision behavior under the alias.
-        assert len([f for f in s.children_fields if f.name == "a"]) == 1
+        assert len([f for f in s.children if f.name == "a"]) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +176,7 @@ class TestWithFields:
             Field(name="b", dtype=StringType()),
             Field(name="c", dtype=Float64Type()),
         ])
-        assert [f.name for f in s.children_fields] == ["a", "b", "c"]
+        assert [f.name for f in s.children] == ["a", "b", "c"]
 
     def test_promote_then_extend(self) -> None:
         prim = Field(name="root", dtype=Int64Type())
@@ -184,13 +184,13 @@ class TestWithFields:
             Field(name="b", dtype=StringType()),
             Field(name="c", dtype=Float64Type()),
         ])
-        names = [f.name for f in prim.children_fields]
+        names = [f.name for f in prim.children]
         assert names == ["root", "b", "c"]
 
     def test_mixed_string_and_field_inputs(self) -> None:
         s = Field.empty()
         s.with_fields(["x", Field(name="y", dtype=StringType())])
-        assert {f.name for f in s.children_fields} == {"x", "y"}
+        assert {f.name for f in s.children} == {"x", "y"}
 
     def test_mode_applies_per_entry(self) -> None:
         s = Field.empty()
@@ -224,5 +224,5 @@ class TestInplace:
         ret = s.with_field("x", inplace=False)
         assert ret is not s
         # Original unchanged.
-        assert len(s.children_fields) == 0
-        assert "x" in [f.name for f in ret.children_fields]
+        assert len(s.children) == 0
+        assert "x" in [f.name for f in ret.children]

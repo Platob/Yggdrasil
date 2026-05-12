@@ -3,15 +3,23 @@
 What it carries
 ---------------
 
-Two :class:`Field` s (``source_field``, ``target_field``) — the
-inferred / desired schema at each end of a cast. A ``safe`` flag for
-strict-vs-permissive semantics (overflow, truncation, nulls-in-non-
-nullable). Sizing knobs ``row_size`` / ``byte_size`` that batch-
-oriented readers/writers honour. A :class:`Mode` pair for write
-semantics: ``mode`` controls the data write (overwrite / append /
-error-if-exists), ``schema_mode`` controls how schema drift is
-handled. An optional ``arrow_memory_pool`` for callers routing
-allocations through a bounded pool.
+Two :class:`Field` s (``source``, ``target``) — the inferred /
+desired schema at each end of a cast. Because :class:`Schema` is a
+subclass of :class:`StructField` which is a :class:`Field`, the same
+slot covers "I have a single column" and "I have a full schema" —
+the type just promotes through :meth:`Field.from_` on construction
+(``pa.Schema`` lands as :class:`StructField`, ``pa.DataType`` lands
+as a leaf :class:`Field`). Callers that want a Schema-shaped view
+specifically can call ``.target.to_schema()`` / ``.source.to_schema()``.
+
+A ``safe`` flag for strict-vs-permissive semantics (overflow,
+truncation, nulls-in-non-nullable). Sizing knobs ``row_size`` /
+``byte_size`` that batch-oriented readers/writers honour. A
+:class:`Mode` pair for write semantics: ``mode`` controls the data
+write (overwrite / append / error-if-exists), ``schema_mode``
+controls how schema drift is handled. An optional
+``arrow_memory_pool`` for callers routing allocations through a
+bounded pool.
 
 The canonical entry point
 -------------------------
@@ -19,7 +27,7 @@ The canonical entry point
 :meth:`CastOptions.check` is what every :class:`DataIO` public method
 funnels through. It accepts any of: an existing CastOptions to reuse,
 a dict of overrides, a :class:`pa.DataType` / :class:`pa.Field` /
-:class:`pa.Schema` to promote to a target-field hint, or ``None`` for
+:class:`pa.Schema` to promote to a target hint, or ``None`` for
 defaults. It merges everything into a single :class:`CastOptions`
 instance — immutable from there, so no per-call mutation hazards.
 
@@ -40,7 +48,7 @@ Field normalization
 :meth:`Field.from_`, so callers can pass a :class:`pa.Schema`, a
 :class:`pa.Field`, a :class:`pa.DataType`, a yggdrasil :class:`Schema`
 or :class:`Field`, or a dict spec — all land as a uniform
-:class:`Field`. Stops ``CastOptions(target_field=pa_schema)`` from
+:class:`Field`. Stops ``CastOptions(target=pa_schema)`` from
 propagating an un-wrapped pyarrow object into the casting engines.
 
 Engine dispatch
@@ -52,8 +60,8 @@ dispatch table (engine detection via :meth:`ObjectSerde.module_and_name`,
 shape detection via isinstance under the engine's lazy-imported
 module). :class:`CastOptions` adds exactly two things on top:
 
-1. The ``target_field is None`` short-circuit — valid on options but
-   not on a Field, which always carries a dtype. Lets
+1. The ``target is None`` short-circuit — valid on options but not
+   on a Field, which always carries a dtype. Lets
    :meth:`CastOptions.cast` pass *obj* through unchanged when no
    target is bound.
 2. ``options=self`` plumbing — callers threading options through a
@@ -111,7 +119,7 @@ __all__ = [
 # (``safe``, ``row_size``, ``mode`` *already as* a Mode enum, …) can
 # skip ``__post_init__`` entirely.
 _NORMALIZED_KEYS = frozenset({
-    "source_field", "target_field", "match_by", "mode", "schema_mode",
+    "source", "target", "match_by", "mode", "schema_mode",
 })
 
 
@@ -122,7 +130,7 @@ def _struct_of_objects(columns: "Iterable[str]") -> "Schema":
     ``columns=`` list and no source/target peek bound a schema. The
     children default to :class:`ObjectType` so casts pass through
     untouched — the caller can later refine the dtype with a real
-    ``source_field`` / ``target_field`` once they know more.
+    ``source`` / ``target`` once they know more.
     """
     # Local imports to avoid the bootstrap cycle described above —
     # this helper only fires when a caller actually passed columns.
@@ -140,7 +148,7 @@ def _struct_of_objects(columns: "Iterable[str]") -> "Schema":
 
 # Accept at the public boundary: an existing CastOptions, a dict of
 # field overrides, a pa.DataType/Field/Schema that we promote to
-# target_field, or None for defaults. Kept intentionally broad —
+# target, or None for defaults. Kept intentionally broad —
 # .check() handles the routing.
 CastOptionsArg = Union[
     "CastOptions",
@@ -171,8 +179,8 @@ class CastOptions:
 
     All fields default to safe no-ops:
 
-    * ``source_field`` / ``target_field`` = ``None`` → no cast
-      coercion. :meth:`cast` returns inputs unchanged.
+    * ``source`` / ``target`` = ``None`` → no cast coercion.
+      :meth:`cast` returns inputs unchanged.
     * ``safe`` = ``False`` → permissive cast: bad rows / overflow
       become null. Strict semantics are opt-in via ``safe=True``.
     * ``mode`` / ``schema_mode`` = :attr:`Mode.AUTO` → writer
@@ -182,8 +190,8 @@ class CastOptions:
     * ``arrow_memory_pool`` = ``None`` → use pyarrow's default pool.
     """
 
-    source_field: "Field | None" = None
-    target_field: "Field | None" = None
+    source: "Field | None" = None
+    target: "Field | None" = None
     #: ``False`` by default: bad rows / overflow / out-of-range values
     #: become null instead of raising. The wider data plane (CSV-from-web,
     #: JSON-from-API, Spark joins on partial frames) is messy enough that
@@ -314,35 +322,25 @@ class CastOptions:
     # of times across a single batch pipeline. The underlying
     # ``Field.merge_with`` walks the full struct tree on each call.
     # ``CastOptions`` is frozen, so the inputs to that merge
-    # (``source_field``, ``target_field``, ``schema_mode``) cannot
-    # change for a given instance — the result is safe to cache for
-    # the lifetime of the options object.
+    # (``source``, ``target``, ``schema_mode``) cannot change for a
+    # given instance — the result is safe to cache for the lifetime
+    # of the options object.
     #
     # ``merged_schema`` returns the same object: now that
     # :class:`StructField` *is* a :class:`Field`, the merged result
     # for struct sides already satisfies the Schema interface — one
-    # cache slot covers both views.
+    # cache slot covers both views.  The same logic collapses
+    # ``source`` / ``target`` themselves: a single :class:`Field`
+    # slot serves both "I want a column-ish Field" and "I want a
+    # schema-shaped Field" callers — no parallel ``*_schema`` cache
+    # is necessary.
     #
-    # Sibling slots ``_source_schema_cache`` / ``_target_schema_cache``
-    # cache the corresponding :meth:`Field.to_schema` projections,
-    # which the cast pipeline (``Tabular``, ``ArrowTabular``,
-    # ``DataIO.collect_schema``) hits repeatedly per options instance
-    # — each ``to_schema`` rebuilds a fresh :class:`Schema` and is
-    # expensive enough (tens of microseconds for a wide schema) that
-    # an instance-local cache pays for itself after a single re-read.
-    #
-    # ``init=False`` keeps the slots out of the constructor signature;
+    # ``init=False`` keeps the slot out of the constructor signature;
     # ``compare=False`` keeps two functionally identical CastOptions
     # equal regardless of which one happened to have its cache warmed;
     # ``repr=False`` keeps the cache out of the dataclass-generated
     # repr (the custom repr below also skips non-repr fields).
     _merged_field_cache: Any = dataclasses.field(
-        default=..., init=False, repr=False, compare=False
-    )
-    _source_schema_cache: Any = dataclasses.field(
-        default=..., init=False, repr=False, compare=False
-    )
-    _target_schema_cache: Any = dataclasses.field(
         default=..., init=False, repr=False, compare=False
     )
 
@@ -370,15 +368,15 @@ class CastOptions:
         # lookup until we actually need the Field type, so the common
         # "no source, no target, no match_by" path skips the import
         # cache hit entirely.
-        src = self.source_field
-        tgt = self.target_field
+        src = self.source
+        tgt = self.target
         match_by = self.match_by
         if src is not None or tgt is not None or match_by:
             Field = field_class()
             if src is not None and not isinstance(src, Field):
-                setattr_(self, "source_field", Field.from_(src))
+                setattr_(self, "source", Field.from_(src))
             if tgt is not None and not isinstance(tgt, Field):
-                setattr_(self, "target_field", Field.from_(tgt))
+                setattr_(self, "target", Field.from_(tgt))
             # match_by normalization — accept list[Field | str | dict |
             # pa.Field]. Plain strings become a default-typed Field so
             # the selector machinery (alias / position lookup) has a
@@ -415,53 +413,16 @@ class CastOptions:
     # ==================================================================
 
     @property
-    def source_schema(self) -> Schema | None:
-        """The source field's :class:`Schema`, if a source field is bound.
-
-        Returns ``None`` when no source is bound — callers that need a
-        non-None schema should use :meth:`check_source` first to bind
-        one from a peekable object.
-
-        Memoized on the instance: :meth:`Field.to_schema` rebuilds a
-        full :class:`Schema` (and a struct-projected dtype) per call;
-        cast pipelines walk this property repeatedly, so the second
-        and later reads are returned from the cache.
-        """
-        cached = self._source_schema_cache
-        if cached is not ...:
-            return cached
-        src = self.source_field
-        result = src.to_schema() if src is not None else None
-        object.__setattr__(self, "_source_schema_cache", result)
-        return result
-
-    @property
-    def target_schema(self) -> Schema | None:
-        """The target field's :class:`Schema`, if a target field is bound.
-
-        Memoized symmetrically with :attr:`source_schema` — same
-        invalidation contract: any path that swaps ``target_field``
-        clears the slot back to ``...``.
-        """
-        cached = self._target_schema_cache
-        if cached is not ...:
-            return cached
-        tgt = self.target_field
-        result = tgt.to_schema() if tgt is not None else None
-        object.__setattr__(self, "_target_schema_cache", result)
-        return result
-
-    @property
     def merged_field(self) -> Field | None:
         cached = self._merged_field_cache
         if cached is not ...:
             return cached
-        if self.source_field and self.target_field:
-            result = self.target_field.merge_with(
-                self.source_field, mode=self.schema_mode
+        if self.source and self.target:
+            result = self.target.merge_with(
+                self.source, mode=self.schema_mode
             )
         else:
-            result = self.target_field or self.source_field
+            result = self.target or self.source
         object.__setattr__(self, "_merged_field_cache", result)
         return result
 
@@ -482,18 +443,18 @@ class CastOptions:
 
     def select_source_column_names(self) -> list[str] | None:
         """The source field's column names, if a source field is bound."""
-        if self.source_field is None:
+        if self.source is None:
             return None
 
-        source_names = list(self.source_field.names)
+        source_names = list(self.source.names)
 
-        if self.target_field is None:
+        if self.target is None:
             return source_names
 
         selected: list[str] = []
 
-        for target_name in self.target_field.names:
-            found = self.source_field.field(name=target_name, raise_error=False)
+        for target_name in self.target.names:
+            found = self.source.field(name=target_name, raise_error=False)
             if found is not None:
                 selected.append(found.name)
 
@@ -531,9 +492,6 @@ class CastOptions:
         cls: type[T],
         options: CastOptionsArg = None,
         /,
-        *,
-        source: Any = ...,
-        target: Any = ...,
         **overrides: Any,
     ) -> T:
         """Canonical entry point — coerce anything into a :class:`CastOptions`.
@@ -546,25 +504,24 @@ class CastOptions:
         * :class:`Mapping` (including ``dict``) — merge into overrides
           and construct fresh (override args win on key collision).
         * :class:`pa.DataType` / :class:`pa.Field` / :class:`pa.Schema`
-          / :class:`Field` / :class:`Schema` — treat as a target-field
-          hint. Equivalent to ``check(target_field=options, **overrides)``.
+          / :class:`Field` / :class:`Schema` — treat as a target hint.
+          Equivalent to ``check(target=options, **overrides)``.
 
-        The ``source=`` / ``target=`` keyword-only shortcuts are for
-        peek-and-bind use: ``check(target=some_table)`` runs
-        :meth:`Field.peek_from` to infer a target field from the
-        table's shape. ``source_field=`` / ``target_field=`` (via
-        ``**overrides``) remain the explicit form.
+        ``source=`` / ``target=`` go straight into the dataclass slots
+        (after :meth:`Field.from_` normalization in ``__post_init__``).
+        Callers that want the peek-and-bind "only set if not already
+        bound" semantic should chain :meth:`check_source` /
+        :meth:`check_target` after the call.
 
         ``columns=`` shortcut: a sequence of column names. When the
-        caller didn't bind a source by any other means (no
-        ``source=`` peek, no ``source_field=`` override, the wrapped
-        options didn't carry one either), the names are promoted to
-        a struct-shaped source field whose children default to
-        :class:`ObjectType` — a "I have these columns, no idea what's
-        in them yet" placeholder that downstream casts treat as
-        passthroughs. Ignored when the source is already bound, so
-        callers can pass it defensively without clobbering richer
-        schemas.
+        caller didn't bind a source by any other means (no ``source=``
+        override, the wrapped options didn't carry one either), the
+        names are promoted to a struct-shaped source field whose
+        children default to :class:`ObjectType` — a "I have these
+        columns, no idea what's in them yet" placeholder that
+        downstream casts treat as passthroughs. Ignored when the source
+        is already bound, so callers can pass it defensively without
+        clobbering richer schemas.
 
         :raises TypeError: if *options* is a type the dispatch table
             doesn't cover.
@@ -582,25 +539,21 @@ class CastOptions:
         # called without an explicit options hits this branch, and
         # going through ``_build`` (with its dict comprehension over
         # ``field_names()``) is pure overhead when there's nothing to
-        # merge. The hand-rolled gate matches what ``_build`` would
-        # return for empty overrides + unset peek args.
+        # merge.
         if options is None or options is ...:
-            if not overrides and source is ... and target is ... and not columns:
+            if not overrides and not columns:
                 instance = cls()
             else:
-                instance = cls._build(overrides, source=source, target=target)
+                instance = cls._build(overrides)
 
         # 2. Already a CastOptions — reuse via copy if overrides
         # given, otherwise passthrough. Typed check with ``cls`` so a
         # subclass CastOptions stays on its subclass.
         elif isinstance(options, cls):
-            if (
-                not overrides and source is ... and target is ...
-                and not columns
-            ):
+            if not overrides and not columns:
                 instance = options
             else:
-                instance = options.copy(source=source, target=target, **overrides)
+                instance = options.copy(**overrides)
         elif isinstance(options, CastOptions):
             # Different CastOptions subclass → re-home onto cls. Only
             # carry over fields shared with cls (base CastOptions
@@ -617,17 +570,17 @@ class CastOptions:
                 if f.name in carry
             }
             merged.update(overrides)
-            instance = cls._build(merged, source=source, target=target)
+            instance = cls._build(merged)
 
         # 3. Mapping → merge into overrides (explicit kwargs win).
         elif isinstance(options, Mapping):
             merged = {**options, **overrides}
-            instance = cls._build(merged, source=source, target=target)
+            instance = cls._build(merged)
 
-        # 4. Schema-shaped → promote to a target_field hint.
+        # 4. Schema-shaped → promote to a target hint.
         elif isinstance(options, (pa.DataType, pa.Field, pa.Schema, field_class(), schema_class())):
-            overrides.setdefault("target_field", options)
-            instance = cls._build(overrides, source=source, target=target)
+            overrides.setdefault("target", options)
+            instance = cls._build(overrides)
 
         else:
             raise TypeError(
@@ -636,8 +589,8 @@ class CastOptions:
                 "yggdrasil Field/Schema, or None."
             )
 
-        if columns and instance.source_field is None:
-            instance = instance.copy(source_field=_struct_of_objects(columns))
+        if columns and instance.source is None:
+            instance = instance.copy(source=_struct_of_objects(columns))
         return instance
 
     @classmethod
@@ -679,9 +632,6 @@ class CastOptions:
     def _build(
         cls: type[T],
         overrides: Mapping[str, Any],
-        *,
-        source: Any = ...,
-        target: Any = ...,
     ) -> T:
         # Single filter pass over the override mapping: drop ``...``
         # sentinels (caller didn't say) and foreign keys (DataIO
@@ -700,14 +650,8 @@ class CastOptions:
             if v is not ... and k in allowed
         }
         if options is None:
-            instance = cls(**clean)
-        else:
-            instance = options.copy(**clean)
-        if source is not ...:
-            instance = instance.check_source(obj=source)
-        if target is not ...:
-            instance = instance.check_target(obj=target)
-        return instance
+            return cls(**clean)
+        return options.copy(**clean)
 
     # ==================================================================
     # Copy / mutation helpers
@@ -716,18 +660,15 @@ class CastOptions:
     def copy(
         self: T,
         /,
-        *,
-        source: Any = ...,
-        target: Any = ...,
         **overrides: Any,
     ) -> T:
         """Return a copy with *overrides* applied.
 
-        ... values in *overrides* are ignored (keep existing).
-        ``source``/``target`` run a peek-and-bind after the base copy
-        so they compose with explicit ``source_field``/``target_field``
-        overrides — the explicit always wins, peek only fires when
-        the override left the slot unbound.
+        ... values in *overrides* are ignored (keep existing). Pass
+        ``source=``/``target=`` to swap either slot — :class:`Field`
+        normalization runs in ``__post_init__`` so any
+        :class:`Field`-shaped input (``pa.Schema``, ``pa.DataType``,
+        dict, …) is accepted.
 
         Implementation note: bypasses :func:`dataclasses.replace`, which
         rebuilds via ``cls(**all_fields)`` and pays a full ``__init__``
@@ -746,18 +687,7 @@ class CastOptions:
             for k, v in overrides.items()
             if v is not ... and k in allowed
         }
-
-        replaced = self._fast_clone(clean)
-
-        if source is not ... and source is not None:
-            replaced = replaced.with_source(source, copy=False)
-        elif source is None:
-            replaced = replaced.with_source(None, copy=False)
-        if target is not ... and target is not None:
-            replaced = replaced.with_target(target, copy=False)
-        elif target is None:
-            replaced = replaced.with_target(None, copy=False)
-        return replaced
+        return self._fast_clone(clean)
 
     def _fast_clone(self: T, overrides: Mapping[str, Any]) -> T:
         """Build a fresh instance by copying slots, applying *overrides*.
@@ -798,12 +728,10 @@ class CastOptions:
         else:
             for fname in names:
                 setattr_(new, fname, getattr(self, fname))
-        # Init=False memoization slots: always start cleared on the
-        # clone — overridden source_field / target_field / schema_mode
-        # would otherwise read stale cached merges.
+        # Init=False memoization slot: always start cleared on the
+        # clone — overridden source / target / schema_mode would
+        # otherwise read a stale cached merge.
         setattr_(new, "_merged_field_cache", ...)
-        setattr_(new, "_source_schema_cache", ...)
-        setattr_(new, "_target_schema_cache", ...)
         # Only re-run normalization when an override could plausibly
         # need it. Slots not touched here were already normalized on
         # *self* and just propagated via getattr.
@@ -817,22 +745,22 @@ class CastOptions:
         *,
         copy: bool = True,
     ) -> T:
-        """Bind a ``source_field`` if one isn't already set.
+        """Bind a :attr:`source` if one isn't already set.
 
         Two ways to supply one:
 
-        1. ``source_field=`` — explicit Field / Schema / pa type. Wins
-           even if ``self.source_field`` is already set (explicit
-           override).
-        2. ``obj=`` — a peekable object. Only runs :meth:`peek_source`
-           when ``self.source_field`` is currently ``None`` — an
-           already-bound field is never clobbered by a peek.
+        1. ``source=`` on :meth:`check` / :meth:`copy` — explicit
+           Field / Schema / pa type. Wins even if ``self.source`` is
+           already set (explicit override).
+        2. ``obj=`` here — a peekable object. Only runs the peek
+           when ``self.source`` is currently ``None`` — an already-
+           bound field is never clobbered by a peek.
 
         Returns self unchanged when neither is given. Used from
         :class:`DataIO` methods (``collect_schema``, ``read_arrow_dataset``)
         that want to pin a source schema before running a batch walk.
         """
-        if self.source_field is None and obj is not None:
+        if self.source is None and obj is not None:
             try:
                 peeked = obj() if callable(obj) else field_class().from_(obj)
             except (TypeError, ValueError):
@@ -851,12 +779,12 @@ class CastOptions:
         *,
         copy: bool = True
     ) -> T:
-        """Bind a ``target_field`` if one isn't already set.
+        """Bind a :attr:`target` if one isn't already set.
 
         Symmetry partner for :meth:`check_source`. See that method
         for the argument semantics — source/target behave identically.
         """
-        if self.target_field is None and obj is not None:
+        if self.target is None and obj is not None:
             return self.with_target(
                 obj() if callable(obj) else field_class().from_(obj),
                 copy=copy
@@ -864,7 +792,7 @@ class CastOptions:
         return self
 
     def with_source(self: T, source: "Field", copy: bool = False) -> T:
-        """Return a copy with *field* as the new source field.
+        """Return a copy with *source* as the new source field.
 
         Accepts the same shapes :meth:`Field.from_` does (pa schema,
         yggdrasil Field, dict, etc.) — normalized in ``__post_init__``
@@ -876,50 +804,45 @@ class CastOptions:
         setattr_ = object.__setattr__
         if source is None:
             if copy:
-                return self.copy(source=None, copy=copy)
-            setattr_(self, "source_field", None)
+                return self.copy(source=None)
+            setattr_(self, "source", None)
             setattr_(self, "_merged_field_cache", ...)
-            setattr_(self, "_source_schema_cache", ...)
             return self
 
         source = field_class().from_(source)
 
-        if source == self.source_field:
+        if source == self.source:
             return self
 
         if copy:
             # ``replace`` drops init=False fields back to their
-            # defaults, which clears the merged_field + schema caches
-            # for free.
-            return dataclasses.replace(self, source_field=source)
-        setattr_(self, "source_field", source)
-        # In-place edit invalidates whatever the merged_field /
-        # source_schema caches held.
+            # defaults, which clears the merged_field cache for free.
+            return dataclasses.replace(self, source=source)
+        setattr_(self, "source", source)
+        # In-place edit invalidates whatever the merged_field
+        # cache held.
         setattr_(self, "_merged_field_cache", ...)
-        setattr_(self, "_source_schema_cache", ...)
         return self
 
     def with_target(self: T, target: "Field", copy: bool = True) -> T:
-        """Return a copy with *field* as the new target field."""
+        """Return a copy with *target* as the new target field."""
         setattr_ = object.__setattr__
         if target is None:
             if copy:
-                return self.copy(target=None, copy=copy)
-            setattr_(self, "target_field", None)
+                return self.copy(target=None)
+            setattr_(self, "target", None)
             setattr_(self, "_merged_field_cache", ...)
-            setattr_(self, "_target_schema_cache", ...)
             return self
 
         target = field_class().from_(target)
 
-        if target == self.target_field:
+        if target == self.target:
             return self
 
         if copy:
-            return dataclasses.replace(self, target_field=target)
-        setattr_(self, "target_field", target)
+            return dataclasses.replace(self, target=target)
+        setattr_(self, "target", target)
         setattr_(self, "_merged_field_cache", ...)
-        setattr_(self, "_target_schema_cache", ...)
         return self
 
     # ==================================================================
@@ -955,8 +878,8 @@ class CastOptions:
         the target's field types verbatim to keep MERGE happy.
         """
         clean = self.check_source(source, copy=False).check_target(target, copy=False)
-        src = clean.source_field
-        tgt = clean.target_field
+        src = clean.source
+        tgt = clean.target
         if src is None or tgt is None:
             return False
 
@@ -970,9 +893,9 @@ class CastOptions:
 
     def finalize(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Finalize any object — delegates to :meth:`Field.finalize`."""
-        if self.target_field is None:
+        if self.target is None:
             return obj
-        return self.target_field.finalize(obj, default_scalar=default_scalar)
+        return self.target.finalize(obj, default_scalar=default_scalar)
 
     def finalize_spark_cast(
         self,
@@ -987,7 +910,7 @@ class CastOptions:
         diverge from the target after a cast chain, so the alias
         step belongs in finalize rather than in each cast site.
         """
-        if self.target_field is None:
+        if self.target is None:
             return obj
         filled = self.fill_spark_nulls(obj, default_scalar=default_scalar)
         return self.spark_alias(filled)
@@ -1006,7 +929,7 @@ class CastOptions:
         already handles inline via the target schema. Finalize here
         just means "apply the default-scalar null fill."
         """
-        if self.target_field is None:
+        if self.target is None:
             return obj
         return self.fill_arrow_nulls(obj, default_scalar=default_scalar)
 
@@ -1023,7 +946,7 @@ class CastOptions:
         cast methods directly. Finalize is fill-only, matching
         :meth:`finalize_arrow_cast`.
         """
-        if self.target_field is None:
+        if self.target is None:
             return obj
         return self.fill_pandas_nulls(obj, default_scalar=default_scalar)
 
@@ -1036,60 +959,60 @@ class CastOptions:
     # ``cast_*_tabular``/``cast_*_series``/...). :class:`CastOptions`
     # wraps those methods with:
     #
-    # 1. The ``target_field is None`` short-circuit — valid on options
+    # 1. The ``target is None`` short-circuit — valid on options
     #    but not on a Field (which always has a dtype).
     # 2. Ergonomic ``options=self`` plumbing — so callers of the wider
     #    DataIO surface don't have to thread options through every
     #    cast site.
     #
     # Single source of truth for engine dispatch = one place to update
-    # when a new engine lands. When ``target_field`` is bound, every
+    # when a new engine lands. When ``target`` is bound, every
     # method in this section is one-line-delegate.
 
     # ---- Top-level dispatch ------------------------------------------
 
     def cast(self, obj: Any) -> Any:
-        """Cast *obj* to :attr:`target_field` using its native engine.
+        """Cast *obj* to :attr:`target` using its native engine.
 
-        Short-circuits to *obj* unchanged when ``target_field is None``.
+        Short-circuits to *obj* unchanged when ``target is None``.
         Otherwise delegates to :meth:`Field.cast`, which handles engine
         detection (pyarrow/polars/pandas/spark + iterable fallback) and
         shape dispatch (tabular vs array/series/column/expr).
 
-        Dispatch is keyed on :attr:`target_field` (not
+        Dispatch is keyed on :attr:`target` (not
         :attr:`merged_field`) — the caller asked for the target shape,
         not a reconciled middle ground.  Source-side metadata still
         flows through via ``options=self`` for the inner cast paths
         that need it.
         """
-        if self.target_field is None:
+        if self.target is None:
             return obj
-        return self.target_field.cast(obj, options=self)
+        return self.target.cast(obj, options=self)
 
     # ---- pyarrow -----------------------------------------------------
 
     def cast_pyarrow(self, obj: Any) -> Any:
         """Cast any pyarrow object — delegates to :meth:`Field.cast_arrow`."""
-        if self.target_field is None:
+        if self.target is None:
             return obj
-        return self.target_field.cast_arrow(obj, options=self)
+        return self.target.cast_arrow(obj, options=self)
 
     def cast_arrow_array(self, array: Any) -> Any:
         """Cast a :class:`pa.Array` or :class:`pa.ChunkedArray`."""
-        if self.target_field is None:
+        if self.target is None:
             return array
-        return self.target_field.cast_arrow_array(array, options=self)
+        return self.target.cast_arrow_array(array, options=self)
 
     def cast_arrow_tabular(self, table: Any) -> Any:
         """Cast a :class:`pa.Table` or :class:`pa.RecordBatch`."""
-        if self.target_field is None:
+        if self.target is None:
             return table
-        return self.target_field.cast_arrow_tabular(table, options=self)
+        return self.target.cast_arrow_tabular(table, options=self)
 
     def cast_arrow_batch_iterator(self, batches: Any) -> Any:
         """Cast a stream of :class:`pa.RecordBatch` and rechunk by ``byte_size`` / ``row_size``.
 
-        With a bound ``target_field``: per-batch tabular cast + streamed
+        With a bound ``target``: per-batch tabular cast + streamed
         rechunking via :meth:`Field.cast_arrow_batch_iterator` (which
         routes through the struct-side helper).
 
@@ -1097,7 +1020,7 @@ class CastOptions:
         is set, otherwise passthrough. Lets callers that did an
         in-engine cast upstream still pick up the optimized rechunker.
         """
-        if self.target_field is None:
+        if self.target is None:
             if not self.byte_size and not self.row_size:
                 return batches
             from yggdrasil.arrow.cast import rechunk_arrow_batches
@@ -1107,19 +1030,19 @@ class CastOptions:
                 row_size=self.row_size,
                 memory_pool=self.arrow_memory_pool,
             )
-        return self.target_field.cast_arrow_batch_iterator(batches, options=self)
+        return self.target.cast_arrow_batch_iterator(batches, options=self)
 
     def fill_arrow_nulls(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Engine-level null fill — delegates to :meth:`Field.fill_arrow`."""
-        if self.target_field is None:
+        if self.target is None:
             return obj
-        return self.target_field.fill_arrow(obj, default_scalar=default_scalar)
+        return self.target.fill_arrow(obj, default_scalar=default_scalar)
 
     def fill_arrow_array_nulls(self, array: Any, *, default_scalar: Any = None) -> Any:
         """Narrow null fill for a :class:`pa.Array` / :class:`pa.ChunkedArray`."""
-        if self.target_field is None:
+        if self.target is None:
             return array
-        return self.target_field.fill_arrow_array_nulls(
+        return self.target.fill_arrow_array_nulls(
             array, default_scalar=default_scalar
         )
 
@@ -1127,15 +1050,15 @@ class CastOptions:
 
     def cast_polars(self, obj: Any) -> Any:
         """Cast any polars object — delegates to :meth:`Field.cast_polars`."""
-        if self.target_field is None:
+        if self.target is None:
             return obj
-        return self.target_field.cast_polars(obj, options=self)
+        return self.target.cast_polars(obj, options=self)
 
     def cast_polars_series(self, series: Any, *, default_scalar: Any = None) -> Any:
         """Cast a :class:`pl.Series`."""
-        if self.target_field is None:
+        if self.target is None:
             return series
-        return self.target_field.cast_polars_series(
+        return self.target.cast_polars_series(
             series, options=self, default_scalar=default_scalar
         )
 
@@ -1145,79 +1068,79 @@ class CastOptions:
         Wraps the expression tree with a cast operator — actual work
         fires when the containing LazyFrame is collected.
         """
-        if self.target_field is None:
+        if self.target is None:
             return expr
-        return self.target_field.cast_polars_expr(
+        return self.target.cast_polars_expr(
             expr, options=self, default_scalar=default_scalar
         )
 
     def cast_polars_tabular(self, data: Any) -> Any:
         """Cast a :class:`pl.DataFrame` or :class:`pl.LazyFrame`."""
-        if self.target_field is None:
+        if self.target is None:
             return data
-        return self.target_field.cast_polars_tabular(data, options=self)
+        return self.target.cast_polars_tabular(data, options=self)
 
     def fill_polars_nulls(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Engine-level polars null fill — delegates to :meth:`Field.fill_polars`."""
-        if self.target_field is None:
+        if self.target is None:
             return obj
-        return self.target_field.fill_polars(obj, default_scalar=default_scalar)
+        return self.target.fill_polars(obj, default_scalar=default_scalar)
 
     def polars_alias(self, obj: Any) -> Any:
         """Rename a polars Series/Expr to the target name — no-op if matching.
 
-        Delegates to :meth:`Field.polars_alias`. When ``target_field``
+        Delegates to :meth:`Field.polars_alias`. When ``target``
         is unbound there's no name to rename to, so we pass through.
         """
-        if self.target_field is None:
+        if self.target is None:
             return obj
-        return self.target_field.polars_alias(obj)
+        return self.target.polars_alias(obj)
 
     # ---- pandas ------------------------------------------------------
 
     def cast_pandas(self, obj: Any) -> Any:
         """Cast any pandas object — delegates to :meth:`Field.cast_pandas`."""
-        if self.target_field is None:
+        if self.target is None:
             return obj
-        return self.target_field.cast_pandas(obj, options=self)
+        return self.target.cast_pandas(obj, options=self)
 
     def fill_pandas_nulls(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Engine-level pandas null fill — delegates to :meth:`Field.fill_pandas`."""
-        if self.target_field is None:
+        if self.target is None:
             return obj
-        return self.target_field.fill_pandas(obj, default_scalar=default_scalar)
+        return self.target.fill_pandas(obj, default_scalar=default_scalar)
 
     # ---- spark -------------------------------------------------------
 
     def cast_spark(self, obj: Any) -> Any:
         """Cast any spark object — delegates to :meth:`Field.cast_spark`."""
-        if self.target_field is None:
+        if self.target is None:
             return obj
-        return self.target_field.cast_spark(obj, options=self)
+        return self.target.cast_spark(obj, options=self)
 
     def cast_spark_tabular(self, obj: Any) -> Any:
         """Cast any spark object — delegates to :meth:`Field.cast_spark`."""
-        if self.target_field is None:
+        if self.target is None:
             return obj
-        return self.target_field.cast_spark_tabular(obj, options=self)
+        return self.target.cast_spark_tabular(obj, options=self)
 
     def cast_spark_column(self, obj: Any) -> Any:
         """Cast any spark object — delegates to :meth:`Field.cast_spark`."""
-        if self.target_field is None:
+        if self.target is None:
             return obj
-        return self.target_field.cast_spark_column(obj, options=self)
+        return self.target.cast_spark_column(obj, options=self)
 
     def fill_spark_nulls(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Engine-level spark null fill — delegates to :meth:`Field.fill_spark`."""
-        if self.target_field is None:
+        if self.target is None:
             return obj
-        return self.target_field.fill_spark(obj, default_scalar=default_scalar)
+        return self.target.fill_spark(obj, default_scalar=default_scalar)
 
     def spark_alias(self, obj: Any) -> Any:
         """Rename a Spark Column to the target name — delegates to :meth:`Field.spark_alias`."""
-        if self.target_field is None:
+        if self.target is None:
             return obj
-        return self.target_field.spark_alias(obj)
+        return self.target.spark_alias(obj)
 
     # ==================================================================
     # Dunders

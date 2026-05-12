@@ -28,7 +28,7 @@ class PrimitiveType(DataType, ABC):
     byte_size: int | None = None
 
     @property
-    def children_fields(self) -> list["Field"]:
+    def children(self) -> list["Field"]:
         return []
 
     def to_dict(self) -> dict[str, Any]:

@@ -51,16 +51,16 @@ def cast_spark_struct_column(
     if not options.need_cast(column):
         return column
 
-    if options.source_field.dtype.type_id != DataTypeId.STRUCT:
-        raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
+    if options.source.dtype.type_id != DataTypeId.STRUCT:
+        raise TypeError(f"Cannot cast {options.source} to {options.target}")
 
-    source_field: "Field" = options.source_field
+    source_field: "Field" = options.source
     source_type: "StructType" = source_field.dtype
-    target_type: "StructType" = options.target_field.dtype
+    target_type: "StructType" = options.target.dtype
 
     child_columns: list[Any] = []
 
-    for i, target_child in enumerate(target_type.children_fields):
+    for i, target_child in enumerate(target_type.children):
         source_child = source_type.field_by(
             name=target_child.name,
             index=i,
@@ -73,8 +73,8 @@ def cast_spark_struct_column(
             child = target_child.cast_spark_column(
                 column[source_child.name],
                 options=options.copy(
-                    source_field=source_child,
-                    target_field=target_child,
+                    source=source_child,
+                    target=target_child,
                 ),
             ).alias(target_child.name)
 
@@ -95,23 +95,23 @@ def cast_spark_map_column(
     if not options.need_cast(column):
         return column
 
-    if options.source_field.dtype.type_id != DataTypeId.MAP:
-        raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
+    if options.source.dtype.type_id != DataTypeId.MAP:
+        raise TypeError(f"Cannot cast {options.source} to {options.target}")
 
-    source_field: "Field" = options.source_field
+    source_field: "Field" = options.source
     source_type: "MapType" = source_field.dtype
-    target_type: "StructType" = options.target_field.dtype
+    target_type: "StructType" = options.target.dtype
 
     child_columns: list[Any] = []
 
-    for target_child in target_type.children_fields:
+    for target_child in target_type.children:
         extracted = F.element_at(column, F.lit(target_child.name))
 
         casted = target_child.cast_spark_column(
             extracted,
             options=options.copy(
-                source_field=source_type.value_field,
-                target_field=target_child,
+                source=source_type.value_field,
+                target=target_child,
             ),
         ).alias(target_child.name)
 
@@ -130,11 +130,11 @@ def cast_spark_list_column(
     if not options.need_cast(column):
         return column
 
-    if options.source_field.dtype.type_id != DataTypeId.ARRAY:
-        raise TypeError(f"Cannot cast {options.source_field} to {options.target_field}")
+    if options.source.dtype.type_id != DataTypeId.ARRAY:
+        raise TypeError(f"Cannot cast {options.source} to {options.target}")
 
-    source_field: "Field" = options.source_field
-    target_type: "StructType" = options.target_field.dtype
+    source_field: "Field" = options.source
+    target_type: "StructType" = options.target.dtype
 
     # ArrayType import is lazy via TYPE_CHECKING; we read .item_field
     # off the runtime instance below.
@@ -142,7 +142,7 @@ def cast_spark_list_column(
 
     child_columns: list[Any] = []
 
-    for i, target_child in enumerate(target_type.children_fields):
+    for i, target_child in enumerate(target_type.children):
         # F.get is the null-on-out-of-bounds accessor; plain column[i] /
         # column.getItem(i) raises an ArrayIndexOutOfBoundsException in
         # Spark 4.x when the source list is shorter than the target struct.
@@ -151,8 +151,8 @@ def cast_spark_list_column(
         casted = target_child.cast_spark_column(
             extracted,
             options=options.copy(
-                source_field=source_type.item_field,
-                target_field=target_child,
+                source=source_type.item_field,
+                target=target_child,
             ),
         ).alias(target_child.name)
 
@@ -173,7 +173,7 @@ def cast_spark_tabular(
     if not options.need_cast(data, check_names=True):
         return data
 
-    source_schema = options.source_schema
+    source_schema = options.source
     target_schema = options.merged_schema
 
     # Engine-level fast bypass — Field/DataType detail (semantic
@@ -187,7 +187,7 @@ def cast_spark_tabular(
 
     cols: list[Any] = []
 
-    for i, target_field in enumerate(target_schema.children_fields):
+    for i, target_field in enumerate(target_schema.children):
         source_field = source_schema.field_by(
             name=target_field.name,
             index=i,
@@ -200,8 +200,8 @@ def cast_spark_tabular(
             col = target_field.cast_spark_column(
                 spark.functions.col(source_field.name),
                 options=options.copy(
-                    source_field=source_field,
-                    target_field=target_field,
+                    source=source_field,
+                    target=target_field,
                 ),
             ).alias(target_field.name)
 

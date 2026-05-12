@@ -45,8 +45,8 @@ class TestListToList:
         result = cast_arrow_list_array(
             array,
             CastOptions(
-                source_field=source_array_field,
-                target_field=target_array_field,
+                source=source_array_field,
+                target=target_array_field,
             ),
         )
 
@@ -64,8 +64,8 @@ class TestListToList:
         result = cast_arrow_list_array(
             array,
             CastOptions(
-                source_field=source_array_field,
-                target_field=target_large_array_field,
+                source=source_array_field,
+                target=target_large_array_field,
             ),
         )
 
@@ -83,8 +83,8 @@ class TestListToList:
         result = cast_arrow_list_array(
             array,
             CastOptions(
-                source_field=source_array_field,
-                target_field=target_fixed_array_field,
+                source=source_array_field,
+                target=target_fixed_array_field,
             ),
         )
 
@@ -106,8 +106,8 @@ class TestListToList:
         result = cast_arrow_list_array(
             array,
             CastOptions(
-                source_field=source_array_field,
-                target_field=target_array_field,
+                source=source_array_field,
+                target=target_array_field,
             ),
         )
 
@@ -128,8 +128,8 @@ class TestListToList:
         result = cast_arrow_list_array(
             array,
             CastOptions(
-                source_field=source_array_field,
-                target_field=target_array_field,
+                source=source_array_field,
+                target=target_array_field,
             ),
         )
 
@@ -146,7 +146,7 @@ class TestListShortCircuits:
 
         out = cast_arrow_list_array(
             array,
-            CastOptions(source_field=source_array_field, target_field=None),
+            CastOptions(source=source_array_field, target=None),
         )
 
         assert out is array
@@ -167,8 +167,8 @@ class TestListRejections:
             cast_arrow_list_array(
                 array,
                 CastOptions(
-                    source_field=source_map_field,
-                    target_field=target_array_field,
+                    source=source_map_field,
+                    target=target_array_field,
                 ),
             )
 
@@ -183,8 +183,8 @@ class TestListRejections:
             cast_arrow_list_array(
                 array,
                 CastOptions(
-                    source_field=source_array_field,
-                    target_field=target_view_array_field,
+                    source=source_array_field,
+                    target=target_view_array_field,
                 ),
             )
 
@@ -213,8 +213,8 @@ class TestMapToListEntries:
         result = cast_arrow_map_array_to_list(
             array,
             CastOptions(
-                source_field=source_map_field,
-                target_field=target_entries_array_field,
+                source=source_map_field,
+                target=target_entries_array_field,
             ),
         )
 
@@ -246,8 +246,8 @@ class TestMapToListEntries:
         result = cast_arrow_map_array_to_list(
             array,
             CastOptions(
-                source_field=source_map_field,
-                target_field=target_entries_large_array_field,
+                source=source_map_field,
+                target=target_entries_large_array_field,
             ),
         )
 
@@ -273,8 +273,8 @@ class TestMapToListEntries:
         result = cast_arrow_map_array_to_list(
             array,
             CastOptions(
-                source_field=source_map_field,
-                target_field=target_entries_array_field,
+                source=source_map_field,
+                target=target_entries_array_field,
             ),
         )
 
@@ -297,7 +297,7 @@ class TestMapToListShortCircuits:
 
         out = cast_arrow_map_array_to_list(
             array,
-            CastOptions(source_field=source_map_field, target_field=None),
+            CastOptions(source=source_map_field, target=None),
         )
 
         assert out is array
@@ -316,8 +316,8 @@ class TestMapToListRejections:
             cast_arrow_map_array_to_list(
                 array,
                 CastOptions(
-                    source_field=source_array_field,
-                    target_field=target_entries_array_field,
+                    source=source_array_field,
+                    target=target_entries_array_field,
                 ),
             )
 
@@ -334,8 +334,8 @@ class TestMapToListRejections:
             cast_arrow_map_array_to_list(
                 array,
                 CastOptions(
-                    source_field=source_map_field,
-                    target_field=invalid_target_entries_scalar_array_field,
+                    source=source_map_field,
+                    target=invalid_target_entries_scalar_array_field,
                 ),
             )
 
@@ -352,7 +352,7 @@ class TestMapToListRejections:
             cast_arrow_map_array_to_list(
                 array,
                 CastOptions(
-                    source_field=source_map_field,
-                    target_field=invalid_target_entries_struct_one_field_array_field,
+                    source=source_map_field,
+                    target=invalid_target_entries_struct_one_field_array_field,
                 ),
             )

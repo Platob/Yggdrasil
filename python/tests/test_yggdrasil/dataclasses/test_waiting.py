@@ -81,19 +81,20 @@ def test_check_arg_dict_deadline_and_timeout_raises():
 @pytest.mark.parametrize(
     "arg, expected_timeout",
     [
-        # IMPORTANT: in Python, bool is a subclass of int.
-        # Your check_arg checks (int, float, timedelta) BEFORE bool,
-        # so True becomes 1.0 and False becomes 0.0 here.
+        # ``WaitingConfig.from_`` special-cases ``bool`` *before* the
+        # ``(int, float, timedelta)`` fallback (bool is a subclass of
+        # int, so the order matters). ``True`` enables the default
+        # ticks-based timeout; ``False`` is "no wait".
         (True, 1200.0),
         (False, 0.0),
     ],
 )
-def test_check_arg_bool_is_treated_as_int_due_to_type_order(arg, expected_timeout):
+def test_check_arg_bool_uses_default_ticks_timeout(arg, expected_timeout):
     wc = WaitingConfig.from_(arg)
     assert wc.timeout == expected_timeout
     assert wc.interval == 0.5
     assert wc.backoff == 1.5
-    assert wc.max_interval == 15.0
+    assert wc.max_interval == 10.0
 
 
 def test_check_arg_kwargs_override_arg():

@@ -53,7 +53,7 @@ def schema(
     elif isinstance(fields, StructField):
         if not metadata:
             metadata = fields.metadata
-        fields = fields.children_fields
+        fields = fields.children
     elif not isinstance(fields, (list, set, tuple)):
         fields = [fields]
 
@@ -191,7 +191,7 @@ class StructField(Field):
     def __repr__(self):
         body = "".join(
             f"\n{f.pretty_format(level=1)}"
-            for f in self.children_fields
+            for f in self.children
         )
         comment = self.comment
         return f"StructField: {self.name!r} {comment!r}{body}"

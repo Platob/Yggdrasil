@@ -75,8 +75,8 @@ def any_to_polars_dataframe(
 
     if obj is None:
         schema = (
-            opts.target_field.to_schema().to_polars_schema()
-            if opts.target_field is not None
+            opts.target.to_schema().to_polars_schema()
+            if opts.target is not None
             else None
         )
         return cast_polars_dataframe(pl.DataFrame(schema=schema), opts)
@@ -119,7 +119,7 @@ def polars_dataframe_to_arrow_table(
 
     ``pl.LazyFrame`` inputs are materialised via ``collect()`` first.
     The resulting Arrow table is routed through :func:`cast_arrow_tabular`
-    so ``options.target_field`` is honoured symmetrically with the
+    so ``options.target`` is honoured symmetrically with the
     pandas and Spark helpers.
     """
     opts = CastOptions.check(options)

@@ -91,7 +91,7 @@ class TestTargetSchemaCast:
         io.write_arrow_table(pa.table({
             "id": ["1", "2", "3"], "v": ["1.5", "2.5", "3.5"],
         }))
-        casted = io.read_arrow_table(target_field=self._target_field())
+        casted = io.read_arrow_table(target=self._target_field())
         assert casted.schema.field("id").type == pa.int64()
         assert casted.schema.field("v").type == pa.float64()
         assert casted.column("id").to_pylist() == [1, 2, 3]
@@ -103,7 +103,7 @@ class TestTargetSchemaCast:
         io = ParquetIO()
         io.write_arrow_table(
             pa.table({"id": ["1", "2"], "v": ["1.5", "2.5"]}),
-            target_field=self._target_field(),
+            target=self._target_field(),
         )
         # Read without a target so we see exactly what was persisted.
         raw = io.read_arrow_table()

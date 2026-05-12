@@ -49,8 +49,8 @@ class TestMapToMap:
         result = cast_arrow_map_array(
             array,
             CastOptions(
-                source_field=source_map_field,
-                target_field=target_map_field,
+                source=source_map_field,
+                target=target_map_field,
             ),
         )
 
@@ -69,7 +69,7 @@ class TestMapToMap:
 
         out = cast_arrow_map_array(
             array,
-            CastOptions(source_field=source_map_field, target_field=None),
+            CastOptions(source=source_map_field, target=None),
         )
 
         assert out is array
@@ -93,8 +93,8 @@ class TestMapToMap:
             cast_arrow_map_array(
                 array,
                 CastOptions(
-                    source_field=source_list_of_struct_field,
-                    target_field=target_map_field,
+                    source=source_list_of_struct_field,
+                    target=target_map_field,
                 ),
             )
 
@@ -126,8 +126,8 @@ class TestListToMap:
         result = cast_arrow_list_array_to_map(
             array,
             CastOptions(
-                source_field=source_list_of_struct_field,
-                target_field=target_map_field,
+                source=source_list_of_struct_field,
+                target=target_map_field,
             ),
         )
 
@@ -169,8 +169,8 @@ class TestStructToMap:
         result = cast_arrow_struct_array_to_map(
             array,
             CastOptions(
-                source_field=source_struct_to_map_field,
-                target_field=target_map_field,
+                source=source_struct_to_map_field,
+                target=target_map_field,
             ),
         )
 

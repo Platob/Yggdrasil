@@ -182,7 +182,7 @@ class SparkStatementExecutor(
         options = CastOptions.check(options)
         df = any_to_spark_dataframe(
             inputs,
-            options.with_target(options.source_field).with_source(None)
+            options.with_target(options.source).with_source(None)
         )
 
         def within_partitions(iterator: Iterator[IN]):

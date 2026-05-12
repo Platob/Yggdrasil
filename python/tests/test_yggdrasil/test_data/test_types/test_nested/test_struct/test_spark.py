@@ -55,8 +55,8 @@ class TestCastStructColumn:
         )
 
         options = CastOptions(
-            source_field=source_struct_field,
-            target_field=target_struct_field,
+            source=source_struct_field,
+            target=target_struct_field,
         )
 
         result = frame.select(
@@ -86,8 +86,8 @@ class TestCastStructColumn:
         )
 
         options = CastOptions(
-            source_field=source_struct_field,
-            target_field=target_struct_field,
+            source=source_struct_field,
+            target=target_struct_field,
         )
 
         result = frame.select(
@@ -121,8 +121,8 @@ class TestCastMapColumn:
         )
 
         options = CastOptions(
-            source_field=source_map_field,
-            target_field=target_struct_field,
+            source=source_map_field,
+            target=target_struct_field,
         )
 
         result = frame.select(
@@ -158,8 +158,8 @@ class TestCastListColumn:
         )
 
         options = CastOptions(
-            source_field=source_list_field,
-            target_field=target_list_to_struct_field,
+            source=source_list_field,
+            target=target_list_to_struct_field,
         )
 
         result = frame.select(
@@ -193,8 +193,8 @@ class TestCastListColumn:
         )
 
         options = CastOptions(
-            source_field=source_list_field,
-            target_field=target_list_to_struct_field,
+            source=source_list_field,
+            target=target_list_to_struct_field,
         )
 
         result = frame.select(

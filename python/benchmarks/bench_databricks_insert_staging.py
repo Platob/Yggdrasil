@@ -3,7 +3,7 @@
 The real arrow_insert flow is:
 
     pandas/polars/arrow source
-        -> ParquetIO.write_table(data, CastOptions(target_field=...))
+        -> ParquetIO.write_table(data, CastOptions(target=...))
             -> _write_pandas_frame / _write_polars_frame / _write_arrow_table
                 -> _write_arrow_batches  (cast each batch, write to parquet sink)
         -> staging.write_stream(buffer)   # network upload to Databricks Volume
@@ -208,7 +208,7 @@ def _time_one(label: str, fn: Callable[[], int], repeat: int) -> dict:
 def run_bench(rows: int, shape: str, repeat: int) -> list[dict]:
     table = SHAPES[shape](rows)
     target_field = Schema.from_arrow(table.schema).to_field()
-    options = CastOptions(target_field=target_field)
+    options = CastOptions(target=target_field)
 
     pandas_df = table.to_pandas()
     polars_df = pl.from_arrow(table)

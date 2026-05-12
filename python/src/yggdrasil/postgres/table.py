@@ -715,8 +715,8 @@ def _to_arrow_reader(
         # which is the right answer (caller wrote nothing into a
         # table whose shape can't be inferred).
         target = (
-            options.target_schema.to_arrow_schema()
-            if options and options.target_schema is not None
+            options.target.to_arrow_schema()
+            if options and options.target is not None
             else pa.schema([])
         )
         return pa.RecordBatchReader.from_batches(target, iter(()))

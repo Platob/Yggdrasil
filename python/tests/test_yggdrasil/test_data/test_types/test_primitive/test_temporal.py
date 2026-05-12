@@ -78,7 +78,7 @@ def _options(target: TemporalType, *, safe: bool = False) -> CastOptions:
     Source binding is deliberately deferred to call time so we exercise
     the same ``check_source`` / ``need_cast`` path production casts use.
     """
-    return CastOptions(target_field=Field("col", target), safe=safe)
+    return CastOptions(target=Field("col", target), safe=safe)
 
 
 def _cast_arrow(
@@ -96,7 +96,7 @@ def _cast_polars(
 def _polars_source_field(col: str, df: "pl.DataFrame") -> Field:
     """Build a :class:`Field` from a polars column dtype.
 
-    The Expr-path dispatcher needs ``options.source_field.dtype.to_polars()``
+    The Expr-path dispatcher needs ``options.source.dtype.to_polars()``
     to re-derive the source dtype. Using ``DataType.from_polars_type``
     keeps the test agnostic to which primitive subclass owns the dtype.
     """
@@ -445,8 +445,8 @@ class TestPolarsExpr:
         )
         target = TimestampType(unit="us")
         options = CastOptions(
-            source_field=_polars_source_field("col", df),
-            target_field=Field("col", target),
+            source=_polars_source_field("col", df),
+            target=Field("col", target),
             safe=False,
         )
 
@@ -459,8 +459,8 @@ class TestPolarsExpr:
         df = pl.DataFrame({"col": ["2024-01-15", "2024-12-31"]})
         target = DateType()
         options = CastOptions(
-            source_field=_polars_source_field("col", df),
-            target_field=Field("col", target),
+            source=_polars_source_field("col", df),
+            target=Field("col", target),
             safe=False,
         )
 

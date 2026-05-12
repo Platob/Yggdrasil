@@ -606,7 +606,7 @@ class TemporalType(PrimitiveType, ABC):
         if self._needs_arrow_bridge():
             return expr.cast(self._polars_dtype_instance(), strict=options.safe)
 
-        source_field = options.source_field
+        source_field = options.source
         source_dtype = (
             source_field.dtype.to_polars() if source_field is not None else pl.String
         )

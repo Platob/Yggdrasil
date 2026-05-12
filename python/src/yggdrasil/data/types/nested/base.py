@@ -23,7 +23,7 @@ LOGGER = logging.getLogger(__name__)
 class NestedType(DataType, ABC):
     """Base class for nested data types (struct, map, array).
 
-    Nested types expose their inner fields via ``children_fields`` and
+    Nested types expose their inner fields via ``children`` and
     therefore share a common ``equals`` implementation that compares
     their children pairwise.
     """
@@ -36,14 +36,14 @@ class NestedType(DataType, ABC):
         check_metadata: bool = True,
     ) -> bool:
         # A non-nested dtype cannot structurally equal a nested one.
-        if not hasattr(other, "children_fields"):
+        if not hasattr(other, "children"):
             return False
 
         if check_dtypes and self.type_id != other.type_id:
             return False
 
-        self_children = list(self.children_fields)
-        other_children = list(other.children_fields)
+        self_children = list(self.children)
+        other_children = list(other.children)
 
         if len(self_children) != len(other_children):
             return False

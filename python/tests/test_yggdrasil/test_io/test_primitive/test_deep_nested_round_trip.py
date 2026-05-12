@@ -151,7 +151,7 @@ def _bind_target(table: pa.Table) -> CastOptions:
     what the Databricks staging path passes when it has already collected
     the destination table's schema before staging.
     """
-    return CastOptions(target_field=Schema.from_arrow(table.schema).to_field())
+    return CastOptions(target=Schema.from_arrow(table.schema).to_field())
 
 
 def _normalize(table: pa.Table) -> pa.Table:

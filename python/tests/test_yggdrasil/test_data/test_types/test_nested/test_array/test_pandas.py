@@ -38,8 +38,8 @@ class TestCastPandasListSeries:
         out = cast_pandas_list_series(
             series,
             CastOptions(
-                source_field=source_array_field,
-                target_field=target_array_field,
+                source=source_array_field,
+                target=target_array_field,
             ),
         )
 
@@ -66,8 +66,8 @@ class TestCastPandasListSeries:
         out = cast_pandas_list_series(
             series,
             CastOptions(
-                source_field=source_array_field,
-                target_field=target_array_field,
+                source=source_array_field,
+                target=target_array_field,
             ),
         )
 
@@ -86,8 +86,8 @@ class TestCastPandasListSeries:
         out = cast_pandas_list_series(
             series,
             CastOptions(
-                source_field=source_array_field,
-                target_field=target_array_field,
+                source=source_array_field,
+                target=target_array_field,
             ),
         )
 

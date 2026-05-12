@@ -50,19 +50,19 @@ class CastError(YGGException, pa.ArrowInvalid):
         self,
         reason: str,
         *,
-        source_field: "Field | None" = None,
-        target_field: "Field | None" = None,
+        source: "Field | None" = None,
+        target: "Field | None" = None,
         original: BaseException | None = None,
     ) -> None:
         self.reason = reason
-        self.source_field = source_field
-        self.target_field = target_field
+        self.source = source
+        self.target = target
         self.original = original
         super().__init__(self._format_message())
 
     def _format_message(self) -> str:
-        src_desc = _describe_field(self.source_field) or "?"
-        tgt_desc = _describe_field(self.target_field) or "?"
+        src_desc = _describe_field(self.source) or "?"
+        tgt_desc = _describe_field(self.target) or "?"
         return f"cast {src_desc} -> {tgt_desc} failed: {self.reason}"
 
 

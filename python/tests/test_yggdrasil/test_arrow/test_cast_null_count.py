@@ -54,7 +54,7 @@ class _NullCountMixin:
         tgt = Field.from_arrow(
             pa.field("x", target_type, nullable=target_nullable)
         )
-        return CastOptions(source_field=src, target_field=tgt).cast_arrow_array(array)
+        return CastOptions(source=src, target=tgt).cast_arrow_array(array)
 
 
 class TestIntegerCastNullCount(_NullCountMixin, ArrowTestCase):

@@ -39,8 +39,8 @@ class TestCastStructSeries:
         )
 
         options = CastOptions(
-            source_field=source_struct_field,
-            target_field=target_struct_field,
+            source=source_struct_field,
+            target=target_struct_field,
         )
 
         result = cast_pandas_struct_series(series, options)
@@ -64,8 +64,8 @@ class TestCastStructSeries:
         )
 
         options = CastOptions(
-            source_field=source_struct_field,
-            target_field=target_struct_field,
+            source=source_struct_field,
+            target=target_struct_field,
         )
 
         result = cast_pandas_struct_series(series, options)
@@ -92,8 +92,8 @@ class TestCastListSeries:
         )
 
         options = CastOptions(
-            source_field=source_list_field,
-            target_field=target_list_to_struct_field,
+            source=source_list_field,
+            target=target_list_to_struct_field,
         )
 
         result = cast_pandas_list_series(series, options)
@@ -120,8 +120,8 @@ class TestCastTabular:
         frame = pd.DataFrame({"a": [1, 2, None], "b": ["x", "y", "z"]})
 
         options = CastOptions(
-            source_field=source_tabular_schema,
-            target_field=target_tabular_schema,
+            source=source_tabular_schema,
+            target=target_tabular_schema,
         )
 
         result = cast_pandas_tabular(frame, options)
@@ -143,8 +143,8 @@ class TestCastTabular:
         frame = pd.DataFrame({"a": pd.Series([], dtype="int64"), "b": pd.Series([], dtype="object")})
 
         options = CastOptions(
-            source_field=source_tabular_schema,
-            target_field=target_tabular_schema,
+            source=source_tabular_schema,
+            target=target_tabular_schema,
         )
 
         result = cast_pandas_tabular(frame, options)

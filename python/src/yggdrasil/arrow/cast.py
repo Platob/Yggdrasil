@@ -28,7 +28,7 @@ Design principles
    module.
 
 4. **Bind source schemas, don't peek.** When we infer a source
-   schema, we bind it onto ``options.source_field`` so it propagates
+   schema, we bind it onto ``options.source`` so it propagates
    downstream and drives :meth:`CastOptions.need_cast` without
    re-inference.
 
@@ -104,12 +104,12 @@ ArrowDataType = Union[
 
 
 def _bind_source(options: CastOptions, obj: Any) -> CastOptions:
-    """Bind an inferred source schema onto ``options.source_field``.
+    """Bind an inferred source schema onto ``options.source``.
 
     Idempotent. Coercion failures are swallowed — "couldn't infer"
     is not a hard error here.
     """
-    if options.source_field is not None:
+    if options.source is not None:
         return options
     try:
         return options.check_source(obj=obj, copy=False)
@@ -551,14 +551,14 @@ def _pandas_to_arrow(obj: Any, options: CastOptions) -> tuple[pa.Table, CastOpti
         if keep and list(obj.columns) != keep:
             obj = obj.loc[:, keep]
 
-    if options.target_field is not None and options.need_cast():
+    if options.target is not None and options.need_cast():
         obj = options.cast_pandas(obj)
 
     table = pa.Table.from_pandas(
         obj,
         preserve_index=bool(obj.index.name),
     )
-    return table, options.copy(target_field=None)
+    return table, options.copy(target=None)
 
 
 def _spark_to_arrow(obj: Any, options: CastOptions) -> tuple[pa.Table, CastOptions]:
@@ -585,11 +585,11 @@ def _spark_to_arrow(obj: Any, options: CastOptions) -> tuple[pa.Table, CastOptio
         if keep and list(obj.columns) != keep:
             obj = obj.select(*keep)
 
-    if options.target_field is not None and options.need_cast():
+    if options.target is not None and options.need_cast():
         obj = options.cast_spark(obj)
 
     from yggdrasil.spark.cast import spark_dataframe_to_arrow
-    return spark_dataframe_to_arrow(obj), options.copy(target_field=None)
+    return spark_dataframe_to_arrow(obj), options.copy(target=None)
 
 
 # ---------------------------------------------------------------------------
@@ -628,8 +628,8 @@ def any_to_arrow_table(
 
     elif isinstance(obj, (pa.Array, pa.ChunkedArray)):
         name = (
-            options.target_field.name
-            if options.target_field and options.target_field.name
+            options.target.name
+            if options.target and options.target.name
             else "value"
         )
         table = pa.table({name: obj})
@@ -774,9 +774,9 @@ def any_to_arrow_batch_iterator(
                     obj = obj.select(*keep)
 
             # In-engine cast before streaming — fuses into Spark plan.
-            if options.target_field is not None and options.need_cast():
+            if options.target is not None and options.need_cast():
                 obj = options.cast_spark(obj)
-                options = options.copy(target_field=None)
+                options = options.copy(target=None)
 
             to_iter = getattr(obj, "toArrowBatchIterator", None)
             if callable(to_iter):
@@ -801,7 +801,7 @@ def any_to_arrow_batch_iterator(
     # Generic fallback — bulk-convert in-engine (cast applied), then
     # re-stream the already-cast table through the rechunker.
     table = any_to_arrow_table(obj, options)
-    return options.copy(target_field=None).cast_arrow_batch_iterator(table.to_batches())
+    return options.copy(target=None).cast_arrow_batch_iterator(table.to_batches())
 
 
 def _flatten_to_arrow_batches(
@@ -883,7 +883,7 @@ def any_to_arrow_scalar(
     if isinstance(scalar, pa.Scalar):
         return cast_arrow_scalar(scalar, options)
 
-    target_field = options.target_field
+    target_field = options.target
 
     if scalar is None:
         return default_arrow_scalar(
@@ -915,7 +915,7 @@ def cast_arrow_scalar(
 ) -> pa.Scalar:
     """Cast an Arrow scalar via the array path."""
     options = CastOptions.check(options)
-    if options.target_field is None:
+    if options.target is None:
         return scalar
     arr = pa.array([scalar])
     return cast_arrow_array(arr, options)[0]
@@ -959,7 +959,7 @@ def cast_arrow_record_batch_reader(
     options = CastOptions.check(options)
     options = _bind_source(options, data.schema)
 
-    needs_cast = options.target_field is not None and options.need_cast()
+    needs_cast = options.target is not None and options.need_cast()
     needs_chunk = bool(options.row_size or options.byte_size)
 
     if not needs_cast and not needs_chunk:
@@ -1022,7 +1022,7 @@ def _polars_lazyframe_prep(
     projection = _resolve_projection(options)
 
     # Bind source from the lazy plan schema — cheap, no materialization.
-    if options.source_field is None:
+    if options.source is None:
         try:
             options = options.check_source(obj=lf.collect_schema(), copy=False)
         except Exception:
@@ -1035,9 +1035,9 @@ def _polars_lazyframe_prep(
             lf = lf.select(keep)
 
     # Plan-level cast — fuses into streaming execution.
-    if options.target_field is not None and options.need_cast():
+    if options.target is not None and options.need_cast():
         lf = options.cast_polars(lf)
-        options = options.copy(target_field=None)
+        options = options.copy(target=None)
 
     return lf, options
 
@@ -1069,9 +1069,9 @@ def _polars_eager_to_arrow(
             keep = [c for c in projection if c in df.columns]
             if keep and list(df.columns) != keep:
                 df = df.select(keep)
-        if options.target_field is not None and options.need_cast():
+        if options.target is not None and options.need_cast():
             df = options.cast_polars(df)
-            options = options.copy(target_field=None)
+            options = options.copy(target=None)
 
     else:
         raise TypeError("Unsupported eager Polars object: %s" % (df,))

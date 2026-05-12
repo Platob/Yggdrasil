@@ -50,7 +50,7 @@ class ObjectType(DataType):
         return f"{pad}object"
 
     @property
-    def children_fields(self) -> list["Field"]:
+    def children(self) -> list["Field"]:
         return []
 
     # ------------------------------------------------------------------

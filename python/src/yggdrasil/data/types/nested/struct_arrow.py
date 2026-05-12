@@ -4,7 +4,7 @@ Materialized entry points, one per source shape:
 
 * :func:`cast_arrow_struct_array` — struct → struct (per-child rebuild,
   missing children defaulted, nested casts threaded through
-  ``options.copy(source_field=, target_field=)``).
+  ``options.copy(source=, target=)``).
 * :func:`cast_arrow_map_array` — map → struct via ``pc.map_lookup``;
   one lookup per target child.
 * :func:`cast_arrow_list_array` — list → struct by positional index;
@@ -68,18 +68,18 @@ def cast_arrow_struct_array(
     if not options.need_cast(array, check_nullable=True):
         return array
 
-    if options.source_field.dtype.type_id != DataTypeId.STRUCT:
+    if options.source.dtype.type_id != DataTypeId.STRUCT:
         raise pa.ArrowInvalid(
-            f"Cannot cast {options.source_field} to {options.target_field}"
+            f"Cannot cast {options.source} to {options.target}"
         )
 
-    source_field: "Field" = options.source_field
+    source_field: "Field" = options.source
     source_type: "StructType" = source_field.dtype
-    target_type: "StructType" = options.target_field.dtype
+    target_type: "StructType" = options.target.dtype
 
     children: list[pa.Array] = []
 
-    for i, target_child in enumerate(target_type.children_fields):
+    for i, target_child in enumerate(target_type.children):
         # See the tabular variant for the rationale — single-method
         # name-then-alias lookup against the source struct's
         # children.
@@ -96,7 +96,7 @@ def cast_arrow_struct_array(
             children.append(
                 target_child.cast_arrow_array(
                     array.field(source_child.name),
-                    options=options.copy(source_field=source_child, target_field=target_child),
+                    options=options.copy(source=source_child, target=target_child),
                 )
             )
 
@@ -130,24 +130,24 @@ def cast_arrow_map_array(
     if not options.need_cast(array):
         return array
 
-    if options.source_field.dtype.type_id != DataTypeId.MAP:
+    if options.source.dtype.type_id != DataTypeId.MAP:
         raise pa.ArrowInvalid(
-            f"Cannot cast {options.source_field} to {options.target_field}"
+            f"Cannot cast {options.source} to {options.target}"
         )
 
-    source_field: "Field" = options.source_field
+    source_field: "Field" = options.source
     source_type: "MapType" = source_field.dtype
-    target_type: "StructType" = options.target_field.dtype
+    target_type: "StructType" = options.target.dtype
 
     children: list[pa.Array] = []
 
-    for target_child in target_type.children_fields:
+    for target_child in target_type.children:
         values = pc.map_lookup(array, target_child.name, occurrence="first")
         casted = target_child.cast_arrow_array(
             values,
             options=options.copy(
-                source_field=source_type.value_field,
-                target_field=target_child,
+                source=source_type.value_field,
+                target=target_child,
             ),
         )
         children.append(casted)
@@ -167,16 +167,16 @@ def cast_arrow_list_array(
     if not options.need_cast(array):
         return array
 
-    if options.source_field.dtype.type_id != DataTypeId.ARRAY:
+    if options.source.dtype.type_id != DataTypeId.ARRAY:
         raise pa.ArrowInvalid(
-            f"Cannot cast {options.source_field} to {options.target_field}"
+            f"Cannot cast {options.source} to {options.target}"
         )
 
-    source_field: "Field" = options.source_field
+    source_field: "Field" = options.source
     source_type: "ArrayType" = source_field.dtype
-    target_type: "StructType" = options.target_field.dtype
+    target_type: "StructType" = options.target.dtype
 
-    target_children = target_type.children_fields
+    target_children = target_type.children
     memory_pool = options.arrow_memory_pool
 
     children: list[pa.Array] = _extract_list_positions(
@@ -189,8 +189,8 @@ def cast_arrow_list_array(
             target_child.cast_arrow_array(
                 extracted,
                 options=options.copy(
-                    source_field=source_type.item_field,
-                    target_field=target_child,
+                    source=source_type.item_field,
+                    target=target_child,
                 ),
             )
         )
@@ -304,12 +304,12 @@ def cast_arrow_tabular(
     # nullability-only mismatch is cheap — the rebuild collapses to a
     # ``pa.Table.from_arrays(arrays, schema=target_schema)`` metadata
     # rebind rather than a per-row copy.
-    src = options.source_field
-    tgt = options.target_field
+    src = options.source
+    tgt = options.target
     if src is None or tgt is None:
         return data
-    src_children = src.children_fields
-    tgt_children = tgt.children_fields
+    src_children = src.children
+    tgt_children = tgt.children
     if len(src_children) == len(tgt_children) and all(
         s.equals(
             t,
@@ -322,7 +322,7 @@ def cast_arrow_tabular(
     ):
         return data
 
-    source_schema = options.source_schema
+    source_schema = options.source
     target_schema = options.merged_schema
 
     target_arrow_schema = target_schema.to_arrow_schema()
@@ -344,7 +344,7 @@ def cast_arrow_tabular(
     target_arrays: list[pa.Array] = []
     num_rows = data.num_rows
 
-    for i, target_field in enumerate(target_schema.children_fields):
+    for i, target_field in enumerate(target_schema.children):
         source_field = source_schema.field(name=target_field.name, index=i, raise_error=False)
 
         if source_field is None:
@@ -360,8 +360,8 @@ def cast_arrow_tabular(
             casted = target_field.cast_arrow_array(
                 source_array,
                 options=options.copy(
-                    source_field=source_field,
-                    target_field=target_field,
+                    source=source_field,
+                    target=target_field,
                 ),
             )
 
@@ -385,7 +385,7 @@ def cast_arrow_batch_iterator(
 
     Per-batch cast goes through :func:`cast_arrow_tabular` (which
     already short-circuits on schema match — also when
-    ``options.target_field`` is unbound). Source-field binding is
+    ``options.target`` is unbound). Source-field binding is
     deferred to the first batch so callers don't have to peek upstream;
     the bound options are reused for every subsequent batch.
 

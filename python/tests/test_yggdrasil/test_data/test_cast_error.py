@@ -68,8 +68,8 @@ class TestBadJsonRowsNullOutByDefault(ArrowTestCase):
             schema=src,
         )
         opts = CastOptions(
-            source_field=Field.from_arrow(src),
-            target_field=Field.from_arrow(tgt),
+            source=Field.from_arrow(src),
+            target=Field.from_arrow(tgt),
         )
         out = opts.cast_arrow_tabular(tbl)
 
@@ -89,8 +89,8 @@ class TestBadJsonRowsNullOutByDefault(ArrowTestCase):
             schema=src,
         )
         opts = CastOptions(
-            source_field=Field.from_arrow(src),
-            target_field=Field.from_arrow(tgt),
+            source=Field.from_arrow(src),
+            target=Field.from_arrow(tgt),
             safe=True,
         )
         with self.assertRaises(CastError) as ctx:
@@ -98,10 +98,10 @@ class TestBadJsonRowsNullOutByDefault(ArrowTestCase):
 
         err = ctx.exception
         # Source / target fields are accessible programmatically.
-        self.assertIsNotNone(err.source_field)
-        self.assertIsNotNone(err.target_field)
-        self.assertEqual(err.source_field.name, "payload")
-        self.assertEqual(err.target_field.name, "payload")
+        self.assertIsNotNone(err.source)
+        self.assertIsNotNone(err.target)
+        self.assertEqual(err.source.name, "payload")
+        self.assertEqual(err.target.name, "payload")
         # Message mentions the failing column on both ends.
         msg = str(err)
         self.assertIn("payload: string", msg)
@@ -125,8 +125,8 @@ class TestCastErrorBackCompat(ArrowTestCase):
         )
         tbl = pa.table({"payload": ["not-json"]}, schema=src)
         opts = CastOptions(
-            source_field=Field.from_arrow(src),
-            target_field=Field.from_arrow(tgt),
+            source=Field.from_arrow(src),
+            target=Field.from_arrow(tgt),
             safe=True,
         )
 
@@ -150,7 +150,7 @@ class TestCastErrorMessageShape(ArrowTestCase):
     def test_constructed_message_includes_both_sides(self) -> None:
         src = Field.from_arrow(self.pa.field("price", self.pa.string()))
         tgt = Field.from_arrow(self.pa.field("price", self.pa.float64()))
-        err = CastError("bad value 'oops'", source_field=src, target_field=tgt)
+        err = CastError("bad value 'oops'", source=src, target=tgt)
         msg = str(err)
         self.assertIn("price: string", msg)
         self.assertIn("price: double", msg)
@@ -201,15 +201,15 @@ class TestNestedCastErrorPropagation(ArrowTestCase):
             {"row": [{"kept": "ok", "bad": "not-a-number"}]}, schema=src,
         )
         opts = CastOptions(
-            source_field=Field.from_arrow(src),
-            target_field=Field.from_arrow(tgt),
+            source=Field.from_arrow(src),
+            target=Field.from_arrow(tgt),
             safe=True,
         )
         with self.assertRaises(CastError) as ctx:
             opts.cast_arrow_tabular(tbl)
 
         # The leaf is what got bound — not the outer ``row`` field.
-        self.assertEqual(ctx.exception.target_field.name, "bad")
+        self.assertEqual(ctx.exception.target.name, "bad")
         self.assertIn("bad: string", str(ctx.exception))
         self.assertIn("bad: int64", str(ctx.exception))
 
@@ -227,13 +227,13 @@ class TestNestedCastErrorPropagation(ArrowTestCase):
         ])
         tbl = pa.table({"payload": [[{"count": "bad"}]]}, schema=src)
         opts = CastOptions(
-            source_field=Field.from_arrow(src),
-            target_field=Field.from_arrow(tgt),
+            source=Field.from_arrow(src),
+            target=Field.from_arrow(tgt),
             safe=True,
         )
         with self.assertRaises(CastError) as ctx:
             opts.cast_arrow_tabular(tbl)
-        self.assertEqual(ctx.exception.target_field.name, "count")
+        self.assertEqual(ctx.exception.target.name, "count")
 
     def test_deeply_nested_leaf_failure(self) -> None:
         # struct → struct → struct: the innermost leaf is what gets bound.
@@ -256,15 +256,15 @@ class TestNestedCastErrorPropagation(ArrowTestCase):
             {"outer": [{"inner": {"val": "abc"}}]}, schema=src,
         )
         opts = CastOptions(
-            source_field=Field.from_arrow(src),
-            target_field=Field.from_arrow(tgt),
+            source=Field.from_arrow(src),
+            target=Field.from_arrow(tgt),
             safe=True,
         )
         with self.assertRaises(CastError) as ctx:
             opts.cast_arrow_tabular(tbl)
         # Bound to the deepest leaf, not the outer ``outer`` / ``inner``
         # wrappers.
-        self.assertEqual(ctx.exception.target_field.name, "val")
+        self.assertEqual(ctx.exception.target.name, "val")
         self.assertIn("val: string", str(ctx.exception))
         self.assertIn("val: int64", str(ctx.exception))
 
@@ -277,7 +277,7 @@ class TestNestedCastErrorPropagation(ArrowTestCase):
         arr = pa.array(["nope"], type=pa.string())
         with self.assertRaises(CastError) as ctx:
             tgt_field.cast_arrow_array(
-                arr, source_field=src_field, safe=True,
+                arr, source=src_field, safe=True,
             )
-        self.assertEqual(ctx.exception.target_field.name, "amount")
+        self.assertEqual(ctx.exception.target.name, "amount")
         self.assertIsNotNone(ctx.exception.original)

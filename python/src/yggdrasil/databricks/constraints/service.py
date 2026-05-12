@@ -12,7 +12,7 @@ Constraints are represented as :class:`~yggdrasil.data.data_field.Field`
 instances:
 
 - ``field.name`` is the constraint name.
-- ``field.children_fields`` are the participating columns
+- ``field.children`` are the participating columns
   (single-column constraints unwrap to ``[field]`` itself, per
   :meth:`Field.make_constraint_field`).
 - ``field.constraint_key`` is ``True``.
@@ -256,7 +256,7 @@ class TableConstraints(DatabricksService):
         - ``field.primary_key`` or just ``field.constraint_key`` → PK.
         - otherwise → :class:`NamedTableConstraint` (CHECK-style).
         """
-        child_columns = [c.name for c in field.children_fields] or [field.name]
+        child_columns = [c.name for c in field.children] or [field.name]
 
         if field.foreign_key:
             parent_table, parent_columns = _read_parent_ref(field)

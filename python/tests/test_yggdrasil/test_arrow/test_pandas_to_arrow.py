@@ -50,7 +50,7 @@ class TestPandasDataFrameToArrow(PandasTestCase, ArrowTestCase):
     def test_target_field_casts_int64_to_int32(self) -> None:
         df = self.df({"a": [1, 2, 3]})
         target = Schema.from_arrow(self.pa.schema([self.pa.field("a", self.pa.int32())]))
-        out = any_to_arrow_table(df, CastOptions(target_field=target))
+        out = any_to_arrow_table(df, CastOptions(target=target))
         self.assertEqual(out.schema.field("a").type, self.pa.int32())
         self.assertEqual(out["a"].to_pylist(), [1, 2, 3])
 
@@ -60,7 +60,7 @@ class TestPandasDataFrameToArrow(PandasTestCase, ArrowTestCase):
             self.pa.field("c", self.pa.bool_()),
             self.pa.field("a", self.pa.int64()),
         ]))
-        out = any_to_arrow_table(df, CastOptions(target_field=target))
+        out = any_to_arrow_table(df, CastOptions(target=target))
         self.assertEqual(out.column_names, ["c", "a"])
 
     def test_nullable_int_extension_dtype(self) -> None:
@@ -69,13 +69,13 @@ class TestPandasDataFrameToArrow(PandasTestCase, ArrowTestCase):
         # bug.  With cast_pandas, the NA survives as a real null.
         df = self.df({"a": self.pd.array([1, None, 3], dtype="Int64")})
         target = Schema.from_arrow(self.pa.schema([self.pa.field("a", self.pa.int64())]))
-        out = any_to_arrow_table(df, CastOptions(target_field=target))
+        out = any_to_arrow_table(df, CastOptions(target=target))
         self.assertEqual(out["a"].to_pylist(), [1, None, 3])
 
     def test_string_dtype(self) -> None:
         df = self.df({"a": self.pd.array(["x", None, "z"], dtype="string")})
         target = Schema.from_arrow(self.pa.schema([self.pa.field("a", self.pa.string())]))
-        out = any_to_arrow_table(df, CastOptions(target_field=target))
+        out = any_to_arrow_table(df, CastOptions(target=target))
         self.assertEqual(out["a"].to_pylist(), ["x", None, "z"])
 
     def test_bool_column(self) -> None:
@@ -87,7 +87,7 @@ class TestPandasDataFrameToArrow(PandasTestCase, ArrowTestCase):
     def test_float_column(self) -> None:
         df = self.df({"a": [1.5, 2.5, 3.5]})
         target = Schema.from_arrow(self.pa.schema([self.pa.field("a", self.pa.float32())]))
-        out = any_to_arrow_table(df, CastOptions(target_field=target))
+        out = any_to_arrow_table(df, CastOptions(target=target))
         self.assertEqual(out.schema.field("a").type, self.pa.float32())
 
     def test_named_index_is_preserved(self) -> None:
@@ -146,7 +146,7 @@ class TestPandasSeriesToArrow(PandasTestCase, ArrowTestCase):
     def test_series_target_cast(self) -> None:
         s = self.series([1, 2, 3], name="vals")
         target = Schema.from_arrow(self.pa.schema([self.pa.field("vals", self.pa.int16())]))
-        out = any_to_arrow_table(s, CastOptions(target_field=target))
+        out = any_to_arrow_table(s, CastOptions(target=target))
         self.assertEqual(out.schema.field("vals").type, self.pa.int16())
 
     def test_series_with_nulls(self) -> None:

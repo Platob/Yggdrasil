@@ -26,7 +26,7 @@ import pyarrow as pa
 from yggdrasil.io.tabular.execution.expr import Expression
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.statement import PreparedStatement, StatementResult
-from yggdrasil.data.enums import MimeType
+from yggdrasil.data.enums import MimeType, State
 from yggdrasil.io.tabular import Tabular
 
 from .catalog import SqlContext, default_context
@@ -213,6 +213,21 @@ class SqlStatementResult(StatementResult[SqlPreparedStatement]):
     @property
     def failed(self) -> bool:
         return self._failure is not None
+
+    def _compute_state(self) -> State:
+        """Map the local ``_started`` / ``_failure`` flags onto :class:`State`.
+
+        In-process SQL is synchronous — :meth:`start` either returns
+        with ``_started=True`` and a persisted payload, or with
+        ``_failure`` set. There's nothing remote to refresh, so the
+        mapping is purely local-state. Mirrors the Spark statement
+        implementation since the lifecycle shape is the same.
+        """
+        if not self._started:
+            return State.PENDING
+        if self._failure is not None:
+            return State.FAILED
+        return State.SUCCEEDED
 
     def refresh_status(self) -> None:
         """No-op — in-process SQL has no remote state to refresh."""

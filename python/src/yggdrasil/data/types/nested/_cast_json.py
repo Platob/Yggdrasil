@@ -147,7 +147,7 @@ def cast_arrow_json_string_array(
     those we go straight to the Python path, which builds the map
     via ``pa.array(list_of_dicts, type=map_type)``.
     """
-    target_field = options.target_field
+    target_field = options.target
     if target_field is None:
         return array
 
@@ -375,14 +375,14 @@ def cast_polars_json_string_expr(
 ) -> Any:
     pl = get_polars()
 
-    target_field = options.target_field
+    target_field = options.target
     if target_field is None:
         return expr
 
     target_polars_type = target_field.dtype.to_polars()
 
-    src_id = options.source_field.dtype.type_id
-    src_dtype = options.source_field.dtype.to_polars()
+    src_id = options.source.dtype.type_id
+    src_dtype = options.source.dtype.to_polars()
     if src_id == DataTypeId.BINARY or src_id == DataTypeId.BJSON or src_dtype == pl.Binary:
         expr = expr.cast(pl.String)
 
@@ -415,7 +415,7 @@ def cast_polars_json_string_series(
 ) -> Any:
     pl = get_polars()
     expr = cast_polars_json_string_expr(pl.col(series.name), options).alias(
-        options.target_field.name
+        options.target.name
     )
     return pl.DataFrame({series.name: series}).select(expr).to_series()
 
@@ -427,13 +427,13 @@ def cast_spark_json_string_column(
     spark = get_spark_sql()
     F = spark.functions
 
-    target_field = options.target_field
+    target_field = options.target
     if target_field is None:
         return column
 
     target_ddl = target_field.dtype.to_spark_name()
 
-    src_id = options.source_field.dtype.type_id
+    src_id = options.source.dtype.type_id
     if src_id == DataTypeId.BINARY or src_id == DataTypeId.BJSON:
         column = column.cast("string")
 
@@ -494,7 +494,7 @@ def cast_arrow_json_encode_array(
     bytecode — a list comprehension would be the same speed but more
     Python-frame overhead.
     """
-    target_field = options.target_field
+    target_field = options.target
     if target_field is None:
         return array
 
@@ -543,7 +543,7 @@ def cast_polars_json_encode_series(
     """
     pl = get_polars()
 
-    target_field = options.target_field
+    target_field = options.target
     if target_field is None:
         return series
 
@@ -565,7 +565,7 @@ def cast_spark_json_encode_column(
     spark = get_spark_sql()
     F = spark.functions
 
-    target_field = options.target_field
+    target_field = options.target
     if target_field is None:
         return column
 

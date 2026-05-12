@@ -862,8 +862,8 @@ class DeltaIO(FolderIO):
     # ==================================================================
 
     def _infer_partition_columns(self, options: DeltaOptions) -> "List[str]":
-        """Pull partition columns from ``options.target_field`` tags."""
-        target = options.target_field
+        """Pull partition columns from ``options.target`` tags."""
+        target = options.target
         if target is None:
             return []
         names: list[str] = []
