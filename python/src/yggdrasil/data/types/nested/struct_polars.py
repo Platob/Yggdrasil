@@ -67,9 +67,7 @@ def cast_polars_struct_expr(
     fields: list[Any] = []
 
     for target_child in target_type.children_fields:
-        # Single-method name-then-alias lookup — see the arrow
-        # struct cast for rationale.
-        source_child = target_child.select_in_field(source_type, default=None)
+        source_child = source_type.field(target_child.name, raise_error=False)
 
         if source_child is None:
             child_expr = target_child.default_polars_expr(alias=target_child.name)

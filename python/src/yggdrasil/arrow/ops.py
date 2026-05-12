@@ -45,9 +45,8 @@ def _resolve_match_by_keys(
 
     Accepts the historic plain-string list, the new
     :class:`yggdrasil.data.Field` list, or a mix. Field entries
-    contribute :attr:`Field.name`; the alias / position fallbacks
-    are handled by the per-frame ``select_in_*`` consumers, not the
-    raw key-list used by the dedup hash.
+    contribute :attr:`Field.name` — the raw key list used by the
+    dedup hash works on column names directly.
     """
     if not match_by:
         return []
@@ -88,11 +87,9 @@ def upsert_arrow_tabular(
         One or more column references — names (``str``) or
         :class:`yggdrasil.data.Field` instances — present on both
         operands and identifying a row. Field entries contribute
-        their :attr:`Field.name`; per-frame alias / position
-        fallbacks live on the ``select_in_*`` side. Nested key
-        types (``struct`` / ``list`` / ``map`` / union) are
-        supported via a Python-set fallback; flat keys take a
-        vectorized left-anti join.
+        their :attr:`Field.name`. Nested key types (``struct`` /
+        ``list`` / ``map`` / union) are supported via a Python-set
+        fallback; flat keys take a vectorized left-anti join.
     mode
         :attr:`Mode.APPEND` keeps ``left`` for matching keys and only
         appends rows from ``right`` whose keys are not in ``left``. Any
@@ -224,10 +221,9 @@ def upsert_arrow_batches(
         Column references — names (``str``) or
         :class:`yggdrasil.data.Field` instances — present on both
         operands and identifying a row. Field entries contribute
-        their :attr:`Field.name`; alias / position fallbacks live
-        on the ``select_in_*`` side and don't bleed into the dedup
-        hash. Nested key types work transparently — keys are
-        materialized to hashable Python values for set membership.
+        their :attr:`Field.name`. Nested key types work
+        transparently — keys are materialized to hashable Python
+        values for set membership.
         ``None`` / empty degrades to a plain key-less concatenation
         (``left`` first, then ``right``) so callers can wire the
         same dispatch through whether or not they have keys to

@@ -80,10 +80,7 @@ def cast_arrow_struct_array(
     children: list[pa.Array] = []
 
     for target_child in target_type.children_fields:
-        # See the tabular variant for the rationale — single-method
-        # name-then-alias lookup against the source struct's
-        # children.
-        source_child = target_child.select_in_field(source_type, default=None)
+        source_child = source_type.field(target_child.name, raise_error=False)
 
         if source_child is None:
             children.append(
@@ -338,12 +335,7 @@ def cast_arrow_tabular(
     num_rows = data.num_rows
 
     for target_field in target_schema.children_fields:
-        # ``select_in_field`` walks ``source_schema.children_fields``
-        # by name → alias and returns the matching child (or the
-        # ``default`` sentinel on miss). One method, one rule —
-        # mirrors what callers get on the read side via
-        # ``select_in_arrow_tabular``.
-        source_field = target_field.select_in_field(source_schema, default=None)
+        source_field = source_schema.field(target_field.name, raise_error=False)
 
         if source_field is None:
             casted = target_field.default_arrow_array(
