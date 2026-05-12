@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import threading
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, ClassVar, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Tuple
 
 from .config import AwsCredentials
 
@@ -71,7 +71,10 @@ class AwsCredentialsProvider(ABC):
         if getattr(self, "_initialized", False):
             return
         self.key: str = str(key)
-        self._client_cache: "dict[Optional[str], AWSClient]" = {}
+        # Cache key is provider-defined — region for the plain base,
+        # ``(mode, region)`` for the Databricks subclasses that vend
+        # different creds per read/write scope.
+        self._client_cache: "dict[Any, AWSClient]" = {}
         self._client_cache_lock: threading.Lock = threading.Lock()
         self._initialized = True
 

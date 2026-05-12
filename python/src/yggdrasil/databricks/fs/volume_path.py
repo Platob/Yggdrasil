@@ -329,31 +329,22 @@ class VolumePath(DatabricksPath):
             operation=operation,
         )
 
-    def credentials_refresher(
-        self,
-        *,
-        mode: ModeLike = Mode.READ_ONLY,
-    ) -> "AWSDatabricksVolumeCredentials":
+    def credentials_refresher(self) -> "AWSDatabricksVolumeCredentials":
         """Return the process-wide singleton credentials provider for
         this volume.
 
-        Keyed by ``(volume_id, operation)`` — every :class:`VolumePath`
-        instance pointing at the same UC volume and asking for the same
-        op collapses to one provider. That provider caches its
-        :class:`AWSClient` per region, so the boto session,
-        :class:`RefreshableCredentials`, and STS vending are shared
-        across every reader / writer on the volume in this process.
+        Keyed by ``volume_id`` — every :class:`VolumePath` instance
+        pointing at the same UC volume collapses to one provider. The
+        provider handles both read and write modes internally and
+        caches its :class:`AWSClient` per ``(mode, region)``, so the
+        boto session, :class:`RefreshableCredentials`, and STS vending
+        are shared across every reader / writer on the volume in this
+        process.
 
         The bound :class:`DatabricksClient` is updated on each call —
         the latest live handle wins so subsequent refresh cycles use
         the freshest auth context.
         """
-        op = Mode.from_(mode, default=Mode.READ_ONLY)
-        if op is Mode.READ_ONLY:
-            operation = VolumeOperation.READ_VOLUME
-        else:
-            operation = VolumeOperation.WRITE_VOLUME
-
         info = self.volume_info()
         volume_id = getattr(info, "volume_id", None)
         if not volume_id:
@@ -363,7 +354,6 @@ class VolumePath(DatabricksPath):
             )
         return AWSDatabricksVolumeCredentials(
             volume_id=volume_id,
-            operation=operation,
             client=self.client,
         )
 
@@ -389,7 +379,7 @@ class VolumePath(DatabricksPath):
         from env / config / instance metadata. Pass it explicitly when
         the volume sits in a non-default region.
         """
-        return self.credentials_refresher(mode=mode).aws_client(region=region)
+        return self.credentials_refresher().aws_client(mode=mode, region=region)
 
     def arrow_filesystem(
         self,

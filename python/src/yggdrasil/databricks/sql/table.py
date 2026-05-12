@@ -3396,7 +3396,7 @@ class Table(DatabricksResource, Holder):
 
     def aws(
         self,
-        operation: TableOperation = TableOperation.READ,
+        operation: "TableOperation | ModeLike | None" = None,
         *,
         region: Optional[str] = None,
     ) -> "AWSClient":
@@ -3404,28 +3404,32 @@ class Table(DatabricksResource, Holder):
         from Unity Catalog's ``temporary_table_credentials`` API.
 
         Routes through :meth:`credentials_refresher` — every
-        :class:`Table` instance pointing at the same UC table id and
-        asking for the same operation collapses to one provider, and
-        that provider caches its :class:`AWSClient` per region. So the
-        boto session, :class:`RefreshableCredentials`, connection pool,
-        and STS vending are shared across every reader / writer on the
-        table in this process.
-        """
-        return self.credentials_refresher(operation=operation).aws_client(
-            region=region,
-        )
+        :class:`Table` instance pointing at the same UC table id
+        collapses to one provider that handles both read and write
+        modes internally. The provider caches its :class:`AWSClient`
+        per ``(mode, region)`` so the boto session,
+        :class:`RefreshableCredentials`, connection pool, and STS
+        vending are shared across every caller on the same scope.
 
-    def credentials_refresher(
-        self,
-        operation: TableOperation = TableOperation.READ,
-    ) -> "AWSDatabricksTableCredentials":
+        ``operation`` accepts a :class:`TableOperation`, a
+        :class:`Mode` / mode-like string, or ``None`` (defaults to the
+        right operation for this table's type).
+        """
+        op = _resolve_table_operation(operation, self.infos.table_type)
+        mode = Mode.READ_ONLY if op == TableOperation.READ else Mode.OVERWRITE
+        return self.credentials_refresher().aws_client(mode=mode, region=region)
+
+    def credentials_refresher(self) -> "AWSDatabricksTableCredentials":
         """Return the process-wide singleton credentials provider for
-        this table."""
+        this table.
+
+        Keyed by ``table_id``; handles both read and write modes
+        internally via :meth:`AWSDatabricksTableCredentials.get_credentials`.
+        """
         from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
 
         return AWSDatabricksTableCredentials(
             table_id=self.table_id,
-            operation=operation,
             client=self.client,
         )
 

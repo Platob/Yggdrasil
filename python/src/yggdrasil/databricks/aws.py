@@ -5,15 +5,19 @@ Catalog's temporary-credentials APIs:
 
 - :class:`AWSDatabricksVolumeCredentials` — vended through
   ``temporary_volume_credentials.generate_temporary_volume_credentials``,
-  scoped to a volume id + :class:`VolumeOperation`.
+  scoped to a volume id.
 - :class:`AWSDatabricksTableCredentials` — vended through
   ``temporary_table_credentials.generate_temporary_table_credentials``,
-  scoped to a table id + :class:`TableOperation`.
+  scoped to a table id.
 
-Both inherit the provider's process-wide singleton-by-key behavior
-and per-region :class:`AWSClient` cache, so any number of
-:class:`VolumePath` / :class:`Table` instances on the same scope
-share one STS vend, one boto session, and one connection pool.
+Each provider is a process-wide singleton per resource id and
+handles **both read and write modes internally** —
+:meth:`get_credentials(mode=...)` resolves the requested
+:class:`Mode` into the right UC operation and returns the matching
+credentials. The per-region :class:`AWSClient` cache is keyed by
+``(mode, region)`` so reads and writes mint distinct boto sessions
+while still sharing one provider, one bound :class:`DatabricksClient`,
+and the singleton-by-resource_id guarantee.
 
 The bound :class:`DatabricksClient` is mutable: every constructor
 call updates the live binding so refreshes that follow a client
@@ -22,14 +26,17 @@ rotation pick up the fresh workspace auth.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+import dataclasses
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 from yggdrasil.aws.config import AwsCredentials
 from yggdrasil.aws.provider import AwsCredentialsProvider
+from yggdrasil.data.enums import Mode, ModeLike
 
 if TYPE_CHECKING:
     from databricks.sdk.service.catalog import TableOperation, VolumeOperation
 
+    from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.client import DatabricksClient
 
 
@@ -37,15 +44,6 @@ __all__ = [
     "AWSDatabricksVolumeCredentials",
     "AWSDatabricksTableCredentials",
 ]
-
-
-def _op_token(operation: Any) -> str:
-    """Stable wire token for an enum-or-string operation."""
-    return (
-        getattr(operation, "value", None)
-        or getattr(operation, "name", None)
-        or str(operation)
-    )
 
 
 def _iso_or_str(value: Any) -> Optional[str]:
@@ -70,14 +68,32 @@ def _iso_or_str(value: Any) -> Optional[str]:
     return str(value)
 
 
+@dataclasses.dataclass(frozen=True)
+class _ModeBoundRefresher:
+    """Picklable per-mode adapter exposed as a no-arg refresher.
+
+    Botocore's :class:`RefreshableCredentials` re-invokes its refresher
+    with no arguments; the bound mode lets one provider drive both
+    read and write botocore sessions from the same singleton.
+    """
+
+    provider: "_DatabricksCredentialsBase"
+    mode: Mode
+
+    def __call__(self) -> AwsCredentials:
+        return self.provider.get_credentials(self.mode)
+
+
 class _DatabricksCredentialsBase(AwsCredentialsProvider):
     """Common plumbing for the volume / table UC-vended providers.
 
-    Concrete subclasses define :attr:`_RESOURCE_NAME` and
-    :meth:`_generate` (the actual SDK call).
+    Subclasses define :attr:`_RESOURCE_NAME` (used in error messages),
+    :meth:`_operation_for` (Mode → UC operation), and
+    :meth:`_generate` (the SDK call).
     """
 
-    _RESOURCE_NAME: str = ""
+    _RESOURCE_NAME: ClassVar[str] = ""
+    DEFAULT_MODE: ClassVar[Mode] = Mode.READ_ONLY
 
     def __init__(
         self,
@@ -86,14 +102,16 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
         client: Any = None,
     ) -> None:
         # ``AwsCredentialsProvider.__init__`` is idempotent — re-entry
-        # only updates the bound client so refreshes after a client
-        # rotation pick up the new workspace auth.
+        # just rebinds the live client so refreshes after a workspace
+        # rotation pick up the new auth context.
         if getattr(self, "_initialized", False):
             if client is not None:
                 self._client = client
             return
         super().__init__(key)
         self._client: Any = client
+        # Cache key is the *resolved* mode + region.
+        self._client_cache: "dict[tuple[Mode, Optional[str]], AWSClient]" = {}
 
     @property
     def client(self) -> "DatabricksClient":
@@ -114,12 +132,21 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
         self._client = client
         return self
 
-    # Refresh-time storage location returned by the SDK is irrelevant
-    # for the credential refresh, but subclasses surface it via the
-    # raw SDK response.
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-    def get_credentials(self) -> AwsCredentials:
-        resp = self._generate()
+    def get_credentials(self, mode: ModeLike = None) -> AwsCredentials:
+        """Return fresh credentials scoped to *mode*.
+
+        ``mode`` accepts a :class:`Mode` enum, a mode-like string
+        (``"read"``, ``"overwrite"``, …), or ``None`` (uses
+        :attr:`DEFAULT_MODE`). Read-only modes vend the UC "read"
+        operation; everything else vends the writable operation.
+        """
+        resolved = Mode.from_(mode, default=self.DEFAULT_MODE)
+        operation = self._operation_for(resolved)
+        resp = self._generate(operation)
         aws = getattr(resp, "aws_temp_credentials", None)
         if aws is None:
             raise RuntimeError(
@@ -136,16 +163,65 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
             expiration=_iso_or_str(getattr(resp, "expiration_time", None)),
         )
 
-    def _generate(self) -> Any:
+    def __call__(self) -> AwsCredentials:
+        return self.get_credentials()
+
+    # ------------------------------------------------------------------
+    # AWSClient binding — one per (mode, region)
+    # ------------------------------------------------------------------
+
+    def aws_client(
+        self,
+        *,
+        mode: ModeLike = None,
+        region: Optional[str] = None,
+    ) -> "AWSClient":
+        """Return the cached :class:`AWSClient` for this provider /
+        mode / region.
+
+        First call per ``(mode, region)`` seeds a botocore
+        :class:`RefreshableCredentials`-backed session whose refresher
+        is bound to *mode*; subsequent calls with the same key return
+        the same client and reuse the connection pool, boto-client
+        cache, and in-flight refresh state.
+        """
+        resolved = Mode.from_(mode, default=self.DEFAULT_MODE)
+        cache_key = (resolved, region)
+        with self._client_cache_lock:
+            existing = self._client_cache.get(cache_key)
+            if existing is not None:
+                return existing
+            from yggdrasil.aws.config import AWSConfig
+            refresher = _ModeBoundRefresher(provider=self, mode=resolved)
+            # Discriminator so the AWSClient singleton cache mints a
+            # distinct session per (provider, resource, mode) — without
+            # it, read and write configs would collapse to one client
+            # (refresher itself is excluded from equality).
+            refresher_key = f"{type(self).__name__}:{self.key}:{resolved.name}"
+            client = AWSConfig.from_refresher(
+                refresher, region=region, refresher_key=refresher_key,
+            ).to_client()
+            self._client_cache[cache_key] = client
+            return client
+
+    # ------------------------------------------------------------------
+    # Subclass contract
+    # ------------------------------------------------------------------
+
+    def _operation_for(self, mode: Mode) -> Any:
+        raise NotImplementedError
+
+    def _generate(self, operation: Any) -> Any:
         raise NotImplementedError
 
 
 class AWSDatabricksVolumeCredentials(_DatabricksCredentialsBase):
     """Refreshable AWS creds for a Unity Catalog volume.
 
-    Singleton-cached per ``(volume_id, operation)``. Subsequent
-    constructions return the same instance and just re-bind the
-    :class:`DatabricksClient` if one is passed.
+    Singleton-cached per ``volume_id``. One provider serves both
+    read (``READ_VOLUME``) and write (``WRITE_VOLUME``) modes — the
+    requested mode is resolved at :meth:`get_credentials` / :meth:`aws_client`
+    time.
     """
 
     _RESOURCE_NAME = "volume_id"
@@ -153,17 +229,14 @@ class AWSDatabricksVolumeCredentials(_DatabricksCredentialsBase):
     def __new__(
         cls,
         volume_id: str,
-        operation: "VolumeOperation",
         *,
         client: Any = None,
     ) -> "AWSDatabricksVolumeCredentials":
-        key = f"{volume_id}:{_op_token(operation)}"
-        return super().__new__(cls, key)
+        return super().__new__(cls, str(volume_id))
 
     def __init__(
         self,
         volume_id: str,
-        operation: "VolumeOperation",
         *,
         client: Any = None,
     ) -> None:
@@ -171,35 +244,36 @@ class AWSDatabricksVolumeCredentials(_DatabricksCredentialsBase):
             if client is not None:
                 self._client = client
             return
-        key = f"{volume_id}:{_op_token(operation)}"
-        super().__init__(key, client=client)
+        super().__init__(str(volume_id), client=client)
         self.volume_id: str = str(volume_id)
-        self.operation: Any = operation
 
     def __getnewargs__(self):
-        return (self.volume_id, self.operation)
+        return (self.volume_id,)
 
     def __getstate__(self):
-        return {"volume_id": self.volume_id, "operation": self.operation}
+        return {"volume_id": self.volume_id}
 
     def __setstate__(self, state):
         if getattr(self, "_initialized", False):
             return
-        # Re-derive the key from the identity fields so the parent
-        # class' internal slot stays consistent with the singleton key.
         volume_id = state["volume_id"]
-        operation = state["operation"]
-        super().__setstate__({"key": f"{volume_id}:{_op_token(operation)}"})
+        super().__setstate__({"key": str(volume_id)})
         self.volume_id = str(volume_id)
-        self.operation = operation
         self._client = None
+        self._client_cache = {}
 
-    def _generate(self) -> Any:
+    def _operation_for(self, mode: Mode) -> "VolumeOperation":
+        from databricks.sdk.service.catalog import VolumeOperation
+        if mode is Mode.READ_ONLY:
+            return VolumeOperation.READ_VOLUME
+        return VolumeOperation.WRITE_VOLUME
+
+    def _generate(self, operation: "VolumeOperation") -> Any:
         return (
             self.workspace.temporary_volume_credentials
             .generate_temporary_volume_credentials(
                 volume_id=self.volume_id,
-                operation=self.operation,
+                operation=operation,
             )
         )
 
@@ -207,7 +281,10 @@ class AWSDatabricksVolumeCredentials(_DatabricksCredentialsBase):
 class AWSDatabricksTableCredentials(_DatabricksCredentialsBase):
     """Refreshable AWS creds for a Unity Catalog table.
 
-    Singleton-cached per ``(table_id, operation)``.
+    Singleton-cached per ``table_id``. One provider serves both
+    read (``READ``) and write (``READ_WRITE``) modes — the requested
+    mode is resolved at :meth:`get_credentials` / :meth:`aws_client`
+    time.
     """
 
     _RESOURCE_NAME = "table_id"
@@ -215,17 +292,14 @@ class AWSDatabricksTableCredentials(_DatabricksCredentialsBase):
     def __new__(
         cls,
         table_id: str,
-        operation: "TableOperation",
         *,
         client: Any = None,
     ) -> "AWSDatabricksTableCredentials":
-        key = f"{table_id}:{_op_token(operation)}"
-        return super().__new__(cls, key)
+        return super().__new__(cls, str(table_id))
 
     def __init__(
         self,
         table_id: str,
-        operation: "TableOperation",
         *,
         client: Any = None,
     ) -> None:
@@ -233,32 +307,35 @@ class AWSDatabricksTableCredentials(_DatabricksCredentialsBase):
             if client is not None:
                 self._client = client
             return
-        key = f"{table_id}:{_op_token(operation)}"
-        super().__init__(key, client=client)
+        super().__init__(str(table_id), client=client)
         self.table_id: str = str(table_id)
-        self.operation: Any = operation
 
     def __getnewargs__(self):
-        return (self.table_id, self.operation)
+        return (self.table_id,)
 
     def __getstate__(self):
-        return {"table_id": self.table_id, "operation": self.operation}
+        return {"table_id": self.table_id}
 
     def __setstate__(self, state):
         if getattr(self, "_initialized", False):
             return
         table_id = state["table_id"]
-        operation = state["operation"]
-        super().__setstate__({"key": f"{table_id}:{_op_token(operation)}"})
+        super().__setstate__({"key": str(table_id)})
         self.table_id = str(table_id)
-        self.operation = operation
         self._client = None
+        self._client_cache = {}
 
-    def _generate(self) -> Any:
+    def _operation_for(self, mode: Mode) -> "TableOperation":
+        from databricks.sdk.service.catalog import TableOperation
+        if mode is Mode.READ_ONLY:
+            return TableOperation.READ
+        return TableOperation.READ_WRITE
+
+    def _generate(self, operation: "TableOperation") -> Any:
         return (
             self.workspace.temporary_table_credentials
             .generate_temporary_table_credentials(
                 table_id=self.table_id,
-                operation=self.operation,
+                operation=operation,
             )
         )
