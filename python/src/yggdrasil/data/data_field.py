@@ -628,6 +628,22 @@ class Field(BaseMetadata, BaseChildrenFields):
             if isinstance(child, Field) and child.parent is not self:
                 object.__setattr__(child, "parent", self)
 
+    def invalidate_cache(self, *, cascade: bool = True) -> None:
+        """Drop cached engine projections, cascading to ancestors by default.
+
+        Public surface over :meth:`_invalidate_cache`. Callers that
+        mutate the underlying state outside of the ``with_*`` mutators
+        (custom DataType subclass that swaps children in place,
+        external code that pokes ``dtype.fields`` directly) should call
+        this once to make sure the next ``to_arrow_field`` /
+        ``to_polars_field`` / ``to_pyspark_field`` / ``*_schema``
+        request rebuilds with the new state. With ``cascade=True``
+        (the default) every ancestor reachable via :attr:`parent`
+        also drops its cache, so a struct's cached arrow schema gets
+        rebuilt after one of its children mutates.
+        """
+        self._invalidate_cache(cascade=cascade)
+
     def _invalidate_cache(self, *, cascade: bool = True) -> None:
         """Drop cached arrow / polars / spark projections.
 

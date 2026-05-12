@@ -213,6 +213,153 @@ _FLOAT_TYPE_ID_TO_SIZE: dict[DataTypeId, int] = {
 }
 
 
+# ---------------------------------------------------------------------
+# Arrow view <-> flat compatibility.
+#
+# pyarrow ≥ 17 exposes the ``*_view`` layout variants (``string_view``,
+# ``binary_view``, ``list_view``, ``large_list_view``) — they carry the
+# same logical values as their flat counterparts but with a different
+# in-memory representation (per-cell offset+length tuples that can
+# reference shared variadic buffers). At the cast layer they're
+# interchangeable: feeding a ``string_view`` array to a consumer that
+# asked for ``string`` produces the same logical values, and forcing
+# ``pc.cast`` would copy every cell into a fresh flat buffer for no
+# semantic gain. The bypass treats each pair as compatible so the view
+# layout survives the cast.
+_VIEW_FLAT_PAIRS_PROBES: tuple[tuple[str, str], ...] = (
+    ("string_view", "string"),
+    ("binary_view", "binary"),
+    ("list_view", "list"),
+    ("large_list_view", "large_list"),
+)
+
+
+def _types_mod():
+    types_mod = getattr(pa, "types", None)
+    if types_mod is None:  # pragma: no cover — pyarrow ≥ 5 always has it
+        return None
+    return types_mod
+
+
+def _is_view_flat_pair(a: pa.DataType, b: pa.DataType) -> bool:
+    """``True`` when *a* and *b* are the view/flat variants of the same logical type.
+
+    Probes ``pa.types.is_<probe>`` for both directions. Older pyarrow
+    builds that lack a particular ``is_*`` helper degrade gracefully —
+    the pair is reported as not-compatible and the regular cast runs.
+    For list-shaped pairs the element types must also match recursively,
+    otherwise we'd let a ``list_view<int32>`` pass for a ``list<int64>``.
+    """
+    types = _types_mod()
+    if types is None:
+        return False
+    for view_name, flat_name in _VIEW_FLAT_PAIRS_PROBES:
+        is_view = getattr(types, f"is_{view_name}", None)
+        is_flat = getattr(types, f"is_{flat_name}", None)
+        if is_view is None or is_flat is None:
+            continue
+        try:
+            view_first = is_view(a) and is_flat(b)
+            flat_first = is_flat(a) and is_view(b)
+        except Exception:
+            continue
+        if not (view_first or flat_first):
+            continue
+        # Scalar view variants (``string_view`` / ``binary_view``) have
+        # no element type, so the kind match is the whole story. List
+        # variants carry one child each; require the child types match
+        # before declaring the pair interchangeable.
+        if view_name in {"list_view", "large_list_view"}:
+            a_value = getattr(a, "value_type", None)
+            b_value = getattr(b, "value_type", None)
+            if a_value is None or b_value is None:
+                return False
+            return _arrow_types_compatible(a_value, b_value)
+        return True
+    return False
+
+
+def _arrow_types_compatible(source_type: pa.DataType, target_type: pa.DataType) -> bool:
+    """Bypass-equality check for two pyarrow types.
+
+    Returns ``True`` when feeding an array of *source_type* to a
+    consumer that asked for *target_type* would produce the same
+    logical values without any per-cell work. Used by the cast bypass
+    to skip a ``pc.cast`` rebuild that would otherwise just copy
+    buffers around.
+
+    Currently covers:
+
+    * Exact ``pa.DataType.equals`` match — the common case.
+    * View / flat layout pairs (``string_view`` ↔ ``string``,
+      ``binary_view`` ↔ ``binary``, ``list_view<T>`` ↔ ``list<T>``,
+      ``large_list_view<T>`` ↔ ``large_list<T>``).
+
+    Returns ``False`` for everything else; the caller falls through to
+    the regular cast.
+    """
+    if source_type is target_type:
+        return True
+    if source_type.equals(target_type):
+        return True
+    return _is_view_flat_pair(source_type, target_type)
+
+
+#: Per-class singleton cache for default-arg construction. Lives at
+#: module scope (rather than as a ClassVar on :class:`DataType`) so
+#: ``DataType.__new__`` and overriding subclass ``__new__`` methods can
+#: both reach it without going through the descriptor machinery during
+#: ``__new__`` (descriptor protocol there has bitten subclasses before).
+_DATA_TYPE_DEFAULT_SINGLETONS: dict[type, "DataType"] = {}
+
+
+def _default_singleton(cls: type) -> "DataType":
+    """Return the cached default-arg instance of ``cls``, building it on miss.
+
+    Used by :meth:`DataType.__new__` and engine-leaf overrides
+    (``IntegerType.__new__``, ``FloatingPointType.__new__``) so leaves
+    like :class:`Int64Type` or :class:`StringType` resolve to a single
+    process-wide instance — lets the lazy ``to_arrow`` / ``to_polars`` /
+    ``to_spark`` caches share state across every caller and skips a
+    fresh dataclass allocation on the hot path.
+    """
+    existing = _DATA_TYPE_DEFAULT_SINGLETONS.get(cls)
+    if existing is not None:
+        return existing
+    inst = object.__new__(cls)
+    _DATA_TYPE_DEFAULT_SINGLETONS[cls] = inst
+    return inst
+
+
+def _cached_engine_method(method):
+    """Wrap a ``to_arrow`` / ``to_polars`` / ``to_spark`` impl with caching.
+
+    Stores the per-instance result on a private attribute keyed by the
+    method name so repeated calls (the cast hot path hits these
+    constantly) skip the rebuild. The attribute is set via
+    :func:`object.__setattr__` so the cache works on frozen dataclasses.
+
+    Pickling / copy semantics: the cache attribute isn't a dataclass
+    field, so dataclass ``__reduce__`` ignores it on the way out and a
+    restored instance has a fresh empty cache — correct behavior.
+    """
+    cache_attr = f"_{method.__name__}_cached"
+
+    def wrapper(self):
+        cached = getattr(self, cache_attr, None)
+        if cached is not None:
+            return cached
+        cached = method(self)
+        object.__setattr__(self, cache_attr, cached)
+        return cached
+
+    wrapper.__name__ = method.__name__
+    wrapper.__qualname__ = method.__qualname__
+    wrapper.__doc__ = method.__doc__
+    wrapper.__wrapped__ = method
+    return wrapper
+
+
 @dataclass(frozen=True, repr=False)
 class DataType(BaseChildrenFields, ABC):
     _singleton_instance: ClassVar["DataType | None"] = None
@@ -220,6 +367,27 @@ class DataType(BaseChildrenFields, ABC):
     # ==================================================================
     # Dunder / identity
     # ==================================================================
+
+    def __new__(cls, *args, **kwargs):
+        """Per-class singleton on default-arg construction.
+
+        ``Int64Type()``, ``StringType()``, ``BooleanType()`` and the
+        other final primitives have no init-time variation — every
+        call produces an instance with the same field values. Caching
+        a single instance per concrete class lets the lazy
+        ``to_arrow`` / ``to_polars`` / ``to_spark`` caches share state
+        across every caller and saves a fresh dataclass allocation on
+        the hot cast path. Non-default construction falls through to a
+        regular allocation since per-instance state varies.
+
+        Subclasses with a custom ``__new__`` (e.g. ``IntegerType`` that
+        redirects to a specialized fixed-width subclass) should route
+        through :func:`_default_singleton` for the leaf they're
+        landing on so the singleton fast path still fires.
+        """
+        if not args and not kwargs:
+            return _default_singleton(cls)
+        return object.__new__(cls)
 
     def __str__(self):
         return self.pretty_format()
@@ -242,6 +410,23 @@ class DataType(BaseChildrenFields, ABC):
                     DATA_TYPE_CLASSES[type_id.value] = cls
             except TypeError:
                 pass
+
+        # Lazy-cache the engine projections on every subclass that
+        # implements its own ``to_arrow`` / ``to_polars`` / ``to_spark``.
+        # Skips abstract methods (raise on call) and methods already
+        # wrapped on a parent class (subclasses that just inherit pick
+        # up the wrapped parent method as-is).
+        for name in ("to_arrow", "to_polars", "to_spark"):
+            method = cls.__dict__.get(name)
+            if method is None or not callable(method):
+                continue
+            if getattr(method, "__isabstractmethod__", False):
+                continue
+            if getattr(method, "__wrapped__", None) is not None:
+                # Already wrapped by an earlier definition (subclass
+                # re-overrode with the wrapped version of the parent).
+                continue
+            setattr(cls, name, _cached_engine_method(method))
 
     def equals(
         self,
@@ -1461,9 +1646,21 @@ class DataType(BaseChildrenFields, ABC):
         array: pa.Array,
         options: "CastOptions",
     ) -> pa.Array:
+        target_type = self.to_arrow()
+        # Engine-level fast bypass. Field/DataType can carry semantic
+        # detail (currency tag, unit / extension metadata, subclass intent)
+        # that lowers to the same pa.DataType — so Field-level
+        # ``need_cast`` may flag a difference even when the underlying
+        # engine types match. When they do, ``pc.cast`` would be a
+        # no-op rebuild; skip it. The compatibility check also keeps
+        # ``string_view`` / ``binary_view`` sources unmaterialized when
+        # the target is the flat ``string`` / ``binary`` counterpart —
+        # the view layout already carries the same logical values, and
+        # forcing the cast would copy every cell into a fresh offsets
+        # buffer for no semantic gain.
+        if _arrow_types_compatible(array.type, target_type):
+            return array
         if options.need_cast(array, self):
-            target_type = self.to_arrow()
-
             try:
                 casted = pc.cast(
                     array,
@@ -1495,6 +1692,11 @@ class DataType(BaseChildrenFields, ABC):
         array: pa.ChunkedArray,
         options: "CastOptions",
     ) -> pa.ChunkedArray:
+        # Engine-level fast bypass — see :meth:`_cast_arrow_array` for
+        # rationale. ``ChunkedArray.type`` is uniform across chunks, so
+        # a single comparison covers the whole stream.
+        if _arrow_types_compatible(array.type, self.to_arrow()):
+            return array
         if options.need_cast(array, self):
             chunks = [self._cast_arrow_array(chunk, options) for chunk in array.chunks]
             # Identity short-circuit: if every per-chunk cast returned
@@ -1584,6 +1786,13 @@ class DataType(BaseChildrenFields, ABC):
         series: "polars.Series",
         options: "CastOptions",
     ):
+        # Engine-level fast bypass — Field/DataType differences may not
+        # surface at the polars level (e.g. metadata-only divergence,
+        # subclass dtype that lowers to the same ``pl.DataType``). When
+        # the engine dtypes already match, ``series.cast`` is identity
+        # work; skip it.
+        if series.dtype == self.to_polars():
+            return series
         if options.need_cast(series, self):
             try:
                 casted = series.cast(dtype=self.to_polars(), strict=options.safe)

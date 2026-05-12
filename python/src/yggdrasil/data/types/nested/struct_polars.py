@@ -207,6 +207,19 @@ def cast_polars_tabular(
     source_schema = options.source_schema
     target_schema = options.merged_schema
 
+    # Engine-level fast bypass — when the source polars schema already
+    # equals the target engine schema, the per-column rebuild produces
+    # the same frame back. Field-level ``need_cast`` may flag a
+    # difference for metadata / subclass dtypes that don't surface in
+    # ``pl.DataFrame.schema``; this short-circuits those cases. Lazy
+    # frames go through ``collect_schema`` so we don't materialize.
+    target_pl_schema = target_schema.to_polars_schema()
+    source_pl_schema = (
+        data.collect_schema() if isinstance(data, pl.LazyFrame) else data.schema
+    )
+    if source_pl_schema == target_pl_schema:
+        return data
+
     exprs: list[Any] = []
 
     for i, target_field in enumerate(target_schema.children_fields):

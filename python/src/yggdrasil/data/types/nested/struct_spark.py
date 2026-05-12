@@ -176,6 +176,15 @@ def cast_spark_tabular(
     source_schema = options.source_schema
     target_schema = options.merged_schema
 
+    # Engine-level fast bypass — Field/DataType detail (semantic
+    # subclass, metadata) doesn't surface in the underlying Spark
+    # ``StructType``. When the source frame's Spark schema already
+    # equals the target engine schema, ``DataFrame.select`` would just
+    # rebuild the plan with the same columns; skip it.
+    target_spark_schema = target_schema.to_spark_schema()
+    if data.schema == target_spark_schema:
+        return data
+
     cols: list[Any] = []
 
     for i, target_field in enumerate(target_schema.children_fields):

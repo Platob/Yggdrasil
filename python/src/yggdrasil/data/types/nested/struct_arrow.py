@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Iterator, Iterable
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from yggdrasil.data.types.base import _arrow_types_compatible
 from yggdrasil.data.types.id import DataTypeId
 
 if TYPE_CHECKING:
@@ -309,6 +310,30 @@ def cast_arrow_tabular(
     source_schema = options.source_schema
     target_schema = options.merged_schema
 
+    # Engine-level fast bypass — yggdrasil Field/DataType can encode
+    # detail (semantic subclass, extension metadata) that the
+    # underlying ``pa.Schema`` does not carry. When the source pyarrow
+    # schema already equals the target engine schema, rebuilding the
+    # table is pure metadata churn; skip it. The per-field probe also
+    # treats view/flat layout pairs as compatible so a ``string_view``
+    # column survives a cast to a ``string`` target without being
+    # materialized into a fresh flat buffer.
+    target_arrow_schema = target_schema.to_arrow_schema()
+    if data.schema.equals(target_arrow_schema, check_metadata=False):
+        return data
+    if (
+        len(data.schema) == len(target_arrow_schema)
+        and all(
+            data.schema.field(i).name == target_arrow_schema.field(i).name
+            and data.schema.field(i).nullable == target_arrow_schema.field(i).nullable
+            and _arrow_types_compatible(
+                data.schema.field(i).type, target_arrow_schema.field(i).type,
+            )
+            for i in range(len(data.schema))
+        )
+    ):
+        return data
+
     target_arrays: list[pa.Array] = []
     num_rows = data.num_rows
 
@@ -339,8 +364,6 @@ def cast_arrow_tabular(
             )
 
         target_arrays.append(casted)
-
-    target_arrow_schema = target_schema.to_arrow_schema()
 
     if isinstance(data, pa.Table):
         return pa.Table.from_arrays(target_arrays, schema=target_arrow_schema)
