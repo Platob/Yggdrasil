@@ -1019,15 +1019,19 @@ class Tabular(ABC, Generic[O]):
     def _write_arrow_table(self, table: pa.Table, options: O) -> None:
         casted = options.cast_arrow_tabular(table)
 
-        self._write_arrow_batches(
-            casted.to_batches(),
-            options.copy(
-                target=None,
-                sync_metadata=False,
-                row_size=None,
-                byte_size=None,
-            ),
+        # Keep target_field set: downstream writers (delta partition
+        # inference, schema-driven SQL DDL, …) read tags off it. Bind
+        # source_field to the merged target so the per-batch
+        # ``cast_arrow_tabular`` collapses to its bypass instead of
+        # re-running the cast on data we've already shaped.
+        merged = options.merged_field
+        inner = options.copy(
+            source=merged if merged is not None else ...,
+            sync_metadata=False,
+            row_size=None,
+            byte_size=None,
         )
+        self._write_arrow_batches(casted.to_batches(), inner)
 
         if options.sync_metadata:
             self._commit_metadata()
@@ -1079,7 +1083,13 @@ class Tabular(ABC, Generic[O]):
         if frame.height == 0:
             return
 
-        self._write_arrow_table(casted.to_arrow(compat_level=pl.CompatLevel.newest()), options)
+        # ``CompatLevel.newest()`` emits ``string_view`` / ``binary_view`` —
+        # great for in-memory pyarrow.compute, but the pyarrow parquet
+        # writer (and several downstream tabular paths) still raise
+        # ``Slicing not implemented for StringView`` when fed view
+        # buffers. ``oldest()`` keeps the legacy flat ``string`` /
+        # ``binary`` shape that every reader/writer handles.
+        self._write_arrow_table(casted.to_arrow(compat_level=pl.CompatLevel.oldest()), options)
 
         if options.sync_metadata:
             self._commit_metadata()
