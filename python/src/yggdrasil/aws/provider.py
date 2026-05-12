@@ -31,6 +31,8 @@ import threading
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, ClassVar, Optional, Tuple
 
+from yggdrasil.data.enums import Mode
+
 from .config import AwsCredentials
 
 if TYPE_CHECKING:
@@ -83,14 +85,20 @@ class AwsCredentialsProvider(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    def get_credentials(self) -> AwsCredentials:
+    def get_credentials(self, mode: Mode | None = None) -> AwsCredentials:
         """Return a fresh :class:`AwsCredentials`. Called by botocore
-        ~5 min before token expiry."""
+        ~5 min before token expiry.
 
-    def __call__(self) -> AwsCredentials:
+        Subclasses that vend different credentials per read/write scope
+        (e.g. the Databricks UC providers) use *mode* to pick the
+        backing UC operation; providers that don't care about scope
+        ignore it. ``None`` means "the subclass's default mode".
+        """
+
+    def __call__(self, mode: Mode | None = None) -> AwsCredentials:
         """Delegate to :meth:`get_credentials` so the provider doubles
         as an :attr:`AWSConfig.refresher`."""
-        return self.get_credentials()
+        return self.get_credentials(mode)
 
     # ------------------------------------------------------------------
     # AWSClient binding — one client per (provider, region)
