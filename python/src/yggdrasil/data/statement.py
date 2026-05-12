@@ -678,13 +678,6 @@ class StatementResult(Tabular, Generic[PS]):
         if cfg is None:
             raise RuntimeError(f"Statement {self.key!r} is not retryable.")
 
-        # Make sure we have an up-to-date terminal verdict before deciding.
-        if not self.done:
-            self.refresh_status()
-
-        if self.done and not self.failed:
-            return self
-
         total_tries = max(1, cfg.total_try_count)
         loop_started = time.time()
 
@@ -763,22 +756,13 @@ class StatementResult(Tabular, Generic[PS]):
         iteration = 0
         start = time.time()
 
-        self.refresh_status()
         while not self.done:
             wait_cfg.sleep(iteration=iteration, start=start)
             iteration += 1
-            self.refresh_status()
 
         if raise_error:
             self.raise_for_status()
 
-        # Successful terminal — drop any per-statement scratch (staged
-        # volumes, temp views) now that we don't need them. Failed
-        # results keep their scratch so a follow-up :meth:`retry` (or
-        # :meth:`StatementBatch.retry` after auto-promote) can re-run
-        # the statement against the same staged source; cleanup falls
-        # to :meth:`raise_for_status` (terminal failure) or to the end
-        # of the retry loop.
         if not self.failed:
             try:
                 self.statement.clear_temporary_resources()

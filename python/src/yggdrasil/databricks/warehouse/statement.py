@@ -1067,7 +1067,7 @@ class WarehouseStatementResult(StatementResult):
             # and friends would otherwise fall back to ``Schema.empty()``
             # because the caller's ``CastOptions`` doesn't have the
             # target schema bound.
-            schema_for_empty = options.merged_schema or self._collect_schema(options)
+            schema_for_empty = options.with_target(self._collect_schema(options)).merged_schema
             yield from _empty_arrow_batches(schema_for_empty.to_arrow_schema())
 
     def _write_arrow_batches(self, batches: Iterable[pa.RecordBatch], options: CastOptions) -> None:
