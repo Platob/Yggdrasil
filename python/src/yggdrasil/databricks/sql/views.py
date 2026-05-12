@@ -25,7 +25,6 @@ Cache entries can be invalidated per-view via
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import Iterable, Iterator, Optional, TYPE_CHECKING
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
@@ -61,7 +60,6 @@ def _is_view_info(info: TableInfo) -> bool:
     return info.table_type in _VIEW_TABLE_TYPES
 
 
-@dataclass
 class Views(DatabricksService):
     """Collection-level service for Unity Catalog views.
 
@@ -74,9 +72,17 @@ class Views(DatabricksService):
             ...
     """
 
-    catalog_name: str | None = None
-    schema_name: str | None = None
-    view_name: str | None = None
+    def __init__(
+        self,
+        client=None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        view_name: str | None = None,
+    ):
+        super().__init__(client=client)
+        self.catalog_name = catalog_name
+        self.schema_name = schema_name
+        self.view_name = view_name
 
     # ── context rebind ────────────────────────────────────────────────────────
 

@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
 from typing import Iterator, Optional, Union
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
@@ -51,7 +50,6 @@ logger = logging.getLogger(__name__)
 _SCHEMA_INFO_CACHE: ExpiringDict[str, SchemaInfo] = ExpiringDict(default_ttl=300.0)
 
 
-@dataclass
 class Schemas(DatabricksService):
     """Collection-level service for Unity Catalog schemas.
 
@@ -76,8 +74,15 @@ class Schemas(DatabricksService):
                 ...
     """
 
-    catalog_name: str | None = None
-    schema_name: str | None = None
+    def __init__(
+        self,
+        client=None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+    ):
+        super().__init__(client=client)
+        self.catalog_name = catalog_name
+        self.schema_name = schema_name
 
     # ── context rebind ────────────────────────────────────────────────────────
 

@@ -25,7 +25,6 @@ Notes
 
 from __future__ import annotations
 
-import dataclasses
 import inspect
 import logging
 import re
@@ -149,18 +148,6 @@ class Cluster(DatabricksResource):
     -----
     ``Cluster`` caches ``ClusterDetails`` and refreshes them lazily.
     """
-
-    service: Clusters = dataclasses.field(
-        default_factory=Clusters.current,
-        repr=False,
-        compare=False,
-    )
-    cluster_id: str | None = None
-    cluster_name: str | None = None
-
-    _details: Optional[ClusterDetails] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
-    _details_refresh_time: float = dataclasses.field(default=0.0, repr=False, hash=False, compare=False)
-    _contexts: dict[str, ExecutionContext] = dataclasses.field(default_factory=dict, repr=False, hash=False, compare=False)
 
     def __init__(
         self,

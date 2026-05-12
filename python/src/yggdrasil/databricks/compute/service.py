@@ -1,7 +1,6 @@
 import inspect
 import logging
 import re
-from dataclasses import dataclass
 from typing import Optional, MutableMapping, Sequence, Union, Any, TYPE_CHECKING, Iterator
 
 from databricks.sdk.errors import ResourceDoesNotExist, PermissionDenied
@@ -17,6 +16,7 @@ from ...environ.pip_settings import PipIndexSettings
 
 if TYPE_CHECKING:
     from .cluster import Cluster
+    from .instance_pool import InstancePools
 
 __all__ = [
     "Compute",
@@ -100,7 +100,6 @@ def _py_filter_tuple(python_version: Union[str, tuple[int, ...]]) -> tuple[int, 
     return int(python_version[0]), int(python_version[1])
 
 
-@dataclass
 class Compute(DatabricksService):
 
     @property
@@ -112,8 +111,18 @@ class Compute(DatabricksService):
             use_cache=True
         )
 
+    @property
+    def instance_pools(self) -> "InstancePools":
+        from .instance_pool import InstancePools
 
-@dataclass
+        return self.client.lazy_property(
+            self,
+            cache_attr="_instance_pools",
+            factory=lambda: InstancePools(client=self.client),
+            use_cache=True,
+        )
+
+
 class Clusters(DatabricksService):
 
     # ------------------------------------------------------------------ #
@@ -137,7 +146,10 @@ class Clusters(DatabricksService):
             if key:
                 key = key.strip()
 
-            name = key or "All Purpose"
+            # Default to a per-user name (e.g. ``"All Purpose-alice"``) so
+            # multiple developers in the same workspace don't fight over a
+            # single ``"All Purpose"`` cluster.
+            name = key or self.client.user_scoped_name("All Purpose")
 
         existing = NAMED_CLUSTERS.get(name, None)
 
@@ -296,7 +308,8 @@ class Clusters(DatabricksService):
                 new_details.data_security_mode = DataSecurityMode.DATA_SECURITY_MODE_DEDICATED
 
         if not new_details.node_type_id:
-            new_details.node_type_id = "rd-fleet.xlarge"
+            from yggdrasil.data.enums import NodeType
+            new_details.node_type_id = NodeType.DEFAULT.value
 
         if (
             getattr(new_details, "virtual_cluster_size", None) is None

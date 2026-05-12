@@ -28,7 +28,6 @@ A module-level :class:`ExpiringDict` (``_CATALOG_INFO_CACHE``) keyed by
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import Iterator, Optional, Union
 
 from databricks.sdk.service.catalog import CatalogInfo
@@ -50,7 +49,6 @@ logger = logging.getLogger(__name__)
 _CATALOG_INFO_CACHE: ExpiringDict[str, CatalogInfo] = ExpiringDict(default_ttl=300.0)
 
 
-@dataclass
 class Catalogs(DatabricksService):
     """Collection-level service for Unity Catalog catalogs and schemas.
 

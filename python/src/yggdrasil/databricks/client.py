@@ -782,18 +782,27 @@ class DatabricksClient(URLBased):
     def default_tags(self, update: bool = True):
         """Return default resource tags for Databricks assets.
 
+        On create (``update=False``) the tag set is enriched with
+        environment-derived owner metadata pulled from
+        :class:`~yggdrasil.environ.UserInfo`:
+
+        - ``Product`` / ``ProductVersion`` from the client config.
+        - ``Owner`` — UserInfo email when available.
+        - ``Hostname`` — local hostname so per-user pools / clusters are
+          distinguishable in shared workspaces.
+        - ``User`` — ``whoami`` key, useful when no email is reachable.
+
+        ``custom_tags`` on the client always wins over these defaults.
+
         Returns:
             A dict of default tags.
         """
         if update:
-            base = dict()
+            base: dict[str, str] = dict()
         else:
             base = {
                 k: self.safe_tag_value(v)
-                for k, v in (
-                    ("Product", self.product),
-                    ("ProductVersion", self.product_version),
-                )
+                for k, v in self._owner_tag_pairs()
                 if v
             }
 
@@ -801,6 +810,79 @@ class DatabricksClient(URLBased):
             base.update(self.custom_tags)
 
         return base
+
+    def _owner_tag_pairs(self) -> list[tuple[str, Optional[str]]]:
+        """Return the ``(key, value)`` tag pairs sourced from environment + client.
+
+        Split out so subclasses / tests can extend the set without
+        rewriting :meth:`default_tags`.
+        """
+        from yggdrasil.environ import UserInfo
+
+        try:
+            info = UserInfo.current()
+        except Exception:  # noqa: BLE001 - userinfo is best-effort
+            info = None
+
+        pairs: list[tuple[str, Optional[str]]] = [
+            ("Product", self.product),
+            ("ProductVersion", self.product_version),
+        ]
+        if info is not None:
+            pairs.extend([
+                ("Owner", info.email),
+                ("Hostname", info.hostname or None),
+                ("User", info.key or None),
+            ])
+        return pairs
+
+    def user_scoped_name(
+        self,
+        base: str,
+        *,
+        separator: str = "-",
+        max_length: int = 80,
+    ) -> str:
+        """Return ``base`` suffixed with a stable per-user slug.
+
+        Resolution order for the slug:
+
+        1. ``UserInfo.email`` local part (``alice@example.com`` → ``alice``).
+        2. ``UserInfo.key`` (``whoami``).
+        3. ``UserInfo.hostname``.
+
+        Each candidate is sanitized with :meth:`safe_tag_value` so the result
+        is a legal Databricks resource name. Falls back to ``base`` unchanged
+        when no candidate is available — useful in test harnesses where the
+        environment carries no identity. The result is truncated to
+        ``max_length`` characters (default ``80``, well under the Databricks
+        cluster / pool name cap of 100).
+        """
+        from yggdrasil.environ import UserInfo
+
+        try:
+            info = UserInfo.current()
+        except Exception:  # noqa: BLE001 - best-effort
+            return self.safe_tag_value(base)[:max_length]
+
+        candidates: list[Optional[str]] = []
+        email = info.email
+        if email and "@" in email:
+            candidates.append(email.split("@", 1)[0])
+        candidates.extend([info.key, info.hostname])
+
+        slug: Optional[str] = None
+        for candidate in candidates:
+            cleaned = self.safe_tag_value(candidate) if candidate else ""
+            if cleaned and cleaned.lower() not in {"unknown", "none", ""}:
+                slug = cleaned
+                break
+
+        sanitized_base = self.safe_tag_value(base) or base
+        if not slug:
+            return sanitized_base[:max_length]
+
+        return f"{sanitized_base}{separator}{slug}"[:max_length]
 
     @staticmethod
     def safe_tag_value(value: str, *, repl: str = "-") -> str:
@@ -1210,17 +1292,21 @@ def is_checked_tmp_path(host: str, base_path: str):
     return False
 
 
-@dataclass
 class DatabricksService(ABC):
-    client: DatabricksClient = field(
-        default_factory=DatabricksClient.current,
-        repr=False, compare=False, hash=False,
-    )
+    """Base class for every Databricks service wrapper.
+
+    Subclasses are plain classes (no ``@dataclass``); they inherit the
+    ``client``-only constructor by default and override :meth:`__init__`
+    explicitly when they need to accept additional configuration.
+    """
 
     _current: ClassVar[Optional["DatabricksService"]] = None
 
-    def __post_init__(self):
-        pass
+    def __init__(self, client: Optional[DatabricksClient] = None):
+        self.client = client if client is not None else DatabricksClient.current()
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(client={self.client!r})"
 
     def __getstate__(self):
         return {"client": self.client}
@@ -1350,10 +1436,6 @@ class DatabricksService(ABC):
 
 
 class DatabricksResource(ABC):
-    service: DatabricksService = field(
-        default_factory=DatabricksService.current,
-        repr=False, compare=False, hash=False,
-    )
 
     def __getstate__(self):
         state = super().__getstate__()
