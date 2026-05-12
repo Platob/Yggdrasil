@@ -38,13 +38,14 @@ import time
 from abc import abstractmethod
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Iterable, Iterator, Literal, Mapping, Optional, TypeVar
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.disposable import Disposable
-from yggdrasil.data.enums import MimeType, MimeTypes
+from yggdrasil.data.enums import MimeType, MimeTypes, State
 from yggdrasil.io.tabular import Tabular
 
 if TYPE_CHECKING:
@@ -452,6 +453,7 @@ class StatementResult(Tabular, Generic[PS]):
     _TRANSIENT_ERROR_PATTERNS: ClassVar[tuple[str, ...]] = ()
     _transient_pattern_re: ClassVar[Optional["re.Pattern[str]"]] = None
     _auto_retry_promoted: bool = False
+    _state_snapshot: Optional[State] = None
 
     def __init__(
         self,
@@ -468,6 +470,7 @@ class StatementResult(Tabular, Generic[PS]):
         self._cached_schema: Optional[Schema] = None
         self.num_try = num_try or 0
         self._auto_retry_promoted = False
+        self._state_snapshot = None
         # ``_persisted_data`` (Optional[Tabular]) is initialised by
         # the :class:`Tabular` base ``__init__``; subclasses populate
         # it via :meth:`persist` to expose the materialised result
@@ -478,20 +481,80 @@ class StatementResult(Tabular, Generic[PS]):
     # Execution lifecycle contract
     # -------------------------------------------------------------------------
 
-    @property
     @abstractmethod
-    def started(self) -> bool:
-        """Whether the statement has been started."""
+    def _compute_state(self) -> State:
+        """Refresh from the backend and return the current unified :class:`State`.
+
+        Subclass hook — every backend translates its own state
+        vocabulary (Databricks ``StatementState``, Spark's local
+        ``_started`` / ``_failure`` flags, pymongo command response,
+        ...) into the unified enum here. Called once per ``state``
+        access except inside a :meth:`state_snapshot` block, where the
+        first call's result is cached and re-used.
+        """
 
     @property
-    @abstractmethod
+    def state(self) -> State:
+        """Current unified :class:`State`.
+
+        Reads the per-instance snapshot when a :meth:`state_snapshot`
+        block is active so multiple state-derived accesses
+        (``done``, ``failed``, ``started``) in the same block share a
+        single ``refresh_status`` call. Outside a snapshot, every
+        access goes through :meth:`_compute_state`.
+        """
+        cached = self._state_snapshot
+        if cached is not None:
+            return cached
+        return self._compute_state()
+
+    @contextmanager
+    def state_snapshot(self) -> Iterator[State]:
+        """Pin :attr:`state` for the duration of the block.
+
+        Single refresh on enter — ``state`` / ``done`` / ``failed`` /
+        ``started`` accesses inside the block re-use the snapshotted
+        value. Re-entrant: nested ``state_snapshot()`` blocks reuse
+        the outer pin.
+
+        Use when a code path checks several state-derived predicates
+        before deciding what to do (cancel, raise_for_status,
+        ``_auto_promote_transient_retry``, ...). Don't use inside a
+        polling loop — the whole point of :meth:`wait` is to refresh
+        each iteration.
+        """
+        if self._state_snapshot is not None:
+            yield self._state_snapshot
+            return
+        snap = self._compute_state()
+        self._state_snapshot = snap
+        try:
+            yield snap
+        finally:
+            self._state_snapshot = None
+
+    @property
+    def started(self) -> bool:
+        """Whether the statement has been started.
+
+        Derived from :attr:`state` — :attr:`State.is_started` is
+        ``True`` for anything past :attr:`State.PENDING`. Override in a
+        subclass only when ``started`` needs to be sticky across
+        terminal states that the unified enum doesn't distinguish
+        (e.g. Spark's ``_started`` flag stays ``True`` after a failure
+        before the result is reset).
+        """
+        return self.state.is_started
+
+    @property
     def done(self) -> bool:
         """Whether the statement is in a terminal state."""
+        return self.state.is_done
 
     @property
-    @abstractmethod
     def failed(self) -> bool:
         """Whether the statement failed or was canceled."""
+        return self.state.is_failed
 
     @abstractmethod
     def refresh_status(self) -> None:
@@ -520,16 +583,22 @@ class StatementResult(Tabular, Generic[PS]):
         the underlying statement to ``retryable=True`` once if the
         failure matches a known-transient pattern declared by the
         subclass — the caller's :meth:`retry` will then pick it up.
-        """
-        if not self.failed:
-            return
-        try:
-            self.statement.clear_temporary_resources()
-        except Exception:
-            logger.exception("clear_temporary_resources failed during raise_for_status; continuing.")
 
-        self._auto_promote_transient_retry()
-        return self._raise_for_status()
+        The state checks live inside a :meth:`state_snapshot` block so
+        the ``failed`` / ``done`` reads here and inside
+        ``_auto_promote_transient_retry`` share a single backend
+        ``refresh_status`` call.
+        """
+        with self.state_snapshot():
+            if not self.failed:
+                return
+            try:
+                self.statement.clear_temporary_resources()
+            except Exception:
+                logger.exception("clear_temporary_resources failed during raise_for_status; continuing.")
+
+            self._auto_promote_transient_retry()
+            return self._raise_for_status()
 
     def _auto_promote_transient_retry(self) -> bool:
         """Install a retry :class:`WaitingConfig` on a transient failure.
@@ -544,12 +613,13 @@ class StatementResult(Tabular, Generic[PS]):
         can promote without first having to swallow the per-result
         exception just to flip ``retryable``.
         """
-        if not self.failed:
-            return self.statement.retry is not None
-        if self._auto_retry_promoted:
-            return self.statement.retry is not None
-        if not self._is_transient_failure():
-            return self.statement.retry is not None
+        with self.state_snapshot():
+            if not self.failed:
+                return self.statement.retry is not None
+            if self._auto_retry_promoted:
+                return self.statement.retry is not None
+            if not self._is_transient_failure():
+                return self.statement.retry is not None
         self._auto_retry_promoted = True
         if self.statement.retry is None:
             cfg = self.default_retry() or WaitingConfig.default()
@@ -714,8 +784,9 @@ class StatementResult(Tabular, Generic[PS]):
                         "refresh_status failed after start() raised; will retry if budget remains.",
                     )
 
-            if self.done and not self.failed:
-                return self
+            with self.state_snapshot() as snap:
+                if snap.is_done and not snap.is_failed:
+                    return self
 
         # Exhausted budget.  Surface the latest failure if asked.
         if raise_error:

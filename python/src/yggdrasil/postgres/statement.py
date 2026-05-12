@@ -48,7 +48,7 @@ from yggdrasil.data.statement import (
 )
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io.tabular.base import O
-from yggdrasil.data.enums import MimeType
+from yggdrasil.data.enums import MimeType, State
 
 if TYPE_CHECKING:
     from .connection import PostgresConnection
@@ -227,17 +227,13 @@ class PostgresStatementResult(StatementResult[PostgresPreparedStatement]):
     # Lifecycle
     # ------------------------------------------------------------------
 
-    @property
-    def started(self) -> bool:
-        return self._started
-
-    @property
-    def done(self) -> bool:
-        return self._started
-
-    @property
-    def failed(self) -> bool:
-        return self._failure is not None
+    def _compute_state(self) -> State:
+        """Local-state mapping — Postgres materialises synchronously in :meth:`start`."""
+        if not self._started:
+            return State.PENDING
+        if self._failure is not None:
+            return State.FAILED
+        return State.SUCCEEDED
 
     def refresh_status(self) -> None:
         """No-op — Postgres is synchronous, no remote state to poll."""

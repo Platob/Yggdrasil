@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from yggdrasil.data.enums import State
 from yggdrasil.data.statement import (
     PreparedStatement,
     StatementBatch,
@@ -73,17 +74,14 @@ class _StubResult(StatementResult[_StubStatement]):
 
     # ----- lifecycle ----------------------------------------------------------
 
-    @property
-    def started(self) -> bool:
-        return self._started
-
-    @property
-    def done(self) -> bool:
-        return self._done
-
-    @property
-    def failed(self) -> bool:
-        return self._failed
+    def _compute_state(self) -> State:
+        if not self._started:
+            return State.PENDING
+        if self._failed:
+            return State.FAILED
+        if self._done:
+            return State.SUCCEEDED
+        return State.RUNNING
 
     def refresh_status(self) -> None:
         return None

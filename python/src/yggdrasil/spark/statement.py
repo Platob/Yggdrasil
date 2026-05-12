@@ -31,7 +31,7 @@ from yggdrasil.io.tabular import Tabular
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.tabular.base import O
-from yggdrasil.data.enums import MimeType, MimeTypes
+from yggdrasil.data.enums import MimeType, MimeTypes, State
 
 if TYPE_CHECKING:
     from yggdrasil.spark.executor import SparkStatementExecutor
@@ -202,25 +202,19 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
     # Lifecycle
     # -------------------------------------------------------------------------
 
-    @property
-    def started(self) -> bool:
-        """True once :meth:`start` has run (terminal in either direction)."""
-        return self._started
+    def _compute_state(self) -> State:
+        """Map the local ``_started`` / ``_failure`` flags onto :class:`State`.
 
-    @property
-    def done(self) -> bool:
-        # Once start() has run we're terminal: either a frame is persisted
-        # or _failure is set.  Pre-start, done=False so wait() will loop —
-        # refresh_status() is a no-op so wait() will return after the first
-        # call to start() that the loop induces (start is idempotent, but
-        # nothing in the base contract calls start from wait()).  Callers
-        # are expected to call start() before wait() — same as the warehouse
-        # path.
-        return self._started
-
-    @property
-    def failed(self) -> bool:
-        return self._failure is not None
+        Spark SQL is synchronous from this side — :meth:`start` either
+        returns with ``_started=True`` and a persisted frame, or
+        ``_failure`` set. There's nothing remote to refresh, so the
+        mapping is purely local-state.
+        """
+        if not self._started:
+            return State.PENDING
+        if self._failure is not None:
+            return State.FAILED
+        return State.SUCCEEDED
 
     def _raise_for_status(self) -> None:
         # Auto-promote happens in the base raise_for_status() before this
