@@ -188,14 +188,22 @@ class TestReadMv:
 
     def test_full_object_read(self, client) -> None:
         client.head_object.return_value = {"ContentLength": 5, "LastModified": None}
-        client.get_object.return_value = {"Body": _Body(b"hello")}
+        client.get_object.return_value = {
+            "Body": _Body(b"hello"),
+            "ContentLength": 5,
+        }
         p = S3Path("s3://b/k", client=client)
         assert p.read_bytes() == b"hello"
-        # Range header covers [0, size-1] inclusive.
+        # ``read_bytes()`` / ``read_mv(-1, 0)`` issues a single
+        # whole-object GET (no ``Range`` header) — the ``HeadObject``
+        # probe the base ``Holder.read_mv`` used to run is skipped
+        # because S3 surfaces the canonical size on the GET response
+        # and we seed the stat cache from there.
         kwargs = client.get_object.call_args.kwargs
         assert kwargs["Bucket"] == "b"
         assert kwargs["Key"] == "k"
-        assert kwargs["Range"] == "bytes=0-4"
+        assert "Range" not in kwargs
+        client.head_object.assert_not_called()
 
     def test_range_read(self, client) -> None:
         client.head_object.return_value = {"ContentLength": 100, "LastModified": None}

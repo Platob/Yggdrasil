@@ -450,19 +450,45 @@ class S3Path(RemotePath):
     # Holder I/O — _read_mv / _write_mv / truncate / _clear
     # ==================================================================
 
+    def read_mv(self, n: int, pos: int) -> memoryview:
+        """Range read with a whole-file fast path that skips the size probe.
+
+        The base :meth:`Holder.read_mv` resolves a ``n < 0`` "read to
+        EOF" request by calling ``self.size`` first, which is one
+        ``HeadObject`` round trip every time the stat cache is cold.
+        For the dominant shape — ``read_bytes()`` /
+        ``read_arrow_table()`` against a fresh path — that probe is
+        wasted: the ``GetObject`` we're about to issue without a
+        ``Range`` header returns the whole object *and* carries the
+        canonical size in ``Content-Length``, which :meth:`_read_mv`
+        folds back into the cache. Partial / positional reads keep
+        the base bounds check so out-of-range windows still raise.
+        """
+        if n < 0 and pos == 0:
+            return self._read_mv(-1, 0)
+        return super().read_mv(n, pos)
+
     def _read_mv(self, n: int, pos: int) -> memoryview:
         """Range-based ``GetObject`` → :class:`memoryview` over bytes.
 
         :class:`Holder.read_mv` already normalized ``(n, pos)`` to a
         non-negative range that fits within :attr:`size`, so the
-        ``Range`` header always covers a valid window.
+        ``Range`` header always covers a valid window — except for
+        the ``(-1, 0)`` whole-file fast path above, which feeds
+        ``n == -1`` straight through. Omitting the ``Range`` header
+        in that case asks S3 for the whole object in one call.
         """
         if n == 0:
             return memoryview(b"")
 
         kwargs: dict[str, Any] = {"Bucket": self.bucket, "Key": self.key}
-        # Closed range — boto wants inclusive end byte.
-        kwargs["Range"] = f"bytes={pos}-{pos + n - 1}"
+        if n > 0:
+            # Closed range — boto wants inclusive end byte.
+            kwargs["Range"] = f"bytes={pos}-{pos + n - 1}"
+        elif pos > 0:
+            # ``bytes={pos}-`` — open-ended range from ``pos`` to EOF.
+            kwargs["Range"] = f"bytes={pos}-"
+        # else: full-object GET — no ``Range`` header.
 
         try:
             response = self._call(self.client.get_object, **kwargs)
@@ -486,11 +512,16 @@ class S3Path(RemotePath):
 
         # Seed the stat cache from the response when S3 hands us the
         # canonical total. ``Content-Range: bytes <a>-<b>/<total>`` is
-        # present on every successful ranged GET; ``<total>`` is the
-        # object's full size, independent of the requested window.
-        # The next ``size`` / ``exists`` lookup on this singleton path
-        # becomes a local hit — no separate ``HeadObject`` round trip.
+        # present on every successful ranged GET; whole-object GETs
+        # (no ``Range`` header) instead surface the size as
+        # ``Content-Length``. Either way the next ``size`` / ``exists``
+        # lookup on this singleton path becomes a local hit — no
+        # separate ``HeadObject`` round trip.
         total = _content_range_total(response)
+        if total is None and "Range" not in kwargs:
+            cl = response.get("ContentLength") if isinstance(response, dict) else None
+            if isinstance(cl, int):
+                total = cl
         if total is not None:
             mtime = _mtime_from_response(response)
             media_type = _media_type_from_response(response)

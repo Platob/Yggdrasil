@@ -604,6 +604,20 @@ class Holder(URLBased, Tabular[O], Disposable):
     def size(self) -> int:
         """Current visible size in bytes."""
 
+    @property
+    def size_known(self) -> bool:
+        """``True`` when reading :attr:`size` won't trigger a backend probe.
+
+        Always true for in-memory holders (size is a slot). Path
+        holders override to ``True`` only when their stat cache is
+        warm — callers that want to short-circuit on an empty buffer
+        (parquet / arrow IPC / CSV readers checking ``size == 0``)
+        can guard the check on this predicate so a cold remote path
+        doesn't pay a ``HeadObject`` / ``get_status`` / ``get_metadata``
+        round trip just to discover the file is non-empty.
+        """
+        return True
+
     def is_empty(self):
         return self.size == 0
 

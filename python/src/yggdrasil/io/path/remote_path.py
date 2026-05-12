@@ -229,6 +229,25 @@ class RemotePath(Path):
     # Stat — cached probe, subclass implements the network call
     # ------------------------------------------------------------------
 
+    @property
+    def size_known(self) -> bool:
+        """``True`` only when the stat cache carries a fresh entry.
+
+        Lets ``ParquetIO`` / ``CsvIO`` / ``ArrowIPCIO`` skip a probe
+        round trip just to short-circuit on ``size == 0``: when the
+        cache is cold the format reader will trip its own EOF /
+        empty-file error which the caller catches and translates to
+        an empty schema. When the cache is warm the cheap ``size``
+        read fires unchanged.
+        """
+        cached = self._stat_cached
+        if cached is None:
+            return False
+        ttl = self.stat_cache_ttl
+        if ttl is None:
+            return True
+        return (time.monotonic() - self._stat_cached_at) <= ttl
+
     def _stat(self) -> IOStats:
         """Cached :class:`IOStats` probe.
 

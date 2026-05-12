@@ -130,14 +130,24 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
         read it back" flow is common enough to deserve the
         short-circuit.
         """
-        if self.size == 0:
+        if self.size_known and self.size == 0:
             return
 
-        with self.arrow_input_stream() as v:
-            reader = ipc.RecordBatchFileReader(v)
+        try:
+            stream_ctx = self.arrow_input_stream()
+            stream = stream_ctx.__enter__()
+        except FileNotFoundError:
+            return
+        try:
+            try:
+                reader = ipc.RecordBatchFileReader(stream)
+            except pa.ArrowInvalid:
+                return
             for i in range(reader.num_record_batches):
                 batch = reader.get_batch(i)
                 yield options.cast_arrow_tabular(batch)
+        finally:
+            stream_ctx.__exit__(None, None, None)
 
     def _collect_schema(self, options: ArrowIPCOptions) -> Schema:
         """Read the schema straight from the IPC footer.
@@ -146,10 +156,13 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
         through :meth:`arrow_input_stream` so a codec'd holder is
         transparently decompressed before the footer probe.
         """
-        if self.size == 0:
+        if self.size_known and self.size == 0:
             return Schema.empty()
-        with self.arrow_input_stream() as v:
-            return Schema.from_arrow(ipc.RecordBatchFileReader(v).schema)
+        try:
+            with self.arrow_input_stream() as v:
+                return Schema.from_arrow(ipc.RecordBatchFileReader(v).schema)
+        except (FileNotFoundError, pa.ArrowInvalid):
+            return Schema.empty()
 
     # ==================================================================
     # Write path

@@ -137,6 +137,50 @@ class TestRead:
         with pytest.raises(FileNotFoundError):
             p.read_bytes()
 
+    def test_read_bytes_skips_metadata_probe(self, workspace, client) -> None:
+        # ``DatabricksPath.read_mv(-1, 0)`` short-circuits the base
+        # ``Holder.read_mv`` size probe, so a whole-file read is one
+        # ``files.download`` round trip — no preceding
+        # ``files.get_metadata`` call.
+        body = SimpleNamespace(read=lambda: b"hello")
+        workspace.files.download.return_value = SimpleNamespace(contents=body)
+        p = VolumePath("/Volumes/c/s/v/x", client=client)
+        assert p.read_bytes() == b"hello"
+        workspace.files.get_metadata.assert_not_called()
+        workspace.files.download.assert_called_once()
+
+    def test_parquet_read_arrow_table_one_sdk_call(self, workspace, client) -> None:
+        # The tabular IO ↔ remote path interaction is the headline
+        # scenario: ``ParquetIO(VolumePath).read_arrow_table()`` must
+        # bottom out in a single ``files.download`` call. Earlier
+        # versions issued a ``get_metadata`` probe before the
+        # download to short-circuit on empty buffers; that's now
+        # gated on the ``size_known`` predicate so a cold remote
+        # path skips the probe and falls back to "parse what we
+        # got" semantics via the format reader's own EOF errors.
+        import io as _io
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from yggdrasil.io.primitive.parquet_io import ParquetIO
+
+        sink = _io.BytesIO()
+        pq.write_table(
+            pa.table({"id": pa.array([1, 2, 3], type=pa.int64())}),
+            sink,
+        )
+        payload = sink.getvalue()
+
+        body = SimpleNamespace(read=lambda: payload)
+        workspace.files.download.return_value = SimpleNamespace(
+            contents=body,
+            content_type="application/octet-stream",
+            last_modified="Mon, 01 Jan 2024 00:00:00 GMT",
+        )
+        p = VolumePath("/Volumes/c/s/v/x.parquet", client=client)
+        ParquetIO(holder=p).read_arrow_table()
+        workspace.files.get_metadata.assert_not_called()
+        assert workspace.files.download.call_count == 1
+
 
 class TestWrite:
 

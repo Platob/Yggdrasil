@@ -214,19 +214,22 @@ class CsvIO(IO[bytes, CsvOptions]):
     # ==================================================================
 
     def _collect_schema(self, options: CsvOptions) -> Schema:
-        if self.size == 0:
+        if self.size_known and self.size == 0:
             return Schema.empty()
-        with self.arrow_input_stream() as v:
-            reader = pa_csv.open_csv(
-                v,
-                read_options=options.to_read_options(),
-                parse_options=options.to_parse_options(),
-                convert_options=options.to_convert_options(),
-            )
-            try:
-                return Schema.from_arrow(reader.schema)
-            finally:
-                reader.close()
+        try:
+            with self.arrow_input_stream() as v:
+                reader = pa_csv.open_csv(
+                    v,
+                    read_options=options.to_read_options(),
+                    parse_options=options.to_parse_options(),
+                    convert_options=options.to_convert_options(),
+                )
+                try:
+                    return Schema.from_arrow(reader.schema)
+                finally:
+                    reader.close()
+        except (FileNotFoundError, pa.ArrowInvalid):
+            return Schema.empty()
 
     # ==================================================================
     # Read path
@@ -245,20 +248,30 @@ class CsvIO(IO[bytes, CsvOptions]):
         sniffs) need to be coerced to a stricter target. When no
         target is bound the cast is a passthrough.
         """
-        if self.size == 0:
+        if self.size_known and self.size == 0:
             return
-        with self.arrow_input_stream() as v:
-            reader = pa_csv.open_csv(
-                v,
-                read_options=options.to_read_options(),
-                parse_options=options.to_parse_options(),
-                convert_options=options.to_convert_options(),
-            )
+        try:
+            stream_ctx = self.arrow_input_stream()
+            stream = stream_ctx.__enter__()
+        except FileNotFoundError:
+            return
+        try:
+            try:
+                reader = pa_csv.open_csv(
+                    stream,
+                    read_options=options.to_read_options(),
+                    parse_options=options.to_parse_options(),
+                    convert_options=options.to_convert_options(),
+                )
+            except pa.ArrowInvalid:
+                return
             try:
                 for batch in reader:
                     yield options.cast_arrow_tabular(batch)
             finally:
                 reader.close()
+        finally:
+            stream_ctx.__exit__(None, None, None)
 
     # ==================================================================
     # Write path

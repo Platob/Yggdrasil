@@ -134,12 +134,20 @@ class ParquetIO(IO[bytes, ParquetOptions]):
         Routes through :meth:`view` so the parent cursor isn't moved
         — :class:`pq.ParquetFile` seeks to the footer to parse it
         and would otherwise leave ``self._pos`` pointing at the file
-        end.
+        end. When the holder reports a known size (in-memory, or a
+        path with a warm stat cache) we short-circuit on empty; for
+        a cold remote path we attempt the read and translate
+        FileNotFound / "File too small" errors into an empty schema
+        rather than paying for an extra ``HeadObject`` /
+        ``get_metadata`` round trip up front.
         """
-        if self.size == 0:
+        if self.size_known and self.size == 0:
             return Schema.empty()
-        with self.arrow_input_stream() as v:
-            return Schema.from_arrow(pq.ParquetFile(v).schema_arrow)
+        try:
+            with self.arrow_input_stream() as v:
+                return Schema.from_arrow(pq.ParquetFile(v).schema_arrow)
+        except (FileNotFoundError, pa.ArrowInvalid):
+            return Schema.empty()
 
     # ==================================================================
     # Read path
@@ -166,12 +174,23 @@ class ParquetIO(IO[bytes, ParquetOptions]):
         bound ``target_field`` reshapes rows to the caller's schema.
         When no target is bound the cast is a passthrough.
         """
-        if self.size == 0:
+        if self.size_known and self.size == 0:
             return
 
         batch_size = int(options.row_size or 65536)
-        with self.arrow_input_stream() as v:
-            with pq.ParquetFile(v) as pf:
+        try:
+            stream_ctx = self.arrow_input_stream()
+            stream = stream_ctx.__enter__()
+        except FileNotFoundError:
+            return
+        try:
+            try:
+                pf = pq.ParquetFile(stream)
+            except pa.ArrowInvalid:
+                # Empty or truncated payload — same end state as the
+                # ``size == 0`` short-circuit on the in-memory path.
+                return
+            with pf:
                 columns = self._projection_columns(options, pf.schema_arrow.names)
                 for batch in pf.iter_batches(
                     batch_size=batch_size,
@@ -179,6 +198,8 @@ class ParquetIO(IO[bytes, ParquetOptions]):
                     columns=columns,
                 ):
                     yield options.cast_arrow_tabular(batch)
+        finally:
+            stream_ctx.__exit__(None, None, None)
 
     def _read_arrow_table(self, options: ParquetOptions) -> pa.Table:
         """Read the whole Parquet file as a :class:`pa.Table`.
@@ -192,16 +213,19 @@ class ParquetIO(IO[bytes, ParquetOptions]):
         Python side. ``options.target`` still drives the projection
         pushdown via :meth:`_projection_columns`.
         """
-        if self.size == 0:
+        if self.size_known and self.size == 0:
             return super()._read_arrow_table(options)
 
-        with self.arrow_input_stream() as v:
-            with pq.ParquetFile(v) as pf:
-                columns = self._projection_columns(options, pf.schema_arrow.names)
-                table = pf.read(
-                    columns=columns,
-                    use_threads=options.use_threads,
-                )
+        try:
+            with self.arrow_input_stream() as v:
+                with pq.ParquetFile(v) as pf:
+                    columns = self._projection_columns(options, pf.schema_arrow.names)
+                    table = pf.read(
+                        columns=columns,
+                        use_threads=options.use_threads,
+                    )
+        except (FileNotFoundError, pa.ArrowInvalid):
+            return super()._read_arrow_table(options)
         return options.cast_arrow_tabular(table)
 
     # ==================================================================
