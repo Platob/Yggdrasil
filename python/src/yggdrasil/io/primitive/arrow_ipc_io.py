@@ -280,7 +280,7 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
         with self.arrow_output_stream() as sink:
             with ipc.RecordBatchFileWriter(
                 sink,
-                write_options.merged_schema.to_arrow_schema(),
+                write_options.merged.to_arrow_schema(),
                 options=options.to_writer_options(nbytes_hint),
             ) as writer:
                 if first_casted.num_rows > 0:

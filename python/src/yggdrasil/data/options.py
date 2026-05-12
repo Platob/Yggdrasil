@@ -426,21 +426,6 @@ class CastOptions:
         object.__setattr__(self, "_merged_cache", result)
         return result
 
-    @property
-    def merged_schema(self) -> Schema | None:
-        """The :attr:`merged` projected as a :class:`Schema`.
-
-        Mutualized through :attr:`merged` — a single
-        ``merge_with`` walk feeds both views. Non-struct merges are
-        lifted into a single-child struct via :meth:`Field.to_schema`
-        so the schema-shape contract holds for every caller (cast
-        pipelines, ``empty_table`` builders, tabular planners).
-        """
-        merged = self.merged
-        if merged is None:
-            return None
-        return merged.to_schema()
-
     def select_source_column_names(self) -> list[str] | None:
         """The source field's column names, if a source field is bound."""
         if self.source is None:
@@ -980,6 +965,18 @@ class CastOptions:
 
     # ---- Top-level dispatch ------------------------------------------
 
+    def _cast_target(self) -> "Field | None":
+        """Field that ``cast_*`` dispatchers drive against.
+
+        Always the ``merged`` view (``target.merge_with(source)`` when
+        both are set, else ``target``). When only ``source`` is bound —
+        i.e. the caller never set a target — we don't have anything to
+        cast *to*, so callers passthrough on the ``None`` return.
+        """
+        if self.target is None:
+            return None
+        return self.merged
+
     def cast(self, obj: Any) -> Any:
         """Cast *obj* to :attr:`target` using its native engine.
 
@@ -994,29 +991,33 @@ class CastOptions:
         flows through via ``options=self`` for the inner cast paths
         that need it.
         """
-        if self.target is None:
+        target = self._cast_target()
+        if target is None:
             return obj
-        return self.target.cast(obj, options=self)
+        return target.cast(obj, options=self)
 
     # ---- pyarrow -----------------------------------------------------
 
     def cast_pyarrow(self, obj: Any) -> Any:
         """Cast any pyarrow object — delegates to :meth:`Field.cast_arrow`."""
-        if self.target is None:
+        target = self._cast_target()
+        if target is None:
             return obj
-        return self.target.cast_arrow(obj, options=self)
+        return target.cast_arrow(obj, options=self)
 
     def cast_arrow_array(self, array: Any) -> Any:
         """Cast a :class:`pa.Array` or :class:`pa.ChunkedArray`."""
-        if self.target is None:
+        target = self._cast_target()
+        if target is None:
             return array
-        return self.target.cast_arrow_array(array, options=self)
+        return target.cast_arrow_array(array, options=self)
 
     def cast_arrow_tabular(self, table: Any) -> Any:
         """Cast a :class:`pa.Table` or :class:`pa.RecordBatch`."""
-        if self.target is None:
+        target = self._cast_target()
+        if target is None:
             return table
-        return self.target.cast_arrow_tabular(table, options=self)
+        return target.cast_arrow_tabular(table, options=self)
 
     def cast_arrow_batch_iterator(self, batches: Any) -> Any:
         """Cast a stream of :class:`pa.RecordBatch` and rechunk by ``byte_size`` / ``row_size``.
@@ -1029,7 +1030,8 @@ class CastOptions:
         is set, otherwise passthrough. Lets callers that did an
         in-engine cast upstream still pick up the optimized rechunker.
         """
-        if self.target is None:
+        target = self._cast_target()
+        if target is None:
             if not self.byte_size and not self.row_size:
                 return batches
             from yggdrasil.arrow.cast import rechunk_arrow_batches
@@ -1039,7 +1041,7 @@ class CastOptions:
                 row_size=self.row_size,
                 memory_pool=self.arrow_memory_pool,
             )
-        return self.target.cast_arrow_batch_iterator(batches, options=self)
+        return target.cast_arrow_batch_iterator(batches, options=self)
 
     def fill_arrow_nulls(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Engine-level null fill — delegates to :meth:`Field.fill_arrow`."""
@@ -1059,15 +1061,17 @@ class CastOptions:
 
     def cast_polars(self, obj: Any) -> Any:
         """Cast any polars object — delegates to :meth:`Field.cast_polars`."""
-        if self.target is None:
+        target = self._cast_target()
+        if target is None:
             return obj
-        return self.target.cast_polars(obj, options=self)
+        return target.cast_polars(obj, options=self)
 
     def cast_polars_series(self, series: Any, *, default_scalar: Any = None) -> Any:
         """Cast a :class:`pl.Series`."""
-        if self.target is None:
+        target = self._cast_target()
+        if target is None:
             return series
-        return self.target.cast_polars_series(
+        return target.cast_polars_series(
             series, options=self, default_scalar=default_scalar
         )
 
@@ -1077,17 +1081,19 @@ class CastOptions:
         Wraps the expression tree with a cast operator — actual work
         fires when the containing LazyFrame is collected.
         """
-        if self.target is None:
+        target = self._cast_target()
+        if target is None:
             return expr
-        return self.target.cast_polars_expr(
+        return target.cast_polars_expr(
             expr, options=self, default_scalar=default_scalar
         )
 
     def cast_polars_tabular(self, data: Any) -> Any:
         """Cast a :class:`pl.DataFrame` or :class:`pl.LazyFrame`."""
-        if self.target is None:
+        target = self._cast_target()
+        if target is None:
             return data
-        return self.target.cast_polars_tabular(data, options=self)
+        return target.cast_polars_tabular(data, options=self)
 
     def fill_polars_nulls(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Engine-level polars null fill — delegates to :meth:`Field.fill_polars`."""
@@ -1109,9 +1115,10 @@ class CastOptions:
 
     def cast_pandas(self, obj: Any) -> Any:
         """Cast any pandas object — delegates to :meth:`Field.cast_pandas`."""
-        if self.target is None:
+        target = self._cast_target()
+        if target is None:
             return obj
-        return self.target.cast_pandas(obj, options=self)
+        return target.cast_pandas(obj, options=self)
 
     def fill_pandas_nulls(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Engine-level pandas null fill — delegates to :meth:`Field.fill_pandas`."""
@@ -1123,21 +1130,24 @@ class CastOptions:
 
     def cast_spark(self, obj: Any) -> Any:
         """Cast any spark object — delegates to :meth:`Field.cast_spark`."""
-        if self.target is None:
+        target = self._cast_target()
+        if target is None:
             return obj
-        return self.target.cast_spark(obj, options=self)
+        return target.cast_spark(obj, options=self)
 
     def cast_spark_tabular(self, obj: Any) -> Any:
         """Cast any spark object — delegates to :meth:`Field.cast_spark`."""
-        if self.target is None:
+        target = self._cast_target()
+        if target is None:
             return obj
-        return self.target.cast_spark_tabular(obj, options=self)
+        return target.cast_spark_tabular(obj, options=self)
 
     def cast_spark_column(self, obj: Any) -> Any:
         """Cast any spark object — delegates to :meth:`Field.cast_spark`."""
-        if self.target is None:
+        target = self._cast_target()
+        if target is None:
             return obj
-        return self.target.cast_spark_column(obj, options=self)
+        return target.cast_spark_column(obj, options=self)
 
     def fill_spark_nulls(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Engine-level spark null fill — delegates to :meth:`Field.fill_spark`."""

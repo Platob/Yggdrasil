@@ -619,23 +619,39 @@ class ExpiringDict(Generic[K, V]):
 
     def get(self, key: K, default: Any = None) -> Optional[V]:
         """Return value for *key*, or *default* if missing / expired."""
-        refresher_key: Any = ...  # sentinel: ... → don't run refresher
-        evicted: List[Tuple[K, V]] = []
-
+        # Hot-path fast return — keep the body small enough that the
+        # bytecode interpreter doesn't have to walk evict/refresher
+        # branches on every cache hit. The full eviction + refresher
+        # path stays below in the slow branch.
         with self._lock:
             entry = self._store.get(key)
             if entry is None:
-                result = default
+                # Miss — no purge needed if there's nothing to expire.
+                if self._default_ttl_ns is not None:
+                    self._maybe_schedule_purge()
+                if self._refresher is None:
+                    return default
+                refresher_key: Any = key
+                evicted: List[Tuple[K, V]] = []
             else:
                 value, expires_at = entry
-                if not self._is_expired(expires_at):
-                    result = value
-                else:
-                    del self._store[key]
-                    evicted.append((key, value))
-                    result = default
-                    refresher_key = key  # expired — may need refresher
+                # Inline ``_is_expired`` so the no-TTL path
+                # (``expires_at is None``) is one branch + one return,
+                # without an extra method call.
+                if expires_at is None or now_utc_ns() < expires_at:
+                    # Hot path. Purge scheduling only matters when
+                    # entries can expire; skip the wall-clock read
+                    # entirely for non-expiring stores.
+                    if self._default_ttl_ns is not None:
+                        self._maybe_schedule_purge()
+                    return value
+                # Expired — drop, set up the eviction-callback
+                # bookkeeping for the slow branch below.
+                del self._store[key]
+                evicted = [(key, value)]
+                refresher_key = key
 
+        result = default
         # Fire the eviction callback for the expired-on-read drop, if any.
         self._notify_evicted(evicted)
 

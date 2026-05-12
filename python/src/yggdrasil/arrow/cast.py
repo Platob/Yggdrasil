@@ -663,13 +663,13 @@ def any_to_arrow_table(
     elif isinstance(obj, (Generator, Iterator)):
         batches = list(_flatten_to_arrow_batches(iter(obj), options))
         if not batches:
-            merged_schema = options.merged_schema or Schema.empty()
+            merged_schema = options.merged or Schema.empty()
             return pa.Table.from_batches([], schema=merged_schema.to_arrow_schema())
         table = pa.Table.from_batches(batches)
 
     elif isinstance(obj, (list, tuple)):
         if not obj:
-            merged_schema = options.merged_schema or Schema.empty()
+            merged_schema = options.merged or Schema.empty()
             return pa.Table.from_batches([], schema=merged_schema.to_arrow_schema())
 
         try:
@@ -851,7 +851,7 @@ def any_to_arrow_record_batch_reader(
 
     iterator = any_to_arrow_batch_iterator(obj, options)
 
-    merged_schema = options.merged_schema
+    merged_schema = options.merged
     if merged_schema is not None:
         return pa.RecordBatchReader.from_batches(merged_schema.to_arrow_schema(), iterator)
 
@@ -965,7 +965,7 @@ def cast_arrow_record_batch_reader(
     if not needs_cast and not needs_chunk:
         return data
 
-    merged_schema = options.check_target(data.schema).merged_schema
+    merged_schema = options.check_target(data.schema).merged
 
     return pa.RecordBatchReader.from_batches(
         merged_schema.to_arrow_schema(),

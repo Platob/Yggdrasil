@@ -867,7 +867,7 @@ class Tabular(ABC, Generic[O]):
         )
 
     def _read_arrow_batch_reader(self, options: O) -> "pa.RecordBatchReader":
-        schema = options.check_target(obj=self.collect_schema).merged_schema
+        schema = options.check_target(obj=self.collect_schema).merged
         return pa.RecordBatchReader.from_batches(
             schema.to_arrow_schema(), self._read_arrow_batches(options),
         )

@@ -45,7 +45,7 @@ def _cast_pandas_series_impl(
     """
     Cast a pandas Series to a target Arrow type using Arrow casting rules.
 
-    The target type/field should be provided via `options` (e.g. options.merged_schema
+    The target type/field should be provided via `options` (e.g. options.merged
     or options.target, depending on how ArrowCastOptions is defined).
 
     Arrow does:
@@ -94,7 +94,7 @@ def _cast_pandas_dataframe_impl(
     Behavior is analogous to the Polars version, but we delegate casting to
     `cast_arrow_table` and then adjust columns on the pandas side:
 
-      - options.merged_schema: Arrow schema / field used by cast_arrow_table
+      - options.merged: Arrow schema / field used by cast_arrow_table
       - options.allow_add_columns:
           * False: result only has columns from the cast Arrow table
           * True: extra pandas columns (not in the target schema / cast result)

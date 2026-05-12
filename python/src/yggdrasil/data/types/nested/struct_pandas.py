@@ -480,7 +480,7 @@ def _tabular_columnwise(
 ) -> "pd.DataFrame":
     pd = pandas_module()
     source_schema = options.source
-    target_schema = options.merged_schema
+    target_schema = options.merged.to_struct()
 
     out: dict[str, pd.Series] = {}
     num_rows = len(data)

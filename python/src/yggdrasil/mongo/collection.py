@@ -366,7 +366,7 @@ class MongoCollection(Tabular):
         )
 
     def _target_arrow_schema(self, options: O) -> Optional[pa.Schema]:
-        target = options.target or options.merged_schema
+        target = options.target or options.merged
         if target is None:
             return None
         return target.to_arrow_schema()
