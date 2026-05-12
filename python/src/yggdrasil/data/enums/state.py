@@ -202,27 +202,31 @@ class State(IntEnum):
 
     @classmethod
     def _from_str(cls, value: str, *, default: Any = ...) -> "State":
+        # Fast path: most callers pass an already-canonical token
+        # (``"succeeded"`` / ``"SUCCEEDED"`` / ``"running"``).
+        # A single dict probe resolves them without paying any string
+        # normalisation cost.
+        hit = _STATE_LOOKUP.get(value)
+        if hit is not None:
+            return hit
+
         token = value.strip().lower().replace("-", "_").replace(" ", "_")
         if not token:
             if default is not ...:
                 return default
             return cls.PENDING
 
-        canonical = _STATE_ALIASES.get(token)
-        if canonical is not None:
-            return cls[canonical]
+        hit = _STATE_LOOKUP.get(token)
+        if hit is not None:
+            return hit
 
-        # Fall back to direct member name lookup ("PENDING", "RUNNING", …).
-        try:
-            return cls[token.upper()]
-        except KeyError:
-            if default is not ...:
-                return default
-            raise ValueError(
-                f"Cannot parse {value!r} as a State. Accepted values: "
-                f"{sorted(m.name for m in cls)} or aliases like "
-                f"{sorted(_STATE_ALIASES)}."
-            )
+        if default is not ...:
+            return default
+        raise ValueError(
+            f"Cannot parse {value!r} as a State. Accepted values: "
+            f"{sorted(m.name for m in cls)} or aliases like "
+            f"{sorted(_STATE_ALIASES)}."
+        )
 
     @classmethod
     def is_valid(cls, value: Any) -> bool:
@@ -243,3 +247,28 @@ _DONE_STATES: frozenset["State"] = frozenset(
     {State.SUCCEEDED, State.FAILED, State.CANCELED}
 )
 _FAILED_STATES: frozenset["State"] = frozenset({State.FAILED, State.CANCELED})
+
+
+def _build_state_lookup() -> dict[str, State]:
+    """Pre-compute every accepted spelling → :class:`State` member.
+
+    Folds :data:`_STATE_ALIASES` (lower-case keys) with the canonical
+    member names (``"PENDING"`` / ``"RUNNING"`` / …), their upper-case
+    form, and lower-case so :meth:`State._from_str` resolves any
+    common spelling with a single ``dict.get`` and no string
+    allocation.
+    """
+    out: dict[str, State] = {}
+    for alias, canonical in _STATE_ALIASES.items():
+        member = State[canonical]
+        out[alias] = member
+        upper = alias.upper()
+        if upper != alias:
+            out[upper] = member
+    for member in State:
+        out[member.name] = member
+        out[member.name.lower()] = member
+    return out
+
+
+_STATE_LOOKUP: dict[str, State] = _build_state_lookup()

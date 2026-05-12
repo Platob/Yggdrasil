@@ -174,20 +174,21 @@ class NodeType(str, Enum):
             return cls.DEFAULT
 
         if isinstance(value, str):
-            token = value.strip().lower()
-            canonical = _NODETYPE_ALIASES.get(token)
-            if canonical is not None:
-                return cls(canonical)
-            # Bare member name (``"FLEET_XLARGE"``).
-            try:
-                return cls[value.strip().upper()]
-            except KeyError:
-                pass
-            # Direct value match (case-sensitive — Azure SKUs are mixed case).
-            try:
-                return cls(value.strip())
-            except ValueError:
-                pass
+            # Fast path: callers commonly pass an already-canonical
+            # token (``"default"`` / ``"rd-fleet.xlarge"`` /
+            # ``"FLEET_XLARGE"`` / ``"m5.large"``). A single dict probe
+            # resolves any of those without paying ``strip().lower()``.
+            hit = _NODETYPE_LOOKUP.get(value)
+            if hit is not None:
+                return hit
+
+            stripped = value.strip()
+            hit = _NODETYPE_LOOKUP.get(stripped)
+            if hit is not None:
+                return hit
+            hit = _NODETYPE_LOOKUP.get(stripped.lower())
+            if hit is not None:
+                return hit
 
         if default is not ...:
             return default
@@ -226,19 +227,24 @@ class NodeType(str, Enum):
                 return cls.DEFAULT.value
             return cls.to_id(default)
 
+        # Fast path: skip the ``str(value).strip()`` allocation when
+        # the caller already handed us a canonical alias / member name
+        # / value — the prebuilt lookup covers every common spelling.
+        if isinstance(value, str):
+            hit = _NODETYPE_LOOKUP.get(value)
+            if hit is not None:
+                return hit.value
+
         text = str(value).strip()
         if not text:
             return cls.DEFAULT.value
 
-        canonical = _NODETYPE_ALIASES.get(text.lower())
-        if canonical is not None:
-            return canonical
-
-        # Bare member name (e.g. ``"FLEET_XLARGE"``).
-        try:
-            return cls[text.upper()].value
-        except KeyError:
-            pass
+        hit = _NODETYPE_LOOKUP.get(text)
+        if hit is not None:
+            return hit.value
+        hit = _NODETYPE_LOOKUP.get(text.lower())
+        if hit is not None:
+            return hit.value
 
         # Unknown SKU — passthrough so cloud-specific identifiers work.
         return text
@@ -260,6 +266,34 @@ NodeType.SMALL = NodeType.FLEET_XLARGE  # type: ignore[misc]
 NodeType.MEDIUM = NodeType.FLEET_2XLARGE  # type: ignore[misc]
 NodeType.LARGE = NodeType.FLEET_4XLARGE  # type: ignore[misc]
 NodeType.XLARGE = NodeType.FLEET_8XLARGE  # type: ignore[misc]
+
+
+def _build_nodetype_lookup() -> dict[str, NodeType]:
+    """Pre-compute every accepted spelling → :class:`NodeType` member.
+
+    Folds :data:`_NODETYPE_ALIASES` with member names (``"FLEET_XLARGE"``
+    / ``"SMALL"`` / …), their lower-case form, and the canonical
+    member values (``"rd-fleet.xlarge"`` / ``"Standard_D8ds_v5"`` /
+    ``"m5.large"``) — including a case-folded variant — so both
+    :meth:`NodeType.from_` and :meth:`NodeType.to_id` resolve any
+    common SKU with a single ``dict.get``.
+    """
+    out: dict[str, NodeType] = {}
+    for alias, canonical_value in _NODETYPE_ALIASES.items():
+        member = NodeType(canonical_value)
+        out[alias] = member
+        upper = alias.upper()
+        if upper != alias:
+            out[upper] = member
+    for member in NodeType:
+        out[member.name] = member
+        out[member.name.lower()] = member
+        out[member.value] = member
+        out[member.value.lower()] = member
+    return out
+
+
+_NODETYPE_LOOKUP: dict[str, NodeType] = _build_nodetype_lookup()
 
 
 # ---------------------------------------------------------------------------

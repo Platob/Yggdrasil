@@ -162,16 +162,21 @@ class Mode(IntEnum):
                 f"{type(value).__name__}: {value!r}"
             )
 
+        # Fast path: most callers pass an already-canonical token
+        # (``"overwrite"`` / ``"OVERWRITE"`` / ``"rb"`` / ``"wb+"``).
+        # A single dict probe resolves them without paying any string
+        # normalisation cost.
+        hit = _MODE_LOOKUP.get(value)
+        if hit is not None:
+            return hit
+
         # Normalize once. Lower-case, strip whitespace, replace
         # "error-if-exists" → "error_if_exists" style.
         normalized = value.strip().lower().replace("-", "_")
         if not normalized:
             return default if default is not None else cls.AUTO
 
-        # Alias table first (covers "overwrite", "replace", "fail",
-        # plus the simple OS modes that are also direct keys —
-        # "w", "wb", "a", "ab", "i", "x", "xb").
-        hit = STR_MAPPING.get(normalized)
+        hit = _MODE_LOOKUP.get(normalized)
         if hit is not None:
             return hit
 
@@ -183,18 +188,11 @@ class Mode(IntEnum):
         if os_match is not None:
             return os_match
 
-        # Last resort: try the enum's name lookup. Mode names are
-        # upper-snake-case, so "OVERWRITE" / "APPEND" /
-        # "ERROR_IF_EXISTS" land here cleanly. Anything else raises
-        # ValueError with a helpful message.
-        try:
-            return cls[normalized.upper()]
-        except KeyError:
-            raise ValueError(
-                f"Cannot parse {value!r} as a Mode. Accepted "
-                f"values: {sorted(m.name for m in cls)} or aliases "
-                f"like {sorted(STR_MAPPING)}."
-            )
+        raise ValueError(
+            f"Cannot parse {value!r} as a Mode. Accepted "
+            f"values: {sorted(m.name for m in cls)} or aliases "
+            f"like {sorted(STR_MAPPING)}."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +228,9 @@ _seed_mode_to_os()
 # ---------------------------------------------------------------------------
 
 
+_OS_MODE_CHARS = frozenset("rwaxbt+")
+
+
 def _parse_os_mode(s: str) -> Optional[Mode]:
     """Parse an OS-style mode string into a :class:`Mode`.
 
@@ -258,8 +259,10 @@ def _parse_os_mode(s: str) -> Optional[Mode]:
 
     # Quick rejection: if any character is not a valid mode letter,
     # this isn't an OS mode at all — let the caller try other
-    # strategies (alias map, enum value, etc.).
-    if not all(c in "rwaxbt+" for c in s):
+    # strategies (alias map, enum value, etc.). The set check beats
+    # an ``all(...)`` generator over the string for the typical 1-3
+    # character mode strings ``open(2)`` accepts.
+    if not _OS_MODE_CHARS.issuperset(s):
         return None
 
     # Count primary chars. Exactly one must be present.
@@ -373,3 +376,53 @@ STR_MAPPING = {
     "auto": Mode.AUTO,
     "default": Mode.AUTO,
 }
+
+
+def _build_mode_lookup() -> dict[str, Mode]:
+    """Pre-compute every accepted spelling → :class:`Mode` member.
+
+    Folds :data:`STR_MAPPING` with the canonical member names
+    (``"OVERWRITE"`` / ``"APPEND"`` / …), every OS-mode permutation
+    (``"rb"``, ``"rb+"``, ``"r+b"``, ``"+rb"``, ``"wb+"``, …), and the
+    upper-case variant of each alias so :meth:`Mode.from_` resolves
+    common shapes with a single ``dict.get`` and no string allocation.
+    """
+    out: dict[str, Mode] = {}
+    for alias, mode in STR_MAPPING.items():
+        out[alias] = mode
+        if alias and alias != alias.upper():
+            out[alias.upper()] = mode
+
+    # Member names — "OVERWRITE" / "APPEND" / "ERROR_IF_EXISTS" / ...
+    for member in Mode:
+        out[member.name] = member
+        out[member.name.lower()] = member
+
+    # Full POSIX permutations: every primary (r/w/a/x) × every subset
+    # of {b, t, +} in every order. There are 1 × (1 + 3 + 3*2 + 3*2*1)
+    # × 4 = 64 strings total — small enough to enumerate.
+    from itertools import permutations
+    for primary, target in (
+        ("r", Mode.READ_ONLY),
+        ("w", Mode.OVERWRITE),
+        ("a", Mode.APPEND),
+        ("x", Mode.ERROR_IF_EXISTS),
+    ):
+        for flags_subset in ((), ("b",), ("t",), ("+",),
+                             ("b", "+"), ("t", "+"),
+                             ("b", "t"), ("b", "t", "+")):
+            # ``b`` and ``t`` are mutually exclusive — skip mixed.
+            if "b" in flags_subset and "t" in flags_subset:
+                continue
+            for perm in permutations((primary,) + flags_subset):
+                s = "".join(perm)
+                # ``r`` variants: only the bare-read forms resolve to
+                # READ_ONLY; the ``+`` family resolves to AUTO.
+                if primary == "r" and "+" in s:
+                    out.setdefault(s, Mode.AUTO)
+                else:
+                    out.setdefault(s, target)
+    return out
+
+
+_MODE_LOOKUP: dict[str, Mode] = _build_mode_lookup()

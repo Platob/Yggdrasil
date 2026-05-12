@@ -381,6 +381,12 @@ class Codec(abc.ABC):
 
         # Short-name shortcut: accept bare codec names for ergonomics.
         if isinstance(obj, str):
+            # Fast path: most callers pass the canonical lower-case name
+            # (``"gzip"`` / ``"zstd"``). One ``dict.get`` resolves them
+            # without paying ``strip().lower()``.
+            hit = _CODEC_BY_NAME.get(obj)
+            if hit is not None:
+                return hit
             hit = _CODEC_BY_NAME.get(obj.lower().strip())
             if hit is not None:
                 return hit
@@ -779,7 +785,13 @@ ZLIB: Codec = _ZlibCodec()
 LZMA: Codec = _LzmaCodec()
 
 _ALL_CODECS: list[Codec] = [GZIP, ZSTD, LZ4, BZIP2, XZ, SNAPPY, BROTLI, ZLIB, LZMA]
-_CODEC_BY_NAME: dict[str, Codec] = {c.name: c for c in _ALL_CODECS}
+# Pre-fold case variants so ``Codec.from_("GZIP")`` / ``Codec.from_("Gzip")``
+# resolve via a single ``dict.get`` without an extra ``.lower()``.
+_CODEC_BY_NAME: dict[str, Codec] = {}
+for _c in _ALL_CODECS:
+    _CODEC_BY_NAME[_c.name] = _c
+    _CODEC_BY_NAME[_c.name.upper()] = _c
+del _c
 
 
 def _build_codec_by_mime() -> dict["MimeType", Codec]:

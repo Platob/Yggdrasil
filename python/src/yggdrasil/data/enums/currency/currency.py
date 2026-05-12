@@ -59,12 +59,32 @@ class Currency:
     def parse_str(cls, s: str) -> "Currency":
         if not isinstance(s, str):
             raise TypeError(f"Expected str, got {type(s).__name__}")
+        # Fast path: most callers pass an already-canonical ISO code
+        # (``"USD"`` / ``"EUR"``) or a known alias (``"$"`` / ``"€"``).
+        # Hit the prebuilt instance cache before paying ``strip().upper()``
+        # and ``__post_init__`` validation again.
+        hit = _CURRENCY_CACHE.get(s)
+        if hit is not None:
+            return hit
+
         raw = s.strip()
         if not raw:
             raise ValueError("Currency string cannot be empty")
         upper = raw.upper()
+        hit = _CURRENCY_CACHE.get(upper)
+        if hit is not None:
+            return hit
         canonical = _CURRENCY_ALIASES.get(upper, upper)
-        return cls(canonical)
+        instance = cls(canonical)
+        # Memoize the result keyed by the canonical form so the next
+        # caller passing the same canonical ISO code lands on the same
+        # frozen instance (Currency instances are immutable). Bounded
+        # at the canonical-set + popular-alias set so the cache can't
+        # grow with unbounded user input — unknown inputs construct
+        # fresh each time, but they're rare.
+        _CURRENCY_CACHE[upper] = instance
+        _CURRENCY_CACHE[canonical] = instance
+        return instance
 
     @classmethod
     def polars_normalize(
@@ -94,3 +114,25 @@ Currency.EUR = Currency("EUR")
 Currency.GBP = Currency("GBP")
 Currency.CHF = Currency("CHF")
 Currency.JPY = Currency("JPY")
+
+
+# Instance cache: canonical ISO code → frozen :class:`Currency`. Pre-seeded
+# with the named constants plus every alias form. Hot ``parse_str`` calls
+# short-circuit through this map before paying any string allocation.
+_CURRENCY_CACHE: dict[str, Currency] = {
+    "USD": Currency.USD,
+    "usd": Currency.USD,
+    "EUR": Currency.EUR,
+    "eur": Currency.EUR,
+    "GBP": Currency.GBP,
+    "gbp": Currency.GBP,
+    "CHF": Currency.CHF,
+    "chf": Currency.CHF,
+    "JPY": Currency.JPY,
+    "jpy": Currency.JPY,
+}
+for _alias, _canonical in _CURRENCY_ALIASES.items():
+    _instance = _CURRENCY_CACHE.get(_canonical) or Currency(_canonical)
+    _CURRENCY_CACHE.setdefault(_canonical, _instance)
+    _CURRENCY_CACHE[_alias] = _instance
+del _alias, _canonical, _instance

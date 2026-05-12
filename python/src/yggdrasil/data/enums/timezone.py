@@ -69,6 +69,11 @@ _TIMEZONE_ALIASES: dict[str, str] = {
 
 _OFFSET_RE = re.compile(r"^([+-])(\d{2}):?(\d{2})$")
 
+# Hot per-process cache of resolved Timezone strings. Pre-seeded after
+# the class body with every alias and the named constants; misses
+# fall through to ``_parse_timezone_string`` and cache the result.
+_TIMEZONE_STR_CACHE: dict[str, "Timezone"] = {}
+
 # Sentinel iana value for the naive Timezone — empty string keeps
 # ``str(Timezone.NAIVE)`` invisible in pretty-printed output and makes
 # ``bool(Timezone.NAIVE)`` falsy. Internal-only — callers should use
@@ -271,12 +276,25 @@ class Timezone:
 
     @classmethod
     def _from_str(cls, s: str, *, default: Any = ...) -> "Timezone":
+        # Fast path: most callers pass an already-canonical IANA name
+        # (``"UTC"`` / ``"Europe/Paris"``) or a popular alias
+        # (``"CET"`` / ``"EST"`` / ``"Z"``). A pre-seeded cache resolves
+        # those without re-parsing or rebuilding the available-zones
+        # frozenset.
+        hit = _TIMEZONE_STR_CACHE.get(s)
+        if hit is not None:
+            return hit
         try:
-            return cls(_parse_timezone_string(s))
+            instance = cls(_parse_timezone_string(s))
         except (TypeError, ValueError):
             if default is not ...:
                 return default
             raise
+        # Memoize the input (the parser strips/normalises, so cache
+        # the raw input the caller actually handed us — the next
+        # identical call hits the cache without re-stripping).
+        _TIMEZONE_STR_CACHE[s] = instance
+        return instance
 
     # ── ZoneInfo interop ─────────────────────────────────────────────────────
 
@@ -562,3 +580,44 @@ Timezone.MOUNTAIN = Timezone("America/Denver")
 Timezone.PACIFIC = Timezone("America/Los_Angeles")
 Timezone.JST = Timezone("Asia/Tokyo")
 Timezone.SGT = Timezone("Asia/Singapore")
+
+
+# Pre-seed the string-resolution cache: every alias key (and a few
+# canonical IANA names that show up in tests / DataFrame schemas) is
+# mapped to a singleton :class:`Timezone`. ``Timezone._from_str``
+# hits this map first and only falls through to the parser for
+# inputs we haven't seen yet.
+def _seed_timezone_cache() -> None:
+    available = _available_timezones_cached()
+    seeds = {
+        "UTC": Timezone.UTC,
+        "Etc/UTC": Timezone.UTC,
+        "Europe/Paris": Timezone.CET,
+        "Europe/Lisbon": Timezone.WET,
+        "Europe/Helsinki": Timezone.EET,
+        "America/New_York": Timezone.EASTERN,
+        "America/Chicago": Timezone.CENTRAL,
+        "America/Denver": Timezone.MOUNTAIN,
+        "America/Los_Angeles": Timezone.PACIFIC,
+        "Asia/Tokyo": Timezone.JST,
+        "Asia/Singapore": Timezone.SGT,
+    }
+    _TIMEZONE_STR_CACHE.update(seeds)
+    # Folded alias variants — every alias key (upper-cased in the
+    # table) plus its lower-case form land on the canonical Timezone
+    # instance. Aliases that are *themselves* a valid IANA name
+    # (e.g. ``"GMT"`` is a real zone) are skipped so the parser's
+    # available-zones-first contract is preserved.
+    for alias, canonical in _TIMEZONE_ALIASES.items():
+        if alias in available:
+            instance = Timezone(alias)
+        else:
+            instance = _TIMEZONE_STR_CACHE.get(canonical) or Timezone(canonical)
+            _TIMEZONE_STR_CACHE.setdefault(canonical, instance)
+        _TIMEZONE_STR_CACHE[alias] = instance
+        lower = alias.lower()
+        if lower != alias and lower not in available:
+            _TIMEZONE_STR_CACHE[lower] = instance
+
+
+_seed_timezone_cache()

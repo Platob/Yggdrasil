@@ -287,6 +287,13 @@ class MimeType:
         if isinstance(obj, cls):
             return obj
 
+        # Strings: hand straight to :meth:`from_str`. ``from_str``
+        # already covers path-shaped strings via ``Path(candidate).suffix``
+        # — routing through :class:`URL` for every string was a ~10x
+        # detour for plain extension / mime-value inputs.
+        if isinstance(obj, str):
+            return cls.from_str(obj, default=default)
+
         # Path-shaped inputs short-circuit through URL: extension and
         # scheme tell us the mime without even constructing a Path
         # holder. Maps the sentinel to ``None`` for the forwarded call
@@ -295,9 +302,6 @@ class MimeType:
             mt = URL.from_(obj).infer_media_type(default=None)
             if mt is not None:
                 return mt.mime_type
-
-        if isinstance(obj, str):
-            return cls.from_str(obj, default=default)
 
         return cls.from_magic(obj, default=default)
 
@@ -365,30 +369,50 @@ class MimeType:
 
         Tries, in order:
 
-        - If the string looks path-like (contains ``.``, ``/``, or
-          ``\\``), take its suffix as an extension key.
-        - Strip leading dots and try the bare form as an extension key.
-        - Fall back to :meth:`get` (name / mime-value lookup).
+        - Direct lookup against the lower-cased input (covers
+          ``"text/csv"`` / ``"json"`` / ``".csv"`` without paying a
+          :class:`pathlib.Path` allocation).
+        - If the string looks path-like (contains ``/`` or ``\\``),
+          take its suffix as an extension key.
+        - Fall back to :meth:`get` (name / mime-value lookup with the
+          ``application/`` / ``text/`` / … prefix stripping).
         - Structural sniff on leading ``{`` / ``[``.
 
         :param default: see :class:`MimeType` class docstring for the
             shared default-handling contract.
         :raises ValueError: on a miss when *default* was not supplied.
         """
-        candidate = value.strip()
+        # Fast path: most callers pass already-stripped lowercase input
+        # (``"text/csv"`` / ``"csv"`` / ``".parquet"`` / ``"application/json"``).
+        # A single dict probe each against ``_BY_VALUE`` / ``_EXT_MAP``
+        # resolves them without normalising or allocating a ``Path``.
+        hit = cls._BY_VALUE.get(value)
+        if hit is not None:
+            return hit
+        bare = value[1:] if value.startswith(".") else value
+        hit = cls._EXT_MAP.get(bare)
+        if hit is not None:
+            return hit
 
-        if "." in candidate or "/" in candidate or "\\" in candidate:
+        candidate = value.strip()
+        lower = candidate.lower()
+
+        hit = cls._BY_VALUE.get(lower)
+        if hit is not None:
+            return hit
+
+        bare = lower.lstrip(".")
+        hit = cls._EXT_MAP.get(bare)
+        if hit is not None:
+            return hit
+
+        if "/" in lower or "\\" in lower:
             p = Path(candidate)
             ext = p.suffix.lstrip(".").lower()
             if ext:
                 hit = cls._EXT_MAP.get(ext)
                 if hit is not None:
                     return hit
-
-        bare = candidate.lstrip(".").lower()
-        hit = cls._EXT_MAP.get(bare)
-        if hit is not None:
-            return hit
 
         mt = cls.get(candidate)
         if mt is not None:
