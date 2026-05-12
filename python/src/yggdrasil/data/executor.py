@@ -42,6 +42,11 @@ __all__ = [
     "StatementExecutor",
 ]
 
+
+# Forward-declared module-level singleton — instantiated after
+# :class:`ExecutionOptions` is defined.
+_DEFAULT_EXECUTION_OPTIONS: "ExecutionOptions"
+
 logger = logging.getLogger(__name__)
 
 
@@ -102,7 +107,10 @@ class ExecutionOptions:
         - a Mapping -> constructed from it, then overrides applied
         """
         if value is None:
-            base = cls()
+            # Reuse the singleton — every executor ``execute`` /
+            # ``execute_many`` call hits this path when the caller
+            # didn't supply an options object.
+            base = _DEFAULT_EXECUTION_OPTIONS
         elif isinstance(value, cls):
             base = value
         elif isinstance(value, Mapping):
@@ -123,7 +131,21 @@ class ExecutionOptions:
     @property
     def waits(self) -> bool:
         """True if this policy will block on completion at all."""
-        return bool(WaitingConfig.from_(self.wait))
+        # Fast-path the common scalar values that don't need a
+        # ``WaitingConfig.from_`` roundtrip — ``True``/``False`` are
+        # what ``execute`` / ``execute_many`` pass by default; numeric
+        # forms are what callers supply for "wait at most X seconds".
+        w = self.wait
+        if w is True:
+            return True
+        if w is False or w is None:
+            return False
+        if isinstance(w, (int, float)) and not isinstance(w, bool):
+            return w > 0
+        return bool(WaitingConfig.from_(w))
+
+
+_DEFAULT_EXECUTION_OPTIONS = ExecutionOptions()
 
 
 # ---------------------------------------------------------------------------
@@ -304,18 +326,26 @@ class StatementExecutor(Disposable, ABC, Generic[PS, SR, SB]):
         the wait off without disturbing the rest.
         """
         if options is None:
+            # Steady state: every ``execute()`` / ``execute_many()`` hit
+            # with the public defaults lands here. Reuse the singleton
+            # when nothing diverges so the kwargless path is allocation-
+            # free.
+            if wait is True and raise_error is True and parallel is None:
+                return _DEFAULT_EXECUTION_OPTIONS
             return ExecutionOptions(wait=wait, raise_error=raise_error, parallel=parallel)
 
         # Only apply overrides that diverge from the dataclass defaults.
         # This lets callers do `executor.execute(stmt, options=opts)`
         # without accidentally clobbering opts.wait with the kwarg default.
-        defaults = ExecutionOptions()
+        # Inline the comparisons against the singleton defaults — saves
+        # one ``ExecutionOptions()`` allocation per call (was the most
+        # expensive line of the resolver).
         overrides: dict[str, Any] = {}
-        if wait != defaults.wait:
+        if wait is not True:
             overrides["wait"] = wait
-        if raise_error != defaults.raise_error:
+        if raise_error is not True:
             overrides["raise_error"] = raise_error
-        if parallel != defaults.parallel:
+        if parallel is not None:
             overrides["parallel"] = parallel
         if not overrides:
             return options
