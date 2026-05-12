@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Union, Any, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Optional, Union
 
-from databricks.sdk.errors import ResourceDoesNotExist
+from databricks.sdk.errors import NotFound, ResourceAlreadyExists, ResourceDoesNotExist
 
 from ..client import DatabricksService
 
 if TYPE_CHECKING:
-    from .resource import Secret, Scope, Permission
+    from .resource import Permission, Scope, Secret
 
 __all__ = ["Secrets"]
 
@@ -24,15 +24,22 @@ class Secrets(DatabricksService):
         return self.scope(item)
 
     def __setitem__(self, key, value):
-        found = self.secret(key).refresh(raise_error=False)
-
-        if not found.b64:
-            return self.create_secret(key=key, value=value)
-        else:
-            return found.update(value=value)
+        return self.create_secret(key=key, value=value)
 
     def __delitem__(self, key):
         return self.delete_secret(key=key)
+
+    def __iter__(self):
+        return iter(self.list_scopes())
+
+    def __contains__(self, item: Any) -> bool:
+        if not isinstance(item, str):
+            return False
+        if "/" in item or ":" in item:
+            return self.secret(item).refresh(raise_error=False).b64 is not None
+        return any(s.key == item for s in self.list_scopes())
+
+    # ------------------------------------------------------------------ scopes
 
     def scope(
         self,
@@ -40,10 +47,16 @@ class Secrets(DatabricksService):
     ) -> "Scope":
         from .resource import Scope
 
-        return Scope.parse(
+        return Scope.from_(
             key,
             service=self,
         )
+
+    def list_scopes(self) -> list["Scope"]:
+        from .resource import Scope
+
+        api = self.client.workspace_client().secrets
+        return [Scope(service=self, key=s.name) for s in api.list_scopes()]
 
     def create_scope(
         self,
@@ -55,23 +68,35 @@ class Secrets(DatabricksService):
         from .resource import Scope
 
         if not scope:
-            scope = Scope.parse_mapping(
-                key,
+            scope = Scope.from_mapping(
+                {"key": key} if key else None,
                 service=self,
             )
+        elif isinstance(scope, str):
+            scope = Scope.from_(scope, service=self)
 
         if not scope.key:
             raise ValueError("Scope must have a key to be created")
 
         LOGGER.debug("Creating scope %s", scope)
 
-        client = self.client.workspace_client().secrets
+        api = self.client.workspace_client().secrets
 
-        client.create_scope(scope=scope.key)
-
-        LOGGER.info("Created scope %s", scope)
+        try:
+            api.create_scope(scope=scope.key)
+            LOGGER.info("Created scope %s", scope)
+        except ResourceAlreadyExists:
+            LOGGER.debug("Scope %s already exists; skipping create", scope)
 
         return scope.update(permissions=permissions)
+
+    def delete_scope(
+        self,
+        scope: Union["Scope", str],
+    ) -> None:
+        return self.scope(scope).delete() if isinstance(scope, str) else scope.delete()
+
+    # ----------------------------------------------------------------- secrets
 
     def secret(
         self,
@@ -81,11 +106,17 @@ class Secrets(DatabricksService):
     ) -> "Secret":
         from .resource import Secret
 
-        return Secret.parse(
+        return Secret.from_(
             key,
             service=self,
             scope=scope
         )
+
+    def list_secrets(
+        self,
+        scope: Union["Scope", str],
+    ) -> list["Secret"]:
+        return self.scope(scope).list_secrets() if isinstance(scope, str) else scope.list_secrets()
 
     def create_secret(
         self,
@@ -94,30 +125,46 @@ class Secrets(DatabricksService):
         *,
         scope: Union["Scope", str, None] = None,
         permissions: Union[list["Permission"], None] = None,
-        secret: Union["Secret", str] = None,
+        secret: Union["Secret", str, None] = None,
     ) -> "Secret":
         from .resource import Secret
 
         if not secret:
-            secret = Secret.parse_mapping(
-                key=key,
-                scope=scope,
+            secret = Secret.from_mapping(
+                {"key": key, "scope": scope, "value": value},
                 service=self,
-                value=value
             )
+        elif isinstance(secret, str):
+            secret = Secret.from_(secret, service=self, scope=scope)
+            secret.set_value(value)
 
-        if not secret.scope or not secret.key:
+        if not secret.scope or not secret.scope.key or not secret.key:
             raise ValueError("Secret must have both scope and key to be created")
+
+        target_b64 = secret.b64
+        existing = self.secret(key=secret.key, scope=secret.scope).refresh(raise_error=False)
+
+        # Stronger dedup: skip the put_secret round-trip when the existing
+        # value already matches the desired b64 payload. The Databricks
+        # Secrets API doesn't return cleartext outside DBR, but GetSecretResponse
+        # carries the same base64 we'd otherwise upload, so b64 equality is the
+        # safest cheap fingerprint we can compute client-side.
+        if target_b64 and existing.b64 == target_b64:
+            LOGGER.debug("Secret %s already at desired value; skipping put_secret", secret)
+            secret.update_timestamp = existing.update_timestamp
+            if permissions:
+                secret.scope.update(permissions=permissions)
+            return secret
 
         LOGGER.debug("Creating secret %s", secret)
 
-        client = self.client.workspace_client().secrets
+        api = self.client.workspace_client().secrets
 
         try:
-            client.put_secret(
+            api.put_secret(
                 scope=secret.scope.key,
                 key=secret.key,
-                bytes_value=secret.b64,
+                bytes_value=target_b64,
             )
         except ResourceDoesNotExist as e:
             msg = str(e)
@@ -129,37 +176,71 @@ class Secrets(DatabricksService):
                     scope=secret.scope,
                 )
 
-                client.put_secret(
+                api.put_secret(
                     scope=secret.scope.key,
                     key=secret.key,
-                    bytes_value=secret.b64,
+                    bytes_value=target_b64,
                 )
             else:
                 raise
 
         LOGGER.info("Created secret %s", secret)
 
-        return secret.update(permissions=permissions)
+        if permissions:
+            secret.scope.update(permissions=permissions)
+
+        return secret
 
     def delete_secret(
         self,
-        key: str,
+        key: Union[str, "Secret"],
         *,
         scope: Union["Scope", str, None] = None,
     ) -> None:
-        secret = self.secret(key=key, scope=scope)
+        from .resource import Secret
 
-        if not secret.scope or not secret.key:
-            raise ValueError("Secret must have both scope and key to be deleted")
+        if isinstance(key, Secret):
+            return key.delete()
 
-        LOGGER.debug("Deleting secret %s", secret)
+        return self.secret(key=key, scope=scope).delete()
 
-        client = self.client.workspace_client().secrets
+    # ------------------------------------------------------------- permissions
 
-        try:
-            client.delete_secret(
-                scope=secret.scope.key,
-                key=secret.key,
-            )
-        except ResourceDoesNotExist:
-            LOGGER.warning("Secret %s does not exist; skipping delete", secret)
+    def list_permissions(
+        self,
+        scope: Union["Scope", str],
+    ) -> list["Permission"]:
+        return self.scope(scope).list_permissions() if isinstance(scope, str) else scope.list_permissions()
+
+    def permission(
+        self,
+        scope: Union["Scope", str],
+        principal: str,
+    ) -> Optional["Permission"]:
+        target = self.scope(scope) if isinstance(scope, str) else scope
+        return target.permission(principal)
+
+    def set_permission(
+        self,
+        scope: Union["Scope", str],
+        principal: Any,
+        acl: Any = None,
+    ) -> "Permission":
+        target = self.scope(scope) if isinstance(scope, str) else scope
+        return target.set_permission(principal, acl=acl)
+
+    def set_permissions(
+        self,
+        scope: Union["Scope", str],
+        permissions: Iterable[Any],
+    ) -> list["Permission"]:
+        target = self.scope(scope) if isinstance(scope, str) else scope
+        return [target.set_permission(p) for p in permissions]
+
+    def delete_permission(
+        self,
+        scope: Union["Scope", str],
+        principal: str,
+    ) -> None:
+        target = self.scope(scope) if isinstance(scope, str) else scope
+        return target.delete_permission(principal)

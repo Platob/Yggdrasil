@@ -18,23 +18,26 @@ Tweak the service-level :class:`GenieDefaults` once and every subsequent call
 inherits them::
 
     from dataclasses import replace
+    from yggdrasil.dataclasses import WaitingConfig
     client.genie.defaults = replace(
         client.genie.defaults,
         space_id="01ef...",
         warehouse_id="abc123",
-        timeout_seconds=300,
+        wait=WaitingConfig.from_(300),
     )
 """
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Iterator, Optional
+from typing import TYPE_CHECKING, Iterator, Optional
 
 from yggdrasil.databricks.client import DatabricksService
+from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
 
 from .resources import (
     DEFAULT_POLL_INTERVAL_SECONDS,
     DEFAULT_TIMEOUT_SECONDS,
+    DEFAULT_WAIT,
     GenieAnswer,
     GenieConversation,
     GenieDefaults,
@@ -96,8 +99,7 @@ class Genie(DatabricksService):
         *,
         space_id: str | None = None,
         conversation_id: str | None = None,
-        timeout_seconds: float | None = None,
-        poll_interval_seconds: float | None = None,
+        wait: WaitingConfigArg = None,
     ) -> GenieAnswer:
         """Send a question to Genie and return the completed reply.
 
@@ -111,16 +113,16 @@ class Genie(DatabricksService):
         conversation_id
             Continue an existing conversation. When ``None``, a new one is
             started.
-        timeout_seconds
-            Override :attr:`GenieDefaults.timeout_seconds` for this call.
-        poll_interval_seconds
-            Reserved for future use — the SDK currently controls polling
-            cadence inside ``wait_get_message_genie_completed``.
+        wait
+            Per-call wait budget. Anything :meth:`WaitingConfig.from_`
+            accepts works — a number of seconds, a :class:`datetime.timedelta`,
+            a deadline ``datetime``, an options dict, or a full
+            :class:`WaitingConfig`. When ``None`` the
+            :attr:`GenieDefaults.wait` budget is used.
         """
-        del poll_interval_seconds  # SDK controls cadence; kept for symmetry
-
         space_id = self._resolve_space_id(space_id)
-        timeout = self._timeout(timeout_seconds)
+        wait_cfg = self._resolve_wait(wait)
+        timeout = wait_cfg.timeout_timedelta
 
         if conversation_id:
             LOGGER.debug(
@@ -264,10 +266,10 @@ class Genie(DatabricksService):
     # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #
-    def _timeout(self, override: float | None) -> Any:
-        import datetime as dt
-        seconds = override if override is not None else self.defaults.timeout_seconds
-        return dt.timedelta(seconds=float(seconds))
+    def _resolve_wait(self, override: WaitingConfigArg) -> WaitingConfig:
+        if override is None:
+            return self.defaults.wait or DEFAULT_WAIT
+        return WaitingConfig.from_(override)
 
     def _resolve_space_id(self, space_id: str | None) -> str:
         if space_id:

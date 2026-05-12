@@ -19,8 +19,9 @@ from databricks.sdk.service.dashboards import (
     TextAttachment,
 )
 
-from yggdrasil.databricks.ai.genie import (
+from yggdrasil.databricks.genie import (
     DEFAULT_TIMEOUT_SECONDS,
+    DEFAULT_WAIT,
     Genie,
     GenieAnswer,
     GenieConversation,
@@ -28,6 +29,7 @@ from yggdrasil.databricks.ai.genie import (
     GenieSpace,
 )
 from yggdrasil.databricks.tests import DatabricksTestCase
+from yggdrasil.dataclasses import WaitingConfig
 
 
 def _build_completed_message(
@@ -85,14 +87,15 @@ class TestGenieDefaults(GenieTestCase):
 
     def test_defaults_attached_to_service(self):
         self.assertIsInstance(self.genie.defaults, GenieDefaults)
-        self.assertEqual(self.genie.defaults.timeout_seconds, DEFAULT_TIMEOUT_SECONDS)
+        self.assertIs(self.genie.defaults.wait, DEFAULT_WAIT)
+        self.assertEqual(self.genie.defaults.wait.timeout, DEFAULT_TIMEOUT_SECONDS)
         self.assertTrue(self.genie.defaults.auto_pick_space)
 
     def test_defaults_override_in_place(self):
         self.genie.defaults = replace(
             self.genie.defaults,
             space_id="space-x",
-            timeout_seconds=60.0,
+            wait=WaitingConfig.from_(60),
         )
         self.assertEqual(self.genie.defaults.space_id, "space-x")
         self.assertEqual(self.genie.defaults.timeout, dt.timedelta(seconds=60))
@@ -158,7 +161,7 @@ class TestGenieAsk(GenieTestCase):
             dt.timedelta(seconds=DEFAULT_TIMEOUT_SECONDS),
         )
 
-    def test_ask_with_explicit_timeout(self):
+    def test_ask_with_explicit_wait_seconds(self):
         captured = []
 
         def _record(timeout=None, callback=None):
@@ -166,8 +169,19 @@ class TestGenieAsk(GenieTestCase):
             return self.completed
 
         self.start_waiter.result = _record  # type: ignore[method-assign]
-        self.genie.ask("Q", timeout_seconds=30)
+        self.genie.ask("Q", wait=30)
         self.assertEqual(captured[0], dt.timedelta(seconds=30))
+
+    def test_ask_with_explicit_wait_config(self):
+        captured = []
+
+        def _record(timeout=None, callback=None):
+            captured.append(timeout)
+            return self.completed
+
+        self.start_waiter.result = _record  # type: ignore[method-assign]
+        self.genie.ask("Q", wait=WaitingConfig(timeout=45.0))
+        self.assertEqual(captured[0], dt.timedelta(seconds=45))
 
     def test_ask_continues_conversation_when_id_given(self):
         create_waiter = Wait(

@@ -151,6 +151,6 @@ with ExecutionContext(cluster=cluster) as ctx:
 - [fs](fs/README.md)
 - [secrets](secrets/README.md)
 - [iam](iam/README.md)
-- [ai.genie](ai/genie/README.md)
+- [genie](genie/README.md)
 - [jobs](jobs/README.md)
 - [account](account/README.md)

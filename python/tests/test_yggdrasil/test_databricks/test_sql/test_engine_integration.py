@@ -208,6 +208,30 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
         self.assertEqual(row["c"], self.catalog_name)
         self.assertEqual(row["s"], self.schema_name)
 
+    def test_execute_empty_result_preserves_metadata_schema(self) -> None:
+        """A SELECT that yields zero rows still surfaces a typed
+        :class:`pa.Schema` derived from the warehouse statement
+        manifest, not a schema-less empty table.
+
+        Guards against the regression where ``read_arrow_table`` would
+        collapse to ``Schema.empty()`` when the result chunk iterator
+        was empty (the warehouse never streams a header batch on an
+        empty result set, so the schema has to come from the manifest).
+        """
+        result = self.engine.execute(
+            "SELECT CAST(1 AS BIGINT) AS id, CAST('x' AS STRING) AS label, "
+            "CAST(NULL AS DOUBLE) AS amount WHERE 1 = 0"
+        )
+
+        arrow_table = result.to_arrow_table()
+        self.assertEqual(arrow_table.num_rows, 0)
+        self.assertEqual(
+            arrow_table.schema.names, ["id", "label", "amount"],
+        )
+        self.assertEqual(arrow_table.schema.field("id").type, pa.int64())
+        self.assertEqual(arrow_table.schema.field("label").type, pa.string())
+        self.assertEqual(arrow_table.schema.field("amount").type, pa.float64())
+
     # ------------------------------------------------------------------
     # Engine.create_table — auto-create on miss
     # ------------------------------------------------------------------

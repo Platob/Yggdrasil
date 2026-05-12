@@ -305,7 +305,7 @@ def normalize_options(options=None, *, target_field=None) -> CastOptions:
 | `yggdrasil.polars` / `yggdrasil.pandas` / `yggdrasil.spark` | Engine bridges (`cast.py`, `lib.py`, `tests.py` TestCase bases) |
 | `yggdrasil.io` | `BytesIO`, `URL`, `SendConfig`/`SendManyConfig`, codecs, media types |
 | `yggdrasil.io.http_` | `HTTPSession` (preferred), `PreparedRequest`, `Response` |
-| `yggdrasil.databricks` | `DatabricksClient` + `sql`/`compute`/`workspaces`/`fs`/`iam`/`secrets`/`jobs`/`account`/`ai.genie` |
+| `yggdrasil.databricks` | `DatabricksClient` + `sql`/`compute`/`workspaces`/`fs`/`iam`/`secrets`/`jobs`/`account`/`genie` |
 | `yggdrasil.fastapi` | FastAPI service powering the Power Query connector |
 | `yggdrasil.pyutils` / `yggdrasil.concurrent` | `retry`, `parallelize`, `Job`, `JobPoolExecutor` |
 | `yggdrasil.pickle` / `blake3` / `xxhash` | Optional serialization + hashing |

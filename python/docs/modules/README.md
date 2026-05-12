@@ -22,7 +22,7 @@ Hand-written, copy-paste-friendly pages for the most-used surfaces. The auto-gen
 - [databricks/workspaces](databricks/workspaces/README.md), [databricks/fs](databricks/fs/README.md).
 - [databricks/secrets](databricks/secrets/README.md), [databricks/iam](databricks/iam/README.md).
 - [databricks/jobs](databricks/jobs/README.md), [databricks/account](databricks/account/README.md).
-- [databricks/ai/genie](databricks/ai/genie/README.md).
+- [databricks/genie](databricks/genie/README.md).
 
 ## Utilities
 

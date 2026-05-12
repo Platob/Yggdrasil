@@ -1,4 +1,4 @@
-# yggdrasil.databricks.ai.genie
+# yggdrasil.databricks.genie
 
 Genie conversational analytics service wrapper.
 
