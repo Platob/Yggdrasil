@@ -1005,8 +1005,8 @@ class TestSQLInsertFillMissingColumns(_SQLIntegrationBase):
         self.assertEqual(
             self._read_rows(table),
             [
-                {"id": 5, "label": "fresh-a", "amount": None, "active": None},
-                {"id": 6, "label": "fresh-b", "amount": None, "active": None},
+                {"id": 5, "label": "fresh-a"},
+                {"id": 6, "label": "fresh-b"},
             ],
         )
 

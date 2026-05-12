@@ -13,7 +13,6 @@ def _safe_seconds_tick(ticks: Union[int, float, dt.timedelta]):
 
 
 DEFAULT_TIMEOUT_TICKS = float(20 * 60) # 20 minutes
-WAIT_STRATEGY_PHASE_SECONDS = 5.0
 WaitingConfigArg = Union["WaitingConfig", dict, int, float, dt.datetime, bool]
 
 
@@ -22,7 +21,7 @@ class WaitingConfig:
     timeout: float = DEFAULT_TIMEOUT_TICKS
     interval: float = 0.5
     backoff: float = 1.5
-    max_interval: float = 15.0
+    max_interval: float = 10.0
     retries: int = 8
 
     def __getstate__(self) -> dict:
@@ -39,7 +38,7 @@ class WaitingConfig:
         object.__setattr__(self, "timeout", state.get("timeout", DEFAULT_TIMEOUT_TICKS))
         object.__setattr__(self, "interval", state.get("interval", 1.5))
         object.__setattr__(self, "backoff", state.get("backoff", 1.0))
-        object.__setattr__(self, "max_interval", state.get("max_interval", 15.0))
+        object.__setattr__(self, "max_interval", state.get("max_interval", 10.0))
         object.__setattr__(self, "retries", state.get("retries", 8))
 
     def __bool__(self):
@@ -129,7 +128,7 @@ class WaitingConfig:
                 base_timeout = DEFAULT_TIMEOUT_TICKS if arg else 0.0
                 base_interval = 0.5
                 base_backoff = 1.5
-                base_max_interval = 15.0
+                base_max_interval = 10.0
                 base_retries = 8
 
             elif isinstance(arg, (int, float, dt.timedelta)):
@@ -235,18 +234,6 @@ class WaitingConfig:
             remaining = self.timeout - elapsed
             if remaining <= 0:
                 raise TimeoutError(f"Timed out waiting after {self.timeout:.3f}s")
-
-            # Alternate fast and slow polling windows every 5 seconds.
-            # Fast window: use the computed backoff sleep.
-            # Slow window: force at least a 5s cadence to reduce request pressure.
-            if elapsed >= 0:
-                in_slow_window = int(elapsed // WAIT_STRATEGY_PHASE_SECONDS) % 2 == 1
-                if in_slow_window:
-                    sleep_s = max(sleep_s, WAIT_STRATEGY_PHASE_SECONDS)
-            sleep_s = min(sleep_s, remaining)
-
-        if sleep_s <= 0:
-            return
 
         time.sleep(sleep_s)
 

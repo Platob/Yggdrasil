@@ -47,7 +47,7 @@ from yggdrasil.data.statement import (
 )
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io.tabular.base import O
-from yggdrasil.data.enums import MimeType
+from yggdrasil.data.enums import MimeType, State
 
 from yggdrasil.lazy_imports import has_pymongoarrow, pymongoarrow_api_module
 from .types import documents_to_arrow_table
@@ -338,17 +338,13 @@ class MongoStatementResult(StatementResult[MongoCommand]):
     # Lifecycle
     # ------------------------------------------------------------------
 
-    @property
-    def started(self) -> bool:
-        return self._started
-
-    @property
-    def done(self) -> bool:
-        return self._started
-
-    @property
-    def failed(self) -> bool:
-        return self._failure is not None
+    def _compute_state(self) -> State:
+        """Local-state mapping — Mongo materialises synchronously in :meth:`start`."""
+        if not self._started:
+            return State.PENDING
+        if self._failure is not None:
+            return State.FAILED
+        return State.SUCCEEDED
 
     def refresh_status(self) -> None:
         return None
