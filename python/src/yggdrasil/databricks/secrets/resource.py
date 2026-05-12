@@ -7,7 +7,7 @@ from typing import Optional, Any, Mapping
 
 import yggdrasil.pickle.json as json_module
 from databricks.sdk.errors import NotFound
-from databricks.sdk.service.workspace import GetSecretResponse, AclPermission
+from databricks.sdk.service.workspace import AclItem, AclPermission, GetSecretResponse
 from yggdrasil.data.cast import any_to_datetime
 
 from .service import Secrets
@@ -29,25 +29,32 @@ class Permission:
     acl: AclPermission
 
     @classmethod
-    def parse(cls, obj: Any):
+    def parse(cls, obj: Any, *, acl: Any = None):
         if isinstance(obj, cls):
             return obj
-        elif isinstance(obj, str):
-            return cls.parse_str(obj)
-        elif isinstance(obj, Mapping):
+        if isinstance(obj, AclItem):
+            return cls(principal=obj.principal, acl=AclPermission(obj.permission))
+        if isinstance(obj, str):
+            return cls.parse_str(obj, acl=acl)
+        if isinstance(obj, Mapping):
             principal = obj.get("principal")
-            acl = obj.get("acl", AclPermission.READ)
             if not principal:
-                raise ValueError("Principal is required to parse Permission from mapping")
-            return cls(principal=principal, acl=AclPermission(acl))
-        else:
-            raise ValueError(f"Cannot parse {obj!r} as Permission")
+                raise ValueError(
+                    f"Cannot parse Permission from mapping {obj!r}: "
+                    f"'principal' is required."
+                )
+            value = obj.get("acl", obj.get("permission", AclPermission.READ))
+            return cls(principal=principal, acl=AclPermission(value))
+        raise ValueError(
+            f"Cannot parse {obj!r} as Permission. "
+            f"Expected Permission, AclItem, str, or mapping with 'principal'."
+        )
 
     @classmethod
-    def parse_str(cls, value: str):
-        if value in {"users"}:
-            return cls(principal=value, acl=AclPermission.READ)
-        return cls(principal=value, acl=AclPermission.MANAGE)
+    def parse_str(cls, value: str, *, acl: Any = None):
+        if acl is None:
+            acl = AclPermission.READ if value in {"users"} else AclPermission.MANAGE
+        return cls(principal=value, acl=AclPermission(acl))
 
 
 class Scope(DatabricksResource):
@@ -82,12 +89,7 @@ class Scope(DatabricksResource):
         if not self.key:
             raise ValueError("Scope must have a key to set secrets")
 
-        found = self.service.secret(key, scope=self).refresh(raise_error=False)
-
-        if not found.b64:
-            return self.service.create_secret(key=key, value=value, scope=self)
-        else:
-            return found.update(value=value)
+        return self.service.create_secret(key=key, value=value, scope=self)
 
     def __delitem__(self, key):
         if not self.key:
@@ -149,32 +151,136 @@ class Scope(DatabricksResource):
             if key:
                 self.key = key
             else:
-                raise ValueError("Secret must have both scope and key to be updated")
+                raise ValueError("Scope must have a key to be updated")
         elif key and key != self.key:
             raise ValueError(f"Cannot change scope key from {self.key!r} to {key!r}")
-
-        client = self.client.workspace_client().secrets
 
         if not permissions:
             return self
 
-        permissions = [Permission.parse(_) for _ in permissions]
-
         for p in permissions:
-            if p not in Permission:
-                raise ValueError(f"Invalid permission: {p!r}")
-
-            LOGGER.debug("Updating ACL for %s: %s", self, p)
-
-            client.put_acl(
-                scope=self.key,
-                principal=p.principal,
-                permission=p.acl
-            )
-
-            LOGGER.info("Updated ACL for %s: %s", self, p)
+            self.set_permission(p)
 
         return self
+
+    def list_secrets(self) -> list["Secret"]:
+        if not self.key:
+            raise ValueError("Scope must have a key to list secrets")
+
+        api = self.client.workspace_client().secrets
+
+        try:
+            metas = list(api.list_secrets(scope=self.key))
+        except NotFound:
+            return []
+
+        out: list[Secret] = []
+        for meta in metas:
+            ts = getattr(meta, "last_updated_timestamp", None)
+            out.append(
+                Secret(
+                    service=self.service,
+                    scope=self,
+                    key=meta.key,
+                    update_timestamp=any_to_datetime(ts) if ts else None,
+                )
+            )
+        return out
+
+    def list_permissions(self) -> list[Permission]:
+        if not self.key:
+            raise ValueError("Scope must have a key to list permissions")
+
+        api = self.client.workspace_client().secrets
+
+        try:
+            items = list(api.list_acls(scope=self.key))
+        except NotFound:
+            return []
+
+        return [Permission.parse(item) for item in items]
+
+    def permission(self, principal: str) -> Optional[Permission]:
+        if not self.key:
+            raise ValueError("Scope must have a key to read a permission")
+
+        api = self.client.workspace_client().secrets
+
+        try:
+            item = api.get_acl(scope=self.key, principal=principal)
+        except NotFound:
+            return None
+
+        return Permission.parse(item)
+
+    def set_permission(
+        self,
+        principal: Any,
+        acl: Any = None,
+    ) -> Permission:
+        if not self.key:
+            raise ValueError("Scope must have a key to set a permission")
+
+        if isinstance(principal, str):
+            target = Permission.parse_str(principal, acl=acl)
+        else:
+            target = Permission.parse(principal, acl=acl)
+
+        existing = self.permission(target.principal)
+        if existing == target:
+            LOGGER.debug("Permission %s already set on %s; skipping put_acl", target, self)
+            return existing
+
+        LOGGER.debug("Updating ACL for %s: %s", self, target)
+
+        self.client.workspace_client().secrets.put_acl(
+            scope=self.key,
+            principal=target.principal,
+            permission=target.acl,
+        )
+
+        LOGGER.info("Updated ACL for %s: %s", self, target)
+        return target
+
+    def delete_permission(self, principal: str) -> None:
+        if not self.key:
+            raise ValueError("Scope must have a key to delete a permission")
+
+        try:
+            self.client.workspace_client().secrets.delete_acl(
+                scope=self.key,
+                principal=principal,
+            )
+        except NotFound:
+            LOGGER.debug(
+                "ACL for principal %r on scope %s does not exist; skipping delete",
+                principal, self.key,
+            )
+
+    def delete(self) -> None:
+        if not self.key:
+            raise ValueError("Scope must have a key to be deleted")
+
+        LOGGER.debug("Deleting scope %s", self)
+
+        try:
+            self.client.workspace_client().secrets.delete_scope(scope=self.key)
+        except NotFound:
+            LOGGER.warning("Scope %s does not exist; skipping delete", self)
+            return
+
+        LOGGER.info("Deleted scope %s", self)
+
+    def secret(self, key: str) -> "Secret":
+        return self.service.secret(key, scope=self)
+
+    def __iter__(self):
+        return iter(self.list_secrets())
+
+    def __contains__(self, key: Any) -> bool:
+        if not self.key or not isinstance(key, str):
+            return False
+        return self.service.secret(key, scope=self).refresh(raise_error=False).b64 is not None
 
 
 class Secret(DatabricksResource):
@@ -407,3 +513,20 @@ class Secret(DatabricksResource):
             self.scope.update(permissions=permissions)
 
         return self.refresh()
+
+    def delete(self) -> None:
+        if not self.scope or not self.scope.key or not self.key:
+            raise ValueError("Secret must have both scope and key to be deleted")
+
+        LOGGER.debug("Deleting secret %s", self)
+
+        try:
+            self.client.workspace_client().secrets.delete_secret(
+                scope=self.scope.key,
+                key=self.key,
+            )
+        except NotFound:
+            LOGGER.warning("Secret %s does not exist; skipping delete", self)
+            return
+
+        LOGGER.info("Deleted secret %s", self)
