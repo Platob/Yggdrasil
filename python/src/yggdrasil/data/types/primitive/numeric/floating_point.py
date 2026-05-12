@@ -28,6 +28,7 @@ import pyarrow as pa
 from yggdrasil.data.enums import Mode
 
 from .._helpers import _coerce_str
+from ...base import _default_singleton
 from ...id import DataTypeId
 from ...support import get_polars, get_spark_sql
 from .base import NumericType
@@ -58,9 +59,13 @@ class FloatingPointType(NumericType):
         # ``Float32Type(byte_size=8)`` lands on ``Float64Type`` rather
         # than carrying a malformed width.
         target = _SPECIALIZED_FLOAT_TYPES.get(byte_size)
-        if target is not None and target is not cls:
-            return object.__new__(target)
-        return object.__new__(cls)
+        resolved = target if (target is not None and target is not cls) else cls
+        # Singleton fast path — leaf ``FloatXType`` classes share one
+        # instance so the lazy ``to_arrow`` / ``to_polars`` /
+        # ``to_spark`` caches survive across every caller.
+        if not kwargs and resolved in _SPECIALIZED_FLOAT_TYPES.values():
+            return _default_singleton(resolved)
+        return object.__new__(resolved)
 
     def pretty_format(self, indent: int = 2, level: int = 0) -> str:
         pad = " " * indent * level

@@ -265,3 +265,161 @@ class TestFieldObjectSkipPandas(PandasTestCase):
         f = Field(name="x", dtype=ObjectType(), nullable=True)
 
         self.assertIs(f.cast_pandas_tabular(df), df)
+
+
+# ---------------------------------------------------------------------------
+# Engine-type bypass — when the yggdrasil DataType is "too precise"
+# relative to the underlying engine type. Field equality reports
+# "differ", engine type comparison says "same"; the cast is no-op work
+# and the bypass returns the source unchanged.
+# ---------------------------------------------------------------------------
+
+
+class TestEngineTypeBypassArrow(ArrowTestCase):
+    """SJsonType / StringType both lower to ``pa.string()`` — Field-level
+    equality flags them as different (semantic dtype subclass), engine
+    equality treats them as identical."""
+
+    def _sjson(self):
+        from yggdrasil.data.types.primitive.json import SJsonType
+        return SJsonType()
+
+    def test_array_passes_through_when_engine_type_matches(self) -> None:
+        pa = self.pa
+        arr = pa.array(["a", "b", "c"], type=pa.string())
+
+        out = self._sjson().cast_arrow_array(arr)
+
+        self.assertIs(out, arr)
+
+    def test_chunked_array_passes_through_when_engine_type_matches(self) -> None:
+        pa = self.pa
+        arr = pa.chunked_array([["a", "b"], ["c"]], type=pa.string())
+
+        out = self._sjson().cast_arrow_array(arr)
+
+        self.assertIs(out, arr)
+
+    def test_tabular_passes_through_when_engine_schema_matches(self) -> None:
+        from yggdrasil.data.options import CastOptions
+        from yggdrasil.data.schema import Schema
+
+        pa = self.pa
+        table = pa.table({"a": pa.array(["x", "y"], type=pa.string())})
+
+        # Target is "string" (engine), source Field carries SJsonType
+        # (yggdrasil's "string-backed json" — same arrow type). Field
+        # equality says they differ; the engine-level bypass should
+        # still return the table unchanged.
+        target_field = Schema.from_arrow(table.schema).to_field()
+        source_field = Field(
+            name=target_field.name,
+            dtype=Schema(inner_fields=[
+                Field(name="a", dtype=self._sjson(), nullable=True),
+            ]).dtype,
+            nullable=target_field.nullable,
+        )
+        opts = CastOptions(source_field=source_field, target_field=target_field)
+
+        out = opts.cast_arrow_tabular(table)
+
+        self.assertIs(out, table)
+
+
+class TestArrowViewFlatBypass(ArrowTestCase):
+    """Arrow view layouts (``string_view`` / ``binary_view`` / list views)
+    carry the same logical values as their flat counterparts. A cast
+    that would force the view into the flat layout is buffer-churn for
+    no semantic gain — the bypass keeps the view intact."""
+
+    def _string_view_array(self, values):
+        pa = self.pa
+        # ``pa.array([...], type=pa.string_view())`` works in pyarrow ≥ 17;
+        # fall back to building from string then casting via the cast
+        # kernel itself when the constructor route isn't available.
+        try:
+            return pa.array(values, type=pa.string_view())
+        except (TypeError, pa.ArrowNotImplementedError):
+            return pa.array(values, type=pa.string()).cast(pa.string_view())
+
+    def test_string_view_target_string_returns_input(self) -> None:
+        if not hasattr(self.pa, "string_view"):
+            self.skipTest("pyarrow build has no string_view")
+        arr = self._string_view_array(["a", "b", "c"])
+
+        out = StringType().cast_arrow_array(arr)
+
+        self.assertIs(out, arr)
+        self.assertEqual(out.type, self.pa.string_view())
+
+    def test_string_view_chunked_target_string_returns_input(self) -> None:
+        if not hasattr(self.pa, "string_view"):
+            self.skipTest("pyarrow build has no string_view")
+        pa = self.pa
+        arr = pa.chunked_array(
+            [self._string_view_array(["a", "b"]), self._string_view_array(["c"])]
+        )
+
+        out = StringType().cast_arrow_array(arr)
+
+        self.assertIs(out, arr)
+        self.assertEqual(out.type, pa.string_view())
+
+    def test_table_with_string_view_column_passes_through(self) -> None:
+        if not hasattr(self.pa, "string_view"):
+            self.skipTest("pyarrow build has no string_view")
+        from yggdrasil.data.options import CastOptions
+        from yggdrasil.data.schema import Schema
+
+        pa = self.pa
+        table = pa.table({"a": self._string_view_array(["x", "y"])})
+
+        # Target uses the flat ``string`` type; source carries the
+        # ``string_view`` layout. Engine-level bypass should still
+        # return the table unchanged (view layout preserved).
+        flat_schema = pa.schema([pa.field("a", pa.string(), nullable=True)])
+        target_field = Schema.from_arrow(flat_schema).to_field()
+        opts = CastOptions(target_field=target_field).check_source(
+            obj=table, copy=True,
+        )
+
+        out = opts.cast_arrow_tabular(table)
+
+        self.assertIs(out, table)
+        self.assertEqual(out.schema.field("a").type, pa.string_view())
+
+
+class TestEngineTypeBypassPolars(PolarsTestCase):
+
+    def _sjson(self):
+        from yggdrasil.data.types.primitive.json import SJsonType
+        return SJsonType()
+
+    def test_series_passes_through_when_engine_type_matches(self) -> None:
+        pl = self.pl
+        s = pl.Series("x", ["a", "b"], dtype=pl.String)
+
+        out = self._sjson().cast_polars_series(s)
+
+        self.assertIs(out, s)
+
+    def test_tabular_passes_through_when_engine_schema_matches(self) -> None:
+        from yggdrasil.data.options import CastOptions
+        from yggdrasil.data.schema import Schema
+
+        pl = self.pl
+        df = pl.DataFrame({"a": ["x", "y"]})
+
+        target_field = Schema.from_polars_schema(df.schema).to_field()
+        source_field = Field(
+            name=target_field.name,
+            dtype=Schema(inner_fields=[
+                Field(name="a", dtype=self._sjson(), nullable=True),
+            ]).dtype,
+            nullable=target_field.nullable,
+        )
+        opts = CastOptions(source_field=source_field, target_field=target_field)
+
+        out = opts.cast_polars_tabular(df)
+
+        self.assertIs(out, df)

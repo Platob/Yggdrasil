@@ -36,6 +36,7 @@ from .._helpers import (
     _INT_DDL_SIGNED,
     _INT_DDL_UNSIGNED,
 )
+from ...base import _default_singleton
 from ...id import DataTypeId
 from ...support import get_polars, get_spark_sql
 from .base import (
@@ -89,9 +90,21 @@ class IntegerType(NumericType):
         # dataclass default fills in ``byte_size=8`` during ``__init__``
         # after ``__new__`` returns).
         target = _SPECIALIZED_INTEGER_TYPES.get((byte_size, bool(signed)))
-        if target is not None and target is not cls:
-            return object.__new__(target)
-        return object.__new__(cls)
+        resolved = target if (target is not None and target is not cls) else cls
+        # Singleton fast path: leaf specialized subclasses
+        # (``Int8Type`` … ``UInt64Type``) construct with the same field
+        # values every time — share one instance so the lazy
+        # ``to_arrow`` / ``to_polars`` / ``to_spark`` caches survive
+        # across every caller. ``kwargs`` carries metadata-only knobs
+        # in some subclasses, so it bypasses the singleton. The
+        # abstract :class:`IntegerType` itself only singletons on the
+        # default-arg call (``IntegerType()``) — non-default widths
+        # need their own instance because the field values differ.
+        if not kwargs and resolved in _SPECIALIZED_INTEGER_TYPES.values():
+            return _default_singleton(resolved)
+        if not kwargs and byte_size is None and signed is True and resolved is IntegerType:
+            return _default_singleton(resolved)
+        return object.__new__(resolved)
 
     def pretty_format(self, indent: int = 2, level: int = 0) -> str:
         pad = " " * (indent * level)
