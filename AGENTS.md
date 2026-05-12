@@ -1040,20 +1040,21 @@ Concrete rules, in order of priority:
 3. **Singleton-cache by config in `__new__`.** When two callers build the same client / session / service with the same config, they must share the same in-process instance — otherwise the connection pool, cookie jar, boto-client cache, and per-instance lazy state get duplicated for nothing. Pattern:
 
    ```python
-   _INSTANCES: ClassVar[dict[tuple[type, ConfigT], "Self"]] = {}
-   _INSTANCES_LOCK: ClassVar[threading.Lock] = threading.Lock()
+   from yggdrasil.dataclasses.expiring import ExpiringDict
+
+   # ExpiringDict owns its own RLock and an atomic get_or_set, so
+   # the singleton cache doesn't need an external _INSTANCES_LOCK.
+   # default_ttl=None ⇒ entries live for the process lifetime; pass
+   # seconds / timedelta / max_size if a config should age out or
+   # be capped (rare for client singletons, common for query-result
+   # caches).
+   _INSTANCES: ClassVar[ExpiringDict[tuple[type, ConfigT], "Self"]] = ExpiringDict(default_ttl=None)
 
    def __new__(cls, config=None):
        if config is None:
            config = ConfigT()
        key = (cls, config)
-       with cls._INSTANCES_LOCK:
-           cached = cls._INSTANCES.get(key)
-           if cached is not None:
-               return cached
-           inst = super().__new__(cls)
-           cls._INSTANCES[key] = inst
-           return inst
+       return cls._INSTANCES.get_or_set(key, lambda: object.__new__(cls))
 
    def __init__(self, config=None):
        if getattr(self, "_initialized", False):
@@ -1065,7 +1066,7 @@ Concrete rules, in order of priority:
        return (self.config,)  # collapse to live singleton on in-process unpickle
    ```
 
-   `__getnewargs__` is what makes pickle round-trip preserve singleton identity within a process. The `_INSTANCES` dict is also the seam tests use to clear cross-test bleed (`Cls._INSTANCES.clear()` in an autouse fixture).
+   `__getnewargs__` is what makes pickle round-trip preserve singleton identity within a process. The `_INSTANCES` `ExpiringDict` is also the seam tests use to clear cross-test bleed (`Cls._INSTANCES.clear()` in an autouse fixture). **Don't** reach for a bare `dict` + `threading.Lock` here — `ExpiringDict` is already the project-wide primitive for concurrent / TTL-bearing caches (see `databricks/sql/{schemas,tables,views,catalogs}.py`, `databricks/warehouse/service.py`, `MSALAuth._INSTANCES`). It gives you `get_or_set`, `set_many`, `pop`, `purge_expired`, an `on_evict` hook for values that own external resources, and pickling that preserves only live entries — all behaviors a hand-rolled `dict + Lock + sweep` triple has to grow over time.
 
 4. **Hash and equality follow config, not identity.** Two clients built from equal configs must compare equal and hash equal so they collapse to the same `_INSTANCES` slot. Don't add `__hash__` based on `id(self)` — the singleton mechanism already gives you stable identity for free, and config-based equality lets configs flow into sets / dict keys / Spark `groupBy` keys without surprising the caller.
 
