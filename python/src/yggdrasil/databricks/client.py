@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from .workspaces import Workspaces, Workspace
     from .fs.service import FileSystem
     from .fs.path import DatabricksPath
-    from .ai.genie import Genie
+    from .genie import Genie
     from .tags.service import EntityTags
 
 __all__ = [
@@ -1236,7 +1236,7 @@ class DatabricksClient(URLBased):
     @property
     def genie(self) -> "Genie":
         """Genie conversation and space management helper for this client."""
-        from .ai.genie import Genie
+        from .genie import Genie
 
         return self.lazy_property(
             self,

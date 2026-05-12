@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterator, Optional, Union
 
 from yggdrasil.databricks.client import DatabricksResource
+from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io.url import URL
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -50,6 +51,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = [
     "DEFAULT_TIMEOUT_SECONDS",
     "DEFAULT_POLL_INTERVAL_SECONDS",
+    "DEFAULT_WAIT",
     "GenieDefaults",
     "GenieAnswer",
     "GenieConversation",
@@ -69,6 +71,14 @@ DEFAULT_TIMEOUT_SECONDS: float = 1200.0
 #: Default polling cadence when the SDK has not finished a message yet. The
 #: SDK's own waiter polls every second; we keep the same default.
 DEFAULT_POLL_INTERVAL_SECONDS: float = 1.0
+
+#: Canonical :class:`WaitingConfig` used by :class:`GenieDefaults`. Pre-built
+#: so the dataclass default is a real singleton — replace the whole field via
+#: ``replace(defaults, wait=WaitingConfig.from_(60))`` to tweak per call site.
+DEFAULT_WAIT: WaitingConfig = WaitingConfig(
+    timeout=DEFAULT_TIMEOUT_SECONDS,
+    interval=DEFAULT_POLL_INTERVAL_SECONDS,
+)
 
 #: Non-pending Genie message statuses. When :meth:`Genie.ask` polls and
 #: observes one of these, the response is considered final.
@@ -112,10 +122,14 @@ class GenieDefaults:
         Optional warehouse id used to materialise Genie's SQL results when
         :meth:`GenieAnswer.arrow_table` / ``polars`` / ``pandas`` is called.
         Defaults to the workspace's default warehouse when unset.
-    timeout_seconds
-        Maximum time to wait for Genie to finish a message.
-    poll_interval_seconds
-        Polling cadence while the message is still in a pending status.
+    wait
+        :class:`~yggdrasil.dataclasses.WaitingConfig` carrying the maximum
+        time to wait for Genie to finish a message (``wait.timeout``) and the
+        SDK polling cadence (``wait.interval``). Defaults to
+        :data:`DEFAULT_WAIT` (20 minutes / 1 second). Override per-call by
+        passing ``wait=`` to :meth:`Genie.ask` — anything
+        :meth:`WaitingConfig.from_` accepts (seconds, ``timedelta``, deadline,
+        dict, full ``WaitingConfig``) works.
     auto_execute_query
         When ``True``, :meth:`GenieAnswer.arrow_table` /
         :meth:`GenieAnswer.polars` / :meth:`GenieAnswer.pandas` will
@@ -130,15 +144,14 @@ class GenieDefaults:
     space_id: Optional[str] = None
     space_name: Optional[str] = None
     warehouse_id: Optional[str] = None
-    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
-    poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS
+    wait: WaitingConfig = DEFAULT_WAIT
     auto_execute_query: bool = True
     auto_pick_space: bool = True
 
     @property
     def timeout(self) -> dt.timedelta:
-        """The :attr:`timeout_seconds` value, expressed as a ``timedelta``."""
-        return dt.timedelta(seconds=float(self.timeout_seconds))
+        """The wait budget expressed as a ``timedelta`` (SDK shorthand)."""
+        return self.wait.timeout_timedelta
 
 
 # ---------------------------------------------------------------------------

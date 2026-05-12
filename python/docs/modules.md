@@ -41,7 +41,7 @@ Engines register their converters **on import** — pull them in once at startup
 | `yggdrasil.databricks.iam` | Users + groups (workspace/account) | [databricks/iam](modules/databricks/iam/README.md) |
 | `yggdrasil.databricks.jobs` | Typed `NotebookConfig` widgets | [databricks/jobs](modules/databricks/jobs/README.md) |
 | `yggdrasil.databricks.account` | Account-level service | [databricks/account](modules/databricks/account/README.md) |
-| `yggdrasil.databricks.ai.genie` | Conversational analytics | [databricks/ai/genie](modules/databricks/ai/genie/README.md) |
+| `yggdrasil.databricks.genie` | Conversational analytics | [databricks/genie](modules/databricks/genie/README.md) |
 
 ## Platform and utilities
 
