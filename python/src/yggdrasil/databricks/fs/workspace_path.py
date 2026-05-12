@@ -12,9 +12,11 @@ read-modify-rewrite scheme.
 from __future__ import annotations
 
 import io as _stdio
+import time
 from typing import Any, ClassVar, Iterator
 
 from yggdrasil.data.enums import Scheme
+from yggdrasil.data.enums.media_type import MediaType
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 
@@ -178,16 +180,16 @@ class WorkspacePath(DatabricksPath):
             if _looks_like_already_exists(exc):
                 if not exist_ok:
                     raise
-                self._invalidate_stat_cache()
+                self._seed_stat_cache(IOStats(kind=IOKind.DIRECTORY))
                 return
             if _looks_like_protected_parent(exc):
                 # Hitting a protected ancestor (e.g. ``/Workspace/Users``)
                 # is fine if the leaf already landed — fall through and
                 # let downstream ops succeed.
-                self._invalidate_stat_cache()
+                self._seed_stat_cache(IOStats(kind=IOKind.DIRECTORY))
                 return
             raise
-        self._invalidate_stat_cache()
+        self._seed_stat_cache(IOStats(kind=IOKind.DIRECTORY))
 
     def _remove_file(self, missing_ok: bool = True) -> None:
         try:
@@ -233,6 +235,27 @@ class WorkspacePath(DatabricksPath):
             data = body.read()
         except AttributeError:
             data = bytes(body)
+
+        # ``workspace.download`` always returns the whole object, so its
+        # length IS the file size. Seed the stat cache (or refresh the
+        # ``size`` slot when the prior entry came from a metadata probe)
+        # so the next ``size`` / ``exists`` lookup is local.
+        media_type = _media_type_from_response(response)
+        if self._stat_cached is None:
+            self._seed_stat_cache(IOStats(
+                size=len(data),
+                kind=IOKind.FILE,
+                media_type=media_type,
+            ))
+        else:
+            self._stat_cached.size = len(data)
+            if media_type is not None and self._stat_cached.media_type is None:
+                self._stat_cached.media_type = media_type
+            # Re-stamp the TTL — this download IS the freshest size we
+            # could observe; the entry should outlive the original
+            # probe's window from this point on.
+            self._seed_stat_cache(self._stat_cached)
+
         if pos:
             data = data[pos:]
         if n > 0:
@@ -273,7 +296,12 @@ class WorkspacePath(DatabricksPath):
             format=_import_format_auto(),
             overwrite=True,
         )
-        self._invalidate_stat_cache()
+        self._seed_stat_cache(IOStats(
+            size=len(payload),
+            kind=IOKind.FILE,
+            mtime=time.time(),
+            media_type=self._media_type,
+        ))
 
     def truncate(self, n: int) -> int:
         if n < 0:
@@ -302,6 +330,24 @@ class WorkspacePath(DatabricksPath):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _media_type_from_response(info) -> "MediaType | None":
+    """Resolve a :class:`MediaType` from a Workspace download response.
+
+    The SDK exposes the MIME type as ``content_type`` on the response
+    object (when set on import). Returns ``None`` when absent — the
+    caller falls back to URL-extension inference.
+    """
+    if info is None:
+        return None
+    mime = (
+        getattr(info, "content_type", None)
+        or getattr(info, "mime_type", None)
+    )
+    if not mime:
+        return None
+    return MediaType.from_(mime, default=None)
 
 
 def _looks_like_not_found(exc: BaseException) -> bool:
