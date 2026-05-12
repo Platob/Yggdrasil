@@ -26,13 +26,20 @@ BENCH_DIR = Path(__file__).resolve().parent
 # Opt in with ``--include <name>``.
 _REQUIRES_LIVE: frozenset[str] = frozenset({
     "bench_databricks_insert_staging",
+    "bench_io_remote",
 })
 
 
 def _discover() -> list[Path]:
-    """Find every ``bench_*.py`` in ``BENCH_DIR`` (except this runner)."""
+    """Find every ``bench_*.py`` under ``BENCH_DIR`` (recursive).
+
+    Benches are organized into module-mirrored subfolders
+    (``benchmarks/data/``, ``benchmarks/io/primitive/``, …) — we
+    walk the whole tree so newly-added module benches get picked
+    up without touching this file.
+    """
     return sorted(
-        p for p in BENCH_DIR.glob("bench_*.py")
+        p for p in BENCH_DIR.rglob("bench_*.py")
         if p.name != Path(__file__).name
     )
 

@@ -404,6 +404,51 @@ Prefer:
 
 But correctness and user-visible behavior come first.
 
+#### Benchmark-driven optimization — measure, don't guess
+
+Performance changes go through `python/benchmarks/` — not through
+intuition.
+
+The benches are organized to mirror the source tree
+(`benchmarks/data/`, `benchmarks/io/primitive/`,
+`benchmarks/io/path/`, …). Each module that ships a hot path has
+a paired `bench_<name>.py` that exercises the public surface.
+
+The rule for any "I think this is slow" or "this would be faster"
+change:
+
+1. **Find or add the bench first.** If the operation you want to
+   optimize isn't already covered, write the scenario into the
+   matching `benchmarks/<module>/bench_<name>.py`. The bench must
+   exercise the exact call shape callers hit — not a
+   reduced-to-absurdity micro that doesn't represent real use.
+2. **Capture the baseline.** Run `python benchmarks/<file>.py
+   --repeat 5` against `main` (or whatever you're branching from)
+   and save the numbers somewhere — commit message, PR body,
+   scratchpad. Without a baseline you can't tell whether your
+   change helped, regressed, or did nothing.
+3. **Apply the change.** Keep it minimal. One conceptual change at
+   a time so the before/after diff is obvious.
+4. **Re-run the same bench.** Same `--repeat`, same machine, same
+   process — quote the new `best` and `median` against the
+   baseline. A change that improves `mean` while regressing
+   `best` is usually a thermal artefact, not a real win.
+5. **Validate the rest of the suite didn't regress.** Run
+   `python benchmarks/run_all.py --repeat 3` (the full sweep, a
+   few minutes) and skim the output. Optimizations frequently
+   trade off — speeding up one path can slow down another. Show
+   the relevant numbers in the PR / commit.
+6. **Document the win.** Mention the before / after in the commit
+   message body. Future readers (and reviewers) need to know
+   which numbers are load-bearing.
+
+Skipping the bench step is the most common way good intentions
+land regressions. "Felt faster" doesn't ship — quoted numbers do.
+
+When the bench is missing for a hot path, **adding the bench
+counts as part of the change**. It's how the next contributor
+will find their regression.
+
 ### 6. Never loop over data rows in Python
 
 Python `for` loops over Arrow / Polars / pandas / Spark values are the
