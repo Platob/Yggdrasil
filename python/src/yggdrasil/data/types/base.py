@@ -313,6 +313,22 @@ def _arrow_types_compatible(source_type: pa.DataType, target_type: pa.DataType) 
 _DATA_TYPE_DEFAULT_SINGLETONS: dict[type, "DataType"] = {}
 
 
+#: Memoized ``pa.DataType -> DataType`` dispatch results. Populated on
+#: first :meth:`DataType.from_arrow_type` miss; reused on every
+#: subsequent peek of the same ``pa.DataType``. Cast pipelines build
+#: source fields from the same arrow types repeatedly (every batch in a
+#: stream, every iteration in a benchmark loop), and the recursive
+#: subclass-walk dispatch is the dominant cost of binding a source on
+#: the hot path. ``DataType`` instances are fully immutable
+#: (``@dataclass(frozen=True)`` + frozen children) so sharing a single
+#: instance across callers is safe — ``pa.DataType`` is hashable and
+#: equal types collapse to the same key, so distinct caller-built types
+#: with the same shape share the cache entry too. The cache is
+#: unbounded but cardinality is bounded by the distinct schemas a
+#: process touches (typically dozens, not thousands).
+_FROM_ARROW_TYPE_CACHE: dict["pa.DataType", "DataType"] = {}
+
+
 def _default_singleton(cls: type) -> "DataType":
     """Return the cached default-arg instance of ``cls``, building it on miss.
 
@@ -1397,6 +1413,27 @@ class DataType(BaseChildrenFields, ABC):
 
     @classmethod
     def from_arrow_type(cls, value: pa.DataType) -> "DataType":
+        # Cache hot — schemas in a process touch a small bounded set of
+        # ``pa.DataType`` values, and the dispatch below walks every
+        # subclass tree (recursive ``handles_arrow_type``) which is
+        # the dominant cost of binding a source field on the cast hot
+        # path.  Returned ``DataType`` instances are fully immutable
+        # (``@dataclass(frozen=True)``) so sharing a single instance
+        # across callers is safe.  Only cache for the abstract
+        # :class:`DataType` base — subclass-rooted dispatches stay
+        # uncached so a subclass tree (e.g. ``IntegerType.from_arrow_type``)
+        # remains a regular subclass walk.
+        if cls is DataType:
+            cached = _FROM_ARROW_TYPE_CACHE.get(value)
+            if cached is not None:
+                return cached
+            for subclass in cls.__subclasses__():
+                if subclass.handles_arrow_type(value):
+                    built = subclass.from_arrow_type(value)
+                    _FROM_ARROW_TYPE_CACHE[value] = built
+                    return built
+            raise TypeError(f"Unsupported Arrow data type: {value!r}")
+
         for subclass in cls.__subclasses__():
             if subclass.handles_arrow_type(value):
                 return subclass.from_arrow_type(value)

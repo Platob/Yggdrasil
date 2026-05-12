@@ -328,6 +328,12 @@ class MapType(NestedType):
         series: "polars.Series",
         options: "CastOptions",
     ) -> "polars.Series":
+        # Engine-level bypass — see :meth:`StructType._cast_polars_series`.
+        # Polars represents Maps as ``pl.List(pl.Struct(...))`` so the
+        # dtype equality check naturally walks key/value child types.
+        if series.dtype == self.to_polars():
+            return series
+
         pl = polars_module()
         options = options.check_source(series).check_target(self)
 
