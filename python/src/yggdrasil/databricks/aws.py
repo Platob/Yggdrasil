@@ -27,6 +27,8 @@ rotation pick up the fresh workspace auth.
 from __future__ import annotations
 
 import dataclasses
+import logging
+import re
 from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 from yggdrasil.aws.config import AwsCredentials
@@ -44,6 +46,20 @@ __all__ = [
     "AWSDatabricksVolumeCredentials",
     "AWSDatabricksTableCredentials",
 ]
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+# Matches the UC error message shape:
+#   "User does not have EXTERNAL USE SCHEMA on Schema 'cat.sch'"
+# Captures the two-part schema name (with or without surrounding
+# quotes / backticks). Case-insensitive — UC's wording has drifted
+# between releases.
+_EXTERNAL_USE_SCHEMA_RE = re.compile(
+    r"EXTERNAL\s+USE\s+SCHEMA\s+on\s+Schema\s+['\"`]?([^'\"`\s]+)['\"`]?",
+    re.IGNORECASE,
+)
 
 
 def _iso_or_str(value: Any) -> Optional[str]:
@@ -143,10 +159,27 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
         (``"read"``, ``"overwrite"``, …), or ``None`` (uses
         :attr:`DEFAULT_MODE`). Read-only modes vend the UC "read"
         operation; everything else vends the writable operation.
+
+        If the SDK rejects the call with
+        ``PermissionDenied: ... EXTERNAL USE SCHEMA on Schema 'cat.sch'``,
+        we make exactly one attempt to self-grant
+        ``EXTERNAL_USE_SCHEMA`` on the offending schema and retry.
+        Owners of UC schemas commonly forget this grant — when they
+        own the schema they have permission to fix it, and silently
+        succeeding is dramatically less surprising than asking them
+        to read the error and run a follow-up SQL. If the recovery
+        itself fails (non-owner, network error, …) the *original*
+        PermissionDenied propagates so the failure mode stays
+        obvious.
         """
         resolved = Mode.from_(mode, default=self.DEFAULT_MODE)
         operation = self._operation_for(resolved)
-        resp = self._generate(operation)
+        try:
+            resp = self._generate(operation)
+        except Exception as exc:
+            if not self._try_self_grant_external_use_schema(exc):
+                raise
+            resp = self._generate(operation)
         aws = getattr(resp, "aws_temp_credentials", None)
         if aws is None:
             raise RuntimeError(
@@ -213,6 +246,72 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
 
     def _generate(self, operation: Any) -> Any:
         raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Recovery — auto self-grant EXTERNAL_USE_SCHEMA on UC schema
+    # ------------------------------------------------------------------
+
+    def _try_self_grant_external_use_schema(self, exc: BaseException) -> bool:
+        """One-shot recovery for ``PermissionDenied: EXTERNAL USE SCHEMA …``.
+
+        Returns ``True`` when a fresh ``EXTERNAL_USE_SCHEMA`` grant was
+        successfully applied to ``self.client.iam.users.current_user``
+        on the schema named in *exc*, so the caller can retry the
+        credential mint. Returns ``False`` (without raising) on any
+        of:
+
+        - *exc* isn't a permission error;
+        - the error message doesn't carry an ``EXTERNAL USE SCHEMA on
+          Schema 'cat.sch'`` clause we can parse;
+        - the current user lookup fails or produces no usable
+          principal (email / username);
+        - the grant itself fails (caller isn't owner — propagating
+          the *original* PermissionDenied is more informative).
+        """
+        if type(exc).__name__ != "PermissionDenied":
+            return False
+        match = _EXTERNAL_USE_SCHEMA_RE.search(str(exc))
+        if not match:
+            return False
+        full = match.group(1).strip("'\"`")
+        parts = [p for p in full.split(".") if p]
+        if len(parts) != 2:
+            return False
+        catalog_name, schema_name = parts
+
+        try:
+            current = self.client.iam.users.current_user
+        except Exception:
+            LOGGER.debug(
+                "EXTERNAL_USE_SCHEMA self-grant: current_user lookup failed",
+                exc_info=True,
+            )
+            return False
+        principal = (
+            getattr(current, "email", None)
+            or getattr(current, "username", None)
+            or getattr(current, "name", None)
+        )
+        if not principal:
+            return False
+
+        try:
+            schema = self.client.schemas.schema(
+                catalog_name=catalog_name, schema_name=schema_name,
+            )
+            schema.grant(principal, "EXTERNAL_USE_SCHEMA")
+        except Exception:
+            LOGGER.debug(
+                "EXTERNAL_USE_SCHEMA self-grant: grant() failed on %s.%s for %s",
+                catalog_name, schema_name, principal, exc_info=True,
+            )
+            return False
+
+        LOGGER.info(
+            "Self-granted EXTERNAL_USE_SCHEMA on %s.%s to %s; retrying credential mint",
+            catalog_name, schema_name, principal,
+        )
+        return True
 
 
 class AWSDatabricksVolumeCredentials(_DatabricksCredentialsBase):

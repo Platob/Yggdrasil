@@ -1,16 +1,19 @@
 """Generic retry wrapper for remote-path SDK calls.
 
-Two categories of transient failure are worth retrying:
+Only **transient backend errors** (InternalError, BadRequest, 500/503,
+socket timeouts) are retried — up to 4 times with incremental sleep
+(1 s, 2 s, 4 s, 8 s).
 
-* **Transient backend errors** (InternalError, BadRequest, 500/503,
-  socket timeouts) — retried up to 4 times with incremental sleep
-  (1 s, 2 s, 4 s, 8 s).
-* **Permission errors** — retried once with a 1 s sleep, in case the
-  SDK was racing a credential refresh / token mint. Anything beyond
-  that is the caller's misconfiguration; we surface the error.
+Permission errors (PermissionDenied / 401 / 403, expired tokens, …)
+**fail fast**: they're deterministic from the caller's point of view
+— the principal genuinely lacks the grant, the token is dead, or the
+auth config is wrong. Sleeping and retrying just hides the real
+problem; the caller (or a higher-level recovery path like the
+credential-vending auto-grant in :mod:`yggdrasil.databricks.aws`)
+decides what to do.
 
 Anything else (NotFound, AlreadyExists, FileNotFoundError,
-ValueError, …) is **not** retried — those are deterministic.
+ValueError, …) is **not** retried either — those are deterministic.
 
 This module deliberately avoids importing the boto / databricks SDK
 exception classes; it duck-types on the exception's class name and
@@ -44,9 +47,9 @@ _TRANSIENT_NAMES = frozenset({
     "ReadTimeoutError", "ReadTimeout", "TooManyRequests", "RetryError",
 })
 
-#: Class names that signal permission/auth errors. One retry for
-#: credential-refresh races; anything beyond that is a real config
-#: problem.
+#: Class names that signal permission/auth errors. Surfaced via
+#: :func:`is_permission` so higher-level recovery paths can react;
+#: :func:`retry_sdk_call` itself never retries these.
 _PERMISSION_NAMES = frozenset({
     "PermissionDenied", "AccessDenied", "AccessDeniedException",
     "Forbidden", "Unauthorized", "InvalidAccessKeyId",
@@ -149,7 +152,6 @@ def retry_sdk_call(
     func: Callable[..., _T],
     *args: Any,
     max_transient_retries: int = 4,
-    max_permission_retries: int = 1,
     base_sleep: float = 1.0,
     sleep: Callable[[float], None] = time.sleep,
     **kwargs: Any,
@@ -157,19 +159,20 @@ def retry_sdk_call(
     """Call *func(*args, **kwargs)* with the Databricks/AWS retry policy.
 
     Sleep schedule for transient errors: ``base_sleep * 2**attempt``
-    seconds (1, 2, 4, 8 by default). Permission errors get exactly
-    one *base_sleep* nap before retrying once.
+    seconds (1, 2, 4, 8 by default). Permission errors **fail fast**
+    — they're deterministic from the SDK's perspective and any
+    recovery (self-grant, owner takeover, …) belongs in a
+    higher-level handler.
 
     The *sleep* callable is injected so tests can pass a no-op or a
     spy. The default is :func:`time.sleep`.
 
-    Non-transient, non-permission errors propagate immediately —
-    that includes :class:`FileNotFoundError`, :class:`ValueError`,
-    :class:`KeyError`, and any custom error type the caller wants
-    to surface deterministically.
+    Non-transient errors propagate immediately — that includes
+    :class:`PermissionDenied`, :class:`FileNotFoundError`,
+    :class:`ValueError`, :class:`KeyError`, and any custom error
+    type the caller wants to surface deterministically.
     """
     transient_attempt = 0
-    permission_attempt = 0
     while True:
         try:
             return func(*args, **kwargs)
@@ -185,16 +188,5 @@ def retry_sdk_call(
                 )
                 sleep(wait)
                 transient_attempt += 1
-                continue
-            if is_permission(exc):
-                if permission_attempt >= max_permission_retries:
-                    raise
-                LOGGER.info(
-                    "Permission error from %s (attempt %d/%d); sleeping %.1fs: %s",
-                    getattr(func, "__name__", func),
-                    permission_attempt + 1, max_permission_retries, base_sleep, exc,
-                )
-                sleep(base_sleep)
-                permission_attempt += 1
                 continue
             raise
