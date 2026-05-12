@@ -196,9 +196,6 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
             expiration=_iso_or_str(getattr(resp, "expiration_time", None)),
         )
 
-    def __call__(self) -> AwsCredentials:
-        return self.get_credentials()
-
     # ------------------------------------------------------------------
     # AWSClient binding — one per (mode, region)
     # ------------------------------------------------------------------
