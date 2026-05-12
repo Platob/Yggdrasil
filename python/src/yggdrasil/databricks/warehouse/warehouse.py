@@ -74,6 +74,7 @@ from ..client import DatabricksResource
 from ..fs import VolumePath
 
 if TYPE_CHECKING:
+    import urllib3
     from .service import Warehouses
 
 __all__ = [
@@ -214,6 +215,30 @@ class SQLWarehouse(
 
     def __str__(self) -> str:
         return self.warehouse_id or self.warehouse_name or f"{self.__class__.__name__}(<not initialized>)"
+
+    # ------------------------------------------------------------------
+    # External-link fetch pool
+    # ------------------------------------------------------------------
+
+    def external_link_pool(self, max_workers: int) -> "urllib3.PoolManager":
+        """Return the cached :class:`urllib3.PoolManager` for chunk reads.
+
+        The pool is built lazily on the first ``EXTERNAL_LINKS`` chunk
+        read and reused across every :class:`WarehouseStatementResult`
+        attached to this warehouse. Tying the pool to the warehouse
+        instance means a long-running process can dispose of the pool
+        (and its sockets) simply by dropping the warehouse handle —
+        we don't pin connections in a module-level cache the runtime
+        can never reach.
+        """
+        cached = getattr(self, "_external_link_pool_cache", None)
+        if cached is not None and cached[0] == max_workers:
+            return cached[1]
+        from .statement import _build_external_link_pool
+        pool = _build_external_link_pool(max_workers)
+        # Stored on ``self`` so it drops with the warehouse instance.
+        self._external_link_pool_cache = (max_workers, pool)
+        return pool
 
     # ------------------------------------------------------------------
     # Details caching and state

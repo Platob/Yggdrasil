@@ -86,20 +86,17 @@ logger = logging.getLogger(__name__)
 _DEFAULT_BYTE_SIZE = 32 * 1024 * 1024
 
 
-# Module-level cache of :class:`urllib3.PoolManager` keyed by the
-# ``(max_workers, connect, read)`` tuple. Pool managers are thread-safe
-# and reuse TCP connections across calls; rebuilding one per
-# ``_read_arrow_batches`` invocation pays for connection-pool setup +
-# retry config every time a statement result reads its chunks, which is
-# pure overhead for hot pipelines that issue many small reads.
-_EXTERNAL_LINK_POOLS: dict[tuple, urllib3.PoolManager] = {}
+def _build_external_link_pool(max_workers: int) -> urllib3.PoolManager:
+    """Build a :class:`urllib3.PoolManager` for external-link fetches.
 
-
-def _external_link_pool(max_workers: int) -> urllib3.PoolManager:
-    key = (max_workers,)
-    pool = _EXTERNAL_LINK_POOLS.get(key)
-    if pool is not None:
-        return pool
+    The pool is reused across every chunk read for the warehouse it's
+    attached to (see :meth:`SQLWarehouse._external_link_pool`); pulling
+    it onto the warehouse instance — rather than a module-level cache —
+    ties the underlying connection lifecycle to the warehouse handle.
+    When the warehouse is GC'd, the pool drops with it, so a
+    long-running process holding many warehouses doesn't accumulate
+    pooled sockets the runtime can't reach.
+    """
     retry = urllib3.Retry(
         total=4,
         backoff_factor=0.2,
@@ -107,7 +104,7 @@ def _external_link_pool(max_workers: int) -> urllib3.PoolManager:
         allowed_methods=frozenset(["GET"]),
         raise_on_status=False,
     )
-    pool = urllib3.PoolManager(
+    return urllib3.PoolManager(
         num_pools=max_workers * 2,
         maxsize=max_workers * 2,
         retries=retry,
@@ -115,8 +112,6 @@ def _external_link_pool(max_workers: int) -> urllib3.PoolManager:
         headers={"Accept-Encoding": "gzip,deflate"},
         cert_reqs="CERT_REQUIRED",
     )
-    _EXTERNAL_LINK_POOLS[key] = pool
-    return pool
 
 
 def _empty_arrow_batches(arrow_schema: pa.Schema) -> Iterator[pa.RecordBatch]:
@@ -1003,7 +998,10 @@ class WarehouseStatementResult(StatementResult):
         max_workers = 4
         max_in_flight = max_workers * 2
 
-        http = _external_link_pool(max_workers)
+        # Pool is owned by the warehouse executor — its lifetime matches
+        # the warehouse handle, so we don't leak TCP connections in a
+        # long-running process that creates and discards warehouses.
+        http = self.executor.external_link_pool(max_workers)
         byte_size = options.byte_size or _DEFAULT_BYTE_SIZE
         memory_pool = options.arrow_memory_pool
 
