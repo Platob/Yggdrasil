@@ -30,7 +30,13 @@ import time
 from typing import Any, Iterable, Iterator, Mapping, Optional, TYPE_CHECKING
 
 from databricks.sdk.errors import DatabricksError, NotFound
-from databricks.sdk.service.catalog import SchemaInfo, SecurableType
+from databricks.sdk.service.catalog import (
+    PermissionsChange,
+    Privilege,
+    PrivilegeAssignment,
+    SchemaInfo,
+    SecurableType,
+)
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.databricks.client import DatabricksResource
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
@@ -47,6 +53,54 @@ if TYPE_CHECKING:
 __all__ = ["Schema"]
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_privileges(
+    privileges: "str | Privilege | Iterable[str | Privilege] | None",
+) -> Iterator[Privilege]:
+    """Yield :class:`Privilege` enums for any caller-facing privilege spec.
+
+    Accepts a single privilege or an iterable; strings are matched
+    case-insensitively with ``-`` / spaces folded to ``_``
+    (``"external use schema"`` → :attr:`Privilege.EXTERNAL_USE_SCHEMA`).
+    Duplicates are deduped while preserving caller order. ``None`` and
+    empty / whitespace-only items are skipped.
+
+    Raises :class:`ValueError` on an unrecognized privilege name —
+    the error message includes the list of valid privileges so a typo
+    surfaces immediately.
+    """
+    if privileges is None:
+        return
+    if isinstance(privileges, (str, Privilege)):
+        items: Iterable[Any] = (privileges,)
+    else:
+        items = privileges
+
+    seen: set[Privilege] = set()
+    for item in items:
+        if item is None:
+            continue
+        if isinstance(item, Privilege):
+            normalized = item
+        else:
+            token = str(item).strip()
+            if not token:
+                continue
+            key = token.upper().replace("-", "_").replace(" ", "_")
+            key = "_".join(p for p in key.split("_") if p)
+            try:
+                normalized = Privilege(key)
+            except ValueError as exc:
+                valid = ", ".join(p.value for p in Privilege)
+                raise ValueError(
+                    f"Unknown Unity Catalog privilege {token!r}. "
+                    f"Pass a Privilege enum or one of: {valid}."
+                ) from exc
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        yield normalized
 
 
 class Schema(DatabricksResource):
@@ -384,6 +438,165 @@ class Schema(DatabricksResource):
 
     def _grants_full_name(self) -> str:
         return self.full_name()
+
+    # ── permissions (CRUD) ────────────────────────────────────────────────────
+
+    def permissions(
+        self,
+        *,
+        principal: str | None = None,
+    ) -> tuple[PrivilegeAssignment, ...]:
+        """Direct grants on this schema (no inherited privileges).
+
+        Calls the Unity Catalog ``grants.get`` endpoint.
+
+        Args:
+            principal: Optional filter — return only grants for this
+                user / group / service principal.
+
+        Returns:
+            Tuple of :class:`PrivilegeAssignment` (one per principal
+            with at least one direct grant).
+        """
+        kwargs: dict[str, Any] = {}
+        if principal is not None:
+            kwargs["principal"] = principal
+        response = self.client.workspace_client().grants.get(
+            securable_type=SecurableType.SCHEMA.value,
+            full_name=self.full_name(),
+            **kwargs,
+        )
+        return tuple(response.privilege_assignments or ())
+
+    def effective_permissions(
+        self,
+        *,
+        principal: str | None = None,
+    ) -> tuple[Any, ...]:
+        """Effective grants on this schema, including privileges inherited
+        from the parent catalog / metastore.
+
+        Calls the Unity Catalog ``grants.get_effective`` endpoint.
+        """
+        kwargs: dict[str, Any] = {}
+        if principal is not None:
+            kwargs["principal"] = principal
+        response = self.client.workspace_client().grants.get_effective(
+            securable_type=SecurableType.SCHEMA.value,
+            full_name=self.full_name(),
+            **kwargs,
+        )
+        return tuple(response.privilege_assignments or ())
+
+    def grant(
+        self,
+        principal: str,
+        privileges: "str | Privilege | Iterable[str | Privilege]",
+    ) -> "Schema":
+        """Add one or more privileges for *principal* on this schema.
+
+        Privileges may be passed as :class:`Privilege` enums or as
+        strings (case-insensitive, ``-`` / spaces accepted in place of
+        ``_``).  Example::
+
+            schema.grant("alice@example.com", "EXTERNAL USE SCHEMA")
+            schema.grant("data-engs", [Privilege.USE_SCHEMA, "SELECT"])
+        """
+        return self.update_permissions(
+            changes=[PermissionsChange(
+                principal=principal,
+                add=list(_normalize_privileges(privileges)),
+            )]
+        )
+
+    def revoke(
+        self,
+        principal: str,
+        privileges: "str | Privilege | Iterable[str | Privilege]",
+    ) -> "Schema":
+        """Remove one or more privileges for *principal* on this schema."""
+        return self.update_permissions(
+            changes=[PermissionsChange(
+                principal=principal,
+                remove=list(_normalize_privileges(privileges)),
+            )]
+        )
+
+    def set_permissions(
+        self,
+        principal: str,
+        privileges: "str | Privilege | Iterable[str | Privilege]",
+    ) -> "Schema":
+        """Replace *principal*'s direct grants on this schema with
+        exactly *privileges*.
+
+        Computes the diff against the current direct grants and emits a
+        single ``grants.update`` call that adds the missing privileges
+        and removes the extras.  Inherited grants are not touched (they
+        belong to the parent securable).
+        """
+        desired = set(_normalize_privileges(privileges))
+        current: set[Privilege] = set()
+        for assignment in self.permissions(principal=principal):
+            for p in (assignment.privileges or ()):
+                current.add(p if isinstance(p, Privilege) else Privilege(p))
+
+        add = desired - current
+        remove = current - desired
+        if not add and not remove:
+            return self
+
+        return self.update_permissions(
+            changes=[PermissionsChange(
+                principal=principal,
+                add=sorted(add, key=lambda p: p.value) or None,
+                remove=sorted(remove, key=lambda p: p.value) or None,
+            )]
+        )
+
+    def update_permissions(
+        self,
+        changes: "Iterable[PermissionsChange | Mapping[str, Any]]",
+    ) -> "Schema":
+        """Apply a batch of ``PermissionsChange`` to this schema.
+
+        Accepts :class:`PermissionsChange` instances or plain mappings
+        (``{"principal": ..., "add": [...], "remove": [...]}``).  Empty
+        / no-op changes are filtered out before the API call.
+        """
+        normalized: list[PermissionsChange] = []
+        for change in changes or ():
+            if isinstance(change, PermissionsChange):
+                pc = change
+            elif isinstance(change, Mapping):
+                pc = PermissionsChange(
+                    principal=change.get("principal"),
+                    add=list(_normalize_privileges(change.get("add"))) or None,
+                    remove=list(_normalize_privileges(change.get("remove"))) or None,
+                )
+            else:
+                raise TypeError(
+                    f"Schema.update_permissions: each change must be a "
+                    f"PermissionsChange or mapping, got {type(change).__name__}: "
+                    f"{change!r}."
+                )
+            if not pc.principal:
+                raise ValueError(
+                    f"Schema.update_permissions: change is missing 'principal': {pc!r}."
+                )
+            if not pc.add and not pc.remove:
+                continue
+            normalized.append(pc)
+
+        if not normalized:
+            return self
+
+        self.client.workspace_client().grants.update(
+            securable_type=SecurableType.SCHEMA.value,
+            full_name=self.full_name(),
+            changes=normalized,
+        )
+        return self
 
     # ── update ────────────────────────────────────────────────────────────────
 

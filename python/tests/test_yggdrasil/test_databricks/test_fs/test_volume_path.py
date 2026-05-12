@@ -1003,3 +1003,48 @@ class TestS3ServiceArrowFilesystem:
         # but constructing without error is sufficient signal.
         fs = service.arrow_filesystem(region="eu-central-1")
         assert isinstance(fs, pafs.S3FileSystem)
+
+
+class TestUCNavigation:
+    """``catalog_name`` / ``schema_name`` / ``volume_name`` plus the
+    lazy ``catalog`` / ``schema`` properties."""
+
+    def test_names_under_volume(self, workspace, client) -> None:
+        p = VolumePath("/Volumes/cat/sch/vol/sub/x.bin", client=client)
+        assert p.catalog_name == "cat"
+        assert p.schema_name == "sch"
+        assert p.volume_name == "vol"
+
+    def test_names_none_for_volumes_root(self, workspace, client) -> None:
+        p = VolumePath("/Volumes", client=client)
+        assert p.catalog_name is None
+        assert p.schema_name is None
+        assert p.volume_name is None
+
+    def test_catalog_property_is_cached(self, workspace, client) -> None:
+        sentinel = object()
+        client.catalogs.catalog.return_value = sentinel
+        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        assert p.catalog is sentinel
+        assert p.catalog is sentinel
+        client.catalogs.catalog.assert_called_once_with("cat")
+
+    def test_schema_property_is_cached(self, workspace, client) -> None:
+        sentinel = object()
+        client.schemas.schema.return_value = sentinel
+        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        assert p.schema is sentinel
+        assert p.schema is sentinel
+        client.schemas.schema.assert_called_once_with(
+            catalog_name="cat", schema_name="sch",
+        )
+
+    def test_catalog_raises_without_uc_prefix(self, workspace, client) -> None:
+        p = VolumePath("/Volumes", client=client)
+        with pytest.raises(ValueError, match="/Volumes/<cat>/<sch>/<vol>"):
+            _ = p.catalog
+
+    def test_schema_raises_without_uc_prefix(self, workspace, client) -> None:
+        p = VolumePath("/Volumes", client=client)
+        with pytest.raises(ValueError, match="/Volumes/<cat>/<sch>/<vol>"):
+            _ = p.schema

@@ -50,6 +50,8 @@ from .path import DatabricksPath
 
 if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
+    from yggdrasil.databricks.sql.catalog import Catalog
+    from yggdrasil.databricks.sql.schema import Schema
 
 from yggdrasil.databricks.aws import AWSDatabricksVolumeCredentials
 
@@ -63,7 +65,7 @@ __all__ = ["VolumePath", "VolumeCredentialsRefresher"]
 class VolumePath(DatabricksPath):
     """Path under ``/Volumes/<cat>/<sch>/<vol>/...`` via the Files API."""
 
-    __slots__ = ("_volume_info", "_storage_path")
+    __slots__ = ("_volume_info", "_storage_path", "_catalog", "_schema")
 
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_VOLUME
     namespace_prefix: ClassVar[str] = "/Volumes/"
@@ -81,6 +83,8 @@ class VolumePath(DatabricksPath):
         super().__init__(data=data, url=url, **kwargs)
         self._volume_info: Any = None
         self._storage_path: Any = None
+        self._catalog: Any = None
+        self._schema: Any = None
 
     # ==================================================================
     # Path rendering
@@ -138,6 +142,77 @@ class VolumePath(DatabricksPath):
         if len(parts) < 3:
             return None
         return parts[0], parts[1], parts[2]
+
+    @property
+    def catalog_name(self) -> Optional[str]:
+        """The Unity Catalog catalog this volume lives under, or ``None``."""
+        triple = self._split_volume()
+        return triple[0] if triple else None
+
+    @property
+    def schema_name(self) -> Optional[str]:
+        """The Unity Catalog schema this volume lives under, or ``None``."""
+        triple = self._split_volume()
+        return triple[1] if triple else None
+
+    @property
+    def volume_name(self) -> Optional[str]:
+        """The Unity Catalog volume name, or ``None`` when the URL path
+        doesn't address a volume."""
+        triple = self._split_volume()
+        return triple[2] if triple else None
+
+    @property
+    def catalog(self) -> "Catalog":
+        """Return a :class:`Catalog` instance for this volume's parent catalog.
+
+        Lazily resolved on first access and cached on the instance —
+        every subsequent access returns the same :class:`Catalog`. The
+        instance is bound to :attr:`client` via
+        ``client.catalogs.catalog(...)`` so it inherits the same auth
+        / retry / caching behavior as the rest of the SQL surface.
+
+        Raises :class:`ValueError` when the URL path doesn't address a
+        volume (no ``/cat/sch/vol`` prefix), since there's no catalog
+        to bind to.
+        """
+        if self._catalog is not None:
+            return self._catalog
+        catalog_name = self.catalog_name
+        if not catalog_name:
+            raise ValueError(
+                f"{type(self).__name__}.catalog requires a path under "
+                f"/Volumes/<cat>/<sch>/<vol>/... — got {self.full_path()!r}."
+            )
+        self._catalog = self.client.catalogs.catalog(catalog_name)
+        return self._catalog
+
+    @property
+    def schema(self) -> "Schema":
+        """Return a :class:`Schema` instance for this volume's parent schema.
+
+        Lazily resolved on first access and cached on the instance.
+        Bound to :attr:`client` via
+        ``client.schemas.schema(catalog_name=..., schema_name=...)`` so
+        it shares the workspace-scoped schema cache.
+
+        Raises :class:`ValueError` when the URL path doesn't address a
+        volume (no ``/cat/sch/vol`` prefix).
+        """
+        if self._schema is not None:
+            return self._schema
+        triple = self._split_volume()
+        if triple is None:
+            raise ValueError(
+                f"{type(self).__name__}.schema requires a path under "
+                f"/Volumes/<cat>/<sch>/<vol>/... — got {self.full_path()!r}."
+            )
+        catalog_name, schema_name, _ = triple
+        self._schema = self.client.schemas.schema(
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+        )
+        return self._schema
 
     def volume_info(self, refresh: bool = False) -> Any:
         """Return the SDK's :class:`VolumeInfo` for this volume.
