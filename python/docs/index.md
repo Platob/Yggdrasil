@@ -18,7 +18,6 @@ pip install ygg
 - Treat **Arrow schema** as the contract: names, order, nullability, metadata, nested structure are preserved across boundaries.
 - Use **one converter registry** instead of separate utilities per engine.
 - **Optional dependencies** — pull `pandas` / `polars` / `spark` / `databricks` only when you need them.
-- **Rust fast path, Python canonical** — `yggrs` accelerates hot paths; everything works without it.
 
 ---
 
@@ -99,7 +98,7 @@ pip install ygg
   SQL, Unity Catalog, Compute, DBFS/Volumes, Secrets, IAM, Genie.
 
 - :material-tools: **[Development](guides/development.md)**
-  Tests, lint, docs, Rust extension, optional dependencies.
+  Tests, lint, docs, optional dependencies.
 
 - :material-bookshelf: **[Module walkthrough](modules.md)**
   Curated index of focused module pages.
@@ -114,7 +113,7 @@ pip install ygg
 ## Install patterns
 
 ```bash
-pip install ygg                   # core: pyarrow + polars + yggrs
+pip install ygg                   # core: pyarrow + polars
 pip install "ygg[data]"           # pandas, numpy, sqlglot
 pip install "ygg[bigdata]"        # pyspark, delta-spark
 pip install "ygg[databricks]"     # databricks-sdk
@@ -127,4 +126,4 @@ pip install "ygg[kafka]"          # confluent-kafka
 pip install "ygg[delta]"          # deltalake
 ```
 
-The only hard runtime deps are `pyarrow>=20`, `polars>=1.3`, and the matching `yggrs` wheel.
+The only hard runtime deps are `pyarrow>=20` and `polars>=1.3`.

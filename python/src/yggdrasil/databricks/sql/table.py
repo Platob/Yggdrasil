@@ -1713,7 +1713,7 @@ class Table(DatabricksResource, Holder):
             value = getattr(assignment, "tag_value", None) or ""
             metadata[f"tag:{key}".encode("utf-8")] = str(value).encode("utf-8")
 
-        return DataSchema.from_any_fields(fields, metadata=metadata)
+        return DataSchema.from_fields(fields, metadata=metadata)
 
     def collect_data_field(self, safe: bool = False) -> Field:
         return self.collect_schema(safe=safe).to_field()

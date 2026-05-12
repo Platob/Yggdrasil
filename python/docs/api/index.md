@@ -24,7 +24,6 @@ The full literate nav is generated into `reference/SUMMARY.md` and rendered by `
 | `yggdrasil.databricks.jobs` | `NotebookConfig` |
 | `yggdrasil.pyutils` | `retry`, `parallelize` |
 | `yggdrasil.concurrent` | `Job`, `JobPoolExecutor` |
-| `yggdrasil.rs` | `HAS_RS`, accelerated entry points (with Python fallback) |
 
 ## Curated module pages
 

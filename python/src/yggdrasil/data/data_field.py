@@ -51,7 +51,7 @@ from .data_utils import get_cast_options_class, safe_constraint_name
 from .types import NullType, ObjectType
 from .types.base import DataType
 from .types.nested import StructType
-from .types.support import get_pandas, get_polars, get_spark_sql
+from yggdrasil.lazy_imports import pandas_module, polars_module, spark_sql_module
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -360,6 +360,14 @@ class Field(BaseChildrenFields):
     _field_name_fold_map: dict[str, int] | None = dataclasses.field(
         default=None, repr=False, compare=False
     )
+    # Cached :meth:`__hash__` result. ``Field`` is widely used as a
+    # dict key / set member (``CastOptions`` target, schema rebuilds,
+    # field-name lookup); the underlying hash walks ``self.dtype``
+    # plus a sorted view of ``self.metadata`` so the saved cost on
+    # repeat hashing of the same instance is significant — especially
+    # for struct-shaped fields where the dtype hash recurses into
+    # children.
+    _hash: int | None = dataclasses.field(default=None, repr=False, compare=False)
 
     def __repr__(self):
         return self.pretty_format()
@@ -372,16 +380,25 @@ class Field(BaseChildrenFields):
             return True
         if not isinstance(other, Field):
             return NotImplemented
+        # Singleton fast path: primitive ``DataType()`` calls share one
+        # process-wide instance per concrete class (Int64Type, etc.),
+        # so an identity check covers the common case without dispatching
+        # the full structural compare.
         return (
             self.name == other.name
             and self.nullable == other.nullable
-            and self.dtype == other.dtype
+            and (self.dtype is other.dtype or self.dtype == other.dtype)
             and self.metadata == other.metadata
         )
 
     def __hash__(self) -> int:
+        cached = self._hash
+        if cached is not None:
+            return cached
         meta_key = tuple(sorted(self.metadata.items())) if self.metadata else None
-        return hash((self.name, self.dtype, self.nullable, meta_key))
+        h = hash((self.name, self.dtype, self.nullable, meta_key))
+        object.__setattr__(self, "_hash", h)
+        return h
 
     @classmethod
     def default(
@@ -515,7 +532,7 @@ class Field(BaseChildrenFields):
         without having to know to call :class:`Schema` instead. Only
         plain ``Field`` calls redirect; explicit ``Schema(...)`` and
         any other subclass go through normal allocation (so
-        ``Schema(inner_fields=...)`` keeps its own constructor shape).
+        ``Schema(...)`` keeps its own constructor shape).
         """
         if cls is Field:
             # Pull dtype out of either positional or kwargs to match
@@ -602,6 +619,7 @@ class Field(BaseChildrenFields):
         object.__setattr__(self, "_spark_schema", None)
         object.__setattr__(self, "_field_name_map", None)
         object.__setattr__(self, "_field_name_fold_map", None)
+        object.__setattr__(self, "_hash", None)
         # Adopt children — set their ``parent`` so they bubble cache
         # invalidations back up to us when they mutate.
         self._adopt_children()
@@ -663,6 +681,7 @@ class Field(BaseChildrenFields):
             and self._spark_schema is None
             and self._field_name_map is None
             and self._field_name_fold_map is None
+            and self._hash is None
         ):
             # Already clean — still cascade so dirty ancestors clear too.
             if cascade and self.parent is not None:
@@ -676,6 +695,7 @@ class Field(BaseChildrenFields):
         object.__setattr__(self, "_spark_schema", None)
         object.__setattr__(self, "_field_name_map", None)
         object.__setattr__(self, "_field_name_fold_map", None)
+        object.__setattr__(self, "_hash", None)
         if cascade and self.parent is not None:
             self.parent._invalidate_cache(cascade=True)
 
@@ -702,6 +722,8 @@ class Field(BaseChildrenFields):
           (both are structural, schema-defining attributes).
         - ``check_metadata``: compare this field's metadata and recurse.
         """
+        if other is self:
+            return True
         if other is None:
             return False
         if not isinstance(other, Field):
@@ -762,7 +784,7 @@ class Field(BaseChildrenFields):
                             check_metadata=check_metadata,
                         ):
                             return False
-            elif not self.dtype.equals(
+            elif self.dtype is not other.dtype and not self.dtype.equals(
                 other.dtype,
                 check_metadata=check_metadata,
             ):
@@ -1180,12 +1202,9 @@ class Field(BaseChildrenFields):
     ) -> "Field":
         """Construct a struct-shaped instance bypassing subclass init shims.
 
-        Used by mapping mutators / set ops / autotag — the Schema
-        subclass keeps a backwards-compat ``__init__(inner_fields=...)``
-        signature, but the underlying state is pure :class:`Field`.
-        Going through ``__new__`` + ``Field.__init__`` lets the same
-        code construct either a ``Field`` or a ``Schema`` based on
-        ``cls``.
+        Used by mapping mutators / set ops / autotag. Going through
+        ``__new__`` + ``Field.__init__`` lets the same code construct
+        either a ``Field`` or a ``StructField`` based on ``cls``.
         """
         inst = cls.__new__(cls)
         Field.__init__(
@@ -1389,17 +1408,11 @@ class Field(BaseChildrenFields):
             if metadata is None and tags is None
             else _normalize_metadata(metadata, tags=tags)
         )
-        # Honour legacy ``name`` / ``nullable`` embedded in the metadata
-        # dict so callers passing ``metadata={"name": ...}`` still
-        # update the field's first-class name slot.
-        meta, embedded_name, embedded_nullable = _peel_name_nullable(meta)
 
         if name is None:
-            name = embedded_name if embedded_name is not None else self.name
+            name = self.name
         if nullable is None:
-            nullable = (
-                embedded_nullable if embedded_nullable is not None else self.nullable
-            )
+            nullable = self.nullable
 
         inst = type(self).__new__(type(self))
         Field.__init__(
@@ -1794,22 +1807,21 @@ class Field(BaseChildrenFields):
         )
 
     @classmethod
-    def from_any_fields(
+    def from_fields(
         cls,
         fields: Iterable["Field | Any"],
+        *,
+        name: str = DEFAULT_FIELD_NAME,
+        nullable: bool = False,
         metadata: dict[bytes | str, bytes | str | object] | None = None,
         tags: dict[bytes | str, bytes | str | object] | None = None,
     ) -> "Field":
         """Build a struct-shaped instance from a list of fields."""
-        meta = _normalize_metadata(metadata, tags=tags)
-        meta, embedded_name, embedded_nullable = _peel_name_nullable(meta)
         return cls._make_struct(
             children=[Field.from_any(f) for f in fields],
-            metadata=meta,
-            name=embedded_name if embedded_name is not None else DEFAULT_FIELD_NAME,
-            nullable=(
-                bool(embedded_nullable) if embedded_nullable is not None else False
-            ),
+            name=name,
+            nullable=bool(nullable),
+            metadata=_normalize_metadata(metadata, tags=tags),
         )
 
     # ==================================================================
@@ -2299,7 +2311,7 @@ class Field(BaseChildrenFields):
 
     @classmethod
     def from_pandas(cls, obj: Any = None) -> "Field":
-        pd = get_pandas()
+        pd = pandas_module()
 
         if isinstance(obj, pd.DataFrame):
             return cls(
@@ -2340,7 +2352,7 @@ class Field(BaseChildrenFields):
 
     @classmethod
     def from_polars(cls, obj: Any = None) -> "Field":
-        pl = get_polars()
+        pl = polars_module()
 
         if isinstance(obj, pl.Field):
             return cls.from_polars_field(obj)
@@ -2410,7 +2422,7 @@ class Field(BaseChildrenFields):
 
     @classmethod
     def from_spark(cls, obj: Any = None, from_metadata: bool = True) -> "Field":
-        _psql = get_spark_sql()
+        _psql = spark_sql_module()
 
         if not isinstance(obj, _psql.types.StructField):
             if isinstance(obj, _psql.DataFrame):
@@ -2576,7 +2588,7 @@ class Field(BaseChildrenFields):
         if self._polars_field is not None:
             return self._polars_field
 
-        pl = get_polars()
+        pl = polars_module()
         built = pl.Field(self.name, self.dtype.to_polars())
         try:
             built.nullable = self.nullable
@@ -2598,7 +2610,7 @@ class Field(BaseChildrenFields):
         if self._polars_schema is not None:
             return self._polars_schema
 
-        pl = get_polars()
+        pl = polars_module()
         if self.type_id is DataTypeId.STRUCT:
             entries = [(c.name, c.dtype.to_polars()) for c in self.fields]
         else:
@@ -2669,7 +2681,7 @@ class Field(BaseChildrenFields):
         if self._spark_schema is not None:
             return self._spark_schema
 
-        pyspark_sql = get_spark_sql()
+        pyspark_sql = spark_sql_module()
         if self.type_id is DataTypeId.STRUCT:
             fields = [c.to_pyspark_field() for c in self.fields]
         else:
@@ -2736,8 +2748,7 @@ class Field(BaseChildrenFields):
         if new_metadata:
             final_metadata.update(new_metadata)
 
-        return Schema(
-            inner_fields=base.children,
+        return Schema(base.children,
             metadata=final_metadata or None,
             name=base.name if base.name != DEFAULT_FIELD_NAME else None,
             nullable=base.nullable,
@@ -2918,7 +2929,7 @@ class Field(BaseChildrenFields):
         Series → :meth:`cast_polars_series`,
         Expr → :meth:`cast_polars_expr`.
         """
-        pl = get_polars()
+        pl = polars_module()
         # Tabular first — a DataFrame is never a Series, and the pl
         # lazy import dominates dispatch latency. Doing the isinstance
         # walk here beats paying for it at every call site.
@@ -2948,7 +2959,7 @@ class Field(BaseChildrenFields):
         DataIO sense, and ``pa.Table.from_pandas`` carries them via
         ``preserve_index`` at the caller's discretion.
         """
-        pd = get_pandas()
+        pd = pandas_module()
         if isinstance(obj, pd.DataFrame):
             return self.cast_pandas_tabular(obj, options=options, **more)
         if isinstance(obj, pd.Series):
@@ -2969,7 +2980,7 @@ class Field(BaseChildrenFields):
         DataFrame → :meth:`cast_spark_tabular`,
         Column → :meth:`cast_spark_column`.
         """
-        sql = get_spark_sql()
+        sql = spark_sql_module()
         if isinstance(obj, sql.DataFrame):
             return self.cast_spark_tabular(obj, options=options, **more)
         if isinstance(obj, sql.Column):
@@ -3302,7 +3313,7 @@ class Field(BaseChildrenFields):
         identically). DataFrame / LazyFrame route through
         :meth:`cast_polars_tabular` as a self-targeted cast.
         """
-        pl = get_polars()
+        pl = polars_module()
         if isinstance(obj, (pl.Series, pl.Expr)):
             return self.fill_polars_array_nulls(obj, default_scalar=default_scalar)
         if isinstance(obj, (pl.DataFrame, pl.LazyFrame)):
@@ -3314,7 +3325,7 @@ class Field(BaseChildrenFields):
 
     def fill_pandas(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Fill nulls in any pandas object."""
-        pd = get_pandas()
+        pd = pandas_module()
         if isinstance(obj, pd.Series):
             return self.fill_pandas_series_nulls(obj, default_scalar=default_scalar)
         if isinstance(obj, pd.DataFrame):
@@ -3326,7 +3337,7 @@ class Field(BaseChildrenFields):
 
     def fill_spark(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Fill nulls in any spark object."""
-        sql = get_spark_sql()
+        sql = spark_sql_module()
         if isinstance(obj, sql.Column):
             return self.fill_spark_column_nulls(obj, default_scalar=default_scalar)
         if isinstance(obj, sql.DataFrame):
@@ -3623,7 +3634,7 @@ class Field(BaseChildrenFields):
         DataFrame/LazyFrame → identity (tabular cast already finalized
         per-column via the struct walk).
         """
-        pl = get_polars()
+        pl = polars_module()
         if isinstance(obj, (pl.Series, pl.Expr)):
             filled = self.fill_polars_array_nulls(obj, default_scalar=default_scalar)
             return self.polars_alias(filled)
@@ -3686,7 +3697,7 @@ class Field(BaseChildrenFields):
         Column → fill + alias.
         DataFrame → identity (tabular cast already finalized).
         """
-        sql = get_spark_sql()
+        sql = spark_sql_module()
         if isinstance(obj, sql.Column):
             return self.finalize_spark_column(obj, default_scalar=default_scalar)
         if isinstance(obj, sql.DataFrame):

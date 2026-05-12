@@ -214,7 +214,7 @@ The point is to make all of that feel like one coherent system.
 If the task touches a dataframe, schema, field, type, or cross-engine conversion, start here and drop down to `polars` / `pandas` / `pyspark` / `pyarrow` only when the abstraction genuinely does not cover the case.
 
 Prefer, in this order:
-- `DataField` / `Field` and `Schema` (names, nullability, metadata, tags, nested structure, engine dtype intent in one place). Use `Field.from_pandas`, `Field.from_polars`, `Field.from_arrow`, `Schema.from_any_fields` instead of re-building per-engine schemas by hand.
+- `DataField` / `Field` and `Schema` (names, nullability, metadata, tags, nested structure, engine dtype intent in one place). Use `Field.from_pandas`, `Field.from_polars`, `Field.from_arrow`, `Schema.from_fields` instead of re-building per-engine schemas by hand.
 - `DataType` / `DataTypeId` and the `types/` submodules (`primitive`, `nested`, `iso`, `extensions`) for type hints. Don't hand-roll `pa.int64()` / `pl.Int64` / `"bigint"` when a `DataType` produces all of them.
 - `DataTable` and `StatementResult` for "execute, then move rows" integrations. New backends should implement these rather than invent a parallel surface.
 - `yggdrasil.data.cast.convert(value, target, options=...)` with `CastOptions` for value conversion. Do not call `df.to_pandas()`, `pl.from_arrow(...)`, `spark.createDataFrame(...)` directly from feature code if a registered converter already handles it.
@@ -325,9 +325,8 @@ Use the modern stack unless you have a strong reason not to.
 ### AI and SQL
 - `ai/` — OpenAI-backed sessions and SQL generation
 
-### Serialization and acceleration
+### Serialization
 - `pickle/` — custom serialization system
-- `rs.py` — Rust bridge with Python fallback
 - `blake3/`, `xxhash/` — guarded hash wrappers
 
 ### Utilities
@@ -402,10 +401,8 @@ Prefer:
 - vectorized work
 - chunk-preserving operations
 - zero-copy or near-zero-copy flows
-- optional Rust fast paths
 
 But correctness and user-visible behavior come first.
-Python fallback behavior is canonical.
 
 ### 6. Never loop over data rows in Python
 
@@ -656,7 +653,6 @@ Optional dependencies must remain optional.
 
 ### Rules
 - base `ygg` install must work without non-core engines
-- base `ygg` install must work without Rust
 - guarded imports must remain guarded
 - missing dependency errors should say which package/feature is required
 
@@ -791,31 +787,6 @@ When changing AI or SQL code:
 - preserve retry and caching logic
 - keep dialect differences visible and testable
 - avoid hidden network assumptions
-
----
-
-## Rust acceleration policy
-
-Rust is an optional fast path.
-It is not the source of truth.
-
-### Non-negotiable rules
-- Python behavior is canonical
-- Rust behavior must match Python behavior
-- pure Python fallback must stay correct
-- tests must pass with and without native support
-- never import `yggrs` directly outside `yggdrasil/rs.py`
-
-### When Rust is worth it
-Add Rust only when:
-- the path is actually hot
-- semantics are stable
-- Python fallback already exists and is correct
-- the speedup is worth the added maintenance cost
-
-Do not use Rust to hide unclear logic.
-Fix the semantics first.
-Then optimize.
 
 ---
 

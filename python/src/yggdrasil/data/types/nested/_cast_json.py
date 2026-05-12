@@ -24,7 +24,7 @@ import pyarrow.json as paj
 
 from yggdrasil.data.types.base import DataType
 from yggdrasil.data.types.id import DataTypeId
-from yggdrasil.data.types.support import get_polars, get_spark_sql
+from yggdrasil.lazy_imports import polars_module, spark_sql_module
 
 if TYPE_CHECKING:
     from yggdrasil.data.options import CastOptions
@@ -373,7 +373,7 @@ def cast_polars_json_string_expr(
     expr: Any,
     options: "CastOptions",
 ) -> Any:
-    pl = get_polars()
+    pl = polars_module()
 
     target_field = options.target
     if target_field is None:
@@ -413,7 +413,7 @@ def cast_polars_json_string_series(
     series: Any,
     options: "CastOptions",
 ) -> Any:
-    pl = get_polars()
+    pl = polars_module()
     expr = cast_polars_json_string_expr(pl.col(series.name), options).alias(
         options.target.name
     )
@@ -424,7 +424,7 @@ def cast_spark_json_string_column(
     column: Any,
     options: "CastOptions",
 ) -> Any:
-    spark = get_spark_sql()
+    spark = spark_sql_module()
     F = spark.functions
 
     target_field = options.target
@@ -541,7 +541,7 @@ def cast_polars_json_encode_series(
     lists / maps, so the implementation simply roundtrips through
     Arrow's vectorised path and drops back into polars.
     """
-    pl = get_polars()
+    pl = polars_module()
 
     target_field = options.target
     if target_field is None:
@@ -562,7 +562,7 @@ def cast_spark_json_encode_column(
     column: Any,
     options: "CastOptions",
 ) -> Any:
-    spark = get_spark_sql()
+    spark = spark_sql_module()
     F = spark.functions
 
     target_field = options.target

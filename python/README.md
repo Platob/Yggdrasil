@@ -24,7 +24,7 @@ pip install ygg
 ## Install with the right extras
 
 ```bash
-pip install ygg                   # core: pyarrow + polars + xxhash + orjson + yggrs
+pip install ygg                   # core: pyarrow + polars + xxhash + orjson
 pip install "ygg[data]"           # pandas + numpy + sqlglot
 pip install "ygg[bigdata]"        # pyspark + delta-spark
 pip install "ygg[delta]"          # deltalake
@@ -311,7 +311,6 @@ def normalize_options(options=None, *, target_field=None) -> CastOptions:
 | `yggdrasil.pickle` / `blake3` / `xxhash` | Optional serialization + hashing |
 | `yggdrasil.mongo` / `mongoengine` | Mongo helpers |
 | `yggdrasil.fxrates` | FX-rate helpers |
-| `yggdrasil.rs` | Bridge to native `yggrs` kernels (with pure-Python fallback) |
 
 For per-module pages, see [`docs/modules/`](docs/modules/) and the navigable [docs site](https://platob.github.io/Yggdrasil/).
 

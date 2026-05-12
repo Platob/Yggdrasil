@@ -17,7 +17,7 @@ Tests grouped by surface:
 * autotag — schema-level + per-field propagation, partition_by /
   cluster_by consumption.
 * exporters — to_arrow_schema, to_field, polars / spark flavors.
-* constructors — from_field, from_any_fields, from_any, from_,
+* constructors — from_field, from_fields, from_any, from_,
   _coerce_other, _merge_metadata, from_path.
 """
 
@@ -93,7 +93,7 @@ class TestConstruction:
         s = schema(
             [_int_field("a"), _str_field("b")],
             _int_field("c"),
-            metadata={"name": "trade_row", "comment": "schema comment"},
+            name="trade_row", metadata={"comment": "schema comment"},
         )
 
         assert list(s.keys()) == ["a", "b", "c"]
@@ -107,8 +107,7 @@ class TestConstruction:
         assert isinstance(s["a"], Field)
 
     def test_init_with_mapping_rewrites_field_names_to_keys(self) -> None:
-        s = Schema(
-            inner_fields={
+        s = Schema({
                 "qty": _int_field("wrong_name"),
                 "book": _str_field("book"),
             },
@@ -127,7 +126,7 @@ class TestConstruction:
                 ("c", _int_field("c")),
             ]
         )
-        s = Schema(inner_fields=inner)
+        s = Schema(inner)
 
         assert list(s.keys()) == ["a", "b", "c"]
 
@@ -176,7 +175,7 @@ class TestShape:
     def test_copy_deep_copies_fields_and_keeps_metadata(self) -> None:
         s = schema(
             [_int_field("a"), _str_field("b")],
-            metadata={"name": "x", "comment": "y"},
+            name="x", metadata={"comment": "y"},
         )
 
         out = s.copy()
@@ -188,11 +187,11 @@ class TestShape:
         assert out["b"] is not s["b"]
 
     def test_copy_can_replace_fields_and_metadata(self) -> None:
-        s = schema([_int_field("a")], metadata={"name": "old"})
+        s = schema([_int_field("a")], name="old")
 
         out = s.copy(
             fields=[_str_field("b")],
-            metadata={"name": "new", "comment": "desc"},
+            name="new", metadata={"comment": "desc"},
         )
 
         assert list(out.keys()) == ["b"]
@@ -369,11 +368,11 @@ class TestAdd:
     def test_add_unions_with_rhs_overriding_duplicate_names(self) -> None:
         s1 = schema(
             [_int_field("a"), _str_field("b")],
-            metadata={"comment": "left", "name": "left_name"},
+            name="left_name", metadata={"comment": "left"},
         )
         s2 = schema(
             [_int_field("b", nullable=False), _int_field("c")],
-            metadata={"description": "right_desc", "name": "right_name"},
+            name="right_name", metadata={"description": "right_desc"},
         )
 
         out = s1 + s2
@@ -389,7 +388,7 @@ class TestAdd:
         assert out.metadata[b"description"] == b"right_desc"
 
     def test_radd_with_zero_returns_copy(self) -> None:
-        s = schema([_int_field("a")], metadata={"name": "x"})
+        s = schema([_int_field("a")], name="x")
 
         out = 0 + s
 
@@ -399,7 +398,7 @@ class TestAdd:
 
     def test_iadd_mutates_in_place(self) -> None:
         s1 = schema([_int_field("a")], metadata={"comment": "left"})
-        s2 = schema([_str_field("b")], metadata={"name": "right"})
+        s2 = schema([_str_field("b")], name="right")
 
         original_id = id(s1)
         s1 += s2
@@ -418,7 +417,7 @@ class TestSub:
     def test_sub_returns_difference(self) -> None:
         s1 = schema(
             [_int_field("a"), _str_field("b"), _int_field("c")],
-            metadata={"name": "x"},
+            name="x",
         )
         s2 = schema([_str_field("b")])
 
@@ -445,7 +444,7 @@ class TestAnd:
         )
         s2 = schema(
             [_int_field("c"), _int_field("a")],
-            metadata={"name": "right"},
+            name="right",
         )
 
         out = s1 & s2
@@ -463,7 +462,7 @@ class TestAnd:
         )
         s2 = schema(
             [_int_field("c"), _int_field("a")],
-            metadata={"name": "right"},
+            name="right",
         )
 
         s1 &= s2
@@ -478,7 +477,7 @@ class TestOr:
 
     def test_or_and_ior_delegate_to_add(self) -> None:
         s1 = schema([_int_field("a")], metadata={"comment": "left"})
-        s2 = schema([_str_field("b")], metadata={"name": "right"})
+        s2 = schema([_str_field("b")], name="right")
 
         out = s1 | s2
         assert list(out.keys()) == ["a", "b"]
@@ -501,7 +500,7 @@ class TestOr:
 class TestAutotag:
 
     def test_returns_new_schema_with_updated_metadata(self) -> None:
-        s = schema([_int_field("a")], metadata={"name": DEFAULT_FIELD_NAME})
+        s = schema([_int_field("a")], name=DEFAULT_FIELD_NAME)
 
         out = s.autotag(tags={"semantic_type": "fact"})
 
@@ -586,7 +585,7 @@ class TestExporters:
     def test_to_arrow_schema_carries_field_order_and_metadata(self) -> None:
         s = schema(
             [_int_field("qty", nullable=False), _str_field("book")],
-            metadata={"name": "trade_row"},
+            name="trade_row",
         )
 
         out = s.to_arrow_schema()
@@ -600,7 +599,7 @@ class TestExporters:
     def test_to_field_lifts_to_struct_field(self) -> None:
         s = schema(
             [_int_field("qty"), _str_field("book")],
-            metadata={"name": "trade_row", "nullable": "t"},
+            name="trade_row", nullable=True,
         )
 
         f = s.to_field()
@@ -650,10 +649,10 @@ class TestConstructors:
         assert isinstance(s, Schema)
         assert list(s.keys()) == ["qty", "book"]
 
-    def test_from_any_fields_preserves_input_order(self) -> None:
-        s = Schema.from_any_fields(
+    def test_from_fields_preserves_input_order(self) -> None:
+        s = Schema.from_fields(
             [_int_field("a"), _str_field("b"), _int_field("c")],
-            metadata={"name": "ordered"},
+            name="ordered",
         )
 
         assert list(s.keys()) == ["a", "b", "c"]

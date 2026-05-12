@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 import pyarrow as pa
 
 from ..id import DataTypeId
-from ..support import get_polars, get_spark_sql
+from yggdrasil.lazy_imports import polars_module, spark_sql_module
 from .base import PrimitiveType
 
 if TYPE_CHECKING:
@@ -45,7 +45,7 @@ class NullType(PrimitiveType):
 
     @classmethod
     def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
-        pl = get_polars()
+        pl = polars_module()
         return dtype == pl.Null
 
     @classmethod
@@ -56,7 +56,7 @@ class NullType(PrimitiveType):
 
     @classmethod
     def handles_spark_type(cls, dtype: "pst.DataType") -> bool:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         return isinstance(dtype, spark.types.NullType)
 
     @classmethod
@@ -86,11 +86,11 @@ class NullType(PrimitiveType):
         return pa.null()
 
     def to_polars(self) -> "polars.DataType":
-        pl = get_polars()
+        pl = polars_module()
         return pl.Null
 
     def to_spark(self) -> Any:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         return spark.types.NullType()
 
     def to_spark_name(self) -> str:

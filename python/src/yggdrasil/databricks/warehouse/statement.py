@@ -916,7 +916,7 @@ class WarehouseStatementResult(StatementResult):
             # backend skips the schema (e.g. DDL with no result set).
             result_schema = getattr(manifest, "schema", None) if manifest is not None else None
             columns = getattr(result_schema, "columns", None) if result_schema is not None else None
-            self._cached_schema = Schema.from_any_fields(
+            self._cached_schema = Schema.from_fields(
                 [parse_databricks_field(c) for c in (columns or [])],
                 metadata=metadata,
             )

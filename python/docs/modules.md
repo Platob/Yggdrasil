@@ -55,7 +55,6 @@ Engines register their converters **on import** — pull them in once at startup
 | `yggdrasil.blake3` / `yggdrasil.xxhash` | Optional hashing | — |
 | `yggdrasil.mongo` / `yggdrasil.mongoengine` | Mongo helpers | — |
 | `yggdrasil.fxrates` | FX-rate helpers | — |
-| `yggdrasil.rs` | Bridge to native `yggrs` kernels (Python fallback) | — |
 
 ## See also
 

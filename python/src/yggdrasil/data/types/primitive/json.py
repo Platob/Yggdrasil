@@ -175,9 +175,9 @@ def _cast_polars_to_json_expr(
         # operates per-series. Fall back to materialising via the series
         # cast at execution time by wrapping the expr through arrow.
         from ..nested._cast_json import cast_polars_json_encode_series
-        from ..support import get_polars
+        from yggdrasil.lazy_imports import polars_module
 
-        pl = get_polars()
+        pl = polars_module()
         series_cast = cast_polars_json_encode_series
 
         def _apply(series: Any) -> Any:

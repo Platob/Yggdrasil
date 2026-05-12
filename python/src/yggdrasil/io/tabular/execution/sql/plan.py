@@ -712,7 +712,7 @@ def _narrow_schema(full: Any, projection: "Sequence[str]") -> Any:
     keep = [f for f in full.fields if f.name in keep_set]
     if not keep:
         return None
-    return Schema(inner_fields=keep)
+    return Schema(keep)
 
 
 def _columns_referenced(expr: Any) -> "set[str]":

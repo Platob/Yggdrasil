@@ -86,24 +86,7 @@ import polars                             # wrong — breaks base installs
 
 Same applies to `yggdrasil.pandas.lib`, `yggdrasil.spark.lib`, and Databricks-related modules.
 
-The only **hard** runtime deps are `pyarrow>=20`, `polars>=1.3`, and `yggrs`. Base installs must keep working without anything else.
-
-## Rust fast path, Python canonical
-
-`yggdrasil/rs.py` is the **only** place that imports from `yggdrasil.rust.*`. It exposes `HAS_RS` plus the fallback-capable entry points (e.g. `utf8_len`).
-
-Rules:
-
-- Python behavior is the source of truth; Rust must match it, not diverge.
-- Pure-Python fallback must stay correct on its own — tests pass with and without `yggrs` installed.
-- Add Rust only to a path that is actually hot and semantically stable.
-
-```python
-from yggdrasil.rs import HAS_RS, utf8_len
-
-print(HAS_RS)                 # True if yggrs is installed
-print(utf8_len(["héllo"]))    # native if HAS_RS, else pure Python
-```
+The only **hard** runtime deps are `pyarrow>=20` and `polars>=1.3`. Base installs must keep working without anything else.
 
 ## Schema intent across boundaries
 

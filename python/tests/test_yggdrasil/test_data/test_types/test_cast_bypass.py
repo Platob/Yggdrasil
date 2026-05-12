@@ -314,7 +314,7 @@ class TestEngineTypeBypassArrow(ArrowTestCase):
         target_field = Schema.from_arrow(table.schema).to_field()
         source_field = Field(
             name=target_field.name,
-            dtype=Schema(inner_fields=[
+            dtype=Schema([
                 Field(name="a", dtype=self._sjson(), nullable=True),
             ]).dtype,
             nullable=target_field.nullable,
@@ -413,7 +413,7 @@ class TestEngineTypeBypassPolars(PolarsTestCase):
         target_field = Schema.from_polars_schema(df.schema).to_field()
         source_field = Field(
             name=target_field.name,
-            dtype=Schema(inner_fields=[
+            dtype=Schema([
                 Field(name="a", dtype=self._sjson(), nullable=True),
             ]).dtype,
             nullable=target_field.nullable,

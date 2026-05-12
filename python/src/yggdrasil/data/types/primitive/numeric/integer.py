@@ -38,7 +38,7 @@ from .._helpers import (
 )
 from ...base import _default_singleton
 from ...id import DataTypeId
-from ...support import get_polars, get_spark_sql
+from yggdrasil.lazy_imports import polars_module, spark_sql_module
 from .base import (
     NumericType,
     _polars_flip_int_signedness,
@@ -177,7 +177,7 @@ class IntegerType(NumericType):
         options: "CastOptions",
     ):
         if options.need_cast(expr, self):
-            pl = get_polars()
+            pl = polars_module()
             source_field = options.source
             src_dtype = (
                 source_field.dtype.to_polars() if source_field is not None else None
@@ -234,7 +234,7 @@ class IntegerType(NumericType):
 
     @classmethod
     def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
-        pl = get_polars()
+        pl = polars_module()
         return dtype in {
             pl.Int8,
             pl.Int16,
@@ -248,7 +248,7 @@ class IntegerType(NumericType):
 
     @classmethod
     def from_polars_type(cls, dtype: "polars.DataType") -> "IntegerType":
-        pl = get_polars()
+        pl = polars_module()
         mapping = {
             pl.Int8: (1, True),
             pl.Int16: (2, True),
@@ -266,7 +266,7 @@ class IntegerType(NumericType):
 
     @classmethod
     def handles_spark_type(cls, dtype: "pst.DataType") -> bool:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         return isinstance(
             dtype,
             (
@@ -279,7 +279,7 @@ class IntegerType(NumericType):
 
     @classmethod
     def from_spark_type(cls, dtype: "pst.DataType") -> "IntegerType":
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         if isinstance(dtype, spark.types.ByteType):
             return cls(byte_size=1, signed=True)
         if isinstance(dtype, spark.types.ShortType):
@@ -334,13 +334,13 @@ class IntegerType(NumericType):
         return mapping[self._size]()
 
     def to_polars(self) -> "polars.DataType":
-        pl = get_polars()
+        pl = polars_module()
         signed = {1: pl.Int8, 2: pl.Int16, 4: pl.Int32, 8: pl.Int64}
         unsigned = {1: pl.UInt8, 2: pl.UInt16, 4: pl.UInt32, 8: pl.UInt64}
         return (signed if self.signed else unsigned)[self._size]
 
     def to_spark(self) -> Any:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         t = spark.types
         if self.signed:
             mapping = {1: t.ByteType, 2: t.ShortType, 4: t.IntegerType, 8: t.LongType}

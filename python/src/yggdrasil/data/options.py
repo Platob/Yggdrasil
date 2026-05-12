@@ -139,7 +139,7 @@ def _struct_of_objects(columns: "Iterable[str]") -> "Schema":
     from yggdrasil.data.types.primitive.object import ObjectType
 
     children = [_Field(name=str(c), dtype=ObjectType()) for c in columns]
-    return _Schema(inner_fields=children)
+    return _Schema(children)
 
 
 # ---------------------------------------------------------------------------
@@ -877,10 +877,19 @@ class CastOptions:
         when the data is in fact non-null), so the cast has to emit
         the target's field types verbatim to keep MERGE happy.
         """
-        clean = self.check_source(source, copy=False).check_target(target, copy=False)
-        src = clean.source
-        tgt = clean.target
+        # Fast path: no args means "use already-bound source / target"
+        # — skip the two ``check_*`` method-call hops that otherwise
+        # fire on every cast site.
+        if source is None and target is None:
+            src = self.source
+            tgt = self.target
+        else:
+            clean = self.check_source(source, copy=False).check_target(target, copy=False)
+            src = clean.source
+            tgt = clean.target
         if src is None or tgt is None:
+            return False
+        if src is tgt:
             return False
 
         return not src.equals(

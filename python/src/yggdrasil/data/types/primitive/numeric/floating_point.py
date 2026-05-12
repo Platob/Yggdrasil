@@ -30,7 +30,7 @@ from yggdrasil.data.enums import Mode
 from .._helpers import _coerce_str
 from ...base import _default_singleton
 from ...id import DataTypeId
-from ...support import get_polars, get_spark_sql
+from yggdrasil.lazy_imports import polars_module, spark_sql_module
 from .base import NumericType
 
 if TYPE_CHECKING:
@@ -129,12 +129,12 @@ class FloatingPointType(NumericType):
 
     @classmethod
     def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
-        pl = get_polars()
+        pl = polars_module()
         return dtype in {pl.Float32, pl.Float64}
 
     @classmethod
     def from_polars_type(cls, dtype: "polars.DataType") -> "FloatingPointType":
-        pl = get_polars()
+        pl = polars_module()
         if dtype == pl.Float32:
             return cls(byte_size=4)
         if dtype == pl.Float64:
@@ -143,12 +143,12 @@ class FloatingPointType(NumericType):
 
     @classmethod
     def handles_spark_type(cls, dtype: "pst.DataType") -> bool:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         return isinstance(dtype, (spark.types.FloatType, spark.types.DoubleType))
 
     @classmethod
     def from_spark_type(cls, dtype: "pst.DataType") -> "FloatingPointType":
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         if isinstance(dtype, spark.types.FloatType):
             return cls(byte_size=4)
         if isinstance(dtype, spark.types.DoubleType):
@@ -192,11 +192,11 @@ class FloatingPointType(NumericType):
         return pa.float64() if self._size == 8 else pa.float32()
 
     def to_polars(self) -> "polars.DataType":
-        pl = get_polars()
+        pl = polars_module()
         return pl.Float64 if self._size == 8 else pl.Float32
 
     def to_spark(self) -> Any:
-        t = get_spark_sql().types
+        t = spark_sql_module().types
         return t.DoubleType() if self._size == 8 else t.FloatType()
 
     def as_spark(self) -> "FloatingPointType":
