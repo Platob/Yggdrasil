@@ -258,6 +258,16 @@ class CacheConfig(_ConfigBase):
     # Default 1 day mirrors the previous YGGFolderIO behaviour. Set
     # to ``None`` to disable cleanup entirely (cache grows unbounded).
     cleanup_ttl: Optional[dt.timedelta] = dt.timedelta(days=1)
+    # Lazy memo for derived predicates and SQL column lists
+    # (``match_by``, ``sql_match_by``, ``request_by_is_public``, the
+    # ``request_sql_column_names`` array, the partition_by SQL clause).
+    # Each is purely a function of the frozen fields above — caching
+    # turns a per-send (or per-batch-request) recomputation into a
+    # dict lookup. Excluded from pickle / equality / repr; rebuilt
+    # transparently after ``__setstate__``.
+    _derived: Optional[dict] = field(
+        default=None, init=False, hash=False, compare=False, repr=False,
+    )
 
     @staticmethod
     def _check_mapping(values: MutableMapping[str, Any]):
@@ -351,6 +361,7 @@ class CacheConfig(_ConfigBase):
             self, "cleanup_ttl",
             state.get("cleanup_ttl", dt.timedelta(days=1)),
         )
+        object.__setattr__(self, "_derived", None)
 
     @classmethod
     def check_arg(
@@ -393,13 +404,34 @@ class CacheConfig(_ConfigBase):
 
         return cls.parse_mapping(overrides) if overrides else cls.default()
 
+    def _derived_cache(self) -> dict:
+        """Lazy-initialised dict for memoized derived properties.
+
+        Every entry below is a pure function of the frozen fields — we
+        compute on first access, stash it on ``_derived``, and serve
+        the cached value on every subsequent read. Pickle round-trips
+        leave ``_derived = None`` so a worker rebuilds its own cache.
+        """
+        cache = self._derived
+        if cache is None:
+            cache = {}
+            object.__setattr__(self, "_derived", cache)
+        return cache
+
     @property
     def cache_enabled(self):
-        return self.mode in (Mode.APPEND, Mode.AUTO)
+        cache = self._derived_cache()
+        out = cache.get("cache_enabled", ...)
+        if out is ...:
+            out = self.mode in (Mode.APPEND, Mode.AUTO)
+            cache["cache_enabled"] = out
+        return out
 
     @property
     def is_local(self) -> bool:
         """True when this config drives the on-disk fast-path cache."""
+        # ``path`` may be lazy-filled by :meth:`local_cache_path`, so
+        # don't cache this one — read straight from the field.
         return self.path is not None
 
     @property
@@ -426,10 +458,15 @@ class CacheConfig(_ConfigBase):
 
     @property
     def match_by(self) -> list[str]:
-        return [
-            *(self.request_by or ()),
-            *(self.response_by or ()),
-        ]
+        cache = self._derived_cache()
+        out = cache.get("match_by", ...)
+        if out is ...:
+            out = [
+                *(self.request_by or ()),
+                *(self.response_by or ()),
+            ]
+            cache["match_by"] = out
+        return out
 
     @property
     def sql_match_by(self) -> list[str]:
@@ -439,10 +476,32 @@ class CacheConfig(_ConfigBase):
         # bare ``public_url_hash`` / ``method`` / etc. needs the
         # ``request_`` prefix before it can be referenced as a target
         # column in a Delta MERGE. Response-side keys map 1:1 already.
-        return [
-            *(_request_column_sql_name(k) for k in (self.request_by or ())),
-            *(self.response_by or ()),
-        ]
+        cache = self._derived_cache()
+        out = cache.get("sql_match_by", ...)
+        if out is ...:
+            out = [
+                *(_request_column_sql_name(k) for k in (self.request_by or ())),
+                *(self.response_by or ()),
+            ]
+            cache["sql_match_by"] = out
+        return out
+
+    @property
+    def request_sql_columns(self) -> list[str]:
+        """Cached ``_request_column_sql_name`` mapping for every ``request_by`` key.
+
+        ``make_batch_lookup_sql`` walks N requests and emits the same
+        column name for each (it depends only on the config), so
+        precomputing the list cuts the per-request loop's cost — at
+        ``BATCH_SIZE=64`` requests that is 64 ``_request_column_sql_name``
+        calls replaced by one shared list of strings.
+        """
+        cache = self._derived_cache()
+        out = cache.get("request_sql_columns", ...)
+        if out is ...:
+            out = [_request_column_sql_name(k) for k in (self.request_by or ())]
+            cache["request_sql_columns"] = out
+        return out
 
     @property
     def request_by_is_public(self) -> bool:
@@ -458,8 +517,13 @@ class CacheConfig(_ConfigBase):
         clause — the saving is one URL parse + one header normalize per
         request per lookup, which adds up on send_many bursts.
         """
-        keys = self.request_by or ()
-        return bool(keys) and all(str(k).startswith("public_") for k in keys)
+        cache = self._derived_cache()
+        out = cache.get("request_by_is_public", ...)
+        if out is ...:
+            keys = self.request_by or ()
+            out = bool(keys) and all(str(k).startswith("public_") for k in keys)
+            cache["request_by_is_public"] = out
+        return out
 
     @property
     def defined_received_from(self) -> dt.datetime:
@@ -644,15 +708,28 @@ class CacheConfig(_ConfigBase):
         self,
         request: PreparedRequest | None,
     ) -> str:
-        clauses: list[str] = []
+        if request is None:
+            return "1=1"
 
-        if request is not None:
-            for key, value in self.request_values(request).items():
-                column = _request_column_sql_name(key)
-                if value is None:
-                    clauses.append(f"{column} IS NULL")
-                else:
-                    clauses.append(f"{column} = {self.sql_literal(value)}")
+        request_by = self.request_by
+        if not request_by:
+            return "1=1"
+
+        # Walk the precomputed columns in parallel with the keys —
+        # ``make_batch_lookup_sql`` calls this once per request in a
+        # 100-1000-wide batch, and ``_request_column_sql_name`` is
+        # config-level (not request-level), so the per-request loop
+        # shouldn't repeat the prefix lookup.
+        columns = self.request_sql_columns
+        match_value = request.match_value
+        sql_literal = self.sql_literal
+        clauses: list[str] = []
+        for column, key in zip(columns, request_by):
+            value = match_value(key)
+            if value is None:
+                clauses.append(f"{column} IS NULL")
+            else:
+                clauses.append(f"{column} = {sql_literal(value)}")
 
         return " AND ".join(clauses) if clauses else "1=1"
 
@@ -718,14 +795,8 @@ class CacheConfig(_ConfigBase):
         if where_clause != "1=1":
             base_query += f" WHERE {where_clause}"
 
-        identity_cols = list(identity_by) if identity_by is not None else self.match_by
-        if identity_cols:
-            partition_by = ", ".join(
-                _request_column_sql_name(col)
-                if col.partition(".")[0] in REQUEST_ARROW_SCHEMA.names
-                else col
-                for col in identity_cols
-            )
+        partition_by = self._ranked_window_partition_by(identity_by)
+        if partition_by is not None:
             return (
                 "SELECT * FROM ("
                 "  SELECT t.*, row_number() OVER ("
@@ -737,6 +808,46 @@ class CacheConfig(_ConfigBase):
             )
 
         return base_query
+
+    def _ranked_window_partition_by(
+        self,
+        identity_by: Optional[Iterable[str]],
+    ) -> Optional[str]:
+        """Build the ``PARTITION BY`` clause for the ranked-row window.
+
+        When *identity_by* is ``None`` the result depends only on the
+        config — memoize it on ``_derived`` so a 100-wide
+        ``send_many`` batch doesn't rebuild the same string per
+        request. With an explicit *identity_by* the caller is opting
+        out of the default; recompute fresh each time.
+        """
+        if identity_by is None:
+            cache = self._derived_cache()
+            cached = cache.get("ranked_window_partition_by", ...)
+            if cached is not ...:
+                return cached
+            identity_cols = self.match_by
+            if not identity_cols:
+                cache["ranked_window_partition_by"] = None
+                return None
+            out = ", ".join(
+                _request_column_sql_name(col)
+                if col.partition(".")[0] in REQUEST_ARROW_SCHEMA.names
+                else col
+                for col in identity_cols
+            )
+            cache["ranked_window_partition_by"] = out
+            return out
+
+        identity_cols = list(identity_by)
+        if not identity_cols:
+            return None
+        return ", ".join(
+            _request_column_sql_name(col)
+            if col.partition(".")[0] in REQUEST_ARROW_SCHEMA.names
+            else col
+            for col in identity_cols
+        )
 
     def make_batch_lookup_sql(
         self,
@@ -777,14 +888,8 @@ class CacheConfig(_ConfigBase):
         if where_parts:
             base_query += " WHERE " + " AND ".join(where_parts)
 
-        identity_cols = list(identity_by) if identity_by is not None else self.match_by
-        if identity_cols:
-            partition_by = ", ".join(
-                _request_column_sql_name(col)
-                if col.partition(".")[0] in REQUEST_ARROW_SCHEMA.names
-                else col
-                for col in identity_cols
-            )
+        partition_by = self._ranked_window_partition_by(identity_by)
+        if partition_by is not None:
             return (
                 "SELECT * FROM ("
                 "  SELECT t.*, row_number() OVER ("
