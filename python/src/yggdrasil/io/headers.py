@@ -359,6 +359,8 @@ class Headers(MutableMapping[str, str]):
         "_xxh3_64_version",
         "_canonical_bytes",
         "_canonical_bytes_version",
+        "_anonymized_cache",
+        "_anonymized_cache_version",
     )
 
     def __init__(
@@ -374,6 +376,10 @@ class Headers(MutableMapping[str, str]):
         self._xxh3_64_version: int = -1
         self._canonical_bytes: bytes = b""
         self._canonical_bytes_version: int = -1
+        # Lazy: most Headers instances never have :meth:`anonymized`
+        # called on them, so don't pay the per-construct dict alloc.
+        self._anonymized_cache: dict[str, "Headers"] | None = None
+        self._anonymized_cache_version: int = -1
         if data is None:
             self._data = {}
             return
@@ -518,6 +524,8 @@ class Headers(MutableMapping[str, str]):
         new._xxh3_64_version = -1
         new._canonical_bytes = b""
         new._canonical_bytes_version = -1
+        new._anonymized_cache = None
+        new._anonymized_cache_version = -1
         return new
 
     def to_dict(self) -> dict[str, str]:
@@ -545,7 +553,19 @@ class Headers(MutableMapping[str, str]):
         :func:`_looks_like_token` so unrecognized credential headers
         still get sanitized. Names are canonicalized on the way out
         so repeated normalize calls are idempotent.
+
+        Memoized against :attr:`version` — the canonical anonymized
+        form is hot on every request's ``public_hash`` /
+        ``public_url_hash`` computation, and per response's
+        ``public_hash``. A version bump on the source headers
+        invalidates the cache transparently.
         """
+        cache = self._anonymized_cache
+        if self._anonymized_cache_version == self._version and cache is not None:
+            cached = cache.get(mode)
+            if cached is not None:
+                return cached
+
         out = Headers()
         for raw_name, raw_value in self._data.items():
             name, name_lower = _normalize_header_name(raw_name)
@@ -558,6 +578,11 @@ class Headers(MutableMapping[str, str]):
                 sanitized = value
             if sanitized is not None:
                 out[name] = sanitized
+        if cache is None or self._anonymized_cache_version != self._version:
+            cache = {}
+            self._anonymized_cache = cache
+            self._anonymized_cache_version = self._version
+        cache[mode] = out
         return out
 
     def normalized(
@@ -762,3 +787,5 @@ class Headers(MutableMapping[str, str]):
         self._xxh3_64_version = -1
         self._canonical_bytes = b""
         self._canonical_bytes_version = -1
+        self._anonymized_cache = None
+        self._anonymized_cache_version = -1

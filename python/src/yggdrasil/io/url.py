@@ -396,6 +396,14 @@ class URL(os.PathLike):
     _str_enc: str | None = field(default=None, init=False, repr=False, compare=False)
     _str_raw: str | None = field(default=None, init=False, repr=False, compare=False)
     _anonymized: bool | None = field(default=None, init=False, repr=False, compare=False)
+    # Cache for :meth:`anonymize` keyed by mode. Each value is the URL
+    # returned for that mode (which may be ``self`` when nothing
+    # sensitive was found). ``anonymize`` is called repeatedly per
+    # request — once for ``public_url_hash``, once for ``public_hash``,
+    # once again for every cache-side ``request.anonymize(...)`` — so a
+    # mode-keyed cache turns the second-and-later call into a dict
+    # lookup. ``None`` means "not computed yet for this mode".
+    _anonymized_cache: dict | None = field(default=None, init=False, repr=False, compare=False)
 
     def __hash__(self):
         return hash(self.to_string())
@@ -1615,22 +1623,29 @@ class URL(os.PathLike):
         if self._anonymized:
             return self
 
-        if self._anonymized is None:
-            result = self
+        cache = self._anonymized_cache
+        if cache is not None:
+            cached = cache.get(mode)
+            if cached is not None:
+                return cached
 
-            if self.query:
-                current = self.query_dict
-                anonymized = anonymize_parameters(current, mode=mode)
-                if anonymized != current:
-                    result = result.with_query_items(anonymized, sort_keys=sort_keys)
+        result = self
 
-            if self.userinfo:
-                result = result.with_userinfo("<redacted>" if mode == "redact" else None)
+        if self.query:
+            current = self.query_dict
+            anonymized = anonymize_parameters(current, mode=mode)
+            if anonymized != current:
+                result = result.with_query_items(anonymized, sort_keys=sort_keys)
 
-            object.__setattr__(result, "_anonymized", True)
-            return result
+        if self.userinfo:
+            result = result.with_userinfo("<redacted>" if mode == "redact" else None)
 
-        return self
+        object.__setattr__(result, "_anonymized", True)
+        if cache is None:
+            cache = {}
+            object.__setattr__(self, "_anonymized_cache", cache)
+        cache[mode] = result
+        return result
 
     def endswith(self, value: str):
         if value and self.path:
