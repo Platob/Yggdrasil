@@ -103,6 +103,18 @@ __all__ = [
 # "not yet computed".
 
 
+# Slots whose values pass through ``__post_init__`` normalization
+# (Field coercion, Mode coercion, match_by list rebuild). The
+# fast-clone path in :meth:`CastOptions._fast_clone` uses this to
+# decide whether the new instance needs a normalization re-run after
+# applying overrides — copies that only touch primitive flags
+# (``safe``, ``row_size``, ``mode`` *already as* a Mode enum, …) can
+# skip ``__post_init__`` entirely.
+_NORMALIZED_KEYS = frozenset({
+    "source_field", "target_field", "match_by", "mode", "schema_mode",
+})
+
+
 def _struct_of_objects(columns: "Iterable[str]") -> "Schema":
     """Build a :class:`Schema` from *columns* with :class:`ObjectType` fields.
 
@@ -311,12 +323,26 @@ class CastOptions:
     # for struct sides already satisfies the Schema interface — one
     # cache slot covers both views.
     #
-    # ``init=False`` keeps the slot out of the constructor signature;
+    # Sibling slots ``_source_schema_cache`` / ``_target_schema_cache``
+    # cache the corresponding :meth:`Field.to_schema` projections,
+    # which the cast pipeline (``Tabular``, ``ArrowTabular``,
+    # ``DataIO.collect_schema``) hits repeatedly per options instance
+    # — each ``to_schema`` rebuilds a fresh :class:`Schema` and is
+    # expensive enough (tens of microseconds for a wide schema) that
+    # an instance-local cache pays for itself after a single re-read.
+    #
+    # ``init=False`` keeps the slots out of the constructor signature;
     # ``compare=False`` keeps two functionally identical CastOptions
     # equal regardless of which one happened to have its cache warmed;
     # ``repr=False`` keeps the cache out of the dataclass-generated
     # repr (the custom repr below also skips non-repr fields).
     _merged_field_cache: Any = dataclasses.field(
+        default=..., init=False, repr=False, compare=False
+    )
+    _source_schema_cache: Any = dataclasses.field(
+        default=..., init=False, repr=False, compare=False
+    )
+    _target_schema_cache: Any = dataclasses.field(
         default=..., init=False, repr=False, compare=False
     )
 
@@ -329,43 +355,60 @@ class CastOptions:
         :class:`Mode`.
 
         Frozen dataclasses can't use normal attribute assignment in
-        ``__post_init__`` — we go through :func:`object.__setattr__`
+        ``__post_init__`` — we go through :func:`object.__setattr__``
         directly, which is the standard escape hatch for this exact
-        case.
+        case. The body is structured around "skip every branch whose
+        input is already normalized" — the default ``CastOptions()``
+        path (no source/target, ``Mode`` enums already in place, no
+        ``match_by``) is the hottest construction shape and pays no
+        normalization cost beyond the isinstance gates.
         """
+        setattr_ = object.__setattr__
+
         # Field normalization — accept pa.Schema/Field/DataType, dict,
-        # yggdrasil Field/Schema, or None. Field.from_(None) returns
-        # None so the no-cast case passes through cleanly.
-        Field = field_class()
-        if self.source_field is not None and not isinstance(self.source_field, Field):
-            object.__setattr__(self, "source_field", Field.from_(self.source_field))
-        if self.target_field is not None and not isinstance(self.target_field, Field):
-            object.__setattr__(self, "target_field", Field.from_(self.target_field))
+        # yggdrasil Field/Schema, or None. We defer the ``field_class()``
+        # lookup until we actually need the Field type, so the common
+        # "no source, no target, no match_by" path skips the import
+        # cache hit entirely.
+        src = self.source_field
+        tgt = self.target_field
+        match_by = self.match_by
+        if src is not None or tgt is not None or match_by:
+            Field = field_class()
+            if src is not None and not isinstance(src, Field):
+                setattr_(self, "source_field", Field.from_(src))
+            if tgt is not None and not isinstance(tgt, Field):
+                setattr_(self, "target_field", Field.from_(tgt))
+            # match_by normalization — accept list[Field | str | dict |
+            # pa.Field]. Plain strings become a default-typed Field so
+            # the selector machinery (alias / position lookup) has a
+            # Field to drive.
+            if match_by:
+                setattr_(
+                    self, "match_by",
+                    [
+                        item if isinstance(item, Field)
+                        else Field.default(name=item) if isinstance(item, str)
+                        else Field.from_(item)
+                        for item in match_by
+                    ],
+                )
+        # Empty match_by list collapses to ``None`` so consumers can
+        # branch on truthiness. Lives outside the field-lookup gate
+        # since it doesn't need the Field type.
+        if match_by is not None and not match_by:
+            setattr_(self, "match_by", None)
 
         # Mode normalization — accept Mode, string ("overwrite"),
-        # or None (→ AUTO). Keeping None on the way in as a distinct
-        # state from AUTO would invite "did I forget to set this?"
-        # confusion downstream.
-        object.__setattr__(self, "mode", Mode.from_(self.mode, default=Mode.AUTO))
-        object.__setattr__(self, "schema_mode", Mode.from_(self.schema_mode, default=Mode.IGNORE))
-
-        # match_by normalization — accept list[Field | str | dict |
-        # pa.Field]. Plain strings become a default-typed Field so
-        # the selector machinery (alias / position lookup) has a
-        # Field to drive. Empty lists collapse to ``None`` so
-        # consumers can branch on truthiness.
-        if self.match_by:
-            object.__setattr__(
-                self, "match_by",
-                [
-                    item if isinstance(item, Field)
-                    else Field.default(name=item) if isinstance(item, str)
-                    else Field.from_(item)
-                    for item in self.match_by
-                ],
-            )
-        elif self.match_by is not None:
-            object.__setattr__(self, "match_by", None)
+        # or None (→ AUTO). Already a Mode instance is the overwhelmingly
+        # common case (defaults plus enum-literal callers), so gate the
+        # ``Mode.from_`` call behind an isinstance check.
+        mode = self.mode
+        if not isinstance(mode, Mode):
+            setattr_(self, "mode", Mode.from_(mode, default=Mode.AUTO))
+        schema_mode = self.schema_mode
+        if not isinstance(schema_mode, Mode):
+            setattr_(self, "schema_mode", Mode.from_(schema_mode, default=Mode.IGNORE))
 
     # ==================================================================
     # Derived properties
@@ -378,13 +421,35 @@ class CastOptions:
         Returns ``None`` when no source is bound — callers that need a
         non-None schema should use :meth:`check_source` first to bind
         one from a peekable object.
+
+        Memoized on the instance: :meth:`Field.to_schema` rebuilds a
+        full :class:`Schema` (and a struct-projected dtype) per call;
+        cast pipelines walk this property repeatedly, so the second
+        and later reads are returned from the cache.
         """
-        return self.source_field.to_schema() if self.source_field is not None else None
+        cached = self._source_schema_cache
+        if cached is not ...:
+            return cached
+        src = self.source_field
+        result = src.to_schema() if src is not None else None
+        object.__setattr__(self, "_source_schema_cache", result)
+        return result
 
     @property
     def target_schema(self) -> Schema | None:
-        """The target field's :class:`Schema`, if a target field is bound."""
-        return self.target_field.to_schema() if self.target_field is not None else None
+        """The target field's :class:`Schema`, if a target field is bound.
+
+        Memoized symmetrically with :attr:`source_schema` — same
+        invalidation contract: any path that swaps ``target_field``
+        clears the slot back to ``...``.
+        """
+        cached = self._target_schema_cache
+        if cached is not ...:
+            return cached
+        tgt = self.target_field
+        result = tgt.to_schema() if tgt is not None else None
+        object.__setattr__(self, "_target_schema_cache", result)
+        return result
 
     @property
     def merged_field(self) -> Field | None:
@@ -512,9 +577,18 @@ class CastOptions:
             options = dict(options)
             columns = options.pop("columns", None)
 
-        # 1. None / ... → fresh construction.
+        # 1. None / ... → fresh construction. Fast path when nothing
+        # else is bound either — every DataIO public method that's
+        # called without an explicit options hits this branch, and
+        # going through ``_build`` (with its dict comprehension over
+        # ``field_names()``) is pure overhead when there's nothing to
+        # merge. The hand-rolled gate matches what ``_build`` would
+        # return for empty overrides + unset peek args.
         if options is None or options is ...:
-            instance = cls._build(overrides, source=source, target=target)
+            if not overrides and source is ... and target is ... and not columns:
+                instance = cls()
+            else:
+                instance = cls._build(overrides, source=source, target=target)
 
         # 2. Already a CastOptions — reuse via copy if overrides
         # given, otherwise passthrough. Typed check with ``cls`` so a
@@ -568,6 +642,20 @@ class CastOptions:
 
     @classmethod
     @functools.cache
+    def _init_field_names_tuple(cls) -> tuple[str, ...]:
+        """Ordered tuple of init-eligible field names — cached per-class.
+
+        Sibling of :meth:`field_names` but tuple-shaped: the
+        fast-clone loop in :meth:`_fast_clone` iterates this list
+        once per copy and tuple iteration is measurably tighter than
+        frozenset iteration (no hash probes; predictable cache locality).
+        Cached on the class via :func:`functools.cache` so subclasses
+        get their own expanded tuple on first access.
+        """
+        return tuple(f.name for f in dataclasses.fields(cls) if f.init)
+
+    @classmethod
+    @functools.cache
     def field_names(cls) -> frozenset[str]:
         """Frozenset of this class's constructor-accepting field names.
 
@@ -595,20 +683,22 @@ class CastOptions:
         source: Any = ...,
         target: Any = ...,
     ) -> T:
+        # Single filter pass over the override mapping: drop ``...``
+        # sentinels (caller didn't say) and foreign keys (DataIO
+        # public methods pass mixed kwargs through ``.check()`` and
+        # only CastOptions fields are valid for construction). The
+        # earlier two-pass shape called ``field_names()`` twice and
+        # walked the dict twice for the same final set; one pass is
+        # functionally identical and noticeably faster on hot caller
+        # sites.
         overrides = overrides or {}
         options = overrides.pop("options", None)
+        allowed = cls.field_names()
         clean = {
             k: v
             for k, v in overrides.items()
-            if v is not ... and k in cls.field_names()
+            if v is not ... and k in allowed
         }
-        # Drop foreign keys — DataIO public methods pass mixed kwargs
-        # through .check(), and only CastOptions fields are valid for
-        # construction. Foreign keys are the caller's concern (filter
-        # predicates, format-specific knobs) and should be ignored
-        # here, not raised on.
-        allowed = cls.field_names()
-        clean = {k: v for k, v in clean.items() if k in allowed}
         if options is None:
             instance = cls(**clean)
         else:
@@ -638,13 +728,27 @@ class CastOptions:
         so they compose with explicit ``source_field``/``target_field``
         overrides — the explicit always wins, peek only fires when
         the override left the slot unbound.
+
+        Implementation note: bypasses :func:`dataclasses.replace`, which
+        rebuilds via ``cls(**all_fields)`` and pays a full ``__init__``
+        + ``__post_init__`` traversal even when the caller only tweaked
+        a single bool. Cast pipelines call ``copy`` repeatedly per
+        batched write (``with_source`` / ``check_source`` /
+        ``with_target`` all funnel through here), so the fast clone
+        below — :func:`object.__new__` + slot copy + targeted
+        ``__post_init__`` normalization for the overridden keys — is
+        meaningfully cheaper.
         """
+        cls = type(self)
+        allowed = cls.field_names()
         clean = {
             k: v
             for k, v in overrides.items()
-            if v is not ... and k in self.field_names()
+            if v is not ... and k in allowed
         }
-        replaced = dataclasses.replace(self, **clean)
+
+        replaced = self._fast_clone(clean)
+
         if source is not ... and source is not None:
             replaced = replaced.with_source(source, copy=False)
         elif source is None:
@@ -654,6 +758,58 @@ class CastOptions:
         elif target is None:
             replaced = replaced.with_target(None, copy=False)
         return replaced
+
+    def _fast_clone(self: T, overrides: Mapping[str, Any]) -> T:
+        """Build a fresh instance by copying slots, applying *overrides*.
+
+        Mirrors what :func:`dataclasses.replace` would do for a frozen
+        slotted dataclass, minus the kwargs-construction overhead.
+
+        Semantics preserved:
+
+        - Every init-eligible field on *self* is copied to the new
+          instance, then *overrides* take precedence.
+        - ``__post_init__`` runs to normalize Field/Mode-shaped inputs
+          *if* the override set touches any of those slots. When the
+          overrides are all already-normalized primitives (the typical
+          ``copy(safe=True)`` / ``copy(row_size=1024)`` shape), the
+          normalization pass is skipped — the self-copied values are
+          already normalized from *self*'s own ``__post_init__``.
+        - Memoization slots (``_merged_field_cache`` etc.) are reset
+          on the new instance — :func:`dataclasses.replace` already
+          did this implicitly via the ``init=False`` default, and we
+          keep the same invariant.
+        """
+        cls = type(self)
+        new = object.__new__(cls)
+        setattr_ = object.__setattr__
+        names = cls._init_field_names_tuple()
+        # Specialize on whether there are overrides at all — the empty
+        # case is the hottest (every ``with_source(copy=True)`` /
+        # ``check_source(copy=True)`` path lands here) and the dict-
+        # membership check per field is pure waste when the dict is
+        # empty.
+        if overrides:
+            for fname in names:
+                if fname in overrides:
+                    setattr_(new, fname, overrides[fname])
+                else:
+                    setattr_(new, fname, getattr(self, fname))
+        else:
+            for fname in names:
+                setattr_(new, fname, getattr(self, fname))
+        # Init=False memoization slots: always start cleared on the
+        # clone — overridden source_field / target_field / schema_mode
+        # would otherwise read stale cached merges.
+        setattr_(new, "_merged_field_cache", ...)
+        setattr_(new, "_source_schema_cache", ...)
+        setattr_(new, "_target_schema_cache", ...)
+        # Only re-run normalization when an override could plausibly
+        # need it. Slots not touched here were already normalized on
+        # *self* and just propagated via getattr.
+        if overrides and _NORMALIZED_KEYS.intersection(overrides):
+            new.__post_init__()
+        return new
 
     def check_source(
         self: T,
@@ -717,11 +873,13 @@ class CastOptions:
         don't bypass it here because going through ``replace`` gets
         the normalization for free.
         """
+        setattr_ = object.__setattr__
         if source is None:
             if copy:
                 return self.copy(source=None, copy=copy)
-            object.__setattr__(self, "source_field", None)
-            object.__setattr__(self, "_merged_field_cache", ...)
+            setattr_(self, "source_field", None)
+            setattr_(self, "_merged_field_cache", ...)
+            setattr_(self, "_source_schema_cache", ...)
             return self
 
         source = field_class().from_(source)
@@ -731,20 +889,25 @@ class CastOptions:
 
         if copy:
             # ``replace`` drops init=False fields back to their
-            # defaults, which clears the merged_field cache for free.
+            # defaults, which clears the merged_field + schema caches
+            # for free.
             return dataclasses.replace(self, source_field=source)
-        object.__setattr__(self, "source_field", source)
-        # In-place edit invalidates whatever the merged_field cache held.
-        object.__setattr__(self, "_merged_field_cache", ...)
+        setattr_(self, "source_field", source)
+        # In-place edit invalidates whatever the merged_field /
+        # source_schema caches held.
+        setattr_(self, "_merged_field_cache", ...)
+        setattr_(self, "_source_schema_cache", ...)
         return self
 
     def with_target(self: T, target: "Field", copy: bool = True) -> T:
         """Return a copy with *field* as the new target field."""
+        setattr_ = object.__setattr__
         if target is None:
             if copy:
                 return self.copy(target=None, copy=copy)
-            object.__setattr__(self, "target_field", None)
-            object.__setattr__(self, "_merged_field_cache", ...)
+            setattr_(self, "target_field", None)
+            setattr_(self, "_merged_field_cache", ...)
+            setattr_(self, "_target_schema_cache", ...)
             return self
 
         target = field_class().from_(target)
@@ -754,8 +917,9 @@ class CastOptions:
 
         if copy:
             return dataclasses.replace(self, target_field=target)
-        object.__setattr__(self, "target_field", target)
-        object.__setattr__(self, "_merged_field_cache", ...)
+        setattr_(self, "target_field", target)
+        setattr_(self, "_merged_field_cache", ...)
+        setattr_(self, "_target_schema_cache", ...)
         return self
 
     # ==================================================================
@@ -1059,6 +1223,22 @@ class CastOptions:
     # Dunders
     # ==================================================================
 
+    @classmethod
+    @functools.cache
+    def _repr_field_meta(cls) -> tuple[tuple[str, Any], ...]:
+        """Cached ``(name, default)`` pairs for repr-eligible fields.
+
+        Walking :func:`dataclasses.fields` on every ``repr`` call is
+        pure overhead — the (name, default) signature is fixed at
+        class-definition time. Cached per-class so subclasses with
+        extra fields get their own tuple on first access.
+        """
+        return tuple(
+            (f.name, f.default)
+            for f in dataclasses.fields(cls)
+            if f.repr
+        )
+
     def __repr__(self) -> str:
         """Compact repr — skip fields at their default values.
 
@@ -1067,21 +1247,23 @@ class CastOptions:
         keeps exception messages and debug logs readable.
         """
         parts: list[str] = []
-        for field in dataclasses.fields(self):
-            if not field.repr:
-                # Internal cache slots (and any other repr=False fields
-                # a subclass adds) shouldn't bleed into debug output.
-                continue
-            value = getattr(self, field.name)
-            default = field.default
+        cls_name = type(self).__name__
+        for name, default in type(self)._repr_field_meta():
+            value = getattr(self, name)
             if default is dataclasses.MISSING:
-                parts.append(f"{field.name}={value!r}")
+                parts.append(f"{name}={value!r}")
                 continue
             # Mode normalization makes mode/schema_mode non-None
             # even when default was None → compare against AUTO too.
-            if field.name in ("mode", "schema_mode") and value is Mode.AUTO:
+            if value is default:
+                # Pointer-equal short-circuit: most defaults (Mode enums,
+                # None, False, 0) end up identity-equal after
+                # ``__post_init__``; saves a ``==`` dispatch on the hot
+                # default-only repr path.
+                continue
+            if name in ("mode", "schema_mode") and value is Mode.AUTO:
                 continue
             if value == default:
                 continue
-            parts.append(f"{field.name}={value!r}")
-        return f"{type(self).__name__}({', '.join(parts)})"
+            parts.append(f"{name}={value!r}")
+        return f"{cls_name}({', '.join(parts)})"
