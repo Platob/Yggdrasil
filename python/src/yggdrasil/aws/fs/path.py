@@ -106,6 +106,16 @@ class S3Path(RemotePath):
         retry_sleep: Optional[Callable[[float], None]] = None,
         **kwargs: Any,
     ) -> None:
+        # ``RemotePath.__new__`` already parsed the URL once for the
+        # singleton-cache key; reuse it instead of re-parsing here.
+        if url is None:
+            stashed = getattr(self, "_resolved_url", None)
+            if stashed is not None:
+                url = stashed
+                if isinstance(data, (str, URL)):
+                    # ``stashed`` came from this same ``data`` seed;
+                    # drop it so ``Holder.__init__`` doesn't re-read.
+                    data = None
         if url is None and isinstance(data, str):
             url = URL.from_(data)
             data = None
@@ -333,7 +343,13 @@ class S3Path(RemotePath):
                 yield self._make_child(key)
 
     def _make_child(self, key: str) -> "S3Path":
-        url = URL.from_(f"s3://{self.bucket}/{key.lstrip('/')}")
+        # Skip the ``URL.from_(f"s3://...")`` parse — the bucket/host /
+        # scheme are already canonical on ``self.url`` and only the
+        # path changes. The ``_replace_path`` clone preserves the
+        # invariants without going through :func:`urlsplit` for
+        # every child a listing page yields.
+        cleaned = key.lstrip("/")
+        url = self.url._replace_path("/" + cleaned if cleaned else "/")
         return self._from_url(url)
 
     # ==================================================================
