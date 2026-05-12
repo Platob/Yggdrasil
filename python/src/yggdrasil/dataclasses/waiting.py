@@ -104,8 +104,16 @@ class WaitingConfig:
         max_interval: Optional[Union[int, float, dt.timedelta]] = None,
         retries: int | None = None,
     ) -> "WaitingConfig":
+        # Hot paths — every backend ``wait`` / ``raise_error`` plumbing
+        # routes through here. Cache the three trivial coercions
+        # (``None`` / ``True`` / ``False``) so the steady-state lookup
+        # is one isinstance + one dict-style branch with no allocation.
         if arg is None and timeout is None:
             return DEFAULT_WAITING_CONFIG
+        if arg is True and timeout is None and interval is None and backoff is None and max_interval is None and retries is None:
+            return _TRUE_WAITING_CONFIG
+        if arg is False and timeout is None and interval is None and backoff is None and max_interval is None and retries is None:
+            return _FALSE_WAITING_CONFIG
 
         base_timeout: float | None = None
         base_interval: float | None = None
@@ -256,6 +264,23 @@ class WaitingConfig:
 
 
 DEFAULT_WAITING_CONFIG = WaitingConfig()
+# Pre-built results for ``WaitingConfig.from_(True)`` and
+# ``WaitingConfig.from_(False)`` — every executor ``wait`` /
+# ``raise_error`` hop runs through one of these.
+_TRUE_WAITING_CONFIG = WaitingConfig(
+    timeout=DEFAULT_TIMEOUT_TICKS,
+    interval=0.5,
+    backoff=1.5,
+    max_interval=10.0,
+    retries=8,
+)
+_FALSE_WAITING_CONFIG = WaitingConfig(
+    timeout=0.0,
+    interval=0.5,
+    backoff=1.5,
+    max_interval=10.0,
+    retries=8,
+)
 
 
 # Threshold past which :meth:`WaitingConfig.sleep` switches from the

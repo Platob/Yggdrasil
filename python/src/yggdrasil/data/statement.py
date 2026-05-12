@@ -39,7 +39,7 @@ from abc import abstractmethod
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Iterable, Iterator, Literal, Mapping, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Generic, Iterable, Iterator, Literal, Mapping, Optional, TypeVar
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
@@ -78,6 +78,14 @@ _SQL_COMMENT_OR_WS_RE = re.compile(
 _SQL_QUERY_LEAD_RE = re.compile(
     r"(?:SELECT|WITH|VALUES|TABLE|FROM)\b",
     re.IGNORECASE,
+)
+# Single-pass matcher for ``looks_like_query`` — skips leading
+# whitespace + SQL comments and asserts a query-leading keyword in
+# one regex hop instead of a slice-and-rematch loop.
+_SQL_LOOKS_LIKE_QUERY_RE = re.compile(
+    r"\A(?:\s+|--[^\n]*(?:\n|\Z)|/\*.*?\*/)*"
+    r"(?:SELECT|WITH|VALUES|TABLE|FROM)\b",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -264,14 +272,19 @@ class PreparedStatement(Disposable):
         ] = None,
     ):
         Disposable.__init__(self)
-        self.text = str(text) if text else ""
-        self.key = key or _new_key()
+        # Most callers pass a non-empty ``str`` literal; the
+        # ``isinstance`` check is cheaper than the unconditional
+        # ``str()`` round-trip when the contract is already met.
+        self.text = text if isinstance(text, str) else (str(text) if text else "")
+        self.key = key if key is not None else _new_key()
         # WaitingConfig.from_ accepts WaitingConfig | dict | int | float |
         # timedelta | datetime | bool, but we want None to stay None
         # (= not retryable) and only run from_ when the caller actually
         # passed something.
         self.retry = WaitingConfig.from_(retry) if retry is not None else None
-        self.external_data = _coerce_external_data(external_data)
+        # Avoid the function-call frame when nothing was passed —
+        # 99% of statement constructions don't bind external data.
+        self.external_data = _coerce_external_data(external_data) if external_data else None
 
     @property
     def retryable(self) -> bool:
@@ -304,7 +317,14 @@ class PreparedStatement(Disposable):
         ``retry=None`` clears the policy (statement becomes non-retryable);
         anything else is normalized through :meth:`WaitingConfig.from_`.
         """
-        target = self if inplace else copy_mod.copy(self)
+        if inplace:
+            target = self
+        else:
+            # Skip ``copy.copy``'s ``__reduce_ex__`` dance — same shape
+            # as ``with_text`` so a copy is one ``__new__`` plus a
+            # ``__dict__`` update.
+            target = self.__class__.__new__(self.__class__)
+            target.__dict__.update(self.__dict__)
         target.retry = WaitingConfig.from_(retry) if retry is not None else None
         return target
 
@@ -318,15 +338,10 @@ class PreparedStatement(Disposable):
         """
         if not isinstance(text, str) or not text:
             return False
-        stripped = text.lstrip()
-        if not stripped:
-            return False
-        while True:
-            match = _SQL_COMMENT_OR_WS_RE.match(stripped)
-            if not match:
-                break
-            stripped = stripped[match.end():]
-        return bool(_SQL_QUERY_LEAD_RE.match(stripped))
+        # Single-pass regex over the original string — the comment/ws
+        # prefix and the leading keyword check fuse so we avoid the
+        # per-iteration slice the older two-regex loop paid.
+        return _SQL_LOOKS_LIKE_QUERY_RE.match(text) is not None
 
     @classmethod
     def from_(cls, statement: "PreparedStatement | StatementResult | str") -> "PreparedStatement":
@@ -376,13 +391,16 @@ class PreparedStatement(Disposable):
             return text
         rewritten = text
         for key, entry in external_data.items():
-            if entry.text_value is None:
+            text_value = entry.text_value
+            if text_value is None:
                 raise ValueError(
                     f"ExternalStatementData[{key!r}].text_value is unset; "
                     f"the engine must materialize the binding before "
                     f"applying substitution"
                 )
-            rewritten = rewritten.replace("{%s}" % key, entry.text_value)
+            # ``"{" + key + "}"`` beats ``"{%s}" % key`` on small keys —
+            # avoids the format-spec parse the latter pays per call.
+            rewritten = rewritten.replace("{" + key + "}", text_value)
         return rewritten
 
     def clear_temporary_resources(self) -> None:
@@ -403,8 +421,15 @@ class PreparedStatement(Disposable):
 PS = TypeVar("PS", bound="PreparedStatement")
 
 
-def _new_key() -> str:
-    return f"{int(time.time() * 1e6)}-{os.urandom(4).hex()}"
+def _new_key(
+    _ns: Callable[[], int] = time.time_ns,
+    _rand: Callable[[int], bytes] = os.urandom,
+) -> str:
+    # ``time_ns`` avoids the float-multiply-then-int dance the older
+    # ``int(time.time() * 1e6)`` did; ``os.urandom(4).hex()`` is kept
+    # for the 32-bit collision-resistant tail. Default args bind the
+    # globals once so the call site doesn't pay the LOAD_GLOBAL twice.
+    return f"{_ns() // 1000}-{_rand(4).hex()}"
 
 
 # ---------------------------------------------------------------------------
@@ -556,15 +581,28 @@ class StatementResult(Tabular, Generic[PS]):
         ``_auto_promote_transient_retry`` share a single backend
         ``refresh_status`` call.
         """
-        with self.state_snapshot():
-            if not self.failed:
-                return
+        # Fast-path the steady-state success branch — every executor
+        # ``wait`` / ``execute`` hop pays this. One state read; no
+        # contextmanager allocation when the result is fine.
+        cached = self._state_snapshot
+        snap = cached if cached is not None else self._compute_state()
+        if not snap.is_failed:
+            return
+
+        # Failed branch — pin the snapshot for ``_raise_for_status``
+        # so any state reads it performs share a single backend hop.
+        owned = cached is None
+        if owned:
+            self._state_snapshot = snap
+        try:
             try:
                 self.statement.clear_temporary_resources()
             except Exception:
                 logger.exception("clear_temporary_resources failed during raise_for_status; continuing.")
-
             return self._raise_for_status()
+        finally:
+            if owned:
+                self._state_snapshot = None
 
     @abstractmethod
     def _raise_for_status(self) -> None:
