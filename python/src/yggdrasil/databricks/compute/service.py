@@ -146,7 +146,10 @@ class Clusters(DatabricksService):
             if key:
                 key = key.strip()
 
-            name = key or "All Purpose"
+            # Default to a per-user name (e.g. ``"All Purpose-alice"``) so
+            # multiple developers in the same workspace don't fight over a
+            # single ``"All Purpose"`` cluster.
+            name = key or self.client.user_scoped_name("All Purpose")
 
         existing = NAMED_CLUSTERS.get(name, None)
 
@@ -305,7 +308,8 @@ class Clusters(DatabricksService):
                 new_details.data_security_mode = DataSecurityMode.DATA_SECURITY_MODE_DEDICATED
 
         if not new_details.node_type_id:
-            new_details.node_type_id = "rd-fleet.xlarge"
+            from yggdrasil.data.enums import NodeType
+            new_details.node_type_id = NodeType.DEFAULT.value
 
         if (
             getattr(new_details, "virtual_cluster_size", None) is None

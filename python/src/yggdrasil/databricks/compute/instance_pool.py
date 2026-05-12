@@ -50,9 +50,10 @@ from databricks.sdk.service.compute import (
     Library,
 )
 
+from yggdrasil.data.cast.registry import identity
+from yggdrasil.data.enums import NodeType
 from yggdrasil.dataclasses import ExpiringDict
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
-from yggdrasil.data.cast.registry import identity
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.url import URL
 from yggdrasil.pyutils.equality import dicts_equal
@@ -67,7 +68,7 @@ __all__ = [
     "InstancePools",
     "InstancePool",
     "InstancePoolDefaults",
-    "DEFAULT_POOL_NAME",
+    "DEFAULT_POOL_NAME_PREFIX",
     "databricks_pool_remote_compute",
 ]
 
@@ -85,12 +86,16 @@ _GROUPNAME_RE = re.compile(r"\bGroupName\((?P<group>[^)]*)\)")
 _NAME_ID_CACHE: dict[str, ExpiringDict] = {}
 _NAMED_POOLS: ExpiringDict[str, "InstancePool"] = ExpiringDict(default_ttl=7200.0)
 
-# Default node type used when callers do not supply one explicitly. Matches
-# the cluster service default so a pool-backed cluster lines up by default.
-_DEFAULT_NODE_TYPE_ID = "rd-fleet.xlarge"
+# Default node type used when callers do not supply one explicitly. Sourced
+# from the centralized :class:`NodeType` enum so the cluster service, pool
+# service, and any downstream caller see the same value.
+_DEFAULT_NODE_TYPE_ID = NodeType.DEFAULT.value
 
-# Default ygg pool name used by `default_pool()`.
-DEFAULT_POOL_NAME = "Yggdrasil"
+# Prefix used by :meth:`InstancePools.default_pool` when no explicit
+# pool name is configured on the defaults. The effective name appends a
+# per-user slug (email local part / whoami / hostname) at resolution time so
+# shared workspaces do not collide on a single ``"Yggdrasil"`` pool.
+DEFAULT_POOL_NAME_PREFIX = "Yggdrasil"
 
 
 # ---------------------------------------------------------------------------
@@ -118,8 +123,14 @@ class InstancePoolDefaults:
     Attributes
     ----------
     pool_name
-        Default name used by :meth:`InstancePools.default_pool` and
-        :meth:`InstancePools.pool` when no name is supplied.
+        Explicit pool name. When ``None`` (the default), the effective name is
+        derived at resolution time from :attr:`pool_name_prefix` plus a stable
+        per-user slug (e.g. ``"Yggdrasil-alice"``) via
+        :meth:`DatabricksClient.user_scoped_name`, so shared workspaces do not
+        collide on a single pool.
+    pool_name_prefix
+        Prefix used when :attr:`pool_name` is ``None``. Set this to namespace
+        team-wide pools (e.g. ``"DataPlatform"`` → ``"DataPlatform-alice"``).
     node_type_id
         Default node SKU. Matches the cluster-service default so a pool-backed
         cluster lines up without extra configuration.
@@ -141,7 +152,8 @@ class InstancePoolDefaults:
         :func:`databricks_pool_remote_compute`.
     """
 
-    pool_name: str = DEFAULT_POOL_NAME
+    pool_name: Optional[str] = None
+    pool_name_prefix: str = DEFAULT_POOL_NAME_PREFIX
     node_type_id: str = _DEFAULT_NODE_TYPE_ID
     idle_instance_autotermination_minutes: int = 30
     min_idle_instances: int = 0
@@ -214,6 +226,18 @@ class InstancePools(DatabricksService):
     # ------------------------------------------------------------------ #
     # Singletons
     # ------------------------------------------------------------------ #
+    def default_pool_name(self) -> str:
+        """Resolve the effective default pool name for this workspace.
+
+        Uses :attr:`InstancePoolDefaults.pool_name` verbatim when set,
+        otherwise falls back to ``"{pool_name_prefix}-{user_slug}"`` via
+        :meth:`DatabricksClient.user_scoped_name`. When no user slug can be
+        derived, returns the bare prefix.
+        """
+        if self.defaults.pool_name:
+            return self.defaults.pool_name
+        return self.client.user_scoped_name(self.defaults.pool_name_prefix)
+
     def pool(
         self,
         name: str | None = None,
@@ -232,10 +256,11 @@ class InstancePools(DatabricksService):
 
         Cached per-host for ``7200s`` so repeated calls in the same process
         skip the SDK round trip. Any argument left as ``None`` falls back to
-        the value stored on :attr:`defaults`.
+        the value stored on :attr:`defaults`; an absent pool name defers to
+        :meth:`default_pool_name` (user-scoped by default).
         """
         if not name:
-            name = (key.strip() if key else None) or self.defaults.pool_name
+            name = (key.strip() if key else None) or self.default_pool_name()
 
         existing = _NAMED_POOLS.get(name)
         if existing is not None:
@@ -261,11 +286,11 @@ class InstancePools(DatabricksService):
     def default_pool(self, **overrides: Any) -> "InstancePool":
         """Return the shared default pool used by :meth:`InstancePool.run`.
 
-        Resolves the pool named :attr:`defaults.pool_name <InstancePoolDefaults.pool_name>`,
-        creating it on first call with the rest of :attr:`defaults` applied.
-        ``overrides`` win over the defaults for this one call.
+        The pool name is resolved by :meth:`default_pool_name`, so by default
+        every workspace gets its own per-user pool. ``overrides`` win over the
+        defaults for this one call.
         """
-        return self.pool(self.defaults.pool_name, **overrides)
+        return self.pool(self.default_pool_name(), **overrides)
 
     # ------------------------------------------------------------------ #
     # CRUD
@@ -290,7 +315,9 @@ class InstancePools(DatabricksService):
         spec: dict[str, Any] = {}
         if instance_pool_name is not None:
             spec["instance_pool_name"] = instance_pool_name
-        spec["node_type_id"] = node_type_id or self.defaults.node_type_id
+        spec["node_type_id"] = NodeType.to_id(
+            node_type_id, default=self.defaults.node_type_id,
+        )
 
         # Inject edit-safe defaults for any field the caller left unset.
         for key in InstancePoolDefaults._EDITABLE_FIELDS:

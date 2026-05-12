@@ -17,7 +17,7 @@ from databricks.sdk.service.compute import (
 )
 
 from yggdrasil.databricks.compute.instance_pool import (
-    DEFAULT_POOL_NAME,
+    DEFAULT_POOL_NAME_PREFIX,
     InstancePool,
     InstancePoolDefaults,
 )
@@ -29,8 +29,28 @@ class TestInstancePoolDefaults(DatabricksTestCase):
 
     def test_defaults_attached_to_service(self):
         self.assertIsInstance(self.instance_pools.defaults, InstancePoolDefaults)
-        self.assertEqual(self.instance_pools.defaults.pool_name, DEFAULT_POOL_NAME)
+        # New default: pool_name is None — resolution falls back to the
+        # user-scoped prefix via `default_pool_name()`.
+        self.assertIsNone(self.instance_pools.defaults.pool_name)
+        self.assertEqual(
+            self.instance_pools.defaults.pool_name_prefix,
+            DEFAULT_POOL_NAME_PREFIX,
+        )
         self.assertEqual(self.instance_pools.defaults.max_capacity, 10)
+
+    def test_default_pool_name_is_user_scoped(self):
+        # default_pool_name() composes the prefix with a per-user slug.
+        name = self.instance_pools.default_pool_name()
+        self.assertTrue(name.startswith(DEFAULT_POOL_NAME_PREFIX))
+
+    def test_explicit_pool_name_wins(self):
+        self.instance_pools.defaults = replace(
+            self.instance_pools.defaults, pool_name="custom-pool",
+        )
+        self.assertEqual(
+            self.instance_pools.default_pool_name(),
+            "custom-pool",
+        )
 
     def test_defaults_override_per_call(self):
         self.instance_pools.defaults = replace(
