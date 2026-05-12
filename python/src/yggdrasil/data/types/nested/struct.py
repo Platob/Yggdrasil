@@ -349,6 +349,19 @@ class StructType(NestedType):
         array: pa.Array,
         options: "CastOptions",
     ) -> pa.StructArray | pa.ChunkedArray:
+        # Engine-level bypass — when the array's arrow type already
+        # matches the target's projection (including per-child
+        # nullability — ``pa.DataType.__eq__`` compares field
+        # nullability inside ``pa.struct``), every downstream branch
+        # would either rebuild the same buffers or short-circuit
+        # anyway. Skip the ``check_source`` Field-from-arrow peek
+        # (which builds a fresh Field tree from the struct array) and
+        # the per-child rebuild by returning ``array`` directly. Mirror
+        # :meth:`ArrayType._cast_arrow_array` / :meth:`MapType._cast_arrow_array`
+        # so struct casts pay the same MATCH floor as their nested peers.
+        if array.type == self.to_arrow():
+            return array
+
         options = options.check_source(array).check_target(self)
 
         source_type_id = options.source.dtype.type_id

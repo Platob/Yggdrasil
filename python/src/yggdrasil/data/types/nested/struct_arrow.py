@@ -78,6 +78,7 @@ def cast_arrow_struct_array(
     target_type: "StructType" = options.target.dtype
 
     children: list[pa.Array] = []
+    target_fields = [f.to_arrow_field() for f in target_type.fields]
 
     for i, target_child in enumerate(target_type.children):
         # See the tabular variant for the rationale — single-method
@@ -92,15 +93,36 @@ def cast_arrow_struct_array(
                     memory_pool=options.arrow_memory_pool,
                 )
             )
-        else:
-            children.append(
-                target_child.cast_arrow_array(
-                    array.field(source_child.name),
-                    options=options.copy(source=source_child, target=target_child),
-                )
-            )
+            continue
 
-    target_fields = [f.to_arrow_field() for f in target_type.fields]
+        source_array = array.field(source_child.name)
+        target_arrow_field = target_fields[i]
+        # Per-child fast path: when the source child already carries
+        # the exact target arrow type and the target is nullable (no
+        # fill needed), the recursive cast + finalize cycle is a no-op
+        # — skip the ``options.copy`` + ``Field.cast_arrow_array``
+        # wrap entirely and reuse the source array. Wide structs
+        # (32+ fields where only one widens) pay 30+ pointless
+        # per-child option clones otherwise. The strict equality
+        # check covers field-level nullability too: ``pa.Field.type``
+        # comparison ignores nullability, so we test the full
+        # ``pa.Field`` to make sure a ``NOT NULL`` target still
+        # routes through the rebuild that re-emits the target field
+        # shape.
+        if (
+            target_child.nullable
+            and not target_child.has_default
+            and source_array.type == target_arrow_field.type
+        ):
+            children.append(source_array)
+            continue
+
+        children.append(
+            target_child.cast_arrow_array(
+                source_array,
+                options=options.copy(source=source_child, target=target_child),
+            )
+        )
     # ``pa.StructArray.from_arrays`` validates strict child-type equality
     # against ``fields``. The per-child cast may legitimately return a
     # view-layout buffer (``string_view`` vs ``string``) because
