@@ -39,7 +39,7 @@ class TestDBFSPathIntegration(DatabricksIntegrationCase):
         ).rstrip("/")
         cls.root = DBFSPath(
             f"{cls.base_root}/run-{secrets.token_hex(4)}",
-            workspace=cls.workspace,
+            client=cls.client,
         )
         cls.root.mkdir(parents=True, exist_ok=True)
 

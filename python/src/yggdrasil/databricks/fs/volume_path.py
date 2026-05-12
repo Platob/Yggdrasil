@@ -378,10 +378,11 @@ class VolumePath(DatabricksPath):
         :class:`RefreshableCredentials`, and STS vending are shared
         across every reader / writer on the volume in this process.
 
-        The bound workspace client is updated on each call — the
-        latest live handle wins so subsequent refresh cycles use the
-        freshest auth context (useful when callers rotate workspace
-        clients between sessions).
+        The bound client is updated on each call — the latest live
+        handle wins so subsequent refresh cycles use the freshest auth
+        context (useful when callers rotate Databricks clients between
+        sessions). The SDK workspace client is reached through
+        ``client.workspace_client()`` at refresh time.
         """
         op = _resolve_volume_operation(operation)
         info = self.volume_info()
@@ -394,7 +395,7 @@ class VolumePath(DatabricksPath):
         return VolumeCredentialsRefresher(
             volume_id=volume_id,
             operation=op,
-            workspace=self.workspace,
+            client=self.client,
         )
 
     def aws(
@@ -506,7 +507,6 @@ class VolumePath(DatabricksPath):
         resource_name: Optional[str] = None,
         temporary: bool = True,
         client: Any = None,
-        workspace: Any = None,
         max_lifetime: Optional[float] = None,
         tabular: Any = None,
     ) -> "VolumePath":
@@ -518,10 +518,9 @@ class VolumePath(DatabricksPath):
         process exit; otherwise it is unlinked when the holder is
         released.
 
-        Either ``workspace`` (a workspace client) or ``client`` (a
-        :class:`DatabricksClient`-shaped aggregator with a
-        ``workspace_client()`` method) may be supplied; if both are
-        omitted the path lazy-resolves through the active aggregator
+        Pass ``client`` — a :class:`DatabricksClient` aggregator — to
+        bind the freshly-minted path explicitly. When omitted, the
+        path lazy-resolves through :meth:`DatabricksClient.current`
         on first use.
 
         ``max_lifetime`` is accepted for backwards compatibility —
@@ -543,9 +542,6 @@ class VolumePath(DatabricksPath):
         sch = _staging_clean_part(schema_name)
         tbl = _staging_clean_part(resource_name or "default")
 
-        if workspace is None and client is not None:
-            workspace = client.workspace_client()
-
         epoch_ms = int(time.time() * 1000)
         seed = os.urandom(8).hex()
         leaf = f"part-{epoch_ms}-{seed}.parquet"
@@ -553,7 +549,7 @@ class VolumePath(DatabricksPath):
 
         staged = cls(
             url=URL(scheme=cls.scheme, path=path),
-            workspace=workspace,
+            client=client,
             temporary=temporary,
         )
         if tabular is None:
@@ -597,7 +593,7 @@ class VolumePath(DatabricksPath):
             # which URL-parses ``<cat>`` as a host and drops it.
             child = type(self)(
                 child_path,
-                workspace=self._workspace,
+                client=self._client,
             )
             yield child
             if recursive and getattr(info, "is_directory", False):
@@ -849,13 +845,13 @@ class VolumeCredentialsRefresher:
       constructor call, but the singleton guard re-uses live state.
     - Pickling routes through :meth:`__getnewargs__` /
       :meth:`__setstate__` so a refresher unpickled in the same
-      process collapses back to the live singleton; the workspace
-      handle is transient and not transported.
+      process collapses back to the live singleton; the bound client
+      is transient and not transported.
 
-    The bound workspace client is mutable — every constructor call
-    updates :attr:`workspace` with the freshest one, so STS refreshes
-    that happen after a workspace rotation pick up the new auth
-    context. Pass ``None`` to leave the existing handle in place.
+    The bound :class:`DatabricksClient` is mutable — every constructor
+    call updates :attr:`_client` with the freshest one, so STS
+    refreshes that happen after a workspace rotation pick up the new
+    auth context. Pass ``None`` to leave the existing binding in place.
     """
 
     # Class-level singleton registry. Two refreshers with the same
@@ -868,11 +864,11 @@ class VolumeCredentialsRefresher:
     _INSTANCES_LOCK: ClassVar[threading.Lock] = threading.Lock()
 
     # Slots covering both the identity fields (compared) and the
-    # transient runtime state (workspace + per-region AWS clients).
+    # transient runtime state (DatabricksClient + per-region AWS clients).
     __slots__ = (
         "volume_id",
         "operation",
-        "workspace",
+        "_client",
         "_client_cache",
         "_client_cache_lock",
         "_initialized",
@@ -882,18 +878,17 @@ class VolumeCredentialsRefresher:
         cls,
         volume_id: str,
         operation: Any,
-        workspace: Any = None,
+        client: Any = None,
     ) -> "VolumeCredentialsRefresher":
         key = (cls, str(volume_id), operation)
         with cls._INSTANCES_LOCK:
             existing = cls._INSTANCES.get(key)
             if existing is not None:
-                # Re-bind the latest workspace handle so a follow-up
-                # refresh cycle uses the freshest auth context — a
-                # stale ref would silently 401 once the workspace
-                # client's underlying creds expired.
-                if workspace is not None:
-                    existing.workspace = workspace
+                # Re-bind the latest client so a follow-up refresh
+                # cycle uses the freshest auth context — a stale ref
+                # would silently 401 once the underlying creds expired.
+                if client is not None:
+                    existing._client = client
                 return existing
             instance = super().__new__(cls)
             cls._INSTANCES[key] = instance
@@ -903,18 +898,18 @@ class VolumeCredentialsRefresher:
         self,
         volume_id: str,
         operation: Any,
-        workspace: Any = None,
+        client: Any = None,
     ) -> None:
         # Idempotent init — Python always calls __init__ after __new__
         # returns the cached instance. Skip the second pass so the
         # live ``_client_cache`` survives.
         if getattr(self, "_initialized", False):
-            if workspace is not None:
-                self.workspace = workspace
+            if client is not None:
+                self._client = client
             return
         self.volume_id: str = str(volume_id)
         self.operation: Any = operation
-        self.workspace: Any = workspace
+        self._client: Any = client
         # Per-region AWSClient cache. One client per region per
         # refresher — the cache key is the requested region (which can
         # legitimately be ``None``, letting botocore resolve via env).
@@ -930,22 +925,44 @@ class VolumeCredentialsRefresher:
         return (self.volume_id, self.operation)
 
     def __getstate__(self) -> dict[str, Any]:
-        # ``workspace`` and the AWSClient cache are transient — the
-        # receiver re-binds the workspace via the next VolumePath
-        # construction, and the client cache is rebuilt lazily.
+        # ``_client`` and the AWSClient cache are transient — the
+        # receiver re-binds the client via the next VolumePath
+        # construction, and the AWSClient cache is rebuilt lazily.
         return {"volume_id": self.volume_id, "operation": self.operation}
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         # ``__new__`` may have returned the live singleton — leave its
-        # workspace ref and client cache untouched.
+        # client ref and AWSClient cache untouched.
         if getattr(self, "_initialized", False):
             return
         self.volume_id = state["volume_id"]
         self.operation = state["operation"]
-        self.workspace = None
+        self._client = None
         self._client_cache = {}
         self._client_cache_lock = threading.Lock()
         self._initialized = True
+
+    # ------------------------------------------------------------------
+    # Client / workspace accessors
+    # ------------------------------------------------------------------
+
+    @property
+    def client(self) -> Any:
+        """Bound :class:`DatabricksClient` (or :class:`_WorkspaceOnlyClient` shim).
+
+        Lazily resolves to :meth:`DatabricksClient.current` when no
+        client has been bound. The SDK workspace client is reached
+        through :attr:`workspace` (a thin shortcut).
+        """
+        if self._client is None:
+            from yggdrasil.lazy_imports import databricks_client_class
+            self._client = databricks_client_class().current()
+        return self._client
+
+    @property
+    def workspace(self) -> Any:
+        """Shortcut for ``self.client.workspace_client()``."""
+        return self.client.workspace_client()
 
     # ------------------------------------------------------------------
     # Identity
@@ -972,19 +989,14 @@ class VolumeCredentialsRefresher:
     # Refresh — invoked by botocore's RefreshableCredentials hook
     # ------------------------------------------------------------------
 
-    def with_workspace(self, workspace: Any) -> "VolumeCredentialsRefresher":
-        """Replace the bound workspace client. Returns *self*."""
-        self.workspace = workspace
+    def with_client(self, client: Any) -> "VolumeCredentialsRefresher":
+        """Replace the bound :class:`DatabricksClient`. Returns *self*."""
+        self._client = client
         return self
 
     def __call__(self) -> "AwsCredentials":
         from yggdrasil.aws.config import AwsCredentials
 
-        if self.workspace is None:
-            from yggdrasil.lazy_imports import databricks_client_class
-            self.workspace = (
-                databricks_client_class().current().workspace_client()
-            )
         resp = (
             self.workspace.temporary_volume_credentials
             .generate_temporary_volume_credentials(

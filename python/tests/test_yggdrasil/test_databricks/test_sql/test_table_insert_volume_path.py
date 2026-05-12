@@ -127,7 +127,7 @@ class TestInsertVolumePathIsMockable:
         tbl = _table()
         custom = VolumePath(
             "/Volumes/test/test/tmp/.sql/test/test/tbl/part-fixed.parquet",
-            workspace=MagicMock(),
+            client=MagicMock(),
         )
         tbl.insert_volume_path = lambda *a, **kw: custom  # type: ignore[assignment]
         assert tbl.insert_volume_path() is custom

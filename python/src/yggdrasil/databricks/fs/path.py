@@ -19,35 +19,31 @@ The base owns:
   Catalog :class:`Table`) based on the URL scheme or the POSIX
   namespace in the path. Construction via the abstract base
   "just works" — no need for callers to pick a subclass up front.
-- **Workspace-client binding** — :attr:`workspace` is whatever the
-  caller injected, typically a ``databricks.sdk.WorkspaceClient``
-  in production or a :class:`unittest.mock.Mock` in tests. No
-  imports of ``databricks.sdk`` happen at module load — concrete
-  subclasses pass any quack-compatible client through.
+- **Client binding** — :attr:`client` is a
+  :class:`yggdrasil.databricks.client.DatabricksClient` aggregator.
+  The SDK workspace handle is reached through ``client.workspace_client()``
+  — :class:`DatabricksPath` never holds a bare workspace client
+  directly. No imports of ``databricks.sdk`` happen at module load.
 
-What's intentionally NOT here
------------------------------
-
-The legacy code had a ``DatabricksClient`` aggregator that owned a
-workspace client, retry policies, account-level routing, and more.
-That layer is decoupled in this rewrite — :class:`DatabricksPath`
-just needs the workspace client itself, so:
-
-- Tests pass a :class:`Mock` directly.
-- Production callers pass ``DatabricksClient.current().workspace_client()``.
-
-The aggregator can still exist; it just isn't required for the path
-layer to work.
+Tests pass a :class:`DatabricksClient` (or a mock shaped like one
+— typically ``MagicMock()`` with ``workspace_client.return_value``
+wired to a workspace-shaped mock). There is no alternate
+"workspace-only" entry point: every caller routes through
+:class:`DatabricksClient`.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable, ClassVar, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Optional, Tuple
 
 from yggdrasil.data.enums import Scheme
 from yggdrasil.io.path import RemotePath
 from yggdrasil.io.path._retry import retry_sdk_call
 from yggdrasil.io.url import URL
+
+
+if TYPE_CHECKING:
+    from yggdrasil.databricks.client import DatabricksClient
 
 
 __all__ = ["DatabricksPath"]
@@ -231,7 +227,7 @@ class DatabricksPath(RemotePath):
     everything else → :class:`DBFSPath`).
     """
 
-    __slots__ = ("_workspace", "_retry_sleep")
+    __slots__ = ("_client", "_retry_sleep")
 
     scheme: ClassVar[Scheme] = Scheme.DBFS
 
@@ -303,8 +299,7 @@ class DatabricksPath(RemotePath):
         data: Any = None,
         *,
         url: URL | None = None,
-        workspace: Any = None,
-        client: Any = None,
+        client: "DatabricksClient | None" = None,
         temporary: bool = False,
         retry_sleep: Optional[Callable[[float], None]] = None,
         **kwargs: Any,
@@ -338,20 +333,13 @@ class DatabricksPath(RemotePath):
 
         super().__init__(data=data, url=url, temporary=temporary, **kwargs)
 
-        # Either a workspace SDK client or a :class:`DatabricksClient`
-        # aggregator may seed the path; the aggregator's
-        # ``workspace_client()`` is a cheap accessor (cached on the
-        # aggregator) so we can resolve eagerly when ``workspace`` was
-        # not explicitly passed. Conflicting injections fail loudly —
-        # the caller picked two different sources of truth.
-        if workspace is not None and client is not None:
-            raise ValueError(
-                f"{type(self).__name__}: pass workspace= or client=, not both "
-                f"(got workspace={workspace!r}, client={client!r})."
-            )
-        if workspace is None and client is not None:
-            workspace = client.workspace_client()
-        self._workspace = workspace
+        # :class:`DatabricksClient` is the single source of truth.
+        # The SDK workspace handle is always reached through
+        # ``self.client.workspace_client()`` — the path holds no bare
+        # workspace client. ``client=None`` is allowed; the path then
+        # lazy-resolves to :meth:`DatabricksClient.current` on first
+        # touch.
+        self._client: Any = client
         self._retry_sleep: Optional[Callable[[float], None]] = retry_sleep
 
     # ==================================================================
@@ -420,27 +408,42 @@ class DatabricksPath(RemotePath):
         return cls(url=URL.from_(obj), **kwargs)
 
     # ==================================================================
-    # Workspace client binding
+    # Client binding — DatabricksClient is the single point of access
     # ==================================================================
 
     @property
-    def workspace(self) -> Any:
-        """The workspace client (``databricks.sdk.WorkspaceClient`` or
-        a mock).
+    def client(self) -> "DatabricksClient":
+        """The bound :class:`DatabricksClient` aggregator.
 
-        Lazily resolves through the aggregator client when none was
-        injected. Tests inject mocks at construction so this branch
-        never fires.
+        Lazily resolves to :meth:`DatabricksClient.current` when none
+        was injected at construction — production callers usually let
+        this fire so the active workspace selection follows the
+        process-wide singleton. Tests inject a :class:`DatabricksClient`
+        mock at construction (typically a :class:`MagicMock` with
+        ``workspace_client.return_value`` wired to a workspace-shaped
+        mock) so this branch is a no-op.
         """
-        if self._workspace is None:
+        if self._client is None:
             from yggdrasil.lazy_imports import databricks_client_class
-            self._workspace = databricks_client_class().current().workspace_client()
-        return self._workspace
+            self._client = databricks_client_class().current()
+        return self._client
 
-    def with_workspace(self, workspace: Any) -> "DatabricksPath":
-        """Replace the bound workspace client. Returns *self*."""
-        self._workspace = workspace
+    def with_client(self, client: "DatabricksClient") -> "DatabricksPath":
+        """Replace the bound :class:`DatabricksClient`. Returns *self*."""
+        self._client = client
         return self
+
+    @property
+    def workspace(self) -> Any:
+        """Workspace SDK client reached through :attr:`client`.
+
+        Shortcut for ``self.client.workspace_client()`` — kept so
+        concrete subclasses can stay terse (``self.workspace.files.upload``)
+        while the source of truth is the :class:`DatabricksClient` on
+        :attr:`_client`. No bare workspace handle is stored on the
+        path anymore.
+        """
+        return self.client.workspace_client()
 
     # ==================================================================
     # Retry policy
@@ -504,7 +507,7 @@ class DatabricksPath(RemotePath):
     def _from_url(self, url: URL) -> "DatabricksPath":
         return type(self)(
             url=url,
-            workspace=self._workspace,
+            client=self._client,
             retry_sleep=self._retry_sleep,
         )
 

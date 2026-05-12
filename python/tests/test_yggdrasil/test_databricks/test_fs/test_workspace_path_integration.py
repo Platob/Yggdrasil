@@ -45,7 +45,7 @@ class TestWorkspacePathIntegration(DatabricksIntegrationCase):
         cls.base_root = base.rstrip("/")
         cls.root = WorkspacePath(
             f"{cls.base_root}/run-{secrets.token_hex(4)}",
-            workspace=cls.workspace,
+            client=cls.client,
         )
         cls.root.mkdir(parents=True, exist_ok=True)
 
