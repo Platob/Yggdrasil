@@ -50,7 +50,7 @@ from urllib.parse import (
 
 import pyarrow as pa
 
-from yggdrasil import rs as _rs
+from yggdrasil import cy as _cy
 from yggdrasil.io.parameters import anonymize_parameters
 from yggdrasil.lazy_imports import (
     bytes_io_class,
@@ -58,14 +58,13 @@ from yggdrasil.lazy_imports import (
     mime_type_class,
 )
 
-# Hot-path delegation: when the Rust extension is loaded, hand off URL
-# parsing and percent-encoding to native kernels. The Python fallback
-# below is preserved for environments without `yggrs` (e.g. odd
-# packaging environments where the optional native wheel isn't present);
-# `ygg` now requires `yggrs`, so in normal installs this branch is
-# always taken. Functions are read once at module-import time so the
-# hot path stays a direct attribute lookup.
-_RS_URL = _rs.io_url
+# Hot-path delegation: when the Cython extension (`yggcy`) is
+# installed, hand off URL parsing and percent-encoding to its native
+# kernels. The pure-Python fallback below stays in place for
+# environments without `yggcy` — the wheel is optional, not a hard
+# dependency. Functions are read once at module-import time so the hot
+# path stays a direct attribute lookup.
+_CY_URL = _cy.io_url
 
 __all__ = [
     "URL",
@@ -263,18 +262,18 @@ def _join_segment(seg: Any) -> str:
 def _encode_userinfo(userinfo: str) -> str:
     if not userinfo:
         return ""
-    if _RS_URL is not None:
-        return _RS_URL.encode_userinfo(userinfo)
+    if _CY_URL is not None:
+        return _CY_URL.encode_userinfo(userinfo)
     return quote(userinfo, safe=":!$&'()*+,;=")
 
 
 def _encode_path(path: str, safe: str = _SAFE_PATH) -> str:
-    # The Rust kernel uses the canonical safe set + the same "no space →
+    # The Cython kernel uses the canonical safe set + the same "no space →
     # also keep '%'" rule as the Python fallback. Custom safe sets are a
     # rare debug knob, so detour into the Python fallback when one is
     # supplied.
-    if _RS_URL is not None and safe is _SAFE_PATH:
-        return _RS_URL.encode_path(path)
+    if _CY_URL is not None and safe is _SAFE_PATH:
+        return _CY_URL.encode_path(path)
     if safe:
         if " " not in path:
             safe = safe + "%"
@@ -282,14 +281,14 @@ def _encode_path(path: str, safe: str = _SAFE_PATH) -> str:
 
 
 def _encode_query(query: str) -> str:
-    if _RS_URL is not None:
-        return _RS_URL.encode_query(query)
+    if _CY_URL is not None:
+        return _CY_URL.encode_query(query)
     return quote(query, safe=_SAFE_QUERY + "%")
 
 
 def _encode_fragment(fragment: str) -> str:
-    if _RS_URL is not None:
-        return _RS_URL.encode_fragment(fragment)
+    if _CY_URL is not None:
+        return _CY_URL.encode_fragment(fragment)
     return quote(fragment, safe=_SAFE_FRAGMENT + "%")
 
 
@@ -306,8 +305,8 @@ def _p(value: int | None) -> int:
 
 
 def _normalize_query(query: str) -> str:
-    if _RS_URL is not None:
-        return _RS_URL.normalize_query(query)
+    if _CY_URL is not None:
+        return _CY_URL.normalize_query(query)
     query = query.lstrip("?")
     if not query:
         return ""
@@ -326,8 +325,8 @@ def _parse_port(value: Any) -> int:
 
 
 def _parse_netloc(netloc: str, *, decode: bool) -> tuple[str, str, int]:
-    if _RS_URL is not None:
-        userinfo, host, port = _RS_URL.parse_netloc(netloc, decode=decode)
+    if _CY_URL is not None:
+        userinfo, host, port = _CY_URL.parse_netloc(netloc, decode=decode)
         return userinfo, host, port
     if not netloc:
         return "", "", _NO_PORT
@@ -826,13 +825,13 @@ class URL(os.PathLike):
         decode: bool = False,
         normalize: bool = True,
     ) -> URL:
-        if _RS_URL is not None:
-            # Rust handles split + netloc + Windows drive fix-up + entity
+        if _CY_URL is not None:
+            # Cython handles split + netloc + Windows drive fix-up + entity
             # decoding + the missing-authority recovery. We keep the
             # final normalize pass in Python because `_normalize_path`'s
             # `os.path.realpath` branch for `file://` URLs is platform-
             # sensitive and lives in the Python helper.
-            scheme, userinfo, host, port, path, query, fragment = _RS_URL.parse_url(
+            scheme, userinfo, host, port, path, query, fragment = _CY_URL.parse_url(
                 raw,
                 default_scheme=default_scheme,
                 decode=decode,
