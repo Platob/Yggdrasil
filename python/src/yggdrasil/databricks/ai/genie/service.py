@@ -1,413 +1,299 @@
+"""Databricks Genie service.
+
+``client.genie.ask("How many orders last month?")`` is the entire API surface
+most callers need. The service auto-resolves a default space (via
+:attr:`Genie.defaults`), waits for Genie to finish, and returns a rich
+:class:`GenieAnswer` that can produce the SQL result as Arrow / Polars / pandas.
+
+Higher-level helpers live on the returned resources:
+
+- ``answer.ask(follow_up)`` continues the conversation.
+- ``space = client.genie.space("…")`` gives direct access to one space.
+- ``space.start_conversation(q)`` returns ``(GenieConversation, GenieAnswer)``
+  so the thread can be continued explicitly.
+
+Defaults
+--------
+Tweak the service-level :class:`GenieDefaults` once and every subsequent call
+inherits them::
+
+    from dataclasses import replace
+    client.genie.defaults = replace(
+        client.genie.defaults,
+        space_id="01ef...",
+        warehouse_id="abc123",
+        timeout_seconds=300,
+    )
+"""
 from __future__ import annotations
 
-import time
-from typing import Any, Mapping, Optional
+import logging
+from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 from yggdrasil.databricks.client import DatabricksService
 
-from .resources import GenieAnswer, GenieSpace
+from .resources import (
+    DEFAULT_POLL_INTERVAL_SECONDS,
+    DEFAULT_TIMEOUT_SECONDS,
+    GenieAnswer,
+    GenieConversation,
+    GenieDefaults,
+    GenieSpace,
+)
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from databricks.sdk.service.dashboards import GenieAPI, GenieMessage
+    from yggdrasil.databricks.warehouse.warehouse import SQLWarehouse
+
 
 __all__ = ["Genie"]
 
+LOGGER = logging.getLogger(__name__)
+
 
 class Genie(DatabricksService):
-    """High-level wrapper around Databricks Workspace Genie APIs."""
+    """High-level wrapper around Databricks Workspace Genie APIs.
 
-    def __init__(self, client=None, default_space_id: str | None = None):
+    The simplest path is::
+
+        client.genie.defaults = replace(client.genie.defaults, space_id="…")
+        answer = client.genie.ask("How many orders last month?")
+        print(answer.text)
+        df = answer.polars()  # SQL result, if Genie ran one
+
+    Without a configured default the service can still auto-pick a space when
+    :attr:`GenieDefaults.auto_pick_space` is on (the default). Set
+    :attr:`GenieDefaults.space_name` to bias the pick by title.
+
+    Attributes
+    ----------
+    defaults
+        :class:`GenieDefaults` — service-wide configuration. Replace in place
+        via ``client.genie.defaults = replace(client.genie.defaults, …)``.
+    """
+
+    def __init__(
+        self,
+        client=None,
+        defaults: Optional[GenieDefaults] = None,
+    ):
         super().__init__(client=client)
-        self.default_space_id = default_space_id
+        self.defaults: GenieDefaults = defaults if defaults is not None else GenieDefaults()
 
+    # ------------------------------------------------------------------ #
+    # SDK boundary
+    # ------------------------------------------------------------------ #
     @property
-    def api(self):
+    def api(self) -> "GenieAPI":
         return self.client.workspace_client().genie
 
+    # ------------------------------------------------------------------ #
+    # The one-shot ask
+    # ------------------------------------------------------------------ #
     def ask(
         self,
-        content: str,
+        question: str,
         *,
         space_id: str | None = None,
         conversation_id: str | None = None,
-        timeout_seconds: float = 120.0,
-        poll_interval_seconds: float = 1.0,
+        timeout_seconds: float | None = None,
+        poll_interval_seconds: float | None = None,
     ) -> GenieAnswer:
-        resolved_space_id = space_id or self.default_space_id
-        if not resolved_space_id:
-            raise ValueError("space_id is required unless default_space_id is set")
+        """Send a question to Genie and return the completed reply.
+
+        Parameters
+        ----------
+        question
+            The user's natural-language question.
+        space_id
+            Genie space id. Falls back to :attr:`GenieDefaults.space_id`, then
+            to :meth:`default_space` (when ``auto_pick_space`` is enabled).
+        conversation_id
+            Continue an existing conversation. When ``None``, a new one is
+            started.
+        timeout_seconds
+            Override :attr:`GenieDefaults.timeout_seconds` for this call.
+        poll_interval_seconds
+            Reserved for future use — the SDK currently controls polling
+            cadence inside ``wait_get_message_genie_completed``.
+        """
+        del poll_interval_seconds  # SDK controls cadence; kept for symmetry
+
+        space_id = self._resolve_space_id(space_id)
+        timeout = self._timeout(timeout_seconds)
 
         if conversation_id:
-            message = self._create_message(
-                space_id=resolved_space_id,
-                conversation_id=conversation_id,
-                content=content,
+            LOGGER.debug(
+                "Genie.create_message space=%s conversation=%s len=%d",
+                space_id, conversation_id, len(question),
             )
-        else:
-            conversation, message = self._start_conversation(
-                space_id=resolved_space_id,
-                content=content,
-            )
-            conversation_id = conversation.get("id")
-            if not conversation_id:
-                raise ValueError("Unable to infer conversation_id from start-conversation response")
-
-        message = self._wait_for_message(
-            space_id=resolved_space_id,
-            conversation_id=conversation_id,
-            message=message,
-            timeout_seconds=timeout_seconds,
-            poll_interval_seconds=poll_interval_seconds,
-        )
-
-        return self._to_answer(
-            space_id=resolved_space_id,
-            conversation_id=conversation_id,
-            message=message,
-        )
-
-    def start_conversation(self, content: str, *, space_id: str | None = None) -> GenieSpace:
-        resolved_space_id = space_id or self.default_space_id
-        if not resolved_space_id:
-            raise ValueError("space_id is required unless default_space_id is set")
-
-        conversation, _ = self._start_conversation(space_id=resolved_space_id, content=content)
-
-        conversation_id = conversation.get("id")
-        if not conversation_id:
-            raise ValueError("Unable to infer conversation_id from start-conversation response")
-
-        return GenieSpace(space_id=resolved_space_id, conversation_id=conversation_id)
-
-    def create_message(
-        self,
-        content: str,
-        *,
-        space_id: str,
-        conversation_id: str,
-        timeout_seconds: float = 120.0,
-        poll_interval_seconds: float = 1.0,
-    ) -> GenieAnswer:
-        message = self._create_message(space_id=space_id, conversation_id=conversation_id, content=content)
-        message = self._wait_for_message(
-            space_id=space_id,
-            conversation_id=conversation_id,
-            message=message,
-            timeout_seconds=timeout_seconds,
-            poll_interval_seconds=poll_interval_seconds,
-        )
-        return self._to_answer(space_id=space_id, conversation_id=conversation_id, message=message)
-
-    def get_message(self, *, space_id: str, conversation_id: str, message_id: str) -> GenieAnswer:
-        message = self._as_mapping(
-            self.api.get_message(
+            waiter = self.api.create_message(
                 space_id=space_id,
                 conversation_id=conversation_id,
-                message_id=message_id,
+                content=question,
             )
+            message = waiter.result(timeout=timeout)
+            resolved_conversation_id = conversation_id
+        else:
+            LOGGER.debug(
+                "Genie.start_conversation space=%s len=%d",
+                space_id, len(question),
+            )
+            waiter = self.api.start_conversation(
+                space_id=space_id,
+                content=question,
+            )
+            # Wait.bind() exposes the kwargs captured at submission time
+            # (conversation_id, message_id, space_id). We pull conversation_id
+            # before .result() blocks so callers can build follow-ups even
+            # when the wait times out before completion.
+            resolved_conversation_id = waiter.bind().get("conversation_id") or ""
+            message = waiter.result(timeout=timeout)
+
+        # GenieMessage carries the canonical conversation_id once Genie has
+        # processed the request — prefer it over the bind() snapshot.
+        message_conv_id = getattr(message, "conversation_id", None)
+        if message_conv_id:
+            resolved_conversation_id = message_conv_id
+
+        return GenieAnswer(
+            service=self,
+            space_id=getattr(message, "space_id", None) or space_id,
+            conversation_id=resolved_conversation_id,
+            message=message,
         )
-        return self._to_answer(space_id=space_id, conversation_id=conversation_id, message=message)
 
-    def list_spaces(self, **kwargs):
-        return self.api.list_spaces(**kwargs)
+    # ------------------------------------------------------------------ #
+    # Space resolution
+    # ------------------------------------------------------------------ #
+    def space(self, space_id: str | None = None) -> GenieSpace:
+        """Return a :class:`GenieSpace` handle.
 
+        ``space_id`` defaults to :attr:`GenieDefaults.space_id`; if neither is
+        set and :attr:`GenieDefaults.auto_pick_space` is on, a space is picked
+        from :meth:`list_spaces` (optionally filtered by
+        :attr:`GenieDefaults.space_name`).
+        """
+        resolved = self._resolve_space_id(space_id)
+        return GenieSpace(service=self, space_id=resolved)
+
+    def default_space(self) -> GenieSpace:
+        """Return the default :class:`GenieSpace`."""
+        return self.space(None)
+
+    def find_space(self, *, name: str) -> Optional[GenieSpace]:
+        """Return the first space whose title matches ``name``, or ``None``."""
+        for space in self.list_spaces():
+            title = getattr(space.details, "title", None) if space._details is not None else None
+            if title is None:
+                title = getattr(self.api.get_space(space_id=space.space_id), "title", None)
+            if title == name:
+                return space
+        return None
+
+    def list_spaces(self, *, page_size: int | None = None) -> Iterator[GenieSpace]:
+        """Iterate over Genie spaces accessible to the current identity."""
+        response = self.api.list_spaces(page_size=page_size)
+        for entry in getattr(response, "spaces", None) or []:
+            entry_id = getattr(entry, "space_id", None) or getattr(entry, "id", None)
+            if entry_id is None:
+                continue
+            yield GenieSpace(service=self, space_id=entry_id, details=entry)
+
+    # ------------------------------------------------------------------ #
+    # Space lifecycle (thin SDK passthrough — kept on the service for
+    # discoverability via ``client.genie.create_space(...)``)
+    # ------------------------------------------------------------------ #
     def create_space(
         self,
         *,
-        warehouse_id: str,
+        warehouse_id: str | None = None,
         serialized_space: str,
+        title: str | None = None,
         description: str | None = None,
         parent_path: str | None = None,
-        title: str | None = None,
-    ):
-        return self.api.create_space(
+    ) -> GenieSpace:
+        """Create a new Genie space."""
+        warehouse_id = warehouse_id or self.defaults.warehouse_id
+        if not warehouse_id:
+            raise ValueError(
+                "warehouse_id is required to create a Genie space; "
+                "pass warehouse_id=... or set Genie.defaults.warehouse_id."
+            )
+        space = self.api.create_space(
             warehouse_id=warehouse_id,
             serialized_space=serialized_space,
+            title=title,
             description=description,
             parent_path=parent_path,
-            title=title,
         )
+        space_id = getattr(space, "space_id", None) or getattr(space, "id", None)
+        if not space_id:
+            raise ValueError(f"Genie API returned no space id: {space!r}")
+        return GenieSpace(service=self, space_id=space_id, details=space)
 
-    def get_space(self, space_id: str, **kwargs):
-        return self.api.get_space(space_id=space_id, **kwargs)
+    def delete_space(self, space_id: str) -> None:
+        """Move a Genie space to trash."""
+        self.api.trash_space(space_id=space_id)
 
-    def update_space(
-        self,
-        *,
-        space_id: str,
-        title: str | None = None,
-        description: str | None = None,
-        serialized_space: str | None = None,
-        warehouse_id: str | None = None,
-    ):
-        return self.api.update_space(
-            space_id=space_id,
-            title=title,
-            description=description,
-            serialized_space=serialized_space,
-            warehouse_id=warehouse_id,
-        )
-
-    def delete_space(self, space_id: str):
-        trash = getattr(self.api, "trash_space", None)
-        if trash is not None:
-            return trash(space_id=space_id)
-        return self.api.delete_space(space_id=space_id)
-
-    def trash_space(self, space_id: str):
-        return self.api.trash_space(space_id=space_id)
-
-    def list_conversations(self, space_id: str, **kwargs):
-        return self.api.list_conversations(space_id=space_id, **kwargs)
-
-    def delete_conversation(self, *, space_id: str, conversation_id: str):
-        return self.api.delete_conversation(space_id=space_id, conversation_id=conversation_id)
-
-    def list_conversation_messages(self, *, space_id: str, conversation_id: str, **kwargs):
-        return self.api.list_conversation_messages(space_id=space_id, conversation_id=conversation_id, **kwargs)
-
-    def delete_conversation_message(self, *, space_id: str, conversation_id: str, message_id: str):
-        return self.api.delete_conversation_message(
+    # ------------------------------------------------------------------ #
+    # Conversation passthroughs
+    # ------------------------------------------------------------------ #
+    def conversation(self, *, space_id: str, conversation_id: str) -> GenieConversation:
+        return GenieConversation(
+            service=self,
             space_id=space_id,
             conversation_id=conversation_id,
-            message_id=message_id,
         )
 
-    def send_message_feedback(self, *, space_id: str, conversation_id: str, message_id: str, rating: Any):
-        return self.api.send_message_feedback(
-            space_id=space_id,
-            conversation_id=conversation_id,
-            message_id=message_id,
-            rating=rating,
-        )
+    # ------------------------------------------------------------------ #
+    # Warehouse resolution (for query-result materialisation)
+    # ------------------------------------------------------------------ #
+    def resolve_warehouse(self) -> "SQLWarehouse":
+        """Return the warehouse used to wrap Genie query results.
 
-    def execute_message_query(self, *, space_id: str, conversation_id: str, message_id: str):
-        return self.api.execute_message_query(
-            space_id=space_id,
-            conversation_id=conversation_id,
-            message_id=message_id,
-        )
-
-    def execute_message_attachment_query(
-        self,
-        *,
-        space_id: str,
-        conversation_id: str,
-        message_id: str,
-        attachment_id: str,
-    ):
-        return self.api.execute_message_attachment_query(
-            space_id=space_id,
-            conversation_id=conversation_id,
-            message_id=message_id,
-            attachment_id=attachment_id,
-        )
-
-    def get_message_query_result(self, *, space_id: str, conversation_id: str, message_id: str):
-        return self.api.get_message_query_result(
-            space_id=space_id,
-            conversation_id=conversation_id,
-            message_id=message_id,
-        )
-
-    def get_message_query_result_by_attachment(
-        self,
-        *,
-        space_id: str,
-        conversation_id: str,
-        message_id: str,
-        attachment_id: str,
-    ):
-        return self.api.get_message_query_result_by_attachment(
-            space_id=space_id,
-            conversation_id=conversation_id,
-            message_id=message_id,
-            attachment_id=attachment_id,
-        )
-
-    def generate_download_full_query_result(
-        self,
-        *,
-        space_id: str,
-        conversation_id: str,
-        message_id: str,
-        attachment_id: str,
-    ):
-        return self.api.generate_download_full_query_result(
-            space_id=space_id,
-            conversation_id=conversation_id,
-            message_id=message_id,
-            attachment_id=attachment_id,
-        )
-
-    def get_download_full_query_result(
-        self,
-        *,
-        space_id: str,
-        conversation_id: str,
-        message_id: str,
-        attachment_id: str,
-        download_id: str,
-        download_id_signature: str,
-    ):
-        return self.api.get_download_full_query_result(
-            space_id=space_id,
-            conversation_id=conversation_id,
-            message_id=message_id,
-            attachment_id=attachment_id,
-            download_id=download_id,
-            download_id_signature=download_id_signature,
-        )
-
-    def create_eval_run(self, *, space_id: str, benchmark_question_ids: Optional[list[str]] = None):
-        return self.api.genie_create_eval_run(
-            space_id=space_id,
-            benchmark_question_ids=benchmark_question_ids,
-        )
-
-    def get_eval_run(self, *, space_id: str, eval_run_id: str):
-        return self.api.genie_get_eval_run(space_id=space_id, eval_run_id=eval_run_id)
-
-    def list_eval_runs(self, *, space_id: str, page_size: int | None = None, page_token: str | None = None):
-        return self.api.genie_list_eval_runs(
-            space_id=space_id,
-            page_size=page_size,
-            page_token=page_token,
-        )
-
-    def list_eval_results(
-        self,
-        *,
-        space_id: str,
-        eval_run_id: str,
-        page_size: int | None = None,
-        page_token: str | None = None,
-    ):
-        return self.api.genie_list_eval_results(
-            space_id=space_id,
-            eval_run_id=eval_run_id,
-            page_size=page_size,
-            page_token=page_token,
-        )
-
-    def get_eval_result_details(self, *, space_id: str, eval_run_id: str, result_id: str):
-        return self.api.genie_get_eval_result_details(
-            space_id=space_id,
-            eval_run_id=eval_run_id,
-            result_id=result_id,
-        )
-
-    def _start_conversation(self, *, space_id: str, content: str):
-        response = self._call_first(
-            ("start_conversation_and_wait", "start_conversation"),
-            space_id=space_id,
-            content=content,
-        )
-        response_obj = self._wait_if_needed(response)
-        response_map = self._as_mapping(response_obj)
-
-        if "conversation" in response_map and "message" in response_map:
-            conversation = self._as_mapping(response_map.get("conversation"))
-            message = self._as_mapping(response_map.get("message"))
-            return conversation, message
-
-        message = response_map
-        conversation = {
-            "id": response_map.get("conversation_id"),
-            "space_id": response_map.get("space_id", space_id),
-        }
-        return conversation, message
-
-    def _create_message(self, *, space_id: str, conversation_id: str, content: str):
-        response = self._call_first(
-            ("create_message_and_wait", "create_message"),
-            space_id=space_id,
-            conversation_id=conversation_id,
-            content=content,
-        )
-        return self._as_mapping(self._wait_if_needed(response))
-
-    def _call_first(self, names: tuple[str, ...], **kwargs):
-        missing = []
-        for name in names:
-            method = getattr(self.api, name, None)
-            if method is None:
-                missing.append(name)
-                continue
-            return method(**kwargs)
-
-        raise AttributeError(f"Genie API method not found. Tried: {', '.join(missing)}")
-
-    def _wait_if_needed(self, value: Any):
-        if hasattr(value, "result") and callable(value.result):
-            return value.result()
-        return value
-
-    def _wait_for_message(
-        self,
-        *,
-        space_id: str,
-        conversation_id: str,
-        message: Mapping[str, Any],
-        timeout_seconds: float,
-        poll_interval_seconds: float,
-    ) -> Mapping[str, Any]:
-        message_id = message.get("id")
-        if not message_id:
-            return message
-
-        deadline = time.monotonic() + timeout_seconds
-        current = dict(message)
-
-        while True:
-            status = (current.get("status") or "").upper()
-            if status in {"COMPLETED", "FAILED", "ERROR", "CANCELED"}:
-                return current
-
-            if time.monotonic() >= deadline:
-                return current
-
-            time.sleep(max(poll_interval_seconds, 0.0))
-            current = self._as_mapping(
-                self.api.get_message(
-                    space_id=space_id,
-                    conversation_id=conversation_id,
-                    message_id=message_id,
-                )
+        Resolution order: :attr:`GenieDefaults.warehouse_id` →
+        ``client.sql.warehouse()`` (the workspace default).
+        """
+        if self.defaults.warehouse_id:
+            return self.client.warehouses.find_warehouse(
+                warehouse_id=self.defaults.warehouse_id,
             )
+        return self.client.sql.warehouse()
 
-    def _to_answer(self, *, space_id: str, conversation_id: str, message: Mapping[str, Any]) -> GenieAnswer:
-        attachments = message.get("attachments") or []
-        first_attachment = attachments[0] if attachments else None
-        attachment_map = self._as_mapping(first_attachment)
+    # ------------------------------------------------------------------ #
+    # Internals
+    # ------------------------------------------------------------------ #
+    def _timeout(self, override: float | None) -> Any:
+        import datetime as dt
+        seconds = override if override is not None else self.defaults.timeout_seconds
+        return dt.timedelta(seconds=float(seconds))
 
-        return GenieAnswer(
-            space_id=space_id,
-            conversation_id=conversation_id,
-            message_id=message.get("id") or "",
-            status=message.get("status"),
-            content=message.get("content"),
-            text=attachment_map.get("text"),
-            attachment_id=attachment_map.get("attachment_id"),
-            query=attachment_map.get("query"),
-            query_result=message.get("query_result"),
-            raw_message=dict(message),
-        )
+    def _resolve_space_id(self, space_id: str | None) -> str:
+        if space_id:
+            return space_id
+        if self.defaults.space_id:
+            return self.defaults.space_id
+        if not self.defaults.auto_pick_space:
+            raise ValueError(
+                "No Genie space_id provided and auto_pick_space is disabled. "
+                "Pass space_id=... or set Genie.defaults.space_id."
+            )
+        picked = self._pick_space_id()
+        if not picked:
+            raise ValueError(
+                "Could not auto-pick a Genie space. Either set "
+                "Genie.defaults.space_id, pass space_id=..., or "
+                "create a Genie space in this workspace."
+            )
+        return picked
 
-    @staticmethod
-    def _as_mapping(obj: Any) -> Mapping[str, Any]:
-        if obj is None:
-            return {}
-        if isinstance(obj, Mapping):
-            return obj
-
-        as_dict = getattr(obj, "as_dict", None)
-        if callable(as_dict):
-            return as_dict()
-
-        data: dict[str, Any] = {}
-        for key in dir(obj):
-            if key.startswith("_"):
-                continue
-            value = getattr(obj, key, None)
-            if callable(value):
-                continue
-            data[key] = value
-        return data
+    def _pick_space_id(self) -> Optional[str]:
+        wanted_title = self.defaults.space_name
+        for space in self.list_spaces():
+            if wanted_title is None:
+                return space.space_id
+            title = getattr(space._details, "title", None) if space._details else None
+            if title == wanted_title:
+                return space.space_id
+        return None
