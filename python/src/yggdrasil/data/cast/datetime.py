@@ -182,6 +182,10 @@ def _coerce_target_tzinfo(tz: Any = None, opts: Any = None) -> dt.tzinfo | None:
 
 
 def _apply_target_tz(value: dt.datetime, tz: Any = None, opts: Any = None) -> dt.datetime:
+    # Hot-path: every numeric / datetime → datetime conversion lands here. Skip
+    # the helper allocation when the caller asked for no tz override at all.
+    if tz is None and opts is None:
+        return value
     target_tz = _coerce_target_tzinfo(tz=tz, opts=opts)
     if target_tz is None:
         return value
@@ -191,6 +195,10 @@ def _apply_target_tz(value: dt.datetime, tz: Any = None, opts: Any = None) -> dt
 
 
 def normalize_fractional_seconds(value: str) -> str:
+    # Cheap pre-filter: the regex is anchored on a literal '.' — skip the
+    # whole search when the input has no fractional component at all.
+    if "." not in value:
+        return value
     match = _RE_FRACTIONAL_SECONDS.search(value)
     if not match:
         return value
@@ -205,9 +213,26 @@ def normalize_datetime_string(value: str) -> str:
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
 
-    s = _RE_DATE_SLASH.sub(r"\1-\2-\3", s)
-    s = _RE_TZ_NO_COLON.sub(r"\1:\2", s)
+    # Slash-form date only matters when the string actually has a slash.
+    # Skipping the regex-engine spin-up here is most of the win for
+    # canonical ISO inputs — the dominant shape on the hot path.
+    if "/" in s:
+        s = _RE_DATE_SLASH.sub(r"\1-\2-\3", s)
+
+    # The regex matches `[+-]\d{4}` strictly at the end; we can do the
+    # same check (and the same replacement) with a 5-char tail slice,
+    # avoiding a regex compile + scan when the tail clearly doesn't match.
+    if len(s) >= 5:
+        c5 = s[-5]
+        if (c5 == "+" or c5 == "-") and s[-4:].isdigit():
+            s = s[:-2] + ":" + s[-2:]
+
     s = normalize_fractional_seconds(s)
+
+    # Compact form is digit-prefixed; a dash at index 4 (the standard
+    # `YYYY-` shape) means it can't be compact, so skip the fullmatch.
+    if len(s) < 8 or s[4] == "-":
+        return s
 
     m = _RE_COMPACT_DATETIME.fullmatch(s)
     if not m:
@@ -250,24 +275,34 @@ def str_to_datetime(value: str, opts: Any = None, tz: Any = None) -> dt.datetime
     if s == "now":
         return _apply_target_tz(_DATETIME.now(tz=CURRENT_TZINFO), tz=tz, opts=opts)
 
-    s = normalize_datetime_string(s)
-
+    # Fast path: most ingest flows hand us already-canonical ISO 8601 — try
+    # `fromisoformat` directly and only fall back to the regex normalization
+    # pipeline when it can't accept the string. Trailing 'Z' is the one
+    # cheap fixup we still apply up front because Python <3.11's parser
+    # rejects it. Saves three regex scans + one fullmatch on the hot path.
+    candidate = (s[:-1] + "+00:00") if s.endswith("Z") else s
     try:
-        parsed = _DATETIME.fromisoformat(s)
+        parsed = _DATETIME.fromisoformat(candidate)
     except ValueError:
-        last: Optional[ValueError] = None
-        for fmt in _STRPTIME_FORMATS:
-            try:
-                parsed = _DATETIME.strptime(s, fmt)
-                break
-            except ValueError as e:
-                last = e
-        else:
-            raise last or ValueError(f"Cannot parse datetime from {value!r}")
+        s = normalize_datetime_string(s)
+        try:
+            parsed = _DATETIME.fromisoformat(s)
+        except ValueError:
+            last: Optional[ValueError] = None
+            for fmt in _STRPTIME_FORMATS:
+                try:
+                    parsed = _DATETIME.strptime(s, fmt)
+                    break
+                except ValueError as e:
+                    last = e
+            else:
+                raise last or ValueError(f"Cannot parse datetime from {value!r}")
 
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=_UTC)
 
+    if tz is None and opts is None:
+        return parsed
     return _apply_target_tz(parsed, tz=tz, opts=opts)
 
 
@@ -410,21 +445,26 @@ def _numeric_timestamp_to_seconds(value: int | float) -> float:
 
 
 def _numeric_to_datetime(value: int | float, opts: Any = None, tz: Any = None) -> dt.datetime:
-    return _apply_target_tz(
-        _FROMTIMESTAMP(_numeric_timestamp_to_seconds(value), tz=_UTC),
-        tz=tz,
-        opts=opts,
-    )
+    parsed = _FROMTIMESTAMP(_numeric_timestamp_to_seconds(value), tz=_UTC)
+    if tz is None and opts is None:
+        return parsed
+    return _apply_target_tz(parsed, tz=tz, opts=opts)
 
 
 @register_converter(int, dt.datetime)
 def int_to_datetime(value: int, opts: Any = None, tz: Any = None) -> dt.datetime:
-    return _numeric_to_datetime(value, opts=opts, tz=tz)
+    parsed = _FROMTIMESTAMP(_numeric_timestamp_to_seconds(value), tz=_UTC)
+    if tz is None and opts is None:
+        return parsed
+    return _apply_target_tz(parsed, tz=tz, opts=opts)
 
 
 @register_converter(float, dt.datetime)
 def float_to_datetime(value: float, opts: Any = None, tz: Any = None) -> dt.datetime:
-    return _numeric_to_datetime(value, opts=opts, tz=tz)
+    parsed = _FROMTIMESTAMP(_numeric_timestamp_to_seconds(value), tz=_UTC)
+    if tz is None and opts is None:
+        return parsed
+    return _apply_target_tz(parsed, tz=tz, opts=opts)
 
 
 @register_converter(int, dt.date)

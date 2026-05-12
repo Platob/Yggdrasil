@@ -138,3 +138,66 @@ class TestCastExpr:
         )
 
         assert out is expr
+
+
+class TestPolarsListViewBridge:
+    """``list_view`` source materialised through Arrow before polars
+    sees it. Polars' Rust core rejects ``list_view`` dtypes outright
+    (``DataType "+vl" is still not supported``), so the recommended
+    flow is ``cast_arrow_list_array`` first → polars second. This test
+    exercises that bridge for the wide ``list_view<struct{...}>`` shape
+    that the bench targets.
+    """
+
+    @staticmethod
+    def _wide_struct() -> "pa.StructType":  # type: ignore[name-defined]
+        import pyarrow as pa
+        return pa.struct([
+            (f"i{k:02d}", pa.int64()) for k in range(8)
+        ] + [
+            (f"s{k:02d}", pa.string()) for k in range(8)
+        ])
+
+    def test_list_view_struct_materialises_through_arrow_then_polars(self) -> None:
+        import pyarrow as pa
+        from yggdrasil.data.types.nested import StructType
+        from yggdrasil.data.types.nested.array import cast_arrow_list_array
+        from yggdrasil.data.types.primitive import IntegerType, StringType
+
+        items_per_row, rows = 16, 24
+        src_struct = self._wide_struct()
+        payload = [
+            None if (r % 7 == 0) else [
+                {
+                    **{f"i{k:02d}": r * items_per_row + k for k in range(8)},
+                    **{f"s{k:02d}": f"r{r}-k{k}" for k in range(8)},
+                }
+                for _ in range(items_per_row)
+            ]
+            for r in range(rows)
+        ]
+        src_view = pa.array(payload, type=pa.list_view(src_struct))
+
+        list_target = Field(
+            "rows",
+            ArrayType.from_item(Field(
+                "item",
+                StructType(fields=tuple(
+                    [Field(f"i{k:02d}", IntegerType(byte_size=4, signed=True)) for k in range(8)]
+                    + [Field(f"s{k:02d}", StringType()) for k in range(8)]
+                )),
+            )),
+        )
+        as_list = cast_arrow_list_array(
+            src_view, CastOptions(target=list_target),
+        )
+
+        # Polars accepts the resulting compact list and the cast holds.
+        series = polars.from_arrow(as_list)
+        assert isinstance(series.dtype, polars.List)
+        assert series.len() == rows
+        assert series[0] is None  # r=0 -> None, r%7==0
+        assert series[1].len() == items_per_row
+        # Inner int field really got narrowed.
+        inner_dtype = series.dtype.inner
+        assert inner_dtype.fields[0].dtype == polars.Int32()
