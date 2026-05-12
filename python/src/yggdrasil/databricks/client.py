@@ -178,6 +178,10 @@ class DatabricksClient(URLBased):
     _workspace_client: Optional[DWC] = field(default=None, init=False, repr=False, compare=False, hash=False)
     _account_config: Optional[Config] = field(default=None, init=False, repr=False, compare=False, hash=False)
     _account_client: Optional[DAC] = field(default=None, init=False, repr=False, compare=False, hash=False)
+    # Cached parsed ``base_url`` — ``URL.from_str`` is ~6 us per call, and
+    # the host doesn't change after ``__post_init__``. Cleared on transport
+    # so the receiving process re-parses against its own host.
+    _base_url_cached: Optional[URL] = field(default=None, init=False, repr=False, compare=False, hash=False)
 
     # Serializable session-token snapshot, populated on __getstate__ and
     # consumed on __setstate__. Off-cluster only — DBR runtime ignores it.
@@ -198,6 +202,7 @@ class DatabricksClient(URLBased):
         "_workspace_config",
         "_account_config",
         "_was_connected",
+        "_base_url_cached",
         "_workspace", "_sql", "_entity_tags", "_warehouses", "_compute",
         "_secrets", "_iam", "_tables", "_views", "_columns_svc",
         "_catalogs", "_schemas", "_genie", "_filesystem",
@@ -334,9 +339,16 @@ class DatabricksClient(URLBased):
 
     @property
     def base_url(self):
+        cached = self._base_url_cached
+        if cached is not None:
+            return cached
         if not self.host:
+            # Don't cache the make_config() path — config resolution can
+            # change ``host`` after the auth dance lands.
             return URL.from_str(self.make_config().host)
-        return URL.from_str(self.host)
+        parsed = URL.from_str(self.host)
+        object.__setattr__(self, "_base_url_cached", parsed)
+        return parsed
 
     @property
     def explore_url(self) -> URL:

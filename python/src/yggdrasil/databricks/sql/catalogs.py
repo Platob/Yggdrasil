@@ -211,7 +211,10 @@ class Catalogs(DatabricksService):
     # ── cache helpers ─────────────────────────────────────────────────────────
 
     def _cache_key(self, catalog_name: str) -> str:
-        host = self.client.base_url.to_string() if self.client else "default"
+        # Use the dataclass ``host`` field directly — ``base_url.to_string()``
+        # would parse a fresh URL on every call (~6 us). The host string is
+        # already normalized in ``DatabricksClient.__post_init__``.
+        host = (self.client.host if self.client else None) or "default"
         return f"{host}|{catalog_name}"
 
     @classmethod

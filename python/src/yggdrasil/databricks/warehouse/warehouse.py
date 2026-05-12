@@ -270,8 +270,16 @@ class SQLWarehouse(
 
     @property
     def state(self):
-        """Return the current warehouse state (always hits the API)."""
-        return self.latest_details().state
+        """Return the current warehouse state.
+
+        Refreshes the cached :attr:`details` on every access — same
+        semantics as :attr:`Cluster.state`. When you only need the
+        most-recent-known state without paying for a round-trip, use
+        :attr:`is_running` / :attr:`is_pending` instead; they read from
+        the cache and the lifecycle methods refresh it for you.
+        """
+        self.refresh()
+        return self._details.state if self._details is not None else None
 
     @property
     def is_serverless(self) -> bool:
@@ -279,11 +287,30 @@ class SQLWarehouse(
 
     @property
     def is_running(self) -> bool:
-        return self.state == State.RUNNING
+        """``True`` if the *cached* details say RUNNING.
+
+        Lifecycle helpers (:meth:`start`, :meth:`stop`,
+        :meth:`wait_for_status`) call :meth:`refresh` before consulting
+        this predicate, so they still see fresh state. External callers
+        who polled ``is_running`` in a hot loop were paying one
+        ``warehouses.get`` per check; that cost is gone — call
+        :meth:`refresh` explicitly when you need to re-confirm.
+        """
+        details = self._details
+        if details is None:
+            details = self.details
+        return details.state == State.RUNNING
 
     @property
     def is_pending(self) -> bool:
-        return self.state in {State.DELETING, State.STARTING, State.STOPPING}
+        """``True`` if the cached state is one of the transitional states.
+
+        Cached. See :attr:`is_running` for the contract.
+        """
+        details = self._details
+        if details is None:
+            details = self.details
+        return details.state in {State.DELETING, State.STARTING, State.STOPPING}
 
     @property
     def explore_url(self):
@@ -305,7 +332,12 @@ class SQLWarehouse(
                 "Waiting for warehouse %s (%s) to leave pending state (timeout=%.0fs)",
                 self.warehouse_name, self.warehouse_id, wait.timeout,
             )
-            while self.is_pending:
+            # Refresh once per iteration explicitly — ``is_pending`` reads the
+            # cached state, so without this the loop would spin on stale data.
+            while True:
+                self.refresh()
+                if not self.is_pending:
+                    break
                 wait.sleep(iteration=iteration, start=start)
                 iteration += 1
             LOGGER.debug(
@@ -322,7 +354,15 @@ class SQLWarehouse(
         """Start the warehouse if it is not already running."""
         client = self.client.workspace_client().warehouses
 
-        if self.warehouse_id and not self.is_running:
+        if not self.warehouse_id:
+            return self
+
+        # Refresh once so the cached ``is_running`` predicate reflects the
+        # current remote state. Same round-trip count as the old preflight,
+        # but the populated cache makes any follow-up ``is_running`` /
+        # ``is_pending`` check free.
+        self.refresh()
+        if not self.is_running:
             LOGGER.debug("Starting warehouse %s (%s)", self.warehouse_name, self.warehouse_id)
             try:
                 response = client.start(id=self.warehouse_id)
@@ -344,6 +384,11 @@ class SQLWarehouse(
 
     def stop(self):
         """Stop the warehouse if it is running."""
+        if not self.warehouse_id:
+            return self
+        # Refresh once so ``is_running`` reflects the live state — see
+        # ``start()`` for the rationale.
+        self.refresh()
         if not self.is_running:
             return self
         LOGGER.debug("Stopping warehouse %s (%s)", self.warehouse_name, self.warehouse_id)
