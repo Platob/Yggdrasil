@@ -1210,17 +1210,21 @@ def is_checked_tmp_path(host: str, base_path: str):
     return False
 
 
-@dataclass
 class DatabricksService(ABC):
-    client: DatabricksClient = field(
-        default_factory=DatabricksClient.current,
-        repr=False, compare=False, hash=False,
-    )
+    """Base class for every Databricks service wrapper.
+
+    Subclasses are plain classes (no ``@dataclass``); they inherit the
+    ``client``-only constructor by default and override :meth:`__init__`
+    explicitly when they need to accept additional configuration.
+    """
 
     _current: ClassVar[Optional["DatabricksService"]] = None
 
-    def __post_init__(self):
-        pass
+    def __init__(self, client: Optional[DatabricksClient] = None):
+        self.client = client if client is not None else DatabricksClient.current()
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(client={self.client!r})"
 
     def __getstate__(self):
         return {"client": self.client}
@@ -1350,10 +1354,6 @@ class DatabricksService(ABC):
 
 
 class DatabricksResource(ABC):
-    service: DatabricksService = field(
-        default_factory=DatabricksService.current,
-        repr=False, compare=False, hash=False,
-    )
 
     def __getstate__(self):
         state = super().__getstate__()

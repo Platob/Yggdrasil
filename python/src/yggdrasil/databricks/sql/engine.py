@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -184,7 +183,6 @@ def _apply_retry_to_warehouse_statement(
 # ---------------------------------------------------------------------------
 
 
-@dataclass
 class SQLEngine(DatabricksService, StatementExecutor):
     """Unified SQL execution and Delta-table write engine for Databricks.
 
@@ -199,17 +197,20 @@ class SQLEngine(DatabricksService, StatementExecutor):
     warehouse API.
     """
 
-    catalog_name: str | None = None
-    schema_name: str | None = None
-    default_warehouse: Optional[SQLWarehouse] = field(
-        default=None, repr=False, hash=False, compare=False,
-    )
-    spark: SparkStatementExecutor = field(
-        default_factory=SparkStatementExecutor, repr=False, compare=False,
-    )
-    _last_default_wh_check: float = field(
-        default=0.0, init=False, repr=False, hash=False, compare=False,
-    )
+    def __init__(
+        self,
+        client=None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        default_warehouse: Optional[SQLWarehouse] = None,
+        spark: Optional[SparkStatementExecutor] = None,
+    ):
+        super().__init__(client=client)
+        self.catalog_name = catalog_name
+        self.schema_name = schema_name
+        self.default_warehouse = default_warehouse
+        self.spark = spark if spark is not None else SparkStatementExecutor()
+        self._last_default_wh_check = 0.0
 
     # ------------------------------------------------------------------
     # Sub-services

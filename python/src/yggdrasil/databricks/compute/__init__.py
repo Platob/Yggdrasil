@@ -7,12 +7,14 @@ __all__ = [
     "ExecutionContext",
     "InstancePool",
     "InstancePools",
+    "InstancePoolDefaults",
 ]
 
 from .cluster import Cluster
 from .execution_context import ExecutionContext
 from .instance_pool import (
     InstancePool,
+    InstancePoolDefaults,
     InstancePools,
     databricks_pool_remote_compute,
 )

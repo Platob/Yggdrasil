@@ -292,17 +292,24 @@ def _retry_call(
     raise last_exc
 
 
-@dataclass
 class EntityTags(DatabricksService):
-    """Collection-level service for Unity Catalog entity tag assignments."""
+    """Collection-level service for Unity Catalog entity tag assignments.
 
-    retry_policy: RetryPolicy = field(default_factory=lambda: _DEFAULT_RETRY_POLICY)
-    """Retry policy for every workspace-client call. Defaults to
-    :data:`_DEFAULT_RETRY_POLICY` (5 attempts, 0.25–8s backoff with jitter,
-    30s deadline, ``Retry-After`` honored). Override per-instance:
+    The ``retry_policy`` attribute controls retries for every workspace-client
+    call. Defaults to :data:`_DEFAULT_RETRY_POLICY` (5 attempts, 0.25–8s
+    backoff with jitter, 30s deadline, ``Retry-After`` honored). Override
+    per-instance::
 
         >>> client.entity_tags.retry_policy = RetryPolicy(attempts=1)
     """
+
+    def __init__(
+        self,
+        client=None,
+        retry_policy: Optional[RetryPolicy] = None,
+    ):
+        super().__init__(client=client)
+        self.retry_policy = retry_policy if retry_policy is not None else _DEFAULT_RETRY_POLICY
 
     def _call(self, fn: Callable[[], T], *, op: str) -> T:
         """Run *fn* under :attr:`retry_policy`. Single funnel for SDK calls."""

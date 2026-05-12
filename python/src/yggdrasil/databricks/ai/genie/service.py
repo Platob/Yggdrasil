@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
 from yggdrasil.databricks.client import DatabricksService
@@ -11,11 +10,12 @@ from .resources import GenieAnswer, GenieSpace
 __all__ = ["Genie"]
 
 
-@dataclass
 class Genie(DatabricksService):
     """High-level wrapper around Databricks Workspace Genie APIs."""
 
-    default_space_id: str | None = None
+    def __init__(self, client=None, default_space_id: str | None = None):
+        super().__init__(client=client)
+        self.default_space_id = default_space_id
 
     @property
     def api(self):

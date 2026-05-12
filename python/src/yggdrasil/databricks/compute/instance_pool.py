@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
+    ClassVar,
     Iterator,
     List,
     Mapping,
@@ -52,6 +53,7 @@ from databricks.sdk.service.compute import (
 from yggdrasil.dataclasses import ExpiringDict
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.data.cast.registry import identity
+from yggdrasil.environ import PyEnv
 from yggdrasil.io.url import URL
 from yggdrasil.pyutils.equality import dicts_equal
 
@@ -64,6 +66,8 @@ if TYPE_CHECKING:
 __all__ = [
     "InstancePools",
     "InstancePool",
+    "InstancePoolDefaults",
+    "DEFAULT_POOL_NAME",
     "databricks_pool_remote_compute",
 ]
 
@@ -89,6 +93,84 @@ _DEFAULT_NODE_TYPE_ID = "rd-fleet.xlarge"
 DEFAULT_POOL_NAME = "Yggdrasil"
 
 
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class InstancePoolDefaults:
+    """Default configuration applied to instance pools created via :class:`InstancePools`.
+
+    Anywhere the caller leaves a field unset (``None``), the corresponding
+    value from this object is injected at create / edit time. Tweak per
+    workspace with::
+
+        from dataclasses import replace
+        client.compute.instance_pools.defaults = replace(
+            client.compute.instance_pools.defaults,
+            max_capacity=50,
+        )
+
+    or by passing ``defaults=InstancePoolDefaults(...)`` to
+    :class:`InstancePools` directly.
+
+    Attributes
+    ----------
+    pool_name
+        Default name used by :meth:`InstancePools.default_pool` and
+        :meth:`InstancePools.pool` when no name is supplied.
+    node_type_id
+        Default node SKU. Matches the cluster-service default so a pool-backed
+        cluster lines up without extra configuration.
+    idle_instance_autotermination_minutes
+        How long an idle pool node sits before Databricks releases it. ``30``
+        keeps cost predictable while still smoothing the second attach.
+    min_idle_instances
+        Minimum pre-warmed nodes kept alive. ``0`` means fully lazy — the
+        cheapest default that still lets the pool be the canonical attach point.
+    max_capacity
+        Cap on the total pool size (idle + in-use). ``10`` is a safe ceiling
+        for shared workspaces; set to ``None`` for unlimited.
+    enable_elastic_disk
+        Auto-grow attached disk under load. Recommended for ad-hoc workloads.
+    preload_local_python_runtime
+        When ``True``, :meth:`InstancePools.create` preloads the latest DBR
+        runtime whose Python minor matches the local interpreter. Speeds up
+        first attach when the caller decorates a local function with
+        :func:`databricks_pool_remote_compute`.
+    """
+
+    pool_name: str = DEFAULT_POOL_NAME
+    node_type_id: str = _DEFAULT_NODE_TYPE_ID
+    idle_instance_autotermination_minutes: int = 30
+    min_idle_instances: int = 0
+    max_capacity: Optional[int] = 10
+    enable_elastic_disk: bool = True
+    preload_local_python_runtime: bool = True
+
+    #: Pool-spec fields that :meth:`InstancePools._normalize_pool_spec` injects
+    #: when the caller leaves them unset. Restricted to keys accepted by both
+    #: ``create`` and ``edit`` so the same defaults survive a pool update.
+    _EDITABLE_FIELDS: ClassVar[tuple[str, ...]] = (
+        "idle_instance_autotermination_minutes",
+        "min_idle_instances",
+        "max_capacity",
+    )
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a shallow dict view, dropping ``None`` values."""
+        return {
+            f.name: getattr(self, f.name)
+            for f in dataclasses.fields(self)
+            if getattr(self, f.name) is not None
+        }
+
+
+# Module-level singleton; cheap to share since the dataclass is frozen.
+DEFAULTS = InstancePoolDefaults()
+
+
 def _set_cached_pool_id(client: DatabricksClient, name: str, pool_id: str) -> None:
     host = client.base_url.to_string()
     existing = _NAME_ID_CACHE.get(host)
@@ -108,13 +190,26 @@ def _get_cached_pool_id(client: DatabricksClient, name: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-@dataclass
 class InstancePools(DatabricksService):
     """Collection-level Databricks instance-pool service.
 
     Mirrors the shape of :class:`yggdrasil.databricks.compute.service.Clusters`
     so callers can switch between cluster and pool flows with the same vocabulary.
+
+    The :attr:`defaults` attribute controls auto-configuration of pools created
+    through this service. Override at construction time or replace it in place::
+
+        pools = client.compute.instance_pools
+        pools.defaults = replace(pools.defaults, max_capacity=50)
     """
+
+    def __init__(
+        self,
+        client=None,
+        defaults: Optional[InstancePoolDefaults] = None,
+    ):
+        super().__init__(client=client)
+        self.defaults = defaults if defaults is not None else InstancePoolDefaults()
 
     # ------------------------------------------------------------------ #
     # Singletons
@@ -125,9 +220,9 @@ class InstancePools(DatabricksService):
         *,
         key: str | None = None,
         node_type_id: str | None = None,
-        min_idle_instances: int = 0,
+        min_idle_instances: int | None = None,
         max_capacity: int | None = None,
-        idle_instance_autotermination_minutes: int = 30,
+        idle_instance_autotermination_minutes: int | None = None,
         custom_tags: Optional[Mapping[str, str]] = None,
         preloaded_spark_versions: Optional[Sequence[str]] = None,
         permissions: Optional[list[str | InstancePoolAccessControlRequest]] = None,
@@ -136,10 +231,11 @@ class InstancePools(DatabricksService):
         """Return a named instance pool, creating it if necessary.
 
         Cached per-host for ``7200s`` so repeated calls in the same process
-        skip the SDK round trip.
+        skip the SDK round trip. Any argument left as ``None`` falls back to
+        the value stored on :attr:`defaults`.
         """
         if not name:
-            name = (key.strip() if key else None) or DEFAULT_POOL_NAME
+            name = (key.strip() if key else None) or self.defaults.pool_name
 
         existing = _NAMED_POOLS.get(name)
         if existing is not None:
@@ -163,8 +259,13 @@ class InstancePools(DatabricksService):
         return existing
 
     def default_pool(self, **overrides: Any) -> "InstancePool":
-        """Return the shared default pool used by :meth:`InstancePool.run`."""
-        return self.pool(DEFAULT_POOL_NAME, **overrides)
+        """Return the shared default pool used by :meth:`InstancePool.run`.
+
+        Resolves the pool named :attr:`defaults.pool_name <InstancePoolDefaults.pool_name>`,
+        creating it on first call with the rest of :attr:`defaults` applied.
+        ``overrides`` win over the defaults for this one call.
+        """
+        return self.pool(self.defaults.pool_name, **overrides)
 
     # ------------------------------------------------------------------ #
     # CRUD
@@ -181,11 +282,24 @@ class InstancePools(DatabricksService):
         custom_tags: Optional[Mapping[str, str]],
         **pool_spec: Any,
     ) -> dict[str, Any]:
-        """Apply defaults (node type, tags) and drop unknown / None keys."""
+        """Apply :attr:`defaults`, merge tags, and drop unset keys.
+
+        Defaults from :attr:`InstancePools.defaults` are filled in only for
+        keys the caller left as ``None``. Explicit values always win.
+        """
         spec: dict[str, Any] = {}
         if instance_pool_name is not None:
             spec["instance_pool_name"] = instance_pool_name
-        spec["node_type_id"] = node_type_id or _DEFAULT_NODE_TYPE_ID
+        spec["node_type_id"] = node_type_id or self.defaults.node_type_id
+
+        # Inject edit-safe defaults for any field the caller left unset.
+        for key in InstancePoolDefaults._EDITABLE_FIELDS:
+            value = pool_spec.get(key)
+            if value is None:
+                value = getattr(self.defaults, key, None)
+            if value is not None:
+                spec[key] = value
+            pool_spec.pop(key, None)
 
         for key, value in pool_spec.items():
             if value is not None:
@@ -201,6 +315,27 @@ class InstancePools(DatabricksService):
 
         return spec
 
+    def _local_python_preloaded_versions(self) -> Optional[list[str]]:
+        """Resolve the latest DBR runtime matching the local Python minor.
+
+        Returns ``None`` on any lookup failure — preloading is a smoothing
+        optimization, not a correctness requirement.
+        """
+        try:
+            local = PyEnv.current().version_info
+            version = self.client.compute.clusters.latest_spark_version(
+                python_version=(local.major, local.minor),
+                allow_ml=False,
+                allow_gpu=False,
+            )
+        except Exception:  # noqa: BLE001 - best-effort preload
+            LOGGER.debug(
+                "Could not resolve local-Python-matching DBR runtime for pool preload",
+                exc_info=True,
+            )
+            return None
+        return [version.key] if version and version.key else None
+
     def create(
         self,
         *,
@@ -209,7 +344,27 @@ class InstancePools(DatabricksService):
         permissions: Optional[list[str | InstancePoolAccessControlRequest]] = None,
         **pool_spec: Any,
     ) -> "InstancePool":
-        """Create a new instance pool and return its :class:`InstancePool` wrapper."""
+        """Create a new instance pool and return its :class:`InstancePool` wrapper.
+
+        Create-only defaults from :attr:`defaults` are applied here:
+
+        - ``enable_elastic_disk`` is injected when the caller did not supply one.
+        - ``preloaded_spark_versions`` is auto-populated with the latest DBR
+          whose Python minor matches the local interpreter when
+          :attr:`InstancePoolDefaults.preload_local_python_runtime` is set
+          and the caller passed nothing. Lookup failures are swallowed.
+        """
+        if pool_spec.get("enable_elastic_disk") is None and self.defaults.enable_elastic_disk is not None:
+            pool_spec["enable_elastic_disk"] = self.defaults.enable_elastic_disk
+
+        if (
+            pool_spec.get("preloaded_spark_versions") is None
+            and self.defaults.preload_local_python_runtime
+        ):
+            preloaded = self._local_python_preloaded_versions()
+            if preloaded:
+                pool_spec["preloaded_spark_versions"] = preloaded
+
         spec = self._normalize_pool_spec(
             update=False,
             instance_pool_name=instance_pool_name,
@@ -382,18 +537,6 @@ class InstancePool(DatabricksResource):
     - :meth:`run` / :meth:`decorate` for the simplest local-or-remote Python
       execution flow built on top of the existing cluster command stack
     """
-
-    service: InstancePools = dataclasses.field(
-        default_factory=InstancePools.current,
-        repr=False,
-        compare=False,
-    )
-    instance_pool_id: str | None = None
-    instance_pool_name: str | None = None
-
-    _details: Optional[GetInstancePool | InstancePoolAndStats] = dataclasses.field(
-        default=None, repr=False, hash=False, compare=False,
-    )
 
     def __init__(
         self,

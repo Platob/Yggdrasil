@@ -20,7 +20,6 @@ Cache entries can be invalidated per-table via :meth:`Tables._invalidate`.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import Optional, Iterator, TYPE_CHECKING, Any
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
@@ -47,7 +46,6 @@ logger = logging.getLogger(__name__)
 _TABLE_CACHE: ExpiringDict[str, Table] = ExpiringDict(default_ttl=300.0)
 
 
-@dataclass
 class Tables(DatabricksService):
     """Collection-level service for Unity Catalog tables.
 
@@ -60,9 +58,17 @@ class Tables(DatabricksService):
             ...
     """
 
-    catalog_name: str | None = None
-    schema_name: str | None = None
-    table_name: str | None = None
+    def __init__(
+        self,
+        client=None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
+    ):
+        super().__init__(client=client)
+        self.catalog_name = catalog_name
+        self.schema_name = schema_name
+        self.table_name = table_name
 
     def __call__(
         self,
