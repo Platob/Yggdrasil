@@ -597,6 +597,9 @@ class S3Path(RemotePath):
                     self._stat_cached.mtime = mtime
                 if media_type is not None and self._stat_cached.media_type is None:
                     self._stat_cached.media_type = media_type
+                # Reset the TTL window so the fresh data we just folded
+                # in lives a full ``stat_cache_ttl`` before re-probing.
+                self._seed_stat_cache(self._stat_cached)
 
         return memoryview(data or b"")
 

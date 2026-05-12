@@ -251,6 +251,10 @@ class WorkspacePath(DatabricksPath):
             self._stat_cached.size = len(data)
             if media_type is not None and self._stat_cached.media_type is None:
                 self._stat_cached.media_type = media_type
+            # Re-stamp the TTL — this download IS the freshest size we
+            # could observe; the entry should outlive the original
+            # probe's window from this point on.
+            self._seed_stat_cache(self._stat_cached)
 
         if pos:
             data = data[pos:]

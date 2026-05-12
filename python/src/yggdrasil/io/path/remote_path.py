@@ -27,6 +27,7 @@ substrate, different backing.
 
 from __future__ import annotations
 
+import threading
 import time
 from abc import abstractmethod
 from typing import Any, ClassVar, Tuple
@@ -54,17 +55,31 @@ def _extract_url_key(args: tuple, kwargs: dict) -> "str | None":
     """Best-effort URL key from constructor args/kwargs.
 
     ``__new__`` runs before ``__init__`` normalizes its inputs, so we
-    peek at whatever is already URL-shaped. Returns ``None`` when the
-    caller passed a raw string / pathlib object that only resolves
-    after ``__init__`` — those allocations skip the singleton cache
-    (typical entry points — :meth:`Path.from_`, :meth:`Path._from_url`,
-    :meth:`iterdir` — pass ``url=`` explicitly and hit the fast path).
+    peek at whatever is already URL-shaped — and try a best-effort
+    :meth:`URL.from_` parse on string / :class:`pathlib.PurePath`
+    seeds so the common ``S3Path("s3://bucket/key")`` shape hits the
+    singleton cache instead of allocating a fresh instance per call.
+    Returns ``None`` only when nothing parses cleanly; that path
+    falls back to a fresh allocation rather than crashing
+    construction.
     """
     url = kwargs.get("url")
     if url is None and args:
         seed = args[0]
         if isinstance(seed, URL):
             url = seed
+        elif isinstance(seed, (str, bytes)):
+            try:
+                url = URL.from_(seed)
+            except Exception:
+                url = None
+        else:
+            # pathlib / os.PathLike fall through here. ``URL.from_``
+            # accepts ``__fspath__``-able objects.
+            try:
+                url = URL.from_(seed)
+            except Exception:
+                url = None
     if url is None:
         return None
     try:
@@ -104,6 +119,16 @@ class RemotePath(Path):
         max_size=4096,
     )
 
+    #: Serializes first-time ``__init__`` on a freshly allocated
+    #: singleton. ``__new__`` can hand the same instance to two
+    #: threads racing on the same URL; without a lock both would run
+    #: ``super().__init__`` and reset ``_stat_cached`` / ``_stat_cached_at``
+    #: to their defaults, potentially overwriting a seed produced
+    #: by another caller in between. The lock is held only for the
+    #: brief setup window; the fast path (``_initialized`` already
+    #: True) short-circuits before touching it.
+    _INIT_LOCK: ClassVar[threading.Lock] = threading.Lock()
+
     # ------------------------------------------------------------------
     # Singleton-by-URL construction
     # ------------------------------------------------------------------
@@ -130,13 +155,18 @@ class RemotePath(Path):
         # Singleton-cached instances are re-entered on every constructor
         # call (Python always invokes ``__init__`` after ``__new__``);
         # skip the second pass so the live ``_stat_cached`` and any
-        # subclass-side state stay untouched.
+        # subclass-side state stay untouched. The lock + double-check
+        # serializes first-time init: two threads racing on the same
+        # URL won't both reset the defaults.
         if getattr(self, "_initialized", False):
             return
-        super().__init__(*args, **kwargs)
-        self._stat_cached: IOStats | None = None
-        self._stat_cached_at: float = 0.0
-        self._initialized = True
+        with self._INIT_LOCK:
+            if getattr(self, "_initialized", False):
+                return
+            super().__init__(*args, **kwargs)
+            self._stat_cached: IOStats | None = None
+            self._stat_cached_at: float = 0.0
+            self._initialized = True
 
     # ------------------------------------------------------------------
     # Backing-shape predicates
@@ -173,11 +203,11 @@ class RemotePath(Path):
         cached = self._stat_cached
         if cached is not None:
             ttl = self.stat_cache_ttl
-            if ttl is None or (time.time() - self._stat_cached_at) <= ttl:
+            if ttl is None or (time.monotonic() - self._stat_cached_at) <= ttl:
                 return cached
         result = self._stat_uncached()
         self._stat_cached = result
-        self._stat_cached_at = time.time()
+        self._stat_cached_at = time.monotonic()
         return result
 
     @abstractmethod
@@ -257,8 +287,11 @@ class RemotePath(Path):
         Databricks ``dbutils.fs.ls`` returns size) or a read/write
         (the response body's length IS the file size). Stamps the
         cache time so the entry observes the same TTL budget as one
-        produced by :meth:`_stat_uncached`. The next :meth:`_stat`
-        call on the warmed path is a local hit.
+        produced by :meth:`_stat_uncached`. Passing the existing
+        ``self._stat_cached`` (after an in-place mutation) is the
+        canonical way to refresh the TTL — the assignment is a no-op,
+        the timestamp moves. The next :meth:`_stat` call on the
+        warmed path is a local hit.
         """
         self._stat_cached = stats
-        self._stat_cached_at = time.time()
+        self._stat_cached_at = time.monotonic()

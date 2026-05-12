@@ -193,6 +193,10 @@ class DBFSPath(DatabricksPath):
                 ))
             else:
                 self._stat_cached.size = offset
+                # Re-stamp the TTL — the data we just folded in is
+                # fresh, so the entry deserves a full window before
+                # the next backend probe.
+                self._seed_stat_cache(self._stat_cached)
         return memoryview(bytes(out))
 
     def _write_mv(self, data: memoryview, pos: int) -> int:

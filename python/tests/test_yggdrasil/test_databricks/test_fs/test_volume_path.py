@@ -890,12 +890,12 @@ class TestStoragePath:
         gen.return_value = _aws_creds_response()
 
         p = VolumePath("/Volumes/c/s/v/x", client=client)
-        first = p.storage_path()
-        second = p.storage_path(refresh=True)
-        # ``refresh=True`` forces a fresh ``volumes.read`` and rebuilds
-        # the cached Path so future readers see whatever VolumeInfo
-        # rotated under the hood.
-        assert first is not second
+        p.storage_path()
+        p.storage_path(refresh=True)
+        # ``refresh=True`` forces a fresh ``volumes.read``; the
+        # rebuilt :class:`S3Path` happens to collapse to the
+        # singleton-by-URL instance, but the SDK was hit twice.
+        assert workspace.volumes.read.call_count == 2
 
     def test_unsupported_scheme_raises(self, workspace, client) -> None:
         workspace.volumes.read.return_value = _volume_info(
