@@ -588,6 +588,48 @@ class CastOptions:
         return frozenset(f.name for f in dataclasses.fields(cls) if f.init)
 
     @classmethod
+    @functools.cache
+    def _all_slots(cls) -> tuple[str, ...]:
+        """All slot names (init + non-init) in declaration order.
+
+        Cached per-class so :meth:`_replace` can copy every slot in
+        one tight loop without re-walking ``dataclasses.fields`` on
+        every call. The :class:`dataclasses` machinery generates
+        ``__slots__`` for ``slots=True`` frozen dataclasses; we trust
+        that shape rather than rebuilding it here.
+        """
+        return cls.__slots__
+
+    def _replace(self: T, /, **overrides: Any) -> T:
+        """Fast copy that bypasses :func:`dataclasses.replace`.
+
+        Allocates via :meth:`__new__`, copies every slot through
+        :func:`object.__setattr__`, then overwrites the requested
+        slots. **Skips** :meth:`__post_init__` — callers must pass
+        already-normalized values for the fields that ``__post_init__``
+        coerces (``source_field`` / ``target_field`` / ``mode`` /
+        ``schema_mode`` / ``match_by``). :meth:`copy` runs that
+        normalization for the public surface; internal callers that
+        already hold a :class:`Field` / :class:`Mode` can route here
+        directly.
+
+        Invalidates ``_merged_field_cache`` whenever the source or
+        target field is overwritten — the merge result is no longer
+        valid for the new pair.
+        """
+        cls = type(self)
+        new = cls.__new__(cls)
+        setattr_ = object.__setattr__
+        for slot in cls._all_slots():
+            if slot in overrides:
+                setattr_(new, slot, overrides[slot])
+            else:
+                setattr_(new, slot, getattr(self, slot))
+        if "source_field" in overrides or "target_field" in overrides:
+            setattr_(new, "_merged_field_cache", ...)
+        return new
+
+    @classmethod
     def _build(
         cls: type[T],
         overrides: Mapping[str, Any],
@@ -639,12 +681,51 @@ class CastOptions:
         overrides — the explicit always wins, peek only fires when
         the override left the slot unbound.
         """
-        clean = {
-            k: v
-            for k, v in overrides.items()
-            if v is not ... and k in self.field_names()
-        }
-        replaced = dataclasses.replace(self, **clean)
+        if not overrides and source is ... and target is ...:
+            return self
+
+        field_names = self.field_names()
+        clean: dict[str, Any] = {}
+        for k, v in overrides.items():
+            if v is ... or k not in field_names:
+                continue
+            clean[k] = v
+
+        # Mirror the field-shaped coercions ``__post_init__`` would
+        # run, so the fast :meth:`_replace` can skip the post-init
+        # walk entirely. Only the slots that need it pay the cost;
+        # everything else is a direct slot copy.
+        if "source_field" in clean:
+            v = clean["source_field"]
+            if v is not None:
+                Field = field_class()
+                if not isinstance(v, Field):
+                    clean["source_field"] = Field.from_(v)
+        if "target_field" in clean:
+            v = clean["target_field"]
+            if v is not None:
+                Field = field_class()
+                if not isinstance(v, Field):
+                    clean["target_field"] = Field.from_(v)
+        if "mode" in clean:
+            clean["mode"] = Mode.from_(clean["mode"], default=Mode.AUTO)
+        if "schema_mode" in clean:
+            clean["schema_mode"] = Mode.from_(clean["schema_mode"], default=Mode.IGNORE)
+        if "match_by" in clean:
+            mb = clean["match_by"]
+            if mb:
+                Field = field_class()
+                clean["match_by"] = [
+                    item if isinstance(item, Field)
+                    else Field.default(name=item) if isinstance(item, str)
+                    else Field.from_(item)
+                    for item in mb
+                ]
+            elif mb is not None:
+                clean["match_by"] = None
+
+        replaced = self._replace(**clean)
+
         if source is not ... and source is not None:
             replaced = replaced.with_source(source, copy=False)
         elif source is None:
@@ -711,15 +792,16 @@ class CastOptions:
         """Return a copy with *field* as the new source field.
 
         Accepts the same shapes :meth:`Field.from_` does (pa schema,
-        yggdrasil Field, dict, etc.) — normalized in ``__post_init__``
-        via :func:`dataclasses.replace`. The frozen slot is updated
-        through :func:`object.__setattr__` in the post-init hook; we
-        don't bypass it here because going through ``replace`` gets
-        the normalization for free.
+        yggdrasil Field, dict, etc.); the value is normalized through
+        :meth:`Field.from_` before assignment. With ``copy=True`` the
+        new field lands on a fresh :class:`CastOptions` via
+        :meth:`_replace` (which skips ``__post_init__``); with
+        ``copy=False`` the frozen slot is updated through
+        :func:`object.__setattr__` in place.
         """
         if source is None:
             if copy:
-                return self.copy(source=None, copy=copy)
+                return self._replace(source_field=None)
             object.__setattr__(self, "source_field", None)
             object.__setattr__(self, "_merged_field_cache", ...)
             return self
@@ -730,9 +812,7 @@ class CastOptions:
             return self
 
         if copy:
-            # ``replace`` drops init=False fields back to their
-            # defaults, which clears the merged_field cache for free.
-            return dataclasses.replace(self, source_field=source)
+            return self._replace(source_field=source)
         object.__setattr__(self, "source_field", source)
         # In-place edit invalidates whatever the merged_field cache held.
         object.__setattr__(self, "_merged_field_cache", ...)
@@ -742,7 +822,7 @@ class CastOptions:
         """Return a copy with *field* as the new target field."""
         if target is None:
             if copy:
-                return self.copy(target=None, copy=copy)
+                return self._replace(target_field=None)
             object.__setattr__(self, "target_field", None)
             object.__setattr__(self, "_merged_field_cache", ...)
             return self
@@ -753,7 +833,7 @@ class CastOptions:
             return self
 
         if copy:
-            return dataclasses.replace(self, target_field=target)
+            return self._replace(target_field=target)
         object.__setattr__(self, "target_field", target)
         object.__setattr__(self, "_merged_field_cache", ...)
         return self
