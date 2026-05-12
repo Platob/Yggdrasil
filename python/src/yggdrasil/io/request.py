@@ -19,6 +19,7 @@ from .base import IO
 from .bytes_io import BytesIO
 from yggdrasil.data.enums import GZIP, Codec, MimeType
 from .headers import Headers
+from .authorization.base import Authorization
 from .holder import Holder
 from .memory import Memory
 from .url import URL, URL_STRUCT
@@ -332,6 +333,7 @@ class PreparedRequest:
         local_cache_config: Optional["CacheConfig"] = None,
         remote_cache_config: Optional["CacheConfig"] = None,
         sender: Optional[UserInfo] = None,
+        auth: Optional[Authorization] = None,
     ) -> None:
         self.method = method or "GET"
         self.url = URL.from_(url)
@@ -347,6 +349,7 @@ class PreparedRequest:
         self._sender: UserInfo | None = (
             _coerce_userinfo(sender) if sender is not None else _default_sender()
         )
+        self._auth: Authorization | None = auth
         self._session: "Session | None" = None
         # Memoization for the deterministic projection — hashes,
         # url-struct, arrow_values dict. Invalidated when
@@ -657,6 +660,7 @@ class PreparedRequest:
         compress_threshold: Optional[int] = 4 * 1024 * 1024,
         compress_codec: Optional[Codec] = GZIP,
         sender: Optional[UserInfo | Mapping[str, Any]] = None,
+        auth: Optional[Authorization] = None,
     ) -> "PreparedRequest":
         parsed_url = URL.from_(url, normalize=normalize)
         out_headers: dict[str, str] = _string_dict(headers)
@@ -701,6 +705,7 @@ class PreparedRequest:
             local_cache_config=local_cache_config,
             remote_cache_config=remote_cache_config,
             sender=_coerce_userinfo(sender),
+            auth=auth,
         )
 
     def copy(
@@ -715,6 +720,7 @@ class PreparedRequest:
         local_cache_config: Optional["CacheConfig"] = ...,
         remote_cache_config: Optional["CacheConfig"] = ...,
         sender: Optional[UserInfo] = ...,
+        auth: Optional[Authorization] = ...,
         normalize: bool = True,
         copy_buffer: bool = False,
     ) -> "PreparedRequest":
@@ -730,6 +736,7 @@ class PreparedRequest:
 
         new_tags = dict(self.tags) if tags is None else _string_dict(tags)
         new_sender = self.sender if sender is ... else _coerce_userinfo(sender)
+        new_auth = self._auth if auth is ... else auth
 
         return self.__class__(
             method=self.method if method is None else str(method),
@@ -741,6 +748,7 @@ class PreparedRequest:
             local_cache_config=self.local_cache_config if local_cache_config is ... else local_cache_config,
             remote_cache_config=self.remote_cache_config if remote_cache_config is ... else remote_cache_config,
             sender=new_sender,
+            auth=new_auth,
         )
 
     @property
@@ -772,14 +780,57 @@ class PreparedRequest:
         return self.headers.get("Authorization") if self.headers else None
 
     @authorization.setter
-    def authorization(self, value: Optional[str]):
+    def authorization(self, value: "Authorization | str | None"):
+        # Forgiving on input: accept either a static header value
+        # (``str`` / ``None``) or an :class:`Authorization` handler.
+        # Handlers are invoked lazily by :meth:`prepare_authorization`
+        # so a single instance can mint fresh tokens for every send.
+        if isinstance(value, Authorization):
+            self._auth = value
+            return
         if self.headers is None:
             self.headers = Headers()
         if value is None:
             self.headers.pop("Authorization", None)
         else:
             self.headers["Authorization"] = str(value)
+        self._auth = None
         self._invalidate_cache()
+
+    @property
+    def auth(self) -> Optional[Authorization]:
+        """The :class:`Authorization` handler bound to this request, if any.
+
+        When set, :meth:`prepare_authorization` resolves it lazily into
+        the ``Authorization`` header just before the request is sent —
+        every send picks up a freshly-minted header value.
+        """
+        return self._auth
+
+    @auth.setter
+    def auth(self, value: Optional[Authorization]) -> None:
+        if value is not None and not isinstance(value, Authorization):
+            raise TypeError(
+                f"auth must be an Authorization instance or None; got "
+                f"{type(value).__name__}. Use ``request.authorization = '<value>'`` "
+                f"to set a static header string."
+            )
+        self._auth = value
+
+    def prepare_authorization(self) -> "PreparedRequest":
+        """Resolve the bound :class:`Authorization` handler into the header.
+
+        No-op when no handler is bound. Calls ``handler.authorization``
+        each time, so handlers that refresh internally (e.g. MSAL) emit
+        the current token on every send.
+        """
+        if self._auth is None:
+            return self
+        value = self._auth.authorization
+        if self.headers is None:
+            self.headers = Headers()
+        self.headers["Authorization"] = value
+        return self
 
     @property
     def x_api_key(self) -> Optional[str]:
