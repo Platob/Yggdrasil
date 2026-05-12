@@ -6,6 +6,11 @@ byte zero every call. APPEND is implemented honestly at the leaf
 level (concat new bytes; suppress header on the second-and-later
 session) since the format itself supports it without a footer
 rewrite.
+
+Nested columns are serialized to JSON strings on write — pyarrow's
+CSV writer rejects ``list`` / ``struct`` / ``map`` / ``dictionary``
+types outright, so the only honest representation in a flat text
+format is one JSON cell per row. See :func:`_encode_nested_as_json`.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
 from yggdrasil.io.base import IO
+from yggdrasil.pickle import json as yg_json
 
 if TYPE_CHECKING:
     import polars as pl
@@ -37,6 +43,98 @@ __all__ = ["CsvIO", "CsvOptions"]
 _MERGE_MODES = frozenset({Mode.APPEND, Mode.UPSERT, Mode.MERGE})
 
 
+def _is_nested_arrow_type(t: pa.DataType) -> bool:
+    """``True`` when *t* can't be written by :class:`pa_csv.CSVWriter`.
+
+    pyarrow's CSV encoder supports scalar primitives + temporals +
+    binary/string. Anything column-shaped — list, large_list,
+    fixed_size_list, struct, map, dictionary — has to be flattened
+    to a single text cell before it reaches the writer. Matches the
+    full set the writer rejects with ``Unsupported Type``.
+    """
+    return (
+        pa.types.is_list(t)
+        or pa.types.is_large_list(t)
+        or pa.types.is_fixed_size_list(t)
+        or pa.types.is_struct(t)
+        or pa.types.is_map(t)
+        or pa.types.is_dictionary(t)
+    )
+
+
+def _csv_nested_schema(schema: pa.Schema) -> "tuple[pa.Schema, tuple[int, ...]]":
+    """Project *schema* onto a CSV-writable shape.
+
+    Returns the projected schema (nested fields rewritten as
+    ``string``, nullability preserved, original field metadata kept
+    around so a downstream reader binding the same target can still
+    parse the JSON cells back) and the index tuple of columns that
+    need per-batch JSON encoding. Indices are cached upstream so we
+    don't re-walk the schema for every batch.
+    """
+    fields: list[pa.Field] = []
+    nested_indices: list[int] = []
+    for i, field in enumerate(schema):
+        if _is_nested_arrow_type(field.type):
+            nested_indices.append(i)
+            fields.append(
+                pa.field(
+                    field.name,
+                    pa.string(),
+                    nullable=field.nullable,
+                    metadata=field.metadata,
+                )
+            )
+        else:
+            fields.append(field)
+    return pa.schema(fields, metadata=schema.metadata), tuple(nested_indices)
+
+
+def _encode_nested_as_json(
+    batch: pa.RecordBatch,
+    schema: pa.Schema,
+    indices: "tuple[int, ...]",
+    *,
+    ensure_ascii: bool,
+    sort_keys: bool,
+) -> pa.RecordBatch:
+    """Replace each nested column of *batch* with a JSON-string column.
+
+    CSV write is a documented row-endpoint — rows are leaving Arrow
+    for a flat text format anyway — so ``to_pylist`` on the nested
+    columns is the canonical exemption from the no-row-loop rule
+    (CLAUDE.md → "Never to_pylist heavy data" → exemption 2). The
+    scalar columns sail through unchanged; only the nested ones pay
+    the row hop.
+
+    JSON encoding goes through :func:`yggdrasil.pickle.json.dumps`
+    (orjson under the hood) for the type coverage we need:
+    ``datetime`` / ``date`` / ``time`` / ``UUID`` / ``Decimal`` /
+    ``bytes`` all serialize the way callers expect when they pop up
+    inside a list or struct cell.
+    """
+    if not indices:
+        return batch
+
+    arrays: list[pa.Array] = list(batch.columns)
+    for i in indices:
+        rows = arrays[i].to_pylist()
+        encoded: list[str | None] = [
+            None
+            if row is None
+            else yg_json.dumps(
+                row,
+                ensure_ascii=ensure_ascii,
+                sort_keys=sort_keys,
+                to_bytes=False,
+            )
+            for row in rows
+        ]
+        arrays[i] = pa.array(encoded, type=pa.string())
+
+    return pa.RecordBatch.from_arrays(arrays, schema=schema)
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class CsvOptions(CastOptions):
     """:class:`CastOptions` extended with CSV-specific knobs."""
@@ -51,6 +149,17 @@ class CsvOptions(CastOptions):
 
     write_header: bool = True
     line_ending: str = "\n"
+
+    #: When ``True`` (the default), nested columns — ``list``,
+    #: ``struct``, ``map``, ``dictionary``, ``fixed_size_list`` — are
+    #: serialized as JSON strings before reaching the CSV writer.
+    #: Without this any nested column trips pyarrow's
+    #: "Unsupported Type" guard and the write fails outright. Turn
+    #: off only when a caller has already flattened the schema to
+    #: scalars upstream.
+    nested_as_json: bool = True
+    json_ensure_ascii: bool = False
+    json_sort_keys: bool = False
 
     def to_read_options(self) -> "pa_csv.ReadOptions":
         return pa_csv.ReadOptions(
@@ -261,7 +370,30 @@ class CsvIO(IO[bytes, CsvOptions]):
         # encoder sees them.
         cast_opts = options.check_source(first.schema)
         first_casted = cast_opts.cast_arrow_tabular(first)
-        schema = cast_opts.merged_schema.to_arrow_schema()
+
+        # CSV can't encode nested arrow types — pyarrow's CSVWriter
+        # raises ``ArrowInvalid: Unsupported Type`` on the first
+        # ``list`` / ``struct`` / ``map`` cell. Project the post-cast
+        # schema onto a CSV-writable shape (nested fields rewritten
+        # as ``string``) once and feed every batch through
+        # :func:`_encode_nested_as_json` so the writer sees pure
+        # scalar / string columns. When the schema has no nested
+        # columns ``nested_indices`` is empty and the encoder is a
+        # passthrough.
+        writer_schema = cast_opts.merged_schema.to_arrow_schema()
+        nested_indices: tuple[int, ...] = ()
+        if options.nested_as_json:
+            writer_schema, nested_indices = _csv_nested_schema(writer_schema)
+            if nested_indices:
+                first_casted = _encode_nested_as_json(
+                    first_casted,
+                    writer_schema,
+                    nested_indices,
+                    ensure_ascii=options.json_ensure_ascii,
+                    sort_keys=options.json_sort_keys,
+                )
+
+        schema = writer_schema
 
         if is_append_uncompressed:
             # Append path: drive the CSVWriter against the IO's
@@ -278,6 +410,14 @@ class CsvIO(IO[bytes, CsvOptions]):
                         writer.write_batch(first_casted)
                     for batch in iterator:
                         casted = cast_opts.cast_arrow_tabular(batch)
+                        if nested_indices:
+                            casted = _encode_nested_as_json(
+                                casted,
+                                writer_schema,
+                                nested_indices,
+                                ensure_ascii=options.json_ensure_ascii,
+                                sort_keys=options.json_sort_keys,
+                            )
                         if casted.num_rows > 0:
                             writer.write_batch(casted)
             return
@@ -291,6 +431,14 @@ class CsvIO(IO[bytes, CsvOptions]):
                     writer.write_batch(first_casted)
                 for batch in iterator:
                     casted = cast_opts.cast_arrow_tabular(batch)
+                    if nested_indices:
+                        casted = _encode_nested_as_json(
+                            casted,
+                            writer_schema,
+                            nested_indices,
+                            ensure_ascii=options.json_ensure_ascii,
+                            sort_keys=options.json_sort_keys,
+                        )
                     if casted.num_rows > 0:
                         writer.write_batch(casted)
 
