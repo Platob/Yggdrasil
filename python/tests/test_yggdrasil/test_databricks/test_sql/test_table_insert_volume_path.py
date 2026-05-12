@@ -89,7 +89,7 @@ class TestInsertVolumePath:
         the rest of the insert uses for Files API calls."""
         ws = MagicMock(name="workspace")
         tbl = _table(workspace=ws)
-        assert tbl.insert_volume_path().workspace is ws
+        assert tbl.insert_volume_path().workspace_client is ws
 
 
 # ---------------------------------------------------------------------------

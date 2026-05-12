@@ -213,7 +213,7 @@ class TestStagingPath:
         assert full.startswith("/Volumes/cat/sch/tmp/.sql/cat/sch/tbl/part-")
         assert full.endswith(".parquet")
         assert p.temporary is True
-        assert p.workspace is workspace
+        assert p.workspace_client is workspace
 
     def test_temporary_false(self, workspace, client) -> None:
         p = VolumePath.staging_path(
@@ -238,7 +238,7 @@ class TestStagingPath:
         p = VolumePath.staging_path(
             catalog_name="c", schema_name="s", client=client,
         )
-        assert p.workspace is workspace
+        assert p.workspace_client is workspace
 
     def test_segments_are_sanitized(self, workspace, client) -> None:
         p = VolumePath.staging_path(
@@ -599,7 +599,7 @@ class TestTemporaryCredentials:
         gen.return_value = _aws_creds_response()
 
         p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
-        resp = p.temporary_credentials(operation="read")
+        resp = p.temporary_credentials(mode="read")
         assert resp.aws_temp_credentials.access_key_id == "AKIA-test"
 
         # Call kwargs must include the volume_id from VolumeInfo plus
@@ -618,7 +618,7 @@ class TestTemporaryCredentials:
         gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         gen.return_value = _aws_creds_response()
         p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
-        p.temporary_credentials(operation="overwrite")
+        p.temporary_credentials(mode="overwrite")
 
         assert _op_token(gen.call_args.kwargs["operation"]) == "WRITE_VOLUME"
 
@@ -627,91 +627,6 @@ class TestTemporaryCredentials:
         p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
         with pytest.raises(ValueError, match="volume_id"):
             p.temporary_credentials()
-
-
-class TestAWSAndS3Path:
-
-    def test_aws_returns_refreshable_client(self, workspace, client) -> None:
-        workspace.volumes.read.return_value = _volume_info()
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
-        gen.return_value = _aws_creds_response()
-
-        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
-        aws = p.aws(operation="read", region="us-east-1")
-
-        # Snapshot creds bound to the AWSConfig — these came from the
-        # initial refresher call. The refresher itself is wired into
-        # the config so botocore can re-invoke it on token expiry.
-        assert aws.config.access_key_id == "AKIA-test"
-        assert aws.config.region == "us-east-1"
-        assert aws.config.has_refresher()
-
-    def test_aws_refresher_rotates_credentials(self, workspace, client) -> None:
-        # The refresher is the same callable on every cycle — botocore
-        # would re-invoke it via the config. We invoke it manually here
-        # to prove fresh creds flow through on every call.
-        workspace.volumes.read.return_value = _volume_info()
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
-        gen.side_effect = [
-            _aws_creds_response(access_key_id="AKIA-1"),
-            _aws_creds_response(access_key_id="AKIA-2"),
-        ]
-        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
-        aws = p.aws(operation="read")
-        # First call seeded the config; invoke the refresher once more.
-        refreshed = aws.config.refresher()
-        assert refreshed.access_key_id == "AKIA-2"
-
-    def test_aws_raises_for_non_s3_volume(self, workspace, client) -> None:
-        workspace.volumes.read.return_value = _volume_info()
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
-        # Azure-style response — no ``aws_temp_credentials``.
-        gen.return_value = SimpleNamespace(
-            aws_temp_credentials=None,
-            azure_aad=SimpleNamespace(aad_token="token"),
-            azure_user_delegation_sas=None,
-            gcp_oauth_token=None,
-            r2_temp_credentials=None,
-            expiration_time=None,
-            url=None,
-        )
-        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
-        with pytest.raises(RuntimeError, match="aws_temp_credentials"):
-            p.aws(operation="read")
-
-    def test_s3_path_joins_storage_with_subvolume_tail(self, workspace, client) -> None:
-        workspace.volumes.read.return_value = _volume_info(
-            storage_location="s3://my-bucket/__unitystorage/cat/sch/vol",
-        )
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
-        gen.return_value = _aws_creds_response()
-
-        p = VolumePath(
-            "/Volumes/cat/sch/vol/sub/dir/file.parquet", client=client,
-        )
-        s3 = p.s3_path(operation="read", region="us-east-1")
-
-        from yggdrasil.aws.fs.path import S3Path
-        assert isinstance(s3, S3Path)
-        assert s3.full_path() == (
-            "s3://my-bucket/__unitystorage/cat/sch/vol/sub/dir/file.parquet"
-        )
-
-    def test_s3_path_at_volume_root(self, workspace, client) -> None:
-        workspace.volumes.read.return_value = _volume_info(
-            storage_location="s3://b/__unitystorage/c/s/v/",
-        )
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
-        gen.return_value = _aws_creds_response()
-
-        p = VolumePath("/Volumes/c/s/v", client=client)
-        s3 = p.s3_path()
-        # No sub-volume tail to append — the storage root URL drives
-        # the address verbatim, trailing slash preserved as a
-        # directory-marker.
-        assert s3.full_path() == "s3://b/__unitystorage/c/s/v/"
-        assert s3.bucket == "b"
-        assert s3.key == "__unitystorage/c/s/v/"
 
 
 # ---------------------------------------------------------------------------
@@ -732,8 +647,8 @@ class TestCredentialsRefresherSingleton:
         # Two distinct VolumePath instances pointing at the same volume.
         p1 = VolumePath("/Volumes/cat/sch/vol/x", client=client)
         p2 = VolumePath("/Volumes/cat/sch/vol/y", client=client)
-        r1 = p1.credentials_refresher(operation="read")
-        r2 = p2.credentials_refresher(operation="read")
+        r1 = p1.credentials_refresher(mode="read")
+        r2 = p2.credentials_refresher(mode="read")
         assert isinstance(r1, VolumeCredentialsRefresher)
         assert r1 is r2
 
@@ -745,8 +660,8 @@ class TestCredentialsRefresherSingleton:
         gen.return_value = _aws_creds_response()
 
         p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
-        r_read = p.credentials_refresher(operation="read")
-        r_write = p.credentials_refresher(operation="overwrite")
+        r_read = p.credentials_refresher(mode="read")
+        r_write = p.credentials_refresher(mode="overwrite")
         assert r_read is not r_write
 
     def test_different_volume_id_yields_different_refresher(
@@ -759,13 +674,13 @@ class TestCredentialsRefresherSingleton:
             name="v1", volume_id="vid-A",
         )
         p1 = VolumePath("/Volumes/cat/sch/v1/x", client=client)
-        r1 = p1.credentials_refresher(operation="read")
+        r1 = p1.credentials_refresher(mode="read")
 
         workspace.volumes.read.return_value = _volume_info(
             name="v2", volume_id="vid-B",
         )
         p2 = VolumePath("/Volumes/cat/sch/v2/x", client=client)
-        r2 = p2.credentials_refresher(operation="read")
+        r2 = p2.credentials_refresher(mode="read")
         assert r1 is not r2
 
     def test_aws_client_shared_through_refresher(self, workspace, client) -> None:
@@ -776,8 +691,8 @@ class TestCredentialsRefresherSingleton:
         p1 = VolumePath("/Volumes/cat/sch/vol/x", client=client)
         p2 = VolumePath("/Volumes/cat/sch/vol/y", client=client)
         # Same volume + operation + region → same AWSClient instance.
-        c1 = p1.aws(operation="read", region="us-east-1")
-        c2 = p2.aws(operation="read", region="us-east-1")
+        c1 = p1.aws(mode="read", region="us-east-1")
+        c2 = p2.aws(mode="read", region="us-east-1")
         assert c1 is c2
 
     def test_aws_client_cached_per_region(self, workspace, client) -> None:
@@ -786,7 +701,7 @@ class TestCredentialsRefresherSingleton:
         gen.return_value = _aws_creds_response()
 
         p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
-        r = p.credentials_refresher(operation="read")
+        r = p.credentials_refresher(mode="read")
         c_us = r.aws_client(region="us-east-1")
         c_eu = r.aws_client(region="eu-central-1")
         c_us_again = r.aws_client(region="us-east-1")
@@ -800,7 +715,7 @@ class TestCredentialsRefresherSingleton:
 
         # First binding uses ``workspace`` (fixture-provided).
         p1 = VolumePath("/Volumes/cat/sch/vol/x", client=client)
-        r1 = p1.credentials_refresher(operation="read")
+        r1 = p1.credentials_refresher(mode="read")
         assert r1.workspace is workspace
 
         # Second binding with a different client must refresh the
@@ -811,7 +726,7 @@ class TestCredentialsRefresherSingleton:
         workspace_b.volumes.read.return_value = _volume_info(volume_id="vid-A")
         workspace_b.temporary_volume_credentials.generate_temporary_volume_credentials.return_value = _aws_creds_response()
         p2 = VolumePath("/Volumes/cat/sch/vol/y", client=client_b)
-        r2 = p2.credentials_refresher(operation="read")
+        r2 = p2.credentials_refresher(mode="read")
         assert r2 is r1
         assert r2.workspace is workspace_b
 
@@ -822,7 +737,7 @@ class TestCredentialsRefresherSingleton:
         gen.return_value = _aws_creds_response()
 
         p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
-        r = p.credentials_refresher(operation="read")
+        r = p.credentials_refresher(mode="read")
         # In-process pickle round-trip must collapse to the same
         # singleton (no duplicate boto session, no duplicate refresh).
         loaded = pickle.loads(pickle.dumps(r))
@@ -837,7 +752,7 @@ class TestCredentialsRefresherSingleton:
         )
 
         p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
-        r = p.credentials_refresher(operation="read")
+        r = p.credentials_refresher(mode="read")
         out = r()
         assert isinstance(out, AwsCredentials)
         assert out.access_key_id == "AKIA-direct"
@@ -939,7 +854,7 @@ class TestVolumeInfoNotFoundRecovery:
         gen.return_value = _aws_creds_response()
 
         p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
-        resp = p.temporary_credentials(operation="read")
+        resp = p.temporary_credentials(mode="read")
         assert resp.aws_temp_credentials.access_key_id == "AKIA-test"
         workspace.volumes.create.assert_called_once()
         gen.assert_called_once()

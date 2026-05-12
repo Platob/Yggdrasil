@@ -433,18 +433,6 @@ class DatabricksPath(RemotePath):
         self._client = client
         return self
 
-    @property
-    def workspace(self) -> Any:
-        """Workspace SDK client reached through :attr:`client`.
-
-        Shortcut for ``self.client.workspace_client()`` — kept so
-        concrete subclasses can stay terse (``self.workspace.files.upload``)
-        while the source of truth is the :class:`DatabricksClient` on
-        :attr:`_client`. No bare workspace handle is stored on the
-        path anymore.
-        """
-        return self.client.workspace_client()
-
     # ==================================================================
     # Retry policy
     # ==================================================================

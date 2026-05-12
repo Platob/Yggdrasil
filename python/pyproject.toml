@@ -83,7 +83,7 @@ delta = [
 ]
 
 databricks = [
-  "databricks-sdk>=0.97",
+  "databricks-sdk>=0.107",
 ]
 
 pickle = [

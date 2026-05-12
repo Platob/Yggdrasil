@@ -23,8 +23,6 @@ from .path import DatabricksPath
 __all__ = ["DBFSPath"]
 
 
-#: Hard cap on a single ``dbfs.read`` — requesting more returns
-#: ``BadRequest``. Drives the chunk loop in :meth:`_read_mv`.
 _DBFS_CHUNK = 1 * 1024 * 1024
 
 
@@ -55,7 +53,7 @@ class DBFSPath(DatabricksPath):
 
     def _stat_uncached(self) -> IOStats:
         try:
-            info = self._call(self.workspace.dbfs.get_status, self.api_path)
+            info = self._call(self.client.workspace_client().dbfs.get_status, self.api_path)
         except Exception:
             return IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
 
@@ -78,7 +76,7 @@ class DBFSPath(DatabricksPath):
 
     def _ls(self, recursive: bool = False) -> Iterator["DBFSPath"]:
         try:
-            entries = list(self._call(self.workspace.dbfs.list, self.api_path))
+            entries = list(self._call(self.client.workspace_client().dbfs.list, self.api_path))
         except Exception:
             return
         for info in entries:
@@ -99,7 +97,7 @@ class DBFSPath(DatabricksPath):
 
     def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
         try:
-            self._call(self.workspace.dbfs.mkdirs, self.api_path)
+            self._call(self.client.workspace_client().dbfs.mkdirs, self.api_path)
         except Exception as exc:
             if not exist_ok and _looks_like_already_exists(exc):
                 raise
@@ -108,7 +106,7 @@ class DBFSPath(DatabricksPath):
     def _remove_file(self, missing_ok: bool = True) -> None:
         try:
             self._call(
-                self.workspace.dbfs.delete, self.api_path, recursive=False,
+                self.client.workspace_client().dbfs.delete, self.api_path, recursive=False,
             )
         except Exception:
             if not missing_ok:
@@ -120,7 +118,7 @@ class DBFSPath(DatabricksPath):
     ) -> None:
         try:
             self._call(
-                self.workspace.dbfs.delete, self.api_path, recursive=recursive,
+                self.client.workspace_client().dbfs.delete, self.api_path, recursive=recursive,
             )
         except Exception:
             if not missing_ok:
@@ -138,7 +136,7 @@ class DBFSPath(DatabricksPath):
         short page signals EOF. ``n < 0`` means "read to EOF" — the
         loop keeps issuing chunk-sized requests with no upper bound
         and stops on the first short page. The aggressive ``_bread``
-        path leans on this so a whole-file read costs one
+        path leans on this, so a whole-file read costs one
         ``ceil(size / 1 MiB)``-chunk round-trip burst, no preceding
         ``get_status`` probe.
         """
@@ -158,7 +156,7 @@ class DBFSPath(DatabricksPath):
                 chunk_size = min(_DBFS_CHUNK, remaining)
             try:
                 resp = self._call(
-                    self.workspace.dbfs.read,
+                    self.client.workspace_client().dbfs.read,
                     path=self.api_path,
                     offset=offset,
                     length=chunk_size,
@@ -211,7 +209,7 @@ class DBFSPath(DatabricksPath):
     def _stream_upload(self, payload: bytes) -> None:
         """Write *payload* to ``self.api_path`` via the streaming SDK."""
         def _do_upload() -> None:
-            with self.workspace.dbfs.open(
+            with self.client.workspace_client().dbfs.open(
                 path=self.api_path, read=False, write=True, overwrite=True,
             ) as fh:
                 offset = 0

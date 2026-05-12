@@ -747,6 +747,8 @@ class TestSQLMergeStrategy(_SQLIntegrationBase):
                 "amount": pa.array([0.0], type=pa.float64()),
             }
         )
+
+
         table.insert(replacement, mode=Mode.TRUNCATE)
 
         rows = self._read_rows(table)

@@ -40,18 +40,17 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional, Tuple
 
-from yggdrasil.data.enums import Mode, Scheme
+from databricks.sdk.service.catalog import VolumeOperation
+
+from yggdrasil.data.enums import Mode, ModeLike, Scheme
 from yggdrasil.io.io_stats import IOStats, IOKind
+from yggdrasil.io.path import Path
 from yggdrasil.io.url import URL
-
 from .path import DatabricksPath
-
 
 if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.aws.config import AwsCredentials
-    from yggdrasil.aws.fs.path import S3Path
-
 
 __all__ = ["VolumePath", "VolumeCredentialsRefresher"]
 
@@ -64,14 +63,6 @@ class VolumePath(DatabricksPath):
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_VOLUME
     namespace_prefix: ClassVar[str] = "/Volumes/"
 
-    #: Process-wide :class:`VolumeInfo` cache keyed by
-    #: ``(catalog, schema, volume)``. Unity Catalog volume metadata
-    #: (storage_location, volume_id, volume_type) is stable for the
-    #: volume's lifetime, so the very first :meth:`volume_info` call
-    #: against a given triple pays the SDK round trip and every
-    #: subsequent ``VolumePath`` on the same volume reads from this
-    #: cache. Lock-guarded so concurrent constructions don't race the
-    #: SDK call.
     _VOLUME_INFO_CACHE: ClassVar["dict[Tuple[str, str, str], Any]"] = {}
     _VOLUME_INFO_CACHE_LOCK: ClassVar[threading.Lock] = threading.Lock()
 
@@ -83,19 +74,7 @@ class VolumePath(DatabricksPath):
         **kwargs: Any,
     ) -> None:
         super().__init__(data=data, url=url, **kwargs)
-        # Per-instance pointer into the shared
-        # :attr:`_VOLUME_INFO_CACHE`. ``None`` until
-        # :meth:`volume_info` populates it; once set it aliases the
-        # class-level cached entry, so the instance's view stays
-        # consistent with every other :class:`VolumePath` on the
-        # same volume.
         self._volume_info: Any = None
-        # Cached :class:`Path` (typically :class:`S3Path`) at the
-        # volume's root storage location. Resolved lazily by
-        # :meth:`storage_path` — once built it carries the
-        # auto-refreshing :class:`AWSClient` session, so reusing the
-        # cached instance keeps the boto pool and the credential
-        # vending session shared across calls.
         self._storage_path: Any = None
 
     # ==================================================================
@@ -115,7 +94,7 @@ class VolumePath(DatabricksPath):
     # ==================================================================
 
     def _stat_uncached(self) -> IOStats:
-        files = self.workspace.files
+        files = self.client.workspace_client().files
         try:
             info = self._call(files.get_metadata, self.api_path)
         except Exception:
@@ -205,7 +184,7 @@ class VolumePath(DatabricksPath):
 
         full_name = f"{catalog}.{schema}.{volume}"
         try:
-            info = self._call(self.workspace.volumes.read, full_name)
+            info = self._call(self.client.workspace_client().volumes.read, full_name)
         except Exception as exc:
             if not _looks_like_not_found(exc):
                 raise
@@ -217,7 +196,7 @@ class VolumePath(DatabricksPath):
             # the parent-walking failed.
             if not self._ensure_volume():
                 raise
-            info = self._call(self.workspace.volumes.read, full_name)
+            info = self._call(self.client.workspace_client().volumes.read, full_name)
 
         # Publish to the process-wide cache under the lock so
         # concurrent constructions converge on one entry. ``setdefault``
@@ -267,7 +246,7 @@ class VolumePath(DatabricksPath):
     def storage_path(
         self,
         *,
-        operation: Any = None,
+        mode: ModeLike = Mode.AUTO,
         region: Optional[str] = None,
         refresh: bool = False,
     ) -> Any:
@@ -302,32 +281,17 @@ class VolumePath(DatabricksPath):
                 f"Volume info: {info!r}."
             )
 
-        url = URL.from_(str(raw))
-        scheme = (url.scheme or "").lower()
-        if scheme in ("s3", "s3a", "s3n"):
-            # Route through the shared :class:`AWSClient` so the
-            # boto session + refreshable credentials follow the same
-            # singleton that :meth:`aws` returns. We bind the
-            # ``client=`` directly (S3Path stores it on ``_client``)
-            # so every sibling built off this root reuses one boto
-            # session.
-            from yggdrasil.aws.fs.path import S3Path
-            aws_client = self.aws(operation=operation, region=region)
-            storage_path = S3Path(url=url, client=aws_client.s3.boto_client)
+        mode = Mode.from_(mode, default=Mode.AUTO)
+        storage_path = Path.from_url(raw)
+
+        if storage_path.scheme.startswith("s3"):
+            credentials = self.temporary_credentials(mode=mode)
+            # TODO: complete S3 crdentials
         else:
-            # Azure / GCS / etc. — fall back to ``URLBased`` dispatch.
-            # The path won't carry refreshable Databricks creds, but
-            # it'll still address the right object store; callers can
-            # plug in their own credential refresh strategy.
-            from yggdrasil.io.url import URLBased
-            try:
-                target = URLBased.for_scheme(scheme)
-            except (ValueError, ImportError) as exc:
-                raise ValueError(
-                    f"{type(self).__name__}: storage_location scheme "
-                    f"{scheme!r} has no registered Path class. URL: {raw!r}."
-                ) from exc
-            storage_path = target.from_url(url)
+            raise ValueError(
+                f"{type(self).__name__}: volume has no storage_location yet. "
+                f"Volume info: {info!r}."
+            )
 
         self._storage_path = storage_path
         return storage_path
@@ -335,7 +299,7 @@ class VolumePath(DatabricksPath):
     def temporary_credentials(
         self,
         *,
-        operation: Any = None,
+        mode: ModeLike = Mode.AUTO,
     ) -> Any:
         """Vend temporary cloud credentials for this volume.
 
@@ -349,7 +313,6 @@ class VolumePath(DatabricksPath):
         ``READ_VOLUME``; read-only modes map to ``READ_VOLUME``,
         everything else to ``WRITE_VOLUME``.
         """
-        op = _resolve_volume_operation(operation)
         info = self.volume_info()
         volume_id = getattr(info, "volume_id", None)
         if not volume_id:
@@ -357,17 +320,23 @@ class VolumePath(DatabricksPath):
                 f"{type(self).__name__}: volume_info has no volume_id; "
                 f"cannot vend temporary credentials. Info: {info!r}."
             )
+
+        mode = Mode.from_(mode, default=Mode.READ_ONLY)
+        if mode is Mode.READ_ONLY:
+            operation = VolumeOperation.READ_VOLUME
+        else:
+            operation = VolumeOperation.WRITE_VOLUME
+
         return self._call(
-            self.workspace.temporary_volume_credentials
-            .generate_temporary_volume_credentials,
+            self.client.workspace_client().temporary_volume_credentials.generate_temporary_volume_credentials,
             volume_id=volume_id,
-            operation=op,
+            operation=operation,
         )
 
     def credentials_refresher(
         self,
         *,
-        operation: Any = None,
+        mode: ModeLike = Mode.READ_ONLY,
     ) -> "VolumeCredentialsRefresher":
         """Return the process-wide singleton refresher for this volume.
 
@@ -384,7 +353,7 @@ class VolumePath(DatabricksPath):
         sessions). The SDK workspace client is reached through
         ``client.workspace_client()`` at refresh time.
         """
-        op = _resolve_volume_operation(operation)
+        op = Mode.from_(mode, default=Mode.READ_ONLY)
         info = self.volume_info()
         volume_id = getattr(info, "volume_id", None)
         if not volume_id:
@@ -401,7 +370,7 @@ class VolumePath(DatabricksPath):
     def aws(
         self,
         *,
-        operation: Any = None,
+        mode: ModeLike = None,
         region: Optional[str] = None,
     ) -> "AWSClient":
         """Return an :class:`AWSClient` whose credentials self-refresh
@@ -420,50 +389,7 @@ class VolumePath(DatabricksPath):
         from env / config / instance metadata. Pass it explicitly when
         the volume sits in a non-default region.
         """
-        return self.credentials_refresher(operation=operation).aws_client(region=region)
-
-    def s3_path(
-        self,
-        *,
-        operation: Any = None,
-        region: Optional[str] = None,
-    ) -> "S3Path":
-        """Return an :class:`S3Path` over the volume's S3 storage.
-
-        Joins this path's sub-volume tail (``/sub/dir/file.parquet``)
-        onto the cached :meth:`storage_path` so reads and writes
-        bypass the SDK's Files API and go directly against S3 —
-        cheaper on Unity Catalog quota and faster on the wire. The
-        returned :class:`S3Path` shares the boto client that
-        :meth:`storage_path` minted via the singleton
-        :class:`AWSClient`, so credentials auto-refresh and the boto
-        session is reused across every reader / writer on the
-        volume.
-
-        Only S3-backed volumes are supported by this fast path; an
-        Azure / GCP volume raises :class:`ValueError` from
-        :meth:`storage_path` when it can't dispatch to an
-        :class:`S3Path`.
-        """
-        root = self.storage_path(operation=operation, region=region)
-        from yggdrasil.aws.fs.path import S3Path
-        if not isinstance(root, S3Path):
-            raise ValueError(
-                f"{type(self).__name__}.s3_path requires an S3-backed "
-                f"volume; got {type(root).__name__} at {root.full_path()!r}."
-            )
-        tail = _sub_volume_tail(self.url.path or "/")
-        if not tail:
-            target_url = root.url
-        else:
-            target_url = root.url.joinpath(tail.lstrip("/"))
-        # Reuse the boto client the storage root is bound to so every
-        # S3Path on this volume shares the same auto-refreshing session.
-        return S3Path(
-            url=target_url,
-            client=root._client,
-            temporary=self.temporary,
-        )
+        return self.credentials_refresher(mode=mode).aws_client(region=region)
 
     def arrow_filesystem(
         self,
@@ -490,8 +416,8 @@ class VolumePath(DatabricksPath):
         # Ensure the volume's storage path is resolved (and the
         # underlying AWSClient session is live) before snapshotting
         # credentials.
-        self.storage_path(operation=operation, region=region)
-        aws_client = self.aws(operation=operation, region=region)
+        self.storage_path(mode=operation, region=region)
+        aws_client = self.aws(mode=operation, region=region)
         return aws_client.s3.arrow_filesystem(region=region)
 
     # ==================================================================
@@ -575,7 +501,7 @@ class VolumePath(DatabricksPath):
     # ==================================================================
 
     def _ls(self, recursive: bool = False) -> Iterator["VolumePath"]:
-        files = self.workspace.files
+        files = self.client.workspace_client().files
         try:
             entries = self._call(files.list_directory_contents, self.api_path)
         except Exception:
@@ -627,7 +553,7 @@ class VolumePath(DatabricksPath):
         if has_subdir:
             try:
                 self._call(
-                    self.workspace.files.create_directory, parent.api_path,
+                    self.client.workspace_client().files.create_directory, parent.api_path,
                 )
                 return True
             except Exception as exc:
@@ -643,7 +569,7 @@ class VolumePath(DatabricksPath):
         if has_subdir:
             try:
                 self._call(
-                    self.workspace.files.create_directory, parent.api_path,
+                    self.client.workspace_client().files.create_directory, parent.api_path,
                 )
             except Exception as exc:
                 if not _looks_like_already_exists(exc):
@@ -666,7 +592,7 @@ class VolumePath(DatabricksPath):
         if triple is None:
             return False
         catalog, schema, volume = triple
-        ws = self.workspace
+        ws = self.client.workspace_client()
 
         def _create_volume() -> Any:
             return ws.volumes.create(
@@ -714,7 +640,7 @@ class VolumePath(DatabricksPath):
     def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
         try:
             self._call_ensuring_parents(
-                self.workspace.files.create_directory, self.api_path,
+                self.client.workspace_client().files.create_directory, self.api_path,
             )
         except Exception as exc:
             if not exist_ok and _looks_like_already_exists(exc):
@@ -723,7 +649,7 @@ class VolumePath(DatabricksPath):
 
     def _remove_file(self, missing_ok: bool = True) -> None:
         try:
-            self._call(self.workspace.files.delete, self.api_path)
+            self._call(self.client.workspace_client().files.delete, self.api_path)
         except Exception:
             if not missing_ok:
                 raise
@@ -733,7 +659,7 @@ class VolumePath(DatabricksPath):
         self, recursive: bool = True, missing_ok: bool = True,
     ) -> None:
         try:
-            self._call(self.workspace.files.delete_directory, self.api_path)
+            self._call(self.client.workspace_client().files.delete_directory, self.api_path)
         except Exception:
             if not missing_ok:
                 raise
@@ -747,7 +673,7 @@ class VolumePath(DatabricksPath):
         if n == 0:
             return memoryview(b"")
         try:
-            response = self._call(self.workspace.files.download, self.api_path)
+            response = self._call(self.client.workspace_client().files.download, self.api_path)
         except Exception as exc:
             if _looks_like_not_found(exc):
                 raise FileNotFoundError(self.full_path()) from exc
@@ -787,7 +713,7 @@ class VolumePath(DatabricksPath):
 
     def _upload(self, payload: bytes) -> None:
         self._call_ensuring_parents(
-            self.workspace.files.upload,
+            self.client.workspace_client().files.upload,
             file_path=self.api_path,
             contents=_stdio.BytesIO(payload),
             overwrite=True,
@@ -877,7 +803,7 @@ class VolumeCredentialsRefresher:
     def __new__(
         cls,
         volume_id: str,
-        operation: Any,
+        operation: VolumeOperation,
         client: Any = None,
     ) -> "VolumeCredentialsRefresher":
         key = (cls, str(volume_id), operation)
@@ -1101,39 +1027,6 @@ def _iso_or_str(value: Any) -> Optional[str]:
     if callable(isoformat):
         return isoformat()
     return str(value)
-
-
-def _resolve_volume_operation(operation: Any) -> Any:
-    """Map a caller-supplied operation hint to a :class:`VolumeOperation`.
-
-    Accepts the SDK enum (passes through), a :class:`Mode` /
-    mode-like string (``"read"`` / ``"overwrite"`` / …, normalized
-    via :meth:`Mode.from_`), or ``None`` (defaults to
-    ``READ_VOLUME``). Anything :meth:`Mode.from_` recognizes as a
-    read-only mode (``AUTO`` / ``READ_ONLY``) collapses to
-    ``READ_VOLUME``; everything else is a write and gets
-    ``WRITE_VOLUME``.
-    """
-    # ``VolumeOperation`` only landed in databricks-sdk 0.34+. Older SDKs
-    # accept the bare literal "READ_VOLUME" / "WRITE_VOLUME" on the wire
-    # all the same — mirror the ``_managed_volume_type`` fallback.
-    try:
-        from databricks.sdk.service.catalog import VolumeOperation as _VO
-    except ImportError:
-        _VO = None
-
-    read_volume = _VO.READ_VOLUME if _VO is not None else "READ_VOLUME"
-    write_volume = _VO.WRITE_VOLUME if _VO is not None else "WRITE_VOLUME"
-
-    if _VO is not None and isinstance(operation, _VO):
-        return operation
-    if operation is None:
-        return read_volume
-
-    mode = Mode.from_(operation, default=Mode.AUTO)
-    if mode in (Mode.AUTO, Mode.READ_ONLY):
-        return read_volume
-    return write_volume
 
 
 def _mtime(info) -> float:

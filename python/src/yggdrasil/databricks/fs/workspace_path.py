@@ -86,7 +86,7 @@ class WorkspacePath(DatabricksPath):
         :meth:`_resolve_me` then leaves the placeholder untouched
         rather than masking the real error at every callsite.
         """
-        ws = self.workspace
+        ws = self.workspace_client
         key = id(ws)
         cached = _USER_NAME_CACHE.get(key)
         if cached is not None:
@@ -110,7 +110,7 @@ class WorkspacePath(DatabricksPath):
     def _stat_uncached(self) -> IOStats:
         try:
             info = self._call(
-                self.workspace.workspace.get_status, self.api_path,
+                self.client.workspace_client().workspace.get_status, self.api_path,
             )
         except Exception:
             return IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
@@ -139,7 +139,7 @@ class WorkspacePath(DatabricksPath):
     def _ls(self, recursive: bool = False) -> Iterator["WorkspacePath"]:
         try:
             entries = list(
-                self._call(self.workspace.workspace.list, self.api_path)
+                self._call(self.client.workspace_client().workspace.list, self.api_path)
             )
         except Exception:
             return
@@ -173,7 +173,7 @@ class WorkspacePath(DatabricksPath):
 
     def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
         try:
-            self._call(self.workspace.workspace.mkdirs, self.api_path)
+            self._call(self.client.workspace_client().workspace.mkdirs, self.api_path)
         except Exception as exc:
             if _looks_like_already_exists(exc):
                 if not exist_ok:
@@ -192,7 +192,7 @@ class WorkspacePath(DatabricksPath):
     def _remove_file(self, missing_ok: bool = True) -> None:
         try:
             self._call(
-                self.workspace.workspace.delete,
+                self.client.workspace_client().workspace.delete,
                 self.api_path, recursive=False,
             )
         except Exception:
@@ -205,7 +205,7 @@ class WorkspacePath(DatabricksPath):
     ) -> None:
         try:
             self._call(
-                self.workspace.workspace.delete,
+                self.client.workspace_client().workspace.delete,
                 self.api_path, recursive=recursive,
             )
         except Exception:
@@ -222,7 +222,7 @@ class WorkspacePath(DatabricksPath):
             return memoryview(b"")
         try:
             response = self._call(
-                self.workspace.workspace.download, self.api_path,
+                self.client.workspace_client().workspace.download, self.api_path,
             )
         except Exception as exc:
             if _looks_like_not_found(exc):
@@ -267,7 +267,7 @@ class WorkspacePath(DatabricksPath):
         # no items``. ``AUTO`` lets the server inspect the extension and
         # content to decide between workspace file and notebook.
         self._call_ensuring_parents(
-            self.workspace.workspace.upload,
+            self.client.workspace_client().workspace.upload,
             path=self.api_path,
             content=_stdio.BytesIO(payload),
             format=_import_format_auto(),

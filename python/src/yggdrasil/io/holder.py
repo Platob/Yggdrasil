@@ -191,17 +191,6 @@ class Holder(URLBased, Tabular[O], Disposable):
     # URLBased — round-trip through a :class:`URL`
     # ------------------------------------------------------------------
 
-    @classmethod
-    def from_url(cls, url: "URL | str", **kwargs: Any) -> "Holder":
-        """Construct a holder of *cls* from *url*.
-
-        Concrete subclasses inherit this default, which forwards to
-        ``cls(url=url, **kwargs)``. Backends that need extra
-        construction knobs (sessions, workspace clients) override
-        with their own forwarding shape.
-        """
-        return cls(url=URL.from_(url), **kwargs)
-
     def to_url(self) -> "URL":
         """The canonical :class:`URL` that addresses this holder."""
         return self.url
@@ -248,7 +237,7 @@ class Holder(URLBased, Tabular[O], Disposable):
         ``auto_open``, …) ride through ``**kwargs`` so subclass
         ``__new__`` and the eventual ``__init__`` see them.
         """
-        if cls is Holder:
+        if cls.__subclasses__() and not cls.__subclasses__().__contains__(cls):
             target = _resolve_subclass(
                 scheme=scheme, url=url, binary=binary, path=path, data=data,
             )
@@ -435,7 +424,7 @@ class Holder(URLBased, Tabular[O], Disposable):
     @classmethod
     def from_url(cls, url: URL, **kwargs) -> Holder:
         """Create a new holder from a URL."""
-        return cls(url=url, **kwargs)
+        return cls(url=URL.from_(url), **kwargs)
 
     @classmethod
     def from_bytes(cls, data: bytes, **kwargs) -> Holder:

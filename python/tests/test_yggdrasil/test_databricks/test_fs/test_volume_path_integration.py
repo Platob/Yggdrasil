@@ -36,7 +36,7 @@ class TestVolumePathIntegration(DatabricksIntegrationCase):
         super().setUpClass()
         base = os.environ.get(
             "DATABRICKS_INTEGRATION_VOLUME_DIR",
-            "/Volumes/trading/unittest/unittest/scratch"
+            "/Volumes/trading_tgp_dev/unittest/unittest/scratch"
         ).strip()
         if not base:
             raise unittest.SkipTest(
@@ -124,3 +124,8 @@ class TestVolumePathIntegration(DatabricksIntegrationCase):
             self.assertEqual(staged.read_bytes(), b"staged")
         finally:
             staged.unlink(missing_ok=True)
+
+    def test_storage_location(self):
+        path = self.root / "storage_location.bin"
+
+        assert path.storage_path() == f"/Volumes/{self.catalog}/{self.schema}/integration/storage_location.bin"
