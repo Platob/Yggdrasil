@@ -1102,18 +1102,27 @@ def _resolve_volume_operation(operation: Any) -> Any:
     ``READ_VOLUME``; everything else is a write and gets
     ``WRITE_VOLUME``.
     """
-    from databricks.sdk.service.catalog import VolumeOperation
+    # ``VolumeOperation`` only landed in databricks-sdk 0.34+. Older SDKs
+    # accept the bare literal "READ_VOLUME" / "WRITE_VOLUME" on the wire
+    # all the same — mirror the ``_managed_volume_type`` fallback.
+    try:
+        from databricks.sdk.service.catalog import VolumeOperation as _VO
+    except ImportError:
+        _VO = None
 
-    if isinstance(operation, VolumeOperation):
+    read_volume = _VO.READ_VOLUME if _VO is not None else "READ_VOLUME"
+    write_volume = _VO.WRITE_VOLUME if _VO is not None else "WRITE_VOLUME"
+
+    if _VO is not None and isinstance(operation, _VO):
         return operation
     if operation is None:
-        return VolumeOperation.READ_VOLUME
+        return read_volume
 
     from yggdrasil.data.enums.mode import Mode
     mode = Mode.from_(operation, default=Mode.AUTO)
     if mode in (Mode.AUTO, Mode.READ_ONLY):
-        return VolumeOperation.READ_VOLUME
-    return VolumeOperation.WRITE_VOLUME
+        return read_volume
+    return write_volume
 
 
 def _mtime(info) -> float:
