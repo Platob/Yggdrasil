@@ -32,6 +32,7 @@ from yggdrasil.dataclasses.waiting import (
     WaitingConfigArg,
 )
 from yggdrasil.data.enums import Mode
+from .authorization.base import Authorization
 from .bytes_io import BytesIO
 from .headers import Headers
 from .request import PreparedRequest
@@ -341,6 +342,7 @@ class Session(ABC):
         waiting: WaitingConfig = DEFAULT_WAITING_CONFIG,
         *,
         key: str = "",
+        auth: Optional[Authorization] = None,
     ) -> None:
         # Singleton-cached instances are re-entered on every constructor call
         # (Python always invokes ``__init__`` after ``__new__``); skip the
@@ -353,6 +355,7 @@ class Session(ABC):
         self.pool_maxsize = pool_maxsize if pool_maxsize and pool_maxsize > 0 else 8
         self.headers: Headers = Headers.from_(headers)
         self.waiting = waiting
+        self._auth: Authorization | None = auth
         self._lock = threading.RLock()
         self._job_pool: Optional[JobPoolExecutor] = None
         self._initialized = True
@@ -397,6 +400,27 @@ class Session(ABC):
                     self._job_pool = JobPoolExecutor(max_workers=self.pool_maxsize)
                     LOGGER.debug("Created job pool with max_workers=%s", self.pool_maxsize)
         return self._job_pool
+
+    @property
+    def auth(self) -> Optional[Authorization]:
+        """Session-wide :class:`Authorization` handler.
+
+        When set, :meth:`prepare_request_before_send` resolves it
+        lazily into each outbound request's ``Authorization`` header,
+        unless the request carries its own :attr:`PreparedRequest.auth`
+        (per-request wins). Travels into Spark workers via the standard
+        ``__getstate__`` / ``__setstate__`` round-trip.
+        """
+        return self._auth
+
+    @auth.setter
+    def auth(self, value: Optional[Authorization]) -> None:
+        if value is not None and not isinstance(value, Authorization):
+            raise TypeError(
+                f"auth must be an Authorization instance or None; got "
+                f"{type(value).__name__}."
+            )
+        self._auth = value
 
     @property
     def x_api_key(self) -> Optional[str]:
@@ -649,6 +673,18 @@ class Session(ABC):
             if request.headers is None:
                 request.headers = {}
             request.headers.update(self.headers)
+        # Lazy auth resolution: per-request handler wins, else fall
+        # back to the session-wide handler. Each call hits the
+        # handler's ``authorization`` property so refresh-on-expiry
+        # handlers (e.g. MSAL) emit the current token per send. We
+        # write the resolved header directly instead of mutating
+        # ``request.auth`` so a request reused across sessions doesn't
+        # carry a stale session-level binding.
+        handler = request.auth or self._auth
+        if handler is not None:
+            if request.headers is None:
+                request.headers = Headers()
+            request.headers["Authorization"] = handler.authorization
         return request
 
     def prepare_response_after_received(self, response: Response) -> Response:

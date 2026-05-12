@@ -15,6 +15,7 @@ from yggdrasil.io.memory import Memory
 from yggdrasil.io.primitive import ArrowIPCIO
 from yggdrasil.io.url import URL
 
+from ..authorization.base import Authorization
 from ..request import PreparedRequest
 from ..send_config import SendConfig
 from ..session import Session
@@ -112,6 +113,7 @@ class HTTPSession(Session):
         waiting: WaitingConfig = DEFAULT_WAITING_CONFIG,
         *,
         key: str = "",
+        auth: Optional[Authorization] = None,
     ) -> None:
         if getattr(self, "_initialized", False):
             return
@@ -126,6 +128,7 @@ class HTTPSession(Session):
             headers=headers,
             waiting=waiting,
             key=key,
+            auth=auth,
         )
         self._http_pool: Optional[urllib3.PoolManager] = self._build_http_pool()
 
