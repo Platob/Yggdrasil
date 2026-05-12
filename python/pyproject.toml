@@ -1,10 +1,11 @@
 [build-system]
-# Pure-Python sdist + wheel; the Rust acceleration ships as the
-# separate `yggrs` PyPI package (see rust/) and is pulled in
-# automatically via the runtime dependency below. Native wheels for
-# `yggrs` are published in lockstep with `ygg` from the same repo
-# (.github/workflows/publish.yml + publish-native.yml).
-requires = ["setuptools>=69", "wheel"]
+# Cython-compiled accelerators ship inside `ygg` itself: the .pyx
+# sources live next to the Python modules they accelerate (see
+# ``python/src/yggdrasil/io/_url.pyx``), get compiled to .so files at
+# build time via ``python/setup.py`` (``cythonize`` driving setuptools),
+# and are imported with a pure-Python fallback so editable installs
+# without a C toolchain still work. Wheels are now platform-specific.
+requires = ["setuptools>=69", "wheel", "Cython>=3.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -152,6 +153,11 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 yggdrasil = ["py.typed"]
+
+[tool.setuptools.exclude-package-data]
+# Keep generated Cython artefacts out of the wheel — the .so is the
+# compiled product; the .c / .html dumps are build side-effects.
+"*" = ["*.c", "*.html", "*.pyx"]
 
 [tool.uv]
 native-tls = true

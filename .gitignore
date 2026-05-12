@@ -170,8 +170,8 @@ dmypy.json
 cython_debug/
 
 # Generated C files from cythonize() — the .pyx is the source of truth.
-cython/src/_yggcy/**/*.c
-cython/src/_yggcy/**/*.html
+python/src/yggdrasil/**/*.c
+python/src/yggdrasil/**/*.html
 
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

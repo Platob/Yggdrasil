@@ -50,7 +50,6 @@ from urllib.parse import (
 
 import pyarrow as pa
 
-from yggdrasil import cy as _cy
 from yggdrasil.io.parameters import anonymize_parameters
 from yggdrasil.lazy_imports import (
     bytes_io_class,
@@ -58,13 +57,16 @@ from yggdrasil.lazy_imports import (
     mime_type_class,
 )
 
-# Hot-path delegation: when the Cython extension (`yggcy`) is
-# installed, hand off URL parsing and percent-encoding to its native
-# kernels. The pure-Python fallback below stays in place for
-# environments without `yggcy` — the wheel is optional, not a hard
-# dependency. Functions are read once at module-import time so the hot
-# path stays a direct attribute lookup.
-_CY_URL = _cy.io_url
+# Hot-path delegation: the Cython kernels live in ``_url.pyx`` next
+# to this file and are compiled into ``yggdrasil/io/_url.<arch>.so``
+# at build time (see ``python/setup.py``). When the extension is
+# present, hand off URL parsing and percent-encoding to it; otherwise
+# fall back to the pure-Python helpers below. Read the module once at
+# import time so the hot path is a direct attribute lookup.
+try:
+    from yggdrasil.io import _url as _CY_URL  # type: ignore[attr-defined]
+except ImportError:
+    _CY_URL = None
 
 __all__ = [
     "URL",
