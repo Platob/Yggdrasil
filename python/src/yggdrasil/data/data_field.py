@@ -3323,16 +3323,65 @@ class Field(BaseMetadata, BaseChildrenFields):
         :class:`Schema` (which is a Field subclass). Returns the
         matching child Field, or ``default`` on miss (ellipsis
         sentinel raises).
+
+        Unlike the engine-specific selectors (which match against
+        plain column-name strings), the children here are full
+        :class:`Field` objects that may carry their own ``alias``.
+        Match priority — first hit wins:
+
+        1. ``self.name`` against each child's ``name``.
+        2. ``self.name`` against each child's ``alias``.
+        3. ``self.alias`` against each child's ``name``.
+        4. ``self.alias`` against each child's ``alias``.
+        5. ``self.position`` as the last-resort positional fallback
+           (``children[position]`` when in range).
+
+        Resolution is index-based — when the position fallback fires,
+        the field at that exact index is returned even if two
+        children happen to share a name.
         """
         children = list(other.children_fields)
-        names = [f.name for f in children]
-        column_name = self._resolve_column_name(
-            names,
-            raise_error=default is ...,
-        )
-        if column_name is None:
+        n = len(children)
+
+        self_name = self.name or None
+        self_alias = self.alias if self.has_alias else None
+
+        # Two-pass per key: name match first across all children
+        # before falling back to alias match. Keeps "name-on-name"
+        # wins over "name-on-alias" when both are present in
+        # different children.
+        for key in (self_name, self_alias):
+            if not key:
+                continue
+            for child in children:
+                if child.name == key:
+                    return child
+            for child in children:
+                if child.has_alias and child.alias == key:
+                    return child
+
+        position = self.position
+        if position is not None and 0 <= position < n:
+            return children[position]
+
+        if default is not ...:
             return default
-        return next(f for f in children if f.name == column_name)
+
+        candidates: list[str] = []
+        if self_name is not None:
+            candidates.append(self_name)
+        if self_alias is not None:
+            candidates.append(self_alias)
+        if position is not None:
+            candidates.append(f"[{position}]")
+        available = [
+            f"{f.name}{'/' + f.alias if f.has_alias else ''}"
+            for f in children
+        ]
+        raise KeyError(
+            f"Field {self.name!r} not found — looked for {candidates!r}. "
+            f"Available children (name/alias): {available}"
+        )
 
     #: Schema is a :class:`Field` subclass, so :meth:`select_in_field`
     #: handles both. ``select_in_schema`` is a readability alias for

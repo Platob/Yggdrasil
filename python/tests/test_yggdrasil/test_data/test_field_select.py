@@ -256,6 +256,81 @@ class TestSelectInField:
         out = f.select_in_field(schema, default=f)
         assert out is f
 
+    def test_finds_when_child_alias_matches_self_name(self) -> None:
+        # Source's child renames "user_id" -> "id" via its own alias.
+        # The lookup field carries name="id" and should match.
+        renamed = Field.from_(pa.field("user_id", pa.int64())).with_alias("id")
+        schema = Schema([renamed, Field.from_(pa.field("name", pa.string()))])
+        out = _id_field().select_in_field(schema)
+        assert out is not None and out.name == "user_id"
+
+    def test_finds_when_child_alias_matches_self_alias(self) -> None:
+        # Both sides carry alias "id"; neither side's bare name matches.
+        renamed = Field.from_(pa.field("user_id", pa.int64())).with_alias("id")
+        schema = Schema([renamed, Field.from_(pa.field("name", pa.string()))])
+        f = Field.from_(pa.field("identifier", pa.int64())).with_alias("id")
+        out = f.select_in_field(schema)
+        assert out is not None and out.name == "user_id"
+
+    def test_name_on_name_wins_over_name_on_alias(self) -> None:
+        # First child aliases "id" away from its real name; second child
+        # has the literal name "id". A name-on-name match must beat the
+        # alias match no matter the iteration order.
+        aliased = Field.from_(pa.field("user_id", pa.int64())).with_alias("id")
+        direct = Field.from_(pa.field("id", pa.int64()))
+        schema = Schema([aliased, direct])
+        out = _id_field().select_in_field(schema)
+        assert out is not None and out.name == "id"
+
+    def test_self_name_wins_over_self_alias(self) -> None:
+        # ``self`` has both name and alias; matching by name takes
+        # priority over matching by alias.
+        schema = Schema([
+            Field.from_(pa.field("id", pa.int64())),
+            Field.from_(pa.field("user_id", pa.int64())),
+        ])
+        f = _id_field().with_alias("user_id")
+        out = f.select_in_field(schema)
+        assert out is not None and out.name == "id"
+
+    def test_position_fallback_when_names_dont_match(self) -> None:
+        schema = Schema([
+            Field.from_(pa.field("alpha", pa.int64())),
+            Field.from_(pa.field("beta", pa.int64())),
+        ])
+        f = Field.from_(pa.field("gamma", pa.int64())).with_position(1)
+        out = f.select_in_field(schema)
+        assert out is not None and out.name == "beta"
+
+    def test_position_returns_child_at_index_with_duplicate_names(self) -> None:
+        # Two children share a name. Resolving by position must return
+        # the child at the requested index, not the first match by
+        # name (which is what a name-scan after position lookup would
+        # do).
+        a = Field.from_(pa.field("dup", pa.int64()))
+        b = Field.from_(pa.field("dup", pa.int64())).with_alias("second")
+        schema = Schema([a, b])
+        f = Field.from_(pa.field("other", pa.int64())).with_position(1)
+        out = f.select_in_field(schema)
+        assert out is b
+        assert out.alias == "second"
+
+    def test_position_out_of_range_falls_through_to_default(self) -> None:
+        schema = Schema([Field.from_(pa.field("only", pa.int64()))])
+        f = Field.from_(pa.field("missing", pa.int64())).with_position(5)
+        assert f.select_in_field(schema, default=None) is None
+        with pytest.raises(KeyError):
+            f.select_in_field(schema)
+
+    def test_error_message_lists_name_and_alias_pairs(self) -> None:
+        renamed = Field.from_(pa.field("user_id", pa.int64())).with_alias("uid")
+        schema = Schema([renamed])
+        with pytest.raises(KeyError) as info:
+            _id_field().select_in_field(schema)
+        msg = str(info.value)
+        assert "user_id/uid" in msg
+        assert "'id'" in msg
+
 
 # ---------------------------------------------------------------------------
 # CastOptions.match_by / match_by_keys
