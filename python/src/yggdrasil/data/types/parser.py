@@ -81,7 +81,14 @@ class DataTypeMetadata:
 @dataclass(frozen=True, slots=True)
 class ParsedDataType:
     type_id: DataTypeId
-    metadata: DataTypeMetadata = field(default_factory=DataTypeMetadata)
+    # Share the empty-metadata singleton instead of allocating a fresh
+    # ``DataTypeMetadata`` (and its empty ``extras`` dict) on every
+    # default construction. ``DataTypeMetadata`` is itself immutable
+    # and downstream callers treat ``extras`` as read-only — see the
+    # note on :func:`_parse_cached`.
+    metadata: "DataTypeMetadata" = field(
+        default_factory=lambda: _EMPTY_METADATA
+    )
 
     name: str | None = None
     children: tuple["ParsedDataType", ...] = ()
@@ -212,6 +219,14 @@ _MULTI_TOKEN_TYPE_NAMES = {
     "timestamp with time zone",
     "timestamp without time zone",
 }
+
+# First-word prefixes of every entry in ``_MULTI_TOKEN_TYPE_NAMES``.
+# Used as a cheap gate in :meth:`_Parser._parse_type_head_name` so the
+# 1-token fast path doesn't pay for the lookahead loop on every
+# ``int`` / ``string`` / ``timestamp_ntz`` it sees.
+_MULTI_TOKEN_FIRST_WORDS = frozenset(
+    name.split(" ", 1)[0] for name in _MULTI_TOKEN_TYPE_NAMES
+)
 
 _TYPE_METADATA_KEYS = {
     "item",
@@ -499,6 +514,22 @@ _NAME_ALIASES: dict[str, tuple[str, DataTypeId | None]] = {
 # have dedicated branches earlier in parse_primary and don't need this.
 # ---------------------------------------------------------------------
 
+# Keyword heads that ``parse_primary`` dispatches before falling through
+# to the regular type-name path. Keeping them in one frozenset lets the
+# parser do a single ``str.lower()`` + ``in`` check instead of four
+# separate ``_peek_ident_ci`` calls per primary.
+_KEYWORD_HEADS = frozenset({"optional", "annotated", "union", "literal"})
+
+
+# Shared singleton for "no metadata declared". Every ``DataTypeMetadata()``
+# default allocates an ``extras`` dict via ``default_factory``; sharing
+# one instance turns the no-op metadata path into a pointer copy.
+# Safe because ``ParsedDataType`` is immutable and downstream code is
+# documented to treat ``DataTypeMetadata.extras`` as read-only (see the
+# note on :func:`_parse_cached`).
+_EMPTY_METADATA = DataTypeMetadata()
+
+
 _BRACKET_METADATA_TYPE_IDS = frozenset({
     DataTypeId.BOOL,
     DataTypeId.INTEGER,
@@ -601,9 +632,16 @@ class _Lexer:
 
 
 class _Parser:
+    __slots__ = ("text", "tokens", "n_tokens", "index", "default")
+
     def __init__(self, text: str, *, default: Any = ...) -> None:
         self.text = text
         self.tokens = _Lexer(text).lex()
+        # Cached once so the per-token ``_current`` / ``_peek_token`` /
+        # ``_at_end`` checks don't pay a ``len()`` call each — those
+        # three helpers fire on every token boundary, so the cost adds
+        # up across deeply nested DDL.
+        self.n_tokens = len(self.tokens)
         self.index = 0
         # Stored for subclass / debug use; the parser body always
         # raises on failure and lets :meth:`ParsedDataType.parse`
@@ -670,56 +708,71 @@ class _Parser:
         )
 
     def parse_primary(self) -> ParsedDataType:
-        if self._peek_ident_ci("optional"):
-            self._advance()
-            inner = self._parse_generic_single()
-            return _set_nullable(inner, True)
+        # Dispatch the four special keyword heads (``optional`` /
+        # ``annotated`` / ``union`` / ``literal``) through a single
+        # ``.lower()`` + set check instead of four separate
+        # ``_peek_ident_ci`` calls. ``parse_primary`` runs once per
+        # type node, so this gate fires on every nested struct field.
+        tok = self.tokens[self.index] if self.index < self.n_tokens else None
+        if tok is not None and tok.kind == "ident":
+            head_low = tok.value.lower()
+            if head_low in _KEYWORD_HEADS:
+                if head_low == "optional":
+                    self.index += 1
+                    inner = self._parse_generic_single()
+                    return _set_nullable(inner, True)
 
-        if self._peek_ident_ci("annotated"):
-            self._advance()
-            inner, extras = self._parse_annotated()
-            return ParsedDataType(
-                type_id=inner.type_id,
-                metadata=replace(
-                    inner.metadata, extras={**inner.metadata.extras, **extras}
-                ),
-                name=inner.name,
-                children=inner.children,
-            )
+                if head_low == "annotated":
+                    self.index += 1
+                    inner, extras = self._parse_annotated()
+                    return ParsedDataType(
+                        type_id=inner.type_id,
+                        metadata=replace(
+                            inner.metadata,
+                            extras={**inner.metadata.extras, **extras},
+                        ),
+                        name=inner.name,
+                        children=inner.children,
+                    )
 
-        if self._peek_ident_ci("union"):
-            self._advance()
-            parts = self._parse_generic_list()
-            non_null: list[ParsedDataType] = []
-            nullable = False
+                if head_low == "union":
+                    self.index += 1
+                    parts = self._parse_generic_list()
+                    non_null: list[ParsedDataType] = []
+                    nullable = False
 
-            for part in parts:
-                if part.type_id is DataTypeId.NULL:
-                    nullable = True
-                else:
-                    non_null.append(part)
+                    for part in parts:
+                        if part.type_id is DataTypeId.NULL:
+                            nullable = True
+                        else:
+                            non_null.append(part)
 
-            if len(non_null) == 1:
-                return _set_nullable(
-                    non_null[0], True if nullable else non_null[0].metadata.nullable
+                    if len(non_null) == 1:
+                        return _set_nullable(
+                            non_null[0],
+                            True if nullable else non_null[0].metadata.nullable,
+                        )
+
+                    return ParsedDataType(
+                        type_id=DataTypeId.UNION,
+                        metadata=DataTypeMetadata(
+                            nullable=True if nullable else None
+                        ),
+                        children=tuple(non_null),
+                    )
+
+                # head_low == "literal"
+                self.index += 1
+                literals = self._parse_literal_list()
+                return ParsedDataType(
+                    type_id=DataTypeId.ENUM,
+                    metadata=DataTypeMetadata(
+                        literals=tuple(literals),
+                        enum_values=tuple(
+                            v for v in literals if isinstance(v, str)
+                        ),
+                    ),
                 )
-
-            return ParsedDataType(
-                type_id=DataTypeId.UNION,
-                metadata=DataTypeMetadata(nullable=True if nullable else None),
-                children=tuple(non_null),
-            )
-
-        if self._peek_ident_ci("literal"):
-            self._advance()
-            literals = self._parse_literal_list()
-            return ParsedDataType(
-                type_id=DataTypeId.ENUM,
-                metadata=DataTypeMetadata(
-                    literals=tuple(literals),
-                    enum_values=tuple(v for v in literals if isinstance(v, str)),
-                ),
-            )
 
         if self._peek_punct("("):
             self._advance()
@@ -1016,11 +1069,21 @@ class _Parser:
         canonical: str,
     ) -> DataTypeMetadata:
         """Default metadata for a plain-token type (no brackets seen yet)."""
-        if dtype is not None and dtype.is_integer:
-            return DataTypeMetadata(byte_size=_default_integer_byte_size(canonical))
-        if dtype is not None and dtype.is_floating_point:
-            return DataTypeMetadata(byte_size=_default_float_byte_size(canonical))
-        return DataTypeMetadata()
+        # Inline the bounds check from ``DataTypeId.is_integer`` /
+        # ``is_floating_point`` — both are simple range tests, and the
+        # property-attribute lookup is the dominant cost here.
+        value = dtype.value
+        if 20 <= value < 40:
+            byte_size = _INTEGER_BYTE_SIZES.get(canonical)
+            if byte_size is None:
+                return _EMPTY_METADATA
+            return DataTypeMetadata(byte_size=byte_size)
+        if 40 <= value < 50:
+            byte_size = _FLOAT_BYTE_SIZES.get(canonical)
+            if byte_size is None:
+                return _EMPTY_METADATA
+            return DataTypeMetadata(byte_size=byte_size)
+        return _EMPTY_METADATA
 
     # ------------------------------------------------------------------
 
@@ -1029,22 +1092,34 @@ class _Parser:
         if tok is None or tok.kind not in {"ident", "string"}:
             return self._fail("Expected type name")
 
-        # Look ahead up to 3 tokens past the head for multi-token names like
-        # `double precision` or `timestamp with time zone`. Take the longest
-        # match found in `_MULTI_TOKEN_TYPE_NAMES`; if none match, just consume
-        # the head token.
+        # Fast path: the overwhelming majority of type heads are a
+        # single token (``int`` / ``bigint`` / ``timestamp_ntz`` /
+        # ``array`` / …). Only the four entries in
+        # ``_MULTI_TOKEN_TYPE_NAMES`` need lookahead, and they all
+        # start with one of three identifiers — gate on that prefix
+        # set instead of building a list + ``" ".join`` + ``.lower()``
+        # per token on every type.
+        head_low = tok.value.lower()
+        if head_low not in _MULTI_TOKEN_FIRST_WORDS:
+            self.index += 1
+            return tok.value
+
         max_parts = 4
         best_len = 1
-        lookahead_parts = [tok.value]
+        lookahead_parts = [head_low]
 
         for offset in range(1, max_parts):
             nxt = self._peek_token(offset)
             if nxt is None or nxt.kind != "ident":
                 break
-            lookahead_parts.append(nxt.value)
-            candidate = " ".join(lookahead_parts).lower()
+            lookahead_parts.append(nxt.value.lower())
+            candidate = " ".join(lookahead_parts)
             if candidate in _MULTI_TOKEN_TYPE_NAMES:
                 best_len = len(lookahead_parts)
+
+        if best_len == 1:
+            self.index += 1
+            return tok.value
 
         selected: list[str] = []
         for _ in range(best_len):
@@ -1052,7 +1127,7 @@ class _Parser:
             if current is None:
                 break
             selected.append(current.value)
-            self._advance()
+            self.index += 1
 
         return " ".join(selected)
 
@@ -1521,21 +1596,21 @@ class _Parser:
         return True
 
     def _current(self) -> Token | None:
-        return self.tokens[self.index] if self.index < len(self.tokens) else None
+        return self.tokens[self.index] if self.index < self.n_tokens else None
 
     def _peek_token(self, offset: int) -> Token | None:
         pos = self.index + offset
-        return self.tokens[pos] if pos < len(self.tokens) else None
+        return self.tokens[pos] if pos < self.n_tokens else None
 
     def _advance(self) -> Token:
-        tok = self._current()
-        if tok is None:
+        if self.index >= self.n_tokens:
             return self._fail("Unexpected end of input")
+        tok = self.tokens[self.index]
         self.index += 1
         return tok
 
     def _at_end(self) -> bool:
-        return self.index >= len(self.tokens)
+        return self.index >= self.n_tokens
 
     def _fail(self, message: str) -> Any:
         """Signal a parse error by raising ``ValueError``.
@@ -1657,12 +1732,18 @@ def _set_nullable(parsed: ParsedDataType, nullable: bool | None) -> ParsedDataTy
     )
 
 
+@lru_cache(maxsize=2048)
 def _canonical_name(name: str) -> tuple[str, DataTypeId | None]:
     """Normalize a raw type name to its canonical alias + DataTypeId.
 
     Returns ``(canonical, None)`` for unknown names so ``parse_primary``
     can route them to the OBJECT-forward-ref fallback with the raw name
     preserved on metadata.
+
+    Memoized — the input domain is small (handful of dialect spellings
+    across every schema we see) and the function fires on every type
+    head during a cold parse; the cache turns repeated normalizations
+    into a single dict lookup.
     """
     low = name.strip().lower().replace(" ", "_").replace("-", "_")
     return _NAME_ALIASES.get(low, (low, None))
