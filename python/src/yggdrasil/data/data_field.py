@@ -426,6 +426,21 @@ class Field(BaseChildrenFields):
             metadata=_normalize_metadata(metadata, tags=tags, default_value=default),
         )
 
+    # Pre-computed full metadata keys for the tag flags below
+    # (``TAG_PREFIX + b"<name>"``). The tag accessors are some of the
+    # hottest properties on ``Field`` — every ``fields`` filter walks
+    # ``constraint_key`` per child, every ``primary_keys`` /
+    # ``foreign_keys`` projection walks the matching flag — so building
+    # the lookup key once and reading ``self.metadata`` directly saves
+    # the per-call ``_to_bytes`` + bytes concat that the generic
+    # ``_tag_flag`` path would do.
+    _TAG_KEY_PARTITION_BY: ClassVar[bytes] = TAG_PREFIX + b"partition_by"
+    _TAG_KEY_CLUSTER_BY: ClassVar[bytes] = TAG_PREFIX + b"cluster_by"
+    _TAG_KEY_PRIMARY_KEY: ClassVar[bytes] = TAG_PREFIX + b"primary_key"
+    _TAG_KEY_FOREIGN_KEY: ClassVar[bytes] = TAG_PREFIX + b"foreign_key"
+    _TAG_KEY_CONSTRAINT_KEY: ClassVar[bytes] = TAG_PREFIX + b"constraint_key"
+    _TAG_KEY_SORTED: ClassVar[bytes] = TAG_PREFIX + b"sorted"
+
     # Tag-flag → short token shown in pretty_format. Order is the
     # display order in the bracketed marker group; only flags whose
     # ``_tag_flag`` is truthy appear, so the output stays scannable
@@ -534,42 +549,73 @@ class Field(BaseChildrenFields):
         any other subclass go through normal allocation (so
         ``Schema(...)`` keeps its own constructor shape).
         """
-        if cls is Field:
-            # Pull dtype out of either positional or kwargs to match
-            # Field.__init__'s ``(name, dtype, ...)`` signature.
-            dtype = kwargs.get("dtype")
-            if dtype is None and len(args) >= 2:
-                dtype = args[1]
-            if dtype is not None:
-                try:
-                    resolved = DataType.from_any(dtype)
-                except Exception:
-                    resolved = None
-                if resolved is not None and resolved.type_id is DataTypeId.STRUCT:
-                    Schema = schema_class()
-                    instance = object.__new__(Schema)
-                    # Python's ``type.__call__`` follows up with
-                    # ``Schema.__init__(instance, *args, **kwargs)``,
-                    # which loops through ``Field.__init__`` again —
-                    # the idempotent-init guard there short-circuits
-                    # the second pass once we've stamped the slots.
-                    name = (
-                        kwargs.get("name")
-                        if "name" in kwargs
-                        else (args[0] if args else "")
-                    )
-                    Field.__init__(
-                        instance,
-                        name=name,
-                        dtype=resolved,
-                        nullable=kwargs.get("nullable", True),
-                        metadata=kwargs.get("metadata"),
-                        tags=kwargs.get("tags"),
-                        default=kwargs.get("default"),
-                        parent=kwargs.get("parent"),
-                    )
-                    return instance
-        return object.__new__(cls)
+        if cls is not Field:
+            return object.__new__(cls)
+        # Pull dtype out of either positional or kwargs to match
+        # Field.__init__'s ``(name, dtype, ...)`` signature.
+        dtype = kwargs.get("dtype")
+        if dtype is None and len(args) >= 2:
+            dtype = args[1]
+        if dtype is None:
+            return object.__new__(cls)
+        # Fast paths: answer the struct-redirect question directly off
+        # the input shape so the common non-struct case never runs
+        # ``DataType.from_any`` (which then runs a second time inside
+        # ``__init__``). Coverage:
+        #   - already-resolved ``DataType`` (the dominant case — cached
+        #     primitive singletons, ``StructType(...)``, ``MapType(...)``);
+        #   - native Arrow ``DataType`` / ``Field`` — ``pa.types.is_struct``
+        #     is a single C call;
+        #   - everything else (str shorthand, dict, dataclass, …) falls
+        #     back through ``from_any``.
+        if isinstance(dtype, DataType):
+            if dtype.type_id is not DataTypeId.STRUCT:
+                return object.__new__(cls)
+            resolved = dtype
+        elif isinstance(dtype, pa.DataType):
+            if not pa.types.is_struct(dtype):
+                return object.__new__(cls)
+            try:
+                resolved = DataType.from_any(dtype)
+            except Exception:
+                return object.__new__(cls)
+        elif isinstance(dtype, pa.Field):
+            if not pa.types.is_struct(dtype.type):
+                return object.__new__(cls)
+            try:
+                resolved = DataType.from_any(dtype)
+            except Exception:
+                return object.__new__(cls)
+        else:
+            try:
+                resolved = DataType.from_any(dtype)
+            except Exception:
+                return object.__new__(cls)
+            if resolved is None or resolved.type_id is not DataTypeId.STRUCT:
+                return object.__new__(cls)
+        Schema = schema_class()
+        instance = object.__new__(Schema)
+        # Python's ``type.__call__`` follows up with
+        # ``Schema.__init__(instance, *args, **kwargs)``, which loops
+        # through ``Field.__init__`` again — the idempotent-init guard
+        # there short-circuits the second pass once we've stamped the
+        # slots.
+        name = (
+            kwargs.get("name")
+            if "name" in kwargs
+            else (args[0] if args else "")
+        )
+        Field.__init__(
+            instance,
+            name=name,
+            dtype=resolved,
+            nullable=kwargs.get("nullable", True),
+            metadata=kwargs.get("metadata"),
+            tags=kwargs.get("tags"),
+            default=kwargs.get("default"),
+            parent=kwargs.get("parent"),
+        )
+        return instance
 
     def __init__(
         self,
@@ -581,48 +627,63 @@ class Field(BaseChildrenFields):
         default: Any = None,
         parent: "Field | None" = None,
     ) -> None:
+        # Resolve the dtype up front. ``isinstance`` short-circuit
+        # before ``DataType.from_any`` matters — ``from_any`` does an
+        # MRO walk + dispatch even when the answer is "give me back
+        # what I passed in", and Field construction is hot enough that
+        # the saved call shows up.
+        resolved_dtype = (
+            dtype if isinstance(dtype, DataType) else DataType.from_any(dtype)
+        )
         # Idempotent re-init guard for the ``Field.__new__`` struct
         # redirect: when ``__new__`` returns a fully-initialized
         # :class:`Schema`, Python still calls ``Schema.__init__`` on
         # it (which loops back through ``Field.__init__``) with the
         # original args. Detecting that case here keeps us from
-        # re-running ``DataType.from_any`` and re-stamping the cache
-        # slots a second time.
+        # re-stamping the cache slots a second time. ``self.dtype`` is
+        # a slot — accessing it on a fresh instance raises AttributeError
+        # which we treat as "not initialized yet" and proceed.
         try:
             existing = self.dtype
         except AttributeError:
             existing = None
-        if existing is not None:
-            resolved_dtype = (
-                dtype if isinstance(dtype, DataType) else DataType.from_any(dtype)
-            )
-            if existing == resolved_dtype and self.name == name:
-                return
+        if existing is not None and self.name == name and existing == resolved_dtype:
+            return
+        setattr_ = object.__setattr__
+        setattr_(self, "name", name)
+        setattr_(self, "dtype", resolved_dtype)
+        setattr_(self, "nullable", bool(nullable))
+        # Skip the ``_normalize_metadata`` call entirely when the caller
+        # passed nothing — the function would just walk into its own
+        # short-circuit and return ``None``, but the dispatch + arg
+        # marshalling shows up in the construction profile.
+        if metadata is None and tags is None and default is None:
+            normalized_meta = None
         else:
-            resolved_dtype = DataType.from_any(dtype)
-        object.__setattr__(self, "name", name)
-        object.__setattr__(self, "dtype", resolved_dtype)
-        object.__setattr__(self, "nullable", bool(nullable))
-        object.__setattr__(
-            self,
-            "metadata",
-            _normalize_metadata(metadata, tags=tags, default_value=default),
-        )
-        object.__setattr__(self, "parent", parent)
+            normalized_meta = _normalize_metadata(
+                metadata, tags=tags, default_value=default
+            )
+        setattr_(self, "metadata", normalized_meta)
+        setattr_(self, "parent", parent)
         # Initialize cache slots so the dataclass is fully populated
         # — accessing an unset slot would raise AttributeError.
-        object.__setattr__(self, "_arrow_field", None)
-        object.__setattr__(self, "_arrow_schema", None)
-        object.__setattr__(self, "_polars_field", None)
-        object.__setattr__(self, "_polars_schema", None)
-        object.__setattr__(self, "_spark_field", None)
-        object.__setattr__(self, "_spark_schema", None)
-        object.__setattr__(self, "_field_name_map", None)
-        object.__setattr__(self, "_field_name_fold_map", None)
-        object.__setattr__(self, "_hash", None)
+        setattr_(self, "_arrow_field", None)
+        setattr_(self, "_arrow_schema", None)
+        setattr_(self, "_polars_field", None)
+        setattr_(self, "_polars_schema", None)
+        setattr_(self, "_spark_field", None)
+        setattr_(self, "_spark_schema", None)
+        setattr_(self, "_field_name_map", None)
+        setattr_(self, "_field_name_fold_map", None)
+        setattr_(self, "_hash", None)
         # Adopt children — set their ``parent`` so they bubble cache
-        # invalidations back up to us when they mutate.
-        self._adopt_children()
+        # invalidations back up to us when they mutate. Skip the call
+        # entirely on primitive fields where ``dtype.children`` is
+        # always empty (saves an attribute lookup + iter() per
+        # construction, which is the dominant ``Field`` allocation
+        # shape).
+        if resolved_dtype.children:
+            self._adopt_children()
 
     # ==================================================================
     # Cache layer — invalidation + child adoption
@@ -1115,27 +1176,33 @@ class Field(BaseChildrenFields):
 
     @property
     def partition_by(self) -> bool:
-        return self._tag_flag(b"partition_by")
+        md = self.metadata
+        return bool(md and md.get(self._TAG_KEY_PARTITION_BY))
 
     @property
     def cluster_by(self) -> bool:
-        return self._tag_flag(b"cluster_by")
+        md = self.metadata
+        return bool(md and md.get(self._TAG_KEY_CLUSTER_BY))
 
     @property
     def primary_key(self) -> bool:
-        return self._tag_flag(b"primary_key")
+        md = self.metadata
+        return bool(md and md.get(self._TAG_KEY_PRIMARY_KEY))
 
     @property
     def foreign_key(self) -> bool:
-        return self._tag_flag(b"foreign_key")
+        md = self.metadata
+        return bool(md and md.get(self._TAG_KEY_FOREIGN_KEY))
 
     @property
     def constraint_key(self) -> bool:
-        return self._tag_flag(b"constraint_key")
+        md = self.metadata
+        return bool(md and md.get(self._TAG_KEY_CONSTRAINT_KEY))
 
     @property
     def sorted(self) -> bool:
-        return self._tag_flag(b"sorted")
+        md = self.metadata
+        return bool(md and md.get(self._TAG_KEY_SORTED))
 
     @property
     def comment(self) -> str | None:
@@ -1154,7 +1221,18 @@ class Field(BaseChildrenFields):
     @property
     def fields(self) -> list["Field"]:
         """Children excluding constraint-only fields."""
-        return [f for f in self.children if not f.constraint_key]
+        # Hot path: nearly every nested-field access (arrow_fields,
+        # to_arrow_schema, to_polars_schema, to_spark_schema,
+        # primary_keys / foreign_keys / constraints) routes through
+        # ``fields``. Inline the constraint-key check against the
+        # precomputed metadata key so we don't pay the property dispatch
+        # + bytes concat on every child.
+        children = self.children
+        key = self._TAG_KEY_CONSTRAINT_KEY
+        return [
+            f for f in children
+            if not (f.metadata and key in f.metadata)
+        ]
 
     @property
     def inner_fields(self) -> "OrderedDict[str, Field]":
@@ -3203,47 +3281,6 @@ class Field(BaseChildrenFields):
     # candidates and available column names included). Passing any
     # other value (a literal, a typed pa.Array, ``None``, another
     # Field for the schema variant) returns that value as-is.
-
-    def _resolve_column_name(
-        self,
-        available: Iterable[str] | None,
-        *,
-        raise_error: bool = True,
-    ) -> str | None:
-        """Pick the column name to use when selecting from a frame.
-
-        Tries :attr:`name` first, then :attr:`alias` if set, against
-        ``available`` (any iterable of column names). Returns the
-        winning string. With ``raise_error=False`` returns ``None``
-        instead of raising on a miss — useful for "best effort"
-        callers that want to skip absent fields.
-        """
-        names = list(available or ())
-        if self.name and self.name in names:
-            return self.name
-        # ``alias`` falls back to ``name`` — only worth a second
-        # lookup when the user actually configured one.
-        if self.has_alias and self.alias in names:
-            return self.alias
-        # Last-resort positional fallback: when the field carries a
-        # configured ``position`` and that index is in range,
-        # resolve to the column at that index. Lets callers carry
-        # "this is the third column" intent through a schema diff
-        # where names rotate.
-        position = self.position
-        if position is not None and 0 <= position < len(names):
-            return names[position]
-        if not raise_error:
-            return None
-        candidates = [self.name]
-        if self.has_alias:
-            candidates.append(self.alias)
-        if position is not None:
-            candidates.append(f"[{position}]")
-        raise KeyError(
-            f"Field {self.name!r} not found — looked for "
-            f"{candidates!r}. Available columns: {names}"
-        )
 
     # ==================================================================
     # Fill — null-only dispatch (no cast), mirrors the cast dispatcher
