@@ -4,13 +4,16 @@ Two cast surfaces under test:
 
 * :func:`cast_arrow_list_array` — list / large_list / fixed_size_list
   / list_view / large_list_view / chunked_list source → list /
-  large_list / fixed_size_list / list_view / large_list_view target.
+  large_list / fixed_size_list target. ListView / LargeListView
+  inputs are normalised to compact List/LargeList on the way in;
+  view *targets* aren't supported (Parquet has no view encoding),
+  see :class:`TestListRejections`.
 * :func:`cast_arrow_map_array_to_list` — map<k,v> →
   list<struct<key,value>>; the inverse direction lives in
   ``test_map``.
 
-Plus the rejection paths: mismatched source kind and struct items
-that don't fit the (key, value) 2-ary contract.
+Plus the rejection paths: mismatched source kind, list_view target,
+and struct items that don't fit the (key, value) 2-ary contract.
 """
 from __future__ import annotations
 
@@ -172,6 +175,23 @@ class TestListRejections:
                 ),
             )
 
+    def test_list_view_target_rejected(
+        self,
+        source_array_field: Field,
+        target_view_array_field: Field,
+    ) -> None:
+        array = pa.array([[1, 2]], type=pa.list_(pa.int64()))
+
+        with pytest.raises(pa.ArrowInvalid, match="Cannot cast"):
+            cast_arrow_list_array(
+                array,
+                CastOptions(
+                    source=source_array_field,
+                    target=target_view_array_field,
+                ),
+            )
+
+
 class TestListViewSource:
     """ListView / LargeListView source coverage.
 
@@ -240,53 +260,6 @@ class TestListViewSource:
         )
 
         assert result.to_pylist() == [["1", "2"], None, ["3", "4", "5"]]
-
-
-class TestListViewTarget:
-    """``view=True`` target builds a ListView / LargeListView from the
-    cast result instead of raising.
-    """
-
-    def test_list_to_list_view(
-        self,
-        source_array_field: Field,
-        target_view_array_field: Field,
-    ) -> None:
-        array = pa.array(
-            [[1, 2], [3, None], None, [4, 5, 6]],
-            type=pa.list_(pa.int64()),
-        )
-
-        result = cast_arrow_list_array(
-            array,
-            CastOptions(
-                source=source_array_field,
-                target=target_view_array_field,
-            ),
-        )
-
-        assert isinstance(result, pa.ListViewArray)
-        assert result.type == pa.list_view(pa.string())
-        assert result.to_pylist() == [
-            ["1", "2"], ["3", None], None, ["4", "5", "6"],
-        ]
-
-    def test_list_view_to_list_view(
-        self,
-        target_view_array_field: Field,
-    ) -> None:
-        array = pa.array(
-            [[1, 2], [3], [4, 5, 6]],
-            type=pa.list_view(pa.int64()),
-        )
-
-        result = cast_arrow_list_array(
-            array,
-            CastOptions(target=target_view_array_field),
-        )
-
-        assert isinstance(result, pa.ListViewArray)
-        assert result.to_pylist() == [["1", "2"], ["3"], ["4", "5", "6"]]
 
 
 class TestListViewOfStructWide:
@@ -441,16 +414,12 @@ class TestListViewOfStructWide:
         assert roundtripped.to_pylist() == casted.to_pylist()
         assert pa.types.is_list(roundtripped.type)
 
-    def test_large_list_view_target_then_cast_back_writes_to_parquet(
+    def test_large_list_view_source_then_write_to_parquet(
         self, tmp_path,
     ) -> None:
-        """Verify the full view round-trip: list -> large_list_view ->
-        large_list and parquet round-trip.
-
-        Parquet rejects ``large_list_view`` directly; the realistic
-        flow is "cast to view for in-memory analytics, cast back to
-        list before persistence". Both legs of that chain go through
-        :func:`cast_arrow_list_array`.
+        """Same shape but with ``large_list_view`` on the source side
+        — verifies the int64-offsets variant of the source
+        normalisation path also Parquet-round-trips.
         """
         import pyarrow.parquet as pq
 
@@ -459,16 +428,9 @@ class TestListViewOfStructWide:
 
         src = pa.array(
             [[1, 2], None, [3, 4, 5]] * 100,
-            type=pa.list_(pa.int64()),
+            type=pa.large_list_view(pa.int64()),
         )
 
-        view_target = Field(
-            "vals",
-            ArrayType.from_item(
-                Field("item", IntegerType(byte_size=8, signed=True)),
-                large=True, view=True,
-            ),
-        )
         list_target = Field(
             "vals",
             ArrayType.from_item(
@@ -477,20 +439,15 @@ class TestListViewOfStructWide:
             ),
         )
 
-        as_view = cast_arrow_list_array(
-            src, CastOptions(target=view_target),
-        )
-        assert isinstance(as_view, pa.LargeListViewArray)
-
         as_list = cast_arrow_list_array(
-            as_view, CastOptions(target=list_target),
+            src, CastOptions(target=list_target),
         )
         assert isinstance(as_list, pa.LargeListArray)
 
-        path = tmp_path / "large_list_view_round_trip.parquet"
+        path = tmp_path / "large_list_view_source.parquet"
         pq.write_table(pa.table({"vals": as_list}), path)
         roundtripped = pq.read_table(path)["vals"].combine_chunks()
-        assert roundtripped.to_pylist() == as_view.to_pylist() == src.to_pylist()
+        assert roundtripped.to_pylist() == src.to_pylist()
 
 
 # ---------------------------------------------------------------------------

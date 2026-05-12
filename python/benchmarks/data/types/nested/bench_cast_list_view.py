@@ -1,5 +1,5 @@
 """Benchmark ``ArrayType`` casts on ``list_view`` / ``large_list_view``
-sources and targets across pyarrow / polars / pandas.
+sources across pyarrow / polars / pandas.
 
 Why this exists
 ---------------
@@ -8,9 +8,14 @@ Why this exists
 pairs — rows can point anywhere into the shared values buffer in any
 order, and ranges may overlap. ``pyarrow.compute.cast(list_view → list)``
 silently drops rows whose offsets don't pack into monotone List
-offsets; we materialise via ``flatten()`` + ``cumulative_sum(sizes)``
-in :func:`yggdrasil.data.types.nested.array.cast_arrow_list_array` to
-keep every row, including out-of-order and overlapping layouts.
+offsets; we normalise on the way in via
+:func:`yggdrasil.data.types.nested.array.cast_arrow_list_array` so
+every row survives, including out-of-order and overlapping layouts.
+
+ListView / LargeListView *targets* aren't supported (Parquet has no
+view encoding and pyarrow's view-side casts are inconsistent across
+builds) — the cast helper raises in that direction. This bench only
+measures source-side normalisation.
 
 Workloads measured here:
 
@@ -18,11 +23,9 @@ Workloads measured here:
   baseline.
 * ``list_view<struct{...wide...}>`` → ``list<struct{narrowed}>`` — the
   realistic event-array shape with many struct items per row. Two
-  axes: items-per-row (``small`` / ``wide``) and out-of-order layouts
-  (``ordered`` / ``out_of_order``).
-* ``list<...>`` → ``list_view<...>`` — the reverse path that builds
-  the (offsets, sizes) view from the compact list output.
-* ``large_list_view`` round-trip — int64 offsets path.
+  axes: items-per-row and out-of-order layouts (``ordered`` /
+  ``out_of_order``).
+* ``large_list_view`` source — int64 offsets path.
 * End-to-end Parquet round-trip — Parquet has no native list_view
   encoding, so the full ingest flow is "cast list_view source → list
   → Parquet write → Parquet read". Measures the whole chain.
@@ -196,27 +199,11 @@ def _arrow_scenarios(rows: int, items_per_row: int, repeat: int) -> list[dict]:
         "vals",
         ArrayType.from_item(Field("item", IntegerType(byte_size=4, signed=True))),
     )
-    int_view_target = Field(
-        "vals",
-        ArrayType.from_item(
-            Field("item", IntegerType(byte_size=4, signed=True)), view=True,
-        ),
-    )
 
     wide_lv = _build_wide_list_view(items_per_row, rows)
     wide_lv_oo = _build_out_of_order_list_view(rows, items_per_row)
     wide_target = Field(
         "rows", ArrayType.from_item(_wide_struct_target_field(int_byte_size=4)),
-    )
-    wide_view_target = Field(
-        "rows",
-        ArrayType.from_item(_wide_struct_target_field(int_byte_size=4)),
-    )
-    # Patch view=True via dataclasses.replace
-    from dataclasses import replace
-    wide_view_target = Field(
-        wide_view_target.name,
-        replace(wide_view_target.dtype, view=True),
     )
 
     wide_large_lv = _build_wide_large_list_view(items_per_row, rows)
@@ -225,22 +212,10 @@ def _arrow_scenarios(rows: int, items_per_row: int, repeat: int) -> list[dict]:
         ArrayType.from_item(_wide_struct_target_field(int_byte_size=4), large=True),
     )
 
-    # Compact list source for the reverse direction (list -> list_view).
-    wide_list = pa.array(
-        _wide_payload(items_per_row, rows),
-        type=pa.list_(_wide_struct_arrow_type()),
-    )
-
     out.append(_time_one(
         f"arrow: list_view<int64> -> list<int32> rows={rows}",
         lambda: cast_arrow_list_array(
             int_lv, CastOptions(target=int_target)),
-        repeat=repeat, inner=200,
-    ))
-    out.append(_time_one(
-        f"arrow: list_view<int64> -> list_view<int32> rows={rows}",
-        lambda: cast_arrow_list_array(
-            int_lv, CastOptions(target=int_view_target)),
         repeat=repeat, inner=200,
     ))
     out.append(_time_one(
@@ -253,12 +228,6 @@ def _arrow_scenarios(rows: int, items_per_row: int, repeat: int) -> list[dict]:
         f"arrow: list_view<struct{{16}}>x{items_per_row} OUT-OF-ORDER -> list rows={rows}",
         lambda: cast_arrow_list_array(
             wide_lv_oo, CastOptions(target=wide_target)),
-        repeat=repeat, inner=20,
-    ))
-    out.append(_time_one(
-        f"arrow: list<struct{{16}}>x{items_per_row} -> list_view<struct> rows={rows}",
-        lambda: cast_arrow_list_array(
-            wide_list, CastOptions(target=wide_view_target)),
         repeat=repeat, inner=20,
     ))
     out.append(_time_one(

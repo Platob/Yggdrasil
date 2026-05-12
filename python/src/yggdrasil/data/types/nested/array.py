@@ -605,12 +605,13 @@ def cast_arrow_list_array(
     # — sizes can overlap or be out-of-order, and pyarrow's ``pc.cast``
     # to regular list silently drops rows it can't pack into monotone
     # offsets. Normalise to the equivalent compact List/LargeList up
-    # front (one ``cumulative_sum`` + ``flatten``, fully vectorised) so
-    # the rest of this function works on the regular layout it was
-    # written for, then materialise back to the requested view at the
-    # end if the target asked for one. Same pattern as the JSON-string
-    # branch above: detect the awkward source shape, route through a
-    # specialised normaliser, fall back into the shared cast path.
+    # front so the rest of this function works on the regular layout
+    # it was written for. View *targets* aren't supported on the way
+    # out — Parquet has no list_view encoding and pyarrow's view-side
+    # support is patchy across builds; the raise below catches that.
+    # Same pattern as the JSON-string branch above: detect the awkward
+    # source shape, route through a specialised normaliser, fall back
+    # into the shared cast path.
     if pat.is_list_view(array.type) or pat.is_large_list_view(array.type):
         array = _list_view_to_list(array)
 
@@ -639,16 +640,13 @@ def cast_arrow_list_array(
         )
 
     if target_type.view:
-        # Build the requested ListView / LargeListView from the compact
-        # (offsets, values) we just produced. Sizes are the diff between
-        # consecutive offsets; the view itself reuses the same offsets
-        # array minus the trailing total. All vectorised — no per-row
-        # work — keeping parity with the regular-list rebuild paths.
-        return _list_to_list_view(
-            offsets=src_offsets,
-            values=target_values,
-            mask=array.is_null(),
-            large=target_type.large,
+        # ListView / LargeListView targets aren't supported as a cast
+        # output — Parquet doesn't carry the encoding and pyarrow's
+        # view-side casts are inconsistent across builds. Callers that
+        # need a view layout should construct one directly from the
+        # rebuilt list with ``ListViewArray.from_arrays``.
+        raise pa.ArrowInvalid(
+            f"Cannot cast {options.source} to {options.target}"
         )
 
     if target_type.large:
@@ -790,41 +788,6 @@ def _build_list_from_compact(
         )
     return pa.ListArray.from_arrays(
         offsets=offsets, values=values, mask=mask,
-    )
-
-
-def _list_to_list_view(
-    *,
-    offsets: pa.Array,
-    values: pa.Array,
-    mask: pa.Array,
-    large: bool,
-) -> "pa.ListViewArray | pa.LargeListViewArray":
-    """Build a (Large)ListView from the compact (offsets, values) we get
-    out of the regular cast path.
-
-    ``offsets`` here is the canonical List offsets array (length N+1,
-    starts at 0, monotone). The view layout wants per-row
-    ``(offset, size)`` pairs of length N — slice off the trailing total
-    and derive sizes via ``pc.subtract`` over the original.
-    """
-    import pyarrow.compute as pc
-
-    view_offsets = offsets.slice(0, len(offsets) - 1)
-    sizes = pc.subtract(offsets.slice(1), view_offsets)
-
-    if large:
-        return pa.LargeListViewArray.from_arrays(
-            offsets=view_offsets,
-            sizes=sizes,
-            values=values,
-            mask=mask,
-        )
-    return pa.ListViewArray.from_arrays(
-        offsets=view_offsets,
-        sizes=sizes,
-        values=values,
-        mask=mask,
     )
 
 
