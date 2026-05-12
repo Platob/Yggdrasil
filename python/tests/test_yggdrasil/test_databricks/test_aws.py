@@ -322,3 +322,109 @@ class TestRefresherKeyIsolation:
         assert "READ_ONLY" in key_r
         assert "OVERWRITE" in key_w
         assert AWSDatabricksVolumeCredentials.__name__ in key_r
+
+
+# ===========================================================================
+# Auto self-grant EXTERNAL_USE_SCHEMA on credential mint failure
+# ===========================================================================
+
+
+class _PermissionDenied(Exception):
+    """Locally-typed stand-in for ``databricks.sdk.errors.platform.PermissionDenied``.
+
+    The recovery hook keys off ``type(exc).__name__ == 'PermissionDenied'``
+    so an in-test exception with that name is sufficient — we don't need
+    to import the real SDK error class.
+    """
+
+
+PermissionDenied = type("PermissionDenied", (_PermissionDenied,), {})
+
+
+_EXTERNAL_USE_MSG = (
+    "User does not have EXTERNAL USE SCHEMA on Schema "
+    "'trading_tgp_dev.unittest'. Config: host=...."
+)
+
+
+class TestExternalUseSchemaSelfGrant:
+
+    @staticmethod
+    def _wire_self_grant(client) -> MagicMock:
+        """Hook ``current_user`` and ``schemas.schema(...).grant(...)``
+        on *client* so the recovery path has something to call."""
+        # ``name=`` is a reserved MagicMock kwarg — set attributes
+        # explicitly so ``getattr(user, "name", None)`` works as
+        # expected (and email/username, which aren't reserved, can ride
+        # along on the constructor).
+        user = MagicMock(email="alice@example.com", username="alice")
+        user.name = "alice"
+        client.iam.users.current_user = user
+        schema = MagicMock()
+        client.schemas.schema.return_value = schema
+        return schema
+
+    def test_self_grants_and_retries_on_external_use_schema_denied(self) -> None:
+        client, gen = _volume_client()
+        # First call → PermissionDenied; second call → fresh creds.
+        gen.side_effect = [
+            PermissionDenied(_EXTERNAL_USE_MSG),
+            _aws_creds_response(),
+        ]
+        schema = self._wire_self_grant(client)
+
+        p = AWSDatabricksVolumeCredentials("vid-A", client=client)
+        out = p.get_credentials(mode="overwrite")
+        assert isinstance(out, AwsCredentials)
+        # The mint was tried twice (fail → recover → succeed).
+        assert gen.call_count == 2
+        # Schema was looked up by the two-part name from the error
+        # message; grant landed on the current user.
+        client.schemas.schema.assert_called_once_with(
+            catalog_name="trading_tgp_dev", schema_name="unittest",
+        )
+        schema.grant.assert_called_once_with(
+            "alice@example.com", "EXTERNAL_USE_SCHEMA",
+        )
+
+    def test_non_external_use_permission_denied_propagates(self) -> None:
+        client, gen = _volume_client()
+        gen.side_effect = PermissionDenied(
+            "User does not have SELECT on Table 'cat.sch.tbl'."
+        )
+        schema = self._wire_self_grant(client)
+
+        p = AWSDatabricksVolumeCredentials("vid-A", client=client)
+        with pytest.raises(PermissionDenied):
+            p.get_credentials()
+        # No grant attempted — message didn't match.
+        schema.grant.assert_not_called()
+        assert gen.call_count == 1
+
+    def test_grant_failure_propagates_original_error(self) -> None:
+        # When the self-grant itself fails (caller isn't owner), the
+        # original PermissionDenied wins — that's the actionable error.
+        client, gen = _volume_client()
+        original = PermissionDenied(_EXTERNAL_USE_MSG)
+        gen.side_effect = [original, _aws_creds_response()]
+        schema = self._wire_self_grant(client)
+        schema.grant.side_effect = RuntimeError("not owner")
+
+        p = AWSDatabricksVolumeCredentials("vid-A", client=client)
+        with pytest.raises(PermissionDenied) as info:
+            p.get_credentials()
+        assert info.value is original
+        # No retry of the mint happened.
+        assert gen.call_count == 1
+
+    def test_no_principal_skips_grant(self) -> None:
+        client, gen = _volume_client()
+        gen.side_effect = PermissionDenied(_EXTERNAL_USE_MSG)
+        user = MagicMock(email=None, username=None)
+        user.name = None
+        client.iam.users.current_user = user
+
+        p = AWSDatabricksVolumeCredentials("vid-A", client=client)
+        with pytest.raises(PermissionDenied):
+            p.get_credentials()
+        client.schemas.schema.assert_not_called()
