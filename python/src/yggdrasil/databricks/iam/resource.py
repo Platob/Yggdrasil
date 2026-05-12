@@ -79,7 +79,8 @@ class IAMUser(DatabricksResource):
         client_type: ClientType = ClientType.ACCOUNT,
         **kwargs: Any,
     ):
-        super().__init__(service=service, id=id, **kwargs)
+        super().__init__(service=IAMUsers.current() if service is None else service)
+        object.__setattr__(self, "id", id)
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "username", username)
         object.__setattr__(self, "emails", emails)

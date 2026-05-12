@@ -141,6 +141,8 @@ class IAMGroups(IAM):
         group_id: str | None = None,
         client_type: Optional[ClientType] = None
     ):
+        from .resource import IAMGroup
+
         if isinstance(obj, IAMGroup):
             return self.delete_group(group=obj, client_type=client_type)
         elif group_id:
@@ -154,6 +156,8 @@ class IAMGroups(IAM):
         *,
         client_type: Optional[ClientType] = None
     ):
+        from .resource import IAMGroup
+
         if isinstance(group, IAMGroup):
             group_id = group.id
 
