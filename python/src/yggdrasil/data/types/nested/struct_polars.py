@@ -61,6 +61,7 @@ def cast_polars_struct_expr(
         raise TypeError(f"Cannot cast {options.source} to {options.target}")
 
     source_field: "Field" = options.source
+    source_type: "StructType" = source_field.dtype
     target_type: "StructType" = options.target.dtype
 
     fields: list[Any] = []
@@ -70,6 +71,18 @@ def cast_polars_struct_expr(
 
         if source_child is None:
             child_expr = target_child.default_polars_expr(alias=target_child.name)
+        elif (
+            source_child.name == target_child.name
+            and source_child.dtype.to_polars() == target_child.dtype.to_polars()
+        ):
+            # Per-child fast path — when the source child already
+            # lowers to the same polars dtype with the same name, the
+            # recursive cast would produce ``expr.struct.field(name)``
+            # back. Skip the ``options.copy`` + recursive walk
+            # entirely.  Wide structs (32+ fields where only one
+            # widens) otherwise pay per-child option-clone overhead
+            # the polars engine can't see through.
+            child_expr = expr.struct.field(source_child.name)
         else:
             child_expr = target_child.cast_polars_expr(
                 expr.struct.field(source_child.name),

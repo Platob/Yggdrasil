@@ -416,6 +416,14 @@ class StructType(NestedType):
         series: "polars.Series",
         options: "CastOptions",
     ) -> "polars.Series":
+        # Engine-level bypass mirroring :meth:`_cast_arrow_array` — when
+        # the series' polars dtype already matches the target's
+        # projection, the per-child rebuild produces the same series
+        # back. Skip the ``check_source`` peek + DataFrame/select hop
+        # that the expression path takes downstream.
+        if series.dtype == self.to_polars():
+            return series
+
         pl = polars_module()
         options = options.check_source(series).check_target(self)
 

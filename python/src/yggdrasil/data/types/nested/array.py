@@ -465,6 +465,12 @@ class ArrayType(NestedType):
         series: "polars.Series",
         options: "CastOptions",
     ) -> "polars.Series":
+        # Engine-level bypass — see :meth:`StructType._cast_polars_series`
+        # for the rationale.  ``pl.List`` equality already walks inner
+        # dtypes so a list<inner> MATCH collapses to identity here.
+        if series.dtype == self.to_polars():
+            return series
+
         pl = polars_module()
         options = options.check_source(series).check_target(self)
 
