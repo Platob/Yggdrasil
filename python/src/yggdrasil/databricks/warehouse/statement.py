@@ -66,6 +66,7 @@ from yggdrasil.data.statement import (
 from yggdrasil.databricks.sql.exceptions import SQLError
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
 from yggdrasil.data.enums import MimeType, MimeTypes
+from yggdrasil.data.enums.state import State
 from yggdrasil.io.tabular import Tabular
 from ..fs import VolumePath, DatabricksPath
 from ..sql.types import parse_databricks_field
@@ -108,6 +109,20 @@ DONE_STATES = {
 FAILED_STATES = {
     StatementState.FAILED,
     StatementState.CANCELED,
+}
+
+
+# Map the Databricks SDK ``StatementState`` to the unified
+# :class:`yggdrasil.data.enums.State`. ``CLOSED`` is "result already
+# fetched / TTL elapsed" — terminal but not an error, so it buckets with
+# ``SUCCEEDED`` (matches the legacy ``done and not failed`` behavior).
+_SDK_TO_STATE: dict[StatementState, State] = {
+    StatementState.PENDING:   State.PENDING,
+    StatementState.RUNNING:   State.RUNNING,
+    StatementState.SUCCEEDED: State.SUCCEEDED,
+    StatementState.CLOSED:    State.SUCCEEDED,
+    StatementState.FAILED:    State.FAILED,
+    StatementState.CANCELED:  State.CANCELED,
 }
 
 
@@ -636,7 +651,12 @@ class WarehouseStatementResult(StatementResult):
 
     @property
     def started(self) -> bool:
-        """True once the statement has been submitted (``statement_id`` present)."""
+        """True once the statement has been submitted (``statement_id`` present).
+
+        Doesn't read :attr:`state` (which would refresh) — the
+        ``statement_id`` is set synchronously by :meth:`start` and is
+        the cheapest started-flag the warehouse path has.
+        """
         return bool(self.statement_id)
 
     @property
@@ -762,6 +782,10 @@ class WarehouseStatementResult(StatementResult):
         """Cancel the running statement.  No-op when not started or already terminal."""
         if not self.started or self.statement_id == "SparkSQL":
             return self
+        # Use the cached SDK response directly here — we don't want to
+        # trigger ``state``'s refresh just to short-circuit on an already
+        # terminal statement, and the cached response is authoritative
+        # for this check.
         if self._response is not None and self._response.status.state in DONE_STATES:
             return self
 
@@ -828,16 +852,31 @@ class WarehouseStatementResult(StatementResult):
         return self.response.status
 
     @property
-    def state(self) -> StatementState:
+    def sdk_state(self) -> StatementState:
+        """Backend-typed :class:`StatementState` (Databricks SDK).
+
+        Use :attr:`state` for the unified :class:`State` enum that
+        ``done`` / ``failed`` / ``started`` derive from; reach for
+        ``sdk_state`` only when a caller specifically needs the SDK
+        type (e.g. for pattern matching against ``StatementState``
+        members the unified enum collapses, like ``CLOSED``).
+        """
         return self.status.state
 
-    @property
-    def done(self) -> bool:
-        return self.state in DONE_STATES
+    def _compute_state(self) -> State:
+        """Refresh and map the SDK state onto the unified :class:`State`.
 
-    @property
-    def failed(self) -> bool:
-        return self.state in FAILED_STATES
+        Single source of truth for ``done`` / ``failed`` / ``started``
+        on the warehouse path; the base ``state`` property caches this
+        for the duration of any :meth:`state_snapshot` block so a code
+        path that checks several state-derived predicates only hits the
+        warehouse status endpoint once.
+        """
+        self.refresh_status()
+        if self._response is None or self._response.status is None:
+            return State.PENDING
+        sdk = self._response.status.state
+        return _SDK_TO_STATE.get(sdk, State.PENDING) if sdk is not None else State.PENDING
 
     # ------------------------------------------------------------------
     # Transient-failure detection (overrides base)
@@ -893,7 +932,8 @@ class WarehouseStatementResult(StatementResult):
 
     def _raise_for_status(self) -> None:
         # Auto-promote happens in the base raise_for_status() before this
-        # hook fires; we just raise the backend-specific exception.
+        # hook fires (inside its ``state_snapshot`` block — this access
+        # of ``self.failed`` reuses that snapshot, no extra refresh).
         if self.failed:
             raise SQLError.from_statement(self)
 
