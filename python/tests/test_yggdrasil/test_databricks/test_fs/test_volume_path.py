@@ -636,7 +636,7 @@ class TestTemporaryCredentials:
 
 class TestCredentialsRefresherSingleton:
 
-    def test_same_volume_same_operation_collapses_to_one_refresher(
+    def test_same_volume_collapses_to_one_provider(
         self, workspace, client,
     ) -> None:
         from yggdrasil.databricks.fs.volume_path import VolumeCredentialsRefresher
@@ -647,12 +647,12 @@ class TestCredentialsRefresherSingleton:
         # Two distinct VolumePath instances pointing at the same volume.
         p1 = VolumePath("/Volumes/cat/sch/vol/x", client=client)
         p2 = VolumePath("/Volumes/cat/sch/vol/y", client=client)
-        r1 = p1.credentials_refresher(mode="read")
-        r2 = p2.credentials_refresher(mode="read")
+        r1 = p1.credentials_refresher()
+        r2 = p2.credentials_refresher()
         assert isinstance(r1, VolumeCredentialsRefresher)
         assert r1 is r2
 
-    def test_different_operation_yields_different_refresher(
+    def test_get_credentials_per_mode_hits_right_operation(
         self, workspace, client,
     ) -> None:
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
@@ -660,11 +660,13 @@ class TestCredentialsRefresherSingleton:
         gen.return_value = _aws_creds_response()
 
         p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
-        r_read = p.credentials_refresher(mode="read")
-        r_write = p.credentials_refresher(mode="overwrite")
-        assert r_read is not r_write
+        r = p.credentials_refresher()
+        r.get_credentials(mode="read")
+        r.get_credentials(mode="overwrite")
+        ops = [_op_token(c.kwargs["operation"]) for c in gen.call_args_list]
+        assert "READ_VOLUME" in ops and "WRITE_VOLUME" in ops
 
-    def test_different_volume_id_yields_different_refresher(
+    def test_different_volume_id_yields_different_provider(
         self, workspace, client,
     ) -> None:
         gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
@@ -674,39 +676,41 @@ class TestCredentialsRefresherSingleton:
             name="v1", volume_id="vid-A",
         )
         p1 = VolumePath("/Volumes/cat/sch/v1/x", client=client)
-        r1 = p1.credentials_refresher(mode="read")
+        r1 = p1.credentials_refresher()
 
         workspace.volumes.read.return_value = _volume_info(
             name="v2", volume_id="vid-B",
         )
         p2 = VolumePath("/Volumes/cat/sch/v2/x", client=client)
-        r2 = p2.credentials_refresher(mode="read")
+        r2 = p2.credentials_refresher()
         assert r1 is not r2
 
-    def test_aws_client_shared_through_refresher(self, workspace, client) -> None:
+    def test_aws_client_shared_through_provider(self, workspace, client) -> None:
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
         gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         gen.return_value = _aws_creds_response()
 
         p1 = VolumePath("/Volumes/cat/sch/vol/x", client=client)
         p2 = VolumePath("/Volumes/cat/sch/vol/y", client=client)
-        # Same volume + operation + region → same AWSClient instance.
+        # Same volume + mode + region → same AWSClient instance.
         c1 = p1.aws(mode="read", region="us-east-1")
         c2 = p2.aws(mode="read", region="us-east-1")
         assert c1 is c2
 
-    def test_aws_client_cached_per_region(self, workspace, client) -> None:
+    def test_aws_client_cached_per_mode_and_region(self, workspace, client) -> None:
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
         gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         gen.return_value = _aws_creds_response()
 
         p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
-        r = p.credentials_refresher(mode="read")
-        c_us = r.aws_client(region="us-east-1")
-        c_eu = r.aws_client(region="eu-central-1")
-        c_us_again = r.aws_client(region="us-east-1")
+        r = p.credentials_refresher()
+        c_us = r.aws_client(mode="read", region="us-east-1")
+        c_eu = r.aws_client(mode="read", region="eu-central-1")
+        c_us_write = r.aws_client(mode="overwrite", region="us-east-1")
+        c_us_again = r.aws_client(mode="read", region="us-east-1")
         assert c_us is c_us_again
         assert c_us is not c_eu
+        assert c_us is not c_us_write
 
     def test_workspace_rebound_on_repeat_construction(self, workspace, client) -> None:
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
@@ -715,7 +719,7 @@ class TestCredentialsRefresherSingleton:
 
         # First binding uses ``workspace`` (fixture-provided).
         p1 = VolumePath("/Volumes/cat/sch/vol/x", client=client)
-        r1 = p1.credentials_refresher(mode="read")
+        r1 = p1.credentials_refresher()
         assert r1.workspace is workspace
 
         # Second binding with a different client must refresh the
@@ -726,7 +730,7 @@ class TestCredentialsRefresherSingleton:
         workspace_b.volumes.read.return_value = _volume_info(volume_id="vid-A")
         workspace_b.temporary_volume_credentials.generate_temporary_volume_credentials.return_value = _aws_creds_response()
         p2 = VolumePath("/Volumes/cat/sch/vol/y", client=client_b)
-        r2 = p2.credentials_refresher(mode="read")
+        r2 = p2.credentials_refresher()
         assert r2 is r1
         assert r2.workspace is workspace_b
 
@@ -737,13 +741,13 @@ class TestCredentialsRefresherSingleton:
         gen.return_value = _aws_creds_response()
 
         p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
-        r = p.credentials_refresher(mode="read")
+        r = p.credentials_refresher()
         # In-process pickle round-trip must collapse to the same
         # singleton (no duplicate boto session, no duplicate refresh).
         loaded = pickle.loads(pickle.dumps(r))
         assert loaded is r
 
-    def test_refresher_call_returns_canonical_credentials(self, workspace, client) -> None:
+    def test_get_credentials_returns_canonical_credentials(self, workspace, client) -> None:
         from yggdrasil.aws.config import AwsCredentials
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
         gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
@@ -752,8 +756,8 @@ class TestCredentialsRefresherSingleton:
         )
 
         p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
-        r = p.credentials_refresher(mode="read")
-        out = r()
+        r = p.credentials_refresher()
+        out = r.get_credentials(mode="read")
         assert isinstance(out, AwsCredentials)
         assert out.access_key_id == "AKIA-direct"
         assert out.secret_access_key == "secret-direct"
@@ -915,7 +919,7 @@ class TestStoragePath:
             storage_location="ftp://nope/no",
         )
         p = VolumePath("/Volumes/c/s/v/x", client=client)
-        with pytest.raises(ValueError, match="no registered Path class"):
+        with pytest.raises(ValueError, match="Unknown scheme"):
             p.storage_path()
 
 

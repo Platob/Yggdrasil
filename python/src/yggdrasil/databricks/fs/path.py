@@ -433,6 +433,12 @@ class DatabricksPath(RemotePath):
         self._client = client
         return self
 
+    @property
+    def workspace_client(self) -> Any:
+        """Shortcut for ``self.client.workspace_client()`` — the live
+        Databricks SDK workspace handle every SDK call routes through."""
+        return self.client.workspace_client()
+
     # ==================================================================
     # Retry policy
     # ==================================================================

@@ -59,7 +59,6 @@ from yggdrasil.data.enums import Scheme
 from yggdrasil.io.primitive import ParquetIO
 from yggdrasil.data.enums import MimeTypes, MimeType, MediaType
 from yggdrasil.data.enums.mode import ModeLike, Mode
-from yggdrasil.lazy_imports import aws_config_class
 
 from .column import Column
 from .sql_utils import (
@@ -82,6 +81,7 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.sql.columns import Columns
     from yggdrasil.databricks.sql.schema import Schema as UCSchema
     from yggdrasil.aws.client import AWSClient
+    from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
     from yggdrasil.databricks.warehouse import WarehousePreparedStatement
     from yggdrasil.io.nested import DeltaIO
     from yggdrasil.io.path import Path
@@ -3394,37 +3394,43 @@ class Table(DatabricksResource, Holder):
 
         return DeltaIO.from_path(self.storage_location(operation=operation))
 
-    def aws(self, operation: TableOperation = TableOperation.READ) -> "AWSClient":
+    def aws(
+        self,
+        operation: "TableOperation | ModeLike | None" = None,
+        *,
+        region: Optional[str] = None,
+    ) -> "AWSClient":
         """Return an :class:`AWSClient` whose credentials self-refresh
-        from :meth:`temporary_credentials`.
+        from Unity Catalog's ``temporary_table_credentials`` API.
 
-        The returned client carries a botocore
-        :class:`RefreshableCredentials`-backed session: every signing
-        request that runs after the token's near-expiry window
-        re-invokes :meth:`temporary_credentials` and rotates the
-        underlying creds in place. No caller-side refresh dance.
+        Routes through :meth:`credentials_refresher` — every
+        :class:`Table` instance pointing at the same UC table id
+        collapses to one provider that handles both read and write
+        modes internally. The provider caches its :class:`AWSClient`
+        per ``(mode, region)`` so the boto session,
+        :class:`RefreshableCredentials`, connection pool, and STS
+        vending are shared across every caller on the same scope.
+
+        ``operation`` accepts a :class:`TableOperation`, a
+        :class:`Mode` / mode-like string, or ``None`` (defaults to the
+        right operation for this table's type).
         """
-        from yggdrasil.aws.config import AwsCredentials
+        op = _resolve_table_operation(operation, self.infos.table_type)
+        mode = Mode.READ_ONLY if op == TableOperation.READ else Mode.OVERWRITE
+        return self.credentials_refresher().aws_client(mode=mode, region=region)
 
-        def _refresh() -> AwsCredentials:
-            creds = self.temporary_credentials(operation=operation)
-            aws = creds.aws_temp_credentials
-            expiration = getattr(creds, "expiration_time", None) / 1000
-            return AwsCredentials(
-                access_key_id=aws.access_key_id,
-                secret_access_key=aws.secret_access_key,
-                session_token=aws.session_token,
-                expiration=(
-                    expiration.isoformat()
-                    if expiration is not None and hasattr(expiration, "isoformat")
-                    else (str(expiration) if expiration is not None else None)
-                ),
-            )
+    def credentials_refresher(self) -> "AWSDatabricksTableCredentials":
+        """Return the process-wide singleton credentials provider for
+        this table.
 
-        return (
-            aws_config_class()
-            .from_refresher(_refresh, region="eu-central-1")
-            .to_client()
+        Keyed by ``table_id``; handles both read and write modes
+        internally via :meth:`AWSDatabricksTableCredentials.get_credentials`.
+        """
+        from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
+
+        return AWSDatabricksTableCredentials(
+            table_id=self.table_id,
+            client=self.client,
         )
 
     def temporary_credentials(self, operation: TableOperation = TableOperation.READ):

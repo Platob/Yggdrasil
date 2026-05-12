@@ -190,6 +190,18 @@ class AWSConfig:
 
     # --- External credential refresher --------------------------------------
 
+    refresher_key: Optional[str] = None
+    """Opaque discriminator for refresher-backed configs.
+
+    Two configs with the same region / endpoint but different refreshers
+    (e.g. one Databricks volume read + one volume write) need to mint
+    distinct :class:`AWSClient` instances so each carries its own
+    :class:`RefreshableCredentials` cycle. Because callables aren't
+    comparable, :attr:`refresher` is excluded from equality and hash;
+    this string field carries the comparable identity instead.
+    ``None`` for the common case (no provider, or refreshers that share
+    identity intentionally)."""
+
     refresher: Optional[CredentialsRefresher] = dataclasses.field(
         default=None, repr=False, compare=False, hash=False,
     )
@@ -279,6 +291,7 @@ class AWSConfig:
         *,
         region: Optional[str] = None,
         endpoint_url: Optional[str] = None,
+        refresher_key: Optional[str] = None,
         **kwargs,
     ) -> "AWSConfig":
         """Build a self-refreshing AWSConfig from a credentials callback.
@@ -317,6 +330,7 @@ class AWSConfig:
             region=region,
             endpoint_url=endpoint_url,
             refresher=refresher,
+            refresher_key=refresher_key,
             **kwargs,
         )
 
