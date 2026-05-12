@@ -201,38 +201,111 @@ def _saturating_add(a: int, b: int) -> int:
     return _MAX_NBYTES if s > _MAX_NBYTES else s
 
 
+def _resolve_view_probes() -> tuple:
+    """Bind ``pa.types.is_*_view`` predicates once at import time.
+
+    Old impl re-did the four ``getattr(pa.types, ...)`` lookups on
+    every call. Hot rechunk passes call :func:`_is_view_type` once
+    per Array leaf, so the bound-once form removes 4 attribute hops
+    per leaf invocation.
+    """
+    types_mod = getattr(pa, "types", None)
+    if types_mod is None:
+        return ()
+    out = []
+    for name in (
+        "is_string_view", "is_binary_view",
+        "is_list_view", "is_large_list_view",
+    ):
+        fn = getattr(types_mod, name, None)
+        if fn is not None:
+            out.append(fn)
+    return tuple(out)
+
+
+_VIEW_PROBES: tuple = _resolve_view_probes()
+
+#: Memo of view-ness keyed by Arrow DataType. ``pa`` interns primitive
+#: types (``pa.int64() is pa.int64()`` is True) so this dict caps at
+#: O(#distinct schemas seen) — bounded in practice. Avoids the 4-probe
+#: scan on every leaf of every rechunk pass.
+_VIEW_TYPE_CACHE: "dict[Any, bool]" = {}
+
+#: Memo of "does this schema have any top-level view-typed column?"
+#: Keyed by ``pa.Schema``. The recursive walk is correct but pays the
+#: full Python frame dispatch on every column on every call. Caching
+#: lets a hot rechunk pipeline (where every batch shares one schema
+#: reference) collapse the container check to one dict lookup + one
+#: native ``.nbytes`` call.
+_SCHEMA_TOP_VIEW_CACHE: "dict[Any, bool]" = {}
+
+
+def _schema_has_top_view(schema: Any) -> bool:
+    """``True`` iff *schema* has any top-level view-typed field.
+
+    Mirrors the existing :func:`get_arrow_nbytes` semantics: only the
+    top-level type of each column matters (a nested type wrapping a
+    view-typed leaf is *not* caught here — same as the recursive
+    walk, which short-circuits on view-ness only at the top of each
+    leaf array). Result is memoized per :class:`pa.Schema`.
+    """
+    cached = _SCHEMA_TOP_VIEW_CACHE.get(schema)
+    if cached is not None:
+        return cached
+    result = False
+    try:
+        for field in schema:
+            if _is_view_type(field.type):
+                result = True
+                break
+    except Exception:
+        # Defensive — non-Schema objects shouldn't reach here, but a
+        # walk-failure shouldn't crash the rechunker.
+        result = True  # bail to the safe recursive path
+    try:
+        _SCHEMA_TOP_VIEW_CACHE[schema] = result
+    except TypeError:
+        pass
+    return result
+
+
 def _is_view_type(arr_type: Any) -> bool:
     """True if ``arr_type`` is one of the Arrow view types whose
     ``.nbytes`` either raises or over-counts on slices.
 
-    Routes through ``pa.types.is_*_view`` when available (pyarrow
+    Routes through cached ``pa.types.is_*_view`` predicates (pyarrow
     ≥ 17 exposes ``is_string_view`` / ``is_binary_view`` / list-view
     helpers); falls back to a string match on ``str(arr_type)`` for
     older builds and for list-view variants the helper module may
     not enumerate.
+
+    Result is memoized per ``arr_type`` so a hot rechunk path pays
+    the probe cost once per distinct schema, not once per batch.
     """
-    types_mod = getattr(pa, "types", None)
-    if types_mod is not None:
-        for probe in (
-            "is_string_view",
-            "is_binary_view",
-            "is_list_view",
-            "is_large_list_view",
-        ):
-            fn = getattr(types_mod, probe, None)
-            if fn is None:
-                continue
-            try:
-                if fn(arr_type):
-                    return True
-            except Exception:
-                continue
-    # Last-resort textual match — covers exotic / future view types
-    # whose ``is_*`` helper isn't exposed yet.
+    cached = _VIEW_TYPE_CACHE.get(arr_type)
+    if cached is not None:
+        return cached
+    result = False
+    for probe in _VIEW_PROBES:
+        try:
+            if probe(arr_type):
+                result = True
+                break
+        except Exception:
+            continue
+    if not result:
+        # Last-resort textual match — covers exotic / future view types
+        # whose ``is_*`` helper isn't exposed yet.
+        try:
+            result = "view" in str(arr_type).lower()
+        except Exception:
+            result = False
     try:
-        return "view" in str(arr_type).lower()
-    except Exception:
-        return False
+        _VIEW_TYPE_CACHE[arr_type] = result
+    except TypeError:
+        # Unhashable type — return without caching.
+        pass
+    return result
 
 
 def get_arrow_nbytes(obj: Any, default: int = 0) -> int:
@@ -277,51 +350,74 @@ def get_arrow_nbytes(obj: Any, default: int = 0) -> int:
     if obj is None:
         return default
 
-    # Container types: recurse into children before falling back to
-    # ``.nbytes``. Tables / RecordBatches expose ``.columns``;
-    # ChunkedArray exposes ``.chunks``. Recursing first lets a
-    # view-typed column / chunk hit the 1 MiB short-circuit per chunk
-    # rather than getting subsumed into a wrong (over-counted)
-    # container ``.nbytes``. Sum saturates at ``_MAX_NBYTES``.
-    chunks = getattr(obj, "chunks", None)
-    if chunks is not None:
-        try:
-            total = 0
-            for c in chunks:
-                total = _saturating_add(total, get_arrow_nbytes(c, default=default))
-                if total >= _MAX_NBYTES:
-                    break
-            return total
-        except Exception:
-            pass
+    # Container dispatch via ``isinstance`` rather than ``getattr``
+    # probing — Arrow's container hierarchy is closed (ChunkedArray /
+    # Table / RecordBatch) and the explicit check skips two
+    # missing-attribute lookups on every leaf call.
+    #
+    # Fast path: when the container has no top-level view-typed
+    # column, the native ``.nbytes`` (sum of all buffers, computed
+    # C-side) is both correct and an order of magnitude cheaper than
+    # the per-column Python recursion. The "any view column?" check
+    # is memoized per ``pa.Schema`` / ``pa.DataType`` so a streaming
+    # pipeline pays it once.
+    if isinstance(obj, pa.ChunkedArray):
+        if not _is_view_type(obj.type):
+            try:
+                nb = int(obj.nbytes)
+            except (NotImplementedError, AttributeError, TypeError):
+                nb = None
+            except Exception:
+                nb = None
+            if nb is not None:
+                if nb < 0:
+                    return default
+                return _MAX_NBYTES if nb > _MAX_NBYTES else nb
+        total = 0
+        for c in obj.chunks:
+            total = _saturating_add(total, get_arrow_nbytes(c, default=default))
+            if total >= _MAX_NBYTES:
+                break
+        return total
 
-    columns = getattr(obj, "columns", None)
-    if columns is not None:
-        try:
-            total = 0
-            for c in columns:
-                total = _saturating_add(total, get_arrow_nbytes(c, default=default))
-                if total >= _MAX_NBYTES:
-                    break
-            return total
-        except Exception:
-            pass
+    if isinstance(obj, (pa.Table, pa.RecordBatch)):
+        if not _schema_has_top_view(obj.schema):
+            try:
+                nb = int(obj.nbytes)
+            except (NotImplementedError, AttributeError, TypeError):
+                nb = None
+            except Exception:
+                nb = None
+            if nb is not None:
+                if nb < 0:
+                    return default
+                return _MAX_NBYTES if nb > _MAX_NBYTES else nb
+        total = 0
+        for c in obj.columns:
+            total = _saturating_add(total, get_arrow_nbytes(c, default=default))
+            if total >= _MAX_NBYTES:
+                break
+        return total
 
+    # Leaf path — Array, Scalar, or any object with ``.nbytes``. Check
+    # the view-type short-circuit first so a sliced view doesn't fall
+    # through to the over-counting ``.nbytes`` path.
     arr_type = getattr(obj, "type", None)
     if arr_type is not None and _is_view_type(arr_type):
         return _VIEW_DEFAULT_NBYTES
 
     try:
         nb = int(obj.nbytes)
+    except (NotImplementedError, AttributeError, TypeError):
+        nb = None
+    except Exception:
+        nb = None
+    if nb is not None:
         if nb < 0:
             nb = default
         elif nb > _MAX_NBYTES:
             nb = _MAX_NBYTES
         return nb
-    except (NotImplementedError, AttributeError, TypeError):
-        pass
-    except Exception:
-        pass
 
     # Leaf array fallback: walk every buffer. For view types this is a
     # known over-counter (see the docstring) — the dedicated branch
