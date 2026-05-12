@@ -290,7 +290,10 @@ class Tables(DatabricksService):
         table_name: Optional[str],
     ) -> str:
         """Build a stable, host-scoped cache key."""
-        host = self.client.base_url.to_string() if self.client else "default"
+        # See ``Catalogs._cache_key`` — ``base_url.to_string()`` parses a
+        # fresh URL per call. ``client.host`` is the same identity in string
+        # form, already normalized in ``DatabricksClient.__post_init__``.
+        host = (self.client.host if self.client else None) or "default"
         return f"{host}|{catalog_name}.{schema_name}.{table_name}"
 
     def invalidate_cached_table(

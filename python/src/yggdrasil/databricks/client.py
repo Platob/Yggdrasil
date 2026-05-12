@@ -53,6 +53,20 @@ TS = TypeVar("TS", bound="DatabricksService")
 _ALLOWED = re.compile(r"^[\d \w\+\-=\.:/@]*$")  # noqa
 _SANITIZE = re.compile(r"[^\d \w\+\-=\.:/@]+")  # noqa
 
+# Cache the collapse-repeats regex per ``repl`` so ``safe_tag_value`` doesn't
+# pay ``re.escape`` + ``re.compile`` on every dirty input. Real workloads only
+# ever pass the default ``"-"``, but keep the mapping general for the rare
+# caller that overrides it.
+_SAFE_TAG_COLLAPSE_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def _safe_tag_collapse(repl: str) -> re.Pattern[str]:
+    pattern = _SAFE_TAG_COLLAPSE_CACHE.get(repl)
+    if pattern is None:
+        pattern = re.compile(re.escape(repl) + r"{2,}")
+        _SAFE_TAG_COLLAPSE_CACHE[repl] = pattern
+    return pattern
+
 
 def getenv(name: str) -> Optional[str]:
     v = os.getenv(name)
@@ -164,6 +178,10 @@ class DatabricksClient(URLBased):
     _workspace_client: Optional[DWC] = field(default=None, init=False, repr=False, compare=False, hash=False)
     _account_config: Optional[Config] = field(default=None, init=False, repr=False, compare=False, hash=False)
     _account_client: Optional[DAC] = field(default=None, init=False, repr=False, compare=False, hash=False)
+    # Cached parsed ``base_url`` — ``URL.from_str`` is ~6 us per call, and
+    # the host doesn't change after ``__post_init__``. Cleared on transport
+    # so the receiving process re-parses against its own host.
+    _base_url_cached: Optional[URL] = field(default=None, init=False, repr=False, compare=False, hash=False)
 
     # Serializable session-token snapshot, populated on __getstate__ and
     # consumed on __setstate__. Off-cluster only — DBR runtime ignores it.
@@ -184,6 +202,7 @@ class DatabricksClient(URLBased):
         "_workspace_config",
         "_account_config",
         "_was_connected",
+        "_base_url_cached",
         "_workspace", "_sql", "_entity_tags", "_warehouses", "_compute",
         "_secrets", "_iam", "_tables", "_views", "_columns_svc",
         "_catalogs", "_schemas", "_genie", "_filesystem",
@@ -320,9 +339,16 @@ class DatabricksClient(URLBased):
 
     @property
     def base_url(self):
+        cached = self._base_url_cached
+        if cached is not None:
+            return cached
         if not self.host:
+            # Don't cache the make_config() path — config resolution can
+            # change ``host`` after the auth dance lands.
             return URL.from_str(self.make_config().host)
-        return URL.from_str(self.host)
+        parsed = URL.from_str(self.host)
+        object.__setattr__(self, "_base_url_cached", parsed)
+        return parsed
 
     @property
     def explore_url(self) -> URL:
@@ -349,15 +375,7 @@ class DatabricksClient(URLBased):
         URL); defaults to :attr:`Scheme.DATABRICKS`.
         """
         query: dict[str, Any] = {}
-        keys = [
-            f.name
-            for f in fields(self)
-            if f.init and f.name not in (
-                "host", "token", "client_id", "client_secret"
-            )
-        ]
-
-        for key in keys:
+        for key in _TO_URL_QUERY_KEYS:
             value = getattr(self, key)
             if value is not None:
                 query[key] = value
@@ -904,7 +922,7 @@ class DatabricksClient(URLBased):
 
         # collapse repeated repl and trim edges
         if repl:
-            s = re.sub(re.escape(repl) + r"{2,}", repl, s).strip(repl + " ")
+            s = _safe_tag_collapse(repl).sub(repl, s).strip(repl + " ")
 
         return s
 
@@ -1275,6 +1293,13 @@ class DatabricksClient(URLBased):
 
 
 DATABRICKS_CLIENT_INIT_NAMES = frozenset(f.name for f in fields(DatabricksClient) if f.init)
+# Fields that ``to_url`` emits as query items: every init field except the
+# credentials / host that already ride in the URL host + userinfo. Computed
+# once at import so the hot path doesn't walk ``fields(self)`` per call.
+_TO_URL_QUERY_KEYS: tuple[str, ...] = tuple(
+    name for name in (f.name for f in fields(DatabricksClient) if f.init)
+    if name not in ("host", "token", "client_id", "client_secret")
+)
 CHECKED_TMP_WORKSPACES: ExpiringDict[str, set[str]] = ExpiringDict()
 
 
@@ -1282,7 +1307,10 @@ def is_checked_tmp_path(host: str, base_path: str):
     existing = CHECKED_TMP_WORKSPACES.get(host)
 
     if existing is None:
-        CHECKED_TMP_WORKSPACES[host] = set(base_path)
+        # Seed with the path itself — ``set(base_path)`` would iterate the
+        # string into a set of characters, defeating the cache and forcing
+        # every other call to re-walk the Volumes listing.
+        CHECKED_TMP_WORKSPACES[host] = {base_path}
         return False
 
     if base_path in existing:

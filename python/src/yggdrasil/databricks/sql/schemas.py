@@ -397,7 +397,9 @@ class Schemas(DatabricksService):
     # ── cache helpers ─────────────────────────────────────────────────────────
 
     def _cache_key(self, catalog_name: str, schema_name: str) -> str:
-        host = self.client.base_url.to_string() if self.client else "default"
+        # See ``Catalogs._cache_key`` — ``base_url.to_string()`` would build
+        # a fresh URL per call. ``client.host`` is already a stable string.
+        host = (self.client.host if self.client else None) or "default"
         return f"{host}|{catalog_name}.{schema_name}"
 
     def invalidate(
