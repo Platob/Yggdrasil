@@ -319,6 +319,189 @@ def scenarios(repeat: int) -> list[dict]:
         repeat=repeat, inner=50_000,
     ))
 
+    # ---------------------------------------------------------------------
+    # Nested-type construction + projection — the shapes tabular casts and
+    # cross-engine schemas actually carry. List, map, struct, and the
+    # nested-of-nested cases that show up in real warehouse schemas.
+    # ---------------------------------------------------------------------
+
+    # Nested fixtures built once so the timing loop measures the
+    # *operation*, not the fixture construction.
+    DEEP_STRUCT_DT = StructType(fields=(
+        Field("id", IntegerType(), nullable=False),
+        Field("name", StringType()),
+        Field("address", StructType(fields=(
+            Field("street", StringType()),
+            Field("city", StringType()),
+            Field("zip", StringType()),
+        ))),
+        Field("tags", ArrayType.from_item(Field("item", StringType()))),
+        Field("attributes", MapType.from_key_value(
+            key_field=Field("k", StringType(), nullable=False),
+            value_field=Field("v", StringType()),
+        )),
+    ))
+    LIST_OF_STRUCT_DT = ArrayType.from_item(Field(
+        "item",
+        StructType(fields=(
+            Field("k", StringType()),
+            Field("v", IntegerType()),
+        )),
+    ))
+    MAP_STR_LIST_DT = MapType.from_key_value(
+        key_field=Field("k", StringType(), nullable=False),
+        value_field=Field(
+            "v",
+            ArrayType.from_item(Field("item", IntegerType())),
+        ),
+    )
+
+    # type_id / hash / equality — recursion footprint matters for nested.
+    results.append(_time_one(
+        "id: ArrayType.type_id",
+        lambda: ARRAY_DT.type_id,
+        repeat=repeat, inner=500_000,
+    ))
+    results.append(_time_one(
+        "id: MapType.type_id",
+        lambda: MAP_DT.type_id,
+        repeat=repeat, inner=500_000,
+    ))
+    results.append(_time_one(
+        "hash: hash(ArrayType)",
+        lambda: hash(ARRAY_DT),
+        repeat=repeat, inner=200_000,
+    ))
+    results.append(_time_one(
+        "hash: hash(MapType)",
+        lambda: hash(MAP_DT),
+        repeat=repeat, inner=200_000,
+    ))
+    results.append(_time_one(
+        "hash: hash(DEEP_STRUCT) struct-of-struct+list+map",
+        lambda: hash(DEEP_STRUCT_DT),
+        repeat=repeat, inner=50_000,
+    ))
+    results.append(_time_one(
+        "hash: hash(LIST_OF_STRUCT)",
+        lambda: hash(LIST_OF_STRUCT_DT),
+        repeat=repeat, inner=100_000,
+    ))
+    results.append(_time_one(
+        "hash: hash(MAP_STR_LIST) map<str,list<int>>",
+        lambda: hash(MAP_STR_LIST_DT),
+        repeat=repeat, inner=100_000,
+    ))
+    other_deep = DEEP_STRUCT_DT
+    results.append(_time_one(
+        "eq: DEEP_STRUCT == DEEP_STRUCT (identity)",
+        lambda: DEEP_STRUCT_DT == other_deep,
+        repeat=repeat, inner=500_000,
+    ))
+
+    # Engine projections — to_arrow warmed + cold.
+    results.append(_time_one(
+        "to_arrow: ArrayType warm cache",
+        lambda: ARRAY_DT.to_arrow(),
+        repeat=repeat, inner=500_000,
+    ))
+    results.append(_time_one(
+        "to_arrow: MapType warm cache",
+        lambda: MAP_DT.to_arrow(),
+        repeat=repeat, inner=500_000,
+    ))
+    results.append(_time_one(
+        "to_arrow: DEEP_STRUCT warm cache",
+        lambda: DEEP_STRUCT_DT.to_arrow(),
+        repeat=repeat, inner=500_000,
+    ))
+    results.append(_time_one(
+        "to_arrow: LIST_OF_STRUCT warm cache",
+        lambda: LIST_OF_STRUCT_DT.to_arrow(),
+        repeat=repeat, inner=500_000,
+    ))
+
+    # to_dict / to_json — nested dict round-trip cost shows the
+    # recursion overhead beyond the type_id lookup.
+    results.append(_time_one(
+        "to_dict: ArrayType",
+        lambda: ARRAY_DT.to_dict(),
+        repeat=repeat, inner=100_000,
+    ))
+    results.append(_time_one(
+        "to_dict: MapType",
+        lambda: MAP_DT.to_dict(),
+        repeat=repeat, inner=100_000,
+    ))
+    results.append(_time_one(
+        "to_dict: DEEP_STRUCT",
+        lambda: DEEP_STRUCT_DT.to_dict(),
+        repeat=repeat, inner=5_000,
+    ))
+    results.append(_time_one(
+        "to_dict: LIST_OF_STRUCT",
+        lambda: LIST_OF_STRUCT_DT.to_dict(),
+        repeat=repeat, inner=20_000,
+    ))
+
+    # from_arrow_type — parquet / arrow readers feed these in per
+    # schema collected from a file footer.
+    PA_DEEP = DEEP_STRUCT_DT.to_arrow()
+    PA_LIST_OF_STRUCT = LIST_OF_STRUCT_DT.to_arrow()
+    PA_MAP_STR_LIST = MAP_STR_LIST_DT.to_arrow()
+    results.append(_time_one(
+        "from_arrow_type: pa.list_(pa.int64())",
+        lambda: DataType.from_arrow_type(PA_LIST),
+        repeat=repeat, inner=10_000,
+    ))
+    results.append(_time_one(
+        "from_arrow_type: pa.struct(...deep...)",
+        lambda: DataType.from_arrow_type(PA_DEEP),
+        repeat=repeat, inner=500,
+    ))
+    results.append(_time_one(
+        "from_arrow_type: pa.list_(pa.struct(...))",
+        lambda: DataType.from_arrow_type(PA_LIST_OF_STRUCT),
+        repeat=repeat, inner=2_000,
+    ))
+    results.append(_time_one(
+        "from_arrow_type: pa.map_(str, list<int>)",
+        lambda: DataType.from_arrow_type(PA_MAP_STR_LIST),
+        repeat=repeat, inner=2_000,
+    ))
+
+    # from_str — DDL-style string parser for nested shapes.
+    results.append(_time_one(
+        "from_str: 'array<int64>'",
+        lambda: DataType.from_str("array<int64>"),
+        repeat=repeat, inner=5_000,
+    ))
+    results.append(_time_one(
+        "from_str: 'map<string,int64>'",
+        lambda: DataType.from_str("map<string,int64>"),
+        repeat=repeat, inner=5_000,
+    ))
+    results.append(_time_one(
+        "from_str: 'struct<id:int64,addr:struct<city:string>>'",
+        lambda: DataType.from_str(
+            "struct<id:int64,addr:struct<city:string>>"
+        ),
+        repeat=repeat, inner=2_000,
+    ))
+
+    # autotag — recursion visible at the per-field level when nested
+    # schemas push tags to children for Unity-Catalog metadata.
+    results.append(_time_one(
+        "autotag: StructType",
+        lambda: STRUCT_DT.autotag(),
+        repeat=repeat, inner=50_000,
+    ))
+    results.append(_time_one(
+        "autotag: ArrayType",
+        lambda: ARRAY_DT.autotag(),
+        repeat=repeat, inner=50_000,
+    ))
+
     return results
 
 

@@ -91,6 +91,49 @@ F_STRUCT = Field(
     )),
 )
 
+# Deeper nested shapes — list-of-struct, map<str, list<int>>,
+# struct-of-struct + nested array + nested map. These mirror the
+# real-world warehouse schemas tabular casts hit (JSON-ingested
+# rows, Delta nested columns, Mongo documents).
+F_LIST_OF_STRUCT = Field(
+    "rows",
+    ArrayType.from_item(Field(
+        "item",
+        StructType(fields=(
+            Field("k", StringType()),
+            Field("v", IntegerType(byte_size=8, signed=True)),
+        )),
+    )),
+)
+F_MAP_STR_LIST = Field(
+    "buckets",
+    MapType.from_key_value(
+        key_field=Field("k", StringType(), nullable=False),
+        value_field=Field(
+            "v",
+            ArrayType.from_item(Field("item", IntegerType(byte_size=8, signed=True))),
+        ),
+    ),
+)
+F_DEEP_STRUCT = Field(
+    "row",
+    StructType(fields=(
+        Field("id", IntegerType(byte_size=8, signed=True), nullable=False),
+        Field("name", StringType()),
+        Field("amount", DecimalType(precision=18, scale=2)),
+        Field("address", StructType(fields=(
+            Field("street", StringType()),
+            Field("city", StringType()),
+            Field("zip", StringType()),
+        ))),
+        Field("tags", ArrayType.from_item(Field("item", StringType()))),
+        Field("attrs", MapType.from_key_value(
+            key_field=Field("k", StringType(), nullable=False),
+            value_field=Field("v", StringType()),
+        )),
+    )),
+)
+
 
 # ---------------------------------------------------------------------------
 # Source arrays — pyarrow originals; converted to polars/pandas inline.
@@ -141,6 +184,57 @@ def _build_sources() -> dict[str, pa.Array]:
     struct_match = pa.array(struct_payload, type=struct_match_type)
     struct_widen = pa.array(struct_payload, type=struct_widen_type)
 
+    # list<struct> — array of {k: str, v: int}.
+    list_of_struct_type = pa.list_(pa.struct([("k", pa.string()), ("v", pa.int64())]))
+    list_of_struct_widen_type = pa.list_(pa.struct([("k", pa.string()), ("v", pa.int32())]))
+    list_of_struct_payload = [[{"k": "x", "v": i}] for i in range(ROWS)]
+    list_of_struct_match = pa.array(list_of_struct_payload, type=list_of_struct_type)
+    list_of_struct_widen = pa.array(list_of_struct_payload, type=list_of_struct_widen_type)
+
+    # map<str, list<int>>.
+    map_str_list_type = pa.map_(pa.string(), pa.list_(pa.int64()))
+    map_str_list_widen_type = pa.map_(pa.string(), pa.list_(pa.int32()))
+    map_str_list_payload = [[("k", [i, i + 1])] for i in range(ROWS)]
+    map_str_list_match = pa.array(map_str_list_payload, type=map_str_list_type)
+    map_str_list_widen = pa.array(map_str_list_payload, type=map_str_list_widen_type)
+
+    # deep struct — nested struct + array + map, plus decimal scalar.
+    deep_struct_type = pa.struct([
+        ("id", pa.int64()),
+        ("name", pa.string()),
+        ("amount", pa.decimal128(18, 2)),
+        ("address", pa.struct([
+            ("street", pa.string()),
+            ("city", pa.string()),
+            ("zip", pa.string()),
+        ])),
+        ("tags", pa.list_(pa.string())),
+        ("attrs", pa.map_(pa.string(), pa.string())),
+    ])
+    deep_struct_widen_type = pa.struct([
+        ("id", pa.int32()),
+        ("name", pa.string()),
+        ("amount", pa.decimal128(18, 2)),
+        ("address", pa.struct([
+            ("street", pa.string()),
+            ("city", pa.string()),
+            ("zip", pa.string()),
+        ])),
+        ("tags", pa.list_(pa.string())),
+        ("attrs", pa.map_(pa.string(), pa.string())),
+    ])
+    from decimal import Decimal as _D
+    deep_struct_payload = [
+        {
+            "id": i, "name": "x", "amount": _D("1.50"),
+            "address": {"street": "1", "city": "x", "zip": "00"},
+            "tags": ["a", "b"], "attrs": [("k", "v")],
+        }
+        for i in range(ROWS)
+    ]
+    deep_struct_match = pa.array(deep_struct_payload, type=deep_struct_type)
+    deep_struct_widen = pa.array(deep_struct_payload, type=deep_struct_widen_type)
+
     return {
         "int64": arr_int64, "int32": arr_int32,
         "f64": arr_f64, "f32": arr_f32,
@@ -150,6 +244,12 @@ def _build_sources() -> dict[str, pa.Array]:
         "list_match": list_match, "list_widen": list_widen,
         "map_match": map_match, "map_widen": map_widen,
         "struct_match": struct_match, "struct_widen": struct_widen,
+        "list_of_struct_match": list_of_struct_match,
+        "list_of_struct_widen": list_of_struct_widen,
+        "map_str_list_match": map_str_list_match,
+        "map_str_list_widen": map_str_list_widen,
+        "deep_struct_match": deep_struct_match,
+        "deep_struct_widen": deep_struct_widen,
     }
 
 
@@ -343,6 +443,24 @@ def scenarios(repeat: int) -> list[dict]:
         "struct (match / cast int32+f32→)",
         F_STRUCT, s["struct_match"], s["struct_widen"],
         repeat=repeat, inner=200,
+    ))
+    out.extend(_block(
+        "list<struct> (match / cast inner int32→)",
+        F_LIST_OF_STRUCT,
+        s["list_of_struct_match"], s["list_of_struct_widen"],
+        repeat=repeat, inner=100,
+    ))
+    out.extend(_block(
+        "map<str,list<int>> (match / cast inner int32→)",
+        F_MAP_STR_LIST,
+        s["map_str_list_match"], s["map_str_list_widen"],
+        repeat=repeat, inner=100,
+    ))
+    out.extend(_block(
+        "deep struct{addr,tags,attrs,decimal} (match / cast id int32→)",
+        F_DEEP_STRUCT,
+        s["deep_struct_match"], s["deep_struct_widen"],
+        repeat=repeat, inner=100,
     ))
 
     return out

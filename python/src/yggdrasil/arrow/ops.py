@@ -405,9 +405,12 @@ def _align_batch_to_schema(
         batch = batch.select(target.names)
     if batch.schema.equals(target):
         return batch
+    # ``pa.Schema`` exposes its column count via ``len(...)``;
+    # ``num_fields`` only exists on the nested-type variant
+    # (``pa.StructType``).
     arrays = [
         batch.column(i).cast(target.field(i).type)
-        for i in range(target.num_fields)
+        for i in range(len(target))
     ]
     return pa.RecordBatch.from_arrays(arrays, schema=target)
 

@@ -27,9 +27,19 @@ from typing import Callable
 
 import pyarrow as pa
 
+from yggdrasil.data.enums import Mode
+from yggdrasil.data.options import CastOptions
 from yggdrasil.io.path.local_path import LocalPath
 from yggdrasil.io.primitive.csv_io import CsvIO
 from yggdrasil.io.primitive.parquet_io import ParquetIO
+
+
+# Writes share the same target path across iterations, so use OVERWRITE
+# to keep each write independent. Without this, AUTO mode appends +
+# does a read-modify-rewrite and per-iteration cost grows linearly
+# with iteration count — the bench would measure snowballing upsert
+# work rather than per-write throughput.
+_OVERWRITE = CastOptions(mode=Mode.OVERWRITE)
 
 # NOTE: ``ArrowIPCIO`` is intentionally excluded — its
 # ``_write_arrow_batches`` against a :class:`LocalPath` currently
@@ -117,11 +127,11 @@ def _bench_format(
     path = tmp / filename
 
     # Seed the file so the read bench has stable bytes to load.
-    leaf_cls(path=LocalPath(str(path))).write_arrow_table(table)
+    leaf_cls(path=LocalPath(str(path))).write_arrow_table(table, _OVERWRITE)
     rows = table.num_rows
 
     def write_arrow():
-        leaf_cls(path=LocalPath(str(path))).write_arrow_table(table)
+        leaf_cls(path=LocalPath(str(path))).write_arrow_table(table, _OVERWRITE)
     def read_arrow():
         leaf_cls(path=LocalPath(str(path))).read_arrow_table()
 
@@ -139,7 +149,7 @@ def _bench_format(
         pl_frame = leaf_cls(path=LocalPath(str(path))).read_polars_frame()
 
         def write_polars():
-            leaf_cls(path=LocalPath(str(path))).write_polars_frame(pl_frame)
+            leaf_cls(path=LocalPath(str(path))).write_polars_frame(pl_frame, _OVERWRITE)
         def read_polars():
             leaf_cls(path=LocalPath(str(path))).read_polars_frame()
 
@@ -164,7 +174,7 @@ def _bench_format(
         pd_frame = leaf_cls(path=LocalPath(str(path))).read_pandas_frame()
 
         def write_pandas():
-            leaf_cls(path=LocalPath(str(path))).write_pandas_frame(pd_frame)
+            leaf_cls(path=LocalPath(str(path))).write_pandas_frame(pd_frame, _OVERWRITE)
         def read_pandas():
             leaf_cls(path=LocalPath(str(path))).read_pandas_frame()
 
