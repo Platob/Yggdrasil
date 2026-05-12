@@ -47,7 +47,7 @@ class Secrets(DatabricksService):
     ) -> "Scope":
         from .resource import Scope
 
-        return Scope.parse(
+        return Scope.from_(
             key,
             service=self,
         )
@@ -68,12 +68,12 @@ class Secrets(DatabricksService):
         from .resource import Scope
 
         if not scope:
-            scope = Scope.parse_mapping(
+            scope = Scope.from_mapping(
                 {"key": key} if key else None,
                 service=self,
             )
         elif isinstance(scope, str):
-            scope = Scope.parse(scope, service=self)
+            scope = Scope.from_(scope, service=self)
 
         if not scope.key:
             raise ValueError("Scope must have a key to be created")
@@ -106,7 +106,7 @@ class Secrets(DatabricksService):
     ) -> "Secret":
         from .resource import Secret
 
-        return Secret.parse(
+        return Secret.from_(
             key,
             service=self,
             scope=scope
@@ -130,12 +130,12 @@ class Secrets(DatabricksService):
         from .resource import Secret
 
         if not secret:
-            secret = Secret.parse_mapping(
+            secret = Secret.from_mapping(
                 {"key": key, "scope": scope, "value": value},
                 service=self,
             )
         elif isinstance(secret, str):
-            secret = Secret.parse(secret, service=self, scope=scope)
+            secret = Secret.from_(secret, service=self, scope=scope)
             secret.set_value(value)
 
         if not secret.scope or not secret.scope.key or not secret.key:

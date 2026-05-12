@@ -29,29 +29,29 @@ class Permission:
     acl: AclPermission
 
     @classmethod
-    def parse(cls, obj: Any, *, acl: Any = None):
+    def from_(cls, obj: Any, *, acl: Any = None):
         if isinstance(obj, cls):
             return obj
         if isinstance(obj, AclItem):
             return cls(principal=obj.principal, acl=AclPermission(obj.permission))
         if isinstance(obj, str):
-            return cls.parse_str(obj, acl=acl)
+            return cls.from_str(obj, acl=acl)
         if isinstance(obj, Mapping):
             principal = obj.get("principal")
             if not principal:
                 raise ValueError(
-                    f"Cannot parse Permission from mapping {obj!r}: "
+                    f"Cannot build Permission from mapping {obj!r}: "
                     f"'principal' is required."
                 )
             value = obj.get("acl", obj.get("permission", AclPermission.READ))
             return cls(principal=principal, acl=AclPermission(value))
         raise ValueError(
-            f"Cannot parse {obj!r} as Permission. "
+            f"Cannot build Permission from {obj!r}. "
             f"Expected Permission, AclItem, str, or mapping with 'principal'."
         )
 
     @classmethod
-    def parse_str(cls, value: str, *, acl: Any = None):
+    def from_str(cls, value: str, *, acl: Any = None):
         if acl is None:
             acl = AclPermission.READ if value in {"users"} else AclPermission.MANAGE
         return cls(principal=value, acl=AclPermission(acl))
@@ -98,7 +98,7 @@ class Scope(DatabricksResource):
         return self.service.delete_secret(key=key, scope=self)
 
     @classmethod
-    def parse(
+    def from_(
         cls,
         obj: Any,
         *,
@@ -117,13 +117,13 @@ class Scope(DatabricksResource):
             )
 
         elif isinstance(obj, Mapping):
-            return cls.parse_mapping(obj, service=service)
+            return cls.from_mapping(obj, service=service)
 
         else:
-            raise ValueError(f"Cannot parse {obj!r} as Scope")
+            raise ValueError(f"Cannot build Scope from {obj!r}")
 
     @classmethod
-    def parse_mapping(
+    def from_mapping(
         cls,
         data: Mapping[str, Any] = None,
         *,
@@ -135,7 +135,7 @@ class Scope(DatabricksResource):
         key = data.get("key")
 
         if not key:
-            raise ValueError("Key is required to parse Scope from mapping")
+            raise ValueError("Key is required to build Scope from mapping")
 
         return cls(
             service=service or Secrets.current(),
@@ -198,7 +198,7 @@ class Scope(DatabricksResource):
         except NotFound:
             return []
 
-        return [Permission.parse(item) for item in items]
+        return [Permission.from_(item) for item in items]
 
     def permission(self, principal: str) -> Optional[Permission]:
         if not self.key:
@@ -211,7 +211,7 @@ class Scope(DatabricksResource):
         except NotFound:
             return None
 
-        return Permission.parse(item)
+        return Permission.from_(item)
 
     def set_permission(
         self,
@@ -222,9 +222,9 @@ class Scope(DatabricksResource):
             raise ValueError("Scope must have a key to set a permission")
 
         if isinstance(principal, str):
-            target = Permission.parse_str(principal, acl=acl)
+            target = Permission.from_str(principal, acl=acl)
         else:
-            target = Permission.parse(principal, acl=acl)
+            target = Permission.from_(principal, acl=acl)
 
         existing = self.permission(target.principal)
         if existing == target:
@@ -312,7 +312,7 @@ class Secret(DatabricksResource):
         self.update_timestamp = update_timestamp
 
     def __post_init__(self):
-        self.scope = Scope.parse(self.scope, service=self.service)
+        self.scope = Scope.from_(self.scope, service=self.service)
 
         if self.update_timestamp:
             self.update_timestamp = any_to_datetime(self.update_timestamp)
@@ -336,7 +336,7 @@ class Secret(DatabricksResource):
         return self
 
     @classmethod
-    def parse(
+    def from_(
         cls,
         obj: Any,
         *,
@@ -344,7 +344,7 @@ class Secret(DatabricksResource):
         service: Optional[Secrets] = None,
     ):
         if scope:
-            scope = Scope.parse(scope, service=service)
+            scope = Scope.from_(scope, service=service)
 
             if not service:
                 service = scope.service
@@ -357,11 +357,11 @@ class Secret(DatabricksResource):
         elif isinstance(obj, str):
             if "/" in obj:
                 scope_str, key = obj.split("/", 1)
-                scope = Scope.parse(scope_str, service=service)
+                scope = Scope.from_(scope_str, service=service)
                 return cls(service=service or scope.service, scope=scope, key=key)
             elif ":" in obj:
                 scope_str, key = obj.split(":", 1)
-                scope = Scope.parse(scope_str, service=service)
+                scope = Scope.from_(scope_str, service=service)
                 return cls(service=service or scope.service, scope=scope, key=key)
             else:
                 return cls(service=service or Secrets.current(), scope=scope, key=obj)
@@ -369,15 +369,15 @@ class Secret(DatabricksResource):
         elif isinstance(obj, GetSecretResponse):
             return cls(
                 service=service or Secrets.current(),
-                scope=Scope.parse(obj.scope, service=service),
+                scope=Scope.from_(obj.scope, service=service),
                 key=obj.key,
             ).set_value(obj.value)
 
         else:
-            raise ValueError(f"Cannot parse {obj!r} as Secret")
+            raise ValueError(f"Cannot build Secret from {obj!r}")
 
     @classmethod
-    def parse_mapping(
+    def from_mapping(
         cls,
         data: Mapping[str, Any] = None,
         *,
@@ -390,7 +390,7 @@ class Secret(DatabricksResource):
         key = kwargs.get("key")
 
         if not key:
-            raise ValueError("Key is required to parse Secret from mapping")
+            raise ValueError("Key is required to build Secret from mapping")
 
         if "/" in key:
             scope_str, key = key.split("/", 1)
@@ -403,9 +403,9 @@ class Secret(DatabricksResource):
 
         scope = kwargs.pop("scope", None)
         if not scope:
-            raise ValueError("Scope is required to parse Secret from mapping")
+            raise ValueError("Scope is required to build Secret from mapping")
 
-        scope = Scope.parse(scope, service=kwargs.get("service", service))
+        scope = Scope.from_(scope, service=kwargs.get("service", service))
         service = service if service else scope.service
         value = kwargs.get("value")
 
