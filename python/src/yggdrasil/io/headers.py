@@ -365,7 +365,6 @@ class Headers(MutableMapping[str, str]):
         self,
         data: "Headers | Mapping[Any, Any] | Iterable[tuple[Any, Any]] | None" = None,
     ) -> None:
-        self._data: dict[str, str] = {}
         # ``_version`` starts at 0; the cache slots use ``-1`` so the
         # first read is always a miss even when no mutation has fired.
         self._version: int = 0
@@ -376,16 +375,26 @@ class Headers(MutableMapping[str, str]):
         self._canonical_bytes: bytes = b""
         self._canonical_bytes_version: int = -1
         if data is None:
+            self._data = {}
             return
         if isinstance(data, Headers):
-            self._data.update(data._data)
+            # Already string-keyed string-valued — copy in one shot.
+            self._data = dict(data._data)
+            return
+        if isinstance(data, dict):
+            # Hot path: most callers pass a ``dict[str, str]`` literal.
+            # Trust the shape and copy directly; fall back to per-item
+            # ``str()`` coercion only when something diverges.
+            for k, v in data.items():
+                if type(k) is not str or type(v) is not str:
+                    self._data = {str(k): str(v) for k, v in data.items()}
+                    return
+            self._data = dict(data)
             return
         if isinstance(data, Mapping):
-            for k, v in data.items():
-                self._data[str(k)] = str(v)
+            self._data = {str(k): str(v) for k, v in data.items()}
             return
-        for k, v in data:
-            self._data[str(k)] = str(v)
+        self._data = {str(k): str(v) for k, v in data}
 
     @classmethod
     def from_(
@@ -494,8 +503,22 @@ class Headers(MutableMapping[str, str]):
         self._version += 1
 
     def copy(self) -> "Headers":
-        """Shallow copy as a fresh :class:`Headers` (version reset)."""
-        return Headers(self._data)
+        """Shallow copy as a fresh :class:`Headers` (version reset).
+
+        Bypasses ``__init__``'s per-item ``str()`` coercion — we already
+        know the source's keys / values are strings and the rest of the
+        cache slots start fresh.
+        """
+        new = Headers.__new__(Headers)
+        new._data = dict(self._data)
+        new._version = 0
+        new._byte_length = 0
+        new._byte_length_version = -1
+        new._xxh3_64 = 0
+        new._xxh3_64_version = -1
+        new._canonical_bytes = b""
+        new._canonical_bytes_version = -1
+        return new
 
     def to_dict(self) -> dict[str, str]:
         """Snapshot as a plain ``dict`` — handy for code that needs
