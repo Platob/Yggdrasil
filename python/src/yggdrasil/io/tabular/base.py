@@ -867,7 +867,7 @@ class Tabular(ABC, Generic[O]):
         )
 
     def _read_arrow_batch_reader(self, options: O) -> "pa.RecordBatchReader":
-        schema = options.check_target(obj=self.collect_schema).merged_schema
+        schema = options.check_target(obj=self.collect_schema).merged
         return pa.RecordBatchReader.from_batches(
             schema.to_arrow_schema(), self._read_arrow_batches(options),
         )
@@ -1117,7 +1117,12 @@ class Tabular(ABC, Generic[O]):
         self._write_pandas_frame(frame, self.check_options(options, overrides=locals()))
 
     def _write_pandas_frame(self, frame: "pandas.DataFrame", options: O) -> None:
-        include_index = bool(frame.index.names)
+        # ``frame.index.names`` is always a list (e.g. ``[None]`` for a
+        # default ``RangeIndex``), so ``bool(...)`` is True even on
+        # an anonymous index — we'd round-trip a synthetic column that
+        # the reader then complains about. Only preserve the index
+        # when at least one level has a user-assigned name.
+        include_index = any(n is not None for n in frame.index.names)
         try:
             casted = pa.Table.from_pandas(frame, preserve_index=include_index)
             self._write_arrow_table(casted, options)

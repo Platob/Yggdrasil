@@ -71,9 +71,6 @@ extra:
     - icon: fontawesome/brands/python
       link: https://pypi.org/project/ygg/
       name: ygg on PyPI
-    - icon: fontawesome/solid/cube
-      link: https://pypi.org/project/yggrs/
-      name: yggrs on PyPI
 
 markdown_extensions:
   - abbr

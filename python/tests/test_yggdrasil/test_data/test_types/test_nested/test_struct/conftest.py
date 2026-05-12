@@ -124,8 +124,7 @@ def target_list_to_struct_field(int64_type: IntegerType, string_type) -> Field:
 
 @pytest.fixture
 def source_tabular_schema(int64_type: IntegerType, string_type) -> Schema:
-    return Schema(
-        inner_fields=[
+    return Schema([
             Field(name="a", dtype=int64_type, nullable=True),
             Field(name="b", dtype=string_type, nullable=True),
         ]
@@ -134,8 +133,7 @@ def source_tabular_schema(int64_type: IntegerType, string_type) -> Schema:
 
 @pytest.fixture
 def target_tabular_schema(int64_type: IntegerType, string_type) -> Schema:
-    return Schema(
-        inner_fields=[
+    return Schema([
             Field(name="b", dtype=string_type, nullable=True),
             Field(name="c", dtype=int64_type, nullable=True),
             Field(name="a", dtype=int64_type, nullable=True),

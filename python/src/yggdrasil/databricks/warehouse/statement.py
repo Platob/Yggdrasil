@@ -86,6 +86,34 @@ logger = logging.getLogger(__name__)
 _DEFAULT_BYTE_SIZE = 32 * 1024 * 1024
 
 
+def _build_external_link_pool(max_workers: int) -> urllib3.PoolManager:
+    """Build a :class:`urllib3.PoolManager` for external-link fetches.
+
+    The pool is reused across every chunk read for the warehouse it's
+    attached to (see :meth:`SQLWarehouse._external_link_pool`); pulling
+    it onto the warehouse instance — rather than a module-level cache —
+    ties the underlying connection lifecycle to the warehouse handle.
+    When the warehouse is GC'd, the pool drops with it, so a
+    long-running process holding many warehouses doesn't accumulate
+    pooled sockets the runtime can't reach.
+    """
+    retry = urllib3.Retry(
+        total=4,
+        backoff_factor=0.2,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    return urllib3.PoolManager(
+        num_pools=max_workers * 2,
+        maxsize=max_workers * 2,
+        retries=retry,
+        timeout=urllib3.Timeout(connect=2.0, read=5.0),
+        headers={"Accept-Encoding": "gzip,deflate"},
+        cert_reqs="CERT_REQUIRED",
+    )
+
+
 def _empty_arrow_batches(arrow_schema: pa.Schema) -> Iterator[pa.RecordBatch]:
     """Yield a single zero-row :class:`pa.RecordBatch` matching *arrow_schema*.
 
@@ -916,7 +944,7 @@ class WarehouseStatementResult(StatementResult):
             # backend skips the schema (e.g. DDL with no result set).
             result_schema = getattr(manifest, "schema", None) if manifest is not None else None
             columns = getattr(result_schema, "columns", None) if result_schema is not None else None
-            self._cached_schema = Schema.from_any_fields(
+            self._cached_schema = Schema.from_fields(
                 [parse_databricks_field(c) for c in (columns or [])],
                 metadata=metadata,
             )
@@ -970,24 +998,12 @@ class WarehouseStatementResult(StatementResult):
         max_workers = 4
         max_in_flight = max_workers * 2
 
-        retry = urllib3.Retry(
-            total=4,
-            backoff_factor=0.2,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset(["GET"]),
-            raise_on_status=False,
-        )
-        http = urllib3.PoolManager(
-            num_pools=max_workers * 2,
-            maxsize=max_workers * 2,
-            retries=retry,
-            timeout=urllib3.Timeout(connect=2.0, read=5.0),
-            headers={"Accept-Encoding": "gzip,deflate"},
-            cert_reqs="CERT_REQUIRED",
-        )
-
-        row_size = options.row_size
+        # Pool is owned by the warehouse executor — its lifetime matches
+        # the warehouse handle, so we don't leak TCP connections in a
+        # long-running process that creates and discards warehouses.
+        http = self.executor.external_link_pool(max_workers)
         byte_size = options.byte_size or _DEFAULT_BYTE_SIZE
+        memory_pool = options.arrow_memory_pool
 
         def fetch_batches(url: str) -> Iterator[pa.RecordBatch]:
             resp = http.request("GET", url, preload_content=True)
@@ -1021,7 +1037,6 @@ class WarehouseStatementResult(StatementResult):
 
         pending: List[pa.RecordBatch] = []
         pending_bytes = 0
-        arrow_schema: Optional[pa.Schema] = None
         yielded_any = False
 
         def flush() -> Iterator[pa.RecordBatch]:
@@ -1029,17 +1044,20 @@ class WarehouseStatementResult(StatementResult):
             if not pending:
                 return
 
-            casted = options.cast_arrow_tabular(
-                pa.concat_batches(pending, memory_pool=options.arrow_memory_pool)
-            )
+            # Skip the concat copy when there's a single pending batch —
+            # ``pa.concat_batches`` always materializes a fresh batch, so
+            # the singleton case pays a copy for nothing.
+            if len(pending) == 1:
+                combined = pending[0]
+            else:
+                combined = pa.concat_batches(pending, memory_pool=memory_pool)
+            casted = options.cast_arrow_tabular(combined)
             pending = []
             pending_bytes = 0
             yielded_any = True
             yield casted
 
         for batch in raw_batches():
-            if arrow_schema is None:
-                arrow_schema = batch.schema
             pending.append(batch)
             pending_bytes += batch.nbytes
             if pending_bytes >= byte_size:
@@ -1048,7 +1066,7 @@ class WarehouseStatementResult(StatementResult):
         yield from flush()
 
         if not yielded_any:
-            schema_for_empty = options.with_target(self._collect_schema(options)).merged_schema
+            schema_for_empty = options.with_target(self._collect_schema(options)).merged
             yield from _empty_arrow_batches(schema_for_empty.to_arrow_schema())
 
     def _write_arrow_batches(self, batches: Iterable[pa.RecordBatch], options: CastOptions) -> None:

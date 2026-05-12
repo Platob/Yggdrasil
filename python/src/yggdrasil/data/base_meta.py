@@ -223,7 +223,6 @@ class BaseChildrenFields(ABC):
         index = index if index is not None else inferred_index
 
         available_fields = self.children
-        available_names = [f.name for f in available_fields]
 
         indexed_field = None
         if index is not None:
@@ -257,6 +256,11 @@ class BaseChildrenFields(ABC):
                 "  dtype.field_by(name='price')\n"
                 "  dtype.field_by(index=0)"
             )
+
+        # Lazy: only materialize the available-names list when we need
+        # it for the error message — the hot path is "name resolves",
+        # which never walks the children to collect them.
+        available_names = [f.name for f in available_fields]
 
         if name is None:
             raise KeyError(

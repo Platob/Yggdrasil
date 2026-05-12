@@ -380,7 +380,7 @@ class CsvIO(IO[bytes, CsvOptions]):
         # scalar / string columns. When the schema has no nested
         # columns ``nested_indices`` is empty and the encoder is a
         # passthrough.
-        writer_schema = cast_opts.merged_schema.to_arrow_schema()
+        writer_schema = cast_opts.merged.to_arrow_schema()
         nested_indices: tuple[int, ...] = ()
         if options.nested_as_json:
             writer_schema, nested_indices = _csv_nested_schema(writer_schema)

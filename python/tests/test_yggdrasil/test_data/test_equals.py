@@ -418,7 +418,7 @@ class TestSchemaEquals(unittest.TestCase):
 
     @staticmethod
     def _xy_schema() -> Schema:
-        return Schema.from_any_fields(
+        return Schema.from_fields(
             [
                 Field(name="x", dtype=IntegerType(byte_size=8), nullable=True),
                 Field(name="y", dtype=StringType(), nullable=True),
@@ -430,7 +430,7 @@ class TestSchemaEquals(unittest.TestCase):
 
     def test_reorder_tolerated_by_default(self) -> None:
         a = self._xy_schema()
-        b = Schema.from_any_fields(
+        b = Schema.from_fields(
             [
                 Field(name="y", dtype=StringType(), nullable=True),
                 Field(name="x", dtype=IntegerType(byte_size=8), nullable=True),
@@ -441,7 +441,7 @@ class TestSchemaEquals(unittest.TestCase):
 
     def test_reorder_inequal_when_check_names_false(self) -> None:
         a = self._xy_schema()
-        b = Schema.from_any_fields(
+        b = Schema.from_fields(
             [
                 Field(name="y", dtype=StringType(), nullable=True),
                 Field(name="x", dtype=IntegerType(byte_size=8), nullable=True),
@@ -452,7 +452,7 @@ class TestSchemaEquals(unittest.TestCase):
 
     def test_missing_field_in_either_direction(self) -> None:
         a = self._xy_schema()
-        b = Schema.from_any_fields(
+        b = Schema.from_fields(
             [Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)]
         )
 
@@ -460,10 +460,10 @@ class TestSchemaEquals(unittest.TestCase):
         self.assertFalse(b.equals(a))
 
     def test_extra_field_unequal(self) -> None:
-        a = Schema.from_any_fields(
+        a = Schema.from_fields(
             [Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)]
         )
-        b = Schema.from_any_fields(
+        b = Schema.from_fields(
             [
                 Field(name="x", dtype=IntegerType(byte_size=8), nullable=True),
                 Field(name="z", dtype=StringType(), nullable=True),
@@ -473,10 +473,10 @@ class TestSchemaEquals(unittest.TestCase):
         self.assertFalse(a.equals(b))
 
     def test_renamed_field_unequal_unless_check_names_false(self) -> None:
-        a = Schema.from_any_fields(
+        a = Schema.from_fields(
             [Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)]
         )
-        b = Schema.from_any_fields(
+        b = Schema.from_fields(
             [Field(name="z", dtype=IntegerType(byte_size=8), nullable=True)]
         )
 
@@ -484,11 +484,11 @@ class TestSchemaEquals(unittest.TestCase):
         self.assertTrue(a.equals(b, check_names=False))
 
     def test_metadata_difference_gated_by_check_metadata(self) -> None:
-        a = Schema.from_any_fields(
+        a = Schema.from_fields(
             [Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)],
             metadata={"origin": "A"},
         )
-        b = Schema.from_any_fields(
+        b = Schema.from_fields(
             [Field(name="x", dtype=IntegerType(byte_size=8), nullable=True)],
             metadata={"origin": "B"},
         )
@@ -543,14 +543,14 @@ class TestSchemaNestedEquals(unittest.TestCase):
         )
 
     def test_nested_clone_is_equal(self) -> None:
-        a = Schema.from_any_fields([self._build_nested()])
-        b = Schema.from_any_fields([self._build_nested()])
+        a = Schema.from_fields([self._build_nested()])
+        b = Schema.from_fields([self._build_nested()])
 
         self.assertTrue(a.equals(b))
 
     def test_nested_leaf_tz_change_breaks_equality(self) -> None:
-        a = Schema.from_any_fields([self._build_nested(tz="UTC")])
-        b = Schema.from_any_fields([self._build_nested(tz=None)])
+        a = Schema.from_fields([self._build_nested(tz="UTC")])
+        b = Schema.from_fields([self._build_nested(tz=None)])
 
         self.assertFalse(a.equals(b))
 

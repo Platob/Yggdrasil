@@ -193,7 +193,7 @@ def any_to_spark_schema(
     schema: pa.Schema,
     options: Optional[CastOptions] = None,
 ) -> T.StructType:
-    return options.check_source(schema).merged_schema.to_spark_schema()
+    return options.check_source(schema).merged.to_spark_schema()
 
 
 @register_converter(pyspark_sql.Column, pyspark_sql.Column)
@@ -240,7 +240,7 @@ def any_to_spark_dataframe(
     )
 
     if obj is None:
-        return spark.createDataFrame([], schema=opts.merged_schema.to_spark_schema())
+        return spark.createDataFrame([], schema=opts.merged.to_spark_schema())
 
     arrow_table = any_to_arrow_table(obj, options=opts)
     rechunked = list(rechunk_arrow_batches(
@@ -249,5 +249,5 @@ def any_to_spark_dataframe(
         memory_pool=opts.arrow_memory_pool,
     ))
     arrow_table = pa.Table.from_batches(rechunked, schema=arrow_table.schema)
-    df = spark.createDataFrame(arrow_table, schema=opts.merged_schema.to_spark_schema())
+    df = spark.createDataFrame(arrow_table, schema=opts.merged.to_spark_schema())
     return opts.cast_spark(df)

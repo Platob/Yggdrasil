@@ -26,7 +26,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from yggdrasil.data.types.id import DataTypeId
-from yggdrasil.data.types.support import get_polars
+from yggdrasil.lazy_imports import polars_module
 from yggdrasil.lazy_imports import polars_module
 
 if TYPE_CHECKING:
@@ -52,7 +52,7 @@ def cast_polars_struct_expr(
     expr: Any,
     options: "CastOptions",
 ) -> Any:
-    pl = get_polars()
+    pl = polars_module()
 
     if not options.need_cast(expr):
         return expr
@@ -90,7 +90,7 @@ def cast_polars_map_expr(
     expr: Any,
     options: "CastOptions",
 ) -> Any:
-    pl = get_polars()
+    pl = polars_module()
 
     if not options.need_cast(expr):
         return expr
@@ -134,7 +134,7 @@ def cast_polars_list_expr(
     expr: Any,
     options: "CastOptions",
 ) -> Any:
-    pl = get_polars()
+    pl = polars_module()
 
     if not options.need_cast(expr):
         return expr
@@ -172,7 +172,7 @@ def cast_polars_struct_series(
     if not options.need_cast(series):
         return series
 
-    pl = get_polars()
+    pl = polars_module()
     expr = cast_polars_struct_expr(pl.col(series.name), options).alias(options.target.name)
     return pl.DataFrame({series.name: series}).select(expr).to_series()
 
@@ -184,7 +184,7 @@ def cast_polars_list_series(
     if not options.need_cast(series):
         return series
 
-    pl = get_polars()
+    pl = polars_module()
     expr = cast_polars_list_expr(pl.col(series.name), options).alias(options.target.name)
     return pl.DataFrame({series.name: series}).select(expr).to_series()
 
@@ -202,7 +202,7 @@ def cast_polars_tabular(
         return data
 
     source_schema = options.source
-    target_schema = options.merged_schema
+    target_schema = options.merged.to_struct()
 
     # Engine-level fast bypass — when the source polars schema already
     # equals the target engine schema, the per-column rebuild produces

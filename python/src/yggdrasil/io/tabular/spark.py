@@ -117,7 +117,7 @@ class SparkTabular(Tabular[CastOptions]):
     def _read_spark_frame(self, options: CastOptions) -> "SparkDataFrame":
         if self._frame is None:
             spark = self._require_spark()
-            schema = options.merged_schema
+            schema = options.merged
             spark_schema = (
                 schema.to_spark_schema() if schema is not None else None
             )

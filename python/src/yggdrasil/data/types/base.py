@@ -39,7 +39,7 @@ from yggdrasil.data.types.parser import (
 from yggdrasil.data.enums.mode import Mode
 from yggdrasil.lazy_imports import field_class, polars_module, pandas_module
 from yggdrasil.pickle.serde import ObjectSerde
-from .support import get_pandas, get_polars, get_spark_sql
+from yggdrasil.lazy_imports import pandas_module, polars_module, spark_sql_module
 from ..base_meta import BaseChildrenFields
 from ..data_utils import get_cast_options_class
 
@@ -403,13 +403,21 @@ class DataType(BaseChildrenFields, ABC):
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
 
-        if not cls.__subclasses__():
-            try:
-                type_id = cls.class_type_id()
-                if type_id is not None:
-                    DATA_TYPE_CLASSES[type_id.value] = cls
-            except TypeError:
-                pass
+        # Snapshot the class-level type id once at class creation time so
+        # ``instance.type_id`` is a plain class-attribute read instead of
+        # the property → classmethod call it used to be. Every cast site,
+        # ``equals``, and routing branch in ``from_arrow_type`` /
+        # ``from_str`` reads this attribute on a per-row / per-column
+        # basis, so the saved descriptor + classmethod cost adds up.
+        try:
+            tid = cls.class_type_id()
+        except TypeError:
+            tid = None
+
+        if tid is not None:
+            cls.type_id = tid
+            if not cls.__subclasses__():
+                DATA_TYPE_CLASSES[tid.value] = cls
 
         # Lazy-cache the engine projections on every subclass that
         # implements its own ``to_arrow`` / ``to_polars`` / ``to_spark``.
@@ -440,9 +448,12 @@ class DataType(BaseChildrenFields, ABC):
     @classmethod
     def class_type_id(cls) -> DataTypeId: ...
 
-    @property
-    def type_id(self) -> DataTypeId:
-        return self.class_type_id()
+    # ``type_id`` is set as a class attribute by :meth:`__init_subclass__`
+    # using the value returned by :meth:`class_type_id`. Defined here as
+    # ``None`` so direct access on the abstract :class:`DataType` base
+    # doesn't raise — the property was a per-call ``classmethod`` round
+    # trip; the attribute reads in one ``LOAD_ATTR`` against the class.
+    type_id: ClassVar["DataTypeId | None"] = None
 
     @classmethod
     def instance(cls) -> "DataType":
@@ -491,6 +502,12 @@ class DataType(BaseChildrenFields, ABC):
         downcast: bool = False,
         upcast: bool = False,
     ):
+        # Identity short-circuit — primitive singletons (Int64Type, ...)
+        # land here on every same-shape merge; the merge result is just
+        # ``self``. Saves the ``_merge_with_*`` dispatch for the no-op case.
+        if other is self:
+            return self
+
         mode = Mode.from_(mode, Mode.UPSERT)
 
         if mode is Mode.IGNORE:
@@ -1391,7 +1408,7 @@ class DataType(BaseChildrenFields, ABC):
 
     @classmethod
     def from_polars(cls, value: Any) -> "DataType":
-        pl = get_polars()
+        pl = polars_module()
 
         if isinstance(value, type) and issubclass(value, pl.DataType):
             return cls.from_polars_type(value())
@@ -1418,7 +1435,7 @@ class DataType(BaseChildrenFields, ABC):
 
     @classmethod
     def from_polars_schema(cls, schema: "polars.Schema") -> "StructType":
-        pl = get_polars()
+        pl = polars_module()
         from ..data_field import Field
 
         return StructType(
@@ -1435,7 +1452,7 @@ class DataType(BaseChildrenFields, ABC):
 
         from .primitive import StringType
 
-        pl = get_polars()
+        pl = polars_module()
         if dtype == pl.Categorical():
             return StringType()
 
@@ -1447,7 +1464,7 @@ class DataType(BaseChildrenFields, ABC):
 
     @classmethod
     def from_pandas(cls, obj: Any):
-        pd = get_pandas()
+        pd = pandas_module()
         import numpy as np
 
         if isinstance(obj, pd.Series):
@@ -1530,7 +1547,7 @@ class DataType(BaseChildrenFields, ABC):
 
     @classmethod
     def from_spark(cls, value: Any) -> "DataType":
-        sp = get_spark_sql()
+        sp = spark_sql_module()
 
         if isinstance(value, type) and issubclass(value, sp.types.DataType):
             return cls.from_spark_type(value())
@@ -1672,7 +1689,7 @@ class DataType(BaseChildrenFields, ABC):
                 # Polars fallback — for casts pyarrow rejects (e.g. string →
                 # decimal, nested-struct coercions). Round-trip through
                 # polars, then re-cast to pin down the exact target type.
-                pl = get_polars()
+                pl = polars_module()
                 array = (
                     pl.from_arrow(array)
                     .cast(dtype=self.to_polars(), strict=options.safe)
@@ -2041,7 +2058,7 @@ class DataType(BaseChildrenFields, ABC):
         nullable: bool = False,
         default_scalar: Any = None,
     ) -> "ps.Column":
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         F = spark.functions
 
         if default_scalar is None:
@@ -2142,7 +2159,7 @@ class DataType(BaseChildrenFields, ABC):
         alias: str | None = None,
         nullable: bool = True,
     ):
-        pl = get_polars()
+        pl = polars_module()
         value = (
             self.default_polars_scalar(nullable=nullable) if value is None else value
         )
@@ -2160,7 +2177,7 @@ class DataType(BaseChildrenFields, ABC):
         size: int = 0,
         name: str = "",
     ):
-        pl = get_polars()
+        pl = polars_module()
         value = (
             self.default_polars_scalar(nullable=nullable) if value is None else value
         )
@@ -2179,7 +2196,7 @@ class DataType(BaseChildrenFields, ABC):
         name: str | None = None,
         index: Any = None,
     ):
-        pd = get_pandas()
+        pd = pandas_module()
         value = (
             self.default_pandas_scalar(nullable=nullable) if value is None else value
         )
@@ -2196,7 +2213,7 @@ class DataType(BaseChildrenFields, ABC):
         *,
         nullable: bool = True,
     ):
-        spark = get_spark_sql()
+        spark = spark_sql_module()
 
         # TODO: Spark should handle nested types
         if self.type_id.is_nested:

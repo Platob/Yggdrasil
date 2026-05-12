@@ -848,6 +848,14 @@ class Holder(URLBased, Tabular[O], Disposable):
 
     @url.setter
     def url(self, value: "URL") -> None:
+        # Fast path: when ``value`` is already a :class:`URL` with the
+        # expected scheme, skip the ``with_scheme`` rebuild — Holder
+        # construction off ``Path.parent`` / ``Path.joinpath`` always
+        # produces same-schemed URLs and was paying for an unconditional
+        # ``_replace`` copy here.
+        if isinstance(value, URL) and value.scheme == self.scheme:
+            self._url = value
+            return
         self._url = URL.from_(value).with_scheme(self.scheme)
 
     # ------------------------------------------------------------------

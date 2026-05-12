@@ -9,7 +9,7 @@ from yggdrasil.data.enums import Mode
 
 from ..base import DataType
 from ..id import DataTypeId
-from ..support import get_polars, get_spark_sql
+from yggdrasil.lazy_imports import polars_module, spark_sql_module
 
 if TYPE_CHECKING:
     import polars
@@ -71,7 +71,7 @@ class ObjectType(DataType):
 
     @classmethod
     def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
-        pl = get_polars()
+        pl = polars_module()
         return dtype == pl.Object
 
     @classmethod
@@ -119,11 +119,11 @@ class ObjectType(DataType):
         return pa.large_binary()
 
     def to_polars(self) -> "polars.DataType":
-        pl = get_polars()
+        pl = polars_module()
         return pl.Object
 
     def to_spark(self) -> Any:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         return spark.types.BinaryType()
 
     def to_spark_name(self) -> str:

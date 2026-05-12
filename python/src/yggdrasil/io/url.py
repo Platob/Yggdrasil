@@ -50,22 +50,12 @@ from urllib.parse import (
 
 import pyarrow as pa
 
-from yggdrasil import rs as _rs
 from yggdrasil.io.parameters import anonymize_parameters
 from yggdrasil.lazy_imports import (
     bytes_io_class,
     media_type_class,
     mime_type_class,
 )
-
-# Hot-path delegation: when the Rust extension is loaded, hand off URL
-# parsing and percent-encoding to native kernels. The Python fallback
-# below is preserved for environments without `yggrs` (e.g. odd
-# packaging environments where the optional native wheel isn't present);
-# `ygg` now requires `yggrs`, so in normal installs this branch is
-# always taken. Functions are read once at module-import time so the
-# hot path stays a direct attribute lookup.
-_RS_URL = _rs.io_url
 
 __all__ = [
     "URL",
@@ -263,18 +253,10 @@ def _join_segment(seg: Any) -> str:
 def _encode_userinfo(userinfo: str) -> str:
     if not userinfo:
         return ""
-    if _RS_URL is not None:
-        return _RS_URL.encode_userinfo(userinfo)
     return quote(userinfo, safe=":!$&'()*+,;=")
 
 
 def _encode_path(path: str, safe: str = _SAFE_PATH) -> str:
-    # The Rust kernel uses the canonical safe set + the same "no space →
-    # also keep '%'" rule as the Python fallback. Custom safe sets are a
-    # rare debug knob, so detour into the Python fallback when one is
-    # supplied.
-    if _RS_URL is not None and safe is _SAFE_PATH:
-        return _RS_URL.encode_path(path)
     if safe:
         if " " not in path:
             safe = safe + "%"
@@ -282,14 +264,10 @@ def _encode_path(path: str, safe: str = _SAFE_PATH) -> str:
 
 
 def _encode_query(query: str) -> str:
-    if _RS_URL is not None:
-        return _RS_URL.encode_query(query)
     return quote(query, safe=_SAFE_QUERY + "%")
 
 
 def _encode_fragment(fragment: str) -> str:
-    if _RS_URL is not None:
-        return _RS_URL.encode_fragment(fragment)
     return quote(fragment, safe=_SAFE_FRAGMENT + "%")
 
 
@@ -306,8 +284,6 @@ def _p(value: int | None) -> int:
 
 
 def _normalize_query(query: str) -> str:
-    if _RS_URL is not None:
-        return _RS_URL.normalize_query(query)
     query = query.lstrip("?")
     if not query:
         return ""
@@ -326,9 +302,6 @@ def _parse_port(value: Any) -> int:
 
 
 def _parse_netloc(netloc: str, *, decode: bool) -> tuple[str, str, int]:
-    if _RS_URL is not None:
-        userinfo, host, port = _RS_URL.parse_netloc(netloc, decode=decode)
-        return userinfo, host, port
     if not netloc:
         return "", "", _NO_PORT
 
@@ -436,8 +409,22 @@ class URL(os.PathLike):
         return self.anonymize('redact').to_string(encode=False)
 
     def __eq__(self, other):
+        if other is self:
+            return True
         if isinstance(other, URL):
-            return self.__hash__() == other.__hash__()
+            # Compare slot-by-slot rather than hashing both sides — slot
+            # comparison short-circuits on the first mismatch, and even
+            # on equal URLs it skips the per-side ``hash(to_string())``
+            # round-trip the previous implementation paid twice.
+            return (
+                self.scheme == other.scheme
+                and self.path == other.path
+                and self.host == other.host
+                and self.port == other.port
+                and self.query == other.query
+                and self.fragment == other.fragment
+                and self.userinfo == other.userinfo
+            )
         if isinstance(other, str):
             return self.to_string() == other
         return False
@@ -489,10 +476,35 @@ class URL(os.PathLike):
         get ``["csv", "zst"]``, matching the codec/media-type refactor
         convention (outer format first, compression codec last). Leading
         dotfile marker isn't treated as an extension.
+
+        Mirrors :attr:`pathlib.PurePosixPath.suffixes` but inlined —
+        ``extensions`` is read on every codec / media-type dispatch in
+        the IO layer, and ``PurePosixPath`` is ~5x slower than the
+        string-level walk this implementation does.
         """
-        if not self.path or self.path == "/":
+        path = self.path
+        if not path or path == "/":
             return []
-        return [s.lstrip(".").lower() for s in PurePosixPath(self.path).suffixes]
+        # Last path segment, with trailing slash stripped.
+        if path.endswith("/"):
+            path = path[:-1]
+            if not path:
+                return []
+        idx = path.rfind("/")
+        name = path[idx + 1:] if idx != -1 else path
+        if not name:
+            return []
+        # Leading-dot files (``.env``, ``.hidden``) have no extension on
+        # their own; ``.env.local`` still yields ``["local"]``.
+        if name[0] == ".":
+            name = name[1:]
+            if "." not in name:
+                return []
+        if "." not in name:
+            return []
+        parts = name.split(".")
+        # ``"file.csv".split(".") == ["file", "csv"]`` — drop the stem.
+        return [s.lower() for s in parts[1:]]
 
     @property
     def name(self) -> str:
@@ -506,14 +518,19 @@ class URL(os.PathLike):
             URL.from_("/").name        == ""
             URL.from_("").name         == ""
 
-        ``PurePosixPath`` normalizes the trailing slash, so directory-style
-        URLs still return their last non-empty segment.
+        Inline string handling rather than building ``self.parts`` —
+        ``name`` is a hot accessor (every IO routing decision) and the
+        list build dominates the cost.
         """
-        if not self.path or self.path == "/":
+        path = self.path
+        if not path or path == "/":
             return ""
-        elif self.path.endswith("/"):
-            return self.parts[-2]
-        return self.parts[-1]
+        if path.endswith("/"):
+            path = path[:-1]
+            if not path:
+                return ""
+        idx = path.rfind("/")
+        return path[idx + 1:] if idx != -1 else path
 
     @property
     def stem(self) -> str:
@@ -555,19 +572,25 @@ class URL(os.PathLike):
         over unchanged. If the inherited query/fragment don't make
         sense for the parent URL, strip them yourself via
         :meth:`with_query` / :meth:`with_fragment`.
+
+        String-level walk rather than ``PurePosixPath(...).parent`` —
+        ``parent`` is hit by every "walk up the tree" iteration in path
+        registries and listings; ``PurePosixPath`` allocates a fresh
+        object each call.
         """
-        if not self.path or self.path == "/":
+        path = self.path
+        if not path or path == "/":
             # Root is its own parent (pathlib semantics) and also the
             # sensible answer when path is empty (the dataclass default
             # is "/", so "" shouldn't occur in practice but guard anyway).
             return self._replace(path="/")
-        parent_path = str(PurePosixPath(self.path).parent)
-        # PurePosixPath("").parent is ".", not "/" — coerce to "/" for
-        # URL semantics. Can't reach this branch given the guard above,
-        # but belt-and-braces.
-        if parent_path == ".":
-            parent_path = "/"
-        return self._replace(path=parent_path)
+        # Strip trailing slashes (``"a/b/c/" → "a/b/c"`` so we don't
+        # peel off the empty tail and end up at the same path).
+        stripped = path.rstrip("/")
+        idx = stripped.rfind("/")
+        if idx <= 0:
+            return self._replace(path="/")
+        return self._replace(path=stripped[:idx])
 
     @property
     def parents(self) -> tuple[URL, ...]:
@@ -826,62 +849,49 @@ class URL(os.PathLike):
         decode: bool = False,
         normalize: bool = True,
     ) -> URL:
-        if _RS_URL is not None:
-            # Rust handles split + netloc + Windows drive fix-up + entity
-            # decoding + the missing-authority recovery. We keep the
-            # final normalize pass in Python because `_normalize_path`'s
-            # `os.path.realpath` branch for `file://` URLs is platform-
-            # sensitive and lives in the Python helper.
-            scheme, userinfo, host, port, path, query, fragment = _RS_URL.parse_url(
-                raw,
-                default_scheme=default_scheme,
-                decode=decode,
-                normalize=False,
-            )
-        else:
-            split = urlsplit(raw)
-            userinfo, host, port = _parse_netloc(split.netloc, decode=decode)
+        split = urlsplit(raw)
+        userinfo, host, port = _parse_netloc(split.netloc, decode=decode)
 
-            scheme = split.scheme
+        scheme = split.scheme
 
-            path = _decode_maybe(split.path, decode)
+        path = _decode_maybe(split.path, decode)
 
-            # A single-letter "scheme" is a Windows drive letter (e.g. C:/path
-            # or C:\path). Reattach the drive to the path, normalize backslash
-            # separators inside this branch, and force the file scheme so
-            # ``URL.from_str("C:\\foo")`` matches ``URL.from_(Path("C:\\foo"))``.
-            if scheme and len(scheme) == 1 and scheme.isalpha():
-                drive = scheme.upper()
-                rest = path.replace("\\", "/")
-                if not rest.startswith("/"):
-                    rest = "/" + rest
-                path = f"/{drive}:{rest}"
-                scheme = "file"
+        # A single-letter "scheme" is a Windows drive letter (e.g. C:/path
+        # or C:\path). Reattach the drive to the path, normalize backslash
+        # separators inside this branch, and force the file scheme so
+        # ``URL.from_str("C:\\foo")`` matches ``URL.from_(Path("C:\\foo"))``.
+        if scheme and len(scheme) == 1 and scheme.isalpha():
+            drive = scheme.upper()
+            rest = path.replace("\\", "/")
+            if not rest.startswith("/"):
+                rest = "/" + rest
+            path = f"/{drive}:{rest}"
+            scheme = "file"
 
-            scheme = default_scheme or scheme
+        scheme = default_scheme or scheme
 
-            # URLs sourced from XML/HTML payloads often arrive with ``&`` encoded
-            # as the entity ``&amp;`` (e.g. an Atom feed link, an HTML attribute,
-            # an XML-RPC body). Without this fix, ``urlsplit`` keeps the literal
-            # ``amp;`` and the parameter separator ``&`` is lost — the next pair
-            # in the query gets glued onto the previous key (``amp;update_id``)
-            # and round-trips through Arrow keep the broken form. Decode the
-            # entity here so the query/fragment parse as the caller intended;
-            # callers that genuinely need a literal ``&amp;`` must percent-encode
-            # the ``&`` themselves.
-            query = _decode_maybe(split.query, decode).replace("&amp;", "&")
-            fragment = _decode_maybe(split.fragment, decode).replace("&amp;", "&")
+        # URLs sourced from XML/HTML payloads often arrive with ``&`` encoded
+        # as the entity ``&amp;`` (e.g. an Atom feed link, an HTML attribute,
+        # an XML-RPC body). Without this fix, ``urlsplit`` keeps the literal
+        # ``amp;`` and the parameter separator ``&`` is lost — the next pair
+        # in the query gets glued onto the previous key (``amp;update_id``)
+        # and round-trips through Arrow keep the broken form. Decode the
+        # entity here so the query/fragment parse as the caller intended;
+        # callers that genuinely need a literal ``&amp;`` must percent-encode
+        # the ``&`` themselves.
+        query = _decode_maybe(split.query, decode).replace("&amp;", "&")
+        fragment = _decode_maybe(split.fragment, decode).replace("&amp;", "&")
 
-            # Fix-up for URLs that lack "//" authority (e.g. "http:example.com/path")
-            # but NOT for schemaless strings — those would incorrectly extract the
-            # first path segment as the host.
-            if scheme and scheme not in ("file",) and not host and path:
-                if "/" in path:
-                    host, path = path.split("/", 1)
-                    path = "/" + path.lstrip("/")
-                else:
-                    host = path
-                    path = "/"
+        # Fix-up for URLs that lack "//" authority (e.g. "http:example.com/path")
+        # but NOT for schemaless strings — those would incorrectly extract the
+        # first path segment as the host.
+        if scheme and scheme not in ("file",) and not host and path:
+            if "/" in path:
+                host, path = path.split("/", 1)
+                path = "/" + path.lstrip("/")
+            else:
+                host = path
+                path = "/"
 
         if normalize:
             scheme, host, port, path, query, fragment = _normalize_components(

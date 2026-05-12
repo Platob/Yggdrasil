@@ -10,7 +10,7 @@ import pyarrow.compute as pc
 
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.nested import NestedType
-from yggdrasil.data.types.support import get_pandas, get_polars, get_spark_sql
+from yggdrasil.lazy_imports import pandas_module, polars_module, spark_sql_module
 from yggdrasil.environ.importlib import cached_from_import
 from yggdrasil.data.enums import Mode
 from yggdrasil.lazy_imports import field_class, struct_type_class
@@ -188,7 +188,7 @@ class MapType(NestedType):
 
     @classmethod
     def handles_polars_type(cls, dtype: "polars.List") -> bool:
-        pl = get_polars()
+        pl = polars_module()
         return isinstance(dtype, pl.List) and isinstance(dtype.inner, pl.Struct)
 
     @classmethod
@@ -214,14 +214,14 @@ class MapType(NestedType):
 
     @classmethod
     def handles_spark_type(cls, dtype: "pst.DataType") -> bool:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         return isinstance(dtype, spark.types.MapType)
 
     @classmethod
     def from_spark_type(cls, dtype: "pst.DataType") -> "MapType":
         _f = cached_from_import("yggdrasil.data.data_field", "Field")
         StructType = cached_from_import("yggdrasil.data.types.nested", "StructType")
-        spark = get_spark_sql()
+        spark = spark_sql_module()
 
         if not isinstance(dtype, spark.types.MapType):
             raise TypeError(f"Unsupported Spark data type: {dtype!r}")
@@ -274,6 +274,13 @@ class MapType(NestedType):
         array: pa.Array,
         options: "CastOptions",
     ) -> pa.MapArray | pa.ChunkedArray:
+        # Engine-level bypass — match the array variant. When the
+        # source's arrow type already matches the target, skip the
+        # ``check_source`` Field-from-arrow peek + the ``need_cast``
+        # walk and return ``array`` directly.
+        if array.type == self.to_arrow():
+            return array
+
         options = options.check_source(array).check_target(self)
 
         if options.need_cast(array, self):
@@ -313,7 +320,7 @@ class MapType(NestedType):
         return array
 
     def to_polars(self) -> "polars.DataType":
-        pl = get_polars()
+        pl = polars_module()
         return pl.List(self.item_field.dtype.to_polars())
 
     def _cast_polars_series(
@@ -321,7 +328,7 @@ class MapType(NestedType):
         series: "polars.Series",
         options: "CastOptions",
     ) -> "polars.Series":
-        pl = get_polars()
+        pl = polars_module()
         options = options.check_source(series).check_target(self)
 
         source_type_id = options.source.dtype.type_id
@@ -450,7 +457,7 @@ class MapType(NestedType):
         )
 
     def to_spark(self) -> Any:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         return spark.types.MapType(
             keyType=self.key_field.dtype.to_spark(),
             valueType=self.value_field.dtype.to_spark(),
@@ -902,7 +909,7 @@ def cast_polars_map_expr(
     expr: Any,
     options: "CastOptions",
 ) -> Any:
-    pl = get_polars()
+    pl = polars_module()
 
     if options.target is None:
         return expr
@@ -943,7 +950,7 @@ def cast_polars_list_expr_to_map(
     expr: Any,
     options: "CastOptions",
 ) -> Any:
-    pl = get_polars()
+    pl = polars_module()
 
     if options.target is None:
         return expr
@@ -992,7 +999,7 @@ def cast_polars_struct_expr_to_map(
     expr: Any,
     options: "CastOptions",
 ) -> Any:
-    pl = get_polars()
+    pl = polars_module()
 
     if options.target is None:
         return expr
@@ -1043,7 +1050,7 @@ def cast_polars_map_series(
     series: "polars.Series",
     options: "CastOptions",
 ) -> "polars.Series":
-    pl = get_polars()
+    pl = polars_module()
     expr = cast_polars_map_expr(pl.col(series.name), options)
     casted = pl.DataFrame({series.name: series}).select(expr).to_series()
     return options.polars_alias(casted)
@@ -1053,7 +1060,7 @@ def cast_polars_list_series_to_map(
     series: "polars.Series",
     options: "CastOptions",
 ) -> "polars.Series":
-    pl = get_polars()
+    pl = polars_module()
     expr = cast_polars_list_expr_to_map(pl.col(series.name), options)
     casted = pl.DataFrame({series.name: series}).select(expr).to_series()
     return options.polars_alias(casted)
@@ -1063,7 +1070,7 @@ def cast_polars_struct_series_to_map(
     series: "polars.Series",
     options: "CastOptions",
 ) -> "polars.Series":
-    pl = get_polars()
+    pl = polars_module()
     expr = cast_polars_struct_expr_to_map(pl.col(series.name), options)
     casted = pl.DataFrame({series.name: series}).select(expr).to_series()
     return options.polars_alias(casted)
@@ -1094,7 +1101,7 @@ def cast_spark_map_column(
     column: Any,
     options: "CastOptions",
 ) -> Any:
-    spark = get_spark_sql()
+    spark = spark_sql_module()
     F = spark.functions
 
     options = options.check_source(column)
@@ -1145,7 +1152,7 @@ def cast_spark_list_column_to_map(
     column: Any,
     options: "CastOptions",
 ) -> Any:
-    spark = get_spark_sql()
+    spark = spark_sql_module()
     F = spark.functions
 
     options = options.check_source(column)
@@ -1202,7 +1209,7 @@ def cast_spark_struct_column_to_map(
     column: Any,
     options: "CastOptions",
 ) -> Any:
-    spark = get_spark_sql()
+    spark = spark_sql_module()
     F = spark.functions
 
     options = options.check_source(column)

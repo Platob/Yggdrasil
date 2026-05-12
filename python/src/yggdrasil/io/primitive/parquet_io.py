@@ -251,7 +251,7 @@ class ParquetIO(IO[bytes, ParquetOptions]):
         # encoder sees them.
         write_options = options.check_source(first.schema)
         first_casted = write_options.cast_arrow_tabular(first)
-        schema = write_options.merged_schema.to_arrow_schema()
+        schema = write_options.merged.to_arrow_schema()
 
         # If the first batch came back as the same object the cast was a
         # full bypass (source schema already matched the target). The

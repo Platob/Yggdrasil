@@ -192,7 +192,7 @@ class TestFieldAndSchemaAsSpark(unittest.TestCase):
         self.assertIs(f.as_spark(), f)
 
     def test_schema_returns_schema_with_spark_dtypes(self) -> None:
-        s = Schema(inner_fields=[
+        s = Schema([
             Field("x", IntegerType(byte_size=4, signed=False)),
             Field("y", TimeType()),
         ])
@@ -202,7 +202,7 @@ class TestFieldAndSchemaAsSpark(unittest.TestCase):
         self.assertIsInstance(spark["y"].dtype, StringType)
 
     def test_schema_already_spark_returns_self(self) -> None:
-        s = Schema(inner_fields=[
+        s = Schema([
             Field("x", IntegerType(byte_size=4, signed=True)),
             Field("y", StringType()),
         ])
@@ -250,7 +250,7 @@ class TestSignFlipCastEngine(unittest.TestCase):
             "big": pa.array([(1 << 64) - 1, 0, 100], type=pa.uint64()),
             "small": pa.array([255, 0, 100], type=pa.uint8()),
         })
-        s = Schema(inner_fields=[
+        s = Schema([
             Field("big", IntegerType(byte_size=8, signed=True)),
             Field("small", IntegerType(byte_size=1, signed=True)),
         ])
@@ -528,7 +528,7 @@ class TestAsPolars(unittest.TestCase):
         from yggdrasil.data.types.primitive.numeric import Float8Type
         from yggdrasil.data.schema import Schema
 
-        s = Schema(inner_fields=[
+        s = Schema([
             Field("x", Float8Type()),
             Field("y", TimestampType(unit="s", tz="UTC")),
         ])
@@ -540,7 +540,7 @@ class TestAsPolars(unittest.TestCase):
     def test_schema_already_polars_returns_self(self) -> None:
         from yggdrasil.data.schema import Schema
 
-        s = Schema(inner_fields=[
+        s = Schema([
             Field("x", IntegerType(byte_size=4, signed=True)),
             Field("y", StringType()),
         ])

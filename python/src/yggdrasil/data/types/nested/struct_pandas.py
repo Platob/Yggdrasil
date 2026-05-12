@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any
 import pyarrow as pa
 
 from yggdrasil.data.types.id import DataTypeId
-from yggdrasil.data.types.support import get_pandas, get_polars
+from yggdrasil.lazy_imports import pandas_module, polars_module
 from yggdrasil.exceptions import CastError
 
 if TYPE_CHECKING:
@@ -85,7 +85,7 @@ def _series_via_polars(series: "pd.Series", options: "CastOptions") -> "pd.Serie
     Raises whatever Polars raises — callers wrap this in a try/except
     as the second strategy in the fallback chain.
     """
-    pl = get_polars()
+    pl = polars_module()
     pl_series = pl.from_pandas(series)
 
     casted_pl = options.target.dtype.cast_polars_series(pl_series, options=options)
@@ -191,7 +191,7 @@ def _struct_series_columnwise(
     ``pa.StructArray.from_arrays`` plus ``Array.to_pandas()`` — so the
     dict-cell materialisation stays inside the Arrow → pandas C bridge.
     """
-    pd = get_pandas()
+    pd = pandas_module()
     source_field: "Field" = options.source
     source_type: "StructType" = source_field.dtype
     target_type: "StructType" = options.target.dtype
@@ -283,7 +283,7 @@ def _list_series_columnwise(
     ``pa.StructArray.from_arrays`` + ``Array.to_pandas()`` pass, no
     Python ``for`` over rows.
     """
-    pd = get_pandas()
+    pd = pandas_module()
     source_field: "Field" = options.source
     source_type: "ArrayType" = source_field.dtype
     target_type: "StructType" = options.target.dtype
@@ -342,7 +342,7 @@ def _reassemble_object_series(
     Arrow → pandas C bridge.  Null parent rows mask to ``None`` via
     ``StructArray.from_arrays(mask=...)`` — no post-processing loop.
     """
-    pd = get_pandas()
+    pd = pandas_module()
     num_rows = len(series_index)
     if num_rows == 0:
         return pd.Series([], index=series_index, name=series_name, dtype="object")
@@ -383,7 +383,7 @@ def cast_pandas_tabular(
     data: "pd.DataFrame",
     options: "CastOptions",
 ) -> "pd.DataFrame":
-    pd = get_pandas()
+    pd = pandas_module()
 
     if not isinstance(data, pd.DataFrame):
         raise CastError(
@@ -463,7 +463,7 @@ def _tabular_via_polars(
     data: "pd.DataFrame",
     options: "CastOptions",
 ) -> "pd.DataFrame":
-    pl = get_polars()
+    pl = polars_module()
     pl_df = pl.from_pandas(data)
     target_dtype = options.target.dtype
     casted_pl = target_dtype.cast_polars_tabular(pl_df, options=options)
@@ -478,9 +478,9 @@ def _tabular_columnwise(
     data: "pd.DataFrame",
     options: "CastOptions",
 ) -> "pd.DataFrame":
-    pd = get_pandas()
+    pd = pandas_module()
     source_schema = options.source
-    target_schema = options.merged_schema
+    target_schema = options.merged.to_struct()
 
     out: dict[str, pd.Series] = {}
     num_rows = len(data)

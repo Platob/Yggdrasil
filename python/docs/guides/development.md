@@ -9,15 +9,6 @@ uv venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
 uv pip install -e .[dev]
 ```
 
-Optional: native acceleration (editable, into the same venv):
-
-```bash
-cd ../rust
-maturin develop --release        # use --release; debug builds are slow
-```
-
-`yggdrasil/rs.py` is the only place that imports from `yggdrasil.rust.*`. With `yggrs` installed, it dispatches to native; without it, the pure-Python fallback runs.
-
 ## Tests
 
 ```bash
@@ -96,14 +87,13 @@ The version in [`python/pyproject.toml`](https://github.com/Platob/Yggdrasil/blo
 | Workflow | Builds |
 |---|---|
 | [`publish.yml`](https://github.com/Platob/Yggdrasil/blob/main/.github/workflows/publish.yml) | `ygg` sdist + pure-Python wheel → PyPI; tags `vX.Y.Z`; cuts a GitHub Release |
-| [`publish-native.yml`](https://github.com/Platob/Yggdrasil/blob/main/.github/workflows/publish-native.yml) | `yggrs` wheels for `linux-{x86_64,aarch64}`, `windows-x86_64`, `macos-{x86_64,arm64}` + sdist → PyPI |
 | [`docs.yml`](https://github.com/Platob/Yggdrasil/blob/main/.github/workflows/docs.yml) | MkDocs Material site → GitHub Pages |
 
-`ygg` declares `yggrs==X.Y.Z` so a release is fully usable once both PyPI uploads land. Do not push to `main` from an agent session — develop on a branch and open a PR.
+Do not push to `main` from an agent session — develop on a branch and open a PR.
 
 ## Conventions worth knowing
 
-- **Python 3.10 minimum.** No 3.11+ syntax (e.g. `typing.Self`) without a fallback. The Rust `abi3-py310` wheel is the floor.
+- **Python 3.10 minimum.** No 3.11+ syntax (e.g. `typing.Self`) without a fallback.
 - **Be forgiving on input, strict on meaning.** Accept the shapes a real caller has, but fail loudly on conflicting arguments.
 - **Preserve schema intent across boundaries.** Field names, order, nullability, metadata, nested structure, precision/scale, timezone intent are part of the user contract.
 - **Error messages must answer:** what you passed, what was expected, valid values, what to try next. See [`AGENTS.md`](https://github.com/Platob/Yggdrasil/blob/main/AGENTS.md) for tone and worked examples.

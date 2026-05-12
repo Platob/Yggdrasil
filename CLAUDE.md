@@ -4,10 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project layout
 
-Three sibling packages live at the repo root:
+Two sibling packages live at the repo root:
 
 - `python/` — the main library. PyPI package `ygg`, import package `yggdrasil`. Sources in `python/src/yggdrasil/`, tests in `python/tests/test_yggdrasil/`, docs in `python/docs/` (MkDocs).
-- `rust/` — optional native acceleration published separately as `yggrs`. Built with `maturin` + PyO3 `abi3-py310`. Slots into the `yggdrasil` namespace as `yggdrasil.rust.*`; the library reaches it only through `yggdrasil/rs.py` (the Python-fallback bridge).
 - `powerquery/` — Excel (`.pq`) and Power BI (`.mez`) connectors that talk to the FastAPI service in `yggdrasil.fastapi`. Build/install via `build.ps1` / `install.ps1` (PowerShell).
 
 `AGENTS.md` at the root is the canonical style, tone, and design-rule guide — read it before non-trivial changes. It supersedes generic instincts on error messages, comment voice, and API ergonomics.
@@ -58,14 +57,6 @@ Rules:
 - `SparkTestCase` shares a single process-wide `SparkSession`; don't call `SparkSession.builder` yourself and don't stop the session in `tearDown`.
 - For Databricks integration tests, keep the `integration` marker *and* subclass `ArrowTestCase` (or whichever engine is actually exercised) so the local run still skips cleanly without `DATABRICKS_HOST`.
 
-Rust extension (only when touching `rust/`):
-
-```bash
-cd rust
-maturin develop --extras dev   # editable build, compiles the extension
-maturin build --release        # wheels → rust/dist/
-```
-
 Docs site (MkDocs Material):
 
 ```bash
@@ -87,7 +78,7 @@ python -m yggdrasil.fastapi.main   # entry point, also exposed as `ygg-api`
 
 Prefer these primitives in this order:
 
-- `yggdrasil.data.DataField` / `Field` and `yggdrasil.data.Schema` for describing columns — they carry names, nullability, metadata, tags, nested structure, and engine-side dtype intent in one place. Build them with `Field.from_pandas`, `Field.from_polars`, `Field.from_arrow`, `Schema.from_any_fields`, etc. instead of re-building per-engine schemas by hand.
+- `yggdrasil.data.DataField` / `Field` and `yggdrasil.data.Schema` for describing columns — they carry names, nullability, metadata, tags, nested structure, and engine-side dtype intent in one place. Build them with `Field.from_pandas`, `Field.from_polars`, `Field.from_arrow`, `Schema.from_fields`, etc. instead of re-building per-engine schemas by hand.
 - `yggdrasil.data.DataType` / `DataTypeId` (and the `types/` submodules: `primitive`, `nested`, `iso`, `extensions`) for type hints — don't hand-roll `pa.int64()` / `pl.Int64` / `"bigint"` strings when a `DataType` can produce all of them.
 - `yggdrasil.data.DataTable` and `yggdrasil.data.statement_result.StatementResult` for anything that looks like "execute a query, then move rows somewhere" — new integrations should implement these interfaces rather than invent a parallel one.
 - `yggdrasil.data.cast.convert(value, target, options=...)` with `CastOptions` for value conversion. Do not call `df.to_pandas()`, `pl.from_arrow(...)`, or `spark.createDataFrame(...)` directly from feature code if a registered converter already handles it — that's what the registry is for.
@@ -120,14 +111,6 @@ The only hard runtime dependency of `ygg` is `pyarrow` (`>=20`). Base installs m
 
 `yggdrasil/io/` is not "utilities" — it's the transport surface: buffers (`buffer/` → `BytesIO`, `MediaIO`), URLs, requests, responses, codecs, media types, sessions, pagination, caching. For new HTTP work prefer the modern stack in `io/http_/`: `HTTPSession`, `PreparedRequest`, `Response`, `SendConfig` / `SendManyConfig`. Preserve observability fields (normalized URL parts, promoted/remaining headers, body bytes, payload hashes, timestamps, status/timing) — tooling downstream relies on them. Buffer changes must preserve spill-to-disk behavior, codec handling, cursor safety, and Arrow/Parquet/JSON/IPC compatibility.
 
-### Rust fast path, Python is canonical
-
-`yggdrasil/rs.py` is the **only** place that imports from `yggdrasil.rust.*`. It exposes `HAS_RS` plus the fallback-capable entry points (e.g. `utf8_len`). Rules:
-
-- Python behavior is the source of truth; Rust must match it, not diverge.
-- Pure-Python fallback must stay correct on its own — tests must pass with and without `yggrs` installed.
-- Only add Rust to a path that is actually hot and semantically stable.
-
 ### Module map (top level of `yggdrasil/`)
 
 - **Schema & conversion (start here):** `data/` is the canonical surface — cast registry + `CastOptions`, `DataType`/`DataTypeId`, `DataField`/`Schema`/`DataTable`, `StatementResult`, normalized enums (currency, geozone, timezone). `arrow/` holds type inference and Arrow cast helpers; `dataclasses/` has dataclass→Arrow field helpers and waiting/expiring utilities.
@@ -138,7 +121,7 @@ The only hard runtime dependency of `ygg` is `pyarrow` (`>=20`). Base installs m
 
 ## Conventions that aren't obvious
 
-- **Python 3.10 minimum.** Don't use 3.11+ syntax (e.g. `typing.Self`) without a fallback. The Rust `abi3-py310` wheel is the compatibility floor.
+- **Python 3.10 minimum.** Don't use 3.11+ syntax (e.g. `typing.Self`) without a fallback.
 - **Integrate, don't invent.** Before writing anything new, find where the behavior already lives and extend it. Modify the function/class that already does most of the job, register into `data/cast/registry.py` instead of writing a one-off conversion at a call site, add a flag to `CastOptions` instead of a new options object, add a method to `DataField`/`Schema`/`DataTable`/`StatementResult` instead of a sibling helper module, use `HTTPSession`/`PreparedRequest`/`Response` instead of a parallel HTTP path. Only create a new module/class/abstraction when the existing surface genuinely cannot host the behavior — and wire it back through the canonical path so the next caller finds it.
 - **No Python `for` loops over data.** Row-by-row Python iteration over Arrow / Polars / pandas / Spark values is the single biggest performance trap in this codebase. Reach for vectorised primitives in this order before considering a loop:
   1. **pyarrow.compute** kernels (`pc.cast`, `pc.if_else`, `pc.list_element`, `pc.binary_join_element_wise`, `pc.replace_substring_regex`, `pc.fill_null`, `pc.equal`, etc.) — these stay inside the C++ runtime and don't cross a Python frame per row.
@@ -160,6 +143,7 @@ The only hard runtime dependency of `ygg` is `pyarrow` (`>=20`). Base installs m
 - **Use `yggdrasil.pickle.json` for JSON, not stdlib `json`.** `orjson` is a hard dependency; `yggdrasil.pickle.json` wraps it with the type coverage we use across the codebase (datetime/date/time/UUID/Path/Enum/dataclass/namedtuple/set/Mapping/bytes/Decimal). Same `loads / dumps / load / dump` surface, faster, fewer surprises with rich types. Drop down to `import orjson` directly only inside hot inner loops where you don't need any of the type coercions. Stdlib `import json` is reserved for: parsing third-party config where stdlib semantics are part of the contract, debug `print` formatting, and inside `yggdrasil.pickle.json` itself (which keeps stdlib as a fallback for option combos orjson can't express).
 - **Reach for the enums in `yggdrasil.data.enums` first.** Whenever a value belongs to a fixed token set — currencies, time units, byte sizes (`ByteUnit`), media types, MIME types, modes, codecs, geozones, timezones — use the enum's member or its `Enum.from_(...)` / `Enum.parse_size(...)` / `Enum.parse(...)` coercion at the API boundary instead of hand-rolling a dict, regex, alias table, or expression like `int(x) * 1024 * 1024` at the call site. Centralizing these tokens in an enum is how aliases, validation, formatting, and cross-engine mapping stay consistent across the codebase. If an enum is missing a member or alias the code legitimately needs, **add it to the enum** and have the caller route through it; do not branch around the enum with a one-off lookup. When introducing a new fixed-vocabulary concept, add a new enum to `yggdrasil.data.enums` (matching the `from_` / `parse*` / `is_valid` shape of the existing ones) instead of scattering string constants.
 - **Prefer top-level imports; reach for function-scope imports only when you have to.** The default is one `from yggdrasil.data.enums import Mode` at the top of the module. Function-scope (`def foo(): from yggdrasil.x import Y`) is reserved for: (1) breaking a real circular import that can't be fixed by reshaping the modules, (2) optional-dependency guards that already live in a `lib.py` (`polars`, `pandas`, `spark`, `databricks`, `blake3`, `xxhash`, …), (3) `TYPE_CHECKING`-only types where a runtime import would be pure cost. Everywhere else, hoist the import. Function-scope imports make call sites noisier, hide the module's real dependency graph from readers and tooling, and pay an attribute-lookup cost on every call. If you find yourself reaching for one, first try moving the import to the top of the file and check what actually breaks.
+- **Benchmark-driven optimization — measure, don't guess.** Performance changes go through `python/benchmarks/`, organized to mirror the source tree (`benchmarks/data/`, `benchmarks/io/primitive/`, `benchmarks/io/path/`, …). For *any* "I think this is slow" or "this would be faster" change: (1) find or add the bench first — write the scenario into the matching `benchmarks/<module>/bench_<name>.py` if it doesn't already cover the call shape; (2) capture the baseline with `python benchmarks/<file>.py --repeat 5` against the pre-change tree; (3) apply one conceptual change at a time; (4) re-run the same bench and quote `best` + `median` before / after; (5) run `python benchmarks/run_all.py --repeat 3` to confirm the rest of the suite didn't regress — optimizations frequently trade off, so show the surrounding numbers; (6) put the before / after in the commit body so the next reader knows which numbers are load-bearing. "Felt faster" doesn't ship — quoted numbers do. When the bench is missing for the hot path you're touching, **adding the bench counts as part of the change**. See `AGENTS.md` → "Benchmark-driven optimization" for the worked rules.
 - **Keep diffs small and reuse-heavy.** Prefer a small edit to an existing function over a new module. Don't add parameters, branches, classes, or files "in case we need them later" — add them when a real caller needs them. Three nearly-identical lines is fine; a premature base class is not.
 - **No dead or isolated code.** Every new function, class, option, file, or test must be reachable from a real caller in the same change. No helpers defined but never called, no flags never read, no new files that only re-export existing names, no speculative branches for inputs the public API doesn't accept. If nothing uses it yet, delete it or wait for the caller.
 - **Be forgiving on input, strict on meaning.** Accept the shapes a real caller has (type hints, strings, dict payloads, framework objects, things with `.schema`/`.type`/`.arrow_schema`). But fail loudly on *conflicting* arguments — don't silently pick a side.
@@ -181,7 +165,7 @@ The only hard runtime dependency of `ygg` is `pyarrow` (`>=20`). Base installs m
 
 ## Release & CI
 
-- Version is the single source of truth in `python/pyproject.toml`. `.github/workflows/publish.yml` reads it, checks PyPI, and on `main` pushes that touch `python/src/**`, `pyproject.toml`, README, or LICENSE, it builds the sdist + pure-Python wheel and publishes `ygg`, then tags `vX.Y.Z` and cuts a GitHub Release. Native wheels for `yggrs` are built separately by a maturin-based workflow across linux (x86_64 + aarch64/QEMU), windows-x86_64, macos-arm64, and macos-x86_64.
+- Version is the single source of truth in `python/pyproject.toml`. `.github/workflows/publish.yml` reads it, checks PyPI, and on `main` pushes that touch `python/src/**`, `pyproject.toml`, README, or LICENSE, it builds the sdist + pure-Python wheel and publishes `ygg`, then tags `vX.Y.Z` and cuts a GitHub Release.
 - `.github/workflows/docs.yml` publishes the MkDocs site to GitHub Pages (`https://platob.github.io/Yggdrasil/`).
 - Do not push to `main` directly from an agent session — develop on the branch you were given and open a PR only when the user asks.
 - **Cleanup-previous-release commit convention.** Include the literal token `!cleanup-prev-release` anywhere in any commit message on a push to `main` to opt the release into removing the previous one. `publish.yml` resolves the previous tag as the highest semver `v*` tag below the new version, then deletes its git tag + GitHub Release after the new release lands. PyPI yanking is *not* automated (no public API): the workflow summary surfaces the `pypi.org/manage/...` link so the maintainer can yank in one click. Use this when the previous release was broken and you want it off the index, never for routine version bumps.

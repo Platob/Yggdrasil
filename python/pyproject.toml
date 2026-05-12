@@ -1,9 +1,4 @@
 [build-system]
-# Pure-Python sdist + wheel; the Rust acceleration ships as the
-# separate `yggrs` PyPI package (see rust/) and is pulled in
-# automatically via the runtime dependency below. Native wheels for
-# `yggrs` are published in lockstep with `ygg` from the same repo
-# (.github/workflows/publish.yml + publish-native.yml).
 requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
@@ -46,7 +41,6 @@ dev = [
   "black",
   "ruff",
   "mypy",
-  "maturin>=1.7",
   "twine",
   "mkdocs>=1.6",
   "mkdocs-material>=9.5",

@@ -5,10 +5,7 @@
 | Package | What it is | Where it lives |
 |---|---|---|
 | `ygg` (PyPI) / `yggdrasil` (import) | Pure-Python core: cast registry, Arrow schema, engine bridges, IO/HTTP, Databricks, FastAPI | [`python/`](python/) |
-| `yggrs` (PyPI) | Optional Rust acceleration kernels (PyO3, `abi3-py310`) | [`rust/`](rust/) |
 | Power Query connector | Excel `.pq` and Power BI `.mez` connectors that call the FastAPI service | [`powerquery/`](powerquery/) |
-
-`pip install ygg` pulls both `ygg` and the matching `yggrs` wheel for your platform.
 
 📚 **Docs site:** https://platob.github.io/Yggdrasil/
 
@@ -30,7 +27,7 @@ pip install "ygg[kafka]"          # + confluent-kafka
 pip install "ygg[delta]"          # + deltalake
 ```
 
-The only hard runtime deps are `pyarrow>=20`, `polars>=1.3`, and the matching `yggrs` wheel. Everything else is opt-in.
+The only hard runtime deps are `pyarrow>=20` and `polars>=1.3`. Everything else is opt-in.
 
 ---
 
@@ -103,7 +100,27 @@ stmt.to_pylist()        # list[dict]
 - **Production HTTP stack.** `HTTPSession`, prepared requests, batch dispatch, typed response → Arrow/pandas/Polars/Spark.
 - **Databricks toolkit.** `DatabricksClient` covers SQL, Unity Catalog, Compute, DBFS/Volumes, Secrets, IAM, Genie, Spark Connect.
 - **Optional dep guards.** Base installs stay light. `from yggdrasil.polars.lib import polars` is the safe import.
-- **Rust fast path, Python canonical.** `yggdrasil.rs` exposes accelerated functions; tests pass with and without `yggrs` installed.
+
+---
+
+## Performance
+
+The cast registry, schema layer, and engine bridges are all tuned for the hot path — type checks, equality, hash, projection, and same-shape merges live in the nanosecond range so per-batch overhead stays negligible.
+
+Run the benchmark sweep locally:
+
+```bash
+cd python
+python benchmarks/run_all.py --repeat 5
+```
+
+Benches are organized to mirror the source tree:
+
+- [`benchmarks/data/`](python/benchmarks/data) — `Field`, `DataType`, cast registry, equality, merge, options
+- [`benchmarks/dataclasses/`](python/benchmarks/dataclasses) — `ExpiringDict`, `WaitingConfig`, pickle helpers
+- [`benchmarks/concurrent/`](python/benchmarks/concurrent) — `Job`, `JobResult`, `JobPoolExecutor`, `ThreadJob`
+- [`benchmarks/io/`](python/benchmarks/io) — `URL`, `Headers`, `BytesIO`, `Memory`, paths, primitive + nested leaves
+- [`benchmarks/databricks/`](python/benchmarks/databricks) — Databricks-specific code paths (live)
 
 ---
 
@@ -127,7 +144,6 @@ stmt.to_pylist()        # list[dict]
 - [`python/`](python/) — `ygg` source, tests, MkDocs site.
   - [`python/README.md`](python/README.md) — package guide with progressive examples (scalars → schema → engines → HTTP → Databricks).
   - [`python/docs/`](python/docs/) — published documentation source (https://platob.github.io/Yggdrasil/).
-- [`rust/`](rust/) — `yggrs` crate (maturin + PyO3, `abi3-py310`).
 - [`powerquery/`](powerquery/) — Excel `.pq` and Power BI `.mez` connectors over the FastAPI service.
 - [`AGENTS.md`](AGENTS.md) — house style, error-message tone, comment voice, API ergonomics.
 - [`CLAUDE.md`](CLAUDE.md) — agent-facing notes for AI contributors.
@@ -142,12 +158,7 @@ cd Yggdrasil/python
 
 uv venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
 uv pip install -e .[dev]                       # core + dev tooling
-
-# Optional: native acceleration (editable, into the same venv)
-cd ../rust && maturin develop --release
 ```
-
-`yggdrasil/rs.py` is the only place that imports from `yggdrasil.rust.*`. With `yggrs` installed it dispatches to native; without it, the pure-Python fallback runs. Tests must pass either way.
 
 ```bash
 cd python
@@ -168,11 +179,8 @@ The version in [`python/pyproject.toml`](python/pyproject.toml) is the single so
 
 | Workflow | Builds | Triggers |
 |---|---|---|
-| [`publish.yml`](.github/workflows/publish.yml) | `ygg` sdist + pure-Python wheel → PyPI, then tags `vX.Y.Z` and cuts a GitHub Release | push to `main` touching `python/src/**`, `pyproject.toml`, README, LICENSE, `rust/**`, or workflow itself |
-| [`publish-native.yml`](.github/workflows/publish-native.yml) | `yggrs` wheels for `linux-{x86_64,aarch64}`, `windows-x86_64`, `macos-{x86_64,arm64}` + sdist → PyPI | same triggers |
+| [`publish.yml`](.github/workflows/publish.yml) | `ygg` sdist + pure-Python wheel → PyPI, then tags `vX.Y.Z` and cuts a GitHub Release | push to `main` touching `python/src/**`, `pyproject.toml`, README, LICENSE, or workflow itself |
 | [`docs.yml`](.github/workflows/docs.yml) | MkDocs Material site → GitHub Pages (https://platob.github.io/Yggdrasil/) | push to `main` touching `python/docs/**`, `python/src/**`, `mkdocs.yml`, or workflow itself |
-
-`ygg` declares `yggrs==X.Y.Z` so a release is fully usable once both PyPI uploads land.
 
 Do not push to `main` from an agent session — develop on a branch and open a PR.
 

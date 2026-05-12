@@ -9,7 +9,7 @@ import pyarrow as pa
 import pyarrow.types as pat
 
 from yggdrasil.data.types.id import DataTypeId
-from yggdrasil.data.types.support import get_pandas, get_polars, get_spark_sql
+from yggdrasil.lazy_imports import pandas_module, polars_module, spark_sql_module
 from yggdrasil.data.enums import Mode
 from yggdrasil.lazy_imports import field_class
 from ._cast_json import (
@@ -231,7 +231,7 @@ class ArrayType(NestedType):
 
     @classmethod
     def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
-        pl = get_polars()
+        pl = polars_module()
         return isinstance(dtype, pl.List)
 
     @classmethod
@@ -255,7 +255,7 @@ class ArrayType(NestedType):
 
     @classmethod
     def handles_spark_type(cls, dtype: "pst.DataType") -> bool:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         return isinstance(dtype, spark.types.ArrayType)
 
     @classmethod
@@ -320,6 +320,17 @@ class ArrayType(NestedType):
         array: pa.Array | pa.ChunkedArray,
         options: "CastOptions",
     ) -> pa.Array | pa.ChunkedArray:
+        # Engine-level bypass — when the array's arrow type already
+        # matches the target's projection, every downstream branch
+        # would either rebuild the same buffers or short-circuit
+        # anyway. Skip the ``check_source`` Field-from-arrow peek
+        # (which builds a fresh Field tree from the array) + the
+        # subsequent ``need_cast`` walk by returning ``array``
+        # directly. Mirror :meth:`DataType._cast_arrow_array` (base
+        # primitive bypass) so list casts pay the same MATCH floor.
+        if array.type == self.to_arrow():
+            return array
+
         options = options.check_source(array).check_target(self)
 
         if options.need_cast(source=array, target=self):
@@ -354,11 +365,11 @@ class ArrayType(NestedType):
         return array
 
     def to_polars(self) -> "polars.DataType":
-        pl = get_polars()
+        pl = polars_module()
         return pl.List(self.item_field.dtype.to_polars())
 
     def to_spark(self) -> Any:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         return spark.types.ArrayType(
             self.item_field.dtype.to_spark(),
             containsNull=self.item_field.nullable,
@@ -454,7 +465,7 @@ class ArrayType(NestedType):
         series: "polars.Series",
         options: "CastOptions",
     ) -> "polars.Series":
-        pl = get_polars()
+        pl = polars_module()
         options = options.check_source(series).check_target(self)
 
         if options.source.dtype.type_id == DataTypeId.NULL or series.null_count() == len(series):
@@ -494,7 +505,7 @@ class ArrayType(NestedType):
         series: "pd.Series",
         options: "CastOptions",
     ) -> "pd.Series":
-        pd = get_pandas()
+        pd = pandas_module()
         options = options.check_source(series).check_target(self)
 
         source_type_id = options.source.dtype.type_id
@@ -544,7 +555,12 @@ def cast_arrow_list_array(
     array: pa.Array | pa.ChunkedArray,
     options: "CastOptions",
 ) -> pa.Array | pa.ChunkedArray:
-    options = options.check_source(array)
+    # Public entry point — peek the array as a source Field only when
+    # the caller hasn't already done so. ``ArrayType._cast_arrow_array``
+    # always runs the peek before reaching here, so the common
+    # internal path skips the rebuild.
+    if options.source is None:
+        options = options.check_source(array)
 
     if options.target is None:
         return array
@@ -751,7 +767,7 @@ def cast_polars_list_expr(
     expr: Any,
     options: "CastOptions",
 ) -> Any:
-    pl = get_polars()
+    pl = polars_module()
 
     if options.target is None:
         return expr
@@ -776,7 +792,7 @@ def cast_polars_list_series(
     series: "polars.Series",
     options: "CastOptions",
 ) -> "polars.Series":
-    pl = get_polars()
+    pl = polars_module()
     expr = cast_polars_list_expr(pl.col(series.name), options).alias(options.target.name)
     return pl.DataFrame({series.name: series}).select(expr).to_series()
 
@@ -820,7 +836,7 @@ def cast_spark_list_column(
     column: Any,
     options: "CastOptions",
 ) -> Any:
-    spark = get_spark_sql()
+    spark = spark_sql_module()
     F = spark.functions
 
     if options.target is None:

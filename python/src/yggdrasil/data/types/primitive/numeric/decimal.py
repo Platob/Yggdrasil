@@ -21,7 +21,7 @@ from yggdrasil.data.enums import Mode
 
 from .._helpers import _coerce_str
 from ...id import DataTypeId
-from ...support import get_polars, get_spark_sql
+from yggdrasil.lazy_imports import polars_module, spark_sql_module
 from .base import NumericType
 
 if TYPE_CHECKING:
@@ -103,7 +103,7 @@ class DecimalType(NumericType):
 
     @classmethod
     def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
-        pl = get_polars()
+        pl = polars_module()
         return isinstance(dtype, pl.Decimal)
 
     @classmethod
@@ -116,7 +116,7 @@ class DecimalType(NumericType):
 
     @classmethod
     def handles_spark_type(cls, dtype: "pst.DataType") -> bool:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         return isinstance(dtype, spark.types.DecimalType)
 
     @classmethod
@@ -154,11 +154,11 @@ class DecimalType(NumericType):
         return pa.decimal256(self.precision, self.scale)
 
     def to_polars(self) -> "polars.DataType":
-        pl = get_polars()
+        pl = polars_module()
         return pl.Decimal(precision=self.precision, scale=self.scale)
 
     def to_spark(self) -> Any:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         return spark.types.DecimalType(self.precision, self.scale)
 
     def to_spark_name(self) -> str:

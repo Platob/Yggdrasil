@@ -38,7 +38,7 @@ from yggdrasil.data.enums import Mode
 
 from .base import PrimitiveType
 from ..id import DataTypeId
-from ..support import get_polars, get_spark_sql
+from yggdrasil.lazy_imports import polars_module, spark_sql_module
 
 if TYPE_CHECKING:
     import polars  # noqa: F401
@@ -224,7 +224,7 @@ def _arrow_target_fits_polars(target: "pa.DataType") -> bool:
 
 def _arrow_to_polars_target(target: "pa.DataType") -> Any:
     """Map an Arrow dtype to the polars dtype instance ``cast_polars_array_to_temporal`` expects."""
-    pl = get_polars()
+    pl = polars_module()
     if pa.types.is_timestamp(target):
         return pl.Datetime(time_unit=target.unit, time_zone=target.tz)
     if pa.types.is_date(target):
@@ -265,7 +265,7 @@ def arrow_cast(
     if not _is_temporal_target(target) or not _arrow_target_fits_polars(target):
         return pc.cast(array, target, safe=safe)
 
-    pl = get_polars()
+    pl = polars_module()
     pl_target = _arrow_to_polars_target(target)
 
     # ChunkedArray needs per-chunk handling because ``pl.from_arrow`` on a
@@ -333,7 +333,7 @@ def cast_polars_array_to_temporal(
     with default ISO format. Naive→aware uses ``replace_time_zone``
     (wall-clock reinterpret). Everything else is ``.cast(target)``.
     """
-    pl = get_polars()
+    pl = polars_module()
     is_expr = isinstance(array, pl.Expr)
     series_name = "" if is_expr else (array.name or "")
 
@@ -549,7 +549,7 @@ class TemporalType(PrimitiveType, ABC):
 
     def _polars_dtype_instance(self):
         """``to_polars()`` normalized to an instance, widening unsupported units."""
-        pl = get_polars()
+        pl = polars_module()
 
         target = self
         if self.unit in {"s", "d"} and self.type_id in {
@@ -570,7 +570,7 @@ class TemporalType(PrimitiveType, ABC):
         return False
 
     def _polars_from_arrow(self, series: "polars.Series", options: "CastOptions"):
-        pl = get_polars()
+        pl = polars_module()
         arrow = series.to_arrow()
         casted = self._cast_arrow_array(arrow, options)
         return pl.Series(name=series.name, values=casted)
@@ -581,7 +581,7 @@ class TemporalType(PrimitiveType, ABC):
         if self._needs_arrow_bridge():
             return self._polars_from_arrow(series, options)
 
-        pl = get_polars()
+        pl = polars_module()
         source_dtype = series.dtype
         casted = cast_polars_array_to_temporal(
             series,
@@ -601,7 +601,7 @@ class TemporalType(PrimitiveType, ABC):
         if not options.need_cast(expr, self):
             return expr
 
-        pl = get_polars()
+        pl = polars_module()
 
         if self._needs_arrow_bridge():
             return expr.cast(self._polars_dtype_instance(), strict=options.safe)
@@ -769,7 +769,7 @@ class DateType(TemporalType):
 
     @classmethod
     def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
-        pl = get_polars()
+        pl = polars_module()
         return dtype == pl.Date
 
     @classmethod
@@ -780,7 +780,7 @@ class DateType(TemporalType):
 
     @classmethod
     def handles_spark_type(cls, dtype: "pst.DataType") -> bool:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         return isinstance(dtype, spark.types.DateType)
 
     @classmethod
@@ -797,11 +797,11 @@ class DateType(TemporalType):
         return pa.date64() if self.unit == "ms" else pa.date32()
 
     def to_polars(self) -> "polars.DataType":
-        pl = get_polars()
+        pl = polars_module()
         return pl.Date
 
     def to_spark(self) -> Any:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         return spark.types.DateType()
 
     def to_spark_name(self) -> str:
@@ -871,7 +871,7 @@ class TimeType(TemporalType):
 
     @classmethod
     def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
-        pl = get_polars()
+        pl = polars_module()
         return dtype == pl.Time
 
     @classmethod
@@ -898,11 +898,11 @@ class TimeType(TemporalType):
         return pa.time64(self.unit)
 
     def to_polars(self) -> "polars.DataType":
-        pl = get_polars()
+        pl = polars_module()
         return pl.Time
 
     def to_spark(self) -> Any:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         return spark.types.StringType()
 
     def as_spark(self):
@@ -984,7 +984,7 @@ class TimestampType(TemporalType):
 
     @classmethod
     def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
-        pl = get_polars()
+        pl = polars_module()
         return isinstance(dtype, pl.Datetime)
 
     @classmethod
@@ -997,14 +997,14 @@ class TimestampType(TemporalType):
 
     @classmethod
     def handles_spark_type(cls, dtype: "pst.DataType") -> bool:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         return isinstance(
             dtype, (spark.types.TimestampType, spark.types.TimestampNTZType)
         )
 
     @classmethod
     def from_spark_type(cls, dtype: "pst.DataType") -> "TimestampType":
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         if isinstance(dtype, spark.types.TimestampType):
             return cls(byte_size=8, unit="us", tz="UTC")
         if isinstance(dtype, spark.types.TimestampNTZType):
@@ -1030,11 +1030,11 @@ class TimestampType(TemporalType):
         return pa.timestamp(unit=self.unit, tz=self.tz_iana)
 
     def to_polars(self) -> "polars.DataType":
-        pl = get_polars()
+        pl = polars_module()
         return pl.Datetime(time_unit=self.unit, time_zone=self.tz_iana)
 
     def to_spark(self) -> Any:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         if self.tz.is_naive() and hasattr(spark.types, "TimestampNTZType"):
             return spark.types.TimestampNTZType()
         return spark.types.TimestampType()
@@ -1154,7 +1154,7 @@ class DurationType(TemporalType):
 
     @classmethod
     def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
-        pl = get_polars()
+        pl = polars_module()
         return isinstance(dtype, pl.Duration)
 
     @classmethod
@@ -1180,11 +1180,11 @@ class DurationType(TemporalType):
         return pa.duration(self.unit)
 
     def to_polars(self) -> "polars.DataType":
-        pl = get_polars()
+        pl = polars_module()
         return pl.Duration(time_unit=self.unit)
 
     def to_spark(self) -> Any:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         return spark.types.LongType()
 
     def as_spark(self):

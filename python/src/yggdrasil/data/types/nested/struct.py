@@ -33,7 +33,7 @@ from yggdrasil.data.types.nested._cast_json import (
     cast_spark_json_string_column,
     is_json_string_source,
 )
-from yggdrasil.data.types.support import get_polars, get_spark_sql
+from yggdrasil.lazy_imports import polars_module, spark_sql_module
 from yggdrasil.environ.importlib import cached_from_import
 from yggdrasil.lazy_imports import field_class
 
@@ -171,7 +171,7 @@ class StructType(NestedType):
 
     @classmethod
     def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
-        pl = get_polars()
+        pl = polars_module()
         return isinstance(dtype, pl.Struct)
 
     @classmethod
@@ -183,7 +183,7 @@ class StructType(NestedType):
 
     @classmethod
     def handles_spark_type(cls, dtype: "pst.DataType") -> bool:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         return isinstance(dtype, spark.types.StructType)
 
     @classmethod
@@ -222,11 +222,11 @@ class StructType(NestedType):
         return pa.struct([f.to_arrow_field() for f in self.fields])
 
     def to_polars(self) -> "polars.DataType":
-        pl = get_polars()
+        pl = polars_module()
         return pl.Struct([f.to_polars_field() for f in self.fields])
 
     def to_spark(self) -> Any:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         return spark.types.StructType([f.to_pyspark_field() for f in self.fields])
 
     def as_spark(self) -> "StructType":
@@ -403,7 +403,7 @@ class StructType(NestedType):
         series: "polars.Series",
         options: "CastOptions",
     ) -> "polars.Series":
-        pl = get_polars()
+        pl = polars_module()
         options = options.check_source(series).check_target(self)
 
         if options.source.dtype.type_id == DataTypeId.NULL or series.null_count() == len(series):

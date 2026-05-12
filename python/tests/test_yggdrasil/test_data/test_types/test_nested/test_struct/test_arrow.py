@@ -285,8 +285,8 @@ class TestCastTabular:
 
     def test_rejects_non_table_input(self) -> None:
         options = CastOptions(
-            source=Schema(inner_fields=[]),
-            target=Schema(inner_fields=[]),
+            source=Schema([]),
+            target=Schema([]),
         )
 
         with pytest.raises(TypeError, match="Unsupported tabular type"):

@@ -167,7 +167,7 @@ def _semantic_source_field(target_field: Field) -> Field:
         new_children.append(
             Field(name=ch.name, dtype=dtype, nullable=ch.nullable)
         )
-    return Field(name=target_field.name, dtype=Schema(inner_fields=new_children).dtype, nullable=target_field.nullable)
+    return Field(name=target_field.name, dtype=Schema(new_children).dtype, nullable=target_field.nullable)
 
 
 def bench_arrow(rows: int, repeat: int) -> list[dict]:

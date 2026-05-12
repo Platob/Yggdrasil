@@ -23,7 +23,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from yggdrasil.data.types.id import DataTypeId
-from yggdrasil.data.types.support import get_spark_sql
+from yggdrasil.lazy_imports import spark_sql_module
 
 if TYPE_CHECKING:
     import pyspark.sql as psql
@@ -45,7 +45,7 @@ def cast_spark_struct_column(
     column: Any,
     options: "CastOptions",
 ) -> Any:
-    spark = get_spark_sql()
+    spark = spark_sql_module()
     F = spark.functions
 
     if not options.need_cast(column):
@@ -89,7 +89,7 @@ def cast_spark_map_column(
     column: Any,
     options: "CastOptions",
 ) -> Any:
-    spark = get_spark_sql()
+    spark = spark_sql_module()
     F = spark.functions
 
     if not options.need_cast(column):
@@ -124,7 +124,7 @@ def cast_spark_list_column(
     column: Any,
     options: "CastOptions",
 ) -> Any:
-    spark = get_spark_sql()
+    spark = spark_sql_module()
     F = spark.functions
 
     if not options.need_cast(column):
@@ -165,7 +165,7 @@ def cast_spark_tabular(
     data: "psql.DataFrame",
     options: "CastOptions",
 ) -> "psql.DataFrame":
-    spark = get_spark_sql()
+    spark = spark_sql_module()
 
     if not isinstance(data, spark.DataFrame):
         raise TypeError(f"Unsupported tabular type: {type(data)!r}")
@@ -174,7 +174,7 @@ def cast_spark_tabular(
         return data
 
     source_schema = options.source
-    target_schema = options.merged_schema
+    target_schema = options.merged.to_struct()
 
     # Engine-level fast bypass — Field/DataType detail (semantic
     # subclass, metadata) doesn't surface in the underlying Spark

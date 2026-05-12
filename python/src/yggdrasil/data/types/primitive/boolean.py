@@ -9,7 +9,7 @@ import pyarrow as pa
 from ._helpers import _BOOL_FALSE, _BOOL_TRUE, _coerce_str
 from .base import PrimitiveType
 from ..id import DataTypeId
-from ..support import get_polars, get_spark_sql
+from yggdrasil.lazy_imports import polars_module, spark_sql_module
 
 if TYPE_CHECKING:
     import polars
@@ -46,7 +46,7 @@ class BooleanType(PrimitiveType):
 
     @classmethod
     def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
-        pl = get_polars()
+        pl = polars_module()
         return dtype == pl.Boolean
 
     @classmethod
@@ -57,7 +57,7 @@ class BooleanType(PrimitiveType):
 
     @classmethod
     def handles_spark_type(cls, dtype: "pst.DataType") -> bool:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         return isinstance(dtype, spark.types.BooleanType)
 
     @classmethod
@@ -87,11 +87,11 @@ class BooleanType(PrimitiveType):
         return pa.bool_()
 
     def to_polars(self) -> "polars.DataType":
-        pl = get_polars()
+        pl = polars_module()
         return pl.Boolean
 
     def to_spark(self) -> Any:
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         return spark.types.BooleanType()
 
     def to_spark_name(self) -> str:

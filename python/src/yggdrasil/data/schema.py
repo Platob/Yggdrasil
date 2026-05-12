@@ -1,33 +1,24 @@
 """StructField — a :class:`Field` whose dtype is a :class:`StructType`.
 
-``StructField`` (historically ``Schema``) is just a thin type-hinting
-subclass of :class:`Field`: every schema-shaped operation (mapping
-surface, set operators, engine schema export, autotag propagation,
-struct-aware ``equals``) lives on :class:`Field` itself. The subclass
-is kept around so existing call sites that type-hint ``Schema`` (and
-the ``schema(...)`` factory) keep their meaning, but no behaviour is
-unique to it — ``StructField`` is just a ``Field`` with the
-schema-style ``__init__`` signature.
+``StructField`` is a thin type-hinting subclass of :class:`Field`:
+every schema-shaped operation lives on :class:`Field` itself. The
+subclass exists so the constructor can take a list of children
+directly (``StructField([f1, f2])``) instead of the dtype-by-dtype
+shape Field requires.
 
-``Schema`` remains as an alias for ``StructField`` so the existing
-public surface keeps working unchanged.
+``Schema`` is exported as a historical alias for ``StructField``.
 """
 from __future__ import annotations
 
 import dataclasses
 from collections.abc import Iterable
-from typing import Any, Mapping
+from typing import Any
 
 import pyarrow as pa
 
 from yggdrasil.data.cast.registry import register_converter
 from yggdrasil.data.constants import DEFAULT_FIELD_NAME
-from .data_field import (
-    Field,
-    field,
-    _normalize_inner_fields,
-    _peel_name_nullable,
-)
+from .data_field import Field, field, _normalize_inner_fields
 from .types.nested import StructType
 
 
@@ -41,28 +32,33 @@ __all__ = [
 
 
 def schema(
-    fields: Iterable[Field | pa.Field | str],
+    fields: Iterable[Field | pa.Field | str] | Field,
     *other: Field | pa.Field,
+    name: str = DEFAULT_FIELD_NAME,
+    nullable: bool = False,
     metadata: dict[bytes | str, bytes | str | object] | None = None,
     tags: dict[bytes | str, bytes | str | object] | None = None,
 ) -> "StructField":
     if fields is None:
-        fields = []
-    elif isinstance(fields, Field):
-        fields = [fields]
+        fields = ()
     elif isinstance(fields, StructField):
         if not metadata:
             metadata = fields.metadata
+        if name == DEFAULT_FIELD_NAME:
+            name = fields.name
         fields = fields.children
+    elif isinstance(fields, Field):
+        fields = (fields,)
     elif not isinstance(fields, (list, set, tuple)):
-        fields = [fields]
+        fields = (fields,)
 
     if other:
-        fields = list(fields)
-        fields.extend(other)
+        fields = (*fields, *other)
 
-    return StructField.from_any_fields(
+    return StructField(
         fields,
+        name=name,
+        nullable=nullable,
         metadata=metadata,
         tags=tags,
     )
@@ -72,118 +68,83 @@ def schema(
 class StructField(Field):
     """A :class:`Field` whose ``dtype`` is a :class:`StructType`.
 
-    Historically named ``Schema`` (still exported as that alias).
-    StructField is *just* a struct field — every method that mattered
-    on the old standalone class is now a regular :class:`Field` method
-    that works for any struct dtype. This subclass keeps the
-    schema-style ``__init__(inner_fields=...)`` signature so existing
-    call sites don't need to convert, plus a header-style ``__repr__``;
-    everything else is inherited.
+    ``StructField([f1, f2, ...])`` builds a struct field from its
+    children directly — sugar for the equivalent
+    ``Field(name=..., dtype=StructType(fields=(...,)))`` chain that
+    :class:`Field`'s constructor accepts. Every schema-shaped method
+    (mapping surface, set operators, engine schema export, autotag,
+    struct-aware ``equals``) is inherited from :class:`Field`.
     """
 
-    # Strict shape — Schema's dtype is always a StructType.
+    # Strict shape — StructField's dtype is always a StructType.
     dtype: StructType
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """``StructField(inner_fields=..., metadata=...)`` — schema-style init.
+        """``StructField(fields, name=..., metadata=..., ...)``.
 
-        Wide ``*args / **kwargs`` signature so the same constructor
-        can absorb the two call shapes that reach it:
+        ``fields`` is the children list — :class:`Field` instances,
+        :class:`pa.Field` instances, or anything :meth:`Field.from_any`
+        accepts. ``dtype=<StructType>`` is accepted as an alternative
+        for callers (and the ``Field.__new__`` redirect) that already
+        have a built struct dtype in hand; pass one or the other, not
+        both.
 
-        1. **Schema-style** — ``StructField(inner_fields=[...],
-           metadata=..., name=..., nullable=...)`` — the historical
-           ``Schema(...)`` surface.
-        2. **Field-style re-init** — when ``Field.__new__`` redirects
-           a struct ``Field(name=..., dtype=struct_t, ...)`` call to
-           :class:`StructField`, Python follows up by calling
-           ``StructField.__init__`` on the already-initialized
-           instance with the original *Field*-positional args. The
-           re-init guard short-circuits before any signature parsing,
-           which avoids a positional-vs-keyword clash on ``metadata``.
+        The wide ``*args / **kwargs`` shape is here because
+        ``Field.__new__`` redirects struct-shaped ``Field(...)`` calls
+        (positional *or* keyword) to this class and Python then
+        re-enters ``__init__`` on the already-stamped instance with
+        the original Field arguments. The re-init guard below
+        absorbs that pass before any signature parsing runs.
         """
-        # Re-init guard — slots already set by ``Field.__new__``.
+        # Re-init guard for the Field.__new__ struct redirect.
         try:
             if self.dtype is not None:
                 return
         except AttributeError:
             pass
 
-        # Parse the schema-style call shape.
-        inner_fields = kwargs.pop("inner_fields", ...)
-        metadata = kwargs.pop("metadata", None)
+        fields: Any = ...
         if args:
-            if inner_fields is ...:
-                inner_fields = args[0]
-                args = args[1:]
-            if args and metadata is None:
-                metadata = args[0]
-                args = args[1:]
-            if args:
+            fields = args[0]
+            args = args[1:]
+        if "fields" in kwargs:
+            if fields is not ...:
                 raise TypeError(
-                    f"StructField() takes at most 2 positional arguments "
-                    f"(inner_fields, metadata); got {len(args) + 2} extra."
+                    "StructField(): got multiple values for argument 'fields'"
                 )
-        if inner_fields is ...:
-            inner_fields = None
-        name = kwargs.pop("name", None)
-        nullable = kwargs.pop("nullable", None)
+            fields = kwargs.pop("fields")
+        if fields is ...:
+            fields = None
+
+        dtype = kwargs.pop("dtype", None)
+        name = kwargs.pop("name", DEFAULT_FIELD_NAME)
+        nullable = kwargs.pop("nullable", False)
+        metadata = kwargs.pop("metadata", None)
         tags = kwargs.pop("tags", None)
         parent = kwargs.pop("parent", None)
-        dtype = kwargs.pop("dtype", None)
-        default = kwargs.pop("default", None)
-        if kwargs:
+
+        if args or kwargs:
             raise TypeError(
-                f"StructField() got unexpected keyword arguments: "
-                f"{sorted(kwargs)}."
+                f"StructField() got unexpected arguments: "
+                f"args={args!r}, kwargs={sorted(kwargs)!r}"
             )
 
         if dtype is not None:
-            if inner_fields is not None:
+            if fields:
                 raise TypeError(
-                    "Schema(): pass either inner_fields= or dtype=, not both"
+                    "StructField(): pass either fields=... or dtype=..., not both"
                 )
-            # Downgrade to Field's call shape — happens when a
-            # generic factory (e.g. ``Schema.from_dataclass``) hands
-            # us a fully-built dtype. Lift non-struct dtypes into a
-            # single-child struct so the schema-shape contract holds.
-            from .types.base import DataType
-            resolved = DataType.from_any(dtype)
-            if not isinstance(resolved, StructType):
-                wrapped_name = name or DEFAULT_FIELD_NAME
-                resolved = StructType(
-                    fields=(
-                        Field(
-                            name=wrapped_name,
-                            dtype=resolved,
-                            nullable=True if nullable is None else bool(nullable),
-                        ),
-                    )
-                )
-            Field.__init__(
-                self,
-                name=name or DEFAULT_FIELD_NAME,
-                dtype=resolved,
-                nullable=False if nullable is None else bool(nullable),
-                metadata=metadata,
-                tags=tags,
-                default=default,
-                parent=parent,
-            )
-            return
-
-        children = _normalize_inner_fields(inner_fields)
-        meta, embedded_name, embedded_nullable = _peel_name_nullable(metadata)
-        if name is None:
-            name = embedded_name if embedded_name is not None else DEFAULT_FIELD_NAME
-        if nullable is None:
-            nullable = bool(embedded_nullable) if embedded_nullable is not None else False
+            resolved = dtype
+        else:
+            children = _normalize_inner_fields(fields)
+            resolved = StructType(fields=tuple(children))
 
         Field.__init__(
             self,
             name=name,
-            dtype=StructType(fields=tuple(children)),
+            dtype=resolved,
             nullable=bool(nullable),
-            metadata=meta,
+            metadata=metadata,
             tags=tags,
             parent=parent,
         )
@@ -197,47 +158,29 @@ class StructField(Field):
         return f"StructField: {self.name!r} {comment!r}{body}"
 
     def to_field(self) -> Field:
-        """Return this struct field as a :class:`Field` — i.e. ``self``.
-
-        StructField IS a Field, so the cast is identity. Kept as a
-        no-op alias for callers that want to type-narrow.
-        """
+        """Identity — StructField IS a Field. Kept for type-narrowing callers."""
         return self
 
     def as_spark(self) -> "StructField":
-        """Return a :class:`StructField` whose dtype is Spark-compatible.
-
-        Like :meth:`Field.as_spark`, but the result is wrapped back
-        into a :class:`StructField` so callers chain through
-        schema-shaped APIs without dropping to a plain :class:`Field`.
-        When every child is already Spark-compatible the same instance
-        is returned. Use :meth:`to_spark_schema` when you need an
-        actual ``pyspark.sql.types.StructType``.
-        """
+        """Return a :class:`StructField` whose dtype is Spark-compatible."""
         return self._rewrap_with_dtype(self.dtype.as_spark())
 
     def as_polars(self) -> "StructField":
-        """Return a :class:`StructField` whose dtype is Polars-compatible.
-
-        Same shape as :meth:`as_spark`, just delegating to
-        :meth:`DataType.as_polars` on the inner dtype.
-        """
+        """Return a :class:`StructField` whose dtype is Polars-compatible."""
         return self._rewrap_with_dtype(self.dtype.as_polars())
 
-    def _rewrap_with_dtype(self, dtype) -> "StructField":
+    def _rewrap_with_dtype(self, dtype: StructType) -> "StructField":
         if dtype is self.dtype:
             return self
         return StructField(
-            inner_fields=tuple(dtype.fields),
-            metadata=self.metadata,
+            tuple(dtype.fields),
             name=self.name,
             nullable=self.nullable,
+            metadata=self.metadata,
         )
 
 
-# Historical alias — every existing call site that imports ``Schema``
-# from ``yggdrasil.data.schema`` keeps working; new code should reach
-# for the descriptive ``StructField`` name.
+# Historical alias — call sites that imported ``Schema`` keep working.
 Schema = StructField
 
 

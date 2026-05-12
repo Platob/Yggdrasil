@@ -29,7 +29,7 @@ import pyarrow.compute as pc
 from ..id import DataTypeId
 from ..primitive.base import PrimitiveType
 from ..primitive.string import StringType
-from ..support import get_polars, get_spark_sql
+from yggdrasil.lazy_imports import polars_module, spark_sql_module
 
 if TYPE_CHECKING:
     import polars
@@ -321,7 +321,7 @@ class DictionaryType(PrimitiveType):
 
     @classmethod
     def handles_polars_type(cls, dtype: "polars.DataType") -> bool:
-        pl = get_polars()
+        pl = polars_module()
         try:
             return isinstance(dtype, pl.Enum) or dtype == pl.Enum
         except Exception:
@@ -329,7 +329,7 @@ class DictionaryType(PrimitiveType):
 
     @classmethod
     def from_polars_type(cls, dtype: "polars.DataType") -> "DictionaryType":
-        pl = get_polars()
+        pl = polars_module()
         if not (isinstance(dtype, pl.Enum) or dtype == pl.Enum):
             raise TypeError(f"Unsupported Polars data type: {dtype!r}")
         # ``pl.Enum`` is the dtype class itself when not parameterized
@@ -353,7 +353,7 @@ class DictionaryType(PrimitiveType):
         )
 
     def to_polars(self) -> "polars.DataType":
-        pl = get_polars()
+        pl = polars_module()
         if isinstance(self.value_type, StringType) and self.categories:
             return pl.Enum(list(self.categories))
         # Polars Enum is string-only and requires a non-empty category
@@ -578,7 +578,7 @@ class DictionaryType(PrimitiveType):
         series: "polars.Series",
         options: "CastOptions",
     ):
-        pl = get_polars()
+        pl = polars_module()
         target_dtype = self.to_polars()
 
         # ``strict=False`` on an Enum cast is exactly our lenient
@@ -598,7 +598,7 @@ class DictionaryType(PrimitiveType):
         expr: "polars.Expr",
         options: "CastOptions",
     ):
-        pl = get_polars()
+        pl = polars_module()
         target_dtype = self.to_polars()
 
         if isinstance(target_dtype, pl.Enum):
@@ -614,7 +614,7 @@ class DictionaryType(PrimitiveType):
         column: Any,
         options: "CastOptions",
     ):
-        spark = get_spark_sql()
+        spark = spark_sql_module()
         F = spark.functions
         options = options.check_source(column)
 

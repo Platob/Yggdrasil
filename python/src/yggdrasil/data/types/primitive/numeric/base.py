@@ -31,7 +31,7 @@ from yggdrasil.data.enums import Mode
 from ..base import PrimitiveType
 from ...base import DataType
 from ...id import DataTypeId
-from ...support import get_polars, get_spark_sql
+from yggdrasil.lazy_imports import polars_module, spark_sql_module
 
 if TYPE_CHECKING:
     import polars  # noqa: F401
@@ -161,7 +161,7 @@ class NumericType(PrimitiveType, ABC):
         options: "CastOptions",
     ) -> "polars.Expr":
         if options.need_cast(expr, self):
-            pl = get_polars()
+            pl = polars_module()
             src_id = self._source_type_id(options)
 
             if src_id == DataTypeId.STRING:
@@ -189,7 +189,7 @@ class NumericType(PrimitiveType, ABC):
         options: "CastOptions",
     ) -> Any:
         if options.need_cast(column, self):
-            spark = get_spark_sql()
+            spark = spark_sql_module()
             F = spark.functions
             src_id = self._source_type_id(options)
 
@@ -209,7 +209,7 @@ class NumericType(PrimitiveType, ABC):
 
 
 def _polars_flip_int_signedness(dtype: Any) -> Any:
-    pl = get_polars()
+    pl = polars_module()
     flip = {
         pl.Int8: pl.UInt8,
         pl.Int16: pl.UInt16,
@@ -224,7 +224,7 @@ def _polars_flip_int_signedness(dtype: Any) -> Any:
 
 
 def _polars_is_integer(dtype: Any) -> bool:
-    pl = get_polars()
+    pl = polars_module()
     return dtype in {
         pl.Int8, pl.Int16, pl.Int32, pl.Int64,
         pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
@@ -232,5 +232,5 @@ def _polars_is_integer(dtype: Any) -> bool:
 
 
 def _polars_is_signed_int(dtype: Any) -> bool:
-    pl = get_polars()
+    pl = polars_module()
     return dtype in {pl.Int8, pl.Int16, pl.Int32, pl.Int64}
