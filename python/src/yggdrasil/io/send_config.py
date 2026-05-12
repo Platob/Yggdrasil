@@ -18,7 +18,6 @@ from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
     from yggdrasil.io.tabular import Tabular
-    from yggdrasil.io.nested.folder_io import FolderIO
     from yggdrasil.io.response import Response
     from yggdrasil.io.session import Session
 
@@ -39,6 +38,7 @@ _DEFAULT_REQUEST_BY: tuple[str, ...] = (
 _CACHE_CONFIG_FIELDS: frozenset[str] = frozenset(
     {
         "tabular",
+        "path",
         "request_by",
         "response_by",
         "mode",
@@ -47,7 +47,7 @@ _CACHE_CONFIG_FIELDS: frozenset[str] = frozenset(
         "received_to",
         "wait",
         "mirror_local_to_remote",
-        "optimize_on_write",
+        "cleanup_ttl",
     }
 )
 
@@ -159,39 +159,12 @@ def _is_tabular_io(arg: Any) -> bool:
     )
 
 
-def _folderio_for_local_cache(path: Path) -> "FolderIO":
-    """Wrap a local filesystem :class:`Path` into a partitioned cache folder.
-
-    Returns a :class:`YGGFolderIO` rooted at *path* and bound to
-    :data:`RESPONSE_SCHEMA`. The schema's ``partition_by``-tagged
-    fields drive the Hive layout automatically; partition pruning
-    on read uses ``options.prune_values`` (which the cache flow
-    in :mod:`yggdrasil.io.session` populates from the request
-    batch's ``partition_key`` set).
-    """
-    from yggdrasil.io.nested.ygg_folder_io import YGGFolderIO
-    from yggdrasil.io.path import LocalPath
-
-    return YGGFolderIO(path=LocalPath(path), schema=RESPONSE_SCHEMA)
-
-
 def _coerce_optional_datetime(value: Any) -> Optional[dt.datetime]:
     if value in (None, ""):
         return None
     if isinstance(value, dt.datetime):
         return value
     return any_to_datetime(value)
-
-
-# Hot dimensions for partition pruning of the local response cache —
-# kept here for callers that introspect the cache layout. The same
-# tag now lives on :data:`RESPONSE_SCHEMA` itself (set via the
-# schema-level ``partition_by`` autotag), so :class:`FolderIO`
-# derives the Hive partition layout straight from the schema without
-# any per-cache rewriting.
-LOCAL_CACHE_PARTITION_COLUMNS: tuple[str, ...] = tuple(
-    f.name for f in RESPONSE_SCHEMA.children_fields if f._tag_flag(b"partition_by")
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,13 +226,16 @@ class _ConfigBase:
 class CacheConfig(_ConfigBase):
     _FIELD_NAMES: ClassVar[frozenset[str]] = _CACHE_CONFIG_FIELDS
 
-    # Unified backend slot — accepts any :class:`Tabular` subclass:
-    # :class:`FolderIO` for an on-disk cache, :class:`Table` (Databricks)
-    # for a remote cache, or any other registered tabular adapter.
-    # Both backends share the same partitioning / primary-key /
-    # match-by rules driven from RESPONSE_SCHEMA, so the cache flow
-    # in Session is the same regardless of where the rows actually
-    # land.
+    # Local cache root directory. When set, the session writes each
+    # successful response as one Arrow IPC file at
+    # ``<path>/<METHOD>/<host>/<seg>/.../<public_hash>.arrow`` (see
+    # :mod:`yggdrasil.io.session._local_fast_path_relative`). Stored
+    # as a string so the frozen-dataclass instance pickles cleanly
+    # across worker boundaries (Spark, multiprocessing, Power Query).
+    path: Optional[str] = field(default=None, hash=False, compare=False)
+    # Remote cache backend — a :class:`Tabular` subclass (Databricks
+    # Table, …). Mutually exclusive with :attr:`path`: a single
+    # config is either local *or* remote, not both.
     tabular: Optional["Tabular"] = field(default=None, hash=False, compare=False)
     request_by: Optional[list[str]] = field(default=None, hash=False, compare=False)
     response_by: Optional[list[str]] = field(default=None, hash=False, compare=False)
@@ -277,18 +253,11 @@ class CacheConfig(_ConfigBase):
     # write per group instead of waiting for a fresh network call to
     # repopulate remote. Default False keeps the legacy behavior.
     mirror_local_to_remote: bool = False
-    # When True (default), each :meth:`Session.send_many` batch
-    # invokes :meth:`YGGFolderIO.optimize` on the local cache once
-    # the batch's writes have settled — but scoped to the partition
-    # tuples that batch actually touched. A typical batch spreads its
-    # writes across a handful of ``partition_key=…`` directories;
-    # compacting only those leaves means we never pay for a full-tree
-    # walk just because a few new small files landed. Remote caches
-    # ignore this flag (compaction is the warehouse's job). Set False
-    # to opt out — useful when an external process already runs
-    # OPTIMIZE on a schedule, or for very write-heavy bursts where
-    # the per-batch fsync is unwelcome.
-    optimize_on_write: bool = True
+    # TTL after which orphaned fast-path ``.arrow`` files in the
+    # local cache tree are unlinked by the writer-side cleanup pass.
+    # Default 1 day mirrors the previous YGGFolderIO behaviour. Set
+    # to ``None`` to disable cleanup entirely (cache grows unbounded).
+    cleanup_ttl: Optional[dt.timedelta] = dt.timedelta(days=1)
 
     @staticmethod
     def _check_mapping(values: MutableMapping[str, Any]):
@@ -300,6 +269,10 @@ class CacheConfig(_ConfigBase):
         if received_ttl is not None:
             values["received_ttl"] = any_to_timedelta(received_ttl)
 
+        cleanup_ttl = values.get("cleanup_ttl")
+        if cleanup_ttl is not None:
+            values["cleanup_ttl"] = any_to_timedelta(cleanup_ttl)
+
         received_from = values.get("received_from")
         if received_from is not None:
             values["received_from"] = _coerce_optional_datetime(received_from)
@@ -307,6 +280,10 @@ class CacheConfig(_ConfigBase):
         received_to = values.get("received_to")
         if received_to is not None:
             values["received_to"] = _coerce_optional_datetime(received_to)
+
+        path = values.get("path")
+        if path is not None and not isinstance(path, str):
+            values["path"] = str(path)
 
         return values
 
@@ -327,17 +304,27 @@ class CacheConfig(_ConfigBase):
             if not self.received_from:
                 object.__setattr__(self, "received_from", self.received_to - self.received_ttl)
 
+        if self.path is not None and not isinstance(self.path, str):
+            object.__setattr__(self, "path", str(self.path))
+
+        if self.path is not None and self.tabular is not None:
+            raise ValueError(
+                "CacheConfig accepts either ``path`` (local cache) or "
+                "``tabular`` (remote cache), not both."
+            )
+
     def __getstate__(self):
         return {
             "mode": self.mode,
             "wait": self.wait,
+            "path": self.path,
             "request_by": self.request_by,
             "response_by": self.response_by,
             "received_from": self.received_from,
             "received_to": self.received_to,
             "received_ttl": self.received_ttl,
             "mirror_local_to_remote": self.mirror_local_to_remote,
-            "optimize_on_write": self.optimize_on_write,
+            "cleanup_ttl": self.cleanup_ttl,
         }
 
     def __setstate__(self, state):
@@ -348,11 +335,12 @@ class CacheConfig(_ConfigBase):
         object.__setattr__(self, "received_from", state["received_from"])
         object.__setattr__(self, "received_to", state["received_to"])
         object.__setattr__(self, "received_ttl", state["received_ttl"])
+        object.__setattr__(self, "path", state.get("path"))
         # ``tabular`` is intentionally excluded from __getstate__ —
-        # local FolderIO paths don't survive process boundaries and
-        # remote Table handles wrap a live Databricks client. Init
-        # to None so attribute access on the deserialized side
-        # doesn't AttributeError.
+        # remote :class:`Tabular` handles wrap a live Databricks
+        # client and don't survive process boundaries. Init to None
+        # so attribute access on the deserialized side doesn't
+        # AttributeError.
         object.__setattr__(self, "tabular", state.get("tabular"))
         object.__setattr__(self, "anonymize", state.get("anonymize", "remove"))
         object.__setattr__(
@@ -360,8 +348,8 @@ class CacheConfig(_ConfigBase):
             state.get("mirror_local_to_remote", False),
         )
         object.__setattr__(
-            self, "optimize_on_write",
-            state.get("optimize_on_write", True),
+            self, "cleanup_ttl",
+            state.get("cleanup_ttl", dt.timedelta(days=1)),
         )
 
     @classmethod
@@ -378,7 +366,10 @@ class CacheConfig(_ConfigBase):
             return cls.parse_mapping(arg, **overrides)
 
         if isinstance(arg, Path):
-            overrides["tabular"] = _folderio_for_local_cache(arg)
+            overrides["path"] = str(arg)
+
+        elif isinstance(arg, str):
+            overrides["path"] = arg
 
         elif _is_tabular_io(arg):
             overrides["tabular"] = arg
@@ -407,33 +398,31 @@ class CacheConfig(_ConfigBase):
         return self.mode in (Mode.APPEND, Mode.AUTO)
 
     @property
-    def is_local_tabular(self) -> bool:
-        """True when ``tabular`` is a :class:`FolderIO` (on-disk cache).
+    def is_local(self) -> bool:
+        """True when this config drives the on-disk fast-path cache."""
+        return self.path is not None
 
-        Used to dispatch between FolderIO write semantics
-        (``write_arrow_batches`` + ``FolderOptions``) and
-        Databricks-Table write semantics (``insert(..., match_by=...,
-        prune_by=...)``) inside :class:`Session`.
-        """
-        from yggdrasil.io.nested.folder_io import FolderIO
-        return isinstance(self.tabular, FolderIO)
+    @property
+    def is_remote(self) -> bool:
+        """True when this config drives a remote :class:`Tabular`-backed cache."""
+        return self.tabular is not None
 
     @property
     def local_cache_enabled(self):
         # Two ways to opt into a local cache layer:
-        #   1) ``tabular`` is set to a FolderIO (explicit local backend);
-        #   2) a ``received_from`` / ``received_to`` window is set, in
-        #      which case ``local_cache()`` lazy-builds a FolderIO at
-        #      the default path on first read.
+        #   1) ``path`` is set to a directory (explicit local backend);
+        #   2) a ``received_from`` / ``received_to`` window is set,
+        #      in which case ``local_cache_path()`` lazy-fills the
+        #      default ``~/.yggdrasil/cache/response/...`` root.
         if not self.cache_enabled:
             return False
-        if self.is_local_tabular:
+        if self.is_local:
             return True
         return self.received_from is not None or self.received_to is not None
 
     @property
     def remote_cache_enabled(self):
-        return self.cache_enabled and self.tabular is not None and not self.is_local_tabular
+        return self.cache_enabled and self.is_remote
 
     @property
     def match_by(self) -> list[str]:
@@ -512,11 +501,11 @@ class CacheConfig(_ConfigBase):
     def local_cache_folder(self, session: "Session | None" = None) -> Path:
         """Filesystem root for the local cache.
 
-        Returns ``self.tabular.path`` when ``tabular`` is a
-        :class:`FolderIO`. Otherwise builds the default path under
-        ``~/.yggdrasil/cache/response``, suffixed with the session's
-        ``base_url`` host + path when one is available so different
-        APIs sharing the same machine don't collide on disk:
+        Returns :attr:`path` when explicitly set, otherwise builds
+        the default path under ``~/.yggdrasil/cache/response``,
+        suffixed with the session's ``base_url`` host + path when
+        one is available so different APIs sharing the same machine
+        don't collide on disk:
 
         * ``base_url=https://api.example.com/v1/`` → ``…/response/api.example.com/v1``
         * ``base_url`` unset → ``…/response/default``
@@ -524,8 +513,8 @@ class CacheConfig(_ConfigBase):
         Used as the per-config key for grouping cache hits in
         :class:`yggdrasil.io.response_batch.ResponseBatch`.
         """
-        if self.is_local_tabular:
-            return Path(str(self.tabular.path))
+        if self.path is not None:
+            return Path(self.path)
         root = Path.home() / ".yggdrasil" / "cache" / "response"
         base_url = getattr(session, "base_url", None) if session is not None else None
         host = getattr(base_url, "host", None) if base_url is not None else None
@@ -534,53 +523,35 @@ class CacheConfig(_ConfigBase):
         path = (getattr(base_url, "path", "") or "").strip("/")
         return root / host / path if path else root / host
 
-    def local_cache(self, session: "Session | None" = None) -> "FolderIO":
-        """Return the local-cache folder.
+    def local_cache_path(self, session: "Session | None" = None) -> str:
+        """Return the local-cache root as a string and memoize it on :attr:`path`.
 
-        Returns ``self.tabular`` when it's already a FolderIO,
-        otherwise lazy-builds a :class:`YGGFolderIO` rooted at
-        :meth:`local_cache_folder` (and caches it back into
-        ``tabular`` so subsequent calls return the same instance).
-        The schema is :data:`RESPONSE_SCHEMA` — its
-        ``partition_by``-tagged ``partition_key`` column drives the
-        Hive layout automatically; the ``.ygg/`` sidecar lets the
-        cache attach stats / checkpoints without a separate
-        wrapper.
-
-        Pass *session* so the lazy default path picks up the
-        session's ``base_url`` host/path (see :meth:`local_cache_folder`).
-
-        Stale-part cleanup is decoupled from the build now: writers
-        call :meth:`Tabular.cleanup` after a successful insert and
-        the backend decides whether anything is due — cf.
-        :meth:`prebuild` for the session-time prebuild contract.
+        Wraps :meth:`local_cache_folder` and stores the resolved
+        directory back onto the frozen dataclass via
+        ``object.__setattr__`` so repeat calls (per-batch lookups,
+        per-response writes) don't keep recomputing the default-path
+        suffix from the session's ``base_url``. The string form is
+        what every downstream caller needs (Job pickle payloads,
+        ``str(...)`` group keys, ``os.path.join`` callers).
         """
-        if self.is_local_tabular:
-            return self.tabular  # type: ignore[return-value]
-        folder = _folderio_for_local_cache(self.local_cache_folder(session=session))
-        # Cache the lazy-built FolderIO so repeated send_many()
-        # calls don't keep re-instantiating it. Frozen-dataclass
-        # safe via ``object.__setattr__``.
-        if self.tabular is None:
-            object.__setattr__(self, "tabular", folder)
-        return folder  # type: ignore[return-value]
+        if self.path is not None:
+            return self.path
+        resolved = str(self.local_cache_folder(session=session))
+        object.__setattr__(self, "path", resolved)
+        return resolved
 
     def prebuild(self, session: "Session | None" = None) -> "CacheConfig":
-        """Materialise :attr:`tabular` for local-cache configs.
+        """Materialise :attr:`path` for local-cache configs.
 
         After this call the session-level cache flow can reach for
-        ``cfg.tabular`` regardless of whether the cache is local or
-        remote — symmetric to remote configs which always ship with
-        a prebuilt ``tabular`` (a :class:`Table` or other registered
-        :class:`Tabular`). Lets the local- and remote-side helpers
-        in :class:`Session` share the same group-by-cache shape:
-        ``str(cfg.tabular.path)`` for the disk cache, and
-        ``cfg.tabular.full_name(safe=True)`` for the remote table.
+        ``cfg.path`` directly without a ``local_cache_path(session)``
+        dance. Symmetric to remote configs which always ship with a
+        prebuilt :attr:`tabular`.
 
         No-op when:
 
-        - :attr:`tabular` is already set (already prebuilt or
-          remote);
+        - :attr:`path` is already set;
+        - the cache is remote-only (:attr:`tabular` is set);
         - :attr:`local_cache_enabled` is False (mode disables the
           cache, no ``received_*`` window, etc).
 
@@ -588,12 +559,13 @@ class CacheConfig(_ConfigBase):
         ``cfg.prebuild(session)`` at the entry of
         :meth:`Session._send_many_batches`.
         """
-        if self.tabular is not None:
+        if self.path is not None:
+            return self
+        if self.is_remote:
             return self
         if not self.local_cache_enabled:
             return self
-        folder = _folderio_for_local_cache(self.local_cache_folder(session=session))
-        object.__setattr__(self, "tabular", folder)
+        self.local_cache_path(session=session)
         return self
 
     def request_values(
