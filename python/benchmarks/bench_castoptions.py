@@ -14,7 +14,7 @@ allocating a frozen dataclass, normalizing a target field, running
 
 This benchmark targets the construction / coercion / copy paths that
 fire whether or not any real data is touched, plus the cached
-property accessors (``merged_field``, ``column_names``) that pipelines
+property accessors (``merged``, ``column_names``) that pipelines
 walk repeatedly. It does **not** measure the per-engine cast kernels
 — see ``bench_engine_type_bypass`` for those.
 
@@ -200,17 +200,17 @@ def scenarios(repeat: int) -> list[dict]:
         repeat=repeat, inner=200_000,
     ))
 
-    # 13. merged_field — cached on the instance; subsequent reads are
+    # 13. merged — cached on the instance; subsequent reads are
     # what the cast pipeline actually pays for once the cache warms up.
     opts_both = CastOptions(source=PA_SCHEMA, target=PA_SCHEMA)
-    _ = opts_both.merged_field  # warm the slot
+    _ = opts_both.merged  # warm the slot
     results.append(_time_one(
-        "prop: opts.merged_field cached read",
-        lambda: opts_both.merged_field,
+        "prop: opts.merged cached read",
+        lambda: opts_both.merged,
         repeat=repeat, inner=500_000,
     ))
 
-    # 14. column_names — goes through merged_field then walks names.
+    # 14. column_names — goes through merged then walks names.
     results.append(_time_one(
         "prop: opts.column_names",
         lambda: opts_both.column_names,

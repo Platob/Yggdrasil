@@ -1024,7 +1024,7 @@ class Tabular(ABC, Generic[O]):
         # source_field to the merged target so the per-batch
         # ``cast_arrow_tabular`` collapses to its bypass instead of
         # re-running the cast on data we've already shaped.
-        merged = options.merged_field
+        merged = options.merged
         inner = options.copy(
             source=merged if merged is not None else ...,
             sync_metadata=False,

@@ -7,41 +7,33 @@ wrapper around a single Databricks SQL Warehouse that provides:
 - property-based status checks (running, pending, serverless)
 - lifecycle helpers: start, stop, delete, wait_for_status
 - configuration updates and permission management
-- SQL statement execution with retry / back-off logic
+- SQL statement execution
 
 Executor contract
 -----------------
 :class:`SQLWarehouse` is a concrete :class:`StatementExecutor` —
 ``_submit_statement`` reads typed warehouse fields off
-:class:`WarehousePreparedStatement` and submits via the SDK.
+:class:`WarehousePreparedStatement` and submits via the SDK.  If the SDK
+call fails (``DeadlineExceeded`` on a cold/busy warehouse, transport
+errors, etc.) the exception propagates — there is no submission-level
+retry layer.
 
 Execution policy travels through :class:`DatabricksExecutionOptions`
 (``wait``, ``raise_error``, ``parallel`` from the base, plus
-``submit_wait``, ``external_data``, ``external_volume_paths``).  The base
+``external_data``, ``external_volume_paths``).  The base
 :meth:`StatementExecutor._execute` hook handles submit + wait/raise; this
 subclass overrides it to stage external data first and merge volume
 paths onto the statement.
 
-Two retry layers — keep them straight
--------------------------------------
-This module participates in two distinct retry mechanisms.  They cover
-different failure modes and are configured independently:
-
-1. **Submission-level retry** — :meth:`_submit_with_retry`.  Always on.
-   Wraps the SDK ``execute_statement`` call in a backoff loop that retries
-   :class:`DeadlineExceeded` errors (cold/busy warehouses) until
-   ``submit_wait.timeout`` elapses.  Configured via
-   :attr:`DatabricksExecutionOptions.submit_wait` (or the ``submit_wait``
-   kwarg on :meth:`execute`).  This isn't tied to ``statement.retry`` —
-   even a non-retryable statement gets submission-level retries because
-   "warehouse was busy when I knocked" is not a statement failure.
-
-2. **Result-level retry** — :meth:`StatementResult.retry`.  Opt-in by
-   setting ``statement.retry`` to a :class:`WaitingConfig`.  After a
-   *terminal-failure* result (statement_id was issued, query ran,
-   query failed), drives :meth:`StatementResult.start` ``reset=True``
-   per attempt with backoff driven by the WaitingConfig.  Used for
-   genuinely flaky queries, not for warehouse availability.
+Result-level retry
+------------------
+:meth:`StatementResult.retry` is opt-in by setting ``statement.retry``
+to a :class:`WaitingConfig`.  After a *terminal-failure* result
+(statement_id was issued, query ran, query failed), it drives
+:meth:`StatementResult.start` ``reset=True`` per attempt with backoff
+driven by the WaitingConfig.  Used for genuinely flaky queries, not for
+warehouse availability — that's the caller's responsibility now that
+submission-level retry is gone.
 
 Collection-level operations (listing, finding, creating warehouses) live
 in the companion :mod:`~yggdrasil.databricks.sql.service` module.
@@ -54,7 +46,6 @@ import time
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar, List, Mapping, Optional, Union, TYPE_CHECKING
 
-from databricks.sdk.errors import DeadlineExceeded, InternalError
 from databricks.sdk.service.sql import (
     Disposition,
     EndpointInfo,
@@ -64,8 +55,13 @@ from databricks.sdk.service.sql import (
 )
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data.executor import ExecutionOptions, StatementExecutor
-from yggdrasil.databricks.warehouse.wh_utils import safeEndpointInfo, _EDIT_ARG_NAMES, _jitter_sleep_seconds, \
-    serverless_sibling_spec, name_at_index, indexed_name_parts
+from yggdrasil.databricks.warehouse.wh_utils import (
+    _EDIT_ARG_NAMES,
+    indexed_name_parts,
+    name_at_index,
+    safeEndpointInfo,
+    serverless_sibling_spec,
+)
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.pyutils.equality import dicts_equal
 
@@ -88,20 +84,6 @@ __all__ = [
 LOGGER = logging.getLogger(__name__)
 
 
-_DEFAULT_SUBMIT_WAIT = WaitingConfig(
-    timeout=300,
-    interval=1.0,
-    backoff=1.8,
-    max_interval=8.0,
-)
-
-# This module assumes :class:`WarehousePreparedStatement` carries a
-# ``submit_wait: Optional[WaitingConfig] = None`` field — set on the
-# statement by :meth:`SQLWarehouse._apply_databricks_options` and read
-# back by :meth:`_submit_statement`.  Without that field, the retry
-# policy falls back to ``_DEFAULT_SUBMIT_WAIT`` everywhere.
-
-
 # ---------------------------------------------------------------------------
 # DatabricksExecutionOptions
 # ---------------------------------------------------------------------------
@@ -111,14 +93,8 @@ _DEFAULT_SUBMIT_WAIT = WaitingConfig(
 class DatabricksExecutionOptions(ExecutionOptions):
     """Databricks-specific :class:`ExecutionOptions`.
 
-    Adds three knobs on top of the base contract:
+    Adds two knobs on top of the base contract:
 
-    submit_wait
-        Retry policy for the SDK ``execute_statement`` call itself
-        (covers cold/busy warehouses returning ``DeadlineExceeded``).
-        Distinct from ``wait``, which controls *result-level* polling,
-        and from per-statement ``retry``, which drives
-        :meth:`StatementResult.retry` after a terminal failure.
     external_data
         ``{alias: tabular-or-VolumePath}``.  Tabular values are staged to
         Parquet on a fresh :class:`VolumePath`; existing volumes pass
@@ -135,7 +111,6 @@ class DatabricksExecutionOptions(ExecutionOptions):
     "I just told you to stage this; use it" intent.
     """
 
-    submit_wait: WaitingConfigArg = None
     external_data: Optional[Mapping[str, Any]] = None
     external_volume_paths: Optional[Mapping[str, VolumePath]] = None
 
@@ -150,9 +125,6 @@ class DatabricksExecutionOptions(ExecutionOptions):
         external_volume_paths: Optional[Mapping[str, VolumePath]],
     ) -> "DatabricksExecutionOptions":
         return replace(self, external_volume_paths=external_volume_paths)
-
-    def with_submit_wait(self, submit_wait: WaitingConfigArg) -> "DatabricksExecutionOptions":
-        return replace(self, submit_wait=submit_wait)
 
 
 # ---------------------------------------------------------------------------
@@ -537,13 +509,10 @@ class SQLWarehouse(
 
         - ``external_data`` is staged to fresh Parquet volumes.
         - ``external_volume_paths`` is merged onto the statement.
-        - ``submit_wait`` is copied onto the statement so
-          :meth:`_submit_statement` can read it without a side-channel.
 
         Merge precedence on alias collisions (lowest → highest): existing
         statement paths < ``options.external_volume_paths`` < just-staged.
         """
-        # ---- Staging ----
         staged = WarehousePreparedStatement.check_external_data(
             options.external_data,
             catalog_name=statement.catalog_name,
@@ -557,28 +526,20 @@ class SQLWarehouse(
             merged.update(staged)
             statement.external_volume_paths = merged or None
 
-        # ---- Submit-retry policy ----
-        # Use setattr so this works even if WarehousePreparedStatement
-        # hasn't been migrated to declare submit_wait as a typed field.
-        if options.submit_wait is not None:
-            statement.submit_wait = WaitingConfig.from_(options.submit_wait)
-
         return statement
 
     def _submit_statement(
         self,
         statement: WarehousePreparedStatement,
     ) -> WarehouseStatementResult:
-        """Submit ``statement`` via the SDK, with busy-warehouse retry.
+        """Submit ``statement`` via the SDK.
 
-        Reads typed routing fields directly off the statement.  The
-        ``submit_wait`` policy (if any) is picked up from the statement's
-        own field, set by :meth:`_apply_databricks_options` from
-        :class:`DatabricksExecutionOptions.submit_wait`.
-
-        This is the *submission-level* retry layer (cold/busy warehouse,
-        ``DeadlineExceeded``).  Result-level retry (statement ran and
-        failed) is driven separately by :meth:`StatementResult.retry`.
+        Reads typed routing fields directly off the statement and hands
+        them to ``execute_statement``. Any SDK exception (cold/busy
+        warehouse ``DeadlineExceeded``, transport errors, validation
+        errors, …) propagates unchanged — the caller decides whether to
+        retry or fail.  Result-level retry for queries that ran and
+        failed is still available via :meth:`StatementResult.retry`.
 
         Defaults applied in-line:
 
@@ -601,26 +562,18 @@ class SQLWarehouse(
             self, statement.text,
         )
 
-        # Submission-level retry: distinct from result-level polling.
-        # Read from the statement (set by _apply_databricks_options).
-        # `getattr` keeps this safe during the migration where older
-        # WarehousePreparedStatement builds may not have the field yet.
-        submit_wait = getattr(statement, "submit_wait", None) or _DEFAULT_SUBMIT_WAIT
-        started_at = time.monotonic()
-        deadline = (
-            started_at + submit_wait.timeout
-            if submit_wait and submit_wait.timeout
-            else None
-        )
-
-        response = self._submit_with_retry(
-            sdk_client=sdk_client,
-            statement=statement,
-            target_wh_id=target_wh_id,
+        response = sdk_client.execute_statement(
+            statement=statement.text,
+            warehouse_id=target_wh_id,
+            byte_limit=statement.byte_limit,
             disposition=disposition,
-            format_=format_,
-            submit_wait=submit_wait,
-            deadline=deadline,
+            format=format_,
+            on_wait_timeout=statement.on_wait_timeout,
+            parameters=statement.to_parameter_list(),
+            row_limit=statement.row_limit,
+            wait_timeout=statement.wait_timeout,
+            catalog=statement.catalog_name,
+            schema=statement.schema_name,
         )
 
         result = WarehouseStatementResult(
@@ -633,140 +586,6 @@ class SQLWarehouse(
             self, result,
         )
         return result
-
-    def _submit_with_retry(
-        self,
-        *,
-        sdk_client,
-        statement: WarehousePreparedStatement,
-        target_wh_id: str | None,
-        disposition: Disposition,
-        format_: Format,
-        submit_wait: WaitingConfig | None,
-        deadline: float | None,  # kept for signature compat; unused now
-    ):
-        """Submit with one busy retry, then serverless-sibling failover.
-
-        Attempt sequence on :class:`DeadlineExceeded`:
-
-        1. First failure  → back off per ``submit_wait`` and retry on the
-           same warehouse once.
-        2. Second failure → :meth:`get_or_create_sibling` for the next
-           ``[idx]`` (serverless), submit there.  ``self`` is not mutated;
-           only the local ``target_wh_id`` is swapped.
-        3. Third failure  → raise.
-        """
-        target_wh_id = target_wh_id or self.warehouse_id
-        original_wh_id = target_wh_id
-        started_at = time.monotonic()
-        attempt = 0  # 0=first try, 1=retry on original, 2=try on sibling
-        failed_over = False
-
-        while True:
-            try:
-                return sdk_client.execute_statement(
-                    statement=statement.text,
-                    warehouse_id=target_wh_id,
-                    byte_limit=statement.byte_limit,
-                    disposition=disposition,
-                    format=format_,
-                    on_wait_timeout=statement.on_wait_timeout,
-                    parameters=statement.to_parameter_list(),
-                    row_limit=statement.row_limit,
-                    wait_timeout=statement.wait_timeout,
-                    catalog=statement.catalog_name,
-                    schema=statement.schema_name,
-                )
-            except (DeadlineExceeded, InternalError) as e:
-                if attempt == 0:
-                    sleep_for = _jitter_sleep_seconds(
-                        submit_wait, iteration=0, remaining=None,
-                    )
-                    LOGGER.warning(
-                        "%r is busy; execute submit hit DeadlineExceeded. "
-                        "Retrying in %.2fs (attempt=1)",
-                        self, sleep_for,
-                    )
-                    if sleep_for > 0:
-                        time.sleep(sleep_for)
-                    attempt = 1
-                    continue
-
-                if attempt == 1 and not failed_over:
-                    sibling = self._failover_to_sibling(
-                        busy_wh_id=original_wh_id,
-                        elapsed=time.monotonic() - started_at,
-                    )
-                    target_wh_id = sibling.warehouse_id
-                    failed_over = True
-                    attempt = 2
-                    continue
-
-                elapsed = time.monotonic() - started_at
-                LOGGER.error(
-                    "Submit failed after retry and sibling failover for %r "
-                    "(original=%s, sibling=%s, elapsed=%.2fs)",
-                    self, original_wh_id, target_wh_id, elapsed,
-                )
-                raise DeadlineExceeded(
-                    f"Submit deadline exceeded for {self.warehouse_name!r}: "
-                    f"original warehouse {original_wh_id} busy after retry, "
-                    f"sibling {target_wh_id} also returned DeadlineExceeded "
-                    f"(elapsed={elapsed:.2f}s, attempts={attempt + 1}). "
-                    f"Original cause: {e}"
-                ) from e
-
-    def _failover_to_sibling(
-        self,
-        *,
-        busy_wh_id: str,
-        elapsed: float,
-    ) -> "SQLWarehouse":
-        """Get-or-create the next-indexed sibling for submit failover.
-
-        Wraps :meth:`get_or_create_sibling` with diagnostic context — used
-        by :meth:`_submit_with_retry` after the original warehouse exhausts
-        its busy-retry budget.  Any failure here is re-raised as a
-        :class:`RuntimeError` chaining the original cause, so the caller
-        sees both *why we tried to fail over* and *why failover failed*.
-
-        Parameters
-        ----------
-        busy_wh_id:
-            The warehouse id we just gave up on — included in error
-            messages and logs for debuggability.
-        elapsed:
-            Seconds spent in the submit loop before failover, for logging.
-        """
-        _, current_idx = indexed_name_parts(self.warehouse_name or "")
-        sibling_idx = current_idx + 1
-
-        try:
-            sibling = self.get_or_create_sibling(sibling_idx)
-        except Exception as exc:
-            LOGGER.error(
-                "Failover failed: could not get-or-create sibling [%d] of %r "
-                "after original %s exhausted its submit retry (elapsed=%.2fs): %s",
-                sibling_idx,
-                self.warehouse_name,
-                busy_wh_id,
-                elapsed,
-                exc,
-            )
-            raise RuntimeError(
-                f"Could not fail over from busy warehouse "
-                f"{self.warehouse_name!r} ({busy_wh_id}): "
-                f"sibling [{sibling_idx}] could not be acquired ({exc})"
-            ) from exc
-
-        LOGGER.warning(
-            "Original warehouse %s still busy after retry; "
-            "failing over to sibling %r (%s) for this submit",
-            busy_wh_id,
-            sibling.warehouse_name,
-            sibling.warehouse_id,
-        )
-        return sibling
 
     # ------------------------------------------------------------------
     # Public execute() — back-compat shim over the typed pipeline
@@ -793,7 +612,6 @@ class SQLWarehouse(
         external_volume_paths: Optional[Mapping[str, VolumePath]] = None,
         # Execution policy
         wait: WaitingConfigArg = True,
-        submit_wait: WaitingConfigArg = None,
         raise_error: bool = True,
         # Result-level retry policy.  ``None`` means "leave whatever the
         # statement already says alone" — important when the caller
@@ -807,9 +625,9 @@ class SQLWarehouse(
 
         Three ways to control execution policy:
 
-        1. Per-call kwargs (``wait``, ``raise_error``, ``submit_wait``,
-           ``external_data``, ``external_volume_paths``, ``retry``) —
-           ergonomic, the default API.
+        1. Per-call kwargs (``wait``, ``raise_error``, ``external_data``,
+           ``external_volume_paths``, ``retry``) — ergonomic, the default
+           API.
         2. ``options=DatabricksExecutionOptions(...)`` — when the same
            policy is reused across many calls.
         3. Both — kwargs override fields they explicitly set.
@@ -823,9 +641,9 @@ class SQLWarehouse(
 
         ``retry`` configures the *result-level* retry — what
         :meth:`StatementResult.retry` will do if the caller invokes it
-        after a terminal failure.  Has no effect on submission-level
-        retry (cold/busy warehouse), which is always on and configured
-        via ``submit_wait``.
+        after a terminal failure.  Submission failures (cold/busy
+        warehouse ``DeadlineExceeded``, transport errors, …) propagate
+        directly — there's no submission-level retry layer.
         """
         # Cross-warehouse redirect: resolve and delegate.
         if (warehouse_id and warehouse_id != self.warehouse_id) or (
@@ -847,7 +665,6 @@ class SQLWarehouse(
                 external_data=external_data,
                 external_volume_paths=external_volume_paths,
                 wait=wait,
-                submit_wait=submit_wait,
                 raise_error=raise_error,
                 retry=retry,
             )
@@ -878,7 +695,6 @@ class SQLWarehouse(
             options,
             wait=wait,
             raise_error=raise_error,
-            submit_wait=submit_wait,
         )
 
         # Hand off to base lifecycle: _execute (overridden above) stages
@@ -893,21 +709,15 @@ class SQLWarehouse(
         *,
         wait: WaitingConfigArg,
         raise_error: bool,
-        submit_wait: WaitingConfigArg,
     ) -> ExecutionOptions:
-        """Merge per-call kwargs onto a base options object.
-
-        Per-call ``submit_wait`` is honored when the kwarg is non-None;
-        otherwise the existing ``options.submit_wait`` (if any) wins.
-        """
+        """Merge per-call kwargs onto a base options object."""
         if options is None:
-            if submit_wait is None and wait is True and raise_error is True:
+            if wait is True and raise_error is True:
                 # Cheapest path — skip the dataclass construction.
                 return ExecutionOptions()
             return DatabricksExecutionOptions(
                 wait=wait,
                 raise_error=raise_error,
-                submit_wait=submit_wait,
             )
 
         # Diff against defaults so passing the kwarg defaults doesn't
@@ -918,8 +728,6 @@ class SQLWarehouse(
             overrides["wait"] = wait
         if raise_error != defaults.raise_error:
             overrides["raise_error"] = raise_error
-        if submit_wait is not None:
-            overrides["submit_wait"] = submit_wait
         if not overrides:
             return options
         return replace(options, **overrides)

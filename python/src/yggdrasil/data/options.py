@@ -317,7 +317,7 @@ class CastOptions:
     sync_metadata: bool = True
 
     # --- Memoization slot ----------------------------------------------
-    # ``merged_field`` is read repeatedly by every cast / fill / alias
+    # ``merged`` is read repeatedly by every cast / fill / alias
     # entry point on this class — once per dispatch call, often dozens
     # of times across a single batch pipeline. The underlying
     # ``Field.merge_with`` walks the full struct tree on each call.
@@ -340,7 +340,7 @@ class CastOptions:
     # equal regardless of which one happened to have its cache warmed;
     # ``repr=False`` keeps the cache out of the dataclass-generated
     # repr (the custom repr below also skips non-repr fields).
-    _merged_field_cache: Any = dataclasses.field(
+    _merged_cache: Any = dataclasses.field(
         default=..., init=False, repr=False, compare=False
     )
 
@@ -413,8 +413,8 @@ class CastOptions:
     # ==================================================================
 
     @property
-    def merged_field(self) -> Field | None:
-        cached = self._merged_field_cache
+    def merged(self) -> Field | None:
+        cached = self._merged_cache
         if cached is not ...:
             return cached
         if self.source and self.target:
@@ -423,20 +423,20 @@ class CastOptions:
             )
         else:
             result = self.target or self.source
-        object.__setattr__(self, "_merged_field_cache", result)
+        object.__setattr__(self, "_merged_cache", result)
         return result
 
     @property
     def merged_schema(self) -> Schema | None:
-        """The :attr:`merged_field` projected as a :class:`Schema`.
+        """The :attr:`merged` projected as a :class:`Schema`.
 
-        Mutualized through :attr:`merged_field` — a single
+        Mutualized through :attr:`merged` — a single
         ``merge_with`` walk feeds both views. Non-struct merges are
         lifted into a single-child struct via :meth:`Field.to_schema`
         so the schema-shape contract holds for every caller (cast
         pipelines, ``empty_table`` builders, tabular planners).
         """
-        merged = self.merged_field
+        merged = self.merged
         if merged is None:
             return None
         return merged.to_schema()
@@ -463,7 +463,7 @@ class CastOptions:
     @property
     def column_names(self) -> list[str] | None:
         """The target field's column names, if a target field is bound."""
-        merged = self.merged_field
+        merged = self.merged
 
         if merged is None:
             return None
@@ -619,7 +619,7 @@ class CastOptions:
         ``filter=`` or ``columns=`` to crash construction.
 
         Excludes ``init=False`` fields (the private memoization slots
-        for ``merged_field`` / ``merged_schema``); those are not valid
+        for ``merged`` / ``merged_schema``); those are not valid
         ``__init__`` keywords and a copy via ``dataclasses.replace``
         would crash if it tried to forward them.
 
@@ -705,7 +705,7 @@ class CastOptions:
           ``copy(safe=True)`` / ``copy(row_size=1024)`` shape), the
           normalization pass is skipped — the self-copied values are
           already normalized from *self*'s own ``__post_init__``.
-        - Memoization slots (``_merged_field_cache`` etc.) are reset
+        - Memoization slots (``_merged_cache`` etc.) are reset
           on the new instance — :func:`dataclasses.replace` already
           did this implicitly via the ``init=False`` default, and we
           keep the same invariant.
@@ -731,7 +731,7 @@ class CastOptions:
         # Init=False memoization slot: always start cleared on the
         # clone — overridden source / target / schema_mode would
         # otherwise read a stale cached merge.
-        setattr_(new, "_merged_field_cache", ...)
+        setattr_(new, "_merged_cache", ...)
         # Only re-run normalization when an override could plausibly
         # need it. Slots not touched here were already normalized on
         # *self* and just propagated via getattr.
@@ -806,7 +806,7 @@ class CastOptions:
             if copy:
                 return self.copy(source=None)
             setattr_(self, "source", None)
-            setattr_(self, "_merged_field_cache", ...)
+            setattr_(self, "_merged_cache", ...)
             return self
 
         source = field_class().from_(source)
@@ -816,12 +816,12 @@ class CastOptions:
 
         if copy:
             # ``replace`` drops init=False fields back to their
-            # defaults, which clears the merged_field cache for free.
+            # defaults, which clears the merged cache for free.
             return dataclasses.replace(self, source=source)
         setattr_(self, "source", source)
-        # In-place edit invalidates whatever the merged_field
+        # In-place edit invalidates whatever the merged
         # cache held.
-        setattr_(self, "_merged_field_cache", ...)
+        setattr_(self, "_merged_cache", ...)
         return self
 
     def with_target(self: T, target: "Field", copy: bool = True) -> T:
@@ -831,7 +831,7 @@ class CastOptions:
             if copy:
                 return self.copy(target=None)
             setattr_(self, "target", None)
-            setattr_(self, "_merged_field_cache", ...)
+            setattr_(self, "_merged_cache", ...)
             return self
 
         target = field_class().from_(target)
@@ -842,7 +842,7 @@ class CastOptions:
         if copy:
             return dataclasses.replace(self, target=target)
         setattr_(self, "target", target)
-        setattr_(self, "_merged_field_cache", ...)
+        setattr_(self, "_merged_cache", ...)
         return self
 
     # ==================================================================
@@ -980,7 +980,7 @@ class CastOptions:
         shape dispatch (tabular vs array/series/column/expr).
 
         Dispatch is keyed on :attr:`target` (not
-        :attr:`merged_field`) — the caller asked for the target shape,
+        :attr:`merged`) — the caller asked for the target shape,
         not a reconciled middle ground.  Source-side metadata still
         flows through via ``options=self`` for the inner cast paths
         that need it.
