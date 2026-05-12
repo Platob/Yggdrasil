@@ -154,20 +154,23 @@ class TimeUnit(str, Enum):
 
     @classmethod
     def _from_str(cls, value: str, *, default: Any = ...) -> "TimeUnit":
+        # Fast path: already-canonical token (``"us"`` / ``"ms"`` /
+        # ``"day_time"`` / ``"US"`` / ``"microsecond"``). A single
+        # ``dict.get`` resolves them without paying any string
+        # normalisation cost.
+        hit = _TIMEUNIT_LOOKUP.get(value)
+        if hit is not None:
+            return hit
+
         token = value.strip().lower().replace("-", "_").replace(" ", "_")
         if not token:
             if default is not ...:
                 return default
             raise ValueError("TimeUnit string cannot be empty")
 
-        canonical = _TIMEUNIT_ALIASES.get(token)
-        if canonical is not None:
-            return cls(canonical)
-
-        try:
-            return cls(token)
-        except ValueError:
-            pass
+        hit = _TIMEUNIT_LOOKUP.get(token)
+        if hit is not None:
+            return hit
 
         if default is not ...:
             return default
@@ -259,3 +262,29 @@ _UNIT_ORDER: dict[str, int] = {
     "day_time":       -1,
     "month_day_nano": -1,
 }
+
+
+def _build_timeunit_lookup() -> dict[str, TimeUnit]:
+    """Pre-compute every accepted spelling → :class:`TimeUnit` member.
+
+    Folds the alias table (lower-case keys) with the canonical token
+    values (already TimeUnit values, but stored as plain strings),
+    upper-case variants, and member names so :meth:`TimeUnit._from_str`
+    resolves any common spelling with a single ``dict.get``.
+    """
+    out: dict[str, TimeUnit] = {}
+    for alias, canonical in _TIMEUNIT_ALIASES.items():
+        member = TimeUnit(canonical)
+        out[alias] = member
+        upper = alias.upper()
+        if upper != alias:
+            out[upper] = member
+    for member in TimeUnit:
+        out[member.value] = member
+        out[member.value.upper()] = member
+        out[member.name] = member
+        out[member.name.lower()] = member
+    return out
+
+
+_TIMEUNIT_LOOKUP: dict[str, TimeUnit] = _build_timeunit_lookup()

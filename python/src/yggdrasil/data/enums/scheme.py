@@ -175,18 +175,26 @@ class Scheme(str, Enum):
             raise ValueError("Scheme cannot be derived from None")
 
         if isinstance(value, str):
+            # Fast path: callers commonly pass an already-canonical
+            # token (``"s3"`` / ``"https"`` / ``"S3"`` / ``"dbfs"``).
+            # A single dict probe resolves them without paying any
+            # string normalisation.
+            hit = _SCHEME_LOOKUP.get(value)
+            if hit is not None:
+                return hit
+
             token = value.strip().lower()
             if token.endswith("://"):
                 token = token[:-3]
-            canonical = _SCHEME_ALIASES.get(token)
-            if canonical is None:
-                if default is not ...:
-                    return default
-                raise ValueError(
-                    f"Unknown Scheme: {value!r}. "
-                    f"Valid schemes: {sorted({m.value for m in cls})!r}"
-                )
-            return cls(canonical)
+            hit = _SCHEME_LOOKUP.get(token)
+            if hit is not None:
+                return hit
+            if default is not ...:
+                return default
+            raise ValueError(
+                f"Unknown Scheme: {value!r}. "
+                f"Valid schemes: {sorted({m.value for m in cls})!r}"
+            )
 
         if default is not ...:
             return default
@@ -270,3 +278,32 @@ class Scheme(str, Enum):
 
     def __str__(self) -> str:
         return self.value
+
+
+def _build_scheme_lookup() -> dict[str, Scheme]:
+    """Pre-compute every accepted spelling → :class:`Scheme` member.
+
+    Folds :data:`_SCHEME_ALIASES` (lower-case keys) with their
+    upper-case variants, canonical member names (``"FILE"`` /
+    ``"S3"`` / …), and the ``"<scheme>://"`` trailing-slash form so
+    :meth:`Scheme.from_` resolves any common spelling with a single
+    ``dict.get``.
+    """
+    out: dict[str, Scheme] = {}
+    for alias, canonical in _SCHEME_ALIASES.items():
+        member = Scheme(canonical)
+        out[alias] = member
+        upper = alias.upper()
+        if upper != alias:
+            out[upper] = member
+        if alias:
+            out[alias + "://"] = member
+            out[upper + "://"] = member
+    for member in Scheme:
+        out[member.name] = member
+        out[member.value] = member
+        out[member.value.upper()] = member
+    return out
+
+
+_SCHEME_LOOKUP: dict[str, Scheme] = _build_scheme_lookup()

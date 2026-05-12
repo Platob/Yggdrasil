@@ -183,16 +183,18 @@ class ByteUnit(IntEnum):
 
     @classmethod
     def _from_str(cls, value: str, *, default: Any = ...) -> "ByteUnit":
-        token = value.strip().lower()
-        canonical = _BYTEUNIT_ALIASES.get(token)
-        if canonical is not None:
-            return cls[canonical]
+        # Fast path: most callers pass already-canonical tokens
+        # (``"MIB"`` / ``"mib"`` / ``"MB"`` / ``"GiB"``). A single dict
+        # probe resolves them without paying ``strip().lower()`` on the
+        # common case.
+        hit = _BYTEUNIT_LOOKUP.get(value)
+        if hit is not None:
+            return hit
 
-        # Bare uppercase member name (``"MIB"``).
-        try:
-            return cls[value.strip().upper()]
-        except KeyError:
-            pass
+        token = value.strip().lower()
+        hit = _BYTEUNIT_LOOKUP.get(token)
+        if hit is not None:
+            return hit
 
         if default is not ...:
             return default
@@ -273,6 +275,16 @@ class ByteUnit(IntEnum):
     def _parse_size_str(
         cls, value: str, *, default: Any = ...,
     ) -> int:
+        # Fast path for a bare unit token (``"MiB"`` / ``"MB"`` /
+        # ``"bytes"``): a direct lookup beats the regex when there is
+        # no leading scalar at all. The empty-string entry from the
+        # alias table is deliberately excluded — ``parse_size("")``
+        # is a parse error, not "one byte".
+        if value:
+            hit = _BYTEUNIT_LOOKUP.get(value)
+            if hit is not None:
+                return int(hit.value)
+
         match = _QUANTITY_RE.match(value)
         if match is not None:
             scalar = float(match.group("value"))
@@ -371,3 +383,23 @@ _IEC_TOKENS: dict[str, str] = {
     "TIB": "TiB",
     "PIB": "PiB",
 }
+
+
+def _build_byteunit_lookup() -> dict[str, ByteUnit]:
+    """Pre-compute every accepted spelling → :class:`ByteUnit` member.
+
+    Folds the alias table (lower-case keys) with the canonical member
+    names (``"B"`` / ``"MIB"`` / ``"GIB"`` …) and their lower-case
+    counterparts so :meth:`ByteUnit._from_str` can resolve any common
+    spelling with a single ``dict.get`` and no string allocation.
+    """
+    out: dict[str, ByteUnit] = {}
+    for alias, canonical in _BYTEUNIT_ALIASES.items():
+        out[alias] = ByteUnit[canonical]
+    for member in ByteUnit:
+        out[member.name] = member
+        out[member.name.lower()] = member
+    return out
+
+
+_BYTEUNIT_LOOKUP: dict[str, ByteUnit] = _build_byteunit_lookup()

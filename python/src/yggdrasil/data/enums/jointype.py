@@ -197,27 +197,28 @@ class JoinType(IntEnum):
 
     @classmethod
     def _from_str(cls, value: str, *, default: Any = ...) -> "JoinType":
+        # Fast path: most callers pass an already-canonical token
+        # (``"inner"`` / ``"left outer"`` / ``"LEFT JOIN"`` /
+        # ``"LEFT_OUTER"``). A single dict probe resolves them without
+        # paying ``strip().lower().replace(...)``.
+        hit = _JOINTYPE_LOOKUP.get(value)
+        if hit is not None:
+            return hit
+
         token = value.strip().lower().replace("-", "_")
         if not token:
             if default is not ...:
                 return default
             raise ValueError("JoinType string cannot be empty")
 
-        # Try the alias table both with underscores intact and with
-        # them flipped to spaces — covers Arrow's space-separated form
-        # when the caller hands in ``"left_anti"`` style.
-        canonical = (
-            _JOINTYPE_ALIASES.get(token)
-            or _JOINTYPE_ALIASES.get(token.replace("_", " "))
-        )
-        if canonical is not None:
-            return _ARROW_TO_MEMBER[canonical]
-
-        # Last resort: try the enum's name lookup ("LEFT_OUTER", …).
-        try:
-            return cls[token.upper().replace(" ", "_")]
-        except KeyError:
-            pass
+        hit = _JOINTYPE_LOOKUP.get(token)
+        if hit is not None:
+            return hit
+        # Arrow's canonical tokens are space-separated — fold the
+        # underscore form here.
+        hit = _JOINTYPE_LOOKUP.get(token.replace("_", " "))
+        if hit is not None:
+            return hit
 
         if default is not ...:
             return default
@@ -350,6 +351,37 @@ _SQL_MAP: dict["JoinType", str] = {
     JoinType.LEFT_ANTI:   "LEFT ANTI JOIN",
     JoinType.RIGHT_ANTI:  "RIGHT ANTI JOIN",
 }
+
+
+def _build_jointype_lookup() -> dict[str, JoinType]:
+    """Pre-compute every accepted spelling → :class:`JoinType` member.
+
+    Folds :data:`_JOINTYPE_ALIASES` with the canonical member names
+    (``"INNER"`` / ``"LEFT_OUTER"`` / …), their lower-case form, the
+    SQL upper-case spellings (``"LEFT JOIN"`` / ``"LEFT OUTER JOIN"``),
+    and the engine-specific tokens (``"left outer"`` / ``"left"``) so
+    :meth:`JoinType._from_str` resolves any common spelling with a
+    single ``dict.get``.
+    """
+    out: dict[str, JoinType] = {}
+    for alias, canonical_arrow in _JOINTYPE_ALIASES.items():
+        member = _ARROW_TO_MEMBER[canonical_arrow]
+        out[alias] = member
+        upper = alias.upper()
+        if upper != alias:
+            out[upper] = member
+    for member in JoinType:
+        out[member.name] = member
+        out[member.name.lower()] = member
+    # SQL spellings (``"LEFT JOIN"`` / ``"LEFT OUTER JOIN"`` /
+    # ``"INNER JOIN"`` …) and Arrow spellings (``"left outer"``).
+    for member, sql in _SQL_MAP.items():
+        out[sql] = member
+        out[sql.lower()] = member
+    return out
+
+
+_JOINTYPE_LOOKUP: dict[str, JoinType] = _build_jointype_lookup()
 
 
 def _polars_swap_hint(jt: "JoinType") -> str:
