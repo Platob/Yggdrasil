@@ -83,7 +83,7 @@ def cast_arrow_struct_array(
         # See the tabular variant for the rationale — single-method
         # name-then-alias lookup against the source struct's
         # children.
-        source_child = target_child.field(name=target_child.name, index=i, raise_error=False)
+        source_child = source_type.field(name=target_child.name, index=i, raise_error=False)
 
         if source_child is None:
             children.append(
@@ -100,9 +100,24 @@ def cast_arrow_struct_array(
                 )
             )
 
+    target_fields = [f.to_arrow_field() for f in target_type.fields]
+    # ``pa.StructArray.from_arrays`` validates strict child-type equality
+    # against ``fields``. The per-child cast may legitimately return a
+    # view-layout buffer (``string_view`` vs ``string``) because
+    # ``_arrow_types_compatible`` short-circuits the scalar bypass — fine
+    # for top-level consumers, but the struct assembler refuses. Force a
+    # physical cast at the assembly boundary so the resulting struct
+    # honours the target's exact child types.
+    children = [
+        child if child.type.equals(field.type) else pc.cast(
+            child, target_type=field.type,
+            safe=options.safe, memory_pool=options.arrow_memory_pool,
+        )
+        for child, field in zip(children, target_fields)
+    ]
     return pa.StructArray.from_arrays(
         children,
-        fields=[f.to_arrow_field() for f in target_type.fields],
+        fields=target_fields,
         mask=array.is_null(),
         memory_pool=options.arrow_memory_pool,
     )

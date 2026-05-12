@@ -31,7 +31,7 @@ class _StaticProvider(AwsCredentialsProvider):
     AWSClient is bound to without faking botocore.
     """
 
-    def get_credentials(self) -> AwsCredentials:
+    def get_credentials(self, mode=None) -> AwsCredentials:
         return AwsCredentials(
             access_key_id=f"AKIA-{self.key}",
             secret_access_key=f"secret-{self.key}",

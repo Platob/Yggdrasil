@@ -117,9 +117,10 @@ class _DBFSStreamWriter:
         self._sink.append(bytes(data))
 
 
-def _dbfs_round_trip_workspace(payload_holder: dict) -> MagicMock:
-    """Mock workspace that round-trips bytes through DBFS."""
-    ws = MagicMock()
+def _dbfs_round_trip_client(payload_holder: dict) -> MagicMock:
+    """Mock :class:`DatabricksClient` that round-trips bytes through DBFS."""
+    client = MagicMock()
+    ws = client.workspace_client.return_value
 
     def get_status(path):
         buf = payload_holder.get("buf")
@@ -161,7 +162,7 @@ def _dbfs_round_trip_workspace(payload_holder: dict) -> MagicMock:
         return _CommittingWriter(sink)
 
     ws.dbfs.open.side_effect = open_writer_committing
-    return ws
+    return client
 
 
 # ---------------------------------------------------------------------------
@@ -258,8 +259,8 @@ class TestParquetOverDBFS:
 
     def test_round_trip(self, table) -> None:
         store = {}
-        ws = _dbfs_round_trip_workspace(store)
-        dbfs = DBFSPath("/dbfs/data.parquet", workspace=ws)
+        client = _dbfs_round_trip_client(store)
+        dbfs = DBFSPath("/dbfs/data.parquet", client=client)
 
         ParquetIO(holder=dbfs, owns_holder=False).write_arrow_table(table)
         assert store["buf"].startswith(b"PAR1")
@@ -281,8 +282,8 @@ class TestCsvOverDBFS:
 
     def test_round_trip(self, table) -> None:
         store = {}
-        ws = _dbfs_round_trip_workspace(store)
-        dbfs = DBFSPath("/dbfs/data.csv", workspace=ws)
+        client = _dbfs_round_trip_client(store)
+        dbfs = DBFSPath("/dbfs/data.csv", client=client)
 
         CsvIO(holder=dbfs, owns_holder=False).write_arrow_table(table)
         dbfs._invalidate_stat_cache()
@@ -299,7 +300,8 @@ class TestArrowIPCOverVolume:
 
     def test_round_trip(self, table) -> None:
         store = {}
-        ws = MagicMock()
+        client = MagicMock()
+        ws = client.workspace_client.return_value
 
         def get_metadata(path):
             buf = store.get("buf")
@@ -324,7 +326,7 @@ class TestArrowIPCOverVolume:
         ws.files.download.side_effect = download
         ws.files.upload.side_effect = upload
 
-        vol = VolumePath("/Volumes/c/s/v/data.arrow", workspace=ws)
+        vol = VolumePath("/Volumes/c/s/v/data.arrow", client=client)
         ArrowIPCIO(holder=vol, owns_holder=False).write_arrow_table(table)
         vol._invalidate_stat_cache()
         loaded = ArrowIPCIO(holder=vol, owns_holder=False).read_arrow_table()
