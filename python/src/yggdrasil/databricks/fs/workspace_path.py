@@ -156,7 +156,7 @@ class WorkspacePath(DatabricksPath):
                 url_path = url_path[len("/Workspace"):] or "/"
             child = type(self)(
                 url=URL(scheme=self.scheme, path=url_path),
-                workspace=self._workspace,
+                client=self._client,
             )
             yield child
             ot = getattr(info, "object_type", None)

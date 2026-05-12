@@ -87,7 +87,7 @@ class DBFSPath(DatabricksPath):
                 continue
             child = type(self)(
                 url=URL(scheme=self.scheme, path=api_path),
-                workspace=self._workspace,
+                client=self._client,
             )
             yield child
             if recursive and getattr(info, "is_dir", False):

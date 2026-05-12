@@ -47,7 +47,7 @@ class TestVolumePathIntegration(DatabricksIntegrationCase):
         cls.base_root = base.rstrip("/")
         cls.root = VolumePath(
             f"{cls.base_root}/run-{secrets.token_hex(4)}",
-            workspace=cls.workspace,
+            client=cls.client,
         )
         cls.root.mkdir(parents=True, exist_ok=True)
 
@@ -115,7 +115,7 @@ class TestVolumePathIntegration(DatabricksIntegrationCase):
             catalog_name=catalog,
             schema_name=schema,
             resource_name="integration",
-            workspace=self.workspace,
+            client=self.client,
             temporary=False,
         )
         try:
