@@ -320,6 +320,17 @@ class ArrayType(NestedType):
         array: pa.Array | pa.ChunkedArray,
         options: "CastOptions",
     ) -> pa.Array | pa.ChunkedArray:
+        # Engine-level bypass — when the array's arrow type already
+        # matches the target's projection, every downstream branch
+        # would either rebuild the same buffers or short-circuit
+        # anyway. Skip the ``check_source`` Field-from-arrow peek
+        # (which builds a fresh Field tree from the array) + the
+        # subsequent ``need_cast`` walk by returning ``array``
+        # directly. Mirror :meth:`DataType._cast_arrow_array` (base
+        # primitive bypass) so list casts pay the same MATCH floor.
+        if array.type == self.to_arrow():
+            return array
+
         options = options.check_source(array).check_target(self)
 
         if options.need_cast(source=array, target=self):
@@ -544,7 +555,12 @@ def cast_arrow_list_array(
     array: pa.Array | pa.ChunkedArray,
     options: "CastOptions",
 ) -> pa.Array | pa.ChunkedArray:
-    options = options.check_source(array)
+    # Public entry point — peek the array as a source Field only when
+    # the caller hasn't already done so. ``ArrayType._cast_arrow_array``
+    # always runs the peek before reaching here, so the common
+    # internal path skips the rebuild.
+    if options.source is None:
+        options = options.check_source(array)
 
     if options.target is None:
         return array

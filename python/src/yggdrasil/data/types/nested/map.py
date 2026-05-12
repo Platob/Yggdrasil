@@ -274,6 +274,13 @@ class MapType(NestedType):
         array: pa.Array,
         options: "CastOptions",
     ) -> pa.MapArray | pa.ChunkedArray:
+        # Engine-level bypass — match the array variant. When the
+        # source's arrow type already matches the target, skip the
+        # ``check_source`` Field-from-arrow peek + the ``need_cast``
+        # walk and return ``array`` directly.
+        if array.type == self.to_arrow():
+            return array
+
         options = options.check_source(array).check_target(self)
 
         if options.need_cast(array, self):
