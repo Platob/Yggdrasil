@@ -41,6 +41,7 @@ from __future__ import annotations
 
 from .client import AWSClient, AWSResource, AWSService
 from .config import AWSConfig, AwsCredentials, DatabricksSQLCredentialsRefresher
+from .provider import AwsCredentialsProvider
 
 
 __all__ = [
@@ -49,5 +50,6 @@ __all__ = [
     "AWSResource",
     "AWSConfig",
     "AwsCredentials",
+    "AwsCredentialsProvider",
     "DatabricksSQLCredentialsRefresher",
 ]
