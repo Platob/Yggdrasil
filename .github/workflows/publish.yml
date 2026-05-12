@@ -12,11 +12,21 @@
 #
 # Jobs
 # ----
-#   detect         → reads version, checks ygg on PyPI, decides
-#   build-python   → sdist + pure-Python wheel (uv / setuptools)
-#   publish-python → uploads ygg dist to PyPI
-#   tag            → creates vX.Y.Z git tag + GitHub Release
-#   skip           → summary when publish is intentionally skipped
+#   detect             → reads version, checks ygg on PyPI, decides
+#   build-python       → sdist + pure-Python wheel (uv / setuptools)
+#   publish-python     → uploads ygg dist to PyPI
+#   tag                → creates vX.Y.Z git tag + GitHub Release
+#   cleanup-previous   → opt-in: removes previous tag/release on
+#                        ``!cleanup-prev-release`` commit marker
+#   skip               → summary when publish is intentionally skipped
+#
+# Commit conventions
+# ------------------
+# Include the literal token ``!cleanup-prev-release`` anywhere in any
+# commit message on the push to ask CI to delete the previous git tag
+# + GitHub Release after the new one publishes. PyPI yanking has to be
+# confirmed manually (no public API); the workflow summary links the
+# release management page.
 #
 # PyPI setup required
 # -------------------
@@ -69,8 +79,10 @@ jobs:
     runs-on: ubuntu-latest
 
     outputs:
-      version:        ${{ steps.meta.outputs.version }}
-      should_publish: ${{ steps.decision.outputs.should_publish }}
+      version:           ${{ steps.meta.outputs.version }}
+      should_publish:    ${{ steps.decision.outputs.should_publish }}
+      cleanup_previous:  ${{ steps.cleanup.outputs.cleanup_previous }}
+      previous_tag:      ${{ steps.cleanup.outputs.previous_tag }}
 
     steps:
       - name: Checkout
@@ -119,6 +131,40 @@ jobs:
           else
             echo "should_publish=false" >> "$GITHUB_OUTPUT"
             echo "⏭️  Skipping – version already on PyPI and force=false."
+          fi
+
+      # Convention: any commit on the push that carries the literal token
+      # ``!cleanup-prev-release`` in its message asks CI to remove the
+      # previous release after this one publishes (GitHub tag + release,
+      # and a PyPI yank for the previous version). The marker is opt-in
+      # per push so routine releases stay non-destructive.
+      - name: Detect cleanup-prev-release marker
+        id: cleanup
+        env:
+          CURRENT: ${{ steps.meta.outputs.version }}
+        run: |
+          MARKER='!cleanup-prev-release'
+          # Look at every commit on this push, not just HEAD — a release
+          # often lands in a merge that doesn't itself carry the marker.
+          if git log --format='%B' ${{ github.event.before }}..${{ github.sha }} 2>/dev/null \
+               | grep -qF "$MARKER" \
+             || git log -1 --format='%B' ${{ github.sha }} | grep -qF "$MARKER"; then
+            CLEANUP=true
+          else
+            CLEANUP=false
+          fi
+
+          # Resolve previous tag: highest semver v* tag below the current
+          # version. Skip the new version's own tag if it's already pushed.
+          PREV=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname \
+                 | grep -vx "v$CURRENT" \
+                 | head -n1)
+          echo "cleanup_previous=$CLEANUP" >> "$GITHUB_OUTPUT"
+          echo "previous_tag=$PREV" >> "$GITHUB_OUTPUT"
+          if [ "$CLEANUP" = "true" ]; then
+            echo "🧹 Cleanup marker found; previous_tag=${PREV:-<none>}"
+          else
+            echo "ℹ️  No !cleanup-prev-release marker; previous release will be kept."
           fi
 
   # --------------------------------------------------------------------------
@@ -284,6 +330,62 @@ jobs:
             echo "| Tag | \`v${VERSION}\` |"
             echo "| PyPI (\`ygg\`) | https://pypi.org/project/ygg/${VERSION}/ |"
             echo "| Commit | \`${{ github.sha }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------------------
+  # cleanup-previous — opt-in via !cleanup-prev-release commit marker
+  # --------------------------------------------------------------------------
+  #
+  # When any commit on the push carries the literal token
+  # ``!cleanup-prev-release`` in its message, this job deletes the prior
+  # ``vX.Y.Z`` git tag + GitHub Release and yanks the prior PyPI version.
+  # The marker is opt-in per push so routine releases stay non-destructive.
+  # PyPI's public API does not expose a yank endpoint; the maintainer-side
+  # yank link is surfaced in the workflow summary as the source of truth.
+  cleanup-previous:
+    name: Cleanup previous release
+    runs-on: ubuntu-latest
+    needs: [detect, tag]
+    if: >-
+      needs.detect.outputs.cleanup_previous == 'true'
+      && needs.tag.result == 'success'
+      && needs.detect.outputs.previous_tag != ''
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Delete previous GitHub Release + tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREV:     ${{ needs.detect.outputs.previous_tag }}
+        run: |
+          echo "🧹 Deleting GitHub Release + tag $PREV"
+          gh release delete "$PREV" --cleanup-tag --yes
+          echo "✅ Removed $PREV from GitHub"
+
+      - name: Yank previous PyPI version
+        env:
+          PREV: ${{ needs.detect.outputs.previous_tag }}
+        run: |
+          VERSION="${PREV#v}"
+          MANAGE_URL="https://pypi.org/manage/project/ygg/release/${VERSION}/"
+          # PyPI does not expose a public token-authenticated yank endpoint;
+          # surface the manage URL so the maintainer can yank in one click.
+          echo "::warning ::PyPI yank for ygg ${VERSION} must be confirmed manually at ${MANAGE_URL}"
+          {
+            echo "## 🧹 Cleaned up previous release \`${PREV}\`"
+            echo ""
+            echo "- GitHub tag + Release: deleted"
+            echo "- PyPI \`ygg ${VERSION}\`: **yank manually** at ${MANAGE_URL}"
+            echo ""
+            echo "_PyPI does not expose a public yank API; once the official"
+            echo "endpoint stabilises, wire it in here._"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # --------------------------------------------------------------------------

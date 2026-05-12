@@ -40,7 +40,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional, Tuple
 
-from yggdrasil.data.enums import Scheme
+from yggdrasil.data.enums import Mode, Scheme
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 
@@ -1118,7 +1118,6 @@ def _resolve_volume_operation(operation: Any) -> Any:
     if operation is None:
         return read_volume
 
-    from yggdrasil.data.enums.mode import Mode
     mode = Mode.from_(operation, default=Mode.AUTO)
     if mode in (Mode.AUTO, Mode.READ_ONLY):
         return read_volume
