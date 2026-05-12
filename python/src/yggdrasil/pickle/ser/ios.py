@@ -210,6 +210,12 @@ def _encode_media_type(obj: io.IOBase) -> bytes | None:
             mt = None
     if mt is None:
         mt = getattr(obj, "_media_type", None)
+        # ``...`` is the lazy-resolution sentinel on :class:`Holder` —
+        # a holder whose media_type slot was never observed. Treat it
+        # the same as a real ``None`` so the encoder skips the field
+        # instead of emitting a malformed wire byte for the Ellipsis.
+        if mt is ...:
+            mt = None
     if mt is None:
         return None
     wire = mt.mime_type.name.encode("utf-8")

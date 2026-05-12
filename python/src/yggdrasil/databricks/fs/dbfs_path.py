@@ -189,7 +189,7 @@ class DBFSPath(DatabricksPath):
                 self._seed_stat_cache(IOStats(
                     size=offset,
                     kind=IOKind.FILE,
-                    media_type=self._media_type,
+                    media_type=self.media_type,
                 ))
             else:
                 self._stat_cached.size = offset
@@ -247,7 +247,7 @@ class DBFSPath(DatabricksPath):
             size=len(payload),
             kind=IOKind.FILE,
             mtime=time.time(),
-            media_type=self._media_type,
+            media_type=self.media_type,
         ))
 
     def truncate(self, n: int) -> int:

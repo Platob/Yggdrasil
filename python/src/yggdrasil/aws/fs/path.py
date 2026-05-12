@@ -533,7 +533,7 @@ class S3Path(RemotePath):
             size=len(payload),
             kind=IOKind.FILE,
             mtime=time.time(),
-            media_type=self._media_type,
+            media_type=self.media_type,
         ))
         return n
 
@@ -574,7 +574,7 @@ class S3Path(RemotePath):
             size=len(payload),
             kind=IOKind.FILE,
             mtime=time.time(),
-            media_type=self._media_type,
+            media_type=self.media_type,
         ))
         return n
 
@@ -626,7 +626,7 @@ class S3Path(RemotePath):
                 size=len(payload),
                 kind=IOKind.FILE,
                 mtime=time.time(),
-                media_type=self._media_type,
+                media_type=self.media_type,
             ))
             return len(payload)
         return self._write_mv(memoryview(payload), pos)

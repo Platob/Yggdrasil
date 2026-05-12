@@ -184,6 +184,44 @@ class TestStatAndMtime:
         assert m.size == 4
 
 
+class TestLazyMediaType:
+    """``Holder._media_type`` resolves lazily on first read.
+
+    The :class:`Holder` constructor parks an ``...`` sentinel on the
+    slot when the caller didn't seed an explicit media type; the
+    :meth:`media_type` property runs :meth:`URL.infer_media_type`
+    once and caches the result. Sibling-construction shapes
+    (:meth:`Path.parent`, :meth:`Path.joinpath`) never observe the
+    media type, so the eager parse was pure waste in path
+    traversal."""
+
+    def test_local_path_media_type_inferred_on_first_read(self, tmp_path) -> None:
+        from yggdrasil.data.enums.mime_type import MimeTypes
+        lp = LocalPath(str(tmp_path / "data.parquet"))
+        # Lazy: slot carries the sentinel until first read.
+        assert lp._media_type is ...
+        # First read drives ``URL.infer_media_type`` and caches.
+        assert lp.media_type is not None
+        assert lp.media_type.mime_type is MimeTypes.PARQUET
+        assert lp._media_type is lp.media_type
+
+    def test_seeded_via_stat_skips_lazy(self, tmp_path) -> None:
+        from yggdrasil.data.enums.media_type import MediaType
+        from yggdrasil.data.enums.mime_type import MimeTypes
+        from yggdrasil.io.io_stats import IOStats
+        seed = MediaType(mime_type=MimeTypes.CSV)
+        lp = LocalPath(str(tmp_path / "x"), stat=IOStats(media_type=seed))
+        # Eager: stat-seeded media_type lands directly on the slot.
+        assert lp._media_type is seed
+
+    def test_parent_inherits_lazy_slot(self, tmp_path) -> None:
+        lp = LocalPath(str(tmp_path / "a/b/file.parquet"))
+        parent = lp.parent
+        # Sibling-constructed paths also start lazy — they don't pay
+        # for the URL-mime walk during traversal.
+        assert parent._media_type is ...
+
+
 class TestPredicates:
 
     def test_memory_predicates(self) -> None:

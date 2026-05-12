@@ -289,7 +289,7 @@ class MemoryStream(Holder):
             kind=IOKind.MEMORY,
             size=self.size,
             mtime=self._mtime,
-            media_type=self._media_type,
+            media_type=self.media_type,
         )
 
     def read_mv(self, n: int, pos: int) -> memoryview:

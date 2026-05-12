@@ -314,7 +314,7 @@ class Memory(Holder):
             kind=IOKind.MEMORY,
             size=self._size,
             mtime=self._mtime,
-            media_type=self._media_type,
+            media_type=self.media_type,
         )
 
     @property
