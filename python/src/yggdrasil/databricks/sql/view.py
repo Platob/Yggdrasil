@@ -573,13 +573,11 @@ class View(DatabricksResource):
 
         When ``cast`` is ``True`` (default), the union is "smart": column
         names are aligned across inputs, types are promoted to the widest
-        compatible :class:`DataType` via ``merge_with(upcast=True)``, every
-        column is wrapped in an explicit ``CAST(... AS <ddl>)``, and any
-        column missing from a given input is emitted as ``CAST(NULL AS
-        <ddl>)``.  This means inputs with diverging schemas (extra columns,
-        slightly different numeric widths, ``INT`` vs ``BIGINT`` vs
-        ``DECIMAL``) still concatenate cleanly — the resulting view exposes
-        the unified, promoted schema in the order columns are first seen.
+        compatible :class:`DataType` via ``merge_with(upcast=True)``, each
+        input projects the unified column list in order, and any column
+        missing from a given input is emitted as ``CAST(NULL AS <ddl>)`` so
+        the unified schema is preserved.  Present columns are selected
+        as-is — Databricks reconciles compatible types across the union.
 
         When ``cast`` is ``False`` the method falls back to a plain
         ``SELECT * FROM <table> UNION ALL [BY NAME] ...`` — Databricks does
@@ -627,12 +625,13 @@ class View(DatabricksResource):
     def _build_smart_union_query(
         tables_list: list["Table | View"],
     ) -> str:
-        """Render a ``UNION ALL`` query with explicit per-column casts.
+        """Render a ``UNION ALL`` query projecting each input to a unified schema.
 
         Walks every input's ``columns``, accumulates a unified schema
         (first-seen column order, types promoted via ``merge_with(upcast=
-        True)``), then projects each input to that schema — substituting
-        ``CAST(NULL AS <ddl>)`` for absent columns.
+        True)``), then projects each input to that column order —
+        selecting present columns as-is and substituting
+        ``CAST(NULL AS <ddl>)`` for absent ones.
         """
         from yggdrasil.data.enums.mode import Mode as _Mode
 
@@ -663,10 +662,12 @@ class View(DatabricksResource):
         for tbl, cols in zip(tables_list, per_table):
             exprs: list[str] = []
             for name in column_order:
-                ddl = unified[name].to_spark_name()
                 qname = quote_ident(name)
-                source = qname if name in cols else "NULL"
-                exprs.append(f"CAST({source} AS {ddl}) AS {qname}")
+                if name in cols:
+                    exprs.append(qname)
+                else:
+                    ddl = unified[name].to_spark_name()
+                    exprs.append(f"CAST(NULL AS {ddl}) AS {qname}")
 
             select_blocks.append(
                 "SELECT\n  " + ",\n  ".join(exprs)

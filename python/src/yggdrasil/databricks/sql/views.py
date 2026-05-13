@@ -588,8 +588,8 @@ class Views(DatabricksService):
                 when ``cast`` is ``False``.
             cast:
                 Forwarded to :meth:`View.concat_tables` — enables smart
-                column-name alignment + type promotion via explicit
-                ``CAST(... AS <ddl>)``.  Default ``True``.
+                column-name alignment with ``CAST(NULL AS <ddl>)`` fills
+                for columns missing from a given input.  Default ``True``.
             comment:
                 Optional ``COMMENT`` on the view.
             mode:
