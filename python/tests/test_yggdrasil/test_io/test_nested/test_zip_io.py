@@ -40,6 +40,32 @@ class TestRegistration:
     def test_registry(self) -> None:
         assert Tabular.class_for_media_type(MimeTypes.ZIP) is ZipIO
 
+    def test_registry_lazy_bootstrap_without_nested_import(self) -> None:
+        # Caller never touches ``yggdrasil.io.nested`` — the registry
+        # still resolves ``application/zip`` to :class:`ZipIO` because
+        # :meth:`Tabular.class_for_media_type` self-bootstraps every
+        # leaf package on a miss. Regression for the response-body
+        # dispatch failure where ``Response.open(mode="rb")`` over an
+        # ``application/zip`` body fell back to a plain :class:`IO`
+        # and raised ``NotImplementedError`` from ``read_arrow_batches``.
+        import subprocess
+        import sys
+        import textwrap
+        script = textwrap.dedent(
+            """
+            import sys
+            mods = [m for m in sys.modules if m.startswith('yggdrasil.io.nested')]
+            assert not mods, f'unexpected pre-loaded nested modules: {mods}'
+            from yggdrasil.io.tabular.base import Tabular
+            target = Tabular.class_for_media_type('application/zip')
+            print(target.__module__ + '.' + target.__name__)
+            """
+        )
+        out = subprocess.check_output(
+            [sys.executable, "-c", script], text=True,
+        ).strip()
+        assert out == "yggdrasil.io.nested.zip_io.ZipIO"
+
 
 class TestDirectoryWalk:
 
