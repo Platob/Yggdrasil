@@ -37,6 +37,7 @@ pattern where nested structures are stored as JSON strings in a flat column
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 import pyarrow as pa
@@ -60,6 +61,9 @@ __all__ = [
     "spark_dataframe_to_arrow",
     "spark_dataframe_to_pandas",
 ]
+
+
+logger = logging.getLogger(__name__)
 
 #: Cap on per-batch Arrow size handed to ``createDataFrame``. 128 MiB matches
 #: Spark's preferred Arrow batch size and keeps a single oversized chunk from
@@ -173,8 +177,7 @@ def _log_arrow_path_fallback(api: str, exc: BaseException) -> None:
     output.  The call site continues with the pandas path; see
     :func:`spark_dataframe_to_arrow`.
     """
-    import logging
-    logging.getLogger(__name__).debug(
+    logger.debug(
         "spark_dataframe_to_arrow: %s failed (%s); falling back",
         api, exc.__class__.__name__,
     )
@@ -249,5 +252,10 @@ def any_to_spark_dataframe(
         memory_pool=opts.arrow_memory_pool,
     ))
     arrow_table = pa.Table.from_batches(rechunked, schema=arrow_table.schema)
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "spark.createDataFrame from %d batches / %d rows",
+            len(rechunked), arrow_table.num_rows,
+        )
     df = spark.createDataFrame(arrow_table, schema=opts.merged.to_spark_schema())
     return opts.cast_spark(df)

@@ -138,10 +138,17 @@ class SparkStatementExecutor(
         if statement.spark_session is None and self.spark_session is not None:
             statement.spark_session = self.spark_session
 
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Spark executing:\n%s", statement.text)
         result = self._STATEMENT_RESULT_CLASS(statement=statement, executor=self)
         # raise_error=False: errors are recorded on the result; the base
         # executor's _execute calls raise_for_status afterwards if needed.
         result.start(wait=False, raise_error=False)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Spark executed: failed=%s",
+                getattr(result, "failed", "?"),
+            )
         return result
 
     # -------------------------------------------------------------------------
