@@ -761,11 +761,6 @@ class WarehouseStatementResult(StatementResult):
 
         from yggdrasil.databricks.warehouse.warehouse import SQLWarehouse
 
-        # Prefer the already-resolved executor across retries: the original
-        # submission resolves the dispatcher to a concrete warehouse, but
-        # ``self.statement.warehouse_id`` is never written back, so a naive
-        # ``SQLWarehouse(warehouse_id=None, warehouse_name=None)`` would
-        # submit without a warehouse_id and the SDK would 400 on the retry.
         prior = self.executor
         eff_wh_id = (
             warehouse_id
@@ -825,7 +820,6 @@ class WarehouseStatementResult(StatementResult):
             statement_id=self.statement_id,
         )
         self._response = None
-        self.refresh_status()
         return self
 
     # ------------------------------------------------------------------

@@ -199,7 +199,7 @@ class Tables(DatabricksService):
     ) -> tuple[str, Optional[str], Optional[str], Optional[str]]:
         if location:
             c, s, t = self.parse_catalog_schema_table_names(location)
-            catalog_name, schema_name, table_name = catalog_name or c, schema_name or s, table_name or t
+            catalog_name, schema_name, table_name = c or catalog_name, s or schema_name, t or table_name
 
         catalog_name = catalog_name or self.catalog_name
         schema_name = schema_name or self.schema_name

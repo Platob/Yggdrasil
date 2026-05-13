@@ -234,12 +234,24 @@ class SQLEngine(DatabricksService, StatementExecutor):
 
     def __call__(
         self,
+        obj: str | None = None,
         *,
         catalog_name: str | None = None,
         schema_name: str | None = None,
         warehouse: Optional[SQLWarehouse | str] = None,
-    ) -> SQLEngine:
+    ) -> Union[SQLEngine, StatementResult]:
         """Return a re-scoped engine, sharing the same inner Spark executor."""
+        if obj is not None:
+            catalog_name = catalog_name or self.catalog_name
+            schema_name = schema_name or self.schema_name
+
+            if PreparedStatement.looks_like_query(obj) or isinstance(obj, PreparedStatement):
+                return self.execute(obj, catalog_name=catalog_name, schema_name=schema_name)
+            else:
+                raise TypeError(
+                    f"SQLEngine.__call__ only accepts SQL strings, not {type(obj).__name__}."
+                )
+
         if catalog_name is None and schema_name is None and warehouse is None:
             return self
         if (

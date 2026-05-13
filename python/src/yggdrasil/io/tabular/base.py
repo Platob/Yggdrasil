@@ -1111,6 +1111,7 @@ class Tabular(ABC, Generic[O]):
         merged = options.merged
         inner = options.copy(
             source=merged if merged is not None else ...,
+            target=None,
             sync_metadata=False,
             row_size=None,
             byte_size=None,
