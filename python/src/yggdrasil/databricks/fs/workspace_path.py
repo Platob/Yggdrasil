@@ -169,12 +169,21 @@ class WorkspacePath(DatabricksPath):
                 url=URL(scheme=self.scheme, path=url_path),
                 client=self._client,
             )
-            yield child
             ot = getattr(info, "object_type", None)
             is_dir = (
                 getattr(ot, "name", None) == "DIRECTORY"
                 or str(ot).upper().endswith("DIRECTORY")
             )
+            # Seed from the listing entry so the caller's ``is_file()``
+            # / ``size`` / ``exists()`` per child don't each issue a
+            # follow-up ``workspace.get_status`` round trip.
+            mtime_ms = getattr(info, "modified_at", None) or 0
+            child._seed_stat_cache(IOStats(
+                kind=IOKind.DIRECTORY if is_dir else IOKind.FILE,
+                size=0 if is_dir else int(getattr(info, "size", 0) or 0),
+                mtime=float(mtime_ms) / 1000.0 if mtime_ms else 0.0,
+            ))
+            yield child
             if recursive and is_dir:
                 yield from child._ls(recursive=True)
 

@@ -111,23 +111,48 @@ class VolumePath(DatabricksPath):
 
     def _stat_uncached(self) -> IOStats:
         files = self.client.workspace_client().files
+        api_path = self.api_path
+        # Heuristic: a leaf with a ``.`` is almost always a file
+        # (``foo.parquet`` / ``part-….json``); a bare leaf is almost
+        # always a directory (``/Volumes/cat/sch/vol``,
+        # ``/Volumes/cat/sch/vol/tmp``). Probe that side first so the
+        # common case is one Files-API round trip instead of two.
+        # The 0.6.21 ``get_volume_status`` used the same heuristic;
+        # the rewrite dropped it and silently doubled stat latency
+        # for every directory probe.
+        file_first = "." in (self.url.path or "").rsplit("/", 1)[-1]
+        if file_first:
+            first_probe, first_kind = files.get_metadata, IOKind.FILE
+            second_probe, second_kind = files.get_directory_metadata, IOKind.DIRECTORY
+        else:
+            first_probe, first_kind = files.get_directory_metadata, IOKind.DIRECTORY
+            second_probe, second_kind = files.get_metadata, IOKind.FILE
         try:
-            info = self._call(files.get_metadata, self.api_path)
+            info = self._call(first_probe, api_path)
         except Exception:
             info = None
         if info is not None:
-            return IOStats(
-                kind=IOKind.FILE,
-                size=int(getattr(info, "content_length", 0) or 0),
-                mtime=_mtime(info),
-                media_type=_media_type_from_response(info),
-            )
+            if first_kind is IOKind.FILE:
+                return IOStats(
+                    kind=IOKind.FILE,
+                    size=int(getattr(info, "content_length", 0) or 0),
+                    mtime=_mtime(info),
+                    media_type=_media_type_from_response(info),
+                )
+            return IOStats(kind=IOKind.DIRECTORY, size=0, mtime=_mtime(info))
         try:
-            dir_info = self._call(files.get_directory_metadata, self.api_path)
+            info = self._call(second_probe, api_path)
         except Exception:
-            dir_info = None
-        if dir_info is not None:
-            return IOStats(kind=IOKind.DIRECTORY, size=0, mtime=0.0)
+            info = None
+        if info is not None:
+            if second_kind is IOKind.FILE:
+                return IOStats(
+                    kind=IOKind.FILE,
+                    size=int(getattr(info, "content_length", 0) or 0),
+                    mtime=_mtime(info),
+                    media_type=_media_type_from_response(info),
+                )
+            return IOStats(kind=IOKind.DIRECTORY, size=0, mtime=_mtime(info))
         return IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
 
     @property
@@ -599,8 +624,23 @@ class VolumePath(DatabricksPath):
                 child_path,
                 client=self._client,
             )
+            # The listing entry already carries ``is_directory`` /
+            # ``file_size`` / ``last_modified`` — seed the child's stat
+            # cache so the caller's ``is_file()`` / ``size`` /
+            # ``exists()`` per child collapses to a local hit. Without
+            # this, iterating an N-entry directory floods the Files
+            # API with N extra ``get_metadata`` round trips. (0.6.21
+            # already did this; the rewrite dropped it.)
+            is_directory = bool(getattr(info, "is_directory", False))
+            child._seed_stat_cache(IOStats(
+                kind=IOKind.DIRECTORY if is_directory else IOKind.FILE,
+                size=0 if is_directory else int(
+                    getattr(info, "file_size", 0) or 0,
+                ),
+                mtime=_mtime(info),
+            ))
             yield child
-            if recursive and getattr(info, "is_directory", False):
+            if recursive and is_directory:
                 yield from child._ls(recursive=True)
 
     # ==================================================================
