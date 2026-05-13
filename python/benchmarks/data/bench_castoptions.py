@@ -33,7 +33,9 @@ from typing import Callable
 import pyarrow as pa
 
 from yggdrasil.data.options import CastOptions
+from yggdrasil.data.data_field import Field
 from yggdrasil.data.enums import Mode
+from yggdrasil.io.primitive.csv_io import CsvOptions
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +270,124 @@ def scenarios(repeat: int) -> list[dict]:
     results.append(_time_one(
         "construct: CastOptions(mode=Mode.OVERWRITE)",
         lambda: CastOptions(mode=Mode.OVERWRITE),
+        repeat=repeat, inner=50_000,
+    ))
+
+    # ----------------------------------------------------------------
+    # Focused .check() micro-scenarios — every DataIO public method
+    # funnels through .check(), so each shape below maps to a real
+    # caller pattern (engine cast wrappers, registry dispatch, table
+    # writers, etc.). The numbers here drive any future optimization
+    # of the dispatch chain inside .check().
+    # ----------------------------------------------------------------
+
+    # 22. .check(None, safe=True) — None options + a single override.
+    # Fires when a cast wrapper hands a kwarg through without a base
+    # options object (``cast(value, target=..., safe=True)`` on the
+    # registry dispatcher).
+    results.append(_time_one(
+        "check: CastOptions.check(None, safe=True)",
+        lambda: CastOptions.check(None, safe=True),
+        repeat=repeat, inner=20_000,
+    ))
+
+    # 23. .check(existing, target=pa.Schema) — copy with a field
+    # override. Hot in cast wrappers that pin a target onto an
+    # existing options bundle.
+    existing_no_target = CastOptions(safe=True)
+    results.append(_time_one(
+        "check: CastOptions.check(existing, target=pa.Schema)",
+        lambda: CastOptions.check(existing_no_target, target=PA_SCHEMA),
+        repeat=repeat, inner=2_000,
+    ))
+
+    # 24. .check(pa.DataType) — cheapest schema-promote shape:
+    # single-column casts where the caller passes a bare dtype.
+    results.append(_time_one(
+        "check: CastOptions.check(pa.DataType)",
+        lambda: CastOptions.check(PA_DTYPE),
+        repeat=repeat, inner=20_000,
+    ))
+
+    # 25. .check(pa.Field) — schema-promote with a single field.
+    results.append(_time_one(
+        "check: CastOptions.check(pa.Field)",
+        lambda: CastOptions.check(PA_FIELD),
+        repeat=repeat, inner=10_000,
+    ))
+
+    # 26. .check(yggdrasil Field) — already-Field input. Tests the
+    # isinstance-tuple match path on the schema-promote branch.
+    YG_FIELD = Field.from_(PA_SCHEMA)
+    results.append(_time_one(
+        "check: CastOptions.check(yggdrasil Field)",
+        lambda: CastOptions.check(YG_FIELD),
+        repeat=repeat, inner=20_000,
+    ))
+
+    # 27. .check(dict, safe=True) — Mapping options + an explicit
+    # override. Exercises the {**options, **overrides} merge.
+    cfg_no_safe = {"target": PA_SCHEMA, "row_size": 1024}
+    results.append(_time_one(
+        "check: CastOptions.check(dict, safe=True)",
+        lambda: CastOptions.check(cfg_no_safe, safe=True),
+        repeat=repeat, inner=2_000,
+    ))
+
+    # 28. .check({"columns": [...]}) — columns shortcut from a dict.
+    # Forces the columns-extraction branch (dict copy + struct-of-
+    # ObjectType source build).
+    cfg_columns = {"columns": ["id", "name", "amount", "ts"]}
+    results.append(_time_one(
+        "check: CastOptions.check({'columns': [...]})",
+        lambda: CastOptions.check(cfg_columns),
+        repeat=repeat, inner=5_000,
+    ))
+
+    # 29. .check(None, columns=[...]) — columns shortcut as a kwarg,
+    # no options. Fires when callers want a placeholder source.
+    cols_only = ["id", "name", "amount", "ts"]
+    results.append(_time_one(
+        "check: CastOptions.check(None, columns=[...])",
+        lambda: CastOptions.check(None, columns=cols_only),
+        repeat=repeat, inner=5_000,
+    ))
+
+    # 30. .check(subclass_existing) — passthrough on a subclass
+    # options instance. Same as scenario 6 but with a CsvOptions
+    # input (catches any regression when the cls check moves).
+    csv_opts = CsvOptions(target=PA_SCHEMA)
+    results.append(_time_one(
+        "check: CsvOptions.check(csv_opts) passthrough",
+        lambda: CsvOptions.check(csv_opts),
+        repeat=repeat, inner=200_000,
+    ))
+
+    # 31. .check(base_options) on subclass — re-home from
+    # CastOptions to CsvOptions. Walks dataclasses.fields and
+    # carries over only the shared base fields.
+    base_opts = CastOptions(target=PA_SCHEMA, safe=True)
+    results.append(_time_one(
+        "check: CsvOptions.check(base_castoptions) re-home",
+        lambda: CsvOptions.check(base_opts),
+        repeat=repeat, inner=2_000,
+    ))
+
+    # 32. .check(existing) on subclass — passthrough fast-path on
+    # subclass.
+    csv_no_target = CsvOptions()
+    results.append(_time_one(
+        "check: CsvOptions.check(csv_opts_default) passthrough",
+        lambda: CsvOptions.check(csv_no_target),
+        repeat=repeat, inner=200_000,
+    ))
+
+    # 33. .check(...) — Ellipsis-as-options sentinel: equivalent to
+    # None. Some callers thread ``...`` through a default to
+    # distinguish "didn't pass" from "passed None".
+    results.append(_time_one(
+        "check: CastOptions.check(...)",
+        lambda: CastOptions.check(...),
         repeat=repeat, inner=50_000,
     ))
 

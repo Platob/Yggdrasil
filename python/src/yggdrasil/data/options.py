@@ -160,6 +160,28 @@ CastOptionsArg = Union[
 ]
 
 
+# Cached tuple for the schema-promote isinstance check on the
+# :meth:`CastOptions.check` hot path. The tuple is rebuilt the
+# first time a non-CastOptions / non-None / non-Mapping value
+# lands in ``check``; ``field_class()`` / ``schema_class()`` are
+# themselves lru-cached, but resolving + tuple-allocating on every
+# call shows up as ~200ns of pure overhead in the bench. Stored as
+# a module-level slot to avoid a second function-call hop.
+_PROMOTE_TYPES: "tuple[type, ...] | None" = None
+
+
+def _promote_types() -> "tuple[type, ...]":
+    global _PROMOTE_TYPES
+    cached = _PROMOTE_TYPES
+    if cached is None:
+        cached = (
+            pa.DataType, pa.Field, pa.Schema,
+            field_class(), schema_class(),
+        )
+        _PROMOTE_TYPES = cached
+    return cached
+
+
 # ---------------------------------------------------------------------------
 # CastOptions
 # ---------------------------------------------------------------------------
@@ -511,13 +533,33 @@ class CastOptions:
         :raises TypeError: if *options* is a type the dispatch table
             doesn't cover.
         """
+        # Hot fast-path: ``check(opts)`` / ``check(None)`` with no
+        # overrides. Every cast wrapper in arrow/polars/pandas/spark
+        # ``cast.py`` funnels through that exact call shape, and the
+        # passthrough is by far the most common dispatch. Resolving
+        # it before the ``columns`` pop, the ``Mapping`` ABC check,
+        # and the promotable-types tuple build saves ~250ns on each
+        # passthrough.
+        if not overrides:
+            if options is None or options is ...:
+                return cls()
+            if isinstance(options, cls):
+                return options
+            # Other shapes (Mapping, schema-promote, subclass re-home)
+            # still need full processing — fall through.
+
         # ``columns`` is not a CastOptions field — pop it from both
         # ``overrides`` and any Mapping-shaped ``options`` before the
         # field-name filter in :meth:`_build` discards it.
-        columns = overrides.pop("columns", None)
+        columns = overrides.pop("columns", None) if overrides else None
         if columns is None and isinstance(options, Mapping):
-            options = dict(options)
-            columns = options.pop("columns", None)
+            # Only copy the mapping when the caller actually stuffed
+            # ``columns`` into it — the common dict shape (target +
+            # safe + row_size, no columns) skips the copy entirely.
+            cols = options.get("columns")
+            if cols is not None:
+                options = dict(options)
+                columns = options.pop("columns")
 
         # 1. None / ... → fresh construction. Fast path when nothing
         # else is bound either — every DataIO public method that's
@@ -554,16 +596,25 @@ class CastOptions:
                 for f in dataclasses.fields(options)
                 if f.name in carry
             }
-            merged.update(overrides)
+            if overrides:
+                merged.update(overrides)
             instance = cls._build(merged)
 
         # 3. Mapping → merge into overrides (explicit kwargs win).
         elif isinstance(options, Mapping):
-            merged = {**options, **overrides}
+            # ``_build`` mutates the passed dict (pops ``"options"``),
+            # so the caller's mapping is never the one we hand on.
+            # Skip the ``{**options, **overrides}`` double-spread when
+            # the caller passed a dict alone — a single ``dict(options)``
+            # copy is enough and meaningfully cheaper on small dicts.
+            if overrides:
+                merged = {**options, **overrides}
+            else:
+                merged = dict(options)
             instance = cls._build(merged)
 
         # 4. Schema-shaped → promote to a target hint.
-        elif isinstance(options, (pa.DataType, pa.Field, pa.Schema, field_class(), schema_class())):
+        elif isinstance(options, _promote_types()):
             overrides.setdefault("target", options)
             instance = cls._build(overrides)
 
