@@ -50,7 +50,6 @@ from __future__ import annotations
 import dataclasses
 import enum
 import inspect
-import logging
 import types
 from collections.abc import Iterable, Mapping
 from typing import (
@@ -71,8 +70,6 @@ import pyarrow as pa
 
 if TYPE_CHECKING:
     from .options import CastOptions
-
-logger = logging.getLogger(__name__)
 
 __all__ = ["register_converter", "convert", "identity"]
 
@@ -135,15 +132,6 @@ def register_converter(from_hint: Any, to_hint: Any) -> Callable[[F], F]:
         # Any new registration may open new conversion paths, so stale cached
         # results are no longer valid.
         _find_cache.clear()
-
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "register_converter: %s -> %s via %s.%s",
-                getattr(from_hint, "__name__", from_hint),
-                getattr(to_hint, "__name__", to_hint),
-                getattr(func, "__module__", "?"),
-                getattr(func, "__qualname__", getattr(func, "__name__", "?")),
-            )
 
         return func
 
@@ -257,21 +245,15 @@ def find_converter(from_type: Any, to_hint: Any, check_namespace: bool = True) -
 
         # IMPORTANT: these imports are *side effects* that register more converters.
         if from_namespace.startswith("polars") or to_namespace.startswith("polars"):
-            logger.debug("find_converter: triggering polars cast registration for %s -> %s", from_type, to_hint)
             from yggdrasil.polars import cast as _polars_cast  # noqa: F401
         elif from_namespace.startswith("pandas") or to_namespace.startswith("pandas"):
-            logger.debug("find_converter: triggering pandas cast registration for %s -> %s", from_type, to_hint)
             from yggdrasil.pandas import cast as _pandas_cast  # noqa: F401
         elif from_namespace.startswith("pyspark") or to_namespace.startswith("pyspark"):
-            logger.debug("find_converter: triggering spark cast registration for %s -> %s", from_type, to_hint)
             from yggdrasil.spark import cast as _spark_cast  # noqa: F401
         elif from_namespace.startswith("pyarrow") or to_namespace.startswith("pyarrow"):
-            logger.debug("find_converter: triggering arrow cast registration for %s -> %s", from_type, to_hint)
             from yggdrasil.arrow import cast as _arrow_cast  # noqa: F401
 
         result = find_converter(from_type, to_hint, check_namespace=False)
-        if result is None:
-            logger.debug("find_converter: no converter resolved for %s -> %s", from_type, to_hint)
         _find_cache[cache_key] = result
         return result
 
@@ -379,13 +361,6 @@ def convert(
 
     conv = find_converter(type(value), target_hint)
     if conv is not None:
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "convert: %s -> %s via %s",
-                type(value).__name__,
-                getattr(target_hint, "__name__", target_hint),
-                getattr(conv, "__qualname__", getattr(conv, "__name__", repr(conv))),
-            )
         return conv(value, options)  # type: ignore[return-value]
 
     if target_is_type:

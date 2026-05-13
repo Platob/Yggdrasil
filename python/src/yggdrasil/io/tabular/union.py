@@ -193,22 +193,14 @@ class UnionTabular(LazyTabular):
         self, options: CastOptions,
     ) -> Iterator[pa.RecordBatch]:
         if not self._children:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("UnionTabular._read_arrow_batches: empty children, no-op")
             return
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "UnionTabular._read_arrow_batches: union over %d children, plan_ops=%d",
-                len(self._children),
-                len(self._plan),
-            )
         lf = self._build_lazy(options)
         table: pa.Table = lf.collect().to_arrow()
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                "UnionTabular._read_arrow_batches: collected %d rows / %d cols",
+                "UnionTabular union(%d children) -> %d rows",
+                len(self._children),
                 table.num_rows,
-                table.num_columns,
             )
         row_size = getattr(options, "row_size", None) or None
         for batch in table.to_batches(max_chunksize=row_size):

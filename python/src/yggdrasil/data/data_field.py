@@ -3,7 +3,6 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import json
-import logging
 import os
 import pathlib
 import types
@@ -70,9 +69,6 @@ __all__ = [
     "_to_bytes",
     "_merge_metadata_and_tags",
 ]
-
-
-logger = logging.getLogger(__name__)
 
 
 # ======================================================================
@@ -3101,16 +3097,6 @@ class Field(BaseChildrenFields):
             return array
         options = get_cast_options_class().check(options=options, **more)
         scoped = options.with_target(self)
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "cast_arrow_array: field=%r dtype=%s -> %s (len=%d, type=%s, safe=%s)",
-                self.name,
-                getattr(array, "type", "?"),
-                self.dtype,
-                len(array) if hasattr(array, "__len__") else -1,
-                type(array).__name__,
-                getattr(scoped, "safe", None),
-            )
         # Wrap any inner failure in CastError carrying the *current*
         # field as the target.  Nested rebuilds (struct / list / map
         # children, tabular per-column) all funnel through this method
@@ -3142,18 +3128,6 @@ class Field(BaseChildrenFields):
             return table
         options = get_cast_options_class().check(options=options, **more)
         scoped = options.with_target(self)
-        if logger.isEnabledFor(logging.DEBUG):
-            src_schema = getattr(table, "schema", None)
-            logger.debug(
-                "cast_arrow_tabular: %s rows=%s cols=%s src=%s -> target=%s (safe=%s mode=%s)",
-                type(table).__name__,
-                getattr(table, "num_rows", "?"),
-                getattr(table, "num_columns", "?"),
-                src_schema.names if src_schema is not None else "?",
-                [c.name for c in self.children] if self.children else self.name,
-                getattr(scoped, "safe", None),
-                getattr(scoped, "mode", None),
-            )
         # Same wrap shape as :meth:`cast_arrow_array` — covers a
         # tabular-level failure that doesn't originate inside one of
         # the per-column casts (schema-mismatch, missing column, etc.).
@@ -3192,14 +3166,6 @@ class Field(BaseChildrenFields):
         if self.dtype.type_id == DataTypeId.OBJECT:
             return iter(batches)
         options = get_cast_options_class().check(options=options, **more)
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "cast_arrow_batch_iterator: target=%r byte_size=%s row_size=%s safe=%s",
-                self.name,
-                getattr(options, "byte_size", None),
-                getattr(options, "row_size", None),
-                getattr(options, "safe", None),
-            )
         return self.to_struct().dtype.cast_arrow_batch_iterator(
             batches, options=options.with_target(self)
         )
@@ -3241,17 +3207,6 @@ class Field(BaseChildrenFields):
         if self.dtype.type_id == DataTypeId.OBJECT:
             return data
         options = get_cast_options_class().check(options=options, **more)
-        if logger.isEnabledFor(logging.DEBUG):
-            # ``LazyFrame.columns`` resolves the full schema (warns in
-            # polars); skip the column listing for lazy frames.
-            pl = polars_module()
-            cols = data.columns if isinstance(data, pl.DataFrame) else "<lazy>"
-            logger.debug(
-                "cast_polars_tabular: %s columns=%s -> %s",
-                type(data).__name__,
-                cols,
-                [c.name for c in self.children] if self.children else self.name,
-            )
         casted = self.to_struct().dtype.cast_polars_tabular(
             data, options=options.with_target(self)
         )
@@ -3281,14 +3236,6 @@ class Field(BaseChildrenFields):
         if self.dtype.type_id == DataTypeId.OBJECT:
             return data
         options = get_cast_options_class().check(options=options, **more)
-        if logger.isEnabledFor(logging.DEBUG):
-            cols = getattr(data, "columns", None)
-            logger.debug(
-                "cast_pandas_tabular: shape=%s columns=%s -> %s",
-                getattr(data, "shape", None),
-                list(cols) if cols is not None else None,
-                [c.name for c in self.children] if self.children else self.name,
-            )
         casted = self.dtype.cast_pandas_tabular(data, options=options.with_target(self))
         return self.finalize_pandas(casted)
 
@@ -3315,12 +3262,6 @@ class Field(BaseChildrenFields):
         if self.dtype.type_id == DataTypeId.OBJECT:
             return data
         options = get_cast_options_class().check(options=options, **more)
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "cast_spark_tabular: columns=%s -> %s",
-                getattr(data, "columns", None),
-                [c.name for c in self.children] if self.children else self.name,
-            )
         casted = self.dtype.cast_spark_tabular(data, options=options.with_target(self))
         return self.finalize_spark(casted)
 

@@ -337,27 +337,17 @@ class LazyTabular(Tabular[CastOptions]):
         self, options: CastOptions,
     ) -> Iterator[pa.RecordBatch]:
         if self._plan.is_empty():
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "LazyTabular._read_arrow_batches: empty plan, passthrough source=%s",
-                    type(self._source).__name__,
-                )
             yield from self._source._read_arrow_batches(options)
             return
 
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "LazyTabular._read_arrow_batches: executing plan over %s (ops=%d)",
-                type(self._source).__name__,
-                len(self._plan),
-            )
         lf = self._build_lazy(options)
         table: pa.Table = lf.collect().to_arrow()
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                "LazyTabular._read_arrow_batches: plan collected %d rows / %d cols",
+                "LazyTabular plan(%d ops) over %s -> %d rows",
+                len(self._plan),
+                type(self._source).__name__,
                 table.num_rows,
-                table.num_columns,
             )
         row_size = getattr(options, "row_size", None) or None
         for batch in table.to_batches(max_chunksize=row_size):
