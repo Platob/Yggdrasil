@@ -1444,6 +1444,28 @@ class _Parser:
 
         self._advance()
         name = tok.value
+
+        # XML-namespaced field names contain ':' (e.g. `_xml:lang`,
+        # `_rtr:msgType`, `rtr:versionedId`). The lexer treats `:`
+        # as punctuation and splits those names into separate tokens,
+        # so glue them back here: while the lookahead is `:` `ident`
+        # `:` — i.e. another colon follows that would act as the
+        # real name/type separator — fold `:ident` into the name.
+        # Quoted names are already a single token and don't take
+        # this path.
+        if tok.kind == "ident":
+            while (
+                self._peek_punct(":")
+                and (next_tok := self._peek_token(1)) is not None
+                and next_tok.kind == "ident"
+                and (after := self._peek_token(2)) is not None
+                and after.kind == "punct"
+                and after.value == ":"
+            ):
+                self._advance()
+                part = self._advance()
+                name = f"{name}:{part.value}"
+
         nullable: bool | None = None
 
         if self._peek_punct("?"):
