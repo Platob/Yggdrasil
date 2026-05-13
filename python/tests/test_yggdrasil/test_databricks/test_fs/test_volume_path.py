@@ -100,16 +100,41 @@ class TestConstruction:
 class TestStat:
 
     def test_existing_file(self, workspace, client) -> None:
+        # Leaf carries ``.`` — heuristic probes ``get_metadata`` first.
         workspace.files.get_metadata.return_value = _file_meta(42)
-        p = VolumePath("/Volumes/c/s/v/x", client=client)
+        p = VolumePath("/Volumes/c/s/v/x.parquet", client=client)
         s = p._stat_uncached()
         assert s.kind is IOKind.FILE
         assert s.size == 42
+        workspace.files.get_directory_metadata.assert_not_called()
 
-    def test_directory_fallback(self, workspace, client) -> None:
-        workspace.files.get_metadata.side_effect = NotFound()
+    def test_existing_directory_no_extension(self, workspace, client) -> None:
+        # Bare leaf — heuristic probes ``get_directory_metadata`` first,
+        # so the single round trip resolves the directory without
+        # touching ``get_metadata``.
         workspace.files.get_directory_metadata.return_value = SimpleNamespace()
         p = VolumePath("/Volumes/c/s/v/dir", client=client)
+        assert p._stat_uncached().kind is IOKind.DIRECTORY
+        workspace.files.get_metadata.assert_not_called()
+
+    def test_file_fallback_when_leaf_has_no_extension(self, workspace, client) -> None:
+        # Even a bare-leaf path can be a file (extensionless data
+        # dumps). When the directory probe NotFounds, fall back to
+        # ``get_metadata``.
+        workspace.files.get_directory_metadata.side_effect = NotFound()
+        workspace.files.get_metadata.return_value = _file_meta(7)
+        p = VolumePath("/Volumes/c/s/v/x", client=client)
+        s = p._stat_uncached()
+        assert s.kind is IOKind.FILE
+        assert s.size == 7
+
+    def test_directory_fallback_when_leaf_has_extension(self, workspace, client) -> None:
+        # ``foo.parquet`` looks like a file but could legitimately be a
+        # directory; when ``get_metadata`` NotFounds we fall back to
+        # ``get_directory_metadata``.
+        workspace.files.get_metadata.side_effect = NotFound()
+        workspace.files.get_directory_metadata.return_value = SimpleNamespace()
+        p = VolumePath("/Volumes/c/s/v/dir.d", client=client)
         assert p._stat_uncached().kind is IOKind.DIRECTORY
 
     def test_missing(self, workspace, client) -> None:
@@ -211,9 +236,11 @@ class TestMutators:
 
     def test_unlink(self, workspace, client) -> None:
         workspace.files.get_metadata.return_value = _file_meta(0)
-        p = VolumePath("/Volumes/c/s/v/x", client=client)
+        # Leaf has ``.`` so the heuristic resolves it as a file
+        # without spuriously routing through ``get_directory_metadata``.
+        p = VolumePath("/Volumes/c/s/v/x.bin", client=client)
         p.unlink()
-        workspace.files.delete.assert_called_once_with("/Volumes/c/s/v/x")
+        workspace.files.delete.assert_called_once_with("/Volumes/c/s/v/x.bin")
 
     def test_mkdir(self, workspace, client) -> None:
         p = VolumePath("/Volumes/c/s/v/folder", client=client)
@@ -520,8 +547,11 @@ class TestRetryPolicy:
             return r
 
         workspace.files.get_metadata.side_effect = get_metadata
+        # Leaf carries ``.`` so the file-first heuristic routes the
+        # InternalError-then-success sequence through
+        # ``get_metadata`` rather than ``get_directory_metadata``.
         p = VolumePath(
-            "/Volumes/c/s/v/x", client=client, retry_sleep=spy,
+            "/Volumes/c/s/v/x.bin", client=client, retry_sleep=spy,
         )
         assert p.size == 3
         assert recorded == [1.0, 1.0]
