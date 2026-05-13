@@ -162,6 +162,31 @@ class TabularStaticValues(Mapping):
 # time, looked up by the factory classmethods.
 _TABULAR_REGISTRY: "dict[str, type[Tabular]]" = {}
 
+# Side-effect bootstrap flag — :meth:`Tabular.class_for_media_type`
+# flips this on the first registry miss to force every concrete leaf
+# package to load (primitive ParquetIO / CsvIO / … *and* nested ZipIO
+# / FolderIO / DeltaIO). Without the nested side-effect import a
+# holder stamped ``application/zip`` would fall through to a plain
+# :class:`IO` and raise ``NotImplementedError`` from
+# ``_read_arrow_batches`` — see ``test_nested_leaves_register_lazily``.
+_TABULAR_REGISTRY_BOOTSTRAPPED: bool = False
+
+
+def _bootstrap_tabular_registry() -> None:
+    """Force-load every concrete :class:`Tabular` leaf package once.
+
+    Each leaf module registers its ``mime_type`` via
+    :meth:`Tabular.__init_subclass__` on import, so importing the
+    leaf packages is enough to populate :data:`_TABULAR_REGISTRY`.
+    Idempotent — the module-level flag short-circuits repeat calls.
+    """
+    global _TABULAR_REGISTRY_BOOTSTRAPPED
+    if _TABULAR_REGISTRY_BOOTSTRAPPED:
+        return
+    _TABULAR_REGISTRY_BOOTSTRAPPED = True
+    import yggdrasil.io.primitive  # noqa: F401
+    import yggdrasil.io.nested  # noqa: F401
+
 
 class Tabular(ABC, Generic[O]):
     """Pure interface — Arrow record-batch source/sink + engine fan-out.
@@ -421,6 +446,16 @@ class Tabular(ABC, Generic[O]):
         hit = _TABULAR_REGISTRY.get(mt.mime_type.name)
         if hit is not None:
             return hit
+
+        # Miss may just mean the leaf package hasn't been imported
+        # yet — force the side-effect bootstrap once and retry. This
+        # is what catches nested leaves (ZipIO / FolderIO / DeltaIO)
+        # for callers that never touched ``yggdrasil.io.nested``.
+        if not _TABULAR_REGISTRY_BOOTSTRAPPED:
+            _bootstrap_tabular_registry()
+            hit = _TABULAR_REGISTRY.get(mt.mime_type.name)
+            if hit is not None:
+                return hit
 
         if default is ...:
             raise KeyError(

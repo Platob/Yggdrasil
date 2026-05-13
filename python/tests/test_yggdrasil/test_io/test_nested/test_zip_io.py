@@ -40,6 +40,32 @@ class TestRegistration:
     def test_registry(self) -> None:
         assert Tabular.class_for_media_type(MimeTypes.ZIP) is ZipIO
 
+    def test_registry_lazy_bootstrap_without_nested_import(self) -> None:
+        # Caller never touches ``yggdrasil.io.nested`` — the registry
+        # still resolves ``application/zip`` to :class:`ZipIO` because
+        # :meth:`Tabular.class_for_media_type` self-bootstraps every
+        # leaf package on a miss. Regression for the response-body
+        # dispatch failure where ``Response.open(mode="rb")`` over an
+        # ``application/zip`` body fell back to a plain :class:`IO`
+        # and raised ``NotImplementedError`` from ``read_arrow_batches``.
+        import subprocess
+        import sys
+        import textwrap
+        script = textwrap.dedent(
+            """
+            import sys
+            mods = [m for m in sys.modules if m.startswith('yggdrasil.io.nested')]
+            assert not mods, f'unexpected pre-loaded nested modules: {mods}'
+            from yggdrasil.io.tabular.base import Tabular
+            target = Tabular.class_for_media_type('application/zip')
+            print(target.__module__ + '.' + target.__name__)
+            """
+        )
+        out = subprocess.check_output(
+            [sys.executable, "-c", script], text=True,
+        ).strip()
+        assert out == "yggdrasil.io.nested.zip_io.ZipIO"
+
 
 class TestDirectoryWalk:
 
@@ -97,8 +123,22 @@ class TestTabularDispatch:
 
     def test_unknown_entry_name_extension_raises(self, table) -> None:
         z = ZipIO()
-        with pytest.raises(ValueError, match="known tabular MediaType"):
+        with pytest.raises(ValueError) as excinfo:
             z.write_arrow_table(table, options=ZipOptions(entry_name="data.qqq"))
+        msg = str(excinfo.value)
+        assert "data.qqq" in msg
+        # Error must name the offending entry, explain why dispatch
+        # failed, and surface the registered extensions for recovery.
+        assert "Tabular leaf" in msg or "MediaType" in msg
+        assert "parquet" in msg and "csv" in msg
+
+    def test_no_extension_entry_name_raises_on_write(self, table) -> None:
+        z = ZipIO()
+        with pytest.raises(ValueError) as excinfo:
+            z.write_arrow_table(table, options=ZipOptions(entry_name="payload"))
+        msg = str(excinfo.value)
+        assert "payload" in msg
+        assert "no recognized extension" in msg or "no MediaType" in msg
 
     def test_skip_non_tabular_entries_in_aggregate_read(self) -> None:
         # Mix a tabular entry with a non-tabular one; the aggregate
@@ -112,6 +152,35 @@ class TestTabularDispatch:
         ])
         out = z.read_arrow_table()
         assert out.column("id").to_pylist() == [1, 2]
+
+    def test_aggregate_read_raises_when_no_entry_resolves(self) -> None:
+        # Zip with entries but NONE of them resolve to a tabular leaf —
+        # silently returning zero batches would hide the real problem
+        # (entry names missing the format extension, an unknown
+        # format, …). Surface the failure with a clear message.
+        z = ZipIO()
+        z.write_entries([
+            ("readme.txt", b"hello"),
+            ("notes.bin", b"\x00\x01"),
+        ])
+        with pytest.raises(ValueError) as excinfo:
+            z.read_arrow_table()
+        msg = str(excinfo.value)
+        assert "readme.txt" in msg and "notes.bin" in msg
+        assert "Registered tabular extensions" in msg
+
+    def test_entry_read_raises_on_unrecognized_extension(self) -> None:
+        # Reading a single ``ZipEntryIO`` directly against an
+        # unrecognized name surfaces the same explicit error rather
+        # than yielding an empty iterator.
+        z = ZipIO()
+        z.write_entries([("opaque.bin", b"\x00\x01")])
+        entry = z.child("opaque.bin")
+        with pytest.raises(ValueError) as excinfo:
+            list(entry._read_arrow_batches(entry.options_class()()))
+        msg = str(excinfo.value)
+        assert "opaque.bin" in msg
+        assert "Registered tabular extensions" in msg
 
 
 class TestEmpty:

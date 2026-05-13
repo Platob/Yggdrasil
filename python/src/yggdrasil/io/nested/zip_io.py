@@ -58,12 +58,66 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.data.enums.media_type import MediaType
+from yggdrasil.data.enums.mime_type import MimeType
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.tabular.base import Tabular
 
 
 __all__ = ["ZipIO", "ZipOptions", "ZipEntryIO"]
+
+
+def _registered_tabular_extensions() -> "list[str]":
+    """Return a sorted list of extensions a zip entry name can carry
+    that will dispatch to a registered :class:`Tabular` leaf.
+
+    Used by the read- and write-side errors so the message points at
+    actual valid suffixes for the current registry state instead of a
+    hard-coded sample.
+    """
+    from yggdrasil.io.tabular.base import _TABULAR_REGISTRY
+
+    out: "set[str]" = set()
+    for name in _TABULAR_REGISTRY:
+        mt = MediaType.from_(name, default=None)
+        if mt is None:
+            continue
+        out.update(MimeType.extensions_for(mt.mime_type))
+    return sorted(out)
+
+
+def _describe_entry_resolution_failure(entry_name: str) -> str:
+    """Return a one-line reason *entry_name* didn't resolve to a leaf.
+
+    Distinguishes the three failure shapes so the caller's error
+    points at the right thing: (1) name has no recognizable
+    extension, (2) extension maps to a non-tabular mime, (3)
+    extension maps to a tabular mime with no registered leaf.
+    """
+    from yggdrasil.io.tabular.base import Tabular
+
+    try:
+        mt = MediaType.from_(entry_name, default=None)
+    except Exception:
+        mt = None
+    if mt is None:
+        return (
+            f"{entry_name!r}: no MediaType could be inferred from the "
+            "entry name (no recognized extension)"
+        )
+    try:
+        cls = Tabular.class_for_media_type(mt, default=None)
+    except Exception:
+        cls = None
+    if cls is None:
+        return (
+            f"{entry_name!r}: MediaType {mt.mime_type.value!r} has no "
+            "registered Tabular leaf"
+        )
+    return (
+        f"{entry_name!r}: resolved to {cls.__name__} — unexpected, "
+        "should have dispatched"
+    )
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -211,7 +265,12 @@ class ZipEntryIO(BytesIO):
     def _read_arrow_batches(self, options) -> Iterator[pa.RecordBatch]:
         leaf = self._resolve_leaf()
         if leaf is None:
-            return iter(())
+            exts = _registered_tabular_extensions()
+            raise ValueError(
+                f"{type(self).__name__}: cannot read Arrow batches from "
+                f"{_describe_entry_resolution_failure(self.entry_name)}. "
+                f"Registered tabular extensions: {exts!r}."
+            )
         return leaf._read_arrow_batches(leaf.options_class()())
 
     def _collect_schema(self, options) -> Schema:
@@ -324,13 +383,46 @@ class ZipIO(BytesIO):
     ) -> Iterator[pa.RecordBatch]:
         """Walk every tabular entry and yield its batches in order.
 
-        Entries that don't resolve to a registered tabular leaf
-        (text, opaque binary, …) are skipped silently — that's the
-        contract for the zip-as-Tabular view. Use
+        Entries that DO resolve to a registered tabular leaf
+        (parquet / csv / ndjson / arrow / …) stream their batches in
+        archive order. Entries that don't resolve are skipped
+        silently when at least one tabular entry is present — that's
+        the contract for the zip-as-Tabular view. Use
         :meth:`iter_children` for an unfiltered walk.
+
+        Raises :class:`ValueError` when the archive has entries but
+        NONE of them resolve to a registered tabular leaf — silently
+        returning zero batches in that case hides the real problem
+        (entry names missing the format extension, an unknown
+        format, …) behind an empty read. Empty archives still
+        return zero batches without raising.
         """
-        for child in self.iter_children():
-            yield from child._read_arrow_batches(child.options_class()())
+        children = list(self.iter_children())
+        if not children:
+            return
+
+        leaves: "list[tuple[ZipEntryIO, Tabular]]" = []
+        unresolved: "list[str]" = []
+        for child in children:
+            leaf = child._resolve_leaf()
+            if leaf is None:
+                unresolved.append(
+                    _describe_entry_resolution_failure(child.entry_name)
+                )
+                continue
+            leaves.append((child, leaf))
+
+        if not leaves:
+            exts = _registered_tabular_extensions()
+            raise ValueError(
+                f"{type(self).__name__}: archive has {len(children)} "
+                "entries but none resolve to a registered Tabular leaf. "
+                f"Reasons: {unresolved!r}. Registered tabular extensions: "
+                f"{exts!r}."
+            )
+
+        for _child, leaf in leaves:
+            yield from leaf._read_arrow_batches(leaf.options_class()())
 
     # ==================================================================
     # Write path
@@ -383,11 +475,13 @@ class ZipIO(BytesIO):
             except Exception:
                 inner_cls = None
         if inner_cls is None:
+            exts = _registered_tabular_extensions()
             raise ValueError(
-                f"{type(self).__name__}: entry_name {options.entry_name!r} "
-                "does not resolve to a known tabular MediaType. "
-                "Use a name with a registered extension (e.g. "
-                "'data.parquet', 'data.csv', 'data.arrow')."
+                f"{type(self).__name__}: cannot infer Tabular leaf for "
+                f"entry_name {options.entry_name!r} — "
+                f"{_describe_entry_resolution_failure(options.entry_name)}. "
+                f"Set ZipOptions.entry_name to a value whose suffix is one "
+                f"of the registered tabular extensions: {exts!r}."
             )
 
         leaf = inner_cls(holder=Memory(), owns_holder=True)
