@@ -30,16 +30,16 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from yggdrasil.data.constants import DEFAULT_FIELD_NAME
+from yggdrasil.data.enums.mode import Mode
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.parser import (
     DataTypeMetadata,
     ParsedDataType,
     parse_data_type,
 )
-from yggdrasil.data.enums.mode import Mode
-from yggdrasil.lazy_imports import field_class, polars_module, pandas_module
-from yggdrasil.pickle.serde import ObjectSerde
+from yggdrasil.lazy_imports import field_class
 from yggdrasil.lazy_imports import pandas_module, polars_module, spark_sql_module
+from yggdrasil.pickle.serde import ObjectSerde
 from ..base_meta import BaseChildrenFields
 from ..data_utils import get_cast_options_class
 

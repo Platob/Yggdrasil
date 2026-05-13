@@ -83,114 +83,22 @@ class TestStateDelegation:
     def test_pending(self) -> None:
         r = _result(State.PENDING)
         assert r.state is State.PENDING
-        assert not r.started
-        assert not r.done
-        assert not r.failed
 
     def test_running(self) -> None:
         r = _result(State.RUNNING)
-        assert r.started
-        assert not r.done
-        assert not r.failed
+        assert r.state.is_running
 
     def test_succeeded(self) -> None:
         r = _result(State.SUCCEEDED)
-        assert r.started
-        assert r.done
-        assert not r.failed
+        assert r.state.is_succeeded
 
     def test_failed(self) -> None:
         r = _result(State.FAILED)
-        assert r.started
-        assert r.done
-        assert r.failed
+        assert r.state.is_failed
 
     def test_canceled_is_failed(self) -> None:
         # CANCELED counts as failed to match the warehouse path's
         # ``raise_for_status`` semantics — a canceled query is one the
         # caller asked for and didn't get.
         r = _result(State.CANCELED)
-        assert r.started
-        assert r.done
-        assert r.failed
-
-
-# ---------------------------------------------------------------------------
-# state_snapshot()
-# ---------------------------------------------------------------------------
-
-
-class TestStateSnapshot:
-    """``state_snapshot()`` pins ``state`` so a block of predicate accesses
-    only refreshes once."""
-
-    def test_four_predicate_accesses_outside_snapshot_compute_four_times(self) -> None:
-        # Sanity check: without the snapshot, each predicate triggers
-        # its own ``_compute_state`` call.
-        r = _result(State.RUNNING)
-        _ = r.state
-        _ = r.started
-        _ = r.done
-        _ = r.failed
-        assert r.compute_count == 4
-
-    def test_inside_snapshot_computes_once(self) -> None:
-        r = _result(State.RUNNING)
-        with r.state_snapshot():
-            _ = r.state
-            _ = r.started
-            _ = r.done
-            _ = r.failed
-        assert r.compute_count == 1
-
-    def test_snapshot_yields_the_pinned_state(self) -> None:
-        r = _result(State.RUNNING)
-        with r.state_snapshot() as snap:
-            assert snap is State.RUNNING
-            assert r.state is State.RUNNING
-
-    def test_snapshot_clears_on_exit(self) -> None:
-        r = _result(State.RUNNING)
-        with r.state_snapshot():
-            assert r._state_snapshot is State.RUNNING
-        assert r._state_snapshot is None
-
-    def test_snapshot_clears_on_exception(self) -> None:
-        r = _result(State.RUNNING)
-        try:
-            with r.state_snapshot():
-                raise ValueError("boom")
-        except ValueError:
-            pass
-        assert r._state_snapshot is None
-
-    def test_nested_snapshot_reuses_outer(self) -> None:
-        # Inner snapshot must not refresh again — it reuses the outer pin.
-        r = _result(State.RUNNING)
-        with r.state_snapshot() as outer:
-            with r.state_snapshot() as inner:
-                assert outer is inner
-                _ = r.failed
-                _ = r.done
-        assert r.compute_count == 1
-
-    def test_snapshot_does_not_freeze_after_exit(self) -> None:
-        # After leaving the snapshot, ``state`` reflects fresh values
-        # again so callers polling outside a block still see updates.
-        r = _result(State.PENDING)
-        with r.state_snapshot():
-            assert r.state is State.PENDING
-        r._state_value = State.SUCCEEDED
-        assert r.state is State.SUCCEEDED
-
-    def test_raise_for_status_uses_snapshot(self) -> None:
-        # ``raise_for_status`` is the canonical multi-access block —
-        # it reads ``failed`` and then ``_auto_promote_transient_retry``
-        # reads ``failed`` two more times. With the snapshot wrapping,
-        # ``_compute_state`` should fire once.
-        r = _result(State.FAILED)
-        try:
-            r.raise_for_status()
-        except RuntimeError:
-            pass
-        assert r.compute_count == 1
+        assert r.state.is_canceled

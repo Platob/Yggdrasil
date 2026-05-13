@@ -56,6 +56,8 @@ from databricks.sdk.service.sql import (
 
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.data import Schema
+from yggdrasil.data.enums import MimeType, MimeTypes
+from yggdrasil.data.enums.state import State
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.statement import (
     ExternalStatementData,
@@ -65,13 +67,12 @@ from yggdrasil.data.statement import (
 )
 from yggdrasil.databricks.sql.exceptions import SQLError
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
-from yggdrasil.data.enums import MimeType, MimeTypes
-from yggdrasil.data.enums.state import State
 from yggdrasil.io.tabular import Tabular
 from ..fs import VolumePath, DatabricksPath
 from ..sql.types import parse_databricks_field
 
 if TYPE_CHECKING:
+    from yggdrasil.databricks.client import DatabricksClient
     from yggdrasil.databricks.warehouse.warehouse import SQLWarehouse
 
 __all__ = [
@@ -274,6 +275,7 @@ class WarehousePreparedStatement(PreparedStatement):
         schema_name: Optional[str] = None,
         resource_name: Optional[str] = None,
         temporary: bool = True,
+        client: "DatabricksClient | None" = None,
     ) -> dict[str, VolumePath]:
         """Validate ``external_data`` and stage tabular values to Parquet volumes.
 
@@ -335,6 +337,7 @@ class WarehousePreparedStatement(PreparedStatement):
                 schema_name=schema_name,
                 resource_name=resource_name,
                 temporary=temporary,
+                client=client
             )
 
         return out
@@ -371,6 +374,7 @@ class WarehousePreparedStatement(PreparedStatement):
         schema_name: Optional[str],
         resource_name: Optional[str],
         temporary: bool,
+        client: "DatabricksClient"
     ) -> VolumePath:
         """Stage tabular ``value`` to a fresh Parquet volume.  Override
         in subclasses for custom file formats / staging policies.
@@ -387,6 +391,7 @@ class WarehousePreparedStatement(PreparedStatement):
                 resource_name=resource_name or alias,
                 temporary=temporary,
                 tabular=value,
+                client=client
             )
         except Exception as e:
             raise RuntimeError(
@@ -403,6 +408,7 @@ class WarehousePreparedStatement(PreparedStatement):
         cls,
         statement: "WarehousePreparedStatement | PreparedStatement | str",
         *,
+        client: "DatabricksClient | None" = None,
         parameters: Optional[Mapping[str, Any] | List[StatementParameterListItem]] = None,
         external_data: Optional[Mapping[str, Any]] = None,
         external_volume_paths: Optional[dict[str, VolumePath]] = None,
@@ -434,6 +440,7 @@ class WarehousePreparedStatement(PreparedStatement):
             schema_name=schema_name,
             resource_name=resource_name,
             temporary=temporary,
+            client=client
         )
         ext_paths: dict[str, VolumePath] = dict(prepared.external_volume_paths or {})
         if external_volume_paths:
@@ -869,20 +876,14 @@ class WarehouseStatementResult(StatementResult):
             )
             return self
 
-        # Route the cache-hit decision through ``_SDK_TO_STATE`` so the
-        # "is this terminal?" check shares its truth source with
-        # ``_compute_state``; an SDK value the map doesn't recognize
-        # falls back to ``PENDING`` and re-polls rather than stalling.
-        prev = self._response.status.state if self._response is not None else None
-        if prev is None or not _SDK_TO_STATE.get(prev, State.PENDING).is_done:
+        if self._response is None:
             statement_execution = self.client.workspace_client().statement_execution
             self._response = statement_execution.get_statement(self.statement_id)
-            new_state = self._response.status.state
-            if logger.isEnabledFor(logging.DEBUG) and new_state != prev:
-                logger.debug(
-                    "statement %s state: %s -> %s",
-                    self.statement_id, prev, new_state,
-                )
+        elif self._response.status.state in DONE_STATES:
+            return self._response
+
+        statement_execution = self.client.workspace_client().statement_execution
+        self._response = statement_execution.get_statement(self.statement_id)
         return self
 
     @property
@@ -910,18 +911,12 @@ class WarehouseStatementResult(StatementResult):
         path that checks several state-derived predicates only hits the
         warehouse status endpoint once.
         """
-        self.refresh_status()
-        if self._response is None or self._response.status is None:
-            return State.PENDING
-        sdk = self._response.status.state
-        return _SDK_TO_STATE.get(sdk, State.PENDING) if sdk is not None else State.PENDING
+        return _SDK_TO_STATE.get(self.sdk_state, State.PENDING)
 
     def _raise_for_status(self) -> None:
-        # Auto-promote happens in the base raise_for_status() before this
-        # hook fires (inside its ``state_snapshot`` block — this access
-        # of ``self.failed`` reuses that snapshot, no extra refresh).
-        if self.failed:
-            raise SQLError.from_statement(self)
+        error = SQLError.from_statement(self)
+        if error is not None:
+            raise error
 
     # ------------------------------------------------------------------
     # Manifest / schema
@@ -929,12 +924,10 @@ class WarehouseStatementResult(StatementResult):
 
     @property
     def manifest(self):
-        self.wait()
         return self.response.manifest
 
     @property
     def result(self):
-        self.wait()
         return self.response.result
 
     @property
@@ -972,6 +965,7 @@ class WarehouseStatementResult(StatementResult):
                 f"{self.disposition!r}, not EXTERNAL_LINKS"
             )
 
+        self.wait()
         result_data = self.result
         wsdk = self.client.workspace_client()
 

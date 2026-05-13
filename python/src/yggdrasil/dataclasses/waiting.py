@@ -207,7 +207,8 @@ class WaitingConfig:
     def sleep(
         self,
         iteration: int,
-        start: float | None = None
+        start: float | None = None,
+        max_interval: Optional[float] = None,
     ) -> None:
         """
         iteration is 0-based (first wait => iteration=0)
@@ -230,9 +231,10 @@ class WaitingConfig:
         growth_exp = self.backoff ** iteration
 
         sleep_s = self.interval * growth_exp
+        max_interval = max_interval or self.max_interval
 
-        if self.max_interval > 0:
-            sleep_s = min(sleep_s, self.max_interval)
+        if max_interval > 0:
+            sleep_s = min(sleep_s, max_interval)
 
         if sleep_s <= 0:
             return
@@ -242,18 +244,6 @@ class WaitingConfig:
             remaining = self.timeout - elapsed
             if remaining <= 0:
                 raise TimeoutError(f"Timed out waiting after {self.timeout:.3f}s")
-
-            # Slow-window cadence: once we're past the 5s fast window,
-            # callers usually don't need sub-second polling — bump the
-            # cadence to the minimum slow-window interval (5s) so we
-            # don't hammer the backend with low-value polls. Skip the
-            # bump for callers with a tighter ``max_interval`` cap,
-            # since that's an explicit "stay under this".
-            if elapsed >= _FAST_WINDOW_SECONDS:
-                slow_cadence = _SLOW_WINDOW_INTERVAL
-                if self.max_interval > 0:
-                    slow_cadence = min(slow_cadence, self.max_interval)
-                sleep_s = max(sleep_s, slow_cadence)
 
             # Always cap to remaining so we don't oversleep past the
             # deadline — better to undershoot and let the next loop

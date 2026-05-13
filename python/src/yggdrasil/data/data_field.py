@@ -40,18 +40,18 @@ from yggdrasil.data.constants import (
     POSITION_KEY,
     TAG_PREFIX,
 )
+from yggdrasil.data.enums import Mode
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.parser import ParsedDataType
-from yggdrasil.data.enums import Mode
 from yggdrasil.exceptions import CastError
-from yggdrasil.lazy_imports import path_class, schema_class, pandas_module
+from yggdrasil.lazy_imports import pandas_module, polars_module, spark_sql_module
+from yggdrasil.lazy_imports import path_class, schema_class
 from yggdrasil.pickle.serde import ObjectSerde
 from .cast.registry import register_converter
 from .data_utils import get_cast_options_class, safe_constraint_name
 from .types import NullType, ObjectType
 from .types.base import DataType
 from .types.nested import StructType
-from yggdrasil.lazy_imports import pandas_module, polars_module, spark_sql_module
 
 if TYPE_CHECKING:
     import pandas as pd

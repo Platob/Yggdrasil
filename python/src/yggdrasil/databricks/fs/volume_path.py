@@ -646,6 +646,10 @@ class VolumePath(DatabricksPath):
         never blocks process exit and never raises into the caller.
         """
         key = (catalog, schema, resource)
+
+        if key in cls._STAGING_SWEPT:
+            return
+
         with cls._STAGING_SWEPT_LOCK:
             if key in cls._STAGING_SWEPT:
                 return
@@ -920,6 +924,10 @@ class VolumePath(DatabricksPath):
             if not exist_ok and _looks_like_already_exists(exc):
                 raise
         self._seed_stat_cache(IOStats(kind=IOKind.DIRECTORY))
+        logger.info(
+            "files.create_directory %s (parents=%s)",
+            self.api_path, parents,
+        )
 
     def _remove_file(self, missing_ok: bool = True) -> None:
         if logger.isEnabledFor(logging.DEBUG):
@@ -1023,9 +1031,11 @@ class VolumePath(DatabricksPath):
         return n
 
     def _upload(self, payload: bytes) -> None:
+        size = len(payload)
+
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                "files.upload %s -> %d bytes", self.api_path, len(payload),
+                "files.upload %s -> %d bytes", self.api_path, size,
             )
         self._call_ensuring_parents(
             self.client.workspace_client().files.upload,
@@ -1033,18 +1043,21 @@ class VolumePath(DatabricksPath):
             contents=_stdio.BytesIO(payload),
             overwrite=True,
         )
-        logger.info("wrote %s (%d bytes)", self, len(payload))
+        logger.info("wrote %s (%d bytes)", self, size)
         self._seed_stat_cache(IOStats(
             size=len(payload),
             kind=IOKind.FILE,
             mtime=time.time(),
             media_type=self.media_type,
         ))
+        return None
 
     def truncate(self, n: int) -> int:
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
         if n == 0:
+            if self.is_file() and self.size == 0:
+                return 0
             self._upload(b"")
             return 0
         # One ``files.download`` round trip — skip the ``get_metadata``
@@ -1108,13 +1121,13 @@ def _media_type_from_response(info) -> "MediaType | None":
 
 
 def _mtime(info) -> float:
-    val = getattr(info, "last_modified", None) or getattr(info, "modification_time", None) or getattr(info, "last_modified_time", None)
+    val = getattr(info, "last_modified", None) or getattr(info, "modification_time", None)
 
     if val is None:
         return 0.0
 
     try:
-        return float(any_to_datetime(val, tz=dt.datetime.utc).timestamp())
+        return float(any_to_datetime(val, tz=dt.timezone.utc).timestamp())
     except Exception:
         try:
             return float(val) / 1000.0

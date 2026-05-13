@@ -26,7 +26,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional, Union, TYPE_CHECKING, Mapping, Iterable, Iterator, Literal
+from typing import Any, Dict, Optional, Union, TYPE_CHECKING, Mapping, Iterable, Iterator, Literal, ClassVar
 
 import pyarrow as pa
 from databricks.sdk.errors import DatabricksError, NotFound
@@ -39,11 +39,13 @@ from databricks.sdk.service.catalog import (
     TableType, EntityTagAssignment,
 )
 from pyarrow.fs import FileSystem, S3FileSystem
+
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data import Field
 from yggdrasil.data.data_utils import safe_constraint_name
-from yggdrasil.io.tabular.execution.expr import Predicate, col as expr_col
-from yggdrasil.io.tabular.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
+from yggdrasil.data.enums import MimeTypes, MimeType, MediaType
+from yggdrasil.data.enums import Scheme
+from yggdrasil.data.enums.mode import ModeLike, Mode
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema as DataSchema
 from yggdrasil.data.statement import PreparedStatement, StatementResult
@@ -54,12 +56,10 @@ from yggdrasil.environ import PyEnv
 from yggdrasil.io import URL
 from yggdrasil.io.holder import Holder
 from yggdrasil.io.io_stats import IOKind, IOStats
-from yggdrasil.io.tabular import Tabular, O
-from yggdrasil.data.enums import Scheme
 from yggdrasil.io.primitive import ParquetIO
-from yggdrasil.data.enums import MimeTypes, MimeType, MediaType
-from yggdrasil.data.enums.mode import ModeLike, Mode
-
+from yggdrasil.io.tabular import Tabular, O
+from yggdrasil.io.tabular.execution.expr import Predicate, col as expr_col
+from yggdrasil.io.tabular.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
 from .column import Column
 from .sql_utils import (
     quote_ident,
@@ -70,7 +70,6 @@ from .sql_utils import (
 from ..fs import VolumePath
 
 if TYPE_CHECKING:
-    import delta
     import pandas
     import polars
     import pyspark
@@ -1306,24 +1305,28 @@ class Table(DatabricksResource, Holder):
         ]
         return client_url.with_path("/" + "/".join(path_parts) if path_parts else "/")
 
-    def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
-        options = options.with_source(source=self.collect_schema())
+    def _options_to_sql(self, options: CastOptions):
         safe_char = "`"
         names = ",".join(
             safe_char + name + safe_char
             for name in options.column_names or [c.name for c in self.columns]
         )
         query = f"SELECT {names} FROM {self.full_name(safe=True)}"
-        # The unified ``predicate`` on CastOptions becomes a SQL
-        # ``WHERE`` so the warehouse drops non-matching rows before
-        # they reach the cast pipeline. Pushdown is the whole point —
-        # round-tripping rows through Arrow just to filter them on
-        # the driver wastes a round trip per batch.
+
         if options.predicate is not None:
             query += (
                 f" WHERE "
                 f"{expr_to_sql(options.predicate, dialect=Dialect.DATABRICKS)}"
             )
+
+        if options.row_limit:
+            query += f" LIMIT {options.row_limit}"
+
+        return query
+
+    def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
+        options = options.with_source(source=self.collect_schema())
+        query = self._options_to_sql(options)
 
         for batch in self.execute(query).read_arrow_batches(options=options):
             yield batch
@@ -1357,9 +1360,8 @@ class Table(DatabricksResource, Holder):
         )
 
     def _read_spark_frame(self, options: O) -> "SparkDataFrame":
-        return self.sql.execute(
-            f"SELECT * FROM {self.full_name(safe=True)}"
-        ).read_spark_frame(options)
+        query = self._options_to_sql(options)
+        return self.sql.execute(query).read_spark_frame(options)
 
     def _write_spark_frame(
         self,
@@ -1538,6 +1540,7 @@ class Table(DatabricksResource, Holder):
         object.__setattr__(self, "_infos", None)
         object.__setattr__(self, "_infos_fetched_at", None)
         object.__setattr__(self, "_columns", None)
+        object.__setattr__(self, "_schema_cache", ...)
 
     def _invalidate_entity_tag_cache(self) -> None:
         """Drop cached tag lists for this table and every cached column."""
@@ -3230,7 +3233,6 @@ class Table(DatabricksResource, Holder):
             zorder_by=zorder_by,
             optimize_after_merge=optimize_after_merge,
             vacuum_hours=vacuum_hours,
-            safe_merge=safe_merge,
         )
 
         retry_active = retry is not None

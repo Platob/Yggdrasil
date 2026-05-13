@@ -310,7 +310,7 @@ class TestStagingPath:
             client=client,
         )
         full = p.full_path()
-        assert full.startswith("/Volumes/cat/sch/tmp/.sql/cat/sch/tbl/part-")
+        assert full.startswith("/Volumes/cat/sch/tmp_tbl/.sql/part-")
         assert full.endswith(".parquet")
         assert p.temporary is True
         assert p.workspace_client is workspace
@@ -323,7 +323,7 @@ class TestStagingPath:
             client=client,
         )
         assert p.temporary is False
-        assert "/cat/sch/tmp/.sql/cat/sch/default/" in p.full_path()
+        assert "/cat/sch/tmp_default/.sql/" in p.full_path()
 
     def test_unique_per_call(self, workspace, client) -> None:
         a = VolumePath.staging_path(
@@ -348,7 +348,7 @@ class TestStagingPath:
             client=client,
         )
         full = p.full_path()
-        assert "/cat/sch/tmp/.sql/cat/sch/a_b/" in full
+        assert "/cat/sch/tmp_a_b/.sql/" in full
 
 
 class TestVolumeAutoCreate:

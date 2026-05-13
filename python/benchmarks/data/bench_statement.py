@@ -266,36 +266,9 @@ def _result_scenarios(repeat: int) -> list[dict]:
         repeat=repeat, inner=500_000,
     ))
     out.append(_time_one(
-        "result.done",
-        lambda: result.done,
-        repeat=repeat, inner=500_000,
-    ))
-    out.append(_time_one(
-        "result.failed",
-        lambda: result.failed,
-        repeat=repeat, inner=500_000,
-    ))
-    out.append(_time_one(
-        "result.started",
-        lambda: result.started,
-        repeat=repeat, inner=500_000,
-    ))
-    out.append(_time_one(
         "result.text  (property -> statement.text)",
         lambda: result.text,
         repeat=repeat, inner=500_000,
-    ))
-
-    def _snapshot_block() -> None:
-        with result.state_snapshot():
-            _ = result.done
-            _ = result.failed
-            _ = result.started
-
-    out.append(_time_one(
-        "result.state_snapshot()  + 3 reads",
-        _snapshot_block,
-        repeat=repeat, inner=200_000,
     ))
 
     out.append(_time_one(

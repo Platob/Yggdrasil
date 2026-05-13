@@ -30,7 +30,6 @@ A few design rules the cleanup pass enforces:
 
 from __future__ import annotations
 
-import copy as copy_mod
 import logging
 import os
 import re
@@ -38,14 +37,14 @@ import time
 from abc import abstractmethod
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Generic, Iterable, Iterator, Literal, Mapping, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Generic, Iterable, Iterator, Literal, Mapping, Optional, \
+    TypeVar
 
+from yggdrasil.data.enums import MimeType, MimeTypes, State
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.disposable import Disposable
-from yggdrasil.data.enums import MimeType, MimeTypes, State
 from yggdrasil.io.tabular import Tabular
 
 if TYPE_CHECKING:
@@ -456,8 +455,6 @@ class StatementResult(Tabular, Generic[PS]):
     def default_media_type(cls) -> MimeType:
         return MimeTypes.STATEMENT_RESULT
 
-    _state_snapshot: Optional[State] = None
-
     def __init__(
         self,
         statement: PS,
@@ -472,7 +469,6 @@ class StatementResult(Tabular, Generic[PS]):
         self.key = key or self.statement.key
         self._cached_schema: Optional[Schema] = None
         self.num_try = num_try or 0
-        self._state_snapshot = None
         super().__init__(**kwargs)
 
     # -------------------------------------------------------------------------
@@ -501,42 +497,7 @@ class StatementResult(Tabular, Generic[PS]):
         single ``refresh_status`` call. Outside a snapshot, every
         access goes through :meth:`_compute_state`.
         """
-        cached = self._state_snapshot
-        if cached is not None:
-            return cached
         return self._compute_state()
-
-    @contextmanager
-    def state_snapshot(self) -> Iterator[State]:
-        """Pin :attr:`state` for the duration of the block.
-
-        Single refresh on enter — ``state`` / ``done`` / ``failed`` /
-        ``started`` accesses inside the block re-use the snapshotted
-        value. Re-entrant: nested ``state_snapshot()`` blocks reuse
-        the outer pin.
-        """
-        if self._state_snapshot is not None:
-            yield self._state_snapshot
-            return
-        snap = self._compute_state()
-        self._state_snapshot = snap
-        try:
-            yield snap
-        finally:
-            self._state_snapshot = None
-
-    @property
-    def started(self) -> bool:
-        """Whether the statement has been started.
-
-        Derived from :attr:`state` — :attr:`State.is_started` is
-        ``True`` for anything past :attr:`State.PENDING`. Override in a
-        subclass only when ``started`` needs to be sticky across
-        terminal states that the unified enum doesn't distinguish
-        (e.g. Spark's ``_started`` flag stays ``True`` after a failure
-        before the result is reset).
-        """
-        return self.state.is_started
 
     @property
     def done(self) -> bool:
@@ -584,25 +545,15 @@ class StatementResult(Tabular, Generic[PS]):
         # Fast-path the steady-state success branch — every executor
         # ``wait`` / ``execute`` hop pays this. One state read; no
         # contextmanager allocation when the result is fine.
-        cached = self._state_snapshot
-        snap = cached if cached is not None else self._compute_state()
-        if not snap.is_failed:
-            return
+        state = self._compute_state()
+        if not state.is_failed:
+            return None
 
-        # Failed branch — pin the snapshot for ``_raise_for_status``
-        # so any state reads it performs share a single backend hop.
-        owned = cached is None
-        if owned:
-            self._state_snapshot = snap
         try:
-            try:
-                self.statement.clear_temporary_resources()
-            except Exception:
-                logger.exception("clear_temporary_resources failed during raise_for_status; continuing.")
-            return self._raise_for_status()
-        finally:
-            if owned:
-                self._state_snapshot = None
+            self.statement.clear_temporary_resources()
+        except Exception:
+            logger.exception("clear_temporary_resources failed during raise_for_status; continuing.")
+        return self._raise_for_status()
 
     @abstractmethod
     def _raise_for_status(self) -> None:
@@ -708,23 +659,20 @@ class StatementResult(Tabular, Generic[PS]):
                 self.raise_for_status()
             return self
 
-        iteration = 0
         start = time.time()
         state = self.state
 
         while not state.is_done:
-            wait_cfg.sleep(iteration=iteration, start=start)
-            iteration += 1
-            state = self.state
+            wait_cfg.sleep(iteration=0, start=start, max_interval=5)
+            state = self._compute_state()
 
         if raise_error:
             self.raise_for_status()
 
-        if not self.failed:
-            try:
-                self.statement.clear_temporary_resources()
-            except Exception:
-                logger.exception("clear_temporary_resources failed after wait; continuing.")
+        try:
+            self.statement.clear_temporary_resources()
+        except Exception:
+            logger.exception("clear_temporary_resources failed after wait; continuing.")
 
         return self
 

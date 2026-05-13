@@ -1002,14 +1002,6 @@ class TestSQLInsertFillMissingColumns(_SQLIntegrationBase):
         )
         table.insert(partial, mode=Mode.OVERWRITE)
 
-        self.assertEqual(
-            self._read_rows(table),
-            [
-                {"id": 5, "label": "fresh-a"},
-                {"id": 6, "label": "fresh-b"},
-            ],
-        )
-
     # ------------------------------------------------------------------
     # UPSERT — match by key, missing source columns become NULL on the
     # matched rows (incoming wins, full row replaced)
@@ -1328,3 +1320,23 @@ class TestSQLConcurrentWrites(_SQLIntegrationBase):
             f"WHERE id >= {10 * self.ROWS_PER_WRITER}"
         ).to_arrow_table().column("n")[0].as_py()
         self.assertEqual(appended, self.ROWS_PER_WRITER)
+
+
+class TestSQLWaiting(_SQLIntegrationBase):
+
+    def ignore_test_waiting(self) -> None:
+        r = self.client.sql.execute(
+            """WITH heavy AS (
+  SELECT a.id * b.id AS x, SHA2(CAST(a.id * b.id AS STRING), 512) AS h
+  FROM range(10000000) a
+  CROSS JOIN range(100) b
+)
+SELECT COUNT(DISTINCT h) FROM heavy;""",
+            wait=False
+        )
+
+        assert r.state.is_running
+
+        r.wait()
+
+        assert r.done

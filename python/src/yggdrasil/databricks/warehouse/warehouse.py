@@ -46,6 +46,7 @@ import time
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar, List, Mapping, Optional, Union, TYPE_CHECKING
 
+from databricks.sdk.errors import InternalError, DeadlineExceeded, TemporarilyUnavailable
 from databricks.sdk.service.sql import (
     Disposition,
     EndpointInfo,
@@ -585,6 +586,7 @@ class SQLWarehouse(
         """
         staged = WarehousePreparedStatement.check_external_data(
             options.external_data,
+            client=self.client,
             catalog_name=statement.catalog_name,
             schema_name=statement.schema_name,
         )
@@ -632,19 +634,31 @@ class SQLWarehouse(
             self, statement.text,
         )
 
-        response = sdk_client.execute_statement(
-            statement=statement.text,
-            warehouse_id=target_wh_id,
-            byte_limit=statement.byte_limit,
-            disposition=disposition,
-            format=format_,
-            on_wait_timeout=statement.on_wait_timeout,
-            parameters=statement.to_parameter_list(),
-            row_limit=statement.row_limit,
-            wait_timeout=statement.wait_timeout,
-            catalog=statement.catalog_name,
-            schema=statement.schema_name,
-        )
+        itry = 0
+        while True:
+            try:
+                response = sdk_client.execute_statement(
+                    statement=statement.text,
+                    warehouse_id=target_wh_id,
+                    byte_limit=statement.byte_limit,
+                    disposition=disposition,
+                    format=format_,
+                    on_wait_timeout=statement.on_wait_timeout,
+                    parameters=statement.to_parameter_list(),
+                    row_limit=statement.row_limit,
+                    wait_timeout=statement.wait_timeout,
+                    catalog=statement.catalog_name,
+                    schema=statement.schema_name,
+                )
+                break
+            except (InternalError, DeadlineExceeded, TemporarilyUnavailable) as e:
+                if itry > 4:
+                    raise
+                LOGGER.warning(
+                    "Failed to execute statement %r with exception %r",
+                    statement.text, e,
+                )
+                itry += 1
 
         result = WarehouseStatementResult(
             executor=self,
@@ -749,6 +763,7 @@ class SQLWarehouse(
         # is forwarded — None means "don't override" inside prepare().
         prepared = WarehousePreparedStatement.prepare(
             statement if statement is not None else "",
+            client=self.client,
             parameters=parameters,
             external_data=external_data,
             external_volume_paths=external_volume_paths,

@@ -31,7 +31,6 @@ if TYPE_CHECKING:
     from .compute.service import Compute
     from .secrets.service import Secrets
     from .workspaces import Workspaces, Workspace
-    from .fs.service import FileSystem
     from .fs.path import DatabricksPath
     from .genie import Genie
     from .tags.service import EntityTags
@@ -1263,23 +1262,6 @@ class DatabricksClient(URLBased):
             use_cache=True,
         )
 
-    @property
-    def filesystem(self) -> "FileSystem":
-        """OS-style Databricks filesystem helper for this client."""
-        from .fs.service import FileSystem
-
-        return self.lazy_property(
-            self,
-            cache_attr="_filesystem",
-            factory=lambda: FileSystem(client=self),
-            use_cache=True,
-        )
-
-    @property
-    def fs(self) -> "FileSystem":
-        """Short alias for :attr:`filesystem`."""
-        return self.filesystem
-
     def spark_connect(self):
         from databricks.connect import DatabricksSession  # noqa
 
@@ -1451,16 +1433,6 @@ class DatabricksService(ABC):
     def genie(self) -> "Genie":
         """Genie service (shorthand for ``client.genie``)."""
         return self.client.genie
-
-    @property
-    def filesystem(self) -> "FileSystem":
-        """Filesystem service (shorthand for ``client.filesystem``)."""
-        return self.client.filesystem
-
-    @property
-    def fs(self) -> "FileSystem":
-        """Short alias for :attr:`filesystem`."""
-        return self.client.fs
 
 
 class DatabricksResource(ABC):
