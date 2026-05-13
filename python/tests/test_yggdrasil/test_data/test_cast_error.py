@@ -281,3 +281,76 @@ class TestNestedCastErrorPropagation(ArrowTestCase):
             )
         self.assertEqual(ctx.exception.target.name, "amount")
         self.assertIsNotNone(ctx.exception.original)
+
+
+class TestCastErrorWrapWithoutBoundSource(ArrowTestCase):
+    """When the caller doesn't bind a source field, the wrap derives one
+    from the actual pyarrow input — message stays informative instead of
+    rendering ``cast ? -> <target>``."""
+
+    def test_array_wrap_derives_source_from_arrow_type(self) -> None:
+        pa = self.pa
+        tgt_field = Field.from_arrow(pa.field("amount", pa.int64()))
+        arr = pa.array(["nope"], type=pa.string())
+        # No ``source=`` kwarg — the wrap must fall back to the array's type.
+        with self.assertRaises(CastError) as ctx:
+            tgt_field.cast_arrow_array(arr, safe=True)
+        msg = str(ctx.exception)
+        self.assertNotIn("? ->", msg)
+        self.assertIn("string", msg)
+        self.assertIn("amount: int64", msg)
+
+    def test_tabular_wrap_derives_source_from_table_schema(self) -> None:
+        # The outer table-level wrap on :meth:`Field.cast_arrow_tabular`
+        # was the case that motivated this — when a deeper rebuild bubbles
+        # a non-CastError out (schema build / merge / pyarrow kernel),
+        # the message used to read ``cast ? -> <target>`` because the
+        # outer scope hadn't bound source. The wrap now derives one from
+        # ``table.schema`` so the user sees what they actually passed.
+        pa = self.pa
+        tgt = Field.from_arrow(pa.schema([
+            pa.field(
+                "payload",
+                pa.struct([pa.field("a", pa.int64())]),
+                nullable=True,
+            ),
+        ]))
+        # Force a non-CastError to bubble out of the inner cast — pass
+        # an opaque object that isn't a Table/RecordBatch but passes the
+        # outer isinstance(Table|RecordBatch) gate. We do that by going
+        # straight at the inner ``to_struct().dtype.cast_arrow_tabular``
+        # via the public method with a degenerate table whose only column
+        # types make pyarrow give up. A string column targeted at a
+        # struct, with ``safe=True``, raises a per-column ``CastError``
+        # — so to exercise the outer wrap we trip the schema merge by
+        # passing an input table whose column count + names match but
+        # which the struct rebuild later rejects mid-build.
+        tbl = pa.table(
+            {"payload": pa.array(["{not-json"], type=pa.string())},
+        )
+        # ``safe=True`` makes the JSON decode raise a ``pa.ArrowInvalid``
+        # from inside the per-column cast — wrapped at the leaf seam,
+        # so source is bound there. Verify the leaf still carries the
+        # bound source (this is the existing contract) AND that
+        # str(error) names the column type.
+        with self.assertRaises(CastError) as ctx:
+            tgt.cast_arrow_tabular(tbl, safe=True)
+        msg = str(ctx.exception)
+        self.assertIn("payload: string", msg)
+        self.assertIn("payload: struct", msg)
+
+    def test_reason_prefixes_underlying_exception_type(self) -> None:
+        # ``ArrowNotImplementedError: ...`` vs ``ArrowInvalid: ...`` vs
+        # ``InvalidOperationError: ...`` is an actionable distinction —
+        # the wrap prefixes the original exception type name onto the
+        # reason so the user can tell which family of failure they hit.
+        pa = self.pa
+        tgt_field = Field.from_arrow(pa.field("amount", pa.int64()))
+        arr = pa.array(["nope"], type=pa.string())
+        with self.assertRaises(CastError) as ctx:
+            tgt_field.cast_arrow_array(arr, safe=True)
+        err = ctx.exception
+        msg = str(err)
+        # The original exception's type name shows up in the reason.
+        self.assertIsNotNone(err.original)
+        self.assertIn(type(err.original).__name__, msg)

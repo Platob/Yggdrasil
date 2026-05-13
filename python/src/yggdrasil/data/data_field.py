@@ -416,6 +416,37 @@ def _peel_name_nullable(metadata: Any) -> tuple[Any, str | None, bool | None]:
 # ======================================================================
 
 
+def _safe_field_from_arrow(obj: Any) -> "Field | None":
+    """Best-effort ``Field`` describing a pyarrow array/table/batch for error context.
+
+    Used by the ``cast_arrow_*`` wrap sites: when the caller didn't bind a
+    source field on :class:`CastOptions`, the raised :class:`CastError`
+    would otherwise render ``cast ? -> <target>`` — leaving the user to
+    guess what shape they actually passed. Building a transient Field
+    from the input's arrow type/schema keeps the message useful without
+    polluting the cast options. Returns ``None`` when the input shape is
+    too exotic to describe so the wrap stays best-effort.
+    """
+    try:
+        return Field.from_arrow(obj)
+    except Exception:
+        return None
+
+
+def _format_cast_reason(exc: BaseException) -> str:
+    """Prefix the exception's type name to its message for cast error reasons.
+
+    ``ArrowNotImplementedError: Unsupported cast ...`` is materially more
+    actionable than the bare ``Unsupported cast ...`` PyArrow renders —
+    the type distinguishes "no conversion exists" from "value rejected".
+    """
+    text = str(exc)
+    name = type(exc).__name__
+    if text.startswith(name):
+        return text
+    return f"{name}: {text}" if text else name
+
+
 def field(
     name: str,
     dtype: DataType | type[DataType] | pa.DataType | None = None,
@@ -3397,8 +3428,9 @@ class Field(BaseChildrenFields):
             raise
         except Exception as exc:
             raise CastError(
-                str(exc),
-                source=scoped.source,
+                _format_cast_reason(exc),
+                source=scoped.source if scoped.source is not None
+                    else _safe_field_from_arrow(array),
                 target=self,
                 original=exc,
             ) from exc
@@ -3427,8 +3459,9 @@ class Field(BaseChildrenFields):
             raise
         except Exception as exc:
             raise CastError(
-                str(exc),
-                source=scoped.source,
+                _format_cast_reason(exc),
+                source=scoped.source if scoped.source is not None
+                    else _safe_field_from_arrow(table),
                 target=self,
                 original=exc,
             ) from exc
