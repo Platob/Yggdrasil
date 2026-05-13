@@ -514,6 +514,27 @@ class TestParserSQLSyntax:
             ("b", None),
         ]
 
+    def test_struct_field_name_with_colon(self) -> None:
+        # XML-namespaced field names (Reuters/IPTC NewsML payloads land
+        # in Spark/Databricks DDL with names like `_xml:lang` and
+        # `_rtr:msgType` — the colon is part of the name, not the
+        # name/type separator).
+        parsed = ParsedDataType.parse(
+            "struct<_xml:lang:string, _rtr:msgType:string, normal:int, "
+            "rtr:versionedId:array<struct<_guid:string>>>"
+        )
+        assert [(c.name, c.type_id) for c in parsed.children] == [
+            ("_xml:lang", DataTypeId.STRING),
+            ("_rtr:msgType", DataTypeId.STRING),
+            ("normal", DataTypeId.INT32),
+            ("rtr:versionedId", DataTypeId.ARRAY),
+        ]
+        nested_struct = parsed.children[3].children[0]
+        assert nested_struct.type_id is DataTypeId.STRUCT
+        assert [(c.name, c.type_id) for c in nested_struct.children] == [
+            ("_guid", DataTypeId.STRING),
+        ]
+
     def test_recursive_nested_expression(self) -> None:
         assert ParsedDataType.parse(
             "array<map<string, struct<a:int,b:array<string>>>> | null"

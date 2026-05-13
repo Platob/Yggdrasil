@@ -19,7 +19,7 @@ __all__ = [
 LOGGER = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class NestedType(DataType, ABC):
     """Base class for nested data types (struct, map, array).
 
