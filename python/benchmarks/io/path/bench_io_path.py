@@ -139,6 +139,63 @@ def scenarios(repeat: int) -> list[dict]:
         repeat=repeat, inner=500_000,
     ))
 
+    # Pure-path derivations — every URL routing decision touches these.
+    out.append(_time_one(
+        "path.stem",
+        lambda: LOCAL_PATH.stem,
+        repeat=repeat, inner=200_000,
+    ))
+    out.append(_time_one(
+        "path.suffix",
+        lambda: LOCAL_PATH.suffix,
+        repeat=repeat, inner=200_000,
+    ))
+    out.append(_time_one(
+        "path.suffixes",
+        lambda: LOCAL_PATH.suffixes,
+        repeat=repeat, inner=200_000,
+    ))
+    out.append(_time_one(
+        "path.parents",
+        lambda: LOCAL_PATH.parents,
+        repeat=repeat, inner=20_000,
+    ))
+    out.append(_time_one(
+        "path.is_absolute",
+        lambda: LOCAL_PATH.is_absolute,
+        repeat=repeat, inner=500_000,
+    ))
+    out.append(_time_one(
+        "path / 'leaf.csv'",
+        lambda: LOCAL_PATH / "leaf.csv",
+        repeat=repeat, inner=20_000,
+    ))
+    out.append(_time_one(
+        "path.with_suffix('.csv')",
+        lambda: LOCAL_PATH.with_suffix(".csv"),
+        repeat=repeat, inner=20_000,
+    ))
+    out.append(_time_one(
+        "path.with_stem('renamed')",
+        lambda: LOCAL_PATH.with_stem("renamed"),
+        repeat=repeat, inner=20_000,
+    ))
+    out.append(_time_one(
+        "path.with_name('renamed.csv')",
+        lambda: LOCAL_PATH.with_name("renamed.csv"),
+        repeat=repeat, inner=20_000,
+    ))
+    out.append(_time_one(
+        "path == path (distinct, equal)",
+        lambda: LOCAL_PATH == Path.from_(LOCAL_STR),
+        repeat=repeat, inner=200_000,
+    ))
+    out.append(_time_one(
+        "path.__fspath__()",
+        lambda: LOCAL_PATH.__fspath__(),
+        repeat=repeat, inner=500_000,
+    ))
+
     return out
 
 

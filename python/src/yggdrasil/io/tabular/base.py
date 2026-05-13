@@ -1080,7 +1080,11 @@ class Tabular(ABC, Generic[O]):
         if isinstance(casted, pl.LazyFrame):
             casted = casted.collect()
 
-        if frame.height == 0:
+        # Empty-frame guard reads off the post-collect ``casted`` —
+        # the input may have been a LazyFrame (no ``.height``), and
+        # the cast can also produce an empty frame from a non-empty
+        # source when projecting columns the source doesn't carry.
+        if casted.height == 0:
             return
 
         # ``CompatLevel.newest()`` emits ``string_view`` / ``binary_view`` —
@@ -1123,10 +1127,44 @@ class Tabular(ABC, Generic[O]):
         # the reader then complains about. Only preserve the index
         # when at least one level has a user-assigned name.
         include_index = any(n is not None for n in frame.index.names)
+
+        # When the caller bound an Arrow-oriented target on
+        # ``CastOptions.target``, hand the target's arrow schema to
+        # :func:`pa.Table.from_pandas` as a type hint. The pandas
+        # bridge in pyarrow's C++ runtime uses it to skip object-
+        # column inference (decimals, timestamps with timezone,
+        # nested struct payloads in ``object`` cells) and emit the
+        # target types directly — same result the downstream cast
+        # would produce, one engine hop earlier. Only intersect-and-
+        # hint columns the frame actually carries: extra target
+        # columns get backfilled with nulls by the cast in
+        # :meth:`_write_arrow_table`, but ``from_pandas`` raises
+        # outright on a field that isn't in the frame.
+        schema_hint: "pa.Schema | None" = None
+        target = getattr(options, "target", None)
+        if target is not None:
+            try:
+                arrow_schema = target.to_arrow_schema()
+            except Exception:
+                arrow_schema = None
+            if arrow_schema is not None:
+                frame_cols = frozenset(frame.columns)
+                hinted = [f for f in arrow_schema if f.name in frame_cols]
+                if hinted:
+                    schema_hint = pa.schema(hinted)
+
         try:
-            casted = pa.Table.from_pandas(frame, preserve_index=include_index)
+            casted = pa.Table.from_pandas(
+                frame, schema=schema_hint, preserve_index=include_index,
+            )
             self._write_arrow_table(casted, options)
-        except:
+        except (pa.ArrowException, TypeError, ValueError):
+            # pyarrow's pandas bridge raises ``pa.ArrowException``
+            # (e.g. for unsupported extension dtypes) and stdlib
+            # ``TypeError`` / ``ValueError`` (e.g. for unhashable
+            # cell contents); fall back to polars, which handles a
+            # broader set of object-typed pandas frames at the cost
+            # of an extra conversion hop.
             pl = polars_module()
             casted = pl.from_pandas(frame, include_index=include_index)
             self._write_polars_frame(casted, options)

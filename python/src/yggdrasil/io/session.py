@@ -1054,22 +1054,58 @@ class Session(ABC):
                 misses.append(req)
         return hits, misses
 
-    @staticmethod
+    # Per-SparkSession cache of the empty :class:`SparkDataFrame` keyed
+    # to :data:`RESPONSE_SCHEMA`. The bare ``createDataFrame([],
+    # schema=...)`` path costs ~30 ms per call (most of which is JVM
+    # round-trip overhead on the empty payload), and the cache layer
+    # hits it once per bucket pass + once per empty-table branch in
+    # :meth:`_lookup_remote_table_spark`. Caching by ``id(spark)`` keeps
+    # this safe across multiple concurrent SparkSessions in the same
+    # process; ``WeakValueDictionary`` would be cleaner but Spark
+    # DataFrames hold a strong reference to their session so the
+    # entries don't outlive the session anyway.
+    _EMPTY_SPARK_FRAMES: "ClassVar[dict[int, SparkDataFrame]]" = {}
+
+    @classmethod
+    def _cached_empty_spark_frame(
+        cls, spark: "SparkSession",
+    ) -> "SparkDataFrame":
+        """Return a process-cached empty :class:`SparkDataFrame` with
+        :data:`RESPONSE_SCHEMA`.
+
+        One DataFrame per :class:`SparkSession` — same identity for
+        repeat callers, so downstream ``unionByName`` paths can keep
+        their plan cached. The cache key is ``id(spark)``: each
+        SparkSession owns its own DataFrames anyway, and the entry
+        is dropped when the session is.
+        """
+        key = id(spark)
+        cached = cls._EMPTY_SPARK_FRAMES.get(key)
+        if cached is not None:
+            return cached
+        df = spark.createDataFrame(
+            [], schema=RESPONSE_SCHEMA.to_spark_schema(),
+        )
+        cls._EMPTY_SPARK_FRAMES[key] = df
+        return df
+
+    @classmethod
     def _responses_to_spark(
+        cls,
         responses: list[Response],
         spark: "SparkSession",
     ) -> "SparkDataFrame":
         """Lift a list of :class:`Response` to a schema-bearing Spark frame.
 
         Used on the spark path to keep every bucket frame-resident.
-        Empty input yields an empty DataFrame keyed to
-        :data:`RESPONSE_SCHEMA` so downstream ``unionByName`` calls never
-        trip on a column-list mismatch.
+        Empty input yields a cached empty DataFrame keyed to
+        :data:`RESPONSE_SCHEMA` (one per :class:`SparkSession`) so the
+        ``createDataFrame([], schema=...)`` JVM round-trip — about 30 ms
+        on a warm cluster — only pays once per session instead of per
+        bucket pass.
         """
         if not responses:
-            return spark.createDataFrame(
-                [], schema=RESPONSE_SCHEMA.to_spark_schema(),
-            )
+            return cls._cached_empty_spark_frame(spark)
         table = pa.Table.from_batches(
             [r.to_arrow_batch(parse=False) for r in responses]
         )

@@ -149,6 +149,31 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
         finally:
             stream_ctx.__exit__(None, None, None)
 
+    def _read_arrow_table(self, options: ArrowIPCOptions) -> pa.Table:
+        """Read every batch in one C++ pass via :meth:`read_all`.
+
+        Overrides the base ``iter_batches`` + ``Table.from_batches``
+        shape: :class:`pa.ipc.RecordBatchFileReader.read_all` decodes
+        every batch into a single :class:`pa.Table` inside the C++
+        runtime, skipping the per-batch hop through Python. The
+        post-read :meth:`CastOptions.cast_arrow_tabular` still
+        reshapes the table to the caller's ``target_field`` — and
+        bypasses for free when the source schema already matches.
+        """
+        if self.size_known and self.size == 0:
+            return super()._read_arrow_table(options)
+
+        try:
+            with self.arrow_input_stream() as stream:
+                try:
+                    reader = ipc.RecordBatchFileReader(stream)
+                except pa.ArrowInvalid:
+                    return super()._read_arrow_table(options)
+                table = reader.read_all()
+        except FileNotFoundError:
+            return super()._read_arrow_table(options)
+        return options.cast_arrow_tabular(table)
+
     def _collect_schema(self, options: ArrowIPCOptions) -> Schema:
         """Read the schema straight from the IPC footer.
 
