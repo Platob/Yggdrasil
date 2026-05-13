@@ -58,6 +58,12 @@ F_INT = Field("id", INT_DT, nullable=False)
 F_INT_OTHER = Field("id", INT_DT, nullable=False)            # equal, distinct
 F_INT_DIFF_NAME = Field("price", INT_DT, nullable=False)     # not equal
 F_INT_NULL = Field("id", INT_DT, nullable=True)              # not equal
+F_INT_META_A = Field(
+    "id", INT_DT, nullable=False, metadata={"comment": "primary id"}
+)
+F_INT_META_B = Field(
+    "id", INT_DT, nullable=False, metadata={"comment": "row id"}
+)
 F_STR = Field("name", STR_DT)
 
 F_STRUCT = Field(
@@ -83,6 +89,37 @@ F_STRUCT_OTHER = Field(
             Field("active", BooleanType()),
         )
     ),
+)
+# Same struct shape as ``F_STRUCT`` but one child carries different
+# metadata — exercises the "deep dtype walk that fails on the
+# umpteenth child's metadata dict" path.
+F_STRUCT_DIFF_CHILD_META = Field(
+    "row",
+    StructType(
+        fields=(
+            Field("id", INT_DT, nullable=False),
+            Field("name", STR_DT, metadata={"comment": "display name"}),
+            Field("amount", FloatingPointType()),
+            Field("ts", TS_DT),
+            Field("active", BooleanType()),
+        )
+    ),
+)
+# ``F_STRUCT`` plus top-level metadata on the wrapper — same children,
+# but the outer Field's ``metadata`` differs. The cheap-first compare
+# path should bail before recursing into the struct.
+F_STRUCT_DIFF_META = Field(
+    "row",
+    StructType(
+        fields=(
+            Field("id", INT_DT, nullable=False),
+            Field("name", STR_DT),
+            Field("amount", FloatingPointType()),
+            Field("ts", TS_DT),
+            Field("active", BooleanType()),
+        )
+    ),
+    metadata={"comment": "user row"},
 )
 
 SCHEMA = Schema.from_fields(
@@ -217,6 +254,21 @@ def scenarios(repeat: int) -> list[dict]:
     results.append(_time_one(
         "field: F_STRUCT == F_STRUCT_OTHER (equal, distinct)",
         lambda: F_STRUCT == F_STRUCT_OTHER,
+        repeat=repeat, inner=50_000,
+    ))
+    results.append(_time_one(
+        "field: F_INT_META_A == F_INT_META_B (metadata differs)",
+        lambda: F_INT_META_A == F_INT_META_B,
+        repeat=repeat, inner=200_000,
+    ))
+    results.append(_time_one(
+        "field: F_STRUCT == F_STRUCT_DIFF_META (outer metadata differs)",
+        lambda: F_STRUCT == F_STRUCT_DIFF_META,
+        repeat=repeat, inner=200_000,
+    ))
+    results.append(_time_one(
+        "field: F_STRUCT == F_STRUCT_DIFF_CHILD_META (child metadata differs)",
+        lambda: F_STRUCT == F_STRUCT_DIFF_CHILD_META,
         repeat=repeat, inner=50_000,
     ))
 

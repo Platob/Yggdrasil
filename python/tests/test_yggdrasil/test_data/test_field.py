@@ -176,3 +176,67 @@ class TestFieldFromStrNullability:
 
         assert f.name == "qty"
         assert f.nullable is False
+
+
+class TestFieldPrettyFormat:
+    """Repr coherence — every Field, flat or nested, renders as a
+    uniform ``field: 'name' <dtype>[markers]`` row tree."""
+
+    def test_flat_field_with_known_tag(self) -> None:
+        f = Field(
+            name="id",
+            dtype=IntegerType(byte_size=8, signed=True),
+            nullable=False,
+            tags={"primary_key": True},
+        )
+        assert f.pretty_format() == "field: 'id' int64 not null [PK]"
+
+    def test_custom_tags_surface_in_repr(self) -> None:
+        # Previously: caller-defined tags (anything outside the
+        # well-known PK / FK / partition_by / ... set) were silently
+        # dropped from repr. They must now render as ``name=value``
+        # markers so the field round-trips visibly through ``print(f)``.
+        f = Field(
+            name="region",
+            dtype=StringType(),
+            tags={"unit": "iso-3166", "description": "geo"},
+        )
+        formatted = f.pretty_format()
+        assert formatted.startswith("field: 'region' string ")
+        assert "description='geo'" in formatted
+        assert "unit='iso-3166'" in formatted
+
+    def test_boolean_custom_tag_renders_as_bare_flag(self) -> None:
+        # Boolean tags round-trip through metadata as ``b"True"``;
+        # render them as a bare marker (no ``=value``) to match the
+        # PK / FK convention.
+        f = Field(
+            name="qty",
+            dtype=IntegerType(byte_size=8, signed=True),
+            tags={"reviewed": True},
+        )
+        assert "[reviewed]" in f.pretty_format()
+
+    def test_nested_struct_walks_inner_fields(self) -> None:
+        # Nested types render header + children inline at level + 1.
+        # No more ``struct<...>`` bracket frame around the children
+        # when the wrapping ``Field`` is the print root — they sit
+        # in the same row tree as their parent.
+        f = Field(
+            name="row",
+            dtype=__import__("yggdrasil.data.types.nested", fromlist=["StructType"]).StructType(
+                fields=(
+                    Field(name="id", dtype=IntegerType(byte_size=8, signed=True), nullable=False),
+                    Field(name="email", dtype=StringType()),
+                )
+            ),
+        )
+        formatted = f.pretty_format()
+        assert formatted.startswith("field: 'row' struct")
+        # children indented one level (2 spaces) and using the same
+        # ``field: 'name' <dtype>`` row shape.
+        assert "\n  field: 'id' int64 not null" in formatted
+        assert "\n  field: 'email' string" in formatted
+        # No legacy bracket frame.
+        assert "struct<" not in formatted
+        assert ">" not in formatted

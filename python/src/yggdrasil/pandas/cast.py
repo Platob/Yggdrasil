@@ -76,11 +76,11 @@ def cast_pandas_dataframe(
     This is now a thin wrapper around Schema.cast_pandas_frame.
     """
     options = CastOptions.check(options)
-    if options.target_arrow_schema is None and options.target is None:
+    if options.target is None:
         return _cast_pandas_dataframe_impl(dataframe, options=options)
 
     from yggdrasil.data.schema import Schema
-    target_schema = Schema.from_any(options.target or options.target_arrow_schema)
+    target_schema = Schema.from_any(options.target)
     return target_schema.cast_pandas_frame(dataframe, options=options)
 
 
@@ -157,7 +157,7 @@ def arrow_table_to_pandas_dataframe(
     """
     opts = CastOptions.check(cast_options)
 
-    if opts.target_arrow_schema is not None:
+    if opts.target is not None:
         table = cast_arrow_tabular(table, opts)
 
     return table.to_pandas()

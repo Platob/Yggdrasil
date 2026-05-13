@@ -150,12 +150,13 @@ class StructField(Field):
         )
 
     def __repr__(self):
-        body = "".join(
-            f"\n{f.pretty_format(level=1)}"
-            for f in self.children
-        )
-        comment = self.comment
-        return f"StructField: {self.name!r} {comment!r}{body}"
+        # Delegate to Field.pretty_format so the schema / nested field
+        # tree reads as one consistent ``field: 'name' <dtype>`` block.
+        # The previous bespoke ``StructField: 'name' None\n  field: ...``
+        # header rendered the comment slot as a literal ``None`` for
+        # the (common) case where no comment is set, and broke the
+        # uniform per-row tree the rest of the codebase prints.
+        return self.pretty_format()
 
     def to_field(self) -> Field:
         """Identity — StructField IS a Field. Kept for type-narrowing callers."""

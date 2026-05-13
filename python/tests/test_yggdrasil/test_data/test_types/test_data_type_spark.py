@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import pyarrow as pa
 
+from yggdrasil.data import Field
 from yggdrasil.data.types.base import DataType
 from yggdrasil.data.types.nested import StructType
 from yggdrasil.data.types.primitive import (
@@ -158,3 +159,67 @@ class TestSparkCompute(SparkTestCase):
         rows = [r.x for r in df.withColumn("x", result).collect()]
 
         self.assertEqual(rows, [1, 0, 3])
+
+
+class TestFieldFromSparkColumn(SparkTestCase):
+    """``Field.from_spark`` infers a Field from a ``pyspark.sql.Column``.
+
+    PySpark removed the public dtype probe (``_jc.expr().dataType()``)
+    in 4.x, so the only JVM surface we can rely on across versions is
+    the SQL string from ``_jc.toString()``. We parse that:
+
+    * Plain references (``df["x"]``) — name comes through; dtype
+      falls back to :class:`ObjectType` since the SQL string carries
+      no schema information.
+    * Casts (``df["x"].cast("string")``, ``df["x"].astype(...)``)
+      — name follows the inner expression, dtype reads off the
+      ``CAST(... AS T)`` token.
+    * Aliases (``df["x"].alias("y")``) — name follows the alias;
+      dtype recurses into the inner expression so an alias around
+      a cast keeps the cast's dtype.
+    """
+
+    def _df(self):
+        return self.spark.createDataFrame(
+            [(1, "alice", 1.5, True)],
+            ["id", "name", "amount", "active"],
+        )
+
+    def test_plain_column_takes_name(self) -> None:
+        df = self._df()
+        f = Field.from_spark(df["id"])
+        self.assertEqual(f.name, "id")
+        # Spark 4 hides the Catalyst dataType behind a resolution
+        # step the SQL string can't reach; falling back to
+        # ``ObjectType`` is the documented behaviour.
+        from yggdrasil.data.types.primitive import ObjectType
+        self.assertIsInstance(f.dtype, ObjectType)
+        self.assertTrue(f.nullable)
+
+    def test_cast_column_reads_target_dtype(self) -> None:
+        df = self._df()
+        f = Field.from_spark(df["id"].cast("string"))
+        self.assertIsInstance(f.dtype, StringType)
+        # Name follows the inner ``id`` reference.
+        self.assertEqual(f.name, "id")
+
+    def test_cast_to_decimal_preserves_precision_scale(self) -> None:
+        df = self._df()
+        f = Field.from_spark(df["amount"].cast("decimal(10,2)"))
+        self.assertIsInstance(f.dtype, DecimalType)
+        self.assertEqual(f.dtype.precision, 10)
+        self.assertEqual(f.dtype.scale, 2)
+
+    def test_aliased_column_uses_alias_as_name(self) -> None:
+        df = self._df()
+        f = Field.from_spark(df["id"].alias("user_id"))
+        self.assertEqual(f.name, "user_id")
+        # Inner is a plain reference, so dtype falls back.
+        from yggdrasil.data.types.primitive import ObjectType
+        self.assertIsInstance(f.dtype, ObjectType)
+
+    def test_aliased_cast_keeps_inner_dtype(self) -> None:
+        df = self._df()
+        f = Field.from_spark(df["id"].cast("string").alias("user_id"))
+        self.assertEqual(f.name, "user_id")
+        self.assertIsInstance(f.dtype, StringType)

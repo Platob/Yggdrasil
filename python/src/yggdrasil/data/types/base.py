@@ -328,6 +328,29 @@ _DATA_TYPE_DEFAULT_SINGLETONS: dict[type, "DataType"] = {}
 #: process touches (typically dozens, not thousands).
 _FROM_ARROW_TYPE_CACHE: dict["pa.DataType", "DataType"] = {}
 
+#: Same idea as ``_FROM_ARROW_TYPE_CACHE`` for the polars dispatch path.
+#: Polars dtype instances are hashable and value-equal, and the
+#: ``handles_polars_type`` subclass walk costs the same recursive
+#: ``polars_module()`` + ``isinstance`` / ``==`` chain as the arrow side.
+#: ``from_polars_schema`` / ``from_polars_field`` ingest the same dtype
+#: tokens (``pl.Int64``, ``pl.Utf8``, ``pl.Datetime("us","UTC")``)
+#: column-after-column, so even modest schemas collapse to a handful of
+#: cache entries.
+_FROM_POLARS_TYPE_CACHE: dict[Any, "DataType"] = {}
+
+#: And the Spark dispatch — same shape, same justification. Spark
+#: ``pst.DataType`` instances are hashable + value-equal, and the
+#: ``handles_spark_type`` walk pays a recursive ``spark_sql_module()``
+#: + ``isinstance`` chain per subclass. Reading a DataFrame schema or
+#: a Databricks ``DESCRIBE`` projection touches a small set of distinct
+#: Spark types (``LongType``, ``StringType``, ``TimestampType``,
+#: ``DecimalType(10,2)``, ...), so even a wide schema collapses to a
+#: handful of entries. Nested types (``ArrayType`` / ``MapType`` /
+#: ``StructType``) cache their full shape too — ``StructType.fields``
+#: is part of equality / hash, so two identically-shaped structs
+#: collide on the cache key.
+_FROM_SPARK_TYPE_CACHE: dict[Any, "DataType"] = {}
+
 
 def _default_singleton(cls: type) -> "DataType":
     """Return the cached default-arg instance of ``cls``, building it on miss.
@@ -1472,17 +1495,46 @@ class DataType(BaseChildrenFields, ABC):
 
     @classmethod
     def from_polars_schema(cls, schema: "polars.Schema") -> "StructType":
-        pl = polars_module()
-        from ..data_field import Field
-
+        # Direct ``(name, dtype) -> Field`` build — skip the legacy
+        # ``pl.Field(name=k, dtype=d)`` round-trip + ``Field.from_polars``
+        # dispatch (which would re-isinstance-check the pl.Field on every
+        # column) since we already know each entry is a dtype. Always
+        # route the dtype through :meth:`DataType.from_polars_type`
+        # (not ``cls``) so subclass-rooted callers like
+        # ``StructType.from_polars_schema`` still dispatch every
+        # per-column dtype through the full subclass tree instead of
+        # restricting the lookup to the caller's subclass family.
+        Field = field_class()
+        from_polars_type = DataType.from_polars_type
         return StructType(
             fields=[
-                Field.from_polars(pl.Field(name=k, dtype=d)) for k, d in schema.items()
+                Field(name=k, dtype=from_polars_type(d), nullable=True, metadata=None)
+                for k, d in schema.items()
             ]
         )
 
     @classmethod
     def from_polars_type(cls, dtype: "polars.DataType") -> "DataType":
+        if cls is DataType:
+            cached = _FROM_POLARS_TYPE_CACHE.get(dtype)
+            if cached is not None:
+                return cached
+            for subclass in cls.__subclasses__():
+                if subclass.handles_polars_type(dtype):
+                    built = subclass.from_polars_type(dtype)
+                    _FROM_POLARS_TYPE_CACHE[dtype] = built
+                    return built
+
+            from .primitive import StringType
+
+            pl = polars_module()
+            if dtype == pl.Categorical():
+                built = StringType()
+                _FROM_POLARS_TYPE_CACHE[dtype] = built
+                return built
+
+            raise TypeError(f"Unsupported Polars data type: {dtype!r}")
+
         for subclass in cls.__subclasses__():
             if subclass.handles_polars_type(dtype):
                 return subclass.from_polars_type(dtype)
@@ -1595,15 +1647,36 @@ class DataType(BaseChildrenFields, ABC):
         if isinstance(value, sp.types.StructField):
             return cls.from_spark_type(value.dataType)
         if isinstance(value, sp.Column):
-            try:
-                return cls.from_str(value._jc.expr().dataType().typeName())
-            except Exception:
-                pass
+            # Route through ``Field.from_spark_column`` so the
+            # SQL-string parser (cast / alias / leaf) is the single
+            # source of truth — the legacy ``_jc.expr().dataType()``
+            # probe broke in PySpark 4 when Catalyst's ``expr`` was
+            # hidden from the JVM-facing Column.
+            return field_class().from_spark_column(value).dtype
 
         raise TypeError(f"Unsupported Spark data type: {value!r}")
 
     @classmethod
     def from_spark_type(cls, value: "pst.DataType") -> "DataType":
+        # Cache hot — same justification as ``from_arrow_type`` /
+        # ``from_polars_type``: a DataFrame / Databricks projection
+        # touches a small set of distinct Spark dtype tokens, and the
+        # recursive ``handles_spark_type`` walk is the dominant cost
+        # of every per-column dispatch. Only memoize on the
+        # :class:`DataType` base entry point so subclass-rooted
+        # callers (``IntegerType.from_spark_type``) keep their
+        # constrained walk.
+        if cls is DataType:
+            cached = _FROM_SPARK_TYPE_CACHE.get(value)
+            if cached is not None:
+                return cached
+            for subclass in cls.__subclasses__():
+                if subclass.handles_spark_type(value):
+                    built = subclass.from_spark_type(value)
+                    _FROM_SPARK_TYPE_CACHE[value] = built
+                    return built
+            raise ValueError(f"Unknown DataType payload: {value!r}")
+
         for subclass in cls.__subclasses__():
             if subclass.handles_spark_type(value):
                 return subclass.from_spark_type(value)
@@ -1749,26 +1822,61 @@ class DataType(BaseChildrenFields, ABC):
         # Engine-level fast bypass — see :meth:`_cast_arrow_array` for
         # rationale. ``ChunkedArray.type`` is uniform across chunks, so
         # a single comparison covers the whole stream.
-        if _arrow_types_compatible(array.type, self.to_arrow()):
+        target_type = self.to_arrow()
+        if _arrow_types_compatible(array.type, target_type):
             return array
-        if options.need_cast(array, self):
-            chunks = [self._cast_arrow_array(chunk, options) for chunk in array.chunks]
-            # Identity short-circuit: if every per-chunk cast returned
-            # the same array object it was handed (subclass override
-            # decided no work was needed for that chunk), skip the
-            # ``pa.chunked_array`` rebuild and hand back the original.
-            # Saves an O(num_chunks) constructor pass on partial-cast
-            # paths where the per-chunk dispatch already knows the
-            # types align (e.g. some subclasses short-circuit on a
-            # source-flag check that ``need_cast`` can't see at the
-            # ChunkedArray level).
-            if chunks and all(
-                c is orig for c, orig in zip(chunks, array.chunks)
-            ):
+        if not options.need_cast(array, self):
+            return array
+
+        chunks = array.chunks
+        n_chunks = len(chunks)
+        if n_chunks == 0:
+            return array
+
+        # Multi-chunk hot path: per-chunk ``_cast_arrow_array`` pays
+        # ``options.need_cast`` (full Field merge) + the cast kernel
+        # dispatch N times. For a 65-chunk int64 -> int32 cast the
+        # per-chunk loop measured ~1270 us. Combining once, casting
+        # once, and slicing the result back into the original chunk
+        # boundaries compresses that to a single kernel call (~130 us
+        # in the same shape) while preserving chunk count — downstream
+        # consumers that depend on the chunk layout (cast pipelines
+        # that re-key by chunk index, streaming sinks) see the same
+        # shape they handed us. ``pa.Array.slice`` is zero-copy on the
+        # validity + values buffers, so the re-split itself is free.
+        if n_chunks > 1:
+            combined = array.combine_chunks()
+            casted = self._cast_arrow_array(combined, options)
+            if casted is combined:
+                # Subclass override decided no cast was needed for the
+                # combined array — return the original chunked layout.
                 return array
-            chunk_type = chunks[0].type if chunks else self.to_arrow()
-            return pa.chunked_array(chunks, type=chunk_type)
-        return array
+            if not isinstance(casted, pa.Array) or len(casted) != len(array):
+                # Defensive: a subclass override that returns a
+                # different shape (different length, ChunkedArray, ...)
+                # — fall back to the per-chunk path so we don't lose
+                # the result.
+                pass
+            else:
+                offset = 0
+                rebuilt: list[pa.Array] = []
+                for chunk in chunks:
+                    sz = len(chunk)
+                    rebuilt.append(casted.slice(offset, sz))
+                    offset += sz
+                return pa.chunked_array(rebuilt, type=casted.type)
+
+        # Single-chunk or fallback path: per-chunk cast, then identity
+        # short-circuit. Single-chunk is the dominant shape for arrays
+        # that round-trip through ``ChunkedArray.combine_chunks`` or
+        # come from a single-row-group Parquet read.
+        cast_chunks = [self._cast_arrow_array(chunk, options) for chunk in chunks]
+        if cast_chunks and all(
+            c is orig for c, orig in zip(cast_chunks, chunks)
+        ):
+            return array
+        chunk_type = cast_chunks[0].type if cast_chunks else target_type
+        return pa.chunked_array(cast_chunks, type=chunk_type)
 
     def _cast_arrow_tabular(
         self,
