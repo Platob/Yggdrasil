@@ -792,12 +792,13 @@ class WarehouseStatementResult(StatementResult):
             raise_error=raise_error,
         )
 
-        # Adopt server-resolved state.  Retry config rides on
-        # ``self.statement.retry`` and is preserved by
-        # ``self.statement = submitted.statement`` below.
+        # Adopt server-resolved state.  ``_response`` carries the status
+        # the SDK already returned — copying it spares the next
+        # ``wait()`` / ``state`` read a redundant ``get_statement``.
         self.statement = submitted.statement
         self.statement_id = submitted.statement_id
         self.executor = submitted.executor
+        self._response = submitted._response
 
         return self
 
@@ -868,9 +869,13 @@ class WarehouseStatementResult(StatementResult):
             )
             return self
 
-        statement_execution = self.client.workspace_client().statement_execution
-        if self._response is None or self._response.status.state not in DONE_STATES:
-            prev = self._response.status.state if self._response is not None else None
+        # Route the cache-hit decision through ``_SDK_TO_STATE`` so the
+        # "is this terminal?" check shares its truth source with
+        # ``_compute_state``; an SDK value the map doesn't recognize
+        # falls back to ``PENDING`` and re-polls rather than stalling.
+        prev = self._response.status.state if self._response is not None else None
+        if prev is None or not _SDK_TO_STATE.get(prev, State.PENDING).is_done:
+            statement_execution = self.client.workspace_client().statement_execution
             self._response = statement_execution.get_statement(self.statement_id)
             new_state = self._response.status.state
             if logger.isEnabledFor(logging.DEBUG) and new_state != prev:
