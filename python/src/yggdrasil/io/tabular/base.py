@@ -1080,7 +1080,11 @@ class Tabular(ABC, Generic[O]):
         if isinstance(casted, pl.LazyFrame):
             casted = casted.collect()
 
-        if frame.height == 0:
+        # Empty-frame guard reads off the post-collect ``casted`` —
+        # the input may have been a LazyFrame (no ``.height``), and
+        # the cast can also produce an empty frame from a non-empty
+        # source when projecting columns the source doesn't carry.
+        if casted.height == 0:
             return
 
         # ``CompatLevel.newest()`` emits ``string_view`` / ``binary_view`` —
@@ -1123,10 +1127,28 @@ class Tabular(ABC, Generic[O]):
         # the reader then complains about. Only preserve the index
         # when at least one level has a user-assigned name.
         include_index = any(n is not None for n in frame.index.names)
+
+        # Type alignment is the cast's job, not the bridge's: passing
+        # ``schema=options.target.to_arrow_schema()`` to
+        # ``pa.Table.from_pandas`` would force the pandas bridge to
+        # coerce frame values into the target shape, which raises
+        # outright when the caller's pandas types don't already line
+        # up with the target (e.g. ``string`` frame column against a
+        # numeric target field). The downstream
+        # :meth:`_write_arrow_table` runs the proper
+        # :meth:`CastOptions.cast_arrow_tabular` over the inferred
+        # table — that's the one path that knows how to widen, fill
+        # missing columns, and reorder safely.
         try:
             casted = pa.Table.from_pandas(frame, preserve_index=include_index)
             self._write_arrow_table(casted, options)
-        except:
+        except (pa.ArrowException, TypeError, ValueError):
+            # pyarrow's pandas bridge raises ``pa.ArrowException``
+            # (e.g. for unsupported extension dtypes) and stdlib
+            # ``TypeError`` / ``ValueError`` (e.g. for unhashable
+            # cell contents); fall back to polars, which handles a
+            # broader set of object-typed pandas frames at the cost
+            # of an extra conversion hop.
             pl = polars_module()
             casted = pl.from_pandas(frame, include_index=include_index)
             self._write_polars_frame(casted, options)

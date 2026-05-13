@@ -30,6 +30,7 @@ import pyarrow as pa
 from yggdrasil.data.enums import Mode
 from yggdrasil.data.options import CastOptions
 from yggdrasil.io.path.local_path import LocalPath
+from yggdrasil.io.primitive.arrow_ipc_io import ArrowIPCIO
 from yggdrasil.io.primitive.csv_io import CsvIO
 from yggdrasil.io.primitive.parquet_io import ParquetIO
 
@@ -40,12 +41,6 @@ from yggdrasil.io.primitive.parquet_io import ParquetIO
 # with iteration count — the bench would measure snowballing upsert
 # work rather than per-write throughput.
 _OVERWRITE = CastOptions(mode=Mode.OVERWRITE)
-
-# NOTE: ``ArrowIPCIO`` is intentionally excluded — its
-# ``_write_arrow_batches`` against a :class:`LocalPath` currently
-# fails with an ``OSError: Bad address`` (unrelated bug in the
-# Arrow-IPC + local mmap interaction). Once that's fixed, add it
-# back the same way as Parquet / CSV.
 
 
 ROWS = 5_000
@@ -201,6 +196,8 @@ def scenarios(repeat: int, tmp: Path) -> list[dict]:
     out: list[dict] = []
     table = _table(ROWS)
     out.extend(_bench_format("parquet", ParquetIO, "data.parquet",
+                             table, repeat=repeat, tmp=tmp, inner=5))
+    out.extend(_bench_format("arrow-ipc", ArrowIPCIO, "data.arrow",
                              table, repeat=repeat, tmp=tmp, inner=5))
     out.extend(_bench_format("csv", CsvIO, "data.csv",
                              table, repeat=repeat, tmp=tmp, inner=3))

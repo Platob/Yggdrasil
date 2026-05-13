@@ -260,6 +260,57 @@ def _write_scenarios(rows: int, repeat: int) -> list[dict]:
         lambda: _write(cast_table, opts_cast),
         repeat=repeat, inner=200,
     ))
+
+    # write_pandas_frame — exercises the arrow-oriented schema hint
+    # path on :meth:`_write_pandas_frame`. With a bound target,
+    # ``pa.Table.from_pandas`` consumes the target's arrow schema and
+    # the downstream cast collapses to its bypass.
+    try:
+        import pandas as pd  # noqa: F401
+
+        pandas_frame = match_table.to_pandas()
+
+        def _write_pandas(frame, opts: CastOptions) -> None:
+            sink = ArrowTabular()
+            sink.write_pandas_frame(frame, opts)
+
+        out.append(_time_one(
+            f"write: write_pandas_frame no-target rows={rows}",
+            lambda: _write_pandas(pandas_frame, opts_none),
+            repeat=repeat, inner=200,
+        ))
+        out.append(_time_one(
+            f"write: write_pandas_frame MATCH target rows={rows}",
+            lambda: _write_pandas(pandas_frame, opts_match),
+            repeat=repeat, inner=200,
+        ))
+    except ImportError:
+        pass
+
+    # write_polars_frame — confirms the polars cast → arrow → write
+    # chain doesn't regress when the target adds an arrow-oriented
+    # schema.
+    try:
+        import polars as pl  # noqa: F401
+
+        polars_frame = pl.from_arrow(match_table)
+
+        def _write_polars(frame, opts: CastOptions) -> None:
+            sink = ArrowTabular()
+            sink.write_polars_frame(frame, opts)
+
+        out.append(_time_one(
+            f"write: write_polars_frame no-target rows={rows}",
+            lambda: _write_polars(polars_frame, opts_none),
+            repeat=repeat, inner=200,
+        ))
+        out.append(_time_one(
+            f"write: write_polars_frame MATCH target rows={rows}",
+            lambda: _write_polars(polars_frame, opts_match),
+            repeat=repeat, inner=200,
+        ))
+    except ImportError:
+        pass
     return out
 
 
@@ -345,12 +396,100 @@ def _rechunk_scenarios(rows: int, repeat: int) -> list[dict]:
     return out
 
 
+def _spark_scenarios(rows: int, repeat: int) -> list[dict]:
+    """:class:`CastOptions` against pyspark frames.
+
+    Skipped when pyspark isn't installed or a local SparkSession
+    fails to come up — the bench still reports a single skip row
+    so the gap is visible in the output.
+    """
+    out: list[dict] = []
+    try:
+        import pyspark  # noqa: F401
+    except ImportError:
+        return out
+
+    try:
+        from yggdrasil.environ import PyEnv
+        spark = PyEnv.spark_session(create=True)
+        if spark is None:
+            raise RuntimeError("spark_session returned None")
+    except Exception as exc:
+        out.append({
+            "label": f"spark: SKIPPED ({type(exc).__name__}: {exc})",
+            "best": 0.0, "median": 0.0, "mean": 0.0,
+        })
+        return out
+
+    # Build the two fixtures once: a "match" frame whose schema
+    # already lines up with TARGET_SCHEMA, and a "mismatch" frame
+    # whose ``id`` column needs the int32 → int64 cast kernel.
+    match_table = _arrow_table(rows, mismatch=False)
+    cast_table = _arrow_table(rows, mismatch=True)
+    spark_match = spark.createDataFrame(match_table.to_pandas())
+    spark_cast = spark.createDataFrame(cast_table.to_pandas())
+
+    opts_none = CastOptions()
+    opts_match = CastOptions(target=TARGET_SCHEMA)
+    opts_cast = CastOptions(target=TARGET_SCHEMA)
+
+    # ``cast_spark_tabular`` builds the engine-side plan; without
+    # ``.collect()`` the cost is the plan rewrite, not the row
+    # materialization. That's the right thing to measure here —
+    # downstream callers chain more ops before collecting and the
+    # cost amortizes — but it also explains why the timings are
+    # microseconds rather than the seconds spark.createDataFrame /
+    # collect take.
+    out.append(_time_one(
+        f"spark: opts.cast_spark_tabular no-target rows={rows}",
+        lambda: opts_none.cast_spark_tabular(spark_match),
+        repeat=repeat, inner=200,
+    ))
+    out.append(_time_one(
+        f"spark: opts.cast_spark_tabular MATCH rows={rows}",
+        lambda: opts_match.cast_spark_tabular(spark_match),
+        repeat=repeat, inner=200,
+    ))
+    out.append(_time_one(
+        f"spark: opts.cast_spark_tabular CAST rows={rows}",
+        lambda: opts_cast.cast_spark_tabular(spark_cast),
+        repeat=repeat, inner=200,
+    ))
+
+    # Full write round-trip through ArrowTabular: pulls the spark
+    # frame back across the Arrow bridge (``toArrow`` when available,
+    # else ``toPandas``) and feeds it through the arrow-cast path.
+    # This is the cost the downstream :meth:`Tabular.write_spark_frame`
+    # call sites actually pay.
+    def _write_spark(frame, opts: CastOptions) -> None:
+        sink = ArrowTabular()
+        sink.write_spark_frame(frame, opts)
+
+    out.append(_time_one(
+        f"spark: write_spark_frame no-target rows={rows}",
+        lambda: _write_spark(spark_match, opts_none),
+        repeat=repeat, inner=20,
+    ))
+    out.append(_time_one(
+        f"spark: write_spark_frame MATCH rows={rows}",
+        lambda: _write_spark(spark_match, opts_match),
+        repeat=repeat, inner=20,
+    ))
+    out.append(_time_one(
+        f"spark: write_spark_frame CAST rows={rows}",
+        lambda: _write_spark(spark_cast, opts_cast),
+        repeat=repeat, inner=20,
+    ))
+    return out
+
+
 def scenarios(rows: int, repeat: int) -> list[dict]:
     return [
         *_ingest_scenarios(rows, repeat),
         *_read_scenarios(rows, repeat),
         *_write_scenarios(rows, repeat),
         *_rechunk_scenarios(rows, repeat),
+        *_spark_scenarios(rows, repeat),
     ]
 
 
