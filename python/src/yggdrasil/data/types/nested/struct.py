@@ -188,10 +188,13 @@ class StructType(NestedType):
 
     @classmethod
     def from_spark_type(cls, dtype: "pst.StructType") -> "StructType":
-        return cls(fields=[
-            cached_from_import("yggdrasil.data.data_field", "Field").from_spark(f)
-            for f in dtype.fields
-        ])
+        # Each child is already a ``pst.StructField`` — go through
+        # ``from_spark_field`` directly so we skip the isinstance fan
+        # ``from_spark`` would walk per child (DataFrame /
+        # StructField / DataType / Column branches), and the cached
+        # ``from_spark_type`` lookup keeps repeated child dtypes fast.
+        Field = cached_from_import("yggdrasil.data.data_field", "Field")
+        return cls(fields=[Field.from_spark_field(f) for f in dtype.fields])
 
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:

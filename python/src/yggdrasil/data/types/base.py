@@ -338,6 +338,19 @@ _FROM_ARROW_TYPE_CACHE: dict["pa.DataType", "DataType"] = {}
 #: cache entries.
 _FROM_POLARS_TYPE_CACHE: dict[Any, "DataType"] = {}
 
+#: And the Spark dispatch — same shape, same justification. Spark
+#: ``pst.DataType`` instances are hashable + value-equal, and the
+#: ``handles_spark_type`` walk pays a recursive ``spark_sql_module()``
+#: + ``isinstance`` chain per subclass. Reading a DataFrame schema or
+#: a Databricks ``DESCRIBE`` projection touches a small set of distinct
+#: Spark types (``LongType``, ``StringType``, ``TimestampType``,
+#: ``DecimalType(10,2)``, ...), so even a wide schema collapses to a
+#: handful of entries. Nested types (``ArrayType`` / ``MapType`` /
+#: ``StructType``) cache their full shape too — ``StructType.fields``
+#: is part of equality / hash, so two identically-shaped structs
+#: collide on the cache key.
+_FROM_SPARK_TYPE_CACHE: dict[Any, "DataType"] = {}
+
 
 def _default_singleton(cls: type) -> "DataType":
     """Return the cached default-arg instance of ``cls``, building it on miss.
@@ -1634,15 +1647,36 @@ class DataType(BaseChildrenFields, ABC):
         if isinstance(value, sp.types.StructField):
             return cls.from_spark_type(value.dataType)
         if isinstance(value, sp.Column):
-            try:
-                return cls.from_str(value._jc.expr().dataType().typeName())
-            except Exception:
-                pass
+            # Route through ``Field.from_spark_column`` so the
+            # SQL-string parser (cast / alias / leaf) is the single
+            # source of truth — the legacy ``_jc.expr().dataType()``
+            # probe broke in PySpark 4 when Catalyst's ``expr`` was
+            # hidden from the JVM-facing Column.
+            return field_class().from_spark_column(value).dtype
 
         raise TypeError(f"Unsupported Spark data type: {value!r}")
 
     @classmethod
     def from_spark_type(cls, value: "pst.DataType") -> "DataType":
+        # Cache hot — same justification as ``from_arrow_type`` /
+        # ``from_polars_type``: a DataFrame / Databricks projection
+        # touches a small set of distinct Spark dtype tokens, and the
+        # recursive ``handles_spark_type`` walk is the dominant cost
+        # of every per-column dispatch. Only memoize on the
+        # :class:`DataType` base entry point so subclass-rooted
+        # callers (``IntegerType.from_spark_type``) keep their
+        # constrained walk.
+        if cls is DataType:
+            cached = _FROM_SPARK_TYPE_CACHE.get(value)
+            if cached is not None:
+                return cached
+            for subclass in cls.__subclasses__():
+                if subclass.handles_spark_type(value):
+                    built = subclass.from_spark_type(value)
+                    _FROM_SPARK_TYPE_CACHE[value] = built
+                    return built
+            raise ValueError(f"Unknown DataType payload: {value!r}")
+
         for subclass in cls.__subclasses__():
             if subclass.handles_spark_type(value):
                 return subclass.from_spark_type(value)

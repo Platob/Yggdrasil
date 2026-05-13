@@ -76,6 +76,12 @@ __all__ = [
 # ======================================================================
 
 _TYPE_JSON_METADATA_KEY = b"type_json"
+#: ``str`` form of the ``type_json`` key. Spark stores metadata
+#: ``dict[str, Any]`` (Java ``Metadata`` view), so engine-side
+#: lookups use this key; the ``bytes`` form is what Arrow uses.
+#: Pre-decoded once at import so ``from_spark_field`` doesn't pay a
+#: ``.decode("utf-8")`` per call.
+_TYPE_JSON_METADATA_KEY_STR = _TYPE_JSON_METADATA_KEY.decode("utf-8")
 _NONE_TYPE = type(None)
 
 
@@ -113,13 +119,117 @@ def _strip_internal_metadata(
     if not metadata:
         return None
 
-    type_json_str = _TYPE_JSON_METADATA_KEY.decode("utf-8")
     out = {
         key: value
         for key, value in metadata.items()
-        if key != _TYPE_JSON_METADATA_KEY and key != type_json_str
+        if key != _TYPE_JSON_METADATA_KEY and key != _TYPE_JSON_METADATA_KEY_STR
     }
     return out or None
+
+
+def _parse_spark_column_sql(sql: str) -> "tuple[str, DataType | None]":
+    """Best-effort name + dtype extract from a Spark Column's SQL form.
+
+    Spark renders Columns as SQL strings via ``_jc.toString()`` — the
+    same surface ``Column.__repr__`` uses (``Column<'<sql>'>``):
+
+    * ``id`` — bare leaf reference. Name = ``"id"``, dtype = ``None``
+      (caller picks a fallback).
+    * ``CAST(id AS STRING)`` — name = ``"id"``, dtype = ``StringType``.
+    * ``id AS user_id`` — name = ``"user_id"``, dtype recurses on
+      ``id`` (so a cast inside the alias keeps its dtype).
+    * ``CAST(id AS DECIMAL(10,2)) AS price`` — name = ``"price"``,
+      dtype = ``DecimalType(10, 2)``.
+    * Anything else (arithmetic, function calls, complex subqueries)
+      falls back to ``(<full sql>, None)`` so the caller can decide
+      whether to keep the SQL as a name or substitute the default.
+
+    Public-shape-stable: this is a string-grammar helper, so we
+    operate on the rendered token stream rather than the JVM
+    expression tree, which has moved between PySpark releases.
+    """
+    text = sql.strip()
+    if not text:
+        return "", None
+
+    # Strip outer backticks Spark wraps around qualified identifiers.
+    if len(text) >= 2 and text[0] == "`" and text[-1] == "`" and " " not in text:
+        return text[1:-1], None
+
+    # Alias form: ``<expr> AS <alias>``. The alias is always the
+    # tail; the inner expression keeps its own dtype.
+    # Split on the rightmost top-level " AS " so we don't trip on
+    # ``CAST(x AS T)`` nested inside the expression.
+    alias_split = _split_top_level_as(text)
+    if alias_split is not None:
+        inner_sql, alias = alias_split
+        # Alias token may itself be backtick-quoted.
+        alias = alias.strip()
+        if len(alias) >= 2 and alias[0] == "`" and alias[-1] == "`":
+            alias = alias[1:-1]
+        _, inner_dtype = _parse_spark_column_sql(inner_sql)
+        return alias, inner_dtype
+
+    # Cast form: ``CAST(<expr> AS <dtype>)`` — the dtype token is a
+    # Spark DDL fragment our parser already understands.
+    upper = text.upper()
+    if upper.startswith("CAST(") and text.endswith(")"):
+        # Walk to the matching closing paren so nested CAST inside
+        # CAST doesn't trip us. ``text[5:-1]`` is the body.
+        body = text[5:-1]
+        cast_split = _split_top_level_as(body)
+        if cast_split is not None:
+            inner_sql, dtype_token = cast_split
+            try:
+                dtype = DataType.from_str(dtype_token.strip())
+            except Exception:
+                dtype = None
+            # Name follows the inner leaf, but ``CAST(...)`` has no
+            # natural name slot — return the inner expression's
+            # parsed name so chains like ``df["x"].cast("string")``
+            # land on ``name="x"``.
+            inner_name, _ = _parse_spark_column_sql(inner_sql)
+            return inner_name or text, dtype
+
+    # Plain identifier — name is the text itself.
+    return text, None
+
+
+def _split_top_level_as(text: str) -> "tuple[str, str] | None":
+    """Split *text* on the rightmost top-level ``" AS "`` token.
+
+    "Top-level" means not nested inside parentheses or backticks.
+    Returns ``(left, right)`` on a match, ``None`` otherwise.
+    Case-insensitive on the ``AS`` keyword to match Spark's
+    ``simpleString`` / ``toString`` rendering, which uses uppercase.
+    """
+    upper = text.upper()
+    n = len(text)
+    depth = 0
+    in_backtick = False
+    # Walk right-to-left so chained casts split on the outermost
+    # ``AS`` (``CAST(CAST(x AS T1) AS T2) AS y``). Depth must track
+    # every paren on the way back, so we start at the end and only
+    # attempt the 4-char ``" AS "`` match once there's room.
+    for i in range(n - 1, -1, -1):
+        ch = text[i]
+        if ch == "`":
+            in_backtick = not in_backtick
+            continue
+        if in_backtick:
+            continue
+        if ch == ")":
+            depth += 1
+        elif ch == "(":
+            depth -= 1
+        elif (
+            depth == 0
+            and i + 4 <= n
+            and upper[i:i + 4] == " AS "
+            and (i == 0 or text[i - 1] != " ")
+        ):
+            return text[:i].strip(), text[i + 4:].strip()
+    return None
 
 
 def _safe_issubclass(obj: object, class_or_tuple: object) -> bool:
@@ -2597,27 +2707,93 @@ class Field(BaseChildrenFields):
     def from_spark(cls, obj: Any = None, from_metadata: bool = True) -> "Field":
         _psql = spark_sql_module()
 
-        if not isinstance(obj, _psql.types.StructField):
-            if isinstance(obj, _psql.DataFrame):
-                obj = _psql.types.StructField(
-                    DEFAULT_FIELD_NAME,
-                    obj.schema,
-                    nullable=False,
-                    metadata=None,
-                )
-            elif isinstance(obj, _psql.types.DataType):
-                obj = _psql.types.StructField(
-                    DEFAULT_FIELD_NAME,
-                    obj,
-                    nullable=True,
-                    metadata=None,
-                )
-            else:
-                raise TypeError(
-                    f"Cannot build {cls.__name__} from {type(obj).__name__}"
-                )
+        if isinstance(obj, _psql.types.StructField):
+            return cls.from_spark_field(obj, from_metadata=from_metadata)
+        if isinstance(obj, _psql.DataFrame):
+            obj = _psql.types.StructField(
+                DEFAULT_FIELD_NAME,
+                obj.schema,
+                nullable=False,
+                metadata=None,
+            )
+            return cls.from_spark_field(obj, from_metadata=from_metadata)
+        if isinstance(obj, _psql.types.DataType):
+            obj = _psql.types.StructField(
+                DEFAULT_FIELD_NAME,
+                obj,
+                nullable=True,
+                metadata=None,
+            )
+            return cls.from_spark_field(obj, from_metadata=from_metadata)
+        if isinstance(obj, _psql.Column):
+            return cls.from_spark_column(obj)
 
-        return cls.from_spark_field(obj, from_metadata=from_metadata)
+        raise TypeError(
+            f"Cannot build {cls.__name__} from {type(obj).__name__}"
+        )
+
+    @classmethod
+    def from_spark_column(cls, column: "ps.Column") -> "Field":
+        """Build a :class:`Field` from a ``pyspark.sql.Column``.
+
+        ``Column`` objects don't expose a typed dtype on the public
+        Python surface — the only stable JVM access path that
+        survives across PySpark releases is the SQL-rendered
+        ``_jc.toString()`` (which is what ``Column.__repr__``
+        wraps). We parse that:
+
+        * ``id`` — bare reference. Name is ``id``, dtype defers
+          to the fallback (``ObjectType``) since the JVM doesn't
+          expose the underlying schema on a free-standing column.
+        * ``CAST(<expr> AS <dtype>)`` / ``CAST(<expr> AS <dtype>)``
+          — name follows the inner ``<expr>``'s leaf, dtype reads
+          straight off ``<dtype>`` through
+          :meth:`DataType.from_str`. Covers ``df["x"].cast("string")``,
+          ``df["x"].astype("decimal(10,2)")``, ``F.col("x").cast(StringType())``.
+        * ``<expr> AS <alias>`` — name follows ``<alias>``, dtype
+          comes from the inner ``<expr>`` (recurses, so a cast
+          inside an alias keeps its dtype).
+        * Anything else falls back to the full SQL string as the
+          name with :class:`ObjectType` as the dtype, since we
+          can't infer the dtype of an arbitrary Catalyst
+          expression without binding it through
+          :meth:`SparkSession.createDataFrame` (which would be a
+          live JVM round trip the caller didn't ask for).
+
+        Use :meth:`Field.from_spark_field` instead when the caller
+        already has the resolved ``StructField`` (e.g. from
+        ``df.schema.fields[i]``) — that path keeps the precise dtype
+        without going through the SQL string.
+        """
+        from .types.primitive import ObjectType
+
+        jc = getattr(column, "_jc", None)
+        if jc is None:
+            raise TypeError(
+                f"Cannot build {cls.__name__} from pyspark Column without "
+                f"a backing JVM expression: {column!r}"
+            )
+
+        try:
+            rendered = jc.toString()
+        except Exception:
+            rendered = None
+        if not rendered:
+            raise TypeError(
+                f"Cannot read SQL representation from pyspark Column: {column!r}"
+            )
+
+        name, dtype = _parse_spark_column_sql(str(rendered))
+        if dtype is None:
+            dtype = ObjectType()
+        if not name:
+            name = DEFAULT_FIELD_NAME
+        # Nullability is not part of the Column SQL string. Default
+        # ``True`` matches the rest of the from-engine constructors
+        # (``from_polars_field`` etc.) and the conservative-Spark
+        # ``Expression.nullable`` would default to True anyway for
+        # everything but ``isNotNull``-gated expressions.
+        return cls(name=name, dtype=dtype, nullable=True)
 
     @classmethod
     def from_spark_field(
@@ -2626,26 +2802,41 @@ class Field(BaseChildrenFields):
         # Spark stores metadata as ``dict[str, Any]`` (a Java
         # ``Metadata`` view). The ``type_json`` round-trip blob — only
         # written for Map/Array dtypes by :meth:`to_pyspark_field` —
-        # therefore lives under the str key, not the bytes one.
-        type_json_key_str = _TYPE_JSON_METADATA_KEY.decode("utf-8")
-        if from_metadata and value.metadata:
-            dtype_json = value.metadata.get(type_json_key_str, None)
+        # therefore lives under the str key, not the bytes one. Pull
+        # ``value.metadata`` once so the (callable on the Java side)
+        # accessor doesn't fire twice; route the ``dataType`` through
+        # :meth:`DataType.from_spark_type` directly so we skip the
+        # ``from_spark`` isinstance fan-out (we already know it's a
+        # ``pst.DataType``) — the cached lookup then collapses the
+        # walk for repeated dtype tokens.
+        meta = value.metadata
+        if from_metadata and meta:
+            dtype_json = meta.get(_TYPE_JSON_METADATA_KEY_STR)
             if dtype_json is None:
-                dtype_json = value.metadata.get(_TYPE_JSON_METADATA_KEY, None)
+                dtype_json = meta.get(_TYPE_JSON_METADATA_KEY)
             if dtype_json is None:
-                dtype = DataType.from_spark(value.dataType)
+                dtype = DataType.from_spark_type(value.dataType)
             else:
                 dtype = DataType.from_json(dtype_json)
         else:
-            dtype = DataType.from_spark(value.dataType)
+            dtype = DataType.from_spark_type(value.dataType)
+
+        # ``_normalize_metadata`` re-builds a fresh dict even when the
+        # input is the empty dict that Spark hands back by default —
+        # short-circuit so the no-metadata path skips both the
+        # normalize + the strip-internal-keys pass.
+        if meta:
+            normalized = _strip_internal_metadata(
+                _normalize_metadata(meta, tags=None)
+            )
+        else:
+            normalized = None
 
         return cls(
             name=value.name,
             dtype=dtype,
             nullable=value.nullable,
-            metadata=_strip_internal_metadata(
-                _normalize_metadata(value.metadata, tags=None)
-            ),
+            metadata=normalized,
         )
 
     # ==================================================================
