@@ -53,6 +53,7 @@ dispatch on :class:`Holder`.
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Iterator, TypeVar
@@ -63,6 +64,9 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MediaType, MimeType
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
+
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import pandas
@@ -613,6 +617,12 @@ class Tabular(ABC, Generic[O]):
         as the stream goes by, keeping the streaming property: only
         one batch resides in memory at a time.
         """
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "%s._delete: predicate=%r",
+                type(self).__name__,
+                predicate,
+            )
         survivors: "list[pa.RecordBatch]" = []
         kept_rows = 0
         total_rows = 0
@@ -629,7 +639,21 @@ class Tabular(ABC, Generic[O]):
             survivors.append(kept)
         deleted = total_rows - kept_rows
         if deleted == 0:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "%s._delete: 0 rows matched (scanned=%d)",
+                    type(self).__name__,
+                    total_rows,
+                )
             return 0
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "%s._delete: deleting %d / %d rows; rewriting %d survivors",
+                type(self).__name__,
+                deleted,
+                total_rows,
+                kept_rows,
+            )
         self._write_arrow_batches(iter(survivors), options)
         return deleted
 
@@ -719,8 +743,26 @@ class Tabular(ABC, Generic[O]):
         a read sees the new shape without a re-collect.
         """
         if self._schema_cache is not ...:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "%s.collect_schema: cache hit (%d fields)",
+                    type(self).__name__,
+                    len(self._schema_cache) if hasattr(self._schema_cache, "__len__") else -1,
+                )
             return self._schema_cache
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "%s.collect_schema: cache miss, reading from source",
+                type(self).__name__,
+            )
         schema = self._collect_schema(self.check_options(options, overrides=locals()))
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "%s.collect_schema: collected %d fields: %s",
+                type(self).__name__,
+                len(schema) if hasattr(schema, "__len__") else -1,
+                getattr(schema, "names", None),
+            )
         self._persist_schema(schema)
         return schema
 
@@ -839,8 +881,31 @@ class Tabular(ABC, Generic[O]):
     def read_arrow_batches(
         self, options: "O | None" = None, **kwargs: Any,
     ) -> Iterator[pa.RecordBatch]:
-        yield from self._read_arrow_batches(
-            self.check_options(options, overrides=locals())
+        resolved = self.check_options(options, overrides=locals())
+        debug = logger.isEnabledFor(logging.DEBUG)
+        if debug:
+            logger.debug(
+                "%s.read_arrow_batches: start (target=%s predicate=%s row_size=%s byte_size=%s)",
+                type(self).__name__,
+                getattr(resolved.target, "name", None) if resolved.target else None,
+                resolved.predicate is not None,
+                resolved.row_size,
+                resolved.byte_size,
+            )
+        if not debug:
+            yield from self._read_arrow_batches(resolved)
+            return
+        n_batches = 0
+        n_rows = 0
+        for batch in self._read_arrow_batches(resolved):
+            n_batches += 1
+            n_rows += batch.num_rows
+            yield batch
+        logger.debug(
+            "%s.read_arrow_batches: done (batches=%d rows=%d)",
+            type(self).__name__,
+            n_batches,
+            n_rows,
         )
 
     def read_arrow_table(
@@ -856,7 +921,21 @@ class Tabular(ABC, Generic[O]):
                 or getattr(options, "source_schema", None)
                 or Schema.empty()
             )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "%s._read_arrow_table: empty source, returning empty table (schema=%s)",
+                    type(self).__name__,
+                    getattr(schema, "names", None),
+                )
             return schema.to_arrow_schema().empty_table()
+        if logger.isEnabledFor(logging.DEBUG):
+            total_rows = sum(b.num_rows for b in batches)
+            logger.debug(
+                "%s._read_arrow_table: materialised %d batches / %d rows",
+                type(self).__name__,
+                len(batches),
+                total_rows,
+            )
         return pa.Table.from_batches(batches)
 
     def read_arrow_batch_reader(
@@ -917,7 +996,18 @@ class Tabular(ABC, Generic[O]):
 
     def _write_table(self, obj: Any, options: O) -> None:
         if obj is None:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "%s._write_table: skip (obj=None)", type(self).__name__,
+                )
             return
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "%s._write_table: dispatching %s (mode=%s)",
+                type(self).__name__,
+                type(obj).__name__,
+                options.mode,
+            )
         if isinstance(obj, Tabular):
             self._write_arrow_batches(obj.read_arrow_batches(), options)
             return
@@ -1005,7 +1095,31 @@ class Tabular(ABC, Generic[O]):
         **kwargs: Any,
     ) -> None:
         options = self.check_options(options, overrides=locals())
-        self._write_arrow_batches(batches, options)
+        debug = logger.isEnabledFor(logging.DEBUG)
+        if debug:
+            logger.debug(
+                "%s.write_arrow_batches: start (mode=%s target=%s)",
+                type(self).__name__,
+                options.mode,
+                getattr(options.target, "name", None) if options.target else None,
+            )
+            n_batches = 0
+            n_rows = 0
+            def _counted() -> "Iterator[pa.RecordBatch]":
+                nonlocal n_batches, n_rows
+                for batch in batches:
+                    n_batches += 1
+                    n_rows += batch.num_rows
+                    yield batch
+            self._write_arrow_batches(_counted(), options)
+            logger.debug(
+                "%s.write_arrow_batches: wrote %d batches / %d rows",
+                type(self).__name__,
+                n_batches,
+                n_rows,
+            )
+        else:
+            self._write_arrow_batches(batches, options)
         if options.sync_metadata:
             self._commit_metadata()
 
@@ -1017,6 +1131,15 @@ class Tabular(ABC, Generic[O]):
         )
 
     def _write_arrow_table(self, table: pa.Table, options: O) -> None:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "%s._write_arrow_table: rows=%d cols=%d target=%s mode=%s",
+                type(self).__name__,
+                table.num_rows,
+                table.num_columns,
+                getattr(options.target, "name", None) if options.target else None,
+                options.mode,
+            )
         casted = options.cast_arrow_tabular(table)
 
         # Keep target_field set: downstream writers (delta partition
@@ -1284,19 +1407,38 @@ class Tabular(ABC, Generic[O]):
         from yggdrasil.data.record import Record
 
         chunk_size = max(1, getattr(options, "row_size", None) or 1024)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "%s._write_records: chunk_size=%d mode=%s",
+                type(self).__name__,
+                chunk_size,
+                options.mode,
+            )
         chunk_rows: "list[dict]" = []
         chunk_schema: "pa.Schema | None" = None
         # Per-batch sub-call defers metadata commits; we commit once
         # below if the caller asked for it.
         inner = options.copy(sync_metadata=False) if options.sync_metadata else options
+        flushed_batches = 0
+        flushed_rows = 0
 
         def _flush() -> None:
+            nonlocal flushed_batches, flushed_rows
             if not chunk_rows:
                 return
             batch = pa.RecordBatch.from_pylist(chunk_rows, schema=chunk_schema)
             if chunk_schema is not None:
                 self._persist_schema(Schema.from_arrow(chunk_schema))
             self._write_arrow_batches([batch], inner)
+            flushed_batches += 1
+            flushed_rows += len(chunk_rows)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "%s._write_records: flushed batch #%d (%d rows)",
+                    type(self).__name__,
+                    flushed_batches,
+                    len(chunk_rows),
+                )
             chunk_rows.clear()
 
         for rec in records:
@@ -1314,6 +1456,13 @@ class Tabular(ABC, Generic[O]):
             if len(chunk_rows) >= chunk_size:
                 _flush()
         _flush()
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "%s._write_records: done (batches=%d rows=%d)",
+                type(self).__name__,
+                flushed_batches,
+                flushed_rows,
+            )
         if options.sync_metadata:
             self._commit_metadata()
 

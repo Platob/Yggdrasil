@@ -14,6 +14,7 @@ bytes.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Iterator, Optional
 
 import pyarrow as pa
@@ -27,6 +28,9 @@ if TYPE_CHECKING:
 
 
 __all__ = ["SparkTabular"]
+
+
+logger = logging.getLogger(__name__)
 
 
 class SparkTabular(Tabular[CastOptions]):
@@ -158,9 +162,22 @@ class SparkTabular(Tabular[CastOptions]):
         # Loud rather than silent — the call site is the one asking
         # for Arrow batches off a Spark holder.
         if self._frame is None:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("SparkTabular._read_arrow_batches: no frame, no-op")
             return
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "SparkTabular._read_arrow_batches: collecting Spark frame to Arrow (row_size=%s)",
+                options.row_size,
+            )
         from yggdrasil.spark.cast import spark_dataframe_to_arrow
         arrow_table = spark_dataframe_to_arrow(self._frame)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "SparkTabular._read_arrow_batches: collected %d rows / %d cols",
+                arrow_table.num_rows,
+                arrow_table.num_columns,
+            )
         for batch in arrow_table.to_batches(max_chunksize=options.row_size):
             yield options.cast_arrow_tabular(batch)
 
@@ -188,7 +205,17 @@ class SparkTabular(Tabular[CastOptions]):
             # APPEND of nothing is a no-op; OVERWRITE of nothing
             # leaves the existing frame. Match the IPC writer's
             # behavior on an empty iterator.
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("SparkTabular._write_arrow_batches: empty input, no-op")
             return
+        if logger.isEnabledFor(logging.DEBUG):
+            total_rows = sum(b.num_rows for b in materialized)
+            logger.debug(
+                "SparkTabular._write_arrow_batches: building Spark frame from %d batches / %d rows (mode=%s)",
+                len(materialized),
+                total_rows,
+                options.mode,
+            )
         from yggdrasil.spark.cast import any_to_spark_dataframe
 
         table = pa.Table.from_batches(materialized)

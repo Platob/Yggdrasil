@@ -324,6 +324,13 @@ class ArrowTabular(Tabular[CastOptions]):
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
         # Spilled chunk first — those batches are zero-copy views into
         # the mmap. The in-memory tail follows in append order.
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "ArrowTabular._read_arrow_batches: spilled=%s in_memory_batches=%d in_memory_bytes=%d",
+                self._spilled_table is not None,
+                len(self._batches),
+                self._in_memory_bytes,
+            )
         if self._spilled_table is not None:
             for batch in self._spilled_table.to_batches():
                 yield options.cast_arrow_tabular(batch)
@@ -336,6 +343,17 @@ class ArrowTabular(Tabular[CastOptions]):
         options: CastOptions,
     ) -> None:
         action = self._resolve_save_mode(options.mode)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "ArrowTabular._write_arrow_batches: requested=%s resolved=%s "
+                "current(num_batches=%d num_rows=%d spilled=%s in_memory_bytes=%d)",
+                options.mode,
+                action,
+                self._total_batches(),
+                self.num_rows,
+                self._spilled_table is not None,
+                self._in_memory_bytes,
+            )
         if action is Mode.IGNORE:
             return
         if action is Mode.OVERWRITE:
@@ -348,8 +366,21 @@ class ArrowTabular(Tabular[CastOptions]):
                 f"{type(self).__name__}._write_arrow_batches handles "
                 f"OVERWRITE / APPEND / IGNORE; got {action!r}."
             )
+        written = 0
+        written_rows = 0
         for batch in batches:
             self._append_batch(batch)
+            written += 1
+            written_rows += batch.num_rows
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "ArrowTabular._write_arrow_batches: appended %d batches / %d rows "
+                "(in_memory_bytes=%d, threshold=%d)",
+                written,
+                written_rows,
+                self._in_memory_bytes,
+                self._spill_bytes_threshold,
+            )
         # Single spill check after the bulk write so threshold-crossing
         # within a single write batches into one round-trip rather than
         # one-spill-per-record-batch.
@@ -416,6 +447,15 @@ class ArrowTabular(Tabular[CastOptions]):
             tables[0] if len(tables) == 1
             else pa.concat_tables(tables, promote_options="default")
         )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "ArrowTabular._consolidate_spill: merging %d table(s) -> %d rows / %d cols (threshold=%d, in_memory_bytes=%d)",
+                len(tables),
+                merged.num_rows,
+                merged.num_columns,
+                self._spill_bytes_threshold,
+                self._in_memory_bytes,
+            )
 
         caller_owned = (
             self._spill_path is not None and not self._owns_spill_path
@@ -476,6 +516,14 @@ class ArrowTabular(Tabular[CastOptions]):
         self._spilled_table = new_table
         self._batches.clear()
         self._in_memory_bytes = 0
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "ArrowTabular._consolidate_spill: spilled to %s (%d rows, %d cols, caller_owned=%s)",
+                target_path,
+                new_table.num_rows,
+                new_table.num_columns,
+                caller_owned,
+            )
 
         # Old mmap (when we had one and didn't already close it) plus
         # any old owned file at a different path — tear down now that
@@ -564,6 +612,12 @@ class ArrowTabular(Tabular[CastOptions]):
     def _ingest(self, source: ArrowSource) -> None:
         if source is None:
             return
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "ArrowTabular._ingest: %s.%s",
+                getattr(type(source), "__module__", "?"),
+                type(source).__name__,
+            )
         if isinstance(source, pa.RecordBatch):
             self._append_batch(source)
             self._maybe_spill()

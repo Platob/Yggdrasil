@@ -34,6 +34,7 @@ of the source; it does not apply on the write path.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Iterable, Iterator, Union
 
 import pyarrow as pa
@@ -59,6 +60,9 @@ if TYPE_CHECKING:
 
 
 __all__ = ["LazyTabular"]
+
+
+logger = logging.getLogger(__name__)
 
 
 # A "selector" is anything that fronts a column / column-expression. The
@@ -333,11 +337,28 @@ class LazyTabular(Tabular[CastOptions]):
         self, options: CastOptions,
     ) -> Iterator[pa.RecordBatch]:
         if self._plan.is_empty():
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "LazyTabular._read_arrow_batches: empty plan, passthrough source=%s",
+                    type(self._source).__name__,
+                )
             yield from self._source._read_arrow_batches(options)
             return
 
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "LazyTabular._read_arrow_batches: executing plan over %s (ops=%d)",
+                type(self._source).__name__,
+                len(self._plan),
+            )
         lf = self._build_lazy(options)
         table: pa.Table = lf.collect().to_arrow()
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "LazyTabular._read_arrow_batches: plan collected %d rows / %d cols",
+                table.num_rows,
+                table.num_columns,
+            )
         row_size = getattr(options, "row_size", None) or None
         for batch in table.to_batches(max_chunksize=row_size):
             yield options.cast_arrow_tabular(batch)
