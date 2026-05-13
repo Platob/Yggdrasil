@@ -94,6 +94,15 @@ _registry: dict[RegistryKey, Converter] = {}
 # Wildcard registrations: Any/object -> to_hint -> converter
 _any_registry: dict[Any, Converter] = {}
 
+# Resolved-lookup cache: (from_type, to_hint) -> converter (or None if no path exists).
+# Populated lazily on the first full dispatch resolution (check_namespace=True path).
+# Cleared on every register_converter() call so dynamic registrations invalidate stale hits.
+_find_cache: dict[RegistryKey, "Converter | None"] = {}
+
+# Sentinel: entry in _find_cache that hasn't been populated yet.
+# Using ... so None (= "no converter found") is a cacheable result too.
+_CACHE_MISS: Any = ...
+
 
 def register_converter(from_hint: Any, to_hint: Any) -> Callable[[F], F]:
     """
@@ -119,6 +128,10 @@ def register_converter(from_hint: Any, to_hint: Any) -> Callable[[F], F]:
             _any_registry[to_hint] = conv  # type: ignore[assignment]
         else:
             _registry[(from_hint, to_hint)] = conv  # type: ignore[assignment]
+
+        # Any new registration may open new conversion paths, so stale cached
+        # results are no longer valid.
+        _find_cache.clear()
 
         return func
 
@@ -190,20 +203,37 @@ def find_converter(from_type: Any, to_hint: Any, check_namespace: bool = True) -
       5) MRO cross-product lookup
       6) scan-based fallback with issubclass checks for odd keys
       7) one-hop composition: from -> mid -> to (single intermediate)
-    """
 
-    # 1) exact
-    conv = _registry.get((from_type, to_hint))
+    Results (including ``None`` for "no path") are cached in ``_find_cache`` on
+    the ``check_namespace=True`` path so repeated calls for the same type pair pay
+    only a single dict lookup on subsequent invocations.
+    """
+    cache_key = (from_type, to_hint)
+
+    # 1) exact — also gate the cache read here so the common path
+    #    (exact match already registered) stays at a single dict lookup.
+    if check_namespace:
+        cached = _find_cache.get(cache_key, _CACHE_MISS)
+        if cached is not _CACHE_MISS:
+            return cached
+
+    conv = _registry.get(cache_key)
     if conv is not None:
+        if check_namespace:
+            _find_cache[cache_key] = conv
         return conv
 
     # 2) cheap identities
     if from_type == to_hint or to_hint in (object, Any):
+        if check_namespace:
+            _find_cache[cache_key] = identity
         return identity
 
     # 3) wildcard Any -> to_hint
     any_converter = _any_registry.get(to_hint)
     if any_converter is not None:
+        if check_namespace:
+            _find_cache[cache_key] = any_converter
         return any_converter
 
     # 4) late import side-effect: ensure namespace-specific converters are registered
@@ -223,7 +253,9 @@ def find_converter(from_type: Any, to_hint: Any, check_namespace: bool = True) -
         elif from_namespace.startswith("pyarrow") or to_namespace.startswith("pyarrow"):
             from yggdrasil.arrow import cast as _arrow_cast  # noqa: F401
 
-        return find_converter(from_type, to_hint, check_namespace=False)
+        result = find_converter(from_type, to_hint, check_namespace=False)
+        _find_cache[cache_key] = result
+        return result
 
     # 5) MRO cross-product lookup (fast and deterministic)
     for f in iter_mro(from_type):

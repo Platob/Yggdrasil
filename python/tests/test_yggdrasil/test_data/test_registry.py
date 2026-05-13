@@ -271,3 +271,169 @@ class TestOptions:
         # reject the options object.
         opts = CastOptions.check()
         assert convert("2", int, options=opts) == 2
+
+    def test_str_to_float_empty_string_raises_without_options(self) -> None:
+        with pytest.raises(ValueError):
+            convert("", float)
+
+    def test_str_to_bool_empty_string_raises(self) -> None:
+        with pytest.raises(ValueError):
+            convert("", bool)
+
+
+# ---------------------------------------------------------------------------
+# Dispatch cache — populated on first call, reused on subsequent calls
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchCache:
+    """_find_cache memoizes resolved (from_type, to_hint) pairs so repeated
+    find_converter calls pay a single dict lookup instead of MRO scanning."""
+
+    def test_same_converter_returned_on_repeated_calls(self) -> None:
+        from yggdrasil.data.cast.registry import find_converter
+
+        c1 = find_converter(str, int)
+        c2 = find_converter(str, int)
+        assert c1 is c2
+
+    def test_mro_miss_is_cached_as_none(self) -> None:
+        from yggdrasil.data.cast.registry import find_converter
+
+        # A pair with no registered converter should resolve to None and
+        # the None result should itself be cached so the MRO scan doesn't
+        # repeat on the next call.
+        class _Src:
+            pass
+
+        class _Tgt:
+            pass
+
+        c1 = find_converter(_Src, _Tgt)
+        c2 = find_converter(_Src, _Tgt)
+        assert c1 is None
+        assert c2 is None
+
+    def test_cache_invalidated_on_new_registration(self) -> None:
+        from yggdrasil.data.cast.registry import _find_cache, find_converter
+
+        class _A:
+            pass
+
+        class _B:
+            pass
+
+        # Populate cache with None.
+        c_before = find_converter(_A, _B)
+        assert c_before is None
+        assert (_A, _B) in _find_cache
+
+        # New registration invalidates the cache.
+        @register_converter(_A, _B)
+        def a_to_b(v: _A, opts: Any) -> _B:
+            return _B()
+
+        assert (_A, _B) not in _find_cache
+
+        c_after = find_converter(_A, _B)
+        assert c_after is a_to_b
+
+    def test_identity_is_cached_for_any_target(self) -> None:
+        from yggdrasil.data.cast.registry import _find_cache, find_converter, identity
+        from typing import Any as TypingAny
+
+        find_converter(str, TypingAny)
+        assert _find_cache.get((str, TypingAny)) is identity
+
+
+# ---------------------------------------------------------------------------
+# Extended container / dataclass / enum edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestContainersEdgeCases:
+
+    def test_list_no_element_type_annotation_passes_through(self) -> None:
+        # ``list`` without a subscript → element hint defaults to Any → fast path.
+        result = convert([1, "2", True], list)
+        assert result == [1, "2", True]
+
+    def test_tuple_empty_passes_through(self) -> None:
+        assert convert([], tuple) == ()
+
+    def test_dict_value_only_cast(self) -> None:
+        # key hint is Any → only values are cast.
+        out = convert({"a": "1", "b": "2"}, dict[str, int])
+        assert out == {"a": 1, "b": 2}
+
+    def test_dict_key_only_cast(self) -> None:
+        out = convert({"1": "x", "2": "y"}, dict[int, str])
+        assert out == {1: "x", 2: "y"}
+
+    def test_nested_list_int(self) -> None:
+        assert convert([["1", "2"], ["3"]], list[list[int]]) == [[1, 2], [3]]
+
+    def test_str_to_list_raises(self) -> None:
+        with pytest.raises(TypeError):
+            convert("abc", list[str])
+
+    def test_bytes_to_tuple_raises(self) -> None:
+        with pytest.raises(TypeError):
+            convert(b"abc", tuple[int, ...])
+
+
+class TestDataclassEdgeCases:
+
+    def test_non_mapping_input_raises(self) -> None:
+        @dataclass
+        class Cfg:
+            x: int = 0
+
+        with pytest.raises(TypeError):
+            convert([1, 2], Cfg)
+
+    def test_already_instance_returns_same_object(self) -> None:
+        @dataclass
+        class Cfg:
+            x: int = 0
+
+        obj = Cfg(x=5)
+        assert convert(obj, Cfg) is obj
+
+    def test_extra_mapping_keys_are_ignored(self) -> None:
+        @dataclass
+        class Cfg:
+            a: int = 0
+
+        out = convert({"a": 3, "extra": "ignored"}, Cfg)
+        assert out.a == 3
+
+
+class TestEnumEdgeCases:
+
+    def test_already_member_returns_same_object(self) -> None:
+        class Color(enum.Enum):
+            RED = 1
+
+        assert convert(Color.RED, Color) is Color.RED
+
+    def test_str_value_lookup_works(self) -> None:
+        class Status(enum.Enum):
+            ACTIVE = "active"
+            INACTIVE = "inactive"
+
+        assert convert("active", Status) is Status.ACTIVE
+
+    def test_int_value_lookup_works(self) -> None:
+        class Priority(enum.Enum):
+            LOW = 1
+            HIGH = 2
+
+        assert convert(1, Priority) is Priority.LOW
+
+    def test_case_insensitive_name_lookup(self) -> None:
+        class Color(enum.Enum):
+            RED = 1
+
+        assert convert("RED", Color) is Color.RED
+        assert convert("red", Color) is Color.RED

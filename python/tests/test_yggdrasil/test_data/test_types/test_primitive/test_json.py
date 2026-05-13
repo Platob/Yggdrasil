@@ -27,6 +27,7 @@ from yggdrasil.data.types import (
     BJsonType,
     DataType,
     DataTypeId,
+    DecimalType,
     IntegerType,
     MapType,
     SJsonType,
@@ -464,3 +465,184 @@ class TestJsonPolarsPermissive:
             None,
             {"a": 2, "b": "y"},
         ]
+
+
+# ---------------------------------------------------------------------------
+# Arrow JSON encode — edge-case types in struct payloads
+# ---------------------------------------------------------------------------
+
+
+class TestJsonArrowEncodeEdgeCases(ArrowTestCase):
+    """Edge cases for ``cast_arrow_json_encode_array``.
+
+    The encode path tries orjson first and falls back to stdlib json + the
+    ``_json_default`` coercion for types orjson cannot natively handle.
+    All three fallback types are exercised here.
+    """
+
+    def test_null_rows_remain_null_in_output(self) -> None:
+        struct_dtype = StructType(
+            fields=[Field("n", _INT64)]
+        )
+        src = self.pa.array(
+            [{"n": 1}, None, {"n": 3}],
+            type=struct_dtype.to_arrow(),
+        )
+
+        sjson = SJsonType()
+        out = sjson.cast_arrow_array(
+            src,
+            source=Field("s", struct_dtype),
+            target=Field("s", sjson),
+        )
+
+        rows = out.to_pylist()
+        self.assertIsNotNone(rows[0])
+        self.assertIsNone(rows[1])
+        self.assertIsNotNone(rows[2])
+
+    def test_decimal_value_in_struct_encodes_as_string(self) -> None:
+        import decimal as _decimal
+
+        src = self.pa.array(
+            [{"amount": _decimal.Decimal("1.23")}],
+            type=self.pa.struct([self.pa.field("amount", self.pa.decimal128(10, 2))]),
+        )
+
+        struct_dtype = StructType(
+            fields=[Field("amount", DecimalType(precision=10, scale=2))]
+        )
+        sjson = SJsonType()
+        out = sjson.cast_arrow_array(
+            src,
+            source=Field("s", struct_dtype),
+            target=Field("s", sjson),
+        )
+
+        decoded = json.loads(out[0].as_py())
+        # Decimal serialised as string by _json_default fallback.
+        self.assertEqual(decoded["amount"], "1.23")
+
+    def test_empty_array_returns_empty_string_array(self) -> None:
+        struct_dtype = StructType(
+            fields=[Field("x", _INT64)]
+        )
+        src = self.pa.array([], type=struct_dtype.to_arrow())
+
+        sjson = SJsonType()
+        out = sjson.cast_arrow_array(
+            src,
+            source=Field("s", struct_dtype),
+            target=Field("s", sjson),
+        )
+
+        self.assertEqual(len(out), 0)
+        self.assertEqual(out.type, self.pa.string())
+
+    def test_large_batch_all_nulls_encodes_correctly(self) -> None:
+        struct_dtype = StructType(
+            fields=[Field("n", _INT64)]
+        )
+        src = self.pa.array(
+            [None] * 100,
+            type=struct_dtype.to_arrow(),
+        )
+
+        sjson = SJsonType()
+        out = sjson.cast_arrow_array(
+            src,
+            source=Field("s", struct_dtype),
+            target=Field("s", sjson),
+        )
+
+        self.assertEqual(len(out), 100)
+        self.assertTrue(all(v is None for v in out.to_pylist()))
+
+    def test_chunked_array_input_handled(self) -> None:
+        struct_dtype = StructType(
+            fields=[Field("n", _INT64)]
+        )
+        chunk1 = self.pa.array([{"n": 1}, {"n": 2}], type=struct_dtype.to_arrow())
+        chunk2 = self.pa.array([{"n": 3}], type=struct_dtype.to_arrow())
+        chunked = self.pa.chunked_array([chunk1, chunk2])
+
+        sjson = SJsonType()
+        out = sjson.cast_arrow_array(
+            chunked,
+            source=Field("s", struct_dtype),
+            target=Field("s", sjson),
+        )
+
+        decoded = [json.loads(v) for v in out.to_pylist()]
+        self.assertEqual(decoded, [{"n": 1}, {"n": 2}, {"n": 3}])
+
+
+# ---------------------------------------------------------------------------
+# JSON encode correctness — verify orjson output is valid JSON
+# ---------------------------------------------------------------------------
+
+
+class TestJsonEncodeOutputFormat(ArrowTestCase):
+    """Verify that encoded rows parse as valid JSON and preserve value
+    semantics regardless of which backend (orjson vs stdlib) handled them."""
+
+    def test_list_of_ints_encodes_to_valid_json(self) -> None:
+        arr_dtype = ArrayType.from_item(Field("item", _INT64))
+        src = self.pa.array(
+            [[1, 2, 3], [4, 5], None],
+            type=arr_dtype.to_arrow(),
+        )
+
+        bjson = BJsonType()
+        out = bjson.cast_arrow_array(
+            src,
+            source=Field("a", arr_dtype),
+            target=Field("a", bjson),
+        )
+
+        rows = out.to_pylist()
+        self.assertEqual(json.loads(rows[0]), [1, 2, 3])
+        self.assertEqual(json.loads(rows[1]), [4, 5])
+        self.assertIsNone(rows[2])
+
+    def test_map_encodes_to_valid_json_object(self) -> None:
+        map_dtype = MapType.from_key_value(
+            key_field=Field("key", StringType()),
+            value_field=Field("value", _INT64),
+        )
+        src = self.pa.array(
+            [[("a", 1), ("b", 2)], [("z", 99)]],
+            type=map_dtype.to_arrow(),
+        )
+
+        sjson = SJsonType()
+        out = sjson.cast_arrow_array(
+            src,
+            source=Field("m", map_dtype),
+            target=Field("m", sjson),
+        )
+
+        self.assertEqual(json.loads(out[0].as_py()), {"a": 1, "b": 2})
+        self.assertEqual(json.loads(out[1].as_py()), {"z": 99})
+
+    def test_unicode_strings_preserved_without_escaping(self) -> None:
+        struct_dtype = StructType(
+            fields=[Field("name", StringType())]
+        )
+        src = self.pa.array(
+            [{"name": "héllo"}, {"name": "日本語"}],
+            type=struct_dtype.to_arrow(),
+        )
+
+        sjson = SJsonType()
+        out = sjson.cast_arrow_array(
+            src,
+            source=Field("s", struct_dtype),
+            target=Field("s", sjson),
+        )
+
+        for raw in out.to_pylist():
+            decoded = json.loads(raw)
+            # Non-ASCII chars must survive the round-trip unescaped.
+            self.assertNotIn("\\u", raw)
+            self.assertIn(decoded["name"], {"héllo", "日本語"})
