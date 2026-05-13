@@ -270,6 +270,35 @@ class TestListing:
         ]
         assert all(isinstance(c, VolumePath) for c in children)
 
+    def test_iterdir_seeds_child_stat(self, workspace, client) -> None:
+        # ``list_directory_contents`` already carries ``is_directory``
+        # + ``file_size`` per entry, so every child's stat cache must
+        # land warm. Otherwise, an N-entry iterdir() that asks
+        # ``size`` / ``is_file()`` per child floods the Files API
+        # with N extra ``get_metadata`` round trips.
+        workspace.files.list_directory_contents.return_value = [
+            SimpleNamespace(
+                path="/Volumes/c/s/v/folder/a.parquet",
+                is_directory=False,
+                file_size=1024,
+                last_modified=None,
+            ),
+            SimpleNamespace(
+                path="/Volumes/c/s/v/folder/sub",
+                is_directory=True,
+                file_size=0,
+                last_modified=None,
+            ),
+        ]
+        p = VolumePath("/Volumes/c/s/v/folder", client=client)
+        children = list(p.iterdir())
+        # Inspecting every child collapses to a local hit.
+        assert children[0].size == 1024
+        assert children[0].is_file() is True
+        assert children[1].is_dir() is True
+        workspace.files.get_metadata.assert_not_called()
+        workspace.files.get_directory_metadata.assert_not_called()
+
 
 class TestStagingPath:
 

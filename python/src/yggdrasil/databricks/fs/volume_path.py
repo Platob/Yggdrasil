@@ -624,8 +624,23 @@ class VolumePath(DatabricksPath):
                 child_path,
                 client=self._client,
             )
+            # The listing entry already carries ``is_directory`` /
+            # ``file_size`` / ``last_modified`` — seed the child's stat
+            # cache so the caller's ``is_file()`` / ``size`` /
+            # ``exists()`` per child collapses to a local hit. Without
+            # this, iterating an N-entry directory floods the Files
+            # API with N extra ``get_metadata`` round trips. (0.6.21
+            # already did this; the rewrite dropped it.)
+            is_directory = bool(getattr(info, "is_directory", False))
+            child._seed_stat_cache(IOStats(
+                kind=IOKind.DIRECTORY if is_directory else IOKind.FILE,
+                size=0 if is_directory else int(
+                    getattr(info, "file_size", 0) or 0,
+                ),
+                mtime=_mtime(info),
+            ))
             yield child
-            if recursive and getattr(info, "is_directory", False):
+            if recursive and is_directory:
                 yield from child._ls(recursive=True)
 
     # ==================================================================

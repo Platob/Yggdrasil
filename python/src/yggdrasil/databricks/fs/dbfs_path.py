@@ -96,8 +96,19 @@ class DBFSPath(DatabricksPath):
                 url=URL(scheme=self.scheme, path=api_path),
                 client=self._client,
             )
+            # ``dbfs.list`` returns ``is_dir`` / ``file_size`` /
+            # ``modification_time`` per entry — seed the child so
+            # downstream ``is_file()`` / ``size`` / ``exists()`` don't
+            # each fire a follow-up ``dbfs.get_status`` round trip.
+            is_dir = bool(getattr(info, "is_dir", False))
+            mtime_ms = getattr(info, "modification_time", None) or 0
+            child._seed_stat_cache(IOStats(
+                kind=IOKind.DIRECTORY if is_dir else IOKind.FILE,
+                size=0 if is_dir else int(getattr(info, "file_size", 0) or 0),
+                mtime=float(mtime_ms) / 1000.0 if mtime_ms else 0.0,
+            ))
             yield child
-            if recursive and getattr(info, "is_dir", False):
+            if recursive and is_dir:
                 yield from child._ls(recursive=True)
 
     # ==================================================================
