@@ -474,13 +474,24 @@ def _json_default(obj: Any) -> Any:
 def _encode_row(value: Any) -> Any:
     if value is None:
         return None
-    return json.dumps(value, default=_json_default, ensure_ascii=False)
+    # orjson is ~10x faster than stdlib json for common types (int/float/str/bool/
+    # list/dict/None).  It returns bytes; decode to UTF-8 once per row.  Fall back
+    # to stdlib for types orjson rejects (Decimal, raw bytes, timedelta) so the
+    # _json_default coercions still fire for edge-case values.
+    try:
+        return orjson.dumps(value).decode("utf-8")
+    except TypeError:
+        return json.dumps(value, default=_json_default, ensure_ascii=False)
 
 
 def _encode_map_row(value: Any) -> Any:
     if value is None:
         return None
-    return json.dumps(dict(value), default=_json_default, ensure_ascii=False)
+    d = dict(value)
+    try:
+        return orjson.dumps(d).decode("utf-8")
+    except TypeError:
+        return json.dumps(d, default=_json_default, ensure_ascii=False)
 
 
 def cast_arrow_json_encode_array(
