@@ -35,6 +35,7 @@ quota burn for the bulk transfer.
 from __future__ import annotations
 
 import io as _stdio
+import logging
 import os
 import threading
 import time
@@ -63,6 +64,9 @@ from yggdrasil.databricks.aws import AWSDatabricksVolumeCredentials
 VolumeCredentialsRefresher = AWSDatabricksVolumeCredentials
 
 __all__ = ["VolumePath", "VolumeCredentialsRefresher"]
+
+
+logger = logging.getLogger(__name__)
 
 
 class VolumePath(DatabricksPath):
@@ -572,9 +576,14 @@ class VolumePath(DatabricksPath):
     def _ls(self, recursive: bool = False) -> Iterator["VolumePath"]:
         files = self.client.workspace_client().files
         try:
-            entries = self._call(files.list_directory_contents, self.api_path)
+            entries = list(self._call(files.list_directory_contents, self.api_path))
         except Exception:
             return
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "files.list_directory_contents %s -> %d entries (recursive=%s)",
+                self.api_path, len(entries), recursive,
+            )
         for info in entries:
             child_path = getattr(info, "path", None)
             if not child_path:
@@ -662,6 +671,11 @@ class VolumePath(DatabricksPath):
             return False
         catalog, schema, volume = triple
         ws = self.client.workspace_client()
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "VolumePath._ensure_volume %s.%s.%s",
+                catalog, schema, volume,
+            )
 
         def _create_volume() -> Any:
             return ws.volumes.create(
@@ -707,6 +721,8 @@ class VolumePath(DatabricksPath):
     # ==================================================================
 
     def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("files.create_directory %s", self.api_path)
         try:
             self._call_ensuring_parents(
                 self.client.workspace_client().files.create_directory, self.api_path,
@@ -717,6 +733,8 @@ class VolumePath(DatabricksPath):
         self._seed_stat_cache(IOStats(kind=IOKind.DIRECTORY))
 
     def _remove_file(self, missing_ok: bool = True) -> None:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("files.delete %s", self.api_path)
         try:
             self._call(self.client.workspace_client().files.delete, self.api_path)
         except Exception:
@@ -727,6 +745,11 @@ class VolumePath(DatabricksPath):
     def _remove_dir(
         self, recursive: bool = True, missing_ok: bool = True,
     ) -> None:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "files.delete_directory %s (recursive=%s)",
+                self.api_path, recursive,
+            )
         try:
             self._call(self.client.workspace_client().files.delete_directory, self.api_path)
         except Exception:
@@ -753,6 +776,11 @@ class VolumePath(DatabricksPath):
             data = body.read()
         except AttributeError:
             data = bytes(body)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "files.download %s -> %d bytes (slice pos=%d n=%s)",
+                self.api_path, len(data), pos, "EOF" if n < 0 else n,
+            )
 
         media_type = _media_type_from_response(response)
         try:
@@ -806,6 +834,10 @@ class VolumePath(DatabricksPath):
         return n
 
     def _upload(self, payload: bytes) -> None:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "files.upload %s -> %d bytes", self.api_path, len(payload),
+            )
         self._call_ensuring_parents(
             self.client.workspace_client().files.upload,
             file_path=self.api_path,

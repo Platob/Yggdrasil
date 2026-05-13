@@ -53,6 +53,7 @@ dispatch on :class:`Holder`.
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Iterator, TypeVar
@@ -63,6 +64,9 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MediaType, MimeType
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
+
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import pandas
@@ -630,6 +634,13 @@ class Tabular(ABC, Generic[O]):
         deleted = total_rows - kept_rows
         if deleted == 0:
             return 0
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "%s deleted %d / %d rows",
+                type(self).__name__,
+                deleted,
+                total_rows,
+            )
         self._write_arrow_batches(iter(survivors), options)
         return deleted
 
@@ -721,6 +732,13 @@ class Tabular(ABC, Generic[O]):
         if self._schema_cache is not ...:
             return self._schema_cache
         schema = self._collect_schema(self.check_options(options, overrides=locals()))
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "%s schema collected: %d fields %s",
+                type(self).__name__,
+                len(schema) if hasattr(schema, "__len__") else -1,
+                getattr(schema, "names", None),
+            )
         self._persist_schema(schema)
         return schema
 
@@ -839,8 +857,21 @@ class Tabular(ABC, Generic[O]):
     def read_arrow_batches(
         self, options: "O | None" = None, **kwargs: Any,
     ) -> Iterator[pa.RecordBatch]:
-        yield from self._read_arrow_batches(
-            self.check_options(options, overrides=locals())
+        resolved = self.check_options(options, overrides=locals())
+        if not logger.isEnabledFor(logging.DEBUG):
+            yield from self._read_arrow_batches(resolved)
+            return
+        n_batches = 0
+        n_rows = 0
+        for batch in self._read_arrow_batches(resolved):
+            n_batches += 1
+            n_rows += batch.num_rows
+            yield batch
+        logger.debug(
+            "%s read %d batches / %d rows",
+            type(self).__name__,
+            n_batches,
+            n_rows,
         )
 
     def read_arrow_table(
@@ -1005,7 +1036,25 @@ class Tabular(ABC, Generic[O]):
         **kwargs: Any,
     ) -> None:
         options = self.check_options(options, overrides=locals())
-        self._write_arrow_batches(batches, options)
+        if not logger.isEnabledFor(logging.DEBUG):
+            self._write_arrow_batches(batches, options)
+        else:
+            n_batches = 0
+            n_rows = 0
+            def _counted() -> "Iterator[pa.RecordBatch]":
+                nonlocal n_batches, n_rows
+                for batch in batches:
+                    n_batches += 1
+                    n_rows += batch.num_rows
+                    yield batch
+            self._write_arrow_batches(_counted(), options)
+            logger.debug(
+                "%s wrote %d batches / %d rows (mode=%s)",
+                type(self).__name__,
+                n_batches,
+                n_rows,
+                options.mode,
+            )
         if options.sync_metadata:
             self._commit_metadata()
 

@@ -14,6 +14,7 @@ bytes.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Iterator, Optional
 
 import pyarrow as pa
@@ -27,6 +28,9 @@ if TYPE_CHECKING:
 
 
 __all__ = ["SparkTabular"]
+
+
+logger = logging.getLogger(__name__)
 
 
 class SparkTabular(Tabular[CastOptions]):
@@ -161,6 +165,11 @@ class SparkTabular(Tabular[CastOptions]):
             return
         from yggdrasil.spark.cast import spark_dataframe_to_arrow
         arrow_table = spark_dataframe_to_arrow(self._frame)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "SparkTabular collected %d rows from Spark frame",
+                arrow_table.num_rows,
+            )
         for batch in arrow_table.to_batches(max_chunksize=options.row_size):
             yield options.cast_arrow_tabular(batch)
 

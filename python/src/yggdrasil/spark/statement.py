@@ -212,7 +212,19 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
 
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
         self._require_started()
-        yield from self._persisted_data._read_arrow_batches(options)
+        if not logger.isEnabledFor(logging.DEBUG):
+            yield from self._persisted_data._read_arrow_batches(options)
+            return
+        n_batches = 0
+        n_rows = 0
+        for batch in self._persisted_data._read_arrow_batches(options):
+            n_batches += 1
+            n_rows += batch.num_rows
+            yield batch
+        logger.debug(
+            "SparkStatementResult streamed %d batches / %d rows",
+            n_batches, n_rows,
+        )
 
     def _write_arrow_batches(
         self,
@@ -280,6 +292,8 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
             text = PreparedStatement.apply_external_substitution(
                 self.statement.text, self.statement.external_data,
             )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Spark session.sql:\n%s", text)
             df = session.sql(text)
             row_limit = self.statement.row_limit
             if row_limit:

@@ -817,6 +817,10 @@ class WarehouseStatementResult(StatementResult):
         if self._response is not None and self._response.status.state in DONE_STATES:
             return self
 
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "statement_execution.cancel_execution %s", self.statement_id,
+            )
         self.client.workspace_client().statement_execution.cancel_execution(
             statement_id=self.statement_id,
         )
@@ -872,7 +876,14 @@ class WarehouseStatementResult(StatementResult):
 
         statement_execution = self.client.workspace_client().statement_execution
         if self._response is None or self._response.status.state not in DONE_STATES:
+            prev = self._response.status.state if self._response is not None else None
             self._response = statement_execution.get_statement(self.statement_id)
+            new_state = self._response.status.state
+            if logger.isEnabledFor(logging.DEBUG) and new_state != prev:
+                logger.debug(
+                    "statement %s state: %s -> %s",
+                    self.statement_id, prev, new_state,
+                )
         return self
 
     @property
@@ -1038,9 +1049,11 @@ class WarehouseStatementResult(StatementResult):
         pending: List[pa.RecordBatch] = []
         pending_bytes = 0
         yielded_any = False
+        total_rows = 0
+        total_batches = 0
 
         def flush() -> Iterator[pa.RecordBatch]:
-            nonlocal pending, pending_bytes, yielded_any
+            nonlocal pending, pending_bytes, yielded_any, total_rows, total_batches
             if not pending:
                 return
 
@@ -1055,6 +1068,8 @@ class WarehouseStatementResult(StatementResult):
             pending = []
             pending_bytes = 0
             yielded_any = True
+            total_batches += 1
+            total_rows += casted.num_rows
             yield casted
 
         for batch in raw_batches():
@@ -1068,6 +1083,11 @@ class WarehouseStatementResult(StatementResult):
         if not yielded_any:
             schema_for_empty = options.with_target(self._collect_schema(options)).merged
             yield from _empty_arrow_batches(schema_for_empty.to_arrow_schema())
+        elif logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "statement %s streamed %d batches / %d rows",
+                self.statement_id, total_batches, total_rows,
+            )
 
     def _write_arrow_batches(self, batches: Iterable[pa.RecordBatch], options: CastOptions) -> None:
         raise NotImplementedError("Cannot write to Databricks SQL")

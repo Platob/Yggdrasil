@@ -27,6 +27,7 @@ than picking one child silently or fan-writing to all of them.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Iterable, Iterator, Tuple
 
 import pyarrow as pa
@@ -44,6 +45,9 @@ if TYPE_CHECKING:
 
 
 __all__ = ["UnionTabular"]
+
+
+logger = logging.getLogger(__name__)
 
 
 class UnionTabular(LazyTabular):
@@ -192,6 +196,12 @@ class UnionTabular(LazyTabular):
             return
         lf = self._build_lazy(options)
         table: pa.Table = lf.collect().to_arrow()
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "UnionTabular union(%d children) -> %d rows",
+                len(self._children),
+                table.num_rows,
+            )
         row_size = getattr(options, "row_size", None) or None
         for batch in table.to_batches(max_chunksize=row_size):
             yield options.cast_arrow_tabular(batch)

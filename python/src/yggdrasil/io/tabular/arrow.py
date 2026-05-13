@@ -476,6 +476,12 @@ class ArrowTabular(Tabular[CastOptions]):
         self._spilled_table = new_table
         self._batches.clear()
         self._in_memory_bytes = 0
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "ArrowTabular spilled %d rows to %s",
+                new_table.num_rows,
+                target_path,
+            )
 
         # Old mmap (when we had one and didn't already close it) plus
         # any old owned file at a different path — tear down now that
