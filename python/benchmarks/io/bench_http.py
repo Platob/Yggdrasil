@@ -411,6 +411,194 @@ def _session_scenarios(repeat: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Arrow conversion scenarios (request / response, both directions)
+# ---------------------------------------------------------------------------
+
+
+def _arrow_scenarios(repeat: int) -> list[dict]:
+    """Bench every Arrow-side conversion the cache pipeline depends on.
+
+    Covers both directions for both shapes:
+
+    * ``PreparedRequest.to_arrow_batch`` / ``.to_arrow_table`` — fires on
+      every cache *write* (local fast-path and remote insert) and again
+      on every ``_split_remote_cache`` lookup that has to project a
+      request row for ``request_tuple`` matching.
+    * ``Response.to_arrow_batch`` / ``.to_arrow_table`` — fires once per
+      successful network fetch on the writeback path (``_persist_remote``,
+      ``_store_local_cached_response``).
+    * Bulk ``pa.Table.from_batches([r.to_arrow_batch(...) for r in N])``
+      — the shape ``_persist_remote`` builds before handing off to
+      ``cfg.tabular.insert``. Measures the per-row build amortised over
+      a 64-row batch, which is the relevant cost for "batched insert"
+      vs. "row-at-a-time insert".
+    * ``PreparedRequest.from_arrow`` / ``Response.from_arrow_tabular``
+      / ``Response.from_records`` — fires on every cache *read* (remote
+      lookup → :class:`Response` reconstruction, local fast-path read).
+      Both single-row and 64-row batches.
+    """
+    import pyarrow as pa
+    out: list[dict] = []
+
+    # --- to_arrow: single row ---
+    out.append(_time_one(
+        "PreparedRequest.to_arrow_batch(parse=False)",
+        lambda: REQ_NO_BODY.to_arrow_batch(parse=False),
+        repeat=repeat, inner=2_000,
+    ))
+    out.append(_time_one(
+        "PreparedRequest.to_arrow_batch(parse=False) (with body)",
+        lambda: REQ_WITH_BODY.to_arrow_batch(parse=False),
+        repeat=repeat, inner=2_000,
+    ))
+    out.append(_time_one(
+        "PreparedRequest.to_arrow_table(parse=False)",
+        lambda: REQ_NO_BODY.to_arrow_table(parse=False),
+        repeat=repeat, inner=2_000,
+    ))
+    out.append(_time_one(
+        "Response.to_arrow_batch(parse=False) (no body)",
+        lambda: RESP_NO_BODY.to_arrow_batch(parse=False),
+        repeat=repeat, inner=2_000,
+    ))
+    out.append(_time_one(
+        "Response.to_arrow_batch(parse=False) (with body)",
+        lambda: RESP_WITH_BODY.to_arrow_batch(parse=False),
+        repeat=repeat, inner=2_000,
+    ))
+    out.append(_time_one(
+        "Response.to_arrow_table(parse=False)",
+        lambda: RESP_NO_BODY.to_arrow_table(parse=False),
+        repeat=repeat, inner=2_000,
+    ))
+
+    # --- to_arrow: bulk-batch shape (the _persist_remote build) ---
+    BULK = 64
+    bulk_reqs = [
+        PreparedRequest.prepare(
+            "GET",
+            f"https://api.example.com/v1/r{i:05d}?page={i % 7}",
+            headers=dict(HEADERS_SMALL),
+        )
+        for i in range(BULK)
+    ]
+    bulk_resps = [
+        Response(
+            request=r,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            tags={},
+            buffer=Memory(binary=RAW_BODY),
+            received_at=dt.datetime.now(dt.timezone.utc),
+        )
+        for r in bulk_reqs
+    ]
+    # Warm the identity / projection caches — the cold cost is
+    # already covered above; bulk shape measures the conversion
+    # itself, not the first-touch hash work.
+    for r in bulk_reqs:
+        _ = r.public_hash, r.arrow_values
+    for r in bulk_resps:
+        _ = r.public_hash, r.arrow_values
+
+    out.append(_time_one(
+        f"pa.Table.from_batches([req.to_arrow_batch] x {BULK}) (per-row build)",
+        lambda: pa.Table.from_batches(
+            [r.to_arrow_batch(parse=False) for r in bulk_reqs]
+        ),
+        repeat=repeat, inner=50,
+    ))
+    out.append(_time_one(
+        f"PreparedRequest.values_to_arrow_batch ({BULK} rows, bulk)",
+        lambda: PreparedRequest.values_to_arrow_batch(bulk_reqs),
+        repeat=repeat, inner=500,
+    ))
+    out.append(_time_one(
+        f"pa.Table.from_batches([resp.to_arrow_batch] x {BULK}) (per-row build)",
+        lambda: pa.Table.from_batches(
+            [r.to_arrow_batch(parse=False) for r in bulk_resps]
+        ),
+        repeat=repeat, inner=50,
+    ))
+    out.append(_time_one(
+        f"Response.values_to_arrow_batch ({BULK} rows, bulk)",
+        lambda: Response.values_to_arrow_batch(bulk_resps),
+        repeat=repeat, inner=500,
+    ))
+
+    # --- from_arrow: single row + bulk-batch ---
+    req_batch_1 = REQ_NO_BODY.to_arrow_batch(parse=False)
+    resp_batch_1 = RESP_NO_BODY.to_arrow_batch(parse=False)
+    req_table_n = pa.Table.from_batches(
+        [r.to_arrow_batch(parse=False) for r in bulk_reqs]
+    ).combine_chunks()
+    resp_table_n = pa.Table.from_batches(
+        [r.to_arrow_batch(parse=False) for r in bulk_resps]
+    ).combine_chunks()
+
+    out.append(_time_one(
+        "PreparedRequest.from_arrow (1 row, batch)",
+        lambda: list(PreparedRequest.from_arrow(req_batch_1, normalize=False)),
+        repeat=repeat, inner=1_000,
+    ))
+    out.append(_time_one(
+        f"PreparedRequest.from_arrow ({BULK} rows, table)",
+        lambda: list(PreparedRequest.from_arrow(req_table_n, normalize=False)),
+        repeat=repeat, inner=50,
+    ))
+    out.append(_time_one(
+        "Response.from_arrow_tabular (1 row, batch)",
+        lambda: list(Response.from_arrow_tabular(resp_batch_1, normalize=False)),
+        repeat=repeat, inner=1_000,
+    ))
+    out.append(_time_one(
+        f"Response.from_arrow_tabular ({BULK} rows, table)",
+        lambda: list(Response.from_arrow_tabular(resp_table_n, normalize=False)),
+        repeat=repeat, inner=20,
+    ))
+
+    # Records path used by `_send_many` to flatten ResponseBatch holders.
+    resp_records = list(
+        Response.from_arrow_tabular(resp_table_n, normalize=False)
+    )
+    record_dicts = [r.arrow_values for r in resp_records]
+    out.append(_time_one(
+        f"Response.from_records ({BULK} mappings)",
+        lambda: list(Response.from_records(record_dicts, normalize=False)),
+        repeat=repeat, inner=50,
+    ))
+
+    # arrow_values walk — the underlying column source for to_arrow_batch.
+    # Cold (no cache) so this measures the projection cost, not the
+    # cached attribute read benched elsewhere.
+    def _cold_req_arrow_values():
+        r = PreparedRequest.prepare("GET", HTTPS_STR, headers=dict(HEADERS_SMALL))
+        return r.arrow_values
+    out.append(_time_one(
+        "PreparedRequest.arrow_values (cold)",
+        _cold_req_arrow_values,
+        repeat=repeat, inner=500,
+    ))
+    def _cold_resp_arrow_values():
+        r = Response(
+            request=REQ_NO_BODY,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            tags={},
+            buffer=Memory(binary=RAW_BODY),
+            received_at=dt.datetime.now(dt.timezone.utc),
+        )
+        return r.arrow_values
+    out.append(_time_one(
+        "Response.arrow_values (cold)",
+        _cold_resp_arrow_values,
+        repeat=repeat, inner=500,
+    ))
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Aggregator + CLI
 # ---------------------------------------------------------------------------
 
@@ -420,6 +608,7 @@ def scenarios(repeat: int) -> list[dict]:
         *_request_scenarios(repeat),
         *_response_scenarios(repeat),
         *_session_scenarios(repeat),
+        *_arrow_scenarios(repeat),
     ]
 
 

@@ -1106,8 +1106,11 @@ class Session(ABC):
         """
         if not responses:
             return cls._cached_empty_spark_frame(spark)
+        # Single bulk struct-array build — same ~30x speedup over the
+        # per-row ``[r.to_arrow_batch(...) for r]`` loop documented on
+        # :meth:`Response.values_to_arrow_batch`.
         table = pa.Table.from_batches(
-            [r.to_arrow_batch(parse=False) for r in responses]
+            [Response.values_to_arrow_batch(responses)]
         )
         return spark.createDataFrame(table)
 
@@ -1356,19 +1359,24 @@ class Session(ABC):
     def _backfill_local_cache(
         self,
         responses: list[Response],
-        url_to_local_cfg: Mapping[str, CacheConfig],
+        key_to_local_cfg: Mapping[int, CacheConfig],
         session_local_cfg: CacheConfig,
     ) -> None:
         """Write remote-cache hits back to the local fast-path cache.
 
         Each response is stored against its originating request's
-        effective local config (looked up by URL) — using the
-        session-level config for every response would be wrong
-        whenever a request carries a custom per-request local
-        cache. Each response becomes one fire-and-forget fast-path
-        write keyed by ``public_hash``; concurrent writes against
-        distinct ``rel_path``s never contend, so no per-root
-        serialization is needed.
+        effective local config (looked up by ``public_url_hash``) —
+        using the session-level config for every response would be
+        wrong whenever a request carries a custom per-request local
+        cache. Keying by ``public_url_hash`` (already cached on
+        :class:`PreparedRequest`) instead of the anonymized URL
+        string costs one cached attribute read per response in
+        place of a full ``request.anonymize(mode="remove")`` rebuild.
+
+        Each response becomes one fire-and-forget fast-path write
+        keyed by ``public_hash``; concurrent writes against distinct
+        ``rel_path``s never contend, so no per-root serialization is
+        needed.
 
         After the writes are queued, the per-root cleanup walker
         runs once to unlink stale ``.arrow`` entries — throttled by
@@ -1377,8 +1385,9 @@ class Session(ABC):
         """
         cleanup_roots: dict[str, CacheConfig] = {}
         for response in responses:
-            url_key = str(response.request.url) if response.request else None
-            eff = url_to_local_cfg.get(url_key) if url_key else None
+            req = response.request
+            cfg_key = req.public_url_hash if req is not None else None
+            eff = key_to_local_cfg.get(cfg_key) if cfg_key is not None else None
             if eff is None:
                 eff = session_local_cfg
             if not eff.local_cache_enabled:
@@ -1405,7 +1414,7 @@ class Session(ABC):
     def _persist_remote(
         self,
         responses: list[Response],
-        url_to_remote_cfg: Mapping[str, CacheConfig],
+        key_to_remote_cfg: Mapping[int, CacheConfig],
         session_remote_cfg: CacheConfig,
     ) -> None:
         """Stage 4: bulk-insert successful responses into the remote cache.
@@ -1421,17 +1430,17 @@ class Session(ABC):
         """
         groups: dict[tuple, tuple[CacheConfig, list[Response]]] = {}
         for response in responses:
-            # Per-request lookup keys still use the anonymized URL
-            # because that's how :meth:`_send_many_batches` keyed the
-            # ``url_to_remote_cfg`` map; the *stored* response is the
-            # original. Match-by/identity all hash through the
-            # ``public_*`` columns so anonymizing the row before
-            # insert isn't required to keep cache lookups consistent.
-            url_key = (
-                str(response.request.anonymize(mode="remove").url)
-                if response.request else None
-            )
-            eff = url_to_remote_cfg.get(url_key) if url_key else None
+            # Per-request lookup keys ride on ``public_url_hash`` —
+            # already cached on :class:`PreparedRequest` and stable
+            # across the ``request.copy(...)`` worker scatter — so we
+            # don't pay an ``anonymize()`` rebuild per response just to
+            # turn the URL into a dict key. Match-by/identity all hash
+            # through the ``public_*`` columns so anonymizing the row
+            # before insert isn't required to keep cache lookups
+            # consistent.
+            req = response.request
+            cfg_key = req.public_url_hash if req is not None else None
+            eff = key_to_remote_cfg.get(cfg_key) if cfg_key is not None else None
             if eff is None:
                 eff = session_remote_cfg
             if not eff.remote_cache_enabled:
@@ -1452,10 +1461,15 @@ class Session(ABC):
                 len(group_responses),
                 cfg.tabular,
             )
-            batches = pa.Table.from_batches([
-                r.to_arrow_batch(parse=False)
-                for r in group_responses
-            ]).combine_chunks()
+            # One C++ struct walk over the whole group beats N
+            # per-row builds + an outer ``combine_chunks`` concat —
+            # see :meth:`Response.values_to_arrow_batch`. The result
+            # is a single chunked-on-construction batch wrapped in a
+            # one-element table so the downstream
+            # ``batches["partition_key"]`` slot lookup keeps working.
+            batches = pa.Table.from_batches(
+                [Response.values_to_arrow_batch(group_responses)]
+            )
 
             cfg.tabular.insert(
                 batches,
@@ -1479,7 +1493,7 @@ class Session(ABC):
     def _mirror_local_hits_to_remote(
         self,
         local_hits_by_path: Mapping[str, "list[Response]"],
-        url_to_remote_cfg: Mapping[str, CacheConfig],
+        key_to_remote_cfg: Mapping[int, CacheConfig],
         session_remote_cfg: CacheConfig,
     ) -> None:
         """Bulk-upsert local-cache hits into the remote cache.
@@ -1513,14 +1527,14 @@ class Session(ABC):
         # Filter down to responses whose effective remote cache is
         # both enabled AND opted into the mirror — keeps a session
         # that toggles the flag for one cache from accidentally
-        # syncing into another.
+        # syncing into another. Keyed by ``public_url_hash`` so the
+        # per-response lookup is a cached attribute read instead of a
+        # full ``request.anonymize(mode="remove")`` rebuild.
         keep: list[Response] = []
         for response in flat:
-            url_key = (
-                str(response.request.anonymize(mode="remove").url)
-                if response.request else None
-            )
-            eff = url_to_remote_cfg.get(url_key) if url_key else None
+            req = response.request
+            cfg_key = req.public_url_hash if req is not None else None
+            eff = key_to_remote_cfg.get(cfg_key) if cfg_key is not None else None
             if eff is None:
                 eff = session_remote_cfg
             if not eff.remote_cache_enabled:
@@ -1536,7 +1550,7 @@ class Session(ABC):
             "Mirroring %s local-cache hit(s) to remote cache",
             len(keep),
         )
-        self._persist_remote(keep, url_to_remote_cfg, session_remote_cfg)
+        self._persist_remote(keep, key_to_remote_cfg, session_remote_cfg)
 
     def _send_many(
         self,
@@ -1746,19 +1760,25 @@ class Session(ABC):
             new_hits: "list[Response] | SparkDataFrame | None" = None
 
             # Snapshot per-request effective configs BEFORE we mutate copies
-            # for the worker pool. Keyed by URL string — the natural identity
-            # for matching a response back to its originating request. We
-            # cover the *whole* chunk (not just ``after_local``) so the
+            # for the worker pool. Keyed by ``PreparedRequest.public_url_hash``
+            # — a cached xxh3_64 of ``(method, url.anonymize('remove'))`` —
+            # so the per-request key build collapses from a full
+            # ``anonymize()`` rebuild (~70 us / request, allocates a fresh
+            # :class:`PreparedRequest`) to one cached attribute read. The
+            # hash is stable across the ``request.copy(...)`` worker scatter
+            # in :meth:`_fetch_misses`, so :meth:`_persist_remote` /
+            # :meth:`_mirror_local_hits_to_remote` /
+            # :meth:`_backfill_local_cache` resolve responses back to their
+            # originating request's effective config with the same key.
+            # We cover the *whole* chunk (not just ``after_local``) so the
             # local-hit mirror below can resolve per-request remote configs
             # for responses that never reached stage 2.
-            url_to_remote_cfg: dict[str, CacheConfig] = {
-                str(r.anonymize(mode="remove").url): self._effective_remote_cfg(r, session_remote_cfg)
-                for r in chunk
-            }
-            url_to_local_cfg: dict[str, CacheConfig] = {
-                str(r.anonymize(mode="remove").url): self._effective_local_cfg(r, session_local_cfg)
-                for r in chunk
-            }
+            key_to_remote_cfg: dict[int, CacheConfig] = {}
+            key_to_local_cfg: dict[int, CacheConfig] = {}
+            for r in chunk:
+                k = r.public_url_hash
+                key_to_remote_cfg[k] = self._effective_remote_cfg(r, session_remote_cfg)
+                key_to_local_cfg[k] = self._effective_local_cfg(r, session_local_cfg)
 
             if not after_local:
                 # Even when every request is a local hit we may still
@@ -1768,7 +1788,7 @@ class Session(ABC):
                 if not is_spark:
                     self._mirror_local_hits_to_remote(
                         local_hits_by_path,
-                        url_to_remote_cfg,
+                        key_to_remote_cfg,
                         session_remote_cfg,
                     )
                 yield ResponseBatch(
@@ -1809,7 +1829,7 @@ class Session(ABC):
                 # the response-to-request mapping by URL.
                 self._backfill_local_cache(
                     [r for table_hits in remote_hits.values() for r in table_hits],
-                    url_to_local_cfg,
+                    key_to_local_cfg,
                     session_local_cfg,
                 )
                 # Mirror local-cache hits to remote in bulk before any
@@ -1820,7 +1840,7 @@ class Session(ABC):
                 # entries the remote was missing.
                 self._mirror_local_hits_to_remote(
                     local_hits_by_path,
-                    url_to_remote_cfg,
+                    key_to_remote_cfg,
                     session_remote_cfg,
                 )
 
@@ -1875,7 +1895,7 @@ class Session(ABC):
                     stage4.append(
                         lambda: self._persist_remote(
                             new_hits,
-                            url_to_remote_cfg,
+                            key_to_remote_cfg,
                             session_remote_cfg,
                         )
                     )
@@ -1892,7 +1912,7 @@ class Session(ABC):
                     stage4.append(
                         lambda: self._backfill_local_cache(
                             new_hits,
-                            url_to_local_cfg,
+                            key_to_local_cfg,
                             session_local_cfg,
                         )
                     )
