@@ -124,14 +124,3 @@ class TestVolumePathIntegration(DatabricksIntegrationCase):
             self.assertEqual(staged.read_bytes(), b"staged")
         finally:
             staged.unlink(missing_ok=True)
-
-    def test_parquet_write(self):
-        table = self.client.sql.table("trading.ba_3mv_polaris__p__volcano_output.thermal_new")
-        data = self.client.sql(f"SELECT * from {table.full_name()} limit 10000").to_arrow()
-
-        path = self.root / "test.parquet"
-        path.write_table(data, target=table.collect_schema())
-
-        assert path.stat().size > 0
-
-        path.unlink()

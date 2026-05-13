@@ -37,16 +37,18 @@ from __future__ import annotations
 import io as _stdio
 import logging
 import os
+import re
 import threading
 import time
 import datetime as dt
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional, Tuple
+from databricks.sdk.errors import PermissionDenied
 
 from databricks.sdk.service.catalog import VolumeOperation
 
-from yggdrasil.data.cast import any_to_datetime
+from yggdrasil.data.cast import any_to_datetime, parse_http_date
 from yggdrasil.data.enums import Mode, ModeLike, Scheme
-from yggdrasil.data.enums.media_type import MediaType
+from yggdrasil.data.enums.media_type import MediaType, MediaTypes
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.path import Path
 from yggdrasil.io.url import URL
@@ -69,6 +71,15 @@ __all__ = ["VolumePath", "VolumeCredentialsRefresher"]
 logger = logging.getLogger(__name__)
 
 
+# Filename produced by ``staging_path``:
+#     tmp-{start_epoch_s}-{end_epoch_s}-{seed}.parquet
+# ``end_epoch_s`` is the TTL the external sweepers honour, so the in-process
+# sweeper keys off the same field.
+_STAGING_LEAF_RE = re.compile(
+    r"^tmp-(?P<start>\d+)-(?P<end>\d+)-[0-9a-f]+\.parquet$",
+)
+
+
 class VolumePath(DatabricksPath):
     """Path under ``/Volumes/<cat>/<sch>/<vol>/...`` via the Files API."""
 
@@ -79,6 +90,13 @@ class VolumePath(DatabricksPath):
 
     _VOLUME_INFO_CACHE: ClassVar["dict[Tuple[str, str, str], Any]"] = {}
     _VOLUME_INFO_CACHE_LOCK: ClassVar[threading.Lock] = threading.Lock()
+
+    # Process-wide "already swept" set, keyed by ``(catalog, schema, resource)``
+    # so concurrent ``staging_path`` calls collapse to one sweep per staging
+    # directory. Insert under the lock *before* launching the sweeper thread
+    # so duplicate triggers don't double-launch.
+    _STAGING_SWEPT: ClassVar["set[Tuple[str, str, str]]"] = set()
+    _STAGING_SWEPT_LOCK: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(
         self,
@@ -559,29 +577,41 @@ class VolumePath(DatabricksPath):
         file ready to reference from SQL.  Cleanup matches the
         ``temporary`` flag: a write failure unlinks the path when
         ``temporary=True``.
-        """
-        del max_lifetime  # filename carries the timestamp; unused here
 
+        Side effect: on first call per ``(cat, sch, resource)`` in
+        this process, a background sweep of the staging directory
+        deletes files whose embedded TTL (``end_epoch_s`` segment of
+        the leaf name) has already passed. The sweep is fire-and-
+        forget; staging never blocks on it and failures are logged
+        only.
+        """
         cat = _staging_clean_part(catalog_name)
         sch = _staging_clean_part(schema_name)
         tbl = _staging_clean_part(resource_name or "default")
 
-        epoch_ms = int(time.time() * 1000)
-        seed = os.urandom(8).hex()
-        leaf = f"part-{epoch_ms}-{seed}.parquet"
-        path = f"/{cat}/{sch}/tmp/.sql/{cat}/{sch}/{tbl}/{leaf}"
+        start_epoch_s = int(time.time())
+        end_epoch_s = start_epoch_s + int(max_lifetime or 3600)
+        seed = os.urandom(4).hex()
+        leaf = f"tmp-{start_epoch_s}-{end_epoch_s}-{seed}.parquet"
+        path = f"/{cat}/{sch}/tmp_{tbl}/.sql/{leaf}"
 
         staged = cls(
             url=URL(scheme=cls.scheme, path=path),
             client=client,
             temporary=temporary,
         )
+
+        # Opportunistic, one-shot-per-process staging sweep. Runs in
+        # the background — the new staging path is returned immediately.
+        cls._maybe_sweep_staging(
+            catalog=cat,
+            schema=sch,
+            resource=tbl,
+            client=client,
+        )
+
         if tabular is None:
             return staged
-
-        # Local imports — keep optional engine deps off the import path
-        # for a plain ``staging_path()`` call that doesn't write.
-        from yggdrasil.data.enums import MediaTypes
 
         try:
             staged.as_media(media_type=MediaTypes.PARQUET).write_table(tabular)
@@ -595,19 +625,138 @@ class VolumePath(DatabricksPath):
         return staged
 
     # ==================================================================
+    # Staging sweep — one-time per (cat, sch, resource) per process
+    # ==================================================================
+
+    @classmethod
+    def _maybe_sweep_staging(
+        cls,
+        *,
+        catalog: str,
+        schema: str,
+        resource: str,
+        client: Any,
+    ) -> None:
+        """Launch a one-shot background sweep of the staging directory.
+
+        Idempotent per process: the ``(catalog, schema, resource)`` key is
+        inserted into :attr:`_STAGING_SWEPT` under the lock *before* the
+        thread is launched, so concurrent ``staging_path`` calls on the
+        same directory don't double-launch. The thread is a daemon — it
+        never blocks process exit and never raises into the caller.
+        """
+        key = (catalog, schema, resource)
+        with cls._STAGING_SWEPT_LOCK:
+            if key in cls._STAGING_SWEPT:
+                return
+            cls._STAGING_SWEPT.add(key)
+
+        thread = threading.Thread(
+            target=cls._sweep_staging,
+            kwargs={
+                "catalog": catalog,
+                "schema": schema,
+                "resource": resource,
+                "client": client,
+            },
+            name=f"volume-staging-sweep-{catalog}.{schema}.{resource}",
+            daemon=True,
+        )
+        thread.start()
+
+    @classmethod
+    def _sweep_staging(
+        cls,
+        *,
+        catalog: str,
+        schema: str,
+        resource: str,
+        client: Any,
+    ) -> None:
+        """List the staging directory and delete files whose TTL has passed.
+
+        Best-effort: every failure mode (missing directory, listing
+        permission denied, individual delete failures) is swallowed
+        and logged. The sweep MUST NOT raise — it is invoked from a
+        daemon thread and any uncaught exception would just disappear
+        into the void anyway, but explicit handling keeps the log
+        trail readable.
+
+        Filenames are matched against :data:`_STAGING_LEAF_RE`; only
+        files whose embedded ``end_epoch_s`` is strictly in the past
+        are deleted. Anything else (foreign files, in-flight stagers
+        from other processes whose TTL hasn't elapsed, oddly-named
+        leftovers) is left alone.
+        """
+        staging_dir = cls(
+            url=URL(
+                scheme=cls.scheme,
+                path=f"/{catalog}/{schema}/tmp_{resource}/.sql",
+            ),
+            client=client,
+        )
+        now = int(time.time())
+        deleted = 0
+        scanned = 0
+        try:
+            for child in staging_dir._ls(recursive=False):
+                scanned += 1
+                leaf = (child.url.path or "").rsplit("/", 1)[-1]
+                match = _STAGING_LEAF_RE.match(leaf)
+                if not match:
+                    continue
+                try:
+                    end_epoch_s = int(match.group("end"))
+                except (TypeError, ValueError):
+                    continue
+                if end_epoch_s >= now:
+                    continue
+                try:
+                    child._remove_file(missing_ok=True)
+                    deleted += 1
+                except Exception:
+                    logger.debug(
+                        "staging sweep: failed to delete %s",
+                        child.full_path(),
+                        exc_info=True,
+                    )
+        except Exception:
+            # Directory missing, permission denied, transient SDK
+            # error — all benign. Log at debug so production logs
+            # stay quiet but the trail exists for diagnosis.
+            logger.debug(
+                "staging sweep aborted for /%s/%s/tmp_%s/.sql",
+                catalog, schema, resource,
+                exc_info=True,
+            )
+            return
+        if deleted or scanned:
+            logger.debug(
+                "staging sweep /%s/%s/tmp_%s/.sql: scanned=%d deleted=%d",
+                catalog, schema, resource, scanned, deleted,
+            )
+
+    # ==================================================================
     # Listing
     # ==================================================================
 
     def _ls(self, recursive: bool = False) -> Iterator["VolumePath"]:
         files = self.client.workspace_client().files
         try:
-            entries = list(self._call(files.list_directory_contents, self.api_path))
+            entries = self._call(files.list_directory_contents, self.api_path)
+        except PermissionDenied as e:
+            logger.warning(
+                f"Permission denied listing directory %r: %e",
+                self, e
+            )
+            return
         except Exception:
             return
         if logger.isEnabledFor(logging.DEBUG):
+            entries = list(entries)
             logger.debug(
-                "files.list_directory_contents %s -> %d entries (recursive=%s)",
-                self.api_path, len(entries), recursive,
+                "files.list_directory_contents %r -> %d entries (recursive=%s)",
+                self, len(entries), recursive,
             )
         for info in entries:
             child_path = getattr(info, "path", None)
@@ -884,6 +1033,7 @@ class VolumePath(DatabricksPath):
             contents=_stdio.BytesIO(payload),
             overwrite=True,
         )
+        logger.info("wrote %s (%d bytes)", self, len(payload))
         self._seed_stat_cache(IOStats(
             size=len(payload),
             kind=IOKind.FILE,

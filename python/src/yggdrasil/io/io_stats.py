@@ -207,12 +207,3 @@ class IOStats:
         yield self.kind
         yield self.mode
         yield self.media_type
-
-    def __repr__(self) -> str:
-        mt = self.media_type
-        mt_repr = repr(mt) if mt is not None else "None"
-        return (
-            f"IOStats(size={self.size}, mtime={self.mtime!r}, "
-            f"kind={self.kind.name}, mode={self.mode!r}, "
-            f"media_type={mt_repr})"
-        )
