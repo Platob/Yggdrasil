@@ -1128,35 +1128,19 @@ class Tabular(ABC, Generic[O]):
         # when at least one level has a user-assigned name.
         include_index = any(n is not None for n in frame.index.names)
 
-        # When the caller bound an Arrow-oriented target on
-        # ``CastOptions.target``, hand the target's arrow schema to
-        # :func:`pa.Table.from_pandas` as a type hint. The pandas
-        # bridge in pyarrow's C++ runtime uses it to skip object-
-        # column inference (decimals, timestamps with timezone,
-        # nested struct payloads in ``object`` cells) and emit the
-        # target types directly — same result the downstream cast
-        # would produce, one engine hop earlier. Only intersect-and-
-        # hint columns the frame actually carries: extra target
-        # columns get backfilled with nulls by the cast in
-        # :meth:`_write_arrow_table`, but ``from_pandas`` raises
-        # outright on a field that isn't in the frame.
-        schema_hint: "pa.Schema | None" = None
-        target = getattr(options, "target", None)
-        if target is not None:
-            try:
-                arrow_schema = target.to_arrow_schema()
-            except Exception:
-                arrow_schema = None
-            if arrow_schema is not None:
-                frame_cols = frozenset(frame.columns)
-                hinted = [f for f in arrow_schema if f.name in frame_cols]
-                if hinted:
-                    schema_hint = pa.schema(hinted)
-
+        # Type alignment is the cast's job, not the bridge's: passing
+        # ``schema=options.target.to_arrow_schema()`` to
+        # ``pa.Table.from_pandas`` would force the pandas bridge to
+        # coerce frame values into the target shape, which raises
+        # outright when the caller's pandas types don't already line
+        # up with the target (e.g. ``string`` frame column against a
+        # numeric target field). The downstream
+        # :meth:`_write_arrow_table` runs the proper
+        # :meth:`CastOptions.cast_arrow_tabular` over the inferred
+        # table — that's the one path that knows how to widen, fill
+        # missing columns, and reorder safely.
         try:
-            casted = pa.Table.from_pandas(
-                frame, schema=schema_hint, preserve_index=include_index,
-            )
+            casted = pa.Table.from_pandas(frame, preserve_index=include_index)
             self._write_arrow_table(casted, options)
         except (pa.ArrowException, TypeError, ValueError):
             # pyarrow's pandas bridge raises ``pa.ArrowException``
