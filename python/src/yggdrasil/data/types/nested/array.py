@@ -614,6 +614,13 @@ def cast_arrow_list_array(
     # into the shared cast path.
     if pat.is_list_view(array.type) or pat.is_large_list_view(array.type):
         array = _list_view_to_list(array)
+    elif pat.is_fixed_size_list(array.type):
+        # FixedSizeListArray has no ``.offsets`` — the layout is
+        # implicit (k elements per row). Synthesise monotone offsets
+        # so the rest of the function operates on the regular list
+        # layout it was written for.  Same pattern as the list_view
+        # branch above.
+        array = _fixed_size_list_to_list(array)
 
     # Slicing a ListArray keeps the offsets buffer pointing at the parent's
     # absolute positions and the null bitmap carrying a slice offset.
@@ -788,6 +795,42 @@ def _build_list_from_compact(
         )
     return pa.ListArray.from_arrays(
         offsets=offsets, values=values, mask=mask,
+    )
+
+
+def _fixed_size_list_to_list(
+    array: "pa.FixedSizeListArray",
+) -> "pa.ListArray":
+    """Materialise a FixedSizeListArray as a regular ListArray.
+
+    FixedSizeListArray stores ``k`` elements per row implicitly — there
+    is no ``.offsets`` buffer.  Build the equivalent monotone offsets
+    ``[0, k, 2k, ..., n*k]`` and slice ``.values`` to the window the
+    (possibly sliced) parent actually covers.  The parent null bitmap
+    is carried over via ``mask=array.is_null()`` so list-level nulls
+    survive the rebuild.
+
+    Used by :func:`cast_arrow_list_array` to normalise FixedSizeList
+    sources up front so the shared offset-based cast path doesn't have
+    to special-case them.
+    """
+    import numpy as np
+
+    list_size = array.type.list_size
+    n = len(array)
+    # ``.offset`` counts rows; the flat values buffer is the parent's
+    # full k*N buffer, so slice it down to the sub-window this view
+    # covers (k elements per row, starting at ``offset * k``).
+    values_offset = array.offset * list_size
+    sliced_values = array.values.slice(values_offset, n * list_size)
+    new_offsets = pa.array(
+        np.arange(0, (n + 1) * list_size, list_size, dtype=np.int32),
+        type=pa.int32(),
+    )
+    return pa.ListArray.from_arrays(
+        offsets=new_offsets,
+        values=sliced_values,
+        mask=array.is_null(),
     )
 
 

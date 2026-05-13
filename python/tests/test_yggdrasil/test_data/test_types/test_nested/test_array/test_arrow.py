@@ -450,6 +450,99 @@ class TestListViewOfStructWide:
         assert roundtripped.to_pylist() == src.to_pylist()
 
 
+class TestFixedSizeListSource:
+    """FixedSizeListArray source coverage.
+
+    FixedSizeListArray stores ``k`` elements per row implicitly — it
+    has no ``.offsets`` buffer. The cast path used to access ``.offsets``
+    directly and raised ``AttributeError`` for any FixedSizeList input.
+    Normalising to a regular ListArray with synthesised offsets up
+    front lets the shared cast machinery handle the inner struct
+    rebuild + null mask + final list-variant choice.
+    """
+
+    @staticmethod
+    def _fixed_size_struct_array(list_size: int = 2) -> pa.FixedSizeListArray:
+        return pa.array(
+            [
+                [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}],
+                None,
+                [{"a": 3, "b": "z"}, {"a": 4, "b": "w"}],
+            ],
+            type=pa.list_(
+                pa.struct([("a", pa.int32()), ("b", pa.string())]),
+                list_size,
+            ),
+        )
+
+    def test_fixed_size_list_of_struct_widens_inner_int(self) -> None:
+        from yggdrasil.data.types.nested import ArrayType, StructType
+        from yggdrasil.data.types.primitive import IntegerType, StringType
+
+        src = self._fixed_size_struct_array()
+
+        item_field = Field("item", StructType(fields=(
+            Field("a", IntegerType(byte_size=8, signed=True)),
+            Field("b", StringType()),
+        )))
+        target = Field("rows", ArrayType.from_item(item_field))
+
+        result = cast_arrow_list_array(src, CastOptions(target=target))
+
+        assert isinstance(result, pa.ListArray)
+        assert result.type.value_type.field("a").type == pa.int64()
+        # Null row survives the rebuild and values come through unchanged
+        # — before the fix this crashed before producing any output.
+        assert result.to_pylist() == [
+            [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}],
+            None,
+            [{"a": 3, "b": "z"}, {"a": 4, "b": "w"}],
+        ]
+
+    def test_fixed_size_list_of_struct_to_fixed_size_list(self) -> None:
+        from yggdrasil.data.types.nested import ArrayType, StructType
+        from yggdrasil.data.types.primitive import IntegerType, StringType
+
+        src = self._fixed_size_struct_array()
+
+        item_field = Field("item", StructType(fields=(
+            Field("a", IntegerType(byte_size=8, signed=True)),
+            Field("b", StringType()),
+        )))
+        target = Field("rows", ArrayType.from_item(item_field, list_size=2))
+
+        result = cast_arrow_list_array(src, CastOptions(target=target))
+
+        assert isinstance(result, pa.FixedSizeListArray)
+        assert result.type.list_size == 2
+        assert result.to_pylist() == src.to_pylist()
+        # Inner widen actually applied.
+        assert result.type.value_type.field("a").type == pa.int64()
+
+    def test_sliced_fixed_size_list_of_struct_keeps_row_window(self) -> None:
+        from yggdrasil.data.types.nested import ArrayType, StructType
+        from yggdrasil.data.types.primitive import IntegerType, StringType
+
+        # Slice past the null row so the parent's ``.offset`` is
+        # non-zero — the values-buffer slice has to honour that or the
+        # rebuilt rows shift by ``offset * list_size`` cells.
+        src = self._fixed_size_struct_array().slice(1, 2)
+
+        item_field = Field("item", StructType(fields=(
+            Field("a", IntegerType(byte_size=8, signed=True)),
+            Field("b", StringType()),
+        )))
+        target = Field("rows", ArrayType.from_item(item_field))
+
+        result = cast_arrow_list_array(src, CastOptions(target=target))
+
+        assert isinstance(result, pa.ListArray)
+        assert result.to_pylist() == [
+            None,
+            [{"a": 3, "b": "z"}, {"a": 4, "b": "w"}],
+        ]
+
+
 # ---------------------------------------------------------------------------
 # map → list<struct<key, value>>
 # ---------------------------------------------------------------------------
