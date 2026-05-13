@@ -328,6 +328,16 @@ _DATA_TYPE_DEFAULT_SINGLETONS: dict[type, "DataType"] = {}
 #: process touches (typically dozens, not thousands).
 _FROM_ARROW_TYPE_CACHE: dict["pa.DataType", "DataType"] = {}
 
+#: Same idea as ``_FROM_ARROW_TYPE_CACHE`` for the polars dispatch path.
+#: Polars dtype instances are hashable and value-equal, and the
+#: ``handles_polars_type`` subclass walk costs the same recursive
+#: ``polars_module()`` + ``isinstance`` / ``==`` chain as the arrow side.
+#: ``from_polars_schema`` / ``from_polars_field`` ingest the same dtype
+#: tokens (``pl.Int64``, ``pl.Utf8``, ``pl.Datetime("us","UTC")``)
+#: column-after-column, so even modest schemas collapse to a handful of
+#: cache entries.
+_FROM_POLARS_TYPE_CACHE: dict[Any, "DataType"] = {}
+
 
 def _default_singleton(cls: type) -> "DataType":
     """Return the cached default-arg instance of ``cls``, building it on miss.
@@ -1472,17 +1482,46 @@ class DataType(BaseChildrenFields, ABC):
 
     @classmethod
     def from_polars_schema(cls, schema: "polars.Schema") -> "StructType":
-        pl = polars_module()
-        from ..data_field import Field
-
+        # Direct ``(name, dtype) -> Field`` build — skip the legacy
+        # ``pl.Field(name=k, dtype=d)`` round-trip + ``Field.from_polars``
+        # dispatch (which would re-isinstance-check the pl.Field on every
+        # column) since we already know each entry is a dtype. Always
+        # route the dtype through :meth:`DataType.from_polars_type`
+        # (not ``cls``) so subclass-rooted callers like
+        # ``StructType.from_polars_schema`` still dispatch every
+        # per-column dtype through the full subclass tree instead of
+        # restricting the lookup to the caller's subclass family.
+        Field = field_class()
+        from_polars_type = DataType.from_polars_type
         return StructType(
             fields=[
-                Field.from_polars(pl.Field(name=k, dtype=d)) for k, d in schema.items()
+                Field(name=k, dtype=from_polars_type(d), nullable=True, metadata=None)
+                for k, d in schema.items()
             ]
         )
 
     @classmethod
     def from_polars_type(cls, dtype: "polars.DataType") -> "DataType":
+        if cls is DataType:
+            cached = _FROM_POLARS_TYPE_CACHE.get(dtype)
+            if cached is not None:
+                return cached
+            for subclass in cls.__subclasses__():
+                if subclass.handles_polars_type(dtype):
+                    built = subclass.from_polars_type(dtype)
+                    _FROM_POLARS_TYPE_CACHE[dtype] = built
+                    return built
+
+            from .primitive import StringType
+
+            pl = polars_module()
+            if dtype == pl.Categorical():
+                built = StringType()
+                _FROM_POLARS_TYPE_CACHE[dtype] = built
+                return built
+
+            raise TypeError(f"Unsupported Polars data type: {dtype!r}")
+
         for subclass in cls.__subclasses__():
             if subclass.handles_polars_type(dtype):
                 return subclass.from_polars_type(dtype)

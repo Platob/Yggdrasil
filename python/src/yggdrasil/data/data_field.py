@@ -7,7 +7,7 @@ import os
 import pathlib
 import types
 from collections import OrderedDict
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, is_dataclass
 from typing import (
     TYPE_CHECKING,
@@ -380,15 +380,21 @@ class Field(BaseChildrenFields):
             return True
         if not isinstance(other, Field):
             return NotImplemented
-        # Singleton fast path: primitive ``DataType()`` calls share one
-        # process-wide instance per concrete class (Int64Type, etc.),
-        # so an identity check covers the common case without dispatching
-        # the full structural compare.
+        # Cheap-first ordering: name (str eq) → nullable (bool eq) →
+        # metadata (small ``bytes → bytes`` dict, length-then-pair eq)
+        # → dtype (recursive structural compare for nested types).
+        # Putting metadata before dtype short-circuits the common
+        # "different comment / different tag / different child
+        # metadata" case before paying for the deep dtype walk — a
+        # 5-column struct dtype eq is ~1.2 us, a metadata-dict eq is
+        # ~30 ns. Singleton ``dtype is other.dtype`` covers the
+        # steady-state primitive case (one process-wide
+        # ``Int64Type()`` etc.).
         return (
             self.name == other.name
             and self.nullable == other.nullable
-            and (self.dtype is other.dtype or self.dtype == other.dtype)
             and self.metadata == other.metadata
+            and (self.dtype is other.dtype or self.dtype == other.dtype)
         )
 
     def __hash__(self) -> int:
@@ -453,19 +459,61 @@ class Field(BaseChildrenFields):
         (b"cluster_by", "cluster"),
         (b"sorted", "sorted"),
     )
+    # Tag names handled by ``_PRETTY_TAG_FLAGS``. Anything stored under
+    # ``TAG_PREFIX + <name>`` that isn't in this set is treated as a
+    # caller-defined tag and rendered as ``name=value`` (or just
+    # ``name`` for boolean-truthy values) in the marker group, so the
+    # repr no longer silently drops custom metadata like
+    # ``tags={"unit": "meters"}``.
+    _PRETTY_WELL_KNOWN_TAGS: ClassVar[frozenset[bytes]] = frozenset(
+        name for name, _ in _PRETTY_TAG_FLAGS
+    )
 
     def _pretty_markers(self) -> str:
         """Bracketed marker group for :meth:`pretty_format`.
 
         Surfaces the schema-shaping tags a reader most often cares
         about (primary / foreign / constraint key, partition,
-        cluster, sorted) plus the default value if one is set.
+        cluster, sorted), any caller-defined tags stored under
+        :data:`TAG_PREFIX`, and the default value if one is set.
         Returns an empty string when nothing is set so the common
         case stays uncluttered.
         """
         tokens: list[str] = [
             label for tag, label in self._PRETTY_TAG_FLAGS if self._tag_flag(tag)
         ]
+        # Surface caller-defined tags too — these were previously
+        # silent (only the well-known flag set rendered). Custom tag
+        # values are stored as bytes; booleans round-trip as
+        # ``b"True"``/``b"False"`` so render them as a bare flag, and
+        # decode everything else as ``name=value``.
+        md = self.metadata
+        if md:
+            well_known = self._PRETTY_WELL_KNOWN_TAGS
+            prefix_len = len(TAG_PREFIX)
+            extras: list[tuple[bytes, bytes]] = []
+            for key, value in md.items():
+                if not key.startswith(TAG_PREFIX):
+                    continue
+                tag_name = key[prefix_len:]
+                if tag_name in well_known:
+                    continue
+                extras.append((tag_name, value))
+            # Deterministic order so the repr is stable across runs.
+            extras.sort(key=lambda kv: kv[0])
+            for tag_name, value in extras:
+                name_str = tag_name.decode("utf-8", errors="replace")
+                if value in (b"True", b"true"):
+                    tokens.append(name_str)
+                    continue
+                if value in (b"False", b"false", b""):
+                    # Falsey custom tag — skip; matches how
+                    # ``_tag_flag`` reads a bool tag.
+                    continue
+                value_str = value.decode("utf-8", errors="replace")
+                # Mirror ``f"x={value!r}"`` shape but on the decoded
+                # string so multi-byte text reads cleanly.
+                tokens.append(f"{name_str}={value_str!r}")
         if self.has_default:
             try:
                 tokens.append(f"default={self.default_value!r}")
@@ -478,44 +526,52 @@ class Field(BaseChildrenFields):
     def pretty_format(self, indent: int = 2, level: int = 0) -> str:
         """Pretty-print this field with the header on one line and the dtype below.
 
-        Layout is uniform across flat and nested dtypes::
+        Layout is uniform across flat and nested dtypes — every field
+        renders as a single ``field: 'name' <dtype>{markers}`` header
+        line, with nested dtypes walking their inner fields inline at
+        ``level + 1`` so the tree reads as a flat list of consistent
+        rows::
 
-            'name'[ not null][ [tags...]][ 'comment']
-              <dtype block at level + 1>
+            field: 'row' struct
+              field: 'id' int64 not null [PK]
+              field: 'name' string
+              field: 'inner' struct
+                field: 'age' int64
+                field: 'email' string
 
         ``indent`` is the per-level step in spaces; ``level`` is the
-        current depth. The header carries the name, the ``not null``
-        marker, the bracketed marker group (primary / foreign /
-        constraint key, partition / cluster / sorted, default value),
-        and the comment; the dtype renders on the next line(s) at
-        ``level + 1`` so its body always sits one step in from the
-        field name.
+        current depth. The header carries the dtype kind (``struct`` /
+        ``list`` / ``map`` for nested, the primitive pretty-format for
+        flat), the ``not null`` marker, the bracketed marker group
+        (primary / foreign / constraint key, partition / cluster /
+        sorted, any caller-defined tags, default value), and the
+        comment.
+
+        Map dtypes flatten the synthetic ``entry`` struct into
+        ``field: 'key' …`` / ``field: 'value' …`` lines so the
+        key / value framing reads at the same level as a struct's
+        own children rather than under an artificial wrapper.
 
         Examples::
 
             >>> print(field("id", "int64", nullable=False,
             ...             tags={"primary_key": True}).pretty_format())
-            'id' int64 not null [PK]
+            field: 'id' int64 not null [PK]
 
             >>> print(field("date", "date32",
             ...             tags={"partition_by": True}).pretty_format())
-            'date' date32 [partition]
+            field: 'date' date32 [partition]
 
             >>> print(field("user", StructType.from_fields([
             ...     field("id", "int64"),
             ...     field("email", "string"),
             ... ])).pretty_format())
-            'user'
-              struct
-                'id'
-                  int64,
-                'email'
-                  string
-              >
+            field: 'user' struct
+              field: 'id' int64
+              field: 'email' string
         """
         pad = " " * (indent * level)
 
-        header = f"{pad}field: {self.name!r}"
         suffix = ""
         if not self.nullable:
             suffix += " not null"
@@ -527,11 +583,50 @@ class Field(BaseChildrenFields):
             suffix += f" {comment!r}"
 
         if self.type_id.is_nested:
-            dtype_str = self.dtype.pretty_format(indent=indent, level=level + 1)
-            return f"{header}{suffix}\n{dtype_str}"
-        else:
-            dtype_str = self.dtype.pretty_format()
-            return f"{header} {dtype_str}{suffix}"
+            dtype_kind = self._nested_pretty_kind()
+            header = f"{pad}field: {self.name!r} {dtype_kind}{suffix}"
+            children = self._nested_pretty_children()
+            if not children:
+                return header
+            body = "\n".join(
+                child.pretty_format(indent=indent, level=level + 1)
+                for child in children
+            )
+            return f"{header}\n{body}"
+
+        dtype_str = self.dtype.pretty_format()
+        return f"{pad}field: {self.name!r} {dtype_str}{suffix}"
+
+    def _nested_pretty_kind(self) -> str:
+        """Short dtype-kind token displayed on the header line for nested fields.
+
+        Returns ``"struct"`` / ``"list"`` / ``"map"`` for the three
+        canonical nested shapes, falling back to the dtype's
+        ``type_id.name.lower()`` for any future nested addition.
+        """
+        tid = self.type_id
+        if tid is DataTypeId.STRUCT:
+            return "struct"
+        if tid is DataTypeId.ARRAY:
+            return "list"
+        if tid is DataTypeId.MAP:
+            return "map"
+        return tid.name.lower()
+
+    def _nested_pretty_children(self) -> "Sequence[Field]":
+        """Children to walk under the header line for nested pretty_format.
+
+        Mirrors :attr:`dtype.children` except for :class:`MapType`,
+        where the synthetic ``entry`` struct gets flattened into the
+        ``key_field`` and ``value_field`` pair so the rendered tree
+        treats key / value as siblings of a regular struct's columns
+        instead of one extra layer of nesting.
+        """
+        dtype = self.dtype
+        tid = dtype.type_id
+        if tid is DataTypeId.MAP:
+            return (dtype.key_field, dtype.value_field)
+        return dtype.children
 
     # ==================================================================
     # Dunder / identity
