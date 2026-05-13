@@ -416,6 +416,147 @@ def _session_cache_scenarios(repeat: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# send_many_batches: per-chunk cache machinery
+# ---------------------------------------------------------------------------
+
+
+def _send_many_cache_scenarios(repeat: int) -> list[dict]:
+    """Hot loops inside ``_send_many_batches`` that scale with the chunk size.
+
+    Targets the per-chunk machinery that wraps the actual local/remote
+    cache calls:
+
+    * the ``key_to_remote_cfg`` / ``key_to_local_cfg`` dict-builds that
+      key per-request effective configs (one entry per request);
+    * the per-response key lookup pattern used by ``_persist_remote``,
+      ``_mirror_local_hits_to_remote`` and ``_backfill_local_cache`` to
+      resolve a response back to its originating per-request config;
+    * ``Session._split_local_cache`` — the stage-1 scan that decides
+      which requests can short-circuit to the on-disk fast-path.
+
+    Numbers reported are *per chunk* (not per request), so a 1024-batch
+    figure of 30 ms means the dict-build is paying ~30 us / request.
+    """
+    out: list[dict] = []
+
+    # Pre-warm the public_url_hash / public_hash caches so the
+    # optimized key path measures the warm fast-path. The status-quo
+    # ``anonymize().url`` path doesn't have a warm cache — every call
+    # rebuilds.
+    for r in REQ_BATCH:
+        _ = r.public_url_hash, r.public_hash, r.partition_key
+
+    # The current ``_send_many_batches`` shape: one full anonymize per
+    # request, twice over (once for remote, once for local). This is
+    # the dict-build cost stage 4 / mirror / backfill all queue behind.
+    def _build_url_keyed_maps():
+        url_to_remote = {
+            str(r.anonymize(mode="remove").url): CFG_REMOTE_BY_PUBLIC
+            for r in REQ_BATCH
+        }
+        url_to_local = {
+            str(r.anonymize(mode="remove").url): CFG_LOCAL
+            for r in REQ_BATCH
+        }
+        return url_to_remote, url_to_local
+    out.append(_time_one(
+        f"_send_many_batches: anonymize-url dict-build ({BATCH_SIZE} req)",
+        _build_url_keyed_maps,
+        repeat=repeat, inner=20,
+    ))
+
+    # The optimized shape: a single pass over the chunk, keyed by
+    # ``request.public_url_hash`` (already cached on the request) so
+    # the per-request anonymize cost collapses to one cached attribute
+    # read per request.
+    def _build_hash_keyed_maps():
+        url_to_remote: dict[int, CacheConfig] = {}
+        url_to_local: dict[int, CacheConfig] = {}
+        for r in REQ_BATCH:
+            k = r.public_url_hash
+            url_to_remote[k] = CFG_REMOTE_BY_PUBLIC
+            url_to_local[k] = CFG_LOCAL
+        return url_to_remote, url_to_local
+    out.append(_time_one(
+        f"_send_many_batches: public_url_hash dict-build ({BATCH_SIZE} req)",
+        _build_hash_keyed_maps,
+        repeat=repeat, inner=200,
+    ))
+
+    # Per-response lookup pattern used by ``_persist_remote`` /
+    # ``_mirror_local_hits_to_remote``. Today this re-anonymizes the
+    # response's request once per row — the optimized path just reads
+    # ``response.request.public_url_hash``.
+    resp_batch = [
+        Response(
+            request=r,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            tags={},
+            buffer=Memory(binary=b'{"ok":true}'),
+            received_at=dt.datetime.now(dt.timezone.utc),
+        )
+        for r in REQ_BATCH
+    ]
+
+    url_keyed = {
+        str(r.anonymize(mode="remove").url): CFG_REMOTE_BY_PUBLIC
+        for r in REQ_BATCH
+    }
+    hash_keyed = {r.public_url_hash: CFG_REMOTE_BY_PUBLIC for r in REQ_BATCH}
+
+    def _lookup_via_anonymize_url():
+        for resp in resp_batch:
+            url_key = str(resp.request.anonymize(mode="remove").url)
+            _ = url_keyed.get(url_key)
+    out.append(_time_one(
+        f"_persist_remote: anonymize-url per-response lookup ({BATCH_SIZE} resp)",
+        _lookup_via_anonymize_url,
+        repeat=repeat, inner=20,
+    ))
+
+    def _lookup_via_public_url_hash():
+        for resp in resp_batch:
+            _ = hash_keyed.get(resp.request.public_url_hash)
+    out.append(_time_one(
+        f"_persist_remote: public_url_hash per-response lookup ({BATCH_SIZE} resp)",
+        _lookup_via_public_url_hash,
+        repeat=repeat, inner=2_000,
+    ))
+
+    # Stage-1 cache scan over a misses-only chunk so the on-disk read
+    # path doesn't dominate — the bench targets the per-request
+    # dispatch, not the IPC decode (covered by
+    # ``_read_fast_path_arrow_batch`` above).
+    cold_batch = [
+        PreparedRequest.prepare(
+            "GET",
+            f"https://api.example.com/v1/cold/{i:05d}?p={i % 9}",
+            headers={"Content-Type": "application/json"},
+        )
+        for i in range(BATCH_SIZE)
+    ]
+    for r in cold_batch:
+        _ = r.public_hash, r.public_url_hash
+    out.append(_time_one(
+        f"Session._split_local_cache (all miss, {BATCH_SIZE} req)",
+        lambda: SESSION._split_local_cache(cold_batch, CFG_LOCAL),
+        repeat=repeat, inner=200,
+    ))
+
+    # Same scan when no local cache is active anywhere in the batch —
+    # the early-exit predicate matters because hot Spark workers /
+    # cache-disabled callers walk this path on every chunk.
+    out.append(_time_one(
+        f"Session._split_local_cache (cache off, {BATCH_SIZE} req)",
+        lambda: SESSION._split_local_cache(cold_batch, CFG_DEFAULT),
+        repeat=repeat, inner=2_000,
+    ))
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Aggregator + CLI
 # ---------------------------------------------------------------------------
 
@@ -428,6 +569,7 @@ def scenarios(repeat: int) -> list[dict]:
         *_sql_scenarios(repeat),
         *_local_fast_path_scenarios(repeat),
         *_session_cache_scenarios(repeat),
+        *_send_many_cache_scenarios(repeat),
     ]
 
 
