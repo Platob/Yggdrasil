@@ -79,6 +79,11 @@ PAYLOADS: dict[str, bytes] = {
     "kib1": _build_payload(1024),
     # ~64 KiB — exercises buffered IO and the response holder copy.
     "kib64": _build_payload(64 * 1024),
+    # ~2 MiB — above the ``_BODY_AUTOCOMPRESS_MIN_SIZE`` cache-persist
+    # threshold. Used by the local-cache scenarios to surface the
+    # auto-gzip win on the store side and the decompress cost on the
+    # subsequent fetch.
+    "mib2": _build_payload(2 * 1024 * 1024),
 }
 
 
@@ -252,6 +257,15 @@ def _local_cache_scenarios(base_url: str, repeat: int) -> list[dict]:
     """Compare bare ``HTTPSession.send`` against a session with the local
     on-disk cache turned on. Cache hits dodge the entire socket round trip,
     so the delta is the visible win the on-disk fast-path buys.
+
+    Includes a 2 MiB JSON scenario to exercise the cache-persist
+    auto-compress helper: on the MISS the body is gzipped before the
+    Arrow IPC write (much smaller on-disk row); on the HIT the
+    compressed buffer is materialised and ``Response.content`` /
+    ``.json()`` decompress transparently through the existing
+    :class:`Codec` path. The numbers expose the compress cost on
+    store, the decompress cost on read, and the dispatch baseline
+    for a large compressed payload.
     """
     out: list[dict] = []
 
@@ -291,6 +305,34 @@ def _local_cache_scenarios(base_url: str, repeat: int) -> list[dict]:
             "HTTPSession.send tiny (local-cache MISS, store-to-disk)",
             _send_cache_miss,
             repeat=repeat, inner=200,
+        ))
+
+        # 2 MiB JSON path — above the auto-compress threshold. Seed
+        # one entry then time the HIT (decompress cost) and the MISS
+        # (compress + store cost) at smaller inner counts since each
+        # call moves ~2 MiB.
+        big_seed = PreparedRequest.prepare("GET", f"{base_url}/mib2")
+        sess.send(big_seed, local_cache=cfg, raise_error=False)
+        big_warm = PreparedRequest.prepare("GET", f"{base_url}/mib2")
+        _ = big_warm.public_hash
+        out.append(_time_one(
+            "HTTPSession.send mib2 (local-cache HIT, auto-gzip body)",
+            lambda: sess.send(big_warm, local_cache=cfg, raise_error=False),
+            repeat=repeat, inner=50,
+        ))
+
+        big_counter = {"n": 0}
+
+        def _send_big_miss():
+            big_counter["n"] += 1
+            r = PreparedRequest.prepare(
+                "GET", f"{base_url}/mib2?probe={big_counter['n']}",
+            )
+            return sess.send(r, local_cache=cfg, raise_error=False)
+        out.append(_time_one(
+            "HTTPSession.send mib2 (local-cache MISS, compress + store)",
+            _send_big_miss,
+            repeat=repeat, inner=50,
         ))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
