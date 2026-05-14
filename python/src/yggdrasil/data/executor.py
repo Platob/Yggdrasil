@@ -25,6 +25,7 @@ the kwargs dance.
 from __future__ import annotations
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar, Generic, Iterable, Mapping, Optional, TypeVar
@@ -93,6 +94,13 @@ class ExecutionOptions:
     wait: WaitingConfigArg = True
     raise_error: bool = True
     parallel: Optional[int] = None
+
+    def __post_init__(self):
+        if self.parallel is not None:
+            if isinstance(self.parallel, bool):
+                object.__setattr__(self, "parallel", os.cpu_count() if self.parallel else 1)
+            elif self.parallel <= 0:
+                raise ValueError("Parallelism must be positive or None")
 
     @classmethod
     def from_(
@@ -181,8 +189,13 @@ class StatementExecutor(Disposable, ABC, Generic[PS, SR, SB]):
     # Subclass contract
     # -------------------------------------------------------------------------
 
+    def submit_statement(self, statement: PS, start: bool = True) -> SR:
+        """Submit a statement and return a tracking result."""
+        result = self._submit_statement(statement, start=start)
+        return result
+
     @abstractmethod
-    def _submit_statement(self, statement: PS) -> SR:
+    def _submit_statement(self, statement: PS, start: bool = True) -> SR:
         """Hand ``statement`` to the backend and return a tracking result.
 
         The result need not have completed — callers use
@@ -216,6 +229,7 @@ class StatementExecutor(Disposable, ABC, Generic[PS, SR, SB]):
         options: Optional[ExecutionOptions] = None,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
+        start: bool = True,
     ) -> SR:
         """Submit a single statement and optionally wait for completion.
 
@@ -237,7 +251,7 @@ class StatementExecutor(Disposable, ABC, Generic[PS, SR, SB]):
         coerced = self._coerce_statement(statement)
         return self._execute(coerced, opts)
 
-    def _execute(self, statement: PS, options: ExecutionOptions) -> SR:
+    def _execute(self, statement: PS, options: ExecutionOptions, start: bool = True) -> SR:
         """Hot-path execution: submit + wait/raise per ``options``.
 
         Subclasses can override to add cross-cutting behavior (logging,
@@ -248,7 +262,7 @@ class StatementExecutor(Disposable, ABC, Generic[PS, SR, SB]):
         2. Tracks the result in ``self._live_results`` for dispose.
         3. Honors ``options.wait`` / ``options.raise_error``.
         """
-        result = self._submit_statement(statement)
+        result = self._submit_statement(statement, start=start)
 
         if options.waits:
             result.wait(wait=options.wait, raise_error=options.raise_error)
@@ -285,9 +299,11 @@ class StatementExecutor(Disposable, ABC, Generic[PS, SR, SB]):
         opts = self._resolve_options(
             options, wait=wait, raise_error=raise_error, parallel=parallel,
         )
-        batch = self.batch(statements=statements, parallel=opts.parallel, **batch_kwargs)
-        # The batch's submit/wait honors the same options.
-        batch.submit(wait=opts.wait, raise_error=opts.raise_error)
+        batch = self.batch(
+            statements=statements, parallel=opts.parallel,
+            **batch_kwargs
+        )
+        batch.wait(wait=opts.wait, raise_error=opts.raise_error)
         return batch
 
     def batch(
@@ -343,7 +359,7 @@ class StatementExecutor(Disposable, ABC, Generic[PS, SR, SB]):
         overrides: dict[str, Any] = {}
         if wait is not True:
             overrides["wait"] = wait
-        if raise_error is not True:
+        if raise_error:
             overrides["raise_error"] = raise_error
         if parallel is not None:
             overrides["parallel"] = parallel
@@ -358,6 +374,7 @@ class StatementExecutor(Disposable, ABC, Generic[PS, SR, SB]):
     def cancel_all(self) -> None:
         """Best-effort cancel every live result this executor has produced."""
         pass
+
     # -------------------------------------------------------------------------
     # Disposable
     # -------------------------------------------------------------------------

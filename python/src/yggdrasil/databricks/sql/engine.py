@@ -325,6 +325,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
     def _submit_statement(
         self,
         statement: WarehousePreparedStatement | SparkPreparedStatement,
+        start: bool = True
     ) -> WarehouseStatementResult | SparkStatementResult:
         """Dispatch by concrete statement type to the matching inner executor.
 
@@ -333,7 +334,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         ``warehouse_name`` resolves to.
         """
         if isinstance(statement, SparkPreparedStatement):
-            return self.spark._submit_statement(statement)
+            return self.spark.submit_statement(statement, start=start)
 
         if not isinstance(statement, WarehousePreparedStatement):
             statement = WarehousePreparedStatement.from_(statement)
@@ -342,7 +343,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
             warehouse_id=statement.warehouse_id,
             warehouse_name=statement.warehouse_name,
         )
-        return wh._submit_statement(statement)
+        return wh.submit_statement(statement, start=start)
 
     # ------------------------------------------------------------------
     # Public execution surface
@@ -364,10 +365,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
         spark_session: Optional["SparkSession"] = None,
         external_data: Mapping[str, "VolumePath | Any"] | None = None,
         parameters: Mapping[str, Any] | None = None,
-        # Result-level retry policy — forwarded to
-        # WarehousePreparedStatement.prepare on the warehouse path.
-        # Ignored on the Spark path (Spark statements don't go through
-        # the WarehouseStatementResult.retry loop in the engine layer).
         retry: Optional[WaitingConfigArg] = None,
     ) -> StatementResult:
         """Execute a SQL statement through Spark or the Databricks SQL API.
@@ -425,6 +422,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         else:
             prepared = WarehousePreparedStatement.prepare(
                 statement,
+                client=self.client,
                 parameters=parameters,
                 external_data=external_data,
                 catalog_name=catalog_name,
@@ -448,9 +446,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
         warehouse_id: str | None = None,
         warehouse_name: str | None = None,
         spark_session: Optional["SparkSession"] = None,
-        # Result-level retry policy.  On the warehouse path, broadcast
-        # onto each WarehousePreparedStatement before submission.
-        # Ignored on the Spark path.
         retry: Optional[WaitingConfigArg] = None,
     ) -> StatementBatch:
         """Run a collection of statements; return per-statement results in order.

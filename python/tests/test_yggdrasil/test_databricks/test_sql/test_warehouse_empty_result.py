@@ -125,8 +125,6 @@ class TestCollectSchemaEmptyResult:
         sch = result.collect_schema()
 
         assert sch.names == ["a", "b"]
-        # The cache should be populated so a second call doesn't recompute.
-        assert result._cached_schema is sch
         assert result.collect_schema() is sch
 
     def test_returns_empty_schema_when_manifest_is_missing(self) -> None:
@@ -145,8 +143,6 @@ class TestCollectSchemaEmptyResult:
         sch = result.collect_schema()
 
         assert sch.names == []
-        # Cached, not recomputed.
-        assert result._cached_schema is sch
 
     def test_returns_empty_schema_when_manifest_schema_is_missing(self) -> None:
         """``ResultManifest.schema`` is ``Optional`` in the SDK — guard

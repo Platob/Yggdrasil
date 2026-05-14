@@ -400,7 +400,7 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
                     entry.text_value = None
         super().clear_temporary_resources()
 
-    def cancel(self) -> "SparkStatementResult":
+    def cancel(self, wait: WaitingConfigArg = None, raise_error: bool = False, **kwargs) -> "SparkStatementResult":
         """No-op: Spark SQL is synchronous, there is nothing to cancel.
 
         Cancelling a running Spark *job* needs the caller's

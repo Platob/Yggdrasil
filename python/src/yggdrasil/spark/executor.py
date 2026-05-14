@@ -124,7 +124,7 @@ class SparkStatementExecutor(
     # Executor contract
     # -------------------------------------------------------------------------
 
-    def _submit_statement(self, statement: SparkPreparedStatement) -> SparkStatementResult:
+    def _submit_statement(self, statement: SparkPreparedStatement, start: bool = True) -> SparkStatementResult:
         """Build a :class:`SparkStatementResult` and run it eagerly.
 
         Spark execution is synchronous; the result handle is terminal by

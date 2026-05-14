@@ -1,4 +1,5 @@
 import datetime as dt
+import random
 import time
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -12,6 +13,7 @@ def _safe_seconds_tick(ticks: Union[int, float, dt.timedelta]):
     return ticks
 
 
+_JITTER_RNG = random.Random()
 DEFAULT_TIMEOUT_TICKS = float(20 * 60) # 20 minutes
 WaitingConfigArg = Union["WaitingConfig", dict, int, float, dt.datetime, bool]
 
@@ -251,6 +253,21 @@ class WaitingConfig:
             sleep_s = min(sleep_s, remaining)
 
         time.sleep(sleep_s)
+
+    def jittered_sleep(self, iteration: int = 0) -> None:
+        if self.max_interval <= 0:
+            return
+
+        if not iteration:
+            iteration = 1
+        else:
+            iteration += 1
+
+        max_interval = min(120, self.max_interval * iteration)
+
+        delay = _JITTER_RNG.uniform(0, max_interval)
+        if delay > 0:
+            time.sleep(delay)
 
 
 DEFAULT_WAITING_CONFIG = WaitingConfig()

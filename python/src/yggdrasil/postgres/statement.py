@@ -285,7 +285,7 @@ class PostgresStatementResult(StatementResult[PostgresPreparedStatement]):
         self._started = True
         return self
 
-    def cancel(self) -> "PostgresStatementResult":
+    def cancel(self, wait: WaitingConfigArg = None, raise_error: bool = False, **kwargs) -> "PostgresStatementResult":
         """Best-effort cursor cancel — Postgres cancellation is connection-scoped.
 
         For an already-terminal result this is a no-op. For an in-

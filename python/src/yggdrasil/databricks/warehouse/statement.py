@@ -85,35 +85,13 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_BYTE_SIZE = 32 * 1024 * 1024
+# Module-level — single source of truth for retryable error codes.
+_RETRYABLE_ERROR_CODES: frozenset[str] = frozenset({
+    "DELTA_CONCURRENT_APPEND.ROW_LEVEL_CHANGES",
+})
 
-
-def _build_external_link_pool(max_workers: int) -> urllib3.PoolManager:
-    """Build a :class:`urllib3.PoolManager` for external-link fetches.
-
-    The pool is reused across every chunk read for the warehouse it's
-    attached to (see :meth:`SQLWarehouse._external_link_pool`); pulling
-    it onto the warehouse instance — rather than a module-level cache —
-    ties the underlying connection lifecycle to the warehouse handle.
-    When the warehouse is GC'd, the pool drops with it, so a
-    long-running process holding many warehouses doesn't accumulate
-    pooled sockets the runtime can't reach.
-    """
-    retry = urllib3.Retry(
-        total=4,
-        backoff_factor=0.2,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET"]),
-        raise_on_status=False,
-    )
-    return urllib3.PoolManager(
-        num_pools=max_workers * 2,
-        maxsize=max_workers * 2,
-        retries=retry,
-        timeout=urllib3.Timeout(connect=2.0, read=5.0),
-        headers={"Accept-Encoding": "gzip,deflate"},
-        cert_reqs="CERT_REQUIRED",
-    )
-
+_RETRYABLE_ELAPSED_LIMIT: float = 120.0
+_RETRYABLE_ITERATION_LIMIT: int = 3
 
 def _empty_arrow_batches(arrow_schema: pa.Schema) -> Iterator[pa.RecordBatch]:
     """Yield a single zero-row :class:`pa.RecordBatch` matching *arrow_schema*.
@@ -685,6 +663,39 @@ class WarehouseStatementResult(StatementResult):
     # ------------------------------------------------------------------
 
     @property
+    def retryable(self) -> bool:
+        """Result-level retry predicate.
+
+        Drives the base :meth:`StatementResult.retry` loop, which calls
+        :meth:`start` with ``reset=True`` and sleeps per
+        ``self.statement.retry`` between attempts.  Returns ``True`` only
+        when:
+
+        - the statement ran and failed (``_compute_error`` returned an error),
+        - the failure code is one we know is transient
+          (``DELTA_CONCURRENT_APPEND.ROW_LEVEL_CHANGES`` today),
+        - we haven't blown the elapsed budget (5 min) or the attempt
+          budget (2 retries).
+
+        Submission-level failures (cold/busy warehouse, transport) aren't
+        seen here — those propagate from ``submit_statement`` and the
+        caller owns the retry decision.
+        """
+        if self.iteration >= _RETRYABLE_ITERATION_LIMIT:
+            return False
+
+        elapsed = self.elapsed_timestamp
+        if elapsed and elapsed > _RETRYABLE_ELAPSED_LIMIT:
+            return False
+
+        error = self._compute_error()
+        if error is None:
+            return False
+
+        msg = getattr(error, "message", None) or ""
+        return any(code in msg for code in _RETRYABLE_ERROR_CODES)
+
+    @property
     def started(self) -> bool:
         """True once the statement has been submitted (``statement_id`` present).
 
@@ -692,7 +703,7 @@ class WarehouseStatementResult(StatementResult):
         ``statement_id`` is set synchronously by :meth:`start` and is
         the cheapest started-flag the warehouse path has.
         """
-        return bool(self.statement_id)
+        return bool(self.statement_id) and self.statement_id != "unknown"
 
     @property
     def cached(self) -> bool:
@@ -719,23 +730,18 @@ class WarehouseStatementResult(StatementResult):
     def set_api_response(self, response: StatementResponse) -> "WarehouseStatementResult":
         """Test hook: stuff a fully-formed API response into the result."""
         self._response = response
-        self.statement_id = response.statement_id
+
+        if isinstance(self._response, StatementResponse):
+            self.statement_id = response.statement_id
+
         return self
 
     def start(
         self,
         reset: bool = False,
         *,
-        warehouse: "Optional[SQLWarehouse]" = None,
-        warehouse_id: Optional[str] = None,
-        warehouse_name: Optional[str] = None,
-        byte_limit: Optional[int] = None,
-        row_limit: Optional[int] = None,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        disposition: Optional[Disposition] = None,
-        wait: WaitingConfigArg = True,
-        raise_error: bool = True,
+        wait: WaitingConfigArg = False,
+        raise_error: bool = False,
         **kwargs: Any,
     ) -> "WarehouseStatementResult":
         """Submit the statement.  Idempotent on already-started results.
@@ -751,67 +757,26 @@ class WarehouseStatementResult(StatementResult):
             if not reset:
                 return self
 
-            # On retry-after-failure the prior submission is already in a
-            # terminal state, so cancel() short-circuits.  But guard anyway
-            # so a hung-PENDING resubmit also drops the prior server-side
-            # state cleanly.
-            try:
-                self.cancel()
-            except Exception:
-                logger.exception(
-                    "cancel() during start(reset=True) failed for %r; continuing.",
-                    self.key,
-                )
+            self.cancel(wait=False)
+
             self.statement_id = None
             self._response = None
-            self._cached_schema = None
+            self._unpersist_schema()
 
-        from yggdrasil.databricks.warehouse.warehouse import SQLWarehouse
-
-        prior = self.executor
-        eff_wh_id = (
-            warehouse_id
-            or self.statement.warehouse_id
-            or (prior.warehouse_id if prior is not None else None)
-        )
-        eff_wh_name = (
-            warehouse_name
-            or self.statement.warehouse_name
-            or (prior.warehouse_name if prior is not None else None)
+        submitted = self.executor.submit_statement(
+            statement=self.statement,
+            start=True
         )
 
-        if warehouse is None:
-            warehouse = prior or SQLWarehouse(
-                warehouse_id=eff_wh_id,
-                warehouse_name=eff_wh_name,
-            )
-
-        submitted = warehouse.execute(
-            statement=self,
-            warehouse_id=eff_wh_id,
-            warehouse_name=eff_wh_name,
-            byte_limit=byte_limit if byte_limit is not None else self.statement.byte_limit,
-            disposition=disposition if disposition is not None else self.statement.disposition,
-            row_limit=row_limit if row_limit is not None else self.statement.row_limit,
-            catalog_name=catalog_name if catalog_name is not None else self.statement.catalog_name,
-            schema_name=schema_name if schema_name is not None else self.statement.schema_name,
-            wait=wait,
-            raise_error=raise_error,
-        )
-
-        # Adopt server-resolved state.  ``_response`` carries the status
-        # the SDK already returned — copying it spares the next
-        # ``wait()`` / ``state`` read a redundant ``get_statement``.
         self.statement = submitted.statement
-        self.statement_id = submitted.statement_id
-        self.executor = submitted.executor
-        self._response = submitted._response
+        self.set_api_response(submitted._response)
+        self.iteration = self.iteration + 1
 
         return self
 
-    def cancel(self) -> "WarehouseStatementResult":
+    def cancel(self, wait: WaitingConfigArg = False, **kwargs) -> "WarehouseStatementResult":
         """Cancel the running statement.  No-op when not started or already terminal."""
-        if not self.started or self.statement_id == "SparkSQL":
+        if not self.started:
             return self
         # Use the cached SDK response directly here — we don't want to
         # trigger ``state``'s refresh just to short-circuit on an already
@@ -820,13 +785,23 @@ class WarehouseStatementResult(StatementResult):
         if self._response is not None and self._response.status.state in DONE_STATES:
             return self
 
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "statement_execution.cancel_execution %s", self.statement_id,
-            )
-        self.client.workspace_client().statement_execution.cancel_execution(
-            statement_id=self.statement_id,
-        )
+        wait = WaitingConfig.from_(wait)
+
+        if wait:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "statement_execution.cancel_execution %s", self.statement_id,
+                )
+            try:
+                self.client.workspace_client().statement_execution.cancel_execution(
+                    statement_id=self.statement_id,
+                )
+            except Exception:
+                logger.exception("Failed to cancel statement %r", self.key)
+        else:
+            logger.debug("statement_execution.cancel_execution %s (no-wait)", self.statement_id)
+            Job.make(self.client.workspace_client().statement_execution.cancel_execution, statement_id=self.statement_id).fire_and_forget()
+
         self._response = None
         return self
 
@@ -869,6 +844,16 @@ class WarehouseStatementResult(StatementResult):
         )
 
     def refresh_status(self) -> "WarehouseStatementResult":
+        """Pull the latest :class:`StatementResponse` from the SDK.
+
+        Pure status read — no side effects beyond updating ``self._response``.
+        Terminal responses are sticky (the SDK won't change them), so we
+        short-circuit and return ``self`` without a round-trip.  Auto-retry
+        of retryable failures lives in :meth:`retry` / the base
+        :class:`StatementResult` retry loop, not here — keeping this method
+        pure means ``wait()`` loops and the ``state`` snapshot cache hold
+        their invariants.
+        """
         if not self.statement_id:
             self._response = StatementResponse(
                 statement_id="unknown",
@@ -876,14 +861,11 @@ class WarehouseStatementResult(StatementResult):
             )
             return self
 
-        if self._response is None:
-            statement_execution = self.client.workspace_client().statement_execution
-            self._response = statement_execution.get_statement(self.statement_id)
-        elif self._response.status.state in DONE_STATES:
-            return self._response
+        if self._response is not None and self._response.status.state in DONE_STATES:
+            return self
 
         statement_execution = self.client.workspace_client().statement_execution
-        self._response = statement_execution.get_statement(self.statement_id)
+        self.set_api_response(statement_execution.get_statement(self.statement_id))
         return self
 
     @property
@@ -913,8 +895,21 @@ class WarehouseStatementResult(StatementResult):
         """
         return _SDK_TO_STATE.get(self.sdk_state, State.PENDING)
 
+    def _compute_error(self) -> Optional[SQLError]:
+        """Build a :class:`SQLError` from the SDK response, or ``None`` on success.
+
+        Only meaningful in terminal states — :meth:`SQLError.from_statement`
+        inspects ``status.error``, which the SDK only populates on FAILED
+        / CANCELED.  Called from both :attr:`retryable` (no-refresh, uses
+        cached state) and :meth:`_raise_for_status` (after ``wait()`` has
+        forced termination).
+        """
+        if self.sdk_state not in FAILED_STATES:
+            return None
+        return SQLError.from_statement(self)
+
     def _raise_for_status(self) -> None:
-        error = SQLError.from_statement(self)
+        error = self._compute_error()
         if error is not None:
             raise error
 
@@ -935,23 +930,29 @@ class WarehouseStatementResult(StatementResult):
         return self.statement.disposition
 
     def _collect_schema(self, options) -> Schema:
-        if self._cached_schema is None:
-            self.wait()
-            manifest = self.manifest
-            metadata = {
-                b"engine": b"databricks-sql",
-                b"statement_id": (self.statement_id or "").encode(),
-            }
-            # ``manifest.schema`` is ``Optional[ResultSchema]`` in the SDK
-            # — guard both layers so we don't AttributeError when the
-            # backend skips the schema (e.g. DDL with no result set).
-            result_schema = getattr(manifest, "schema", None) if manifest is not None else None
-            columns = getattr(result_schema, "columns", None) if result_schema is not None else None
-            self._cached_schema = Schema.from_fields(
-                [parse_databricks_field(c) for c in (columns or [])],
-                metadata=metadata,
-            )
-        return self._cached_schema
+        if options.target:
+            return options.target
+
+        self.wait()
+        manifest = self.manifest
+        metadata = {
+            b"engine": b"databricks-sql",
+            b"warehouse_id": (self.executor.warehouse_id or "").encode(),
+            b"statement_id": (self.statement_id or "").encode(),
+        }
+        result_schema = getattr(manifest, "schema", None) if manifest is not None else None
+        columns = getattr(result_schema, "columns", None) if result_schema is not None else None
+
+        if columns is None:
+            return Schema.empty(metadata=metadata)
+
+        schema = Schema.from_fields(
+            [parse_databricks_field(c) for c in (columns or [])],
+            name=self.key,
+            metadata=metadata,
+        )
+        self._persist_schema(schema)
+        return schema
 
     # ------------------------------------------------------------------
     # External links
@@ -999,32 +1000,61 @@ class WarehouseStatementResult(StatementResult):
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
         options = options.check_target(self.collect_schema)
 
-        max_workers = 4
+        max_workers = 8
         max_in_flight = max_workers * 2
 
         # Pool is owned by the warehouse executor — its lifetime matches
         # the warehouse handle, so we don't leak TCP connections in a
-        # long-running process that creates and discards warehouses.
+        # long-running process that creates and discards warehouses, and
+        # we still get connection reuse across every chunk fetched
+        # against this warehouse.
         http = self.executor.external_link_pool(max_workers)
+        options = options.with_target(self._collect_schema(options))
         byte_size = options.byte_size or _DEFAULT_BYTE_SIZE
         memory_pool = options.arrow_memory_pool
+        pending: List[pa.RecordBatch] = []
+        pending_bytes = 0
+        yielded_any = False
+        total_rows = 0
+        total_batches = 0
+        total_bytes = 0
 
         def fetch_batches(url: str) -> Iterator[pa.RecordBatch]:
-            resp = http.request("GET", url, preload_content=True)
+            # `preload_content=False` keeps urllib3 from buffering the
+            # full payload into a `bytes` object before we ever see it —
+            # critical for chunks that can run hundreds of MB.  We stream
+            # straight into Arrow's IPC reader instead.
+            resp = http.request(
+                "GET", url,
+                preload_content=False,
+                decode_content=True,
+            )
             try:
                 if resp.status >= 400:
                     raise RuntimeError(f"GET {url} failed: {resp.status}")
-                buf = memoryview(resp.data)
+                with pa.input_stream(resp) as src:
+                    reader = pipc.open_stream(src)
+                    for batch in reader:
+                        yield batch
             finally:
+                # Drain anything Arrow didn't consume so the connection
+                # can return to the pool cleanly; `release_conn` alone
+                # won't recycle a partially-read response.
+                try:
+                    resp.drain_conn()
+                except Exception:
+                    pass
                 resp.release_conn()
 
-            with pa.input_stream(buf) as src:
-                reader = pipc.open_stream(src)
-                yield from reader
-
         def jobs() -> Iterable[Job]:
+            nonlocal total_rows, total_batches, total_bytes
+
             for link in self.external_links():
                 if link.external_link:
+                    if logger.isEnabledFor(logging.INFO):
+                        total_batches += 1
+                        total_rows += link.row_count or 0
+                        total_bytes += link.byte_count or 0
                     yield Job.make(fetch_batches, link.external_link)
 
         def raw_batches() -> Iterator[pa.RecordBatch]:
@@ -1039,30 +1069,22 @@ class WarehouseStatementResult(StatementResult):
                 ):
                     yield from result.result
 
-        pending: List[pa.RecordBatch] = []
-        pending_bytes = 0
-        yielded_any = False
-        total_rows = 0
-        total_batches = 0
-
         def flush() -> Iterator[pa.RecordBatch]:
-            nonlocal pending, pending_bytes, yielded_any, total_rows, total_batches
+            nonlocal pending, pending_bytes, yielded_any
             if not pending:
                 return
 
-            # Skip the concat copy when there's a single pending batch —
-            # ``pa.concat_batches`` always materializes a fresh batch, so
-            # the singleton case pays a copy for nothing.
-            if len(pending) == 1:
-                combined = pending[0]
-            else:
-                combined = pa.concat_batches(pending, memory_pool=memory_pool)
+            # Always go through `concat_batches`, even for a singleton.
+            # The singleton-skip shortcut handed out a batch that could
+            # alias the HTTP response buffer that backed the IPC read;
+            # once `fetch_batches` returns and the response is GC'd,
+            # those buffers vanish.  `concat_batches` materializes a
+            # fresh batch owned by `memory_pool`, breaking the alias.
+            combined = pa.concat_batches(pending, memory_pool=memory_pool)
             casted = options.cast_arrow_tabular(combined)
             pending = []
             pending_bytes = 0
             yielded_any = True
-            total_batches += 1
-            total_rows += casted.num_rows
             yield casted
 
         for batch in raw_batches():
@@ -1074,12 +1096,11 @@ class WarehouseStatementResult(StatementResult):
         yield from flush()
 
         if not yielded_any:
-            schema_for_empty = options.with_target(self._collect_schema(options)).merged
-            yield from _empty_arrow_batches(schema_for_empty.to_arrow_schema())
-        elif logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "statement %s streamed %d batches / %d rows",
-                self.statement_id, total_batches, total_rows,
+            yield from _empty_arrow_batches(options.target.to_arrow_schema())
+        elif logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "%r streamed %d batches / %d rows / %d bytes",
+                self, total_batches, total_rows, total_bytes,
             )
 
     def _write_arrow_batches(self, batches: Iterable[pa.RecordBatch], options: CastOptions) -> None:

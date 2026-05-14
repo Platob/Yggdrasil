@@ -385,7 +385,7 @@ class CommandExecution:
         self._register_shutdown_cancel()
         return self
 
-    def cancel(self, wait: WaitingConfigArg = False, raise_error: bool = False):
+    def cancel(self, wait: WaitingConfigArg = False, raise_error: bool = False, **kwargs):
         if not self.command_id or not self.context.context_id:
             self._unregister_shutdown_cancel()
             return self

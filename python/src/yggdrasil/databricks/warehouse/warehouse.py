@@ -42,10 +42,12 @@ in the companion :mod:`~yggdrasil.databricks.sql.service` module.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar, List, Mapping, Optional, Union, TYPE_CHECKING
 
+import urllib3
 from databricks.sdk.errors import InternalError, DeadlineExceeded, TemporarilyUnavailable
 from databricks.sdk.service.sql import (
     Disposition,
@@ -54,6 +56,7 @@ from databricks.sdk.service.sql import (
     State,
     WarehouseAccessControlRequest,
 )
+
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data.executor import ExecutionOptions, StatementExecutor
 from yggdrasil.databricks.warehouse.wh_utils import (
@@ -65,7 +68,6 @@ from yggdrasil.databricks.warehouse.wh_utils import (
 )
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.pyutils.equality import dicts_equal
-
 from .statement import (
     WarehousePreparedStatement,
     WarehouseStatementResult,
@@ -75,7 +77,6 @@ from ..client import DatabricksResource
 from ..fs import VolumePath
 
 if TYPE_CHECKING:
-    import urllib3
     from .service import Warehouses
 
 __all__ = [
@@ -195,6 +196,10 @@ class SQLWarehouse(
             self.warehouse_name = found.warehouse_name
             self._details = found._details
 
+        # Existing init body unchanged.
+        self._external_link_pool_lock = threading.Lock()
+        self._external_link_pool_instance = None
+
     def __call__(
         self,
         *,
@@ -221,25 +226,62 @@ class SQLWarehouse(
     # External-link fetch pool
     # ------------------------------------------------------------------
 
-    def external_link_pool(self, max_workers: int) -> "urllib3.PoolManager":
+    def external_link_pool(self, max_workers: int = 8) -> "urllib3.PoolManager":
         """Return the cached :class:`urllib3.PoolManager` for chunk reads.
 
-        The pool is built lazily on the first ``EXTERNAL_LINKS`` chunk
-        read and reused across every :class:`WarehouseStatementResult`
-        attached to this warehouse. Tying the pool to the warehouse
-        instance means a long-running process can dispose of the pool
-        (and its sockets) simply by dropping the warehouse handle —
-        we don't pin connections in a module-level cache the runtime
-        can never reach.
+        Built lazily on the first ``EXTERNAL_LINKS`` chunk read and
+        reused across every :class:`WarehouseStatementResult` attached
+        to this warehouse.  Tying the pool to the warehouse instance
+        means a long-running process can dispose of the pool (and its
+        sockets) by dropping the warehouse handle — no module-level
+        cache the runtime can never reach.
+
+        ``max_workers`` is a sizing *hint* applied only on the first
+        call; subsequent callers get the existing pool regardless of
+        what they pass.  Per-warehouse pool sizing is a warehouse-level
+        property, not a per-call one.  If you need a differently-sized
+        pool, that's a separate warehouse handle.
         """
-        cached = getattr(self, "_external_link_pool_cache", None)
-        if cached is not None and cached[0] == max_workers:
-            return cached[1]
-        from .statement import _build_external_link_pool
-        pool = _build_external_link_pool(max_workers)
-        # Stored on ``self`` so it drops with the warehouse instance.
-        self._external_link_pool_cache = (max_workers, pool)
-        return pool
+        pool = self._external_link_pool_instance
+        if pool is not None:
+            return pool
+        with self._external_link_pool_lock:
+            # Double-check after acquiring the lock — another thread
+            # may have built it while we were waiting.
+            if self._external_link_pool_instance is None:
+                self._external_link_pool_instance = _build_external_link_pool(max_workers)
+            return self._external_link_pool_instance
+
+    def _release(self, committed: bool = False) -> None:
+        """Release per-warehouse resources.
+
+        Currently just clears the external-link pool's connections.
+        Safe to call multiple times.  Existing lifecycle methods
+        (:meth:`stop`, :meth:`delete`) don't call this — closing
+        sockets is independent of remote warehouse state, since a
+        stopped warehouse can be started again and the pool would
+        still serve.
+        """
+        pool = self._external_link_pool_instance
+        if pool is not None:
+            try:
+                pool.clear()
+            except Exception:
+                LOGGER.exception(
+                    "Failed to clear external-link pool for %r; continuing.",
+                    self,
+                )
+            self._external_link_pool_instance = None
+        super()._release(committed=committed)
+
+    def __del__(self) -> None:
+        # Best-effort cleanup on GC.  `__del__` runs in an uncertain
+        # interpreter-shutdown context, so we swallow everything — the
+        # OS will reclaim sockets anyway, this is just to be tidy.
+        try:
+            self.close(force=True)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Details caching and state
@@ -364,15 +406,14 @@ class SQLWarehouse(
         # ``is_pending`` check free.
         self.refresh()
         if not self.is_running:
-            LOGGER.debug("Starting warehouse %s (%s)", self.warehouse_name, self.warehouse_id)
+            LOGGER.debug("Starting warehouse %r", self)
             try:
                 response = client.start(id=self.warehouse_id)
             except Exception:
                 if raise_error:
                     raise
                 LOGGER.warning(
-                    "Failed to start warehouse %s (%s)",
-                    self.warehouse_name, self.warehouse_id,
+                    "Failed to start warehouse %r", self
                 )
                 return self
 
@@ -380,7 +421,7 @@ class SQLWarehouse(
                 wait_cfg = WaitingConfig.from_(wait)
                 response.result(timeout=wait_cfg.timeout_timedelta)
 
-            LOGGER.info("Started warehouse %s (%s)", self.warehouse_name, self.warehouse_id)
+            LOGGER.info("Started warehouse%r", self)
         return self
 
     def stop(self):
@@ -392,19 +433,19 @@ class SQLWarehouse(
         self.refresh()
         if not self.is_running:
             return self
-        LOGGER.debug("Stopping warehouse %s (%s)", self.warehouse_name, self.warehouse_id)
+        LOGGER.debug("Stopping warehouse %r", self)
         client = self.client.workspace_client().warehouses
         result = client.stop(id=self.warehouse_id)
-        LOGGER.info("Stopped warehouse %s (%s)", self.warehouse_name, self.warehouse_id)
+        LOGGER.info("Stopped warehouse %r", self)
         return result
 
     def delete(self) -> None:
         """Delete the warehouse."""
         if not self.warehouse_id:
             return
-        LOGGER.debug("Deleting warehouse %s (%s)", self.warehouse_name, self.warehouse_id)
+        LOGGER.debug("Deleting warehouse %r", self)
         self.client.workspace_client().warehouses.delete(id=self.warehouse_id)
-        LOGGER.info("Deleted warehouse %s (%s)", self.warehouse_name, self.warehouse_id)
+        LOGGER.info("Deleted warehouse %r", self)
 
     # ------------------------------------------------------------------
     # Update
@@ -513,7 +554,7 @@ class SQLWarehouse(
         if permissions:
             self.update_permissions(permissions=permissions, wait=wait)
 
-        LOGGER.info("Updated warehouse %s (%s)", self.warehouse_name, self.warehouse_id)
+        LOGGER.info("Updated warehouse %r", self)
         return self
 
     # ------------------------------------------------------------------
@@ -559,6 +600,7 @@ class SQLWarehouse(
         self,
         statement: WarehousePreparedStatement,
         options: ExecutionOptions,
+        start: bool = True
     ) -> WarehouseStatementResult:
         """Stage external data and forward to the base ``_execute``.
 
@@ -569,7 +611,7 @@ class SQLWarehouse(
         """
         if isinstance(options, DatabricksExecutionOptions):
             statement = self._apply_databricks_options(statement, options)
-        return super()._execute(statement, options)
+        return super()._execute(statement, options, start=start)
 
     def _apply_databricks_options(
         self,
@@ -603,6 +645,7 @@ class SQLWarehouse(
     def _submit_statement(
         self,
         statement: WarehousePreparedStatement,
+        start: bool = True
     ) -> WarehouseStatementResult:
         """Submit ``statement`` via the SDK.
 
@@ -619,30 +662,38 @@ class SQLWarehouse(
         - ``disposition`` → :attr:`Disposition.EXTERNAL_LINKS` (forced
           for CSV/ARROW_STREAM since INLINE only supports JSON_ARRAY)
         """
-        target_wh_id = statement.warehouse_id or self.warehouse_id
+        statement.warehouse_id = statement.warehouse_id or self.warehouse_id
 
-        format_ = statement.format or Format.ARROW_STREAM
-        if format_ in (Format.CSV, Format.ARROW_STREAM):
-            disposition = Disposition.EXTERNAL_LINKS
+        statement.format = statement.format or Format.ARROW_STREAM
+        if statement.format in (Format.CSV, Format.ARROW_STREAM):
+            statement.disposition = Disposition.EXTERNAL_LINKS
         else:
-            disposition = statement.disposition or Disposition.INLINE
+            statement.disposition = statement.disposition or Disposition.INLINE
 
         sdk_client = self.client.workspace_client().statement_execution
+
+        result = WarehouseStatementResult(
+            executor=self,
+            statement=statement,
+        )
+
+        if not start:
+            return result
 
         LOGGER.debug(
             "%r executing:\n%s",
             self, statement.text,
         )
 
-        itry = 0
+        itry, start = 0, time.time()
         while True:
             try:
                 response = sdk_client.execute_statement(
                     statement=statement.text,
-                    warehouse_id=target_wh_id,
+                    warehouse_id=statement.warehouse_id,
                     byte_limit=statement.byte_limit,
-                    disposition=disposition,
-                    format=format_,
+                    disposition=statement.disposition,
+                    format=statement.format,
                     on_wait_timeout=statement.on_wait_timeout,
                     parameters=statement.to_parameter_list(),
                     row_limit=statement.row_limit,
@@ -650,9 +701,12 @@ class SQLWarehouse(
                     catalog=statement.catalog_name,
                     schema=statement.schema_name,
                 )
+                result.start_timestamp = time.time()
                 break
             except (InternalError, DeadlineExceeded, TemporarilyUnavailable) as e:
                 if itry > 4:
+                    raise
+                elif (time.time() - start) > 120:
                     raise
                 LOGGER.warning(
                     "Failed to execute statement %r with exception %r",
@@ -660,10 +714,8 @@ class SQLWarehouse(
                 )
                 itry += 1
 
-        result = WarehouseStatementResult(
-            executor=self,
-            statement=statement,
-        ).set_api_response(response)
+        result.set_api_response(response)
+        result.iteration = 1
 
         LOGGER.info(
             "%r executed %r",
@@ -697,12 +749,6 @@ class SQLWarehouse(
         # Execution policy
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
-        # Result-level retry policy.  ``None`` means "leave whatever the
-        # statement already says alone" — important when the caller
-        # passes a pre-built WarehousePreparedStatement with retry
-        # configured and expects execute() not to clobber it.
-        # Pass ``False`` to explicitly clear an existing retry policy,
-        # or any :class:`WaitingConfigArg` to install one.
         retry: Optional[WaitingConfigArg] = None,
     ) -> WarehouseStatementResult:
         """Execute a SQL statement on this (or another) warehouse.
@@ -816,3 +862,40 @@ class SQLWarehouse(
         if not overrides:
             return options
         return replace(options, **overrides)
+
+
+
+def _build_external_link_pool(max_workers: int) -> urllib3.PoolManager:
+    """Build a :class:`urllib3.PoolManager` for external-link fetches.
+
+    The pool is reused across every chunk read for the warehouse it's
+    attached to (see :meth:`SQLWarehouse.external_link_pool`); pulling
+    it onto the warehouse instance — rather than a module-level cache —
+    ties the underlying connection lifecycle to the warehouse handle.
+    When the warehouse is GC'd, the pool drops with it, so a
+    long-running process holding many warehouses doesn't accumulate
+    pooled sockets the runtime can't reach.
+
+    Sizing is keyed off `max_workers` so a warehouse running with
+    higher fetch parallelism gets a correspondingly larger pool;
+    `maxsize` is a cap, not a floor, so idle slots cost nothing.
+    Timeouts are generous because external-link payloads are Arrow
+    IPC streams from cloud storage that can run hundreds of MB.
+    """
+    retry = urllib3.Retry(
+        total=4,
+        connect=4,
+        read=4,
+        backoff_factor=0.2,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+    return urllib3.PoolManager(
+        num_pools=max(4, max_workers // 2),
+        maxsize=max_workers * 2,
+        retries=retry,
+        timeout=urllib3.Timeout(connect=10.0, read=60.0),
+        cert_reqs="CERT_REQUIRED",
+    )

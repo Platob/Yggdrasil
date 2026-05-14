@@ -54,7 +54,7 @@ class TestInsertVolumePath:
         path = tbl.insert_volume_path()
         assert isinstance(path, VolumePath)
         full = path.full_path()
-        assert full.startswith("/Volumes/cat/sch/tmp/.sql/cat/sch/tbl/part-")
+        assert full.startswith("/Volumes/cat/sch/tmp_tbl/.sql")
         assert full.endswith(".parquet")
         # Default keeps the staged Parquet temporary so the holder
         # cleans up after itself.
@@ -73,7 +73,7 @@ class TestInsertVolumePath:
         other = _table("cat2", "sch2", "extra")
         path = tbl.insert_volume_path(other)
         full = path.full_path()
-        assert "/Volumes/cat2/sch2/tmp/.sql/cat2/sch2/extra/" in full
+        assert "/Volumes/cat2/sch2/tmp_extra/.sql" in full
 
     def test_unique_per_call(self) -> None:
         tbl = _table()

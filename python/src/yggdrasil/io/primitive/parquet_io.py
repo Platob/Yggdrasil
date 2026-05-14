@@ -272,7 +272,12 @@ class ParquetIO(IO[bytes, ParquetOptions]):
             action = Mode.UPSERT if options.match_by_keys else Mode.APPEND
         elif mode is Mode.TRUNCATE:
             action = Mode.OVERWRITE
-        elif mode in _MERGE_MODES or mode in (
+        elif mode in _MERGE_MODES:
+            if self.size == 0:
+                action = Mode.OVERWRITE
+            else:
+                action = mode
+        elif mode in (
             Mode.IGNORE, Mode.ERROR_IF_EXISTS, Mode.OVERWRITE,
         ):
             action = mode

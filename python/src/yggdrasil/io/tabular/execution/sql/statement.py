@@ -297,7 +297,7 @@ class SqlStatementResult(StatementResult[SqlPreparedStatement]):
         self._started = True
         return self
 
-    def cancel(self) -> "SqlStatementResult":
+    def cancel(self, wait: WaitingConfigArg = None, raise_error: bool = False, **kwargs) -> "SqlStatementResult":
         """No-op for in-process execution."""
         return self
 

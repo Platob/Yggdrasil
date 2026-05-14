@@ -35,17 +35,19 @@ import os
 import re
 import time
 from abc import abstractmethod
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Generic, Iterable, Iterator, Literal, Mapping, Optional, \
     TypeVar
 
+import pyarrow as pa
+
+from yggdrasil.data import Mode
 from yggdrasil.data.enums import MimeType, MimeTypes, State
-from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.disposable import Disposable
-from yggdrasil.io.tabular import Tabular
+from yggdrasil.io.tabular import Tabular, O
 
 if TYPE_CHECKING:
     from yggdrasil.data.executor import StatementExecutor
@@ -461,14 +463,17 @@ class StatementResult(Tabular, Generic[PS]):
         *,
         key: Optional[str] = None,
         executor: Optional["StatementExecutor"] = None,
-        num_try: int = 0,
+        iteration: int = 0,
+        start_timestamp: Optional[int] = None,
         **kwargs: Any,
     ):
         self.executor = executor
         self.statement = self._PREPARED_STATEMENT_CLASS.from_(statement)
         self.key = key or self.statement.key
+        self.start_timestamp: int | None = start_timestamp
+        self.iteration = iteration or 0
+
         self._cached_schema: Optional[Schema] = None
-        self.num_try = num_try or 0
         super().__init__(**kwargs)
 
     # -------------------------------------------------------------------------
@@ -513,6 +518,29 @@ class StatementResult(Tabular, Generic[PS]):
     def refresh_status(self) -> None:
         """Refresh execution state from the backend."""
 
+    def retry(self, wait: WaitingConfigArg = None, raise_error: bool = False, **kwargs) -> "StatementResult":
+        state = self.state
+
+        if state.is_succeeded:
+            return self
+        if state.is_failed:
+            if self.retryable:
+                return self.start(
+                    reset=True,
+                    wait=wait,
+                    raise_error=raise_error,
+                    **kwargs,
+                )
+            self.raise_for_status()
+            # raise_for_status raised; this line is unreachable, but keep
+            # the explicit return for type-checker happiness.
+            return self
+
+        # Non-terminal state — caller explicitly asked to retry something
+        # still in flight.  This isn't a hot path (wait() guards against
+        # it), so the error is the right answer.
+        raise RuntimeError(f"{self!r} in current state {state!r} cannot be retried.")
+
     @abstractmethod
     def start(
         self,
@@ -525,7 +553,7 @@ class StatementResult(Tabular, Generic[PS]):
         """Submit the statement for execution.  Idempotent on already-started results."""
 
     @abstractmethod
-    def cancel(self) -> "StatementResult":
+    def cancel(self, wait: WaitingConfigArg = None, raise_error: bool = False, **kwargs) -> "StatementResult":
         """Request cancellation.  Idempotent / no-op when not started or already terminal."""
 
     def raise_for_status(self) -> None:
@@ -565,7 +593,10 @@ class StatementResult(Tabular, Generic[PS]):
         Subclasses with their own scratch (cached HTTP pools, intermediate
         files, ...) override and call ``super()``.
         """
-        self.statement.clear_temporary_resources()
+        try:
+            self.statement.clear_temporary_resources()
+        except Exception:
+            logger.exception("clear_temporary_resources failed during clear; continuing.")
 
     # -------------------------------------------------------------------------
     # Retry
@@ -581,52 +612,14 @@ class StatementResult(Tabular, Generic[PS]):
         *completed* attempts, so the original ``start()`` counts as
         attempt 1.
         """
-        cfg = self.statement.retry
-        if cfg is None:
-            return False
-        return self.num_try < cfg.total_try_count
+        return False
 
-    def retry(
-        self,
-        *,
-        wait: WaitingConfigArg = True,
-        raise_error: bool = True,
-        **kwargs: Any,
-    ) -> "StatementResult":
-        """Retry the statement until success or attempts are exhausted.
-
-        Loops internally driven by ``self.statement.retry``
-        (a :class:`WaitingConfig`).  Each iteration calls :meth:`start`
-        with ``reset=True`` and waits for terminal state; on success it
-        returns immediately, on failure it sleeps via
-        :meth:`WaitingConfig.sleep` and tries again.  When attempts are
-        exhausted (or the WaitingConfig timeout elapses), behaves like
-        :meth:`raise_for_status` if ``raise_error`` is True.
-
-        Preconditions:
-
-        - ``self.statement.retry`` must be a :class:`WaitingConfig`, else
-          ``RuntimeError``.
-        - ``self.failed`` must be True (otherwise nothing to retry —
-          returns ``self``).
-
-        ``num_try`` is incremented *before* each attempt so a crash inside
-        ``start()`` still counts toward the budget.  Extra ``**kwargs``
-        are forwarded to ``start()``.
-        """
-        cfg = self.statement.retry or WaitingConfig.default()
-        total_tries = max(1, cfg.total_try_count)
-
-        while self.num_try < total_tries:
-            self.num_try += 1
-            self.start(reset=True, wait=wait, raise_error=False, **kwargs)
-            if self.state.is_succeeded:
-                return self
-
-        # Exhausted budget.  Surface the latest failure if asked.
-        if raise_error:
-            self.raise_for_status()
-        return self
+    @property
+    def elapsed_timestamp(self) -> float:
+        """Time elapsed since the statement was started, in seconds."""
+        if not self.start_timestamp:
+            return 0.0
+        return time.time() - self.start_timestamp
 
     # -------------------------------------------------------------------------
     # Convenience
@@ -651,7 +644,18 @@ class StatementResult(Tabular, Generic[PS]):
         if the result is already failed).  Otherwise drives
         :meth:`refresh_status` on a :class:`WaitingConfig` schedule until
         ``done`` is true.
+
+        Auto-retry: when the result reaches a terminal *failed* state and
+        :attr:`retryable` is true, the wait sleeps with jittered backoff
+        and invokes :meth:`retry`, then resumes polling for the
+        resubmitted attempt.  Jitter decorrelates retry storms when many
+        results fail on a shared upstream conflict (e.g. concurrent
+        Delta appends).  The loop terminates when the statement
+        succeeds, fails non-retryably, or the subclass's
+        :attr:`retryable` flips to ``False`` (typically because the
+        iteration / elapsed budget is exhausted).
         """
+        self.start(reset=False, wait=False, raise_error=False)
         wait_cfg = WaitingConfig.from_(wait)
 
         if not wait_cfg:
@@ -659,48 +663,33 @@ class StatementResult(Tabular, Generic[PS]):
                 self.raise_for_status()
             return self
 
-        start = time.time()
-        state = self.state
+        while True:
+            # Poll to terminal for the current submission.
+            start = time.time()
+            state = self.state
+            while not state.is_done:
+                wait_cfg.sleep(iteration=0, start=start, max_interval=5)
+                state = self._compute_state()
 
-        while not state.is_done:
-            wait_cfg.sleep(iteration=0, start=start, max_interval=5)
-            state = self._compute_state()
+            if state.is_failed and self.retryable:
+                logger.info(
+                    "%r failed but is retryable; resubmitting (iteration=%d).",
+                    self, self.iteration,
+                )
+                wait_cfg.jittered_sleep(iteration=self.iteration)
+                self.retry(wait=False, raise_error=False)
+                continue
+
+            break
 
         if raise_error:
             self.raise_for_status()
 
-        try:
-            self.statement.clear_temporary_resources()
-        except Exception:
-            logger.exception("clear_temporary_resources failed after wait; continuing.")
-
+        # Only clear scratch on success.  ``raise_for_status`` already
+        # cleared on failure; double-clearing is idempotent but noisy.
+        if not state.is_failed:
+            self.clear_temporary_resources()
         return self
-
-    # -------------------------------------------------------------------------
-    # Schema (cached) / Arrow contract
-    # -------------------------------------------------------------------------
-
-    def _collect_schema(self, options: CastOptions) -> Schema:
-        if self._cached_schema is None:
-            self.wait()
-            self._cached_schema = super()._collect_schema(options)
-        return self._cached_schema
-
-    def _read_spark_frame(self, options: CastOptions):
-        """Skip the Arrow round-trip when a Spark-native cache exists.
-
-        The default :class:`Tabular` implementation collects the
-        result via Arrow and rebuilds a Spark DataFrame on the
-        driver. When :attr:`_persisted_data` is itself a
-        Spark-backed :class:`Tabular` (e.g. :class:`SparkTabular`,
-        produced by a SparkSQL fallback or by an explicit
-        ``persist(data=df)``), its ``_read_spark_frame`` returns
-        the inner Spark DataFrame as-is — no driver collect.
-        """
-        persisted = getattr(self, "_persisted_data", None)
-        if persisted is not None:
-            return persisted._read_spark_frame(options)
-        return super()._read_spark_frame(options)
 
 
 SR = TypeVar("SR", bound="StatementResult")
@@ -711,7 +700,7 @@ SR = TypeVar("SR", bound="StatementResult")
 # ---------------------------------------------------------------------------
 
 
-class StatementBatch(Generic[PS, SR]):
+class StatementBatch(Tabular, Generic[PS, SR]):
     """A pending queue of statements plus a map of in-flight / completed results.
 
     *Not* a :class:`Tabular` — a batch as a whole has no rows, only its
@@ -732,63 +721,72 @@ class StatementBatch(Generic[PS, SR]):
     """
 
     executor: "StatementExecutor"
-    statements: deque[PS]
     results: "OrderedDict[str, SR]"
-    parallel: int
 
     def __init__(
         self,
         executor: "StatementExecutor",
         statements: Optional[Iterable["PS | str"]] = None,
-        *,
         parallel: int = 1,
         **kwargs: Any,
     ):
+        super().__init__(**kwargs)
         self.executor = executor
-        self.parallel = max(1, parallel or 1)
-        self.statements = deque()
         self.results = OrderedDict()
+
+        if parallel is None:
+            parallel = 1
+        elif isinstance(parallel, bool):
+            parallel = os.cpu_count() if parallel else 1
+        else:
+            parallel = max(1, parallel)
+
+        self.parallel = parallel
+
         if statements:
             self.extend(statements)
 
-    # -------------------------------------------------------------------------
-    # Subclass hooks
-    # -------------------------------------------------------------------------
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(results={self.results!r})"
 
-    def _coerce(self, statement: "PS | str") -> PS:
-        """Normalize ``statement`` into a backend-specific PreparedStatement.
+    def __hash__(self):
+        return hash(tuple(s for s in self.results.keys()))
 
-        Default uses the base :meth:`PreparedStatement.from_`.  Subclasses
-        override to coerce into their own subclass and to apply any
-        batch-wide rewrites (e.g. external-table substitution).
-        """
-        return PreparedStatement.from_(statement)  # type: ignore[return-value]
+    def _collect_schema(self, options: O) -> Schema:
+        if options.target:
+            return options.target
 
-    def _submit_one(self, stmt: PS, **kwargs: Any) -> SR:
-        """Hand a single statement to the executor.
+        if not self.results:
+            return Schema.empty()  # or whatever your empty sentinel is
 
-        Default delegates to ``self.executor.execute(stmt, wait=False,
-        raise_error=False, **kwargs)``.  Subclasses override only when
-        they need custom dispatch (e.g. routing per warehouse).
-        """
-        return self.executor.execute(stmt, wait=False, raise_error=False, **kwargs)
+        it = iter(self.results.values())
+        schema = next(it).collect_schema(options)
+        for result in it:
+            schema = schema.merge_with(result.collect_schema(options), mode=Mode.APPEND)
+
+        self._persist_schema(schema)
+        return schema
 
     # -------------------------------------------------------------------------
     # Mutation: add / extend / remove / clear
     # -------------------------------------------------------------------------
 
-    def add(self, statement: "PS | str", key: Optional[str] = None) -> str:
+    def add(
+        self,
+        statement: "PS | str",
+        key: Optional[str] = None,
+    ) -> str:
         """Enqueue a statement; return its key.
 
         ``key`` collisions (against pending statements *or* completed
         results) raise :class:`ValueError`.
         """
-        stmt = self._coerce(statement)
+        stmt = self.executor._PREPARED_STATEMENT_CLASS.from_(statement)
         if key is not None:
             if key in self:
                 raise ValueError(f"Duplicate batch key {key!r}.")
             stmt.key = key
-        self.statements.append(stmt)
+        self.results[stmt.key] = self.executor.submit_statement(stmt, start=True)
         return stmt.key
 
     def extend(self, statements: Iterable["PS | str"]) -> list[str]:
@@ -803,16 +801,10 @@ class StatementBatch(Generic[PS, SR]):
         :class:`KeyError`.
         """
         # Pending side first — cheaper and avoids cancelling something we never started.
-        for i, stmt in enumerate(self.statements):
-            if stmt.key == key:
-                del self.statements[i]
-                return None
-
         result = self.results.pop(key, None)
         if result is None:
-            raise KeyError(f"StatementBatch has no entry {key!r}.")
-        _safe(result.cancel, "cancel", key)
-        _safe(result.clear_temporary_resources, "clear_temporary_resources", key)
+            logger.warning("remove(%r): no such result", key)
+            return None
         return result
 
     def clear(self) -> "StatementBatch":
@@ -822,17 +814,11 @@ class StatementBatch(Generic[PS, SR]):
         cancel-but-keep version (so callers can still inspect failures),
         call :meth:`cancel` instead.
         """
-        self.statements.clear()
-        for key, result in list(self.results.items()):
-            _safe(result.cancel, "cancel", key)
-            _safe(result.clear_temporary_resources, "clear_temporary_resources", key)
         self.results.clear()
         return self
 
     def clear_temporary_resources(self) -> "StatementBatch":
         """Release per-result scratch.  Does not cancel or drop anything."""
-        for key, result in self.results.items():
-            _safe(result.clear_temporary_resources, "clear_temporary_resources", key)
         return self
 
     # -------------------------------------------------------------------------
@@ -840,24 +826,15 @@ class StatementBatch(Generic[PS, SR]):
     # -------------------------------------------------------------------------
 
     def __len__(self) -> int:
-        return len(self.statements) + len(self.results)
+        return len(self.results)
 
     def __contains__(self, key: object) -> bool:
         if not isinstance(key, str):
             return False
-        if key in self.results:
-            return True
-        return any(stmt.key == key for stmt in self.statements)
+        return key in self.results
 
     def __getitem__(self, key: str) -> SR:
-        try:
-            return self.results[key]
-        except KeyError:
-            if any(stmt.key == key for stmt in self.statements):
-                raise KeyError(
-                    f"Batch item {key!r} has not been submitted yet; call submit() first."
-                )
-            raise KeyError(f"StatementBatch has no entry {key!r}.")
+        return self.results[key]
 
     def __iter__(self) -> Iterator[str]:
         """Iterate over submitted result keys (in submission order)."""
@@ -871,47 +848,24 @@ class StatementBatch(Generic[PS, SR]):
     # Lifecycle
     # -------------------------------------------------------------------------
 
-    def submit(
+    def start(
         self,
-        statements: Optional[Iterable["PS | str"]] = None,
-        *,
-        wait: WaitingConfigArg = False,
-        raise_error: bool = False,
+        reset: bool = False,
         **kwargs: Any,
-    ) -> "StatementBatch":
-        """Drain the pending queue, asking the executor to start each statement.
+    ):
+        """Submit all statements in the batch."""
+        parallel = self.parallel
+        wait = parallel <= 1
 
-        Returns as soon as every statement has been handed to the backend
-        (does not block until completion by default).  Pass ``wait=True``
-        to fold a :meth:`wait` call in afterwards.
-
-        On any submission exception, every result already collected is
-        cancelled and the original exception propagates.
-        """
-        if statements:
-            for stmt in statements:
-                self.statements.append(self._coerce(stmt))
-
-        try:
-            while self.statements:
-                stmt = self.statements.popleft()
-                result = self._submit_one(stmt, **kwargs)
-                self.results[result.key] = result
-        except BaseException:
-            # Best-effort cleanup of whatever did make it into results.
-            self.cancel()
-            raise
-
-        if wait:
-            self.wait(wait=wait, raise_error=raise_error)
-        elif raise_error:
-            self.raise_for_status()
-        return self
+        for result in self.results.values():
+            result.start(reset=reset, wait=wait, raise_error=False, **kwargs)
 
     def wait(
         self,
+        *,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
+        **kwargs: Any,
     ) -> "StatementBatch":
         """Wait for every submitted statement to reach a terminal state.
 
@@ -920,31 +874,26 @@ class StatementBatch(Generic[PS, SR]):
         ``parallel > 1`` the per-result waits run on a thread pool — each
         :meth:`StatementResult.wait` is I/O-bound polling.
         """
-        if self.statements:
-            self.submit(wait=False, raise_error=False)
-
         if not self.results:
             return self
 
-        if self.parallel <= 1 or len(self.results) <= 1:
-            # Don't raise mid-loop — let every sibling settle first so
-            # cancel() / raise_for_status() see a coherent picture.
+        wait = WaitingConfig.from_(wait)
+        if not wait:
+            return self
+
+        parallel = self.parallel
+
+        if parallel <= 1:
             for result in self.results.values():
-                result.wait(wait=wait, raise_error=False)
+                result.wait(wait=wait, raise_error=raise_error)
         else:
-            self._run_parallel(
-                {key: (result.wait, (wait, False), {}) for key, result in self.results.items()},
-                op_label="wait",
-            )
+            # First, ensure started
+            for result in self.results.values():
+                result.start(wait=False, raise_error=False)
 
-        if raise_error:
-            self.raise_for_status()
+            for result in self.results.values():
+                result.wait(wait=wait, raise_error=raise_error)
 
-        # Per-result :meth:`wait` already cleared scratch for every
-        # success. Skip failed ones — :meth:`retry` may re-run them
-        # against the same staged source, and unlinking it here would
-        # turn a transient failure into a non-recoverable PATH_NOT_FOUND
-        # on the retry attempt.
         for key, result in self.results.items():
             if not result.failed:
                 _safe(result.clear_temporary_resources, "clear_temporary_resources", key)
@@ -968,57 +917,17 @@ class StatementBatch(Generic[PS, SR]):
         statements (never submitted) are submitted first, same as
         :meth:`wait`.
         """
-        if self.statements:
-            self.submit(wait=False, raise_error=False)
 
-        # Refresh once so .failed reflects backend reality before we pick targets.
-        for key, result in self.results.items():
-            try:
-                result.refresh_status()
-            except Exception:
-                logger.exception("refresh_status failed for %r before retry; continuing.", key)
-
-        targets = {
-            key: result
-            for key, result in self.results.items()
-            if result.failed and result.retryable
-        }
-
-        if not targets:
-            if raise_error:
-                self.raise_for_status()
-            return self
-
-        if self.parallel <= 1 or len(targets) <= 1:
-            for key, result in targets.items():
-                try:
-                    result.retry(wait=wait, raise_error=False, **kwargs)
-                except Exception:
-                    logger.exception("retry() raised for batch item %r; continuing.", key)
-        else:
-            self._run_parallel(
-                {
-                    key: (result.retry, (), {"wait": wait, "raise_error": False, **kwargs})
-                    for key, result in targets.items()
-                },
-                op_label="retry",
-            )
-
-        if raise_error:
-            self.raise_for_status()
-
-        self.clear_temporary_resources()
         return self
 
-    def cancel(self) -> "StatementBatch":
+    def cancel(self, wait: WaitingConfigArg = False, raise_error: bool = False, **kwargs) -> "StatementBatch":
         """Cancel every in-flight statement; drop everything still pending.
 
         Idempotent.  Does *not* drop completed results from ``self.results``
         — callers may still want to inspect failure status.
         """
-        self.statements.clear()
         for key, result in self.results.items():
-            _safe(result.cancel, "cancel", key)
+            result.cancel(wait=wait, raise_error=raise_error, **kwargs)
         return self
 
     # -------------------------------------------------------------------------
@@ -1027,8 +936,6 @@ class StatementBatch(Generic[PS, SR]):
 
     @property
     def done(self) -> bool:
-        if self.statements:
-            return False
         return all(result.done for result in self.results.values())
 
     @property
@@ -1102,6 +1009,23 @@ class StatementBatch(Generic[PS, SR]):
                         "%s() raised for batch item %r: %s", op_label, key, exc,
                     )
 
+    def _read_arrow_batches(self, options: O) -> Iterator[pa.RecordBatch]:
+        options = options.with_target(self.collect_schema(options))
+        for key, result in self.materialized():
+            yield from result._read_arrow_batches(options)
+
+    def _write_arrow_batches(self, batches: Iterable[pa.RecordBatch], options: O) -> None:
+        raise NotImplementedError("Cannot write in %r its a reading statement" % self)
+
+    def _read_spark_frame(self, options: O) -> "SparkDataFrame":
+        options = options.with_target(self.collect_schema(options))
+        first = None
+        for key, result in self.materialized():
+            if first is None:
+                first = result._read_spark_frame(options)
+            else:
+                first.unionByName(result._read_spark_frame(options))
+        return first
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -91,6 +91,7 @@ class SqlExecutor(StatementExecutor, ABC):
     def _submit_statement(
         self,
         statement: SqlPreparedStatement,
+        start: bool = True
     ) -> SqlStatementResult:
         """Build a fresh result tied to this executor.
 

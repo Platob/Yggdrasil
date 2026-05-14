@@ -57,7 +57,7 @@ from yggdrasil.io import URL
 from yggdrasil.io.holder import Holder
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.io.primitive import ParquetIO
-from yggdrasil.io.tabular import Tabular, O
+from yggdrasil.io.tabular import Tabular, O, ArrowTabular
 from yggdrasil.io.tabular.execution.expr import Predicate, col as expr_col
 from yggdrasil.io.tabular.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
 from .column import Column
@@ -82,7 +82,6 @@ if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
     from yggdrasil.databricks.warehouse import WarehousePreparedStatement
-    from yggdrasil.io.nested import DeltaIO
     from yggdrasil.io.path import Path
 
 
@@ -1540,7 +1539,7 @@ class Table(DatabricksResource, Holder):
         object.__setattr__(self, "_infos", None)
         object.__setattr__(self, "_infos_fetched_at", None)
         object.__setattr__(self, "_columns", None)
-        object.__setattr__(self, "_schema_cache", ...)
+        self._unpersist_schema()
 
     def _invalidate_entity_tag_cache(self) -> None:
         """Drop cached tag lists for this table and every cached column."""
@@ -1678,7 +1677,6 @@ class Table(DatabricksResource, Holder):
     def _collect_schema(self, options: CastOptions) -> DataSchema:
         """Return the field schema, optionally enriched with UC metadata."""
         metadata: dict[bytes, bytes] = {
-            b"name": self.table_name.encode(),
             b"engine": b"databricks",
             b"catalog_name": self.catalog_name.encode(),
             b"schema_name": self.schema_name.encode(),
@@ -1716,7 +1714,9 @@ class Table(DatabricksResource, Holder):
             value = getattr(assignment, "tag_value", None) or ""
             metadata[f"tag:{key}".encode("utf-8")] = str(value).encode("utf-8")
 
-        return DataSchema.from_fields(fields, metadata=metadata)
+        schema = DataSchema.from_fields(fields, metadata=metadata, name=self.table_name, nullable=False)
+        self._persist_schema(schema)
+        return schema
 
     def collect_data_field(self, safe: bool = False) -> Field:
         return self.collect_schema(safe=safe).to_field()
@@ -1907,13 +1907,14 @@ class Table(DatabricksResource, Holder):
         record_ygg_properties: bool = True,
     ) -> "Table":
         mode = Mode.from_(mode, default=Mode.AUTO)
-        schema = DataSchema.from_(definition)
 
         if self.exists:
             if mode == Mode.ERROR_IF_EXISTS:
                 raise ValueError(f"Table {self!r} already exists")
-            elif mode == Mode.IGNORE:
+            elif mode in (Mode.IGNORE, Mode.AUTO):
                 return self
+
+            schema = DataSchema.from_(definition)
             return self.with_columns(schema.fields, mode=mode)
 
         if table_type is None:
@@ -2685,24 +2686,20 @@ class Table(DatabricksResource, Holder):
         target = self.create(data, mode=schema_mode)
         target_location = target.full_name(safe=True)
         existing_schema = target.collect_schema()
-        cast_options = CastOptions.check(options=cast_options).check_target(
-            existing_schema.to_field(),
-        )
+        cast_options = CastOptions.check(options=cast_options).with_target(existing_schema)
 
         if match_by == "auto":
             match_by = [f.name for f in existing_schema.primary_fields] or None
         prune_by = _resolve_prune_by(prune_by, existing_schema.partition_fields)
 
-        wait_cfg = WaitingConfig.from_(wait)
-
-        staging = self.insert_volume_path(target, temporary=bool(wait_cfg))
+        wait = WaitingConfig.from_(wait)
+        staging = self.insert_volume_path(target, temporary=bool(wait))
 
         prune_values = prune_values or {}
         output_data: "Tabular | None" = None
-        staging.write_table(data, cast_options)
+        staging.write_table(data, cast_options, mode=Mode.OVERWRITE)
         if return_data:
-            from yggdrasil.io.tabular import ArrowTabular
-            output_data = ArrowTabular(staging.read_arrow_table())
+            output_data = staging.read_arrow_table()
 
         prune_predicates = _build_prune_predicates(prune_values, target_alias="T") if prune_values else []
         if where is not None:
@@ -2742,6 +2739,7 @@ class Table(DatabricksResource, Holder):
                 )
                 stmt = WarehousePreparedStatement.prepare(
                     sql,
+                    client=self.client,
                     external_data=external_data,
                     catalog_name=target.catalog_name,
                     schema_name=target.schema_name,
@@ -2759,54 +2757,14 @@ class Table(DatabricksResource, Holder):
             retry_active,
         )
 
-        _execute_dml(
-            self.sql,
+        batch = self.sql.execute_many(
             statements=prepared,
-            wait=wait_cfg,
+            wait=wait,
             raise_error=raise_error,
-            engine_name="api",
+            engine="api",
         )
 
-        dispatch_entries = _resolve_dispatch_targets(table_dispatch, primary=target)
-        if dispatch_entries:
-            extra_prepared: list[WarehousePreparedStatement] = []
-            for extra_target, predicate in dispatch_entries:
-                extra_target.create(data, mode=schema_mode)
-                extra_schema = extra_target.collect_schema()
-                extra_columns = list(extra_schema.field_names())
-                extra_projection = _build_column_projection(extra_schema.fields)
-                where_frag = _render_source_predicate(predicate)
-                where_clause = f"\nWHERE {where_frag}" if where_frag else ""
-                extra_source_sql = (
-                    f"SELECT {extra_projection} FROM {{{_ALIAS_TMPSRC}}}"
-                    f"{where_clause}"
-                )
-                extra_texts = _build_dml_statements(
-                    target_location=extra_target.full_name(safe=True),
-                    source_sql=extra_source_sql,
-                    columns=extra_columns,
-                    mode=mode_enum,
-                    match_by=match_by,
-                    update_column_names=update_column_names,
-                    prune_predicates=[],
-                )
-                extra_prepared.extend(_prepare_batch(extra_texts))
-            if extra_prepared:
-                logger.debug(
-                    "Arrow dispatch fan-out -> %d target(s) | statements=%d",
-                    len(dispatch_entries), len(extra_prepared),
-                )
-                extra_batch = self.sql.execute_many(
-                    extra_prepared,
-                    wait=wait_cfg,
-                    raise_error=False,
-                    engine="api",
-                    parallel=max(1, len(dispatch_entries)),
-                )
-                if raise_error:
-                    extra_batch.raise_for_status()
-
-        return output_data
+        return output_data if return_data else batch
 
     # =========================================================================
     # spark_insert — Spark path, temp-view source
@@ -3134,7 +3092,7 @@ class Table(DatabricksResource, Holder):
             table_dispatch=table_dispatch,
         )
 
-        if isinstance(statement, StatementResult) and statement.cached:
+        if isinstance(statement, StatementResult):
             spark_df = getattr(statement, "spark_dataframe", None)
             cached = spark_df if spark_df is not None else statement.to_arrow_table()
             return self.insert_into(
@@ -3363,23 +3321,6 @@ class Table(DatabricksResource, Holder):
         """
         op = _resolve_table_operation(operation, self.infos.table_type)
         return self.aws(operation=op).s3.path(self.infos.storage_location)
-
-    def tabular_io(
-        self,
-        operation: "TableOperation | ModeLike | None" = None,
-    ) -> "DeltaIO":
-        """Open this table's underlying Delta storage as a :class:`DeltaIO`.
-
-        Convenience over :meth:`storage_location` + ``DeltaIO.from_path``:
-        resolves the right credential :class:`TableOperation` from the
-        table type and the requested mode, then binds a DeltaIO to the
-        backing :class:`S3Path`. The returned IO carries the
-        auto-refreshing credentials from :meth:`aws`, so reads survive
-        STS token rotation without caller-side re-binding.
-        """
-        from yggdrasil.io.nested import DeltaIO
-
-        return DeltaIO.from_path(self.storage_location(operation=operation))
 
     def aws(
         self,

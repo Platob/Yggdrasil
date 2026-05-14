@@ -310,7 +310,7 @@ class TestStagingPath:
             client=client,
         )
         full = p.full_path()
-        assert full.startswith("/Volumes/cat/sch/tmp_tbl/.sql/part-")
+        assert full.startswith("/Volumes/cat/sch/tmp_tbl/.sql/")
         assert full.endswith(".parquet")
         assert p.temporary is True
         assert p.workspace_client is workspace

@@ -86,7 +86,7 @@ class _FastResult(StatementResult[PreparedStatement]):
         self._fixed_state = State.SUCCEEDED
         return self
 
-    def cancel(self) -> "_FastResult":
+    def cancel(self, wait: WaitingConfigArg = None, raise_error: bool = False, **kwargs) -> "_FastResult":
         self._fixed_state = State.FAILED
         return self
 
@@ -105,7 +105,7 @@ class _FastExecutor(StatementExecutor[PreparedStatement, _FastResult, StatementB
     _STATEMENT_RESULT_CLASS = _FastResult
     _STATEMENT_BATCH_CLASS = StatementBatch
 
-    def _submit_statement(self, statement: PreparedStatement) -> _FastResult:
+    def _submit_statement(self, statement: PreparedStatement, start: bool = True) -> _FastResult:
         return _FastResult(statement, executor=self)
 
 
@@ -319,21 +319,9 @@ def _batch_scenarios(repeat: int) -> list[dict]:
         repeat=repeat, inner=10_000,
     ))
 
-    def _submit_drain() -> None:
-        b = exec_.batch()
-        b.extend(statements_ps)
-        b.submit(wait=False, raise_error=False)
-
-    out.append(_time_one(
-        "batch.submit(wait=False)  16 stmts",
-        _submit_drain,
-        repeat=repeat, inner=5_000,
-    ))
-
     # Pre-built submitted batch for the read-side ops.
     submitted = exec_.batch()
     submitted.extend(statements_ps)
-    submitted.submit(wait=False, raise_error=False)
 
     out.append(_time_one(
         "batch.done  16 succeeded",

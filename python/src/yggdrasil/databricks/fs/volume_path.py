@@ -614,13 +614,13 @@ class VolumePath(DatabricksPath):
             return staged
 
         try:
-            staged.as_media(media_type=MediaTypes.PARQUET).write_table(tabular)
+            staged.as_media(media_type=MediaTypes.PARQUET).write_table(
+                tabular,
+                mode=Mode.OVERWRITE
+            )
         except Exception:
-            if temporary:
-                try:
-                    staged.unlink(missing_ok=True)
-                except Exception:
-                    pass
+            if staged.temporary:
+                staged.clear()
             raise
         return staged
 
@@ -930,8 +930,8 @@ class VolumePath(DatabricksPath):
         )
 
     def _remove_file(self, missing_ok: bool = True) -> None:
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("files.delete %s", self.api_path)
+        if logger.isEnabledFor(logging.INFO):
+            logger.info("files.delete %s", self.api_path)
         try:
             self._call(self.client.workspace_client().files.delete, self.api_path)
         except Exception:
@@ -942,8 +942,8 @@ class VolumePath(DatabricksPath):
     def _remove_dir(
         self, recursive: bool = True, missing_ok: bool = True,
     ) -> None:
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
                 "files.delete_directory %s (recursive=%s)",
                 self.api_path, recursive,
             )
@@ -1056,9 +1056,6 @@ class VolumePath(DatabricksPath):
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
         if n == 0:
-            if self.is_file() and self.size == 0:
-                return 0
-            self._upload(b"")
             return 0
         # One ``files.download`` round trip — skip the ``get_metadata``
         # probe and read the whole object. A missing target collapses

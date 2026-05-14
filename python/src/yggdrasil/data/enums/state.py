@@ -91,12 +91,18 @@ class State(IntEnum):
     """
 
     PENDING = 0
-    RUNNING = 1
-    SUCCEEDED = 2
-    FAILED = 3
-    CANCELED = 4
+    SUBMITTED = 1
+    RUNNING = 2
+    SUCCEEDED = 3
+    FAILED = 4
+    CANCELED = 5
 
     # ── Predicates ──────────────────────────────────────────────────────────
+
+    @property
+    def is_submitted(self) -> bool:
+        """``True`` for :attr:`SUBMITTED` — submitted but not yet running."""
+        return self is State.SUBMITTED
 
     @property
     def is_pending(self) -> bool:
@@ -116,7 +122,7 @@ class State(IntEnum):
         accepted the submission, ``is_started`` flips and stays ``True``
         through every terminal state.
         """
-        return self is not State.PENDING
+        return self.value >= self.SUBMITTED.value
 
     @property
     def is_done(self) -> bool:

@@ -52,7 +52,7 @@ class _CountingResult(StatementResult[_StubStatement]):
         self._state_value = State.SUCCEEDED
         return self
 
-    def cancel(self) -> "_CountingResult":
+    def cancel(self, wait: WaitingConfigArg = None, raise_error: bool = False, **kwargs) -> "_CountingResult":
         self._state_value = State.CANCELED
         return self
 

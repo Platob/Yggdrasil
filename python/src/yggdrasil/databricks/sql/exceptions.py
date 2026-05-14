@@ -26,7 +26,7 @@ class SQLError(DatabricksError):
     def __str__(self) -> str:
         return f"[%s][%s][%s]: %s" % (
             self.url,
-            self.state.value,
+            self.state.name,
             self.error_code.value,
             self.message
         )

@@ -403,7 +403,7 @@ class MongoStatementResult(StatementResult[MongoCommand]):
         self._started = True
         return self
 
-    def cancel(self) -> "MongoStatementResult":
+    def cancel(self, wait: WaitingConfigArg = None, raise_error: bool = False, **kwargs) -> "MongoStatementResult":
         # pymongo cursors are cancellable via ``cursor.close()`` but
         # we materialise eagerly inside ``start`` so there's nothing
         # left to cancel from the caller's perspective.

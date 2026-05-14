@@ -109,6 +109,7 @@ class PostgresExecutor(
     def _submit_statement(
         self,
         statement: PostgresPreparedStatement,
+        start: bool = True
     ) -> PostgresStatementResult:
         """Build a :class:`PostgresStatementResult` and run it eagerly."""
         result = self._STATEMENT_RESULT_CLASS(

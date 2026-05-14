@@ -208,6 +208,19 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
         self.assertEqual(row["c"], self.catalog_name)
         self.assertEqual(row["s"], self.schema_name)
 
+    def test_execute_many(self):
+        batch = self.engine.execute_many(
+            ["SELECT 1 AS one, 'hello' AS greeting" for _ in range(4)],
+            parallel=True
+        )
+
+        assert batch.done
+
+        table = batch.to_arrow_table()
+        self.assertEqual(table.num_rows, 4)
+        self.assertEqual(table.column("one").to_pylist(), [1, 1, 1, 1])
+        self.assertEqual(table.column("greeting").to_pylist(), ["hello", "hello", "hello", "hello"])
+
     def test_execute_empty_result_preserves_metadata_schema(self) -> None:
         """A SELECT that yields zero rows still surfaces a typed
         :class:`pa.Schema` derived from the warehouse statement
@@ -345,6 +358,7 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
         )
         prepared = WarehousePreparedStatement.prepare(
             "SELECT id, label FROM {ext} ORDER BY id",
+            client=self.client,
             external_data={"ext": data},
             catalog_name=self.catalog_name,
             schema_name=self.schema_name,
@@ -380,6 +394,7 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
 
         prepared = WarehousePreparedStatement.prepare(
             "SELECT id FROM {src} ORDER BY id",
+            client=self.client,
             external_data={
                 "src": ExternalStatementData(
                     "src", text_value="(VALUES (1), (2), (3)) AS t(id)",
@@ -537,6 +552,7 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
             schema_name=self.schema_name,
             resource_name="staging_factory",
             tabular=data,
+            client=self.client
         )
         try:
             # File exists with the written bytes (size > 0).

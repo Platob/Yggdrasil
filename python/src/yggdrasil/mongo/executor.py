@@ -97,6 +97,7 @@ class MongoExecutor(
     def _submit_statement(
         self,
         statement: MongoCommand,
+        start: bool = True
     ) -> MongoStatementResult:
         result = self._STATEMENT_RESULT_CLASS(
             statement=statement,

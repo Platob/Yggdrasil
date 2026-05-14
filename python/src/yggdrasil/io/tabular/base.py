@@ -258,7 +258,7 @@ class Tabular(ABC, Generic[O]):
         leaf. The full lookup is :meth:`static_values`'s lazy
         Mapping; callers shouldn't read this slot directly.
         """
-        super().__init__(**kwargs)
+        super().__init__()
         self.tabular_parent: "Tabular | None" = tabular_parent
         # Per-instance schema cache. ``...`` means "not yet collected";
         # populated lazily by :meth:`collect_schema`, updated by every
@@ -758,23 +758,16 @@ class Tabular(ABC, Generic[O]):
 
     def collect_schema(self, options: "O | None" = None, **kwargs: Any) -> Schema:
         """Return this Tabular's :class:`Schema`, caching the first hit.
-
-        Subsequent calls reuse :attr:`_schema_cache` without touching
-        the underlying source. :meth:`close` drops the cache; writers
-        refresh it via :meth:`_persist_schema` so a write followed by
-        a read sees the new shape without a re-collect.
         """
         if self._schema_cache is not ...:
             return self._schema_cache
-        schema = self._collect_schema(self.check_options(options, overrides=locals()))
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "%s schema collected: %d fields %s",
-                type(self).__name__,
-                len(schema) if hasattr(schema, "__len__") else -1,
-                getattr(schema, "names", None),
-            )
-        self._persist_schema(schema)
+
+        options = self.check_options(options, overrides=locals())
+
+        if options.target:
+            return options.target
+
+        schema = self._collect_schema(options)
         return schema
 
     def _collect_schema(self, options: O) -> Schema:
@@ -807,7 +800,7 @@ class Tabular(ABC, Generic[O]):
             return
         self._schema_cache = schema
 
-    def _clear_schema_cache(self) -> None:
+    def _unpersist_schema(self) -> None:
         """Drop the per-instance schema cache.
 
         Called from :meth:`close` (so reopening re-collects from the
@@ -830,7 +823,7 @@ class Tabular(ABC, Generic[O]):
         Tabular subclasses without a lifecycle peer get a harmless
         no-op forward.
         """
-        self._clear_schema_cache()
+        self._unpersist_schema()
         sup_close = getattr(super(), "close", None)
         if callable(sup_close):
             sup_close(force=force)
@@ -1379,8 +1372,6 @@ class Tabular(ABC, Generic[O]):
             if not chunk_rows:
                 return
             batch = pa.RecordBatch.from_pylist(chunk_rows, schema=chunk_schema)
-            if chunk_schema is not None:
-                self._persist_schema(Schema.from_arrow(chunk_schema))
             self._write_arrow_batches([batch], inner)
             chunk_rows.clear()
 
