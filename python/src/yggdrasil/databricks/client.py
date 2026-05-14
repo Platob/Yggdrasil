@@ -67,6 +67,17 @@ def _safe_tag_collapse(repl: str) -> re.Pattern[str]:
     return pattern
 
 
+def _is_ygg_dep(dep: Any) -> bool:
+    """True when *dep* refers to the ``ygg`` / ``yggdrasil`` project."""
+    if isinstance(dep, str):
+        head = dep.strip().split("[", 1)[0]
+        for op in ("==", ">=", "<=", "!=", "~=", ">", "<"):
+            head = head.split(op, 1)[0]
+        return head.strip().lower() in ("ygg", "yggdrasil")
+    name = getattr(dep, "__module__", None) or getattr(dep, "__name__", "")
+    return isinstance(name, str) and name.split(".", 1)[0] in ("ygg", "yggdrasil")
+
+
 def getenv(name: str) -> Optional[str]:
     v = os.getenv(name)
     return v if v not in (None, "") else None
@@ -1276,6 +1287,13 @@ class DatabricksClient(URLBased):
         """
         return bool(self.serverless_compute_id) or not self.cluster_id
 
+    #: Default ``ygg`` install spec for :meth:`spark`. Pinned with
+    #: the ``[data, databricks]`` extras so the cluster picks up the
+    #: pandas/numpy/databricks-sdk surface the average UDF actually
+    #: uses. Override via :meth:`spark`'s explicit ``ygg`` spec if
+    #: a project needs a tighter or wider extras set.
+    DEFAULT_YGG_SPEC: ClassVar[str] = "ygg[data,databricks]"
+
     def spark(
         self,
         *dependencies: "Any",
@@ -1296,12 +1314,17 @@ class DatabricksClient(URLBased):
         Each *dependency* is classified once via
         :func:`classify_dependency`:
 
-        - Public PyPI specs (``"ygg"``, ``"numpy>=1.0"``) ride
-          straight to the cluster via
+        - Public PyPI specs (``"ygg[data,databricks]"``,
+          ``"numpy>=1.0"``, …) ride straight to the cluster via
           :meth:`DatabricksEnv.withDependencies`. ``ygg`` is
-          always declared — the cluster pulls it from PyPI so
-          UDFs can use the same :class:`yggdrasil` runtime the
-          driver is using.
+          always declared with the ``[data, databricks]`` extras
+          — the cluster pulls the yggdrasil runtime + the
+          ``pandas`` / ``numpy`` / ``databricks-sdk`` surface
+          from PyPI so UDFs see the same dependency set the
+          driver is using. Override by passing an explicit
+          ``ygg`` spec
+          (e.g. ``client.spark("ygg==0.7.73")`` or
+          ``client.spark("ygg")`` for an editable-mode rebuild).
         - Editable installs (``pip install -e .``) get their
           local working copy built into a wheel whose version
           carries the local hostname
@@ -1335,9 +1358,11 @@ class DatabricksClient(URLBased):
         - *dependencies* — variadic. Each entry is anything
           :func:`classify_dependency` accepts (PyPI spec string,
           bare module name, :class:`os.PathLike`, or any object
-          with ``__module__``). ``client.spark("ygg",
+          with ``__module__``). ``client.spark("polars",
           "my_internal", Path("/some/pkg"))`` is the headline
-          shape.
+          shape; ``ygg[data,databricks]`` is appended
+          automatically unless the caller already provides their
+          own ``ygg`` spec.
         - *registry* — a :class:`WorkspacePyPIRegistry` (or any
           shape its constructor accepts) to use as the shared
           wheel cache. Defaults to a registry rooted at
@@ -1355,8 +1380,8 @@ class DatabricksClient(URLBased):
         from databricks.connect import DatabricksSession  # noqa
 
         deps = list(dependencies)
-        if "ygg" not in [str(d) for d in deps if isinstance(d, str)]:
-            deps.insert(0, "ygg")
+        if not any(_is_ygg_dep(d) for d in deps):
+            deps.insert(0, self.DEFAULT_YGG_SPEC)
 
         registry_obj = self._resolve_registry(registry, cache_dir=cache_dir)
         specs, _remotes = registry_obj.publish_many(deps, check_public=check_public)

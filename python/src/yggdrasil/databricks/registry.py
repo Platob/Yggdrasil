@@ -129,8 +129,18 @@ class DependencyInfo:
 
 
 def _looks_like_pip_spec(s: str) -> bool:
-    """``"ygg"`` is a name; ``"ygg==1.0"`` / ``"numpy>=1"`` is a spec."""
-    return any(op in s for op in ("==", ">=", "<=", "!=", "~=", ">", "<"))
+    """Distinguish bare names from PyPI install specs.
+
+    A "spec" is anything pip understands as more than a project
+    name on its own — a version operator (``"ygg==1.0"``,
+    ``"numpy>=1"``) **or** an extras tag (``"ygg[data,databricks]"``).
+    Bare names like ``"ygg"`` route through the installed-dist
+    classifier so editable installs get caught; specs go straight
+    to ``PUBLIC`` with the raw string handed to pip on the cluster.
+    """
+    return "[" in s or any(
+        op in s for op in ("==", ">=", "<=", "!=", "~=", ">", "<")
+    )
 
 
 def _hostname_version(base_version: Optional[str]) -> str:
@@ -240,8 +250,13 @@ def classify_dependency(
     if isinstance(obj, str):
         spec_str = obj.strip()
         if _looks_like_pip_spec(spec_str):
-            # Spec already carries the version constraint; trust it.
-            name = spec_str.split("=", 1)[0]
+            # Spec already carries the version / extras constraint;
+            # trust it. Strip extras (``ygg[data]`` → ``ygg``) and
+            # version operators so ``name`` is the canonical project
+            # name for the cache key.
+            name = spec_str.split("[", 1)[0]
+            for op in ("==", ">=", "<=", "!=", "~=", ">", "<"):
+                name = name.split(op, 1)[0]
             name = "".join(c for c in name if c.isalnum() or c in "-_.").strip()
             return DependencyInfo(
                 name=name or spec_str,

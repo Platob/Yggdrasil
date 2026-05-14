@@ -278,10 +278,7 @@ def fake_registry(monkeypatch):
             remotes: list = []
             for d in deps:
                 calls.append((d, check_public))
-                if d == "ygg":
-                    specs.append("local:/tmp/ygg-fake.whl")
-                    remotes.append(MagicMock(name=f"remote-{d}"))
-                elif isinstance(d, str):
+                if isinstance(d, str):
                     specs.append(d)
             return specs, remotes
 
@@ -293,7 +290,7 @@ def fake_registry(monkeypatch):
 
 class TestServerlessBranch:
 
-    def test_default_declares_ygg(
+    def test_default_declares_ygg_with_extras(
         self, serverless_client, mocked_builder, stubbed_workspace_config,
         fake_registry,
     ) -> None:
@@ -302,9 +299,10 @@ class TestServerlessBranch:
         assert result is session
 
         env = env_instances[0]
-        # The first ``withDependencies`` call carries the ygg
-        # local spec the fake registry returned.
-        assert env._deps == [["local:/tmp/ygg-fake.whl"]]
+        # Default ygg spec carries the ``[data, databricks]`` extras
+        # so the cluster picks up the runtime + pandas / numpy /
+        # databricks-sdk surface.
+        assert env._deps == [["ygg[data,databricks]"]]
         builder.withEnvironment.assert_called_once_with(env)
         # The client is stashed on the session for downstream use.
         assert session.ygg_client is serverless_client
@@ -316,46 +314,61 @@ class TestServerlessBranch:
         _builder, _session, _env_cls, env_instances = mocked_builder
         serverless_client.spark("numpy==1.0")
         env = env_instances[0]
-        assert env._deps == [["local:/tmp/ygg-fake.whl", "numpy==1.0"]]
+        assert env._deps == [["ygg[data,databricks]", "numpy==1.0"]]
 
     def test_ygg_not_doubled_when_caller_passes_it(
         self, serverless_client, mocked_builder, stubbed_workspace_config,
         fake_registry,
     ) -> None:
-        # Explicit ``"ygg"`` from the caller already covers the
-        # default; we shouldn't end up with two registry calls.
+        # Explicit ``"ygg"`` (any shape — version-pinned, with
+        # extras, bare name) from the caller already covers the
+        # default; we shouldn't see ``ygg[data,databricks]`` added
+        # on top.
         _builder, _session, _env_cls, env_instances = mocked_builder
         _registry_cls, calls = fake_registry
-        serverless_client.spark("ygg")
+        serverless_client.spark("ygg==0.7.73")
         names = [d for d, _ in calls]
-        assert names == ["ygg"]
+        assert names == ["ygg==0.7.73"]
 
 
 class TestClassicBranch:
 
-    def test_local_specs_route_to_add_artifacts(
+    def test_public_specs_dont_call_add_artifacts(
         self, classic_client, mocked_builder, stubbed_workspace_config,
         fake_registry,
     ) -> None:
+        # The default ygg[data,databricks] spec is a public PyPI
+        # entry (no ``local:`` prefix), so the classic-compute
+        # branch has nothing to upload.
         _builder, session, _env_cls, env_instances = mocked_builder
         classic_client.spark()
-        # Classic compute never goes through ``withEnvironment``.
         assert env_instances == []
-        # Local specs feed addArtifacts with ``pyfile=True``.
-        session.addArtifacts.assert_called_once_with(
-            "/tmp/ygg-fake.whl", pyfile=True,
-        )
+        session.addArtifacts.assert_not_called()
 
-    def test_public_specs_dont_show_up_in_add_artifacts(
+    def test_local_specs_route_to_add_artifacts(
         self, classic_client, mocked_builder, stubbed_workspace_config,
-        fake_registry,
+        fake_registry, tmp_path, monkeypatch,
     ) -> None:
-        _builder, session, _env_cls, _envs = mocked_builder
-        classic_client.spark("numpy==1.0")
-        # ``numpy==1.0`` isn't a ``local:`` spec, so the cluster
-        # has no way to install it — classic compute users have
-        # to pre-install public deps. The artifact call carries
-        # only the local-prefixed wheels.
+        # When the registry returns a ``local:`` spec, the classic
+        # branch ships the local wheel through addArtifacts with
+        # ``pyfile=True``. We rebind the fake registry to emit one
+        # such spec on top of the default.
+        _builder, session, _env_cls, env_instances = mocked_builder
+        from yggdrasil.databricks import registry as reg_mod
+
+        wheel = tmp_path / "demo-1.0-py3-none-any.whl"
+        wheel.write_bytes(b"PK\x03\x04")
+
+        class LocalRegistry:
+            def __init__(self, **_kwargs):
+                pass
+
+            def publish_many(self, deps, *, check_public=False):
+                specs = ["ygg[data,databricks]", f"local:{wheel}"]
+                return specs, []
+
+        monkeypatch.setattr(reg_mod, "WorkspacePyPIRegistry", LocalRegistry)
+        classic_client.spark("demo")
         session.addArtifacts.assert_called_once_with(
-            "/tmp/ygg-fake.whl", pyfile=True,
+            str(wheel), pyfile=True,
         )
