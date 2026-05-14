@@ -272,6 +272,45 @@ class TestFastPathLocalLayout:
         rel = _local_fast_path_relative(None, url, 0xDEADBEEF)
         assert rel.split(os.sep)[0] == "GET"
 
+    def test_nul_and_control_chars_are_replaced(self) -> None:
+        # NUL bytes and ASCII control characters (0x00-0x1f) are illegal
+        # in directory names on every supported OS; they must be folded.
+        for bad in ("\x00", "\x01", "\t", "\n", "\r", "\x1f"):
+            out = _safe_fast_path_segment(f"seg{bad}value")
+            assert "\x00" not in out
+            assert bad not in out
+
+    def test_unicode_segment_within_limit_passes_through(self) -> None:
+        # Short unicode segment (fits within max_bytes in UTF-8) → kept as-is.
+        seg = "café"
+        out = _safe_fast_path_segment(seg)
+        assert out == seg
+
+    def test_long_unicode_segment_is_folded_on_byte_boundary(self) -> None:
+        # A 3-byte-per-char CJK string that overflows max_bytes must be
+        # truncated on a valid UTF-8 character boundary (no half-char).
+        seg = "数" * 100  # 100 × 3 = 300 bytes — well over 80
+        out = _safe_fast_path_segment(seg)
+        # Result must be valid UTF-8 (no truncated multi-byte sequence).
+        out.encode("utf-8")
+        assert len(out.encode("utf-8")) <= _FAST_PATH_SEGMENT_MAX_BYTES + 17  # +17 for -<16-hex>
+
+    def test_same_input_same_output_lru_cache(self) -> None:
+        # The LRU cache must return identical results for repeated inputs.
+        seg = "api-v2-endpoint"
+        r1 = _safe_fast_path_segment(seg)
+        r2 = _safe_fast_path_segment(seg)
+        assert r1 == r2
+        assert r1 is r2  # same object — cache hit, not a new str
+
+    def test_different_long_inputs_produce_different_outputs(self) -> None:
+        # Two distinct long tokens that collide on prefix must still produce
+        # distinct outputs (the xxh3 digest restores uniqueness).
+        prefix = "x" * 90  # longer than max_bytes
+        a = _safe_fast_path_segment(prefix + "A")
+        b = _safe_fast_path_segment(prefix + "B")
+        assert a != b
+
 
 # ---------------------------------------------------------------------------
 # Fast-path TTL cleanup walker (_cleanup_local_fast_path)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import itertools
 import logging
 import os
@@ -90,6 +91,7 @@ _FAST_PATH_SEGMENT_MAX_BYTES: int = 80
 _FAST_PATH_UNSAFE_RE = re.compile(r'[\x00-\x1f/\\:*?"<>|]+')
 
 
+@functools.lru_cache(maxsize=512)
 def _safe_fast_path_segment(
     seg: str, *, max_bytes: int = _FAST_PATH_SEGMENT_MAX_BYTES,
 ) -> str:
@@ -104,6 +106,10 @@ def _safe_fast_path_segment(
     The leaf ``<public_hash>.arrow`` filename still carries the full
     request identity, so collisions on a sanitized segment only group
     sibling entries under the same parent, never overwrite them.
+
+    Results are memoized (LRU, max 512 entries): URL segments for a
+    given API endpoint are the same on every request, so the regex
+    substitution + UTF-8 length check only runs once per unique token.
     """
     import xxhash
 

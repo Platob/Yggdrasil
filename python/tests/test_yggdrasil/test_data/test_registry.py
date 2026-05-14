@@ -25,6 +25,7 @@ import dataclasses
 import enum
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import pytest
@@ -437,3 +438,160 @@ class TestEnumEdgeCases:
 
         assert convert("RED", Color) is Color.RED
         assert convert("red", Color) is Color.RED
+
+    def test_unhashable_member_value_falls_back_to_name(self) -> None:
+        # Enum members whose values are unhashable (list, dict) cannot be
+        # put in the value_lookup dict; the fallback is the name-based lookup.
+        class ListEnum(enum.Enum):
+            A = [1, 2]
+            B = [3, 4]
+
+        assert convert("a", ListEnum) is ListEnum.A
+        assert convert("B", ListEnum) is ListEnum.B
+
+    def test_empty_enum_raises_type_error(self) -> None:
+        class Empty(enum.Enum):
+            pass
+
+        with pytest.raises(TypeError, match="empty Enum"):
+            convert("x", Empty)
+
+
+# ---------------------------------------------------------------------------
+# Options pass-through — default_value on str→float and str→bool converters
+#
+# The converters use ``getattr(opts, "default_value", None)`` so any object
+# with that attribute works — CastOptions doesn't carry that field, so we
+# drive the low-level converters directly here with a SimpleNamespace.
+# ---------------------------------------------------------------------------
+
+
+class TestOptionsDefaultValue:
+
+    def test_str_to_float_empty_string_uses_default_value(self) -> None:
+        from yggdrasil.data.cast.registry import str_to_float
+
+        opts = SimpleNamespace(default_value=0.0)
+        assert str_to_float("", opts) == 0.0
+
+    def test_str_to_float_non_empty_ignores_default_value(self) -> None:
+        from yggdrasil.data.cast.registry import str_to_float
+
+        opts = SimpleNamespace(default_value=99.9)
+        assert str_to_float("1.5", opts) == pytest.approx(1.5)
+
+    def test_str_to_bool_empty_string_uses_default_value(self) -> None:
+        from yggdrasil.data.cast.registry import str_to_bool
+
+        opts = SimpleNamespace(default_value=False)
+        assert str_to_bool("", opts) is False
+
+    def test_str_to_bool_non_empty_ignores_default_value(self) -> None:
+        from yggdrasil.data.cast.registry import str_to_bool
+
+        opts = SimpleNamespace(default_value=False)
+        assert str_to_bool("true", opts) is True
+
+
+# ---------------------------------------------------------------------------
+# Composition cache — composed result lands in _find_cache
+# ---------------------------------------------------------------------------
+
+
+class TestCompositionCache:
+
+    def test_composed_result_cached_in_find_cache(self) -> None:
+        from yggdrasil.data.cast.registry import _find_cache, find_converter
+
+        class _P:
+            def __init__(self, n: int) -> None:
+                self.n = n
+
+        class _Q:
+            def __init__(self, s: str) -> None:
+                self.s = s
+
+        @register_converter(_P, _Q)
+        def p_to_q(v: _P, opts: Any) -> _Q:
+            return _Q(str(v.n))
+
+        @register_converter(_Q, float)
+        def q_to_float(v: _Q, opts: Any) -> float:
+            return float(v.s)
+
+        # Clear so this pair starts cold.
+        _find_cache.pop((_P, float), None)
+
+        result = find_converter(_P, float)
+        assert result is not None
+
+        # Second call must return the exact same object (cache hit).
+        result2 = find_converter(_P, float)
+        assert result is result2
+        assert (_P, float) in _find_cache
+
+    def test_composition_produces_correct_value(self) -> None:
+        class _R:
+            def __init__(self, n: int) -> None:
+                self.n = n
+
+        class _S:
+            def __init__(self, s: str) -> None:
+                self.s = s
+
+        @register_converter(_R, _S)
+        def r_to_s(v: _R, opts: Any) -> _S:
+            return _S(str(v.n * 10))
+
+        @register_converter(_S, int)
+        def s_to_int(v: _S, opts: Any) -> int:
+            return int(v.s)
+
+        assert convert(_R(7), int) == 70
+
+
+# ---------------------------------------------------------------------------
+# _registry_by_from index — stays consistent across registrations
+# ---------------------------------------------------------------------------
+
+
+class TestRegistryByFromIndex:
+
+    def test_index_is_rebuilt_after_stale_marking(self) -> None:
+        from yggdrasil.data.cast.registry import (
+            _registry_by_from,
+            _registry_index_stale,
+            find_converter,
+        )
+
+        class _T1:
+            pass
+
+        class _T2:
+            pass
+
+        # Ensure a composition call triggers a rebuild.
+        find_converter(_T1, _T2)  # populates cache, rebuilds index if stale
+        assert not _registry_index_stale  # index is fresh after call
+
+    def test_index_marked_stale_on_registration(self) -> None:
+        import yggdrasil.data.cast.registry as _reg
+
+        # Trigger a rebuild first.
+        from yggdrasil.data.cast.registry import find_converter
+
+        class _U1:
+            pass
+
+        class _U2:
+            pass
+
+        find_converter(_U1, _U2)
+        assert not _reg._registry_index_stale
+
+        # A new registration must mark it stale again.
+        @register_converter(_U1, _U2)
+        def u1_to_u2(v: Any, opts: Any) -> _U2:
+            return _U2()
+
+        assert _reg._registry_index_stale

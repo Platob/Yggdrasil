@@ -30,12 +30,16 @@ from __future__ import annotations
 import argparse
 import statistics
 import time
-from typing import Callable
+from typing import Any, Callable
 
 import pyarrow as pa
 
 from yggdrasil.data import Field
 from yggdrasil.data.cast.registry import (
+    _find_cache,
+    _rebuild_registry_index,
+    _registry_by_from,
+    _registry_index_stale,
     convert,
     find_converter,
     register_converter,
@@ -255,6 +259,66 @@ def _registry_scenarios(repeat: int) -> list[dict]:
         "registry: find_converter(int, str)",
         lambda: find_converter(int, str),
         repeat=repeat, inner=200_000,
+    ))
+
+    # One-hop composition — cold (first call after cache eviction) vs warm.
+    # Register a unique pair so we can measure composition in isolation
+    # without interference from the existing registry entries.
+    class _BenchSrc:
+        pass
+
+    class _BenchMid:
+        pass
+
+    class _BenchDst:
+        pass
+
+    @register_converter(_BenchSrc, _BenchMid)
+    def _src_to_mid(v: _BenchSrc, o: Any) -> _BenchMid:
+        return _BenchMid()
+
+    @register_converter(_BenchMid, _BenchDst)
+    def _mid_to_dst(v: _BenchMid, o: Any) -> _BenchDst:
+        return _BenchDst()
+
+    src_val = _BenchSrc()
+
+    def _cold_composition() -> None:
+        # Evict cache entry to force a fresh resolution on every call.
+        _find_cache.pop((_BenchSrc, _BenchDst), None)
+        import yggdrasil.data.cast.registry as _reg
+        _reg._registry_index_stale = True
+        find_converter(_BenchSrc, _BenchDst)
+
+    def _warm_composition() -> None:
+        # Cache already populated — measures pure dict-lookup cost.
+        find_converter(_BenchSrc, _BenchDst)
+
+    # Warm the cache first.
+    find_converter(_BenchSrc, _BenchDst)
+
+    out.append(_time_one(
+        "registry: find_converter composition COLD (cache miss + index rebuild)",
+        _cold_composition,
+        repeat=repeat, inner=1_000,
+    ))
+    out.append(_time_one(
+        "registry: find_converter composition WARM (cache hit)",
+        _warm_composition,
+        repeat=repeat, inner=200_000,
+    ))
+    out.append(_time_one(
+        "registry: convert(_BenchSrc, _BenchDst) via composition",
+        lambda: convert(src_val, _BenchDst),
+        repeat=repeat, inner=50_000,
+    ))
+
+    # _registry_by_from index rebuild cost — measures how expensive the
+    # lazy rebuild is for the current registry size.
+    out.append(_time_one(
+        "registry: _rebuild_registry_index (full rebuild)",
+        _rebuild_registry_index,
+        repeat=repeat, inner=10_000,
     ))
 
     return out

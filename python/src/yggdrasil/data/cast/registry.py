@@ -103,6 +103,29 @@ _find_cache: dict[RegistryKey, "Converter | None"] = {}
 # Using ... so None (= "no converter found") is a cacheable result too.
 _CACHE_MISS: Any = ...
 
+# Inverted index for one-hop composition (step 7 in find_converter).
+# Maps from_hint → [(to_hint, converter)] so the first leg of a
+# composition search is a single dict lookup rather than a full
+# _registry.items() scan.  Rebuilt lazily after any register_converter()
+# call (tracked by _registry_index_stale) so dynamic registrations
+# see an up-to-date view without paying rebuild cost unless composition
+# is actually needed.
+_registry_by_from: dict[Any, list[tuple[Any, "Converter"]]] = {}
+_registry_index_stale: bool = True
+
+
+def _rebuild_registry_index() -> None:
+    """Rebuild ``_registry_by_from`` from the current ``_registry`` contents."""
+    global _registry_index_stale
+    _registry_by_from.clear()
+    for (rf, rt), conv in _registry.items():
+        lst = _registry_by_from.get(rf)
+        if lst is None:
+            _registry_by_from[rf] = [(rt, conv)]
+        else:
+            lst.append((rt, conv))
+    _registry_index_stale = False
+
 
 def register_converter(from_hint: Any, to_hint: Any) -> Callable[[F], F]:
     """
@@ -130,8 +153,11 @@ def register_converter(from_hint: Any, to_hint: Any) -> Callable[[F], F]:
             _registry[(from_hint, to_hint)] = conv  # type: ignore[assignment]
 
         # Any new registration may open new conversion paths, so stale cached
-        # results are no longer valid.
+        # results are no longer valid.  The composition index is rebuilt lazily
+        # the next time step 7 is actually reached.
+        global _registry_index_stale
         _find_cache.clear()
+        _registry_index_stale = True
 
         return func
 
@@ -195,18 +221,34 @@ def find_converter(from_type: Any, to_hint: Any, check_namespace: bool = True) -
     """
     Find the best converter for (from_type -> to_hint).
 
-    Dispatch order:
-      1) exact (_registry[(from_type, to_hint)])
-      2) identity-ish (same type, or target Any/object)
-      3) wildcard Any->to_hint
-      4) namespace-triggered late imports (polars/pandas/pyspark) once
-      5) MRO cross-product lookup
-      6) scan-based fallback with issubclass checks for odd keys
-      7) one-hop composition: from -> mid -> to (single intermediate)
+    Dispatch order (cheapest first):
+      1) ``_find_cache`` hit — single dict lookup; populated after every full
+         resolution so the same pair never re-pays steps 2-7.
+      2) Exact ``_registry[(from_type, to_hint)]`` match.
+      3) Identity: same type, or target is ``Any`` / ``object``.
+      4) Wildcard ``_any_registry[to_hint]`` (Any → to_hint converters).
+      5) Namespace-triggered late imports (polars/pandas/pyspark/pyarrow):
+         importing the engine module registers its converters as a side effect,
+         then re-runs steps 1-4 before falling through to the MRO scan.
+      6) MRO cross-product: ``iter_mro(from_type) × iter_mro(to_hint)``.
+      7) Scan-based issubclass fallback for odd registered keys (parameterised
+         generics, sentinel types) that ``iter_mro`` doesn't cover.
+      8) One-hop composition — ``from -> mid -> to`` using the pre-built
+         ``_registry_by_from`` index for O(1) first-leg lookup and a direct
+         ``_registry.get((mid, to_hint))`` for the second leg (O(1) common
+         case, MRO fallback for subclass targets).  Intentionally limited to a
+         single intermediate to keep dispatch time deterministic.
 
-    Results (including ``None`` for "no path") are cached in ``_find_cache`` on
-    the ``check_namespace=True`` path so repeated calls for the same type pair pay
-    only a single dict lookup on subsequent invocations.
+    ``check_namespace=True`` (the public default):
+        Triggers engine imports (step 5) and writes the resolved converter —
+        including ``None`` for "no path" — into ``_find_cache`` so subsequent
+        calls for the same pair pay only a single dict lookup.
+
+    ``check_namespace=False`` (recursive internal call after step 5):
+        Skips cache reads/writes and the import side-effects; used inside the
+        namespace-import branch so it doesn't re-enter itself.
+
+    Returns ``None`` when no conversion path exists.
     """
     cache_key = (from_type, to_hint)
 
@@ -274,25 +316,48 @@ def find_converter(from_type: Any, to_hint: Any, check_namespace: bool = True) -
 
     # 7) one-level composition: from -> mid -> to
     # This is intentionally limited: deterministic and avoids path-search explosions.
+    #
+    # Indexed fast path: _registry_by_from[from_hint] → [(mid, c1)] so the
+    # first leg is an O(1) lookup rather than a full registry scan.  For each
+    # matching intermediate type we try a direct _registry[(mid, to_hint)]
+    # lookup (O(1)) before falling back to MRO iteration so the common case
+    # (registered exact types on both hops) pays two dict lookups total.
+    if _registry_index_stale:
+        _rebuild_registry_index()
+
+    for f in iter_mro(from_type):
+        for mid, c1 in _registry_by_from.get(f, ()):
+            # Direct lookup for the second hop (most common case).
+            c2 = _registry.get((mid, to_hint))
+            if c2 is None:
+                # MRO fallback: allow subclass targets on the second leg.
+                for t in iter_mro(to_hint):
+                    if t is not to_hint:
+                        c2 = _registry.get((mid, t))
+                        if c2 is not None:
+                            break
+            if c2 is not None:
+                def composed(v: Any, o: Optional["CastOptions"], _c1=c1, _c2=c2) -> Any:
+                    return _c2(_c1(v, o), o)
+
+                return composed
+
+    # Scan-based fallback for non-class / odd registered keys that type_matches
+    # via issubclass but aren't found by iter_mro (e.g. parameterised generics).
     for (rf, mid), c1 in _registry.items():
         try:
             if not type_matches(from_type, rf):
                 continue
         except TypeError:
             continue
-
         for (rmid, rt), c2 in _registry.items():
             try:
-                if not type_matches(mid, rmid):
-                    continue
-                if not type_matches(to_hint, rt):
+                if not type_matches(mid, rmid) or not type_matches(to_hint, rt):
                     continue
             except TypeError:
                 continue
-
-            def composed(v: Any, o: Optional["CastOptions"], _c1=c1, _c2=c2) -> Any:
+            def composed(v: Any, o: Optional["CastOptions"], _c1=c1, _c2=c2) -> Any:  # noqa: E301
                 return _c2(_c1(v, o), o)
-
             return composed
 
     return None
