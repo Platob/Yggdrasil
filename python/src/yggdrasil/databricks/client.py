@@ -1262,7 +1262,21 @@ class DatabricksClient(URLBased):
             use_cache=True,
         )
 
-    def spark_connect(
+    @property
+    def is_serverless_compute(self) -> bool:
+        """True when this client targets serverless compute.
+
+        A bare client with no ``cluster_id`` always lands on
+        serverless once ``make_config`` flips
+        ``serverless_compute_id`` to ``"auto"``; setting
+        ``cluster_id`` explicitly opts back into the classic
+        compute path. Mirrors the same rule
+        ``_make_base_config`` applies before handing the config
+        off to the SDK.
+        """
+        return bool(self.serverless_compute_id) or not self.cluster_id
+
+    def spark(
         self,
         *,
         dependencies: "Optional[list[Any]]" = None,
@@ -1276,64 +1290,149 @@ class DatabricksClient(URLBased):
         Connect variant) configured against this client's workspace
         host and credentials.
 
-        Dependencies are added via
-        :meth:`SparkSession.addArtifacts` with ``pyfile=True``, so
-        executors and UDFs see them in ``sys.path`` for the
-        lifetime of the session:
+        Dependency wiring picks the right runtime hook for the
+        target compute:
+
+        - **Serverless compute** (the default when no
+          ``cluster_id`` is set) — declarative path: PyPI specs go
+          through :meth:`DatabricksEnv.withDependencies` and local
+          archives ride along with the ``local:`` prefix. The
+          builder applies the environment via
+          :meth:`DatabricksSession.builder.withEnvironment` so
+          serverless installs everything before the session is
+          handed back. This is the path the user normally wants:
+          ``pip_dependencies=("ygg",)`` becomes
+          ``env.withDependencies(["ygg"])`` and ygg is pulled from
+          PyPI on the cluster.
+        - **Classic compute** (a ``cluster_id`` is set) — eager
+          path: dependencies are zipped / pip-downloaded locally
+          and attached via
+          :meth:`SparkSession.addArtifacts` with ``pyfile=True``
+          because classic clusters don't honour the declarative
+          environment.
+
+        Arguments:
 
         - *dependencies* — local Python modules to bundle. Each
           entry is anything :func:`resolve_module_root` accepts
           (importable module name, ``os.PathLike`` to a package
           directory or pre-built ``.zip`` / ``.whl``, or a
-          callable with ``__module__``). Local packages are
-          packed into deflated zips on disk before upload.
+          callable with ``__module__``). Packed into deflated
+          ``.zip`` archives on disk.
         - *pip_dependencies* — PyPI specs (e.g. ``"ygg"``,
-          ``"ygg>=0.5"``). Wheels are fetched via ``pip download
-          --no-deps`` and attached the same way. Defaults to
-          ``("ygg",)`` so the cluster picks up the yggdrasil
-          runtime from PyPI without the caller having to bundle
-          it. Pass an empty tuple to disable.
+          ``"ygg>=0.5"``). Defaults to ``("ygg",)`` so the
+          cluster picks up the yggdrasil runtime from PyPI without
+          the caller having to bundle it. Pass an empty tuple to
+          disable.
         - *cache_dir* — local scratch directory for built archives
           and pip-downloaded wheels. Defaults to a fresh tempdir
           per call.
         - *workspace_cache* — optional :class:`WorkspacePath` (or
           path string under ``/Workspace/...``) to also persist the
-          resolved archives there. Useful for keeping a stable
-          remote copy that other sessions / notebook jobs can
-          point at without re-uploading. Falls back to writing
-          via :meth:`WorkspacePath.upload_module` when given a
-          module spec.
+          resolved local archives there for cross-session reuse.
         """
         from databricks.connect import DatabricksSession  # noqa
 
-        session = (
-            DatabricksSession.builder
-            .sdkConfig(self.workspace_config)
-            .getOrCreate()
-        )
+        deps = list(dependencies or ())
+        pip_deps = list(pip_dependencies or ())
+        builder = DatabricksSession.builder.sdkConfig(self.workspace_config)
 
-        artifacts = self._collect_spark_connect_artifacts(
-            dependencies=dependencies or (),
-            pip_dependencies=pip_dependencies or (),
+        if self.is_serverless_compute:
+            local_archives = self._collect_local_module_archives(
+                deps, cache_dir=cache_dir,
+            )
+            env = self._build_databricks_env(
+                pip_dependencies=pip_deps,
+                local_archives=local_archives,
+            )
+            if env is not None:
+                builder = builder.withEnvironment(env)
+            session = builder.getOrCreate()
+            if workspace_cache is not None and local_archives:
+                self._mirror_artifacts_to_workspace(local_archives, workspace_cache)
+            return session
+
+        # Classic compute — bundle + addArtifacts.
+        session = builder.getOrCreate()
+        artifacts = self._collect_spark_artifacts(
+            dependencies=deps,
+            pip_dependencies=pip_deps,
             cache_dir=cache_dir,
         )
-
         if artifacts:
             session.addArtifacts(*(str(p) for p in artifacts), pyfile=True)
-
             if workspace_cache is not None:
                 self._mirror_artifacts_to_workspace(artifacts, workspace_cache)
-
         return session
 
-    def _collect_spark_connect_artifacts(
+    def _collect_local_module_archives(
+        self,
+        dependencies: "Any",
+        *,
+        cache_dir: "Optional[Union[str, os.PathLike]]",
+    ) -> "list[Path]":
+        """Zip every local-module dependency into *cache_dir*.
+
+        Mirrors the local-module half of
+        :meth:`_collect_spark_artifacts` so the serverless
+        branch can reuse the archive-build step without also
+        running ``pip download``.
+        """
+        import tempfile
+        from yggdrasil.io.path._module_pack import build_module_archive
+
+        deps = list(dependencies)
+        if not deps:
+            return []
+
+        if cache_dir is None:
+            scratch = Path(tempfile.mkdtemp(prefix="ygg-spark-connect-"))
+        else:
+            scratch = Path(os.fspath(cache_dir))
+            scratch.mkdir(parents=True, exist_ok=True)
+
+        return [build_module_archive(dep, dest=scratch) for dep in deps]
+
+    def _build_databricks_env(
+        self,
+        *,
+        pip_dependencies: "list[str]",
+        local_archives: "list[Path]",
+    ):
+        """Build a :class:`DatabricksEnv` for the serverless path.
+
+        Returns ``None`` when neither *pip_dependencies* nor
+        *local_archives* contributed anything — the builder then
+        skips ``withEnvironment`` so the call falls through to a
+        plain ``getOrCreate``.
+
+        PyPI specs and local archives are chained through
+        :meth:`DatabricksEnv.withDependencies`; local files use the
+        ``local:`` prefix per the Databricks Connect docs so
+        serverless picks them up from the client side without a
+        Volume / DBFS round trip.
+        """
+        if not pip_dependencies and not local_archives:
+            return None
+
+        from databricks.connect import DatabricksEnv
+        env = DatabricksEnv()
+        if pip_dependencies:
+            env = env.withDependencies(list(pip_dependencies))
+        if local_archives:
+            env = env.withDependencies(
+                [f"local:{p}" for p in local_archives],
+            )
+        return env
+
+    def _collect_spark_artifacts(
         self,
         *,
         dependencies: "Any",
         pip_dependencies: "Any",
         cache_dir: "Optional[Union[str, os.PathLike]]",
     ) -> "list[Path]":
-        """Build the local artifact list for :meth:`spark_connect`.
+        """Build the local artifact list for :meth:`spark`.
 
         Pure resolution + filesystem work — no Spark calls — so the
         unit tests can exercise it without touching Databricks
