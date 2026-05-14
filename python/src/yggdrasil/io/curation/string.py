@@ -155,6 +155,14 @@ class StringCurator(Curator):
     #: ``None`` to keep naive strings naive.
     assume_naive_tz: Optional[str] = None
     timestamp_unit: str = "us"
+    #: Drop null cells from the curated output array. Defaults to
+    #: ``True`` so a per-array call to ``StringCurator().curate(...)``
+    #: returns a clean, null-free typed array — the common shape for
+    #: "I have these strings, give me the numbers". Auto-disabled by
+    #: :meth:`Curator.curate_arrow_tabular` (and the engine DataFrame
+    #: wrappers that go through it) because dropping nulls per column
+    #: would break row alignment across columns.
+    purge_nulls: bool = True
 
     # =========================================================== handles
 
@@ -192,6 +200,16 @@ class StringCurator(Curator):
             # ``flat`` came in as some string variant; downgrade to plain
             # ``string`` so the inferred type stays canonical.
             result, dtype = pc.cast(cleaned, pa.string()), StringType()
+
+        # Auto-purge nulls — only kicks in for typed results that have
+        # null cells to drop. ``NullType`` outputs stay length-preserved
+        # because everything was null and "drop all" would be surprising.
+        if (
+            self.purge_nulls
+            and not isinstance(dtype, NullType)
+            and result.null_count > 0
+        ):
+            result = result.filter(pc.invert(pc.is_null(result)))
 
         if chunked:
             result = pa.chunked_array([result])

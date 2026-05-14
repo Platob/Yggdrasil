@@ -141,10 +141,21 @@ class Curator(ABC):
 
         Input shape is preserved: a :class:`pa.Table` comes back as a
         Table, a :class:`pa.RecordBatch` comes back as a RecordBatch.
-        ``curator_kwargs`` are forwarded to each curator constructor.
+        ``curator_kwargs`` are forwarded to each curator constructor;
+        unknown kwargs are filtered per curator by :meth:`pick`.
+
+        ``purge_nulls`` is forced to ``False`` for the duration of this
+        call — dropping null cells per column would shift the row
+        alignment between columns. Override by passing
+        ``purge_nulls=True`` if you really want the per-column purge.
         """
         from yggdrasil.data.data_field import Field
         from yggdrasil.data.schema import StructField
+
+        # Tabular usage needs per-column row alignment; auto-purge
+        # would tear that apart. Pin the safer default unless the
+        # caller said otherwise.
+        curator_kwargs.setdefault("purge_nulls", False)
 
         if isinstance(tabular, pa.RecordBatch):
             columns = list(tabular.columns)
@@ -326,16 +337,31 @@ class Curator(ABC):
         """Return a Curator instance that handles *array*'s dtype.
 
         Walks the subclass tree top-down and instantiates the first
-        match with *kwargs*. New subclasses register automatically by
-        existing — no manual registry to keep in sync.
+        match with *kwargs*. Kwargs are filtered to the subclass's
+        ``__init__`` signature so dataclass curators (with fixed
+        fields like ``IntegerCurator(allow_unsigned=...)``) don't trip
+        on options that only make sense for another family (e.g.
+        ``purge_nulls`` on :class:`StringCurator`). Curators that
+        accept ``**kwargs`` (``NestedCurator``) get the full forward.
         """
         for subclass in cls._iter_subclasses():
             if subclass.handles(array.type):
-                return subclass(**kwargs)
+                return subclass(**cls._filter_kwargs(subclass, kwargs))
         raise TypeError(
             f"No Curator subclass handles Arrow type {array.type!r}. "
             f"Register one by subclassing Curator and implementing .handles()."
         )
+
+    @staticmethod
+    def _filter_kwargs(
+        subclass: "type[Curator]", kwargs: dict[str, Any]
+    ) -> dict[str, Any]:
+        import inspect
+
+        params = inspect.signature(subclass.__init__).parameters
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return kwargs
+        return {k: v for k, v in kwargs.items() if k in params}
 
     @classmethod
     def _iter_subclasses(cls):

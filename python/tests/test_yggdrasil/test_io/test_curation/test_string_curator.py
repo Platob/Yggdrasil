@@ -48,9 +48,17 @@ class TestStringCuratorTypeInference(ArrowTestCase):
         self.assertEqual(result.array.to_pylist(), [1.5, 2.5, 3.0])
 
     def test_boolean_mixed_case_and_aliases(self):
+        # Default ``purge_nulls=True`` drops the null cell, so the
+        # output is the four typed booleans — the common shape for a
+        # "give me the cleaned column" call.
         result = self._curate(["true", "False", "YES", "no", None])
         self.assertEqual(result.dtype, BooleanType())
-        self.assertEqual(result.array.to_pylist(), [True, False, True, False, None])
+        self.assertEqual(result.array.to_pylist(), [True, False, True, False])
+
+    def test_purge_nulls_off_keeps_null_positions(self):
+        result = self._curate(["true", "False", None], purge_nulls=False)
+        self.assertEqual(result.dtype, BooleanType())
+        self.assertEqual(result.array.to_pylist(), [True, False, None])
 
     def test_string_fallback_when_nothing_matches(self):
         result = self._curate(["hello", "world", "1"])
@@ -153,9 +161,16 @@ class TestStringCuratorCleaning(ArrowTestCase):
         self.assertEqual(result.array.to_pylist(), [42, 7, 9])
 
     def test_null_tokens_replace_with_real_nulls(self):
+        # ``NA`` / ``n/a`` get mapped to real nulls — and then dropped
+        # by the default ``purge_nulls=True``.
         curator = StringCurator()
         result = curator.curate(self.pa.array(["1", "NA", "n/a", "3"]))
         self.assertEqual(result.dtype, Int64Type())
+        self.assertEqual(result.array.to_pylist(), [1, 3])
+
+    def test_null_tokens_with_purge_off_show_as_nulls(self):
+        curator = StringCurator(purge_nulls=False)
+        result = curator.curate(self.pa.array(["1", "NA", "n/a", "3"]))
         self.assertEqual(result.array.to_pylist(), [1, None, None, 3])
 
     def test_disable_null_tokens_keeps_strings(self):
@@ -254,6 +269,30 @@ class TestCurateArrowArray(ArrowTestCase):
     def test_wrong_dtype_raises_via_call(self):
         with self.assertRaisesRegex(TypeError, "cannot curate Arrow type"):
             StringCurator().curate_arrow_array(self.pa.array([b"x", b"y"]))
+
+
+class TestPurgeNullsDefaults(ArrowTestCase):
+    """``purge_nulls=True`` is the StringCurator default; tabular forces False."""
+
+    def test_default_purges_nulls_in_typed_output(self):
+        result = StringCurator().curate(self.pa.array(["1", None, "3"]))
+        self.assertEqual(result.array.to_pylist(), [1, 3])
+
+    def test_all_null_input_stays_length_preserved(self):
+        # NullType output deliberately skips the purge — dropping "all
+        # null" would surprise the caller with an empty array.
+        result = StringCurator().curate(self.pa.array(["NA", None, ""]))
+        self.assertEqual(result.array.null_count, 3)
+        self.assertEqual(len(result.array), 3)
+
+    def test_tabular_forces_purge_off(self):
+        # Two columns with a null on different rows — purging would
+        # tear alignment apart. ``curate_arrow_tabular`` pins
+        # ``purge_nulls=False`` so the columns line up.
+        table = self.pa.table({"a": ["1", "NA", "3"], "b": ["x", "y", "z"]})
+        _, curated = Curator.curate_arrow_tabular(table)
+        self.assertEqual(curated.column("a").to_pylist(), [1, None, 3])
+        self.assertEqual(curated.column("b").to_pylist(), ["x", "y", "z"])
 
 
 class TestCurateArrowTabular(ArrowTestCase):

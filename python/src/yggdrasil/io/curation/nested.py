@@ -51,6 +51,12 @@ class NestedCurator(Curator):
         # Plain class (not a frozen dataclass) because ``Curator.pick``
         # forwards arbitrary curator kwargs in here, and we want to
         # capture them as-is rather than declaring a field for each.
+        # Force ``purge_nulls=False`` for child curators — dropping
+        # nulls in one struct/list/map child would shift its offsets
+        # relative to its siblings (or to the parent's null mask),
+        # tearing the rebuild apart. Same alignment rule that
+        # ``curate_arrow_tabular`` enforces.
+        inner_kwargs.setdefault("purge_nulls", False)
         self._inner_kwargs = inner_kwargs
 
     # ===================================================== Curator surface
