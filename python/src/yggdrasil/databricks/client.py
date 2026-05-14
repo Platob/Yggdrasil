@@ -1262,16 +1262,139 @@ class DatabricksClient(URLBased):
             use_cache=True,
         )
 
-    def spark_connect(self):
+    def spark_connect(
+        self,
+        *,
+        dependencies: "Optional[list[Any]]" = None,
+        pip_dependencies: "Optional[list[str]]" = ("ygg",),
+        cache_dir: "Optional[Union[str, os.PathLike]]" = None,
+        workspace_cache: "Optional[Any]" = None,
+    ):
+        """Open a Databricks Connect session with bundled Python deps.
+
+        Returns a live :class:`pyspark.sql.SparkSession` (Spark
+        Connect variant) configured against this client's workspace
+        host and credentials.
+
+        Dependencies are added via
+        :meth:`SparkSession.addArtifacts` with ``pyfile=True``, so
+        executors and UDFs see them in ``sys.path`` for the
+        lifetime of the session:
+
+        - *dependencies* — local Python modules to bundle. Each
+          entry is anything :func:`resolve_module_root` accepts
+          (importable module name, ``os.PathLike`` to a package
+          directory or pre-built ``.zip`` / ``.whl``, or a
+          callable with ``__module__``). Local packages are
+          packed into deflated zips on disk before upload.
+        - *pip_dependencies* — PyPI specs (e.g. ``"ygg"``,
+          ``"ygg>=0.5"``). Wheels are fetched via ``pip download
+          --no-deps`` and attached the same way. Defaults to
+          ``("ygg",)`` so the cluster picks up the yggdrasil
+          runtime from PyPI without the caller having to bundle
+          it. Pass an empty tuple to disable.
+        - *cache_dir* — local scratch directory for built archives
+          and pip-downloaded wheels. Defaults to a fresh tempdir
+          per call.
+        - *workspace_cache* — optional :class:`WorkspacePath` (or
+          path string under ``/Workspace/...``) to also persist the
+          resolved archives there. Useful for keeping a stable
+          remote copy that other sessions / notebook jobs can
+          point at without re-uploading. Falls back to writing
+          via :meth:`WorkspacePath.upload_module` when given a
+          module spec.
+        """
         from databricks.connect import DatabricksSession  # noqa
 
         session = (
-            DatabricksSession().builder
+            DatabricksSession.builder
             .sdkConfig(self.workspace_config)
             .getOrCreate()
         )
 
+        artifacts = self._collect_spark_connect_artifacts(
+            dependencies=dependencies or (),
+            pip_dependencies=pip_dependencies or (),
+            cache_dir=cache_dir,
+        )
+
+        if artifacts:
+            session.addArtifacts(*(str(p) for p in artifacts), pyfile=True)
+
+            if workspace_cache is not None:
+                self._mirror_artifacts_to_workspace(artifacts, workspace_cache)
+
         return session
+
+    def _collect_spark_connect_artifacts(
+        self,
+        *,
+        dependencies: "Any",
+        pip_dependencies: "Any",
+        cache_dir: "Optional[Union[str, os.PathLike]]",
+    ) -> "list[Path]":
+        """Build the local artifact list for :meth:`spark_connect`.
+
+        Pure resolution + filesystem work — no Spark calls — so the
+        unit tests can exercise it without touching Databricks
+        Connect.
+        """
+        import tempfile
+        from yggdrasil.environ import PyEnv
+        from yggdrasil.io.path._module_pack import build_module_archive
+
+        deps = list(dependencies)
+        pip_deps = list(pip_dependencies)
+        if not deps and not pip_deps:
+            return []
+
+        if cache_dir is None:
+            scratch = Path(tempfile.mkdtemp(prefix="ygg-spark-connect-"))
+        else:
+            scratch = Path(os.fspath(cache_dir))
+            scratch.mkdir(parents=True, exist_ok=True)
+
+        artifacts: list[Path] = []
+        for dep in deps:
+            artifacts.append(build_module_archive(dep, dest=scratch))
+
+        if pip_deps:
+            # Pull wheels into the same scratch dir so addArtifact +
+            # mirroring see one consistent layout. ``--no-deps``
+            # keeps the surface to the requested specs only; the
+            # cluster's own runtime already ships the heavyweight
+            # transitive deps (``pyarrow``, ``polars``, …).
+            pip_args: list[str] = ["download", "--no-deps", "-d", str(scratch)]
+            pip_args.extend(pip_deps)
+            PyEnv.current().pip(*pip_args)
+            for whl in sorted(scratch.glob("*.whl")):
+                if whl not in artifacts:
+                    artifacts.append(whl)
+        return artifacts
+
+    def _mirror_artifacts_to_workspace(
+        self,
+        artifacts: "list[Path]",
+        workspace_cache: "Any",
+    ) -> None:
+        """Copy local artifacts to a :class:`WorkspacePath` cache.
+
+        Accepts a :class:`WorkspacePath`, a workspace path string
+        (``/Workspace/Users/<me>/...``), or any other shape
+        :meth:`WorkspacePath.from_` knows how to coerce. Each
+        artifact is written verbatim under
+        ``workspace_cache / <name>`` — overwriting an existing
+        entry so reruns stay idempotent.
+        """
+        from yggdrasil.databricks.fs.workspace_path import WorkspacePath
+
+        if isinstance(workspace_cache, WorkspacePath):
+            cache_root = workspace_cache.with_client(self)
+        else:
+            cache_root = WorkspacePath.from_(workspace_cache, client=self)
+        cache_root.mkdir(parents=True, exist_ok=True)
+        for art in artifacts:
+            (cache_root / art.name).write_bytes(art.read_bytes())
 
 
 DATABRICKS_CLIENT_INIT_NAMES = frozenset(f.name for f in fields(DatabricksClient) if f.init)

@@ -339,6 +339,88 @@ class WorkspacePath(DatabricksPath):
             media_type=self.media_type,
         ))
 
+    # ==================================================================
+    # Module upload — stream directly through ``workspace.upload``
+    # ==================================================================
+
+    def upload_module(
+        self,
+        module: Any,
+        *,
+        name: str | None = None,
+        overwrite: bool = True,
+    ) -> "WorkspacePath":
+        """Pack a local module / package and import it into the workspace.
+
+        Mirrors the :meth:`Path.upload_module` contract but bypasses
+        the generic ``read_bytes()`` round-trip: the produced
+        ``.zip`` is streamed straight into ``workspace.upload`` from
+        an open file handle, so a large archive doesn't get
+        materialized into a Python ``bytes`` object before the
+        upload.
+
+        Destination resolution stays consistent with the base:
+        ``self`` with a ``.zip`` / ``.whl`` suffix is taken
+        verbatim; anything else gets ``self / <name or
+        "<module>.zip">``. The format hint is :class:`ImportFormat.AUTO`
+        — the Workspace API detects the binary content type and
+        stores the object as a workspace file (not a notebook).
+        """
+        from yggdrasil.io.path._module_pack import (
+            build_module_archive,
+            resolve_module_root,
+        )
+
+        local_root = resolve_module_root(module)
+        suffix = self.suffix.lower()
+        archive_default = (
+            name
+            if name is not None
+            else (
+                local_root.name
+                if local_root.is_file() and suffix in (".zip", ".whl")
+                else f"{local_root.name}.zip"
+            )
+        )
+
+        target: "WorkspacePath" = (
+            self
+            if suffix in (".zip", ".whl")
+            else self / archive_default
+        )
+
+        if not overwrite and target.exists():
+            raise FileExistsError(
+                f"upload_module: destination {target.full_path()!r} "
+                f"already exists. Pass overwrite=True to replace it."
+            )
+
+        archive_path = build_module_archive(local_root, dest=None)
+        try:
+            size = archive_path.stat().st_size
+            with open(archive_path, "rb") as fh:
+                target._call_ensuring_parents(
+                    target.client.workspace_client().workspace.upload,
+                    path=target.api_path,
+                    content=fh,
+                    format=_import_format_auto(),
+                    overwrite=overwrite,
+                )
+        finally:
+            if local_root != archive_path:
+                try:
+                    archive_path.unlink()
+                except OSError:
+                    pass
+
+        target._seed_stat_cache(IOStats(
+            size=int(size),
+            kind=IOKind.FILE,
+            mtime=time.time(),
+            media_type=target.media_type,
+        ))
+        return target
+
     def truncate(self, n: int) -> int:
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")

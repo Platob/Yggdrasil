@@ -278,6 +278,149 @@ class Path(Holder, os.PathLike, ABC):
                 pass
         return self
 
+    # ==================================================================
+    # Module upload / import — share local Python packages over the wire
+    # ==================================================================
+
+    def upload_module(
+        self,
+        module: Any,
+        *,
+        name: str | None = None,
+        overwrite: bool = True,
+    ) -> "Path":
+        """Zip a local module / package and write it under this path.
+
+        *module* is anything :func:`resolve_module_root` accepts —
+        an importable module name (``"yggdrasil.io"``), a
+        :class:`os.PathLike` pointing at a package directory or an
+        existing ``.zip`` / ``.whl`` archive, or a callable
+        carrying a ``__module__`` attribute. The module is packed
+        into a deflated zip whose top-level entry is the package
+        directory itself, so the archive can be added to
+        ``sys.path`` directly (or fed to
+        :meth:`SparkSession.addArtifacts` with ``pyfile=True``).
+
+        Destination shape on *self*:
+
+        - *self* names a file with a ``.zip`` / ``.whl`` suffix —
+          archive bytes land at that exact path.
+        - *self* is anything else — archive lands at
+          ``self / <name or "<module>.zip">``.
+
+        Returns the concrete :class:`Path` that now holds the
+        archive. ``overwrite=False`` raises
+        :class:`FileExistsError` when the destination already
+        exists.
+        """
+        from yggdrasil.io.path._module_pack import (
+            build_module_archive,
+            resolve_module_root,
+        )
+
+        local_root = resolve_module_root(module)
+        suffix = self.suffix.lower()
+        archive_default = (
+            name
+            if name is not None
+            else (
+                local_root.name
+                if local_root.is_file() and suffix in (".zip", ".whl")
+                else f"{local_root.name}.zip"
+            )
+        )
+
+        target: "Path" = (
+            self
+            if suffix in (".zip", ".whl")
+            else self / archive_default
+        )
+
+        if not overwrite and target.exists():
+            raise FileExistsError(
+                f"upload_module: destination {target.full_path()!r} "
+                f"already exists. Pass overwrite=True to replace it."
+            )
+
+        archive_path = build_module_archive(local_root, dest=None)
+        try:
+            target.write_bytes(archive_path.read_bytes())
+        finally:
+            # ``build_module_archive`` writes into the staging dir
+            # when dest is None; remove the local copy after the
+            # remote write succeeds so we don't leak the file.
+            if local_root != archive_path:
+                try:
+                    archive_path.unlink()
+                except OSError:
+                    pass
+        return target
+
+    def import_module(
+        self,
+        module_name: str | None = None,
+        *,
+        install: bool = True,
+        cache_dir: "Any" = None,
+    ) -> Any:
+        """Download a module archive at this path and import it.
+
+        Inverse of :meth:`upload_module`: fetch the archive bytes
+        at *self*, drop them on local disk, prepend the archive (or
+        its extracted parent) to :data:`sys.path`, and return the
+        live module via :func:`importlib.import_module`.
+
+        *module_name* defaults to the archive's stem (filename
+        minus suffix). *cache_dir* picks where the archive lands
+        locally (default: a fresh
+        :meth:`LocalPath.staging_path`-style directory).
+
+        ``install=True`` (the default) preserves the archive on
+        disk so subsequent imports in the same process hit the
+        cache. ``install=False`` makes the cache-dir lifetime the
+        caller's problem.
+        """
+        import importlib
+        import sys
+        import tempfile
+
+        suffix = self.suffix.lower()
+        if suffix not in (".zip", ".whl"):
+            raise ValueError(
+                f"import_module: {self.full_path()!r} does not look "
+                f"like a Python archive (expected .zip or .whl, got "
+                f"{suffix or '<none>'!r})."
+            )
+
+        stem = self.stem
+        resolved_name = module_name or stem
+
+        if cache_dir is None:
+            target_dir = tempfile.mkdtemp(prefix="ygg-module-")
+        else:
+            target_dir = os.fspath(cache_dir)
+            os.makedirs(target_dir, exist_ok=True)
+
+        local_archive = os.path.join(target_dir, self.name)
+        with open(local_archive, "wb") as fh:
+            fh.write(bytes(self.read_mv(-1, 0)))
+
+        if local_archive not in sys.path:
+            sys.path.insert(0, local_archive)
+
+        importlib.invalidate_caches()
+        try:
+            return importlib.import_module(resolved_name)
+        except ModuleNotFoundError:
+            if not install:
+                raise
+            # ``.whl`` archives don't sit on ``sys.path``
+            # directly — installing them is the supported path.
+            from yggdrasil.environ import PyEnv
+            PyEnv.current().install(local_archive, raise_error=True)
+            importlib.invalidate_caches()
+            return importlib.import_module(resolved_name)
+
     def as_media(self, media_type: "Any" = None) -> "Any":
         """Wrap this path in the :class:`Tabular` leaf for its media type.
 
