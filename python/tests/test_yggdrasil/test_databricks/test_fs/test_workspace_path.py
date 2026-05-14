@@ -245,6 +245,86 @@ class TestParentRetry:
         p.mkdir(parents=True, exist_ok=True)
 
 
+class TestUploadModule:
+    """``WorkspacePath.upload_module`` should stream a local module
+    archive straight through ``workspace.upload`` with ``format=AUTO``
+    and seed the stat cache so the next round-trip is local."""
+
+    @pytest.fixture
+    def demo_package(self, tmp_path):
+        pkg = tmp_path / "pkg" / "demo_ws_mod"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("X = 1\n")
+        return pkg
+
+    def test_upload_streams_archive(self, workspace, client, demo_package) -> None:
+        workspace.workspace.get_status.side_effect = NotFound()
+
+        captured: dict = {}
+
+        def capture_upload(**kwargs):
+            content = kwargs["content"]
+            if hasattr(content, "read"):
+                captured["body"] = content.read()
+            else:
+                captured["body"] = bytes(content)
+            captured["kwargs"] = kwargs
+
+        workspace.workspace.upload.side_effect = capture_upload
+
+        target = WorkspacePath(
+            "/Workspace/Users/me/.ygg/modules", client=client,
+        )
+        archive = target.upload_module(demo_package)
+
+        assert archive.full_path() == (
+            "/Workspace/Users/me/.ygg/modules/demo_ws_mod.zip"
+        )
+
+        # One ``workspace.upload`` round trip; the format hint is
+        # AUTO (the SDK default would route through the notebook
+        # importer and fail on raw zip bytes).
+        kwargs = captured["kwargs"]
+        assert kwargs["path"] == archive.full_path()
+        assert kwargs["overwrite"] is True
+        fmt = kwargs["format"]
+        assert getattr(fmt, "name", str(fmt)).upper() == "AUTO"
+
+        # The bytes streamed in really are a zip with the expected entries.
+        import io as _io
+        import zipfile
+        with zipfile.ZipFile(_io.BytesIO(captured["body"])) as zf:
+            assert "demo_ws_mod/__init__.py" in zf.namelist()
+
+    def test_upload_to_explicit_zip_path(self, workspace, client, demo_package) -> None:
+        workspace.workspace.get_status.side_effect = NotFound()
+        target = WorkspacePath(
+            "/Workspace/Users/me/libs/custom.zip", client=client,
+        )
+        archive = target.upload_module(demo_package)
+        assert archive.full_path() == "/Workspace/Users/me/libs/custom.zip"
+        workspace.workspace.upload.assert_called_once()
+        kwargs = workspace.workspace.upload.call_args.kwargs
+        assert kwargs["path"] == "/Workspace/Users/me/libs/custom.zip"
+
+    def test_upload_no_overwrite_raises_when_exists(
+        self, workspace, client, demo_package,
+    ) -> None:
+        workspace.workspace.get_status.return_value = _file_status(123)
+        target = WorkspacePath(
+            "/Workspace/Users/me/.ygg/modules", client=client,
+        )
+        with pytest.raises(FileExistsError):
+            target.upload_module(demo_package, overwrite=False)
+
+
+def _BytesIOFor(data: bytes):
+    """``io.BytesIO`` shim — kept inline so the test file stays
+    free of top-level engine imports for the rest of the suite."""
+    import io as _io
+    return _io.BytesIO(data)
+
+
 class TestRetryPolicy:
 
     @pytest.fixture

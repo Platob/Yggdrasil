@@ -67,6 +67,17 @@ def _safe_tag_collapse(repl: str) -> re.Pattern[str]:
     return pattern
 
 
+def _is_ygg_dep(dep: Any) -> bool:
+    """True when *dep* refers to the ``ygg`` / ``yggdrasil`` project."""
+    if isinstance(dep, str):
+        head = dep.strip().split("[", 1)[0]
+        for op in ("==", ">=", "<=", "!=", "~=", ">", "<"):
+            head = head.split(op, 1)[0]
+        return head.strip().lower() in ("ygg", "yggdrasil")
+    name = getattr(dep, "__module__", None) or getattr(dep, "__name__", "")
+    return isinstance(name, str) and name.split(".", 1)[0] in ("ygg", "yggdrasil")
+
+
 def getenv(name: str) -> Optional[str]:
     v = os.getenv(name)
     return v if v not in (None, "") else None
@@ -1262,16 +1273,206 @@ class DatabricksClient(URLBased):
             use_cache=True,
         )
 
-    def spark_connect(self):
+    @property
+    def is_serverless_compute(self) -> bool:
+        """True when this client targets serverless compute.
+
+        A bare client with no ``cluster_id`` always lands on
+        serverless once ``make_config`` flips
+        ``serverless_compute_id`` to ``"auto"``; setting
+        ``cluster_id`` explicitly opts back into the classic
+        compute path. Mirrors the same rule
+        ``_make_base_config`` applies before handing the config
+        off to the SDK.
+        """
+        return bool(self.serverless_compute_id) or not self.cluster_id
+
+    @classmethod
+    def default_ygg_spec(cls) -> str:
+        """Default ``ygg`` pip spec for :meth:`spark`.
+
+        Pinned to the driver's installed version with the
+        ``[data, databricks]`` extras so executors see the same
+        ygg the driver is using — no surprise drift from
+        whatever PyPI's latest happens to be when the cluster
+        installs it.
+        """
+        return f"ygg[data,databricks]=={ygg_version}"
+
+    def spark(
+        self,
+        *dependencies: "Any",
+        registry: "Optional[Any]" = None,
+        check_public: bool = False,
+        cache_dir: "Optional[Union[str, os.PathLike]]" = None,
+    ):
+        """Open a Databricks Connect session with auto-resolved deps.
+
+        Returns a live :class:`pyspark.sql.SparkSession` (Spark
+        Connect variant) configured against this client's workspace
+        host and credentials. The bound :class:`DatabricksClient`
+        is stashed on the session as ``session.ygg_client`` so
+        downstream helpers (UDFs, :class:`DynamicFrame` extensions,
+        ad-hoc resource lookups) can reach the same auth without an
+        extra ``DatabricksClient.current()`` call.
+
+        Each *dependency* is classified once via
+        :func:`classify_dependency`:
+
+        - Public PyPI specs (``"ygg[data,databricks]==0.7.73"``,
+          ``"numpy>=1.0"``, …) ride straight to the cluster via
+          :meth:`DatabricksEnv.withDependencies`. ``ygg`` is
+          always declared via :meth:`default_ygg_spec` — pinned
+          to the driver's installed version with the
+          ``[data, databricks]`` extras so the cluster sees the
+          exact same runtime + ``pandas`` / ``numpy`` /
+          ``databricks-sdk`` surface the driver is using.
+          Override by passing an explicit ``ygg`` spec
+          (e.g. ``client.spark("ygg==0.7.0")`` or
+          ``client.spark("ygg")`` for an editable-mode rebuild).
+        - Editable installs (``pip install -e .``) get their
+          local working copy built into a wheel whose version
+          carries the local hostname
+          (``0.7.73+host.<host>``). The wheel lives at
+          ``/Workspace/Users/<me>/.ygg/pypi/simple/<pkg>/<wheel>``
+          (overridable via *registry*) and is re-uploaded on every
+          load so the registry slot tracks the developer's
+          working code.
+        - Private / non-PyPI installs get the same wheel-build +
+          workspace-upload treatment, but lazily — the upload
+          is skipped when the workspace slot already exists, so
+          a team sharing one registry path only re-uploads on
+          version bumps.
+
+        Both editable and private wheels are then handed to
+        :meth:`DatabricksEnv.withDependencies` via the
+        ``local:<path>`` prefix Databricks Connect understands;
+        the wheel itself is read back from the workspace into a
+        local cache so the spec is reachable from the driver
+        process.
+
+        Serverless compute (the default — no ``cluster_id``) wires
+        deps through ``DatabricksEnv`` + ``withEnvironment``;
+        classic compute falls back to
+        :meth:`SparkSession.addArtifacts` with ``pyfile=True``
+        since classic clusters don't honour the declarative
+        environment.
+
+        Arguments:
+
+        - *dependencies* — variadic. Each entry is anything
+          :func:`classify_dependency` accepts (PyPI spec string,
+          bare module name, :class:`os.PathLike`, or any object
+          with ``__module__``). ``client.spark("polars",
+          "my_internal", Path("/some/pkg"))`` is the headline
+          shape; ``ygg[data,databricks]`` is appended
+          automatically unless the caller already provides their
+          own ``ygg`` spec.
+        - *registry* — a :class:`WorkspacePyPIRegistry` (or any
+          shape its constructor accepts) to use as the shared
+          wheel cache. Defaults to a registry rooted at
+          ``/Workspace/Users/<me>/.ygg/pypi/simple`` so a
+          single-user setup needs no configuration.
+        - *check_public* — when ``True``, an HTTPS probe to
+          ``pypi.org`` decides whether an installed dist counts
+          as public. Off by default so an offline registry stays
+          fast; turn on when shipping mixed public / private
+          deps.
+        - *cache_dir* — local scratch dir used by the classic
+          compute fallback (and for wheel materialization when
+          no explicit *registry* is passed).
+        """
         from databricks.connect import DatabricksSession  # noqa
 
-        session = (
-            DatabricksSession().builder
-            .sdkConfig(self.workspace_config)
-            .getOrCreate()
-        )
+        deps = list(dependencies)
+        if not any(_is_ygg_dep(d) for d in deps):
+            deps.insert(0, self.default_ygg_spec())
+
+        registry_obj = self._resolve_registry(registry, cache_dir=cache_dir)
+        specs, _remotes = registry_obj.publish_many(deps, check_public=check_public)
+
+        builder = DatabricksSession.builder.sdkConfig(self.workspace_config)
+
+        if self.is_serverless_compute:
+            env = self._build_databricks_env(install_specs=specs)
+            if env is not None:
+                builder = builder.withEnvironment(env)
+            session = builder.getOrCreate()
+        else:
+            # Classic compute — the cluster won't read the
+            # environment, so attach the local wheels as
+            # ``addArtifacts(pyfile=True)`` instead.
+            session = builder.getOrCreate()
+            local_paths = [
+                spec[len("local:"):]
+                for spec in specs
+                if spec.startswith("local:")
+            ]
+            if local_paths:
+                session.addArtifacts(*local_paths, pyfile=True)
+
+        # Stash the client on the session so downstream
+        # ``client.spark(...)``-returned consumers can grab it
+        # without re-resolving ``DatabricksClient.current()``.
+        try:
+            session.ygg_client = self  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
         return session
+
+    def _resolve_registry(
+        self,
+        registry: "Optional[Any]",
+        *,
+        cache_dir: "Optional[Union[str, os.PathLike]]",
+    ):
+        """Coerce *registry* into a :class:`WorkspacePyPIRegistry`.
+
+        ``None`` → fresh registry at the default workspace path
+        with this client bound. Any other shape (string,
+        :class:`WorkspacePath`) is forwarded to the
+        ``WorkspacePyPIRegistry.__init__`` keyword ``base_path``.
+        An already-constructed registry is rebound to this
+        client (no-op if it was already pointing here) and
+        returned as-is so callers can preconfigure the local
+        cache or workspace root once and reuse it.
+        """
+        from yggdrasil.databricks.registry import WorkspacePyPIRegistry
+
+        if isinstance(registry, WorkspacePyPIRegistry):
+            registry.client = self
+            return registry
+
+        local_cache = (
+            Path(os.fspath(cache_dir)) if cache_dir is not None else None
+        )
+        return WorkspacePyPIRegistry(
+            client=self,
+            base_path=registry,
+            local_cache=local_cache,
+        )
+
+    def _build_databricks_env(
+        self,
+        *,
+        install_specs: "list[str]",
+    ):
+        """Build a :class:`DatabricksEnv` for the serverless path.
+
+        *install_specs* is the merged list produced by
+        :meth:`WorkspacePyPIRegistry.publish_many` — a mix of
+        ``"name==version"`` (public PyPI) and ``"local:<path>"``
+        entries. Returns ``None`` when nothing to install so the
+        builder can skip ``withEnvironment`` entirely.
+        """
+        if not install_specs:
+            return None
+
+        from databricks.connect import DatabricksEnv
+        env = DatabricksEnv()
+        env = env.withDependencies(list(install_specs))
+        return env
 
 
 DATABRICKS_CLIENT_INIT_NAMES = frozenset(f.name for f in fields(DatabricksClient) if f.init)
