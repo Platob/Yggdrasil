@@ -271,6 +271,59 @@ class TestCurateArrowArray(ArrowTestCase):
             StringCurator().curate_arrow_array(self.pa.array([b"x", b"y"]))
 
 
+class TestTabularDropAllNullColumns(ArrowTestCase):
+    """``drop_all_null_columns=True`` removes columns that inferred as NullType."""
+
+    def test_default_drops_null_token_only_column(self):
+        # ``empty`` is entirely null tokens — curates to NullType, drops.
+        t = self.pa.table({"id": ["1", "2"], "empty": ["NA", None], "name": ["a", "b"]})
+        schema, curated = Curator.curate_arrow_tabular(t)
+        self.assertEqual(curated.schema.names, ["id", "name"])
+        self.assertEqual([f.name for f in schema.fields], ["id", "name"])
+
+    def test_off_keeps_null_typed_column(self):
+        t = self.pa.table({"id": ["1", "2"], "empty": ["NA", None], "name": ["a", "b"]})
+        schema, curated = Curator.curate_arrow_tabular(t, drop_all_null_columns=False)
+        self.assertIn("empty", curated.schema.names)
+        self.assertEqual(curated.schema.field("empty").type, self.pa.null())
+
+    def test_drops_pretyped_null_column(self):
+        # Pretyped pa.null() column with no curator should also drop.
+        t = self.pa.table(
+            {
+                "id": ["1", "2"],
+                "always_null": self.pa.nulls(2, type=self.pa.null()),
+            }
+        )
+        _, curated = Curator.curate_arrow_tabular(t)
+        self.assertEqual(curated.schema.names, ["id"])
+
+
+class TestTabularDropAllNullRows(ArrowTestCase):
+    """``drop_all_null_rows=True`` drops rows where every column is null."""
+
+    def test_default_drops_all_null_rows(self):
+        # Row 1 is all-null after curation (both NA tokens).
+        t = self.pa.table({"id": ["1", "NA", "3"], "name": ["a", "NA", "c"]})
+        _, curated = Curator.curate_arrow_tabular(t)
+        self.assertEqual(curated.num_rows, 2)
+        self.assertEqual(curated.column("id").to_pylist(), [1, 3])
+        self.assertEqual(curated.column("name").to_pylist(), ["a", "c"])
+
+    def test_off_keeps_all_null_rows(self):
+        t = self.pa.table({"id": ["1", "NA", "3"], "name": ["a", "NA", "c"]})
+        _, curated = Curator.curate_arrow_tabular(t, drop_all_null_rows=False)
+        self.assertEqual(curated.num_rows, 3)
+        self.assertEqual(curated.column("id").to_pylist(), [1, None, 3])
+
+    def test_partial_null_row_is_kept(self):
+        # Only one column null on row 1 — that row stays.
+        t = self.pa.table({"id": ["1", "2", "3"], "name": ["a", "NA", "c"]})
+        _, curated = Curator.curate_arrow_tabular(t)
+        self.assertEqual(curated.num_rows, 3)
+        self.assertEqual(curated.column("name").to_pylist(), ["a", None, "c"])
+
+
 class TestPurgeNullsDefaults(ArrowTestCase):
     """``purge_nulls=True`` is the StringCurator default; tabular forces False."""
 

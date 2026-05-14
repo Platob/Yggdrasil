@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Union
+from typing import TYPE_CHECKING, Any, Iterable, Union
 
 import pyarrow as pa
 
@@ -35,6 +35,48 @@ __all__ = ["Curator", "CurationResult", "ArrayLike", "TabularLike"]
 
 ArrayLike = Union[pa.Array, pa.ChunkedArray]
 TabularLike = Union[pa.Table, pa.RecordBatch]
+
+
+def _drop_all_null_rows(columns: list[ArrayLike]) -> list[ArrayLike]:
+    """Filter *columns* to rows where at least one column is non-null.
+
+    Vectorised: AND together the per-column null masks, invert, and
+    pass the result to ``pa.compute.filter`` for each column. No
+    Python row loop.
+    """
+    import pyarrow.compute as pc
+
+    iterator = iter(columns)
+    first = next(iterator)
+    all_null_mask = pc.is_null(first)
+    for col in iterator:
+        all_null_mask = pc.and_(all_null_mask, pc.is_null(col))
+    keep = pc.invert(all_null_mask)
+    # Short-circuit: nothing to drop.
+    if pc.all(keep).as_py():
+        return columns
+    return [pc.filter(col, keep) for col in columns]
+
+
+def _align_batch_to_schema(batch: pa.RecordBatch, target: pa.Schema) -> pa.RecordBatch:
+    """Project *batch* onto *target* — add missing columns as nulls,
+    drop extras, cast overlapping dtypes to the target width.
+
+    Used by the Spark Pass 2 path to land every cached partition's
+    curated batch on the merged schema, regardless of which subset of
+    columns / which (narrower) dtypes that partition originally
+    inferred.
+    """
+    columns: list[pa.Array] = []
+    for field in target:
+        if field.name in batch.schema.names:
+            col = batch.column(field.name)
+            if col.type != field.type:
+                col = pa.compute.cast(col, field.type, safe=False)
+            columns.append(col)
+        else:
+            columns.append(pa.nulls(batch.num_rows, type=field.type))
+    return pa.RecordBatch.from_arrays(columns, schema=target)
 
 
 @dataclass(frozen=True)
@@ -129,6 +171,8 @@ class Curator(ABC):
         cls,
         tabular: TabularLike,
         nullable: bool = True,
+        drop_all_null_columns: bool = True,
+        drop_all_null_rows: bool = True,
         **curator_kwargs: Any,
     ) -> "tuple[Schema, TabularLike]":
         """Curate every column of *tabular* and return ``(Schema, table)``.
@@ -148,9 +192,22 @@ class Curator(ABC):
         call — dropping null cells per column would shift the row
         alignment between columns. Override by passing
         ``purge_nulls=True`` if you really want the per-column purge.
+
+        ``drop_all_null_columns`` (default ``True``) removes any column
+        that inferred as :class:`NullType` — i.e., every cell was
+        null. These columns carry no information and shipping them
+        downstream tends to cause more grief (Spark / Parquet writers
+        refuse ``null`` columns, schema diff tools flag them, etc.)
+        than keeping them ever helps. Pass ``False`` to preserve them.
+
+        ``drop_all_null_rows`` (default ``True``) drops rows where every
+        remaining column is null. Same rationale — an all-null row is
+        the tabular shape of "no data", and downstream code usually
+        wants it gone. Pass ``False`` to keep them.
         """
         from yggdrasil.data.data_field import Field
         from yggdrasil.data.schema import StructField
+        from yggdrasil.data.types import NullType
 
         # Tabular usage needs per-column row alignment; auto-purge
         # would tear that apart. Pin the safer default unless the
@@ -181,12 +238,18 @@ class Curator(ABC):
                 # No subclass claims this dtype — pass it through with
                 # the existing Arrow type. Better than silently dropping
                 # the column or forcing the caller into a typecheck.
+                if drop_all_null_columns and pa.types.is_null(column.type):
+                    continue
                 fields.append(Field(name=name, dtype=column.type, nullable=nullable))
                 curated_columns.append(column)
                 continue
             field, curated = curator.curate_arrow_array(
                 column, name=name, nullable=nullable
             )
+            if drop_all_null_columns and isinstance(field.dtype, NullType):
+                # All-null column → nothing the downstream can do with
+                # it. Drop the whole pair before the schema gets built.
+                continue
             fields.append(field)
             curated_columns.append(curated)
 
@@ -194,6 +257,10 @@ class Curator(ABC):
         arrow_schema = pa.schema(
             [pa.field(f.name, f.dtype.to_arrow(), nullable=f.nullable) for f in fields]
         )
+
+        if drop_all_null_rows and curated_columns:
+            curated_columns = _drop_all_null_rows(curated_columns)
+
         if is_batch:
             # RecordBatch needs flat Arrays, not ChunkedArrays. Combine
             # if any curator handed back a chunked result.
@@ -201,7 +268,13 @@ class Curator(ABC):
                 c.combine_chunks() if isinstance(c, pa.ChunkedArray) else c
                 for c in curated_columns
             ]
+            # Empty schema (all columns dropped) needs an explicit
+            # row count — pyarrow infers 0 when no arrays are given.
+            if not flat:
+                return schema, pa.RecordBatch.from_arrays([], schema=arrow_schema)
             return schema, pa.RecordBatch.from_arrays(flat, schema=arrow_schema)
+        if not curated_columns:
+            return schema, pa.Table.from_arrays([], schema=arrow_schema)
         return schema, pa.Table.from_arrays(curated_columns, schema=arrow_schema)
 
     # ----------------------------------------------------- Engine wrappers
@@ -307,9 +380,10 @@ class Curator(ABC):
         cls,
         df: Any,
         nullable: bool = True,
+        drop_all_null_columns: bool = True,
         **curator_kwargs: Any,
     ) -> "tuple[Schema, Any]":
-        """Curate every column of a Spark DataFrame via the pandas bridge.
+        """Curate a Spark DataFrame in two distributed ``mapInArrow`` passes.
 
         Returns ``(Schema, pyspark.sql.DataFrame)``. PySpark has no
         standalone column object you can curate in isolation
@@ -317,18 +391,133 @@ class Curator(ABC):
         DataFrame-shaped entry point exists for Spark — pull a single
         column out as ``df.select("x")`` if you need it.
 
-        Round-trips through ``df.toPandas()`` + ``spark.createDataFrame``,
-        which uses Arrow under the hood when
-        ``spark.sql.execution.arrow.pyspark.enabled`` is set (the
-        default on modern PySpark).
+        Layout:
+
+        1. **Pass 1** — ``df.mapInArrow`` runs :meth:`curate_arrow_tabular`
+           per partition's RecordBatch. Each curated batch is serialized
+           to an Arrow IPC stream and emitted alongside the partition's
+           inferred yggdrasil :class:`Schema` (pickled). The intermediate
+           DataFrame is cached so Pass 2 can replay it without re-running
+           the curation.
+        2. **Driver schema merge** — collect the pickled schemas, union
+           the fields, and upcast overlapping dtypes so every column
+           lands at the widest width the data needed across all
+           partitions. (``int8`` in one partition + ``int32`` in another
+           ⇒ ``int32`` in the output.)
+        3. **Pass 2** — ``cached.mapInArrow`` reads each cached IPC blob,
+           rebuilds the RecordBatch, fills missing columns with nulls,
+           casts to the merged Arrow schema, and yields the result. The
+           outer DataFrame carries the curated Spark schema so downstream
+           DataFrame ops see the inferred types directly.
+
+        Keeping the curation distributed (no ``toPandas()`` collect) is
+        the whole point — on production-size frames the driver round-trip
+        is the difference between "a few seconds" and "your YARN slot
+        gets killed for OOM."
         """
-        spark_session = df.sparkSession
-        pandas_df = df.toPandas()
-        schema, curated = cls.curate_pandas_dataframe(
-            pandas_df, nullable=nullable, **curator_kwargs
+        from yggdrasil.data.schema import StructField
+        from yggdrasil.data.enums import Mode
+        from yggdrasil.lazy_imports import spark_sql_module
+
+        # ``pyspark.cloudpickle`` is the canonical serializer for
+        # everything that crosses the Spark driver / worker boundary
+        # in this codebase (see ``spark/frame.py``). It handles
+        # closures + arbitrary Python objects (yggdrasil ``Schema``)
+        # the stock pickle module can't.
+        from pyspark.cloudpickle import dumps as _ser_dumps
+        from pyspark.cloudpickle import loads as _ser_loads
+
+        pst = spark_sql_module().types
+
+        # Bind curator_kwargs into a closure-friendly form.
+        kwargs = dict(curator_kwargs)
+        nullable_arg = nullable
+        drop_nulls = drop_all_null_columns
+
+        # ---- Pass 1: per-partition curate + serialize ----------------
+
+        cache_schema = pst.StructType(
+            [
+                pst.StructField("schema_pickle", pst.BinaryType(), False),
+                pst.StructField("batch_ipc", pst.BinaryType(), False),
+            ]
         )
-        new_df = spark_session.createDataFrame(curated)
-        return schema, new_df
+
+        def _pass_one(
+            batches: "Iterable[pa.RecordBatch]",
+        ) -> "Iterable[pa.RecordBatch]":
+            for batch in batches:
+                if batch.num_rows == 0:
+                    continue
+                schema, curated = cls.curate_arrow_tabular(
+                    batch,
+                    nullable=nullable_arg,
+                    drop_all_null_columns=drop_nulls,
+                    **kwargs,
+                )
+                schema_pickle = _ser_dumps(schema)
+                sink = pa.BufferOutputStream()
+                with pa.ipc.new_stream(sink, curated.schema) as writer:
+                    writer.write_batch(curated)
+                ipc_bytes = sink.getvalue().to_pybytes()
+                yield pa.RecordBatch.from_arrays(
+                    [
+                        pa.array([schema_pickle], type=pa.binary()),
+                        pa.array([ipc_bytes], type=pa.binary()),
+                    ],
+                    names=["schema_pickle", "batch_ipc"],
+                )
+
+        cached = df.mapInArrow(_pass_one, schema=cache_schema).cache()
+
+        # ---- Driver-side schema merge --------------------------------
+
+        merged: "Schema | None" = None
+        for row in cached.select("schema_pickle").toLocalIterator():
+            partition_schema = _ser_loads(row["schema_pickle"])
+            if merged is None:
+                merged = partition_schema
+            else:
+                # ``Mode.APPEND`` keeps every field name from either side
+                # and ``upcast=True`` widens overlapping dtypes (int8 +
+                # int32 → int32, etc) — the right semantic for "all the
+                # rows must fit".
+                merged = merged.merge_with(
+                    partition_schema, mode=Mode.APPEND, upcast=True
+                )
+
+        if merged is None:
+            # No batches → empty frame. Return an empty Spark frame with
+            # an empty schema so callers get a stable shape.
+            empty_schema = StructField([])
+            empty_spark_schema = pst.StructType([])
+            return empty_schema, df.sparkSession.createDataFrame(
+                [], schema=empty_spark_schema
+            )
+
+        merged_fields: list[Field] = list(merged.fields)
+        merged_arrow_schema = pa.schema(
+            [
+                pa.field(f.name, f.dtype.to_arrow(), nullable=f.nullable)
+                for f in merged_fields
+            ]
+        )
+        merged_spark_schema = merged.to_spark_schema()
+
+        # ---- Pass 2: rehydrate + cast to merged schema ---------------
+
+        def _pass_two(
+            batches: "Iterable[pa.RecordBatch]",
+        ) -> "Iterable[pa.RecordBatch]":
+            for meta_batch in batches:
+                ipc_col = meta_batch.column("batch_ipc")
+                for i in range(meta_batch.num_rows):
+                    blob = ipc_col[i].as_py()
+                    reader = pa.ipc.open_stream(pa.BufferReader(blob))
+                    partition_batch = reader.read_next_batch()
+                    yield _align_batch_to_schema(partition_batch, merged_arrow_schema)
+
+        return merged, cached.mapInArrow(_pass_two, schema=merged_spark_schema)
 
     # ------------------------------------------------------------- utils
 
