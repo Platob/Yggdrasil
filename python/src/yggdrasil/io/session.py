@@ -1762,6 +1762,119 @@ class Session(ABC):
         )
         yield from self._send_many_batches(requests, cfg)
 
+    def spark_send(
+        self,
+        request: PreparedRequest,
+        config: SendConfig | Mapping[str, Any] | None = None,
+        *,
+        spark_session: "SparkSession",
+        wait: WaitingConfigArg = None,
+        raise_error: bool = True,
+        stream: bool = True,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
+        local_cache: CacheConfig | Mapping[str, Any] | None = None,
+        **options,
+    ) -> "SparkDataFrame":
+        """Send one request via Spark and return a lazy ``DataFrame[Response]``.
+
+        Thin wrapper over :meth:`spark_send_many` for the single-request
+        case. The returned Spark DataFrame carries :data:`RESPONSE_SCHEMA`
+        and stays unmaterialised on the driver — no executor job fires
+        until the caller triggers an action (``.collect()``,
+        ``.write...``, ``.count()``, …) — so callers can chain additional
+        lazy Spark transforms on top before pulling rows.
+        """
+        return self.spark_send_many(
+            iter([request]),
+            config,
+            spark_session=spark_session,
+            wait=wait,
+            raise_error=raise_error,
+            stream=stream,
+            remote_cache=remote_cache,
+            local_cache=local_cache,
+            **options,
+        )
+
+    def spark_send_many(
+        self,
+        requests: Iterator[PreparedRequest],
+        config: SendManyConfig | SendConfig | Mapping[str, Any] | None = None,
+        *,
+        spark_session: "SparkSession",
+        wait: WaitingConfigArg = None,
+        raise_error: bool = True,
+        normalize: bool | None = None,
+        stream: bool = True,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
+        local_cache: CacheConfig | Mapping[str, Any] | None = None,
+        batch_size: int | None = None,
+        ordered: bool = False,
+        max_in_flight: int | None = None,
+        max_batch_ttl: float | None = None,
+        **options,
+    ) -> "SparkDataFrame":
+        """Send many requests via Spark and return a lazy ``DataFrame[Response]``.
+
+        Drives the same staged ``send_many`` pipeline as :meth:`send_many`
+        but in Spark mode (cf. :meth:`_send_many_batches`): every bucket
+        — local hits, remote hits, network responses — stays
+        frame-resident on the executors, the network fetch fans out via
+        ``mapInArrow``, and the per-chunk :class:`ResponseBatch` frames
+        are stitched into a single union via
+        ``unionByName(allowMissingColumns=True)``.
+        Schema matches :data:`RESPONSE_SCHEMA`.
+        The returned DataFrame is lazy — driver-side cache lookups and
+        the ``mapInArrow`` plan are built eagerly, but no executor job
+        fires until the caller triggers a Spark action.
+        Pass an explicit ``batch_size`` larger than the request count to
+        collapse the pipeline into a single ``mapInArrow`` scatter (one
+        big chunk, one frame); the default chunks at
+        ``min(SendManyConfig.max_batch_size, 1024)`` so an unbounded
+        upstream iterator can't pin every request on the driver before
+        any work scatters.
+        """
+        cfg = SendManyConfig.check_arg(
+            config,
+            wait=wait,
+            raise_error=raise_error,
+            normalize=normalize,
+            stream=stream,
+            remote_cache=remote_cache,
+            local_cache=local_cache,
+            batch_size=batch_size,
+            ordered=ordered,
+            max_in_flight=max_in_flight,
+            max_batch_ttl=max_batch_ttl,
+            spark_session=spark_session,
+            **options,
+        )
+        if cfg.spark_session is None or cfg.spark_session is ...:
+            raise ValueError(
+                "spark_send_many requires a live SparkSession — got "
+                f"{cfg.spark_session!r}. Pass `spark_session=...` (or set it "
+                "on the SendManyConfig) so the staged pipeline can keep its "
+                "buckets frame-resident."
+            )
+        spark = cfg.spark_session
+
+        # Drive the staged pipeline; ``_send_many_batches`` already
+        # picks the Spark path from ``cfg.spark_session`` and yields
+        # one Spark-backed :class:`ResponseBatch` per chunk. Union the
+        # per-chunk frames lazily — ``unionByName`` builds a plan
+        # without firing an action — so the caller gets a single
+        # ``DataFrame[Response]`` to compose with.
+        frames: list["SparkDataFrame"] = []
+        for batch in self._send_many_batches(requests, cfg):
+            frames.append(batch.to_dataframe(spark))
+
+        if not frames:
+            return self._cached_empty_spark_frame(spark)
+        result = frames[0]
+        for part in frames[1:]:
+            result = result.unionByName(part, allowMissingColumns=True)
+        return result
+
     def _send_many_batches(
         self,
         requests: Iterator[PreparedRequest],
