@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Iterable, Mapping
 
 from databricks.sdk.service.catalog import ColumnInfo as CatalogColumnInfo
@@ -16,6 +17,8 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.table.table import Table
 
 __all__ = ["Column"]
+
+logger = logging.getLogger(__name__)
 
 
 class Column:
@@ -47,6 +50,12 @@ class Column:
             f.with_metadata(metadata)
         else:
             f.metadata.update(metadata)
+
+        logger.debug(
+            "Column.from_api: parsed %s.%s.%s.%s dtype=%s nullable=%s",
+            table.catalog_name, table.schema_name, table.table_name, f.name,
+            f.dtype, f.nullable,
+        )
 
         return cls(
             table=table,
@@ -112,8 +121,13 @@ class Column:
         """
         del tag_collation
         if not tags:
+            logger.debug("Column.set_tags: no-op (no tags) on %s", self.entity_name)
             return self
 
+        logger.debug(
+            "Column.set_tags: column=%s keys=%s",
+            self.entity_name, list(tags.keys()),
+        )
         self.table.client.entity_tags.update_entity_tags(
             tags=tags,
             entity_type="columns",
@@ -128,10 +142,15 @@ class Column:
         if_exists: bool = True,
     ):
         """Delete column-level tag assignments by key."""
+        keys = list(tag_keys)
+        logger.debug(
+            "Column.unset_tags: column=%s keys=%s if_exists=%s",
+            self.entity_name, keys, if_exists,
+        )
         self.table.client.entity_tags.delete_entity_tags(
             entity_type="columns",
             entity_name=self.entity_name,
-            tag_keys=tag_keys,
+            tag_keys=keys,
             if_exists=if_exists,
         )
         return self
@@ -142,8 +161,16 @@ class Column:
         if not new_name:
             raise ValueError("Cannot rename column to an empty name")
         if new_name == self.name:
+            logger.debug(
+                "Column.rename: no-op — new name matches current %r on %s",
+                new_name, self.entity_name,
+            )
             return self
 
+        logger.debug(
+            "Column.rename: table=%s %r → %r",
+            self.table.full_name(), self.name, new_name,
+        )
         self.engine.execute(
             f"ALTER TABLE {self.table.full_name(safe=True)} "
             f"RENAME COLUMN {self._qcol()} TO `{new_name}`"

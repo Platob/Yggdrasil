@@ -254,6 +254,10 @@ class Schemas(DatabricksService):
 
         uc = self.client.workspace_client().schemas
         matcher = name_matcher(name)
+        logger.debug(
+            "Schemas.list: catalog=%s name_filter=%s use_cache=%s",
+            catalog_name, name, use_cache,
+        )
 
         for info in uc.list(catalog_name=catalog_name):
             if matcher is not None and not matcher(info.name):
@@ -337,6 +341,10 @@ class Schemas(DatabricksService):
                 object.__setattr__(sch, "_infos", cached)
                 object.__setattr__(sch, "_infos_fetched_at", time.time())
                 return sch
+            logger.debug(
+                "Cache miss [Schemas.find] key=%s schema=%s.%s — fetching remote",
+                cache_key, c, s,
+            )
 
         # 2. Fetch remote --------------------------------------------------------
         info = self.find_remote(catalog_name=c, schema_name=s, raise_error=raise_error)
@@ -421,10 +429,16 @@ class Schemas(DatabricksService):
         schema_name = schema_name or self.schema_name
 
         if catalog_name and schema_name:
+            key = self._cache_key(catalog_name, schema_name)
             try:
-                del _SCHEMA_INFO_CACHE[self._cache_key(catalog_name, schema_name)]
+                del _SCHEMA_INFO_CACHE[key]
+                logger.debug(
+                    "Schemas.invalidate: evicted key=%s", key,
+                )
             except KeyError:
-                pass
+                logger.debug(
+                    "Schemas.invalidate: no entry for key=%s", key,
+                )
 
     @classmethod
     def invalidate_all(cls) -> None:

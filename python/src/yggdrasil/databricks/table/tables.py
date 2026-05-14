@@ -328,8 +328,13 @@ class Tables(DatabricksService):
         if table_name:
             try:
                 del _TABLE_CACHE[key]
+                logger.debug(
+                    "Tables.invalidate_cached_table: evicted key=%s", key,
+                )
             except KeyError:
-                pass
+                logger.debug(
+                    "Tables.invalidate_cached_table: no entry for key=%s", key,
+                )
 
     @classmethod
     def invalidate_all(cls) -> None:
@@ -487,6 +492,10 @@ class Tables(DatabricksService):
                 )
                 object.__setattr__(cached, "service", self)
                 return cached
+            logger.debug(
+                "Cache miss [Tables.find_table] key=%s table=%s.%s.%s — fetching remote",
+                cache_key, catalog, schema, name,
+            )
 
         # 2. Fetch remote ----------------------------------------------------
         info = self.find_table_remote(
@@ -574,7 +583,12 @@ class Tables(DatabricksService):
 
         uc = self.client.workspace_client().tables
         matcher = name_matcher(name)
+        logger.debug(
+            "Tables.list_tables: catalog=%s schema=%s name_filter=%s",
+            catalog_name, schema_name, name,
+        )
 
+        yielded = 0
         for info in uc.list(catalog_name=catalog_name, schema_name=schema_name):
             if matcher is not None and not matcher(info.name):
                 continue
@@ -591,4 +605,9 @@ class Tables(DatabricksService):
                 key = self._cache_key(info.catalog_name, info.schema_name, info.name)
                 if _TABLE_CACHE.get(key) is None:
                     _TABLE_CACHE.set(key, tb, ttl=cache_ttl)
+            yielded += 1
             yield tb
+        logger.debug(
+            "Tables.list_tables: yielded=%d catalog=%s schema=%s",
+            yielded, catalog_name, schema_name,
+        )

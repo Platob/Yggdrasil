@@ -414,6 +414,10 @@ class Views(DatabricksService):
                 )
                 object.__setattr__(cached, "service", self)
                 return cached
+            logger.debug(
+                "Cache miss [Views.find_view] key=%s view=%s.%s.%s — fetching remote",
+                cache_key, catalog, schema, name,
+            )
 
         # 2. Fetch remote ---------------------------------------------------
         info = self.find_view_remote(
@@ -504,7 +508,12 @@ class Views(DatabricksService):
 
         uc = self.client.workspace_client().tables
         matcher = name_matcher(name)
+        logger.debug(
+            "Views.list_views: catalog=%s schema=%s name_filter=%s table_types=%s",
+            catalog_name, schema_name, name, sorted(t.value for t in allowed),
+        )
 
+        yielded = 0
         for info in uc.list(catalog_name=catalog_name, schema_name=schema_name):
             if info.table_type not in allowed:
                 continue
@@ -524,7 +533,12 @@ class Views(DatabricksService):
                 key = self._cache_key(info.catalog_name, info.schema_name, info.name)
                 if _VIEW_CACHE.get(key) is None:
                     _VIEW_CACHE.set(key, vw, ttl=cache_ttl)
+            yielded += 1
             yield vw
+        logger.debug(
+            "Views.list_views: yielded=%d catalog=%s schema=%s",
+            yielded, catalog_name, schema_name,
+        )
 
     # ── concat_tables — create/update a UNION view over multiple tables ──────
 

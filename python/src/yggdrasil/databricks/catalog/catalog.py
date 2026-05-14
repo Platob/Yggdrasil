@@ -153,6 +153,10 @@ class Catalog(DatabricksResource):
                 self.catalog_name, age, self._infos_ttl,
             )
 
+        logger.debug(
+            "Remote fetch [Catalog._infos] catalog=%s",
+            self.catalog_name,
+        )
         infos = self.client.workspace_client().catalogs.get(self.catalog_name)
         object.__setattr__(self, "_infos", infos)
         object.__setattr__(self, "_infos_fetched_at", now)
@@ -197,6 +201,7 @@ class Catalog(DatabricksResource):
     def schemas(self) -> Iterator["Schema"]:
         """Iterate over every schema in this catalog (single API call)."""
         from yggdrasil.databricks.schema.schema import Schema as _Schema
+        logger.debug("Catalog.schemas: listing catalog=%s", self.catalog_name)
         for info in self.client.workspace_client().schemas.list(catalog_name=self.catalog_name):
             s = _Schema(
                 service=self.service,
@@ -262,6 +267,10 @@ class Catalog(DatabricksResource):
             if_not_exists: Silently succeed if the catalog already exists.
         """
         uc = self.client.workspace_client().catalogs
+        logger.debug(
+            "Catalog.create: catalog=%s storage_root=%s if_not_exists=%s",
+            self.catalog_name, storage_root, if_not_exists,
+        )
         try:
             info = uc.create(
                 name=self.catalog_name,
@@ -273,6 +282,10 @@ class Catalog(DatabricksResource):
             object.__setattr__(self, "_infos_fetched_at", time.time())
         except DatabricksError as exc:
             if if_not_exists and "already exists" in str(exc).lower():
+                logger.debug(
+                    "Catalog.create: catalog=%s already exists — soft-resetting cache",
+                    self.catalog_name,
+                )
                 self._reset_cache()
             else:
                 raise
@@ -310,6 +323,10 @@ class Catalog(DatabricksResource):
             raise_error: Re-raise :exc:`DatabricksError` on failure.
         """
         uc = self.client.workspace_client().catalogs
+        logger.debug(
+            "Catalog.delete: catalog=%s force=%s wait=%s",
+            self.catalog_name, force, bool(wait),
+        )
         if wait:
             try:
                 uc.delete(name=self.catalog_name, force=force)
@@ -427,6 +444,10 @@ class Catalog(DatabricksResource):
         if properties is not None:
             kwargs["properties"] = properties
 
+        logger.debug(
+            "Catalog.update: catalog=%s fields=%s",
+            self.catalog_name, sorted(kwargs.keys()),
+        )
         info = self.client.workspace_client().catalogs.update(
             name=self.catalog_name, **kwargs
         )
@@ -442,7 +463,15 @@ class Catalog(DatabricksResource):
         if not new_name:
             raise ValueError("Cannot rename catalog to an empty name")
         if new_name == self.catalog_name:
+            logger.debug(
+                "Catalog.rename: no-op — new name matches current %r",
+                self.catalog_name,
+            )
             return self
+
+        logger.debug(
+            "Catalog.rename: %r → %r", self.catalog_name, new_name,
+        )
 
         # Drop the old entity-tag cache key before the rename — the
         # ``entity_name`` is the key, and after the rename it's dead.
