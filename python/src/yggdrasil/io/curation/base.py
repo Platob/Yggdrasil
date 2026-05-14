@@ -22,14 +22,19 @@ from typing import TYPE_CHECKING, Any, Union
 
 import pyarrow as pa
 
+from yggdrasil.data.constants import DEFAULT_FIELD_NAME
+
 if TYPE_CHECKING:
+    from yggdrasil.data.data_field import Field
+    from yggdrasil.data.schema import Schema
     from yggdrasil.data.types import DataType
 
 
-__all__ = ["Curator", "CurationResult", "ArrayLike"]
+__all__ = ["Curator", "CurationResult", "ArrayLike", "TabularLike"]
 
 
 ArrayLike = Union[pa.Array, pa.ChunkedArray]
+TabularLike = Union[pa.Table, pa.RecordBatch]
 
 
 @dataclass(frozen=True)
@@ -98,6 +103,95 @@ class Curator(ABC):
                 f"dtype, or call the right subclass directly."
             )
         return self.curate(array)
+
+    # ------------------------------------------------------ Field / Schema
+
+    def curate_arrow_array(
+        self,
+        array: ArrayLike,
+        name: str = DEFAULT_FIELD_NAME,
+        nullable: bool = True,
+    ) -> "tuple[Field, ArrayLike]":
+        """Curate *array* and wrap the inferred dtype into a :class:`Field`.
+
+        Returns ``(Field(name, inferred_dtype, nullable), curated_array)``
+        so the caller gets the schema piece + the data piece in one call.
+        The Field name defaults to :data:`DEFAULT_FIELD_NAME` (``""``) —
+        pass it explicitly when you're naming a column.
+        """
+        from yggdrasil.data.data_field import Field
+
+        result = self(array)
+        return Field(name=name, dtype=result.dtype, nullable=nullable), result.array
+
+    @classmethod
+    def curate_arrow_tabular(
+        cls,
+        tabular: TabularLike,
+        nullable: bool = True,
+        **curator_kwargs: Any,
+    ) -> "tuple[Schema, TabularLike]":
+        """Curate every column of *tabular* and return ``(Schema, table)``.
+
+        Picks the right :class:`Curator` subclass per column via
+        :meth:`pick`, so a mixed table (some strings, some bytes, some
+        already-typed numerics) all goes through one call. Columns whose
+        dtype no subclass handles pass through unchanged with the
+        original Arrow type wrapped in a :class:`Field`.
+
+        Input shape is preserved: a :class:`pa.Table` comes back as a
+        Table, a :class:`pa.RecordBatch` comes back as a RecordBatch.
+        ``curator_kwargs`` are forwarded to each curator constructor.
+        """
+        from yggdrasil.data.data_field import Field
+        from yggdrasil.data.schema import StructField
+
+        if isinstance(tabular, pa.RecordBatch):
+            columns = list(tabular.columns)
+            names = list(tabular.schema.names)
+            is_batch = True
+        elif isinstance(tabular, pa.Table):
+            columns = [tabular.column(i) for i in range(tabular.num_columns)]
+            names = list(tabular.schema.names)
+            is_batch = False
+        else:
+            raise TypeError(
+                f"curate_arrow_tabular expects a pyarrow Table or RecordBatch; "
+                f"got {type(tabular).__name__}. Wrap the data in "
+                f"``pa.Table.from_pydict`` (or .from_arrays) first."
+            )
+
+        fields: list[Field] = []
+        curated_columns: list[ArrayLike] = []
+        for name, column in zip(names, columns):
+            try:
+                curator = cls.pick(column, **curator_kwargs)
+            except TypeError:
+                # No subclass claims this dtype — pass it through with
+                # the existing Arrow type. Better than silently dropping
+                # the column or forcing the caller into a typecheck.
+                fields.append(Field(name=name, dtype=column.type, nullable=nullable))
+                curated_columns.append(column)
+                continue
+            field, curated = curator.curate_arrow_array(
+                column, name=name, nullable=nullable
+            )
+            fields.append(field)
+            curated_columns.append(curated)
+
+        schema: "Schema" = StructField(fields)
+        arrow_schema = pa.schema(
+            [pa.field(f.name, f.dtype.to_arrow(), nullable=f.nullable) for f in fields]
+        )
+        if is_batch:
+            # RecordBatch needs flat Arrays, not ChunkedArrays. Combine
+            # if any curator handed back a chunked result.
+            flat = [
+                c.combine_chunks() if isinstance(c, pa.ChunkedArray) else c
+                for c in curated_columns
+            ]
+            return schema, pa.RecordBatch.from_arrays(flat, schema=arrow_schema)
+        return schema, pa.Table.from_arrays(curated_columns, schema=arrow_schema)
 
     # ------------------------------------------------------------- utils
 

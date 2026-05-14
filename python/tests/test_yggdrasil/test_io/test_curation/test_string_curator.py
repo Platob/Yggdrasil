@@ -224,5 +224,98 @@ class TestCuratorDispatch(ArrowTestCase):
         self.assertIsInstance(result, CurationResult)
 
 
+class TestCurateArrowArray(ArrowTestCase):
+    """``curate_arrow_array`` wraps the inferred dtype into a Field."""
+
+    def test_returns_field_and_curated_array(self):
+        from yggdrasil.data.data_field import Field
+
+        field, curated = StringCurator().curate_arrow_array(
+            self.pa.array(["1", "2", "3"]), name="id"
+        )
+        self.assertIsInstance(field, Field)
+        self.assertEqual(field.name, "id")
+        self.assertEqual(field.dtype, Int64Type())
+        self.assertEqual(curated.to_pylist(), [1, 2, 3])
+
+    def test_default_name_is_blank(self):
+        field, _ = StringCurator().curate_arrow_array(self.pa.array(["a", "b"]))
+        self.assertEqual(field.name, "")
+
+    def test_nullable_flag_is_forwarded(self):
+        field, _ = StringCurator().curate_arrow_array(
+            self.pa.array(["1"]), name="id", nullable=False
+        )
+        self.assertFalse(field.nullable)
+
+    def test_wrong_dtype_raises_via_call(self):
+        with self.assertRaisesRegex(TypeError, "cannot curate Arrow type"):
+            StringCurator().curate_arrow_array(self.pa.array([1, 2, 3]))
+
+
+class TestCurateArrowTabular(ArrowTestCase):
+    """``Curator.curate_arrow_tabular`` routes per column."""
+
+    def _mixed_table(self):
+        return self.pa.table(
+            {
+                "id": ["1", "2", "3"],
+                "amount": ["1.5", "2.5", "3.5"],
+                "when": [
+                    "2024-01-15T10:00:00+02:00",
+                    "2024-01-15T11:00:00-05:00",
+                    None,
+                ],
+                "flag": ["true", "false", "yes"],
+                "label": ["a", "b", "c"],
+            }
+        )
+
+    def test_table_returns_schema_and_typed_table(self):
+        from yggdrasil.data.schema import StructField
+
+        schema, curated = Curator.curate_arrow_tabular(self._mixed_table())
+        self.assertIsInstance(schema, StructField)
+        self.assertIsInstance(curated, self.pa.Table)
+
+        types = {name: curated.schema.field(name).type for name in curated.schema.names}
+        self.assertEqual(types["id"], self.pa.int64())
+        self.assertEqual(types["amount"], self.pa.float64())
+        self.assertEqual(str(types["when"]), "timestamp[us, tz=UTC]")
+        self.assertEqual(types["flag"], self.pa.bool_())
+        self.assertEqual(types["label"], self.pa.string())
+
+    def test_record_batch_round_trips_as_record_batch(self):
+        batch = self.pa.record_batch({"id": ["1", "2"], "label": ["a", "b"]})
+        schema, curated = Curator.curate_arrow_tabular(batch)
+        self.assertIsInstance(curated, self.pa.RecordBatch)
+        self.assertEqual(curated.column(0).to_pylist(), [1, 2])
+        self.assertEqual(schema[0].dtype, Int64Type())
+
+    def test_already_typed_columns_pass_through(self):
+        # A pre-typed int column has no Curator subclass that handles
+        # it — should land in the output unchanged with its Field
+        # wrapped in the schema.
+        table = self.pa.table(
+            {"id": self.pa.array([1, 2, 3]), "label": ["a", "b", "c"]}
+        )
+        schema, curated = Curator.curate_arrow_tabular(table)
+        self.assertEqual(curated.schema.field("id").type, self.pa.int64())
+        self.assertEqual(curated.schema.field("label").type, self.pa.string())
+        self.assertEqual(schema[0].dtype, Int64Type())
+
+    def test_rejects_non_arrow_tabular(self):
+        with self.assertRaisesRegex(TypeError, "expects a pyarrow Table"):
+            Curator.curate_arrow_tabular({"id": [1, 2, 3]})  # plain dict
+
+    def test_curator_kwargs_are_forwarded(self):
+        # ``parse_temporal=False`` keeps timestamp strings as strings.
+        schema, curated = Curator.curate_arrow_tabular(
+            self.pa.table({"when": ["2024-01-15T10:00:00"]}),
+            parse_temporal=False,
+        )
+        self.assertEqual(curated.schema.field("when").type, self.pa.string())
+
+
 if __name__ == "__main__":
     unittest.main()
