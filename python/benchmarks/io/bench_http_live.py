@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import socket
 import statistics
 import tempfile
 import threading
@@ -78,6 +79,11 @@ PAYLOADS: dict[str, bytes] = {
     "kib1": _build_payload(1024),
     # ~64 KiB — exercises buffered IO and the response holder copy.
     "kib64": _build_payload(64 * 1024),
+    # ~2 MiB — above the ``_BODY_AUTOCOMPRESS_MIN_SIZE`` cache-persist
+    # threshold. Used by the local-cache scenarios to surface the
+    # auto-gzip win on the store side and the decompress cost on the
+    # subsequent fetch.
+    "mib2": _build_payload(2 * 1024 * 1024),
 }
 
 
@@ -104,8 +110,23 @@ class _BenchHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):  # noqa: A002, D401 - stdlib name
         return
 
+    def setup(self) -> None:  # noqa: D401 - stdlib name
+        super().setup()
+        # Disable Nagle on the per-request socket. ``BaseHTTPRequestHandler``
+        # writes the status line, headers, and body in separate ``send`` calls,
+        # which under Nagle + Linux's client-side delayed-ACK on loopback
+        # stalls every small response by ~40 ms. The fix has to be on the
+        # accepted socket the handler talks to — setting it on the listener
+        # alone doesn't help. With TCP_NODELAY the small-payload numbers
+        # actually reflect yggdrasil's dispatch cost instead of a kernel
+        # quirk.
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
     def _serve(self, path: str) -> None:
-        key = path.strip("/").split("/", 1)[0]
+        # Drop the query — cache MISS scenarios append ``?probe=N`` to
+        # force a fresh URL identity per call. Without the strip those
+        # paths would 404 because the query slips into the key match.
+        key = path.split("?", 1)[0].strip("/").split("/", 1)[0]
         payload = PAYLOADS.get(key)
         if payload is None:
             self.send_response(404)
@@ -232,6 +253,46 @@ def _send_many_scenarios(base_url: str, repeat: int) -> list[dict]:
         _batch_get_tiny,
         repeat=repeat, inner=20,
     ))
+
+    # send_many through a populated local cache — exercises the
+    # staged pipeline's hot path (the snapshot loop above stage 1,
+    # the single-pass classification in _split_remote_cache, the
+    # ResponseBatch flatten). Distinct URLs so the cache reads N
+    # different rows per call rather than one row N times — that
+    # surfaces the per-request resolution cost more honestly.
+    cache_n = 128
+    tmp_cache_many = tempfile.mkdtemp(prefix="ygg-bench-many-cache-")
+    try:
+        from yggdrasil.io.send_config import CacheConfig
+
+        cfg_many = CacheConfig(path=tmp_cache_many)
+        cache_reqs = [
+            PreparedRequest.prepare("GET", f"{base_url}/tiny?x={i}")
+            for i in range(cache_n)
+        ]
+        # Seed by sending each request once; the session writes them
+        # to the cache. The ``time.sleep`` drains the fire-and-forget
+        # writer jobs so the warm pass below finds every entry.
+        for r in cache_reqs:
+            sess.send(r, local_cache=cfg_many, raise_error=False)
+        time.sleep(0.5)
+
+        def _send_many_cache_hits():
+            return list(sess.send_many(
+                iter(cache_reqs),
+                local_cache=cfg_many,
+                batch_size=cache_n,
+                raise_error=False,
+            ))
+
+        out.append(_time_one(
+            f"HTTPSession.send_many local-cache HITs (n={cache_n})",
+            _send_many_cache_hits,
+            repeat=repeat, inner=5,
+        ))
+    finally:
+        shutil.rmtree(tmp_cache_many, ignore_errors=True)
+
     return out
 
 
@@ -239,6 +300,15 @@ def _local_cache_scenarios(base_url: str, repeat: int) -> list[dict]:
     """Compare bare ``HTTPSession.send`` against a session with the local
     on-disk cache turned on. Cache hits dodge the entire socket round trip,
     so the delta is the visible win the on-disk fast-path buys.
+
+    Includes a 2 MiB JSON scenario to exercise the cache-persist
+    auto-compress helper: on the MISS the body is gzipped before the
+    Arrow IPC write (much smaller on-disk row); on the HIT the
+    compressed buffer is materialised and ``Response.content`` /
+    ``.json()`` decompress transparently through the existing
+    :class:`Codec` path. The numbers expose the compress cost on
+    store, the decompress cost on read, and the dispatch baseline
+    for a large compressed payload.
     """
     out: list[dict] = []
 
@@ -278,6 +348,34 @@ def _local_cache_scenarios(base_url: str, repeat: int) -> list[dict]:
             "HTTPSession.send tiny (local-cache MISS, store-to-disk)",
             _send_cache_miss,
             repeat=repeat, inner=200,
+        ))
+
+        # 2 MiB JSON path — above the auto-compress threshold. Seed
+        # one entry then time the HIT (decompress cost) and the MISS
+        # (compress + store cost) at smaller inner counts since each
+        # call moves ~2 MiB.
+        big_seed = PreparedRequest.prepare("GET", f"{base_url}/mib2")
+        sess.send(big_seed, local_cache=cfg, raise_error=False)
+        big_warm = PreparedRequest.prepare("GET", f"{base_url}/mib2")
+        _ = big_warm.public_hash
+        out.append(_time_one(
+            "HTTPSession.send mib2 (local-cache HIT, auto-gzip body)",
+            lambda: sess.send(big_warm, local_cache=cfg, raise_error=False),
+            repeat=repeat, inner=50,
+        ))
+
+        big_counter = {"n": 0}
+
+        def _send_big_miss():
+            big_counter["n"] += 1
+            r = PreparedRequest.prepare(
+                "GET", f"{base_url}/mib2?probe={big_counter['n']}",
+            )
+            return sess.send(r, local_cache=cfg, raise_error=False)
+        out.append(_time_one(
+            "HTTPSession.send mib2 (local-cache MISS, compress + store)",
+            _send_big_miss,
+            repeat=repeat, inner=50,
         ))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

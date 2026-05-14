@@ -213,8 +213,9 @@ class HTTPSession(Session):
             response=raw_resp,
             tags=None,
             received_at=dt.datetime.now(dt.timezone.utc),
+            stream=True,
+            release_conn=True,
         )
-        result.drain_urllib3(raw_resp, stream=True, release_conn=True)
 
         x_current_page = raw_resp.headers.get("X-Current-Page")
         x_total_pages = raw_resp.headers.get("X-Last-Page")
@@ -268,8 +269,9 @@ class HTTPSession(Session):
             response=raw_resp,
             tags=None,
             received_at=dt.datetime.now(tz=dt.timezone.utc),
+            stream=stream,
+            release_conn=True,
         )
-        page_result.drain_urllib3(raw_resp, stream=stream, release_conn=True)
 
         if raise_error:
             page_result.raise_for_status()

@@ -514,12 +514,12 @@ class TestBodyParity:
 
 
 class TestFromUrllib3:
-    """Regression cover for ``HTTPResponse.from_urllib3`` / ``drain_urllib3``.
+    """Regression cover for ``HTTPResponse.from_urllib3``.
 
-    The stubbed ``StubSession`` path bypasses these methods entirely,
-    so we drive them with a duck-typed urllib3 response. The test is
+    The stubbed ``StubSession`` path bypasses this method entirely,
+    so we drive it with a duck-typed urllib3 response. The test is
     here to pin: (a) the buffer class is resolved via the Tabular
-    registry, (b) drain copies bytes into the buffer and rewinds it,
+    registry, (b) the body is drained into the buffer in one pass,
     (c) callers can read JSON / bytes back out.
     """
 
@@ -557,13 +557,13 @@ class TestFromUrllib3:
             response=raw,
             tags=None,
             received_at=dt.datetime.now(dt.timezone.utc),
+            stream=False,
         )
         # The buffer is a Holder; opening it via response.open() routes
         # through the JsonIO leaf for the stamped media type.
         assert isinstance(resp.buffer, Holder)
         with resp.open(mode="rb") as bio:
             assert isinstance(bio, JsonIO)
-        resp.drain_urllib3(raw, stream=False)
         assert raw.released is True
         assert resp.buffer.to_bytes() == b'{"ok":true}'
         assert resp.json() == {"ok": True}
@@ -582,10 +582,10 @@ class TestFromUrllib3:
             response=raw,
             tags=None,
             received_at=dt.datetime.now(dt.timezone.utc),
+            stream=True,
         )
         # Unknown media types must not crash — buffer stays a plain Holder.
         assert isinstance(resp.buffer, Holder)
-        resp.drain_urllib3(raw, stream=True)
         assert resp.buffer.to_bytes() == b"binary blob"
 
 

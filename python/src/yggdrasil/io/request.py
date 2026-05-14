@@ -1329,13 +1329,13 @@ class PreparedRequest:
         req_cols = [f.name for f in REQUEST_ARROW_SCHEMA]
 
         for rb in _iter_batches(batch):
-            cols = {
-                name: rb.column(name)
-                for name in req_cols
-                if name in rb.schema.names
-            }
+            available_set = set(rb.schema.names)
+            picks = [n for n in req_cols if n in available_set]
+            if not picks:
+                continue
+            cols = {n: rb.column(n) for n in picks}
             for i in range(rb.num_rows):
-                yield cls._from_arrow_cols(cols, i, normalize=normalize)
+                yield cls._from_arrow_row(cols, i, normalize=normalize)
 
     @classmethod
     def from_record(
@@ -1348,17 +1348,17 @@ class PreparedRequest:
         return cls._from_get(record.get, normalize=normalize)
 
     @classmethod
-    def _from_arrow_cols(
+    def _from_arrow_row(
         cls,
         cols: dict[str, Any],
         i: int,
         *,
         normalize: bool = True,
     ) -> "PreparedRequest":
+        """Build one :class:`PreparedRequest` from a per-batch column dict + row index."""
         def _arrow_get(name: str) -> Any:
-            if name in cols:
-                return cols[name][i].as_py()
-            return None
+            col = cols.get(name)
+            return col[i].as_py() if col is not None else None
 
         return cls._from_get(_arrow_get, normalize=normalize)
 

@@ -52,9 +52,11 @@ from yggdrasil.io.response import Response
 from yggdrasil.io.send_config import CacheConfig
 from yggdrasil.io.session import (
     Session,
+    _BODY_AUTOCOMPRESS_MIN_SIZE,
     _FAST_PATH_SEGMENT_MAX_BYTES,
     _cleanup_local_fast_path,
     _local_fast_path_relative,
+    _maybe_autocompress_body_for_cache,
     _safe_fast_path_segment,
 )
 
@@ -345,6 +347,107 @@ class TestCleanupLocalFastPath:
         )
         assert removed == 0
         assert live.exists()
+
+
+# ---------------------------------------------------------------------------
+# _maybe_autocompress_body_for_cache
+# ---------------------------------------------------------------------------
+
+
+class TestMaybeAutocompressBodyForCache:
+    """Smart body gzipping run before cache persistence.
+
+    Pinned behavior:
+
+    * threshold is :data:`_BODY_AUTOCOMPRESS_MIN_SIZE` (skip below);
+    * skip when ``Content-Encoding`` is already set (no recompress);
+    * skip when the resolved MIME is not in the compressible set —
+      binary entropy-dense formats (image/png, parquet, …) don't
+      benefit and we don't want to burn CPU on them;
+    * skip when the gzip ratio is < 10% — random / already-compact
+      input bails out so the read side doesn't pay decompress cost
+      for ~no savings;
+    * on a hit, the swap is consistent: the buffer carries the gzipped
+      bytes, ``Content-Encoding`` is ``gzip``, ``Content-Length``
+      matches the new size, ``media_type.codec`` reflects the encoding.
+    """
+
+    def _big_json(self, size: int) -> bytes:
+        # JSON-shaped repetitive bytes — highly compressible and just
+        # over the autocompress threshold by default.
+        chunk = b'{"key":"value"}'
+        repeats = size // len(chunk) + 1
+        return chunk * repeats
+
+    def test_small_body_below_threshold_skips(self) -> None:
+        resp = make_response(body=b'{"k":1}' * 100)  # well under 1 MiB
+        before = resp.buffer.size
+        _maybe_autocompress_body_for_cache(resp)
+        assert resp.buffer.size == before
+        assert resp.headers.get("Content-Encoding") is None
+
+    def test_already_encoded_body_skips(self) -> None:
+        big = self._big_json(_BODY_AUTOCOMPRESS_MIN_SIZE + 1024)
+        resp = make_response(
+            body=big,
+            headers={"Content-Encoding": "br"},
+        )
+        before = resp.buffer.size
+        _maybe_autocompress_body_for_cache(resp)
+        assert resp.buffer.size == before
+        assert resp.headers.get("Content-Encoding") == "br"
+
+    def test_binary_mime_skips(self) -> None:
+        big = self._big_json(_BODY_AUTOCOMPRESS_MIN_SIZE + 1024)
+        resp = make_response(body=big, content_type="image/png")
+        before = resp.buffer.size
+        _maybe_autocompress_body_for_cache(resp)
+        assert resp.buffer.size == before
+        assert resp.headers.get("Content-Encoding") is None
+
+    def test_text_outside_enum_skips(self) -> None:
+        # ``text/css`` is not in the compressible :class:`MimeTypes` set
+        # — strict enum membership keeps the rule predictable; add a
+        # MIME to the set in one place rather than maintaining a string
+        # prefix list at every caller.
+        big = self._big_json(_BODY_AUTOCOMPRESS_MIN_SIZE + 1024)
+        resp = make_response(body=big, content_type="text/css")
+        _maybe_autocompress_body_for_cache(resp)
+        assert resp.headers.get("Content-Encoding") is None
+
+    def test_random_bytes_ratio_bailout(self) -> None:
+        # ``os.urandom`` is incompressible — the gzip output is within
+        # 1% of the input, well above the 10% bail threshold. The
+        # helper has to skip so we don't pay decompress cost on read
+        # for ~no storage win.
+        random = os.urandom(_BODY_AUTOCOMPRESS_MIN_SIZE + 1024)
+        resp = make_response(body=random, content_type="text/plain")
+        _maybe_autocompress_body_for_cache(resp)
+        assert resp.headers.get("Content-Encoding") is None
+
+    def test_large_json_gets_compressed(self) -> None:
+        big = self._big_json(_BODY_AUTOCOMPRESS_MIN_SIZE + 1024)
+        resp = make_response(body=big, content_type="application/json")
+        before = resp.buffer.size
+        _maybe_autocompress_body_for_cache(resp)
+        assert resp.headers.get("Content-Encoding") == "gzip"
+        assert resp.buffer.size < before
+        # Content-Length must be resynced to the compressed bytes —
+        # otherwise the cache row's headers would lie about the payload
+        # and the read-side codec dispatch would break.
+        assert resp.headers.get("Content-Length") == str(resp.buffer.size)
+        assert resp.media_type.codec is not None
+        assert resp.media_type.codec.name == "gzip"
+
+    def test_large_csv_gets_compressed(self) -> None:
+        csv = (b"col1,col2\n1,2\n" * (
+            _BODY_AUTOCOMPRESS_MIN_SIZE // len(b"col1,col2\n1,2\n") + 1
+        ))
+        resp = make_response(body=csv, content_type="text/csv")
+        before = resp.buffer.size
+        _maybe_autocompress_body_for_cache(resp)
+        assert resp.headers.get("Content-Encoding") == "gzip"
+        assert resp.buffer.size < before
 
 
 # ---------------------------------------------------------------------------

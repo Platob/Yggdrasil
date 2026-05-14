@@ -5,11 +5,10 @@ from typing import TYPE_CHECKING, Mapping, Optional
 
 from urllib3 import BaseHTTPResponse
 
-from ..bytes_io import BytesIO
 from ..holder import Holder
 from ..memory import Memory
 from ..request import PreparedRequest
-from ..response import Response, _ensure_media_headers, _media_type_from_headers
+from ..response import Response, _media_type_from_headers
 
 if TYPE_CHECKING:
     from .path import HTTPPath
@@ -46,7 +45,11 @@ class HTTPResponse(Response):
         request: "PreparedRequest",
         response: BaseHTTPResponse,
         tags: Optional[Mapping[str, str]],
-        received_at: dt.datetime
+        received_at: dt.datetime,
+        *,
+        stream: bool = True,
+        amt: int = 512 * 1024,
+        release_conn: bool = True,
     ) -> "HTTPResponse":
         # Pre-infer media type from the response's Content-Type /
         # Content-Encoding so the holder carries it from the start;
@@ -59,27 +62,15 @@ class HTTPResponse(Response):
         if pre_media is not None:
             buffer.media_type = pre_media
 
-        return cls(
-            request=request,
-            status_code=response.status,
-            headers=headers,
-            buffer=buffer,
-            tags=tags,
-            received_at=received_at
-        )
-
-    def drain_urllib3(
-        self,
-        response: BaseHTTPResponse,
-        stream: bool,
-        *,
-        amt: int = 512 * 1024,
-        release_conn: bool = True
-    ) -> "HTTPResponse":
-        buffer = self.buffer
-
+        # Drain the body INTO the buffer before constructing the
+        # ``Response``. ``Response.__init__`` runs ``_ensure_media_headers``
+        # once; if we built the response on an empty buffer first and
+        # drained second we'd pay that header sniff + Content-Length
+        # stamp twice per request (once on the empty buffer, once on
+        # the filled one). Draining first folds both into a single
+        # post-fill pass.
         try:
-            with self.open(mode="wb") as bio:
+            with buffer.open(mode="wb", owns_holder=False) as bio:
                 if stream:
                     for chunk in response.stream(amt=amt):
                         bio.write(chunk)
@@ -89,11 +80,11 @@ class HTTPResponse(Response):
             if release_conn:
                 response.release_conn()
 
-        # Resync Content-Length (and Content-Type/Encoding) to the
-        # post-drain buffer. ``Response.__init__`` ran while the buffer
-        # was still empty, so it stamped ``Content-Length: 0`` over the
-        # remote's value — re-running here matches the persisted header
-        # to the bytes that actually landed.
-        _ensure_media_headers(self.headers, buffer)
-
-        return self
+        return cls(
+            request=request,
+            status_code=response.status,
+            headers=headers,
+            buffer=buffer,
+            tags=tags,
+            received_at=received_at,
+        )
