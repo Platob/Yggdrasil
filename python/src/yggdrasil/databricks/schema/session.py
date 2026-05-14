@@ -28,7 +28,7 @@ import datetime as dt
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Mapping, Optional, Union
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, Optional, Union
 
 from yggdrasil.dataclasses import ExpiringDict
 from yggdrasil.dataclasses.waiting import DEFAULT_WAITING_CONFIG, WaitingConfig
@@ -83,9 +83,6 @@ class SchemaSession(HTTPSession):
                           (default) reads the cache first; anything
                           else (:attr:`Mode.UPSERT`, …) always fetches
                           from the API and writes back.
-        table_prefix:     Prefix prepended to every derived table name.
-                          ``"http_cache"`` by default keeps the schema's
-                          cache tables grouped under one namespace.
         table_cache_ttl:  TTL on the in-process per-path :class:`Table`
                           handle cache. Defaults to 1 hour.
         local_cache:      On-disk fast-path cache control. ``True``
@@ -97,8 +94,6 @@ class SchemaSession(HTTPSession):
                           as-is; ``False`` / ``None`` disables the
                           local layer (remote cache only).
     """
-
-    DEFAULT_TABLE_PREFIX: ClassVar[str] = "http_cache"
 
     def __new__(  # type: ignore[override]
         cls,
@@ -123,7 +118,6 @@ class SchemaSession(HTTPSession):
         base_url: Optional[URL | str] = None,
         *,
         mode: ModeLike = Mode.APPEND,
-        table_prefix: str = DEFAULT_TABLE_PREFIX,
         table_cache_ttl: "float | int | dt.timedelta | None" = _DEFAULT_TABLE_CACHE_TTL,
         local_cache: Union[bool, str, Path, CacheConfig, Mapping[str, Any], None] = True,
         verify: bool = True,
@@ -146,7 +140,6 @@ class SchemaSession(HTTPSession):
         )
         self._schema = schema
         self._mode = Mode.from_(mode, default=Mode.APPEND)
-        self._table_prefix = table_prefix or ""
         self._table_cache: ExpiringDict[str, "Table"] = ExpiringDict(
             default_ttl=table_cache_ttl,
             max_size=1024,
@@ -259,11 +252,6 @@ class SchemaSession(HTTPSession):
         """Cache write disposition (:attr:`Mode.APPEND` by default)."""
         return self._mode
 
-    @property
-    def table_prefix(self) -> str:
-        """Prefix prepended to every derived table name."""
-        return self._table_prefix
-
     def __repr__(self) -> str:
         base = self.base_url.to_string() if self.base_url else None
         return (
@@ -277,17 +265,18 @@ class SchemaSession(HTTPSession):
         """Derive a Unity-Catalog-safe table name from a URL path.
 
         Lowercase, collapse runs of non-alphanumeric chars to ``_``,
-        strip surrounding underscores, prepend :attr:`table_prefix`,
-        and length-cap with :func:`safe_table_name` (truncate + hash
-        the overflow tail so the result is deterministic and fits the
-        255-char identifier limit).
+        strip surrounding underscores, length-cap with
+        :func:`safe_table_name` (truncate + hash the overflow tail so
+        the result is deterministic and fits the 255-char identifier
+        limit). The full path becomes the table name verbatim — no
+        prefix is prepended, so callers who want one should pick a
+        dedicated cache schema instead.
         """
         cleaned = _PATH_TO_IDENT_RE.sub("_", (path or "").lower()).strip("_")
         if not cleaned:
             cleaned = "root"
-        name = f"{self._table_prefix}__{cleaned}" if self._table_prefix else cleaned
         # ``safe_table_name`` never returns ``None`` for a non-empty input.
-        return safe_table_name(name)  # type: ignore[return-value]
+        return safe_table_name(cleaned)  # type: ignore[return-value]
 
     def table_for(self, request: PreparedRequest) -> "Table":
         """Return (caching) the :class:`Table` that backs *request*'s URL path.
