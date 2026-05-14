@@ -193,6 +193,132 @@ class Curator(ABC):
             return schema, pa.RecordBatch.from_arrays(flat, schema=arrow_schema)
         return schema, pa.Table.from_arrays(curated_columns, schema=arrow_schema)
 
+    # ----------------------------------------------------- Engine wrappers
+    #
+    # Each engine method round-trips through Arrow — that's the whole
+    # point of having one curation pipeline. Series-shaped wrappers go
+    # through ``curate_arrow_array`` (instance method, single curator);
+    # frame-shaped wrappers go through ``curate_arrow_tabular``
+    # (classmethod, picks per column, falls back to as-is for any
+    # column no subclass claims).
+
+    def curate_polars_series(
+        self,
+        series: Any,
+        name: str | None = None,
+        nullable: bool = True,
+    ) -> "tuple[Field, Any]":
+        """Curate a polars Series via the Arrow bridge.
+
+        Returns ``(Field, polars.Series)``. The Series name on the way
+        in becomes the Field name by default; pass *name* to override.
+        """
+        from yggdrasil.lazy_imports import polars_module
+
+        pl = polars_module()
+        arrow_arr = series.to_arrow()
+        resolved_name = (
+            name if name is not None else (series.name or DEFAULT_FIELD_NAME)
+        )
+        field, curated = self.curate_arrow_array(
+            arrow_arr, name=resolved_name, nullable=nullable
+        )
+        return field, pl.Series(name=resolved_name, values=curated)
+
+    @classmethod
+    def curate_polars_dataframe(
+        cls,
+        df: Any,
+        nullable: bool = True,
+        **curator_kwargs: Any,
+    ) -> "tuple[Schema, Any]":
+        """Curate every column of a polars DataFrame.
+
+        Returns ``(Schema, polars.DataFrame)``. Columns whose dtype no
+        Curator subclass handles pass through unchanged, matching the
+        contract of :meth:`curate_arrow_tabular`.
+        """
+        from yggdrasil.lazy_imports import polars_module
+
+        pl = polars_module()
+        arrow_table = df.to_arrow()
+        schema, curated = cls.curate_arrow_tabular(
+            arrow_table, nullable=nullable, **curator_kwargs
+        )
+        return schema, pl.from_arrow(curated)
+
+    def curate_pandas_series(
+        self,
+        series: Any,
+        name: str | None = None,
+        nullable: bool = True,
+    ) -> "tuple[Field, Any]":
+        """Curate a pandas Series via the Arrow bridge.
+
+        Returns ``(Field, pandas.Series)``. The Series ``.name`` is the
+        default Field name and survives the round-trip.
+        """
+        arrow_arr = pa.Array.from_pandas(series)
+        resolved_name = (
+            name
+            if name is not None
+            else (series.name if series.name is not None else DEFAULT_FIELD_NAME)
+        )
+        field, curated = self.curate_arrow_array(
+            arrow_arr, name=resolved_name, nullable=nullable
+        )
+        pandas_series = curated.to_pandas()
+        pandas_series.name = resolved_name or None
+        return field, pandas_series
+
+    @classmethod
+    def curate_pandas_dataframe(
+        cls,
+        df: Any,
+        nullable: bool = True,
+        **curator_kwargs: Any,
+    ) -> "tuple[Schema, Any]":
+        """Curate every column of a pandas DataFrame.
+
+        Returns ``(Schema, pandas.DataFrame)``. The pandas index is
+        dropped — re-attach it on the caller side if you need it
+        (``preserve_index=False`` mirrors the canonical Arrow ↔ pandas
+        bridge behaviour).
+        """
+        arrow_table = pa.Table.from_pandas(df, preserve_index=False)
+        schema, curated = cls.curate_arrow_tabular(
+            arrow_table, nullable=nullable, **curator_kwargs
+        )
+        return schema, curated.to_pandas()
+
+    @classmethod
+    def curate_spark_dataframe(
+        cls,
+        df: Any,
+        nullable: bool = True,
+        **curator_kwargs: Any,
+    ) -> "tuple[Schema, Any]":
+        """Curate every column of a Spark DataFrame via the pandas bridge.
+
+        Returns ``(Schema, pyspark.sql.DataFrame)``. PySpark has no
+        standalone column object you can curate in isolation
+        (``Column`` is a reference, not data), so only the
+        DataFrame-shaped entry point exists for Spark — pull a single
+        column out as ``df.select("x")`` if you need it.
+
+        Round-trips through ``df.toPandas()`` + ``spark.createDataFrame``,
+        which uses Arrow under the hood when
+        ``spark.sql.execution.arrow.pyspark.enabled`` is set (the
+        default on modern PySpark).
+        """
+        spark_session = df.sparkSession
+        pandas_df = df.toPandas()
+        schema, curated = cls.curate_pandas_dataframe(
+            pandas_df, nullable=nullable, **curator_kwargs
+        )
+        new_df = spark_session.createDataFrame(curated)
+        return schema, new_df
+
     # ------------------------------------------------------------- utils
 
     @classmethod
