@@ -29,12 +29,15 @@ Int64Type()
 
 from __future__ import annotations
 
-from .base import ArrayLike, CurationResult, Curator
+from .base import ArrayLike, CurationResult, Curator, TabularLike
+from .nested import NestedCurator
 from .string import StringCurator
 
 __all__ = [
     "ArrayLike",
     "CurationResult",
     "Curator",
+    "NestedCurator",
     "StringCurator",
+    "TabularLike",
 ]
