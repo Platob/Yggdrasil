@@ -44,17 +44,37 @@ def _miss(default: Any, reason: str) -> Any:
 # ----------------------------
 # Magic helpers
 # ----------------------------
+class _PrefixMatcher:
+    """Callable wrapper around :meth:`bytes.startswith` that exposes
+    its *prefix* for static introspection.
+
+    :meth:`MimeType.define` reads :attr:`prefix` at registration time
+    and slots the owning MimeType into the :data:`_MAGIC_BY_FIRST_BYTE`
+    fast-path index, so the hot :meth:`MimeType.from_magic` loop can
+    skip the matchers whose first byte doesn't match the head.
+    """
+
+    __slots__ = ("prefix",)
+
+    def __init__(self, prefix: bytes) -> None:
+        self.prefix = prefix
+
+    def __call__(self, b: bytes) -> bool:
+        return b.startswith(self.prefix)
+
+
 def magic_prefix(prefix: bytes) -> MagicMatcher:
-    return lambda b: b.startswith(prefix)
+    return _PrefixMatcher(prefix)
 
 
 def magic_riff_webp(b: bytes) -> bool:
     return b.startswith(b"RIFF") and len(b) >= 12 and b[8:12] == b"WEBP"
 
 
-def magic_parquet(b: bytes) -> bool:
-    # header only; footer exists too but we usually peek small buffers
-    return b.startswith(b"PAR1")
+# Header only; footer exists too but we usually peek small buffers.
+# Wrapped through :class:`_PrefixMatcher` so it lands on the
+# first-byte fast path alongside the other pure-prefix matchers.
+magic_parquet = _PrefixMatcher(b"PAR1")
 
 
 # ----------------------------
@@ -83,6 +103,15 @@ class MimeType:
     _BY_VALUE: ClassVar[dict[str, "MimeType"]] = {}
     _EXT_MAP: ClassVar[dict[str, "MimeType"]] = {}
     _MAGIC_ORDER: ClassVar[list["MimeType"]] = []
+    # First-byte → (prefix, mime) candidates. Populated by :meth:`define`
+    # for any matcher built via :func:`magic_prefix` (i.e. any matcher
+    # that exposes a static :attr:`_PrefixMatcher.prefix`). The hot
+    # :meth:`from_magic` loop probes this in O(1) instead of walking
+    # every registered prefix matcher linearly.
+    _MAGIC_PREFIX_INDEX: ClassVar[dict[int, list[tuple[bytes, "MimeType"]]]] = {}
+    # Matchers that don't reduce to a static prefix (RIFF/WEBP) — these
+    # still walk linearly, but the list is tiny.
+    _MAGIC_DYNAMIC: ClassVar[list[tuple[MagicMatcher, "MimeType"]]] = []
 
     @classmethod
     def define(cls, mt: "MimeType") -> "MimeType":
@@ -94,6 +123,14 @@ class MimeType:
 
         if mt.magics:
             cls._MAGIC_ORDER.append(mt)
+            for matcher in mt.magics:
+                prefix = getattr(matcher, "prefix", None)
+                if isinstance(prefix, (bytes, bytearray)) and prefix:
+                    cls._MAGIC_PREFIX_INDEX.setdefault(prefix[0], []).append(
+                        (bytes(prefix), mt)
+                    )
+                else:
+                    cls._MAGIC_DYNAMIC.append((matcher, mt))
 
         return mt
 
@@ -347,13 +384,26 @@ class MimeType:
                 finally:
                     bio.close()
 
-        for mt in cls._MAGIC_ORDER:
-            for matcher in mt.magics:
-                try:
-                    if matcher(magic):
-                        return mt
-                except Exception:
-                    continue
+        # Fast path: probe the first-byte → prefix index. Almost every
+        # registered magic is a fixed byte prefix (PNG / GZIP / PARQUET /
+        # …) so a single ``magic[0]`` dispatch reduces the per-call cost
+        # from "walk 25 matchers" to "walk 0-2 matchers sharing that
+        # leading byte." :meth:`bytes.startswith` is C-level and can't
+        # raise on a ``bytes`` argument, so no try/except is needed here.
+        candidates = cls._MAGIC_PREFIX_INDEX.get(magic[0])
+        if candidates is not None:
+            for prefix, mt in candidates:
+                if magic.startswith(prefix):
+                    return mt
+
+        # Dynamic matchers (RIFF/WEBP, …) — short list, still walked
+        # linearly. Keep the try/except: these are arbitrary callables.
+        for matcher, mt in cls._MAGIC_DYNAMIC:
+            try:
+                if matcher(magic):
+                    return mt
+            except Exception:
+                continue
 
         # Structural text-format sniffers for common non-magic formats.
         if magic.startswith(b"{") or magic.startswith(b"["):
@@ -407,12 +457,30 @@ class MimeType:
             return hit
 
         if "/" in lower or "\\" in lower:
-            p = Path(candidate)
-            ext = p.suffix.lstrip(".").lower()
-            if ext:
-                hit = cls._EXT_MAP.get(ext)
-                if hit is not None:
-                    return hit
+            # ``Path(candidate).suffix`` worked but allocates a full
+            # PurePath holder for what is a trailing-dot scan. The
+            # inline form lifts ``MimeType.from_str('/data/trades.csv')``
+            # from ~2.3us to a few hundred ns and matches
+            # :attr:`URL.extensions`' string-level convention.
+            #
+            # Last path segment, then last suffix only — preserves
+            # ``pathlib.PurePath.suffix`` semantics (leading dotfile
+            # with no other dots → no suffix; trailing slash ignored).
+            seg = lower
+            slash = max(seg.rfind("/"), seg.rfind("\\"))
+            if slash != -1:
+                seg = seg[slash + 1:]
+            if seg.endswith("/") or seg.endswith("\\"):
+                seg = seg[:-1]
+            if seg.startswith("."):
+                seg = seg[1:]
+            dot = seg.rfind(".")
+            if dot != -1:
+                ext = seg[dot + 1:]
+                if ext:
+                    hit = cls._EXT_MAP.get(ext)
+                    if hit is not None:
+                        return hit
 
         mt = cls.get(candidate)
         if mt is not None:

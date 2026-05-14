@@ -36,6 +36,7 @@ nothing the caller already had.
 
 from __future__ import annotations
 
+import io as _stdio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Iterable, Union, Any
@@ -466,11 +467,17 @@ class MediaType:
         if codec is None:
             return cls(mime_type=outer)
 
-        try:
-            head, _tail = codec.read_start_end(buf, n_start=_INNER_PEEK, n_end=0)
-        except Exception:
-            head = b""
-
+        # Wrap the buffer in a stdlib BytesIO and reuse
+        # :meth:`_read_inner_head_io` — same code path as :meth:`from_io`.
+        # Going through :meth:`Codec.read_start_end` here would pay for
+        # the full yggdrasil BytesIO acquire/release lifecycle plus a
+        # tail-collection state machine we don't need (``n_end=0``).
+        # A bare ``io.BytesIO`` is enough: streaming decompressors
+        # (gzip / zstd / lz4 / bz2 / xz / lzma / zlib) only need a
+        # file-like with ``read``, and the head sniff bounds the read
+        # at :data:`_INNER_PEEK` bytes regardless of source size.
+        bio = _stdio.BytesIO(bytes(buf) if isinstance(buf, memoryview) else buf)
+        head = cls._read_inner_head_io(bio, codec)
         return cls._finalize_inner(head, codec)
 
     @classmethod
