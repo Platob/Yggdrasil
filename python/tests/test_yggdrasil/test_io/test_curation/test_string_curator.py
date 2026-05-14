@@ -207,12 +207,15 @@ class TestCuratorDispatch(ArrowTestCase):
         self.assertIsInstance(curator, StringCurator)
 
     def test_pick_raises_when_no_subclass_matches(self):
+        # Binary arrays have no Curator subclass; integers / floats /
+        # nested types do, so use ``pa.binary()`` to exercise the
+        # "nothing handles it" path.
         with self.assertRaisesRegex(TypeError, "No Curator subclass handles"):
-            Curator.pick(self.pa.array([1, 2, 3]))
+            Curator.pick(self.pa.array([b"x", b"y"]))
 
     def test_curator_call_rejects_wrong_dtype(self):
         with self.assertRaisesRegex(TypeError, "cannot curate Arrow type"):
-            StringCurator()(self.pa.array([1, 2, 3]))
+            StringCurator()(self.pa.array([b"x", b"y"]))
 
     def test_infer_only_returns_dtype(self):
         curator = StringCurator()
@@ -250,7 +253,7 @@ class TestCurateArrowArray(ArrowTestCase):
 
     def test_wrong_dtype_raises_via_call(self):
         with self.assertRaisesRegex(TypeError, "cannot curate Arrow type"):
-            StringCurator().curate_arrow_array(self.pa.array([1, 2, 3]))
+            StringCurator().curate_arrow_array(self.pa.array([b"x", b"y"]))
 
 
 class TestCurateArrowTabular(ArrowTestCase):
@@ -292,17 +295,24 @@ class TestCurateArrowTabular(ArrowTestCase):
         self.assertEqual(curated.column(0).to_pylist(), [1, 2])
         self.assertEqual(schema[0].dtype, Int64Type())
 
-    def test_already_typed_columns_pass_through(self):
-        # A pre-typed int column has no Curator subclass that handles
-        # it — should land in the output unchanged with its Field
-        # wrapped in the schema.
+    def test_pretyped_int_columns_get_shrunk(self):
+        # IntegerCurator picks up pre-typed ints and downcasts to the
+        # narrowest width that holds the range (int64([1..3]) → int8).
         table = self.pa.table(
             {"id": self.pa.array([1, 2, 3]), "label": ["a", "b", "c"]}
         )
         schema, curated = Curator.curate_arrow_tabular(table)
-        self.assertEqual(curated.schema.field("id").type, self.pa.int64())
+        self.assertEqual(curated.schema.field("id").type, self.pa.uint8())
         self.assertEqual(curated.schema.field("label").type, self.pa.string())
-        self.assertEqual(schema[0].dtype, Int64Type())
+
+    def test_unhandled_columns_pass_through(self):
+        # Binary has no Curator subclass — should land in the output
+        # with its Field carrying the original dtype.
+        table = self.pa.table(
+            {"blob": self.pa.array([b"x", b"y"]), "label": ["a", "b"]}
+        )
+        schema, curated = Curator.curate_arrow_tabular(table)
+        self.assertEqual(curated.schema.field("blob").type, self.pa.binary())
 
     def test_rejects_non_arrow_tabular(self):
         with self.assertRaisesRegex(TypeError, "expects a pyarrow Table"):

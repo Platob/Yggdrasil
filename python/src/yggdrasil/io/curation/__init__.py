@@ -31,12 +31,15 @@ from __future__ import annotations
 
 from .base import ArrayLike, CurationResult, Curator, TabularLike
 from .nested import NestedCurator
+from .numeric import FloatCurator, IntegerCurator
 from .string import StringCurator
 
 __all__ = [
     "ArrayLike",
     "CurationResult",
     "Curator",
+    "FloatCurator",
+    "IntegerCurator",
     "NestedCurator",
     "StringCurator",
     "TabularLike",

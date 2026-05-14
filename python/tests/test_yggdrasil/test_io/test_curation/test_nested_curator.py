@@ -49,19 +49,19 @@ class TestStructCuration(ArrowTestCase):
         names = [f.name for f in result.dtype.fields]
         self.assertEqual(names, ["id", "name"])
 
-    def test_struct_child_with_no_curator_passes_through(self):
-        # The ``amount`` column comes in pre-typed (int64) — no
-        # subclass should claim it, so it lands on the rebuild as-is.
+    def test_struct_child_unhandled_dtype_passes_through(self):
+        # The ``blob`` column is binary — no Curator subclass claims
+        # it, so it lands on the rebuild as-is.
         arr = self.pa.StructArray.from_arrays(
             [
                 self.pa.array(["1", "2"]),
-                self.pa.array([100, 200]),
+                self.pa.array([b"x", b"y"]),
             ],
-            names=["id", "amount"],
+            names=["id", "blob"],
         )
         result = Curator.pick(arr).curate(arr)
-        self.assertEqual(str(result.array.type), "struct<id: int64, amount: int64>")
-        self.assertEqual(result.array.field("amount").to_pylist(), [100, 200])
+        self.assertEqual(str(result.array.type), "struct<id: int64, blob: binary>")
+        self.assertEqual(result.array.field("blob").to_pylist(), [b"x", b"y"])
 
 
 class TestListCuration(ArrowTestCase):

@@ -56,12 +56,15 @@ class TestPolarsCuration(PolarsTestCase):
         self.assertEqual(curated.schema["label"], self.pl.String)
         self.assertIsInstance(schema[1].dtype, TimestampType)
 
-    def test_pretyped_columns_pass_through(self):
+    def test_pretyped_int_columns_get_shrunk(self):
+        # IntegerCurator narrows the pretyped int column to the
+        # smallest dtype that holds the range. ``[1..3]`` fits in
+        # uint8.
         df = self.pl.DataFrame(
             {"id": self.pl.Series("id", [1, 2, 3]), "name": ["a", "b", "c"]}
         )
         schema, curated = Curator.curate_polars_dataframe(df)
-        self.assertEqual(curated.schema["id"], self.pl.Int64)
+        self.assertEqual(curated.schema["id"], self.pl.UInt8)
         self.assertEqual(curated.schema["name"], self.pl.String)
 
 
