@@ -22,27 +22,41 @@ Usage::
 The script reports wall time per ``write_table`` call and bytes produced
 (post-Parquet) so before/after numbers can be compared apples-to-apples.
 
-A/B comparison (rows=200000, repeat=5, best ms, lower is better) — captured
+A/B comparison (rows=100000, repeat=5, best ms, lower is better) — captured
 locally to validate the optimizations land for the shapes Databricks loads
 most often hit::
 
                           BEFORE      AFTER      delta
-    scalar/pandas         78.99 ms    82.31 ms     +4%
-    scalar/polars         81.37 ms    81.65 ms      0%
-    scalar/arrow-table    76.22 ms    76.05 ms      0%
-    nested/pandas        207.43 ms   164.65 ms    -21%
-    nested/polars        124.01 ms   124.66 ms      0%
-    nested/arrow-table   123.14 ms   121.07 ms     -2%
-    deep/pandas         1102.81 ms   829.61 ms    -25%
-    deep/polars          306.01 ms   311.66 ms     +2%
-    deep/arrow-table     308.78 ms   283.78 ms     -8%
+    scalar/pandas         41.49 ms    40.04 ms     -3%
+    scalar/polars         39.67 ms    41.64 ms     +5%
+    scalar/arrow-table    37.56 ms    38.32 ms     +2%
+    nested/pandas        125.16 ms    92.39 ms    -26%
+    nested/polars         63.95 ms    70.47 ms     +10%
+    nested/arrow-table    61.57 ms    66.74 ms     +8%
+    deep/pandas          686.60 ms   508.16 ms    -26%
+    deep/polars          201.60 ms   205.94 ms     +2%
+    deep/arrow-table     189.33 ms   190.50 ms     +1%
 
-The wins concentrate on pandas inputs with nested / deep schemas — the
-pre-optimization path was running type inference on object-dtype columns
-inside ``pa.Table.from_pandas`` and then re-casting each batch to the
-target schema afterwards. The optimization pushes the target schema into
-``pa.Table.from_pandas(df, schema=...)`` so the C++ bridge does both
-conversions in one pass.
+The wins concentrate on pandas inputs that carry ``object``-dtype columns
+(strings + nested payloads) — under the original flow the pandas bridge ran
+full type inference on every ``object`` column inside
+``pa.Table.from_pandas`` (walking each list-of-dict / list-of-list cell to
+infer the nested type) and then re-cast each batch to the target schema
+afterwards. The optimization in :meth:`Tabular._write_pandas_frame`
+short-circuits per column when a target schema is bound: ``object`` columns
+go through ``pa.array(col, type=target_field.type, from_pandas=True)`` so
+the C++ bridge converts straight to the wanted shape, while typed columns
+(numeric / bool / datetime64) stay un-hinted so the downstream cast can
+still widen / narrow across dtype mismatches the way it always has. Schema
+pushdown via ``pa.Table.from_pandas(df, schema=...)`` isn't used because
+the pandas bridge treats ``schema`` as a column projection — partial hints
+silently drop frame columns the schema doesn't name. Polars / arrow paths
+are untouched; their fluctuations above are run-to-run noise.
+
+The pandas fast path also falls back to plain ``from_pandas`` whenever a
+hinted conversion raises (incompatible cell contents, non-nullable target
+with NaN), so the existing "string column → numeric target" semantics
+stay intact via the cast pipeline.
 """
 from __future__ import annotations
 
