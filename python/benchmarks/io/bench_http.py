@@ -40,7 +40,7 @@ from yggdrasil.io.http_.session import HTTPSession
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
-from yggdrasil.io.send_config import SendConfig
+from yggdrasil.io.send_config import SendConfig, SendManyConfig
 
 
 # ---------------------------------------------------------------------------
@@ -364,34 +364,155 @@ def _response_scenarios(repeat: int) -> list[dict]:
 def _session_scenarios(repeat: int) -> list[dict]:
     out: list[dict] = []
 
+    # --- Singleton lookup ----------------------------------------------
+    # Most code calls ``HTTPSession(base_url=…)`` as if it were free.
+    # The lookup is keyed on the config so re-entering the same kwargs
+    # collapses to the cached instance; this measures that fast path.
     out.append(_time_one(
         "HTTPSession(base_url) (singleton hit)",
         lambda: HTTPSession(base_url="https://api.example.com"),
         repeat=repeat, inner=20_000,
     ))
+    out.append(_time_one(
+        "HTTPSession(base_url, headers, key) (singleton hit)",
+        lambda: HTTPSession(
+            base_url="https://api.example.com",
+            headers={"X-Tenant": "acme"},
+            key="bench-prepare",
+        ),
+        repeat=repeat, inner=20_000,
+    ))
 
+    # --- Send/SendMany config validation -------------------------------
     out.append(_time_one(
         "SendConfig.check_arg(None) (no-cache default)",
         lambda: SendConfig.check_arg(None, wait=None, raise_error=True, stream=True),
         repeat=repeat, inner=20_000,
     ))
+    cached_cfg = SendConfig.check_arg(None)
+    out.append(_time_one(
+        "SendConfig.check_arg(SendConfig) (pass-through)",
+        lambda: SendConfig.check_arg(cached_cfg),
+        repeat=repeat, inner=50_000,
+    ))
+    out.append(_time_one(
+        "SendManyConfig.check_arg(None)",
+        lambda: SendManyConfig.check_arg(None),
+        repeat=repeat, inner=20_000,
+    ))
 
-    # ``prepare_request_before_send`` is run on every send. Build a
-    # session that has its own default headers so the merge actually
-    # has work to do.
+    # --- prepare_request_before_send fan-out ---------------------------
+    # Three shapes a session pays per send:
+    #   * default no-header session — cheapest path, only sets sent_at;
+    #   * session-level headers merge — every request inherits tenant /
+    #     trace headers from the session;
+    #   * session-level auth handler — every request re-resolves the
+    #     handler's ``authorization`` and stamps the header.
+    session_plain = HTTPSession(base_url="https://api.example.com", key="bench-plain")
     session_with_headers = HTTPSession(
         base_url="https://api.example.com",
         headers={"X-Tenant": "acme", "X-Trace-Id": "abc123"},
         key="bench-prepare",
     )
 
-    def _prepare():
+    # Stand-in auth handler that returns a static token; the real MSAL /
+    # OAuth handlers go through the same property surface, so this
+    # measures the per-send overhead, not the token refresh.
+    class _StaticAuth:
+        scheme = "Bearer"
+        token = "bench-token"
+
+        @property
+        def authorization(self) -> str:
+            return f"Bearer {self.token}"
+
+    session_with_auth = HTTPSession(
+        base_url="https://api.example.com",
+        headers={"X-Tenant": "acme"},
+        auth=_StaticAuth(),  # type: ignore[arg-type]
+        key="bench-auth",
+    )
+
+    def _prepare_plain():
+        r = PreparedRequest.prepare("GET", HTTPS_STR, headers=dict(HEADERS_SMALL))
+        return session_plain.prepare_request_before_send(r)
+    out.append(_time_one(
+        "session.prepare_request_before_send (no extras)",
+        _prepare_plain,
+        repeat=repeat, inner=2_000,
+    ))
+
+    def _prepare_headers():
         r = PreparedRequest.prepare("GET", HTTPS_STR, headers=dict(HEADERS_SMALL))
         return session_with_headers.prepare_request_before_send(r)
     out.append(_time_one(
-        "session.prepare_request_before_send",
-        _prepare,
+        "session.prepare_request_before_send (session headers)",
+        _prepare_headers,
         repeat=repeat, inner=2_000,
+    ))
+
+    def _prepare_auth():
+        r = PreparedRequest.prepare("GET", HTTPS_STR, headers=dict(HEADERS_SMALL))
+        return session_with_auth.prepare_request_before_send(r)
+    out.append(_time_one(
+        "session.prepare_request_before_send (auth handler)",
+        _prepare_auth,
+        repeat=repeat, inner=2_000,
+    ))
+
+    # --- Session.prepare_request (base_url + params merge) -------------
+    out.append(_time_one(
+        "session.prepare_request(relative)",
+        lambda: session_plain.prepare_request("GET", "/v1/accounts/12345"),
+        repeat=repeat, inner=2_000,
+    ))
+    params = {"from": "2024-01-01", "to": "2024-12-31", "page": "3"}
+    out.append(_time_one(
+        "session.prepare_request(relative, params=…)",
+        lambda: session_plain.prepare_request(
+            "GET", "/v1/accounts/12345", params=params,
+        ),
+        repeat=repeat, inner=2_000,
+    ))
+    out.append(_time_one(
+        "URL.join (base_url + relative)",
+        lambda: URL.from_str("https://api.example.com").join("/v1/accounts/12345"),
+        repeat=repeat, inner=10_000,
+    ))
+
+    # --- Full no-cache send dispatch through a fake transport ----------
+    # ``_local_send`` is the only async-coupled step in ``_send``; stub
+    # it so the bench measures the rest of the pipeline (config merge,
+    # ``prepare_request_before_send``, cache short-circuits, post hooks)
+    # without involving a socket.
+    class _FakeHTTPSession(HTTPSession):
+        def _local_send(self, request, config):  # type: ignore[override]
+            resp = Response(
+                request=request,
+                status_code=200,
+                headers={"Content-Type": "application/json", "Content-Length": "0"},
+                tags={},
+                buffer=Memory(),
+                received_at=dt.datetime.now(dt.timezone.utc),
+            )
+            return resp
+
+    fake_session = _FakeHTTPSession(
+        base_url="https://api.example.com",
+        headers={"X-Tenant": "acme", "X-Trace-Id": "abc123"},
+        key="bench-fake",
+    )
+    # ``_send`` short-circuits on cache hits, but here both caches
+    # default to disabled — every iteration walks the no-cache branch:
+    # cache lookup → ``prepare_request_before_send`` → ``_local_send``
+    # → ``prepare_response_after_received``.
+    def _send_via_fake():
+        r = PreparedRequest.prepare("GET", HTTPS_STR, headers=dict(HEADERS_SMALL))
+        return fake_session.send(r, raise_error=False)
+    out.append(_time_one(
+        "session.send (fake transport, no cache)",
+        _send_via_fake,
+        repeat=repeat, inner=1_000,
     ))
 
     # Combined "build + check_arg" — closer to the steady-state cost

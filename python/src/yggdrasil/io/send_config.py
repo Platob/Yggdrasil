@@ -173,7 +173,18 @@ class _ConfigBase:
 
     @classmethod
     def default(cls):
-        return cls()
+        # Per-class singleton — ``Session.send`` constructs one of these
+        # per call as a final fallback (every argument either None or
+        # equal to the field default), so we'd rather hand back the
+        # cached instance than rebuild + ``__post_init__``-normalize a
+        # fresh frozen dataclass on every send. Stamp on ``cls.__dict__``
+        # directly (not ``setattr``) so subclasses get their own slot
+        # instead of inheriting the parent's singleton.
+        inst = cls.__dict__.get("_DEFAULT_INSTANCE")
+        if inst is None:
+            inst = cls()
+            type.__setattr__(cls, "_DEFAULT_INSTANCE", inst)
+        return inst
 
     @classmethod
     def parse_mapping(cls, options: Mapping[str, Any], **overrides: Any):
@@ -184,7 +195,49 @@ class _ConfigBase:
             )
         values = {k: v for k, v in options.items() if k in cls._FIELD_NAMES}
         values.update(overrides)
+        if cls._matches_default(values):
+            return cls.default()
         return cls(**cls._check_mapping(values))
+
+    @classmethod
+    def _matches_default(cls, values: Mapping[str, Any]) -> bool:
+        """``True`` when every value is None or already equal to the
+        field default — i.e. the resulting instance would be
+        value-equal to :meth:`default`.
+
+        Lets ``check_arg`` / ``parse_mapping`` skip the constructor +
+        ``__post_init__`` round trip on the steady-state shape that
+        ``Session.send`` produces (every kwarg either ``None`` or the
+        field default). Any non-None override that diverges from
+        defaults — or an unknown key — falls through to the full
+        constructor.
+
+        Identity match (``is``) is required for non-primitive types
+        because :class:`CacheConfig` (and friends) declare
+        ``path`` / ``tabular`` / ``request_by`` with
+        ``compare=False`` — so two CacheConfigs that differ only on
+        an excluded field compare equal under ``==`` and would
+        otherwise be silently collapsed back to the default.
+        """
+        if not values:
+            return True
+        default = cls.default()
+        for k, v in values.items():
+            if v is None:
+                # ``None`` means "not supplied" — ``_check_mapping``
+                # drops it before the constructor sees it, so it
+                # can't shift the result off-default.
+                continue
+            default_v = getattr(default, k, ...)
+            if default_v is v:
+                continue
+            # Value-equality only for primitive built-ins where
+            # ``==`` and identity-of-interest agree. Custom dataclasses
+            # with ``compare=False`` fields are excluded above.
+            if type(v) in (bool, int, float, str, bytes) and default_v == v:
+                continue
+            return False
+        return True
 
     @staticmethod
     def _check_mapping(values: MutableMapping[str, Any]):
@@ -297,6 +350,22 @@ class CacheConfig(_ConfigBase):
 
         return values
 
+    @classmethod
+    def _matches_default(cls, values: Mapping[str, Any]) -> bool:
+        # CacheConfig treats ``None`` as a real value for some fields —
+        # ``cleanup_ttl=None`` explicitly disables cache cleanup vs.
+        # the default ``timedelta(days=1)``, ``wait=None`` flips wait
+        # behavior off, etc. — and :meth:`_check_mapping` deliberately
+        # keeps Nones rather than filtering them, so we can't reuse
+        # the base implementation's "skip on None" shortcut.
+        if not values:
+            return True
+        default = cls.default()
+        for k, v in values.items():
+            if getattr(default, k, ...) != v:
+                return False
+        return True
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "mode", Mode.from_(self.mode, default=Mode.APPEND))
         object.__setattr__(self, "wait", WaitingConfig.from_(self.wait))
@@ -370,6 +439,12 @@ class CacheConfig(_ConfigBase):
         **overrides: Any,
     ) -> "CacheConfig":
         if arg is None:
+            # Don't reuse :meth:`_ConfigBase._matches_default` here:
+            # :meth:`CacheConfig._check_mapping` intentionally does
+            # *not* drop None — passing ``cleanup_ttl=None`` is the
+            # documented way to disable cache cleanup — so collapsing
+            # ``CacheConfig.check_arg(None, cleanup_ttl=None)`` back to
+            # the default singleton would silently re-enable cleanup.
             return cls.parse_mapping(overrides) if overrides else cls.default()
         if isinstance(arg, cls):
             return arg.merge(**overrides) if overrides else arg
@@ -967,7 +1042,9 @@ class SendConfig(_ConfigBase):
         **overrides: Any,
     ) -> "SendConfig":
         if arg is None:
-            return cls.parse_mapping(overrides) if overrides else cls.default()
+            if not overrides or cls._matches_default(overrides):
+                return cls.default()
+            return cls.parse_mapping(overrides)
         if isinstance(arg, cls):
             return arg.merge(**overrides) if overrides else arg
         if isinstance(arg, Mapping):
@@ -1045,7 +1122,9 @@ class SendManyConfig(_ConfigBase):
         **overrides: Any,
     ) -> "SendManyConfig":
         if arg is None:
-            return cls(**overrides) if overrides else cls.default()
+            if not overrides or cls._matches_default(overrides):
+                return cls.default()
+            return cls(**overrides)
         if isinstance(arg, cls):
             return arg.merge(**overrides) if overrides else arg
         if isinstance(arg, SendConfig):
