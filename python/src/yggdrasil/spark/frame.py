@@ -1,12 +1,31 @@
+import logging
+import sys
 from typing import Any, Callable, Iterable, Iterator
 
 import pyarrow as pa
-from pyspark.cloudpickle import dumps, loads
 from pyspark.sql import DataFrame, SparkSession
 from yggdrasil.arrow.cast import any_to_arrow_batch_iterator, any_to_arrow_table
 from yggdrasil.data import schema as schema_builder, field as field_builder, Schema
 from yggdrasil.data.options import CastOptions
 from yggdrasil.environ import PyEnv
+# Use yggdrasil's serde wire format (orjson-backed with broad type
+# coverage — datetime / UUID / Path / dataclass / namedtuple / Decimal —
+# beyond what cloudpickle alone provides) for the row payloads. The
+# cluster needs ygg installed for the unpickle side; that's exactly
+# what ``DatabricksClient.spark`` auto-declares via
+# ``DatabricksEnv.withDependencies("ygg")``.
+from yggdrasil.pickle import dumps, loads
+
+LOGGER = logging.getLogger(__name__)
+
+# Function dependency scanning helpers — exposed via the pyspark-free
+# ``yggdrasil.spark.dependencies`` module so the scan logic can be
+# tested / imported in environments where ``pyspark`` is not installed
+# (which is the common path for the Spark Connect client).
+from yggdrasil.spark.dependencies import (
+    _function_top_modules as _function_top_modules,  # re-export
+    _stdlib_modules as _stdlib_modules,  # re-export
+)
 
 __all__ = [
     "DynamicFrame",
@@ -117,15 +136,30 @@ class DynamicFrame:
     ``DynamicFrame`` carrying the lifted Arrow schema.
     """
 
-    __slots__ = ('df', 'schema')
+    __slots__ = ('df', 'schema', 'installed_modules')
 
     def __init__(
         self,
         df: DataFrame,
         schema: Schema | None = None,
+        *,
+        installed_modules: "set[str] | None" = None,
     ):
         self.df = df
         self.schema = schema
+        # Top-level package names this frame has already declared on
+        # the cluster. Auto-populated when :meth:`apply` / :meth:`map`
+        # / :meth:`filter` scan a user function's globals and feed
+        # them through :meth:`_ensure_installed`. Persists across
+        # transforms so a chain like
+        # ``df.apply(f).map(g).filter(h)`` only round-trips each
+        # module once per frame lineage. Tests and call sites that
+        # know exactly which modules to ship can seed this directly
+        # (``DynamicFrame(df, installed_modules={"ygg", "polars"})``)
+        # to bypass the scan.
+        self.installed_modules: set[str] = (
+            set(installed_modules) if installed_modules else set()
+        )
 
     # ---- core --------------------------------------------------------------
 
@@ -374,6 +408,172 @@ class DynamicFrame:
 
         return merged
 
+    # ---- executor dependency wiring ----------------------------------------
+
+    def _ensure_installed(self, *functions: Callable[..., Any]) -> set[str]:
+        """Scan *functions* for module deps and ship them to executors.
+
+        The discovered modules are unioned into
+        :attr:`installed_modules` so subsequent calls in the same
+        frame lineage are no-ops. Returns the set of top-level
+        package names this call newly installed (empty when
+        nothing was missing).
+
+        Resolution:
+
+        - Spark Connect session with a bound :class:`DatabricksClient`
+          (``session.ygg_client`` — set by
+          :meth:`DatabricksClient.spark`) — declare each new module
+          via :class:`DatabricksEnv.withDependencies` on a
+          :class:`WorkspacePyPIRegistry` so executors pick them up
+          on next session refresh. Editables / private libs get
+          shared through ``/Workspace/.../.ygg/pypi/simple/``.
+        - Plain Spark / non-Databricks session — fall back to
+          :meth:`SparkContext.addPyFile` with a freshly built
+          ``.zip`` of each module so the executors load it from
+          ``sys.path``. ``.whl`` files are also accepted by
+          ``addPyFile``.
+
+        Failures are logged at WARNING and swallowed — a missing
+        executor install is a load-time error in the UDF; we
+        don't want a best-effort scan to crash an otherwise valid
+        ``apply`` call.
+        """
+        wanted: set[str] = set()
+        for fn in functions:
+            if fn is None:
+                continue
+            wanted.update(_function_top_modules(fn))
+
+        new_modules = wanted - self.installed_modules
+        if not new_modules:
+            return set()
+
+        try:
+            installed = self._install_modules_on_executors(new_modules)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning(
+                "DynamicFrame: failed to install %s on executors: %s",
+                sorted(new_modules), exc,
+            )
+            return set()
+
+        self.installed_modules.update(installed)
+        return installed
+
+    def _install_modules_on_executors(
+        self, modules: "set[str]",
+    ) -> set[str]:
+        """Ship each module to Spark executors via ``addArtifacts``.
+
+        Two backends, picked by feature detection:
+
+        - **Spark Connect / Databricks Connect** — ``session.addArtifacts(
+          path, pyfile=True)`` injects the archive into the
+          session's artifact directory for every executor. When a
+          :class:`DatabricksClient` is stashed on the session
+          (``session.ygg_client`` — set by
+          :meth:`DatabricksClient.spark`), the archive is *also*
+          published to the shared workspace registry at
+          ``/Workspace/.../.ygg/pypi/simple/`` so teammates on the
+          same workspace can reuse it without rebuilding.
+        - **Plain Spark** — falls back to
+          :meth:`SparkContext.addPyFile`.
+
+        Every module is materialized through
+        :func:`build_module_archive` so the artifact is a
+        deflated ``.zip`` whose top-level entry IS the package
+        directory — ``addArtifacts(pyfile=True)`` then loads it
+        straight onto the executor's ``sys.path``. Failures are
+        logged at INFO / WARNING and swallowed: best-effort
+        installs shouldn't crash an otherwise valid transform.
+        """
+        from yggdrasil.io.path._module_pack import (
+            build_module_archive,
+            resolve_module_root,
+        )
+
+        session = self.sparkSession
+        client = getattr(session, "ygg_client", None)
+        registry = None
+        if client is not None:
+            try:
+                from yggdrasil.databricks.registry import WorkspacePyPIRegistry
+                registry = WorkspacePyPIRegistry(client=client)
+            except Exception as exc:
+                LOGGER.info(
+                    "Could not build WorkspacePyPIRegistry: %s", exc,
+                )
+                registry = None
+
+        add_art = getattr(session, "addArtifacts", None) or getattr(
+            session, "addArtifact", None,
+        )
+        sc = getattr(session, "sparkContext", None)
+        add_py = getattr(sc, "addPyFile", None) if sc is not None else None
+
+        if not callable(add_art) and not callable(add_py):
+            LOGGER.info(
+                "SparkSession exposes neither addArtifacts nor "
+                "addPyFile — cannot install %s on executors.",
+                sorted(modules),
+            )
+            return set()
+
+        installed: set[str] = set()
+        for module_name in sorted(modules):
+            try:
+                root = resolve_module_root(module_name)
+            except Exception as exc:
+                LOGGER.info(
+                    "Skipping %s — cannot resolve module root: %s",
+                    module_name, exc,
+                )
+                continue
+
+            archive_path = None
+            if registry is not None:
+                # Workspace-cache path: publish through the registry
+                # so the wheel / zip ends up at
+                # ``.ygg/pypi/simple/<pkg>/...`` for sharing. The
+                # registry returns a ``local:<path>`` spec and the
+                # remote :class:`WorkspacePath`; we use the local
+                # path for ``addArtifacts``.
+                try:
+                    spec, _remote = registry.publish(module_name)
+                    if spec.startswith("local:"):
+                        archive_path = spec[len("local:"):]
+                except Exception as exc:
+                    LOGGER.info(
+                        "Registry publish failed for %s; falling back "
+                        "to in-place archive: %s", module_name, exc,
+                    )
+
+            if archive_path is None:
+                try:
+                    archive_path = str(
+                        build_module_archive(root, dest=None),
+                    )
+                except Exception as exc:
+                    LOGGER.info(
+                        "Skipping %s — cannot build archive: %s",
+                        module_name, exc,
+                    )
+                    continue
+
+            try:
+                if callable(add_art):
+                    add_art(archive_path, pyfile=True)
+                else:
+                    add_py(archive_path)
+            except Exception as exc:
+                LOGGER.warning(
+                    "Failed to ship %s via Spark: %s", module_name, exc,
+                )
+                continue
+            installed.add(module_name)
+        return installed
+
     # ---- transforms --------------------------------------------------------
 
     def map(
@@ -389,6 +589,7 @@ class DynamicFrame:
         (typed mode). Output schema follows ``schema`` if given, else
         the result is a dynamic frame.
         """
+        self._ensure_installed(function)
         function_pickle = dumps(function)
         is_dynamic_in = self.is_dynamic
 
@@ -403,7 +604,10 @@ class DynamicFrame:
             result_df = self.df.mapInArrow(
                 _runner, schema=DYNAMIC_SCHEMA.to_spark_schema()
             )
-            return type(self)(df=result_df, schema=None)
+            return type(self)(
+                df=result_df, schema=None,
+                installed_modules=self.installed_modules,
+            )
 
         schema = Schema.from_any(schema)
 
@@ -428,7 +632,10 @@ class DynamicFrame:
             return _typed_cast(_groups(), schema, byte_size=byte_size)
 
         result_df = self.df.mapInArrow(_typed_runner, schema=schema.to_spark_schema())
-        return type(self)(df=result_df, schema=schema)
+        return type(self)(
+            df=result_df, schema=schema,
+            installed_modules=self.installed_modules,
+        )
 
     def apply(
         self,
@@ -447,6 +654,7 @@ class DynamicFrame:
         if schema is None:
             return self.map(function, byte_size=byte_size)
 
+        self._ensure_installed(function)
         schema = Schema.from_any(schema)
         function_pickle = dumps(function)
         is_dynamic_in = self.is_dynamic
@@ -472,7 +680,10 @@ class DynamicFrame:
             return _typed_cast(_groups(), schema, byte_size=byte_size)
 
         result_df = self.df.mapInArrow(_runner, schema=schema.to_spark_schema())
-        return type(self)(df=result_df, schema=schema)
+        return type(self)(
+            df=result_df, schema=schema,
+            installed_modules=self.installed_modules,
+        )
 
     def filter(
         self,
@@ -487,6 +698,7 @@ class DynamicFrame:
         (typed mode). When called on a typed frame without a ``schema``
         argument, the existing schema is preserved (no re-cast needed).
         """
+        self._ensure_installed(predicate)
         predicate_pickle = dumps(predicate)
         is_dynamic_in = self.is_dynamic
 
@@ -515,7 +727,10 @@ class DynamicFrame:
             result_df = self.df.mapInArrow(
                 _runner, schema=DYNAMIC_SCHEMA.to_spark_schema()
             )
-            return type(self)(df=result_df, schema=None)
+            return type(self)(
+                df=result_df, schema=None,
+                installed_modules=self.installed_modules,
+            )
 
         # Typed input, or dynamic input + explicit output schema.
         out_schema = Schema.from_any(schema) if schema is not None else self.schema
@@ -549,7 +764,10 @@ class DynamicFrame:
         result_df = self.df.mapInArrow(
             _typed_runner, schema=out_schema.to_spark_schema()
         )
-        return type(self)(df=result_df, schema=out_schema)
+        return type(self)(
+            df=result_df, schema=out_schema,
+            installed_modules=self.installed_modules,
+        )
 
     def explode(
         self,
@@ -581,7 +799,10 @@ class DynamicFrame:
             result_df = self.df.mapInArrow(
                 _runner, schema=DYNAMIC_SCHEMA.to_spark_schema()
             )
-            return type(self)(df=result_df, schema=None)
+            return type(self)(
+                df=result_df, schema=None,
+                installed_modules=self.installed_modules,
+            )
 
         schema = Schema.from_any(schema)
 
@@ -598,7 +819,10 @@ class DynamicFrame:
             return _typed_cast(_groups(), schema, byte_size=byte_size)
 
         result_df = self.df.mapInArrow(_typed_runner, schema=schema.to_spark_schema())
-        return type(self)(df=result_df, schema=schema)
+        return type(self)(
+            df=result_df, schema=schema,
+            installed_modules=self.installed_modules,
+        )
 
     def cast(
         self,
@@ -629,7 +853,10 @@ class DynamicFrame:
             return _typed_cast(_groups(), schema, byte_size=byte_size)
 
         result_df = self.df.mapInArrow(_runner, schema=schema.to_spark_schema())
-        return type(self)(df=result_df, schema=schema)
+        return type(self)(
+            df=result_df, schema=schema,
+            installed_modules=self.installed_modules,
+        )
 
     def to_dynamic(self, *, byte_size: int = 128 * 1024 * 1024) -> "DynamicFrame":
         """Drop typing: re-pickle row-dicts back into a dynamic frame.

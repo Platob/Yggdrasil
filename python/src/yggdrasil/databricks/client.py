@@ -1278,222 +1278,171 @@ class DatabricksClient(URLBased):
 
     def spark(
         self,
-        *,
-        dependencies: "Optional[list[Any]]" = None,
-        pip_dependencies: "Optional[list[str]]" = ("ygg",),
+        *dependencies: "Any",
+        registry: "Optional[Any]" = None,
+        check_public: bool = False,
         cache_dir: "Optional[Union[str, os.PathLike]]" = None,
-        workspace_cache: "Optional[Any]" = None,
     ):
-        """Open a Databricks Connect session with bundled Python deps.
+        """Open a Databricks Connect session with auto-resolved deps.
 
         Returns a live :class:`pyspark.sql.SparkSession` (Spark
         Connect variant) configured against this client's workspace
-        host and credentials.
+        host and credentials. The bound :class:`DatabricksClient`
+        is stashed on the session as ``session.ygg_client`` so
+        downstream helpers (UDFs, :class:`DynamicFrame` extensions,
+        ad-hoc resource lookups) can reach the same auth without an
+        extra ``DatabricksClient.current()`` call.
 
-        Dependency wiring picks the right runtime hook for the
-        target compute:
+        Each *dependency* is classified once via
+        :func:`classify_dependency`:
 
-        - **Serverless compute** (the default when no
-          ``cluster_id`` is set) — declarative path: PyPI specs go
-          through :meth:`DatabricksEnv.withDependencies` and local
-          archives ride along with the ``local:`` prefix. The
-          builder applies the environment via
-          :meth:`DatabricksSession.builder.withEnvironment` so
-          serverless installs everything before the session is
-          handed back. This is the path the user normally wants:
-          ``pip_dependencies=("ygg",)`` becomes
-          ``env.withDependencies(["ygg"])`` and ygg is pulled from
-          PyPI on the cluster.
-        - **Classic compute** (a ``cluster_id`` is set) — eager
-          path: dependencies are zipped / pip-downloaded locally
-          and attached via
-          :meth:`SparkSession.addArtifacts` with ``pyfile=True``
-          because classic clusters don't honour the declarative
-          environment.
+        - Public PyPI specs (``"ygg"``, ``"numpy>=1.0"``) ride
+          straight to the cluster via
+          :meth:`DatabricksEnv.withDependencies`. ``ygg`` is
+          always declared — the cluster pulls it from PyPI so
+          UDFs can use the same :class:`yggdrasil` runtime the
+          driver is using.
+        - Editable installs (``pip install -e .``) get their
+          local working copy built into a wheel whose version
+          carries the local hostname
+          (``0.7.73+host.<host>``). The wheel lives at
+          ``/Workspace/Users/<me>/.ygg/pypi/simple/<pkg>/<wheel>``
+          (overridable via *registry*) and is re-uploaded on every
+          load so the registry slot tracks the developer's
+          working code.
+        - Private / non-PyPI installs get the same wheel-build +
+          workspace-upload treatment, but lazily — the upload
+          is skipped when the workspace slot already exists, so
+          a team sharing one registry path only re-uploads on
+          version bumps.
+
+        Both editable and private wheels are then handed to
+        :meth:`DatabricksEnv.withDependencies` via the
+        ``local:<path>`` prefix Databricks Connect understands;
+        the wheel itself is read back from the workspace into a
+        local cache so the spec is reachable from the driver
+        process.
+
+        Serverless compute (the default — no ``cluster_id``) wires
+        deps through ``DatabricksEnv`` + ``withEnvironment``;
+        classic compute falls back to
+        :meth:`SparkSession.addArtifacts` with ``pyfile=True``
+        since classic clusters don't honour the declarative
+        environment.
 
         Arguments:
 
-        - *dependencies* — local Python modules to bundle. Each
-          entry is anything :func:`resolve_module_root` accepts
-          (importable module name, ``os.PathLike`` to a package
-          directory or pre-built ``.zip`` / ``.whl``, or a
-          callable with ``__module__``). Packed into deflated
-          ``.zip`` archives on disk.
-        - *pip_dependencies* — PyPI specs (e.g. ``"ygg"``,
-          ``"ygg>=0.5"``). Defaults to ``("ygg",)`` so the
-          cluster picks up the yggdrasil runtime from PyPI without
-          the caller having to bundle it. Pass an empty tuple to
-          disable.
-        - *cache_dir* — local scratch directory for built archives
-          and pip-downloaded wheels. Defaults to a fresh tempdir
-          per call.
-        - *workspace_cache* — optional :class:`WorkspacePath` (or
-          path string under ``/Workspace/...``) to also persist the
-          resolved local archives there for cross-session reuse.
+        - *dependencies* — variadic. Each entry is anything
+          :func:`classify_dependency` accepts (PyPI spec string,
+          bare module name, :class:`os.PathLike`, or any object
+          with ``__module__``). ``client.spark("ygg",
+          "my_internal", Path("/some/pkg"))`` is the headline
+          shape.
+        - *registry* — a :class:`WorkspacePyPIRegistry` (or any
+          shape its constructor accepts) to use as the shared
+          wheel cache. Defaults to a registry rooted at
+          ``/Workspace/Users/<me>/.ygg/pypi/simple`` so a
+          single-user setup needs no configuration.
+        - *check_public* — when ``True``, an HTTPS probe to
+          ``pypi.org`` decides whether an installed dist counts
+          as public. Off by default so an offline registry stays
+          fast; turn on when shipping mixed public / private
+          deps.
+        - *cache_dir* — local scratch dir used by the classic
+          compute fallback (and for wheel materialization when
+          no explicit *registry* is passed).
         """
         from databricks.connect import DatabricksSession  # noqa
 
-        deps = list(dependencies or ())
-        pip_deps = list(pip_dependencies or ())
+        deps = list(dependencies)
+        if "ygg" not in [str(d) for d in deps if isinstance(d, str)]:
+            deps.insert(0, "ygg")
+
+        registry_obj = self._resolve_registry(registry, cache_dir=cache_dir)
+        specs, _remotes = registry_obj.publish_many(deps, check_public=check_public)
+
         builder = DatabricksSession.builder.sdkConfig(self.workspace_config)
 
         if self.is_serverless_compute:
-            local_archives = self._collect_local_module_archives(
-                deps, cache_dir=cache_dir,
-            )
-            env = self._build_databricks_env(
-                pip_dependencies=pip_deps,
-                local_archives=local_archives,
-            )
+            env = self._build_databricks_env(install_specs=specs)
             if env is not None:
                 builder = builder.withEnvironment(env)
             session = builder.getOrCreate()
-            if workspace_cache is not None and local_archives:
-                self._mirror_artifacts_to_workspace(local_archives, workspace_cache)
-            return session
+        else:
+            # Classic compute — the cluster won't read the
+            # environment, so attach the local wheels as
+            # ``addArtifacts(pyfile=True)`` instead.
+            session = builder.getOrCreate()
+            local_paths = [
+                spec[len("local:"):]
+                for spec in specs
+                if spec.startswith("local:")
+            ]
+            if local_paths:
+                session.addArtifacts(*local_paths, pyfile=True)
 
-        # Classic compute — bundle + addArtifacts.
-        session = builder.getOrCreate()
-        artifacts = self._collect_spark_artifacts(
-            dependencies=deps,
-            pip_dependencies=pip_deps,
-            cache_dir=cache_dir,
-        )
-        if artifacts:
-            session.addArtifacts(*(str(p) for p in artifacts), pyfile=True)
-            if workspace_cache is not None:
-                self._mirror_artifacts_to_workspace(artifacts, workspace_cache)
+        # Stash the client on the session so downstream
+        # ``client.spark(...)``-returned consumers can grab it
+        # without re-resolving ``DatabricksClient.current()``.
+        try:
+            session.ygg_client = self  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
         return session
 
-    def _collect_local_module_archives(
+    def _resolve_registry(
         self,
-        dependencies: "Any",
+        registry: "Optional[Any]",
         *,
         cache_dir: "Optional[Union[str, os.PathLike]]",
-    ) -> "list[Path]":
-        """Zip every local-module dependency into *cache_dir*.
+    ):
+        """Coerce *registry* into a :class:`WorkspacePyPIRegistry`.
 
-        Mirrors the local-module half of
-        :meth:`_collect_spark_artifacts` so the serverless
-        branch can reuse the archive-build step without also
-        running ``pip download``.
+        ``None`` → fresh registry at the default workspace path
+        with this client bound. Any other shape (string,
+        :class:`WorkspacePath`) is forwarded to the
+        ``WorkspacePyPIRegistry.__init__`` keyword ``base_path``.
+        An already-constructed registry is rebound to this
+        client (no-op if it was already pointing here) and
+        returned as-is so callers can preconfigure the local
+        cache or workspace root once and reuse it.
         """
-        import tempfile
-        from yggdrasil.io.path._module_pack import build_module_archive
+        from yggdrasil.databricks.registry import WorkspacePyPIRegistry
 
-        deps = list(dependencies)
-        if not deps:
-            return []
+        if isinstance(registry, WorkspacePyPIRegistry):
+            registry.client = self
+            return registry
 
-        if cache_dir is None:
-            scratch = Path(tempfile.mkdtemp(prefix="ygg-spark-connect-"))
-        else:
-            scratch = Path(os.fspath(cache_dir))
-            scratch.mkdir(parents=True, exist_ok=True)
-
-        return [build_module_archive(dep, dest=scratch) for dep in deps]
+        local_cache = (
+            Path(os.fspath(cache_dir)) if cache_dir is not None else None
+        )
+        return WorkspacePyPIRegistry(
+            client=self,
+            base_path=registry,
+            local_cache=local_cache,
+        )
 
     def _build_databricks_env(
         self,
         *,
-        pip_dependencies: "list[str]",
-        local_archives: "list[Path]",
+        install_specs: "list[str]",
     ):
         """Build a :class:`DatabricksEnv` for the serverless path.
 
-        Returns ``None`` when neither *pip_dependencies* nor
-        *local_archives* contributed anything — the builder then
-        skips ``withEnvironment`` so the call falls through to a
-        plain ``getOrCreate``.
-
-        PyPI specs and local archives are chained through
-        :meth:`DatabricksEnv.withDependencies`; local files use the
-        ``local:`` prefix per the Databricks Connect docs so
-        serverless picks them up from the client side without a
-        Volume / DBFS round trip.
+        *install_specs* is the merged list produced by
+        :meth:`WorkspacePyPIRegistry.publish_many` — a mix of
+        ``"name==version"`` (public PyPI) and ``"local:<path>"``
+        entries. Returns ``None`` when nothing to install so the
+        builder can skip ``withEnvironment`` entirely.
         """
-        if not pip_dependencies and not local_archives:
+        if not install_specs:
             return None
 
         from databricks.connect import DatabricksEnv
         env = DatabricksEnv()
-        if pip_dependencies:
-            env = env.withDependencies(list(pip_dependencies))
-        if local_archives:
-            env = env.withDependencies(
-                [f"local:{p}" for p in local_archives],
-            )
+        env = env.withDependencies(list(install_specs))
         return env
-
-    def _collect_spark_artifacts(
-        self,
-        *,
-        dependencies: "Any",
-        pip_dependencies: "Any",
-        cache_dir: "Optional[Union[str, os.PathLike]]",
-    ) -> "list[Path]":
-        """Build the local artifact list for :meth:`spark`.
-
-        Pure resolution + filesystem work — no Spark calls — so the
-        unit tests can exercise it without touching Databricks
-        Connect.
-        """
-        import tempfile
-        from yggdrasil.environ import PyEnv
-        from yggdrasil.io.path._module_pack import build_module_archive
-
-        deps = list(dependencies)
-        pip_deps = list(pip_dependencies)
-        if not deps and not pip_deps:
-            return []
-
-        if cache_dir is None:
-            scratch = Path(tempfile.mkdtemp(prefix="ygg-spark-connect-"))
-        else:
-            scratch = Path(os.fspath(cache_dir))
-            scratch.mkdir(parents=True, exist_ok=True)
-
-        artifacts: list[Path] = []
-        for dep in deps:
-            artifacts.append(build_module_archive(dep, dest=scratch))
-
-        if pip_deps:
-            # Pull wheels into the same scratch dir so addArtifact +
-            # mirroring see one consistent layout. ``--no-deps``
-            # keeps the surface to the requested specs only; the
-            # cluster's own runtime already ships the heavyweight
-            # transitive deps (``pyarrow``, ``polars``, …).
-            pip_args: list[str] = ["download", "--no-deps", "-d", str(scratch)]
-            pip_args.extend(pip_deps)
-            PyEnv.current().pip(*pip_args)
-            for whl in sorted(scratch.glob("*.whl")):
-                if whl not in artifacts:
-                    artifacts.append(whl)
-        return artifacts
-
-    def _mirror_artifacts_to_workspace(
-        self,
-        artifacts: "list[Path]",
-        workspace_cache: "Any",
-    ) -> None:
-        """Copy local artifacts to a :class:`WorkspacePath` cache.
-
-        Accepts a :class:`WorkspacePath`, a workspace path string
-        (``/Workspace/Users/<me>/...``), or any other shape
-        :meth:`WorkspacePath.from_` knows how to coerce. Each
-        artifact is written verbatim under
-        ``workspace_cache / <name>`` — overwriting an existing
-        entry so reruns stay idempotent.
-        """
-        from yggdrasil.databricks.fs.workspace_path import WorkspacePath
-
-        if isinstance(workspace_cache, WorkspacePath):
-            cache_root = workspace_cache.with_client(self)
-        else:
-            cache_root = WorkspacePath.from_(workspace_cache, client=self)
-        cache_root.mkdir(parents=True, exist_ok=True)
-        for art in artifacts:
-            (cache_root / art.name).write_bytes(art.read_bytes())
 
 
 DATABRICKS_CLIENT_INIT_NAMES = frozenset(f.name for f in fields(DatabricksClient) if f.init)

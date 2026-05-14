@@ -1,36 +1,31 @@
-"""Tests for :meth:`DatabricksClient.spark` dependency wiring.
+"""Tests for :meth:`DatabricksClient.spark` — dependency resolution
+through the :class:`WorkspacePyPIRegistry`.
 
-The Spark Connect session itself is mocked out; the focus is the
-two compute-aware paths:
-
-* **Serverless** (default, no ``cluster_id``) — PyPI specs and
-  local archives ride through ``DatabricksEnv.withDependencies``
-  and the builder applies it via
-  ``DatabricksSession.builder.withEnvironment``.
-* **Classic** (``cluster_id`` set) — same inputs, but the cluster
-  installs nothing for us, so dependencies are resolved into
-  local archives + wheels and attached with
-  ``session.addArtifacts(..., pyfile=True)``.
+Each test mocks just enough of ``databricks.connect`` (the
+``DatabricksSession.builder`` chain + a stand-in ``DatabricksEnv``)
+and the registry's wheel-build helper so the suite stays offline.
 """
 from __future__ import annotations
 
-import os
+import socket
 import sys
-import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 from yggdrasil.databricks import DatabricksClient
+from yggdrasil.databricks.registry import (
+    DependencyInfo,
+    DependencyKind,
+    WorkspacePyPIRegistry,
+    classify_dependency,
+)
 
 
-@pytest.fixture
-def demo_pkg(tmp_path):
-    pkg = tmp_path / "src" / "demo_sc_pkg"
-    pkg.mkdir(parents=True)
-    (pkg / "__init__.py").write_text("VALUE = 99\n")
-    return pkg
+# ---------------------------------------------------------------------------
+# Common fixtures
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -48,96 +43,9 @@ def classic_client():
     )
 
 
-class TestServerlessDetection:
-
-    def test_no_cluster_id_is_serverless(self, serverless_client) -> None:
-        assert serverless_client.is_serverless_compute is True
-
-    def test_explicit_cluster_id_is_classic(self, classic_client) -> None:
-        assert classic_client.is_serverless_compute is False
-
-    def test_explicit_serverless_compute_id_is_serverless(self) -> None:
-        client = DatabricksClient(
-            host="https://ws.example.com",
-            token="dapi-x",
-            cluster_id="abc",
-            serverless_compute_id="auto",
-        )
-        # serverless_compute_id wins — explicit opt-in.
-        assert client.is_serverless_compute is True
-
-
-class TestCollectLocalModuleArchives:
-
-    def test_zips_each_dep(self, serverless_client, demo_pkg, tmp_path) -> None:
-        archives = serverless_client._collect_local_module_archives(
-            [demo_pkg], cache_dir=tmp_path / "cache",
-        )
-        assert len(archives) == 1
-        out = archives[0]
-        assert out.suffix == ".zip"
-        with zipfile.ZipFile(out) as zf:
-            assert "demo_sc_pkg/__init__.py" in zf.namelist()
-
-    def test_empty_input_returns_empty(self, serverless_client, tmp_path) -> None:
-        assert serverless_client._collect_local_module_archives(
-            [], cache_dir=tmp_path / "cache",
-        ) == []
-
-
-class TestCollectArtifactsClassic:
-    """Pure resolution path — no SparkSession needed."""
-
-    def test_local_module_only(self, classic_client, demo_pkg, tmp_path) -> None:
-        artifacts = classic_client._collect_spark_artifacts(
-            dependencies=[demo_pkg],
-            pip_dependencies=(),
-            cache_dir=tmp_path / "cache",
-        )
-        assert len(artifacts) == 1
-        out = artifacts[0]
-        assert out.suffix == ".zip"
-        with zipfile.ZipFile(out) as zf:
-            assert "demo_sc_pkg/__init__.py" in zf.namelist()
-
-    def test_pip_dependency_invokes_pip_download(
-        self, classic_client, tmp_path, monkeypatch,
-    ) -> None:
-        cache = tmp_path / "cache"
-        observed: list[tuple] = []
-        wheel = cache / "ygg-0.0.0-py3-none-any.whl"
-
-        def fake_pip(self, *args, **kwargs):
-            observed.append(args)
-            cache.mkdir(parents=True, exist_ok=True)
-            wheel.write_bytes(b"PK\x03\x04fake")
-            return None
-
-        from yggdrasil.environ import PyEnv
-        monkeypatch.setattr(PyEnv, "pip", fake_pip)
-        monkeypatch.setattr(
-            PyEnv, "current",
-            classmethod(lambda cls: PyEnv(python_path=Path("/usr/bin/python"))),
-        )
-
-        artifacts = classic_client._collect_spark_artifacts(
-            dependencies=(),
-            pip_dependencies=("ygg",),
-            cache_dir=cache,
-        )
-
-        assert observed, "PyEnv.pip should have fired for the PyPI spec"
-        args = observed[0]
-        assert args[0] == "download"
-        assert "--no-deps" in args
-        assert "ygg" in args
-        assert artifacts == [wheel]
-
-
 @pytest.fixture
 def stubbed_workspace_config(monkeypatch):
-    """Skip the live SDK ``Config(...)`` call — it tries to resolve
-    credentials and stalls in offline tests."""
+    """Skip the live SDK ``Config(...)`` call."""
     monkeypatch.setattr(
         DatabricksClient,
         "workspace_config",
@@ -146,132 +54,308 @@ def stubbed_workspace_config(monkeypatch):
 
 
 @pytest.fixture
-def mocked_builder_factory(monkeypatch):
-    """Patch ``databricks.connect`` with a builder we can assert on.
+def mocked_builder(monkeypatch):
+    """Patch ``databricks.connect`` with controllable
+    ``DatabricksSession.builder`` and ``DatabricksEnv`` shapes."""
+    session = MagicMock(name="SparkSession")
+    builder = MagicMock(name="Builder")
+    builder.sdkConfig.return_value = builder
+    builder.withEnvironment.return_value = builder
+    builder.getOrCreate.return_value = session
 
-    Returns a callable so tests can grab the ``(builder, session,
-    env_class)`` triple inside the test body.
-    """
-    def install():
-        session = MagicMock(name="SparkSession")
-        builder = MagicMock(name="Builder")
-        builder.sdkConfig.return_value = builder
-        builder.withEnvironment.return_value = builder
-        builder.getOrCreate.return_value = session
+    env_instances: list = []
 
-        env_instances: list = []
+    class FakeEnv:
+        def __init__(self):
+            self._deps: list = []
+            env_instances.append(self)
 
-        class FakeEnv:
-            def __init__(self):
-                self._deps: list = []
-                env_instances.append(self)
+        def withDependencies(self, specs):
+            self._deps.append(list(specs))
+            return self
 
-            def withDependencies(self, specs):
-                self._deps.append(list(specs))
-                return self
+    databricks_session = MagicMock(name="DatabricksSession", builder=builder)
+    fake_module = type(
+        "FakeConnect", (), {
+            "DatabricksSession": databricks_session,
+            "DatabricksEnv": FakeEnv,
+        },
+    )
+    monkeypatch.setitem(sys.modules, "databricks.connect", fake_module)
+    return builder, session, FakeEnv, env_instances
 
-        databricks_session = MagicMock(name="DatabricksSession", builder=builder)
-        fake_module = type(
-            "FakeConnect", (), {
-                "DatabricksSession": databricks_session,
-                "DatabricksEnv": FakeEnv,
-            },
+
+# ---------------------------------------------------------------------------
+# Classification
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyDependency:
+
+    def test_pip_spec_string(self) -> None:
+        info = classify_dependency("numpy==1.0")
+        assert info.kind == DependencyKind.PUBLIC
+        assert info.spec == "numpy==1.0"
+        assert info.name == "numpy"
+
+    def test_installed_dist_default_is_local(self, monkeypatch) -> None:
+        # ``ygg`` is editable in this repo; force the editable
+        # detector off so we exercise the LOCAL branch alone.
+        import yggdrasil.databricks.registry as reg
+        monkeypatch.setattr(reg, "_detect_editable", lambda dist: False)
+        info = classify_dependency("ygg")
+        assert info.kind == DependencyKind.LOCAL
+        assert info.name == "ygg"
+        assert info.version is not None
+
+    def test_editable_install_is_editable(self) -> None:
+        info = classify_dependency("ygg")
+        # The repo install IS editable; classification should
+        # honour direct_url.json and stamp the hostname.
+        assert info.kind == DependencyKind.EDITABLE
+        host = socket.gethostname() or "unknown"
+        host = "".join(c if c.isalnum() else "-" for c in host).strip("-")
+        assert info.version is not None
+        assert info.version.endswith(f"+host.{host}")
+
+    def test_unknown_falls_back_to_public(self) -> None:
+        info = classify_dependency("zzz-nonexistent-xyz")
+        assert info.kind == DependencyKind.PUBLIC
+
+    def test_pathlike_is_local(self, tmp_path) -> None:
+        info = classify_dependency(tmp_path)
+        assert info.kind == DependencyKind.LOCAL
+        assert info.source == tmp_path.resolve()
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspacePyPIRegistry:
+
+    @pytest.fixture
+    def registry(self, serverless_client, tmp_path, monkeypatch):
+        """Registry with a mocked workspace upload path.
+
+        Workspace I/O is stubbed via direct ``WorkspacePath``
+        monkeypatching so the registry layout assertions don't
+        need a live workspace client.
+
+        Returns ``(registry, store, write_log)`` — ``store``
+        models the persisted workspace state; ``write_log`` is a
+        list of every write so tests can distinguish "exists ==
+        True" from "wrote again this call".
+        """
+        from yggdrasil.databricks.fs.workspace_path import WorkspacePath
+
+        store: dict[str, bytes] = {}
+        writes: list[str] = []
+
+        def fake_write_bytes(self, data, pos=0):
+            store[self.full_path()] = bytes(data)
+            writes.append(self.full_path())
+            return len(data)
+
+        def fake_mkdir(self, parents=True, exist_ok=True):
+            return self
+
+        def fake_exists(self):
+            return self.full_path() in store
+
+        def fake_read_bytes(self, n=-1, pos=0):
+            data = store[self.full_path()]
+            return data if n < 0 else data[pos:pos + n]
+
+        monkeypatch.setattr(WorkspacePath, "write_bytes", fake_write_bytes)
+        monkeypatch.setattr(WorkspacePath, "mkdir", fake_mkdir)
+        monkeypatch.setattr(WorkspacePath, "exists", fake_exists)
+        monkeypatch.setattr(WorkspacePath, "read_bytes", fake_read_bytes)
+
+        reg = WorkspacePyPIRegistry(
+            client=serverless_client,
+            base_path="/Workspace/Shared/.ygg/pypi/simple",
+            local_cache=tmp_path / "cache",
         )
-        monkeypatch.setitem(sys.modules, "databricks.connect", fake_module)
-        return builder, session, FakeEnv, env_instances
+        return reg, store, writes
 
-    return install
+    def test_public_spec_short_circuits(self, registry) -> None:
+        reg, _store, writes = registry
+        spec, remote = reg.publish("numpy==1.0")
+        assert spec == "numpy==1.0"
+        assert remote is None
+        assert writes == []
+
+    def test_local_publishes_lazily(self, registry, monkeypatch, tmp_path) -> None:
+        reg, _store, writes = registry
+
+        wheel_bytes = b"PK\x03\x04fake-wheel"
+        wheel_name = "demo-1.0.0-py3-none-any.whl"
+
+        def fake_pip_wheel(self_reg, info):
+            target = self_reg.local_cache / wheel_name
+            target.write_bytes(wheel_bytes)
+            return target
+
+        monkeypatch.setattr(WorkspacePyPIRegistry, "_pip_wheel", fake_pip_wheel)
+
+        info = DependencyInfo(
+            name="demo", version="1.0.0", kind=DependencyKind.LOCAL,
+        )
+        monkeypatch.setattr(
+            "yggdrasil.databricks.registry.classify_dependency",
+            lambda obj, *, check_public=False: info,
+        )
+
+        # First call uploads once.
+        spec, remote = reg.publish("demo")
+        assert spec.startswith("local:")
+        assert remote is not None
+        expected_remote = (
+            "/Workspace/Shared/.ygg/pypi/simple/demo/demo-1.0.0-py3-none-any.whl"
+        )
+        assert remote.full_path() == expected_remote
+        assert writes == [expected_remote]
+
+        # Second call is lazy — the registry sees the existing
+        # entry and skips the workspace write.
+        spec2, remote2 = reg.publish("demo")
+        assert spec2 == spec
+        assert remote2.full_path() == remote.full_path()
+        assert writes == [expected_remote]  # no second write
+
+    def test_editable_always_overwrites(self, registry, monkeypatch, tmp_path) -> None:
+        reg, _store, writes = registry
+
+        wheel_bytes = b"PK\x03\x04editable-wheel"
+        wheel_name = "demo-1.0.0+host.h-py3-none-any.whl"
+
+        def fake_pip_wheel(self_reg, info):
+            target = self_reg.local_cache / wheel_name
+            target.write_bytes(wheel_bytes)
+            return target
+
+        monkeypatch.setattr(WorkspacePyPIRegistry, "_pip_wheel", fake_pip_wheel)
+
+        info = DependencyInfo(
+            name="demo",
+            version="1.0.0+host.h",
+            kind=DependencyKind.EDITABLE,
+            source=tmp_path,
+        )
+        monkeypatch.setattr(
+            "yggdrasil.databricks.registry.classify_dependency",
+            lambda obj, *, check_public=False: info,
+        )
+
+        reg.publish("demo")
+        reg.publish("demo")
+        # Editable installs refresh the workspace slot on every load.
+        assert len(writes) == 2
+        assert writes[0] == writes[1]
+
+
+# ---------------------------------------------------------------------------
+# Client.spark — serverless + classic branches
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_registry(monkeypatch):
+    """Patch :class:`WorkspacePyPIRegistry` with an in-process stub
+    so ``client.spark`` doesn't touch the workspace at all."""
+    calls: list[tuple] = []
+
+    class FakeRegistry:
+        def __init__(self, client=None, base_path=None, local_cache=None):
+            self.client = client
+            self.base_path = base_path
+            self.local_cache = local_cache
+
+        def publish_many(self, deps, *, check_public=False):
+            specs: list[str] = []
+            remotes: list = []
+            for d in deps:
+                calls.append((d, check_public))
+                if d == "ygg":
+                    specs.append("local:/tmp/ygg-fake.whl")
+                    remotes.append(MagicMock(name=f"remote-{d}"))
+                elif isinstance(d, str):
+                    specs.append(d)
+            return specs, remotes
+
+    monkeypatch.setattr(
+        "yggdrasil.databricks.registry.WorkspacePyPIRegistry", FakeRegistry,
+    )
+    return FakeRegistry, calls
 
 
 class TestServerlessBranch:
-    """Serverless: declarative DatabricksEnv path."""
 
-    def test_pip_dep_routes_through_with_dependencies(
-        self, serverless_client, mocked_builder_factory,
-        stubbed_workspace_config,
+    def test_default_declares_ygg(
+        self, serverless_client, mocked_builder, stubbed_workspace_config,
+        fake_registry,
     ) -> None:
-        builder, session, _env_cls, env_instances = mocked_builder_factory()
-        result = serverless_client.spark(pip_dependencies=("ygg",))
-
+        builder, session, _env_cls, env_instances = mocked_builder
+        result = serverless_client.spark()
         assert result is session
-        assert len(env_instances) == 1
+
         env = env_instances[0]
-        # One ``withDependencies`` call for the pip specs.
-        assert env._deps == [["ygg"]]
+        # The first ``withDependencies`` call carries the ygg
+        # local spec the fake registry returned.
+        assert env._deps == [["local:/tmp/ygg-fake.whl"]]
         builder.withEnvironment.assert_called_once_with(env)
-        # Serverless never falls back to addArtifacts.
-        session.addArtifacts.assert_not_called()
+        # The client is stashed on the session for downstream use.
+        assert session.ygg_client is serverless_client
 
-    def test_local_module_routes_as_local_prefix(
-        self, serverless_client, demo_pkg, mocked_builder_factory,
-        stubbed_workspace_config, tmp_path,
+    def test_user_specs_merge_with_default_ygg(
+        self, serverless_client, mocked_builder, stubbed_workspace_config,
+        fake_registry,
     ) -> None:
-        builder, session, _env_cls, env_instances = mocked_builder_factory()
-        result = serverless_client.spark(
-            dependencies=[demo_pkg],
-            pip_dependencies=(),
-            cache_dir=tmp_path / "cache",
-        )
-
-        assert result is session
+        _builder, _session, _env_cls, env_instances = mocked_builder
+        serverless_client.spark("numpy==1.0")
         env = env_instances[0]
-        # The single ``withDependencies`` call carries the local-prefixed
-        # archive path.
-        assert len(env._deps) == 1
-        specs = env._deps[0]
-        assert len(specs) == 1
-        spec = specs[0]
-        assert spec.startswith("local:")
-        assert spec.endswith("demo_sc_pkg.zip")
-        # The archive really exists on disk.
-        assert os.path.exists(spec[len("local:"):])
-        builder.withEnvironment.assert_called_once_with(env)
-        session.addArtifacts.assert_not_called()
+        assert env._deps == [["local:/tmp/ygg-fake.whl", "numpy==1.0"]]
 
-    def test_no_dependencies_skips_with_environment(
-        self, serverless_client, mocked_builder_factory,
-        stubbed_workspace_config,
+    def test_ygg_not_doubled_when_caller_passes_it(
+        self, serverless_client, mocked_builder, stubbed_workspace_config,
+        fake_registry,
     ) -> None:
-        builder, session, _env_cls, env_instances = mocked_builder_factory()
-        result = serverless_client.spark(pip_dependencies=())
-        assert result is session
-        # Nothing to wire — neither withEnvironment nor addArtifacts.
-        builder.withEnvironment.assert_not_called()
-        session.addArtifacts.assert_not_called()
-        assert env_instances == []
+        # Explicit ``"ygg"`` from the caller already covers the
+        # default; we shouldn't end up with two registry calls.
+        _builder, _session, _env_cls, env_instances = mocked_builder
+        _registry_cls, calls = fake_registry
+        serverless_client.spark("ygg")
+        names = [d for d, _ in calls]
+        assert names == ["ygg"]
 
 
 class TestClassicBranch:
-    """Classic compute: eager ``addArtifacts`` path."""
 
-    def test_session_receives_artifacts(
-        self, classic_client, demo_pkg, tmp_path, mocked_builder_factory,
-        stubbed_workspace_config,
+    def test_local_specs_route_to_add_artifacts(
+        self, classic_client, mocked_builder, stubbed_workspace_config,
+        fake_registry,
     ) -> None:
-        builder, session, _env_cls, env_instances = mocked_builder_factory()
-        result = classic_client.spark(
-            dependencies=[demo_pkg],
-            pip_dependencies=(),
-            cache_dir=tmp_path / "cache",
+        _builder, session, _env_cls, env_instances = mocked_builder
+        classic_client.spark()
+        # Classic compute never goes through ``withEnvironment``.
+        assert env_instances == []
+        # Local specs feed addArtifacts with ``pyfile=True``.
+        session.addArtifacts.assert_called_once_with(
+            "/tmp/ygg-fake.whl", pyfile=True,
         )
 
-        assert result is session
-        session.addArtifacts.assert_called_once()
-        args, kwargs = session.addArtifacts.call_args
-        assert kwargs == {"pyfile": True}
-        assert len(args) == 1
-        assert args[0].endswith("demo_sc_pkg.zip")
-        assert os.path.exists(args[0])
-        # Classic never goes through the env path.
-        builder.withEnvironment.assert_not_called()
-        assert env_instances == []
-
-    def test_no_dependencies_skips_add_artifacts(
-        self, classic_client, mocked_builder_factory,
-        stubbed_workspace_config,
+    def test_public_specs_dont_show_up_in_add_artifacts(
+        self, classic_client, mocked_builder, stubbed_workspace_config,
+        fake_registry,
     ) -> None:
-        builder, session, _env_cls, _envs = mocked_builder_factory()
-        result = classic_client.spark(pip_dependencies=())
-        assert result is session
-        session.addArtifacts.assert_not_called()
-        builder.withEnvironment.assert_not_called()
+        _builder, session, _env_cls, _envs = mocked_builder
+        classic_client.spark("numpy==1.0")
+        # ``numpy==1.0`` isn't a ``local:`` spec, so the cluster
+        # has no way to install it — classic compute users have
+        # to pre-install public deps. The artifact call carries
+        # only the local-prefixed wheels.
+        session.addArtifacts.assert_called_once_with(
+            "/tmp/ygg-fake.whl", pyfile=True,
+        )
