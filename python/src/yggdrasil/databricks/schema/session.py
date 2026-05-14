@@ -34,7 +34,7 @@ from yggdrasil.dataclasses import ExpiringDict
 from yggdrasil.dataclasses.waiting import DEFAULT_WAITING_CONFIG, WaitingConfig
 from yggdrasil.data.enums import Mode
 from yggdrasil.data.enums.mode import ModeLike
-from yggdrasil.databricks.sql.sql_utils import safe_table_name
+from yggdrasil.databricks.sql.sql_utils import MAX_TABLE_NAME_LEN, safe_table_name
 from yggdrasil.io.http_.session import HTTPSession
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.send_config import CacheConfig
@@ -144,6 +144,18 @@ class SchemaSession(HTTPSession):
             default_ttl=table_cache_ttl,
             max_size=1024,
         )
+        # Memoized ``CacheConfig`` per (table_name, mode). The remote
+        # cache config is purely a function of those two — caching the
+        # built dataclass turns a per-cold-request ``CacheConfig(...)``
+        # (≈9 µs: ``__post_init__`` runs request_by validation,
+        # WaitingConfig.from_, mode coercion, …) into a dict lookup.
+        # Bounded by ``max_size=1024`` so a runaway distinct-path
+        # session doesn't grow the dict unbounded; same TTL as the
+        # table cache.
+        self._remote_config_cache: ExpiringDict[tuple[str, Mode], CacheConfig] = ExpiringDict(
+            default_ttl=table_cache_ttl,
+            max_size=1024,
+        )
         self._local_cache_template: Optional[CacheConfig] = self._build_local_template(
             local_cache,
         )
@@ -164,6 +176,29 @@ class SchemaSession(HTTPSession):
         )
 
     # ── factory ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def host_to_schema_name(base_url: URL | str) -> str:
+        """Derive a Unity-Catalog-safe schema name from a URL host.
+
+        Same sanitization as :meth:`path_to_table_name` (lowercase,
+        collapse non-alphanumeric runs to ``_``, strip surrounding
+        underscores, length-cap with :func:`safe_table_name`'s
+        split-and-hash strategy — the 255-char UC ceiling applies to
+        every identifier, schema names included). Non-default ports
+        are folded in so ``https://api.example.com:8443`` and
+        ``https://api.example.com`` route to different schemas; an
+        empty host falls back to ``"default"`` so the result is always
+        a legal identifier.
+        """
+        url = base_url if isinstance(base_url, URL) else URL.from_(base_url)
+        host = (url.host or "").lower()
+        port = getattr(url, "port", None)
+        token = f"{host}_{port}" if port else host
+        cleaned = _PATH_TO_IDENT_RE.sub("_", token).strip("_") or "default"
+        name = safe_table_name(cleaned)
+        assert name is not None and len(name) <= MAX_TABLE_NAME_LEN
+        return name
 
     @classmethod
     def from_(
@@ -190,6 +225,14 @@ class SchemaSession(HTTPSession):
         * ``None`` — *catalog_name* / *schema_name* must be supplied;
           the active :class:`Schemas` service is used (``Schemas.current()``
           via :meth:`Schema` construction).
+
+        When *schema_name* is not supplied (and the caller did not hand
+        in a fully-resolved :class:`Schema`), the session's ``base_url``
+        host is used: ``https://api.example.com`` →
+        ``api_example_com``. This makes the default
+        "one cache schema per upstream host" — call sites pointed at
+        different APIs land in their own namespaces without ceremony.
+        See :meth:`host_to_schema_name` for the sanitization rules.
 
         When *ensure_created* (default ``True``) is set, the resolved
         :class:`Schema` is created if it does not already exist via
@@ -229,6 +272,15 @@ class SchemaSession(HTTPSession):
                     "two-part 'catalog.schema' string, or None plus "
                     "explicit catalog_name / schema_name."
                 )
+
+            # Default schema_name = ``base_url`` host. Skipped when the
+            # caller passed a ``location`` ('catalog.schema') string —
+            # the dotted form already carries the schema name.
+            if not schema_name and location is None:
+                base_url = kwargs.get("base_url")
+                if base_url is not None:
+                    schema_name = cls.host_to_schema_name(base_url)
+
             schema = schemas.schema(
                 location=location,
                 catalog_name=catalog_name,
@@ -264,19 +316,38 @@ class SchemaSession(HTTPSession):
     def path_to_table_name(self, path: str | None) -> str:
         """Derive a Unity-Catalog-safe table name from a URL path.
 
-        Lowercase, collapse runs of non-alphanumeric chars to ``_``,
-        strip surrounding underscores, length-cap with
-        :func:`safe_table_name` (truncate + hash the overflow tail so
-        the result is deterministic and fits the 255-char identifier
-        limit). The full path becomes the table name verbatim — no
-        prefix is prepended, so callers who want one should pick a
-        dedicated cache schema instead.
+        Pipeline:
+
+        1. Lowercase the path, collapse every run of non-alphanumeric
+           chars to a single ``_`` (so ``/``, ``.``, query-string
+           punctuation, and non-ASCII all fold to the same separator).
+        2. Strip surrounding underscores; substitute ``"root"`` for the
+           empty result so ``"/"`` still yields a legal identifier.
+        3. Hand off to :func:`safe_table_name`, which enforces Unity
+           Catalog's 255-char identifier ceiling by splitting on ``_``,
+           keeping as many leading tokens as fit, and BLAKE2b-hashing
+           the overflow tail into a 32-char suffix. Distinct overflows
+           still produce distinct digests, so two long paths that
+           agree only on a common prefix get separate cache tables.
+        4. Defensive assert that the result fits the limit — if a
+           future refactor breaks the contract, fail loudly at the
+           boundary rather than at the SQL layer with a generic
+           identifier-too-long error.
+
+        The result is deterministic, identifier-safe ASCII, and bounded
+        at :data:`MAX_TABLE_NAME_LEN` (255).
         """
         cleaned = _PATH_TO_IDENT_RE.sub("_", (path or "").lower()).strip("_")
         if not cleaned:
             cleaned = "root"
         # ``safe_table_name`` never returns ``None`` for a non-empty input.
-        return safe_table_name(cleaned)  # type: ignore[return-value]
+        name = safe_table_name(cleaned)
+        assert name is not None and len(name) <= MAX_TABLE_NAME_LEN, (
+            f"SchemaSession.path_to_table_name: derived name {name!r} "
+            f"({len(name) if name else 0} chars) exceeds Unity Catalog's "
+            f"{MAX_TABLE_NAME_LEN}-char limit — safe_table_name contract broken."
+        )
+        return name
 
     def table_for(self, request: PreparedRequest) -> "Table":
         """Return (caching) the :class:`Table` that backs *request*'s URL path.
@@ -293,9 +364,25 @@ class SchemaSession(HTTPSession):
 
         Honors a per-request mode override (``request.mode``); falls back
         to the session-level :attr:`mode` when the request didn't set one.
+
+        The result is memoized per ``(table_name, mode)`` on the
+        session — :class:`CacheConfig` construction runs a handful of
+        coercion + validation passes through ``__post_init__`` (≈9 µs
+        cold), and bursts against the same endpoint always rebuild the
+        same config. Cache TTL matches the per-path :class:`Table`
+        cache so a stale handle and its associated config age out
+        together.
         """
+        table = self.table_for(request)
         mode = request.mode if request.mode is not None else self._mode
-        return CacheConfig(tabular=self.table_for(request), mode=mode)
+        # ``id(table)`` is stable for the lifetime of the cached Table
+        # handle (held by ``self._table_cache``) and avoids the
+        # ``full_name()`` join on every hot lookup. When the table
+        # entry expires the live config expires alongside it.
+        key = (id(table), mode)
+        return self._remote_config_cache.get_or_set(
+            key, lambda: CacheConfig(tabular=table, mode=mode),
+        )
 
     def local_cache_config_for(self, request: PreparedRequest) -> Optional[CacheConfig]:
         """Return the local cache :class:`CacheConfig` for *request*, or ``None``.

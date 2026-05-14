@@ -187,6 +187,26 @@ def _fmt(r: dict) -> str:
 def _name_scenarios(repeat: int) -> list[dict]:
     out: list[dict] = []
     sess = SESSION_APPEND
+
+    # Sanity sweep: the derived name must always fit Unity Catalog's
+    # identifier limit, regardless of input shape. Asserting at bench
+    # entry catches a future regression in ``safe_table_name``'s
+    # split-and-hash logic before the bench numbers can mask it.
+    from yggdrasil.databricks.sql.sql_utils import MAX_TABLE_NAME_LEN
+    _shapes = [
+        "/",
+        "/v1/accounts/12345/transactions",
+        "/" + "x/" * 200,                                   # 400 chars, 200 tokens
+        "/" + "/".join(f"part-{i:03d}" for i in range(40)),  # 40 named tokens
+        "/" + "a" * 500,                                    # one giant token
+    ]
+    for _shape in _shapes:
+        _name = sess.path_to_table_name(_shape)
+        assert _name and len(_name) <= MAX_TABLE_NAME_LEN, (
+            f"length-cap regression: path_to_table_name({_shape!r}) "
+            f"→ {_name!r} (len={len(_name) if _name else 0})"
+        )
+
     out.append(_time_one(
         "path_to_table_name (plain)",
         lambda: sess.path_to_table_name("/v1/accounts/12345/transactions"),
@@ -201,6 +221,12 @@ def _name_scenarios(repeat: int) -> list[dict]:
     out.append(_time_one(
         "path_to_table_name (overflow → truncate+hash)",
         lambda: sess.path_to_table_name(long_path),
+        repeat=repeat, inner=50_000,
+    ))
+    one_giant_token = "/" + "a" * 500
+    out.append(_time_one(
+        "path_to_table_name (single overlong token → digest fallback)",
+        lambda: sess.path_to_table_name(one_giant_token),
         repeat=repeat, inner=50_000,
     ))
     return out
