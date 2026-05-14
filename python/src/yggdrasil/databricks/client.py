@@ -1287,12 +1287,17 @@ class DatabricksClient(URLBased):
         """
         return bool(self.serverless_compute_id) or not self.cluster_id
 
-    #: Default ``ygg`` install spec for :meth:`spark`. Pinned with
-    #: the ``[data, databricks]`` extras so the cluster picks up the
-    #: pandas/numpy/databricks-sdk surface the average UDF actually
-    #: uses. Override via :meth:`spark`'s explicit ``ygg`` spec if
-    #: a project needs a tighter or wider extras set.
-    DEFAULT_YGG_SPEC: ClassVar[str] = "ygg[data,databricks]"
+    @classmethod
+    def default_ygg_spec(cls) -> str:
+        """Default ``ygg`` pip spec for :meth:`spark`.
+
+        Pinned to the driver's installed version with the
+        ``[data, databricks]`` extras so executors see the same
+        ygg the driver is using — no surprise drift from
+        whatever PyPI's latest happens to be when the cluster
+        installs it.
+        """
+        return f"ygg[data,databricks]=={ygg_version}"
 
     def spark(
         self,
@@ -1314,16 +1319,16 @@ class DatabricksClient(URLBased):
         Each *dependency* is classified once via
         :func:`classify_dependency`:
 
-        - Public PyPI specs (``"ygg[data,databricks]"``,
+        - Public PyPI specs (``"ygg[data,databricks]==0.7.73"``,
           ``"numpy>=1.0"``, …) ride straight to the cluster via
           :meth:`DatabricksEnv.withDependencies`. ``ygg`` is
-          always declared with the ``[data, databricks]`` extras
-          — the cluster pulls the yggdrasil runtime + the
-          ``pandas`` / ``numpy`` / ``databricks-sdk`` surface
-          from PyPI so UDFs see the same dependency set the
-          driver is using. Override by passing an explicit
-          ``ygg`` spec
-          (e.g. ``client.spark("ygg==0.7.73")`` or
+          always declared via :meth:`default_ygg_spec` — pinned
+          to the driver's installed version with the
+          ``[data, databricks]`` extras so the cluster sees the
+          exact same runtime + ``pandas`` / ``numpy`` /
+          ``databricks-sdk`` surface the driver is using.
+          Override by passing an explicit ``ygg`` spec
+          (e.g. ``client.spark("ygg==0.7.0")`` or
           ``client.spark("ygg")`` for an editable-mode rebuild).
         - Editable installs (``pip install -e .``) get their
           local working copy built into a wheel whose version
@@ -1381,7 +1386,7 @@ class DatabricksClient(URLBased):
 
         deps = list(dependencies)
         if not any(_is_ygg_dep(d) for d in deps):
-            deps.insert(0, self.DEFAULT_YGG_SPEC)
+            deps.insert(0, self.default_ygg_spec())
 
         registry_obj = self._resolve_registry(registry, cache_dir=cache_dir)
         specs, _remotes = registry_obj.publish_many(deps, check_public=check_public)

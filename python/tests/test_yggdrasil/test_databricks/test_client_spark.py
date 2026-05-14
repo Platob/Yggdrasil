@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from yggdrasil.databricks import DatabricksClient
+from yggdrasil.version import __version__ as _ygg_version
 from yggdrasil.databricks.registry import (
     DependencyInfo,
     DependencyKind,
@@ -302,7 +303,7 @@ class TestServerlessBranch:
         # Default ygg spec carries the ``[data, databricks]`` extras
         # so the cluster picks up the runtime + pandas / numpy /
         # databricks-sdk surface.
-        assert env._deps == [["ygg[data,databricks]"]]
+        assert env._deps == [[f"ygg[data,databricks]=={_ygg_version}"]]
         builder.withEnvironment.assert_called_once_with(env)
         # The client is stashed on the session for downstream use.
         assert session.ygg_client is serverless_client
@@ -314,7 +315,7 @@ class TestServerlessBranch:
         _builder, _session, _env_cls, env_instances = mocked_builder
         serverless_client.spark("numpy==1.0")
         env = env_instances[0]
-        assert env._deps == [["ygg[data,databricks]", "numpy==1.0"]]
+        assert env._deps == [[f"ygg[data,databricks]=={_ygg_version}", "numpy==1.0"]]
 
     def test_ygg_not_doubled_when_caller_passes_it(
         self, serverless_client, mocked_builder, stubbed_workspace_config,
@@ -364,7 +365,7 @@ class TestClassicBranch:
                 pass
 
             def publish_many(self, deps, *, check_public=False):
-                specs = ["ygg[data,databricks]", f"local:{wheel}"]
+                specs = [f"ygg[data,databricks]=={_ygg_version}", f"local:{wheel}"]
                 return specs, []
 
         monkeypatch.setattr(reg_mod, "WorkspacePyPIRegistry", LocalRegistry)
