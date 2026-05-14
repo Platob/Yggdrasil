@@ -1206,17 +1206,68 @@ class Tabular(ABC, Generic[O]):
         # when at least one level has a user-assigned name.
         include_index = any(n is not None for n in frame.index.names)
 
-        # Type alignment is the cast's job, not the bridge's: passing
-        # ``schema=options.target.to_arrow_schema()`` to
-        # ``pa.Table.from_pandas`` would force the pandas bridge to
-        # coerce frame values into the target shape, which raises
-        # outright when the caller's pandas types don't already line
-        # up with the target (e.g. ``string`` frame column against a
-        # numeric target field). The downstream
-        # :meth:`_write_arrow_table` runs the proper
-        # :meth:`CastOptions.cast_arrow_tabular` over the inferred
-        # table — that's the one path that knows how to widen, fill
-        # missing columns, and reorder safely.
+        # Fast path for object-dtype columns when a target schema is
+        # bound. Object columns are the ones pyarrow's pandas bridge
+        # has to infer from Python objects (list-of-dict for struct,
+        # list-of-list for nested arrays, mixed scalars for strings) —
+        # inference walks every cell and dominates wall time on nested
+        # payloads. Handing the target type to
+        # ``pa.array(col, type=..., from_pandas=True)`` drives the
+        # conversion straight to the wanted shape and also emits
+        # ``string`` instead of ``large_string`` so the downstream
+        # parquet writer can dictionary-encode it (the post-cast path
+        # used to preserve ``large_string``, which silently disabled
+        # dictionary encoding on every staged Parquet file Databricks
+        # ever saw from a pandas caller).
+        #
+        # We can't push ``schema=`` into ``pa.Table.from_pandas``: the
+        # pandas bridge treats ``schema`` as a column projection and
+        # silently drops every frame column not in the schema. Per-
+        # column conversion keeps the column list intact while still
+        # hinting the slow ones; typed columns stay un-hinted so the
+        # downstream cast can still widen / narrow across dtype
+        # mismatches the way it always has (that's the path the old
+        # "string column → numeric target" case relied on, and it
+        # stays intact here).
+        #
+        # Falls back to plain ``from_pandas`` whenever a hinted
+        # conversion raises (incompatible cell contents, non-nullable
+        # target with NaN, …) or whenever the fast path doesn't apply
+        # (no target, index round-trip, duplicate column names).
+        fast_casted: "pa.Table | None" = None
+        target = getattr(options, "target", None)
+        if (
+            target is not None
+            and not include_index
+            and frame.columns.is_unique
+        ):
+            try:
+                arrow_schema = target.to_arrow_schema()
+            except Exception:
+                arrow_schema = None
+            if arrow_schema is not None:
+                target_by_name = {f.name: f for f in arrow_schema}
+                try:
+                    arrays: "list[pa.Array]" = []
+                    names: "list[str]" = []
+                    for name in frame.columns:
+                        col = frame[name]
+                        tgt = target_by_name.get(name)
+                        if tgt is not None and col.dtype.kind == "O":
+                            arrays.append(
+                                pa.array(col, type=tgt.type, from_pandas=True),
+                            )
+                        else:
+                            arrays.append(pa.array(col, from_pandas=True))
+                        names.append(str(name))
+                    fast_casted = pa.table(arrays, names=names)
+                except (pa.ArrowException, TypeError, ValueError):
+                    fast_casted = None
+
+        if fast_casted is not None:
+            self._write_arrow_table(fast_casted, options)
+            return
+
         try:
             casted = pa.Table.from_pandas(frame, preserve_index=include_index)
             self._write_arrow_table(casted, options)
