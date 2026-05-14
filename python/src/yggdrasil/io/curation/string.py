@@ -55,6 +55,28 @@ _DEFAULT_NULL_TOKENS = frozenset(
 _DEFAULT_TRUE_TOKENS = frozenset({"true", "t", "yes", "y"})
 _DEFAULT_FALSE_TOKENS = frozenset({"false", "f", "no", "n"})
 
+# Regexes used to pre-validate before ``pc.cast`` so we skip the
+# costly ArrowInvalid throw when the column is plainly non-numeric.
+# ``%`` is the conservative ascii integer / float shape; matches
+# Python's ``int()`` / ``float()`` rules for the strings real CSVs
+# carry. Exponent forms (``1e3``) match the float regex.
+_INT_REGEX = r"^[+-]?\d+$"
+_FLOAT_REGEX = r"^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$"
+
+
+def _RE_MATCHES_OR_NULL(array: pa.Array, pattern: str) -> bool:
+    """True iff every non-null cell of *array* matches *pattern*.
+
+    Vectorised pre-check: ``pc.match_substring_regex`` does the work
+    in C++ and the boolean reduction is one more kernel pass — total
+    cost is roughly one pyarrow.compute scan, far cheaper than the
+    ArrowInvalid throw a failed ``pc.cast`` pays.
+    """
+    matches = pc.match_substring_regex(array, pattern=pattern)
+    covered = pc.or_(matches, pc.is_null(array))
+    return pc.all(covered).as_py()
+
+
 # Format catalogues match the polars ones in
 # ``yggdrasil.data.types.primitive.temporal`` so the curator emits the
 # same "this column is a date / time / timestamp" decision the Polars
@@ -244,21 +266,21 @@ class StringCurator(Curator):
         return result, BooleanType()
 
     def _try_int(self, array: pa.Array):
-        try:
-            casted = pc.cast(array, pa.int64(), safe=True)
-        except pa.ArrowInvalid:
+        # Cheap vectorised pre-check: are all non-null cells
+        # integer-shaped? Avoids the costly ``pc.cast`` exception path
+        # when the column is actually floats / labels / timestamps —
+        # ArrowInvalid throwing on 10k rows of "1.5" was the dominant
+        # cost on the StringCurator fallback hot path.
+        if not _RE_MATCHES_OR_NULL(array, _INT_REGEX):
             return None
-        # ``pc.cast`` on a string → int64 with ``safe=True`` raises on
-        # the first bad cell, so reaching here means every non-null
-        # string parsed cleanly.
-        return casted, Int64Type()
+        return pc.cast(array, pa.int64(), safe=True), Int64Type()
 
     def _try_float(self, array: pa.Array):
-        try:
-            casted = pc.cast(array, pa.float64(), safe=True)
-        except pa.ArrowInvalid:
+        # Same shape as ``_try_int``: pre-validate via regex to skip
+        # the exception cost when the column is non-numeric text.
+        if not _RE_MATCHES_OR_NULL(array, _FLOAT_REGEX):
             return None
-        return casted, Float64Type()
+        return pc.cast(array, pa.float64(), safe=True), Float64Type()
 
     def _try_date(self, array: pa.Array):
         parsed = self._coalesce_strptime(array, _DATE_FORMATS, unit="s")
