@@ -447,6 +447,13 @@ class PreparedRequest:
         cached = self._cache.get(name, ...)
         if cached is ...:
             cached = compute()
+            # Re-fingerprint after compute — keep the cache token in
+            # sync if ``compute`` had side effects on tracked state
+            # (mirrors :meth:`Response._cached`). Side-effect-free
+            # computes get the same token back and this is a no-op.
+            post = self._state_token()
+            if post != token:
+                self._cache_token = post
             self._cache[name] = cached
         return cached
 
@@ -734,7 +741,13 @@ class PreparedRequest:
         copy_buffer: bool = False,
     ) -> "PreparedRequest":
         new_url = self.url if url is None else URL.from_(url, normalize=normalize)
-        new_headers = dict(self.headers) if headers is None else _string_dict(headers)
+        # Clone the existing :class:`Headers` directly — ``dict(self.headers)``
+        # would iterate via ``__getitem__`` only for ``Headers.from_`` to
+        # immediately rebuild a :class:`Headers` from that dict. Going
+        # ``Headers -> Headers`` short-circuits the round trip via the
+        # ``isinstance(data, Headers)`` branch in ``Headers.__init__``,
+        # which lifts the internal dict in one C-level shallow copy.
+        new_headers = Headers(self.headers) if headers is None else _string_dict(headers)
 
         if buffer is ...:
             new_buffer = self.buffer
@@ -1107,9 +1120,7 @@ class PreparedRequest:
         self,
         keys: Iterable[str],
     ) -> tuple[Any, ...]:
-        key_list = [str(key) for key in keys]
-        values = self.match_values(key_list)
-        return tuple(values[key] for key in key_list)
+        return tuple(self.match_value(str(key)) for key in keys)
 
     def xxh3_64(
         self,

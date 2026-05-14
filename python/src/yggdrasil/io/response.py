@@ -591,7 +591,7 @@ class Response(Tabular["ResponseOptions"]):
             _coerce_userinfo(receiver) if receiver is not None else _default_sender()
         )
 
-        _ensure_media_headers(self.headers, self.buffer)
+        media = _ensure_media_headers(self.headers, self.buffer)
 
         self._session: "Session | None" = None
         # Memoization for the deterministic projection — hashes,
@@ -602,8 +602,12 @@ class Response(Tabular["ResponseOptions"]):
         # tracks its own mutations through ``version``, so the only
         # blind spot is a same-content :class:`Headers` *swap* on
         # the same response — :meth:`_invalidate_cache` covers that.
-        self._cache: dict[str, Any] = {}
-        self._cache_token: tuple = ()
+        # Seed the media-type slot with the result we just computed:
+        # ``_ensure_media_headers`` is heavy (MIME / codec lookups,
+        # body sniff) and the next ``self.media_type`` access would
+        # otherwise rerun it once before the cache caught.
+        self._cache: dict[str, Any] = {"media_type": media}
+        self._cache_token: tuple = self._state_token()
 
     # ------------------------------------------------------------------
     # Holder access — :attr:`buffer` IS the durable :class:`Holder`.
@@ -750,6 +754,18 @@ class Response(Tabular["ResponseOptions"]):
         cached = self._cache.get(name, ...)
         if cached is ...:
             cached = compute()
+            # Re-fingerprint after compute — some cached properties
+            # (notably :attr:`media_type` via :func:`_ensure_media_headers`)
+            # stamp ``Content-Length`` / ``Content-Type`` back onto the
+            # headers as a side effect, which bumps ``headers.version``.
+            # Without rolling the cache token forward, the next access
+            # would see a shifted state token and wipe the entry we
+            # just populated, so every "warm" read paid for a fresh
+            # compute. Side-effect-free computes get the same token
+            # back and this is a no-op.
+            post = self._state_token()
+            if post != token:
+                self._cache_token = post
             self._cache[name] = cached
         return cached
 
@@ -905,7 +921,10 @@ class Response(Tabular["ResponseOptions"]):
     def media_type(self) -> MediaType:
         if self.headers is None:
             self.headers = {}
-        return _ensure_media_headers(self.headers, self.buffer)
+        return self._cached(
+            "media_type",
+            lambda: _ensure_media_headers(self.headers, self.buffer),
+        )
 
     @media_type.setter
     def media_type(self, value: MediaType) -> None:
@@ -1184,9 +1203,7 @@ class Response(Tabular["ResponseOptions"]):
         self,
         keys: Iterable[str],
     ) -> tuple[Any, ...]:
-        key_list = [str(key) for key in keys]
-        values = self.match_values(key_list)
-        return tuple(values[key] for key in key_list)
+        return tuple(self.match_value(str(key)) for key in keys)
 
     # ------------------------------------------------------------------
     # Anonymisation

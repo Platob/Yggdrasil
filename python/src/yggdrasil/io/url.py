@@ -1466,6 +1466,37 @@ class URL(os.PathLike):
         return Path(_strip_windows_drive_slash(raw))
 
     def join(self, ref: str | URL) -> URL:
+        # Fast-path: ``ref`` is an absolute-path string ("/v1/foo?x=1"
+        # or "/v1/foo#tag") on the same authority. ``Session.prepare_request``
+        # hits this every time a caller pairs a ``base_url`` with a
+        # leading-slash path, which is the common shape. We already
+        # own scheme / host / port / userinfo locally, so going through
+        # ``urljoin`` + ``URL.from_str`` re-parses three strings to
+        # reconstruct what we have — skip it and clone slots directly.
+        # Single-slash only: ``//host/...`` is a protocol-relative URL
+        # that *replaces* the authority, which urljoin handles specially.
+        if (
+            type(ref) is str
+            and ref
+            and ref[0] == "/"
+            and (len(ref) == 1 or ref[1] != "/")
+            and self.host
+        ):
+            path_part, _, frag = ref.partition("#")
+            path, _, query = path_part.partition("?")
+            new = object.__new__(URL)
+            setattr_ = object.__setattr__
+            setattr_(new, "scheme", self.scheme)
+            setattr_(new, "userinfo", self.userinfo)
+            setattr_(new, "host", self.host)
+            setattr_(new, "port", self.port)
+            setattr_(new, "path", path or "/")
+            setattr_(new, "query", query or None)
+            setattr_(new, "fragment", frag or None)
+            setattr_(new, "_str_enc", None)
+            setattr_(new, "_str_raw", None)
+            setattr_(new, "_anonymized", None)
+            return new
         base = self.to_string(encode=True)
         target = ref.to_string(encode=True) if isinstance(ref, URL) else ref
         return URL.from_str(urljoin(base, target), normalize=True)
