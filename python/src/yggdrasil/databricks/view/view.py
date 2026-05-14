@@ -253,6 +253,10 @@ class View(DatabricksResource):
     @property
     def infos(self) -> TableInfo:
         if self._cache_expired():
+            logger.debug(
+                "Cache miss [View.infos] view=%s — fetching remote",
+                self.full_name(),
+            )
             infos = self.service.find_view_remote(
                 catalog_name=self.catalog_name,
                 schema_name=self.schema_name,
@@ -265,6 +269,17 @@ class View(DatabricksResource):
                 Column.from_api(table=self, infos=col_info)
                 for col_info in (infos.columns or [])
             ])
+            logger.debug(
+                "View.infos: stored view=%s table_type=%s columns=%d",
+                self.full_name(), getattr(infos, "table_type", None),
+                len(self._columns or ()),
+            )
+        else:
+            age = time.time() - (self._infos_fetched_at or 0.0)
+            logger.debug(
+                "Cache hit [View.infos] view=%s age=%.0fs",
+                self.full_name(), age,
+            )
         return self._infos
 
     @property
@@ -440,10 +455,18 @@ class View(DatabricksResource):
             properties=properties,
         )
 
+        logger.debug(
+            "View.create: view=%s or_replace=%s if_not_exists=%s mode=%s",
+            self.full_name(), bool(or_replace), bool(if_not_exists), parsed_mode,
+        )
         try:
             self.sql.execute(statement, wait=wait_result)
         except Exception as exc:
             if "SCHEMA_NOT_FOUND" in str(exc):
+                logger.debug(
+                    "View.create: parent schema missing for %s — auto-creating %s.%s",
+                    self.full_name(), self.catalog_name, self.schema_name,
+                )
                 self.sql.execute(
                     f"CREATE SCHEMA IF NOT EXISTS "
                     f"{quote_ident(self.catalog_name)}.{quote_ident(self.schema_name)}",
@@ -491,6 +514,10 @@ class View(DatabricksResource):
         raise_error: bool = True,
     ) -> "View":
         statement = self.delete_ddl(if_exists=if_exists)
+        logger.debug(
+            "View.delete: view=%s if_exists=%s wait=%s",
+            self.full_name(), if_exists, bool(wait),
+        )
         if wait:
             try:
                 self.sql.execute(statement, wait=True)
@@ -514,8 +541,16 @@ class View(DatabricksResource):
         if not new_name:
             raise ValueError("Cannot rename view to an empty name")
         if new_name == self.view_name:
+            logger.debug(
+                "View.rename: no-op — new name matches current %r on %s",
+                new_name, self.full_name(),
+            )
             return self
 
+        logger.debug(
+            "View.rename: %s → %s.%s.%s",
+            self.full_name(), self.catalog_name, self.schema_name, new_name,
+        )
         self.sql.execute(
             f"ALTER VIEW {self.full_name(safe=True)} "
             f"RENAME TO {quote_ident(new_name)}"

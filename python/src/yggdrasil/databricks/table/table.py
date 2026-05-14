@@ -1529,6 +1529,10 @@ class Table(DatabricksResource, Holder):
     # =========================================================================
 
     def _reset_cache(self, invalidate_cache: bool = False) -> None:
+        logger.debug(
+            "Table._reset_cache: table=%s invalidate_cache=%s",
+            self.full_name(), invalidate_cache,
+        )
         if invalidate_cache:
             self.sql.tables.invalidate_cached_table(table=self)
             # Also drop entity-tag entries for this table and its columns —
@@ -1584,14 +1588,28 @@ class Table(DatabricksResource, Holder):
             Column.from_api(table=self, infos=col_info)
             for col_info in (infos.columns or [])
         ]
+        logger.debug(
+            "Table._store_infos: table=%s table_id=%s columns=%d table_type=%s",
+            self.full_name(), getattr(infos, "table_id", None),
+            len(self._columns), getattr(infos, "table_type", None),
+        )
         return infos
 
     @property
     def infos(self) -> TableInfo:
         """Basic :class:`TableInfo` — TTL-cached."""
         if self._infos is not None and self._is_fresh(self._infos_fetched_at):
+            age = time.time() - (self._infos_fetched_at or 0.0)
+            logger.debug(
+                "Cache hit [Table.infos] table=%s age=%.0fs",
+                self.full_name(), age,
+            )
             return self._infos
 
+        logger.debug(
+            "Cache miss [Table.infos] table=%s — fetching remote",
+            self.full_name(),
+        )
         info = self.client.tables.find_table_remote(
             catalog_name=self.catalog_name,
             schema_name=self.schema_name,
@@ -1676,6 +1694,10 @@ class Table(DatabricksResource, Holder):
 
     def _collect_schema(self, options: CastOptions) -> DataSchema:
         """Return the field schema, optionally enriched with UC metadata."""
+        logger.debug(
+            "Table._collect_schema: table=%s columns=%d",
+            self.full_name(), len(self.columns),
+        )
         metadata: dict[bytes, bytes] = {
             b"engine": b"databricks",
             b"catalog_name": self.catalog_name.encode(),
@@ -1716,6 +1738,10 @@ class Table(DatabricksResource, Holder):
 
         schema = DataSchema.from_fields(fields, metadata=metadata, name=self.table_name, nullable=False)
         self._persist_schema(schema)
+        logger.debug(
+            "Table._collect_schema: built schema table=%s fields=%d metadata_keys=%d",
+            self.full_name(), len(fields), len(metadata),
+        )
         return schema
 
     def collect_data_field(self, safe: bool = False) -> Field:
@@ -2069,18 +2095,35 @@ class Table(DatabricksResource, Holder):
             )
 
         statement = "\n".join(sql_parts)
+        logger.debug(
+            "Table.sql_create: table=%s or_replace=%s if_not_exists=%s "
+            "columns=%d partition_by=%d cluster_by=%d primary_keys=%d "
+            "data_source_format=%s column_mapping_mode=%s",
+            self.full_name(), or_replace, if_not_exists,
+            len(column_definitions), len(partition_by or ()),
+            len(cluster_by or ()), len(primary_keys or ()),
+            data_source_format, column_mapping_mode,
+        )
 
         try:
             self.sql.execute(statement, wait=wait_result)
         except Exception as exc:
             if "SCHEMA_NOT_FOUND" in str(exc):
+                logger.debug(
+                    "Table.sql_create: parent schema missing for %s — auto-creating "
+                    "%s.%s and retrying",
+                    self.full_name(), self.catalog_name, self.schema_name,
+                )
                 self.sql.execute(
                     f"CREATE SCHEMA IF NOT EXISTS {quote_ident(self.catalog_name)}.{quote_ident(self.schema_name)}",
                     wait=True,
                 )
                 self.sql.execute(statement, wait=wait_result)
             elif "CONSTRAINT_ALREADY_EXISTS_IN_SCHEMA" in str(exc):
-                pass
+                logger.debug(
+                    "Table.sql_create: constraint already exists on %s — ignoring",
+                    self.full_name(),
+                )
             else:
                 raise
 
@@ -2351,6 +2394,12 @@ class Table(DatabricksResource, Holder):
         if properties:
             merged_properties.update({str(k): str(v) for k, v in properties.items()})
 
+        logger.debug(
+            "Table.api_create: table=%s table_type=%s data_source_format=%s "
+            "storage_location=%s columns=%d properties=%d",
+            self.full_name(), table_type, data_source_format,
+            storage_location, len(column_infos), len(merged_properties),
+        )
         try:
             self.client.workspace_client().tables.create(
                 name=self.table_name,
@@ -2364,6 +2413,10 @@ class Table(DatabricksResource, Holder):
             )
         except DatabricksError as exc:
             if if_not_exists and "already exists" in str(exc).lower():
+                logger.debug(
+                    "Table.api_create: table=%s already exists — soft-resetting cache",
+                    self.full_name(),
+                )
                 self._reset_cache(invalidate_cache=True)
                 return self
             raise
@@ -2418,6 +2471,9 @@ class Table(DatabricksResource, Holder):
         raise_error: bool = True,
     ) -> "Table":
         uc = self.client.workspace_client().tables
+        logger.debug(
+            "Table.delete: table=%s wait=%s", self.full_name(), bool(wait),
+        )
 
         if wait:
             try:
@@ -2440,8 +2496,16 @@ class Table(DatabricksResource, Holder):
         if not new_name:
             raise ValueError("Cannot rename table to an empty name")
         if new_name == self.table_name:
+            logger.debug(
+                "Table.rename: no-op — new name matches current %r on %s",
+                new_name, self.full_name(),
+            )
             return self
 
+        logger.debug(
+            "Table.rename: %s → %s.%s.%s",
+            self.full_name(), self.catalog_name, self.schema_name, new_name,
+        )
         self.sql.execute(
             f"ALTER TABLE {self.full_name(safe=True)} "
             f"RENAME TO {quote_ident(new_name)}"

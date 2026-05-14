@@ -126,9 +126,17 @@ class Catalogs(DatabricksService):
             name: Catalog name.
         """
         cat = Catalog(service=self, catalog_name=name)
-        cached = _CATALOG_INFO_CACHE.get(self._cache_key(name))
+        key = self._cache_key(name)
+        cached = _CATALOG_INFO_CACHE.get(key)
         if cached is not None:
+            logger.debug(
+                "Cache hit [Catalogs.catalog] key=%s catalog=%s", key, name,
+            )
             object.__setattr__(cat, "_infos", cached)
+        else:
+            logger.debug(
+                "Catalogs.catalog: lazy resource catalog=%s (no cached info)", name,
+            )
         return cat
 
     def schema(self, full_name: str) -> Schema:
@@ -168,7 +176,12 @@ class Catalogs(DatabricksService):
                        ``"*_raw"``, ``"*"``).  Without ``*`` it's an exact match.
             use_cache: Populate ``_CATALOG_INFO_CACHE`` from results.
         """
+        logger.debug(
+            "Catalogs.list_catalogs: name_filter=%s use_cache=%s",
+            name, use_cache,
+        )
         matcher = name_matcher(name)
+        yielded = 0
         for info in self.client.workspace_client().catalogs.list():
             if matcher is not None and not matcher(info.name):
                 continue
@@ -179,7 +192,11 @@ class Catalogs(DatabricksService):
             if use_cache:
                 _CATALOG_INFO_CACHE[self._cache_key(info.name)] = info
 
+            yielded += 1
             yield cat
+        logger.debug(
+            "Catalogs.list_catalogs: yielded=%d name_filter=%s", yielded, name,
+        )
 
     # ── parse helper ──────────────────────────────────────────────────────────
 

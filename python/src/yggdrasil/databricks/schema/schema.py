@@ -211,6 +211,9 @@ class Schema(DatabricksResource):
                 self.full_name(), age, self._infos_ttl,
             )
 
+        logger.debug(
+            "Remote fetch [Schema._infos] schema=%s", self.full_name(),
+        )
         infos = self.client.workspace_client().schemas.get(full_name=self.full_name())
         object.__setattr__(self, "_infos", infos)
         object.__setattr__(self, "_infos_fetched_at", now)
@@ -288,6 +291,10 @@ class Schema(DatabricksResource):
             if_not_exists: Silently succeed if the schema already exists.
         """
         uc = self.client.workspace_client().schemas
+        logger.debug(
+            "Schema.create: schema=%s storage_root=%s if_not_exists=%s",
+            self.full_name(), storage_root, if_not_exists,
+        )
         try:
             info = uc.create(
                 catalog_name=self.catalog_name,
@@ -300,6 +307,10 @@ class Schema(DatabricksResource):
             object.__setattr__(self, "_infos_fetched_at", time.time())
         except DatabricksError as exc:
             if if_not_exists and "already exists" in str(exc).lower():
+                logger.debug(
+                    "Schema.create: schema=%s already exists — soft-resetting cache",
+                    self.full_name(),
+                )
                 self._reset_cache()
             else:
                 raise
@@ -337,6 +348,10 @@ class Schema(DatabricksResource):
             raise_error: Re-raise :exc:`DatabricksError` on failure.
         """
         uc = self.client.workspace_client().schemas
+        logger.debug(
+            "Schema.delete: schema=%s force=%s wait=%s",
+            self.full_name(), force, bool(wait),
+        )
         if wait:
             try:
                 uc.delete(full_name=self.full_name(), force=force)
@@ -616,6 +631,10 @@ class Schema(DatabricksResource):
         if properties is not None:
             kwargs["properties"] = properties
 
+        logger.debug(
+            "Schema.update: schema=%s fields=%s",
+            self.full_name(), sorted(kwargs.keys()),
+        )
         info = self.client.workspace_client().schemas.update(
             full_name=self.full_name(), **kwargs
         )
@@ -634,7 +653,16 @@ class Schema(DatabricksResource):
         if not new_name:
             raise ValueError("Cannot rename schema to an empty name")
         if new_name == self.schema_name:
+            logger.debug(
+                "Schema.rename: no-op — new name matches current %r on %s",
+                new_name, self.full_name(),
+            )
             return self
+
+        logger.debug(
+            "Schema.rename: %s → %s.%s",
+            self.full_name(), self.catalog_name, new_name,
+        )
 
         # Drop the old entity-tag cache key before the rename — the
         # ``entity_name`` is the two-part full name, and after the rename
