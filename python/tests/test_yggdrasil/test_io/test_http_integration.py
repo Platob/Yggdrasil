@@ -182,6 +182,96 @@ class TestSessionSend:
         assert len(s.calls) == 3
 
 
+class TestRequestsCompat:
+    """``requests.Session``-style call shapes route through ``request()``."""
+
+    def test_post_form_data_dict_urlencodes_body(self) -> None:
+        s = StubSession()
+        s.post("https://example.com/login", data={"user": "alice", "pw": "x y"})
+        seen = s.calls[0]
+        assert seen.method == "POST"
+        assert seen.buffer.to_bytes() == b"user=alice&pw=x+y"
+        assert seen.headers.get("Content-Type") == "application/x-www-form-urlencoded"
+
+    def test_post_form_data_sequence_of_tuples(self) -> None:
+        # ``requests`` accepts ``[(k, v), (k, v2)]`` for repeated keys —
+        # ``urlencode(doseq=True)`` handles both shapes.
+        s = StubSession()
+        s.post("https://example.com/x", data=[("k", "1"), ("k", "2")])
+        assert s.calls[0].buffer.to_bytes() == b"k=1&k=2"
+
+    def test_post_raw_data_bytes_passthrough(self) -> None:
+        s = StubSession()
+        s.post(
+            "https://example.com/raw",
+            data=b"raw-bytes",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        seen = s.calls[0]
+        assert seen.buffer.to_bytes() == b"raw-bytes"
+        # Caller-supplied Content-Type wins over the form default.
+        assert seen.headers.get("Content-Type") == "application/octet-stream"
+
+    def test_post_raw_data_str_encoded_utf8(self) -> None:
+        s = StubSession()
+        s.post("https://example.com/raw", data="héllo")
+        assert s.calls[0].buffer.to_bytes() == "héllo".encode("utf-8")
+
+    def test_data_and_body_conflict_raises(self) -> None:
+        s = StubSession()
+        with pytest.raises(ValueError, match="body=.*data="):
+            s.post("https://example.com/x", body=b"a", data={"b": "c"})
+
+    def test_get_with_cookies_dict(self) -> None:
+        s = StubSession()
+        s.get("https://example.com/x", cookies={"sid": "abc", "lang": "fr"})
+        cookie = s.calls[0].headers.get("Cookie")
+        assert "sid=abc" in cookie
+        assert "lang=fr" in cookie
+
+    def test_cookies_does_not_override_explicit_header(self) -> None:
+        s = StubSession()
+        s.get(
+            "https://example.com/x",
+            headers={"Cookie": "already=set"},
+            cookies={"sid": "abc"},
+        )
+        assert s.calls[0].headers.get("Cookie") == "already=set"
+
+    def test_get_with_timeout_alias_routes_to_wait(self) -> None:
+        # ``timeout=`` is the requests spelling of our ``wait=``; both
+        # resolve through ``WaitingConfig.from_`` so a numeric arg works.
+        from yggdrasil.dataclasses.waiting import WaitingConfig
+
+        s = StubSession()
+        s.queue(make_response())
+        captured: dict[str, WaitingConfig] = {}
+
+        original_send = s.send
+
+        def spy(req, **kwargs):
+            captured["wait"] = WaitingConfig.from_(kwargs.get("wait"))
+            return original_send(req, **kwargs)
+
+        s.send = spy  # type: ignore[method-assign]
+        s.get("https://example.com/x", timeout=7.5)
+        assert captured["wait"].timeout == 7.5
+
+    def test_timeout_and_wait_conflict_raises(self) -> None:
+        s = StubSession()
+        with pytest.raises(ValueError, match="wait=.*timeout="):
+            s.get("https://example.com/x", wait=2.0, timeout=5.0)
+
+    def test_get_with_params_query_string(self) -> None:
+        # Sanity: existing ``params=`` already mirrors ``requests`` —
+        # pinned here so the compat layer doesn't regress it.
+        s = StubSession()
+        s.get("https://example.com/search", params={"q": "yggdrasil", "n": "10"})
+        seen = s.calls[0]
+        assert "q=yggdrasil" in seen.url.query
+        assert "n=10" in seen.url.query
+
+
 # ---------------------------------------------------------------------------
 # Local cache integration via the URL-mirrored fast-path tree
 # ---------------------------------------------------------------------------

@@ -370,6 +370,39 @@ def _cleanup_local_fast_path(
     return removed
 
 
+def _encode_request_data(
+    data: Any,
+) -> tuple[bytes, "str | None"]:
+    """Encode a ``requests``-style ``data=`` payload into request bytes.
+
+    * ``bytes`` / ``bytearray`` / ``memoryview`` → raw bytes, no header
+      change (caller's ``Content-Type`` wins).
+    * ``str`` → UTF-8 bytes, no header change.
+    * ``Mapping`` / ``Iterable[tuple]`` → ``urlencode(doseq=True)`` with
+      ``application/x-www-form-urlencoded`` as the suggested header,
+      matching :meth:`requests.Session.post`.
+    """
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return bytes(data), None
+    if isinstance(data, str):
+        return data.encode("utf-8"), None
+    from urllib.parse import urlencode
+
+    return urlencode(data, doseq=True).encode("utf-8"), "application/x-www-form-urlencoded"
+
+
+def _format_cookie_header(cookies: Any) -> str:
+    """Serialize a ``requests``-style ``cookies=`` arg into one ``Cookie`` header value."""
+    if hasattr(cookies, "to_header"):
+        return cookies.to_header()
+    if isinstance(cookies, Mapping):
+        return "; ".join(f"{k}={v}" for k, v in cookies.items())
+    raise TypeError(
+        f"cookies must be a Mapping or expose to_header(); got "
+        f"{type(cookies).__name__}."
+    )
+
+
 class Session(ABC):
     # Singleton cache keyed by ``(class, normalized base_url string, key)``.
     # A ``Session`` constructed with a ``base_url`` is intentionally shared
@@ -2206,8 +2239,11 @@ class Session(ABC):
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         body: BytesIO | bytes | None = None,
+        data: Any = None,
         tags: Mapping[str, str] | None = None,
+        cookies: "Mapping[str, str] | None" = None,
         wait: WaitingConfigArg = None,
+        timeout: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = True,
         normalize: bool = True,
@@ -2221,8 +2257,11 @@ class Session(ABC):
             params=params,
             headers=headers,
             body=body,
+            data=data,
             tags=tags,
+            cookies=cookies,
             wait=wait,
+            timeout=timeout,
             raise_error=raise_error,
             stream=stream,
             normalize=normalize,
@@ -2238,9 +2277,12 @@ class Session(ABC):
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         body: BytesIO | bytes | None = None,
+        data: Any = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
+        cookies: "Mapping[str, str] | None" = None,
         wait: WaitingConfigArg = None,
+        timeout: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = True,
         normalize: bool = True,
@@ -2254,9 +2296,12 @@ class Session(ABC):
             params=params,
             headers=headers,
             body=body,
+            data=data,
             tags=tags,
             json=json,
+            cookies=cookies,
             wait=wait,
+            timeout=timeout,
             raise_error=raise_error,
             stream=stream,
             normalize=normalize,
@@ -2272,9 +2317,12 @@ class Session(ABC):
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         body: BytesIO | bytes | None = None,
+        data: Any = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
+        cookies: "Mapping[str, str] | None" = None,
         wait: WaitingConfigArg = None,
+        timeout: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = True,
         normalize: bool = True,
@@ -2288,9 +2336,12 @@ class Session(ABC):
             params=params,
             headers=headers,
             body=body,
+            data=data,
             tags=tags,
             json=json,
+            cookies=cookies,
             wait=wait,
+            timeout=timeout,
             raise_error=raise_error,
             stream=stream,
             normalize=normalize,
@@ -2306,9 +2357,12 @@ class Session(ABC):
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         body: BytesIO | bytes | None = None,
+        data: Any = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
+        cookies: "Mapping[str, str] | None" = None,
         wait: WaitingConfigArg = None,
+        timeout: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = True,
         normalize: bool = True,
@@ -2322,9 +2376,12 @@ class Session(ABC):
             params=params,
             headers=headers,
             body=body,
+            data=data,
             tags=tags,
             json=json,
+            cookies=cookies,
             wait=wait,
+            timeout=timeout,
             raise_error=raise_error,
             stream=stream,
             normalize=normalize,
@@ -2340,9 +2397,12 @@ class Session(ABC):
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         body: BytesIO | bytes | None = None,
+        data: Any = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
+        cookies: "Mapping[str, str] | None" = None,
         wait: WaitingConfigArg = None,
+        timeout: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = True,
         normalize: bool = True,
@@ -2356,9 +2416,12 @@ class Session(ABC):
             params=params,
             headers=headers,
             body=body,
+            data=data,
             tags=tags,
             json=json,
+            cookies=cookies,
             wait=wait,
+            timeout=timeout,
             raise_error=raise_error,
             stream=stream,
             normalize=normalize,
@@ -2374,8 +2437,11 @@ class Session(ABC):
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         body: BytesIO | bytes | None = None,
+        data: Any = None,
         tags: Mapping[str, str] | None = None,
+        cookies: "Mapping[str, str] | None" = None,
         wait: WaitingConfigArg = None,
+        timeout: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = False,
         normalize: bool = True,
@@ -2389,8 +2455,11 @@ class Session(ABC):
             params=params,
             headers=headers,
             body=body,
+            data=data,
             tags=tags,
+            cookies=cookies,
             wait=wait,
+            timeout=timeout,
             raise_error=raise_error,
             stream=stream,
             normalize=normalize,
@@ -2406,9 +2475,12 @@ class Session(ABC):
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         body: BytesIO | bytes | None = None,
+        data: Any = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
+        cookies: "Mapping[str, str] | None" = None,
         wait: WaitingConfigArg = None,
+        timeout: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = True,
         normalize: bool = True,
@@ -2422,9 +2494,12 @@ class Session(ABC):
             params=params,
             headers=headers,
             body=body,
+            data=data,
             tags=tags,
             json=json,
+            cookies=cookies,
             wait=wait,
+            timeout=timeout,
             raise_error=raise_error,
             stream=stream,
             normalize=normalize,
@@ -2441,15 +2516,53 @@ class Session(ABC):
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         body: BytesIO | bytes | None = None,
+        data: Any = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
+        cookies: "Mapping[str, str] | None" = None,
         wait: WaitingConfigArg = None,
+        timeout: WaitingConfigArg = None,
         raise_error: bool = True,
         stream: bool = True,
         normalize: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
     ) -> Response:
+        # ``requests``-style aliases: ``data=`` becomes ``body=`` (with
+        # form-urlencoding for mappings/sequences), ``timeout=`` becomes
+        # ``wait=``, and ``cookies=`` joins ``headers={'Cookie': ...}``.
+        # Conflicting pairs raise — picking a side silently would mask a
+        # caller bug.
+        if data is not None:
+            if body is not None:
+                raise ValueError(
+                    "Pass only one of body= or data= (got both). Use data= "
+                    "for requests-style form/raw bodies, body= for the "
+                    "native BytesIO/bytes path."
+                )
+            body, form_content_type = _encode_request_data(data)
+            if form_content_type is not None:
+                merged = Headers(headers) if headers else Headers()
+                if "Content-Type" not in merged:
+                    merged["Content-Type"] = form_content_type
+                headers = merged
+
+        if timeout is not None:
+            if wait is not None:
+                raise ValueError(
+                    "Pass only one of wait= or timeout= (got both). They "
+                    "map to the same underlying WaitingConfig; pick one."
+                )
+            wait = timeout
+
+        if cookies:
+            cookie_header = _format_cookie_header(cookies)
+            if cookie_header:
+                merged = Headers(headers) if headers else Headers()
+                if "Cookie" not in merged:
+                    merged["Cookie"] = cookie_header
+                headers = merged
+
         prepared = self.prepare_request(
             method=method,
             url=url,
