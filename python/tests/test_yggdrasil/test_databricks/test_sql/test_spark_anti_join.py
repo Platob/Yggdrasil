@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
-from yggdrasil.databricks.sql.table import _spark_filter_existing_keys
+from yggdrasil.databricks.table.table import _spark_filter_existing_keys
 
 
 # ---------------------------------------------------------------------------

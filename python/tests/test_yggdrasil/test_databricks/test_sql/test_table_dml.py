@@ -35,7 +35,7 @@ import pyarrow as pa
 
 from yggdrasil.data.enums import Mode
 from yggdrasil.data.schema import Schema
-from yggdrasil.databricks.sql.table import (
+from yggdrasil.databricks.table.table import (
     _build_anti_join_insert,
     _build_column_projection,
     _build_delete_insert_statements,
@@ -439,16 +439,16 @@ class TestNoMergeFallbackMachinery:
     helpers (MERGE template, anti-join, _execute_dml) remain."""
 
     def test_no_drain_helper(self) -> None:
-        from yggdrasil.databricks.sql import table as _t
+        from yggdrasil.databricks.table import table as _t
         assert not hasattr(_t, "_drain_batch_with_retry")
 
     def test_no_fallback_funnel(self) -> None:
-        from yggdrasil.databricks.sql import table as _t
+        from yggdrasil.databricks.table import table as _t
         assert not hasattr(_t, "_execute_with_merge_fallback")
         assert not hasattr(_t, "_build_merge_fallback_statements")
 
     def test_helpers_present(self) -> None:
-        from yggdrasil.databricks.sql import table as _t
+        from yggdrasil.databricks.table import table as _t
         # MERGE template back, anti-join INSERT alongside, and the
         # simplified executor instead of the fallback funnel.
         assert hasattr(_t, "_build_merge_statement")

@@ -21,7 +21,7 @@ import pytest
 
 from yggdrasil.data.enums import Scheme
 from yggdrasil.databricks import DatabricksClient
-from yggdrasil.databricks.sql.table import Table
+from yggdrasil.databricks.table.table import Table
 from yggdrasil.io.url import URL, URLBased
 
 

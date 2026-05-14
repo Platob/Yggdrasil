@@ -22,11 +22,11 @@ from yggdrasil.version import __version__ as ygg_version
 if TYPE_CHECKING:
     from .iam import IAM
     from .sql.engine import SQLEngine
-    from .sql.tables import Tables
-    from .sql.views import Views
-    from .sql.columns import Columns
-    from .sql.catalogs import Catalogs
-    from .sql.schemas import Schemas
+    from .table.tables import Tables
+    from .view.views import Views
+    from .column.columns import Columns
+    from .catalog.catalogs import Catalogs
+    from .schema.schemas import Schemas
     from .warehouse.service import Warehouses
     from .compute.service import Compute
     from .secrets.service import Secrets
@@ -1179,7 +1179,7 @@ class DatabricksClient(URLBased):
     @property
     def tables(self) -> "Tables":
         """Collection-level Unity Catalog table service for this client."""
-        from .sql.tables import Tables
+        from .table.tables import Tables
 
         return self.lazy_property(
             self,
@@ -1191,7 +1191,7 @@ class DatabricksClient(URLBased):
     @property
     def views(self) -> "Views":
         """Collection-level Unity Catalog view service for this client."""
-        from .sql.views import Views
+        from .view.views import Views
 
         return self.lazy_property(
             self,
@@ -1203,7 +1203,7 @@ class DatabricksClient(URLBased):
     @property
     def columns(self) -> "Columns":
         """Collection-level Unity Catalog column service for this client."""
-        from .sql.columns import Columns
+        from .column.columns import Columns
 
         return self.lazy_property(
             self,
@@ -1222,7 +1222,7 @@ class DatabricksClient(URLBased):
             client.catalogs["main"]["sales"]          # Schema
             client.catalogs["main"]["sales"]["orders"]  # Table
         """
-        from .sql.catalogs import Catalogs
+        from .catalog.catalogs import Catalogs
 
         return self.lazy_property(
             self,
@@ -1241,7 +1241,7 @@ class DatabricksClient(URLBased):
             client.schemas["main.sales.orders"]      # Table
             client.schemas(catalog_name="main")      # Schemas scoped to "main"
         """
-        from .sql.schemas import Schemas
+        from .schema.schemas import Schemas
 
         return self.lazy_property(
             self,

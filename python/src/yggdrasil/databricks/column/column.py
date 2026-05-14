@@ -10,10 +10,10 @@ from yggdrasil.databricks.sql.sql_utils import (
     databricks_tag_literal,
 )
 
-from .types import parse_databricks_field
+from yggdrasil.databricks.sql.types import parse_databricks_field
 
 if TYPE_CHECKING:
-    from .table import Table
+    from yggdrasil.databricks.table.table import Table
 
 __all__ = ["Column"]
 

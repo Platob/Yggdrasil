@@ -1,7 +1,7 @@
 """
 Collection-level service for Unity Catalog columns.
 
-Mirrors the :class:`~yggdrasil.databricks.sql.tables.Tables` pattern:
+Mirrors the :class:`~yggdrasil.databricks.table.tables.Tables` pattern:
 context defaults (``catalog_name``, ``schema_name``, ``table_name``,
 ``column_name``) are carried on the service instance so callers only have to
 supply the parts that differ from the default.
@@ -34,7 +34,7 @@ from yggdrasil.databricks.client import DatabricksService
 
 if TYPE_CHECKING:
     from .column import Column
-    from .table import Table
+    from yggdrasil.databricks.table.table import Table
 
 __all__ = ["Columns"]
 
@@ -183,7 +183,7 @@ class Columns(DatabricksService):
         table_name: str | None = None,
         column_name: str | None = None,
     ) -> "Column":
-        """Resolve and return a single :class:`~yggdrasil.databricks.sql.column.Column`.
+        """Resolve and return a single :class:`~yggdrasil.databricks.column.column.Column`.
 
         Args:
             location:     Dotted name (``"catalog.schema.table.col"`` or fewer parts).

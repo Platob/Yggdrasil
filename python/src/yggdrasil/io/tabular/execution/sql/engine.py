@@ -246,7 +246,7 @@ class Engine:
         it. Currently the only adapter shipped in-tree is
         :mod:`yggdrasil.sql.databricks_pushdown` — when every name in
         the SQL resolves to a
-        :class:`yggdrasil.databricks.sql.table.Table` on one shared
+        :class:`yggdrasil.databricks.table.table.Table` on one shared
         client, the engine rewrites the FROM names to the fully-
         qualified ``catalog.schema.table`` form and submits to that
         client's :class:`SQLEngine`. The returned

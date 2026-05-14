@@ -34,7 +34,7 @@ from databricks.sdk.errors import DatabricksError, NotFound
 
 from yggdrasil.data.enums import Mode
 from yggdrasil.databricks.sql.engine import SQLEngine
-from yggdrasil.databricks.sql.table import Table
+from yggdrasil.databricks.table.table import Table
 
 from .. import DatabricksIntegrationCase
 
@@ -599,7 +599,7 @@ class TestSQLMergeStrategy(_SQLIntegrationBase):
     :class:`TestSQLEngineIntegration` and adds a small helper to
     seed a fresh table with a known initial row set. The expected
     DML each branch generates is documented inline in
-    ``yggdrasil.databricks.sql.table._build_dml_statements``; this
+    ``yggdrasil.databricks.table.table._build_dml_statements``; this
     suite verifies the *observable* outcome (row counts + values).
     """
 

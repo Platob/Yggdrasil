@@ -33,7 +33,12 @@ Engines register their converters **on import** — pull them in once at startup
 | Module | Purpose | Page |
 |---|---|---|
 | `yggdrasil.databricks` | `DatabricksClient` entry point | [databricks](modules/databricks/README.md) |
-| `yggdrasil.databricks.sql` | SQL execution + Unity Catalog | [databricks/sql](modules/databricks/sql/README.md) |
+| `yggdrasil.databricks.sql` | SQL execution engine + helpers | [databricks/sql](modules/databricks/sql/README.md) |
+| `yggdrasil.databricks.catalog` | Unity Catalog catalog resource + service | |
+| `yggdrasil.databricks.schema` | Unity Catalog schema resource + service | |
+| `yggdrasil.databricks.table` | Unity Catalog table resource + service | |
+| `yggdrasil.databricks.column` | Unity Catalog column resource + service | |
+| `yggdrasil.databricks.view` | Unity Catalog view resource + service | |
 | `yggdrasil.databricks.compute` | Cluster lifecycle + remote execution | [databricks/compute](modules/databricks/compute/README.md), [remote](modules/databricks/compute/remote/README.md) |
 | `yggdrasil.databricks.workspaces` | Workspace + path helpers | [databricks/workspaces](modules/databricks/workspaces/README.md) |
 | `yggdrasil.databricks.fs` | DBFS / Volume / Workspace files | [databricks/fs](modules/databricks/fs/README.md) |

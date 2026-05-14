@@ -56,8 +56,8 @@ from .path import DatabricksPath
 
 if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
-    from yggdrasil.databricks.sql.catalog import Catalog
-    from yggdrasil.databricks.sql.schema import Schema
+    from yggdrasil.databricks.catalog.catalog import Catalog
+    from yggdrasil.databricks.schema.schema import Schema
 
 from yggdrasil.databricks.aws import AWSDatabricksVolumeCredentials
 

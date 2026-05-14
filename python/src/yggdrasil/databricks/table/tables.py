@@ -2,7 +2,7 @@
 Collection-level service for Unity Catalog tables.
 
 Provides ``find_table`` and ``list_tables`` against the Databricks catalog API.
-Per-table DDL/DML lives in :class:`~yggdrasil.databricks.sql.table.Table`.
+Per-table DDL/DML lives in :class:`~yggdrasil.databricks.table.table.Table`.
 
 Caching strategy
 ----------------
@@ -31,9 +31,9 @@ from yggdrasil.dataclasses.expiring import ExpiringDict
 from .table import Table
 
 if TYPE_CHECKING:
-    from .catalog import Catalog
-    from .column import Column
-    from .schema import Schema
+    from yggdrasil.databricks.catalog.catalog import Catalog
+    from yggdrasil.databricks.column.column import Column
+    from yggdrasil.databricks.schema.schema import Schema
 
 __all__ = ["Tables"]
 
@@ -227,7 +227,7 @@ class Tables(DatabricksService):
         catalog_name: str | None = None,
         schema_name: str | None = None,
     ) -> "Table":
-        """Return a :class:`~yggdrasil.databricks.sql.table.Table` bound to this service."""
+        """Return a :class:`~yggdrasil.databricks.table.table.Table` bound to this service."""
 
         return Table.from_(
             obj=location,
@@ -243,8 +243,8 @@ class Tables(DatabricksService):
         Args:
             name: Catalog name (falls back to ``self.catalog_name``).
         """
-        from .catalog import Catalog as _Catalog
-        from .catalogs import Catalogs
+        from yggdrasil.databricks.catalog.catalog import Catalog as _Catalog
+        from yggdrasil.databricks.catalog.catalogs import Catalogs
         return _Catalog(
             service=Catalogs(client=self.client),
             catalog_name=name or self.catalog_name,
@@ -265,8 +265,8 @@ class Tables(DatabricksService):
             catalog_name: Override catalog (falls back to ``self.catalog_name``).
             schema_name:  Override schema (falls back to ``self.schema_name``).
         """
-        from .schema import Schema as _Schema
-        from .catalogs import Catalogs
+        from yggdrasil.databricks.schema.schema import Schema as _Schema
+        from yggdrasil.databricks.catalog.catalogs import Catalogs
 
         if name and "." in name:
             parts = [p.strip().strip("`") for p in name.split(".", 1)]
@@ -546,7 +546,7 @@ class Tables(DatabricksService):
         schema_name = self.schema_name if schema_name is None else schema_name
 
         if catalog_name is None or is_glob_pattern(catalog_name):
-            from .catalogs import Catalogs
+            from yggdrasil.databricks.catalog.catalogs import Catalogs
 
             for catalog in Catalogs(client=self.client).list_catalogs(name=catalog_name):
                 yield from self.list_tables(
