@@ -6,6 +6,7 @@ import datetime as dt
 import itertools
 import logging
 import os
+import pathlib
 import re
 import threading
 import time
@@ -171,8 +172,6 @@ def _store_fast_path_arrow_batch(
     ``os.replace`` keeps a partial write from being read mid-flush by
     a concurrent fast-path reader.
     """
-    import pathlib
-
     final = pathlib.Path(cache_root_str) / rel_path
     try:
         final.parent.mkdir(parents=True, exist_ok=True)
@@ -203,8 +202,6 @@ def _read_fast_path_arrow_batch(
     path without a special error case (corrupt entry, race with a
     concurrent rewrite, schema drift, …).
     """
-    import pathlib
-
     file_path = pathlib.Path(os.fspath(cache_root)) / rel_path
     try:
         payload = file_path.read_bytes()
@@ -247,8 +244,6 @@ def _cleanup_local_fast_path(
     the writer. Best-effort: any per-file ``OSError`` is logged and
     the walk continues. Returns the number of files unlinked.
     """
-    import pathlib
-
     if ttl_seconds <= 0:
         return 0
     root = pathlib.Path(cache_root_str)

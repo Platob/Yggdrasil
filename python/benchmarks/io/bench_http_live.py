@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import socket
 import statistics
 import tempfile
 import threading
@@ -103,6 +104,18 @@ class _BenchHandler(BaseHTTPRequestHandler):
     # otherwise dump a line to stderr.
     def log_message(self, format, *args):  # noqa: A002, D401 - stdlib name
         return
+
+    def setup(self) -> None:  # noqa: D401 - stdlib name
+        super().setup()
+        # Disable Nagle on the per-request socket. ``BaseHTTPRequestHandler``
+        # writes the status line, headers, and body in separate ``send`` calls,
+        # which under Nagle + Linux's client-side delayed-ACK on loopback
+        # stalls every small response by ~40 ms. The fix has to be on the
+        # accepted socket the handler talks to — setting it on the listener
+        # alone doesn't help. With TCP_NODELAY the small-payload numbers
+        # actually reflect yggdrasil's dispatch cost instead of a kernel
+        # quirk.
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     def _serve(self, path: str) -> None:
         key = path.strip("/").split("/", 1)[0]

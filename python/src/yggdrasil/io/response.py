@@ -21,6 +21,7 @@ from .base import IO
 from yggdrasil.data.enums import Codec, MediaType, MimeTypes
 from .headers import Headers
 from .holder import Holder
+from .memory import Memory
 from .tabular.base import Tabular
 from yggdrasil.environ.userinfo import USERINFO_STRUCT, UserInfo
 from .request import (
@@ -260,8 +261,6 @@ def _coerce_buffer(
     an :class:`IO` cursor (the holder is borrowed), bytes-like input
     (wrapped in a fresh :class:`Memory`), or ``None`` (empty Memory).
     """
-    from .memory import Memory
-
     if obj is None:
         holder: Holder = Memory()
     elif isinstance(obj, Holder):
@@ -1410,14 +1409,20 @@ class Response(Tabular["ResponseOptions"]):
         response_cols = [f.name for f in RESPONSE_ARROW_SCHEMA] + ["request"]
 
         for rb in _iter_batches(batch):
-            available = rb.schema.names
-            cols = {
-                name: rb.column(name)
-                for name in response_cols
-                if name in available
-            }
+            available_set = set(rb.schema.names)
+            picks = [n for n in response_cols if n in available_set]
+            if not picks:
+                continue
+            # Per-cell ``[i].as_py()`` outperforms ``column.to_pylist()``
+            # on the typical 1-row cache batch: the per-row endpoint here
+            # carries nested (struct / list / map) columns whose full-array
+            # ``to_pylist`` walk costs more than a single scalar pull off
+            # one chunk position. Vectorising helps once batches have
+            # more than a handful of rows, but the dominant local-cache
+            # hit shape is exactly one row.
+            cols = {n: rb.column(n) for n in picks}
             for i in range(rb.num_rows):
-                yield cls._from_arrow_cols(cols, i, normalize=normalize)
+                yield cls._from_arrow_row(cols, i, normalize=normalize)
 
     @classmethod
     def from_record(
@@ -1440,17 +1445,21 @@ class Response(Tabular["ResponseOptions"]):
             yield cls.from_record(record, normalize=normalize)
 
     @classmethod
-    def _from_arrow_cols(
+    def _from_arrow_row(
         cls,
         cols: dict[str, Any],
         i: int,
         *,
         normalize: bool = False,
     ) -> "Response":
+        """Build one :class:`Response` from a per-batch column dict + row index.
+
+        ``cols`` is ``{name: rb.column(name)}`` resolved once outside
+        the row loop so the per-row ``get`` skips the schema-name lookup.
+        """
         def _arrow_get(name: str) -> Any:
-            if name in cols:
-                return cols[name][i].as_py()
-            return None
+            col = cols.get(name)
+            return col[i].as_py() if col is not None else None
 
         return cls._from_get(_arrow_get, normalize=normalize)
 
