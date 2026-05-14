@@ -776,6 +776,14 @@ class MimeTypes:
         )
     )
     CSV = MimeType.define(MimeType("CSV", "text/csv", extensions=("csv",), is_tabular=True))
+    FORM_URLENCODED = MimeType.define(
+        MimeType(
+            "FORM_URLENCODED",
+            "application/x-www-form-urlencoded",
+            extensions=("urlencoded",),
+            is_tabular=True,
+        )
+    )
     TSV = MimeType.define(
         MimeType("TSV", "text/tab-separated-values", extensions=("tsv",), is_tabular=True)
     )

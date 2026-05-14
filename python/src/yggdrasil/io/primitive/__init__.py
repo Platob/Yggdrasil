@@ -21,8 +21,10 @@ from .csv_io import CsvIO
 from .json_io import JsonIO
 from .ndjson_io import NDJsonIO
 from .xlsx_io import XlsxIO
+from .form_urlencoded_io import FormUrlencodedIO
 
 __all__ = [
     'ArrowIPCIO',
     'ParquetIO', 'CsvIO', 'JsonIO', 'NDJsonIO', 'XlsxIO',
+    'FormUrlencodedIO',
 ]
