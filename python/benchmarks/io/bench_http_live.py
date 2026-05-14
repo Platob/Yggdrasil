@@ -123,7 +123,10 @@ class _BenchHandler(BaseHTTPRequestHandler):
         self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     def _serve(self, path: str) -> None:
-        key = path.strip("/").split("/", 1)[0]
+        # Drop the query — cache MISS scenarios append ``?probe=N`` to
+        # force a fresh URL identity per call. Without the strip those
+        # paths would 404 because the query slips into the key match.
+        key = path.split("?", 1)[0].strip("/").split("/", 1)[0]
         payload = PAYLOADS.get(key)
         if payload is None:
             self.send_response(404)
@@ -250,6 +253,46 @@ def _send_many_scenarios(base_url: str, repeat: int) -> list[dict]:
         _batch_get_tiny,
         repeat=repeat, inner=20,
     ))
+
+    # send_many through a populated local cache — exercises the
+    # staged pipeline's hot path (the snapshot loop above stage 1,
+    # the single-pass classification in _split_remote_cache, the
+    # ResponseBatch flatten). Distinct URLs so the cache reads N
+    # different rows per call rather than one row N times — that
+    # surfaces the per-request resolution cost more honestly.
+    cache_n = 128
+    tmp_cache_many = tempfile.mkdtemp(prefix="ygg-bench-many-cache-")
+    try:
+        from yggdrasil.io.send_config import CacheConfig
+
+        cfg_many = CacheConfig(path=tmp_cache_many)
+        cache_reqs = [
+            PreparedRequest.prepare("GET", f"{base_url}/tiny?x={i}")
+            for i in range(cache_n)
+        ]
+        # Seed by sending each request once; the session writes them
+        # to the cache. The ``time.sleep`` drains the fire-and-forget
+        # writer jobs so the warm pass below finds every entry.
+        for r in cache_reqs:
+            sess.send(r, local_cache=cfg_many, raise_error=False)
+        time.sleep(0.5)
+
+        def _send_many_cache_hits():
+            return list(sess.send_many(
+                iter(cache_reqs),
+                local_cache=cfg_many,
+                batch_size=cache_n,
+                raise_error=False,
+            ))
+
+        out.append(_time_one(
+            f"HTTPSession.send_many local-cache HITs (n={cache_n})",
+            _send_many_cache_hits,
+            repeat=repeat, inner=5,
+        ))
+    finally:
+        shutil.rmtree(tmp_cache_many, ignore_errors=True)
+
     return out
 
 

@@ -979,6 +979,8 @@ class Session(ABC):
         self,
         batch: list[PreparedRequest],
         session_local_cfg: CacheConfig,
+        *,
+        key_to_local_cfg: Optional[Mapping[int, CacheConfig]] = None,
     ) -> tuple[dict[str, list[Response]], list[PreparedRequest]]:
         """Stage 1: scan the local cache.
 
@@ -994,6 +996,12 @@ class Session(ABC):
         the default ``~/.yggdrasil/cache/response`` suffix — so the
         per-config split survives all the way to
         :class:`ResponseBatch.local_hits`.
+
+        ``key_to_local_cfg`` is the per-request effective-config map
+        :meth:`_send_many_batches` builds once at the top of a chunk.
+        When passed, the per-request resolution short-circuits to a
+        dict lookup; otherwise we resolve on the fly (used by callers
+        that don't precompute, e.g. unit tests).
         """
         hits: dict[str, list[Response]] = {}
         misses: list[PreparedRequest] = []
@@ -1005,7 +1013,11 @@ class Session(ABC):
             return hits, list(batch)
 
         for req in batch:
-            eff = self._effective_local_cfg(req, session_local_cfg)
+            eff = (
+                key_to_local_cfg.get(req.public_url_hash)
+                if key_to_local_cfg is not None
+                else None
+            ) or self._effective_local_cfg(req, session_local_cfg)
             if not eff.local_cache_enabled or eff.mode == Mode.UPSERT:
                 misses.append(req)
                 continue
@@ -1029,6 +1041,7 @@ class Session(ABC):
         session_remote_cfg: CacheConfig,
         *,
         spark_session: Optional["SparkSession"] = None,
+        key_to_remote_cfg: Optional[Mapping[int, CacheConfig]] = None,
     ) -> tuple[dict[str, list[Response]], list[PreparedRequest]]:
         """Stage 2: scan the remote cache.
 
@@ -1041,30 +1054,39 @@ class Session(ABC):
         :class:`ResponseBatch` can preserve which table answered which
         subset of the batch — collapsing them back into one bucket
         would lose that provenance.
-        """
-        hits: dict[str, list[Response]] = {}
-        # UPSERT is unconditional miss.
-        upsert_reqs = [
-            r for r in requests
-            if self._effective_remote_cfg(r, session_remote_cfg).mode == Mode.UPSERT
-        ]
-        misses: list[PreparedRequest] = list(upsert_reqs)
 
-        # Group APPEND-mode requests by effective table.
+        ``key_to_remote_cfg`` is the per-request effective-config map
+        precomputed by :meth:`_send_many_batches` so we don't pay a
+        per-request override resolution twice (snapshot + this stage);
+        absent, we resolve on the fly.
+        """
+        # Single-pass classify: UPSERT → miss, APPEND with remote cache
+        # → bucket by table, anything else → miss. Replaces a previous
+        # O(N^2) shape that built ``upsert_reqs`` and then re-walked
+        # ``requests`` with ``if req in upsert_reqs`` per element.
+        hits: dict[str, list[Response]] = {}
+        misses: list[PreparedRequest] = []
         table_to_cfg: dict[str, CacheConfig] = {}
         table_to_reqs: dict[str, list[PreparedRequest]] = {}
+
         for req in requests:
-            if req in upsert_reqs:
+            t_cfg = (
+                key_to_remote_cfg.get(req.public_url_hash)
+                if key_to_remote_cfg is not None
+                else None
+            ) or self._effective_remote_cfg(req, session_remote_cfg)
+            if t_cfg.mode == Mode.UPSERT:
+                misses.append(req)
                 continue
-            t_cfg = self._effective_remote_cfg(req, session_remote_cfg)
             if not t_cfg.remote_cache_enabled or t_cfg.mode != Mode.APPEND:
                 misses.append(req)
                 continue
             tkey = t_cfg.tabular.full_name(safe=True)
-            if tkey not in table_to_cfg:
+            bucket = table_to_reqs.get(tkey)
+            if bucket is None:
                 table_to_cfg[tkey] = t_cfg
-                table_to_reqs[tkey] = []
-            table_to_reqs[tkey].append(req)
+                table_to_reqs[tkey] = bucket = []
+            bucket.append(req)
 
         total_hits = 0
         for tkey, t_reqs in table_to_reqs.items():
@@ -1197,6 +1219,7 @@ class Session(ABC):
         requests: list[PreparedRequest],
         session_remote_cfg: CacheConfig,
         *,
+        key_to_remote_cfg: Optional[Mapping[int, CacheConfig]] = None,
         spark: "SparkSession",
     ) -> tuple[dict[str, "SparkDataFrame"], list[PreparedRequest]]:
         """Spark variant of :meth:`_split_remote_cache`.
@@ -1210,26 +1233,28 @@ class Session(ABC):
         because the driver needs concrete request objects to scatter
         through stage 3.
         """
-        upsert_reqs = [
-            r for r in requests
-            if self._effective_remote_cfg(r, session_remote_cfg).mode == Mode.UPSERT
-        ]
-        misses: list[PreparedRequest] = list(upsert_reqs)
-
+        # Single-pass classify mirrors :meth:`_split_remote_cache`.
+        misses: list[PreparedRequest] = []
         table_to_cfg: dict[str, CacheConfig] = {}
         table_to_reqs: dict[str, list[PreparedRequest]] = {}
         for req in requests:
-            if req in upsert_reqs:
+            t_cfg = (
+                key_to_remote_cfg.get(req.public_url_hash)
+                if key_to_remote_cfg is not None
+                else None
+            ) or self._effective_remote_cfg(req, session_remote_cfg)
+            if t_cfg.mode == Mode.UPSERT:
+                misses.append(req)
                 continue
-            t_cfg = self._effective_remote_cfg(req, session_remote_cfg)
             if not t_cfg.remote_cache_enabled or t_cfg.mode != Mode.APPEND:
                 misses.append(req)
                 continue
             tkey = t_cfg.tabular.full_name(safe=True)
-            if tkey not in table_to_cfg:
+            bucket = table_to_reqs.get(tkey)
+            if bucket is None:
                 table_to_cfg[tkey] = t_cfg
-                table_to_reqs[tkey] = []
-            table_to_reqs[tkey].append(req)
+                table_to_reqs[tkey] = bucket = []
+            bucket.append(req)
 
         hits_by_table: dict[str, "SparkDataFrame"] = {}
         for tkey, t_reqs in table_to_reqs.items():
@@ -1807,9 +1832,28 @@ class Session(ABC):
             if not chunk:
                 continue
 
+            # Snapshot per-request effective configs BEFORE stage 1 so
+            # every downstream stage (split_local_cache, split_remote_cache,
+            # _persist_remote, _backfill_local_cache,
+            # _mirror_local_hits_to_remote) reads from the same map
+            # instead of calling :meth:`_effective_local_cfg` /
+            # :meth:`_effective_remote_cfg` per request per stage.
+            # Keyed by ``PreparedRequest.public_url_hash`` — a cached
+            # xxh3_64 of ``(method, url.anonymize('remove'))`` — so
+            # the snapshot survives the ``request.copy(...)`` scatter
+            # in :meth:`_fetch_misses`. Building it once up front is
+            # also what kills the old O(N^2) ``if req in upsert_reqs``
+            # shape in stage 2 — every request resolves exactly once.
+            key_to_remote_cfg: dict[int, CacheConfig] = {}
+            key_to_local_cfg: dict[int, CacheConfig] = {}
+            for r in chunk:
+                k = r.public_url_hash
+                key_to_remote_cfg[k] = self._effective_remote_cfg(r, session_remote_cfg)
+                key_to_local_cfg[k] = self._effective_local_cfg(r, session_local_cfg)
+
             # --- Stage 1: local cache ---
             local_hits_by_path, after_local = self._split_local_cache(
-                chunk, session_local_cfg,
+                chunk, session_local_cfg, key_to_local_cfg=key_to_local_cfg,
             )
             # On the spark path, lift each path's responses to its own
             # Spark frame so every bucket downstream is frame-resident
@@ -1836,27 +1880,6 @@ class Session(ABC):
             # schema-bearing empty holder (Spark or Arrow depending on
             # mode) — no special-case for "stage skipped".
             new_hits: "list[Response] | SparkDataFrame | None" = None
-
-            # Snapshot per-request effective configs BEFORE we mutate copies
-            # for the worker pool. Keyed by ``PreparedRequest.public_url_hash``
-            # — a cached xxh3_64 of ``(method, url.anonymize('remove'))`` —
-            # so the per-request key build collapses from a full
-            # ``anonymize()`` rebuild (~70 us / request, allocates a fresh
-            # :class:`PreparedRequest`) to one cached attribute read. The
-            # hash is stable across the ``request.copy(...)`` worker scatter
-            # in :meth:`_fetch_misses`, so :meth:`_persist_remote` /
-            # :meth:`_mirror_local_hits_to_remote` /
-            # :meth:`_backfill_local_cache` resolve responses back to their
-            # originating request's effective config with the same key.
-            # We cover the *whole* chunk (not just ``after_local``) so the
-            # local-hit mirror below can resolve per-request remote configs
-            # for responses that never reached stage 2.
-            key_to_remote_cfg: dict[int, CacheConfig] = {}
-            key_to_local_cfg: dict[int, CacheConfig] = {}
-            for r in chunk:
-                k = r.public_url_hash
-                key_to_remote_cfg[k] = self._effective_remote_cfg(r, session_remote_cfg)
-                key_to_local_cfg[k] = self._effective_local_cfg(r, session_local_cfg)
 
             if not after_local:
                 # Even when every request is a local hit we may still
@@ -1888,6 +1911,7 @@ class Session(ABC):
                     after_local,
                     session_remote_cfg,
                     spark=spark,
+                    key_to_remote_cfg=key_to_remote_cfg,
                 )
                 # Local-cache backfill from a Spark frame would force a
                 # toLocalIterator on the driver — skip it on the spark
@@ -1899,6 +1923,7 @@ class Session(ABC):
                     after_local,
                     session_remote_cfg,
                     spark_session=spark,
+                    key_to_remote_cfg=key_to_remote_cfg,
                 )
                 # Backfill local cache with remote hits using each request's
                 # effective local config — not the session-level fallback.
