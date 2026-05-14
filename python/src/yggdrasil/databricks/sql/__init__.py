@@ -1,15 +1,14 @@
 """Databricks SQL helpers and engine wrappers."""
 
-from .catalog import Catalog
-from .catalogs import Catalogs
-from .column import Column
-from .columns import Columns
-from .engine import SQLEngine
 from .exceptions import SQLError
-from .schema import Schema
-from .schemas import Schemas
 from .sql_utils import *
-from .table import Table
-from .tables import Tables
-from .view import View
-from .views import Views
+
+
+def __getattr__(name):
+    # ``SQLEngine`` is loaded lazily to avoid a circular import: engine.py
+    # imports the Unity Catalog subpackages (catalog/schema/table/...), which
+    # themselves pull sql_utils from this package's namespace.
+    if name == "SQLEngine":
+        from .engine import SQLEngine as _SQLEngine
+        return _SQLEngine
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

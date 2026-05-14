@@ -194,13 +194,13 @@ def _resolve_databricks_subclass(
     if scheme == Scheme.DATABRICKS_DBFS.value:
         return DBFSPath, candidate
     if scheme == Scheme.DATABRICKS_TABLE.value:
-        # :class:`Table` lives in ``yggdrasil.databricks.sql.table``
+        # :class:`Table` lives in ``yggdrasil.databricks.table.table``
         # and is *not* a :class:`DatabricksPath` subclass — it's a
         # logical Unity Catalog resource on the same ``dbfs+...``
         # family. The dispatcher still surfaces it here so callers
         # that go through ``DatabricksPath(...)`` don't have to know
         # the SQL module exists.
-        from yggdrasil.databricks.sql.table import Table
+        from yggdrasil.databricks.table.table import Table
         return Table, candidate
 
     # Unknown scheme (or empty) — let the caller's intended class
@@ -367,7 +367,7 @@ class DatabricksPath(RemotePath):
           scheme alone.
         - ``dbfs+table://[creds@]host/<cat>/<sch>/<tbl>?…`` — Unity
           Catalog logical table; dispatches to
-          :class:`yggdrasil.databricks.sql.table.Table` (not a
+          :class:`yggdrasil.databricks.table.table.Table` (not a
           :class:`DatabricksPath`, but on the same scheme family).
         - ``dbfs://`` — un-qualified family URL. Dispatched by the
           URL path's leading namespace: ``/Volumes/...`` →

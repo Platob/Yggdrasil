@@ -64,11 +64,11 @@ from typing import Callable
 from unittest.mock import MagicMock
 
 from yggdrasil.databricks.client import DatabricksClient
-from yggdrasil.databricks.sql.catalogs import Catalogs
-from yggdrasil.databricks.sql.columns import Columns
-from yggdrasil.databricks.sql.schemas import Schemas
-from yggdrasil.databricks.sql.table import Table
-from yggdrasil.databricks.sql.tables import Tables
+from yggdrasil.databricks.catalog.catalogs import Catalogs
+from yggdrasil.databricks.column.columns import Columns
+from yggdrasil.databricks.schema.schemas import Schemas
+from yggdrasil.databricks.table.table import Table
+from yggdrasil.databricks.table.tables import Tables
 from yggdrasil.databricks.sql.sql_utils import (
     quote_ident,
     quote_qualified_ident,

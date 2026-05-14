@@ -17,7 +17,7 @@ handles a given call and delegates statement preparation to
 Insert paths
 ------------
 The DML write logic (arrow / spark / sql) lives on :class:`Table`
-(see :mod:`yggdrasil.databricks.sql.table`).  The engine's
+(see :mod:`yggdrasil.databricks.table.table`).  The engine's
 :meth:`insert_into` / :meth:`arrow_insert_into` /
 :meth:`spark_insert_into` / :meth:`sql_insert_into` resolve a target
 :class:`Table` from the caller's parameters and forward to the matching
@@ -63,10 +63,10 @@ from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
 from yggdrasil.data.enums import Mode
 from yggdrasil.spark.executor import SparkStatementExecutor
 from yggdrasil.spark.statement import SparkPreparedStatement, SparkStatementResult
-from .catalogs import Catalogs
-from .schemas import Schemas
-from .table import Table
-from .tables import Tables
+from yggdrasil.databricks.catalog.catalogs import Catalogs
+from yggdrasil.databricks.schema.schemas import Schemas
+from yggdrasil.databricks.table.table import Table
+from yggdrasil.databricks.table.tables import Tables
 from ..client import DatabricksService
 
 logger = logging.getLogger(__name__)

@@ -3,8 +3,8 @@ Collection-level service for Unity Catalog catalogs and schemas.
 
 Provides ``__getitem__``, ``catalog()``, ``schema()``, ``table()``, and
 ``list()`` against the Databricks catalog API.  Per-resource DDL/DML lives in
-:class:`~yggdrasil.databricks.sql.catalog.Catalog` and
-:class:`~yggdrasil.databricks.sql.schema.Schema`.
+:class:`~yggdrasil.databricks.catalog.catalog.Catalog` and
+:class:`~yggdrasil.databricks.schema.schema.Schema`.
 
 Hierarchy
 ---------
@@ -35,11 +35,11 @@ from databricks.sdk.service.catalog import CatalogInfo
 from yggdrasil.databricks.client import DatabricksService
 from yggdrasil.dataclasses.expiring import ExpiringDict
 
-from .catalog import Catalog
-from .column import Column
-from .schema import Schema
-from .sql_utils import name_matcher
-from .table import Table
+from yggdrasil.databricks.catalog.catalog import Catalog
+from yggdrasil.databricks.column.column import Column
+from yggdrasil.databricks.schema.schema import Schema
+from yggdrasil.databricks.sql.sql_utils import name_matcher
+from yggdrasil.databricks.table.table import Table
 
 __all__ = ["Catalogs"]
 

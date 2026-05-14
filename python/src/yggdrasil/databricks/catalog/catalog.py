@@ -3,7 +3,7 @@ Per-catalog resource: lifecycle, navigation, and tag helpers.
 
 The :class:`Catalog` dataclass wraps a single Unity Catalog catalog and
 exposes instance-level methods only.  Collection operations live in
-:mod:`~yggdrasil.databricks.sql.catalogs`.
+:mod:`~yggdrasil.databricks.catalog.catalogs`.
 
 Hierarchy navigation
 --------------------
@@ -38,12 +38,12 @@ from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io import URL
 from yggdrasil.data.enums.mode import ModeLike
 
-from .sql_utils import DEFAULT_TAG_COLLATION, databricks_tag_literal, quote_ident
+from yggdrasil.databricks.sql.sql_utils import DEFAULT_TAG_COLLATION, databricks_tag_literal, quote_ident
 
 if TYPE_CHECKING:
-    from .catalogs import Catalogs
-    from .schema import Schema
-    from .table import Table
+    from yggdrasil.databricks.catalog.catalogs import Catalogs
+    from yggdrasil.databricks.schema.schema import Schema
+    from yggdrasil.databricks.table.table import Table
 
 __all__ = ["Catalog"]
 
@@ -187,7 +187,7 @@ class Catalog(DatabricksResource):
         Args:
             name: Schema name (unqualified).
         """
-        from .schema import Schema as _Schema
+        from yggdrasil.databricks.schema.schema import Schema as _Schema
         return _Schema(
             service=self.service,
             catalog_name=self.catalog_name,
@@ -196,7 +196,7 @@ class Catalog(DatabricksResource):
 
     def schemas(self) -> Iterator["Schema"]:
         """Iterate over every schema in this catalog (single API call)."""
-        from .schema import Schema as _Schema
+        from yggdrasil.databricks.schema.schema import Schema as _Schema
         for info in self.client.workspace_client().schemas.list(catalog_name=self.catalog_name):
             s = _Schema(
                 service=self.service,

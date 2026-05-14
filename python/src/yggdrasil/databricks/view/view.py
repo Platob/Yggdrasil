@@ -3,7 +3,7 @@ Per-view resource: DDL, schema introspection and grant helpers.
 
 The :class:`View` dataclass wraps a single Unity Catalog view and exposes
 instance-level methods only.  Collection operations (``find_view``,
-``list_views``) live in :mod:`~yggdrasil.databricks.sql.views`.
+``list_views``) live in :mod:`~yggdrasil.databricks.view.views`.
 
 In Unity Catalog, views are stored in the same ``tables`` API as tables and
 are distinguished by ``table_type`` (``VIEW``, ``MATERIALIZED_VIEW``, or
@@ -35,8 +35,8 @@ from yggdrasil.databricks.client import DatabricksResource
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io import URL
 from yggdrasil.data.enums.mode import ModeLike, Mode
-from .column import Column
-from .sql_utils import (
+from yggdrasil.databricks.column.column import Column
+from yggdrasil.databricks.sql.sql_utils import (
     DEFAULT_TAG_COLLATION,
     _safe_str,
     databricks_tag_literal,
@@ -48,10 +48,10 @@ from .sql_utils import (
 if TYPE_CHECKING:
     from yggdrasil.data.types import DataType
 
-    from .catalog import Catalog
-    from .engine import SQLEngine
-    from .schema import Schema as UCSchema
-    from .table import Table
+    from yggdrasil.databricks.catalog.catalog import Catalog
+    from yggdrasil.databricks.sql.engine import SQLEngine
+    from yggdrasil.databricks.schema.schema import Schema as UCSchema
+    from yggdrasil.databricks.table.table import Table
     from .views import Views
 
 __all__ = ["View"]
@@ -211,8 +211,8 @@ class View(DatabricksResource):
 
     @property
     def catalog(self) -> "Catalog":
-        from .catalog import Catalog as _Catalog
-        from .catalogs import Catalogs
+        from yggdrasil.databricks.catalog.catalog import Catalog as _Catalog
+        from yggdrasil.databricks.catalog.catalogs import Catalogs
         return _Catalog(
             service=Catalogs(client=self.client),
             catalog_name=self.catalog_name,
@@ -220,8 +220,8 @@ class View(DatabricksResource):
 
     @property
     def schema(self) -> "UCSchema":
-        from .schema import Schema as _Schema
-        from .catalogs import Catalogs
+        from yggdrasil.databricks.schema.schema import Schema as _Schema
+        from yggdrasil.databricks.catalog.catalogs import Catalogs
         return _Schema(
             service=Catalogs(client=self.client),
             catalog_name=self.catalog_name,

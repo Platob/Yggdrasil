@@ -3,7 +3,7 @@ Per-table resource: DDL, DML, schema introspection and storage helpers.
 
 The :class:`Table` dataclass wraps a single Unity Catalog table and exposes
 instance-level methods only.  Collection operations (``find_table``,
-``list_tables``) live in :mod:`~yggdrasil.databricks.sql.tables`.
+``list_tables``) live in :mod:`~yggdrasil.databricks.table.tables`.
 
 Caching strategy
 ----------------
@@ -60,8 +60,8 @@ from yggdrasil.io.primitive import ParquetIO
 from yggdrasil.io.tabular import Tabular, O, ArrowTabular
 from yggdrasil.io.tabular.execution.expr import Predicate, col as expr_col
 from yggdrasil.io.tabular.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
-from .column import Column
-from .sql_utils import (
+from yggdrasil.databricks.column.column import Column
+from yggdrasil.databricks.sql.sql_utils import (
     quote_ident,
     quote_qualified_ident,
     safe_table_name,
@@ -75,10 +75,10 @@ if TYPE_CHECKING:
     import pyspark
     from pyspark.sql import SparkSession, DataFrame as SparkDataFrame
     from yggdrasil.databricks.sql.engine import SQLEngine
-    from yggdrasil.databricks.sql.tables import Tables
-    from yggdrasil.databricks.sql.catalog import Catalog
-    from yggdrasil.databricks.sql.columns import Columns
-    from yggdrasil.databricks.sql.schema import Schema as UCSchema
+    from yggdrasil.databricks.table.tables import Tables
+    from yggdrasil.databricks.catalog.catalog import Catalog
+    from yggdrasil.databricks.column.columns import Columns
+    from yggdrasil.databricks.schema.schema import Schema as UCSchema
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
     from yggdrasil.databricks.warehouse import WarehousePreparedStatement
@@ -1469,8 +1469,8 @@ class Table(DatabricksResource, Holder):
     
     @property
     def catalog(self) -> "Catalog":
-        from .catalog import Catalog as _Catalog
-        from .catalogs import Catalogs
+        from yggdrasil.databricks.catalog.catalog import Catalog as _Catalog
+        from yggdrasil.databricks.catalog.catalogs import Catalogs
         return _Catalog(
             service=Catalogs(client=self.client),
             catalog_name=self.catalog_name,
@@ -1478,8 +1478,8 @@ class Table(DatabricksResource, Holder):
 
     @property
     def schema(self) -> "UCSchema":
-        from .schema import Schema as _Schema
-        from .catalogs import Catalogs
+        from yggdrasil.databricks.schema.schema import Schema as _Schema
+        from yggdrasil.databricks.catalog.catalogs import Catalogs
         return _Schema(
             service=Catalogs(client=self.client),
             catalog_name=self.catalog_name,
@@ -1786,7 +1786,7 @@ class Table(DatabricksResource, Holder):
 
     def _columns_service(self) -> "Columns":
         """Columns service scoped to this table's catalog/schema/table defaults."""
-        from .columns import Columns
+        from yggdrasil.databricks.column.columns import Columns
 
         return Columns(
             client=self.client,

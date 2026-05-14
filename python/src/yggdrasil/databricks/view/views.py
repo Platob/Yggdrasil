@@ -2,7 +2,7 @@
 Collection-level service for Unity Catalog views.
 
 Provides ``find_view`` and ``list_views`` against the Databricks catalog API.
-Per-view DDL lives in :class:`~yggdrasil.databricks.sql.view.View`.
+Per-view DDL lives in :class:`~yggdrasil.databricks.view.view.View`.
 
 Unity Catalog stores views in the same ``tables`` endpoint as regular tables;
 they are identified by ``table_type`` ∈ ``{VIEW, MATERIALIZED_VIEW,
@@ -38,10 +38,10 @@ from yggdrasil.data.enums.mode import Mode, ModeLike
 from .view import View
 
 if TYPE_CHECKING:
-    from .catalog import Catalog
-    from .column import Column
-    from .schema import Schema
-    from .table import Table
+    from yggdrasil.databricks.catalog.catalog import Catalog
+    from yggdrasil.databricks.column.column import Column
+    from yggdrasil.databricks.schema.schema import Schema
+    from yggdrasil.databricks.table.table import Table
 
 __all__ = ["Views"]
 
@@ -250,8 +250,8 @@ class Views(DatabricksService):
         )
 
     def catalog(self, name: str | None = None) -> "Catalog":
-        from .catalog import Catalog as _Catalog
-        from .catalogs import Catalogs
+        from yggdrasil.databricks.catalog.catalog import Catalog as _Catalog
+        from yggdrasil.databricks.catalog.catalogs import Catalogs
         return _Catalog(
             service=Catalogs(client=self.client),
             catalog_name=name or self.catalog_name,
@@ -264,8 +264,8 @@ class Views(DatabricksService):
         catalog_name: str | None = None,
         schema_name: str | None = None,
     ) -> "Schema":
-        from .schema import Schema as _Schema
-        from .catalogs import Catalogs
+        from yggdrasil.databricks.schema.schema import Schema as _Schema
+        from yggdrasil.databricks.catalog.catalogs import Catalogs
 
         if name and "." in name:
             parts = [p.strip().strip("`") for p in name.split(".", 1)]
@@ -474,7 +474,7 @@ class Views(DatabricksService):
         )
 
         if catalog_name is None or is_glob_pattern(catalog_name):
-            from .catalogs import Catalogs
+            from yggdrasil.databricks.catalog.catalogs import Catalogs
 
             for catalog in Catalogs(client=self.client).list_catalogs(name=catalog_name):
                 yield from self.list_views(

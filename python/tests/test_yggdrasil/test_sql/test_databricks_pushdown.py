@@ -1,6 +1,6 @@
 """Tests for the Databricks whole-query pushdown adapter.
 
-The real :class:`yggdrasil.databricks.sql.table.Table` requires the
+The real :class:`yggdrasil.databricks.table.table.Table` requires the
 Databricks SDK. To avoid pulling that in for unit tests we forge a
 duck-typed stand-in whose class name + module path match the
 identity check in :func:`yggdrasil.sql.databricks_pushdown.is_databricks_table`.
@@ -76,7 +76,7 @@ def _make_fake_table_class():
     """Build a class whose module + qualname match the real one.
 
     :func:`is_databricks_table` accepts any class whose
-    ``__module__`` is ``yggdrasil.databricks.sql.table`` and whose
+    ``__module__`` is ``yggdrasil.databricks.table.table`` and whose
     ``__name__`` is ``Table`` — it never reaches into
     ``sys.modules[...]`` to compare identity. So we forge a class with
     those two attributes and don't touch the real module's ``Table``
@@ -96,7 +96,7 @@ def _make_fake_table_class():
 
     import importlib
 
-    mod_path = "yggdrasil.databricks.sql.table"
+    mod_path = "yggdrasil.databricks.table.table"
     parts = mod_path.split(".")
     for i in range(1, len(parts)):
         sub = ".".join(parts[: i + 1])
@@ -114,7 +114,7 @@ def _make_fake_table_class():
         sys.modules[sub] = mod
 
     class Table(ArrowTabular):
-        """Fake :class:`yggdrasil.databricks.sql.table.Table` stand-in."""
+        """Fake :class:`yggdrasil.databricks.table.table.Table` stand-in."""
 
         def __init__(
             self,

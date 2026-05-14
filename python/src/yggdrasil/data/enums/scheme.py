@@ -68,7 +68,7 @@ _PATH_CLASS_TARGETS: dict[str, tuple[str, str]] = {
     "dbfs+dbfs":      ("yggdrasil.databricks.fs.dbfs_path", "DBFSPath"),
     "dbfs+volume":    ("yggdrasil.databricks.fs.volume_path", "VolumePath"),
     "dbfs+workspace": ("yggdrasil.databricks.fs.workspace_path", "WorkspacePath"),
-    "dbfs+table":     ("yggdrasil.databricks.sql.table", "Table"),
+    "dbfs+table":     ("yggdrasil.databricks.table.table", "Table"),
     "s3":             ("yggdrasil.aws.fs.path", "S3Path"),
     "http":           ("yggdrasil.io.http_.path", "HTTPPath"),
     "https":          ("yggdrasil.io.http_.path", "HTTPPath"),

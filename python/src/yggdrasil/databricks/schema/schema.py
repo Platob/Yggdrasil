@@ -3,7 +3,7 @@ Per-schema resource: lifecycle, table navigation, and tag helpers.
 
 The :class:`Schema` dataclass wraps a single Unity Catalog schema and exposes
 instance-level methods only.  Collection operations live in
-:mod:`~yggdrasil.databricks.sql.catalogs`.
+:mod:`~yggdrasil.databricks.catalog.catalogs`.
 
 Hierarchy navigation
 --------------------
@@ -43,12 +43,12 @@ from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io import URL
 from yggdrasil.data.enums.mode import ModeLike
 
-from .sql_utils import DEFAULT_TAG_COLLATION, databricks_tag_literal
+from yggdrasil.databricks.sql.sql_utils import DEFAULT_TAG_COLLATION, databricks_tag_literal
 
 if TYPE_CHECKING:
-    from .schemas import Schemas
-    from .catalog import Catalog
-    from .table import Table
+    from yggdrasil.databricks.schema.schemas import Schemas
+    from yggdrasil.databricks.catalog.catalog import Catalog
+    from yggdrasil.databricks.table.table import Table
 
 __all__ = ["Schema"]
 
@@ -246,7 +246,7 @@ class Schema(DatabricksResource):
     @property
     def catalog(self) -> "Catalog":
         """Navigate up to the parent :class:`Catalog`."""
-        from .catalog import Catalog as _Catalog
+        from yggdrasil.databricks.catalog.catalog import Catalog as _Catalog
         return _Catalog(service=self.service, catalog_name=self.catalog_name)
 
     def table(self, name: str) -> "Table":

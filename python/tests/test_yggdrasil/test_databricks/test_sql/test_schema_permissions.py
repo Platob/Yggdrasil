@@ -13,7 +13,7 @@ from databricks.sdk.service.catalog import (
     SecurableType,
 )
 
-from yggdrasil.databricks.sql.schema import Schema, _normalize_privileges
+from yggdrasil.databricks.schema.schema import Schema, _normalize_privileges
 
 
 @pytest.fixture

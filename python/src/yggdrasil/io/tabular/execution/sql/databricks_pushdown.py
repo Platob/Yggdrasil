@@ -1,7 +1,7 @@
 """Whole-query pushdown into a Databricks SQL warehouse.
 
 When every source the SQL touches resolves to a
-:class:`yggdrasil.databricks.sql.table.Table` (and they all share one
+:class:`yggdrasil.databricks.table.table.Table` (and they all share one
 :class:`DatabricksClient`), it's almost always faster to ship the
 SQL straight to the warehouse than to pull batches over the wire and
 re-do joins / aggregates in pyarrow on the driver. This module
@@ -31,7 +31,7 @@ Returns ``None`` when:
 Why duck-typed instead of ``isinstance(t, Table)``
 --------------------------------------------------
 
-Importing :mod:`yggdrasil.databricks.sql.table` pulls in the
+Importing :mod:`yggdrasil.databricks.table.table` pulls in the
 Databricks SDK and a few transitive dependencies. We don't want a
 plain ``import yggdrasil.io.tabular.execution.sql`` to require any of that on a base
 install. Instead, the dispatcher matches the *class identity*
@@ -57,12 +57,12 @@ if TYPE_CHECKING:
 __all__ = ["try_databricks_pushdown", "is_databricks_table"]
 
 
-_DBR_TABLE_MODULE = "yggdrasil.databricks.sql.table"
+_DBR_TABLE_MODULE = "yggdrasil.databricks.table.table"
 _DBR_TABLE_CLASSNAME = "Table"
 
 
 def is_databricks_table(obj: Any) -> bool:
-    """Duck-type check for a :class:`yggdrasil.databricks.sql.table.Table`.
+    """Duck-type check for a :class:`yggdrasil.databricks.table.table.Table`.
 
     Uses class identity (module + qualname) so we don't have to
     import the Databricks SDK on a base install. Subclasses are

@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from yggdrasil.databricks.fs import VolumePath
-from yggdrasil.databricks.sql.table import Table
+from yggdrasil.databricks.table.table import Table
 
 
 # ---------------------------------------------------------------------------

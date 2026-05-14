@@ -42,7 +42,7 @@ from yggdrasil.data.data_field import Field
 from yggdrasil.databricks.client import DatabricksService
 
 if TYPE_CHECKING:
-    from yggdrasil.databricks.sql.table import Table
+    from yggdrasil.databricks.table.table import Table
 
 __all__ = ["TableConstraints"]
 

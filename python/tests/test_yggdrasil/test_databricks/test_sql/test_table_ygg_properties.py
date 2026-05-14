@@ -15,7 +15,7 @@ from databricks.sdk.service.catalog import DataSourceFormat, TableType
 
 from yggdrasil.data.enums import MimeTypes
 from yggdrasil.data.schema import Schema, field
-from yggdrasil.databricks.sql.table import (
+from yggdrasil.databricks.table.table import (
     YGG_PROPERTY_PREFIX,
     YGG_SCHEMA_FIELD_PREFIX,
     YGG_SCHEMA_FIELD_SUFFIX,

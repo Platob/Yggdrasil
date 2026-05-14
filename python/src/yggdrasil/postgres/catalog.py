@@ -3,7 +3,7 @@
 Postgres calls the top-level container a *database*. SQL-standard
 parlance — and the rest of yggdrasil — calls it a *catalog*. We
 keep the yggdrasil naming so the cross-backend API stays uniform
-with :mod:`yggdrasil.databricks.sql.catalog`, but every DDL emitted
+with :mod:`yggdrasil.databricks.catalog.catalog`, but every DDL emitted
 here is the Postgres ``DATABASE`` form.
 
 Cross-database queries
