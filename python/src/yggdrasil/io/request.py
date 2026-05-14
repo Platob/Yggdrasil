@@ -25,6 +25,8 @@ from .memory import Memory
 from .url import URL, URL_STRUCT
 
 if TYPE_CHECKING:
+    from yggdrasil.data.enums import Mode
+
     from .response import Response
     from .send_config import CacheConfig, SendConfig
     from .session import Session
@@ -378,6 +380,64 @@ class PreparedRequest:
         immutable-ish, so the underlying field is read-only).
         """
         return self._sender
+
+    @property
+    def mode(self) -> "Mode | None":
+        """Effective cache :class:`Mode` for this request, or ``None``.
+
+        Prefers an explicit override set via the :attr:`mode` setter
+        (stashed on ``_mode``) — that's the value cache-aware sessions
+        (:class:`~yggdrasil.databricks.schema.SchemaSession`) should
+        propagate into any session-injected :class:`CacheConfig`.
+        Falls back to whichever of :attr:`remote_cache_config` /
+        :attr:`local_cache_config` is set, so reads stay consistent
+        whether the caller assigned ``mode`` directly or built the
+        cache config by hand.
+        """
+        stashed = getattr(self, "_mode", None)
+        if stashed is not None:
+            return stashed
+        for cfg in (self.remote_cache_config, self.local_cache_config):
+            if cfg is not None:
+                return cfg.mode
+        return None
+
+    @mode.setter
+    def mode(self, value: "Mode | str | int | None") -> None:
+        """Set the cache :class:`Mode` for this request.
+
+        Convenience knob for per-request cache disposition: callers can
+        build a request, then flip the mode without rebuilding the
+        :class:`CacheConfig` themselves. The setter
+
+        1. records the requested mode on the request (so a cache-aware
+           session that hasn't injected a :class:`CacheConfig` yet still
+           sees the override when it builds one);
+        2. rebuilds whichever of :attr:`local_cache_config` /
+           :attr:`remote_cache_config` is set (both are frozen
+           dataclasses) via their ``merge`` helper so the live configs
+           agree with the new mode.
+
+        Assigning ``None`` clears the override and leaves any attached
+        cache configs untouched (use the ``*_cache_config`` setters
+        directly to drop those).
+        """
+        from yggdrasil.data.enums import Mode as _Mode
+
+        if value is None:
+            self._mode = None
+            return
+        mode = _Mode.from_(value, default=None)
+        if mode is None:
+            raise ValueError(
+                f"PreparedRequest.mode: cannot parse {value!r} as a Mode. "
+                f"Valid values: {[m.name for m in _Mode]}"
+            )
+        self._mode = mode
+        if self.remote_cache_config is not None and self.remote_cache_config.mode != mode:
+            self.remote_cache_config = self.remote_cache_config.merge(mode=mode)
+        if self.local_cache_config is not None and self.local_cache_config.mode != mode:
+            self.local_cache_config = self.local_cache_config.merge(mode=mode)
 
     def with_sender(self, sender: UserInfo | Mapping[str, Any] | None) -> "PreparedRequest":
         """Return a copy of this request with :attr:`sender` replaced.
