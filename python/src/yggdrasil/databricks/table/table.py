@@ -2491,28 +2491,208 @@ class Table(DatabricksResource, Holder):
     # Rename
     # =========================================================================
 
-    def rename(self, new_name: str) -> "Table":
-        new_name = (new_name or "").strip().strip("`")
-        if not new_name:
+    def rename(
+        self,
+        new_name: str | None = None,
+        *,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
+    ) -> "Table":
+        """Rename this table in-place (``ALTER TABLE … RENAME TO …``).
+
+        Accepts an unqualified name (``"new_orders"``), a two-part name
+        (``"sales.new_orders"`` → cross-schema move within the same catalog),
+        or a three-part name (``"main.sales.new_orders"``). Catalog/schema
+        keyword overrides win over parts parsed from *new_name*.
+
+        Unity Catalog allows cross-schema renames within the same catalog;
+        moves across catalogs are rejected here with a clear error rather
+        than letting the server return a generic failure.
+        """
+        if new_name is not None:
+            parsed_c, parsed_s, parsed_t = self.sql.tables.parse_catalog_schema_table_names(new_name)
+        else:
+            parsed_c = parsed_s = parsed_t = None
+
+        target_catalog = (catalog_name or parsed_c or self.catalog_name or "").strip().strip("`")
+        target_schema = (schema_name or parsed_s or self.schema_name or "").strip().strip("`")
+        target_table = (table_name or parsed_t or "").strip().strip("`")
+
+        if not target_table:
             raise ValueError("Cannot rename table to an empty name")
-        if new_name == self.table_name:
+        if not target_catalog or not target_schema:
+            raise ValueError(
+                f"Cannot rename {self.full_name()} — target needs a catalog and"
+                f" schema (got catalog={target_catalog!r} schema={target_schema!r})"
+            )
+        if target_catalog != self.catalog_name:
+            raise ValueError(
+                f"Unity Catalog ALTER TABLE RENAME TO cannot move a table across"
+                f" catalogs ({self.catalog_name!r} → {target_catalog!r}). Use"
+                f" Table.clone(...) to copy across catalogs instead."
+            )
+        if target_schema == self.schema_name and target_table == self.table_name:
             logger.debug(
-                "Table.rename: no-op — new name matches current %r on %s",
-                new_name, self.full_name(),
+                "Table.rename: no-op — new name matches current %s",
+                self.full_name(),
             )
             return self
 
+        if target_schema == self.schema_name:
+            rename_to = quote_ident(target_table)
+        else:
+            rename_to = f"{quote_ident(target_schema)}.{quote_ident(target_table)}"
+
         logger.debug(
             "Table.rename: %s → %s.%s.%s",
-            self.full_name(), self.catalog_name, self.schema_name, new_name,
+            self.full_name(), target_catalog, target_schema, target_table,
         )
         self.sql.execute(
-            f"ALTER TABLE {self.full_name(safe=True)} "
-            f"RENAME TO {quote_ident(new_name)}"
+            f"ALTER TABLE {self.full_name(safe=True)} RENAME TO {rename_to}"
         )
         self._reset_cache(invalidate_cache=True)
-        self.table_name = new_name
+        self.schema_name = target_schema
+        self.table_name = target_table
         return self
+
+    # =========================================================================
+    # Clone
+    # =========================================================================
+
+    def clone(
+        self,
+        target: "str | Table | None" = None,
+        *,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
+        deep: bool = True,
+        replace: bool = False,
+        if_not_exists: bool = False,
+        properties: Mapping[str, Any] | None = None,
+        location: str | None = None,
+        version: int | None = None,
+        timestamp: "str | _dt.datetime | _dt.date | None" = None,
+    ) -> "Table":
+        """Clone this table to *target* via Delta ``CREATE TABLE … CLONE``.
+
+        Emits one of::
+
+            CREATE TABLE [IF NOT EXISTS] <target> [SHALLOW|DEEP] CLONE <source>
+                [TBLPROPERTIES (...)] [LOCATION '...']
+            CREATE OR REPLACE TABLE <target> [SHALLOW|DEEP] CLONE <source> ...
+
+        Args:
+            target:        Target location — :class:`Table`, a 1/2/3-part dotted
+                           name, or ``None`` when *catalog_name* / *schema_name*
+                           / *table_name* are passed explicitly.
+            deep:          ``True`` (default) → DEEP CLONE (independent copy);
+                           ``False`` → SHALLOW CLONE (metadata only, shares files).
+            replace:       Emit ``CREATE OR REPLACE TABLE``.
+            if_not_exists: Emit ``CREATE TABLE IF NOT EXISTS``. Mutually
+                           exclusive with *replace*.
+            properties:    Optional ``TBLPROPERTIES`` overrides.
+            location:      External storage path for the target.
+            version:       Delta source version (``VERSION AS OF``).
+            timestamp:     Delta source timestamp (``TIMESTAMP AS OF``).
+
+        Returns:
+            A :class:`Table` bound to this service pointing at the target.
+        """
+        if replace and if_not_exists:
+            raise ValueError("Use either replace=True or if_not_exists=True, not both.")
+        if version is not None and timestamp is not None:
+            raise ValueError(
+                "Pass either version or timestamp to clone, not both — Delta"
+                " accepts one temporal anchor on the source."
+            )
+
+        tables = self.sql.tables
+        if isinstance(target, Table):
+            target_catalog = target.catalog_name
+            target_schema = target.schema_name
+            target_table = target.table_name
+        else:
+            parsed_c, parsed_s, parsed_t = (
+                tables.parse_catalog_schema_table_names(target) if target else (None, None, None)
+            )
+            target_catalog = catalog_name or parsed_c or self.catalog_name
+            target_schema = schema_name or parsed_s or self.schema_name
+            target_table = table_name or parsed_t
+
+        if not (target_catalog and target_schema and target_table):
+            raise ValueError(
+                f"Cannot clone {self.full_name()} — target needs catalog +"
+                f" schema + table (got catalog={target_catalog!r}"
+                f" schema={target_schema!r} table={target_table!r})"
+            )
+        if (
+            target_catalog == self.catalog_name
+            and target_schema == self.schema_name
+            and target_table == self.table_name
+        ):
+            raise ValueError(
+                f"Cannot clone {self.full_name()} onto itself — choose a"
+                f" different target catalog/schema/table."
+            )
+
+        target_full = (
+            f"{quote_ident(target_catalog)}.{quote_ident(target_schema)}."
+            f"{quote_ident(target_table)}"
+        )
+
+        if replace:
+            create_kw = "CREATE OR REPLACE TABLE"
+        elif if_not_exists:
+            create_kw = "CREATE TABLE IF NOT EXISTS"
+        else:
+            create_kw = "CREATE TABLE"
+
+        source_full = self.full_name(safe=True)
+        if version is not None:
+            source_clause = f"{source_full} VERSION AS OF {int(version)}"
+        elif timestamp is not None:
+            if isinstance(timestamp, (_dt.datetime, _dt.date)):
+                ts_lit = f"'{timestamp.isoformat()}'"
+            else:
+                ts_lit = f"'{escape_sql_string(str(timestamp))}'"
+            source_clause = f"{source_full} TIMESTAMP AS OF {ts_lit}"
+        else:
+            source_clause = source_full
+
+        clone_kw = "DEEP CLONE" if deep else "SHALLOW CLONE"
+        sql_parts: list[str] = [
+            f"{create_kw} {target_full} {clone_kw} {source_clause}",
+        ]
+        if properties:
+            sql_parts.append(
+                "TBLPROPERTIES ("
+                + ", ".join(
+                    f"'{escape_sql_string(str(k))}' = {sql_literal(v)}"
+                    for k, v in properties.items()
+                )
+                + ")"
+            )
+        if location:
+            sql_parts.append(f"LOCATION '{escape_sql_string(location)}'")
+
+        statement = " ".join(sql_parts)
+        logger.debug(
+            "Table.clone: %s → %s.%s.%s deep=%s replace=%s if_not_exists=%s",
+            self.full_name(), target_catalog, target_schema, target_table,
+            deep, replace, if_not_exists,
+        )
+        self.sql.execute(statement)
+
+        cloned = Table(
+            service=tables,
+            catalog_name=target_catalog,
+            schema_name=target_schema,
+            table_name=target_table,
+        )
+        tables.invalidate_cached_table(table=cloned)
+        return cloned
 
     def insert(
         self,
