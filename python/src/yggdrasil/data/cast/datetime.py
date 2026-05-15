@@ -518,6 +518,10 @@ def any_to_datetime(value: Any, opts: Any = None, tz: Any = None) -> dt.datetime
         return date_to_datetime(value, opts=opts, tz=tz)
     if isinstance(value, _TIME):
         return time_to_datetime(value, opts=opts, tz=tz)
+    elif isinstance(value, dt.tzinfo):
+        return time_to_datetime(_TIME(0, 0), opts=opts, tz=value)
+    elif isinstance(value, dt.timedelta):
+        return time_to_datetime(_TIME(0, 0), opts=opts, tz=timedelta_to_tzinfo(value, opts))
     raise TypeError(f"No conversion path for {type(value).__name__} -> datetime")
 
 

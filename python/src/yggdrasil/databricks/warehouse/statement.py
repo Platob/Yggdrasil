@@ -865,7 +865,15 @@ class WarehouseStatementResult(StatementResult):
             return self
 
         statement_execution = self.client.workspace_client().statement_execution
-        self.set_api_response(statement_execution.get_statement(self.statement_id))
+        response = statement_execution.get_statement(self.statement_id)
+
+        if logger.isEnabledFor(logging.INFO):
+            if response.status.state in DONE_STATES:
+                logger.info(
+                    "%r finished in state %s",
+                    self, response.status.state,
+                )
+        self.set_api_response(response)
         return self
 
     @property

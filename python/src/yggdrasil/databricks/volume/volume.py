@@ -49,6 +49,7 @@ from databricks.sdk.service.catalog import (
 
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data.enums import Mode, ModeLike, Scheme
+from yggdrasil.databricks import DatabricksClient
 from yggdrasil.databricks.aws import AWSDatabricksVolumeCredentials
 from yggdrasil.databricks.client import DatabricksResource
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
@@ -179,7 +180,7 @@ class Volume(DatabricksResource):
         return self.volume_name
 
     def __repr__(self) -> str:
-        return f"Volume({self.full_name()!r})"
+        return f"Volume({self.explore_url!r})"
 
     def __str__(self) -> str:
         return self.full_name()
@@ -499,7 +500,16 @@ class Volume(DatabricksResource):
             )
         return self._schema
 
-    def path(self, sub: str = "") -> "VolumePath":
+    def path(
+        self,
+        sub: str = "",
+        *,
+        url: URL | None = None,
+        volume: "Volume | None" = None,
+        client: "DatabricksClient | None" = None,
+        temporary: bool = False,
+        **kwargs
+    ) -> "VolumePath":
         """Return a :class:`VolumePath` rooted at this volume.
 
         ``sub`` is appended under the volume root (``""`` → the volume
@@ -507,13 +517,17 @@ class Volume(DatabricksResource):
         """
         from yggdrasil.databricks.fs.volume_path import VolumePath
 
-        leaf = "/" + sub.strip("/") if sub else ""
+        leaf = "/" + sub.lstrip("/") if sub else ""
+
         return VolumePath(
-            url=URL(
+            url=url or URL(
                 scheme=Scheme.DATABRICKS_VOLUME,
                 path=f"/{self.catalog_name}/{self.schema_name}/{self.volume_name}{leaf}",
             ),
-            client=self.client,
+            volume=volume or self,
+            client=client or self.client,
+            temporary=temporary,
+            **kwargs
         )
 
     # ── lifecycle ─────────────────────────────────────────────────────────────

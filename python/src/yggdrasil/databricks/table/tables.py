@@ -20,15 +20,15 @@ Cache entries can be invalidated per-table via :meth:`Tables._invalidate`.
 from __future__ import annotations
 
 import logging
-from typing import Optional, Iterator, TYPE_CHECKING, Any
+from typing import Optional, Iterator, TYPE_CHECKING, Any, Iterable
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
 from databricks.sdk.service.catalog import TableInfo
 
 from yggdrasil.databricks.client import DatabricksService
 from yggdrasil.databricks.sql.sql_utils import is_glob_pattern, name_matcher, quote_ident
-from yggdrasil.dataclasses.expiring import ExpiringDict
 from .table import Table
+from ...data import Mode, ModeLike
 
 if TYPE_CHECKING:
     from yggdrasil.databricks.catalog.catalog import Catalog
@@ -38,12 +38,6 @@ if TYPE_CHECKING:
 __all__ = ["Tables"]
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Module-level function cache
-# Keyed by "host|catalog.schema.table"; default TTL = 5 minutes.
-# ---------------------------------------------------------------------------
-_TABLE_CACHE: ExpiringDict[str, Table] = ExpiringDict(default_ttl=300.0)
 
 
 class Tables(DatabricksService):
@@ -63,12 +57,10 @@ class Tables(DatabricksService):
         client=None,
         catalog_name: str | None = None,
         schema_name: str | None = None,
-        table_name: str | None = None,
     ):
         super().__init__(client=client)
         self.catalog_name = catalog_name
         self.schema_name = schema_name
-        self.table_name = table_name
 
     def __call__(
         self,
@@ -84,9 +76,6 @@ class Tables(DatabricksService):
         if schema_name == "":
             schema_name = self.schema_name
 
-        if table_name == "":
-            table_name = self.table_name
-
         if catalog_name and schema_name and table_name:
             return self.find_table(
                 catalog_name=catalog_name,
@@ -98,7 +87,6 @@ class Tables(DatabricksService):
             client=self.client,
             catalog_name=catalog_name,
             schema_name=schema_name,
-            table_name=table_name
         )
 
     def __getstate__(self):
@@ -234,7 +222,25 @@ class Tables(DatabricksService):
             service=self,
             catalog_name=catalog_name or self.catalog_name,
             schema_name=schema_name or self.schema_name,
-            table_name=table_name or self.table_name,
+            table_name=table_name,
+        )
+
+    def view(
+        self,
+        location: Table | str | None = None,
+        *,
+        table_name: str | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+    ) -> "Table":
+        """Return a :class:`~yggdrasil.databricks.table.table.Table` bound to this service."""
+
+        return Table.from_(
+            obj=location,
+            service=self,
+            catalog_name=catalog_name or self.catalog_name,
+            schema_name=schema_name or self.schema_name,
+            table_name=table_name
         )
 
     def catalog(self, name: str | None = None) -> "Catalog":
@@ -278,68 +284,6 @@ class Tables(DatabricksService):
             catalog_name=catalog_name or self.catalog_name,
             schema_name=schema_name or self.schema_name,
         )
-
-    # -------------------------------------------------------------------------
-    # Cache helpers
-    # -------------------------------------------------------------------------
-
-    def _cache_key(
-        self,
-        catalog_name: Optional[str],
-        schema_name: Optional[str],
-        table_name: Optional[str],
-    ) -> str:
-        """Build a stable, host-scoped cache key."""
-        # See ``Catalogs._cache_key`` — ``base_url.to_string()`` parses a
-        # fresh URL per call. ``client.host`` is the same identity in string
-        # form, already normalized in ``DatabricksClient.__post_init__``.
-        host = (self.client.host if self.client else None) or "default"
-        return f"{host}|{catalog_name}.{schema_name}.{table_name}"
-
-    def invalidate_cached_table(
-        self,
-        table: Table | str | None = None,
-        *,
-        catalog_name: Optional[str] = None,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
-    ):
-        if table is not None:
-            if isinstance(table, Table):
-                catalog_name = table.catalog_name
-                schema_name = table.schema_name
-                table_name = table.table_name
-            else:
-                catalog_name, schema_name, table_name = self.parse_catalog_schema_table_names(table)
-
-        return self._invalidate_cached_table(catalog_name, schema_name, table_name)
-
-    def _invalidate_cached_table(
-        self,
-        catalog_name: Optional[str],
-        schema_name: Optional[str],
-        table_name: Optional[str],
-    ) -> None:
-        """Evict one entry from the module-level cache."""
-        catalog_name = catalog_name or self.catalog_name
-        schema_name = schema_name or self.schema_name
-        key = self._cache_key(catalog_name, schema_name, table_name)
-
-        if table_name:
-            try:
-                del _TABLE_CACHE[key]
-                logger.debug(
-                    "Tables.invalidate_cached_table: evicted key=%s", key,
-                )
-            except KeyError:
-                logger.debug(
-                    "Tables.invalidate_cached_table: no entry for key=%s", key,
-                )
-
-    @classmethod
-    def invalidate_all(cls) -> None:
-        """Clear the entire module-level table-info cache."""
-        _TABLE_CACHE.clear()
 
     # -------------------------------------------------------------------------
     # Remote fetch — single responsibility, no caching
@@ -480,22 +424,6 @@ class Tables(DatabricksService):
             location=location, catalog_name=catalog_name, schema_name=schema_name,
             table_name=table_name
         )
-        cache_key = self._cache_key(catalog, schema, name)
-
-        # 1. Check local cache -----------------------------------------------
-        if cache_ttl is not None:
-            cached: Optional[Table] = _TABLE_CACHE.get(cache_key)
-            if cached is not None:
-                logger.debug(
-                    "Cache hit [Tables.find_table] key=%s table=%s",
-                    cache_key, cached.full_name(),
-                )
-                object.__setattr__(cached, "service", self)
-                return cached
-            logger.debug(
-                "Cache miss [Tables.find_table] key=%s table=%s.%s.%s — fetching remote",
-                cache_key, catalog, schema, name,
-            )
 
         # 2. Fetch remote ----------------------------------------------------
         info = self.find_table_remote(
@@ -520,9 +448,6 @@ class Tables(DatabricksService):
         )
         tb._store_infos(info)
 
-        # 3. Update local cache ----------------------------------------------
-        if cache_ttl is not None:
-            _TABLE_CACHE.set(cache_key, tb, ttl=cache_ttl)
         return tb
 
     def list_tables(
@@ -601,13 +526,116 @@ class Tables(DatabricksService):
             )
             tb._store_infos(info)
 
-            if cache_ttl is not None:
-                key = self._cache_key(info.catalog_name, info.schema_name, info.name)
-                if _TABLE_CACHE.get(key) is None:
-                    _TABLE_CACHE.set(key, tb, ttl=cache_ttl)
             yielded += 1
             yield tb
         logger.debug(
             "Tables.list_tables: yielded=%d catalog=%s schema=%s",
             yielded, catalog_name, schema_name,
+        )
+
+    # ── concat_tables — create/update a UNION view over multiple tables ──────
+
+    @staticmethod
+    def _common_table_name_root(names: Iterable[str]) -> str:
+        """Longest shared prefix across ``names``, stripped of trailing separators.
+
+        Returns an empty string when the inputs share no leading characters.
+        Trailing ``_ - . `` are trimmed so a prefix like ``"sales_"`` becomes
+        a valid unqualified view name (``"sales"``).
+        """
+        name_list = [n for n in names if n]
+        if not name_list:
+            return ""
+        if len(name_list) == 1:
+            return name_list[0].rstrip("_-. ")
+
+        prefix = name_list[0]
+        for other in name_list[1:]:
+            # Shrink until ``prefix`` is a prefix of ``other``.
+            while not other.startswith(prefix):
+                prefix = prefix[:-1]
+                if not prefix:
+                    return ""
+        return prefix.rstrip("_-. ")
+
+    def concat_tables(
+        self,
+        tables: Iterable["Table"],
+        *,
+        view_name: str | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        by_name: bool = True,
+        cast: bool = True,
+        comment: str | None = None,
+        mode: ModeLike = Mode.OVERWRITE,
+    ) -> "Table":
+        """Create or update a view that concatenates *tables* with ``UNION ALL``.
+
+        Resolves the view name + parent (deriving from the inputs' shared
+        prefix and the first input's catalog/schema when not given) and
+        delegates the actual DDL to :meth:`View.concat_tables` — which does
+        the smart by-name + type-promotion projection when ``cast`` is
+        ``True``.
+
+        Args:
+            tables:
+                Iterable of :class:`Table` or :class:`View` instances to
+                union.  At least one input is required.
+            view_name:
+                Unqualified view name.  When omitted, the longest shared
+                prefix of the input table names (trimmed of trailing
+                ``_ - . ``) is used.  Raises ``ValueError`` when the inputs
+                share no common prefix.
+            catalog_name, schema_name:
+                Override the view location.  Fall back to the service
+                defaults, then to the first input table's catalog/schema.
+            by_name:
+                Forwarded to :meth:`View.concat_tables`.  Only consulted
+                when ``cast`` is ``False``.
+            cast:
+                Forwarded to :meth:`View.concat_tables` — enables smart
+                column-name alignment with ``CAST(NULL AS <ddl>)`` fills
+                for columns missing from a given input.  Default ``True``.
+            comment:
+                Optional ``COMMENT`` on the view.
+            mode:
+                Passed through to :meth:`View.create`.  Defaults to
+                :attr:`Mode.OVERWRITE` so the view is created or
+                replaced atomically.
+
+        Returns:
+            The :class:`View` that was created or updated.
+        """
+        tables_list = list(tables)
+        if not tables_list:
+            raise ValueError("concat_tables requires at least one Table")
+
+        if not view_name:
+            view_name = self._common_table_name_root(
+                t.table_name for t in tables_list
+            )
+            if not view_name:
+                input_names = [t.name for t in tables_list]
+                raise ValueError(
+                    "concat_tables could not derive a view name from "
+                    f"{input_names!r}; the input tables share no common "
+                    "prefix.  Pass view_name explicitly."
+                )
+
+        first = tables_list[0]
+        catalog_name = catalog_name or self.catalog_name or first.catalog_name
+        schema_name = schema_name or self.schema_name or first.schema_name
+
+        view = self.table(
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            view_name=view_name,
+        )
+        return view.concat_tables(
+            tables_list,
+            by_name=by_name,
+            cast=cast,
+            comment=comment,
+            mode=mode,
         )

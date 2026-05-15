@@ -60,6 +60,7 @@ import time
 from typing import Any, ClassVar, Iterator
 
 from yggdrasil.data.enums import Mode, Scheme
+from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.path import Path
 from yggdrasil.io.io_stats import IOKind, IOStats
@@ -554,7 +555,7 @@ class LocalPath(Path):
         except AttributeError:
             pass
 
-    def _remove_file(self, missing_ok: bool = True) -> None:
+    def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
         """Unlink the file at this path. Force-closes the fd first."""
         self._close_fd()
         try:
@@ -564,7 +565,7 @@ class LocalPath(Path):
                 raise
 
     def _remove_dir(
-        self, recursive: bool = True, missing_ok: bool = True,
+        self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
     ) -> None:
         """Remove the directory at this path. Force-closes the fd first
         so a holder pointing at the directory (rare, but possible) doesn't

@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, ClassVar, Iterable, Iterator
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from yggdrasil.arrow.ops import upsert_arrow_batches
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MimeTypes, Mode
@@ -141,11 +142,16 @@ class ParquetIO(IO[bytes, ParquetOptions]):
         rather than paying for an extra ``HeadObject`` /
         ``get_metadata`` round trip up front.
         """
+        if options.target:
+            return options.target
+
         if self.size_known and self.size == 0:
             return Schema.empty()
         try:
             with self.arrow_input_stream() as v:
-                return Schema.from_arrow(pq.ParquetFile(v).schema_arrow)
+                schema = Schema.from_arrow(pq.ParquetFile(v).schema_arrow)
+                self._persist_schema(schema)
+                return schema
         except (FileNotFoundError, pa.ArrowInvalid):
             return Schema.empty()
 
@@ -307,10 +313,9 @@ class ParquetIO(IO[bytes, ParquetOptions]):
             return
 
         if action in _MERGE_MODES and self.size > 0:
-            from yggdrasil.arrow.ops import upsert_arrow_batches
-
-            existing = list(self._read_arrow_batches(options))
-            incoming: Iterator[pa.RecordBatch] = iter([first, *iterator])
+            rewrite_options = options.with_target(self.collect_schema(options))
+            existing = list(self._read_arrow_batches(rewrite_options))
+            incoming: Iterator[pa.RecordBatch] = rewrite_options.cast_arrow_batch_iterator(iter([first, *iterator]))
             merged = upsert_arrow_batches(
                 iter(existing),
                 incoming,
@@ -319,7 +324,14 @@ class ParquetIO(IO[bytes, ParquetOptions]):
                 memory_pool=options.arrow_memory_pool,
             )
             return self._write_arrow_batches(
-                merged, dataclasses.replace(options, mode=Mode.OVERWRITE),
+                merged,
+                rewrite_options.copy(
+                    mode=Mode.OVERWRITE,
+                    # remove already applied since cast_arrow_batch_iterator does it
+                    target=None,
+                    row_size=None,
+                    byte_size=None
+                ),
             )
 
         # OVERWRITE — drive the writer against the IO's

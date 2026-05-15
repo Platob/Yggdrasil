@@ -341,10 +341,6 @@ class Schemas(DatabricksService):
                 object.__setattr__(sch, "_infos", cached)
                 object.__setattr__(sch, "_infos_fetched_at", time.time())
                 return sch
-            logger.debug(
-                "Cache miss [Schemas.find] key=%s schema=%s.%s — fetching remote",
-                cache_key, c, s,
-            )
 
         # 2. Fetch remote --------------------------------------------------------
         info = self.find_remote(catalog_name=c, schema_name=s, raise_error=raise_error)

@@ -181,6 +181,5 @@ class Column:
             "columns", self.entity_name,
         )
         object.__setattr__(self, "name", new_name)
-        if hasattr(self.table, "_reset_cache"):
-            self.table._reset_cache(invalidate_cache=True)
+        self.table._invalidate_stat_cache(remove_global=True)
         return self

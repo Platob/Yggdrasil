@@ -181,7 +181,7 @@ def retry_sdk_call(
             if is_transient(exc):
                 if transient_attempt >= max_transient_retries:
                     raise
-                LOGGER.info(
+                LOGGER.warning(
                     "Transient error from %s (attempt %d/%d); sleeping %.1fs: %s",
                     getattr(func, "__name__", func),
                     transient_attempt + 1, max_transient_retries, base_sleep, exc,

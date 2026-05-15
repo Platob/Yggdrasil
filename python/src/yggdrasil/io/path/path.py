@@ -28,15 +28,21 @@ and falls back to :class:`LocalPath`.
 
 from __future__ import annotations
 
+import datetime as dt
+import importlib
 import os
+import re
+import sys
+import tempfile
 from abc import ABC, abstractmethod
-from typing import Any, ClassVar, Iterator, List, Tuple
+from typing import Any, ClassVar, Iterator, List, Tuple, Optional
 
+from yggdrasil.data.enums import Mode
+from yggdrasil.dataclasses import WaitingConfigArg, WaitingConfig
 from yggdrasil.io.base import IO
 from yggdrasil.io.bytes_io import BytesIO
-from yggdrasil.data.enums import Mode
 from yggdrasil.io.holder import Holder
-from yggdrasil.io.io_stats import IOKind, IOStats
+from yggdrasil.io.io_stats import IOKind, IOStats, TimeLike
 from yggdrasil.io.url import URL
 
 __all__ = ["Path"]
@@ -45,6 +51,8 @@ __all__ = ["Path"]
 # ---------------------------------------------------------------------------
 # Path
 # ---------------------------------------------------------------------------
+
+TS_PATTERN = re.compile(r'-(\d+)-(\d+)-')
 
 
 class Path(Holder, os.PathLike, ABC):
@@ -91,7 +99,7 @@ class Path(Holder, os.PathLike, ABC):
             obj = obj.url
 
         url = URL.from_(obj)
-        if cls is Path:
+        if cls.__subclasses__():
             # Holder.__new__ dispatches on scheme; force LocalPath for
             # the no-scheme path case so callers don't accidentally
             # land on :class:`Memory`.
@@ -150,11 +158,13 @@ class Path(Holder, os.PathLike, ABC):
         """Create directory at this path."""
 
     @abstractmethod
-    def _remove_file(self, missing_ok: bool = True) -> None:
+    def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
         """Unlink the file at this path."""
 
     @abstractmethod
-    def _remove_dir(self, recursive: bool = True, missing_ok: bool = True) -> None:
+    def _remove_dir(
+        self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
+    ) -> None:
         """Remove the directory at this path."""
 
     @abstractmethod
@@ -248,34 +258,70 @@ class Path(Holder, os.PathLike, ABC):
         self._mkdir(parents=parents, exist_ok=exist_ok)
         return self
 
-    def unlink(self, missing_ok: bool = True) -> None:
-        kind = self._stat().kind
-        if kind == IOKind.MISSING:
-            if not missing_ok:
-                raise FileNotFoundError(f"{self.full_path()!r} does not exist")
-            return
-        if kind == IOKind.DIRECTORY:
-            raise IsADirectoryError(
-                f"Cannot unlink directory {self.full_path()!r}; use remove()."
-            )
-        self._remove_file(missing_ok=missing_ok)
+    def unlink(self, missing_ok: bool = True, wait: WaitingConfigArg = True) -> None:
+        return self.remove(missing_ok=missing_ok, wait=wait)
 
-    def remove(self, recursive: bool = True, missing_ok: bool = True) -> "Path":
-        kind = self._stat().kind
-        if kind == IOKind.FILE:
-            self._remove_file(missing_ok=missing_ok)
-        elif kind == IOKind.DIRECTORY:
-            self._remove_dir(recursive=recursive, missing_ok=missing_ok)
-        elif kind == IOKind.MISSING and not missing_ok:
+    def remove(
+        self,
+        recursive: bool = True,
+        missing_ok: bool = True,
+        wait: WaitingConfigArg = True,
+        fresher_than: Optional[TimeLike] = None,
+        older_than: Optional[TimeLike] = None
+    ) -> "Path":
+        stat = self._stat()
+        kind = stat.kind
+        wait = WaitingConfig.from_(wait)
+
+        if kind == IOKind.MISSING and not missing_ok:
             raise FileNotFoundError(f"{self.full_path()!r} does not exist")
+
+        if fresher_than or older_than:
+            fresher_than = IOStats.normalize_timestamp(fresher_than, default=0.0)
+            older_than = IOStats.normalize_timestamp(
+                fresher_than,
+                default=dt.datetime.now(tz=dt.timezone.utc).timestamp()
+            )
+
+            if kind == IOKind.FILE:
+                if stat.is_between_timestamp(start=fresher_than, end=older_than):
+                    self._remove_file(missing_ok=missing_ok, wait=wait)
+            elif kind == IOKind.DIRECTORY:
+                for child in self.ls(recursive=False):
+                    child.remove(
+                        recursive=recursive, missing_ok=missing_ok,
+                        wait=wait, fresher_than=fresher_than, older_than=older_than
+                    )
+
+                    if child.is_empty():
+                        child.remove(missing_ok=missing_ok, wait=False)
+
+        else:
+            if kind == IOKind.FILE:
+                self._remove_file(missing_ok=missing_ok, wait=wait)
+            elif kind == IOKind.DIRECTORY:
+                self._remove_dir(recursive=recursive, missing_ok=missing_ok, wait=wait)
+
         return self
+
+    rm = remove
+
+    def is_empty(self):
+        stat = self._stat()
+        kind = stat.kind
+
+        if kind == IOKind.MISSING:
+            return True
+        elif kind == IOKind.FILE:
+            return stat.size == 0
+        elif kind == IOKind.DIRECTORY:
+            return not any(self.ls(recursive=True))
+        else:
+            raise ValueError(f"is_empty: unknown kind {kind!r}")
 
     def touch(self) -> "Path":
         if not self.exists():
-            # An empty ``write_bytes`` short-circuits without creating
-            # the backing — open() is what materializes the file.
-            with self.open("ab"):
-                pass
+            self.write_bytes(b"")
         return self
 
     # ==================================================================
@@ -380,9 +426,6 @@ class Path(Holder, os.PathLike, ABC):
         cache. ``install=False`` makes the cache-dir lifetime the
         caller's problem.
         """
-        import importlib
-        import sys
-        import tempfile
 
         suffix = self.suffix.lower()
         if suffix not in (".zip", ".whl"):
@@ -465,15 +508,21 @@ class Path(Holder, os.PathLike, ABC):
 
     @property
     def parts(self) -> List[str]:
-        return self.url.parts
+        return self.url.parts or []
 
     @property
     def name(self) -> str:
-        return self.url.name
+        return self.url.name or ""
 
     @property
     def stem(self) -> str:
-        return self.url.stem
+        return self.url.stem or ""
+
+    def start_end_timestamp(self) -> Tuple[float, float]:
+        m = TS_PATTERN.search(self.name)
+        if m is None:
+            return None
+        return float(m.group(1)), float(m.group(2))
 
     @property
     def suffix(self) -> str:
@@ -521,6 +570,9 @@ class Path(Holder, os.PathLike, ABC):
     # ==================================================================
     # Dunder
     # ==================================================================
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self.url!r})"
 
     def __fspath__(self) -> str:
         return self.url.__fspath__()

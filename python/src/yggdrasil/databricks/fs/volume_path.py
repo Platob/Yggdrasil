@@ -34,22 +34,26 @@ quota burn for the bulk transfer.
 
 from __future__ import annotations
 
+import datetime as dt
 import io as _stdio
 import logging
 import os
 import re
 import threading
 import time
-import datetime as dt
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional, Tuple
+
 from databricks.sdk.errors import PermissionDenied
 
+from yggdrasil.concurrent import Job
 from yggdrasil.data.cast import any_to_datetime, parse_http_date
 from yggdrasil.data.enums import Mode, ModeLike, Scheme
 from yggdrasil.data.enums.media_type import MediaType, MediaTypes
+from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 from .path import DatabricksPath
+from ..client import DatabricksClient
 
 if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
@@ -106,10 +110,26 @@ class VolumePath(DatabricksPath):
         data: Any = None,
         *,
         url: "URL | None" = None,
+        volume: "Volume | None" = None,
+        client: "DatabricksClient | None" = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(data=data, url=url, **kwargs)
-        self._volume: Optional["Volume"] = None
+        self._volume: Optional["Volume"] = volume
+
+        if volume is not None:
+            client = volume.client
+
+        super().__init__(data=data, client=client, url=url, **kwargs)
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self.explore_url!r})"
+
+    @property
+    def explore_url(self):
+        return self.volume.explore_url.add_param(
+            key="volumePath",
+            value=self.full_path(),
+        )
 
     # ==================================================================
     # Path rendering
@@ -693,7 +713,7 @@ class VolumePath(DatabricksPath):
             self.api_path, parents,
         )
 
-    def _remove_file(self, missing_ok: bool = True) -> None:
+    def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
         if logger.isEnabledFor(logging.INFO):
             logger.info("files.delete %s", self.api_path)
         try:
@@ -704,18 +724,26 @@ class VolumePath(DatabricksPath):
         self._invalidate_stat_cache()
 
     def _remove_dir(
-        self, recursive: bool = True, missing_ok: bool = True,
+        self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
     ) -> None:
         if logger.isEnabledFor(logging.INFO):
             logger.info(
                 "files.delete_directory %s (recursive=%s)",
                 self.api_path, recursive,
             )
-        try:
-            self._call(self.client.workspace_client().files.delete_directory, self.api_path)
-        except Exception:
-            if not missing_ok:
-                raise
+
+        if wait:
+            try:
+                self._call(self.client.workspace_client().files.delete_directory, self.api_path)
+            except Exception:
+                if not missing_ok:
+                    raise
+        else:
+            Job.make(
+                self.client.workspace_client().files.delete_directory,
+                self.api_path,
+                recursive=recursive,
+            )
         self._invalidate_stat_cache()
 
     # ==================================================================

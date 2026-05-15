@@ -28,6 +28,7 @@ from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.io.path import RemotePath
 from yggdrasil.io.url import URL
+from ...dataclasses import WaitingConfig
 
 if TYPE_CHECKING:
     from .session import HTTPSession
@@ -199,7 +200,7 @@ class HTTPPath(RemotePath):
             "s3://, dbfs:/) for the destination."
         )
 
-    def _remove_file(self, missing_ok: bool = True) -> None:
+    def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
         from .request import HTTPRequest
         from ..send_config import SendConfig
 
@@ -213,7 +214,7 @@ class HTTPPath(RemotePath):
         self._invalidate_stat_cache()
 
     def _remove_dir(
-        self, recursive: bool = True, missing_ok: bool = True,
+        self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
     ) -> None:
         del recursive, missing_ok
         raise NotImplementedError(

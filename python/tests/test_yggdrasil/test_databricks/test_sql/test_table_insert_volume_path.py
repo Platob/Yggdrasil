@@ -12,8 +12,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from yggdrasil.databricks.fs import VolumePath
 from yggdrasil.databricks.table.table import Table
 

@@ -25,6 +25,7 @@ from .path import DatabricksPath
 
 
 __all__ = ["WorkspacePath"]
+from ...dataclasses import WaitingConfig
 
 
 logger = logging.getLogger(__name__)
@@ -211,7 +212,7 @@ class WorkspacePath(DatabricksPath):
             raise
         self._seed_stat_cache(IOStats(kind=IOKind.DIRECTORY))
 
-    def _remove_file(self, missing_ok: bool = True) -> None:
+    def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("workspace.delete %s (file)", self.api_path)
         try:
@@ -225,7 +226,7 @@ class WorkspacePath(DatabricksPath):
         self._invalidate_stat_cache()
 
     def _remove_dir(
-        self, recursive: bool = True, missing_ok: bool = True,
+        self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
     ) -> None:
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(

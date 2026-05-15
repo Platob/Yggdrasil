@@ -25,7 +25,6 @@ import logging
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Union, TYPE_CHECKING, Mapping, Iterable, Iterator, Literal, ClassVar
 
 import pyarrow as pa
@@ -38,28 +37,15 @@ from databricks.sdk.service.catalog import (
     TableOperation,
     TableType, EntityTagAssignment,
 )
-from pyarrow.fs import FileSystem, S3FileSystem
 
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data import Field
 from yggdrasil.data.data_utils import safe_constraint_name
-from yggdrasil.data.enums import MimeTypes, MimeType, MediaType
-from yggdrasil.data.enums import Scheme
-from yggdrasil.data.enums.mode import ModeLike, Mode
+from yggdrasil.data.enums import MimeTypes, MimeType, MediaType, MediaTypes, ModeLike, Mode, Scheme
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema as DataSchema
 from yggdrasil.data.statement import PreparedStatement, StatementResult
 from yggdrasil.databricks.client import DatabricksClient, DatabricksResource
-from yggdrasil.dataclasses.expiring import Expiring, RefreshResult
-from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
-from yggdrasil.environ import PyEnv
-from yggdrasil.io import URL
-from yggdrasil.io.holder import Holder
-from yggdrasil.io.io_stats import IOKind, IOStats
-from yggdrasil.io.primitive import ParquetIO
-from yggdrasil.io.tabular import Tabular, O, ArrowTabular
-from yggdrasil.io.tabular.execution.expr import Predicate, col as expr_col
-from yggdrasil.io.tabular.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
 from yggdrasil.databricks.column.column import Column
 from yggdrasil.databricks.sql.sql_utils import (
     quote_ident,
@@ -67,7 +53,18 @@ from yggdrasil.databricks.sql.sql_utils import (
     safe_table_name,
     sql_literal, escape_sql_string,
 )
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+from yggdrasil.environ import PyEnv
+from yggdrasil.io import URL
+from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.io.io_stats import IOKind, IOStats
+from yggdrasil.io.path import Path, RemotePath
+from yggdrasil.io.primitive import ParquetIO
+from yggdrasil.io.tabular import Tabular, O
+from yggdrasil.io.tabular.execution.expr import Predicate, col as expr_col
+from yggdrasil.io.tabular.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
 from ..fs import VolumePath
+from ..volume import Volume
 
 if TYPE_CHECKING:
     import pandas
@@ -82,13 +79,8 @@ if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
     from yggdrasil.databricks.warehouse import WarehousePreparedStatement
-    from yggdrasil.io.path import Path
 
 
-# Modes that only need read credentials. Anything outside this set
-# (OVERWRITE, APPEND, UPSERT, MERGE, TRUNCATE, ERROR_IF_EXISTS) needs
-# READ_WRITE — UC will refuse the write path on a managed table, but
-# we still ask for the right scope so an external table gets one.
 _READ_ONLY_MODES = frozenset({Mode.AUTO})
 
 
@@ -1054,7 +1046,7 @@ def _build_ygg_properties(
 # Table — per-table resource
 # ===========================================================================
 
-class Table(DatabricksResource, Holder):
+class Table(DatabricksResource, RemotePath):
     """A single Unity Catalog table — DDL, DML, schema, storage helpers.
 
     Registers under :attr:`Scheme.DATABRICKS_TABLE` (``dbfs+table://``)
@@ -1068,6 +1060,36 @@ class Table(DatabricksResource, Holder):
     is not a positional byte buffer — callers should use the Tabular
     surface (``read_arrow_table`` / ``write_arrow_table`` / …).
     """
+
+    def _stat_uncached(self) -> IOStats:
+        return IOStats(
+            size=0,
+            mtime=0,
+            kind=IOKind.DIRECTORY if self.exists else IOKind.MISSING,
+            media_type=MediaTypes.DATABRICKS_UNITY_CATALOG_TABLE
+        )
+
+    def _bwrite(self, data: BytesIO, pos: int, mode: Mode) -> int:
+        raise NotImplementedError("Table is a read-only resource")
+
+    def _bread(self, n: int, pos: int, mode: Mode) -> BytesIO:
+        raise NotImplementedError("Table is a read-only resource")
+
+    def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
+        if not self.exists:
+            raise NotImplementedError("Table is a read-only resource")
+
+    def _ls(self, recursive: bool = False) -> Iterator["Path"]:
+        return
+
+    def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
+        self.delete(wait=wait, raise_error=not missing_ok)
+
+    def _remove_dir(self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
+        self.delete(wait=wait, raise_error=not missing_ok)
+
+    def full_path(self) -> str:
+        return self.full_name()
 
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_TABLE
 
@@ -1121,26 +1143,7 @@ class Table(DatabricksResource, Holder):
         self._infos = infos
         self._infos_fetched_at = infos_fetched_at
         self._columns = columns
-
-    def __getstate__(self):
-        state = super().__getstate__()
-        state["catalog_name"] = self.catalog_name
-        state["schema_name"] = self.schema_name
-        state["table_name"] = self.table_name
-        state["_infos"] = self._infos
-        state["_infos_fetched_at"] = self._infos_fetched_at
-        state["_columns"] = self._columns
-
-        return state
-
-    def __setstate__(self, state):
-        object.__setattr__(self, "catalog_name", state["catalog_name"])
-        object.__setattr__(self, "schema_name", state["schema_name"])
-        object.__setattr__(self, "table_name", state["table_name"])
-        object.__setattr__(self, "_infos", state["_infos"])
-        object.__setattr__(self, "_infos_fetched_at", state["_infos_fetched_at"])
-        object.__setattr__(self, "_columns", state["_columns"])
-        super().__setstate__(state)
+        self._staging_volume: Volume | None = None
 
     # ------------------------------------
     # Tabular
@@ -1149,17 +1152,6 @@ class Table(DatabricksResource, Holder):
     @classmethod
     def default_media_type(cls) -> MimeType:
         return MimeTypes.DATABRICKS_UNITY_CATALOG_TABLE
-
-    @property
-    def cached(self) -> bool:
-        return True
-
-    def unpersist(self) -> None:
-        pass
-
-    def persist(self, engine: Literal["arrow", "polars", "spark", "auto"] = "auto", *,
-                data: Any | None = None) -> "Tabular":
-        return self
 
     # ------------------------------------------------------------------
     # Holder primitives — Table is *logical*, not byte-shaped.
@@ -1528,22 +1520,12 @@ class Table(DatabricksResource, Holder):
     # Cache management
     # =========================================================================
 
-    def _reset_cache(self, invalidate_cache: bool = False) -> None:
-        logger.debug(
-            "Table._reset_cache: table=%s invalidate_cache=%s",
-            self.full_name(), invalidate_cache,
-        )
-        if invalidate_cache:
-            self.sql.tables.invalidate_cached_table(table=self)
-            # Also drop entity-tag entries for this table and its columns —
-            # a structural change (rename / drop / recreate) means the
-            # ``entity_name`` keys themselves are stale.
-            self._invalidate_entity_tag_cache()
-
+    def _invalidate_stat_cache(self, remove_global: bool = False) -> None:
         object.__setattr__(self, "_infos", None)
         object.__setattr__(self, "_infos_fetched_at", None)
         object.__setattr__(self, "_columns", None)
-        self._unpersist_schema()
+        self._invalidate_entity_tag_cache()
+        super()._invalidate_stat_cache(remove_global=remove_global)
 
     def _invalidate_entity_tag_cache(self) -> None:
         """Drop cached tag lists for this table and every cached column."""
@@ -1553,10 +1535,6 @@ class Table(DatabricksResource, Holder):
         # ``infos`` here keeps invalidation cheap and safe inside teardown.
         for col in (self._columns or ()):
             tags.invalidate_cached_tags("columns", self.column_full_name(col.name))
-
-    def clear(self) -> "Table":
-        self._reset_cache()
-        return self
 
     # =========================================================================
     # Databricks SDK — lazy-loaded properties
@@ -1600,16 +1578,8 @@ class Table(DatabricksResource, Holder):
         """Basic :class:`TableInfo` — TTL-cached."""
         if self._infos is not None and self._is_fresh(self._infos_fetched_at):
             age = time.time() - (self._infos_fetched_at or 0.0)
-            logger.debug(
-                "Cache hit [Table.infos] table=%s age=%.0fs",
-                self.full_name(), age,
-            )
             return self._infos
 
-        logger.debug(
-            "Cache miss [Table.infos] table=%s — fetching remote",
-            self.full_name(),
-        )
         info = self.client.tables.find_table_remote(
             catalog_name=self.catalog_name,
             schema_name=self.schema_name,
@@ -1915,7 +1885,7 @@ class Table(DatabricksResource, Holder):
             executed = True
 
         if executed:
-            self._reset_cache(invalidate_cache=True)
+            self._invalidate_stat_cache(remove_global=True)
 
         return self
 
@@ -2127,7 +2097,7 @@ class Table(DatabricksResource, Holder):
             else:
                 raise
 
-        self._reset_cache(invalidate_cache=True)
+        self._invalidate_stat_cache(remove_global=True)
 
         # Apply remaining constraints (FK / CHECK) via the SDK post-create.
         # Inline PK was already emitted in DDL — skip it here.
@@ -2417,11 +2387,11 @@ class Table(DatabricksResource, Holder):
                     "Table.api_create: table=%s already exists — soft-resetting cache",
                     self.full_name(),
                 )
-                self._reset_cache(invalidate_cache=True)
+                self._invalidate_stat_cache(remove_global=True)
                 return self
             raise
 
-        self._reset_cache(invalidate_cache=True)
+        self._invalidate_stat_cache(remove_global=True)
 
         # The SDK endpoint doesn't accept a comment — set it via ALTER
         # TABLE so the behaviour matches sql_create (which embeds COMMENT
@@ -2482,9 +2452,9 @@ class Table(DatabricksResource, Holder):
                 if raise_error:
                     raise
         else:
-            Job.make(uc.delete, self.full_name()).fire_and_forget()
+            Job.make(self.delete).fire_and_forget()
 
-        self._reset_cache(invalidate_cache=True)
+        self._invalidate_stat_cache(remove_global=True)
         return self
 
     # =========================================================================
@@ -2551,7 +2521,7 @@ class Table(DatabricksResource, Holder):
         self.sql.execute(
             f"ALTER TABLE {self.full_name(safe=True)} RENAME TO {rename_to}"
         )
-        self._reset_cache(invalidate_cache=True)
+        self._invalidate_stat_cache(remove_global=True)
         self.schema_name = target_schema
         self.table_name = target_table
         return self
@@ -2691,7 +2661,7 @@ class Table(DatabricksResource, Holder):
             schema_name=target_schema,
             table_name=target_table,
         )
-        tables.invalidate_cached_table(table=cloned)
+
         return cloned
 
     def insert(
@@ -2831,6 +2801,31 @@ class Table(DatabricksResource, Holder):
     # =========================================================================
     # arrow_insert — warehouse path, Volume staging
     # =========================================================================
+
+    @property
+    def staging_volume(self):
+        if self._staging_volume is None:
+            if not self.catalog_name or not self.schema_name or not self.table_name:
+                raise ValueError(f"Table {self} is missing required catalog, schema, or table name")
+
+            self._staging_volume = Volume(
+                service=self.service.volumes,
+                catalog_name=self.catalog_name,
+                schema_name=self.schema_name,
+                volume_name="stg_" + self.client.safe_tag_value(self.table_name, repl="_").lower()
+            )
+        return self._staging_volume
+
+    def staging_folder(
+        self,
+        temporary: bool = False,
+        async_write: bool = False,
+    ) -> VolumePath:
+        """Return the staging folder for this table."""
+        if async_write:
+            return self.staging_volume.path(".sql/async/insert", temporary=temporary)
+        else:
+            return self.staging_volume.path(".sql/tmp", temporary=temporary)
 
     def insert_volume_path(
         self,
@@ -3613,60 +3608,6 @@ class Table(DatabricksResource, Holder):
                 table_id=self.table_id,
                 operation=operation,
             )
-        )
-
-    def arrow_filesystem(
-        self,
-        *,
-        operation: TableOperation = TableOperation.READ_WRITE,
-        expiring: bool = False,
-    ) -> Union[FileSystem, "TableFilesystem"]:
-        created_at = time.time_ns()
-        creds = self.temporary_credentials(operation=operation)
-        assert creds.aws_temp_credentials, "Cannot get AWS credentials"
-        aws = creds.aws_temp_credentials
-
-        base = S3FileSystem(
-            access_key=aws.access_key_id,
-            secret_key=aws.secret_access_key,
-            session_token=aws.session_token,
-            region="eu-west-1",
-        )
-
-        if not expiring:
-            return base
-
-        ttl_ns = 3_600_000_000_000
-        return TableFilesystem.create(
-            value=base,
-            created_at=created_at,
-            ttl=ttl_ns,
-            expires_at=created_at + ttl_ns,
-            table=self,
-            operation=operation,
-        )
-
-
-# ===========================================================================
-# TableFilesystem — auto-refreshing S3 filesystem credentials
-# ===========================================================================
-
-@dataclass
-class TableFilesystem(Expiring[FileSystem]):
-    """Expiring wrapper around S3FileSystem that auto-refreshes UC credentials."""
-
-    table: Optional[Table] = field(default=None)
-    operation: TableOperation = TableOperation.READ
-
-    def _refresh(self) -> RefreshResult[FileSystem]:
-        value = self.table.arrow_filesystem(operation=self.operation, expiring=False)
-        created_ns = time.time_ns()
-        ttl_ns = 3_600_000_000_000
-        return RefreshResult(
-            value=value,
-            created_at_ns=created_ns,
-            ttl_ns=ttl_ns,
-            expires_at_ns=created_ns + ttl_ns,
         )
 
 

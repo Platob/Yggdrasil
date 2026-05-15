@@ -27,6 +27,7 @@ substrate, different backing.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from abc import abstractmethod
@@ -49,6 +50,7 @@ __all__ = ["RemotePath"]
 #: against the same key, short enough that a stale entry doesn't
 #: outlive a meaningful change to the underlying object.
 _STAT_CACHE_TTL: float = 300.0
+logger = logging.getLogger(__name__)
 
 
 def _resolve_url_from_args(args: tuple, kwargs: dict) -> "URL | None":
@@ -116,33 +118,13 @@ class RemotePath(Path):
         "_resolved_url",
     )
 
-    #: Per-class freshness window for ``_stat_cached``. Subclasses can
-    #: tighten or loosen the budget — e.g. a path on an append-only
-    #: object store could push this higher; an interactive notebook
-    #: surface could drop it. ``None`` disables the TTL check (the
-    #: entry lives until ``_invalidate_stat_cache`` drops it).
     stat_cache_ttl: ClassVar["float | None"] = _STAT_CACHE_TTL
 
-    #: Process-wide singleton cache shared across every
-    #: :class:`RemotePath` subclass. Keyed by ``(cls, str(url))`` so
-    #: subclasses with the same URL stay distinct (an ``S3Path`` and a
-    #: hypothetical ``S3SignedPath`` for the same key are still
-    #: different instances). ``default_ttl=None`` keeps entries for the
-    #: process lifetime; 4096-entry cap evicts least-recently-set when
-    #: full.
     _INSTANCES: ClassVar["ExpiringDict[Tuple[type, str], RemotePath]"] = ExpiringDict(
         default_ttl=None,
-        max_size=4096,
+        max_size=2048,
     )
 
-    #: Serializes first-time ``__init__`` on a freshly allocated
-    #: singleton. ``__new__`` can hand the same instance to two
-    #: threads racing on the same URL; without a lock both would run
-    #: ``super().__init__`` and reset ``_stat_cached`` / ``_stat_cached_at``
-    #: to their defaults, potentially overwriting a seed produced
-    #: by another caller in between. The lock is held only for the
-    #: brief setup window; the fast path (``_initialized`` already
-    #: True) short-circuits before touching it.
     _INIT_LOCK: ClassVar[threading.Lock] = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -281,6 +263,10 @@ class RemotePath(Path):
 
         if remove_global:
             self._INSTANCES.pop((type(self), str(self.url)), None)
+
+        self._unpersist_schema()
+
+        logger.debug(f"Invalidated stat cache for {self!r}")
 
     # ------------------------------------------------------------------
     # Resize is a no-op on remote backends — the upload IS the resize

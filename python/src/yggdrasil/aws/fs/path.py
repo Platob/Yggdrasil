@@ -51,6 +51,7 @@ from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterator, Optional
 
 from yggdrasil.data.enums import Scheme
 from yggdrasil.data.enums.media_type import MediaType
+from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io.path import RemotePath
 from yggdrasil.io.path._retry import retry_sdk_call
 from yggdrasil.io.io_stats import IOStats, IOKind
@@ -365,7 +366,7 @@ class S3Path(RemotePath):
         """
         del parents, exist_ok
 
-    def _remove_file(self, missing_ok: bool = True) -> None:
+    def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
         try:
             self._call(
                 self.client.delete_object,
@@ -378,7 +379,7 @@ class S3Path(RemotePath):
         self._invalidate_stat_cache()
 
     def _remove_dir(
-        self, recursive: bool = True, missing_ok: bool = True,
+        self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
     ) -> None:
         """Bulk-delete every object under the prefix.
 

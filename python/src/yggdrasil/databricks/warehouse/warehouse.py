@@ -716,7 +716,7 @@ class SQLWarehouse(
             return result
 
         LOGGER.debug(
-            "%r executing:\n%s",
+            "Executing %r:\n%s",
             self, statement.text,
         )
 
@@ -753,8 +753,8 @@ class SQLWarehouse(
         result.iteration = 1
 
         LOGGER.info(
-            "%r executed %r",
-            self, result,
+            "Executed %r",
+            result
         )
         return result
 

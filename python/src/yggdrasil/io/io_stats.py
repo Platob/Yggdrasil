@@ -19,15 +19,22 @@ from __future__ import annotations
 import datetime
 
 import time
+import datetime as dt
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Union
+
+from yggdrasil.data.cast import any_to_datetime
 
 if TYPE_CHECKING:
     from yggdrasil.data.enums import MediaType
 
 
-__all__ = ["IOStats", "IOKind"]
+__all__ = ["IOStats", "IOKind", "TimeLike"]
+
+
+# Anything ``any_to_datetime`` can normalise into a wall-clock instant.
+TimeLike = Union[dt.datetime, dt.date, dt.timedelta, str, float, int]
 
 
 class IOKind(IntEnum):
@@ -86,8 +93,8 @@ class IOStats:
     # ------------------------------------------------------------------
 
     def __repr__(self):
-        dt = datetime.datetime.fromtimestamp(self.mtime, datetime.timezone.utc).isoformat()
-        return f"<IOStats size={self.size} mtime={dt!r} kind={self.kind.name} mode={self.mode} media_type={self.media_type!r}>"
+        dt_ = datetime.datetime.fromtimestamp(self.mtime, datetime.timezone.utc).isoformat()
+        return f"<IOStats size={self.size} mtime={dt_!r} kind={self.kind.name} mode={self.mode} media_type={self.media_type!r}>"
 
     def __str__(self):
         return repr(self)
@@ -122,6 +129,16 @@ class IOStats:
     @property
     def has_media_type(self) -> bool:
         return self.media_type is not None
+
+    @property
+    def has_mtime(self) -> bool:
+        """Whether the backing reported a real modification time.
+
+        ``False`` for memory holders, freshly-minted spills, and any
+        backend that doesn't expose mtime — the sentinel ``0.0``
+        means "unknown", not "epoch".
+        """
+        return self.mtime != 0.0
 
     @property
     def exists(self) -> bool:
@@ -196,6 +213,122 @@ class IOStats:
         if media_type is not ...:
             self.media_type = media_type
         return self
+
+    # ------------------------------------------------------------------
+    # mtime filtering
+    # ------------------------------------------------------------------
+    #
+    # All mtime predicates follow one rule: an unknown timestamp
+    # (``self.mtime == 0.0``) is **excluded** from every range
+    # check. Returning ``False`` rather than guessing keeps the
+    # sentinel honest — a memory holder is never "fresher than
+    # yesterday" *or* "older than yesterday", it's simply unknown,
+    # and callers that want to include it must check ``has_mtime``
+    # explicitly.
+
+    @staticmethod
+    def normalize_timestamp(when: TimeLike | None, default: Any = ...) -> float:
+        """Resolve a flexible time spec to a Unix timestamp.
+
+        ``None`` propagates as ``None`` (caller uses it as "no
+        bound"). Numbers pass through as raw Unix timestamps.
+
+        :class:`datetime.timedelta` is resolved as
+        ``now(UTC) - delta`` — a *past* wall-clock moment. This
+        matches how callers naturally phrase mtime filters: ``stats
+        .is_fresher_than(timedelta(hours=1))`` reads as "modified in
+        the last hour", and ``modified_between(start=timedelta(days
+        =7))`` as "modified in the last week". A zero/negative
+        timedelta is allowed and resolves to "now" or a future
+        instant respectively — useful as a sentinel but uncommon in
+        practice.
+
+        Everything else (datetime, ISO string) goes through
+        :func:`any_to_datetime` for consistent parsing.
+        """
+        if when is None:
+            if default is ...:
+                raise ValueError("Default value required for None to create timestamp.")
+            return default
+        if isinstance(when, (int, float)):
+            return float(when)
+        if isinstance(when, dt.timedelta):
+            return (
+                datetime.datetime.now(datetime.timezone.utc) - when
+            ).timestamp()
+        return any_to_datetime(when, tz=datetime.timezone.utc).timestamp()
+
+    def is_fresher_than(self, mtime: TimeLike) -> bool:
+        """Whether this holder was modified strictly after ``mtime``.
+
+        Unknown mtime (``self.mtime == 0.0``) returns ``False``.
+        """
+        ts = self.normalize_timestamp(mtime, default=None)
+        assert ts is not None  # mtime is required here
+        return self.is_fresher_than_timestamp(ts)
+
+    def is_fresher_than_timestamp(self, mtime: float) -> bool:
+        if self.mtime == 0.0:
+            return False
+        return self.mtime > mtime
+
+    def is_older_than(self, mtime: TimeLike) -> bool:
+        """Whether this holder was modified strictly before ``mtime``.
+
+        Unknown mtime (``self.mtime == 0.0``) returns ``False``.
+        """
+        ts = self.normalize_timestamp(mtime, default=None)
+        assert ts is not None
+        return self.is_older_than_timestamp(ts)
+
+    def is_older_than_timestamp(self, mtime: float) -> bool:
+        if self.mtime == 0.0:
+            return False
+        return self.mtime < mtime
+
+    def modified_between(
+        self,
+        start: TimeLike | None = None,
+        end: TimeLike | None = None,
+    ) -> bool:
+        """Whether mtime falls in the half-open window ``[start, end)``.
+
+        Either bound may be ``None`` for "unbounded on that side", so
+        ``modified_between(start=yesterday)`` reads "modified since
+        yesterday" and ``modified_between(end=cutoff)`` reads
+        "modified before ``cutoff``". Both ``None`` is allowed and
+        accepts any known mtime (still rejects unknown).
+
+        Bounds accept anything :func:`any_to_datetime` understands —
+        ``datetime``, ISO strings, raw timestamps, or a
+        :class:`datetime.timedelta` interpreted relative to now.
+
+        Unknown mtime (``self.mtime == 0.0``) always returns
+        ``False`` — there's no honest answer.
+        """
+        if self.mtime == 0.0:
+            return False
+        start_ts = self.normalize_timestamp(start, default=None)
+        end_ts = self.normalize_timestamp(end, default=None)
+        return self.is_between_timestamp(start_ts, end_ts)
+
+    def is_between_timestamp(
+        self,
+        start: float | None,
+        end: float | None,
+    ) -> bool:
+        """Raw-timestamp variant of :meth:`modified_between`.
+
+        Half-open ``[start, end)``. ``None`` on either side means
+        unbounded. Unknown mtime returns ``False``.
+        """
+        if self.mtime == 0.0:
+            return False
+        if start is not None and self.mtime < start:
+            return False
+        if end is not None and self.mtime >= end:
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Dunder

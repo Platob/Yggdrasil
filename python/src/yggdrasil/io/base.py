@@ -585,6 +585,8 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
             except Exception:
                 pass
 
+        self._unpersist_schema()
+
     def _active(self) -> "Holder":
         """The holder this cursor reads / writes against.
 

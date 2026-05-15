@@ -32,6 +32,7 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 
 from yggdrasil.arrow.cast import get_arrow_nbytes
+from yggdrasil.arrow.ops import upsert_arrow_batches
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import ByteUnit, MimeTypes, Mode
@@ -181,11 +182,16 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
         through :meth:`arrow_input_stream` so a codec'd holder is
         transparently decompressed before the footer probe.
         """
+        if options.target:
+            return options.target
+
         if self.size_known and self.size == 0:
             return Schema.empty()
         try:
             with self.arrow_input_stream() as v:
-                return Schema.from_arrow(ipc.RecordBatchFileReader(v).schema)
+                schema = Schema.from_arrow(ipc.RecordBatchFileReader(v).schema)
+                self._persist_schema(schema)
+                return schema
         except (FileNotFoundError, pa.ArrowInvalid):
             return Schema.empty()
 
@@ -269,19 +275,9 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
             return None
 
         if action in _MERGE_MODES and has_existing:
-            # Read existing batches, merge with the incoming iter, then
-            # recurse with OVERWRITE. The merge is delegated to
-            # :func:`upsert_arrow_batches`, which centralizes the
-            # key-aware dedup *and* the keyless ``match_by is
-            # None`` fallback (plain concat) — so we don't fork on
-            # ``options.match_by_keys`` here. Existing batches are
-            # materialized because we're about to truncate the same
-            # buffer they were read from.
-            from yggdrasil.arrow.ops import upsert_arrow_batches
-
-            rewrite_options = options.check_target(self.collect_schema(options))
-            existing = list(self._read_arrow_batches(options))
-            incoming: Iterator[pa.RecordBatch] = iter([first, *iterator])
+            rewrite_options = options.with_target(self.collect_schema(options))
+            existing = list(self._read_arrow_batches(rewrite_options))
+            incoming: Iterator[pa.RecordBatch] = rewrite_options.cast_arrow_batch_iterator(iter([first, *iterator]))
             merged = upsert_arrow_batches(
                 iter(existing),
                 incoming,
@@ -289,9 +285,8 @@ class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
                 Mode.APPEND if action is Mode.APPEND else Mode.UPSERT,
                 memory_pool=options.arrow_memory_pool,
             )
-            chained = rewrite_options.cast_arrow_batch_iterator(merged)
             return self._write_arrow_batches(
-                chained,
+                merged,
                 rewrite_options.copy(
                     mode=Mode.OVERWRITE,
                     # remove already applied since cast_arrow_batch_iterator does it

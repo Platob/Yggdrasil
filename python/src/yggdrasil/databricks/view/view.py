@@ -254,15 +254,14 @@ class View(DatabricksResource):
     def infos(self) -> TableInfo:
         if self._cache_expired():
             logger.debug(
-                "Cache miss [View.infos] view=%s — fetching remote",
-                self.full_name(),
+                "%r fetching remote infos",
+                self,
             )
             infos = self.service.find_view_remote(
                 catalog_name=self.catalog_name,
                 schema_name=self.schema_name,
                 view_name=self.view_name,
             )
-            self._reset_cache()
             object.__setattr__(self, "_infos", infos)
             object.__setattr__(self, "_infos_fetched_at", time.time())
             object.__setattr__(self, "_columns", [
@@ -270,16 +269,12 @@ class View(DatabricksResource):
                 for col_info in (infos.columns or [])
             ])
             logger.debug(
-                "View.infos: stored view=%s table_type=%s columns=%d",
-                self.full_name(), getattr(infos, "table_type", None),
+                "%r fetched remote infos: stored view=%s table_type=%s columns=%d",
+                self, getattr(infos, "table_type", None),
                 len(self._columns or ()),
             )
         else:
             age = time.time() - (self._infos_fetched_at or 0.0)
-            logger.debug(
-                "Cache hit [View.infos] view=%s age=%.0fs",
-                self.full_name(), age,
-            )
         return self._infos
 
     @property

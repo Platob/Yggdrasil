@@ -127,14 +127,14 @@ class _SQLIntegrationBase(DatabricksIntegrationCase):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _unique_table(self, prefix: str) -> Table:
+    def _unique_table(self, prefix: str, seed: bool = True) -> Table:
         """Return a fresh :class:`Table` handle with a unique name.
 
         The handle is registered for class-level cleanup before any
         DDL runs, so a test that fails mid-flight still leaves the
         teardown loop with something to drop.
         """
-        name = f"yg_{prefix}_{secrets.token_hex(4)}"
+        name = f"yg_{prefix}_{secrets.token_hex(4)}" if seed else f"yg_{prefix}"
         full_name = f"{self.catalog_name}.{self.schema_name}.{name}"
         type(self).created_tables.append(full_name)
         return self.engine.table(full_name)
@@ -250,7 +250,7 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
     # ------------------------------------------------------------------
 
     def test_engine_create_table_auto_creates_managed_table(self) -> None:
-        table = self._unique_table("create")
+        table = self._unique_table("create", seed=False)
         self.assertFalse(table.exists)
 
         created = self.engine.create_table(
@@ -266,6 +266,21 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
             full_name=table.full_name(),
         )
         self.assertTrue(again.exists)
+
+        vol = table.staging_volume
+        vp = table.staging_folder(temporary=False)
+        avp = table.staging_folder(async_write=True)
+
+        assert vol is table.staging_volume
+        assert vp is table.staging_folder(temporary=False)
+        assert avp is table.staging_folder(async_write=True)
+
+        fp = avp / "test.parquet"
+        fp.write_pylist([{"id": 1, "name": "Nika"}], mode='w')
+
+        assert fp.read_pylist() == [{"id": 1, "name": "Nika"}]
+
+        avp.remove()
 
     # ------------------------------------------------------------------
     # Table.create / Table.ensure_created
