@@ -532,32 +532,167 @@ class View(DatabricksResource):
 
     # ── rename ────────────────────────────────────────────────────────────────
 
-    def rename(self, new_name: str) -> "View":
+    def rename(
+        self,
+        new_name: str | None = None,
+        *,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        view_name: str | None = None,
+    ) -> "View":
         """Rename this view in-place (``ALTER VIEW … RENAME TO …``).
 
-        The catalog/schema parent is unchanged; *new_name* is the unqualified name.
+        Accepts an unqualified name (``"new_orders_v"``), a two-part name
+        (``"reporting.orders_v"`` → cross-schema move within the same catalog),
+        or a three-part name (``"main.reporting.orders_v"``). Catalog/schema
+        keyword overrides win over parts parsed from *new_name*.
+
+        Unity Catalog allows cross-schema renames within the same catalog;
+        moves across catalogs are rejected here with a clear error rather
+        than letting the server return a generic failure.
         """
-        new_name = (new_name or "").strip().strip("`")
-        if not new_name:
+        if new_name is not None:
+            parsed_c, parsed_s, parsed_v = self.service.parse_catalog_schema_view_names(new_name)
+        else:
+            parsed_c = parsed_s = parsed_v = None
+
+        target_catalog = (catalog_name or parsed_c or self.catalog_name or "").strip().strip("`")
+        target_schema = (schema_name or parsed_s or self.schema_name or "").strip().strip("`")
+        target_view = (view_name or parsed_v or "").strip().strip("`")
+
+        if not target_view:
             raise ValueError("Cannot rename view to an empty name")
-        if new_name == self.view_name:
+        if not target_catalog or not target_schema:
+            raise ValueError(
+                f"Cannot rename {self.full_name()} — target needs a catalog and"
+                f" schema (got catalog={target_catalog!r} schema={target_schema!r})"
+            )
+        if target_catalog != self.catalog_name:
+            raise ValueError(
+                f"Unity Catalog ALTER VIEW RENAME TO cannot move a view across"
+                f" catalogs ({self.catalog_name!r} → {target_catalog!r}). Use"
+                f" View.clone(...) to copy across catalogs instead."
+            )
+        if target_schema == self.schema_name and target_view == self.view_name:
             logger.debug(
-                "View.rename: no-op — new name matches current %r on %s",
-                new_name, self.full_name(),
+                "View.rename: no-op — new name matches current %s",
+                self.full_name(),
             )
             return self
 
+        if target_schema == self.schema_name:
+            rename_to = quote_ident(target_view)
+        else:
+            rename_to = f"{quote_ident(target_schema)}.{quote_ident(target_view)}"
+
         logger.debug(
             "View.rename: %s → %s.%s.%s",
-            self.full_name(), self.catalog_name, self.schema_name, new_name,
+            self.full_name(), target_catalog, target_schema, target_view,
         )
         self.sql.execute(
-            f"ALTER VIEW {self.full_name(safe=True)} "
-            f"RENAME TO {quote_ident(new_name)}"
+            f"ALTER VIEW {self.full_name(safe=True)} RENAME TO {rename_to}"
         )
         self._reset_cache(invalidate_cache=True)
-        self.view_name = new_name
+        self.schema_name = target_schema
+        self.view_name = target_view
         return self
+
+    # ── clone ─────────────────────────────────────────────────────────────────
+
+    def clone(
+        self,
+        target: "str | View | None" = None,
+        *,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        view_name: str | None = None,
+        query: str | None = None,
+        replace: bool = False,
+        if_not_exists: bool = False,
+        comment: str | None = None,
+        properties: Optional[Mapping[str, Any]] = None,
+    ) -> "View":
+        """Clone this view to *target* by re-emitting its SELECT definition.
+
+        Delta CLONE is table-only, so the view-side analogue is a fresh
+        ``CREATE [OR REPLACE] VIEW [IF NOT EXISTS] <target> AS <query>``.
+
+        Args:
+            target:        Target location — :class:`View`, a 1/2/3-part dotted
+                           name, or ``None`` when *catalog_name* / *schema_name*
+                           / *view_name* are passed explicitly.
+            query:         Override SELECT text. Defaults to the source view's
+                           own :attr:`view_definition`.
+            replace:       Emit ``CREATE OR REPLACE VIEW``.
+            if_not_exists: Emit ``CREATE VIEW IF NOT EXISTS``. Mutually
+                           exclusive with *replace*.
+            comment:       Optional ``COMMENT`` on the cloned view.
+            properties:    Optional ``TBLPROPERTIES`` overrides.
+
+        Returns:
+            A :class:`View` bound to this service pointing at the target.
+        """
+        if replace and if_not_exists:
+            raise ValueError("Use either replace=True or if_not_exists=True, not both.")
+
+        views = self.service
+        if isinstance(target, View):
+            target_catalog = target.catalog_name
+            target_schema = target.schema_name
+            target_view = target.view_name
+        else:
+            parsed_c, parsed_s, parsed_v = (
+                views.parse_catalog_schema_view_names(target) if target else (None, None, None)
+            )
+            target_catalog = catalog_name or parsed_c or self.catalog_name
+            target_schema = schema_name or parsed_s or self.schema_name
+            target_view = view_name or parsed_v
+
+        if not (target_catalog and target_schema and target_view):
+            raise ValueError(
+                f"Cannot clone {self.full_name()} — target needs catalog +"
+                f" schema + view (got catalog={target_catalog!r}"
+                f" schema={target_schema!r} view={target_view!r})"
+            )
+        if (
+            target_catalog == self.catalog_name
+            and target_schema == self.schema_name
+            and target_view == self.view_name
+        ):
+            raise ValueError(
+                f"Cannot clone {self.full_name()} onto itself — choose a"
+                f" different target catalog/schema/view."
+            )
+
+        select_text = (query or self.view_definition or "").strip().rstrip(";").strip()
+        if not select_text:
+            raise ValueError(
+                f"Cannot clone {self.full_name()} — source has no view_definition"
+                f" and no query override was provided."
+            )
+
+        cloned = View(
+            service=views,
+            catalog_name=target_catalog,
+            schema_name=target_schema,
+            view_name=target_view,
+        )
+        statement = cloned.create_ddl(
+            select_text,
+            or_replace=replace,
+            if_not_exists=if_not_exists,
+            comment=comment,
+            properties=properties,
+        )
+        logger.debug(
+            "View.clone: %s → %s.%s.%s replace=%s if_not_exists=%s",
+            self.full_name(), target_catalog, target_schema, target_view,
+            replace, if_not_exists,
+        )
+        self.sql.execute(statement)
+
+        views.invalidate_cached_view(view=cloned)
+        return cloned
 
     # ── tags ──────────────────────────────────────────────────────────────────
 
