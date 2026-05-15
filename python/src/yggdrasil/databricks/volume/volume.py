@@ -247,6 +247,42 @@ class Volume(DatabricksResource, Singleton):
     def explore_url(self) -> URL:
         return self.url
 
+    @classmethod
+    def from_url(cls, url: "URL | str", **kwargs: Any) -> "Volume":
+        """Build a :class:`Volume` from a ``dbfs+volume:///cat/sch/vol`` URL.
+
+        Used by the :class:`DatabricksPath` dispatcher when a caller
+        passes a POSIX volume path that resolves exactly to volume
+        depth (``DatabricksPath("/Volumes/main/sales/staging")`` →
+        ``Volume("main", "sales", "staging")``); deeper paths resolve
+        to :class:`VolumePath` instead.
+        """
+        from .volumes import Volumes
+
+        u = URL.from_(url)
+        parts = [p for p in (u.path or "/").lstrip("/").split("/") if p]
+        if len(parts) < 3:
+            raise ValueError(
+                f"Cannot derive volume name from URL {u!r} — expected "
+                f"three path segments "
+                f"(e.g. ``dbfs+volume:///main/sales/staging``)."
+            )
+        catalog_name, schema_name, volume_name = parts[0], parts[1], parts[2]
+        client = kwargs.pop("client", None)
+        if client is None:
+            client = (
+                DatabricksClient(host=f"https://{u.host}/")
+                if u.host else DatabricksClient.current()
+            )
+        service = kwargs.pop("service", None) or Volumes(client=client)
+        return cls(
+            service=service,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            volume_name=volume_name,
+            **kwargs,
+        )
+
     # ── pickle ────────────────────────────────────────────────────────────────
 
     def __getnewargs_ex__(self):

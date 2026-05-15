@@ -190,6 +190,29 @@ def _resolve_databricks_subclass(
     scheme = (candidate.scheme or "").lower()
 
     if scheme == Scheme.DATABRICKS_VOLUME.value:
+        # Dispatch by path-segment count under the ``/Volumes/`` namespace
+        # so the Unity Catalog hierarchy maps cleanly onto the URL:
+        #
+        #   ``/Volumes``                      → :class:`VolumePath` (root)
+        #   ``/Volumes/cat``                  → :class:`Catalog`
+        #   ``/Volumes/cat/sch``              → :class:`Schema`
+        #   ``/Volumes/cat/sch/vol``          → :class:`Volume`
+        #   ``/Volumes/cat/sch/vol/<rest>``   → :class:`VolumePath`
+        #
+        # Catalog / Schema / Volume are off-family resources (not
+        # :class:`DatabricksPath` subclasses) — :meth:`DatabricksPath.__new__`
+        # routes them through their own :meth:`from_url` constructor.
+        parts = [p for p in (candidate.path or "/").lstrip("/").split("/") if p]
+        depth = len(parts)
+        if depth == 1:
+            from yggdrasil.databricks.catalog.catalog import Catalog
+            return Catalog, candidate
+        if depth == 2:
+            from yggdrasil.databricks.schema.schema import Schema
+            return Schema, candidate
+        if depth == 3:
+            from yggdrasil.databricks.volume.volume import Volume
+            return Volume, candidate
         return VolumePath, candidate
     if scheme == Scheme.DATABRICKS_WORKSPACE.value:
         return WorkspacePath, candidate
@@ -204,6 +227,16 @@ def _resolve_databricks_subclass(
         # the SQL module exists.
         from yggdrasil.databricks.table.table import Table
         return Table, candidate
+    if scheme == Scheme.DATABRICKS_CATALOG.value:
+        # ``dbfs+catalog:///cat`` — explicit catalog URL form. Routes
+        # to the same :class:`Catalog` resource the volume-path dispatch
+        # picks for ``dbfs+volume:///cat``.
+        from yggdrasil.databricks.catalog.catalog import Catalog
+        return Catalog, candidate
+    if scheme == Scheme.DATABRICKS_SCHEMA.value:
+        # ``dbfs+schema:///cat/sch`` — explicit schema URL form.
+        from yggdrasil.databricks.schema.schema import Schema
+        return Schema, candidate
 
     # Unknown scheme (or empty) — let the caller's intended class
     # decide. DBFSPath is the safe default for the un-qualified
@@ -331,21 +364,32 @@ class DatabricksPath(Singleton, RemotePath):
             return super().__new__(cls, data=data, url=url, **kwargs)
 
         target, normalized = _resolve_databricks_subclass(data=data, url=url)
-        # When dispatching to a DatabricksPath subclass, hand back
-        # control to Python so the subclass's ``__init__`` fires with
-        # the caller's original (data, url, **kwargs). Coerce ``data``
-        # to ``None`` once we've folded its information into the URL,
-        # so the subclass init doesn't double-parse it.
+        # Byte-shaped Path subclasses (DBFSPath / VolumePath /
+        # WorkspacePath) accept ``url=`` straight through ``__init__``,
+        # so we can hand control back to Python — their auto-fired
+        # ``__init__`` re-runs with the caller's kwargs and the
+        # normalized URL.
+        #
+        # Resource-shaped subclasses (Catalog / Schema / Volume / Table)
+        # go through ``from_url`` because their constructors take
+        # ``(service, catalog_name=…, schema_name=…, …)``, not
+        # ``(data, url, …)`` — the URL needs to be parsed into Unity
+        # Catalog coordinates before the constructor sees it.
         if isinstance(target, type) and issubclass(target, DatabricksPath):
-            if normalized is not None:
-                data = None
-                url = normalized
-            return target.__new__(target, data=data, url=url, **kwargs)
+            from .fs.dbfs_path import DBFSPath
+            from .fs.volume_path import VolumePath
+            from .fs.workspace_path import WorkspacePath
+            if target in (DBFSPath, VolumePath, WorkspacePath):
+                if normalized is not None:
+                    data = None
+                    url = normalized
+                return target.__new__(target, data=data, url=url, **kwargs)
 
-        # Off-family target (Unity Catalog :class:`Table`) — construct
-        # eagerly via ``from_url`` so the returned object is fully
-        # initialized. Python won't auto-call ``__init__`` because the
-        # result isn't a :class:`DatabricksPath` instance.
+        # Resource-shaped or off-family target — construct eagerly via
+        # ``from_url`` so the returned object is fully initialized.
+        # Python's auto-``__init__`` only fires when the result is an
+        # instance of the originating ``cls`` (DatabricksPath); resource
+        # targets like ``Table`` aren't, so they need eager init here.
         if normalized is None:
             raise TypeError(
                 f"{cls.__name__} cannot dispatch to {target.__name__} "

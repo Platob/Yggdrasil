@@ -271,6 +271,39 @@ class Catalog(DatabricksPath, Singleton):
     def default_media_type(cls) -> MimeType:
         return MimeTypes.DATABRICKS_UNITY_CATALOG_CATALOG
 
+    @classmethod
+    def from_url(cls, url: "URL | str", **kwargs: Any) -> "Catalog":
+        """Build a :class:`Catalog` from a ``dbfs+volume:///cat`` /
+        ``dbfs+catalog:///cat`` URL.
+
+        Used by the :class:`DatabricksPath` dispatcher when a caller
+        passes a POSIX volume path that resolves to catalog depth
+        (``DatabricksPath("/Volumes/main")`` → ``Catalog("main")``).
+        Pulls the catalog name from the first path segment and binds
+        the underlying :class:`DatabricksClient` to whatever the URL's
+        host resolves to (or :meth:`DatabricksClient.current` when
+        the URL carries no host).
+        """
+        from yggdrasil.databricks.client import DatabricksClient
+        from .catalogs import Catalogs
+
+        u = URL.from_(url)
+        parts = [p for p in (u.path or "/").lstrip("/").split("/") if p]
+        if not parts:
+            raise ValueError(
+                f"Cannot derive catalog name from URL {u!r} — expected at "
+                f"least one path segment (e.g. ``dbfs+volume:///main``)."
+            )
+        catalog_name = parts[0]
+        client = kwargs.pop("client", None)
+        if client is None:
+            client = (
+                DatabricksClient(host=f"https://{u.host}/")
+                if u.host else DatabricksClient.current()
+            )
+        service = kwargs.pop("service", None) or Catalogs(client=client)
+        return cls(service=service, catalog_name=catalog_name, **kwargs)
+
     # ── DatabricksResource compatibility ──────────────────────────────────────
 
     @property
