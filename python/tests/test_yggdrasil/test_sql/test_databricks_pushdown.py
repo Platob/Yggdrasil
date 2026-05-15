@@ -11,6 +11,11 @@ import sys
 import types
 from typing import Any
 
+import pytest
+
+# Pushdown rewrite uses the SQL planner which depends on sqlglot.
+pytest.importorskip("sqlglot")
+
 import pyarrow as pa
 
 from yggdrasil.arrow.tests import ArrowTestCase

@@ -1,6 +1,13 @@
 """End-to-end tests for :class:`yggdrasil.sql.engine.Engine`."""
 from __future__ import annotations
 
+import pytest
+
+# The SQL planner pulls in :mod:`sqlglot` for parsing — skip the whole
+# module on installs without the optional ``[sql]`` extra so the
+# project's base test run stays green.
+pytest.importorskip("sqlglot")
+
 import pyarrow as pa
 
 from yggdrasil.arrow.tests import ArrowTestCase

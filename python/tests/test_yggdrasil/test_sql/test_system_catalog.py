@@ -6,6 +6,11 @@ clean between cases.
 """
 from __future__ import annotations
 
+import pytest
+
+# The Engine constructor walks the SQL planner which depends on sqlglot.
+pytest.importorskip("sqlglot")
+
 import pyarrow as pa
 
 from yggdrasil.arrow.tests import ArrowTestCase

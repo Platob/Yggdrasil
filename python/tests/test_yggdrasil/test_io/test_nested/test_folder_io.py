@@ -403,6 +403,9 @@ class TestDelete:
         assert sorted(folder.read_arrow_table().column("id").to_pylist()) == [1, 2]
 
     def test_delete_accepts_sql_string(self, tmp_path) -> None:
+        # SQL-string predicates round-trip through the SQL lifter,
+        # which depends on the optional :mod:`sqlglot` extra.
+        pytest.importorskip("sqlglot")
         folder = FolderIO(path=str(tmp_path))
         folder.write_arrow_table(pa.table({"id": [1, 2, 3, 4]}))
         deleted = folder.delete("id IN (2, 4)")
