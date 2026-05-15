@@ -1,6 +1,37 @@
+"""Temporal type converters for the cast registry.
+
+Parse cascade for strings
+-------------------------
+``str_to_datetime`` tries each strategy in order, stopping at the first hit:
+
+1. Sentinel keywords (``"utcnow"``, ``"now"``).
+2. Direct ``datetime.fromisoformat`` after a cheap ``Z`` → ``+00:00`` fixup —
+   handles the dominant canonical ISO 8601 shape with zero regex overhead.
+3. ``normalize_datetime_string`` (slash-date, colon-less offset, compact
+   ``YYYYMMDD[T]HHMMSS``, fractional-second padding) followed by another
+   ``fromisoformat`` attempt.
+4. ``strptime`` trial over ``_STRPTIME_FORMATS`` as last resort.
+
+Numeric epoch inference
+-----------------------
+``_numeric_timestamp_to_seconds`` auto-scales int/float inputs:
+seconds if the value is ≤ 100× ``time.time()``, milliseconds up to
+100 000×, microseconds beyond that.  Negative values use their absolute
+magnitude for the scale decision.
+
+Interval / truncation helpers
+------------------------------
+``_coerce_interval`` parses a string interval spec (ISO 8601 duration:
+``"PT15M"``, ``"P1D"``, ``"P1M"``) or a ``datetime.timedelta`` into a
+frozen ``_IntervalSpec``.  Results are LRU-cached — ``iter_datetime_ranges``
+calls this on every iteration step with the same argument, so the cache
+removes repeated regex work.
+"""
+
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import math
 import re
 import time
@@ -364,7 +395,7 @@ def str_to_tzinfo(value: str, opts: Any = None) -> dt.tzinfo:
     s = value.strip()
     u = s.upper()
 
-    if u in {"Etc/UTC", "UTC", "Z"}:
+    if u in {"ETC/UTC", "UTC", "Z"}:
         return _UTC
     if u in {"LOCAL", "CURRENT", "NOW"}:
         return CURRENT_TZINFO
@@ -670,7 +701,13 @@ def iter_datetime_ranges(
         current = nxt
 
 
+@functools.lru_cache(maxsize=256)
 def _coerce_interval(interval: str | dt.timedelta) -> _IntervalSpec:
+    # Both str and timedelta are hashable, so lru_cache works directly.
+    # iter_datetime_ranges calls this once per call with the same argument,
+    # but callers that loop over date ranges (e.g. rolling-window pipelines)
+    # call truncate_datetime / iter_datetime_ranges repeatedly with the same
+    # interval string — the cache avoids re-running the ISO duration regex.
     if isinstance(interval, _TIMEDELTA):
         return _interval_spec_from_timedelta(interval)
     if isinstance(interval, str):

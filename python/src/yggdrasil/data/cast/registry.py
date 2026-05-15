@@ -534,6 +534,12 @@ def convert_to_python_enum(value: Any, target: type[enum.Enum], options: Optiona
     raise TypeError(f"No matching Enum member for {value!r} in {target.__name__}")
 
 
+# Per-class cache for resolved type hints.  get_type_hints() does module
+# dict lookups and forward-ref resolution on every call; caching once per
+# class drops that cost to a single dict lookup on subsequent conversions.
+_DATACLASS_HINTS_CACHE: dict[type, dict[str, Any]] = {}
+
+
 def convert_to_python_dataclass(value: Any, target: type[T], options: Optional["CastOptions"] = None) -> T:
     """
     Convert a mapping-like object into a dataclass instance.
@@ -559,8 +565,13 @@ def convert_to_python_dataclass(value: Any, target: type[T], options: Optional["
     if not isinstance(value, Mapping):
         raise TypeError(f"Cannot convert {type(value)} to dataclass {target.__name__}")
 
-    # Resolved annotations (handles __future__.annotations and forward refs)
-    hints = get_type_hints(target)
+    # Resolved annotations (handles __future__.annotations and forward refs).
+    # Cached per class — get_type_hints() pays module-dict + forward-ref
+    # resolution costs on every call; the result is stable for a given class.
+    hints = _DATACLASS_HINTS_CACHE.get(target)
+    if hints is None:
+        hints = get_type_hints(target)
+        _DATACLASS_HINTS_CACHE[target] = hints
     out: dict[str, Any] = {}
 
     for f in dataclasses.fields(target):

@@ -437,3 +437,197 @@ class TestEnumEdgeCases:
 
         assert convert("RED", Color) is Color.RED
         assert convert("red", Color) is Color.RED
+
+
+# ---------------------------------------------------------------------------
+# unwrap_optional — Union / Optional edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestUnwrapOptional:
+
+    def test_optional_int(self) -> None:
+        from yggdrasil.data.cast.registry import unwrap_optional
+
+        is_opt, inner = unwrap_optional(Optional[int])
+        assert is_opt is True
+        assert inner is int
+
+    def test_pipe_syntax_optional(self) -> None:
+        from yggdrasil.data.cast.registry import unwrap_optional
+
+        is_opt, inner = unwrap_optional(int | None)
+        assert is_opt is True
+        assert inner is int
+
+    def test_non_optional_plain_type(self) -> None:
+        from yggdrasil.data.cast.registry import unwrap_optional
+
+        is_opt, inner = unwrap_optional(int)
+        assert is_opt is False
+        assert inner is int
+
+    def test_non_optional_str(self) -> None:
+        from yggdrasil.data.cast.registry import unwrap_optional
+
+        is_opt, inner = unwrap_optional(str)
+        assert is_opt is False
+        assert inner is str
+
+    def test_real_union_with_two_non_none_types_not_unwrapped(self) -> None:
+        # Union[int, str] — not Optional, so is_optional should be False.
+        from typing import Union
+        from yggdrasil.data.cast.registry import unwrap_optional
+
+        is_opt, inner = unwrap_optional(Union[int, str])
+        # Two non-None types: not optional in the "single inner type" sense.
+        assert is_opt is False
+
+
+# ---------------------------------------------------------------------------
+# iter_mro / type_matches / is_runtime_value
+# ---------------------------------------------------------------------------
+
+
+class TestTypeHelpers:
+
+    def test_iter_mro_returns_mro_for_class(self) -> None:
+        from yggdrasil.data.cast.registry import iter_mro
+
+        class A:
+            pass
+
+        class B(A):
+            pass
+
+        mro = list(iter_mro(B))
+        assert B in mro
+        assert A in mro
+
+    def test_iter_mro_non_class_includes_itself(self) -> None:
+        from yggdrasil.data.cast.registry import iter_mro
+        from typing import Any
+
+        result = list(iter_mro(Any))
+        assert Any in result
+
+    def test_type_matches_exact(self) -> None:
+        from yggdrasil.data.cast.registry import type_matches
+
+        assert type_matches(int, int) is True
+
+    def test_type_matches_subclass(self) -> None:
+        from yggdrasil.data.cast.registry import type_matches
+
+        class A:
+            pass
+
+        class B(A):
+            pass
+
+        assert type_matches(B, A) is True
+        assert type_matches(A, B) is False
+
+    def test_type_matches_unrelated(self) -> None:
+        from yggdrasil.data.cast.registry import type_matches
+
+        assert type_matches(int, str) is False
+
+    def test_is_runtime_value_class(self) -> None:
+        from yggdrasil.data.cast.registry import is_runtime_value
+
+        assert is_runtime_value(int) is False
+        assert is_runtime_value(str) is False
+
+    def test_is_runtime_value_instance(self) -> None:
+        from yggdrasil.data.cast.registry import is_runtime_value
+
+        assert is_runtime_value(42) is True
+        assert is_runtime_value("hello") is True
+
+    def test_is_runtime_value_generic_alias(self) -> None:
+        from yggdrasil.data.cast.registry import is_runtime_value
+
+        assert is_runtime_value(list[int]) is False
+
+
+# ---------------------------------------------------------------------------
+# _DATACLASS_HINTS_CACHE — populated on second call, consistent result
+# ---------------------------------------------------------------------------
+
+
+class TestDataclassHintsCache:
+
+    def test_hints_cached_per_class(self) -> None:
+        from yggdrasil.data.cast.registry import _DATACLASS_HINTS_CACHE
+
+        @dataclass
+        class Sample:
+            x: int = 0
+            y: str = "a"
+
+        # Evict any prior entry so the test is deterministic.
+        _DATACLASS_HINTS_CACHE.pop(Sample, None)
+
+        convert({"x": "3"}, Sample)
+        assert Sample in _DATACLASS_HINTS_CACHE
+
+        cached = _DATACLASS_HINTS_CACHE[Sample]
+        convert({"x": "7"}, Sample)
+        # Same dict object is reused — not rebuilt on every call.
+        assert _DATACLASS_HINTS_CACHE[Sample] is cached
+
+    def test_cached_result_is_consistent(self) -> None:
+        from yggdrasil.data.cast.registry import _DATACLASS_HINTS_CACHE
+
+        @dataclass
+        class Pair:
+            a: int = 0
+            b: float = 0.0
+
+        _DATACLASS_HINTS_CACHE.pop(Pair, None)
+
+        out1 = convert({"a": "1", "b": "2.5"}, Pair)
+        out2 = convert({"a": "10", "b": "3.0"}, Pair)
+
+        assert out1 == Pair(a=1, b=2.5)
+        assert out2 == Pair(a=10, b=3.0)
+
+
+# ---------------------------------------------------------------------------
+# _PRIMITIVE_DTYPE_CACHE — singleton reuse
+# ---------------------------------------------------------------------------
+
+
+class TestPrimitiveDtypeCache:
+
+    def test_same_dtype_returned_for_same_type(self) -> None:
+        from yggdrasil.data.cast.registry import _primitive_dtype
+
+        d1 = _primitive_dtype(int)
+        d2 = _primitive_dtype(int)
+        assert d1 is d2
+
+    def test_different_types_different_dtypes(self) -> None:
+        from yggdrasil.data.cast.registry import _primitive_dtype
+
+        assert _primitive_dtype(int) is not _primitive_dtype(float)
+        assert _primitive_dtype(int) is not _primitive_dtype(str)
+
+
+# ---------------------------------------------------------------------------
+# convert — no-path TypeError message
+# ---------------------------------------------------------------------------
+
+
+class TestConvertErrorMessages:
+
+    def test_no_converter_raises_type_error(self) -> None:
+        class _Exotic:
+            pass
+
+        class _Target:
+            pass
+
+        with pytest.raises(TypeError, match="No converter"):
+            convert(_Exotic(), _Target)
