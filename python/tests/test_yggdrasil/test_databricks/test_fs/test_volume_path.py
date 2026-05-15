@@ -46,12 +46,14 @@ def reset_volume_credentials_refresher_singletons():
 
 @pytest.fixture(autouse=True)
 def reset_volume_info_cache():
-    # Class-level ``VolumeInfo`` cache keyed by (cat, sch, vol). Tests
-    # share path coordinates across cases, so leaking the cache would
-    # short-circuit the SDK call this case is trying to observe.
-    VolumePath._VOLUME_INFO_CACHE.clear()
+    # ``Volume`` singletons cache ``VolumeInfo`` per (host, cat, sch,
+    # vol). Tests share path coordinates across cases, so leaking the
+    # cache would short-circuit the SDK call this case is trying to
+    # observe.
+    from yggdrasil.databricks.volume.volume import Volume
+    Volume._INSTANCES.clear()
     yield
-    VolumePath._VOLUME_INFO_CACHE.clear()
+    Volume._INSTANCES.clear()
 
 
 @pytest.fixture
