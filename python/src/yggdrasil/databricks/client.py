@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from .column.columns import Columns
     from .catalog.catalogs import Catalogs
     from .schema.schemas import Schemas
+    from .volume.volumes import Volumes
     from .warehouse.service import Warehouses
     from .compute.service import Compute
     from .secrets.service import Secrets
@@ -215,7 +216,7 @@ class DatabricksClient(URLBased):
         "_base_url_cached",
         "_workspace", "_sql", "_entity_tags", "_warehouses", "_compute",
         "_secrets", "_iam", "_tables", "_views", "_columns_svc",
-        "_catalogs", "_schemas", "_genie", "_filesystem",
+        "_catalogs", "_schemas", "_volumes", "_genie", "_filesystem",
     })
 
     # Config attributes worth snapshotting for warm restart on another host.
@@ -1262,6 +1263,25 @@ class DatabricksClient(URLBased):
         )
 
     @property
+    def volumes(self) -> "Volumes":
+        """Collection-level Unity Catalog volume service for this client.
+
+        Provides dict-like access to volumes::
+
+            client.volumes["main.sales.uploads"]                # Volume
+            client.volumes(catalog_name="main", schema_name="sales")["uploads"]
+            client.volumes.list(catalog_name="main")            # Iterator[Volume]
+        """
+        from .volume.volumes import Volumes
+
+        return self.lazy_property(
+            self,
+            cache_attr="_volumes",
+            factory=lambda: Volumes(client=self),
+            use_cache=True,
+        )
+
+    @property
     def genie(self) -> "Genie":
         """Genie conversation and space management helper for this client."""
         from .genie import Genie
@@ -1629,6 +1649,11 @@ class DatabricksService(ABC):
     def schemas(self) -> "Schemas":
         """Collection-level Unity Catalog schema service (shorthand for ``client.schemas``)."""
         return self.client.schemas
+
+    @property
+    def volumes(self) -> "Volumes":
+        """Collection-level Unity Catalog volume service (shorthand for ``client.volumes``)."""
+        return self.client.volumes
 
     @property
     def genie(self) -> "Genie":
