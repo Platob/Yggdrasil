@@ -94,6 +94,52 @@ class TestVolumeSingleton:
                    schema_name="sch", volume_name=None)
 
 
+class _PicklableClient:
+    """Minimal picklable stand-in for ``DatabricksClient`` — the MagicMock
+    fixture used elsewhere in this file can't survive ``pickle.dumps``."""
+
+    def __init__(self, host: str):
+        self.host = host
+
+    def __eq__(self, other):
+        return isinstance(other, _PicklableClient) and self.host == other.host
+
+    def __hash__(self):
+        return hash((type(self), self.host))
+
+
+class TestVolumePickle:
+    """Pickle round-trip preserves the client (and thus the host /
+    auth context), not just the three-part name."""
+
+    def test_in_process_collapses_to_live_singleton(self):
+        import pickle
+        client = _PicklableClient(host="https://example.cloud.databricks.com")
+        v = Volumes(client=client).volume(
+            catalog_name="cat", schema_name="sch", volume_name="vol",
+        )
+        loaded = pickle.loads(pickle.dumps(v))
+        assert loaded is v
+
+    def test_cross_process_carries_source_client(self):
+        import pickle
+        client = _PicklableClient(host="https://example.cloud.databricks.com")
+        v = Volumes(client=client).volume(
+            catalog_name="cat", schema_name="sch", volume_name="vol",
+        )
+        payload = pickle.dumps(v)
+        # Simulate a fresh process: drop the live singleton cache so
+        # ``__new__`` has to rebuild from the pickle stream alone.
+        Volume._INSTANCES.clear()
+        loaded = pickle.loads(payload)
+        assert loaded is not v
+        # The client that travelled in the pickle is the one the
+        # unpickled Volume uses — not ``Volumes.current()``.
+        assert loaded.client == client
+        assert loaded.client.host == client.host
+        assert loaded.full_name() == "cat.sch.vol"
+
+
 class TestVolumeInfoTTL:
 
     def test_first_access_hits_sdk_subsequent_hit_cache(self, workspace, client):
