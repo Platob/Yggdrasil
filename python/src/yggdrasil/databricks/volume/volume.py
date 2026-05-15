@@ -247,17 +247,13 @@ class Volume(DatabricksResource):
         }
 
     def __setstate__(self, state):
-        carried_service = state.get("service")
+        carried_service = state["service"]
         if getattr(self, "_initialized", False):
             # Singleton cache hit — keep the live instance but rebind to
             # the carried service (mirrors ``__init__``'s rebind-on-cache-
             # hit behavior) so the freshly-pickled client wins.
-            if carried_service is not None:
-                self.service = carried_service
+            self.service = carried_service
             return
-        if carried_service is None:
-            from .volumes import Volumes
-            carried_service = Volumes.current()
         self.service = carried_service
         self.catalog_name = state["catalog_name"]
         self.schema_name = state["schema_name"]
