@@ -898,15 +898,3 @@ def _looks_like_already_exists(exc: BaseException) -> bool:
 def _staging_clean_part(value: str) -> str:
     """Strip backticks/whitespace and forbid ``/`` in path segments."""
     return str(value).strip().strip("`").replace("/", "_")
-
-
-# Backwards-compat alias for the legacy class-level cache. The actual
-# storage now lives on :class:`Volume` singletons keyed by ``(host, cat,
-# sch, name)``; this attribute lets existing test fixtures and external
-# callers reset the cache without coupling to the new module layout.
-def _bind_legacy_cache_alias() -> None:
-    from yggdrasil.databricks.volume.volume import Volume
-    VolumePath._VOLUME_INFO_CACHE = Volume._INSTANCES
-
-
-_bind_legacy_cache_alias()
