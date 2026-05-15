@@ -53,6 +53,7 @@ from databricks.sdk.service.compute import (
 from yggdrasil.data.cast.registry import identity
 from yggdrasil.data.enums import NodeType
 from yggdrasil.dataclasses import ExpiringDict
+from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.url import URL
@@ -552,7 +553,7 @@ class InstancePools(DatabricksService):
 # ---------------------------------------------------------------------------
 
 
-class InstancePool(DatabricksResource):
+class InstancePool(Singleton, DatabricksResource):
     """High-level wrapper around a single Databricks instance pool.
 
     Holds a cached :class:`GetInstancePool` and exposes:
@@ -563,7 +564,24 @@ class InstancePool(DatabricksResource):
     - a :meth:`cluster` helper that returns a cluster attached to this pool
     - :meth:`run` / :meth:`decorate` for the simplest local-or-remote Python
       execution flow built on top of the existing cluster command stack
+
+    Inherits :class:`Singleton` (``_SINGLETON_TTL = None``) so two
+    callers asking for the same pool under the same service share the
+    cached :class:`GetInstancePool` snapshot and the per-pool name
+    resolution.
     """
+
+    _SINGLETON_TTL: ClassVar[Any] = None
+
+    @classmethod
+    def _singleton_key(
+        cls,
+        service: "InstancePools | None" = None,
+        instance_pool_id: str | None = None,
+        instance_pool_name: str | None = None,
+        **_kwargs: Any,
+    ) -> Any:
+        return (cls, service, instance_pool_id, instance_pool_name)
 
     def __init__(
         self,
@@ -572,7 +590,12 @@ class InstancePool(DatabricksResource):
         instance_pool_name: str | None = None,
         *,
         details: Optional[GetInstancePool | InstancePoolAndStats] = None,
+        singleton_ttl: Any = ...,
     ):
+        del singleton_ttl
+        if getattr(self, "_initialized", False):
+            return
+
         super().__init__()
         self.service = service or InstancePools.current()
         self.instance_pool_id = instance_pool_id
@@ -583,6 +606,8 @@ class InstancePool(DatabricksResource):
             found = self.service.find(name=self.instance_pool_name, raise_error=True)
             self.instance_pool_id = found.instance_pool_id
             self._details = found._details
+
+        self._initialized = True
 
     # ------------------------------------------------------------------ #
     # Display / identity

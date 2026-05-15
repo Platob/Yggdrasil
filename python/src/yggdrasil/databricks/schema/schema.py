@@ -335,6 +335,40 @@ class Schema(DatabricksPath, Singleton):
     def default_media_type(cls) -> MimeType:
         return MimeTypes.DATABRICKS_UNITY_CATALOG_SCHEMA
 
+    @classmethod
+    def from_url(cls, url: "URL | str", **kwargs: Any) -> "Schema":
+        """Build a :class:`Schema` from a ``dbfs+volume:///cat/sch`` URL.
+
+        Used by the :class:`DatabricksPath` dispatcher when a caller
+        passes a POSIX volume path that resolves to schema depth
+        (``DatabricksPath("/Volumes/main/sales")`` →
+        ``Schema("main", "sales")``).
+        """
+        from yggdrasil.databricks.client import DatabricksClient
+        from .schemas import Schemas
+
+        u = URL.from_(url)
+        parts = [p for p in (u.path or "/").lstrip("/").split("/") if p]
+        if len(parts) < 2:
+            raise ValueError(
+                f"Cannot derive schema name from URL {u!r} — expected "
+                f"two path segments (e.g. ``dbfs+volume:///main/sales``)."
+            )
+        catalog_name, schema_name = parts[0], parts[1]
+        client = kwargs.pop("client", None)
+        if client is None:
+            client = (
+                DatabricksClient(host=f"https://{u.host}/")
+                if u.host else DatabricksClient.current()
+            )
+        service = kwargs.pop("service", None) or Schemas(client=client)
+        return cls(
+            service=service,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            **kwargs,
+        )
+
     # ── DatabricksResource compatibility ──────────────────────────────────────
 
     @property

@@ -3,51 +3,61 @@
 This bench is local-only — nothing here authenticates, builds a real
 ``Config``, or talks to the workspace. Each scenario exercises a method
 that real callers hit on every job: client construction (from env / kw),
-URL packing/unpacking, tag sanitization, default-tag enrichment,
-per-user name scoping, the temp-path "already cleaned" guard, and the
-pickle round-trip used to ship clients across processes (Spark workers,
-multiprocessing pools, FastAPI forks).
+the singleton hit / miss path that drives every cached lookup, sub-service
+``lazy_property`` access, URL packing/unpacking, tag sanitization,
+default-tag enrichment, per-user name scoping, the temp-path "already
+cleaned" guard, and the pickle round-trip used to ship clients across
+processes (Spark workers, multiprocessing pools, FastAPI forks).
 
 Usage::
 
     python benchmarks/databricks/bench_databricks_client.py
     python benchmarks/databricks/bench_databricks_client.py --repeat 7
-    python benchmarks/databricks/bench_databricks_client.py --only to_url,from_url
+    python benchmarks/databricks/bench_databricks_client.py --only singleton_hit
 
-A/B comparison (n=20_000, repeat=7, best us/op, lower is better) — captured
-locally to validate the optimizations land::
+A/B comparison (n=5_000, repeat=5, best us/op, lower is better) — captured
+locally to validate the singleton optimizations land::
 
-                          BEFORE        AFTER       delta
-    construct            12.41 us     12.43 us      0%
-    to_url               36.50 us     30.45 us    -17%
-    from_url             24.10 us     24.29 us     +1%
-    parse_str_url        54.88 us     52.59 us     -4%
-    safe_tag_clean        0.54 us      0.54 us      0%
-    safe_tag_dirty        3.06 us      2.52 us    -18%
-    default_tags          2.89 us      2.88 us      0%
-    user_scoped_name      1.67 us      1.75 us     +5%
-    is_checked_hit        0.56 us      0.59 us     +5%
-    is_checked_miss       2.72 us      2.51 us     -8%
-    pickle_roundtrip     12.53 us     11.78 us     -6%
+                            BEFORE        AFTER       delta
+    construct              26.21 us      7.18 us    -73%
+    singleton_hit          26.02 us      7.41 us    -72%
+    singleton_miss         27.42 us     18.29 us    -33%
+    singleton_key          24.44 us      4.70 us    -81%
+    to_url                 32.63 us     25.35 us    -22%
+    from_url               46.81 us     16.07 us    -66%
+    parse_str_url          86.85 us     38.31 us    -56%
+    lazy_property_hit       1.55 us      0.12 us    -92%
+    lazy_property_chain    (n/a)         0.45 us     —
+    pickle_roundtrip       35.06 us     27.25 us    -22%
+    singleton_pickle_hit   (n/a)        17.85 us     —
 
 The wins:
 
-* ``to_url`` no longer walks ``fields(self)`` on every call — the
-  emitted-as-query name set is a module-level tuple built once at
-  import (``_TO_URL_QUERY_KEYS``).
-* ``safe_tag_value`` lifts the per-call ``re.escape(repl)`` /
-  ``re.compile`` out of the hot path; the collapse regex is cached
-  in ``_SAFE_TAG_COLLAPSE_CACHE`` keyed by ``repl`` (only ``"-"`` in
-  practice).
-* ``is_checked_tmp_path`` no longer iterates the path string into a
-  character-set seed — the previous ``set(base_path)`` was a latent
-  bug that made the cache miss the second call: ``set("/Volumes/x")``
-  yields ``{'/', 'V', 'o', ...}`` rather than ``{"/Volumes/x"}``, so
-  the second ``is_checked`` call walked the Volume listing again
-  (one extra network round-trip per ``tmp_path`` user, real-world).
-  The bench microsecond delta on ``is_checked_miss`` is small; the
-  *correctness* delta is what matters — ``is_checked_hit`` now actually
-  hits on the second call instead of the third.
+* Env defaults are snapshotted once into a module-level dict
+  (``_env_defaults_snapshot``) instead of paying ~14 us of
+  ``os.getenv`` per constructor call. Every singleton-hit /
+  miss / ``from_url`` build benefits.
+* ``_singleton_key`` no longer calls ``sorted()`` on the resolved
+  kwargs — the dict already lands in the fixed insertion order of
+  ``_ENV_DEFAULTS`` + ``_STATIC_DEFAULTS``, and ``custom_tags`` (the
+  only field that was ever a dict) is gone, so the items tuple is
+  hashable as-is.
+* The ``custom_tags`` field is dropped: callers who want resource
+  tags use :meth:`DatabricksClient.default_tags` (which already
+  pulls owner / product info), and the SDK's per-resource
+  ``custom_tags`` (cluster, warehouse, instance pool) keeps working
+  unchanged.
+* Sub-service properties (``client.sql``, ``client.tables``,
+  ``client.warehouses``, …) inline the cache lookup through
+  ``self.__dict__`` — one dict get + one dict set, no
+  ``getattr`` descriptor walk, no lambda allocation per call.
+
+Earlier (pre-singleton) wins kept:
+
+* ``to_url`` no longer walks ``fields(self)`` on every call.
+* ``safe_tag_value`` caches the collapse regex per ``repl``.
+* ``is_checked_tmp_path`` seeds the cache with ``{base_path}``,
+  not ``set(base_path)`` (which iterated the string into chars).
 """
 from __future__ import annotations
 
@@ -84,7 +94,6 @@ def _make_client() -> DatabricksClient:
         token=_TOKEN,
         auth_type="pat",
         cluster_id="0000-bench-cluster",
-        custom_tags={"Team": "platform", "Env": "bench"},
     )
 
 
@@ -216,8 +225,96 @@ def _scenario_pickle_roundtrip(n: int) -> Callable[[], None]:
     return run
 
 
+def _scenario_singleton_hit(n: int) -> Callable[[], None]:
+    """Same kwargs → cached singleton. Drives the env-snapshot fast path."""
+    DatabricksClient._INSTANCES.clear()
+    DatabricksClient(
+        host=_HOST, token=_TOKEN, auth_type="pat",
+        cluster_id="0000-bench-cluster", singleton_ttl=None,
+    )
+
+    def run() -> None:
+        for _ in range(n):
+            DatabricksClient(
+                host=_HOST, token=_TOKEN, auth_type="pat",
+                cluster_id="0000-bench-cluster", singleton_ttl=None,
+            )
+    return run
+
+
+def _scenario_singleton_miss(n: int) -> Callable[[], None]:
+    """Rotate ``host`` to force a fresh singleton entry on every build."""
+    def run() -> None:
+        for i in range(n):
+            DatabricksClient._INSTANCES.clear()
+            DatabricksClient(
+                host=f"https://h-{i}.example", token=_TOKEN, auth_type="pat",
+                singleton_ttl=None,
+            )
+    return run
+
+
+def _scenario_singleton_pickle_hit(n: int) -> Callable[[], None]:
+    """Pickle round-trip that collapses to the live in-process singleton.
+
+    The cross-process restore path normally rebuilds; with the singleton
+    cache populated, ``__new__`` finds the live entry and ``__setstate__``
+    short-circuits — the receiver pays only the unpickle decode cost.
+    """
+    DatabricksClient._INSTANCES.clear()
+    client = DatabricksClient(
+        host=_HOST, token=_TOKEN, auth_type="pat",
+        cluster_id="0000-bench-cluster", singleton_ttl=None,
+    )
+    blob = pickle.dumps(client)
+
+    def run() -> None:
+        for _ in range(n):
+            pickle.loads(blob)
+    return run
+
+
+def _scenario_lazy_property_hit(n: int) -> Callable[[], None]:
+    """Cached ``client.sql`` access — measures the inlined fast path."""
+    client = _make_client()
+    _ = client.sql  # warm
+
+    def run() -> None:
+        for _ in range(n):
+            client.sql
+    return run
+
+
+def _scenario_lazy_property_chain(n: int) -> Callable[[], None]:
+    """Mixed sub-service cache hits — the realistic per-call shape."""
+    client = _make_client()
+    _ = client.sql; _ = client.tables; _ = client.warehouses; _ = client.catalogs
+
+    def run() -> None:
+        for _ in range(n):
+            client.sql
+            client.tables
+            client.warehouses
+            client.catalogs
+    return run
+
+
+def _scenario_singleton_key(n: int) -> Callable[[], None]:
+    """Just the key-build cost — no cache lookup, no instance creation."""
+    def run() -> None:
+        for _ in range(n):
+            DatabricksClient._singleton_key(
+                host=_HOST, token=_TOKEN, auth_type="pat",
+                cluster_id="0000-bench-cluster",
+            )
+    return run
+
+
 SCENARIOS: dict[str, Callable[[int], Callable[[], None]]] = {
     "construct": _scenario_construct,
+    "singleton_hit": _scenario_singleton_hit,
+    "singleton_miss": _scenario_singleton_miss,
+    "singleton_key": _scenario_singleton_key,
     "to_url": _scenario_to_url,
     "from_url": _scenario_from_url,
     "parse_str_url": _scenario_parse_str_url,
@@ -227,7 +324,10 @@ SCENARIOS: dict[str, Callable[[int], Callable[[], None]]] = {
     "user_scoped_name": _scenario_user_scoped_name,
     "is_checked_hit": _scenario_is_checked_hit,
     "is_checked_miss": _scenario_is_checked_miss,
+    "lazy_property_hit": _scenario_lazy_property_hit,
+    "lazy_property_chain": _scenario_lazy_property_chain,
     "pickle_roundtrip": _scenario_pickle_roundtrip,
+    "singleton_pickle_hit": _scenario_singleton_pickle_hit,
 }
 
 

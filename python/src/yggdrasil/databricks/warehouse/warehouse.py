@@ -66,6 +66,7 @@ from yggdrasil.databricks.warehouse.wh_utils import (
     safeEndpointInfo,
     serverless_sibling_spec,
 )
+from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.pyutils.equality import dicts_equal
 from .statement import (
@@ -136,6 +137,7 @@ class DatabricksExecutionOptions(ExecutionOptions):
 
 
 class SQLWarehouse(
+    Singleton,
     DatabricksResource,
     StatementExecutor[
         WarehousePreparedStatement,
@@ -159,6 +161,12 @@ class SQLWarehouse(
     -----
     ``SQLWarehouse`` caches ``EndpointInfo`` details and refreshes them
     lazily.  Use :meth:`refresh` to force a reload.
+
+    Inherits :class:`Singleton` (``_SINGLETON_TTL = None``) so two
+    callers asking for the same warehouse under the same service
+    collapse to one instance — same cached ``EndpointInfo``, same
+    external-link connection pool — across every ``client.warehouses[id]``
+    or ``Warehouses.find_warehouse(...)`` lookup.
     """
 
     # Pin concrete types so base coercion + result construction produce
@@ -167,6 +175,25 @@ class SQLWarehouse(
     _STATEMENT_RESULT_CLASS: ClassVar[type[WarehouseStatementResult]] = WarehouseStatementResult
     _STATEMENT_BATCH_CLASS: ClassVar[type[WarehouseStatementBatch]] = WarehouseStatementBatch
 
+    # Process-lifetime caching — warehouses are heavyweight (cached
+    # ``EndpointInfo``, urllib3 pool); we want the same id under the
+    # same service to share state.
+    _SINGLETON_TTL: ClassVar[Any] = None
+
+    @classmethod
+    def _singleton_key(
+        cls,
+        service: "Warehouses | None" = None,
+        warehouse_id: str | None = None,
+        warehouse_name: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        # ``service`` is a hashable :class:`DatabricksService` (carries
+        # its own client identity); pin on the (id ∨ name) the caller
+        # provided. ``details=`` is opaque metadata, never part of the
+        # identity.
+        return (cls, service, warehouse_id, warehouse_name)
+
     def __init__(
         self,
         service: "Warehouses | None" = None,
@@ -174,7 +201,14 @@ class SQLWarehouse(
         warehouse_name: str | None = None,
         *,
         details: Optional[EndpointInfo] = None,
+        singleton_ttl: Any = ...,
     ):
+        # ``singleton_ttl`` is consumed by :meth:`Singleton.__new__`;
+        # accept it here so the constructor signature stays open.
+        del singleton_ttl
+        if getattr(self, "_initialized", False):
+            return
+
         if service is None:
             from .service import Warehouses
             service = Warehouses.current()
@@ -199,6 +233,7 @@ class SQLWarehouse(
         # Existing init body unchanged.
         self._external_link_pool_lock = threading.Lock()
         self._external_link_pool_instance = None
+        self._initialized = True
 
     # ------------------------------------------------------------------
     # Pickle support

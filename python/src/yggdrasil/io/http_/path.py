@@ -51,8 +51,6 @@ class HTTPPath(RemotePath):
     single session across paths reuses the connection pool.
     """
 
-    __slots__ = ("_session",)
-
     scheme: ClassVar[Scheme] = Scheme.HTTPS
 
     #: URL schemes accepted on input. Both keep their original spelling

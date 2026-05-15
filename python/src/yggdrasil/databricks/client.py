@@ -118,8 +118,45 @@ _STATIC_DEFAULTS: dict[str, Any] = {
     "rate_limit": None,
     "product": "yggdrasil",
     "product_version": ygg_version,
-    "custom_tags": None,
 }
+
+
+# Lazy snapshot of resolved env-default values. The env values get baked
+# into both the singleton-cache key and the instance's resolved fields,
+# so re-reading 17 ``DATABRICKS_*`` / ``ARM_*`` / ``GOOGLE_*`` vars on
+# every constructor call dominated singleton-hit cost (~14 us of
+# ``os.getenv`` per build). Snapshot once on first use; long-running
+# processes that rotate credentials and tests that mutate the env can
+# call :func:`invalidate_env_defaults` to drop the cache.
+_ENV_DEFAULTS_SNAPSHOT: Optional[dict[str, Any]] = None
+_ENV_DEFAULTS_LOCK: RLock = RLock()
+
+
+def _env_defaults_snapshot() -> dict[str, Any]:
+    """Process-lifetime snapshot of the DATABRICKS_* env-default values."""
+    global _ENV_DEFAULTS_SNAPSHOT
+    cached = _ENV_DEFAULTS_SNAPSHOT
+    if cached is not None:
+        return cached
+    with _ENV_DEFAULTS_LOCK:
+        if _ENV_DEFAULTS_SNAPSHOT is None:
+            _ENV_DEFAULTS_SNAPSHOT = {
+                name: getenv(env_var) for name, env_var in _ENV_DEFAULTS.items()
+            }
+        return _ENV_DEFAULTS_SNAPSHOT
+
+
+def invalidate_env_defaults() -> None:
+    """Drop the env-default snapshot so the next constructor re-reads.
+
+    Call after rotating ``DATABRICKS_*`` / ``ARM_*`` / ``GOOGLE_*`` env vars
+    so a subsequent :class:`DatabricksClient` build picks them up. The
+    in-process singleton cache is *not* cleared — entries already keyed off
+    the previous snapshot stay live until they're replaced or evicted.
+    """
+    global _ENV_DEFAULTS_SNAPSHOT
+    with _ENV_DEFAULTS_LOCK:
+        _ENV_DEFAULTS_SNAPSHOT = None
 
 
 def _normalize_host(host: Optional[str]) -> Optional[str]:
@@ -200,15 +237,13 @@ class DatabricksClient(Singleton, URLBased):
     rate_limit: Optional[int]
     product: Optional[str]
     product_version: Optional[str]
-    custom_tags: Optional[dict]
 
     # ---- private singleton cache -----------------------------------------
 
     # Per-class singleton cache. Two clients constructed with the
     # same canonicalised init kwargs (env defaults applied, host
-    # normalised, ``custom_tags`` dict folded into a ``frozenset``)
-    # collapse to one instance — same SDK clients, same lazy
-    # service caches, same cached Config.
+    # normalised) collapse to one instance — same SDK clients, same
+    # lazy service caches, same cached Config.
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(default_ttl=None)
     _INSTANCES_LOCK: ClassVar[RLock] = RLock()
     # Cache every constructed client for the process lifetime — SDK
@@ -259,11 +294,16 @@ class DatabricksClient(Singleton, URLBased):
         identity) and :meth:`__init__` (to populate instance state)
         so the two never disagree about what a given call should
         produce.
+
+        Env defaults come from :func:`_env_defaults_snapshot` — a lazy
+        process-lifetime cache — so the per-call cost is one dict
+        lookup per name rather than one ``os.getenv`` per name.
         """
+        env_defaults = _env_defaults_snapshot()
         resolved: dict[str, Any] = {}
-        for name, env_var in _ENV_DEFAULTS.items():
+        for name in _ENV_DEFAULTS:
             value = kwargs.get(name, ...)
-            resolved[name] = getenv(env_var) if value is ... else value
+            resolved[name] = env_defaults[name] if value is ... else value
         for name, default in _STATIC_DEFAULTS.items():
             value = kwargs.get(name, ...)
             resolved[name] = default if value is ... else value
@@ -284,16 +324,14 @@ class DatabricksClient(Singleton, URLBased):
         ``args`` is ignored because :meth:`__init__` is keyword-only;
         any positional input is a programmer error and would key
         differently from the equivalent kwarg call anyway.
+
+        ``resolved`` keys land in the fixed insertion order of
+        ``_ENV_DEFAULTS + _STATIC_DEFAULTS``, and every value is
+        either a primitive or ``None``, so the items tuple is
+        already hashable and stable without an extra ``sorted()``
+        per call.
         """
-        resolved = cls._resolve_init_kwargs(**kwargs)
-        items: list[tuple[str, Any]] = []
-        for name in sorted(resolved):
-            value = resolved[name]
-            if isinstance(value, dict):
-                # ``custom_tags`` — fold to a hashable canonical form.
-                value = tuple(sorted(value.items()))
-            items.append((name, value))
-        return (cls, tuple(items))
+        return (cls, tuple(cls._resolve_init_kwargs(**kwargs).items()))
 
     def __init__(
         self,
@@ -325,7 +363,6 @@ class DatabricksClient(Singleton, URLBased):
         rate_limit: Any = ...,
         product: Any = ...,
         product_version: Any = ...,
-        custom_tags: Any = ...,
         singleton_ttl: "int | None" = ...,
     ) -> None:
         # Singleton-cached instances are re-entered on every constructor
@@ -365,7 +402,6 @@ class DatabricksClient(Singleton, URLBased):
             rate_limit=rate_limit,
             product=product,
             product_version=product_version,
-            custom_tags=custom_tags,
         )
         for name, value in resolved.items():
             self.__dict__[name] = value
@@ -993,24 +1029,16 @@ class DatabricksClient(Singleton, URLBased):
           distinguishable in shared workspaces.
         - ``User`` — ``whoami`` key, useful when no email is reachable.
 
-        ``custom_tags`` on the client always wins over these defaults.
-
         Returns:
             A dict of default tags.
         """
         if update:
-            base: dict[str, str] = dict()
-        else:
-            base = {
-                k: self.safe_tag_value(v)
-                for k, v in self._owner_tag_pairs()
-                if v
-            }
-
-        if self.custom_tags:
-            base.update(self.custom_tags)
-
-        return base
+            return {}
+        return {
+            k: self.safe_tag_value(v)
+            for k, v in self._owner_tag_pairs()
+            if v
+        }
 
     def _owner_tag_pairs(self) -> list[tuple[str, Optional[str]]]:
         """Return the ``(key, value)`` tag pairs sourced from environment + client.
@@ -1258,13 +1286,23 @@ class DatabricksClient(Singleton, URLBased):
         factory: Callable[[], T],
         use_cache: bool,
     ) -> T:
+        """Public helper kept for backwards compatibility.
+
+        New properties on :class:`DatabricksClient` inline the
+        lookup directly through ``self.__dict__`` (one dict get,
+        one dict set on miss) — the function-call + lambda overhead
+        of routing every sub-service through this helper used to
+        cost ~1.3 us per access on the hot path. Callers outside
+        this class keep the same surface.
+        """
         if use_cache:
-            cached = getattr(self, cache_attr, None)
+            d = self.__dict__
+            cached = d.get(cache_attr)
             if cached is not None:
                 return cached
 
             created = factory()
-            object.__setattr__(self, cache_attr, created)
+            d[cache_attr] = created
             return created
 
         return factory()
@@ -1277,96 +1315,86 @@ class DatabricksClient(Singleton, URLBased):
 
     @property
     def workspace(self) -> "Workspace":
+        cached = self.__dict__.get("_workspace")
+        if cached is not None:
+            return cached
         from .workspaces import Workspace
-
-        return self.lazy_property(
-            self,
-            cache_attr="_workspace",
-            factory=lambda: Workspace(
-                **{name: getattr(self, name) for name in self._INIT_NAMES}
-            ),
-            use_cache=True,
-        )
+        cached = Workspace(**{name: getattr(self, name) for name in self._INIT_NAMES})
+        self.__dict__["_workspace"] = cached
+        return cached
 
     @property
     def sql(self) -> "SQLEngine":
+        cached = self.__dict__.get("_sql")
+        if cached is not None:
+            return cached
         from .sql.engine import SQLEngine
-
-        return self.lazy_property(
-            self,
-            cache_attr="_sql",
-            factory=lambda: SQLEngine(client=self),
-            use_cache=True,
-        )
+        cached = SQLEngine(client=self)
+        self.__dict__["_sql"] = cached
+        return cached
 
     @property
     def entity_tags(self) -> "EntityTags":
+        cached = self.__dict__.get("_entity_tags")
+        if cached is not None:
+            return cached
         from .tags.service import EntityTags
-
-        return self.lazy_property(
-            self,
-            cache_attr="_entity_tags",
-            factory=lambda: EntityTags(client=self),
-            use_cache=True,
-        )
+        cached = EntityTags(client=self)
+        self.__dict__["_entity_tags"] = cached
+        return cached
 
     @property
     def warehouses(self) -> "Warehouses":
+        cached = self.__dict__.get("_warehouses")
+        if cached is not None:
+            return cached
         from yggdrasil.databricks.warehouse.service import Warehouses
-
-        return self.lazy_property(
-            self,
-            cache_attr="_warehouses",
-            factory=lambda: Warehouses(client=self),
-            use_cache=True,
-        )
+        cached = Warehouses(client=self)
+        self.__dict__["_warehouses"] = cached
+        return cached
 
     @property
     def compute(self) -> "Compute":
         """Default cluster helper for this client."""
+        cached = self.__dict__.get("_compute")
+        if cached is not None:
+            return cached
         from .compute.service import Compute
-
-        return self.lazy_property(
-            self,
-            cache_attr="_compute",
-            factory=lambda: Compute(client=self),
-            use_cache=True,
-        )
+        cached = Compute(client=self)
+        self.__dict__["_compute"] = cached
+        return cached
 
     @property
     def secrets(self) -> "Secrets":
         """Default secrets helper for this client."""
+        cached = self.__dict__.get("_secrets")
+        if cached is not None:
+            return cached
         from .secrets.service import Secrets
-
-        return self.lazy_property(
-            self,
-            cache_attr="_secrets",
-            factory=lambda: Secrets(client=self),
-            use_cache=True,
-        )
+        cached = Secrets(client=self)
+        self.__dict__["_secrets"] = cached
+        return cached
 
     @property
     def iam(self) -> "IAM":
+        cached = self.__dict__.get("_iam")
+        if cached is not None:
+            return cached
         from .iam import IAM
-
-        return self.lazy_property(
-            self,
-            cache_attr="_iam",
-            factory=lambda: IAM(client=self),
-            use_cache=True,
-        )
+        cached = IAM(client=self)
+        self.__dict__["_iam"] = cached
+        return cached
 
     @property
     def tables(self) -> "Tables":
         """Collection-level Unity Catalog table service for this client."""
+        cached = self.__dict__.get("_tables")
+        if cached is not None:
+            return cached
         from .table.tables import Tables
-
-        return self.lazy_property(
-            self,
-            cache_attr="_tables",
-            factory=lambda: Tables(client=self),
-            use_cache=True,
-        )
+        cached = Tables(client=self)
+        self.__dict__["_tables"] = cached
+        return cached
 
     @property
     def views(self) -> "Tables":
@@ -1378,14 +1406,13 @@ class DatabricksClient(Singleton, URLBased):
     @property
     def columns(self) -> "Columns":
         """Collection-level Unity Catalog column service for this client."""
+        cached = self.__dict__.get("_columns_svc")
+        if cached is not None:
+            return cached
         from .column.columns import Columns
-
-        return self.lazy_property(
-            self,
-            cache_attr="_columns_svc",
-            factory=lambda: Columns(client=self),
-            use_cache=True,
-        )
+        cached = Columns(client=self)
+        self.__dict__["_columns_svc"] = cached
+        return cached
 
     @property
     def catalogs(self) -> "Catalogs":
@@ -1397,14 +1424,13 @@ class DatabricksClient(Singleton, URLBased):
             client.catalogs["main"]["sales"]          # Schema
             client.catalogs["main"]["sales"]["orders"]  # Table
         """
+        cached = self.__dict__.get("_catalogs")
+        if cached is not None:
+            return cached
         from .catalog.catalogs import Catalogs
-
-        return self.lazy_property(
-            self,
-            cache_attr="_catalogs",
-            factory=lambda: Catalogs(client=self),
-            use_cache=True,
-        )
+        cached = Catalogs(client=self)
+        self.__dict__["_catalogs"] = cached
+        return cached
 
     @property
     def schemas(self) -> "Schemas":
@@ -1416,14 +1442,13 @@ class DatabricksClient(Singleton, URLBased):
             client.schemas["main.sales.orders"]      # Table
             client.schemas(catalog_name="main")      # Schemas scoped to "main"
         """
+        cached = self.__dict__.get("_schemas")
+        if cached is not None:
+            return cached
         from .schema.schemas import Schemas
-
-        return self.lazy_property(
-            self,
-            cache_attr="_schemas",
-            factory=lambda: Schemas(client=self),
-            use_cache=True,
-        )
+        cached = Schemas(client=self)
+        self.__dict__["_schemas"] = cached
+        return cached
 
     @property
     def volumes(self) -> "Volumes":
@@ -1435,26 +1460,24 @@ class DatabricksClient(Singleton, URLBased):
             client.volumes(catalog_name="main", schema_name="sales")["uploads"]
             client.volumes.list(catalog_name="main")            # Iterator[Volume]
         """
+        cached = self.__dict__.get("_volumes")
+        if cached is not None:
+            return cached
         from .volume.volumes import Volumes
-
-        return self.lazy_property(
-            self,
-            cache_attr="_volumes",
-            factory=lambda: Volumes(client=self),
-            use_cache=True,
-        )
+        cached = Volumes(client=self)
+        self.__dict__["_volumes"] = cached
+        return cached
 
     @property
     def genie(self) -> "Genie":
         """Genie conversation and space management helper for this client."""
+        cached = self.__dict__.get("_genie")
+        if cached is not None:
+            return cached
         from .genie import Genie
-
-        return self.lazy_property(
-            self,
-            cache_attr="_genie",
-            factory=lambda: Genie(client=self),
-            use_cache=True,
-        )
+        cached = Genie(client=self)
+        self.__dict__["_genie"] = cached
+        return cached
 
     @property
     def is_serverless_compute(self) -> bool:

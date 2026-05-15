@@ -34,9 +34,11 @@ wired to a workspace-shaped mock). There is no alternate
 
 from __future__ import annotations
 
+from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Optional, Tuple
 
 from yggdrasil.data.enums import Scheme
+from yggdrasil.dataclasses import ExpiringDict, Singleton
 from yggdrasil.io.path import RemotePath
 from yggdrasil.io.path._retry import retry_sdk_call
 from yggdrasil.io.url import URL
@@ -188,6 +190,29 @@ def _resolve_databricks_subclass(
     scheme = (candidate.scheme or "").lower()
 
     if scheme == Scheme.DATABRICKS_VOLUME.value:
+        # Dispatch by path-segment count under the ``/Volumes/`` namespace
+        # so the Unity Catalog hierarchy maps cleanly onto the URL:
+        #
+        #   ``/Volumes``                      → :class:`VolumePath` (root)
+        #   ``/Volumes/cat``                  → :class:`Catalog`
+        #   ``/Volumes/cat/sch``              → :class:`Schema`
+        #   ``/Volumes/cat/sch/vol``          → :class:`Volume`
+        #   ``/Volumes/cat/sch/vol/<rest>``   → :class:`VolumePath`
+        #
+        # Catalog / Schema / Volume are off-family resources (not
+        # :class:`DatabricksPath` subclasses) — :meth:`DatabricksPath.__new__`
+        # routes them through their own :meth:`from_url` constructor.
+        parts = [p for p in (candidate.path or "/").lstrip("/").split("/") if p]
+        depth = len(parts)
+        if depth == 1:
+            from yggdrasil.databricks.catalog.catalog import Catalog
+            return Catalog, candidate
+        if depth == 2:
+            from yggdrasil.databricks.schema.schema import Schema
+            return Schema, candidate
+        if depth == 3:
+            from yggdrasil.databricks.volume.volume import Volume
+            return Volume, candidate
         return VolumePath, candidate
     if scheme == Scheme.DATABRICKS_WORKSPACE.value:
         return WorkspacePath, candidate
@@ -202,6 +227,16 @@ def _resolve_databricks_subclass(
         # the SQL module exists.
         from yggdrasil.databricks.table.table import Table
         return Table, candidate
+    if scheme == Scheme.DATABRICKS_CATALOG.value:
+        # ``dbfs+catalog:///cat`` — explicit catalog URL form. Routes
+        # to the same :class:`Catalog` resource the volume-path dispatch
+        # picks for ``dbfs+volume:///cat``.
+        from yggdrasil.databricks.catalog.catalog import Catalog
+        return Catalog, candidate
+    if scheme == Scheme.DATABRICKS_SCHEMA.value:
+        # ``dbfs+schema:///cat/sch`` — explicit schema URL form.
+        from yggdrasil.databricks.schema.schema import Schema
+        return Schema, candidate
 
     # Unknown scheme (or empty) — let the caller's intended class
     # decide. DBFSPath is the safe default for the un-qualified
@@ -214,7 +249,7 @@ def _resolve_databricks_subclass(
 # ===========================================================================
 
 
-class DatabricksPath(RemotePath):
+class DatabricksPath(Singleton, RemotePath):
     """Abstract :class:`RemotePath` for Databricks namespaces.
 
     Registers under :attr:`Scheme.DBFS` (the ``dbfs://`` family root)
@@ -225,9 +260,17 @@ class DatabricksPath(RemotePath):
     path's leading namespace (``/Volumes/...`` →
     :class:`VolumePath`, ``/Workspace/...`` → :class:`WorkspacePath`,
     everything else → :class:`DBFSPath`).
-    """
 
-    __slots__ = ("_client", "_retry_sleep")
+    Inherits :class:`Singleton` with a 300-second default TTL on
+    every constructed instance: two callers asking for the same URL
+    inside that window share the live :class:`Holder` (same cached
+    stat, same lazy-bound client) without growing an unbounded cache
+    over the process lifetime. ``iterdir``-style hot loops naturally
+    age out their entries; long-lived consumers that want stronger
+    sharing pass ``singleton_ttl=None`` for process-lifetime caching.
+    The cache is also bounded at 10 000 entries as a defense-in-depth
+    against accidental cardinality explosions.
+    """
 
     scheme: ClassVar[Scheme] = Scheme.DBFS
 
@@ -235,6 +278,49 @@ class DatabricksPath(RemotePath):
     #: (``/dbfs/``, ``/Workspace/``, ``/Volumes/``). Empty on the
     #: abstract base; concrete subclasses override.
     namespace_prefix: ClassVar[Optional[str]] = None
+
+    # Bounded singleton cache with a 5-minute default TTL — keeps
+    # ``iterdir``-style transient paths from leaking, while still
+    # collapsing repeat lookups within the window onto one instance.
+    _SINGLETON_TTL: ClassVar[Any] = 300.0
+    _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
+        default_ttl=300.0, max_size=10_000,
+    )
+    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
+
+    # Stat caches and the lazy ``_volume`` / ``_session`` slots are
+    # subclass-specific; the base only carries the live SDK client and
+    # the optional retry-sleep callback.
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
+        "_stat_cached", "_stat_cached_at",
+    })
+
+    @classmethod
+    def _singleton_key(
+        cls,
+        data: Any = None,
+        *,
+        url: "URL | None" = None,
+        client: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Identity = (subclass, canonical URL string, client).
+
+        ``data`` collapses into ``url`` before keying so ``"/Volumes/x"``
+        and ``URL.from_("/Volumes/x")`` map to the same singleton.
+        ``client`` is part of the key because the same URL can be
+        backed by different workspaces; passing ``client=None`` collapses
+        to the lazy-resolved :meth:`DatabricksClient.current`.
+        """
+        if url is None and isinstance(data, URL):
+            url = data
+        elif url is None and isinstance(data, str):
+            url = URL.from_(_coerce_to_url_str(data))
+        if url is None:
+            # Without a URL there's no canonical identity — fall through
+            # to ``id``-based hashing by returning a unique sentinel.
+            return (cls, object())
+        return (cls, str(url), client)
 
     # ==================================================================
     # Construction — dispatch on the abstract base, allocate on subclasses
@@ -280,21 +366,32 @@ class DatabricksPath(RemotePath):
             return super().__new__(cls, data=data, url=url, **kwargs)
 
         target, normalized = _resolve_databricks_subclass(data=data, url=url)
-        # When dispatching to a DatabricksPath subclass, hand back
-        # control to Python so the subclass's ``__init__`` fires with
-        # the caller's original (data, url, **kwargs). Coerce ``data``
-        # to ``None`` once we've folded its information into the URL,
-        # so the subclass init doesn't double-parse it.
+        # Byte-shaped Path subclasses (DBFSPath / VolumePath /
+        # WorkspacePath) accept ``url=`` straight through ``__init__``,
+        # so we can hand control back to Python — their auto-fired
+        # ``__init__`` re-runs with the caller's kwargs and the
+        # normalized URL.
+        #
+        # Resource-shaped subclasses (Catalog / Schema / Volume / Table)
+        # go through ``from_url`` because their constructors take
+        # ``(service, catalog_name=…, schema_name=…, …)``, not
+        # ``(data, url, …)`` — the URL needs to be parsed into Unity
+        # Catalog coordinates before the constructor sees it.
         if isinstance(target, type) and issubclass(target, DatabricksPath):
-            if normalized is not None:
-                data = None
-                url = normalized
-            return target.__new__(target, data=data, url=url, **kwargs)
+            from .fs.dbfs_path import DBFSPath
+            from .fs.volume_path import VolumePath
+            from .fs.workspace_path import WorkspacePath
+            if target in (DBFSPath, VolumePath, WorkspacePath):
+                if normalized is not None:
+                    data = None
+                    url = normalized
+                return target.__new__(target, data=data, url=url, **kwargs)
 
-        # Off-family target (Unity Catalog :class:`Table`) — construct
-        # eagerly via ``from_url`` so the returned object is fully
-        # initialized. Python won't auto-call ``__init__`` because the
-        # result isn't a :class:`DatabricksPath` instance.
+        # Resource-shaped or off-family target — construct eagerly via
+        # ``from_url`` so the returned object is fully initialized.
+        # Python's auto-``__init__`` only fires when the result is an
+        # instance of the originating ``cls`` (DatabricksPath); resource
+        # targets like ``Table`` aren't, so they need eager init here.
         if normalized is None:
             raise TypeError(
                 f"{cls.__name__} cannot dispatch to {target.__name__} "
@@ -311,8 +408,19 @@ class DatabricksPath(RemotePath):
         client: "DatabricksClient | None" = None,
         temporary: bool = False,
         retry_sleep: Optional[Callable[[float], None]] = None,
+        singleton_ttl: Any = ...,
         **kwargs: Any,
     ) -> None:
+        # Singleton-cached instances are re-entered on every constructor
+        # call (Python always invokes ``__init__`` after ``__new__``);
+        # skip the second pass so the live SDK client binding and stat
+        # cache survive. ``singleton_ttl`` is consumed by
+        # :meth:`Singleton.__new__`; accept it here so callers passing
+        # the opt-in cache flag don't trip the ``__init__`` signature.
+        del singleton_ttl
+        if getattr(self, "_initialized", False):
+            return
+
         # Pre-coerce ``/dbfs/...`` / ``/Volumes/...`` / ``/Workspace/...``
         # into the canonical URL form so the URL parser sees a real
         # scheme.
@@ -350,6 +458,7 @@ class DatabricksPath(RemotePath):
         # touch.
         self._client: Any = client
         self._retry_sleep: Optional[Callable[[float], None]] = retry_sleep
+        self._initialized = True
 
     # ==================================================================
     # URLBased dispatch — ``dbfs://`` resolves here and forwards

@@ -27,6 +27,7 @@ import pyarrow as pa
 
 from yggdrasil.arrow.cast import rechunk_arrow_batches
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
+from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import (
     DEFAULT_WAITING_CONFIG,
     WaitingConfig,
@@ -403,18 +404,35 @@ def _format_cookie_header(cookies: Any) -> str:
     )
 
 
-class Session(ABC):
-    # Singleton cache keyed by ``(class, normalized base_url string, key)``.
-    # A ``Session`` constructed with a ``base_url`` is intentionally shared
-    # so the connection pool, cookie jar, and any other per-host state
-    # survive across the call sites that re-spell the same URL. The ``key``
-    # tag splits same-URL singletons when callers need parallel sessions
-    # against one host (e.g. different credentials / tenants) — default ``""``
-    # keeps the historical "same URL → same instance" behavior.
-    # ``base_url=None`` callers always get a fresh instance — there is no
-    # canonical key.
-    _singleton_cache: ClassVar[dict[tuple[type, str, str], "Session"]] = {}
-    _singleton_lock: ClassVar[threading.Lock] = threading.Lock()
+class Session(Singleton, ABC):
+    """HTTP session base — keyed by ``(class, base_url, key)``.
+
+    Inherits the standard :class:`Singleton` plumbing:
+
+    - same-key constructor calls collapse to one process-lifetime
+      instance (``_SINGLETON_TTL = None``), so connection pool,
+      cookie jar, and per-host state survive across every call site
+      that re-spells the same URL;
+    - the ``key`` kwarg splits same-URL singletons when a caller
+      needs parallel sessions against one host (different
+      credentials / tenants); default ``""`` keeps the historical
+      "same URL → same instance" behavior;
+    - ``base_url=None`` callers always get a fresh instance —
+      there's no canonical identity to cache against.
+
+    Pickling is handled by the :class:`Singleton` base
+    (``__getstate__`` filters :attr:`_TRANSIENT_STATE_ATTRS`,
+    ``__setstate__`` short-circuits on a live singleton). The
+    only Session-specific addition is that the receiver rebuilds
+    a fresh :class:`threading.RLock` instead of carrying the
+    sender's lock state.
+    """
+
+    # Process-lifetime caching when a base_url is supplied. ``__new__``
+    # below opts out (``singleton_ttl=...``) when ``base_url`` is empty
+    # so anonymous Sessions don't share state through the singleton
+    # cache.
+    _SINGLETON_TTL: ClassVar[Any] = None
 
     # Instance attributes that don't survive pickling — excluded by
     # ``__getstate__`` and rebuilt by ``__setstate__``. Subclasses extend
@@ -423,6 +441,20 @@ class Session(ABC):
         "_lock", "_job_pool",
     })
 
+    @classmethod
+    def _singleton_key(
+        cls,
+        base_url: Optional[URL | str] = None,
+        *args: Any,
+        key: str = "",
+        **kwargs: Any,
+    ) -> Any:
+        # ``__new__`` already gates on ``base_url`` being truthy before
+        # the key is computed, so we don't need to defend against the
+        # empty case here.
+        key_url = base_url if isinstance(base_url, URL) else URL.from_(base_url)
+        return (cls, key_url.to_string(), key)
+
     def __new__(
         cls,
         base_url: Optional[URL | str] = None,
@@ -430,17 +462,16 @@ class Session(ABC):
         key: str = "",
         **kwargs: Any,
     ) -> "Session":
+        # Anonymous Sessions (``base_url=None``) bypass the singleton
+        # cache entirely — there's no canonical key, and two different
+        # no-base callers shouldn't share state. We can't route through
+        # :meth:`Singleton.__new__` here because the class-level
+        # ``_SINGLETON_TTL = None`` would override a per-call
+        # ``singleton_ttl=...`` and force a key build.
         if not base_url:
-            return super().__new__(cls)
-        key_url = base_url if isinstance(base_url, URL) else URL.from_(base_url)
-        cache_key = (cls, key_url.to_string(), key)
-        with cls._singleton_lock:
-            cached = cls._singleton_cache.get(cache_key)
-            if cached is not None:
-                return cached
-            instance = super().__new__(cls)
-            cls._singleton_cache[cache_key] = instance
-            return instance
+            kwargs.pop("singleton_ttl", None)
+            return object.__new__(cls)
+        return super().__new__(cls, base_url, *args, key=key, **kwargs)
 
     def __init__(
         self,
@@ -485,20 +516,16 @@ class Session(ABC):
         # keyword (it's keyword-only on the constructor).
         return ((self.base_url,), {"key": self.key})
 
-    def __getstate__(self):
-        return {
-            k: v for k, v in self.__dict__.items()
-            if k not in self._TRANSIENT_STATE_ATTRS
-        }
-
     def __setstate__(self, state):
-        # ``__new__`` may have returned a live singleton — keep its
-        # in-flight state (pool, cookies, init-time config) untouched.
+        # Defer to :meth:`Singleton.__setstate__` for the live-singleton
+        # short-circuit and the transient-attr defaulting; then promote
+        # ``_lock`` from ``None`` to a fresh ``RLock`` so the receiver
+        # has a real lock instead of a sentinel. ``_job_pool`` stays
+        # ``None`` — it's lazy-built on first :attr:`job_pool` access.
         if getattr(self, "_initialized", False):
             return
-        self.__dict__.update(state)
+        super().__setstate__(state)
         self._lock = threading.RLock()
-        self._job_pool = None
         self._initialized = True
 
     @property
