@@ -29,7 +29,7 @@ import inspect
 import logging
 import re
 import time
-from typing import Any, Callable, Dict, Iterable, List, Optional, TypeVar, TYPE_CHECKING, Union
+from typing import Any, Callable, ClassVar, Dict, Iterable, List, Optional, TypeVar, TYPE_CHECKING, Union
 
 from databricks.sdk import ClustersAPI
 from databricks.sdk.client_types import ClientType
@@ -46,6 +46,7 @@ from databricks.sdk.service.compute import (
     PythonPyPiLibrary,
     State,
 )
+from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.environ.pip_settings import PipIndexSettings
 from yggdrasil.io.headers import DEFAULT_HOSTNAME
@@ -130,7 +131,7 @@ def _normalize_pip_pkg_name(spec: str) -> str:
     return name.replace("_", "-")
 
 
-class Cluster(DatabricksResource):
+class Cluster(Singleton, DatabricksResource):
     """
     High-level Databricks cluster helper.
 
@@ -147,7 +148,23 @@ class Cluster(DatabricksResource):
     Notes
     -----
     ``Cluster`` caches ``ClusterDetails`` and refreshes them lazily.
+    Inherits :class:`Singleton` (``_SINGLETON_TTL = None``) so two
+    callers asking for the same cluster under the same service share
+    the live ``ClusterDetails`` cache and the per-cluster execution
+    contexts.
     """
+
+    _SINGLETON_TTL: ClassVar[Any] = None
+
+    @classmethod
+    def _singleton_key(
+        cls,
+        service: "Clusters | None" = None,
+        cluster_id: str | None = None,
+        cluster_name: str | None = None,
+        **_kwargs: Any,
+    ) -> Any:
+        return (cls, service, cluster_id, cluster_name)
 
     def __init__(
         self,
@@ -158,7 +175,14 @@ class Cluster(DatabricksResource):
         details: Optional[ClusterDetails] = None,
         details_refresh_time: float = 0.0,
         contexts: dict[str, ExecutionContext] = None,
+        singleton_ttl: Any = ...,
     ):
+        # ``singleton_ttl`` is consumed by :meth:`Singleton.__new__`;
+        # accept here so the signature stays open.
+        del singleton_ttl
+        if getattr(self, "_initialized", False):
+            return
+
         super().__init__()
         self.service = service or Clusters.current()
         self.cluster_id = cluster_id
@@ -174,6 +198,8 @@ class Cluster(DatabricksResource):
             )
             object.__setattr__(self, "cluster_id", found.cluster_id)
             object.__setattr__(self, "_details", found._details)
+
+        self._initialized = True
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.url()!r})"

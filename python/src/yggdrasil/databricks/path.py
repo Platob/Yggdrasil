@@ -261,14 +261,15 @@ class DatabricksPath(Singleton, RemotePath):
     :class:`VolumePath`, ``/Workspace/...`` → :class:`WorkspacePath`,
     everything else → :class:`DBFSPath`).
 
-    Inherits :class:`Singleton` so callers can opt into per-URL
-    process-wide instance sharing (stat-cache hits across every
-    consumer of the same path) by passing ``singleton_ttl=None``;
-    the default behaviour stays "fresh instance per call" because
-    Path objects are constructed in tight loops (``iterdir`` yields
-    one per child) and unbounded caching would leak. Subclasses
-    that want default-on caching set ``_SINGLETON_TTL = None`` and
-    bound ``_INSTANCES`` with ``max_size=...``.
+    Inherits :class:`Singleton` with a 300-second default TTL on
+    every constructed instance: two callers asking for the same URL
+    inside that window share the live :class:`Holder` (same cached
+    stat, same lazy-bound client) without growing an unbounded cache
+    over the process lifetime. ``iterdir``-style hot loops naturally
+    age out their entries; long-lived consumers that want stronger
+    sharing pass ``singleton_ttl=None`` for process-lifetime caching.
+    The cache is also bounded at 10 000 entries as a defense-in-depth
+    against accidental cardinality explosions.
     """
 
     scheme: ClassVar[Scheme] = Scheme.DBFS
@@ -278,11 +279,12 @@ class DatabricksPath(Singleton, RemotePath):
     #: abstract base; concrete subclasses override.
     namespace_prefix: ClassVar[Optional[str]] = None
 
-    # Bounded singleton cache — opt-in via ``singleton_ttl=None`` on
-    # construction. ``max_size`` keeps a long-running process from
-    # accumulating one entry per yielded ``iterdir`` child.
+    # Bounded singleton cache with a 5-minute default TTL — keeps
+    # ``iterdir``-style transient paths from leaking, while still
+    # collapsing repeat lookups within the window onto one instance.
+    _SINGLETON_TTL: ClassVar[Any] = 300.0
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
-        default_ttl=None, max_size=10_000,
+        default_ttl=300.0, max_size=10_000,
     )
     _INSTANCES_LOCK: ClassVar[RLock] = RLock()
 
