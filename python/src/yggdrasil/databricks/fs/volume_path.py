@@ -44,13 +44,10 @@ import datetime as dt
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional, Tuple
 from databricks.sdk.errors import PermissionDenied
 
-from databricks.sdk.service.catalog import VolumeOperation
-
 from yggdrasil.data.cast import any_to_datetime, parse_http_date
 from yggdrasil.data.enums import Mode, ModeLike, Scheme
 from yggdrasil.data.enums.media_type import MediaType, MediaTypes
 from yggdrasil.io.io_stats import IOStats, IOKind
-from yggdrasil.io.path import Path
 from yggdrasil.io.url import URL
 from .path import DatabricksPath
 
@@ -58,6 +55,7 @@ if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.catalog.catalog import Catalog
     from yggdrasil.databricks.schema.schema import Schema
+    from yggdrasil.databricks.volume.volume import Volume
 
 from yggdrasil.databricks.aws import AWSDatabricksVolumeCredentials
 
@@ -81,15 +79,20 @@ _STAGING_LEAF_RE = re.compile(
 
 
 class VolumePath(DatabricksPath):
-    """Path under ``/Volumes/<cat>/<sch>/<vol>/...`` via the Files API."""
+    """Path under ``/Volumes/<cat>/<sch>/<vol>/...`` via the Files API.
 
-    __slots__ = ("_volume_info", "_storage_path", "_catalog", "_schema")
+    Per-volume metadata (``VolumeInfo``, storage location, temporary
+    credentials, AWS client) lives on the :class:`Volume` resource
+    accessible via :attr:`volume`. Every :class:`VolumePath` pointing at
+    the same UC volume collapses to the same :class:`Volume` singleton,
+    so the SDK round trip and the auto-refreshing :class:`AWSClient`
+    are shared process-wide.
+    """
+
+    __slots__ = ("_volume",)
 
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_VOLUME
     namespace_prefix: ClassVar[str] = "/Volumes/"
-
-    _VOLUME_INFO_CACHE: ClassVar["dict[Tuple[str, str, str], Any]"] = {}
-    _VOLUME_INFO_CACHE_LOCK: ClassVar[threading.Lock] = threading.Lock()
 
     # Process-wide "already swept" set, keyed by ``(catalog, schema, resource)``
     # so concurrent ``staging_path`` calls collapse to one sweep per staging
@@ -106,10 +109,7 @@ class VolumePath(DatabricksPath):
         **kwargs: Any,
     ) -> None:
         super().__init__(data=data, url=url, **kwargs)
-        self._volume_info: Any = None
-        self._storage_path: Any = None
-        self._catalog: Any = None
-        self._schema: Any = None
+        self._volume: Optional["Volume"] = None
 
     # ==================================================================
     # Path rendering
@@ -214,165 +214,89 @@ class VolumePath(DatabricksPath):
         return triple[2] if triple else None
 
     @property
+    def volume(self) -> "Volume":
+        """Return the :class:`Volume` resource backing this path.
+
+        Lazily resolved on first access and cached on the instance.
+        Because :class:`Volume` instances are singletons per
+        ``(host, catalog, schema, name)``, every :class:`VolumePath`
+        on the same UC volume shares the same live metadata cache,
+        the same :class:`VolumeInfo` snapshot, and the same
+        credentials refresher.
+
+        Raises :class:`ValueError` when the URL path doesn't address
+        a volume (no ``/cat/sch/vol`` prefix).
+        """
+        if self._volume is not None:
+            return self._volume
+        triple = self._split_volume()
+        if triple is None:
+            raise ValueError(
+                f"{type(self).__name__}.volume requires a path under "
+                f"/Volumes/<cat>/<sch>/<vol>/... — got {self.full_path()!r}."
+            )
+        catalog, schema, volume_name = triple
+        # Construct the Volume singleton directly rather than routing
+        # through ``client.volumes.volume(...)`` — VolumePath callers
+        # frequently pass a mocked or partially-configured client, and
+        # the SDK round trips that matter (``volumes.read`` /
+        # ``volumes.create``) hit ``client.workspace_client()`` either
+        # way. The singleton dance in :class:`Volume.__new__` still
+        # collapses to the same instance across every path on this UC
+        # volume.
+        from yggdrasil.databricks.volume.volume import Volume
+        from yggdrasil.databricks.volume.volumes import Volumes
+        self._volume = Volume(
+            service=Volumes(client=self.client),
+            catalog_name=catalog,
+            schema_name=schema,
+            volume_name=volume_name,
+        )
+        return self._volume
+
+    @property
     def catalog(self) -> "Catalog":
         """Return a :class:`Catalog` instance for this volume's parent catalog.
 
-        Lazily resolved on first access and cached on the instance —
-        every subsequent access returns the same :class:`Catalog`. The
-        instance is bound to :attr:`client` via
-        ``client.catalogs.catalog(...)`` so it inherits the same auth
-        / retry / caching behavior as the rest of the SQL surface.
+        Delegates to :attr:`volume`.catalog so the underlying
+        :class:`Catalog` instance is reused across every path on this
+        UC volume.
 
         Raises :class:`ValueError` when the URL path doesn't address a
-        volume (no ``/cat/sch/vol`` prefix), since there's no catalog
-        to bind to.
+        volume (no ``/cat/sch/vol`` prefix).
         """
-        if self._catalog is not None:
-            return self._catalog
-        catalog_name = self.catalog_name
-        if not catalog_name:
-            raise ValueError(
-                f"{type(self).__name__}.catalog requires a path under "
-                f"/Volumes/<cat>/<sch>/<vol>/... — got {self.full_path()!r}."
-            )
-        self._catalog = self.client.catalogs.catalog(catalog_name)
-        return self._catalog
+        return self.volume.catalog
 
     @property
     def schema(self) -> "Schema":
         """Return a :class:`Schema` instance for this volume's parent schema.
 
-        Lazily resolved on first access and cached on the instance.
-        Bound to :attr:`client` via
-        ``client.schemas.schema(catalog_name=..., schema_name=...)`` so
-        it shares the workspace-scoped schema cache.
+        Delegates to :attr:`volume`.schema so the underlying
+        :class:`Schema` instance is reused across every path on this
+        UC volume.
 
         Raises :class:`ValueError` when the URL path doesn't address a
         volume (no ``/cat/sch/vol`` prefix).
         """
-        if self._schema is not None:
-            return self._schema
-        triple = self._split_volume()
-        if triple is None:
-            raise ValueError(
-                f"{type(self).__name__}.schema requires a path under "
-                f"/Volumes/<cat>/<sch>/<vol>/... — got {self.full_path()!r}."
-            )
-        catalog_name, schema_name, _ = triple
-        self._schema = self.client.schemas.schema(
-            catalog_name=catalog_name,
-            schema_name=schema_name,
-        )
-        return self._schema
+        return self.volume.schema
 
     def volume_info(self, refresh: bool = False) -> Any:
         """Return the SDK's :class:`VolumeInfo` for this volume.
 
-        Lookups go through the process-wide
-        :attr:`_VOLUME_INFO_CACHE`, keyed by
-        ``(catalog, schema, volume)`` — every :class:`VolumePath`
-        instance on the same volume in this process reads from the
-        same cached info, so only the very first construction pays
-        the ``volumes.read`` SDK round trip. The per-instance slot
-        snapshots the cached entry once populated so subsequent
-        ``self._volume_info`` reads stay a single attribute hop.
-
-        Pass ``refresh=True`` to force a fresh SDK call and overwrite
-        both caches (e.g. after an external schema migration).
-
-        If the underlying ``volumes.read`` raises :class:`NotFound`
-        (or a ``BadRequest``-shaped "does not exist" — UC isn't fully
-        consistent here), the missing pieces of catalog / schema /
-        volume are created on demand via :meth:`_ensure_volume` and
-        the read is retried exactly once. Subsequent failures
-        propagate. This is the only place the credentials path
-        auto-creates a volume, so ``temporary_credentials`` /
-        ``aws`` / ``s3_path`` / ``arrow_filesystem`` all inherit the
-        "first-touch creates" behavior for free.
+        Delegates to :meth:`Volume.read_info`. The result is shared
+        across every :class:`VolumePath` on this UC volume (via the
+        :class:`Volume` singleton) and refreshed when the cached
+        snapshot is past the 5-minute TTL.
 
         Raises :class:`ValueError` when the URL path doesn't address a
-        volume (no ``/cat/sch/vol`` prefix).
+        volume.
         """
-        if self._volume_info is not None and not refresh:
-            return self._volume_info
-        triple = self._split_volume()
-        if triple is None:
-            raise ValueError(
-                f"{type(self).__name__}.volume_info requires a path under "
-                f"/Volumes/<cat>/<sch>/<vol>/... — got {self.full_path()!r}."
-            )
-        catalog, schema, volume = triple
-
-        # Class-level cache — prefer it whenever available so two
-        # ``VolumePath`` instances on the same volume share a single
-        # SDK round trip. ``refresh=True`` skips the cache entirely
-        # and overwrites the entry after the fresh read lands.
-        if not refresh:
-            cached = self._VOLUME_INFO_CACHE.get(triple)
-            if cached is not None:
-                self._adopt_volume_info(cached)
-                return cached
-
-        full_name = f"{catalog}.{schema}.{volume}"
-        try:
-            info = self._call(self.client.workspace_client().volumes.read, full_name)
-        except Exception as exc:
-            if not _looks_like_not_found(exc):
-                raise
-            # Volume (and possibly its catalog / schema) doesn't
-            # exist yet — let ``_ensure_volume`` create the missing
-            # pieces, then re-read. ``_ensure_volume`` swallows
-            # ``AlreadyExists`` on each rung so concurrent creators
-            # don't fight, and only raises if both the create AND
-            # the parent-walking failed.
-            if not self._ensure_volume():
-                raise
-            info = self._call(self.client.workspace_client().volumes.read, full_name)
-
-        # Publish to the process-wide cache under the lock so
-        # concurrent constructions converge on one entry. ``setdefault``
-        # would be racy with the eager refresh case — we want the
-        # latest read to win when ``refresh=True``.
-        with self._VOLUME_INFO_CACHE_LOCK:
-            self._VOLUME_INFO_CACHE[triple] = info
-        self._adopt_volume_info(info, refresh=refresh)
-        return info
-
-    def _adopt_volume_info(self, info: Any, *, refresh: bool = False) -> None:
-        """Mirror ``info`` onto the per-instance slot.
-
-        Kept separate from :meth:`volume_info` so cache-hit and
-        cache-miss paths share one snapshot routine. Also drops the
-        per-instance ``_storage_path`` cache when ``refresh=True``,
-        so the next :meth:`storage_path` call rebuilds against the
-        fresh ``VolumeInfo``.
-        """
-        self._volume_info = info
-        if refresh:
-            self._storage_path = None
+        return self.volume.read_info(refresh=refresh)
 
     def storage_location(self, refresh: bool = False) -> str:
-        """Volume's backing storage URL string (e.g. ``s3://bucket/...``).
-
-        Pure read from :meth:`volume_info` — no AWS auth resolution,
-        no Path construction. Use this when you only need the URL
-        rendering for logging / config plumbing; reach for
-        :meth:`storage_path` when you'll do actual I/O against the
-        location (it carries the auto-refreshing client).
-
-        Raises :class:`ValueError` when the SDK doesn't return a
-        storage location (managed volumes always do; external volumes
-        may return ``None`` while the metastore is still finalizing
-        registration).
-        """
-        info = self.volume_info(refresh=refresh)
-        raw = getattr(info, "storage_location", None)
-        if not raw:
-            raise ValueError(
-                f"{type(self).__name__}: volume has no storage_location yet. "
-                f"Volume info: {info!r}."
-            )
-        return str(raw)
+        """Volume's backing storage URL string. Delegates to
+        :meth:`Volume.storage_location`."""
+        return self.volume.storage_location(refresh=refresh)
 
     def storage_path(
         self,
@@ -381,107 +305,23 @@ class VolumePath(DatabricksPath):
         region: Optional[str] = None,
         refresh: bool = False,
     ) -> Any:
-        """Return the volume's root storage :class:`Path`.
-
-        Resolves the volume's ``storage_location`` URL (via
-        :meth:`volume_info`) and dispatches to the right
-        :class:`URLBased` :class:`Path` subclass — :class:`S3Path`
-        for ``s3://``, :class:`AzureBlobPath` for ``abfss://`` (when
-        registered), etc. The returned :class:`Path` is cached on
-        the instance and carries the auto-refreshing
-        :class:`AWSClient` session minted via
-        :meth:`credentials_refresher` so reads / writes through it
-        survive STS token rotation without caller-side rebinding.
-
-        ``operation`` and ``region`` are forwarded to :meth:`aws` to
-        bind the right credential scope and S3 region. ``refresh``
-        forces a re-resolution (drops the cached :class:`Path` and
-        re-reads :class:`VolumeInfo`).
-
-        Raises :class:`ValueError` when the SDK doesn't return a
-        storage location yet.
-        """
-        if self._storage_path is not None and not refresh:
-            return self._storage_path
-
-        raw = self.storage_location(refresh=refresh)
-        scheme = URL.from_str(raw).scheme or ""
-
-        if scheme.startswith("s3"):
-            storage_path = self.aws(mode=mode, region=region).s3.path(raw)
-        else:
-            # Non-S3 backends (Azure abfss://, GCS gs://) just go
-            # through the generic Path registry — we don't yet have a
-            # UC-credential bridge for those clouds.
-            storage_path = Path.from_url(raw)
-
-        self._storage_path = storage_path
-        return storage_path
+        """Return the volume's root storage :class:`Path`. Delegates to
+        :meth:`Volume.storage_path` — see there for the semantics."""
+        return self.volume.storage_path(mode=mode, region=region, refresh=refresh)
 
     def temporary_credentials(
         self,
         *,
         mode: ModeLike = Mode.AUTO,
     ) -> Any:
-        """Vend temporary cloud credentials for this volume.
-
-        Wraps ``temporary_volume_credentials.generate_temporary_volume_credentials``
-        — Unity Catalog issues short-lived AWS / Azure / GCP creds
-        scoped to the volume's storage root.
-
-        ``operation`` accepts a :class:`VolumeOperation` enum, a
-        :class:`Mode` / mode-like string (``"read"`` / ``"overwrite"`` /
-        ``"append"`` / …), or ``None``. ``None`` defaults to
-        ``READ_VOLUME``; read-only modes map to ``READ_VOLUME``,
-        everything else to ``WRITE_VOLUME``.
-        """
-        info = self.volume_info()
-        volume_id = getattr(info, "volume_id", None)
-        if not volume_id:
-            raise ValueError(
-                f"{type(self).__name__}: volume_info has no volume_id; "
-                f"cannot vend temporary credentials. Info: {info!r}."
-            )
-
-        mode = Mode.from_(mode, default=Mode.READ_ONLY)
-        if mode is Mode.READ_ONLY:
-            operation = VolumeOperation.READ_VOLUME
-        else:
-            operation = VolumeOperation.WRITE_VOLUME
-
-        return self._call(
-            self.client.workspace_client().temporary_volume_credentials.generate_temporary_volume_credentials,
-            volume_id=volume_id,
-            operation=operation,
-        )
+        """Vend temporary cloud credentials for this volume. Delegates to
+        :meth:`Volume.temporary_credentials`."""
+        return self.volume.temporary_credentials(mode=mode)
 
     def credentials_refresher(self) -> "AWSDatabricksVolumeCredentials":
         """Return the process-wide singleton credentials provider for
-        this volume.
-
-        Keyed by ``volume_id`` — every :class:`VolumePath` instance
-        pointing at the same UC volume collapses to one provider. The
-        provider handles both read and write modes internally and
-        caches its :class:`AWSClient` per ``(mode, region)``, so the
-        boto session, :class:`RefreshableCredentials`, and STS vending
-        are shared across every reader / writer on the volume in this
-        process.
-
-        The bound :class:`DatabricksClient` is updated on each call —
-        the latest live handle wins so subsequent refresh cycles use
-        the freshest auth context.
-        """
-        info = self.volume_info()
-        volume_id = getattr(info, "volume_id", None)
-        if not volume_id:
-            raise ValueError(
-                f"{type(self).__name__}: volume_info has no volume_id; "
-                f"cannot mint a credentials provider. Info: {info!r}."
-            )
-        return AWSDatabricksVolumeCredentials(
-            volume_id=volume_id,
-            client=self.client,
-        )
+        this volume. Delegates to :meth:`Volume.credentials_refresher`."""
+        return self.volume.credentials_refresher()
 
     def aws(
         self,
@@ -490,22 +330,8 @@ class VolumePath(DatabricksPath):
         region: Optional[str] = None,
     ) -> "AWSClient":
         """Return an :class:`AWSClient` whose credentials self-refresh
-        from :meth:`temporary_credentials`.
-
-        Routes through :meth:`credentials_refresher` — every
-        ``VolumePath`` on the same ``(volume_id, operation)`` shares
-        one refresher and, via that refresher's per-region cache, one
-        :class:`AWSClient`. Every signing request that runs after the
-        token's near-expiry window re-invokes the refresher and
-        rotates the underlying creds in place. No caller-side refresh
-        dance, and the STS vend is paid once per refresh cycle no
-        matter how many callers are reading the volume concurrently.
-
-        ``region`` is optional — when omitted, botocore resolves it
-        from env / config / instance metadata. Pass it explicitly when
-        the volume sits in a non-default region.
-        """
-        return self.credentials_refresher().aws_client(mode=mode, region=region)
+        from :meth:`temporary_credentials`. Delegates to :meth:`Volume.aws`."""
+        return self.volume.aws(mode=mode, region=region)
 
     def arrow_filesystem(
         self,
@@ -515,26 +341,10 @@ class VolumePath(DatabricksPath):
     ) -> Any:
         """Build a :class:`pyarrow.fs.S3FileSystem` for this volume.
 
-        Routes through the cached :meth:`storage_path` so the
-        filesystem inherits the same :class:`AWSClient` (and its
-        auto-refreshing boto session) as direct :class:`S3Path` I/O.
-        Credentials are sourced via the centralized
-        :meth:`S3Service.arrow_filesystem` so any future tweak to
-        the pyarrow filesystem construction (custom endpoint, retry
-        strategy, …) lives in one place.
-
-        Returns a fresh pyarrow filesystem snapshot bound to the
-        currently-vended STS token. For long-running operations,
-        call this once per refresh window (botocore will rotate the
-        underlying creds in the meantime, so the snapshot stays
-        valid until the token expires).
+        Delegates to :meth:`Volume.arrow_filesystem`. ``operation`` is
+        passed through as the credential mode.
         """
-        # Ensure the volume's storage path is resolved (and the
-        # underlying AWSClient session is live) before snapshotting
-        # credentials.
-        self.storage_path(mode=operation, region=region)
-        aws_client = self.aws(mode=operation, region=region)
-        return aws_client.s3.arrow_filesystem(region=region)
+        return self.volume.arrow_filesystem(mode=operation, region=region)
 
     # ==================================================================
     # SQL staging factory
@@ -850,64 +660,18 @@ class VolumePath(DatabricksPath):
     def _ensure_volume(self) -> bool:
         """Bottom-up create of the missing pieces of catalog / schema / volume.
 
-        Production callers usually have catalog and schema already in
-        place and only need the managed volume created (and frequently
-        lack permission to create catalogs at all). So the order is:
-        try volume first, walk up only when a NotFound proves the
-        next ancestor is also missing.
+        Delegates to :meth:`Volume._ensure_volume` — the actual
+        recovery logic lives on the singleton resource so both
+        ``VolumePath`` writes and direct ``Volume.read_info`` calls
+        share one implementation.
 
-        Each ``create`` swallows ``AlreadyExists`` so re-runs are free.
-        Returns ``True`` if at least one ``create`` landed.
+        Returns ``False`` if the URL path doesn't address a volume
+        (recovery isn't applicable); otherwise returns whatever the
+        underlying :meth:`Volume._ensure_volume` returns.
         """
-        triple = self._split_volume()
-        if triple is None:
+        if self._split_volume() is None:
             return False
-        catalog, schema, volume = triple
-        ws = self.client.workspace_client()
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "VolumePath._ensure_volume %s.%s.%s",
-                catalog, schema, volume,
-            )
-
-        def _create_volume() -> Any:
-            return ws.volumes.create(
-                catalog_name=catalog,
-                schema_name=schema,
-                name=volume,
-                volume_type=_managed_volume_type(),
-            )
-
-        # 1) Try volume only — common case where catalog + schema exist.
-        try:
-            _create_volume()
-            return True
-        except Exception as exc:
-            if _looks_like_already_exists(exc):
-                return False
-            if not _looks_like_not_found(exc):
-                raise
-            # Fall through: a parent (schema or catalog) is missing.
-
-        # 2) Schema may be missing — create it, then retry volume.
-        try:
-            ws.schemas.create(name=schema, catalog_name=catalog)
-        except Exception as exc:
-            if _looks_like_already_exists(exc):
-                pass
-            elif _looks_like_not_found(exc):
-                # 3) Catalog also missing — create catalog, then schema.
-                _safe_create(lambda: ws.catalogs.create(name=catalog))
-                _safe_create(
-                    lambda: ws.schemas.create(
-                        name=schema, catalog_name=catalog,
-                    ),
-                )
-            else:
-                raise
-
-        _safe_create(_create_volume)
-        return True
+        return self.volume._ensure_volume()
 
     # ==================================================================
     # Mutators
@@ -1081,23 +845,6 @@ class VolumePath(DatabricksPath):
 # ---------------------------------------------------------------------------
 
 
-def _sub_volume_tail(path: str) -> str:
-    """Strip the ``/cat/sch/vol`` prefix off a volume-relative URL path.
-
-    ``/cat/sch/vol/sub/dir/x.parquet`` → ``"/sub/dir/x.parquet"``.
-    ``/cat/sch/vol``                    → ``""``.
-
-    Used to map a :class:`VolumePath` URL onto the volume's S3
-    storage root — the storage location already carries the catalog
-    / schema / volume coordinates, so the sub-volume tail is the
-    only part we need to append.
-    """
-    parts = [p for p in path.split("/") if p]
-    if len(parts) < 3:
-        return ""
-    return "/" + "/".join(parts[3:]) if len(parts) > 3 else ""
-
-
 def _media_type_from_response(info) -> "MediaType | None":
     """Resolve a :class:`MediaType` from a Files API response.
 
@@ -1148,31 +895,18 @@ def _looks_like_already_exists(exc: BaseException) -> bool:
     return "already exists" in str(exc).lower()
 
 
-def _safe_create(create: Any) -> bool:
-    """Run *create()*; treat ``AlreadyExists`` as success (idempotent)."""
-    try:
-        create()
-    except Exception as exc:
-        if _looks_like_already_exists(exc):
-            return False
-        raise
-    return True
-
-
-def _managed_volume_type() -> Any:
-    """Resolve the SDK's ``VolumeType.MANAGED`` enum, falling back to a string.
-
-    The Databricks SDK accepts the enum or the literal ``"MANAGED"``;
-    the string fallback keeps the helper usable in test environments
-    that mock the workspace client without the SDK installed.
-    """
-    try:
-        from databricks.sdk.service.catalog import VolumeType
-        return VolumeType.MANAGED
-    except Exception:
-        return "MANAGED"
-
-
 def _staging_clean_part(value: str) -> str:
     """Strip backticks/whitespace and forbid ``/`` in path segments."""
     return str(value).strip().strip("`").replace("/", "_")
+
+
+# Backwards-compat alias for the legacy class-level cache. The actual
+# storage now lives on :class:`Volume` singletons keyed by ``(host, cat,
+# sch, name)``; this attribute lets existing test fixtures and external
+# callers reset the cache without coupling to the new module layout.
+def _bind_legacy_cache_alias() -> None:
+    from yggdrasil.databricks.volume.volume import Volume
+    VolumePath._VOLUME_INFO_CACHE = Volume._INSTANCES
+
+
+_bind_legacy_cache_alias()

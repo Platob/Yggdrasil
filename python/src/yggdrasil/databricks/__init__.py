@@ -2,6 +2,7 @@
 
 from .client import DatabricksClient
 from .fs import DatabricksPath, DBFSPath, VolumePath, WorkspacePath
+from .volume import Volume, Volumes
 from .workspaces import Workspace
 
 __all__ = [
@@ -9,6 +10,8 @@ __all__ = [
     "DatabricksClient",
     "DatabricksPath",
     "DBFSPath",
+    "Volume",
+    "Volumes",
     "VolumePath",
     "WorkspacePath",
 ]
