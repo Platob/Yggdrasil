@@ -82,6 +82,10 @@ class TestLazyTabular(PolarsTestCase, ArrowTestCase):
         self.assertEqual(df["x"].to_list(), [2, 3, 4])
 
     def test_filter_accepts_sql_string(self) -> None:
+        # SQL-string predicates round-trip through the SQL lifter,
+        # which depends on the optional :mod:`sqlglot` extra.
+        import pytest
+        pytest.importorskip("sqlglot")
         lazy = LazyTabular(self._source()).where("x >= 3 AND g = 'a'")
         df = lazy.read_polars_frame()
         self.assertEqual(df["x"].to_list(), [3, 5])

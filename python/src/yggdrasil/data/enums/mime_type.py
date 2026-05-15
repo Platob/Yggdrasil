@@ -932,6 +932,18 @@ class MimeTypes:
             "application/vnd.databricks.uc.table",
         )
     )
+    DATABRICKS_UNITY_CATALOG_CATALOG = MimeType.define(
+        MimeType(
+            "DATABRICKS_CATALOG",
+            "application/vnd.databricks.uc.catalog",
+        )
+    )
+    DATABRICKS_UNITY_CATALOG_SCHEMA = MimeType.define(
+        MimeType(
+            "DATABRICKS_SCHEMA",
+            "application/vnd.databricks.uc.schema",
+        )
+    )
 
     # --- Databricks ``DataSourceFormat`` connectors ---------------------
     # One :class:`MimeType` per Databricks ``DataSourceFormat`` enum value

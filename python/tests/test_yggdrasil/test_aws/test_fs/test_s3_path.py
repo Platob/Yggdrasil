@@ -54,10 +54,7 @@ def _make_paginator(pages: list[dict]) -> Any:
 
 @pytest.fixture(autouse=True)
 def reset_remote_stat_cache():
-    from yggdrasil.io.path.remote_path import RemotePath
-    RemotePath._INSTANCES.clear()
     yield
-    RemotePath._INSTANCES.clear()
 
 
 @pytest.fixture
@@ -99,35 +96,6 @@ class TestUrlParsing:
     def test_s3n_normalizes_to_s3(self, client) -> None:
         p = S3Path("s3n://my-bucket/x", client=client)
         assert p.url.scheme == "s3"
-
-
-class TestSingletonCache:
-    """``RemotePath.__new__`` collapses repeated constructions for the
-    same URL onto one cached instance.
-
-    The optimization reuses the URL parsed once for the cache key so
-    the subclass ``__init__`` doesn't re-parse, and the new pre-allocate
-    cache lookup short-circuits the ``Holder.__new__`` dispatch chain
-    entirely on warm hits.
-    """
-
-    def test_str_form_returns_same_instance(self, client) -> None:
-        a = S3Path("s3://bucket/key", client=client)
-        b = S3Path("s3://bucket/key", client=client)
-        assert a is b
-
-    def test_url_form_returns_same_instance_as_str_form(self, client) -> None:
-        from yggdrasil.io.url import URL
-        a = S3Path("s3://bucket/key", client=client)
-        b = S3Path(url=URL.from_("s3://bucket/key"), client=client)
-        assert a is b
-
-    def test_fresh_construction_drops_resolved_url_after_init(self, client) -> None:
-        # ``__new__`` stashes the parsed URL onto the new instance so
-        # subclass ``__init__`` doesn't re-parse. After init the slot
-        # is cleared so the parsed URL isn't kept alive twice.
-        p = S3Path("s3://bucket/key", client=client)
-        assert p._resolved_url is None
 
 
 class TestPredicates:

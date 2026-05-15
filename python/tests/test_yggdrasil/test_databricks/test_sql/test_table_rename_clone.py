@@ -48,7 +48,24 @@ def _table(catalog: str = "main", schema: str = "sales", name: str = "orders") -
     return table, sql
 
 
+def _clear_singleton_cache() -> None:
+    """Reset the per-class :class:`Table` singleton cache.
+
+    ``Table`` is now a :class:`Singleton` keyed by
+    ``(client, catalog, schema, name)``; rename/clone tests
+    mutate ``catalog/schema/table_name`` after construction, so
+    we need a fresh instance per test to keep state from
+    leaking across the suite.
+    """
+    from yggdrasil.databricks.client import DatabricksClient
+    DatabricksClient._INSTANCES.clear()
+    Table._INSTANCES.clear()
+
+
 class TestRename(unittest.TestCase):
+
+    def setUp(self) -> None:
+        _clear_singleton_cache()
 
     def test_simple_rename_within_schema(self) -> None:
         t, sql = _table()
@@ -118,6 +135,9 @@ class TestRename(unittest.TestCase):
 
 
 class TestClone(unittest.TestCase):
+
+    def setUp(self) -> None:
+        _clear_singleton_cache()
 
     def test_deep_clone_default(self) -> None:
         t, sql = _table()

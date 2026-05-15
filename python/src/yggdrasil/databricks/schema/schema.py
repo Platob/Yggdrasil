@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Iterable, Iterator, Mapping, Optional, TYPE_CHECKING
+from typing import Any, ClassVar, Iterable, Iterator, Mapping, Optional, TYPE_CHECKING
 
 from databricks.sdk.errors import DatabricksError, NotFound
 from databricks.sdk.service.catalog import (
@@ -38,16 +38,22 @@ from databricks.sdk.service.catalog import (
     SecurableType,
 )
 from yggdrasil.concurrent.threading import Job
-from yggdrasil.databricks.client import DatabricksResource
-from yggdrasil.dataclasses.waiting import WaitingConfigArg
+from yggdrasil.data.enums import MediaTypes, MimeType, MimeTypes, Scheme
+from yggdrasil.dataclasses import Singleton
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+from yggdrasil.databricks.path import DatabricksPath
 from yggdrasil.io import URL
-from yggdrasil.data.enums.mode import ModeLike
+from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.io.io_stats import IOKind, IOStats
+from yggdrasil.io.path import Path
+from yggdrasil.data.enums.mode import Mode, ModeLike
 
 from yggdrasil.databricks.sql.sql_utils import DEFAULT_TAG_COLLATION, databricks_tag_literal
 
 if TYPE_CHECKING:
     from yggdrasil.databricks.schema.schemas import Schemas
     from yggdrasil.databricks.catalog.catalog import Catalog
+    from yggdrasil.databricks.client import DatabricksClient
     from yggdrasil.databricks.table.table import Table
 
 __all__ = ["Schema"]
@@ -103,7 +109,107 @@ def _normalize_privileges(
         yield normalized
 
 
-class Schema(DatabricksResource):
+class Schema(DatabricksPath, Singleton):
+    """A single Unity Catalog schema — lifecycle, table navigation, tags.
+
+    Identity is ``(client, catalog_name, schema_name)``: two callers
+    asking for the same schema under the same client collapse onto
+    one instance via the :class:`Singleton` cache, so the cached
+    :class:`SchemaInfo` and tag state are shared.
+
+    URL-addressable through :class:`DatabricksPath` under
+    :attr:`Scheme.DATABRICKS_SCHEMA` (``dbfs+schema://``); the
+    Path / Holder byte primitives raise — a schema is a logical
+    UC resource, not a positional byte buffer. Mirrors the same
+    ``(DatabricksPath, Singleton)`` shape that :class:`Catalog`
+    uses.
+    """
+
+    scheme: ClassVar[Scheme] = Scheme.DATABRICKS_SCHEMA
+
+    # Per-class singleton cache so this surface stays separate from
+    # the rest of the project's :class:`Singleton` users.
+    _INSTANCES: ClassVar = Singleton._INSTANCES.__class__(default_ttl=None)
+    # Cache every schema under the singleton convention — the cached
+    # ``SchemaInfo`` and tag state are worth keeping for the
+    # process lifetime so navigation through ``catalogs[name][schema]``
+    # / ``tables`` doesn't keep refetching.
+    _SINGLETON_TTL: ClassVar[Any] = None
+
+    @classmethod
+    def _singleton_key(
+        cls,
+        service: "Schemas | None" = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        **_kwargs: Any,
+    ) -> Any:
+        # Key on the bound :class:`DatabricksClient` *instance*, not
+        # on the host string — two clients with the same host but
+        # different credentials are distinct identities and must own
+        # distinct ``Schema`` instances. Mirrors :class:`Catalog`'s
+        # convention.
+        client = None
+        try:
+            client = service.client if service is not None else None
+        except Exception:
+            client = None
+        # Resolve the catalog/schema names against the service
+        # defaults the same way ``__init__`` will, so two calls that
+        # differ only in "passed explicitly vs. inherited from the
+        # service" land on the same singleton.
+        if catalog_name is None and service is not None:
+            catalog_name = getattr(service, "catalog_name", None)
+        if schema_name is None and service is not None:
+            schema_name = getattr(service, "schema_name", None)
+        return (cls, client, catalog_name, schema_name)
+
+    def __new__(
+        cls,
+        service: "Schemas | None" = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        *,
+        singleton_ttl: "int | None" = ...,
+        **kwargs: Any,
+    ):
+        # Mirror :class:`Catalog`'s opt-in cache contract: per-call
+        # ``singleton_ttl`` overrides ``_SINGLETON_TTL``; ``...`` on
+        # both sides means "don't register" and every call allocates
+        # a fresh instance. Cache lookup runs BEFORE the
+        # :class:`DatabricksPath` construction chain so a hit skips
+        # :class:`Holder` /:class:`Path` allocation entirely; the
+        # ``object.__new__`` short-circuit keeps the MRO's
+        # :class:`Singleton.__new__` from re-keying with empty args.
+        if singleton_ttl is ...:
+            singleton_ttl = cls._SINGLETON_TTL
+
+        def _allocate() -> "Schema":
+            return object.__new__(cls)
+
+        if singleton_ttl is ...:
+            return _allocate()
+
+        key = cls._singleton_key(
+            service, catalog_name=catalog_name, schema_name=schema_name,
+        )
+        with cls._INSTANCES_LOCK:
+            existing = cls._INSTANCES.get(key)
+            if existing is not None:
+                return existing
+            instance = _allocate()
+            try:
+                object.__setattr__(instance, "_singleton_key_", key)
+            except AttributeError:
+                pass
+            ttl_arg = (
+                float(singleton_ttl)
+                if isinstance(singleton_ttl, int) and not isinstance(singleton_ttl, bool)
+                else singleton_ttl
+            )
+            cls._INSTANCES.set(key, instance, ttl=ttl_arg)
+            return instance
+
     def __init__(
         self,
         service: "Schemas | None" = None,
@@ -113,17 +219,129 @@ class Schema(DatabricksResource):
         infos_ttl: float | None = None,
         infos: SchemaInfo | None = None,
         infos_fetched_at: float | None = None,
+        url: URL | None = None,
+        client: "DatabricksClient | None" = None,
+        singleton_ttl: "int | None" = ...,
     ):
+        # ``singleton_ttl`` is consumed by ``__new__``; accept it here
+        # too so Python's auto-call after ``__new__`` doesn't trip on
+        # an unexpected kwarg.
+        del singleton_ttl
+        # Singleton-cached re-entry: a second ``Schema(service=…,
+        # catalog_name=…, schema_name=…)`` call returns the live
+        # instance via ``__new__``; skip the second pass so the
+        # cached ``_infos`` / fetch timestamp don't get reset under
+        # the caller.
+        if getattr(self, "_initialized", False):
+            return
+
         if service is None:
             from .schemas import Schemas
             service = Schemas.current()
 
-        super().__init__(service=service)
-        self.catalog_name = catalog_name or service.catalog_name
-        self.schema_name = schema_name or service.schema_name
+        catalog_name = catalog_name or service.catalog_name
+        schema_name = schema_name or service.schema_name
+
+        if url is None:
+            host = ""
+            try:
+                base_host = service.client.base_url.host if service is not None else ""
+                host = base_host or ""
+            except Exception:
+                host = ""
+            path_parts = [p for p in (catalog_name, schema_name) if p]
+            url = URL(
+                scheme=type(self).scheme.value,
+                host=host,
+                path="/" + "/".join(path_parts) if path_parts else "/",
+            )
+
+        super().__init__(url=url, client=client or (service.client if service else None))
+        self.service = service
+        self.catalog_name = catalog_name
+        self.schema_name = schema_name
         self._infos_ttl = infos_ttl
         self._infos = infos
         self._infos_fetched_at = infos_fetched_at
+        self._initialized = True
+
+    # ── Path / Holder primitives — Schema is logical, not byte-shaped ─────────
+
+    @property
+    def is_remote_path(self) -> bool:
+        return False
+
+    @property
+    def size(self) -> int:
+        return 0
+
+    def full_path(self) -> str:
+        return self.full_name()
+
+    def _stat(self) -> IOStats:
+        return self._stat_uncached()
+
+    def _stat_uncached(self) -> IOStats:
+        return IOStats(
+            size=0,
+            mtime=0.0,
+            kind=IOKind.DIRECTORY if self.exists else IOKind.MISSING,
+            media_type=MediaTypes.DATABRICKS_UNITY_CATALOG_SCHEMA,
+        )
+
+    def _read_mv(self, n: int, pos: int) -> memoryview:
+        raise NotImplementedError(
+            f"{type(self).__name__} is a logical Unity Catalog resource, "
+            f"not a positional byte buffer. Navigate via "
+            f"``schema['<table>']`` or ``schema.tables()`` instead."
+        )
+
+    def _write_mv(self, data: memoryview, pos: int) -> int:
+        raise NotImplementedError(
+            f"{type(self).__name__} is a logical Unity Catalog resource. "
+            f"Use ``create()`` / ``update()`` to mutate metadata."
+        )
+
+    def _bread(self, n: int, pos: int, mode: Mode) -> BytesIO:
+        raise NotImplementedError(
+            f"{type(self).__name__} is a logical Unity Catalog resource."
+        )
+
+    def _bwrite(self, data: BytesIO, pos: int, mode: Mode) -> int:
+        raise NotImplementedError(
+            f"{type(self).__name__} is a logical Unity Catalog resource."
+        )
+
+    def _ls(self, recursive: bool = False) -> Iterator["Path"]:
+        del recursive
+        return iter(())
+
+    def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
+        del parents
+        self.ensure_created() if exist_ok else self.create(if_not_exists=False)
+
+    def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
+        self.delete(wait=wait, raise_error=not missing_ok)
+
+    def _remove_dir(
+        self,
+        recursive: bool = True,
+        missing_ok: bool = True,
+        wait: WaitingConfig = True,
+    ) -> None:
+        self.delete(force=recursive, wait=wait, raise_error=not missing_ok)
+
+    @classmethod
+    def default_media_type(cls) -> MimeType:
+        return MimeTypes.DATABRICKS_UNITY_CATALOG_SCHEMA
+
+    # ── DatabricksResource compatibility ──────────────────────────────────────
+
+    @property
+    def client(self) -> "DatabricksClient":
+        if self.service is not None:
+            return self.service.client
+        return super().client
 
     # ── identity ──────────────────────────────────────────────────────────────
 
@@ -135,7 +353,7 @@ class Schema(DatabricksResource):
         return f"{self.catalog_name}.{self.schema_name}"
 
     def __repr__(self) -> str:
-        return f"Schema({self.url.to_string()!r})"
+        return f"Schema<{self.url.to_string()!r}>"
 
     def __str__(self) -> str:
         return self.full_name()
@@ -157,15 +375,11 @@ class Schema(DatabricksResource):
     # ── URL ───────────────────────────────────────────────────────────────────
 
     @property
-    def url(self) -> URL:
+    def explore_url(self) -> URL:
+        """Workspace UI URL pointing at this schema's Catalog Explorer page."""
         return self.client.base_url.with_path(
             f"/explore/data/{self.catalog_name}/{self.schema_name}"
         )
-
-    @property
-    def explore_url(self) -> URL:
-        """Workspace UI URL pointing at this schema's Catalog Explorer page."""
-        return self.url
 
     # ── cache management ──────────────────────────────────────────────────────
 

@@ -107,16 +107,6 @@ class S3Path(RemotePath):
         retry_sleep: Optional[Callable[[float], None]] = None,
         **kwargs: Any,
     ) -> None:
-        # ``RemotePath.__new__`` already parsed the URL once for the
-        # singleton-cache key; reuse it instead of re-parsing here.
-        if url is None:
-            stashed = getattr(self, "_resolved_url", None)
-            if stashed is not None:
-                url = stashed
-                if isinstance(data, (str, URL)):
-                    # ``stashed`` came from this same ``data`` seed;
-                    # drop it so ``Holder.__init__`` doesn't re-read.
-                    data = None
         if url is None and isinstance(data, str):
             url = URL.from_(data)
             data = None

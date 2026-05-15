@@ -21,7 +21,7 @@ from yggdrasil.data.enums.media_type import MediaType
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 
-from .path import DatabricksPath
+from ..path import DatabricksPath
 
 
 __all__ = ["WorkspacePath"]

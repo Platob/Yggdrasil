@@ -19,7 +19,7 @@ from yggdrasil.data.enums import Scheme
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 
-from .path import DatabricksPath
+from ..path import DatabricksPath
 
 
 __all__ = ["DBFSPath"]

@@ -3,3 +3,4 @@
 from .dataclass import *
 from .waiting import *
 from .expiring import *
+from .singleton import *

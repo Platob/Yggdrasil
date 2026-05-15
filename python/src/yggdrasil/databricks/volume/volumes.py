@@ -378,8 +378,11 @@ class Volumes(DatabricksService):
             )
         if not (c and s and v):
             return
-        host = (self.client.host if self.client else None) or "default"
-        key = (host, c, s, v)
+        # Singleton key is ``(cls, client, catalog, schema, name)`` —
+        # mirror :meth:`Volume._singleton_key` exactly so the pop hits.
+        key = Volume._singleton_key(
+            self, catalog_name=c, schema_name=s, volume_name=v,
+        )
         with Volume._INSTANCES_LOCK:
             Volume._INSTANCES.pop(key, None)
 

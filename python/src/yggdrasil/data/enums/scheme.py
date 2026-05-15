@@ -64,11 +64,13 @@ _PATH_CLASS_TARGETS: dict[str, tuple[str, str]] = {
     # ``dbfs://`` resolves to the abstract Databricks dispatcher —
     # :class:`DatabricksPath` inspects the URL and forwards to the
     # concrete subclass (DBFS surface, Volumes, Workspace).
-    "dbfs":           ("yggdrasil.databricks.fs.path", "DatabricksPath"),
+    "dbfs":           ("yggdrasil.databricks.path", "DatabricksPath"),
     "dbfs+dbfs":      ("yggdrasil.databricks.fs.dbfs_path", "DBFSPath"),
     "dbfs+volume":    ("yggdrasil.databricks.fs.volume_path", "VolumePath"),
     "dbfs+workspace": ("yggdrasil.databricks.fs.workspace_path", "WorkspacePath"),
     "dbfs+table":     ("yggdrasil.databricks.table.table", "Table"),
+    "dbfs+catalog":   ("yggdrasil.databricks.catalog.catalog", "Catalog"),
+    "dbfs+schema":    ("yggdrasil.databricks.schema.schema", "Schema"),
     "s3":             ("yggdrasil.aws.fs.path", "S3Path"),
     "http":           ("yggdrasil.io.http_.path", "HTTPPath"),
     "https":          ("yggdrasil.io.http_.path", "HTTPPath"),
@@ -137,6 +139,17 @@ class Scheme(str, Enum):
     DATABRICKS_DBFS      = "dbfs+dbfs"
     DATABRICKS_VOLUME    = "dbfs+volume"
     DATABRICKS_WORKSPACE = "dbfs+workspace"
+
+    #: Unity Catalog *catalog* addressed as a logical Path —
+    #: ``dbfs+catalog://[creds@]host/<catalog>?…``. Catalog is the
+    #: top of the UC hierarchy and lives behind a singleton-cached
+    #: :class:`yggdrasil.databricks.catalog.Catalog`.
+    DATABRICKS_CATALOG   = "dbfs+catalog"
+
+    #: Unity Catalog *schema* addressed as a logical Path —
+    #: ``dbfs+schema://[creds@]host/<catalog>/<schema>?…``. Singleton-cached
+    #: :class:`yggdrasil.databricks.schema.Schema`.
+    DATABRICKS_SCHEMA    = "dbfs+schema"
 
     #: Unity Catalog table addressed as a logical Holder /
     #: :class:`Tabular` —

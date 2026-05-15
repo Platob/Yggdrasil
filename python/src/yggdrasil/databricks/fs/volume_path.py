@@ -52,7 +52,7 @@ from yggdrasil.data.enums.media_type import MediaType, MediaTypes
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
-from .path import DatabricksPath
+from ..path import DatabricksPath
 from ..client import DatabricksClient
 
 if TYPE_CHECKING:

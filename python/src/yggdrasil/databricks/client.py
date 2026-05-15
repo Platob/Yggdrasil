@@ -2,8 +2,6 @@ import logging
 import os
 import re
 import time
-from abc import ABC
-from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from threading import RLock
 from typing import Optional, Any, Type, ClassVar, TypeVar, TYPE_CHECKING, Callable, Union
@@ -13,7 +11,7 @@ from databricks.sdk.client_types import ClientType
 from databricks.sdk.config import Config
 
 from yggdrasil.concurrent.threading import Job
-from yggdrasil.dataclasses import WaitingConfigArg, WaitingConfig, ExpiringDict
+from yggdrasil.dataclasses import WaitingConfigArg, WaitingConfig, ExpiringDict, Singleton
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.data.enums import MimeTypes, Scheme
 from yggdrasil.io.url import URL, URLBased
@@ -23,7 +21,6 @@ if TYPE_CHECKING:
     from .iam import IAM
     from .sql.engine import SQLEngine
     from .table.tables import Tables
-    from .view.views import Views
     from .column.columns import Columns
     from .catalog.catalogs import Catalogs
     from .schema.schemas import Schemas
@@ -32,7 +29,7 @@ if TYPE_CHECKING:
     from .compute.service import Compute
     from .secrets.service import Secrets
     from .workspaces import Workspaces, Workspace
-    from .fs.path import DatabricksPath
+    from .path import DatabricksPath
     from .genie import Genie
     from .tags.service import EntityTags
 
@@ -48,7 +45,6 @@ CURRENT_BASE_CLIENT_LOCK: RLock = RLock()
 
 T = TypeVar("T")
 TC = TypeVar("TC", bound="DatabricksClient")
-TS = TypeVar("TS", bound="DatabricksService")
 
 _ALLOWED = re.compile(r"^[\d \w\+\-=\.:/@]*$")  # noqa
 _SANITIZE = re.compile(r"[^\d \w\+\-=\.:/@]+")  # noqa
@@ -84,29 +80,61 @@ def getenv(name: str) -> Optional[str]:
     return v if v not in (None, "") else None
 
 
-def getenv_factory(name: str):
-    def factory():
-        return getenv(name)
-    return factory
+# Init kwarg name → environment variable name. Used by ``__init__`` to
+# fill defaults from the environment when the caller passes ``...`` for
+# a slot, and by :meth:`DatabricksClient._resolve_init_kwargs` to build
+# the canonical kwargs view that drives the singleton key.
+_ENV_DEFAULTS: dict[str, str] = {
+    "host": "DATABRICKS_HOST",
+    "account_id": "DATABRICKS_ACCOUNT_ID",
+    "workspace_id": "DATABRICKS_WORKSPACE_ID",
+    "token": "DATABRICKS_TOKEN",
+    "client_id": "DATABRICKS_CLIENT_ID",
+    "client_secret": "DATABRICKS_CLIENT_SECRET",
+    "token_audience": "DATABRICKS_TOKEN_AUDIENCE",
+    "cluster_id": "DATABRICKS_CLUSTER_ID",
+    "serverless_compute_id": "DATABRICKS_SERVERLESS_COMPUTE_ID",
+    "azure_workspace_resource_id": "ARM_RESOURCE_ID",
+    "azure_client_secret": "ARM_CLIENT_SECRET",
+    "azure_client_id": "ARM_CLIENT_ID",
+    "azure_tenant_id": "ARM_TENANT_ID",
+    "azure_environment": "ARM_ENVIRONMENT",
+    "google_credentials": "GOOGLE_CREDENTIALS",
+    "google_service_account": "DATABRICKS_GOOGLE_SERVICE_ACCOUNT",
+    "profile": "DATABRICKS_CONFIG_PROFILE",
+    "config_file": "DATABRICKS_CONFIG_FILE",
+}
 
 
-def env_field(
-    name: str,
-    *,
-    repr_: bool = False,
-    compare: bool = True,
-    hash_: bool = True,
-):
-    return field(
-        default_factory=getenv_factory(name),
-        repr=repr_,
-        compare=compare,
-        hash=hash_,
-    )
+# Static defaults applied when the caller passes ``...`` and the slot
+# has no environment fallback.
+_STATIC_DEFAULTS: dict[str, Any] = {
+    "azure_use_msi": None,
+    "auth_type": None,
+    "http_timeout_seconds": None,
+    "retry_timeout_seconds": None,
+    "debug_truncate_bytes": None,
+    "debug_headers": None,
+    "rate_limit": None,
+    "product": "yggdrasil",
+    "product_version": ygg_version,
+    "custom_tags": None,
+}
 
 
-@dataclass
-class DatabricksClient(URLBased):
+def _normalize_host(host: Optional[str]) -> Optional[str]:
+    """Mirror :meth:`DatabricksClient.__init__`'s host canonicalisation.
+
+    Strips any scheme + path so two callers passing ``"x.com"`` and
+    ``"https://x.com/foo"`` collapse onto the same singleton key.
+    """
+    if not host:
+        return host
+    normalized = host.split("://")[-1].split("/")[0]
+    return f"https://{normalized}"
+
+
+class DatabricksClient(Singleton, URLBased):
     """
     Thin wrapper around databricks.sdk.config.Config.
 
@@ -143,62 +171,57 @@ class DatabricksClient(URLBased):
     # URLBased registration: ``dbks://`` URLs route to this class.
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS
 
-    # Databricks / generic
-    host: Optional[str] = env_field("DATABRICKS_HOST", repr_=True)
-    account_id: Optional[str] = env_field("DATABRICKS_ACCOUNT_ID", repr_=False)
-    workspace_id: Optional[str] = env_field("DATABRICKS_WORKSPACE_ID", repr_=False)
-    token: Optional[str] = env_field("DATABRICKS_TOKEN", repr_=False)
-    client_id: Optional[str] = env_field("DATABRICKS_CLIENT_ID", repr_=False)
-    client_secret: Optional[str] = env_field("DATABRICKS_CLIENT_SECRET", repr_=False)
-    token_audience: Optional[str] = env_field("DATABRICKS_TOKEN_AUDIENCE", repr_=False)
-    cluster_id: Optional[str] = env_field("DATABRICKS_CLUSTER_ID", repr_=False)
-    serverless_compute_id: Optional[str] = env_field("DATABRICKS_SERVERLESS_COMPUTE_ID", repr_=False)
+    # ---- type hints (init kwargs; defaults applied in ``__init__``) -------
 
-    # Azure
-    azure_workspace_resource_id: Optional[str] = env_field("ARM_RESOURCE_ID", repr_=False)
-    azure_use_msi: bool | None = field(default=None, repr=False)
-    azure_client_secret: Optional[str] = env_field("ARM_CLIENT_SECRET", repr_=False)
-    azure_client_id: Optional[str] = env_field("ARM_CLIENT_ID", repr_=False)
-    azure_tenant_id: Optional[str] = env_field("ARM_TENANT_ID", repr_=False)
-    azure_environment: Optional[str] = env_field("ARM_ENVIRONMENT", repr_=False)
+    host: Optional[str]
+    account_id: Optional[str]
+    workspace_id: Optional[str]
+    token: Optional[str]
+    client_id: Optional[str]
+    client_secret: Optional[str]
+    token_audience: Optional[str]
+    cluster_id: Optional[str]
+    serverless_compute_id: Optional[str]
+    azure_workspace_resource_id: Optional[str]
+    azure_use_msi: bool | None
+    azure_client_secret: Optional[str]
+    azure_client_id: Optional[str]
+    azure_tenant_id: Optional[str]
+    azure_environment: Optional[str]
+    google_credentials: Optional[str]
+    google_service_account: Optional[str]
+    profile: Optional[str]
+    config_file: Optional[str]
+    auth_type: str | None
+    http_timeout_seconds: Optional[int]
+    retry_timeout_seconds: Optional[int]
+    debug_truncate_bytes: Optional[int]
+    debug_headers: bool | None
+    rate_limit: Optional[int]
+    product: Optional[str]
+    product_version: Optional[str]
+    custom_tags: Optional[dict]
 
-    # GCP
-    google_credentials: Optional[str] = env_field("GOOGLE_CREDENTIALS", repr_=False)
-    google_service_account: Optional[str] = env_field("DATABRICKS_GOOGLE_SERVICE_ACCOUNT", repr_=False)
+    # ---- private singleton cache -----------------------------------------
 
-    # Config profile
-    profile: Optional[str] = env_field("DATABRICKS_CONFIG_PROFILE", repr_=False, compare=False, hash_=False)
-    config_file: Optional[str] = env_field("DATABRICKS_CONFIG_FILE", repr_=False, compare=False, hash_=False)
+    # Per-class singleton cache. Two clients constructed with the
+    # same canonicalised init kwargs (env defaults applied, host
+    # normalised, ``custom_tags`` dict folded into a ``frozenset``)
+    # collapse to one instance — same SDK clients, same lazy
+    # service caches, same cached Config.
+    _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(default_ttl=None)
+    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
+    # Cache every constructed client for the process lifetime — SDK
+    # handles, lazy service slots, and the cached Config aren't worth
+    # rebuilding when the same identity comes back.
+    _SINGLETON_TTL: ClassVar[Any] = None
 
-    # HTTP / client behavior
-    auth_type: str | None = None
-    http_timeout_seconds: Optional[int] = field(default=None, repr=False)
-    retry_timeout_seconds: Optional[int] = field(default=None, repr=False)
-    debug_truncate_bytes: Optional[int] = field(default=None, repr=False)
-    debug_headers: bool | None = field(default=None, repr=False)
-    rate_limit: Optional[int] = field(default=None, repr=False)
+    # ---- init field bookkeeping ------------------------------------------
 
-    # Extras
-    product: Optional[str] = field(default="yggdrasil", repr=False)
-    product_version: Optional[str] = field(default=ygg_version, repr=False)
-    custom_tags: Optional[dict] = field(default=None, repr=False)
-
-    # Internal cached SDK clients
-    _was_connected: bool = field(default=False, init=False, repr=False, compare=False, hash=False)
-    _workspace_config: Optional[Config] = field(default=None, init=False, repr=False, compare=False, hash=False)
-    _workspace_client: Optional[DWC] = field(default=None, init=False, repr=False, compare=False, hash=False)
-    _account_config: Optional[Config] = field(default=None, init=False, repr=False, compare=False, hash=False)
-    _account_client: Optional[DAC] = field(default=None, init=False, repr=False, compare=False, hash=False)
-    # Cached parsed ``base_url`` — ``URL.from_str`` is ~6 us per call, and
-    # the host doesn't change after ``__post_init__``. Cleared on transport
-    # so the receiving process re-parses against its own host.
-    _base_url_cached: Optional[URL] = field(default=None, init=False, repr=False, compare=False, hash=False)
-
-    # Serializable session-token snapshot, populated on __getstate__ and
-    # consumed on __setstate__. Off-cluster only — DBR runtime ignores it.
-    _session_token: Optional[dict[str, Any]] = field(
-        default=None, init=False, repr=False, compare=False, hash=False
-    )
+    # Names of the kwargs ``__init__`` accepts. Materialised once so
+    # downstream consumers (Workspace cloning, ``DatabricksService.check_client``,
+    # the pickle serializer) don't have to walk the signature.
+    _INIT_NAMES: ClassVar[tuple[str, ...]] = tuple(_ENV_DEFAULTS) + tuple(_STATIC_DEFAULTS)
 
     # ----- transport policy -------------------------------------------------
 
@@ -215,38 +238,174 @@ class DatabricksClient(URLBased):
         "_was_connected",
         "_base_url_cached",
         "_workspace", "_sql", "_entity_tags", "_warehouses", "_compute",
-        "_secrets", "_iam", "_tables", "_views", "_columns_svc",
+        "_secrets", "_iam", "_tables", "_columns_svc",
         "_catalogs", "_schemas", "_volumes", "_genie", "_filesystem",
     })
 
     # Config attributes worth snapshotting for warm restart on another host.
     # PAT / OAuth secret fields already live on DatabricksClient itself and
-    # round-trip via normal dataclass state — no need to duplicate them here.
+    # round-trip via normal state — no need to duplicate them here.
     _SESSION_TOKEN_KEYS: ClassVar[tuple[str, ...]] = (
         "token",
         "token_audience",
         "auth_type",
     )
 
-    def __post_init__(self):
-        if self.account_id:
-            if not self.host:
-                object.__setattr__(self, "host", "https://accounts.cloud.databricks.com")
+    @classmethod
+    def _resolve_init_kwargs(cls, **kwargs: Any) -> dict[str, Any]:
+        """Apply env / static defaults and host normalisation.
 
-        if self.host:
-            normalized = self.host.split("://")[-1].split("/")[0]
-            object.__setattr__(self, "host", f"https://{normalized}")
+        Used by both :meth:`_singleton_key` (to canonicalise the
+        identity) and :meth:`__init__` (to populate instance state)
+        so the two never disagree about what a given call should
+        produce.
+        """
+        resolved: dict[str, Any] = {}
+        for name, env_var in _ENV_DEFAULTS.items():
+            value = kwargs.get(name, ...)
+            resolved[name] = getenv(env_var) if value is ... else value
+        for name, default in _STATIC_DEFAULTS.items():
+            value = kwargs.get(name, ...)
+            resolved[name] = default if value is ... else value
+
+        # ``account_id`` without an explicit ``host`` lands on the
+        # central accounts endpoint — mirrors the legacy
+        # ``__post_init__`` behaviour.
+        if resolved["account_id"] and not resolved["host"]:
+            resolved["host"] = "https://accounts.cloud.databricks.com"
+
+        resolved["host"] = _normalize_host(resolved["host"])
+        return resolved
+
+    @classmethod
+    def _singleton_key(cls, *args: Any, **kwargs: Any) -> Any:
+        """Identity key: class + canonicalised init kwargs.
+
+        ``args`` is ignored because :meth:`__init__` is keyword-only;
+        any positional input is a programmer error and would key
+        differently from the equivalent kwarg call anyway.
+        """
+        resolved = cls._resolve_init_kwargs(**kwargs)
+        items: list[tuple[str, Any]] = []
+        for name in sorted(resolved):
+            value = resolved[name]
+            if isinstance(value, dict):
+                # ``custom_tags`` — fold to a hashable canonical form.
+                value = tuple(sorted(value.items()))
+            items.append((name, value))
+        return (cls, tuple(items))
+
+    def __init__(
+        self,
+        *,
+        host: Any = ...,
+        account_id: Any = ...,
+        workspace_id: Any = ...,
+        token: Any = ...,
+        client_id: Any = ...,
+        client_secret: Any = ...,
+        token_audience: Any = ...,
+        cluster_id: Any = ...,
+        serverless_compute_id: Any = ...,
+        azure_workspace_resource_id: Any = ...,
+        azure_use_msi: Any = ...,
+        azure_client_secret: Any = ...,
+        azure_client_id: Any = ...,
+        azure_tenant_id: Any = ...,
+        azure_environment: Any = ...,
+        google_credentials: Any = ...,
+        google_service_account: Any = ...,
+        profile: Any = ...,
+        config_file: Any = ...,
+        auth_type: Any = ...,
+        http_timeout_seconds: Any = ...,
+        retry_timeout_seconds: Any = ...,
+        debug_truncate_bytes: Any = ...,
+        debug_headers: Any = ...,
+        rate_limit: Any = ...,
+        product: Any = ...,
+        product_version: Any = ...,
+        custom_tags: Any = ...,
+        singleton_ttl: "int | None" = ...,
+    ) -> None:
+        # Singleton-cached instances are re-entered on every constructor
+        # call (Python always invokes ``__init__`` after ``__new__``);
+        # skip the second pass so live SDK handles + lazy caches survive.
+        # ``singleton_ttl`` is consumed by ``Singleton.__new__``; accept
+        # it here so the auto-init pass doesn't trip on an unknown kwarg.
+        del singleton_ttl
+        if getattr(self, "_initialized", False):
+            return
+
+        resolved = self._resolve_init_kwargs(
+            host=host,
+            account_id=account_id,
+            workspace_id=workspace_id,
+            token=token,
+            client_id=client_id,
+            client_secret=client_secret,
+            token_audience=token_audience,
+            cluster_id=cluster_id,
+            serverless_compute_id=serverless_compute_id,
+            azure_workspace_resource_id=azure_workspace_resource_id,
+            azure_use_msi=azure_use_msi,
+            azure_client_secret=azure_client_secret,
+            azure_client_id=azure_client_id,
+            azure_tenant_id=azure_tenant_id,
+            azure_environment=azure_environment,
+            google_credentials=google_credentials,
+            google_service_account=google_service_account,
+            profile=profile,
+            config_file=config_file,
+            auth_type=auth_type,
+            http_timeout_seconds=http_timeout_seconds,
+            retry_timeout_seconds=retry_timeout_seconds,
+            debug_truncate_bytes=debug_truncate_bytes,
+            debug_headers=debug_headers,
+            rate_limit=rate_limit,
+            product=product,
+            product_version=product_version,
+            custom_tags=custom_tags,
+        )
+        for name, value in resolved.items():
+            self.__dict__[name] = value
+
+        self._was_connected = False
+        self._workspace_config: Optional[Config] = None
+        self._workspace_client: Optional[DWC] = None
+        self._account_config: Optional[Config] = None
+        self._account_client: Optional[DAC] = None
+        # Cached parsed ``base_url`` — ``URL.from_str`` is ~6 us per call,
+        # and the host doesn't change after ``__init__``. Cleared on
+        # transport so the receiving process re-parses against its host.
+        self._base_url_cached: Optional[URL] = None
+        # Serializable session-token snapshot, populated on
+        # ``__getstate__`` and consumed on ``__setstate__``. Off-cluster
+        # only — DBR runtime ignores it.
+        self._session_token: Optional[dict[str, Any]] = None
+
+        self._initialized = True
 
     # -------------------------------------------------------------------------
     # Serialization
     # -------------------------------------------------------------------------
+
+    def __getnewargs_ex__(self):
+        """Route unpickling through ``__new__`` with the originating kwargs.
+
+        Pickle calls ``cls.__new__(cls, **kwargs)`` first, so the
+        singleton machinery can collapse a cross-process restore onto
+        the live in-process instance whose key matches.
+        """
+        kwargs = {name: getattr(self, name, None) for name in self._INIT_NAMES}
+        return (), kwargs
 
     def __getstate__(self):
         """
         Serialize for transport across processes / hosts.
 
         Drops SDK clients, Configs, and lazy sub-service caches (they all
-        rebuild from the dataclass fields on demand). Captures a session
+        rebuild from the init kwargs on demand). Captures a session
         token snapshot from the live Config so the receiving side can warm
         start without re-running an interactive or environment-bound auth.
         """
@@ -254,6 +413,10 @@ class DatabricksClient(URLBased):
 
         for key in self._TRANSIENT_STATE:
             state.pop(key, None)
+        # ``_singleton_key_`` is rebuilt by ``__new__`` from the
+        # ``__getnewargs_ex__`` payload — don't ship it in the
+        # pickle.
+        state.pop("_singleton_key_", None)
 
         # Best-effort. We don't *construct* a Config here — pickling must
         # never trigger a browser flow or network round-trip.
@@ -274,6 +437,13 @@ class DatabricksClient(URLBased):
         so the next ``make_config()`` call picks it up via the normal
         field path — no Config exists yet at unpickle time.
         """
+        # ``__new__`` may have returned a live singleton already
+        # populated by an earlier construction or unpickle in this
+        # process — keep its in-flight state (SDK handles, lazy
+        # caches, init-time config) untouched.
+        if getattr(self, "_initialized", False):
+            return
+
         # Initialize transient slots so attribute access is safe even if
         # the pickle pre-dates a field addition.
         for key in self._TRANSIENT_STATE:
@@ -290,9 +460,11 @@ class DatabricksClient(URLBased):
             self.profile = None
             self.config_file = None
             self._session_token = None
+            self._initialized = True
             return
 
         self._restore_session_token(state.get("_session_token"))
+        self._initialized = True
 
     def _snapshot_session_token(self) -> Optional[dict[str, Any]]:
         """
@@ -953,7 +1125,7 @@ class DatabricksClient(URLBased):
         Returns:
             A DatabricksPath instance.
         """
-        from .fs.path import DatabricksPath
+        from .path import DatabricksPath
 
         return DatabricksPath.from_(
             obj=parts,
@@ -1111,11 +1283,7 @@ class DatabricksClient(URLBased):
             self,
             cache_attr="_workspace",
             factory=lambda: Workspace(
-                **{
-                    f.name: getattr(self, f.name)
-                    for f in fields(self)
-                    if f.init
-                }
+                **{name: getattr(self, name) for name in self._INIT_NAMES}
             ),
             use_cache=True,
         )
@@ -1201,16 +1369,11 @@ class DatabricksClient(URLBased):
         )
 
     @property
-    def views(self) -> "Views":
-        """Collection-level Unity Catalog view service for this client."""
-        from .view.views import Views
-
-        return self.lazy_property(
-            self,
-            cache_attr="_views",
-            factory=lambda: Views(client=self),
-            use_cache=True,
-        )
+    def views(self) -> "Tables":
+        """Alias for :attr:`tables` — Unity Catalog stores views in the
+        same ``tables`` API, and :class:`Table` handles both shapes.
+        """
+        return self.tables
 
     @property
     def columns(self) -> "Columns":
@@ -1495,12 +1658,12 @@ class DatabricksClient(URLBased):
         return env
 
 
-DATABRICKS_CLIENT_INIT_NAMES = frozenset(f.name for f in fields(DatabricksClient) if f.init)
+DATABRICKS_CLIENT_INIT_NAMES = frozenset(DatabricksClient._INIT_NAMES)
 # Fields that ``to_url`` emits as query items: every init field except the
 # credentials / host that already ride in the URL host + userinfo. Computed
-# once at import so the hot path doesn't walk ``fields(self)`` per call.
+# once at import so the hot path doesn't walk the init-name tuple per call.
 _TO_URL_QUERY_KEYS: tuple[str, ...] = tuple(
-    name for name in (f.name for f in fields(DatabricksClient) if f.init)
+    name for name in DatabricksClient._INIT_NAMES
     if name not in ("host", "token", "client_id", "client_secret")
 )
 CHECKED_TMP_WORKSPACES: ExpiringDict[str, set[str]] = ExpiringDict()
@@ -1523,172 +1686,9 @@ def is_checked_tmp_path(host: str, base_path: str):
     return False
 
 
-class DatabricksService(ABC):
-    """Base class for every Databricks service wrapper.
-
-    Subclasses are plain classes (no ``@dataclass``); they inherit the
-    ``client``-only constructor by default and override :meth:`__init__`
-    explicitly when they need to accept additional configuration.
-    """
-
-    _current: ClassVar[Optional["DatabricksService"]] = None
-
-    def __init__(self, client: Optional[DatabricksClient] = None):
-        self.client = client if client is not None else DatabricksClient.current()
-
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(client={self.client!r})"
-
-    def __getstate__(self):
-        return {"client": self.client}
-
-    def __setstate__(self, state):
-        self.client = state["client"]
-
-    @staticmethod
-    def check_client(
-        client: Optional[DatabricksClient] = None,
-        **client_kwargs: Any,
-    ):
-        if client is None and not client_kwargs:
-            return DatabricksClient.current()
-
-        client = client or DatabricksClient.current()
-        return replace(client, **client_kwargs)
-
-    def __call__(self, *args, **kwargs):
-        return self
-
-    def __enter__(self) -> TS:
-        self.client.__enter__()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self.client.__exit__(exc_type, exc_val, exc_tb)
-
-    def connect(self):
-        return self
-
-    def close(self):
-        pass
-
-    @classmethod
-    def service_name(cls) -> str:
-        return cls.__name__.lower()
-
-    @classmethod
-    def url_scheme(cls) -> str:
-        return f"dbks+{cls.service_name()}"
-
-    @classmethod
-    def current(cls, reset: bool = False) -> TS:
-        if reset or cls._current is None:
-            cls._current = cls(client=DatabricksClient.current())
-        return cls._current
-
-    @classmethod
-    def from_parsed_url(cls, url: URL):
-        mod = __import__(f"yggdrasil.databricks.{cls.service_name()}", fromlist=[cls.__name__])
-        service_cls = getattr(mod, cls.__name__)
-
-        return service_cls(client=DatabricksClient.from_parsed_url(url))
-
-    def to_url(self, scheme: str | None = None) -> URL:
-        return (
-            self.client
-            .to_url(scheme=scheme or self.url_scheme())
-            .with_path(f"/{self.service_name()}")
-        )
-
-    def is_in_databricks_environment(self):
-        return self.client.is_in_databricks_environment()
-
-    def default_tags(self, update: bool = True):
-        """Return default resource tags for Databricks assets.
-
-        Returns:
-            A dict of default tags.
-        """
-        base = self.client.default_tags(update=update)
-        base["ServiceName"] = self.service_name()
-
-        return base
-
-    @property
-    def sql(self) -> "SQLEngine":
-        return self.client.sql
-
-    @property
-    def warehouses(self) -> "Warehouses":
-        return self.client.warehouses
-
-    @property
-    def compute(self) -> "Compute":
-        return self.client.compute
-
-    @property
-    def secrets(self) -> "Secrets":
-        return self.client.secrets
-
-    @property
-    def tables(self) -> "Tables":
-        """Collection-level Unity Catalog table service (shorthand for ``client.tables``)."""
-        return self.client.tables
-
-    @property
-    def views(self) -> "Views":
-        """Collection-level Unity Catalog view service (shorthand for ``client.views``)."""
-        return self.client.views
-
-    @property
-    def catalogs(self) -> "Catalogs":
-        """Collection-level Unity Catalog hierarchy service (shorthand for ``client.catalogs``)."""
-        return self.client.catalogs
-
-    @property
-    def schemas(self) -> "Schemas":
-        """Collection-level Unity Catalog schema service (shorthand for ``client.schemas``)."""
-        return self.client.schemas
-
-    @property
-    def volumes(self) -> "Volumes":
-        """Collection-level Unity Catalog volume service (shorthand for ``client.volumes``)."""
-        return self.client.volumes
-
-    @property
-    def genie(self) -> "Genie":
-        """Genie service (shorthand for ``client.genie``)."""
-        return self.client.genie
-
-
-class DatabricksResource(ABC):
-
-    def __getstate__(self):
-        # ``object.__getstate__`` only exists in Python 3.11+, but the
-        # project floor is 3.10 (per ``CLAUDE.md``). Build the state dict
-        # explicitly from ``__dict__`` so calling ``super().__getstate__()``
-        # in subclasses (Table, Cluster, ...) works regardless of runtime.
-        # ``service`` is already in ``__dict__`` after ``__init__`` but
-        # we restate it so slot-based subclasses can still rely on it.
-        state = dict(getattr(self, "__dict__", {}) or {})
-        state["service"] = self.service
-        return state
-
-    def __setstate__(self, state):
-        # Same reason: ``object.__setstate__`` isn't reliable on 3.10.
-        # Restore the full instance dict; subclasses that override are
-        # free to ``super().__setstate__(state)`` to inherit this behavior.
-        self.__dict__.update(state)
-
-    def __init__(self, service=None, *args, **kwargs):
-        self.service = DatabricksService.current() if service is None else service
-        super().__init__(*args, **kwargs)
-
-    @property
-    def client(self) -> DatabricksClient:
-        return self.service.client
-
-    @property
-    def sql(self) -> "SQLEngine":
-        """Shorthand for ``self.service.client.sql`` — the active :class:`SQLEngine`."""
-        return self.client.sql
+# ``DatabricksService`` and ``DatabricksResource`` now live in
+# sibling modules. Re-export here for backward-compatible
+# ``from yggdrasil.databricks.client import DatabricksService /
+# DatabricksResource`` imports.
+from .service import DatabricksService  # noqa: E402
+from .resource import DatabricksResource  # noqa: E402
