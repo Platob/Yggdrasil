@@ -363,39 +363,63 @@ class AsyncInsert:
         return merged
 
     # ------------------------------------------------------------------ #
-    # Job management — one Databricks Job per table for the applier
+    # Job management — one Databricks Job per (catalog, schema)
     # ------------------------------------------------------------------ #
     @staticmethod
-    def default_job_name(target: Any) -> str:
-        """Return the canonical applier-job name for *target*.
+    def resolve_schema_key(target: Any) -> Tuple[str, str]:
+        """Return ``(catalog_name, schema_name)`` for *target*.
 
-        Accepts a :class:`Table`, the table's ``full_name`` string, or
-        any object with a ``full_name`` method. Hyphenates the
-        fully-qualified name so the result is a legal Databricks Job
-        name across catalog / schema / table boundaries.
+        Accepts a :class:`Table`, a :class:`Schema`, a ``"cat.sch"`` /
+        ``"cat.sch.tbl"`` string, or any object exposing
+        ``catalog_name`` / ``schema_name`` attributes. Raises
+        :class:`ValueError` when the pair can't be resolved — the
+        applier job is keyed off the schema, so neither half can be
+        missing.
         """
         if isinstance(target, str):
-            full_name = target
-        else:
-            full_name_attr = getattr(target, "full_name", None)
-            if callable(full_name_attr):
-                try:
-                    full_name = full_name_attr(safe=True)
-                except TypeError:
-                    full_name = full_name_attr()
-            else:
-                full_name = str(target)
-        return f"ygg-async-insert-{full_name.replace('.', '-').replace('`', '')}"
+            parts = [p for p in target.split(".") if p]
+            if len(parts) < 2:
+                raise ValueError(
+                    f"Cannot derive (catalog, schema) from {target!r}; "
+                    "pass ``cat.sch`` or ``cat.sch.tbl``."
+                )
+            return parts[0], parts[1]
+
+        catalog = getattr(target, "catalog_name", None)
+        schema = getattr(target, "schema_name", None)
+        if not catalog or not schema:
+            raise ValueError(
+                f"Cannot derive (catalog, schema) from {target!r}: "
+                "object exposes neither (catalog_name, schema_name) nor a "
+                "parseable ``cat.sch[.tbl]`` string."
+            )
+        return catalog, schema
+
+    @staticmethod
+    def default_job_name(target: Any) -> str:
+        """Return the canonical applier-job name for *target*'s schema.
+
+        Identity is keyed off ``(catalog, schema)`` — every table in
+        the same schema shares one applier job. Accepts a
+        :class:`Table`, a :class:`Schema`, a ``"cat.sch"`` /
+        ``"cat.sch.tbl"`` string, or any object exposing
+        ``catalog_name`` / ``schema_name`` attributes.
+        """
+        catalog, schema = AsyncInsert.resolve_schema_key(target)
+        return f"ygg-async-insert-{catalog}-{schema}"
 
     @classmethod
     def ensure_job(
         cls,
-        table: "Table | None" = None,
+        target: Any = None,
         *,
-        target_full_name: str | None = None,
+        table: "Table | None" = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
         jobs: "Jobs | None" = None,
+        client: "DatabricksClient | None" = None,
         job_name: str | None = None,
-        task: "Any" = None,
+        task: Any = None,
         notebook_path: str | None = None,
         notebook_warehouse_id: str | None = None,
         notebook_base_parameters: Optional[Mapping[str, str]] = None,
@@ -408,30 +432,33 @@ class AsyncInsert:
         tags: Optional[Mapping[str, str]] = None,
         **settings: Any,
     ) -> "Job":
-        """Find-or-create the Databricks Job that applies async inserts for *table*.
+        """Find-or-create the Databricks Job that applies async inserts for a schema.
 
         Resolution
         ----------
-        Identity is keyed off the target's fully-qualified name — by
-        default ``ygg-async-insert-<catalog>-<schema>-<table>``. Pass
-        ``job_name`` to override, or ``target_full_name`` to ensure a
-        job without a live :class:`Table` handle (useful from an
-        applier that only has the metadata).
+        Identity is keyed off ``(catalog_name, schema_name)`` — every
+        table in the same schema shares one applier job (named
+        ``ygg-async-insert-<catalog>-<schema>``). The schema can be
+        derived from any of these arguments (any one is enough):
+
+        - ``target`` — a :class:`Table`, :class:`Schema`, or
+          ``"cat.sch[.tbl]"`` string.
+        - ``table`` — a :class:`Table` handle.
+        - ``catalog_name`` + ``schema_name`` — explicit.
 
         Tasks
         -----
         Provide either:
 
         - ``task`` — a :class:`Task` (or list of) used verbatim.
-        - ``notebook_path`` — wrapped in a default ``apply`` task that
-          carries the target identity as ``base_parameters`` so the
-          notebook can call :meth:`AsyncInsert.merge(folder).execute(engine)`
-          without re-discovering the target.
+        - ``notebook_path`` — wrapped in a default ``apply`` task with
+          ``catalog_name`` / ``schema_name`` in ``base_parameters`` so
+          the notebook can drain *every* table in the schema via
+          :func:`apply_schema_async_inserts`.
 
-        When neither is supplied the job is still ensured (so callers
-        can pre-create the empty-task shell and attach tasks later via
-        ``jobs.create_or_update(name=…, tasks=[…])``), but a warning
-        is logged.
+        When neither is supplied the job is still ensured (empty task
+        list), and a warning is logged — useful for callers that wire
+        the task definition separately.
 
         Scheduling
         ----------
@@ -439,33 +466,27 @@ class AsyncInsert:
         Quartz-style cron string (e.g. ``"0 0 */1 * * ?"``). Passing
         ``None`` leaves the job unscheduled (trigger via
         :meth:`Job.run`).
-
-        Parameters
-        ----------
-        Job-level parameters carry the target identity by default
-        (``target_full_name``, ``target_catalog_name``,
-        ``target_schema_name``, ``target_table_name``); ``parameters``
-        merges on top so callers can add custom keys or override.
         """
-        # Resolve service + identity ------------------------------------
-        if target_full_name is None:
-            if table is None:
-                raise ValueError(
-                    "AsyncInsert.ensure_job needs either ``table`` or "
-                    "``target_full_name``."
-                )
-            target_full_name = table.full_name(safe=True)
+        # Resolve schema identity --------------------------------------
+        resolved_catalog, resolved_schema = cls._resolve_catalog_schema(
+            target=target,
+            table=table,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+        )
 
+        # Resolve service ----------------------------------------------
         if jobs is None:
-            if table is None:
+            resolved_client = client or _client_from_target(target, table=table)
+            if resolved_client is None:
                 raise ValueError(
-                    "AsyncInsert.ensure_job needs either ``jobs`` or a "
-                    "``table`` whose service provides one."
+                    "AsyncInsert.ensure_job needs a ``jobs`` service, a "
+                    "``client``, or a ``table`` whose client exposes ``jobs``."
                 )
-            jobs = table.client.jobs
+            jobs = resolved_client.jobs
 
         if not job_name:
-            job_name = cls.default_job_name(target_full_name)
+            job_name = f"ygg-async-insert-{resolved_catalog}-{resolved_schema}"
 
         # Tasks ---------------------------------------------------------
         resolved_tasks = cls._resolve_tasks(
@@ -473,8 +494,8 @@ class AsyncInsert:
             notebook_path=notebook_path,
             notebook_warehouse_id=notebook_warehouse_id,
             notebook_base_parameters=notebook_base_parameters,
-            target_full_name=target_full_name,
-            table=table,
+            catalog_name=resolved_catalog,
+            schema_name=resolved_schema,
         )
 
         # Schedule ------------------------------------------------------
@@ -484,27 +505,32 @@ class AsyncInsert:
             pause_status=schedule_pause_status,
         )
 
-        # Job parameters carry target identity by default --------------
-        job_params = cls._default_job_parameters(
-            target_full_name=target_full_name, table=table,
-        )
+        # Job parameters carry the schema identity by default ----------
+        from databricks.sdk.service.jobs import JobParameterDefinition
+
+        job_params: list[Any] = [
+            JobParameterDefinition(name="catalog_name", default=resolved_catalog),
+            JobParameterDefinition(name="schema_name", default=resolved_schema),
+        ]
         if parameters:
             existing = {p.name: p for p in job_params}
             for k, v in parameters.items():
                 if k in existing:
                     existing[k].default = str(v)
                 else:
-                    from databricks.sdk.service.jobs import JobParameterDefinition
                     job_params.append(
                         JobParameterDefinition(name=str(k), default=str(v))
                     )
 
         if description is None:
-            description = f"Apply async inserts staged for {target_full_name}"
+            description = (
+                f"Apply async inserts staged across tables in "
+                f"{resolved_catalog}.{resolved_schema}"
+            )
 
         LOGGER.info(
-            "Ensuring async-insert job %r for target %r (schedule=%r tasks=%d)",
-            job_name, target_full_name,
+            "Ensuring async-insert job %r for schema %s.%s (schedule=%r tasks=%d)",
+            job_name, resolved_catalog, resolved_schema,
             cron_schedule.quartz_cron_expression if cron_schedule else None,
             len(resolved_tasks),
         )
@@ -521,14 +547,41 @@ class AsyncInsert:
         )
 
     @staticmethod
+    def _resolve_catalog_schema(
+        *,
+        target: Any,
+        table: "Table | None",
+        catalog_name: str | None,
+        schema_name: str | None,
+    ) -> Tuple[str, str]:
+        """Centralised (catalog, schema) resolution for :meth:`ensure_job`."""
+        if catalog_name and schema_name:
+            return catalog_name, schema_name
+
+        if table is not None:
+            return AsyncInsert.resolve_schema_key(table)
+
+        if target is not None:
+            if isinstance(target, AsyncInsert):
+                if target.target_catalog_name and target.target_schema_name:
+                    return target.target_catalog_name, target.target_schema_name
+                return AsyncInsert.resolve_schema_key(target.target_full_name)
+            return AsyncInsert.resolve_schema_key(target)
+
+        raise ValueError(
+            "AsyncInsert.ensure_job needs one of: ``target``, ``table``, or "
+            "explicit ``catalog_name`` + ``schema_name``."
+        )
+
+    @staticmethod
     def _resolve_tasks(
         *,
         task: Any,
         notebook_path: str | None,
         notebook_warehouse_id: str | None,
         notebook_base_parameters: Optional[Mapping[str, str]],
-        target_full_name: str,
-        table: "Table | None",
+        catalog_name: str,
+        schema_name: str,
     ) -> List[Any]:
         """Normalize the caller's task spec into a list of :class:`Task`."""
         from databricks.sdk.service.jobs import NotebookTask, Task
@@ -540,17 +593,13 @@ class AsyncInsert:
 
         if notebook_path:
             base_params: dict[str, str] = {
-                "target_full_name": target_full_name,
+                "catalog_name": catalog_name,
+                "schema_name": schema_name,
             }
-            if table is not None:
-                if table.catalog_name:
-                    base_params["target_catalog_name"] = table.catalog_name
-                if table.schema_name:
-                    base_params["target_schema_name"] = table.schema_name
-                if table.table_name:
-                    base_params["target_table_name"] = table.table_name
             if notebook_base_parameters:
-                base_params.update({str(k): str(v) for k, v in notebook_base_parameters.items()})
+                base_params.update(
+                    {str(k): str(v) for k, v in notebook_base_parameters.items()}
+                )
 
             return [
                 Task(
@@ -565,9 +614,9 @@ class AsyncInsert:
 
         LOGGER.warning(
             "AsyncInsert.ensure_job called without ``task`` or ``notebook_path`` — "
-            "the resulting job for %r will have no tasks. Attach tasks later via "
-            "``jobs.create_or_update(name=..., tasks=[...])``.",
-            target_full_name,
+            "the resulting job for %s.%s will have no tasks. Attach tasks later "
+            "via ``jobs.create_or_update(name=..., tasks=[...])``.",
+            catalog_name, schema_name,
         )
         return []
 
@@ -602,57 +651,121 @@ class AsyncInsert:
             f"Quartz cron string, or None — got {type(schedule).__name__}."
         )
 
-    @staticmethod
-    def _default_job_parameters(
-        *,
-        target_full_name: str,
-        table: "Table | None",
-    ) -> List[Any]:
-        """Carry the target identity as Job parameters so tasks can read it."""
-        from databricks.sdk.service.jobs import JobParameterDefinition
-
-        params: list[Any] = [
-            JobParameterDefinition(
-                name="target_full_name", default=target_full_name,
-            ),
-        ]
-        if table is not None:
-            if table.catalog_name:
-                params.append(
-                    JobParameterDefinition(
-                        name="target_catalog_name", default=table.catalog_name,
-                    )
-                )
-            if table.schema_name:
-                params.append(
-                    JobParameterDefinition(
-                        name="target_schema_name", default=table.schema_name,
-                    )
-                )
-            if table.table_name:
-                params.append(
-                    JobParameterDefinition(
-                        name="target_table_name", default=table.table_name,
-                    )
-                )
-        return params
-
     def ensure_applier_job(
         self,
         *,
         jobs: "Jobs | None" = None,
+        client: "DatabricksClient | None" = None,
         **kwargs: Any,
     ) -> "Job":
         """Instance-level shortcut for :meth:`ensure_job` keyed off this record.
 
-        Convenient when a caller has just staged a record and wants
-        the matching applier job for the target it points at.
+        Uses the record's schema (``target_catalog_name`` /
+        ``target_schema_name``) — every record for tables in the same
+        schema lands on the same applier job.
         """
         return type(self).ensure_job(
-            target_full_name=self.target_full_name,
+            target=self,
             jobs=jobs,
+            client=client,
             **kwargs,
         )
+
+    # ------------------------------------------------------------------ #
+    # Schema-wide discovery + apply (used by the applier task)
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def iter_schema_staging_folders(
+        cls,
+        catalog_name: str,
+        schema_name: str,
+        *,
+        client: "DatabricksClient | None" = None,
+    ) -> Iterable["VolumePath"]:
+        """Yield every ``.sql/async/insert`` folder under *schema*'s
+        ``stg_*`` volumes.
+
+        These are the folders :func:`stage_async_insert` writes into;
+        the applier task walks them to discover staged metadata files.
+        """
+        client = client or _resolve_current_client()
+        volumes = client.volumes.list(
+            catalog_name=catalog_name, schema_name=schema_name,
+        )
+        for volume in volumes:
+            name = getattr(volume, "volume_name", "") or ""
+            if not name.startswith("stg_"):
+                continue
+            yield volume.path(".sql/async/insert")
+
+    @classmethod
+    def merge_schema(
+        cls,
+        catalog_name: str,
+        schema_name: str,
+        *,
+        client: "DatabricksClient | None" = None,
+    ) -> List["AsyncInsert"]:
+        """Discover + merge every staged metadata file under *schema*.
+
+        One :class:`AsyncInsert` is returned per target table found.
+        Folders without metadata files (or that don't exist yet) are
+        skipped silently.
+        """
+        client = client or _resolve_current_client()
+
+        records: list[AsyncInsert] = []
+        for folder in cls.iter_schema_staging_folders(
+            catalog_name, schema_name, client=client,
+        ):
+            try:
+                records.extend(_iter_records(folder, client=client))
+            except FileNotFoundError:
+                continue
+            except Exception:
+                LOGGER.exception(
+                    "Failed to read async-insert metadata under %r; skipping.",
+                    folder,
+                )
+        if not records:
+            return []
+        return cls.merge(records, client=client)
+
+    @classmethod
+    def apply_schema(
+        cls,
+        engine: "SQLEngine",
+        catalog_name: str,
+        schema_name: str,
+        *,
+        client: "DatabricksClient | None" = None,
+        wait: Any = True,
+        raise_error: bool = True,
+        cleanup: bool = True,
+    ) -> List[Any]:
+        """Merge + execute every staged async insert under *schema*.
+
+        The single entry point for a schema-level applier task — drain
+        every table's staging folder, run the merged inserts, and
+        clean up the staged files. Returns the list of per-target
+        execute results in the order targets were drained.
+        """
+        records = cls.merge_schema(catalog_name, schema_name, client=client)
+        if not records:
+            return []
+
+        results: list[Any] = []
+        for record in records:
+            results.append(
+                record.execute(
+                    engine,
+                    wait=wait,
+                    raise_error=raise_error,
+                    cleanup=cleanup,
+                    client=client,
+                )
+            )
+        return results
 
     # ------------------------------------------------------------------ #
     # SQL rendering
@@ -961,6 +1074,44 @@ def stage_async_insert(
         op_id, table, parquet_path,
     )
     return parquet_path
+
+
+def _resolve_current_client() -> "DatabricksClient":
+    """Lazy import + ``current()`` shortcut so the applier helpers
+    don't drag :class:`DatabricksClient` into every call signature."""
+    from yggdrasil.databricks.client import DatabricksClient
+    return DatabricksClient.current()
+
+
+def _client_from_target(
+    target: Any,
+    *,
+    table: "Table | None" = None,
+) -> "DatabricksClient | None":
+    """Try to pull a :class:`DatabricksClient` out of *target* / *table*.
+
+    Used by :meth:`AsyncInsert.ensure_job` so callers can pass just a
+    :class:`Table` and have the rest (jobs service, applier wiring)
+    resolved for free. Returns ``None`` when nothing usable is
+    reachable.
+    """
+    if table is not None:
+        client = getattr(table, "client", None)
+        if client is not None:
+            return client
+
+    if target is None:
+        return None
+
+    client = getattr(target, "client", None)
+    if client is not None:
+        return client
+
+    service = getattr(target, "service", None)
+    if service is not None:
+        return getattr(service, "client", None)
+
+    return None
 
 
 def _path_for_sql(path: Any) -> str:

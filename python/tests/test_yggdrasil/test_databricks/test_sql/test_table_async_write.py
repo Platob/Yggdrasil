@@ -595,7 +595,12 @@ class TestStageAsyncInsert:
 
 
 class TestEnsureJob:
-    """:meth:`AsyncInsert.ensure_job` find-or-create flow against a mock service."""
+    """:meth:`AsyncInsert.ensure_job` find-or-create flow against a mock service.
+
+    The applier job is keyed off ``(catalog_name, schema_name)`` — one
+    Databricks Job per schema, draining every table whose stg_*
+    volume sits under it.
+    """
 
     def _make_table_with_jobs(self):
         tbl, _, _, _ = _make_table_with_staging()
@@ -608,15 +613,31 @@ class TestEnsureJob:
 
     def test_default_job_name_from_table(self):
         tbl, _, _, _ = _make_table_with_staging()
-        assert AsyncInsert.default_job_name(tbl) == "ygg-async-insert-`cat`-`sch`-`tbl`".replace("`", "")
+        # Schema-level: name uses (catalog, schema) only — every
+        # table in the same schema shares the same job.
+        assert AsyncInsert.default_job_name(tbl) == "ygg-async-insert-cat-sch"
 
     def test_default_job_name_from_full_name_string(self):
         assert (
             AsyncInsert.default_job_name("main.sales.orders")
-            == "ygg-async-insert-main-sales-orders"
+            == "ygg-async-insert-main-sales"
         )
 
-    def test_ensure_job_creates_with_table_identity(self):
+    def test_default_job_name_from_cat_sch_string(self):
+        assert AsyncInsert.default_job_name("main.sales") == "ygg-async-insert-main-sales"
+
+    def test_resolve_schema_key_rejects_single_segment(self):
+        with pytest.raises(ValueError):
+            AsyncInsert.resolve_schema_key("solo")
+
+    def test_resolve_schema_key_from_record(self):
+        rec = _make_record(
+            target="main.sales.orders",
+        )
+        cat, sch = AsyncInsert.resolve_schema_key(rec.target_full_name)
+        assert (cat, sch) == ("main", "sales")
+
+    def test_ensure_job_creates_with_schema_identity(self):
         tbl, jobs_svc = self._make_table_with_jobs()
 
         AsyncInsert.ensure_job(
@@ -625,22 +646,40 @@ class TestEnsureJob:
 
         jobs_svc.create_or_update.assert_called_once()
         _, kwargs = jobs_svc.create_or_update.call_args
-        # Default name + description carry the target identity.
-        assert kwargs["name"].startswith("ygg-async-insert-")
-        assert "cat.sch.tbl" in kwargs["description"] or "cat" in kwargs["description"]
+        # Default name is keyed off (catalog, schema); table name is NOT in it.
+        assert kwargs["name"] == "ygg-async-insert-cat-sch"
+        # Description mentions the schema.
+        assert "cat.sch" in kwargs["description"]
         # The notebook_path shortcut packs a single Task with the
-        # target identity as base_parameters.
+        # schema identity as base_parameters.
         tasks = kwargs["tasks"]
         assert len(tasks) == 1
         assert tasks[0].notebook_task.notebook_path == "/Workspace/Users/me/apply"
         base = tasks[0].notebook_task.base_parameters
-        assert base["target_catalog_name"] == "cat"
-        assert base["target_schema_name"] == "sch"
-        assert base["target_table_name"] == "tbl"
-        # Job-level parameters mirror those identity keys.
+        assert base["catalog_name"] == "cat"
+        assert base["schema_name"] == "sch"
+        # No table-level keys leak into the task parameters.
+        assert "target_table_name" not in base
+        # Job-level parameters are schema-level.
         param_names = {p.name for p in kwargs["parameters"]}
-        assert "target_full_name" in param_names
-        assert "target_catalog_name" in param_names
+        assert param_names == {"catalog_name", "schema_name"}
+
+    def test_ensure_job_keys_same_job_for_two_tables_in_schema(self):
+        """Different tables in the same schema → same job name."""
+        tbl, jobs_svc = self._make_table_with_jobs()
+        AsyncInsert.ensure_job(tbl, notebook_path="/p")
+        first_name = jobs_svc.create_or_update.call_args.kwargs["name"]
+
+        # A second table in the same schema — different name, same job
+        tbl2 = MagicMock()
+        tbl2.client = tbl.client
+        tbl2.catalog_name = "cat"
+        tbl2.schema_name = "sch"
+        tbl2.table_name = "other"
+        AsyncInsert.ensure_job(tbl2, notebook_path="/p", jobs=jobs_svc)
+        second_name = jobs_svc.create_or_update.call_args.kwargs["name"]
+
+        assert first_name == second_name == "ygg-async-insert-cat-sch"
 
     def test_ensure_job_accepts_explicit_task(self):
         tbl, jobs_svc = self._make_table_with_jobs()
@@ -709,38 +748,62 @@ class TestEnsureJob:
         _, kwargs = jobs_svc.create_or_update.call_args
         assert kwargs["schedule"] is None
 
-    def test_ensure_job_requires_table_or_target(self):
+    def test_ensure_job_requires_schema_identity(self):
         with pytest.raises(ValueError):
             AsyncInsert.ensure_job()
 
-    def test_ensure_job_requires_jobs_when_no_table(self):
+    def test_ensure_job_requires_jobs_when_no_client_reachable(self):
         with pytest.raises(ValueError):
-            AsyncInsert.ensure_job(target_full_name="cat.sch.tbl")
+            AsyncInsert.ensure_job(target="cat.sch.tbl")
 
-    def test_ensure_job_with_target_full_name_and_jobs_only(self):
+    def test_ensure_job_with_explicit_catalog_schema(self):
         jobs_svc = MagicMock()
         jobs_svc.create_or_update.return_value = MagicMock()
         AsyncInsert.ensure_job(
-            target_full_name="main.sales.orders",
+            catalog_name="main",
+            schema_name="sales",
             jobs=jobs_svc,
             notebook_path="/p",
         )
         _, kwargs = jobs_svc.create_or_update.call_args
-        assert kwargs["name"] == "ygg-async-insert-main-sales-orders"
-        # Without a table we don't add per-segment identity params.
+        assert kwargs["name"] == "ygg-async-insert-main-sales"
         names = {p.name for p in kwargs["parameters"]}
-        assert names == {"target_full_name"}
+        assert names == {"catalog_name", "schema_name"}
+
+    def test_ensure_job_with_full_name_string_and_jobs(self):
+        jobs_svc = MagicMock()
+        jobs_svc.create_or_update.return_value = MagicMock()
+        AsyncInsert.ensure_job(
+            target="main.sales.orders",
+            jobs=jobs_svc,
+            notebook_path="/p",
+        )
+        _, kwargs = jobs_svc.create_or_update.call_args
+        # Table segment is stripped; schema-level identity only.
+        assert kwargs["name"] == "ygg-async-insert-main-sales"
+
+    def test_ensure_job_with_async_insert_record_as_target(self):
+        jobs_svc = MagicMock()
+        jobs_svc.create_or_update.return_value = MagicMock()
+        rec = _make_record(
+            target="main.sales.orders",
+        )
+        # Even though the record points at a single table, ensure_job
+        # collapses to the schema-level job.
+        AsyncInsert.ensure_job(target=rec, jobs=jobs_svc, notebook_path="/p")
+        _, kwargs = jobs_svc.create_or_update.call_args
+        assert kwargs["name"] == "ygg-async-insert-main-sales"
 
     def test_ensure_job_merges_caller_parameters(self):
         tbl, jobs_svc = self._make_table_with_jobs()
         AsyncInsert.ensure_job(
             tbl, notebook_path="/p",
-            parameters={"target_full_name": "override", "extra": "yes"},
+            parameters={"catalog_name": "override", "extra": "yes"},
         )
         _, kwargs = jobs_svc.create_or_update.call_args
         as_dict = {p.name: p.default for p in kwargs["parameters"]}
         # Caller wins on collision
-        assert as_dict["target_full_name"] == "override"
+        assert as_dict["catalog_name"] == "override"
         # New keys appended
         assert as_dict["extra"] == "yes"
 
@@ -761,7 +824,110 @@ class TestEnsureJob:
         rec = _make_record(target="main.sales.orders")
         rec.ensure_applier_job(jobs=jobs_svc, notebook_path="/p")
         _, kwargs = jobs_svc.create_or_update.call_args
-        assert kwargs["name"] == "ygg-async-insert-main-sales-orders"
+        assert kwargs["name"] == "ygg-async-insert-main-sales"
+
+
+class TestSchemaDiscovery:
+    """:meth:`AsyncInsert.merge_schema` / :meth:`apply_schema` walk
+    every stg_* volume in a schema and drain its metadata."""
+
+    def _client_with_volumes(self, volumes):
+        client = MagicMock()
+        client.volumes.list.return_value = iter(volumes)
+        return client
+
+    def _make_volume(self, name: str, *, json_records=()):
+        vol = MagicMock()
+        vol.volume_name = name
+        folder = MagicMock()
+        # Each json_record becomes a path object the folder's ls yields.
+        folder.ls.return_value = [
+            self._json_entry(r) for r in json_records
+        ]
+        vol.path.return_value = folder
+        return vol, folder
+
+    def _json_entry(self, record):
+        entry = MagicMock()
+        entry.name = "async-1.json"
+        entry.read_bytes.return_value = record.to_json_bytes()
+        return entry
+
+    def test_iter_staging_folders_filters_to_stg_prefix(self):
+        rec_a = _make_record(target="cat.sch.a", parquets=("/a.parquet",),
+                             metas=("/a.json",), ops=("a",))
+        vol_a, folder_a = self._make_volume("stg_a", json_records=[rec_a])
+        vol_b, _ = self._make_volume("other_volume", json_records=[])
+
+        client = self._client_with_volumes([vol_a, vol_b])
+        folders = list(AsyncInsert.iter_schema_staging_folders(
+            "cat", "sch", client=client,
+        ))
+        assert folders == [folder_a]
+        # Volume filtering happens before path resolution.
+        vol_b.path.assert_not_called()
+
+    def test_merge_schema_drains_multiple_volumes(self):
+        rec_a = _make_record(target="cat.sch.a", parquets=("/a.parquet",),
+                             metas=("/a.json",), ops=("a",))
+        rec_b = _make_record(target="cat.sch.b", parquets=("/b.parquet",),
+                             metas=("/b.json",), ops=("b",))
+        vol_a, _ = self._make_volume("stg_a", json_records=[rec_a])
+        vol_b, _ = self._make_volume("stg_b", json_records=[rec_b])
+
+        client = self._client_with_volumes([vol_a, vol_b])
+        merged = AsyncInsert.merge_schema("cat", "sch", client=client)
+        names = sorted(r.target_full_name for r in merged)
+        assert names == ["cat.sch.a", "cat.sch.b"]
+
+    def test_merge_schema_returns_empty_for_no_records(self):
+        client = self._client_with_volumes([])
+        assert AsyncInsert.merge_schema("cat", "sch", client=client) == []
+
+    def test_merge_schema_swallows_per_folder_errors(self):
+        rec_a = _make_record(target="cat.sch.a", parquets=("/a.parquet",),
+                             metas=("/a.json",), ops=("a",))
+        vol_a, folder_a = self._make_volume("stg_a", json_records=[rec_a])
+        vol_bad, folder_bad = self._make_volume("stg_bad", json_records=[])
+        folder_bad.ls.side_effect = RuntimeError("boom")
+
+        client = self._client_with_volumes([vol_a, vol_bad])
+        # Bad folder doesn't blow up the whole walk.
+        merged = AsyncInsert.merge_schema("cat", "sch", client=client)
+        assert len(merged) == 1
+        assert merged[0].target_full_name == "cat.sch.a"
+
+    def test_apply_schema_executes_each_target(self):
+        rec_a = _make_record(target="cat.sch.a", parquets=("/a.parquet",),
+                             metas=("/a.json",), ops=("a",))
+        rec_b = _make_record(target="cat.sch.b", parquets=("/b.parquet",),
+                             metas=("/b.json",), ops=("b",))
+        vol_a, _ = self._make_volume("stg_a", json_records=[rec_a])
+        vol_b, _ = self._make_volume("stg_b", json_records=[rec_b])
+
+        client = self._client_with_volumes([vol_a, vol_b])
+
+        engine = MagicMock()
+        engine.execute.side_effect = ["result-a", "result-b"]
+
+        with patch(
+            "yggdrasil.databricks.path.DatabricksPath.from_",
+        ) as from_:
+            handle = MagicMock()
+            from_.return_value = handle
+            results = AsyncInsert.apply_schema(
+                engine, "cat", "sch", client=client,
+            )
+
+        assert results == ["result-a", "result-b"]
+        # Two execute calls, two cleanup sweeps.
+        assert engine.execute.call_count == 2
+
+    def test_apply_schema_no_records_returns_empty(self):
+        client = self._client_with_volumes([])
+        engine = MagicMock()
+        assert AsyncInsert.apply_schema(engine, "cat", "sch", client=client) == []
+        engine.execute.assert_not_called()
 
 
 class TestTableInsertAsyncWriteFlag:

@@ -206,24 +206,30 @@ class TestAsyncWriteIntegration(_AsyncWriteIntegrationBase):
 
 
 class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
-    """Job find-or-create + scheduling + trigger paths."""
+    """Schema-level applier-job find-or-create + scheduling + trigger paths.
 
-    def test_ensure_job_creates_and_is_idempotent(self):
-        table = self._unique_table("async_job")
-        table.ensure_created(self._sample_schema())
+    The applier job is keyed off ``(catalog, schema)`` — every table
+    in the same schema is drained by the same job.
+    """
 
-        # No applier task to run — we're verifying the find-or-create
-        # + scheduling wire-up. The job is created with an empty task
-        # list (still valid in the Jobs API).
-        first = AsyncInsert.ensure_job(table)
+    def test_ensure_job_is_keyed_by_schema_not_by_table(self):
+        """Two tables in the same schema → one shared applier job."""
+        table_a = self._unique_table("async_share_a")
+        table_a.ensure_created(self._sample_schema())
+        table_b = self._unique_table("async_share_b")
+        table_b.ensure_created(self._sample_schema())
+
+        first = AsyncInsert.ensure_job(table_a)
         assert isinstance(first, Job)
         assert first.job_id is not None
         type(self).created_jobs.append(first.job_id)
-        assert first.job_name.startswith("ygg-async-insert-")
 
-        # Second call collapses onto the same job id.
-        second = AsyncInsert.ensure_job(table)
+        second = AsyncInsert.ensure_job(table_b)
         assert second.job_id == first.job_id
+        assert (
+            first.job_name
+            == f"ygg-async-insert-{self.catalog_name}-{self.schema_name}"
+        )
 
     def test_ensure_job_with_cron_schedule_is_visible_on_the_job(self):
         from databricks.sdk.service.jobs import PauseStatus
@@ -256,7 +262,8 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
         table.ensure_created(self._sample_schema())
 
         job = AsyncInsert.ensure_job(table)
-        type(self).created_jobs.append(job.job_id)
+        if job.job_id not in type(self).created_jobs:
+            type(self).created_jobs.append(job.job_id)
 
         run = job.run()
         assert isinstance(run, JobRun)
@@ -270,3 +277,32 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
             raise_error=False,
         )
         assert run.is_terminal
+
+    def test_apply_schema_drains_multiple_tables(self):
+        """Two tables in the same schema, each with a staged insert →
+        :meth:`AsyncInsert.apply_schema` drains both in one call."""
+        table_a = self._unique_table("apply_a")
+        table_a.ensure_created(self._sample_schema())
+        table_b = self._unique_table("apply_b")
+        table_b.ensure_created(self._sample_schema())
+
+        stage_async_insert(table_a, self._batch([1, 2], label="a"))
+        stage_async_insert(table_b, self._batch([10, 20], label="b"))
+
+        AsyncInsert.apply_schema(
+            self.engine,
+            self.catalog_name,
+            self.schema_name,
+            client=self.client,
+            wait=True,
+            raise_error=True,
+        )
+
+        rows_a = self.engine.execute(
+            f"SELECT id FROM {table_a.full_name(safe=True)} ORDER BY id"
+        ).to_pylist()
+        rows_b = self.engine.execute(
+            f"SELECT id FROM {table_b.full_name(safe=True)} ORDER BY id"
+        ).to_pylist()
+        assert [r["id"] for r in rows_a] == [1, 2]
+        assert [r["id"] for r in rows_b] == [10, 20]
