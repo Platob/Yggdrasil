@@ -70,6 +70,7 @@ _PATH_CLASS_TARGETS: dict[str, tuple[str, str]] = {
     "dbfs+workspace": ("yggdrasil.databricks.fs.workspace_path", "WorkspacePath"),
     "dbfs+table":     ("yggdrasil.databricks.table.table", "Table"),
     "dbfs+catalog":   ("yggdrasil.databricks.catalog.catalog", "Catalog"),
+    "dbfs+schema":    ("yggdrasil.databricks.schema.schema", "Schema"),
     "s3":             ("yggdrasil.aws.fs.path", "S3Path"),
     "http":           ("yggdrasil.io.http_.path", "HTTPPath"),
     "https":          ("yggdrasil.io.http_.path", "HTTPPath"),
@@ -144,6 +145,11 @@ class Scheme(str, Enum):
     #: top of the UC hierarchy and lives behind a singleton-cached
     #: :class:`yggdrasil.databricks.catalog.Catalog`.
     DATABRICKS_CATALOG   = "dbfs+catalog"
+
+    #: Unity Catalog *schema* addressed as a logical Path —
+    #: ``dbfs+schema://[creds@]host/<catalog>/<schema>?…``. Singleton-cached
+    #: :class:`yggdrasil.databricks.schema.Schema`.
+    DATABRICKS_SCHEMA    = "dbfs+schema"
 
     #: Unity Catalog table addressed as a logical Holder /
     #: :class:`Tabular` —

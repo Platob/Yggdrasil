@@ -52,6 +52,7 @@ from yggdrasil.data.enums import Mode, ModeLike, Scheme
 from yggdrasil.databricks import DatabricksClient
 from yggdrasil.databricks.aws import AWSDatabricksVolumeCredentials
 from yggdrasil.databricks.client import DatabricksResource
+from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io.url import URL
 
@@ -67,36 +68,47 @@ __all__ = ["Volume"]
 logger = logging.getLogger(__name__)
 
 
-class Volume(DatabricksResource):
+class Volume(DatabricksResource, Singleton):
     """A single Unity Catalog volume — metadata, credentials, storage path.
 
     Construct via :meth:`Volumes.volume` /
     :meth:`Volumes.__getitem__` for the cache-aware path, or
     directly when callers already have the coordinates. Either way
-    the instance is interned per ``(host, catalog, schema, name)``
-    so subsequent calls collapse to the same live cache.
+    the instance is interned per ``(client, catalog, schema, name)``
+    so subsequent calls collapse to the same live cache — same
+    convention :class:`Catalog` / :class:`Schema` / :class:`Table`
+    use.
     """
 
     DEFAULT_INFO_TTL: ClassVar[float] = 300.0  # 5 minutes
 
-    # Process-wide singleton cache, keyed by
-    # ``(host, catalog, schema, name)``. ``host`` distinguishes two
-    # workspaces that happen to share the same UC coordinates.
-    _INSTANCES: ClassVar["dict[Tuple[str, str, str, str], Volume]"] = {}
-    _INSTANCES_LOCK: ClassVar[threading.Lock] = threading.Lock()
+    # Per-class singleton cache so this surface stays separate from
+    # the rest of the project's :class:`Singleton` users.
+    _INSTANCES: ClassVar = Singleton._INSTANCES.__class__(default_ttl=None)
+    # Cache every Volume under the singleton convention; the cached
+    # ``VolumeInfo`` and credentials refresher are worth keeping for
+    # the process lifetime so navigation / repeated reads don't keep
+    # refetching.
+    _SINGLETON_TTL: ClassVar[Any] = None
 
     @classmethod
     def _singleton_key(
         cls,
-        service: "Volumes | None",
-        catalog_name: str,
-        schema_name: str,
-        volume_name: str,
-    ) -> Tuple[str, str, str, str]:
-        host = ""
-        if service is not None and service.client is not None:
-            host = service.client.host or ""
-        return (host or "default", catalog_name, schema_name, volume_name)
+        service: "Volumes | None" = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        volume_name: str | None = None,
+        **_kwargs: Any,
+    ) -> Any:
+        # Key on the bound :class:`DatabricksClient` *instance* + the
+        # three-part name. Same convention as :class:`Catalog` /
+        # :class:`Schema` / :class:`Table`.
+        client = None
+        try:
+            client = service.client if service is not None else None
+        except Exception:
+            client = None
+        return (cls, client, catalog_name, schema_name, volume_name)
 
     def __new__(
         cls,
@@ -104,6 +116,8 @@ class Volume(DatabricksResource):
         catalog_name: str | None = None,
         schema_name: str | None = None,
         volume_name: str | None = None,
+        *,
+        singleton_ttl: "int | None" = ...,
         **_kwargs: Any,
     ) -> "Volume":
         if not (catalog_name and schema_name and volume_name):
@@ -111,18 +125,36 @@ class Volume(DatabricksResource):
                 f"Volume requires catalog_name + schema_name + volume_name "
                 f"(got {catalog_name!r}, {schema_name!r}, {volume_name!r})."
             )
-        if service is None:
-            from .volumes import Volumes
-            service = Volumes.current()
+        if singleton_ttl is ...:
+            singleton_ttl = cls._SINGLETON_TTL
+
+        def _allocate() -> "Volume":
+            return object.__new__(cls)
+
+        if singleton_ttl is ...:
+            return _allocate()
+
         key = cls._singleton_key(
-            service, str(catalog_name), str(schema_name), str(volume_name),
+            service,
+            catalog_name=str(catalog_name),
+            schema_name=str(schema_name),
+            volume_name=str(volume_name),
         )
         with cls._INSTANCES_LOCK:
             existing = cls._INSTANCES.get(key)
             if existing is not None:
                 return existing
-            instance = super().__new__(cls)
-            cls._INSTANCES[key] = instance
+            instance = _allocate()
+            try:
+                object.__setattr__(instance, "_singleton_key_", key)
+            except AttributeError:
+                pass
+            ttl_arg = (
+                float(singleton_ttl)
+                if isinstance(singleton_ttl, int) and not isinstance(singleton_ttl, bool)
+                else singleton_ttl
+            )
+            cls._INSTANCES.set(key, instance, ttl=ttl_arg)
             return instance
 
     def __init__(
@@ -135,11 +167,16 @@ class Volume(DatabricksResource):
         infos: VolumeInfo | None = None,
         infos_fetched_at: float | None = None,
         infos_ttl: float | None = None,
+        singleton_ttl: "int | None" = ...,
     ) -> None:
+        # ``singleton_ttl`` is consumed by ``__new__``; accept here so
+        # the auto-init pass after ``__new__`` doesn't trip on it.
+        del singleton_ttl
         # Singleton-cached instances are re-entered on every constructor
         # call (Python always invokes __init__ after __new__). Skip the
         # second pass so the live cache survives — but rebind the service
-        # so the latest workspace handle wins.
+        # so the latest workspace handle wins, and accept newer ``infos``
+        # so callers can refresh the cached entry through the constructor.
         if getattr(self, "_initialized", False):
             if service is not None:
                 self.service = service
@@ -485,14 +522,30 @@ class Volume(DatabricksResource):
 
     @property
     def catalog(self) -> "Catalog":
-        """Navigate up to the parent :class:`Catalog` (cached on the singleton)."""
+        """Navigate up to the parent :class:`Catalog`.
+
+        Returns the singleton-cached :class:`Catalog` for this
+        client + catalog name — repeated calls hand back the same
+        instance with shared :class:`CatalogInfo` cache. The
+        per-instance ``_catalog`` slot is kept as a one-attribute
+        shortcut so the navigation path skips the
+        ``client.catalogs.catalog(...)`` round trip on hot loops.
+        """
         if self._catalog is None:
             self._catalog = self.client.catalogs.catalog(self.catalog_name)
         return self._catalog
 
     @property
     def schema(self) -> "UCSchema":
-        """Navigate up to the parent :class:`Schema` (cached on the singleton)."""
+        """Navigate up to the parent :class:`Schema`.
+
+        Returns the singleton-cached :class:`Schema` for this
+        client + (catalog, schema) — repeated calls hand back the
+        same instance with shared :class:`SchemaInfo` cache. The
+        per-instance ``_schema`` slot is kept as a one-attribute
+        shortcut so the navigation path skips the
+        ``client.schemas.schema(...)`` round trip on hot loops.
+        """
         if self._schema is None:
             self._schema = self.client.schemas.schema(
                 catalog_name=self.catalog_name,

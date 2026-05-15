@@ -64,7 +64,17 @@ def _view(
     return t, sql
 
 
+def _clear_singleton_cache() -> None:
+    """Reset the per-class :class:`Table` singleton cache between tests."""
+    from yggdrasil.databricks.client import DatabricksClient
+    DatabricksClient._INSTANCES.clear()
+    Table._INSTANCES.clear()
+
+
 class TestRename(unittest.TestCase):
+
+    def setUp(self) -> None:
+        _clear_singleton_cache()
 
     def test_simple_rename_within_schema(self) -> None:
         v, sql = _view()
@@ -134,6 +144,9 @@ class TestRename(unittest.TestCase):
 
 
 class TestClone(unittest.TestCase):
+
+    def setUp(self) -> None:
+        _clear_singleton_cache()
 
     def test_default_clone_reuses_source_definition(self) -> None:
         v, sql = _view()

@@ -59,8 +59,8 @@ logger = logging.getLogger(__name__)
 class Catalog(DatabricksPath, Singleton):
     """A single Unity Catalog catalog — lifecycle, schema navigation, tags.
 
-    Identity is ``(client_host, catalog_name)``: two callers asking for
-    the same catalog under the same workspace collapse onto one
+    Identity is ``(client, catalog_name)``: two callers asking for
+    the same catalog under the same client collapse onto one
     instance via the :class:`Singleton` cache, so the cached
     :class:`CatalogInfo` and tag state are shared.
 

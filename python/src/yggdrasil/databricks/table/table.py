@@ -47,6 +47,7 @@ from yggdrasil.data.schema import Schema as DataSchema
 from yggdrasil.data.statement import PreparedStatement, StatementResult
 from yggdrasil.databricks.client import DatabricksClient, DatabricksResource
 from yggdrasil.databricks.column.column import Column
+from yggdrasil.dataclasses import Singleton
 from yggdrasil.databricks.sql.sql_utils import (
     quote_ident,
     quote_qualified_ident,
@@ -1055,7 +1056,7 @@ def _build_ygg_properties(
 # Table — per-table resource
 # ===========================================================================
 
-class Table(DatabricksResource, RemotePath):
+class Table(DatabricksResource, RemotePath, Singleton):
     """A single Unity Catalog table — DDL, DML, schema, storage helpers.
 
     Registers under :attr:`Scheme.DATABRICKS_TABLE` (``dbfs+table://``)
@@ -1068,7 +1069,97 @@ class Table(DatabricksResource, RemotePath):
     primitives are intentionally not implemented because a SQL table
     is not a positional byte buffer — callers should use the Tabular
     surface (``read_arrow_table`` / ``write_arrow_table`` / …).
+
+    Identity is ``(client, catalog_name, schema_name, table_name)``:
+    two callers asking for the same fully-qualified table under the
+    same client collapse onto one instance via the :class:`Singleton`
+    cache, so the cached :class:`TableInfo` / columns / staging
+    volume slot are shared across views into the same UC resource.
     """
+
+    # Per-class singleton cache — keeps Table singletons separate
+    # from the rest of the project's :class:`Singleton` users.
+    _INSTANCES: ClassVar = Singleton._INSTANCES.__class__(default_ttl=None)
+    # Cache every Table under the singleton convention; the cached
+    # ``TableInfo`` / columns / staging-volume slot are worth keeping
+    # for the process lifetime so navigation through
+    # ``schema['<table>']`` doesn't keep refetching.
+    _SINGLETON_TTL: ClassVar[Any] = None
+
+    @classmethod
+    def _singleton_key(
+        cls,
+        service: "Tables | None" = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
+        **_kwargs: Any,
+    ) -> Any:
+        # Key on the bound :class:`DatabricksClient` *instance* + the
+        # three-part name. Same convention as :class:`Catalog` /
+        # :class:`Schema`. ``safe_table_name`` is applied here so two
+        # callers with semantically-equivalent but textually-distinct
+        # names (long names, suffix-trimmed forms) collapse correctly.
+        client = None
+        try:
+            client = service.client if service is not None else None
+        except Exception:
+            client = None
+        if catalog_name is None and service is not None:
+            catalog_name = getattr(service, "catalog_name", None)
+        if schema_name is None and service is not None:
+            schema_name = getattr(service, "schema_name", None)
+        return (cls, client, catalog_name, schema_name, safe_table_name(table_name))
+
+    def __new__(
+        cls,
+        service: "Tables | None" = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
+        *,
+        singleton_ttl: "int | None" = ...,
+        **kwargs: Any,
+    ):
+        # Mirror :class:`Catalog` / :class:`Schema`'s opt-in cache
+        # contract: per-call ``singleton_ttl`` overrides
+        # ``_SINGLETON_TTL``; ``...`` on both sides means "don't
+        # register" and every call allocates a fresh instance. Cache
+        # lookup runs BEFORE the :class:`RemotePath` /
+        # :class:`Holder` construction chain so a hit skips
+        # allocation entirely; ``object.__new__`` keeps the MRO's
+        # :class:`Singleton.__new__` from re-keying with empty args.
+        if singleton_ttl is ...:
+            singleton_ttl = cls._SINGLETON_TTL
+
+        def _allocate() -> "Table":
+            return object.__new__(cls)
+
+        if singleton_ttl is ...:
+            return _allocate()
+
+        key = cls._singleton_key(
+            service,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name,
+        )
+        with cls._INSTANCES_LOCK:
+            existing = cls._INSTANCES.get(key)
+            if existing is not None:
+                return existing
+            instance = _allocate()
+            try:
+                object.__setattr__(instance, "_singleton_key_", key)
+            except AttributeError:
+                pass
+            ttl_arg = (
+                float(singleton_ttl)
+                if isinstance(singleton_ttl, int) and not isinstance(singleton_ttl, bool)
+                else singleton_ttl
+            )
+            cls._INSTANCES.set(key, instance, ttl=ttl_arg)
+            return instance
 
     def _stat_uncached(self) -> IOStats:
         return IOStats(
@@ -1118,7 +1209,20 @@ class Table(DatabricksResource, RemotePath):
         columns: list[Column] | None = None,
         url: URL | None = None,
         temporary: bool = False,
+        singleton_ttl: "int | None" = ...,
     ):
+        # ``singleton_ttl`` is consumed by ``__new__``; accept it here
+        # too so Python's auto-call after ``__new__`` doesn't trip on
+        # an unexpected kwarg.
+        del singleton_ttl
+        # Singleton-cached re-entry: a second ``Table(service=…,
+        # catalog_name=…, schema_name=…, table_name=…)`` call returns
+        # the live instance via ``__new__``; skip the second pass so
+        # the cached ``_infos`` / columns / staging volume don't get
+        # reset under the caller.
+        if getattr(self, "_initialized", False):
+            return
+
         if service is None:
             from .tables import Tables
             service = Tables.current()
@@ -1153,6 +1257,7 @@ class Table(DatabricksResource, RemotePath):
         self._infos_fetched_at = infos_fetched_at
         self._columns = columns
         self._staging_volume: Volume | None = None
+        self._initialized = True
 
     # ------------------------------------
     # Tabular
@@ -1470,19 +1575,29 @@ class Table(DatabricksResource, RemotePath):
     
     @property
     def catalog(self) -> "Catalog":
+        """Navigate up to the parent :class:`Catalog`.
+
+        Returns the singleton-cached :class:`Catalog` for this
+        client + catalog name — repeated calls hand back the same
+        instance with shared :class:`CatalogInfo` cache.
+        """
         from yggdrasil.databricks.catalog.catalog import Catalog as _Catalog
-        from yggdrasil.databricks.catalog.catalogs import Catalogs
         return _Catalog(
-            service=Catalogs(client=self.client),
+            service=self.client.catalogs,
             catalog_name=self.catalog_name,
         )
 
     @property
     def schema(self) -> "UCSchema":
+        """Navigate up to the parent :class:`Schema`.
+
+        Returns the singleton-cached :class:`Schema` for this
+        client + (catalog, schema) — repeated calls hand back the
+        same instance with shared :class:`SchemaInfo` cache.
+        """
         from yggdrasil.databricks.schema.schema import Schema as _Schema
-        from yggdrasil.databricks.catalog.catalogs import Catalogs
         return _Schema(
-            service=Catalogs(client=self.client),
+            service=self.client.schemas,
             catalog_name=self.catalog_name,
             schema_name=self.schema_name,
         )
