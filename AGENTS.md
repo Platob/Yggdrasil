@@ -692,6 +692,52 @@ Rule: the message can have attitude, but it still needs to be instantly useful i
 
 ---
 
+## Logging guidance
+
+### Prefer `%r` self-representation in logs with explicit simple texts
+Format objects through their `__repr__` (`%r`) — not `%s` / `str(...)` —
+in every `LOGGER.debug` / `LOGGER.info` / `LOGGER.warning` / `LOGGER.error`
+call. The `__repr__` of our long-lived objects (`DatabricksClient`,
+`DatabricksPath`, `Volume`, `Schema`, `Table`, `Session`, `URL`,
+`HTTPSession`, etc.) carries the full identity (`<VolumePath dbfs+volume://…>`,
+`DatabricksClient(host='…', auth_type='pat')`) — `str(obj)` often
+collapses to a bare path or hostname, which is ambiguous when two
+similar objects are logged in the same line.
+
+The text around the `%r` should be a short, explicit, scannable English
+description — say what happened in plain words, not a one-token
+shorthand. The reader of `journalctl` shouldn't have to grep the source
+to figure out which call emitted the line.
+
+Good:
+```python
+LOGGER.info("Created temp volume path %r (cleanup in %ds)", path, ttl)
+LOGGER.warning("Permission denied listing directory %r: %r", self, exc)
+LOGGER.debug("Cached config snapshot for client %r — host=%r", client, host)
+```
+
+Bad:
+```python
+LOGGER.info("path=%s ttl=%d", path, ttl)              # bare %s drops the type tag
+LOGGER.warning("perm denied %s %s", self, exc)        # cryptic, no English
+LOGGER.debug("config cached")                          # which client? where?
+```
+
+Two practical exceptions:
+- The `%(asctime)s` / `%(levelname)s` / `%(name)s` slots in the
+  `logging` formatter are interpolated by the logging framework with
+  primitive types — keep `%s` there.
+- When the value is *already* a primitive (`int`, `bool`, a URL string
+  that's part of the message structure), `%s` reads more naturally
+  than `%r`'s redundant quotes (`size=1234` not `size='1234'`).
+
+Lazy interpolation (`LOGGER.debug("foo %r", obj)`, not
+`LOGGER.debug(f"foo {obj!r}")`) is still the rule — the formatter
+only renders when the level is enabled, and `repr()` on a heavy
+object is exactly the kind of work the level guard exists to avoid.
+
+---
+
 ## Optional dependency policy
 
 Optional dependencies must remain optional.
