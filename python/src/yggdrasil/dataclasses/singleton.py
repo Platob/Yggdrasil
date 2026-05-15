@@ -56,6 +56,13 @@ class Singleton:
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(default_ttl=None)
     _INSTANCES_LOCK: ClassVar[RLock] = RLock()
 
+    # Class-level default for the per-call ``singleton_ttl`` kwarg.
+    # ``...`` (the default on this base) keeps caching strictly
+    # opt-in — subclasses that always want process-lifetime
+    # caching set this to ``None``; subclasses that want a
+    # bounded cache lifetime set it to a number of seconds.
+    _SINGLETON_TTL: ClassVar[Any] = ...
+
     # Attribute names that don't survive pickling. Subclasses
     # extend with their own non-picklable handles (live SDK clients,
     # connection pools, lazy service caches).
@@ -72,7 +79,27 @@ class Singleton:
         """
         return (cls, args, tuple(sorted(kwargs.items())))
 
-    def __new__(cls, *args: Any, **kwargs: Any) -> "Singleton":
+    def __new__(
+        cls,
+        *args: Any,
+        singleton_ttl: "int | None" = ...,
+        **kwargs: Any,
+    ) -> "Singleton":
+        # ``singleton_ttl`` is the opt-in cache switch:
+        #   - omitted (``...``) → fall back to the subclass's
+        #     ``_SINGLETON_TTL`` ClassVar (default ``...`` on the
+        #     base = no caching at all).
+        #   - ``None``           → register without expiry (live for
+        #     the process lifetime); same shape as the long-running
+        #     MSAL / Databricks SDK ``_INSTANCES`` caches.
+        #   - ``int`` (seconds)  → register with that TTL; the entry
+        #     auto-evicts after the window so callers building one
+        #     instance per short-lived workload don't leak.
+        if singleton_ttl is ...:
+            singleton_ttl = cls._SINGLETON_TTL
+        if singleton_ttl is ...:
+            return super().__new__(cls)
+
         key = cls._singleton_key(*args, **kwargs)
         with cls._INSTANCES_LOCK:
             existing = cls._INSTANCES.get(key)
@@ -80,7 +107,15 @@ class Singleton:
                 return existing
             instance = super().__new__(cls)
             object.__setattr__(instance, "_singleton_key_", key)
-            cls._INSTANCES[key] = instance
+            # ``ExpiringDict.set`` reads bare ``int`` as nanoseconds —
+            # promote to float so the user-facing seconds contract
+            # holds. ``None`` passes through unchanged (no expiry).
+            ttl_arg = (
+                float(singleton_ttl)
+                if isinstance(singleton_ttl, int) and not isinstance(singleton_ttl, bool)
+                else singleton_ttl
+            )
+            cls._INSTANCES.set(key, instance, ttl=ttl_arg)
             return instance
 
     def __hash__(self) -> int:

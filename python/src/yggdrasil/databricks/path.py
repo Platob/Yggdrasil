@@ -166,9 +166,9 @@ def _resolve_databricks_subclass(
     is the historical home of ``dbfs://`` URLs that don't carry a
     leading namespace.
     """
-    from .dbfs_path import DBFSPath
-    from .volume_path import VolumePath
-    from .workspace_path import WorkspacePath
+    from .fs.dbfs_path import DBFSPath
+    from .fs.volume_path import VolumePath
+    from .fs.workspace_path import WorkspacePath
 
     candidate: "URL | None" = url
     if candidate is None and isinstance(data, URL):
@@ -264,12 +264,12 @@ class DatabricksPath(RemotePath):
         pass after ``__new__``.
 
         On a concrete subclass (``DBFSPath`` / ``VolumePath`` /
-        ``WorkspacePath``) the call forwards up the MRO so
-        :meth:`RemotePath.__new__` can apply its singleton-by-URL
-        cache before the eventual ``object.__new__`` allocation —
-        normalize the seed into a URL kwarg first so a POSIX-string
-        construction (``VolumePath("/Volumes/cat/sch/vol/x")``)
-        collapses to the same singleton as the URL-shaped one.
+        ``WorkspacePath``) the call forwards up the MRO to
+        :class:`RemotePath` / :class:`Path` / :class:`Holder` for
+        the eventual ``object.__new__`` allocation — normalize the
+        seed into a URL kwarg first so a POSIX-string construction
+        (``VolumePath("/Volumes/cat/sch/vol/x")``) lands on the
+        same canonical URL as the URL-shaped one.
         """
         if cls is not DatabricksPath:
             if url is None and data is not None:

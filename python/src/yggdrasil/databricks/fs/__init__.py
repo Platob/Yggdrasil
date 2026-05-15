@@ -11,8 +11,8 @@ dispatched by the leading namespace in the URL path.
 
 from __future__ import annotations
 
+from ..path import DatabricksPath
 from .dbfs_path import DBFSPath
-from .path import DatabricksPath
 from .volume_path import VolumePath
 from .workspace_path import WorkspacePath
 

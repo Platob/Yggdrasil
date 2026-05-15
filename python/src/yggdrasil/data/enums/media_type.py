@@ -557,3 +557,4 @@ class MediaTypes:
     ARROW_IPC = MediaType(mime_type=MimeTypes.ARROW_IPC, codec=None)
     ZIP_ENTRY = MediaType(mime_type=MimeTypes.ZIP_ENTRY, codec=None)
     DATABRICKS_UNITY_CATALOG_TABLE = MediaType(mime_type=MimeTypes.DATABRICKS_UNITY_CATALOG_TABLE, codec=None)
+    DATABRICKS_UNITY_CATALOG_CATALOG = MediaType(mime_type=MimeTypes.DATABRICKS_UNITY_CATALOG_CATALOG, codec=None)

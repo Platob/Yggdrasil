@@ -28,20 +28,26 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Iterable, Iterator, Mapping, Optional, TYPE_CHECKING
+from typing import Any, ClassVar, Iterable, Iterator, Mapping, Optional, TYPE_CHECKING
 
 from databricks.sdk.errors import DatabricksError, NotFound
 from databricks.sdk.service.catalog import CatalogInfo, SecurableType
 from yggdrasil.concurrent.threading import Job
-from yggdrasil.databricks.client import DatabricksResource
-from yggdrasil.dataclasses.waiting import WaitingConfigArg
+from yggdrasil.data.enums import MediaTypes, MimeType, MimeTypes, Scheme
+from yggdrasil.dataclasses import Singleton
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+from yggdrasil.databricks.path import DatabricksPath
 from yggdrasil.io import URL
-from yggdrasil.data.enums.mode import ModeLike
+from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.io.io_stats import IOKind, IOStats
+from yggdrasil.io.path import Path
+from yggdrasil.data.enums.mode import Mode, ModeLike
 
 from yggdrasil.databricks.sql.sql_utils import DEFAULT_TAG_COLLATION, databricks_tag_literal, quote_ident
 
 if TYPE_CHECKING:
     from yggdrasil.databricks.catalog.catalogs import Catalogs
+    from yggdrasil.databricks.client import DatabricksClient
     from yggdrasil.databricks.schema.schema import Schema
     from yggdrasil.databricks.table.table import Table
 
@@ -50,9 +56,95 @@ __all__ = ["Catalog"]
 logger = logging.getLogger(__name__)
 
 
-class Catalog(DatabricksResource):
-    """A single Unity Catalog catalog — lifecycle, schema navigation, tags."""
-    
+class Catalog(DatabricksPath, Singleton):
+    """A single Unity Catalog catalog — lifecycle, schema navigation, tags.
+
+    Identity is ``(client_host, catalog_name)``: two callers asking for
+    the same catalog under the same workspace collapse onto one
+    instance via the :class:`Singleton` cache, so the cached
+    :class:`CatalogInfo` and tag state are shared.
+
+    URL-addressable through :class:`DatabricksPath` under
+    :attr:`Scheme.DATABRICKS_CATALOG` (``dbfs+catalog://``); the
+    Path / Holder byte primitives raise — a catalog is a logical
+    UC resource, not a positional byte buffer.
+    """
+
+    scheme: ClassVar[Scheme] = Scheme.DATABRICKS_CATALOG
+
+    # Per-class singleton cache so this surface stays separate from
+    # the rest of the project's :class:`Singleton` users.
+    _INSTANCES: ClassVar = Singleton._INSTANCES.__class__(default_ttl=None)
+    # Cache every catalog under the singleton convention; the cached
+    # ``CatalogInfo`` and tag state are worth keeping for the
+    # process lifetime so navigation through ``catalogs[name]`` /
+    # ``schemas`` / ``tables`` doesn't keep refetching.
+    _SINGLETON_TTL: ClassVar[Any] = None
+
+    @classmethod
+    def _singleton_key(
+        cls,
+        service: "Catalogs | None" = None,
+        *,
+        catalog_name: str | None = None,
+        **_kwargs: Any,
+    ) -> Any:
+        host = ""
+        try:
+            client = service.client if service is not None else None
+            host = (client.host if client is not None else "") or ""
+        except Exception:
+            host = ""
+        return (cls, host, catalog_name)
+
+    def __new__(
+        cls,
+        service: "Catalogs | None" = None,
+        *,
+        catalog_name: str | None = None,
+        singleton_ttl: "int | None" = ...,
+        **kwargs: Any,
+    ):
+        # Mirror :class:`Singleton.__new__`'s opt-in cache contract:
+        # a per-call ``singleton_ttl`` overrides the class default
+        # (:attr:`_SINGLETON_TTL`); ``...`` on both sides means
+        # "don't register" and every call allocates a fresh
+        # instance. Cache lookup runs BEFORE the
+        # :class:`DatabricksPath` construction chain so a hit skips
+        # :class:`Holder` /:class:`Path` allocation entirely.
+        if singleton_ttl is ...:
+            singleton_ttl = cls._SINGLETON_TTL
+
+        # Allocate via ``object.__new__`` directly: ``Catalog.__init__``
+        # builds the canonical ``dbfs+catalog://`` URL itself, so the
+        # :class:`DatabricksPath` /:class:`Holder` ``__new__`` chain
+        # has nothing useful to add — and chaining through it would
+        # also re-enter :class:`Singleton.__new__` from the MRO,
+        # collapsing every allocation onto the empty-key singleton.
+        def _allocate() -> "Catalog":
+            return object.__new__(cls)
+
+        if singleton_ttl is ...:
+            return _allocate()
+
+        key = cls._singleton_key(service, catalog_name=catalog_name)
+        with cls._INSTANCES_LOCK:
+            existing = cls._INSTANCES.get(key)
+            if existing is not None:
+                return existing
+            instance = _allocate()
+            try:
+                object.__setattr__(instance, "_singleton_key_", key)
+            except AttributeError:
+                pass
+            ttl_arg = (
+                float(singleton_ttl)
+                if isinstance(singleton_ttl, int) and not isinstance(singleton_ttl, bool)
+                else singleton_ttl
+            )
+            cls._INSTANCES.set(key, instance, ttl=ttl_arg)
+            return instance
+
     def __init__(
         self,
         service: "Catalogs | None" = None,
@@ -61,17 +153,129 @@ class Catalog(DatabricksResource):
         infos_ttl: float | None = None,
         infos: CatalogInfo | None = None,
         infos_fetched_at: float | None = None,
+        url: URL | None = None,
+        client: "DatabricksClient | None" = None,
+        singleton_ttl: "int | None" = ...,
     ):
+        # ``singleton_ttl`` is consumed by ``__new__``; accept it here
+        # too so Python's auto-call after ``__new__`` doesn't trip on
+        # an unexpected kwarg.
+        del singleton_ttl
+        # Singleton-cached re-entry: a second ``Catalog(service=…,
+        # catalog_name=…)`` call on the same key returns the live
+        # instance via ``__new__``; skip the second pass so the cached
+        # ``_infos`` / fetch timestamp don't get reset under the caller.
+        if getattr(self, "_initialized", False):
+            return
+
         if service is None:
             from .catalogs import Catalogs
             service = Catalogs.current()
 
-        super().__init__(service=service)
+        if url is None:
+            host = ""
+            try:
+                base_host = service.client.base_url.host if service is not None else ""
+                host = base_host or ""
+            except Exception:
+                host = ""
+            url = URL(
+                scheme=type(self).scheme.value,
+                host=host,
+                path=f"/{catalog_name}" if catalog_name else "/",
+            )
+
+        super().__init__(url=url, client=client or (service.client if service else None))
+        self.service = service
         self.catalog_name = catalog_name
         self._infos_ttl = infos_ttl or 1800.0
         self._infos = infos
         self._infos_fetched_at = infos_fetched_at
-    
+        self._initialized = True
+
+    # ── Path / Holder primitives — Catalog is logical, not byte-shaped ────────
+
+    @property
+    def is_remote_path(self) -> bool:
+        # The catalog identity lives in Unity Catalog, not at a
+        # backend file URL — mirror :class:`Table`.
+        return False
+
+    @property
+    def size(self) -> int:
+        return 0
+
+    def full_path(self) -> str:
+        return self.full_name()
+
+    def _stat(self) -> IOStats:
+        return self._stat_uncached()
+
+    def _stat_uncached(self) -> IOStats:
+        return IOStats(
+            size=0,
+            mtime=0.0,
+            kind=IOKind.DIRECTORY if self.exists else IOKind.MISSING,
+            media_type=MediaTypes.DATABRICKS_UNITY_CATALOG_CATALOG,
+        )
+
+    def _read_mv(self, n: int, pos: int) -> memoryview:
+        raise NotImplementedError(
+            f"{type(self).__name__} is a logical Unity Catalog resource, "
+            f"not a positional byte buffer. Navigate via "
+            f"``catalog['<schema>']`` or ``catalog.schemas()`` instead."
+        )
+
+    def _write_mv(self, data: memoryview, pos: int) -> int:
+        raise NotImplementedError(
+            f"{type(self).__name__} is a logical Unity Catalog resource. "
+            f"Use ``create()`` / ``update()`` to mutate metadata."
+        )
+
+    def _bread(self, n: int, pos: int, mode: Mode) -> BytesIO:
+        raise NotImplementedError(
+            f"{type(self).__name__} is a logical Unity Catalog resource."
+        )
+
+    def _bwrite(self, data: BytesIO, pos: int, mode: Mode) -> int:
+        raise NotImplementedError(
+            f"{type(self).__name__} is a logical Unity Catalog resource."
+        )
+
+    def _ls(self, recursive: bool = False) -> Iterator["Path"]:
+        del recursive
+        return iter(())
+
+    def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
+        del parents
+        self.ensure_created() if exist_ok else self.create(if_not_exists=False)
+
+    def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
+        self.delete(wait=wait, raise_error=not missing_ok)
+
+    def _remove_dir(
+        self,
+        recursive: bool = True,
+        missing_ok: bool = True,
+        wait: WaitingConfig = True,
+    ) -> None:
+        self.delete(force=recursive, wait=wait, raise_error=not missing_ok)
+
+    @classmethod
+    def default_media_type(cls) -> MimeType:
+        return MimeTypes.DATABRICKS_UNITY_CATALOG_CATALOG
+
+    # ── DatabricksResource compatibility ──────────────────────────────────────
+
+    @property
+    def client(self) -> "DatabricksClient":
+        # Prefer the service's client (the resource's authoritative
+        # binding); fall back to the path-level client when the
+        # service was explicitly cleared.
+        if self.service is not None:
+            return self.service.client
+        return super().client
+
     # ── identity ──────────────────────────────────────────────────────────────
 
     def full_name(self, safe: bool = None) -> str:
@@ -101,13 +305,9 @@ class Catalog(DatabricksResource):
     # ── URL ───────────────────────────────────────────────────────────────────
 
     @property
-    def url(self) -> URL:
-        return self.client.base_url.with_path(f"/explore/data/{self.catalog_name}")
-
-    @property
     def explore_url(self) -> URL:
         """Workspace UI URL pointing at this catalog's Catalog Explorer page."""
-        return self.url
+        return self.client.base_url.with_path(f"/explore/data/{self.catalog_name}")
 
     # ── cache management ──────────────────────────────────────────────────────
 

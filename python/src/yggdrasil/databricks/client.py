@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from .compute.service import Compute
     from .secrets.service import Secrets
     from .workspaces import Workspaces, Workspace
-    from .fs.path import DatabricksPath
+    from .path import DatabricksPath
     from .genie import Genie
     from .tags.service import EntityTags
 
@@ -212,6 +212,10 @@ class DatabricksClient(Singleton, URLBased):
     # service caches, same cached Config.
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(default_ttl=None)
     _INSTANCES_LOCK: ClassVar[RLock] = RLock()
+    # Cache every constructed client for the process lifetime — SDK
+    # handles, lazy service slots, and the cached Config aren't worth
+    # rebuilding when the same identity comes back.
+    _SINGLETON_TTL: ClassVar[Any] = None
 
     # ---- init field bookkeeping ------------------------------------------
 
@@ -323,10 +327,14 @@ class DatabricksClient(Singleton, URLBased):
         product: Any = ...,
         product_version: Any = ...,
         custom_tags: Any = ...,
+        singleton_ttl: "int | None" = ...,
     ) -> None:
         # Singleton-cached instances are re-entered on every constructor
         # call (Python always invokes ``__init__`` after ``__new__``);
         # skip the second pass so live SDK handles + lazy caches survive.
+        # ``singleton_ttl`` is consumed by ``Singleton.__new__``; accept
+        # it here so the auto-init pass doesn't trip on an unknown kwarg.
+        del singleton_ttl
         if getattr(self, "_initialized", False):
             return
 
@@ -1118,7 +1126,7 @@ class DatabricksClient(Singleton, URLBased):
         Returns:
             A DatabricksPath instance.
         """
-        from .fs.path import DatabricksPath
+        from .path import DatabricksPath
 
         return DatabricksPath.from_(
             obj=parts,
