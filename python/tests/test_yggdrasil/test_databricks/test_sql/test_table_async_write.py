@@ -594,6 +594,176 @@ class TestStageAsyncInsert:
 # ---------------------------------------------------------------------------
 
 
+class TestEnsureJob:
+    """:meth:`AsyncInsert.ensure_job` find-or-create flow against a mock service."""
+
+    def _make_table_with_jobs(self):
+        tbl, _, _, _ = _make_table_with_staging()
+        # Replace the jobs service with a mock so we can assert on
+        # ``create_or_update`` args without touching the SDK.
+        jobs_svc = MagicMock(name="Jobs")
+        jobs_svc.create_or_update.return_value = MagicMock(name="Job")
+        tbl.client.jobs = jobs_svc  # type: ignore[attr-defined]
+        return tbl, jobs_svc
+
+    def test_default_job_name_from_table(self):
+        tbl, _, _, _ = _make_table_with_staging()
+        assert AsyncInsert.default_job_name(tbl) == "ygg-async-insert-`cat`-`sch`-`tbl`".replace("`", "")
+
+    def test_default_job_name_from_full_name_string(self):
+        assert (
+            AsyncInsert.default_job_name("main.sales.orders")
+            == "ygg-async-insert-main-sales-orders"
+        )
+
+    def test_ensure_job_creates_with_table_identity(self):
+        tbl, jobs_svc = self._make_table_with_jobs()
+
+        AsyncInsert.ensure_job(
+            tbl, notebook_path="/Workspace/Users/me/apply", jobs=jobs_svc,
+        )
+
+        jobs_svc.create_or_update.assert_called_once()
+        _, kwargs = jobs_svc.create_or_update.call_args
+        # Default name + description carry the target identity.
+        assert kwargs["name"].startswith("ygg-async-insert-")
+        assert "cat.sch.tbl" in kwargs["description"] or "cat" in kwargs["description"]
+        # The notebook_path shortcut packs a single Task with the
+        # target identity as base_parameters.
+        tasks = kwargs["tasks"]
+        assert len(tasks) == 1
+        assert tasks[0].notebook_task.notebook_path == "/Workspace/Users/me/apply"
+        base = tasks[0].notebook_task.base_parameters
+        assert base["target_catalog_name"] == "cat"
+        assert base["target_schema_name"] == "sch"
+        assert base["target_table_name"] == "tbl"
+        # Job-level parameters mirror those identity keys.
+        param_names = {p.name for p in kwargs["parameters"]}
+        assert "target_full_name" in param_names
+        assert "target_catalog_name" in param_names
+
+    def test_ensure_job_accepts_explicit_task(self):
+        tbl, jobs_svc = self._make_table_with_jobs()
+        from databricks.sdk.service.jobs import NotebookTask, Task
+
+        custom = Task(
+            task_key="custom",
+            notebook_task=NotebookTask(notebook_path="/Workspace/custom"),
+        )
+        AsyncInsert.ensure_job(tbl, task=custom)
+        _, kwargs = jobs_svc.create_or_update.call_args
+        assert kwargs["tasks"] == [custom]
+
+    def test_ensure_job_accepts_list_of_tasks(self):
+        tbl, jobs_svc = self._make_table_with_jobs()
+        from databricks.sdk.service.jobs import NotebookTask, Task
+
+        t1 = Task(task_key="a", notebook_task=NotebookTask(notebook_path="/a"))
+        t2 = Task(task_key="b", notebook_task=NotebookTask(notebook_path="/b"))
+        AsyncInsert.ensure_job(tbl, task=[t1, t2])
+        _, kwargs = jobs_svc.create_or_update.call_args
+        assert kwargs["tasks"] == [t1, t2]
+
+    def test_ensure_job_with_cron_string_builds_cron_schedule(self):
+        from databricks.sdk.service.jobs import CronSchedule
+
+        tbl, jobs_svc = self._make_table_with_jobs()
+        AsyncInsert.ensure_job(
+            tbl, notebook_path="/p",
+            schedule="0 0 */1 * * ?",
+            schedule_timezone="UTC",
+        )
+        _, kwargs = jobs_svc.create_or_update.call_args
+        assert isinstance(kwargs["schedule"], CronSchedule)
+        assert kwargs["schedule"].quartz_cron_expression == "0 0 */1 * * ?"
+        assert kwargs["schedule"].timezone_id == "UTC"
+
+    def test_ensure_job_with_cron_schedule_passes_through(self):
+        from databricks.sdk.service.jobs import CronSchedule, PauseStatus
+
+        tbl, jobs_svc = self._make_table_with_jobs()
+        existing = CronSchedule(
+            quartz_cron_expression="0 0 0 * * ?",
+            timezone_id="Europe/Paris",
+            pause_status=PauseStatus.UNPAUSED,
+        )
+        AsyncInsert.ensure_job(tbl, notebook_path="/p", schedule=existing)
+        _, kwargs = jobs_svc.create_or_update.call_args
+        assert kwargs["schedule"] is existing
+
+    def test_ensure_job_pause_status_string_normalises(self):
+        from databricks.sdk.service.jobs import PauseStatus
+
+        tbl, jobs_svc = self._make_table_with_jobs()
+        AsyncInsert.ensure_job(
+            tbl, notebook_path="/p",
+            schedule="0 */10 * * * ?",
+            schedule_pause_status="paused",
+        )
+        _, kwargs = jobs_svc.create_or_update.call_args
+        assert kwargs["schedule"].pause_status == PauseStatus.PAUSED
+
+    def test_ensure_job_no_schedule_passes_none(self):
+        tbl, jobs_svc = self._make_table_with_jobs()
+        AsyncInsert.ensure_job(tbl, notebook_path="/p")
+        _, kwargs = jobs_svc.create_or_update.call_args
+        assert kwargs["schedule"] is None
+
+    def test_ensure_job_requires_table_or_target(self):
+        with pytest.raises(ValueError):
+            AsyncInsert.ensure_job()
+
+    def test_ensure_job_requires_jobs_when_no_table(self):
+        with pytest.raises(ValueError):
+            AsyncInsert.ensure_job(target_full_name="cat.sch.tbl")
+
+    def test_ensure_job_with_target_full_name_and_jobs_only(self):
+        jobs_svc = MagicMock()
+        jobs_svc.create_or_update.return_value = MagicMock()
+        AsyncInsert.ensure_job(
+            target_full_name="main.sales.orders",
+            jobs=jobs_svc,
+            notebook_path="/p",
+        )
+        _, kwargs = jobs_svc.create_or_update.call_args
+        assert kwargs["name"] == "ygg-async-insert-main-sales-orders"
+        # Without a table we don't add per-segment identity params.
+        names = {p.name for p in kwargs["parameters"]}
+        assert names == {"target_full_name"}
+
+    def test_ensure_job_merges_caller_parameters(self):
+        tbl, jobs_svc = self._make_table_with_jobs()
+        AsyncInsert.ensure_job(
+            tbl, notebook_path="/p",
+            parameters={"target_full_name": "override", "extra": "yes"},
+        )
+        _, kwargs = jobs_svc.create_or_update.call_args
+        as_dict = {p.name: p.default for p in kwargs["parameters"]}
+        # Caller wins on collision
+        assert as_dict["target_full_name"] == "override"
+        # New keys appended
+        assert as_dict["extra"] == "yes"
+
+    def test_ensure_job_invalid_schedule_type_raises(self):
+        tbl, jobs_svc = self._make_table_with_jobs()
+        with pytest.raises(TypeError):
+            AsyncInsert.ensure_job(tbl, notebook_path="/p", schedule=42)
+
+    def test_ensure_job_no_task_logs_warning_and_emits_empty_task_list(self):
+        tbl, jobs_svc = self._make_table_with_jobs()
+        AsyncInsert.ensure_job(tbl)
+        _, kwargs = jobs_svc.create_or_update.call_args
+        assert kwargs["tasks"] == []
+
+    def test_ensure_applier_job_instance_shortcut(self):
+        jobs_svc = MagicMock()
+        jobs_svc.create_or_update.return_value = MagicMock()
+        rec = _make_record(target="main.sales.orders")
+        rec.ensure_applier_job(jobs=jobs_svc, notebook_path="/p")
+        _, kwargs = jobs_svc.create_or_update.call_args
+        assert kwargs["name"] == "ygg-async-insert-main-sales-orders"
+
+
 class TestTableInsertAsyncWriteFlag:
 
     def test_async_write_routes_through_stage_async_insert(self, monkeypatch):

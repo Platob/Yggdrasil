@@ -50,8 +50,12 @@ from yggdrasil.io.tabular.execution.expr import Predicate
 from yggdrasil.pickle import json as ygg_json
 
 if TYPE_CHECKING:
+    from databricks.sdk.service.jobs import CronSchedule
+
     from yggdrasil.databricks.client import DatabricksClient
     from yggdrasil.databricks.fs import VolumePath
+    from yggdrasil.databricks.jobs.job import Job
+    from yggdrasil.databricks.jobs.service import Jobs
     from yggdrasil.databricks.sql.engine import SQLEngine
     from .table import Table
 
@@ -359,10 +363,302 @@ class AsyncInsert:
         return merged
 
     # ------------------------------------------------------------------ #
+    # Job management — one Databricks Job per table for the applier
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def default_job_name(target: Any) -> str:
+        """Return the canonical applier-job name for *target*.
+
+        Accepts a :class:`Table`, the table's ``full_name`` string, or
+        any object with a ``full_name`` method. Hyphenates the
+        fully-qualified name so the result is a legal Databricks Job
+        name across catalog / schema / table boundaries.
+        """
+        if isinstance(target, str):
+            full_name = target
+        else:
+            full_name_attr = getattr(target, "full_name", None)
+            if callable(full_name_attr):
+                try:
+                    full_name = full_name_attr(safe=True)
+                except TypeError:
+                    full_name = full_name_attr()
+            else:
+                full_name = str(target)
+        return f"ygg-async-insert-{full_name.replace('.', '-').replace('`', '')}"
+
+    @classmethod
+    def ensure_job(
+        cls,
+        table: "Table | None" = None,
+        *,
+        target_full_name: str | None = None,
+        jobs: "Jobs | None" = None,
+        job_name: str | None = None,
+        task: "Any" = None,
+        notebook_path: str | None = None,
+        notebook_warehouse_id: str | None = None,
+        notebook_base_parameters: Optional[Mapping[str, str]] = None,
+        schedule: Any = None,
+        schedule_timezone: str = "UTC",
+        schedule_pause_status: Any = None,
+        parameters: Optional[Mapping[str, str]] = None,
+        description: str | None = None,
+        permissions: Optional[List[Any]] = None,
+        tags: Optional[Mapping[str, str]] = None,
+        **settings: Any,
+    ) -> "Job":
+        """Find-or-create the Databricks Job that applies async inserts for *table*.
+
+        Resolution
+        ----------
+        Identity is keyed off the target's fully-qualified name — by
+        default ``ygg-async-insert-<catalog>-<schema>-<table>``. Pass
+        ``job_name`` to override, or ``target_full_name`` to ensure a
+        job without a live :class:`Table` handle (useful from an
+        applier that only has the metadata).
+
+        Tasks
+        -----
+        Provide either:
+
+        - ``task`` — a :class:`Task` (or list of) used verbatim.
+        - ``notebook_path`` — wrapped in a default ``apply`` task that
+          carries the target identity as ``base_parameters`` so the
+          notebook can call :meth:`AsyncInsert.merge(folder).execute(engine)`
+          without re-discovering the target.
+
+        When neither is supplied the job is still ensured (so callers
+        can pre-create the empty-task shell and attach tasks later via
+        ``jobs.create_or_update(name=…, tasks=[…])``), but a warning
+        is logged.
+
+        Scheduling
+        ----------
+        ``schedule`` accepts a :class:`CronSchedule` directly or a
+        Quartz-style cron string (e.g. ``"0 0 */1 * * ?"``). Passing
+        ``None`` leaves the job unscheduled (trigger via
+        :meth:`Job.run`).
+
+        Parameters
+        ----------
+        Job-level parameters carry the target identity by default
+        (``target_full_name``, ``target_catalog_name``,
+        ``target_schema_name``, ``target_table_name``); ``parameters``
+        merges on top so callers can add custom keys or override.
+        """
+        # Resolve service + identity ------------------------------------
+        if target_full_name is None:
+            if table is None:
+                raise ValueError(
+                    "AsyncInsert.ensure_job needs either ``table`` or "
+                    "``target_full_name``."
+                )
+            target_full_name = table.full_name(safe=True)
+
+        if jobs is None:
+            if table is None:
+                raise ValueError(
+                    "AsyncInsert.ensure_job needs either ``jobs`` or a "
+                    "``table`` whose service provides one."
+                )
+            jobs = table.client.jobs
+
+        if not job_name:
+            job_name = cls.default_job_name(target_full_name)
+
+        # Tasks ---------------------------------------------------------
+        resolved_tasks = cls._resolve_tasks(
+            task=task,
+            notebook_path=notebook_path,
+            notebook_warehouse_id=notebook_warehouse_id,
+            notebook_base_parameters=notebook_base_parameters,
+            target_full_name=target_full_name,
+            table=table,
+        )
+
+        # Schedule ------------------------------------------------------
+        cron_schedule = cls._resolve_schedule(
+            schedule=schedule,
+            timezone_id=schedule_timezone,
+            pause_status=schedule_pause_status,
+        )
+
+        # Job parameters carry target identity by default --------------
+        job_params = cls._default_job_parameters(
+            target_full_name=target_full_name, table=table,
+        )
+        if parameters:
+            existing = {p.name: p for p in job_params}
+            for k, v in parameters.items():
+                if k in existing:
+                    existing[k].default = str(v)
+                else:
+                    from databricks.sdk.service.jobs import JobParameterDefinition
+                    job_params.append(
+                        JobParameterDefinition(name=str(k), default=str(v))
+                    )
+
+        if description is None:
+            description = f"Apply async inserts staged for {target_full_name}"
+
+        LOGGER.info(
+            "Ensuring async-insert job %r for target %r (schedule=%r tasks=%d)",
+            job_name, target_full_name,
+            cron_schedule.quartz_cron_expression if cron_schedule else None,
+            len(resolved_tasks),
+        )
+
+        return jobs.create_or_update(
+            name=job_name,
+            tasks=resolved_tasks,
+            schedule=cron_schedule,
+            parameters=job_params,
+            description=description,
+            permissions=permissions,
+            tags=dict(tags) if tags else None,
+            **settings,
+        )
+
+    @staticmethod
+    def _resolve_tasks(
+        *,
+        task: Any,
+        notebook_path: str | None,
+        notebook_warehouse_id: str | None,
+        notebook_base_parameters: Optional[Mapping[str, str]],
+        target_full_name: str,
+        table: "Table | None",
+    ) -> List[Any]:
+        """Normalize the caller's task spec into a list of :class:`Task`."""
+        from databricks.sdk.service.jobs import NotebookTask, Task
+
+        if task is not None:
+            if isinstance(task, Task):
+                return [task]
+            return list(task)
+
+        if notebook_path:
+            base_params: dict[str, str] = {
+                "target_full_name": target_full_name,
+            }
+            if table is not None:
+                if table.catalog_name:
+                    base_params["target_catalog_name"] = table.catalog_name
+                if table.schema_name:
+                    base_params["target_schema_name"] = table.schema_name
+                if table.table_name:
+                    base_params["target_table_name"] = table.table_name
+            if notebook_base_parameters:
+                base_params.update({str(k): str(v) for k, v in notebook_base_parameters.items()})
+
+            return [
+                Task(
+                    task_key="apply",
+                    notebook_task=NotebookTask(
+                        notebook_path=notebook_path,
+                        warehouse_id=notebook_warehouse_id,
+                        base_parameters=base_params,
+                    ),
+                )
+            ]
+
+        LOGGER.warning(
+            "AsyncInsert.ensure_job called without ``task`` or ``notebook_path`` — "
+            "the resulting job for %r will have no tasks. Attach tasks later via "
+            "``jobs.create_or_update(name=..., tasks=[...])``.",
+            target_full_name,
+        )
+        return []
+
+    @staticmethod
+    def _resolve_schedule(
+        *,
+        schedule: Any,
+        timezone_id: str,
+        pause_status: Any,
+    ) -> "CronSchedule | None":
+        """Coerce *schedule* into a :class:`CronSchedule` (or ``None``)."""
+        if schedule is None:
+            return None
+
+        from databricks.sdk.service.jobs import CronSchedule, PauseStatus
+
+        if isinstance(schedule, CronSchedule):
+            return schedule
+
+        if isinstance(schedule, str):
+            resolved_pause: Any = pause_status
+            if isinstance(resolved_pause, str):
+                resolved_pause = PauseStatus(resolved_pause.upper())
+            return CronSchedule(
+                quartz_cron_expression=schedule,
+                timezone_id=timezone_id,
+                pause_status=resolved_pause,
+            )
+
+        raise TypeError(
+            f"AsyncInsert.ensure_job: ``schedule`` must be a CronSchedule, a "
+            f"Quartz cron string, or None — got {type(schedule).__name__}."
+        )
+
+    @staticmethod
+    def _default_job_parameters(
+        *,
+        target_full_name: str,
+        table: "Table | None",
+    ) -> List[Any]:
+        """Carry the target identity as Job parameters so tasks can read it."""
+        from databricks.sdk.service.jobs import JobParameterDefinition
+
+        params: list[Any] = [
+            JobParameterDefinition(
+                name="target_full_name", default=target_full_name,
+            ),
+        ]
+        if table is not None:
+            if table.catalog_name:
+                params.append(
+                    JobParameterDefinition(
+                        name="target_catalog_name", default=table.catalog_name,
+                    )
+                )
+            if table.schema_name:
+                params.append(
+                    JobParameterDefinition(
+                        name="target_schema_name", default=table.schema_name,
+                    )
+                )
+            if table.table_name:
+                params.append(
+                    JobParameterDefinition(
+                        name="target_table_name", default=table.table_name,
+                    )
+                )
+        return params
+
+    def ensure_applier_job(
+        self,
+        *,
+        jobs: "Jobs | None" = None,
+        **kwargs: Any,
+    ) -> "Job":
+        """Instance-level shortcut for :meth:`ensure_job` keyed off this record.
+
+        Convenient when a caller has just staged a record and wants
+        the matching applier job for the target it points at.
+        """
+        return type(self).ensure_job(
+            target_full_name=self.target_full_name,
+            jobs=jobs,
+            **kwargs,
+        )
+
+    # ------------------------------------------------------------------ #
     # SQL rendering
     # ------------------------------------------------------------------ #
     def to_sql(self) -> List[str]:
-        """Render the operation as one or more SQL statements.
+        r"""Render the operation as one or more SQL statements.
 
         The current implementation emits a single statement: an
         ``INSERT INTO`` (append) or ``INSERT OVERWRITE`` (overwrite)
@@ -668,7 +964,7 @@ def stage_async_insert(
 
 
 def _path_for_sql(path: Any) -> str:
-    """Return the path string used inside SQL / metadata.
+    r"""Return the path string used inside SQL / metadata.
 
     Prefers the Unity-style ``/Volumes/...`` shape from
     :meth:`VolumePath.full_path` when available — that's what
