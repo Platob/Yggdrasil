@@ -143,6 +143,9 @@ class DatabricksTestCase(unittest.TestCase):
         from yggdrasil.databricks.client import DatabricksClient
         from yggdrasil.databricks.compute import instance_pool as _ip
         from yggdrasil.databricks.compute import service as _cs
+        from yggdrasil.databricks.jobs import service as _js
+        from yggdrasil.databricks.jobs.job import Job as _JobResource
+        from yggdrasil.databricks.jobs.run import JobRun as _JobRunResource
         from yggdrasil.databricks.schema.schema import Schema
         from yggdrasil.databricks.table.table import Table
         from yggdrasil.databricks.volume.volume import Volume
@@ -156,12 +159,16 @@ class DatabricksTestCase(unittest.TestCase):
         Schema._INSTANCES.clear()
         Table._INSTANCES.clear()
         Volume._INSTANCES.clear()
+        _JobResource._INSTANCES.clear()
+        _JobRunResource._INSTANCES.clear()
 
         _ip._NAMED_POOLS.clear()
         _ip._NAME_ID_CACHE.clear()
         _cs.NAMED_CLUSTERS.clear()
         _cs.NAME_ID_CACHE.clear()
         _cs._SPARK_VERSIONS_CACHE.clear()
+        _js._NAMED_JOBS.clear()
+        _js._NAME_ID_CACHE.clear()
 
         for cache in self.extra_caches_to_clear():
             try:
@@ -200,6 +207,10 @@ class DatabricksTestCase(unittest.TestCase):
     def warehouses(self):
         return self.client.warehouses
 
+    @property
+    def jobs(self):
+        return self.client.jobs
+
     # ------------------------------------------------------------------ #
     # SDK-side mock shortcuts (where the network would normally go)
     # ------------------------------------------------------------------ #
@@ -222,6 +233,11 @@ class DatabricksTestCase(unittest.TestCase):
     def command_execution_api(self):
         """Autospec'd mock of ``workspace_client.command_execution``."""
         return self.workspace_client.command_execution
+
+    @property
+    def jobs_api(self):
+        """Autospec'd mock of ``workspace_client.jobs``."""
+        return self.workspace_client.jobs
 
     # ------------------------------------------------------------------ #
     # Test helpers
