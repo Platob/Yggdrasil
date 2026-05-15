@@ -70,9 +70,9 @@ from ._helpers import StubSession, make_request, make_response
 
 @pytest.fixture(autouse=True)
 def _clear_session_singleton_cache():
-    Session._singleton_cache.clear()
+    Session._INSTANCES.clear()
     yield
-    Session._singleton_cache.clear()
+    Session._INSTANCES.clear()
 
 
 def _local_cache(tmp_path: Path, **overrides: Any) -> CacheConfig:

@@ -66,9 +66,9 @@ class _RotatingAuth(Authorization):
 
 @pytest.fixture(autouse=True)
 def _clear_session_singleton_cache():
-    Session._singleton_cache.clear()
+    Session._INSTANCES.clear()
     yield
-    Session._singleton_cache.clear()
+    Session._INSTANCES.clear()
 
 
 # ---------------------------------------------------------------------------

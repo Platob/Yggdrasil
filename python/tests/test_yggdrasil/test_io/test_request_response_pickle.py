@@ -28,9 +28,9 @@ from yggdrasil.io.session import Session
 
 @pytest.fixture(autouse=True)
 def _clear_session_singleton_cache():
-    Session._singleton_cache.clear()
+    Session._INSTANCES.clear()
     yield
-    Session._singleton_cache.clear()
+    Session._INSTANCES.clear()
 
 
 def _make_request() -> PreparedRequest:
