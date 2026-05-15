@@ -112,6 +112,10 @@ class VolumePath(DatabricksPath):
         client: "DatabricksClient | None" = None,
         **kwargs: Any,
     ) -> None:
+        # Idempotent under ``Singleton`` caching — see ``DatabricksPath.__init__``.
+        if getattr(self, "_initialized", False):
+            return
+
         self._volume: Optional["Volume"] = volume
 
         if volume is not None:

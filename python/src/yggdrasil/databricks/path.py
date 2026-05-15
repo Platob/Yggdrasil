@@ -34,9 +34,11 @@ wired to a workspace-shaped mock). There is no alternate
 
 from __future__ import annotations
 
+from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Optional, Tuple
 
 from yggdrasil.data.enums import Scheme
+from yggdrasil.dataclasses import ExpiringDict, Singleton
 from yggdrasil.io.path import RemotePath
 from yggdrasil.io.path._retry import retry_sdk_call
 from yggdrasil.io.url import URL
@@ -214,7 +216,7 @@ def _resolve_databricks_subclass(
 # ===========================================================================
 
 
-class DatabricksPath(RemotePath):
+class DatabricksPath(Singleton, RemotePath):
     """Abstract :class:`RemotePath` for Databricks namespaces.
 
     Registers under :attr:`Scheme.DBFS` (the ``dbfs://`` family root)
@@ -225,6 +227,15 @@ class DatabricksPath(RemotePath):
     path's leading namespace (``/Volumes/...`` →
     :class:`VolumePath`, ``/Workspace/...`` → :class:`WorkspacePath`,
     everything else → :class:`DBFSPath`).
+
+    Inherits :class:`Singleton` so callers can opt into per-URL
+    process-wide instance sharing (stat-cache hits across every
+    consumer of the same path) by passing ``singleton_ttl=None``;
+    the default behaviour stays "fresh instance per call" because
+    Path objects are constructed in tight loops (``iterdir`` yields
+    one per child) and unbounded caching would leak. Subclasses
+    that want default-on caching set ``_SINGLETON_TTL = None`` and
+    bound ``_INSTANCES`` with ``max_size=...``.
     """
 
     scheme: ClassVar[Scheme] = Scheme.DBFS
@@ -233,6 +244,48 @@ class DatabricksPath(RemotePath):
     #: (``/dbfs/``, ``/Workspace/``, ``/Volumes/``). Empty on the
     #: abstract base; concrete subclasses override.
     namespace_prefix: ClassVar[Optional[str]] = None
+
+    # Bounded singleton cache — opt-in via ``singleton_ttl=None`` on
+    # construction. ``max_size`` keeps a long-running process from
+    # accumulating one entry per yielded ``iterdir`` child.
+    _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
+        default_ttl=None, max_size=10_000,
+    )
+    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
+
+    # Stat caches and the lazy ``_volume`` / ``_session`` slots are
+    # subclass-specific; the base only carries the live SDK client and
+    # the optional retry-sleep callback.
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
+        "_stat_cached", "_stat_cached_at",
+    })
+
+    @classmethod
+    def _singleton_key(
+        cls,
+        data: Any = None,
+        *,
+        url: "URL | None" = None,
+        client: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Identity = (subclass, canonical URL string, client).
+
+        ``data`` collapses into ``url`` before keying so ``"/Volumes/x"``
+        and ``URL.from_("/Volumes/x")`` map to the same singleton.
+        ``client`` is part of the key because the same URL can be
+        backed by different workspaces; passing ``client=None`` collapses
+        to the lazy-resolved :meth:`DatabricksClient.current`.
+        """
+        if url is None and isinstance(data, URL):
+            url = data
+        elif url is None and isinstance(data, str):
+            url = URL.from_(_coerce_to_url_str(data))
+        if url is None:
+            # Without a URL there's no canonical identity — fall through
+            # to ``id``-based hashing by returning a unique sentinel.
+            return (cls, object())
+        return (cls, str(url), client)
 
     # ==================================================================
     # Construction — dispatch on the abstract base, allocate on subclasses
@@ -309,8 +362,19 @@ class DatabricksPath(RemotePath):
         client: "DatabricksClient | None" = None,
         temporary: bool = False,
         retry_sleep: Optional[Callable[[float], None]] = None,
+        singleton_ttl: Any = ...,
         **kwargs: Any,
     ) -> None:
+        # Singleton-cached instances are re-entered on every constructor
+        # call (Python always invokes ``__init__`` after ``__new__``);
+        # skip the second pass so the live SDK client binding and stat
+        # cache survive. ``singleton_ttl`` is consumed by
+        # :meth:`Singleton.__new__`; accept it here so callers passing
+        # the opt-in cache flag don't trip the ``__init__`` signature.
+        del singleton_ttl
+        if getattr(self, "_initialized", False):
+            return
+
         # Pre-coerce ``/dbfs/...`` / ``/Volumes/...`` / ``/Workspace/...``
         # into the canonical URL form so the URL parser sees a real
         # scheme.
@@ -348,6 +412,7 @@ class DatabricksPath(RemotePath):
         # touch.
         self._client: Any = client
         self._retry_sleep: Optional[Callable[[float], None]] = retry_sleep
+        self._initialized = True
 
     # ==================================================================
     # URLBased dispatch — ``dbfs://`` resolves here and forwards
