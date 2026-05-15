@@ -212,18 +212,32 @@ class Volume(DatabricksResource):
     # ── pickle ────────────────────────────────────────────────────────────────
 
     def __getnewargs_ex__(self):
-        # Pickle uses these to invoke ``__new__`` on the receiver. The
-        # singleton dance there collapses to a live instance when one
-        # already exists in the receiving process.
+        # Pickle uses these to invoke ``__new__`` on the receiver. Carrying
+        # the live ``service`` (rather than ``None``) does two things:
+        # (1) ``__new__`` computes the singleton key against the *source*
+        # host instead of falling back to ``Volumes.current()`` in the
+        # receiver — so the cache key doesn't drift; (2) the underlying
+        # :class:`DatabricksClient` rides along inside ``Volumes``'
+        # picklable state (its ``__getstate__`` carries the client, host,
+        # auth fields, and session-token snapshot), so the unpickled
+        # Volume reuses the original client config instead of re-resolving
+        # auth against whatever ``DatabricksClient.current()`` returns on
+        # the receiving side.
         return (), {
-            "service": None,
+            "service": self.service,
             "catalog_name": self.catalog_name,
             "schema_name": self.schema_name,
             "volume_name": self.volume_name,
         }
 
     def __getstate__(self):
+        # ``service`` is also carried by ``__getnewargs_ex__``; pickle
+        # memoization collapses the two references to a single payload.
+        # Restating it here means ``__setstate__`` doesn't have to reach
+        # for ``Volumes.current()`` on the receiver — the source client
+        # wins.
         return {
+            "service": self.service,
             "catalog_name": self.catalog_name,
             "schema_name": self.schema_name,
             "volume_name": self.volume_name,
@@ -233,10 +247,14 @@ class Volume(DatabricksResource):
         }
 
     def __setstate__(self, state):
+        carried_service = state["service"]
         if getattr(self, "_initialized", False):
+            # Singleton cache hit — keep the live instance but rebind to
+            # the carried service (mirrors ``__init__``'s rebind-on-cache-
+            # hit behavior) so the freshly-pickled client wins.
+            self.service = carried_service
             return
-        from .volumes import Volumes
-        self.service = Volumes.current()
+        self.service = carried_service
         self.catalog_name = state["catalog_name"]
         self.schema_name = state["schema_name"]
         self.volume_name = state["volume_name"]
@@ -244,6 +262,8 @@ class Volume(DatabricksResource):
         self._infos = state.get("_infos")
         self._infos_fetched_at = state.get("_infos_fetched_at")
         self._storage_path = None
+        self._catalog = None
+        self._schema = None
         self._initialized = True
 
     # ── cache management ──────────────────────────────────────────────────────
