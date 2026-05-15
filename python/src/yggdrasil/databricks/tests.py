@@ -139,8 +139,14 @@ class DatabricksTestCase(unittest.TestCase):
     # Cache reset
     # ------------------------------------------------------------------ #
     def _clear_databricks_caches(self) -> None:
+        from yggdrasil.databricks.client import DatabricksClient
         from yggdrasil.databricks.compute import instance_pool as _ip
         from yggdrasil.databricks.compute import service as _cs
+
+        # Drop the singleton cache so each test gets a fresh client +
+        # fresh lazy sub-service caches; otherwise mutations on
+        # ``client.<service>.defaults`` bleed across tests.
+        DatabricksClient._INSTANCES.clear()
 
         _ip._NAMED_POOLS.clear()
         _ip._NAME_ID_CACHE.clear()
