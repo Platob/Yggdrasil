@@ -22,7 +22,6 @@ if TYPE_CHECKING:
     from .secrets.service import Secrets
     from .sql.engine import SQLEngine
     from .table.tables import Tables
-    from .view.views import Views
     from .volume.volumes import Volumes
     from .warehouse.service import Warehouses
 
@@ -148,9 +147,10 @@ class DatabricksService(ABC):
         return self.client.tables
 
     @property
-    def views(self) -> "Views":
-        """Collection-level Unity Catalog view service (shorthand for ``client.views``)."""
-        return self.client.views
+    def views(self) -> "Tables":
+        """Alias for :attr:`tables` — :class:`Table` covers both managed/external
+        tables and view-shaped securables."""
+        return self.client.tables
 
     @property
     def catalogs(self) -> "Catalogs":

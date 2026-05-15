@@ -21,7 +21,6 @@ if TYPE_CHECKING:
     from .iam import IAM
     from .sql.engine import SQLEngine
     from .table.tables import Tables
-    from .view.views import Views
     from .column.columns import Columns
     from .catalog.catalogs import Catalogs
     from .schema.schemas import Schemas
@@ -239,7 +238,7 @@ class DatabricksClient(Singleton, URLBased):
         "_was_connected",
         "_base_url_cached",
         "_workspace", "_sql", "_entity_tags", "_warehouses", "_compute",
-        "_secrets", "_iam", "_tables", "_views", "_columns_svc",
+        "_secrets", "_iam", "_tables", "_columns_svc",
         "_catalogs", "_schemas", "_volumes", "_genie", "_filesystem",
     })
 
@@ -1370,16 +1369,11 @@ class DatabricksClient(Singleton, URLBased):
         )
 
     @property
-    def views(self) -> "Views":
-        """Collection-level Unity Catalog view service for this client."""
-        from .view.views import Views
-
-        return self.lazy_property(
-            self,
-            cache_attr="_views",
-            factory=lambda: Views(client=self),
-            use_cache=True,
-        )
+    def views(self) -> "Tables":
+        """Alias for :attr:`tables` — Unity Catalog stores views in the
+        same ``tables`` API, and :class:`Table` handles both shapes.
+        """
+        return self.tables
 
     @property
     def columns(self) -> "Columns":

@@ -83,6 +83,15 @@ if TYPE_CHECKING:
 
 _READ_ONLY_MODES = frozenset({Mode.AUTO})
 
+# Unity Catalog ``table_type`` tokens that identify view-shaped securables.
+# Used by ``Table`` to dispatch view-specific DDL (``ALTER VIEW`` /
+# ``DROP VIEW`` / ``CREATE VIEW``) and by ``Tables`` to filter list output.
+_VIEW_TABLE_TYPES: frozenset[TableType] = frozenset({
+    TableType.VIEW,
+    TableType.MATERIALIZED_VIEW,
+    TableType.METRIC_VIEW,
+})
+
 
 def _coerce_tag_str(value: Any) -> str:
     """Coerce a tag key/value to a UTF-8 string.
@@ -1589,6 +1598,66 @@ class Table(DatabricksResource, RemotePath):
         return info
 
     # =========================================================================
+    # View-shaped tables — Unity Catalog stores views in the same ``tables``
+    # API as managed/external tables, distinguished by ``table_type``.
+    # =========================================================================
+
+    @property
+    def table_type(self) -> Optional[TableType]:
+        """:class:`TableType` from the cached ``infos``.
+
+        Returns ``None`` when the table hasn't been resolved against
+        Unity Catalog yet — the property never triggers a network
+        round trip on its own. Callers that need a guaranteed-fresh
+        answer should access ``self.infos.table_type`` directly.
+        """
+        cached = self._infos
+        return cached.table_type if cached is not None else None
+
+    @property
+    def is_view(self) -> bool:
+        """True for ``VIEW`` / ``MATERIALIZED_VIEW`` / ``METRIC_VIEW`` securables.
+
+        Reads the cached :attr:`table_type`; returns ``False`` until
+        the table's ``infos`` has been resolved at least once.
+        """
+        return self.table_type in _VIEW_TABLE_TYPES
+
+    @property
+    def is_materialized_view(self) -> bool:
+        return self.table_type == TableType.MATERIALIZED_VIEW
+
+    @property
+    def is_metric_view(self) -> bool:
+        return self.table_type == TableType.METRIC_VIEW
+
+    @property
+    def view_definition(self) -> Optional[str]:
+        """The SQL ``SELECT`` text for a view; ``None`` for non-views.
+
+        Reads the cached ``infos``; does not trigger a remote fetch.
+        """
+        cached = self._infos
+        return cached.view_definition if cached is not None else None
+
+    @property
+    def view_dependencies(self):
+        """Upstream dependencies declared by a view (cached only)."""
+        cached = self._infos
+        return cached.view_dependencies if cached is not None else None
+
+    # ── view name aliases — old ``view_name`` callers stay working ───────────
+
+    @property
+    def view_name(self) -> str:
+        """Alias for :attr:`table_name` so view-style call sites keep working."""
+        return self.table_name
+
+    @view_name.setter
+    def view_name(self, value: str) -> None:
+        self.table_name = value
+
+    # =========================================================================
     # Entity-tag assignments — delegated to client.entity_tags
     # =========================================================================
 
@@ -2434,6 +2503,228 @@ class Table(DatabricksResource, RemotePath):
             partition_index=position if f.partition_by else None,
         )
 
+    # =========================================================================
+    # View DDL — same securable family, different create / drop keywords
+    # =========================================================================
+
+    def create_view_ddl(
+        self,
+        query: str,
+        *,
+        or_replace: bool = False,
+        if_not_exists: bool = False,
+        columns: Iterable[str] | None = None,
+        comment: str | None = None,
+        properties: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        """Render a ``CREATE [OR REPLACE] VIEW [IF NOT EXISTS]`` DDL statement.
+
+        Mirrors the legacy :meth:`View.create_ddl` shape; ``or_replace``
+        and ``if_not_exists`` are mutually exclusive, and the SELECT
+        text is required.
+        """
+        if or_replace and if_not_exists:
+            raise ValueError("Use either or_replace or if_not_exists, not both.")
+
+        select_text = (query or "").strip().rstrip(";").strip()
+        if not select_text:
+            raise ValueError("View query (SELECT text) cannot be empty")
+
+        if or_replace:
+            create_kw = "CREATE OR REPLACE VIEW"
+        elif if_not_exists:
+            create_kw = "CREATE VIEW IF NOT EXISTS"
+        else:
+            create_kw = "CREATE VIEW"
+
+        parts: list[str] = [f"{create_kw} {self.full_name(safe=True)}"]
+
+        if columns:
+            parts.append("(" + ", ".join(quote_ident(c) for c in columns) + ")")
+
+        if comment:
+            parts.append(f"COMMENT '{escape_sql_string(comment)}'")
+
+        if properties:
+            def _fmt(k: str, v: Any) -> str:
+                if isinstance(v, bool):
+                    return f"'{k}' = '{'true' if v else 'false'}'"
+                if isinstance(v, str):
+                    return f"'{k}' = '{escape_sql_string(v)}'"
+                return f"'{k}' = {v}"
+
+            parts.append(
+                "TBLPROPERTIES ("
+                + ", ".join(_fmt(k, v) for k, v in properties.items())
+                + ")"
+            )
+
+        parts.append(f"AS {select_text}")
+        return "\n".join(parts)
+
+    def create_view(
+        self,
+        query: str,
+        *,
+        mode: ModeLike = None,
+        or_replace: bool | None = None,
+        if_not_exists: bool | None = None,
+        columns: Iterable[str] | None = None,
+        comment: str | None = None,
+        properties: Optional[Mapping[str, Any]] = None,
+        tags: Mapping[str, str] | None = None,
+        wait_result: bool = True,
+    ) -> "Table":
+        """Create (or replace) this Table as a Unity Catalog view.
+
+        When neither ``or_replace`` nor ``if_not_exists`` is provided
+        the keywords are derived from ``mode``:
+
+        * :data:`Mode.OVERWRITE` → ``or_replace=True``
+        * :data:`Mode.AUTO` / :data:`Mode.APPEND` / :data:`Mode.UPSERT`
+          / :data:`Mode.IGNORE` → ``if_not_exists=True``
+        * :data:`Mode.ERROR_IF_EXISTS` → plain ``CREATE VIEW``
+        """
+        parsed_mode = Mode.from_(mode, default=Mode.AUTO)
+
+        if or_replace is None and if_not_exists is None:
+            if parsed_mode == Mode.OVERWRITE:
+                or_replace = True
+                if_not_exists = False
+            elif parsed_mode == Mode.ERROR_IF_EXISTS:
+                or_replace = False
+                if_not_exists = False
+            else:
+                or_replace = False
+                if_not_exists = True
+
+        statement = self.create_view_ddl(
+            query,
+            or_replace=bool(or_replace),
+            if_not_exists=bool(if_not_exists),
+            columns=columns,
+            comment=comment,
+            properties=properties,
+        )
+
+        logger.debug(
+            "Table.create_view: view=%s or_replace=%s if_not_exists=%s mode=%s",
+            self.full_name(), bool(or_replace), bool(if_not_exists), parsed_mode,
+        )
+        try:
+            self.sql.execute(statement, wait=wait_result)
+        except Exception as exc:
+            if "SCHEMA_NOT_FOUND" in str(exc):
+                logger.debug(
+                    "Table.create_view: parent schema missing for %s — auto-creating %s.%s",
+                    self.full_name(), self.catalog_name, self.schema_name,
+                )
+                self.sql.execute(
+                    f"CREATE SCHEMA IF NOT EXISTS "
+                    f"{quote_ident(self.catalog_name)}.{quote_ident(self.schema_name)}",
+                    wait=True,
+                )
+                self.sql.execute(statement, wait=wait_result)
+            else:
+                raise
+
+        self._invalidate_stat_cache(remove_global=True)
+
+        if tags:
+            self.set_tags(tags)
+
+        return self
+
+    def concat_tables(
+        self,
+        tables: Iterable["Table"],
+        *,
+        by_name: bool = True,
+        cast: bool = True,
+        comment: str | None = None,
+        mode: ModeLike = Mode.OVERWRITE,
+    ) -> "Table":
+        """Create or replace this Table as the ``UNION ALL`` of *tables*.
+
+        When ``cast`` is ``True`` (default), the union is "smart": column
+        names are aligned across inputs, types are promoted to the widest
+        compatible :class:`DataType` via ``merge_with(upcast=True)``,
+        each input projects the unified column list in order, and any
+        column missing from a given input is emitted as
+        ``CAST(NULL AS <ddl>)`` so the unified schema is preserved.
+
+        When ``cast`` is ``False`` the method falls back to a plain
+        ``SELECT * FROM <table> UNION ALL [BY NAME] ...`` and lets
+        Databricks reconcile the schemas at query time.
+        """
+        tables_list = list(tables)
+        if not tables_list:
+            raise ValueError("concat_tables requires at least one table")
+
+        if cast:
+            query = self._build_smart_union_query(tables_list)
+        else:
+            separator = "\nUNION ALL BY NAME\n" if by_name else "\nUNION ALL\n"
+            query = separator.join(
+                f"SELECT * FROM {t.full_name(safe=True)}"
+                for t in tables_list
+            )
+
+        return self.create_view(query, mode=mode, comment=comment)
+
+    @staticmethod
+    def _build_smart_union_query(tables_list: list["Table"]) -> str:
+        """Render a ``UNION ALL`` query projecting each input to a unified schema.
+
+        Walks every input's ``columns``, accumulates a unified schema
+        (first-seen column order, types promoted via
+        ``merge_with(upcast=True)``), then projects each input to that
+        column order — selecting present columns as-is and substituting
+        ``CAST(NULL AS <ddl>)`` for absent ones.
+        """
+        from yggdrasil.data.enums.mode import Mode as _Mode
+
+        column_order: list[str] = []
+        unified: dict[str, Any] = {}
+        per_table: list[dict[str, Any]] = []
+
+        for tbl in tables_list:
+            cols: dict[str, Any] = {}
+            for c in tbl.columns:
+                cols[c.name] = c.field.dtype
+                if c.name not in unified:
+                    column_order.append(c.name)
+                    unified[c.name] = c.field.dtype
+                else:
+                    unified[c.name] = unified[c.name].merge_with(
+                        c.field.dtype, mode=_Mode.UPSERT, upcast=True,
+                    )
+            per_table.append(cols)
+
+        if not column_order:
+            raise ValueError(
+                "concat_tables: input tables have no columns to union; "
+                "ensure each input has been resolved against the catalog"
+            )
+
+        select_blocks: list[str] = []
+        for tbl, cols in zip(tables_list, per_table):
+            exprs: list[str] = []
+            for name in column_order:
+                qname = quote_ident(name)
+                if name in cols:
+                    exprs.append(qname)
+                else:
+                    ddl = unified[name].to_spark_name()
+                    exprs.append(f"CAST(NULL AS {ddl}) AS {qname}")
+
+            select_blocks.append(
+                "SELECT\n  " + ",\n  ".join(exprs)
+                + f"\nFROM {tbl.full_name(safe=True)}"
+            )
+
+        return "\nUNION ALL\n".join(select_blocks)
+
     def delete(
         self,
         *,
@@ -2514,12 +2805,13 @@ class Table(DatabricksResource, RemotePath):
         else:
             rename_to = f"{quote_ident(target_schema)}.{quote_ident(target_table)}"
 
+        keyword = "VIEW" if self.is_view else "TABLE"
         logger.debug(
-            "Table.rename: %s → %s.%s.%s",
-            self.full_name(), target_catalog, target_schema, target_table,
+            "Table.rename: %s %s → %s.%s.%s",
+            keyword, self.full_name(), target_catalog, target_schema, target_table,
         )
         self.sql.execute(
-            f"ALTER TABLE {self.full_name(safe=True)} RENAME TO {rename_to}"
+            f"ALTER {keyword} {self.full_name(safe=True)} RENAME TO {rename_to}"
         )
         self._invalidate_stat_cache(remove_global=True)
         self.schema_name = target_schema
@@ -2606,6 +2898,38 @@ class Table(DatabricksResource, RemotePath):
                 f"Cannot clone {self.full_name()} onto itself — choose a"
                 f" different target catalog/schema/table."
             )
+
+        # Views can't ride the Delta ``CLONE`` path — re-emit the
+        # source's ``view_definition`` as a fresh ``CREATE [OR REPLACE]
+        # VIEW [IF NOT EXISTS]`` against the target, mirroring the
+        # legacy :meth:`View.clone` shape.
+        if self.is_view:
+            select_text = (self.view_definition or "").strip().rstrip(";").strip()
+            if not select_text:
+                raise ValueError(
+                    f"Cannot clone {self.full_name()} — source has no"
+                    f" view_definition. Run ``create_view(query=...)``"
+                    f" against the target directly with explicit SQL."
+                )
+            cloned = Table(
+                service=tables,
+                catalog_name=target_catalog,
+                schema_name=target_schema,
+                table_name=target_table,
+            )
+            statement = cloned.create_view_ddl(
+                select_text,
+                or_replace=replace,
+                if_not_exists=if_not_exists,
+                properties=properties,
+            )
+            logger.debug(
+                "Table.clone[view]: %s → %s.%s.%s replace=%s if_not_exists=%s",
+                self.full_name(), target_catalog, target_schema, target_table,
+                replace, if_not_exists,
+            )
+            self.sql.execute(statement)
+            return cloned
 
         target_full = (
             f"{quote_ident(target_catalog)}.{quote_ident(target_schema)}."

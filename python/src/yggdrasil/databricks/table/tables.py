@@ -23,11 +23,11 @@ import logging
 from typing import Optional, Iterator, TYPE_CHECKING, Any, Iterable
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
-from databricks.sdk.service.catalog import TableInfo
+from databricks.sdk.service.catalog import TableInfo, TableType
 
 from yggdrasil.databricks.client import DatabricksService
 from yggdrasil.databricks.sql.sql_utils import is_glob_pattern, name_matcher, quote_ident
-from .table import Table
+from .table import Table, _VIEW_TABLE_TYPES
 from ...data import Mode, ModeLike
 
 if TYPE_CHECKING:
@@ -230,17 +230,23 @@ class Tables(DatabricksService):
         location: Table | str | None = None,
         *,
         table_name: str | None = None,
+        view_name: str | None = None,
         catalog_name: str | None = None,
         schema_name: str | None = None,
     ) -> "Table":
-        """Return a :class:`~yggdrasil.databricks.table.table.Table` bound to this service."""
+        """Return a :class:`~yggdrasil.databricks.table.table.Table` bound to this service.
 
+        Alias for :meth:`table` — Unity Catalog stores views in the same
+        ``tables`` API as managed/external tables, so the returned
+        :class:`Table` covers both. ``view_name`` is accepted as a
+        convenience alias for ``table_name``.
+        """
         return Table.from_(
             obj=location,
             service=self,
             catalog_name=catalog_name or self.catalog_name,
             schema_name=schema_name or self.schema_name,
-            table_name=table_name
+            table_name=table_name or view_name,
         )
 
     def catalog(self, name: str | None = None) -> "Catalog":
@@ -456,6 +462,7 @@ class Tables(DatabricksService):
         catalog_name: str | None = None,
         schema_name: str | None = None,
         *,
+        table_types: Iterable[TableType] | None = None,
         cache_ttl: float | None = 300.0,
     ) -> Iterator["Table"]:
         """Iterate over tables in the resolved catalog/schema scope.
@@ -474,10 +481,17 @@ class Tables(DatabricksService):
                           When ``None``, iterates every schema in the resolved
                           catalog scope.  When both catalog and schema are
                           ``None``, iterates every visible catalog and schema.
+            table_types:  Restrict the yielded :attr:`Table.table_type`
+                          set. ``None`` (default) yields every securable
+                          UC reports — managed / external tables and
+                          view-shaped securables alike. Pass
+                          :data:`_VIEW_TABLE_TYPES` to filter to views,
+                          or any subset to narrow further.
             cache_ttl:    Entry TTL in seconds (``None`` → 5 min default).
         """
         catalog_name = self.catalog_name if catalog_name is None else catalog_name
         schema_name = self.schema_name if schema_name is None else schema_name
+        allowed = frozenset(table_types) if table_types is not None else None
 
         if catalog_name is None or is_glob_pattern(catalog_name):
             from yggdrasil.databricks.catalog.catalogs import Catalogs
@@ -487,6 +501,7 @@ class Tables(DatabricksService):
                     name=name,
                     catalog_name=catalog.catalog_name,
                     schema_name=schema_name,
+                    table_types=allowed,
                     cache_ttl=cache_ttl,
                 )
             return
@@ -502,6 +517,7 @@ class Tables(DatabricksService):
                     name=name,
                     catalog_name=catalog_name,
                     schema_name=schema_info.name,
+                    table_types=allowed,
                     cache_ttl=cache_ttl,
                 )
             return
@@ -509,12 +525,15 @@ class Tables(DatabricksService):
         uc = self.client.workspace_client().tables
         matcher = name_matcher(name)
         logger.debug(
-            "Tables.list_tables: catalog=%s schema=%s name_filter=%s",
+            "Tables.list_tables: catalog=%s schema=%s name_filter=%s table_types=%s",
             catalog_name, schema_name, name,
+            sorted(t.value for t in allowed) if allowed is not None else None,
         )
 
         yielded = 0
         for info in uc.list(catalog_name=catalog_name, schema_name=schema_name):
+            if allowed is not None and info.table_type not in allowed:
+                continue
             if matcher is not None and not matcher(info.name):
                 continue
 
@@ -531,6 +550,30 @@ class Tables(DatabricksService):
         logger.debug(
             "Tables.list_tables: yielded=%d catalog=%s schema=%s",
             yielded, catalog_name, schema_name,
+        )
+
+    def list_views(
+        self,
+        name: str | None = None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        *,
+        table_types: Iterable[TableType] | None = None,
+        cache_ttl: float | None = 300.0,
+    ) -> Iterator["Table"]:
+        """Iterate over view-shaped securables only.
+
+        Convenience wrapper around :meth:`list_tables` with
+        ``table_types`` defaulted to ``{VIEW, MATERIALIZED_VIEW,
+        METRIC_VIEW}``. Pass an explicit ``table_types`` to narrow
+        further (e.g. only :data:`TableType.MATERIALIZED_VIEW`).
+        """
+        return self.list_tables(
+            name=name,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_types=table_types if table_types is not None else _VIEW_TABLE_TYPES,
+            cache_ttl=cache_ttl,
         )
 
     # ── concat_tables — create/update a UNION view over multiple tables ──────
@@ -630,7 +673,7 @@ class Tables(DatabricksService):
         view = self.table(
             catalog_name=catalog_name,
             schema_name=schema_name,
-            view_name=view_name,
+            table_name=view_name,
         )
         return view.concat_tables(
             tables_list,
