@@ -3115,9 +3115,29 @@ class Table(DatabricksResource, DatabricksPath):
         spark_session: Optional["SparkSession"] = None,
         return_data: bool = False,
         table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
+        async_write: bool = False,
         **kwargs
-    ) -> "Tabular | None":
-        """Insert *data* into this table — thin wrapper over :meth:`insert_into`."""
+    ) -> "Tabular | VolumePath | None":
+        """Insert *data* into this table — thin wrapper over :meth:`insert_into`.
+
+        When ``async_write=True``, the rows are cast to the target schema
+        and dropped (alongside a JSON metadata file describing the
+        operation) under the table's ``stg_<table>/.sql/async/insert``
+        staging folder for a downstream applier to pick up. The SQL
+        insert is *not* executed; the staged Parquet :class:`VolumePath`
+        is returned instead. See :mod:`.async_write` for the wire format.
+        """
+        if async_write:
+            from .async_write import stage_async_insert
+
+            return stage_async_insert(
+                self,
+                data,
+                mode=mode,
+                match_by=match_by,
+                **kwargs,
+            )
+
         return self.insert_into(
             data,
             mode=mode,
