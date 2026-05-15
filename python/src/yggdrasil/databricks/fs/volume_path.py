@@ -93,8 +93,6 @@ class VolumePath(DatabricksPath):
     are shared process-wide.
     """
 
-    __slots__ = ("_volume",)
-
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_VOLUME
     namespace_prefix: ClassVar[str] = "/Volumes/"
 

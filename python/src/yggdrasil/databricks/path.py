@@ -227,8 +227,6 @@ class DatabricksPath(RemotePath):
     everything else → :class:`DBFSPath`).
     """
 
-    __slots__ = ("_client", "_retry_sleep")
-
     scheme: ClassVar[Scheme] = Scheme.DBFS
 
     #: Canonical POSIX prefix for the legacy string shape

@@ -47,11 +47,6 @@ class RemotePath(Path):
     else (predicate pins, stat caching) is inherited from this base.
     """
 
-    __slots__ = (
-        "_stat_cached",
-        "_stat_cached_at",
-    )
-
     stat_cache_ttl: ClassVar["float | None"] = _STAT_CACHE_TTL
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
