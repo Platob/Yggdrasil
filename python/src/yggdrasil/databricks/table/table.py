@@ -59,6 +59,7 @@ from yggdrasil.environ import PyEnv
 from yggdrasil.io import URL
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOKind, IOStats
+from yggdrasil.databricks.path import DatabricksPath
 from yggdrasil.io.path import Path, RemotePath
 from yggdrasil.io.primitive import ParquetIO
 from yggdrasil.io.tabular import Tabular, O
@@ -1056,7 +1057,7 @@ def _build_ygg_properties(
 # Table — per-table resource
 # ===========================================================================
 
-class Table(DatabricksResource, RemotePath, Singleton):
+class Table(DatabricksResource, DatabricksPath):
     """A single Unity Catalog table — DDL, DML, schema, storage helpers.
 
     Registers under :attr:`Scheme.DATABRICKS_TABLE` (``dbfs+table://``)
