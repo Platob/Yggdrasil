@@ -89,13 +89,19 @@ class Catalog(DatabricksPath, Singleton):
         catalog_name: str | None = None,
         **_kwargs: Any,
     ) -> Any:
-        host = ""
+        # Key on the bound :class:`DatabricksClient` *instance*, not on
+        # the host string — two clients with the same host but
+        # different credentials (different PAT, different OAuth
+        # secrets, …) are distinct identities and must own distinct
+        # ``Catalog`` instances. ``DatabricksClient`` is itself a
+        # :class:`Singleton`, so reusing the same client gives a
+        # stable, hashable identity.
+        client = None
         try:
             client = service.client if service is not None else None
-            host = (client.host if client is not None else "") or ""
         except Exception:
-            host = ""
-        return (cls, host, catalog_name)
+            client = None
+        return (cls, client, catalog_name)
 
     def __new__(
         cls,
