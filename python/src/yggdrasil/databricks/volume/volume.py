@@ -216,9 +216,6 @@ class Volume(DatabricksResource, Singleton):
     def name(self) -> str:
         return self.volume_name
 
-    def __repr__(self) -> str:
-        return f"Volume({self.explore_url!r})"
-
     def __str__(self) -> str:
         return self.full_name()
 

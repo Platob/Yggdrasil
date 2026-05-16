@@ -8,7 +8,9 @@ client module's transitive surface.
 from __future__ import annotations
 
 from abc import ABC
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
+
+from yggdrasil.io.url import URL
 
 from .client import DatabricksClient
 from .service import DatabricksService
@@ -20,6 +22,27 @@ __all__ = ["DatabricksResource"]
 
 
 class DatabricksResource(ABC):
+
+    @property
+    def explore_url(self) -> Optional[URL]:
+        """Workspace UI deep-link for this resource, or ``None``.
+
+        Concrete resources (:class:`Catalog`, :class:`Schema`,
+        :class:`Volume`, :class:`Table`, :class:`SQLWarehouse`,
+        :class:`Job`, :class:`VolumePath`, …) override this to return
+        the ``/explore/data/...`` / ``/sql/warehouses/...`` / ``/jobs/...``
+        URL that opens the resource in the workspace UI. The default
+        :meth:`__repr__` keys off the override — anything that returns
+        a non-``None`` URL gets a ``ClassName(<url>)``-style repr for
+        free without restating the format string on every subclass.
+        """
+        return None
+
+    def __repr__(self) -> str:
+        url = self.explore_url
+        if url is None:
+            return super().__repr__()
+        return f"{type(self).__name__}({url!r})"
 
     def __getstate__(self):
         # ``object.__getstate__`` only exists in Python 3.11+, but the

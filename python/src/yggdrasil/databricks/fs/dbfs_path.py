@@ -37,7 +37,7 @@ class DBFSPath(DatabricksPath):
 
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_DBFS
     namespace_prefix: ClassVar[str] = "/dbfs/"
-    _service_class: ClassVar[type] = DBFSService
+    _SERVICE_CLASS: ClassVar[type] = DBFSService
 
     # ==================================================================
     # Path rendering
@@ -126,7 +126,8 @@ class DBFSPath(DatabricksPath):
     # Mutators
     # ==================================================================
 
-    def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
+    def _mkdir(self, parents: bool, exist_ok: bool) -> None:
+        del parents
         logger.debug("Creating DBFS directory %r", self)
         try:
             self._call(self.client.workspace_client().dbfs.mkdirs, self.api_path)
@@ -135,7 +136,8 @@ class DBFSPath(DatabricksPath):
                 raise
         self._seed_stat_cache(IOStats(kind=IOKind.DIRECTORY))
 
-    def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
+    def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
+        del wait
         logger.debug("Deleting DBFS file %r", self)
         try:
             self._call(
@@ -147,8 +149,9 @@ class DBFSPath(DatabricksPath):
         self.invalidate_singleton()
 
     def _remove_dir(
-        self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
+        self, recursive: bool, missing_ok: bool, wait: WaitingConfig,
     ) -> None:
+        del wait
         logger.debug(
             "Deleting DBFS directory %r (recursive=%s)", self, recursive,
         )
@@ -315,7 +318,7 @@ class DBFSPath(DatabricksPath):
         return n
 
     def _clear(self) -> None:
-        self._remove_file(missing_ok=True)
+        self._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
 
 
 # ---------------------------------------------------------------------------

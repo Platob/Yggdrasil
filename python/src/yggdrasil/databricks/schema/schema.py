@@ -321,18 +321,18 @@ class Schema(DatabricksPath, Singleton):
         del recursive, singleton_ttl
         return iter(())
 
-    def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
+    def _mkdir(self, parents: bool, exist_ok: bool) -> None:
         del parents
         self.ensure_created() if exist_ok else self.create(if_not_exists=False)
 
-    def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
+    def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
         self.delete(wait=wait, raise_error=not missing_ok)
 
     def _remove_dir(
         self,
-        recursive: bool = True,
-        missing_ok: bool = True,
-        wait: WaitingConfig = True,
+        recursive: bool,
+        missing_ok: bool,
+        wait: WaitingConfig,
     ) -> None:
         self.delete(force=recursive, wait=wait, raise_error=not missing_ok)
 
@@ -390,9 +390,6 @@ class Schema(DatabricksPath, Singleton):
             q = safe if isinstance(safe, str) else "`"
             return f"{q}{self.catalog_name}{q}.{q}{self.schema_name}{q}"
         return f"{self.catalog_name}.{self.schema_name}"
-
-    def __repr__(self) -> str:
-        return f"Schema<{self.url.to_string()!r}>"
 
     def __str__(self) -> str:
         return self.full_name()

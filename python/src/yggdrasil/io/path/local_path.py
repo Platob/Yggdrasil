@@ -545,7 +545,7 @@ class LocalPath(Path):
             if recursive and is_dir:
                 yield from child._ls(recursive=True)
 
-    def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
+    def _mkdir(self, parents: bool, exist_ok: bool) -> None:
         """Create directory at this path."""
         if parents:
             os.makedirs(self.os_path, exist_ok=exist_ok)
@@ -585,7 +585,7 @@ class LocalPath(Path):
         except AttributeError:
             pass
 
-    def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
+    def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
         """Unlink the file at this path. Force-closes the fd first."""
         self._close_fd()
         try:
@@ -595,7 +595,7 @@ class LocalPath(Path):
                 raise
 
     def _remove_dir(
-        self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
+        self, recursive: bool, missing_ok: bool, wait: WaitingConfig,
     ) -> None:
         """Remove the directory at this path. Force-closes the fd first
         so a holder pointing at the directory (rare, but possible) doesn't
