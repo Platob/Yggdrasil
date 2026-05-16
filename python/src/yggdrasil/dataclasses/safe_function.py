@@ -115,13 +115,24 @@ def _resolve_str_annotation(s: str, func_globals: Optional[dict[str, Any]] = Non
     expanded = _expand_alias(candidate)
     if "." in expanded:
         mod_path, _, attr = expanded.rpartition(".")
+        mod: Any = None
         try:
             mod = importlib.import_module(mod_path)
+        except ImportError:
+            # Module not on the path — try yggdrasil's runtime
+            # auto-install before giving up. Respects whatever install
+            # policy the active :class:`PyEnv` has configured.
+            try:
+                from yggdrasil.environ import PyEnv
+                mod = PyEnv.runtime_import_module(mod_path, warn=False)
+            except Exception:
+                mod = None
+        except Exception:
+            mod = None
+        if mod is not None:
             obj = getattr(mod, attr, None)
             if obj is not None:
                 return obj
-        except Exception:
-            pass
 
     return s
 
@@ -371,10 +382,31 @@ def checkargs(func: F) -> F:
     ``__qualname__``, ``__doc__``, ``__annotations__``, and the
     underlying ``__wrapped__`` so :func:`inspect.signature` still
     reports the original signature.
+
+    Coroutine functions (``async def``) get an ``async`` wrapper that
+    awaits the underlying call; sync functions get a plain wrapper.
+    Re-wrapping is idempotent — applying ``@checkargs`` twice unwraps
+    the inner ``__wrapped__`` so the second decoration doesn't add a
+    second coercion pass.
     """
+    # Idempotent: if the caller stacks ``@checkargs`` twice, peel back
+    # to the original so we don't double-wrap.
+    if getattr(func, "__checkargs_wrapped__", False):
+        func = func.__wrapped__  # type: ignore[attr-defined]
+
+    if inspect.iscoroutinefunction(func):
+        @functools.wraps(func)
+        async def _async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            coerced_args, coerced_kwargs = check_function_args(func, args, kwargs)
+            return await func(*coerced_args, **coerced_kwargs)
+
+        _async_wrapper.__checkargs_wrapped__ = True  # type: ignore[attr-defined]
+        return _async_wrapper  # type: ignore[return-value]
+
     @functools.wraps(func)
     def _wrapper(*args: Any, **kwargs: Any) -> Any:
         coerced_args, coerced_kwargs = check_function_args(func, args, kwargs)
         return func(*coerced_args, **coerced_kwargs)
 
+    _wrapper.__checkargs_wrapped__ = True  # type: ignore[attr-defined]
     return _wrapper  # type: ignore[return-value]

@@ -9,6 +9,7 @@ Optional engine imports (pyarrow / polars / pandas) are gated with
 ``@unittest.skipUnless`` so the file still loads on a base install.
 """
 import datetime as dt
+import inspect
 import unittest
 from typing import Optional
 
@@ -539,6 +540,224 @@ class TestCheckargsFallbackPaths(unittest.TestCase):
 
         self.assertEqual(f("hello"), "hello")
         self.assertEqual(f(42), 42)
+
+
+# ---------------------------------------------------------------------------
+# Real-world use cases — enums, dataclasses, nested generics, methods, async
+# ---------------------------------------------------------------------------
+
+from enum import Enum
+from dataclasses import dataclass
+
+
+class _Color(Enum):
+    RED = "red"
+    GREEN = "green"
+
+
+@dataclass
+class _Point:
+    x: int
+    y: int
+
+
+class TestSafeFunctionEnumsAndDataclasses(unittest.TestCase):
+
+    def test_enum_from_value_string(self):
+        @checkargs
+        def pick(c: _Color) -> str:
+            return c.name
+        # yggdrasil.convert maps the value string to the enum member.
+        self.assertEqual(pick("red"), "RED")
+
+    def test_enum_from_name_string(self):
+        @checkargs
+        def pick(c: _Color) -> str:
+            return c.name
+        # And the member name works too.
+        self.assertEqual(pick("RED"), "RED")
+
+    def test_dataclass_from_dict(self):
+        @checkargs
+        def origin_distance(p: _Point) -> int:
+            return p.x + p.y
+        # convert builds the dataclass from a dict, coercing each field.
+        self.assertEqual(origin_distance({"x": "3", "y": "4"}), 7)
+
+    def test_dataclass_identity_passes_through(self):
+        @checkargs
+        def consume(p: _Point) -> _Point:
+            return p
+        p = _Point(1, 2)
+        self.assertIs(consume(p), p)
+
+
+class TestSafeFunctionNestedGenerics(unittest.TestCase):
+
+    def test_list_of_list(self):
+        from typing import List
+
+        @checkargs
+        def f(rows: List[List[int]]) -> int:
+            return sum(v for row in rows for v in row)
+        # Outer list, inner list — both preserved; identity for already-int values.
+        self.assertEqual(f([[1, 2], [3, 4]]), 10)
+
+    def test_list_of_dict_with_value_coercion(self):
+        from typing import List, Dict
+
+        @checkargs
+        def f(rows: List[Dict[str, int]]) -> int:
+            return sum(r["v"] for r in rows)
+        # Values arrive as strings, get coerced to int via the nested generic.
+        self.assertEqual(f([{"v": "1"}, {"v": "2"}]), 3)
+
+    def test_tuple_with_mixed_element_types(self):
+        from typing import Tuple
+
+        @checkargs
+        def f(row: Tuple[int, str, float]) -> tuple:
+            return (type(row[0]).__name__, row[1], type(row[2]).__name__)
+        self.assertEqual(f((1, "a", 2.0)), ("int", "a", "float"))
+
+
+class TestSafeFunctionDefaultsAndKindedParams(unittest.TestCase):
+
+    def test_defaults_are_not_coerced_when_caller_omits_them(self):
+        ledger: list = []
+
+        @checkargs
+        def f(name: str, count: int = 5) -> None:
+            ledger.append((name, count, type(count).__name__))
+
+        # ``count`` defaults to int 5 — the wrapper must not run the
+        # default through convert (would still be int → int but the
+        # principle stands: only caller-supplied args get coerced).
+        f("alice")
+        self.assertEqual(ledger[-1], ("alice", 5, "int"))
+
+    def test_keyword_only_param_is_coerced(self):
+        @checkargs
+        def f(*, n: int) -> int:
+            return n
+        self.assertEqual(f(n="42"), 42)
+
+    def test_positional_only_param_is_coerced(self):
+        @checkargs
+        def f(n: int, /) -> int:
+            return n
+        self.assertEqual(f("42"), 42)
+
+    def test_var_positional_per_element_coercion(self):
+        @checkargs
+        def f(*nums: int) -> int:
+            return sum(nums)
+        self.assertEqual(f("1", "2", "3"), 6)
+
+    def test_var_keyword_per_element_coercion(self):
+        @checkargs
+        def f(**flags: bool) -> int:
+            return sum(1 for v in flags.values() if v)
+        # Each kwarg value coerces to bool individually.
+        self.assertEqual(f(a="true", b="false", c="yes"), 2)
+
+
+class TestSafeFunctionMethods(unittest.TestCase):
+    """``@checkargs`` on bound / static / class methods."""
+
+    def test_instance_method_self_passes_through(self):
+        class Thing:
+            @checkargs
+            def double(self, n: int) -> int:
+                return n * 2
+
+        # ``self`` has no annotation — it passes through; ``n`` coerces.
+        self.assertEqual(Thing().double("21"), 42)
+
+    def test_classmethod(self):
+        class Thing:
+            @classmethod
+            @checkargs
+            def add(cls, a: int, b: int) -> int:
+                return a + b
+
+        self.assertEqual(Thing.add("2", "3"), 5)
+
+    def test_staticmethod(self):
+        class Thing:
+            @staticmethod
+            @checkargs
+            def mul(a: int, b: int) -> int:
+                return a * b
+
+        self.assertEqual(Thing.mul("4", "5"), 20)
+
+
+class TestSafeFunctionAsync(unittest.TestCase):
+
+    def test_async_function_is_wrapped_in_async_wrapper(self):
+        import asyncio
+
+        @checkargs
+        async def add(a: int, b: int) -> int:
+            return a + b
+
+        self.assertTrue(inspect.iscoroutinefunction(add))
+        result = asyncio.run(add("3", "4"))
+        self.assertEqual(result, 7)
+
+    def test_async_function_preserves_signature(self):
+        @checkargs
+        async def f(name: str, count: int = 1) -> str:
+            """Docstring stays."""
+            return name * count
+
+        self.assertEqual(f.__name__, "f")
+        self.assertEqual(f.__doc__, "Docstring stays.")
+        sig = inspect.signature(f)
+        self.assertEqual(list(sig.parameters), ["name", "count"])
+
+
+class TestSafeFunctionMisc(unittest.TestCase):
+
+    def test_return_value_passes_through_unchanged(self):
+        @checkargs
+        def f(n: int) -> object:
+            return {"n": n, "tag": object()}
+        out = f("10")
+        self.assertEqual(out["n"], 10)
+        self.assertIsInstance(out["tag"], object)
+
+    def test_double_decoration_is_idempotent(self):
+        @checkargs
+        @checkargs
+        def f(n: int) -> int:
+            return n + 1
+
+        # No double coercion (would matter for types whose convert isn't
+        # idempotent), and one level of __wrapped__ peels back to the
+        # original function.
+        self.assertEqual(f("4"), 5)
+        # ``f`` is the second wrapper; ``f.__wrapped__`` is the
+        # original underlying function (the inner @checkargs got
+        # unwrapped during the second application).
+        self.assertEqual(f.__wrapped__.__name__, "f")
+
+    def test_functools_partial_target_works(self):
+        import functools
+
+        def f(name: str, count: int) -> str:
+            return name * count
+
+        wrapped = checkargs(f)
+        bound = functools.partial(wrapped, count="3")
+        self.assertEqual(bound(name="ab"), "ababab")
+
+    def test_lambda_can_be_wrapped(self):
+        # No annotations on a bare lambda; values pass through.
+        wrapped = checkargs(lambda x, y: x + y)
+        self.assertEqual(wrapped("a", "b"), "ab")
+        self.assertEqual(wrapped(1, 2), 3)
 
 
 if __name__ == "__main__":
