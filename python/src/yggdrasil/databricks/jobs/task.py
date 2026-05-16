@@ -17,10 +17,10 @@ decorator form.
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import inspect
 import json
 import logging
-import secrets
 import textwrap
 from dataclasses import replace as _dc_replace
 from typing import Any, Callable, List, Optional, TYPE_CHECKING
@@ -353,12 +353,19 @@ class JobTask:
         from yggdrasil.databricks.fs.workspace_path import WorkspacePath
 
         key = task_key or func.__name__
-        suffix = secrets.token_hex(4)
-
         script = _render_callable_script(func, args, kwargs)
+        # Content hash, not a random token: re-staging the same body
+        # with the same bound args lands on the same path so the
+        # workspace doesn't accumulate near-duplicate
+        # ``<key>-<random>.py`` files across iterations. Hashes only
+        # the bits the caller controls — the function source plus
+        # invocation args — so volatile slots like the embedded
+        # ``staged_at`` / ``yggdrasil_version`` metadata don't shift
+        # the digest between otherwise-identical re-stagings.
+        digest = _content_digest(func, args, kwargs)
 
         path = WorkspacePath(
-            f"{staging_root.rstrip('/')}/{key}-{suffix}.py",
+            f"{staging_root.rstrip('/')}/{key}-{digest}.py",
             client=job.client,
         )
 
@@ -386,6 +393,34 @@ class JobTask:
             environment_key=DEFAULT_ENVIRONMENT_KEY,
         )
         return cls(job=job, task_key=key, details=details)
+
+
+def _content_digest(
+    func: Callable[..., Any], args: tuple, kwargs: dict,
+) -> str:
+    """Return a short blake2b digest of *func*'s source + bound call args.
+
+    Stable across re-stagings of the same body and identical
+    invocation — keyword order is canonicalised — so the workspace
+    path stays put when the only churn is the embedded
+    ``staged_at`` / ``yggdrasil_version`` slots inside the rendered
+    script.
+    """
+    try:
+        source = textwrap.dedent(inspect.getsource(func))
+    except (OSError, TypeError):
+        # Falls back to the qualified name + module — collision-prone
+        # but matches the failure surface of ``inspect.getsource`` in
+        # :func:`_render_callable_script`, which will raise on the
+        # subsequent render.
+        source = f"{func.__module__}.{func.__qualname__}"
+    h = hashlib.blake2b(digest_size=4)
+    h.update(source.encode("utf-8"))
+    h.update(b"\0args\0")
+    h.update(repr(args).encode("utf-8"))
+    h.update(b"\0kwargs\0")
+    h.update(repr(sorted(kwargs.items())).encode("utf-8"))
+    return h.hexdigest()
 
 
 def _default_job_environment(environment_key: str) -> JobEnvironment:

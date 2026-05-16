@@ -24,7 +24,11 @@ from databricks.sdk.service.jobs import (
 from databricks.sdk.service.jobs import SparkPythonTask, Task
 
 from yggdrasil.databricks.jobs import Job, JobRun
-from yggdrasil.databricks.jobs.task import JobTask, _render_callable_script
+from yggdrasil.databricks.jobs.task import (
+    JobTask,
+    _content_digest,
+    _render_callable_script,
+)
 from yggdrasil.databricks.tests import DatabricksTestCase
 
 
@@ -728,6 +732,21 @@ class TestStagedScriptMetadata(DatabricksTestCase):
         self.assertIn("yggdrasil_version", meta)
         self.assertIn("staged_at", meta)
         json.dumps(meta)  # stable JSON shape.
+
+    def test_content_digest_is_stable_for_same_source_and_args(self):
+        """Same callable + same bound args → identical digest across calls."""
+        a = _content_digest(_signature_fixture, (), {"name": "x", "count": 1})
+        b = _content_digest(_signature_fixture, (), {"name": "x", "count": 1})
+        self.assertEqual(a, b)
+        # Kwarg ordering doesn't perturb the digest.
+        c = _content_digest(_signature_fixture, (), {"count": 1, "name": "x"})
+        self.assertEqual(a, c)
+
+    def test_content_digest_changes_with_args(self):
+        """Different bound args → different digest, even for the same callable."""
+        a = _content_digest(_signature_fixture, (), {"name": "x"})
+        b = _content_digest(_signature_fixture, (), {"name": "y"})
+        self.assertNotEqual(a, b)
 
     def test_script_wraps_no_arg_function_with_checkargs(self):
         import ast
