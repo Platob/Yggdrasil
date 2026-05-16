@@ -616,9 +616,11 @@ class TestJobTaskFactoryAndDecorate(DatabricksTestCase):
         self.assertEqual(len(envs), 1)
         self.assertEqual(envs[0].environment_key, DEFAULT_ENVIRONMENT_KEY)
         self.assertEqual(envs[0].spec.client, DEFAULT_ENVIRONMENT_CLIENT)
-        # The default spec pulls in ``ygg`` so staged
-        # ``from yggdrasil...`` imports resolve at runtime.
-        self.assertIn("ygg", envs[0].spec.dependencies)
+        # The default spec pulls in ``ygg`` (currently with the
+        # ``[data,databricks]`` extras — see DEFAULT_ENVIRONMENT_DEPENDENCIES)
+        # so staged ``from yggdrasil...`` imports resolve at runtime.
+        from yggdrasil.databricks.jobs.task import DEFAULT_ENVIRONMENT_DEPENDENCIES
+        self.assertEqual(envs[0].spec.dependencies, DEFAULT_ENVIRONMENT_DEPENDENCIES)
 
     def test_create_skips_environment_merge_when_already_declared(self):
         """``environments`` isn't touched when the key already lives on the job."""
