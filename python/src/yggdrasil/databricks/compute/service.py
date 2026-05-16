@@ -390,7 +390,10 @@ class Clusters(DatabricksService):
             if k in _CREATE_ARG_NAMES
         }
 
-        LOGGER.debug("Creating Databricks cluster %r with %s", update_details.get("cluster_name"), update_details)
+        LOGGER.debug(
+            "Creating cluster %r with spec %s",
+            update_details.get("cluster_name"), update_details,
+        )
 
         client = self.client.workspace_client().clusters
 

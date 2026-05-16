@@ -857,7 +857,7 @@ print(p.stdout, flush=True)
             )
             remote_payload_path = str(tmp)
             LOGGER.debug(
-                "Payload too large (%d bytes) — uploaded to DBFS: %s",
+                "Payload too large (%d bytes) — uploaded to DBFS path %r",
                 len(payload),
                 remote_payload_path,
             )

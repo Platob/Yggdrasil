@@ -235,25 +235,25 @@ class JobRun(Singleton, DatabricksResource):
         if self.run_id is None:
             return self
 
-        LOGGER.debug("Cancelling %r", self)
+        LOGGER.debug("Cancelling job run %r", self)
         waiter = self.service._jobs_api().cancel_run(run_id=self.run_id)
         if wait:
             wait_cfg = WaitingConfig.from_(wait)
             waiter.result(timeout=wait_cfg.timeout_timedelta)
         self.refresh()
-        LOGGER.info("Cancelled %r", self)
+        LOGGER.info("Cancelled job run %r", self)
         return self
 
     def delete(self) -> None:
         """Delete the run record from the workspace."""
         if self.run_id is None:
             return
-        LOGGER.debug("Deleting %r", self)
+        LOGGER.debug("Deleting job run %r", self)
         try:
             self.service._jobs_api().delete_run(run_id=self.run_id)
         except ResourceDoesNotExist:
-            LOGGER.debug("Run %r already deleted", self)
-        LOGGER.info("Deleted %r", self)
+            LOGGER.debug("Job run %r already deleted", self)
+        LOGGER.info("Deleted job run %r", self)
 
     # ------------------------------------------------------------------ #
     # Repair / output / export
@@ -303,14 +303,14 @@ class JobRun(Singleton, DatabricksResource):
             if v is not None
         }
 
-        LOGGER.debug("Repairing %r with %s", self, kwargs)
+        LOGGER.debug("Repairing job run %r with %s", self, kwargs)
         self.service._jobs_api().repair_run(run_id=self.run_id, **kwargs)
 
         if wait:
             self.wait_for_status(wait=wait)
         else:
             self.refresh()
-        LOGGER.info("Repaired %r", self)
+        LOGGER.info("Repaired job run %r", self)
         return self
 
     def output(self) -> RunOutput:

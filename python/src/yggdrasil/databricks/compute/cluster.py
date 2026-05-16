@@ -830,7 +830,9 @@ class Cluster(Singleton, DatabricksResource):
                 if raise_error:
                     raise DatabricksError(message)
 
-                LOGGER.error(message)
+                LOGGER.error(
+                    "Library install failed on cluster %r: %s", self, failed,
+                )
                 return self
 
             running = [

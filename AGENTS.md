@@ -736,6 +736,140 @@ Lazy interpolation (`LOGGER.debug("foo %r", obj)`, not
 only renders when the level is enabled, and `repr()` on a heavy
 object is exactly the kind of work the level guard exists to avoid.
 
+### Message shape: resource → action → metadata
+
+Every log message follows the same scannable shape:
+
+```
+<Verb> <ResourceNoun> %r [(<key>=<value>, <key>=<value>, ...)]
+```
+
+- **Verb** — present-progressive for the *intent* / start of an op
+  (`"Creating"`, `"Deleting"`, `"Starting"`, `"Listing"`), past for
+  the *completed* op (`"Created"`, `"Deleted"`, `"Started"`).
+- **ResourceNoun** — name the kind of thing acted on, even when the
+  `%r` already encodes it. `LOGGER.info("Deleted job run %r", run)`
+  reads cleanly in a wall of mixed lines; `LOGGER.info("Deleted %r", run)`
+  forces the reader to parse the repr to figure out what was deleted.
+- **`%r`** — the resource itself; identity comes from its `__repr__`.
+- **Metadata** — extra fields go in `(...)` parens, `key=value` joined
+  by `,` and a space. Keep keys short and consistent across files
+  (`wait=`, `if_not_exists=`, `recursive=`, `columns=`, `bytes=`).
+
+Worked examples (good shape):
+
+```python
+LOGGER.info("Created cluster %r (size=%d, runtime=%s)", cluster, n, dbr)
+LOGGER.info("Deleted job %r", job)
+LOGGER.info("Deleted job run %r", run)
+LOGGER.info("Submitted job run %r", run)
+LOGGER.info("Started warehouse %r", warehouse)
+LOGGER.debug("Updating job %r (settings=%r, fields_to_remove=%r)", job, s, f)
+LOGGER.debug("Creating table %r via SQL (or_replace=%s, columns=%d)", t, r, n)
+LOGGER.debug("Listing schemas in catalog %r (name_filter=%s)", catalog, pat)
+LOGGER.warning("Permission denied listing directory %r: %r", self, exc)
+```
+
+Anti-patterns (do not write these):
+
+```python
+LOGGER.info("Deleted %r", run)                        # missing ResourceNoun
+LOGGER.info("Job.delete: job=%s", job.full_name())    # function-name prefix
+LOGGER.debug("Catalog.schemas: listing catalog=%s", c)# same
+LOGGER.debug("Cache hit [Schemas.find] key=%s", key)  # bracketed call shorthand
+LOGGER.debug("Spark insert -> %s | mode=%s", t, m)    # ad-hoc | pipe formatting
+```
+
+### Don't log cache hits at debug
+
+Cache hits are the steady-state success path — they fire on every
+read in tight loops and drown out the rare interesting events
+(cache miss, expiry, refresh, eviction). Log the **misses**, the
+**expiries**, and the **invalidations**; the hit is silent.
+
+```python
+# Good — only the interesting transitions:
+if cached is not None:
+    return cached
+logger.debug("Cache expired for schema %r (age=%.0fs) — refreshing", self, age)
+...
+logger.debug("Fetching schema %r from remote", self)
+
+# Bad — every steady-state read fires this:
+if cached is not None:
+    logger.debug("Cache hit for schema %r", self)
+    return cached
+```
+
+### Drop `if logger.isEnabledFor(...)` around single lazy calls
+
+`logger.debug("...", obj)` already evaluates the format args lazily
+when the level is disabled. The guard only earns its keep when there
+is *real* pre-computation outside the `logger.debug(...)` call —
+materialising a generator into a list, building a summary dict, etc.
+
+```python
+# Good — guard wraps real work:
+if logger.isEnabledFor(logging.DEBUG):
+    entries = list(entries)
+    logger.debug("Listing %r -> %d entries (recursive=%s)", self, len(entries), recursive)
+
+# Bad — guard wraps only a lazy format call:
+if logger.isEnabledFor(logging.DEBUG):
+    logger.debug("Deleting %r", self)
+```
+
+### Use the verb without a "Databricks " prefix
+
+The logger name already encodes the module
+(`yggdrasil.databricks.jobs.service`); don't repeat the platform in
+the message body. `LOGGER.debug("Creating job %r", name)`, not
+`LOGGER.debug("Creating Databricks job %r", name)`.
+
+### Lifecycle pairs — log both sides at info, the intermediates at debug
+
+For a method that mutates remote state, log:
+
+- `LOGGER.debug("Verbing <resource> %r (...)", self, ...)` at the
+  start (intent + parameters),
+- `LOGGER.info("Verbed <resource> %r", self)` after the SDK call
+  returns successfully (completion).
+
+Failures don't get a third log call here — `LOGGER.exception(...)` /
+the re-raised exception carries the diagnostic. Logging the failure
+inline duplicates the stacktrace the caller will already see.
+
+```python
+def delete(self, *, missing_ok: bool = False) -> "Table":
+    logger.debug("Deleting table %r", self)
+    try:
+        self.client.workspace_client().tables.delete(self.full_name())
+    except DatabricksError:
+        if not missing_ok:
+            raise
+    logger.info("Deleted table %r", self)
+    return self
+```
+
+### Level selection rules of thumb
+
+- `debug` — fine-grained per-call detail, intermediate steps,
+  parameters echoes, decision branches the reader needs to
+  reconstruct a bug. Verbose; off by default.
+- `info` — completed lifecycle changes worth noting in a normal
+  run (`Created`, `Deleted`, `Submitted`, `Started`, `Closed`).
+  One line per remote mutation, not per remote read.
+- `warning` — recoverable surprise (auto-retry, parent not found
+  and being created, swallowed-non-fatal cleanup failure). Names
+  the resource AND the recovered-from condition.
+- `error` — non-recoverable surprise *that isn't already an
+  exception bubbling up*. If you re-raise, prefer letting the
+  caller decide; only log error when this is the last point that
+  sees the failure context.
+- `exception` — same as error but with traceback; reserved for
+  caught-and-swallowed exceptions where the trace is the
+  diagnostic.
+
 ---
 
 ## Optional dependency policy

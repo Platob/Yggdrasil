@@ -171,13 +171,13 @@ class Job(Singleton, DatabricksResource):
         if self.job_id is None:
             raise ValueError(f"Cannot reset {self}: job_id is not set")
 
-        LOGGER.debug("Resetting %r settings", self)
+        LOGGER.debug("Resetting settings on job %r", self)
         self.service._jobs_api().reset(
             job_id=self.job_id,
             new_settings=new_settings,
         )
         self.refresh()
-        LOGGER.info("Reset %r", self)
+        LOGGER.info("Reset job %r", self)
         return self
 
     def update(
@@ -216,7 +216,7 @@ class Job(Singleton, DatabricksResource):
             )
 
             LOGGER.debug(
-                "Updating %r with settings=%r fields_to_remove=%r",
+                "Updating job %r (settings=%r, fields_to_remove=%r)",
                 self, new_settings_fields, fields_to_remove,
             )
             self.service._jobs_api().update(
@@ -229,7 +229,7 @@ class Job(Singleton, DatabricksResource):
         if permissions:
             self.update_permissions(permissions=permissions)
 
-        LOGGER.info("Updated %r", self)
+        LOGGER.info("Updated job %r", self)
         return self
 
     def delete(self) -> None:
@@ -239,18 +239,18 @@ class Job(Singleton, DatabricksResource):
 
         from .service import _NAME_ID_CACHE
 
-        LOGGER.debug("Deleting %r", self)
+        LOGGER.debug("Deleting job %r", self)
         try:
             self.service._jobs_api().delete(job_id=self.job_id)
         except ResourceDoesNotExist:
-            LOGGER.debug("Job %r already deleted", self)
+            LOGGER.debug("Job %r already deleted — skipping delete", self)
 
         host = self.client.base_url.to_string()
         host_cache = _NAME_ID_CACHE.get(host)
         if host_cache is not None and self.job_name:
             host_cache.pop(self.job_name, None)
 
-        LOGGER.info("Deleted %r", self)
+        LOGGER.info("Deleted job %r", self)
 
     # ------------------------------------------------------------------ #
     # Permissions
@@ -317,10 +317,10 @@ class Job(Singleton, DatabricksResource):
             if v is not None
         }
 
-        LOGGER.debug("Triggering run of %r with %s", self, kwargs)
+        LOGGER.debug("Triggering job %r with %s", self, kwargs)
         waiter = self.service._jobs_api().run_now(job_id=self.job_id, **kwargs)
         run = JobRun(service=self.service, run_id=waiter.run_id)
-        LOGGER.info("Triggered %r", run)
+        LOGGER.info("Triggered job run %r", run)
 
         if wait:
             run.wait_for_status(wait=wait)

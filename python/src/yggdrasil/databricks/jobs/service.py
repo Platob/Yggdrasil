@@ -229,7 +229,7 @@ class Jobs(DatabricksService):
                 self.check_permission(p) for p in permissions
             ]
 
-        LOGGER.debug("Creating Databricks job %r with %s", name, create_kwargs)
+        LOGGER.debug("Creating job %r with spec %s", name, create_kwargs)
         response = self._jobs_api().create(**create_kwargs)
 
         job_id = response.job_id
@@ -241,7 +241,7 @@ class Jobs(DatabricksService):
             job_name=name,
         ).refresh()
 
-        LOGGER.info("Created %r", instance)
+        LOGGER.info("Created job %r", instance)
         return instance
 
     def create_or_update(
@@ -318,12 +318,12 @@ class Jobs(DatabricksService):
         if tasks is not None:
             kwargs["tasks"] = list(tasks)
 
-        LOGGER.debug("Submitting one-off Databricks run %r", run_name or "<unnamed>")
+        LOGGER.debug("Submitting one-off job run %r", run_name or "<unnamed>")
         waiter = self._jobs_api().submit(**kwargs)
         run_id = waiter.run_id
 
         instance = JobRun(service=self, run_id=run_id)
-        LOGGER.info("Submitted %r", instance)
+        LOGGER.info("Submitted job run %r", instance)
 
         if wait:
             instance.wait_for_status(wait=wait)
