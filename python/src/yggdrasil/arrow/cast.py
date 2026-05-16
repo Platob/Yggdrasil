@@ -162,6 +162,19 @@ def _is_yggdrasil_tabular(obj: Any) -> bool:
     return isinstance(obj, Tabular)
 
 
+def _is_tabular_source(obj: Any) -> bool:
+    """Return ``True`` if *obj* can be coerced via :meth:`Tabular.from_`.
+
+    Lifted to a helper so the cast entry points share the same
+    path-string heuristic as :func:`yggdrasil.io.tabular.is_tabular_source`
+    — keeps ``any_to_arrow_table('data.parquet')`` and the engine
+    siblings (``any_to_polars_dataframe`` / ``any_to_spark_dataframe``
+    / ``any_to_pandas_dataframe``) agreeing on what counts as a path.
+    """
+    from yggdrasil.io.tabular import is_tabular_source
+    return is_tabular_source(obj)
+
+
 # ---------------------------------------------------------------------------
 # Streaming rechunker — pure pyarrow, used by every engine entry point that
 # needs ``byte_size`` / ``row_size`` sizing on the way out.
@@ -735,13 +748,20 @@ def any_to_arrow_table(
         options = _bind_source(options, obj.schema)
         table = _project(obj.read_all(), options)
 
-    elif _is_yggdrasil_tabular(obj):
+    elif _is_tabular_source(obj):
         # ``Tabular`` (Response, StatementResult, ParquetIO, …) owns
         # its own engine fan-out — let it produce the table so format
         # leaves use their native scanners (Parquet predicate pushdown,
         # StatementResult's persisted-frame short-circuit) instead of
-        # the polars-wrap fallback further down.
-        table = obj.read_arrow_table(options)
+        # the polars-wrap fallback further down. Path-shaped strings
+        # and ``os.PathLike`` inputs are coerced through
+        # :meth:`Tabular.from_`, which wraps them in a :class:`Path`
+        # holder and lets :meth:`Path.read_arrow_table` dispatch to
+        # the right format leaf (ParquetIO / CsvIO / …) via the
+        # MediaType registry.
+        from yggdrasil.io.tabular import Tabular
+        tabular = obj if _is_yggdrasil_tabular(obj) else Tabular.from_(obj)
+        table = tabular.read_arrow_table(options)
         options = _bind_source(options, table)
 
     elif _is_arrow_dataset(obj):

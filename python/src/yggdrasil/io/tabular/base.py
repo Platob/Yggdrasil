@@ -54,6 +54,7 @@ dispatch on :class:`Holder`.
 from __future__ import annotations
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Iterator, TypeVar
@@ -76,7 +77,41 @@ if TYPE_CHECKING:
     from yggdrasil.io.holder import Holder
 
 
-__all__ = ["Tabular", "TabularStaticValues"]
+__all__ = ["Tabular", "TabularStaticValues", "is_tabular_source"]
+
+
+def is_tabular_source(obj: Any) -> bool:
+    """True iff *obj* is a shape :meth:`Tabular.from_` can coerce.
+
+    Catches the three shapes the cast layer needs to recognise before
+    dispatching to engine-native constructors:
+
+    * an existing :class:`Tabular` (incl. :class:`Holder` / :class:`Path`
+      / :class:`Memory` / :class:`IO` — anything with the read/write
+      Arrow batch contract);
+    * an :class:`os.PathLike` (incl. :class:`pathlib.PurePath`);
+    * a path-shaped ``str`` (``"data.parquet"``, ``"s3://b/k"``,
+      ``"./x.csv"``) — string heuristic deliberately tight so that a
+      caller passing a plain content string (``"hello"``) still falls
+      through to the existing engine-native dispatch.
+
+    File-like objects (have ``read``) aren't probed here: dispatching
+    them needs an explicit ``media_type=`` and the cast layer doesn't
+    carry one — :meth:`Tabular.from_` raises :class:`TypeError` for
+    those if the caller routes them through anyway.
+    """
+    if isinstance(obj, Tabular):
+        return True
+    if isinstance(obj, os.PathLike):
+        return True
+    if isinstance(obj, str):
+        if not obj or len(obj) > 4096:
+            return False
+        if "://" in obj or "/" in obj or "\\" in obj:
+            return True
+        # Bare filename with extension — ``data.parquet``, ``q.csv``.
+        return "." in obj and not obj.startswith(".")
+    return False
 
 
 O = TypeVar("O", bound=CastOptions)
@@ -507,6 +542,87 @@ class Tabular(ABC, Generic[O]):
         if target is default and default is not ...:
             return default
         return target(holder=holder, **kwargs)
+
+    @classmethod
+    def from_(
+        cls,
+        obj: Any,
+        *,
+        media_type: "MediaType | MimeType | str | None" = None,
+        default: Any = ...,
+        **kwargs: Any,
+    ) -> "Tabular":
+        """Coerce *obj* into a :class:`Tabular` leaf for read/write.
+
+        Routes:
+
+        * :class:`Tabular` (incl. :class:`Holder` / :class:`Path` /
+          :class:`Memory` / :class:`IO`) — returned as-is. When
+          *media_type* is supplied and *obj* is a :class:`Holder`,
+          :meth:`for_holder` is invoked so the caller can override the
+          format leaf the holder's stamped MediaType would otherwise
+          dispatch to.
+        * ``str`` / :class:`os.PathLike` — coerced via
+          :meth:`Path.from_`, which scheme-dispatches to the right
+          concrete subclass (:class:`LocalPath`, :class:`S3Path`,
+          :class:`DatabricksPath`, …). Strings are accepted only when
+          path-shaped (see :func:`is_tabular_source`); plain content
+          strings raise.
+        * File-like objects (anything with a callable ``read``
+          returning ``bytes``) — drained into a :class:`Memory`
+          holder; *media_type* is required since a raw byte stream
+          has no URL extension to sniff.
+
+        Falls back to *default* on unrecognised shapes when supplied;
+        otherwise raises :class:`TypeError` with the offending type.
+        """
+        from yggdrasil.io.holder import Holder
+
+        if isinstance(obj, Tabular):
+            if media_type is not None and isinstance(obj, Holder):
+                return cls.for_holder(obj, media_type=media_type, **kwargs)
+            return obj
+
+        if isinstance(obj, (str, os.PathLike)):
+            if isinstance(obj, str) and not is_tabular_source(obj):
+                if default is not ...:
+                    return default
+                raise TypeError(
+                    f"Tabular.from_ string {obj!r} is not path-shaped; "
+                    "pass a URL, a filesystem path, or a name with an "
+                    "extension (e.g. 'data.parquet')."
+                )
+            from yggdrasil.io.path import Path as YggPath
+            path = YggPath.from_(obj)
+            if media_type is not None:
+                return cls.for_holder(path, media_type=media_type, **kwargs)
+            return path
+
+        read = getattr(obj, "read", None)
+        if callable(read):
+            if media_type is None:
+                if default is not ...:
+                    return default
+                raise TypeError(
+                    f"Tabular.from_ requires media_type= for file-like "
+                    f"inputs ({type(obj).__name__}); no URL extension "
+                    "to sniff the format."
+                )
+            from yggdrasil.io.memory import Memory
+            data = read()
+            if isinstance(data, str):
+                data = data.encode()
+            return cls.for_holder(
+                Memory(binary=data), media_type=media_type, **kwargs,
+            )
+
+        if default is not ...:
+            return default
+        raise TypeError(
+            f"Cannot coerce {type(obj).__name__} to a Tabular. "
+            "Pass a Tabular, a path / URL (str or os.PathLike), or "
+            "a file-like object with media_type=."
+        )
 
     @classmethod
     def registered_classes(cls) -> "dict[str, type[Tabular]]":

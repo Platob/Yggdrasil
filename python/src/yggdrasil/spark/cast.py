@@ -231,10 +231,14 @@ def any_to_spark_dataframe(
     # ``StatementResult._read_spark_frame``) and otherwise runs the
     # Arrow round-trip with the same cast options. The leaf already
     # applies ``cast_spark`` / ``cast_spark_tabular`` against ``opts``,
-    # so we don't re-cast at the call site.
-    from yggdrasil.io.tabular import Tabular
-    if isinstance(obj, Tabular):
-        return obj.read_spark_frame(opts)
+    # so we don't re-cast at the call site. Path-shaped strings and
+    # ``os.PathLike`` inputs are wrapped into a :class:`Path` via
+    # :meth:`Tabular.from_` so callers can ``convert("s3://b/k.parquet",
+    # pyspark_sql.DataFrame)`` without hand-rolling the holder.
+    from yggdrasil.io.tabular import Tabular, is_tabular_source
+    if is_tabular_source(obj):
+        tabular = obj if isinstance(obj, Tabular) else Tabular.from_(obj)
+        return tabular.read_spark_frame(opts)
 
     spark = PyEnv.spark_session(
         create=True,
