@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 from typing import (
-    Any, ClassVar, Iterator, List, Optional, TYPE_CHECKING, Union,
+    Any, Callable, ClassVar, Iterator, List, Optional, TYPE_CHECKING, Union,
 )
 
 from databricks.sdk.errors import ResourceDoesNotExist
@@ -386,3 +386,39 @@ class Job(Singleton, DatabricksResource):
 
         details = Task(task_key=task_key, **task_fields)
         return JobTask(job=self, task_key=task_key, details=details)
+
+    def pytask(
+        self,
+        func: Optional[Callable[..., Any]] = None,
+        /,
+        *,
+        task_key: Optional[str] = None,
+        **task_fields: Any,
+    ) -> Any:
+        """Fastpath: stage a Python callable as a task in one decorator.
+
+        Composes :meth:`Job.task` + :meth:`JobTask.decorate` into a
+        single Prefect-style decorator. Equivalent to chaining
+        ``@job.task(key, **fields).decorate``, but shorter for the
+        common case where you just want the function staged.
+
+        Usable bare or parametrized::
+
+            @job.pytask
+            def step(): ...
+
+            @job.pytask(task_key="custom", description="…", environment_key="env-1")
+            def step(): ...
+
+        Bare form defaults ``task_key`` to ``func.__name__``. Any extra
+        *task_fields* flow into :meth:`Job.task` so the same
+        caller-wins / decorate-back-fills semantics apply: explicit
+        fields beat the docstring-derived defaults.
+        """
+        def _decorate(f: Callable[..., Any]) -> Callable[..., Any]:
+            key = task_key or f.__name__
+            return self.task(key, **task_fields).decorate(f)
+
+        if func is None:
+            return _decorate
+        return _decorate(func)

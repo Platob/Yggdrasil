@@ -16,6 +16,7 @@ Exercises against a real workspace:
 - :meth:`Job.task` + :meth:`JobTask.decorate` — Prefect-style sugar
   wires through :meth:`JobTask.from_callable` +
   :meth:`JobTask.create_or_update`.
+- :meth:`Job.pytask` — single-call fastpath that composes the two.
 - :meth:`JobTask.update` / :meth:`JobTask.delete` — round-trip
   through :meth:`Job.update` and the parent job's settings reflect
   the change.
@@ -170,7 +171,7 @@ class TestJobTaskIntegration(_JobsIntegrationBase):
     def test_job_task_decorator_registers_then_re_decorates_in_place(self):
         job = self._fresh_job("decorator")
 
-        @job.task("step_one").decorate
+        @job.pytask
         def step_one(a: str = "hi"):
             """First decorator pass."""
             print(a)
@@ -187,7 +188,7 @@ class TestJobTaskIntegration(_JobsIntegrationBase):
 
         # Re-decorating the same task_key with a different body
         # replaces the entry in place — no duplicate task_key.
-        @job.task("step_one").decorate
+        @job.pytask
         def step_one(a: str = "hi"):  # noqa: F811 — intentional shadow
             """Second decorator pass — different body, same key."""
             print("rewritten", a)
@@ -204,10 +205,10 @@ class TestJobTaskIntegration(_JobsIntegrationBase):
         assert "rewritten" in new_content
 
     def test_job_task_decorator_with_task_fields(self):
-        """``@job.task(key, description=...).decorate`` layers Task fields on."""
+        """``@job.pytask(task_key=…, description=…)`` layers Task fields on."""
         job = self._fresh_job("decorator_fields")
 
-        @job.task("custom_key", description="overridden desc").decorate
+        @job.pytask(task_key="custom_key", description="overridden desc")
         def make_it():
             """Original docstring — should be overridden by description=."""
             print("ok")
@@ -228,7 +229,7 @@ class TestJobTaskIntegration(_JobsIntegrationBase):
     def test_job_task_refresh_update_delete(self):
         job = self._fresh_job("crud")
 
-        @job.task("crud_target").decorate
+        @job.pytask
         def crud_target():
             """First version."""
             print("v1")

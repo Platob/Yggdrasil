@@ -21,7 +21,10 @@ from databricks.sdk.service.jobs import (
     RunState,
 )
 
+from databricks.sdk.service.jobs import SparkPythonTask, Task
+
 from yggdrasil.databricks.jobs import Job, JobRun
+from yggdrasil.databricks.jobs.task import JobTask
 from yggdrasil.databricks.tests import DatabricksTestCase
 
 
@@ -413,6 +416,151 @@ class TestJobRunResource(DatabricksTestCase):
             run.url().to_string(),
             "https://test.databricks.net/#job/1/run/8",
         )
+
+
+class TestJobTaskFactoryAndDecorate(DatabricksTestCase):
+    """:meth:`Job.task` builds a :class:`JobTask`; :meth:`JobTask.decorate` back-fills."""
+
+    def _job(self, *, job_id: int = 42) -> Job:
+        return Job(
+            service=self.jobs,
+            job_id=job_id,
+            job_name="t",
+            details=_job_info(job_id=job_id, name="t"),
+        )
+
+    def test_task_factory_returns_jobtask_with_prebuilt_details(self):
+        job = self._job()
+        jt = job.task("step", description="hi", timeout_seconds=900)
+
+        self.assertIsInstance(jt, JobTask)
+        self.assertIs(jt.job, job)
+        self.assertEqual(jt.task_key, "step")
+        self.assertEqual(jt._details.task_key, "step")
+        self.assertEqual(jt._details.description, "hi")
+        self.assertEqual(jt._details.timeout_seconds, 900)
+
+    def test_decorate_back_fills_only_unset_fields(self):
+        job = self._job()
+        preset_body = SparkPythonTask(python_file="/explicit.py")
+        jt = job.task(
+            "step",
+            description="caller wins",
+            spark_python_task=preset_body,
+            timeout_seconds=600,
+        )
+
+        # Stub from_callable so the test doesn't hit the workspace.
+        staged_body = SparkPythonTask(python_file="/from_callable.py")
+        staged = JobTask(
+            job=job,
+            task_key="step",
+            details=Task(
+                task_key="step",
+                description="from docstring",
+                spark_python_task=staged_body,
+            ),
+        )
+        with self._patch_jobtask_method("from_callable", return_value=staged), \
+                self._patch_jobtask_method("create_or_update"):
+            def step():
+                """from docstring"""
+
+            returned = jt.decorate(step)
+
+        self.assertIs(returned, step)
+        self.assertIs(step._job_task, jt)  # type: ignore[attr-defined]
+        # Pre-set fields untouched.
+        self.assertIs(jt._details.spark_python_task, preset_body)
+        self.assertEqual(jt._details.description, "caller wins")
+        self.assertEqual(jt._details.timeout_seconds, 600)
+
+    def test_decorate_fills_in_missing_defaults(self):
+        job = self._job()
+        # No body / description on the handle — decorate should fill both.
+        jt = job.task("step", timeout_seconds=600)
+
+        staged_body = SparkPythonTask(python_file="/from_callable.py")
+        staged = JobTask(
+            job=job,
+            task_key="step",
+            details=Task(
+                task_key="step",
+                description="from docstring",
+                spark_python_task=staged_body,
+            ),
+        )
+        with self._patch_jobtask_method("from_callable", return_value=staged), \
+                self._patch_jobtask_method("create_or_update"):
+            def step():
+                """from docstring"""
+
+            jt.decorate(step)
+
+        self.assertIs(jt._details.spark_python_task, staged_body)
+        self.assertEqual(jt._details.description, "from docstring")
+        self.assertEqual(jt._details.timeout_seconds, 600)
+
+    def _patch_jobtask_method(self, name: str, *, return_value: Any = None):
+        from unittest.mock import patch
+        return patch.object(JobTask, name, return_value=return_value)
+
+    def test_pytask_bare_defaults_task_key_to_func_name(self):
+        job = self._job()
+        staged_body = SparkPythonTask(python_file="/from_callable.py")
+
+        def _fake_from_callable(cls, j, f, **_kw):
+            return JobTask(
+                job=j,
+                task_key=f.__name__,
+                details=Task(
+                    task_key=f.__name__,
+                    description="from docstring",
+                    spark_python_task=staged_body,
+                ),
+            )
+
+        from unittest.mock import patch
+        with patch.object(JobTask, "from_callable", classmethod(_fake_from_callable)), \
+                patch.object(JobTask, "create_or_update"):
+
+            @job.pytask
+            def step():
+                """from docstring"""
+
+        jt: JobTask = step._job_task  # type: ignore[attr-defined]
+        self.assertEqual(jt.task_key, "step")
+        self.assertIs(jt._details.spark_python_task, staged_body)
+
+    def test_pytask_parametrized_forwards_fields(self):
+        job = self._job()
+        staged_body = SparkPythonTask(python_file="/from_callable.py")
+
+        def _fake_from_callable(cls, j, f, **_kw):
+            return JobTask(
+                job=j,
+                task_key=_kw.get("task_key") or f.__name__,
+                details=Task(
+                    task_key=_kw.get("task_key") or f.__name__,
+                    description="from docstring",
+                    spark_python_task=staged_body,
+                ),
+            )
+
+        from unittest.mock import patch
+        with patch.object(JobTask, "from_callable", classmethod(_fake_from_callable)), \
+                patch.object(JobTask, "create_or_update"):
+
+            @job.pytask(task_key="custom", description="caller wins", timeout_seconds=600)
+            def step():
+                """from docstring"""
+
+        jt: JobTask = step._job_task  # type: ignore[attr-defined]
+        self.assertEqual(jt.task_key, "custom")
+        self.assertEqual(jt._details.description, "caller wins")
+        self.assertEqual(jt._details.timeout_seconds, 600)
+        # spark_python_task wasn't pre-set, decorate filled it in.
+        self.assertIs(jt._details.spark_python_task, staged_body)
 
 
 class TestJobsSubmit(DatabricksTestCase):

@@ -193,10 +193,13 @@ class JobTask:
             def step_one(): ...
 
         Stages *func*'s raw source under the user's workspace via
-        :meth:`from_callable`, layers the resulting
-        :class:`SparkPythonTask` onto any fields the caller already
-        passed through :meth:`Job.task` (description, compute, etc.),
-        then pushes the task through :meth:`create_or_update` so a
+        :meth:`from_callable`, then back-fills its derived defaults
+        (``spark_python_task``, ``description`` from the docstring)
+        onto :attr:`_details` *only where the caller didn't already
+        set that field* through :meth:`Job.task`. Anything pre-set on
+        the handle — ``spark_python_task=…``, ``description=…``,
+        compute, dependencies, retries, environment_key — wins.
+        Pushes the result through :meth:`create_or_update` so a
         re-decoration replaces the previous entry in place.
 
         Returns the original callable so the function stays usable
@@ -210,16 +213,17 @@ class JobTask:
         assert staged_details is not None, (
             "JobTask.from_callable should always populate _details"
         )
-        if self._details is not None:
-            self._details = _dc_replace(
-                self._details,
-                spark_python_task=staged_details.spark_python_task,
-                # Honour an explicit description from Job.task(...); fall
-                # back to the staged docstring-derived one.
-                description=self._details.description or staged_details.description,
-            )
-        else:
+        if self._details is None:
             self._details = staged_details
+        else:
+            # Caller-supplied fields win; decorate only fills in slots
+            # the caller left as None on the pre-built Task.
+            defaults = {
+                k: v for k, v in vars(staged_details).items()
+                if v is not None and getattr(self._details, k, None) is None
+            }
+            if defaults:
+                self._details = _dc_replace(self._details, **defaults)
         self.create_or_update()
         func._job_task = self  # type: ignore[attr-defined]
         return func
