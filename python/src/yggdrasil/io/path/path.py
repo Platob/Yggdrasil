@@ -492,70 +492,44 @@ class Path(Holder, os.PathLike, ABC):
         return self
 
     # ==================================================================
-    # Byte transfer — upload / download between holders, IO cursors, paths
+    # Byte transfer — optimized hooks for Path-to-Path and Path-to-Holder
     # ==================================================================
 
-    def upload(self, to: Any) -> "Holder | IO":
-        """Copy this path's bytes into *to*.
+    def _transfer_to(self, target: "Holder | IO") -> None:
+        """Path-side override of :meth:`Holder._transfer_to`.
 
-        *to* accepts any of:
+        Two filesystem-aware fast paths skip materialising the full
+        payload into Python bytes:
 
-        - :class:`Holder` (including another :class:`Path`) — bytes
-          land at offset 0; the holder is returned.
-        - :class:`IO` — bytes are written at the cursor's current
-          position via :meth:`IO.write`; the cursor is returned.
-        - :class:`str` / :class:`os.PathLike` — coerced via
-          :meth:`Path.from_`. A trailing ``/`` (empty :attr:`URL.name`)
-          marks *to* as a directory; this path's :attr:`name` is
-          joined onto it. The resolved :class:`Path` is returned.
+        1. **Local→local** — both ends back a local file: hand off to
+           :func:`shutil.copyfile`, which uses ``sendfile`` /
+           ``copy_file_range`` / ``fclonefileat`` under the hood.
+        2. **Local→remote holder** — self is a local file, target is
+           a non-IO :class:`Holder` (any remote :class:`Path`, a
+           :class:`Memory`, …): stream via
+           :meth:`Holder.write_local_path` so a multi-GB file
+           uploads in :data:`_COPY_CHUNK`-sized chunks instead of
+           one giant in-memory ``read_bytes()``.
 
-        Returns the resolved target so chains like
-        ``src.upload(dst).read_bytes()`` work.
+        Everything else falls back to the generic
+        :meth:`Holder._transfer_to` (bytes copy).
         """
-        target = self._resolve_transfer_target(to)
-        target.write_bytes(self.read_bytes())
-        return target
+        from yggdrasil.io.base import IO  # local to break the import cycle
 
-    def download(self, to: Any = None) -> "Holder | IO":
-        """Copy this path's bytes to a local target.
-
-        Same *to* coercion as :meth:`upload`. When *to* is :data:`None`,
-        bytes land in the user's ``~/Downloads`` folder under this
-        path's :attr:`name`, with browser-style ``(1)``, ``(2)``, …
-        suffixes appended on name conflict. Returns the resolved
-        target.
-        """
-        if to is None:
-            to = _default_download_target(self.name)
-        return self.upload(to)
-
-    def _resolve_transfer_target(self, to: Any) -> "Holder | IO":
-        """Normalize an upload/download target into a :class:`Holder` or :class:`IO`.
-
-        - :class:`Holder` / :class:`IO` instances pass through. When
-          the holder is a :class:`Path` whose URL ends in ``/``
-          (directory shape), this path's :attr:`name` is appended.
-        - ``str`` / :class:`os.PathLike` is coerced via
-          :meth:`Path.from_` and the same trailing-slash rule.
-
-        Trailing-slash is a local-only directory hint — no
-        ``is_dir`` / ``stat`` round trip is issued against the
-        target. Callers that already know they want a child path
-        should pass ``parent / "name.ext"`` explicitly.
-        """
-        if isinstance(to, IO):
-            return to
-        if isinstance(to, Path):
-            return to / self.name if _looks_like_directory(to) else to
-        if isinstance(to, Holder):
-            return to
-        if isinstance(to, (str, os.PathLike)):
-            target = Path.from_(to)
-            return target / self.name if _looks_like_directory(target) else target
-        raise TypeError(
-            f"Path.upload/download: expected a Holder, IO, str, or "
-            f"os.PathLike target; got {type(to).__name__}: {to!r}"
-        )
+        if isinstance(target, IO):
+            return super()._transfer_to(target)
+        if (
+            isinstance(target, Path)
+            and self.is_local_path
+            and target.is_local_path
+        ):
+            import shutil
+            shutil.copyfile(os.fspath(self), os.fspath(target))
+            return
+        if self.is_local_path:
+            target.write_local_path(os.fspath(self))
+            return
+        return super()._transfer_to(target)
 
     # ==================================================================
     # Module upload / import — share local Python packages over the wire
@@ -822,48 +796,3 @@ class Path(Holder, os.PathLike, ABC):
 
     def __str__(self) -> str:
         return self.full_path()
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _looks_like_directory(path: "Path") -> bool:
-    """Local-only heuristic: ``True`` iff the URL string ends in ``/``.
-
-    Used by :meth:`Path._resolve_transfer_target` to decide whether
-    to join the source's filename onto an upload destination. The
-    rule mirrors POSIX ``cp`` — explicit trailing slash means "into
-    this directory", no slash means "to this exact name". No remote
-    ``stat`` is issued.
-    """
-    parts = path.url.parts
-    return bool(parts) and parts[-1] == ""
-
-
-def _default_download_target(name: str) -> "Path":
-    """Resolve a fresh :class:`LocalPath` under ``~/Downloads`` for *name*.
-
-    Mirrors the browser-side default: drop the file under the user's
-    Downloads folder, and on a name clash append ``(1)``, ``(2)``,
-    … before the suffix until a free slot is found. The directory
-    is created on demand. Returns the :class:`LocalPath` that the
-    caller should write into — the file itself is not created here.
-    """
-    from yggdrasil.io.path.local_path import LocalPath
-
-    downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
-    os.makedirs(downloads_dir, exist_ok=True)
-
-    candidate = os.path.join(downloads_dir, name)
-    if not os.path.exists(candidate):
-        return LocalPath(candidate)
-
-    stem, suffix = os.path.splitext(name)
-    i = 1
-    while True:
-        candidate = os.path.join(downloads_dir, f"{stem} ({i}){suffix}")
-        if not os.path.exists(candidate):
-            return LocalPath(candidate)
-        i += 1

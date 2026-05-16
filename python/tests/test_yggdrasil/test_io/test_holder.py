@@ -369,3 +369,113 @@ class TestHolderTabular:
             {"id": 2, "value": 20},
             {"id": 3, "value": 30},
         ]
+
+
+class TestHolderTransfer:
+    """``Holder.upload`` / ``Holder.download`` accept Holder/IO/str/PathLike."""
+
+    def test_memory_uploads_to_str_path(self, tmp_path) -> None:
+        mem = Memory()
+        mem.write_bytes(b"payload")
+        out = mem.upload(str(tmp_path / "dst.bin"))
+        assert isinstance(out, LocalPath)
+        assert out.read_bytes() == b"payload"
+
+    def test_memory_uploads_to_io_cursor(self) -> None:
+        from yggdrasil.io.bytes_io import BytesIO
+
+        mem = Memory()
+        mem.write_bytes(b"payload")
+        with BytesIO() as bio:
+            out = mem.upload(bio)
+            assert out is bio
+            assert bio.to_bytes() == b"payload"
+
+    def test_memory_uploads_to_holder(self) -> None:
+        # Holder→Holder via the abstract path; both ends are in-process
+        # Memory, so the generic bytes-copy fallback runs.
+        src = Memory()
+        src.write_bytes(b"payload")
+        dst = Memory()
+        out = src.upload(dst)
+        assert out is dst
+        assert dst.read_bytes() == b"payload"
+
+    def test_trailing_slash_target_appends_filename(self, tmp_path) -> None:
+        # The trailing-slash directory hint also applies when the
+        # source is a Memory holder — the fallback filename is
+        # "download" because Memory URLs carry no meaningful name.
+        mem = Memory()
+        mem.write_bytes(b"payload")
+        (tmp_path / "sub").mkdir()
+        out = mem.upload(str(tmp_path / "sub") + "/")
+        assert out.name == "download"
+        assert out.read_bytes() == b"payload"
+
+    def test_default_download_falls_back_to_generic_name(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        # Memory holders don't have a useful URL name; the default
+        # download filename is "download".
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        mem = Memory()
+        mem.write_bytes(b"payload")
+        out = mem.download()
+        assert out.name == "download"
+        assert out.read_bytes() == b"payload"
+
+    def test_upload_rejects_unsupported_type(self) -> None:
+        mem = Memory()
+        mem.write_bytes(b"payload")
+        with pytest.raises(TypeError, match="Holder, IO, str, or os.PathLike"):
+            mem.upload(42)
+
+
+class TestPathTransferOptimization:
+    """``Path._transfer_to`` overrides for local-aware fast paths."""
+
+    def test_local_to_local_uses_shutil_copyfile(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        # When both ends are local files, the Path override hands off
+        # to shutil.copyfile rather than the generic read_bytes →
+        # write_bytes round-trip.
+        import shutil
+
+        calls: list[tuple[str, str]] = []
+        real_copyfile = shutil.copyfile
+
+        def tracer(src, dst, *, follow_symlinks=True):
+            calls.append((str(src), str(dst)))
+            return real_copyfile(src, dst, follow_symlinks=follow_symlinks)
+
+        monkeypatch.setattr(shutil, "copyfile", tracer)
+
+        src = LocalPath(str(tmp_path / "src.bin"))
+        src.write_bytes(b"payload")
+        out = src.upload(str(tmp_path / "dst.bin"))
+        assert calls == [(src.os_path, out.os_path)]
+        assert out.read_bytes() == b"payload"
+
+    def test_local_to_holder_uses_write_local_path(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        # When self is local and target is a non-IO holder (here
+        # Memory), the override routes through Holder.write_local_path
+        # so multi-GB transfers don't materialise the whole payload.
+        seen: list[str] = []
+        real = Memory.write_local_path
+
+        def tracer(self, path, **kw):
+            seen.append(os.fspath(path))
+            return real(self, path, **kw)
+
+        monkeypatch.setattr(Memory, "write_local_path", tracer)
+
+        src = LocalPath(str(tmp_path / "src.bin"))
+        src.write_bytes(b"payload")
+        mem = Memory()
+        out = src.upload(mem)
+        assert out is mem
+        assert seen == [src.os_path]
+        assert mem.read_bytes() == b"payload"
