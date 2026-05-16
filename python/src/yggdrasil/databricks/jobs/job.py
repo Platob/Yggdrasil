@@ -69,15 +69,8 @@ class Job(Singleton, DatabricksResource):
         service: "Jobs | None" = None,
         job_id: int | None = None,
         job_name: str | None = None,
-        *,
-        client: Any = None,
         **_kwargs: Any,
     ) -> Any:
-        # Route ``client=...`` through ``client.jobs`` so two ``Job(client=c, ...)``
-        # calls collapse onto the same singleton key instead of stacking distinct
-        # ``Jobs(client=c)`` instances.
-        if service is None and client is not None:
-            service = client.jobs
         return (cls, service, job_id, job_name)
 
     def __init__(
@@ -86,7 +79,6 @@ class Job(Singleton, DatabricksResource):
         job_id: int | None = None,
         job_name: str | None = None,
         *,
-        client: Any = None,
         details: Optional[JobInfo] = None,
         singleton_ttl: Any = ...,
     ):
@@ -94,8 +86,6 @@ class Job(Singleton, DatabricksResource):
         if getattr(self, "_initialized", False):
             return
 
-        if service is None:
-            service = client.jobs if client is not None else None
         if service is None:
             from .service import Jobs
             service = Jobs.current()
@@ -377,7 +367,7 @@ class Job(Singleton, DatabricksResource):
 
         Usable bare or parametrized::
 
-            job = Job(service=..., job_id=123)
+            job = client.jobs.get_or_create(job_id=123, name="my-job")
 
             @job.task
             def do(a: str, i: int):
@@ -387,10 +377,12 @@ class Job(Singleton, DatabricksResource):
             def do2(x: int): ...
 
         Internally calls :meth:`JobTask.from_callable` to pickle the
-        function under the user's workspace, then :meth:`JobTask.create`
-        to push the new task into the job's settings. Any extra
-        ``task_fields`` are layered onto the resulting
-        :class:`databricks.sdk.service.jobs.Task` via
+        function under the user's workspace, then
+        :meth:`JobTask.create_or_update` to push the task into the
+        job's settings — re-decorating the same function during
+        development replaces the previous entry in place instead of
+        raising. Any extra ``task_fields`` are layered onto the
+        resulting :class:`databricks.sdk.service.jobs.Task` via
         :func:`dataclasses.replace` before submission — useful for
         attaching compute (``new_cluster=`` / ``existing_cluster_id=``
         / ``job_cluster_key=``), dependencies, retries, etc.
@@ -405,7 +397,7 @@ class Job(Singleton, DatabricksResource):
             jt = JobTask.from_callable(self, f, task_key=task_key)
             if task_fields and jt._details is not None:
                 jt._details = _dc_replace(jt._details, **task_fields)
-            jt.create()
+            jt.create_or_update()
             f._job_task = jt  # type: ignore[attr-defined]
             return f
 

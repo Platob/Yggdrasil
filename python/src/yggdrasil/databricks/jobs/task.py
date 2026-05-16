@@ -118,11 +118,47 @@ class JobTask:
         if any(t.task_key == self.task_key for t in existing):
             raise ValueError(
                 f"Task {self.task_key!r} already exists on {self.job!r}; "
-                "call :meth:`update` instead."
+                "call :meth:`update` or :meth:`create_or_update` instead."
             )
         LOGGER.debug("Creating job task %r on %r", self, self.job)
         self.job.update(tasks=[*existing, self._details])
         LOGGER.info("Created job task %r", self)
+        return self
+
+    def create_or_update(self) -> "JobTask":
+        """Append this task — or replace the existing one with the same key.
+
+        Used by the :meth:`Job.task` decorator so re-decorating the same
+        function during development doesn't raise; the staged pickle on
+        the second pass overwrites the first task entry in place.
+        """
+        if self._details is None:
+            raise ValueError(
+                f"Cannot create_or_update {self!r}: details is None. "
+                "Construct with a Task or build through :meth:`from_callable`."
+            )
+        existing = self._existing_tasks()
+        new_details = self._details
+        replaced = False
+        new_tasks: List[Task] = []
+        for t in existing:
+            if t.task_key == self.task_key:
+                new_tasks.append(new_details)
+                replaced = True
+            else:
+                new_tasks.append(t)
+        if not replaced:
+            new_tasks.append(new_details)
+
+        LOGGER.debug(
+            "%s job task %r on %r",
+            "Updating" if replaced else "Creating", self, self.job,
+        )
+        self.job.update(tasks=new_tasks)
+        LOGGER.info(
+            "%s job task %r",
+            "Updated" if replaced else "Created", self,
+        )
         return self
 
     def update(self, **fields: Any) -> "JobTask":
