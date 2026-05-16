@@ -1,7 +1,16 @@
-"""Tests for :mod:`yggdrasil.dataclasses.safe_function`."""
-from __future__ import annotations
+"""Tests for :mod:`yggdrasil.dataclasses.safe_function`.
 
+PEP 563 (``from __future__ import annotations``) is intentionally
+*not* enabled here: the suite exercises annotation resolution and
+needs the type references to be live names in the module globals so
+``inspect.get_annotations(eval_str=True)`` can resolve them.
+Optional engine imports (pyarrow / polars / pandas) are gated with
+``try/except`` and the test classes that use them carry
+``@unittest.skipUnless`` so the file still loads on a base install.
+"""
+import datetime as dt
 import unittest
+from typing import Optional
 
 from yggdrasil.dataclasses.safe_function import (
     check_function_args,
@@ -9,6 +18,29 @@ from yggdrasil.dataclasses.safe_function import (
     describe_signature,
     format_signature,
 )
+
+
+# Optional engine imports — module-level so eval_str can resolve
+# ``pa.Table`` / ``pl.DataFrame`` / ``pd.DataFrame`` against the test
+# module globals at annotation-resolution time.
+try:
+    import pyarrow as pa  # type: ignore[import-not-found]
+except ImportError:
+    pa = None  # type: ignore[assignment]
+
+try:
+    import polars as pl  # type: ignore[import-not-found]
+except ImportError:
+    pl = None  # type: ignore[assignment]
+
+try:
+    import pandas as pd  # type: ignore[import-not-found]
+except ImportError:
+    pd = None  # type: ignore[assignment]
+
+
+def _have(name: str) -> bool:
+    return globals().get(name) is not None
 
 
 def _annotated(name: str = "alice", count: int = 3) -> str:
@@ -152,6 +184,248 @@ class TestCheckargsDecorator(unittest.TestCase):
 
         # No annotations → no coercion; strings stay strings.
         self.assertEqual(passthrough("1", "2"), ("1", "2"))
+
+
+# ---------------------------------------------------------------------------
+# Tricky type hints — primitives, Optional, datetime, list/set, identity
+# ---------------------------------------------------------------------------
+
+class TestSafeFunctionPrimitives(unittest.TestCase):
+    """Built-in scalar coercion targets routed through yggdrasil.convert."""
+
+    def test_int_from_string(self):
+        @checkargs
+        def f(n: int) -> int:
+            return n + 1
+        self.assertEqual(f("41"), 42)
+        # Identity path: an int passed in stays an int.
+        self.assertEqual(f(41), 42)
+
+    def test_float_from_string(self):
+        @checkargs
+        def f(x: float) -> float:
+            return x * 2
+        self.assertEqual(f("3.14"), 6.28)
+
+    def test_bool_from_truthy_string_forms(self):
+        @checkargs
+        def f(flag: bool) -> bool:
+            return flag
+        # Common truthy/falsy strings parse via yggdrasil.convert.
+        for truthy in ("true", "yes", "1", "True"):
+            with self.subTest(truthy=truthy):
+                self.assertTrue(f(truthy))
+        for falsy in ("false", "no", "0", "False"):
+            with self.subTest(falsy=falsy):
+                self.assertFalse(f(falsy))
+
+    def test_date_from_iso_string(self):
+        @checkargs
+        def f(d: dt.date) -> dt.date:
+            return d
+        self.assertEqual(f("2024-01-15"), dt.date(2024, 1, 15))
+
+    def test_datetime_from_iso_string_is_utc_normalized(self):
+        @checkargs
+        def f(ts: dt.datetime) -> dt.datetime:
+            return ts
+        out = f("2024-01-15T10:00:00")
+        self.assertEqual(out, dt.datetime(2024, 1, 15, 10, 0, tzinfo=dt.timezone.utc))
+
+    def test_datetime_from_unix_timestamp(self):
+        @checkargs
+        def f(ts: dt.datetime) -> dt.datetime:
+            return ts
+        # Unix epoch seconds round-trip cleanly via convert.
+        out = f(1700000000)
+        self.assertEqual(out.tzinfo, dt.timezone.utc)
+        self.assertEqual(out, dt.datetime(2023, 11, 14, 22, 13, 20, tzinfo=dt.timezone.utc))
+
+
+class TestSafeFunctionContainers(unittest.TestCase):
+
+    def test_list_int_identity(self):
+        @checkargs
+        def f(xs: list[int]) -> int:
+            return sum(xs)
+        self.assertEqual(f([1, 2, 3]), 6)
+
+    def test_set_int_from_list(self):
+        @checkargs
+        def f(xs: set[int]) -> int:
+            return len(xs)
+        self.assertEqual(f([1, 2, 2, 3]), 3)
+
+
+class TestSafeFunctionOptional(unittest.TestCase):
+    """Optional[T] and None propagation."""
+
+    def test_optional_int_accepts_none(self):
+        @checkargs
+        def f(n: Optional[int]) -> Optional[int]:
+            return n
+        self.assertIsNone(f(None))
+
+    def test_optional_int_coerces_string(self):
+        @checkargs
+        def f(n: Optional[int]) -> Optional[int]:
+            return n
+        self.assertEqual(f("5"), 5)
+        self.assertIsInstance(f("5"), int)
+
+
+# ---------------------------------------------------------------------------
+# Tricky type hints — dataframe engines (pa.Table / pl.DataFrame / pd.DataFrame)
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(_have("pa"), "pyarrow not installed")
+class TestSafeFunctionArrow(unittest.TestCase):
+
+    def test_pa_table_identity(self):
+        @checkargs
+        def f(t: pa.Table) -> int:
+            return t.num_rows
+        tbl = pa.table({"x": [1, 2, 3]})
+        self.assertEqual(f(tbl), 3)
+
+    def test_pa_record_batch_coerced_to_table(self):
+        @checkargs
+        def f(t: pa.Table) -> int:
+            return t.num_rows
+        batch = pa.record_batch([pa.array([1, 2, 3])], names=["x"])
+        # convert lifts a RecordBatch to a single-batch Table.
+        self.assertEqual(f(batch), 3)
+
+    def test_pa_table_coerced_to_record_batch(self):
+        @checkargs
+        def f(b: pa.RecordBatch) -> int:
+            return b.num_rows
+        tbl = pa.table({"x": [1, 2, 3, 4]})
+        self.assertEqual(f(tbl), 4)
+
+
+@unittest.skipUnless(_have("pa") and _have("pl"), "pyarrow or polars not installed")
+class TestSafeFunctionArrowPolars(unittest.TestCase):
+
+    def test_polars_df_coerced_to_pa_table(self):
+        @checkargs
+        def consume(t: pa.Table) -> int:
+            return t.num_rows
+        out = consume(pl.DataFrame({"x": [1, 2, 3]}))
+        self.assertEqual(out, 3)
+
+    def test_pa_table_coerced_to_polars_df(self):
+        @checkargs
+        def consume(df: pl.DataFrame) -> tuple:
+            return df.shape
+        out = consume(pa.table({"x": [1, 2, 3]}))
+        self.assertEqual(out, (3, 1))
+
+
+@unittest.skipUnless(_have("pa") and _have("pd"), "pyarrow or pandas not installed")
+class TestSafeFunctionArrowPandas(unittest.TestCase):
+
+    def test_pandas_df_coerced_to_pa_table(self):
+        @checkargs
+        def consume(t: pa.Table) -> int:
+            return t.num_rows
+        out = consume(pd.DataFrame({"x": [1, 2, 3]}))
+        self.assertEqual(out, 3)
+
+    def test_pa_table_coerced_to_pandas_df(self):
+        @checkargs
+        def consume(df: pd.DataFrame) -> tuple:
+            return df.shape
+        out = consume(pa.table({"x": [1, 2, 3]}))
+        self.assertEqual(out, (3, 1))
+
+
+@unittest.skipUnless(_have("pl") and _have("pd"), "polars or pandas not installed")
+class TestSafeFunctionPolarsPandas(unittest.TestCase):
+
+    def test_polars_df_coerced_to_pandas_df(self):
+        @checkargs
+        def consume(df: pd.DataFrame) -> tuple:
+            return df.shape
+        out = consume(pl.DataFrame({"x": [1, 2, 3]}))
+        self.assertEqual(out, (3, 1))
+
+    def test_pandas_df_coerced_to_polars_df(self):
+        @checkargs
+        def consume(df: pl.DataFrame) -> tuple:
+            return df.shape
+        out = consume(pd.DataFrame({"x": [1, 2, 3]}))
+        self.assertEqual(out, (3, 1))
+
+
+@unittest.skipUnless(_have("pa") and _have("pl"), "pyarrow + polars required")
+class TestCheckFunctionArgsAcrossDataframes(unittest.TestCase):
+    """Round-trip check_function_args against dataframe-shaped signatures."""
+
+    def test_check_function_args_coerces_dataframe_kwargs(self):
+        def consume(t: pa.Table, n: int) -> None: ...
+
+        args, kwargs = check_function_args(
+            consume, (), {"t": pl.DataFrame({"x": [1, 2]}), "n": "7"},
+        )
+        self.assertIsInstance(kwargs["t"], pa.Table)
+        self.assertEqual(kwargs["t"].num_rows, 2)
+        self.assertEqual(kwargs["n"], 7)
+        self.assertIsInstance(kwargs["n"], int)
+
+    def test_check_function_args_coerces_dataframe_positional(self):
+        def consume(t: pa.Table, n: int) -> None: ...
+
+        args, kwargs = check_function_args(
+            consume, (pl.DataFrame({"x": [1, 2]}), "7"), {},
+        )
+        self.assertIsInstance(args[0], pa.Table)
+        self.assertEqual(args[1], 7)
+
+
+# ---------------------------------------------------------------------------
+# Mixed-engine signatures — every parameter coerced independently
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(
+    _have("pa") and _have("pl") and _have("pd"),
+    "pyarrow / polars / pandas all required",
+)
+class TestSafeFunctionMixedEngines(unittest.TestCase):
+
+    def test_each_engine_parameter_coerced_independently(self):
+        @checkargs
+        def heavy(
+            arrow: pa.Table,
+            polars_df: pl.DataFrame,
+            pandas_df: pd.DataFrame,
+            cutoff: dt.date,
+            limit: int,
+        ) -> dict:
+            return {
+                "arrow_rows": arrow.num_rows,
+                "polars_shape": polars_df.shape,
+                "pandas_shape": pandas_df.shape,
+                "cutoff": cutoff,
+                "limit": limit,
+            }
+
+        # Cross every parameter with a non-matching input type so the
+        # decorator actually has to convert each one.
+        out = heavy(
+            arrow=pl.DataFrame({"x": [1, 2, 3]}),         # pl → pa
+            polars_df=pa.table({"x": [4, 5]}),            # pa → pl
+            pandas_df=pl.DataFrame({"x": [6, 7, 8, 9]}),  # pl → pd
+            cutoff="2024-01-15",                          # str → date
+            limit="50",                                   # str → int
+        )
+
+        self.assertEqual(out["arrow_rows"], 3)
+        self.assertEqual(out["polars_shape"], (2, 1))
+        self.assertEqual(out["pandas_shape"], (4, 1))
+        self.assertEqual(out["cutoff"], dt.date(2024, 1, 15))
+        self.assertEqual(out["limit"], 50)
+        self.assertIsInstance(out["limit"], int)
 
 
 if __name__ == "__main__":
