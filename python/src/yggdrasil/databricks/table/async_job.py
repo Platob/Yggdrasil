@@ -424,10 +424,12 @@ class AsyncInsertJob:
 
         Resolves the workspace client, looks up the target table,
         takes an exclusive :meth:`lock` on its staging folder, and
-        applies every staged :class:`AsyncInsert` record against the
-        target via :class:`AsyncWrite`. Concurrent applier runs
-        block on the lock so the staging folder is drained by at
-        most one process at a time.
+        applies every staged :class:`AsyncInsert` record by handing
+        the merged records + engine to :meth:`AsyncInsert.concat`
+        (the engine picks the execution path — warehouse, Spark,
+        whatever it's wired to). Concurrent applier runs block on
+        the lock so the staging folder is drained by at most one
+        process at a time.
 
         Used by :meth:`Table.async_job` as the staged Python task
         when the job doesn't exist yet — ``inspect.getsource`` is
@@ -437,7 +439,7 @@ class AsyncInsertJob:
         """
         from yggdrasil.databricks.client import DatabricksClient
         from yggdrasil.databricks.table.async_job import AsyncInsertJob
-        from yggdrasil.databricks.table.async_write import AsyncWrite
+        from yggdrasil.databricks.table.async_write import AsyncInsert
 
         client = DatabricksClient.current()
         engine = client.sql(
@@ -449,9 +451,9 @@ class AsyncInsertJob:
             records = AsyncInsertJob.load(table)
             if not records:
                 return
-            AsyncWrite.from_records(
+            AsyncInsert.concat(
                 records,
-                executor=engine.warehouse(),
+                engine=engine,
                 client=client,
                 wait=True,
                 raise_error=True,
