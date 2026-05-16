@@ -23,7 +23,7 @@ import json
 import logging
 import textwrap
 from dataclasses import replace as _dc_replace
-from typing import Any, Callable, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, List, Optional, Sequence, TYPE_CHECKING, Union
 
 from databricks.sdk.service.compute import Environment
 from databricks.sdk.service.jobs import JobEnvironment, SparkPythonTask, Task
@@ -33,8 +33,14 @@ from yggdrasil.dataclasses.safe_function import (
     format_signature,
 )
 
+from .introspect import (
+    dependencies_to_pip_specs,
+    sniff_script,
+)
+
 if TYPE_CHECKING:
     from .job import Job
+    from .workspace_pypi import WorkspacePyPI
 
 
 __all__ = [
@@ -95,6 +101,8 @@ class JobTask:
         details: Optional[Task] = None,
         *,
         order: Optional[int] = None,
+        extra_dependencies: Optional[Sequence[str]] = None,
+        sniffed_env_vars: Optional[Sequence[str]] = None,
     ) -> None:
         self.job = job
         self.task_key = task_key
@@ -105,6 +113,22 @@ class JobTask:
         #: ``0`` lands first and ``-1`` lands second-to-last (insert
         #: semantics: ``lst[:order] + [t] + lst[order:]``).
         self.order = order
+        #: Pip requirement strings derived from sniffing the staged
+        #: script's imports — merged into the matching
+        #: :class:`JobEnvironment` on :meth:`create` so the cluster /
+        #: serverless env can resolve them. Populated by
+        #: :meth:`from_callable` when ``auto_dependencies=True``; the
+        #: caller can also pass it directly to pin extra wheels.
+        self.extra_dependencies: List[str] = (
+            list(extra_dependencies) if extra_dependencies else []
+        )
+        #: Env var names the staged script reads via
+        #: ``os.getenv("X")`` / ``os.environ[...]``. Surfaced for
+        #: diagnostics so a caller can spot a missing ``spark_env_vars``
+        #: entry before the run actually fails.
+        self.sniffed_env_vars: List[str] = (
+            list(sniffed_env_vars) if sniffed_env_vars else []
+        )
 
     def __repr__(self) -> str:
         return (
@@ -243,12 +267,12 @@ class JobTask:
         """Return the parent job's ``environments`` extended with *task*'s key.
 
         Returns ``None`` when *task* doesn't reference an
-        ``environment_key`` or when the key is already declared on the
-        job — in both cases :meth:`Job.update` shouldn't touch the
-        ``environments`` setting. Otherwise returns a new list that
-        preserves the existing entries and appends a default
-        :class:`JobEnvironment` so the serverless backend accepts the
-        task on submit.
+        ``environment_key`` and the task carries no
+        :attr:`extra_dependencies`. Otherwise returns a new list that
+        either appends a default :class:`JobEnvironment` for the key
+        (when missing) or extends the existing entry's pip
+        ``dependencies`` with the task's auto-sniffed requirements
+        (when present and not already declared).
         """
         env_key = getattr(task, "environment_key", None)
         if not env_key:
@@ -257,9 +281,26 @@ class JobTask:
         existing: List[JobEnvironment] = list(
             (settings.environments if settings is not None else None) or []
         )
-        if any(getattr(e, "environment_key", None) == env_key for e in existing):
-            return None
-        existing.append(_default_job_environment(env_key))
+        extra = list(self.extra_dependencies or ())
+
+        for idx, env in enumerate(existing):
+            if getattr(env, "environment_key", None) != env_key:
+                continue
+            if not extra:
+                return None
+            merged_spec = _extend_env_dependencies(env, extra)
+            if merged_spec is env:
+                # Nothing new to add — leave the env list untouched.
+                return None
+            existing[idx] = merged_spec
+            return existing
+
+        existing.append(
+            _default_job_environment(
+                env_key,
+                dependencies=[*DEFAULT_ENVIRONMENT_DEPENDENCIES, *extra],
+            )
+        )
         return existing
 
     # ------------------------------------------------------------------ #
@@ -305,6 +346,14 @@ class JobTask:
             }
             if defaults:
                 self._details = _dc_replace(self._details, **defaults)
+        # Carry the sniffed-from-source state across so :meth:`create`
+        # sees the same dependency union it would've gotten if the
+        # caller had built the staged JobTask directly.
+        self.extra_dependencies = _dedupe_preserve(
+            [*self.extra_dependencies, *staged.extra_dependencies],
+        )
+        if not self.sniffed_env_vars:
+            self.sniffed_env_vars = list(staged.sniffed_env_vars)
         self.create()
         func._job_task = self  # type: ignore[attr-defined]
         return func
@@ -320,6 +369,10 @@ class JobTask:
         *args: Any,
         task_key: Optional[str] = None,
         staging_root: str = DEFAULT_STAGING_ROOT,
+        auto_dependencies: bool = True,
+        extra_dependencies: Optional[Sequence[str]] = None,
+        exclude_modules: Sequence[str] = (),
+        workspace_pypi: Union[bool, "WorkspacePyPI", None] = False,
         **kwargs: Any,
     ) -> "JobTask":
         """Stage *func*'s source + bound *args*/*kwargs* as a Python script.
@@ -344,6 +397,38 @@ class JobTask:
         replace with cluster-bound compute (``new_cluster=`` /
         ``existing_cluster_id=`` / ``job_cluster_key=``) via
         :meth:`Job.task` when running on classic clusters.
+
+        When ``auto_dependencies`` is true (default), :func:`sniff_imports`
+        walks the rendered script's AST and the result is fed through
+        :func:`dependencies_to_pip_specs` to derive a pinned pip
+        requirement for every non-stdlib top-level import. Those specs
+        land on :attr:`extra_dependencies` and get merged into the
+        target ``JobEnvironment`` on :meth:`create`, so the staged
+        runner finds every transitive package without the caller
+        spelling them out by hand. Pass ``exclude_modules=(...)`` to
+        drop a noisy import; ``extra_dependencies=(...)`` is unioned
+        in unconditionally — useful for wheels that aren't imported
+        from the function body itself (e.g. a CLI plugin loaded
+        through entry points).
+
+        ``workspace_pypi`` controls how local / editable distributions
+        are handled. ``False`` (default) — emit the bare requirement
+        and let the cluster's pip resolution surface the failure.
+        ``True`` — instantiate
+        :class:`~yggdrasil.databricks.jobs.workspace_pypi.WorkspacePyPI`
+        with workspace defaults, build wheels for every editable /
+        local import and upload them to the workspace-side simple
+        index; the rendered spec becomes a PEP 440 direct reference
+        (``project @ /Workspace/.../wheel.whl``). Pass a pre-built
+        :class:`WorkspacePyPI` to pin a custom root or share the same
+        index across many jobs.
+
+        :func:`sniff_env_vars` runs alongside the import sniff; the
+        result lands on :attr:`sniffed_env_vars` for diagnostics. Wire
+        the names through ``Job.task(spark_env_vars=…)`` or via a
+        ``spark_python_task.parameters`` payload — the auto-dep path
+        deliberately doesn't mutate them since env-var provenance
+        belongs in the job spec, not derived from the body.
 
         *args* / *kwargs* are rendered via :func:`repr`, so they must be
         types whose ``repr`` round-trips through ``eval`` (built-in
@@ -404,7 +489,36 @@ class JobTask:
             ),
             environment_key=DEFAULT_ENVIRONMENT_KEY,
         )
-        return cls(job=job, task_key=key, details=details)
+
+        # One AST walk feeds both the auto-dep resolver and the
+        # diagnostics env-var list.
+        sniffed_modules, sniffed_env_vars = sniff_script(script)
+        sniffed_env_var_names = sorted(sniffed_env_vars)
+        publisher = _resolve_workspace_pypi(workspace_pypi, job)
+        derived_specs: list[str] = []
+        if auto_dependencies:
+            derived_specs = dependencies_to_pip_specs(
+                sniffed_modules,
+                exclude=exclude_modules,
+                workspace_pypi=publisher,
+            )
+        merged_specs = _dedupe_preserve(
+            [*(extra_dependencies or ()), *derived_specs],
+        )
+
+        LOGGER.debug(
+            "Sniffed staged task %r imports=%r env_vars=%r — derived "
+            "dependencies %r",
+            key, sorted(sniffed_modules), sniffed_env_var_names, merged_specs,
+        )
+
+        return cls(
+            job=job,
+            task_key=key,
+            details=details,
+            extra_dependencies=merged_specs,
+            sniffed_env_vars=sniffed_env_var_names,
+        )
 
 
 def _content_digest(
@@ -435,25 +549,78 @@ def _content_digest(
     return h.hexdigest()
 
 
-def _default_job_environment(environment_key: str) -> JobEnvironment:
+def _default_job_environment(
+    environment_key: str,
+    *,
+    dependencies: Optional[Sequence[str]] = None,
+) -> JobEnvironment:
     """Build a minimal serverless :class:`JobEnvironment` for *environment_key*.
 
     Databricks' serverless backend rejects Python tasks unless the
     parent job declares a matching ``environments`` entry with a
     ``client`` pin (``Environment.spec``). The default pulls in
     :data:`DEFAULT_ENVIRONMENT_DEPENDENCIES` (``ygg[data,databricks]``
-    from PyPI) so
-    the staged script's ``from yggdrasil...`` imports resolve at
-    runtime. Callers that need extra packages should declare the
-    environment themselves on the job.
+    from PyPI) so the staged script's ``from yggdrasil...`` imports
+    resolve at runtime. Pass *dependencies* to override the list —
+    used by :meth:`JobTask.from_callable`'s auto-dep path to fold in
+    the sniffed pip requirements at environment-creation time.
     """
+    deps = list(dependencies) if dependencies is not None else list(
+        DEFAULT_ENVIRONMENT_DEPENDENCIES,
+    )
     return JobEnvironment(
         environment_key=environment_key,
         spec=Environment(
             client=DEFAULT_ENVIRONMENT_CLIENT,
-            dependencies=list(DEFAULT_ENVIRONMENT_DEPENDENCIES),
+            dependencies=_dedupe_preserve(deps),
         ),
     )
+
+
+def _extend_env_dependencies(
+    env: JobEnvironment, extra: Sequence[str],
+) -> JobEnvironment:
+    """Return *env* with *extra* unioned into its ``spec.dependencies``.
+
+    Returns the same instance when every entry of *extra* is already
+    declared — lets :meth:`JobTask._merged_environments` skip the
+    job-side update when there's nothing to push.
+    """
+    spec = env.spec
+    current = list((spec.dependencies if spec is not None else None) or [])
+    merged = _dedupe_preserve([*current, *extra])
+    if merged == current:
+        return env
+    return JobEnvironment(
+        environment_key=env.environment_key,
+        spec=Environment(
+            client=(spec.client if spec is not None else DEFAULT_ENVIRONMENT_CLIENT),
+            dependencies=merged,
+        ),
+    )
+
+
+def _dedupe_preserve(items: Sequence[str]) -> List[str]:
+    """Stable de-duplication used for pip-spec lists.
+
+    ``dict.fromkeys`` preserves insertion order on 3.7+ and runs in C,
+    so the common ``[x, y, x]`` case avoids the explicit ``set`` /
+    ``list`` ping-pong.
+    """
+    return list(dict.fromkeys(item for item in items if item))
+
+
+def _resolve_workspace_pypi(
+    value: Union[bool, "WorkspacePyPI", None],
+    job: "Job",
+) -> Optional["WorkspacePyPI"]:
+    """Coerce the ``workspace_pypi`` kwarg into a publisher or ``None``."""
+    if value is None or value is False:
+        return None
+    if value is True:
+        from .workspace_pypi import WorkspacePyPI
+        return WorkspacePyPI(job.client)
+    return value
 
 
 def _render_callable_script(
@@ -468,27 +635,20 @@ def _render_callable_script(
     :func:`yggdrasil.dataclasses.safe_function.checkargs` so every
     call site — the staged invocation below and any future widget /
     argv re-entry — type-checks inputs against the function's
-    annotations via :func:`yggdrasil.data.cast.convert`. Returns a
-    UTF-8 ``str``; caller encodes for the workspace write.
+    annotations via :func:`yggdrasil.data.cast.convert`.
+
+    Walks *func*'s globals and closure cells to inline every locally
+    defined helper function + literal constant the body references —
+    so a script staged from a notebook / module that defines its own
+    helper ``def`` blocks doesn't ``NameError`` on the runner side.
+    Imported names are left alone (they ride through the auto-dep
+    path); only same-module callables and literal values are inlined.
+    Returns a UTF-8 ``str``; caller encodes for the workspace write.
     """
     from yggdrasil.version import __version__ as ygg_version
 
-    try:
-        source = textwrap.dedent(inspect.getsource(func))
-    except (OSError, TypeError) as exc:  # built-ins, REPL-defined lambdas
-        raise ValueError(
-            f"Cannot stage {func!r} as a JobTask: inspect.getsource failed "
-            f"({exc!s}). from_callable needs a function defined in an "
-            "importable source file."
-        ) from exc
-
-    # Drop decorator lines preceding ``def`` — the runner has no
-    # ``@job.task(...).decorate`` (or any other decorator from this
-    # scope) available. We re-apply ``@checkargs`` ourselves below.
-    lines = source.splitlines()
-    while lines and lines[0].lstrip().startswith("@"):
-        lines.pop(0)
-    body = "@checkargs\n" + "\n".join(lines).rstrip() + "\n"
+    captured_block = _capture_local_references(func)
+    body = "@checkargs\n" + _function_source(func) + "\n"
 
     sig_meta = describe_signature(func)
     meta_payload = {
@@ -512,15 +672,178 @@ def _render_callable_script(
         "# The function body below is the verbatim source of the decorated\n"
         "# callable, re-wrapped with @checkargs so every call site coerces\n"
         "# its inputs to the function's annotated types via\n"
-        "# yggdrasil.data.cast.convert. Signature metadata is embedded\n"
+        "# yggdrasil.data.cast.convert. Local helpers and constants the body\n"
+        "# references are inlined above. Signature metadata is embedded\n"
         "# under __yggdrasil_task__.\n"
         "\n"
         "import json as _yggdrasil_json\n"
         "from yggdrasil.dataclasses.safe_function import checkargs\n"
         f"__yggdrasil_task__ = _yggdrasil_json.loads(r\"\"\"{meta_json}\"\"\")\n"
         "\n"
+        f"{captured_block}"
         f"{body}"
         "\n"
         'if __name__ == "__main__":\n'
         f"    {invocation}\n"
     )
+
+
+def _function_source(func: Callable[..., Any]) -> str:
+    """Return *func*'s source with decorator lines stripped.
+
+    The runner side has no ``@job.task(...).decorate`` (or any other
+    decorator from the caller's scope) available, and the metadata
+    block / ``@checkargs`` wrap is re-applied at render time, so
+    every leading ``@…`` line is dropped.
+    """
+    try:
+        source = textwrap.dedent(inspect.getsource(func))
+    except (OSError, TypeError) as exc:  # built-ins, REPL-defined lambdas
+        raise ValueError(
+            f"Cannot stage {func!r} as a JobTask: inspect.getsource failed "
+            f"({exc!s}). from_callable needs a function defined in an "
+            "importable source file."
+        ) from exc
+    lines = source.splitlines()
+    while lines and lines[0].lstrip().startswith("@"):
+        lines.pop(0)
+    return "\n".join(lines).rstrip()
+
+
+#: Types we know we can render via ``repr`` and get an ``eval``-safe
+#: round-trip. Anything else (live handles, classes, generators) is
+#: left out of the captured-constants block — the runner will hit a
+#: ``NameError`` which is more honest than an import-time crash from
+#: a non-roundtrippable value.
+_INLINEABLE_LITERAL_TYPES = (
+    int, float, complex, bool, str, bytes, type(None),
+    list, tuple, dict, set, frozenset,
+)
+
+
+def _capture_local_references(func: Callable[..., Any]) -> str:
+    """Inline every locally-defined helper / literal *func* depends on.
+
+    Walks ``func``'s globals + closure cells, classifies each
+    referenced name, and renders the ones we can carry across the
+    process boundary:
+
+    - **Same-module callables** (functions or classes whose
+      ``__module__`` matches ``func.__module__``) are inlined via
+      :func:`inspect.getsource`, then themselves walked transitively
+      so the staged script is self-contained.
+    - **Literal-like values** (numbers, strings, bytes, bool, ``None``,
+      list / tuple / dict / set / frozenset of the same) emit
+      ``NAME = <repr>`` assignments.
+    - **Modules** and **imported callables** are skipped — the
+      auto-dependency path already adds the matching pip requirement,
+      and the staged script's existing ``import`` lines bring them
+      back at runtime.
+
+    Returns the rendered block (trailing newline included) ready to
+    drop above the staged function body. Empty string when no local
+    helpers / constants are referenced.
+    """
+    func_module = getattr(func, "__module__", None)
+    rendered: list[str] = []
+    rendered_names: set[str] = set()
+    queue: list[Callable[..., Any]] = [func]
+    visited: set[int] = {id(func)}
+
+    while queue:
+        current = queue.pop(0)
+        current_module = getattr(current, "__module__", None)
+        try:
+            closure_vars = inspect.getclosurevars(current)
+        except (TypeError, ValueError):
+            continue
+        candidates: dict[str, Any] = {
+            **closure_vars.globals, **closure_vars.nonlocals,
+        }
+        for name, value in candidates.items():
+            if name in rendered_names:
+                continue
+            if name == current.__name__ or name == func.__name__:
+                # Recursive self-reference — the function's own ``def``
+                # already covers it; skip to avoid re-emitting.
+                continue
+
+            kind = _classify_reference(value, owning_module=func_module)
+            if kind == "skip":
+                continue
+            if kind == "literal":
+                rendered.append(f"{name} = {value!r}")
+                rendered_names.add(name)
+                continue
+            if kind == "inline":
+                if id(value) in visited:
+                    continue
+                visited.add(id(value))
+                try:
+                    body = _function_source(value)
+                except ValueError as exc:
+                    LOGGER.debug(
+                        "Skipping inline of %r (referenced by %r): %s",
+                        name, current.__qualname__, exc,
+                    )
+                    continue
+                rendered.append(body)
+                rendered_names.add(name)
+                queue.append(value)
+                continue
+        # Closure cells (free vars) — same classification, different
+        # lookup path. ``getclosurevars`` already merges them under
+        # ``nonlocals`` for the common case; this guard catches the
+        # vars Python doesn't expose there (e.g. cells holding
+        # unhashable values).
+        if current.__closure__ and current.__code__.co_freevars:
+            for fname, cell in zip(
+                current.__code__.co_freevars, current.__closure__,
+            ):
+                if fname in rendered_names:
+                    continue
+                try:
+                    value = cell.cell_contents
+                except ValueError:
+                    continue
+                kind = _classify_reference(value, owning_module=func_module)
+                if kind == "literal":
+                    rendered.append(f"{fname} = {value!r}")
+                    rendered_names.add(fname)
+
+    if not rendered:
+        return ""
+    return (
+        "# --- captured local references --- #\n"
+        + "\n\n".join(rendered).rstrip() + "\n\n"
+    )
+
+
+def _classify_reference(value: Any, *, owning_module: Optional[str]) -> str:
+    """Return ``"inline"`` / ``"literal"`` / ``"skip"`` for a referenced value.
+
+    - Modules and builtins: ``skip`` — the staged script's own
+      ``import`` lines cover them.
+    - Functions / classes defined in the same module as the entry
+      callable: ``inline`` — same source tree, safe to splice.
+    - Functions / classes from other modules: ``skip`` — they ride
+      through the auto-dep path; inlining would either duplicate or
+      bring along incompatible dependencies.
+    - Plain literal-shaped values: ``literal`` — emit via ``repr``.
+    """
+    if inspect.ismodule(value):
+        return "skip"
+    if inspect.isbuiltin(value):
+        return "skip"
+    if inspect.isfunction(value) or inspect.isclass(value):
+        target_module = getattr(value, "__module__", None)
+        if (
+            target_module is not None
+            and owning_module is not None
+            and target_module == owning_module
+        ):
+            return "inline"
+        return "skip"
+    if isinstance(value, _INLINEABLE_LITERAL_TYPES):
+        return "literal"
+    return "skip"
