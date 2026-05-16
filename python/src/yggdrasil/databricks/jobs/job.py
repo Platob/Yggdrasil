@@ -12,22 +12,27 @@ from __future__ import annotations
 
 import logging
 from typing import (
-    Any, Callable, ClassVar, Iterator, List, Optional, TYPE_CHECKING, Union,
+    Any, Callable, ClassVar, Dict, Iterator, List, Mapping, Optional,
+    TYPE_CHECKING, Union,
 )
 
 from databricks.sdk.errors import ResourceDoesNotExist
 from databricks.sdk.service.jobs import (
+    CronSchedule,
     Job as JobInfo,
     JobAccessControlRequest,
+    JobParameterDefinition,
     JobSettings,
+    PauseStatus,
     Task,
+    TriggerSettings,
 )
 
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io.url import URL
 
-from ..client import DatabricksResource
+from ..client import DatabricksClient, DatabricksResource
 
 if TYPE_CHECKING:
     from .run import JobRun
@@ -430,3 +435,309 @@ class Job(Singleton, DatabricksResource):
         if func is None:
             return _decorate
         return _decorate(func)
+
+    # ====================================================================== #
+    # Skeleton — class-level template for subclasses
+    # ====================================================================== #
+    #
+    # ``Job`` itself doubles as the base skeleton: subclasses declare
+    # how each piece of a :class:`JobSettings` is derived by overriding
+    # the ``default_*`` classmethods below, and call
+    # :meth:`deploy` / :meth:`find_for` / :meth:`get_for` /
+    # :meth:`delete_for` / :meth:`create_for` to drive the lifecycle
+    # against the workspace. Every hook receives the caller's
+    # ``**context`` kwargs (e.g. ``table=`` on :class:`AsyncInsertJob`)
+    # so the subclass can look up structural inputs without re-deriving
+    # them at every call site.
+    #
+    # The hooks return ``None`` / ``[]`` by default — a bare ``Job``
+    # carries no skeleton; subclasses opt in by overriding only what
+    # they need. Caller-supplied kwargs on :meth:`deploy` always win
+    # over the hook defaults, so a one-off deviation never requires a
+    # subclass override.
+    # ------------------------------------------------------------------ #
+
+    # Each ``default_*`` hook is also the *resolver* — it owns the
+    # transform from caller kwargs to the resolved :class:`JobSettings`
+    # field. The default implementations are passthroughs (``name=``
+    # → name, ``tasks=`` → tasks, …) plus a few light coercions (cron
+    # string → :class:`CronSchedule`); subclasses override to derive
+    # the same fields from their own context (a :class:`Table`, a
+    # :class:`Volume`, …) while still honoring the caller's overrides.
+    # Hooks receive every :meth:`deploy` keyword via ``**kwargs`` and
+    # return ``None`` / ``[]`` when there's nothing to set.
+
+    @classmethod
+    def default_name(cls, *, name: Optional[str] = None, **_: Any) -> Optional[str]:
+        """Skeleton: resolve the job name. Override on subclasses."""
+        return name
+
+    @classmethod
+    def default_tasks(
+        cls,
+        *,
+        tasks: Optional[List[Task]] = None,
+        **_: Any,
+    ) -> List[Task]:
+        """Skeleton: resolve the task list (empty unless overridden)."""
+        return list(tasks) if tasks else []
+
+    @classmethod
+    def default_schedule(
+        cls,
+        *,
+        schedule: Any = None,
+        schedule_timezone: str = "UTC",
+        schedule_pause_status: Any = None,
+        **_: Any,
+    ) -> Optional[CronSchedule]:
+        """Skeleton: resolve the cron schedule.
+
+        Accepts a pre-built :class:`CronSchedule`, a Quartz cron
+        string (coerced with the matching ``schedule_timezone`` /
+        ``schedule_pause_status`` kwargs), or ``None``.
+        """
+        if schedule is None:
+            return None
+        if isinstance(schedule, CronSchedule):
+            return schedule
+        if isinstance(schedule, str):
+            resolved_pause: Any = schedule_pause_status
+            if isinstance(resolved_pause, str):
+                resolved_pause = PauseStatus(resolved_pause.upper())
+            return CronSchedule(
+                quartz_cron_expression=schedule,
+                timezone_id=schedule_timezone,
+                pause_status=resolved_pause,
+            )
+        raise TypeError(
+            f"{cls.__name__}: ``schedule`` must be a CronSchedule, a "
+            f"Quartz cron string, or None — got {type(schedule).__name__}."
+        )
+
+    @classmethod
+    def default_trigger(
+        cls,
+        *,
+        trigger: Optional[TriggerSettings] = None,
+        **_: Any,
+    ) -> Optional[TriggerSettings]:
+        """Skeleton: resolve :class:`TriggerSettings` (file-arrival / …)."""
+        return trigger
+
+    @classmethod
+    def default_parameters(
+        cls,
+        *,
+        parameters: Optional[List[JobParameterDefinition]] = None,
+        **_: Any,
+    ) -> List[JobParameterDefinition]:
+        """Skeleton: resolve job-level parameter definitions."""
+        return list(parameters) if parameters else []
+
+    @classmethod
+    def default_description(
+        cls,
+        *,
+        description: Optional[str] = None,
+        **_: Any,
+    ) -> Optional[str]:
+        """Skeleton: resolve the job description."""
+        return description
+
+    @classmethod
+    def default_tags(
+        cls,
+        *,
+        tags: Optional[Mapping[str, str]] = None,
+        **_: Any,
+    ) -> Optional[Dict[str, str]]:
+        """Skeleton: resolve the tag map."""
+        return dict(tags) if tags else None
+
+    @classmethod
+    def default_settings(cls, **_: Any) -> Dict[str, Any]:
+        """Skeleton: extra :class:`JobSettings` kwargs (``max_concurrent_runs``, …)."""
+        return {}
+
+    @classmethod
+    def resolve_jobs(
+        cls,
+        *,
+        service: "Jobs | None" = None,
+        client: "DatabricksClient | None" = None,
+        **_context: Any,
+    ) -> "Jobs":
+        """Resolve the :class:`Jobs` service to operate against.
+
+        Override to pull the service from a context-bound resource
+        (e.g. ``table.client.jobs`` on :class:`AsyncInsertJob`); the
+        default falls back to the explicit ``service`` / ``client``
+        argument, then :meth:`DatabricksClient.current`.
+        """
+        if service is not None:
+            return service
+        if client is None:
+            client = DatabricksClient.current()
+        return client.jobs
+
+    @classmethod
+    def _build_skeleton_kwargs(cls, **context: Any) -> Dict[str, Any]:
+        """Resolve every :class:`JobSettings` field via the ``default_*`` hooks.
+
+        ``context`` carries the caller's full :meth:`deploy` kwarg set;
+        each hook reads what it needs and returns the resolved field.
+        Subclasses override hooks to add context-derived defaults
+        without changing this assembly path.
+        """
+        resolved_name = cls.default_name(**context)
+        if not resolved_name:
+            raise ValueError(
+                f"{cls.__name__}: cannot resolve job name; pass ``name=`` "
+                f"or override ``default_name(cls, **context)``."
+            )
+
+        resolved_parameters = cls.default_parameters(**context)
+        resolved_trigger = cls.default_trigger(**context)
+        kwargs: Dict[str, Any] = {
+            "name": resolved_name,
+            "tasks": cls.default_tasks(**context),
+            "schedule": cls.default_schedule(**context),
+            "parameters": resolved_parameters if resolved_parameters else None,
+            "description": cls.default_description(**context),
+            "tags": cls.default_tags(**context),
+            **cls.default_settings(**context),
+        }
+        # Trigger lands conditionally: ``Jobs.create_or_update`` filters
+        # explicit ``None`` values at its SDK boundary, but the keyword
+        # being absent is what most call sites assert on (no trigger
+        # requested → no trigger field in the API payload).
+        if resolved_trigger is not None:
+            kwargs["trigger"] = resolved_trigger
+        return kwargs
+
+    @classmethod
+    def _wrap(
+        cls,
+        underlying: "Job",
+        *,
+        service: "Jobs | None" = None,
+        **context: Any,
+    ) -> "Job":
+        """Build a *cls* instance from an existing :class:`Job`.
+
+        Subclasses override to thread context-bound arguments through
+        their own ``__init__`` (e.g. ``AsyncInsertJob(table=...)``).
+        The default constructs by id / name / details so plain
+        ``Job.deploy(...)`` returns a singleton-cached :class:`Job`.
+        """
+        return cls(
+            service=service,
+            job_id=underlying.job_id,
+            job_name=underlying.job_name,
+            details=getattr(underlying, "_details", None),
+        )
+
+    # ------------------------------------------------------------------ #
+    # Skeleton CRUD
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def deploy(
+        cls,
+        *,
+        service: "Jobs | None" = None,
+        client: "DatabricksClient | None" = None,
+        permissions: Optional[List[Union[str, JobAccessControlRequest]]] = None,
+        **kwargs: Any,
+    ) -> "Job":
+        """Idempotent create-or-update using the class skeleton.
+
+        Every :class:`JobSettings` field is resolved by the matching
+        ``default_*`` classmethod, which receives the full *kwargs*
+        bundle so subclasses can derive fields from structural inputs
+        (a :class:`Table`, a :class:`Volume`, …) while still honoring
+        caller overrides (``name=`` / ``tasks=`` / ``schedule=`` /
+        ``trigger=`` / ``parameters=`` / ``description=`` / ``tags=``
+        and any extra :class:`JobSettings` knobs through
+        :meth:`default_settings`).
+        """
+        jobs = cls.resolve_jobs(service=service, client=client, **kwargs)
+        api_kwargs = cls._build_skeleton_kwargs(**kwargs)
+        underlying = jobs.create_or_update(permissions=permissions, **api_kwargs)
+        LOGGER.info(
+            "Deployed %s %r (job_id=%s)",
+            cls.__name__, api_kwargs["name"], underlying.job_id,
+        )
+        return cls._wrap(underlying, service=jobs, **kwargs)
+
+    @classmethod
+    def create_for(
+        cls,
+        *,
+        service: "Jobs | None" = None,
+        client: "DatabricksClient | None" = None,
+        permissions: Optional[List[Union[str, JobAccessControlRequest]]] = None,
+        **kwargs: Any,
+    ) -> "Job":
+        """Explicit create (errors when the named job already exists)."""
+        jobs = cls.resolve_jobs(service=service, client=client, **kwargs)
+        api_kwargs = cls._build_skeleton_kwargs(**kwargs)
+        underlying = jobs.create(permissions=permissions, **api_kwargs)
+        return cls._wrap(underlying, service=jobs, **kwargs)
+
+    @classmethod
+    def find_for(
+        cls,
+        *,
+        service: "Jobs | None" = None,
+        client: "DatabricksClient | None" = None,
+        **kwargs: Any,
+    ) -> "Job | None":
+        """Find the job for *kwargs* (via :meth:`default_name`), or ``None``."""
+        jobs = cls.resolve_jobs(service=service, client=client, **kwargs)
+        resolved_name = cls.default_name(**kwargs)
+        if not resolved_name:
+            raise ValueError(
+                f"{cls.__name__}.find_for: cannot resolve job name; pass "
+                f"``name=`` or override ``default_name(cls, **context)``."
+            )
+        found = jobs.find(name=resolved_name)
+        if found is None:
+            return None
+        return cls._wrap(found, service=jobs, **kwargs)
+
+    @classmethod
+    def get_for(cls, **kwargs: Any) -> "Job":
+        """Like :meth:`find_for` but raises when the job is absent."""
+        found = cls.find_for(**kwargs)
+        if found is None:
+            raise ValueError(
+                f"No {cls.__name__} found for context {kwargs!r}."
+            )
+        return found
+
+    @classmethod
+    def get_or_create(cls, **kwargs: Any) -> "Job":
+        """Return the existing skeleton-named job, otherwise :meth:`create_for`."""
+        found = cls.find_for(**kwargs)
+        if found is not None:
+            return found
+        return cls.create_for(**kwargs)
+
+    @classmethod
+    def delete_for(
+        cls,
+        *,
+        service: "Jobs | None" = None,
+        client: "DatabricksClient | None" = None,
+        **kwargs: Any,
+    ) -> None:
+        """Delete the job for *kwargs* (no-op when it doesn't exist)."""
+        jobs = cls.resolve_jobs(service=service, client=client, **kwargs)
+        resolved_name = cls.default_name(**kwargs)
+        if not resolved_name:
+            raise ValueError(
+                f"{cls.__name__}.delete_for: cannot resolve job name; pass "
+                f"``name=`` or override ``default_name(cls, **context)``."
+            )
+        jobs.delete(name=resolved_name)

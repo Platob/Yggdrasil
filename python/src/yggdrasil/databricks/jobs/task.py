@@ -528,6 +528,136 @@ class JobTask:
             sniffed_env_vars=sniffed_env_var_names,
         )
 
+    # ====================================================================== #
+    # Skeleton — class-level template for subclasses
+    # ====================================================================== #
+    #
+    # Just like :class:`Job`, ``JobTask`` doubles as the base skeleton
+    # for task subclasses. Override :meth:`default_task_key` and
+    # :meth:`default_details` to encode the task shape once on a
+    # subclass, then drive the lifecycle through :meth:`deploy` /
+    # :meth:`find_for` / :meth:`delete_for` against a parent
+    # :class:`Job`. The hooks receive the caller's ``**context``
+    # kwargs so contextual inputs (a :class:`Table`, a notebook path)
+    # flow through without re-derivation. Subclasses chain recursively:
+    # ``class ApplyTask(JobTask)`` → ``class FastApplyTask(ApplyTask)``
+    # picks up the parent's overrides and refines them.
+    # ------------------------------------------------------------------ #
+
+    # Optional per-subclass default task key — picked up by
+    # :meth:`default_task_key` when set. Subclasses can either set
+    # this class var or override :meth:`default_task_key` for
+    # context-derived keys.
+    DEFAULT_TASK_KEY: Optional[str] = None
+
+    @classmethod
+    def default_task_key(cls, **context: Any) -> Optional[str]:
+        """Skeleton: default ``task_key`` for the task."""
+        return cls.DEFAULT_TASK_KEY
+
+    @classmethod
+    def default_details(cls, **context: Any) -> Optional[Task]:
+        """Skeleton: default :class:`Task` body (``None`` unless overridden)."""
+        return None
+
+    @classmethod
+    def default_order(cls, **context: Any) -> Optional[int]:
+        """Skeleton: default ``order`` slot in the parent job's task list."""
+        return None
+
+    @classmethod
+    def deploy(
+        cls,
+        job: "Job",
+        *,
+        task_key: Optional[str] = None,
+        details: Optional[Task] = None,
+        order: Optional[int] = None,
+        extra_dependencies: Optional[Sequence[str]] = None,
+        **context: Any,
+    ) -> "JobTask":
+        """Idempotent create-or-update of this task on *job*.
+
+        Each field is resolved from the matching ``default_*`` hook
+        unless the caller passed it explicitly, then the assembled
+        :class:`JobTask` is pushed through :meth:`create` (which is
+        already idempotent — re-deploying replaces the entry in place
+        or moves it to *order*).
+        """
+        resolved_key = (
+            task_key if task_key is not None
+            else cls.default_task_key(**context)
+        )
+        if not resolved_key:
+            raise ValueError(
+                f"{cls.__name__}.deploy: cannot resolve task_key; pass "
+                f"``task_key=`` or override ``default_task_key(cls, **context)``."
+            )
+        resolved_details = (
+            details if details is not None
+            else cls.default_details(task_key=resolved_key, **context)
+        )
+        if resolved_details is None:
+            raise ValueError(
+                f"{cls.__name__}.deploy: cannot resolve details; pass "
+                f"``details=`` or override ``default_details(cls, **context)``."
+            )
+        resolved_order = (
+            order if order is not None else cls.default_order(**context)
+        )
+
+        instance = cls(
+            job=job,
+            task_key=resolved_key,
+            details=resolved_details,
+            order=resolved_order,
+            extra_dependencies=extra_dependencies,
+        )
+        return instance.create()
+
+    @classmethod
+    def find_for(
+        cls,
+        job: "Job",
+        *,
+        task_key: Optional[str] = None,
+        **context: Any,
+    ) -> "JobTask | None":
+        """Return the bound task for *job* (via :meth:`default_task_key`), or ``None``."""
+        resolved_key = (
+            task_key if task_key is not None
+            else cls.default_task_key(**context)
+        )
+        if not resolved_key:
+            return None
+        existing = (
+            (job.settings.tasks if job.settings is not None else None) or []
+        )
+        for t in existing:
+            if t.task_key == resolved_key:
+                return cls(job=job, task_key=resolved_key, details=t)
+        return None
+
+    @classmethod
+    def delete_for(
+        cls,
+        job: "Job",
+        *,
+        task_key: Optional[str] = None,
+        **context: Any,
+    ) -> None:
+        """Delete the skeleton's task from *job* (no-op when absent)."""
+        resolved_key = (
+            task_key if task_key is not None
+            else cls.default_task_key(**context)
+        )
+        if not resolved_key:
+            raise ValueError(
+                f"{cls.__name__}.delete_for: cannot resolve task_key; pass "
+                f"``task_key=`` or override ``default_task_key(cls, **context)``."
+            )
+        cls(job=job, task_key=resolved_key).delete()
+
 
 def _content_digest(
     func: Callable[..., Any], args: tuple, kwargs: dict,

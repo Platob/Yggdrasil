@@ -869,3 +869,335 @@ class TestJobsSubmit(DatabricksTestCase):
         self.assertIsInstance(run, JobRun)
         self.assertEqual(run.run_id, 99)
         self.jobs_api.submit.assert_called_once()
+
+
+class TestJobSkeleton(DatabricksTestCase):
+    """:class:`Job` doubles as a class-level skeleton.
+
+    Subclasses override the ``default_*`` hooks to derive each
+    :class:`JobSettings` field from their own structural inputs, then
+    drive the lifecycle through :meth:`deploy` / :meth:`find_for` /
+    :meth:`get_for` / :meth:`delete_for`. Caller-supplied kwargs flow
+    through ``**kwargs`` so any hook can read them.
+    """
+
+    def _make_skeleton(self):
+        """Return a Job subclass that derives ``name`` from a ``key`` kwarg."""
+        from databricks.sdk.service.jobs import (
+            JobParameterDefinition,
+            NotebookTask,
+            Task,
+            TriggerSettings,
+            FileArrivalTriggerConfiguration,
+        )
+
+        class KeyedJob(Job):
+            JOB_PREFIX = "skel"
+
+            @classmethod
+            def default_name(cls, *, key: str | None = None, **_kw):
+                return f"{cls.JOB_PREFIX}-{key}" if key else None
+
+            @classmethod
+            def default_tasks(cls, *, key: str | None = None, **_kw):
+                return [Task(
+                    task_key="apply",
+                    notebook_task=NotebookTask(notebook_path=f"/p/{key}"),
+                )] if key else []
+
+            @classmethod
+            def default_parameters(cls, *, key: str | None = None, **_kw):
+                return [JobParameterDefinition(name="key", default=key or "")]
+
+            @classmethod
+            def default_description(cls, *, key: str | None = None, **_kw):
+                return f"Apply for {key}" if key else None
+
+            @classmethod
+            def default_trigger(
+                cls, *, key: str | None = None, trigger_url: str | None = None, **_kw,
+            ):
+                if not trigger_url:
+                    return None
+                return TriggerSettings(
+                    file_arrival=FileArrivalTriggerConfiguration(url=trigger_url),
+                )
+
+        return KeyedJob
+
+    def test_deploy_resolves_every_setting_from_hooks(self):
+        from databricks.sdk.service.jobs import Job as JobInfo
+
+        cls = self._make_skeleton()
+        self.jobs_api.create.return_value = MagicMock(job_id=42)
+        self.jobs_api.list.return_value = iter([])  # find by name → not present
+        self.jobs_api.get.return_value = JobInfo(
+            job_id=42, settings=JobSettings(name="skel-orders"),
+        )
+
+        instance = cls.deploy(service=self.jobs, key="orders")
+
+        self.assertIsInstance(instance, cls)
+        self.assertIsInstance(instance, Job)
+        self.assertEqual(instance.job_id, 42)
+        # The SDK boundary saw the resolved name + tasks + description.
+        _, create_kwargs = self.jobs_api.create.call_args
+        self.assertEqual(create_kwargs["name"], "skel-orders")
+        self.assertEqual(create_kwargs["tasks"][0].task_key, "apply")
+        self.assertEqual(
+            create_kwargs["tasks"][0].notebook_task.notebook_path,
+            "/p/orders",
+        )
+        self.assertEqual(create_kwargs["description"], "Apply for orders")
+
+    def test_deploy_passes_trigger_only_when_hook_returns_one(self):
+        cls = self._make_skeleton()
+        self.jobs_api.create.return_value = MagicMock(job_id=1)
+        self.jobs_api.list.return_value = iter([])
+
+        # Hook returns None when no trigger_url → no ``trigger`` kwarg.
+        cls.deploy(service=self.jobs, key="a")
+        _, kwargs = self.jobs_api.create.call_args
+        self.assertNotIn("trigger", kwargs)
+
+        # Hook returns TriggerSettings when trigger_url is set.
+        self.jobs_api.create.reset_mock()
+        self.jobs_api.create.return_value = MagicMock(job_id=2)
+        cls.deploy(
+            service=self.jobs, key="b", trigger_url="dbfs:/Volumes/x/y/z/",
+        )
+        _, kwargs = self.jobs_api.create.call_args
+        self.assertIsNotNone(kwargs.get("trigger"))
+
+    def test_deploy_without_name_resolution_raises(self):
+        """Plain :class:`Job` (default ``default_name`` = passthrough)
+        with no caller-supplied ``name=`` can't resolve a job name."""
+        with self.assertRaises(ValueError):
+            Job.deploy(service=self.jobs)
+
+    def test_find_for_returns_none_when_absent(self):
+        cls = self._make_skeleton()
+        self.jobs_api.list.return_value = iter([])
+
+        result = cls.find_for(service=self.jobs, key="missing")
+        self.assertIsNone(result)
+
+    def test_find_for_wraps_existing_into_subclass(self):
+        cls = self._make_skeleton()
+        existing = _base_job(job_id=77, name="skel-orders")
+        self.jobs_api.list.return_value = iter([existing])
+
+        found = cls.find_for(service=self.jobs, key="orders")
+        self.assertIsNotNone(found)
+        self.assertIsInstance(found, cls)
+        self.assertEqual(found.job_id, 77)
+
+    def test_get_or_create_returns_existing_when_present(self):
+        cls = self._make_skeleton()
+        existing = _base_job(job_id=88, name="skel-orders")
+        self.jobs_api.list.return_value = iter([existing])
+
+        instance = cls.get_or_create(service=self.jobs, key="orders")
+        self.assertEqual(instance.job_id, 88)
+        # Existing → no create call.
+        self.jobs_api.create.assert_not_called()
+
+    def test_get_or_create_creates_when_missing(self):
+        cls = self._make_skeleton()
+        self.jobs_api.list.return_value = iter([])
+        self.jobs_api.create.return_value = MagicMock(job_id=99)
+
+        instance = cls.get_or_create(service=self.jobs, key="new")
+        self.assertEqual(instance.job_id, 99)
+        self.jobs_api.create.assert_called_once()
+
+    def test_delete_for_routes_through_jobs_delete(self):
+        cls = self._make_skeleton()
+        self.jobs_api.list.return_value = iter([
+            _base_job(job_id=44, name="skel-orders"),
+        ])
+
+        cls.delete_for(service=self.jobs, key="orders")
+        self.jobs_api.delete.assert_called_once_with(job_id=44)
+
+    def test_caller_override_wins_in_default_name(self):
+        """Subclass can re-implement ``default_name`` to honor caller ``name=``."""
+
+        class OverridableJob(Job):
+            @classmethod
+            def default_name(cls, *, name=None, key=None, **_kw):
+                return name or (f"derived-{key}" if key else None)
+
+        self.jobs_api.create.return_value = MagicMock(job_id=1)
+        self.jobs_api.list.return_value = iter([])
+        OverridableJob.deploy(service=self.jobs, name="explicit", key="ignored")
+        _, kwargs = self.jobs_api.create.call_args
+        self.assertEqual(kwargs["name"], "explicit")
+
+    def test_default_schedule_coerces_cron_string(self):
+        """Built-in :meth:`Job.default_schedule` accepts cron-string input."""
+        from databricks.sdk.service.jobs import CronSchedule
+
+        cls = self._make_skeleton()
+        self.jobs_api.create.return_value = MagicMock(job_id=1)
+        self.jobs_api.list.return_value = iter([])
+
+        cls.deploy(
+            service=self.jobs, key="a",
+            schedule="0 0 */6 * * ?", schedule_timezone="UTC",
+        )
+        _, kwargs = self.jobs_api.create.call_args
+        self.assertIsInstance(kwargs["schedule"], CronSchedule)
+        self.assertEqual(
+            kwargs["schedule"].quartz_cron_expression, "0 0 */6 * * ?",
+        )
+
+
+class TestJobTaskSkeleton(DatabricksTestCase):
+    """:class:`JobTask` mirrors the same skeleton pattern.
+
+    Subclasses set ``DEFAULT_TASK_KEY`` / override :meth:`default_details`
+    to declare a task shape once, then call :meth:`deploy` /
+    :meth:`find_for` / :meth:`delete_for` against a parent :class:`Job`.
+    Subclasses chain recursively.
+    """
+
+    def _make_job(self, *, tasks: list[Task] | None = None) -> Job:
+        details = _job_info(job_id=10, name="parent", tasks=tasks)
+        return Job(
+            service=self.jobs, job_id=details.job_id,
+            job_name=details.settings.name, details=details,
+        )
+
+    def _make_task_subclass(self):
+        class NotebookApplyTask(JobTask):
+            DEFAULT_TASK_KEY = "apply"
+
+            @classmethod
+            def default_details(cls, *, notebook_path: str = "/p", **_kw):
+                from databricks.sdk.service.jobs import NotebookTask, Task
+
+                return Task(
+                    task_key=cls.DEFAULT_TASK_KEY,
+                    notebook_task=NotebookTask(notebook_path=notebook_path),
+                )
+
+        return NotebookApplyTask
+
+    def test_deploy_creates_task_on_job_from_skeleton(self):
+        cls = self._make_task_subclass()
+        job = self._make_job(tasks=[])
+        self.jobs_api.get.return_value = _job_info(
+            job_id=10, name="parent",
+            tasks=[cls.default_details(notebook_path="/p/apply")],
+        )
+
+        instance = cls.deploy(job, notebook_path="/p/apply")
+
+        self.assertIsInstance(instance, cls)
+        self.assertEqual(instance.task_key, "apply")
+        # Pushed through Job.update via Jobs API.
+        self.jobs_api.update.assert_called_once()
+        _, kwargs = self.jobs_api.update.call_args
+        tasks = kwargs["new_settings"].tasks
+        self.assertEqual(tasks[0].task_key, "apply")
+        self.assertEqual(tasks[0].notebook_task.notebook_path, "/p/apply")
+
+    def test_deploy_requires_details_resolution(self):
+        """Subclass with no ``default_details`` and no caller ``details=`` errors."""
+
+        class BareTask(JobTask):
+            DEFAULT_TASK_KEY = "bare"
+
+        job = self._make_job(tasks=[])
+        with self.assertRaises(ValueError):
+            BareTask.deploy(job)
+
+    def test_find_for_returns_existing_task(self):
+        from databricks.sdk.service.jobs import NotebookTask, Task
+
+        cls = self._make_task_subclass()
+        existing_task = Task(
+            task_key="apply",
+            notebook_task=NotebookTask(notebook_path="/p/existing"),
+        )
+        job = self._make_job(tasks=[existing_task])
+
+        found = cls.find_for(job)
+        self.assertIsNotNone(found)
+        self.assertIsInstance(found, cls)
+        self.assertEqual(found.task_key, "apply")
+
+    def test_find_for_returns_none_when_missing(self):
+        cls = self._make_task_subclass()
+        job = self._make_job(tasks=[])
+        self.assertIsNone(cls.find_for(job))
+
+    def test_delete_for_drops_task_via_fields_to_remove(self):
+        from databricks.sdk.service.jobs import NotebookTask, Task
+
+        cls = self._make_task_subclass()
+        existing = Task(
+            task_key="apply",
+            notebook_task=NotebookTask(notebook_path="/p"),
+        )
+        job = self._make_job(tasks=[existing])
+
+        cls.delete_for(job)
+        self.jobs_api.update.assert_called_once()
+        _, kwargs = self.jobs_api.update.call_args
+        self.assertEqual(kwargs["fields_to_remove"], ["tasks/apply"])
+
+    def test_subclass_skeleton_chains_recursively(self):
+        """A subclass of a :class:`JobTask` skeleton inherits its overrides."""
+        from databricks.sdk.service.jobs import NotebookTask, Task
+
+        cls = self._make_task_subclass()
+
+        class FastApplyTask(cls):
+            """Refines parent skeleton with a different notebook path default."""
+
+            @classmethod
+            def default_details(cls, *, notebook_path: str = "/p/fast", **_kw):
+                return Task(
+                    task_key=cls.DEFAULT_TASK_KEY,
+                    notebook_task=NotebookTask(notebook_path=notebook_path),
+                )
+
+        job = self._make_job(tasks=[])
+        self.jobs_api.get.return_value = _job_info(
+            job_id=10, name="parent",
+            tasks=[FastApplyTask.default_details()],
+        )
+
+        FastApplyTask.deploy(job)
+        _, kwargs = self.jobs_api.update.call_args
+        # Default notebook path comes from the subclass override.
+        self.assertEqual(
+            kwargs["new_settings"].tasks[0].notebook_task.notebook_path,
+            "/p/fast",
+        )
+
+    def test_default_task_key_classvar_drives_resolution(self):
+        from databricks.sdk.service.jobs import NotebookTask, Task
+
+        class KeyedTask(JobTask):
+            DEFAULT_TASK_KEY = "named-step"
+
+            @classmethod
+            def default_details(cls, **_kw):
+                return Task(
+                    task_key=cls.DEFAULT_TASK_KEY,
+                    notebook_task=NotebookTask(notebook_path="/p"),
+                )
+
+        self.assertEqual(KeyedTask.default_task_key(), "named-step")
+
+        job = self._make_job(tasks=[])
+        self.jobs_api.get.return_value = _job_info(
+            job_id=10, name="parent",
+            tasks=[KeyedTask.default_details()],
+        )
+        KeyedTask.deploy(job)
+        _, kwargs = self.jobs_api.update.call_args
+        self.assertEqual(kwargs["new_settings"].tasks[0].task_key, "named-step")

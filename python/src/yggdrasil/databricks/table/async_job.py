@@ -7,15 +7,18 @@ fired automatically by a *file-arrival trigger* watching the
 ``data/`` sub-folder — every newly staged Parquet payload kicks the
 applier without needing a cron schedule.
 
-:class:`AsyncInsertJob` inherits from :class:`Job` so the full Job
-lifecycle (:meth:`refresh`, :meth:`update`, :meth:`run`,
+:class:`AsyncInsertJob` inherits from :class:`Job`, so every Job
+method (:meth:`refresh`, :meth:`update`, :meth:`run`,
 :meth:`delete`, :meth:`runs`, :meth:`cancel_all_runs`,
-:meth:`update_permissions`, …) flows through unchanged. The new
-:attr:`table` attribute is the source of identity — job name and
-file-arrival URL are both derived from it. Classmethod CRUD
-(:meth:`find`, :meth:`get`, :meth:`create`, :meth:`get_or_create`,
-:meth:`create_or_update`) accepts a :class:`Table` and wires the
-result back into a singleton-cached :class:`AsyncInsertJob`.
+:meth:`update_permissions`, …) flows through unchanged. The
+class-level skeleton hooks (:meth:`default_name`,
+:meth:`default_tasks`, :meth:`default_trigger`,
+:meth:`default_parameters`, :meth:`default_description`) declare
+what the job looks like; :meth:`Job.deploy` / :meth:`find_for` /
+:meth:`get_for` / :meth:`delete_for` are inherited and drive the
+lifecycle. The convenience aliases :meth:`create_or_update` /
+:meth:`find` / :meth:`get` / :meth:`get_or_create` / :meth:`create`
+preserve the table-first call shape callers already use.
 """
 from __future__ import annotations
 
@@ -24,18 +27,16 @@ from typing import (
     TYPE_CHECKING,
     Any,
     ClassVar,
+    Dict,
     List,
     Mapping,
     Optional,
     Tuple,
-    Union,
 )
 
 from databricks.sdk.service.jobs import (
-    CronSchedule,
     FileArrivalTriggerConfiguration,
     Job as JobInfo,
-    JobAccessControlRequest,
     JobParameterDefinition,
     NotebookTask,
     PauseStatus,
@@ -72,11 +73,10 @@ class AsyncInsertJob(Job):
     Identity is keyed off ``(catalog_name, schema_name, table_name)``
     on the bound table — one job per target table, watching the
     table's own ``stg_<table>/.sql/async/insert/data/`` folder via a
-    file-arrival trigger.
-
-    Every :class:`Job` method is inherited, so existing call sites
-    (:meth:`run`, :meth:`refresh`, :meth:`update`, :meth:`delete`,
-    :meth:`runs`, :meth:`update_permissions`, …) work unchanged.
+    file-arrival trigger. The skeleton hooks (:meth:`default_name`,
+    :meth:`default_tasks`, :meth:`default_trigger`, …) wire each
+    :class:`JobSettings` field off the bound :class:`Table`, so
+    callers only ever hand in the table plus per-deployment options.
     """
 
     JOB_NAME_PREFIX: ClassVar[str] = "ygg-async-insert"
@@ -104,7 +104,7 @@ class AsyncInsertJob(Job):
                 pass
         if service is None and table is not None:
             try:
-                service = cls._resolve_jobs(table, jobs=None, client=None)
+                service = cls.resolve_jobs(table=table)
             except Exception:  # noqa: BLE001 — best-effort
                 service = None
         return (cls, service, job_id, job_name)
@@ -131,7 +131,7 @@ class AsyncInsertJob(Job):
         if table is not None and not job_name:
             job_name = type(self).job_name_for(table)
         if service is None and table is not None:
-            service = type(self)._resolve_jobs(table, jobs=None, client=None)
+            service = type(self).resolve_jobs(table=table)
 
         super().__init__(
             service=service,
@@ -184,62 +184,87 @@ class AsyncInsertJob(Job):
         return f"dbfs:{path}"
 
     # ------------------------------------------------------------------ #
-    # CRUD — classmethods keyed off Table
+    # Skeleton — hook overrides
     # ------------------------------------------------------------------ #
     @classmethod
-    def find(
+    def resolve_jobs(
         cls,
-        table: "Table",
         *,
-        jobs: "Jobs | None" = None,
+        service: "Jobs | None" = None,
         client: "DatabricksClient | None" = None,
-    ) -> "AsyncInsertJob | None":
-        """Return the applier job bound to *table*, or ``None`` if absent."""
-        jobs = cls._resolve_jobs(table, jobs=jobs, client=client)
-        found = jobs.find(name=cls.job_name_for(table))
-        if found is None:
+        table: "Table | None" = None,
+        **_context: Any,
+    ) -> "Jobs":
+        """Resolve the :class:`Jobs` service off *table* when available."""
+        if service is not None:
+            return service
+        if client is None and table is not None:
+            client = getattr(table, "client", None)
+        return super().resolve_jobs(service=service, client=client)
+
+    @classmethod
+    def default_name(
+        cls,
+        *,
+        table: "Table | None" = None,
+        **_context: Any,
+    ) -> Optional[str]:
+        if table is None:
             return None
-        return cls(
-            table,
-            service=jobs,
-            job_id=found.job_id,
-            job_name=found.job_name,
-            details=found._details,
-        )
+        return cls.job_name_for(table)
 
     @classmethod
-    def get(
+    def default_tasks(
         cls,
-        table: "Table",
         *,
-        jobs: "Jobs | None" = None,
-        client: "DatabricksClient | None" = None,
-    ) -> "AsyncInsertJob":
-        """Like :meth:`find` but raises when the job doesn't exist."""
-        jobs = cls._resolve_jobs(table, jobs=jobs, client=client)
-        found = jobs.get(name=cls.job_name_for(table))
-        return cls(
-            table,
-            service=jobs,
-            job_id=found.job_id,
-            job_name=found.job_name,
-            details=found._details,
-        )
-
-    @classmethod
-    def create(
-        cls,
-        table: "Table",
-        *,
-        jobs: "Jobs | None" = None,
-        client: "DatabricksClient | None" = None,
+        table: "Table | None" = None,
         task: Any = None,
-        notebook_path: str | None = None,
-        notebook_warehouse_id: str | None = None,
+        notebook_path: Optional[str] = None,
+        notebook_warehouse_id: Optional[str] = None,
         notebook_base_parameters: Optional[Mapping[str, str]] = None,
-        schedule: Any = None,
-        schedule_timezone: str = "UTC",
-        schedule_pause_status: Any = None,
+        **_context: Any,
+    ) -> List[Task]:
+        if task is not None:
+            if isinstance(task, Task):
+                return [task]
+            return list(task)
+
+        if notebook_path and table is not None:
+            cat, sch, tbl = cls._identity(table)
+            base_params: Dict[str, str] = {
+                "catalog_name": cat,
+                "schema_name": sch,
+                "table_name": tbl,
+            }
+            if notebook_base_parameters:
+                base_params.update(
+                    {str(k): str(v) for k, v in notebook_base_parameters.items()}
+                )
+            return [
+                Task(
+                    task_key="apply",
+                    notebook_task=NotebookTask(
+                        notebook_path=notebook_path,
+                        warehouse_id=notebook_warehouse_id,
+                        base_parameters=base_params,
+                    ),
+                )
+            ]
+
+        if table is not None:
+            LOGGER.warning(
+                "AsyncInsertJob skeleton built without ``task`` or "
+                "``notebook_path`` — the resulting job for %s will have no "
+                "tasks. Attach tasks later via ``Jobs.create_or_update(...)``.",
+                table.full_name(safe=False),
+            )
+        return []
+
+    @classmethod
+    def default_trigger(
+        cls,
+        *,
+        table: "Table | None" = None,
         file_arrival_trigger: bool = True,
         min_time_between_triggers_seconds: int = (
             DEFAULT_MIN_TIME_BETWEEN_TRIGGERS_SECONDS
@@ -248,57 +273,84 @@ class AsyncInsertJob(Job):
             DEFAULT_WAIT_AFTER_LAST_CHANGE_SECONDS
         ),
         trigger_pause_status: Any = None,
-        parameters: Optional[Mapping[str, str]] = None,
-        description: str | None = None,
-        permissions: Optional[List[Union[str, JobAccessControlRequest]]] = None,
-        tags: Optional[Mapping[str, str]] = None,
-        **settings: Any,
-    ) -> "AsyncInsertJob":
-        """Create the applier job for *table* (errors if it already exists)."""
-        jobs = cls._resolve_jobs(table, jobs=jobs, client=client)
-        kwargs = cls._build_create_kwargs(
-            table=table,
-            task=task,
-            notebook_path=notebook_path,
-            notebook_warehouse_id=notebook_warehouse_id,
-            notebook_base_parameters=notebook_base_parameters,
-            schedule=schedule,
-            schedule_timezone=schedule_timezone,
-            schedule_pause_status=schedule_pause_status,
-            file_arrival_trigger=file_arrival_trigger,
-            min_time_between_triggers_seconds=min_time_between_triggers_seconds,
-            wait_after_last_change_seconds=wait_after_last_change_seconds,
-            trigger_pause_status=trigger_pause_status,
-            parameters=parameters,
-            description=description,
-            permissions=permissions,
-            tags=tags,
-            settings=settings,
-        )
-        underlying = jobs.create(**kwargs)
-        return cls(
-            table,
-            service=jobs,
-            job_id=underlying.job_id,
-            job_name=underlying.job_name,
-            details=underlying._details,
+        **_context: Any,
+    ) -> Optional[TriggerSettings]:
+        if not file_arrival_trigger or table is None:
+            return None
+
+        resolved_pause: Any = trigger_pause_status
+        if isinstance(resolved_pause, str):
+            resolved_pause = PauseStatus(resolved_pause.upper())
+
+        return TriggerSettings(
+            file_arrival=FileArrivalTriggerConfiguration(
+                url=cls.trigger_url(table),
+                min_time_between_triggers_seconds=min_time_between_triggers_seconds,
+                wait_after_last_change_seconds=wait_after_last_change_seconds,
+            ),
+            pause_status=resolved_pause,
         )
 
     @classmethod
-    def get_or_create(
+    def default_parameters(
         cls,
-        table: "Table",
         *,
-        jobs: "Jobs | None" = None,
-        client: "DatabricksClient | None" = None,
-        **create_kwargs: Any,
-    ) -> "AsyncInsertJob":
-        """Return the existing applier job for *table* or create one."""
-        found = cls.find(table, jobs=jobs, client=client)
-        if found is not None:
-            return found
-        return cls.create(table, jobs=jobs, client=client, **create_kwargs)
+        table: "Table | None" = None,
+        parameters: Optional[Mapping[str, str]] = None,
+        **_context: Any,
+    ) -> List[JobParameterDefinition]:
+        if table is None:
+            return []
+        cat, sch, tbl = cls._identity(table)
+        job_params: List[JobParameterDefinition] = [
+            JobParameterDefinition(name="catalog_name", default=cat),
+            JobParameterDefinition(name="schema_name", default=sch),
+            JobParameterDefinition(name="table_name", default=tbl),
+        ]
+        if parameters:
+            existing = {p.name: p for p in job_params}
+            for k, v in parameters.items():
+                if k in existing:
+                    existing[k].default = str(v)
+                else:
+                    job_params.append(
+                        JobParameterDefinition(name=str(k), default=str(v))
+                    )
+        return job_params
 
+    @classmethod
+    def default_description(
+        cls,
+        *,
+        table: "Table | None" = None,
+        **_context: Any,
+    ) -> Optional[str]:
+        if table is None:
+            return None
+        cat, sch, tbl = cls._identity(table)
+        return f"Apply staged async inserts for {cat}.{sch}.{tbl}"
+
+    @classmethod
+    def _wrap(
+        cls,
+        underlying: "Job",
+        *,
+        service: "Jobs | None" = None,
+        table: "Table | None" = None,
+        **_context: Any,
+    ) -> "AsyncInsertJob":
+        """Wire *underlying* into an :class:`AsyncInsertJob` bound to *table*."""
+        return cls(
+            table=table,
+            service=service,
+            job_id=underlying.job_id,
+            job_name=underlying.job_name,
+            details=getattr(underlying, "_details", None),
+        )
+
+    # ------------------------------------------------------------------ #
+    # Convenience aliases — table-first call shape over Job.deploy / …
+    # ------------------------------------------------------------------ #
     @classmethod
     def create_or_update(
         cls,
@@ -306,65 +358,57 @@ class AsyncInsertJob(Job):
         *,
         jobs: "Jobs | None" = None,
         client: "DatabricksClient | None" = None,
-        task: Any = None,
-        notebook_path: str | None = None,
-        notebook_warehouse_id: str | None = None,
-        notebook_base_parameters: Optional[Mapping[str, str]] = None,
-        schedule: Any = None,
-        schedule_timezone: str = "UTC",
-        schedule_pause_status: Any = None,
-        file_arrival_trigger: bool = True,
-        min_time_between_triggers_seconds: int = (
-            DEFAULT_MIN_TIME_BETWEEN_TRIGGERS_SECONDS
-        ),
-        wait_after_last_change_seconds: int = (
-            DEFAULT_WAIT_AFTER_LAST_CHANGE_SECONDS
-        ),
-        trigger_pause_status: Any = None,
-        parameters: Optional[Mapping[str, str]] = None,
-        description: str | None = None,
-        permissions: Optional[List[Union[str, JobAccessControlRequest]]] = None,
-        tags: Optional[Mapping[str, str]] = None,
-        **settings: Any,
+        **kwargs: Any,
     ) -> "AsyncInsertJob":
-        """Idempotent upsert — existing settings are replaced with the new spec."""
-        jobs = cls._resolve_jobs(table, jobs=jobs, client=client)
-        kwargs = cls._build_create_kwargs(
-            table=table,
-            task=task,
-            notebook_path=notebook_path,
-            notebook_warehouse_id=notebook_warehouse_id,
-            notebook_base_parameters=notebook_base_parameters,
-            schedule=schedule,
-            schedule_timezone=schedule_timezone,
-            schedule_pause_status=schedule_pause_status,
-            file_arrival_trigger=file_arrival_trigger,
-            min_time_between_triggers_seconds=min_time_between_triggers_seconds,
-            wait_after_last_change_seconds=wait_after_last_change_seconds,
-            trigger_pause_status=trigger_pause_status,
-            parameters=parameters,
-            description=description,
-            permissions=permissions,
-            tags=tags,
-            settings=settings,
-        )
-        LOGGER.info(
-            "Creating-or-updating async-insert job %r for table %s "
-            "(file_arrival=%s schedule=%r tasks=%d)",
-            kwargs["name"],
-            table.full_name(safe=False),
-            file_arrival_trigger,
-            kwargs.get("schedule").quartz_cron_expression
-            if kwargs.get("schedule") is not None else None,
-            len(kwargs.get("tasks") or []),
-        )
-        underlying = jobs.create_or_update(**kwargs)
-        return cls(
-            table,
-            service=jobs,
-            job_id=underlying.job_id,
-            job_name=underlying.job_name,
-            details=underlying._details,
+        """Alias: :meth:`Job.deploy` with *table* threaded through context."""
+        return cls.deploy(service=jobs, client=client, table=table, **kwargs)
+
+    @classmethod
+    def create(  # type: ignore[override]
+        cls,
+        table: "Table",
+        *,
+        jobs: "Jobs | None" = None,
+        client: "DatabricksClient | None" = None,
+        **kwargs: Any,
+    ) -> "AsyncInsertJob":
+        """Alias: :meth:`Job.create_for` with *table* threaded through context."""
+        return cls.create_for(service=jobs, client=client, table=table, **kwargs)
+
+    @classmethod
+    def find(  # type: ignore[override]
+        cls,
+        table: "Table",
+        *,
+        jobs: "Jobs | None" = None,
+        client: "DatabricksClient | None" = None,
+    ) -> "AsyncInsertJob | None":
+        """Alias: :meth:`Job.find_for` with *table* threaded through context."""
+        return cls.find_for(service=jobs, client=client, table=table)
+
+    @classmethod
+    def get(  # type: ignore[override]
+        cls,
+        table: "Table",
+        *,
+        jobs: "Jobs | None" = None,
+        client: "DatabricksClient | None" = None,
+    ) -> "AsyncInsertJob":
+        """Alias: :meth:`Job.get_for` with *table* threaded through context."""
+        return cls.get_for(service=jobs, client=client, table=table)
+
+    @classmethod
+    def get_or_create(  # type: ignore[override]
+        cls,
+        table: "Table",
+        *,
+        jobs: "Jobs | None" = None,
+        client: "DatabricksClient | None" = None,
+        **kwargs: Any,
+    ) -> "AsyncInsertJob":
+        """Alias: :meth:`Job.get_or_create` with *table* threaded through context."""
+        return super().get_or_create(
+            service=jobs, client=client, table=table, **kwargs,
         )
 
     # ------------------------------------------------------------------ #
@@ -422,199 +466,3 @@ class AsyncInsertJob(Job):
                 f"(catalog.schema.table) — got {table!r}."
             )
         return cat, sch, tbl
-
-    @staticmethod
-    def _resolve_jobs(
-        table: "Table",
-        *,
-        jobs: "Jobs | None",
-        client: "DatabricksClient | None",
-    ) -> "Jobs":
-        if jobs is not None:
-            return jobs
-        if client is None:
-            client = getattr(table, "client", None)
-            if client is None:
-                from yggdrasil.databricks.client import DatabricksClient
-                client = DatabricksClient.current()
-        return client.jobs
-
-    @classmethod
-    def _build_create_kwargs(
-        cls,
-        *,
-        table: "Table",
-        task: Any,
-        notebook_path: str | None,
-        notebook_warehouse_id: str | None,
-        notebook_base_parameters: Optional[Mapping[str, str]],
-        schedule: Any,
-        schedule_timezone: str,
-        schedule_pause_status: Any,
-        file_arrival_trigger: bool,
-        min_time_between_triggers_seconds: int,
-        wait_after_last_change_seconds: int,
-        trigger_pause_status: Any,
-        parameters: Optional[Mapping[str, str]],
-        description: str | None,
-        permissions: Optional[List[Union[str, JobAccessControlRequest]]],
-        tags: Optional[Mapping[str, str]],
-        settings: Mapping[str, Any],
-    ) -> dict:
-        cat, sch, tbl = cls._identity(table)
-        name = cls.job_name_for(table)
-
-        resolved_tasks = cls._resolve_tasks(
-            task=task,
-            notebook_path=notebook_path,
-            notebook_warehouse_id=notebook_warehouse_id,
-            notebook_base_parameters=notebook_base_parameters,
-            table=table,
-        )
-
-        cron_schedule = cls._resolve_schedule(
-            schedule=schedule,
-            timezone_id=schedule_timezone,
-            pause_status=schedule_pause_status,
-        )
-
-        trigger_settings = (
-            cls._build_trigger(
-                table=table,
-                min_time_between_triggers_seconds=min_time_between_triggers_seconds,
-                wait_after_last_change_seconds=wait_after_last_change_seconds,
-                pause_status=trigger_pause_status,
-            )
-            if file_arrival_trigger else None
-        )
-
-        job_params: list[JobParameterDefinition] = [
-            JobParameterDefinition(name="catalog_name", default=cat),
-            JobParameterDefinition(name="schema_name", default=sch),
-            JobParameterDefinition(name="table_name", default=tbl),
-        ]
-        if parameters:
-            existing = {p.name: p for p in job_params}
-            for k, v in parameters.items():
-                if k in existing:
-                    existing[k].default = str(v)
-                else:
-                    job_params.append(
-                        JobParameterDefinition(name=str(k), default=str(v))
-                    )
-
-        if description is None:
-            description = (
-                f"Apply staged async inserts for {cat}.{sch}.{tbl}"
-            )
-
-        kwargs: dict[str, Any] = {
-            "name": name,
-            "tasks": resolved_tasks,
-            "schedule": cron_schedule,
-            "parameters": job_params,
-            "description": description,
-            "permissions": permissions,
-            "tags": dict(tags) if tags else None,
-            **settings,
-        }
-        if trigger_settings is not None:
-            kwargs["trigger"] = trigger_settings
-        return kwargs
-
-    @staticmethod
-    def _resolve_tasks(
-        *,
-        task: Any,
-        notebook_path: str | None,
-        notebook_warehouse_id: str | None,
-        notebook_base_parameters: Optional[Mapping[str, str]],
-        table: "Table",
-    ) -> List[Task]:
-        """Normalize the caller's task spec into a list of :class:`Task`."""
-        if task is not None:
-            if isinstance(task, Task):
-                return [task]
-            return list(task)
-
-        if notebook_path:
-            cat, sch, tbl = AsyncInsertJob._identity(table)
-            base_params: dict[str, str] = {
-                "catalog_name": cat,
-                "schema_name": sch,
-                "table_name": tbl,
-            }
-            if notebook_base_parameters:
-                base_params.update(
-                    {str(k): str(v) for k, v in notebook_base_parameters.items()}
-                )
-            return [
-                Task(
-                    task_key="apply",
-                    notebook_task=NotebookTask(
-                        notebook_path=notebook_path,
-                        warehouse_id=notebook_warehouse_id,
-                        base_parameters=base_params,
-                    ),
-                )
-            ]
-
-        LOGGER.warning(
-            "AsyncInsertJob.create called without ``task`` or "
-            "``notebook_path`` — the resulting job for %s will have no "
-            "tasks. Attach tasks later via ``Jobs.create_or_update(...)``.",
-            table.full_name(safe=False),
-        )
-        return []
-
-    @staticmethod
-    def _resolve_schedule(
-        *,
-        schedule: Any,
-        timezone_id: str,
-        pause_status: Any,
-    ) -> "CronSchedule | None":
-        """Coerce *schedule* into a :class:`CronSchedule` (or ``None``)."""
-        if schedule is None:
-            return None
-
-        if isinstance(schedule, CronSchedule):
-            return schedule
-
-        if isinstance(schedule, str):
-            resolved_pause: Any = pause_status
-            if isinstance(resolved_pause, str):
-                resolved_pause = PauseStatus(resolved_pause.upper())
-            return CronSchedule(
-                quartz_cron_expression=schedule,
-                timezone_id=timezone_id,
-                pause_status=resolved_pause,
-            )
-
-        raise TypeError(
-            f"AsyncInsertJob: ``schedule`` must be a CronSchedule, a "
-            f"Quartz cron string, or None — got {type(schedule).__name__}."
-        )
-
-    @classmethod
-    def _build_trigger(
-        cls,
-        *,
-        table: "Table",
-        min_time_between_triggers_seconds: int,
-        wait_after_last_change_seconds: int,
-        pause_status: Any,
-    ) -> TriggerSettings:
-        """Build the :class:`TriggerSettings` watching the staging folder."""
-        resolved_pause: Any = pause_status
-        if isinstance(resolved_pause, str):
-            resolved_pause = PauseStatus(resolved_pause.upper())
-
-        return TriggerSettings(
-            file_arrival=FileArrivalTriggerConfiguration(
-                url=cls.trigger_url(table),
-                min_time_between_triggers_seconds=min_time_between_triggers_seconds,
-                wait_after_last_change_seconds=wait_after_last_change_seconds,
-            ),
-            pause_status=resolved_pause,
-        )
