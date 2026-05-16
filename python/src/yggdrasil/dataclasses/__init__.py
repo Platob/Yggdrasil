@@ -3,4 +3,5 @@
 from .dataclass import *
 from .waiting import *
 from .expiring import *
+from .safe_function import *
 from .singleton import *

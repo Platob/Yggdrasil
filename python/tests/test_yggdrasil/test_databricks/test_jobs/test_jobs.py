@@ -24,23 +24,13 @@ from databricks.sdk.service.jobs import (
 from databricks.sdk.service.jobs import SparkPythonTask, Task
 
 from yggdrasil.databricks.jobs import Job, JobRun
-from yggdrasil.databricks.jobs.task import (
-    JobTask,
-    _render_callable_script,
-    coerce_kwargs,
-    describe_signature,
-    format_signature,
-)
+from yggdrasil.databricks.jobs.task import JobTask, _render_callable_script
 from yggdrasil.databricks.tests import DatabricksTestCase
 
 
 def _signature_fixture(name: str = "alice", count: int = 3) -> str:
     """Greet someone N times."""
     return f"hi {name}" * count
-
-
-def _signature_unannotated(x, y=7):
-    return (x, y)
 
 
 def _job_info(
@@ -657,81 +647,29 @@ class TestJobTaskFactoryAndDecorate(DatabricksTestCase):
         self.assertIs(jt._details.spark_python_task, staged_body)
 
 
-class TestJobTaskSignatureMetadata(DatabricksTestCase):
-    """Signature metadata, formatting, and yggdrasil-convert kwargs coercion."""
+class TestStagedScriptMetadata(DatabricksTestCase):
+    """Staged JobTask script: signature metadata + check_function_args wiring."""
 
-    def test_describe_signature_captures_annotations_and_defaults(self):
-        meta = describe_signature(_signature_fixture)
-
-        self.assertEqual(meta["qualname"], "_signature_fixture")
-        self.assertEqual(meta["return"], "str")
-        params = {p["name"]: p for p in meta["parameters"]}
-        self.assertEqual(params["name"]["annotation"], "str")
-        self.assertEqual(params["name"]["default"], "'alice'")
-        self.assertEqual(params["count"]["annotation"], "int")
-        self.assertEqual(params["count"]["default"], "3")
-        self.assertEqual(params["count"]["kind"], "POSITIONAL_OR_KEYWORD")
-
-    def test_describe_signature_omits_missing_annotations_and_defaults(self):
-        meta = describe_signature(_signature_unannotated)
-        params = {p["name"]: p for p in meta["parameters"]}
-
-        self.assertNotIn("annotation", params["x"])
-        self.assertNotIn("default", params["x"])
-        self.assertNotIn("annotation", params["y"])
-        self.assertEqual(params["y"]["default"], "7")
-        self.assertIsNone(meta["return"])
-
-    def test_format_signature_renders_python_signature(self):
-        meta = describe_signature(_signature_fixture)
-        self.assertEqual(
-            format_signature(meta),
-            "_signature_fixture(name: str = 'alice', count: int = 3) -> str",
-        )
-
-    def test_coerce_kwargs_routes_through_yggdrasil_convert(self):
-        coerced = coerce_kwargs(
-            _signature_fixture, {"name": "bob", "count": "9"},
-        )
-        # ``count`` was a string, annotation says int — convert flips it.
-        self.assertEqual(coerced, {"name": "bob", "count": 9})
-        self.assertIsInstance(coerced["count"], int)
-
-    def test_coerce_kwargs_skips_unannotated_parameters(self):
-        coerced = coerce_kwargs(
-            _signature_unannotated, {"x": "raw", "y": "9"},
-        )
-        # No annotations → no coercion; values pass through untouched.
-        self.assertEqual(coerced, {"x": "raw", "y": "9"})
-
-    def test_coerce_kwargs_empty_input_short_circuits(self):
-        # Empty kwargs must not import yggdrasil — they short-circuit.
-        self.assertEqual(coerce_kwargs(_signature_fixture, {}), {})
-
-    def test_rendered_script_embeds_metadata_and_coerce_helper(self):
+    def test_script_embeds_signature_metadata_and_routes_through_check(self):
         import ast
         import json
 
         script = _render_callable_script(
             _signature_fixture, (), {"name": "bob", "count": "9"},
         )
-        # Sanity-compile: every staged script must parse on the runner.
         ast.parse(script)
 
         self.assertIn("__yggdrasil_task__", script)
-        self.assertIn("_yggdrasil_coerce_kwargs", script)
-        self.assertIn("Signature: _signature_fixture(name: str", script)
-        # Invocation routes through the coercion helper when kwargs exist.
         self.assertIn(
-            "_yggdrasil_coerce_kwargs(_signature_fixture, ", script,
+            "from yggdrasil.dataclasses.safe_function import check_function_args",
+            script,
         )
+        self.assertIn("Signature: _signature_fixture(name: str", script)
+        self.assertIn("check_function_args(_signature_fixture, ", script)
 
-        # Exec the script end-to-end and confirm "9" was coerced to int.
-        # The fixture writes the values it received to a module-level
-        # list so we can read them back after exec.
+        # Exec end-to-end — runtime path must coerce "9" → int 9 via
+        # check_function_args / yggdrasil.data.cast.convert.
         env: dict = {"__name__": "__main__", "_received": []}
-        # Splice a recorder into the body — the original fixture returns
-        # its result and never side-effects, so we wrap the return.
         patched = script.replace(
             'return f"hi {name}" * count',
             '_received.append((name, count, type(count).__name__))\n'
@@ -740,27 +678,23 @@ class TestJobTaskSignatureMetadata(DatabricksTestCase):
         exec(compile(patched, "<staged>", "exec"), env)
         self.assertEqual(env["_received"], [("bob", 9, "int")])
 
-        # Metadata block round-trips through json.loads at module import.
         meta = env["__yggdrasil_task__"]
         self.assertEqual(meta["qualname"], "_signature_fixture")
         self.assertEqual(meta["return"], "str")
         self.assertIn("yggdrasil_version", meta)
         self.assertIn("staged_at", meta)
-        # Stable JSON shape — re-encoding round-trips.
-        json.dumps(meta)
+        json.dumps(meta)  # stable JSON shape.
 
-    def test_rendered_script_without_kwargs_skips_coerce_call(self):
+    def test_script_without_args_skips_check_call(self):
         import ast
 
-        script = _render_callable_script(_signature_fixture, ("solo",), {})
+        def _noop() -> None:
+            return None
+
+        script = _render_callable_script(_noop, (), {})
         ast.parse(script)
-        # No kwargs at staging → invocation stays positional and the
-        # coercion helper isn't called (yggdrasil import only fires if
-        # someone manually invokes _yggdrasil_coerce_kwargs).
-        self.assertIn("_signature_fixture('solo')", script)
-        self.assertNotIn(
-            "_yggdrasil_coerce_kwargs(_signature_fixture, ", script,
-        )
+        self.assertIn("_noop()", script)
+        self.assertNotIn("check_function_args(_noop, ", script)
 
 
 class TestJobsSubmit(DatabricksTestCase):

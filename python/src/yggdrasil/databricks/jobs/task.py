@@ -23,9 +23,14 @@ import logging
 import secrets
 import textwrap
 from dataclasses import replace as _dc_replace
-from typing import Any, Callable, List, Mapping, Optional, TYPE_CHECKING
+from typing import Any, Callable, List, Optional, TYPE_CHECKING
 
 from databricks.sdk.service.jobs import SparkPythonTask, Task
+
+from yggdrasil.dataclasses.safe_function import (
+    describe_signature,
+    format_signature,
+)
 
 if TYPE_CHECKING:
     from .job import Job
@@ -34,9 +39,6 @@ if TYPE_CHECKING:
 __all__ = [
     "JobTask",
     "DEFAULT_STAGING_ROOT",
-    "describe_signature",
-    "format_signature",
-    "coerce_kwargs",
 ]
 
 LOGGER = logging.getLogger(__name__)
@@ -325,173 +327,6 @@ class JobTask:
         return cls(job=job, task_key=key, details=details)
 
 
-def _annotation_to_str(ann: Any) -> Optional[str]:
-    """Render a parameter annotation as a short, JSON-friendly string."""
-    if ann is inspect.Parameter.empty or ann is None:
-        return None
-    if isinstance(ann, str):
-        # ``from __future__ import annotations`` and PEP 604 stringified
-        # forms arrive as a plain string already — keep them verbatim.
-        return ann
-    if isinstance(ann, type):
-        mod = getattr(ann, "__module__", "builtins")
-        return ann.__qualname__ if mod == "builtins" else f"{mod}.{ann.__qualname__}"
-    return repr(ann)
-
-
-def _resolved_annotations(func: Callable[..., Any]) -> dict[str, Any]:
-    """Resolve string annotations on *func* into real types when possible.
-
-    ``from __future__ import annotations`` (PEP 563) keeps every
-    annotation as a string at runtime; :func:`inspect.get_annotations`
-    with ``eval_str=True`` evaluates them in the function's own
-    module / locals. Failures fall back to the raw string so the
-    caller can still log / display the annotation.
-    """
-    try:
-        return inspect.get_annotations(func, eval_str=True)
-    except Exception:
-        return dict(getattr(func, "__annotations__", {}) or {})
-
-
-def _default_to_str(default: Any) -> tuple[bool, Optional[str]]:
-    """Return ``(has_default, repr(default))`` for a parameter default."""
-    if default is inspect.Parameter.empty:
-        return False, None
-    try:
-        return True, repr(default)
-    except Exception:
-        return True, "<unrepresentable>"
-
-
-def describe_signature(func: Callable[..., Any]) -> dict[str, Any]:
-    """Capture *func*'s signature as a JSON-serializable dict.
-
-    Returns ``{"qualname", "module", "parameters": [...], "return"}``
-    where each parameter entry carries ``name``, ``kind`` (the
-    :class:`inspect.Parameter.kind` name), ``annotation`` (dotted path
-    when the annotation is a class), and ``default`` (``repr`` of the
-    default) where present. Used to stamp signature metadata onto the
-    staged script and the task description so a reader doesn't have
-    to crack the source open to know how to call the function.
-    """
-    try:
-        sig = inspect.signature(func)
-    except (ValueError, TypeError):
-        return {
-            "qualname": getattr(func, "__qualname__", repr(func)),
-            "module": getattr(func, "__module__", None),
-            "parameters": [],
-            "return": None,
-        }
-    resolved = _resolved_annotations(func)
-    params: list[dict[str, Any]] = []
-    for name, p in sig.parameters.items():
-        entry: dict[str, Any] = {"name": name, "kind": p.kind.name}
-        ann = _annotation_to_str(resolved.get(name, p.annotation))
-        if ann is not None:
-            entry["annotation"] = ann
-        has_default, default_repr = _default_to_str(p.default)
-        if has_default:
-            entry["default"] = default_repr
-        params.append(entry)
-    return {
-        "qualname": func.__qualname__,
-        "module": getattr(func, "__module__", None),
-        "parameters": params,
-        "return": _annotation_to_str(resolved.get("return", sig.return_annotation)),
-    }
-
-
-def format_signature(sig_meta: Mapping[str, Any]) -> str:
-    """Render :func:`describe_signature` output as ``qualname(x: int = 5) -> str``."""
-    parts: list[str] = []
-    for p in sig_meta.get("parameters", []):
-        token = str(p["name"])
-        if "annotation" in p:
-            token += f": {p['annotation']}"
-        if "default" in p:
-            token += f" = {p['default']}"
-        parts.append(token)
-    qual = sig_meta.get("qualname") or "<unknown>"
-    out = f"{qual}({', '.join(parts)})"
-    return_ann = sig_meta.get("return")
-    if return_ann:
-        out += f" -> {return_ann}"
-    return out
-
-
-def coerce_kwargs(
-    func: Callable[..., Any],
-    kwargs: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Coerce *kwargs* to *func*'s annotated parameter types.
-
-    Walks ``inspect.signature(func).parameters`` and routes each value
-    whose parameter carries a non-empty annotation through
-    :func:`yggdrasil.data.cast.convert`. Unannotated parameters pass
-    through untouched. Designed for the Databricks runtime side, where
-    parameters arrive as strings (``sys.argv``, ``dbutils.widgets``,
-    job parameters) and need typing before reaching the function.
-    """
-    if not kwargs:
-        return dict(kwargs)
-    from yggdrasil.data.cast import convert
-
-    sig = inspect.signature(func)
-    resolved = _resolved_annotations(func)
-    coerced: dict[str, Any] = {}
-    for name, value in kwargs.items():
-        param = sig.parameters.get(name)
-        if param is None:
-            coerced[name] = value
-            continue
-        annotation = resolved.get(name, param.annotation)
-        if annotation is inspect.Parameter.empty:
-            coerced[name] = value
-            continue
-        coerced[name] = convert(value, annotation)
-    return coerced
-
-
-# Embedded runtime checker. Lives at module level inside every staged
-# script so the runner can coerce widget / argv kwargs into the
-# function's annotated types without re-staging. Mirrors
-# :func:`coerce_kwargs` above; kept in sync as one short block.
-_COERCE_RUNTIME = '''\
-def _yggdrasil_coerce_kwargs(_func, _kwargs):
-    """Coerce string-shaped kwargs to *_func*'s annotated types.
-
-    Resolves string annotations (``from __future__ import annotations``)
-    via :func:`inspect.get_annotations` with ``eval_str=True`` and routes
-    each value through :func:`yggdrasil.data.cast.convert`. Short-circuits
-    when *_kwargs* is empty so the yggdrasil import only fires when
-    there's actually something to coerce.
-    """
-    if not _kwargs:
-        return dict(_kwargs)
-    import inspect as _inspect
-    from yggdrasil.data.cast import convert as _convert
-    _sig = _inspect.signature(_func)
-    try:
-        _resolved = _inspect.get_annotations(_func, eval_str=True)
-    except Exception:
-        _resolved = dict(getattr(_func, "__annotations__", {}) or {})
-    _coerced = {}
-    for _name, _value in _kwargs.items():
-        _p = _sig.parameters.get(_name)
-        if _p is None:
-            _coerced[_name] = _value
-            continue
-        _ann = _resolved.get(_name, _p.annotation)
-        if _ann is _inspect.Parameter.empty:
-            _coerced[_name] = _value
-        else:
-            _coerced[_name] = _convert(_value, _ann)
-    return _coerced
-'''
-
-
 def _render_callable_script(
     func: Callable[..., Any],
     args: tuple,
@@ -500,11 +335,11 @@ def _render_callable_script(
     """Render *func* + bound *args* / *kwargs* as a runnable ``.py`` script.
 
     Embeds a ``__yggdrasil_task__`` metadata block (signature, module,
-    yggdrasil version, staging timestamp) and the runtime
-    ``_yggdrasil_coerce_kwargs`` helper so the runner side can type
-    arbitrary kwargs against the function's annotations via
-    :func:`yggdrasil.data.cast.convert`. Returns a UTF-8 ``str``;
-    caller encodes for the workspace write.
+    yggdrasil version, staging timestamp) and routes the invocation
+    through :func:`yggdrasil.dataclasses.safe_function.check_function_args`
+    so the runner side type-checks args / kwargs against the function's
+    annotations via :func:`yggdrasil.data.cast.convert`. Returns a
+    UTF-8 ``str``; caller encodes for the workspace write.
     """
     from yggdrasil.version import __version__ as ygg_version
 
@@ -536,28 +371,30 @@ def _render_callable_script(
     # without Python tripping on ``null`` / ``true`` / ``false``.
     meta_json = json.dumps(meta_payload, indent=2, sort_keys=True)
 
-    positional = [repr(a) for a in args]
-    if kwargs:
+    if args or kwargs:
+        pos_literal = "(" + ", ".join(repr(a) for a in args) + (",)" if len(args) == 1 else ")")
         kw_literal = "{" + ", ".join(f"{k!r}: {v!r}" for k, v in kwargs.items()) + "}"
-        call_args = positional + [
-            f"**_yggdrasil_coerce_kwargs({func.__name__}, {kw_literal})"
+        invocation_lines = [
+            f"_args, _kwargs = check_function_args({func.__name__}, {pos_literal}, {kw_literal})",
+            f"{func.__name__}(*_args, **_kwargs)",
         ]
     else:
-        call_args = positional
-    invocation = f"{func.__name__}({', '.join(call_args)})"
+        invocation_lines = [f"{func.__name__}()"]
+    invocation = "\n    ".join(invocation_lines)
 
     return (
         "# Auto-generated by yggdrasil.databricks.jobs.JobTask.from_callable.\n"
         f"# Function: {func.__qualname__}\n"
         f"# Signature: {format_signature(sig_meta)}\n"
         "# The function body below is the verbatim source of the decorated\n"
-        "# callable; signature metadata + the kwargs coercion helper are\n"
-        "# embedded so the runner can introspect and type-check inputs.\n"
+        "# callable; signature metadata is embedded under __yggdrasil_task__\n"
+        "# and the invocation is routed through\n"
+        "# yggdrasil.dataclasses.safe_function.check_function_args so the\n"
+        "# runner type-checks args/kwargs against the function's annotations.\n"
         "\n"
         "import json as _yggdrasil_json\n"
+        "from yggdrasil.dataclasses.safe_function import check_function_args\n"
         f"__yggdrasil_task__ = _yggdrasil_json.loads(r\"\"\"{meta_json}\"\"\")\n"
-        "\n"
-        f"{_COERCE_RUNTIME}"
         "\n"
         f"{body}"
         "\n"
