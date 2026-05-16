@@ -16,7 +16,10 @@ import pytest
 
 from yggdrasil.databricks.fs import VolumePath
 from yggdrasil.databricks.table.async_write import (
+    ASYNC_INSERT_DATA_SUBDIR,
+    ASYNC_INSERT_LOGS_SUBDIR,
     AsyncInsert,
+    AsyncWrite,
     METADATA_VERSION,
     _make_operation_id,
     _normalize_prune_by,
@@ -39,7 +42,13 @@ def _make_table_with_staging(
     field_names: list[str] | None = None,
 ) -> tuple[Table, MagicMock, MagicMock, MagicMock]:
     """Build a :class:`Table` whose ``staging_folder`` / ``collect_schema``
-    are mocked so the staging call doesn't touch a workspace."""
+    are mocked so the staging call doesn't touch a workspace.
+
+    The folder mock implements the ``data/`` and ``logs/`` subfolder
+    layout that ``stage_async_insert`` writes into — Parquet payloads
+    under ``data/<op_id>.parquet`` and JSON metadata under
+    ``logs/<op_id>.json``.
+    """
     service = MagicMock()
     service.client.workspace_client.return_value = MagicMock()
     tbl = Table(
@@ -50,19 +59,27 @@ def _make_table_with_staging(
     )
 
     folder = MagicMock(spec=VolumePath)
+    data_folder = MagicMock(spec=VolumePath)
+    logs_folder = MagicMock(spec=VolumePath)
     parquet_path = MagicMock(spec=VolumePath)
     meta_path = MagicMock(spec=VolumePath)
     parquet_path.full_path.return_value = (
-        "/Volumes/cat/sch/stg_tbl/.sql/async/insert/async-1.parquet"
+        "/Volumes/cat/sch/stg_tbl/.sql/async/insert/data/async-1.parquet"
     )
     meta_path.full_path.return_value = (
-        "/Volumes/cat/sch/stg_tbl/.sql/async/insert/async-1.json"
+        "/Volumes/cat/sch/stg_tbl/.sql/async/insert/logs/async-1.json"
     )
 
-    def _join(name: str) -> VolumePath:
-        return parquet_path if name.endswith(".parquet") else meta_path
+    def _root_join(name: str) -> VolumePath:
+        if name == "data":
+            return data_folder
+        if name == "logs":
+            return logs_folder
+        raise AssertionError(f"unexpected root subdir {name!r}")
 
-    folder.joinpath.side_effect = _join
+    folder.joinpath.side_effect = _root_join
+    data_folder.joinpath.side_effect = lambda name: parquet_path
+    logs_folder.joinpath.side_effect = lambda name: meta_path
 
     tbl.staging_folder = MagicMock(return_value=folder)  # type: ignore[assignment]
 
@@ -532,64 +549,56 @@ class TestToStatements:
 
 
 class TestExecute:
+    """:meth:`AsyncInsert.execute` routes through :class:`AsyncWrite`."""
 
-    def test_runs_via_execute_many_with_prepared_statement(self):
+    _ASYNC_WRITE = "yggdrasil.databricks.table.async_write.AsyncWrite.from_records"
+
+    def test_runs_via_async_write_from_records(self):
         rec = _make_record(mode="append")
         engine = MagicMock()
-        engine.execute_many.return_value = "batch-result"
-
-        # Patch to_statements so the test doesn't fan out into
-        # WarehousePreparedStatement.prepare / DatabricksPath.from_ —
-        # those are covered separately in TestToStatements.
-        sentinel_stmt = MagicMock(name="prepared")
-        with patch.object(
-            type(rec), "to_statements", return_value=[sentinel_stmt],
-        ) as to_stmts:
+        sentinel_batch = MagicMock(name="batch")
+        with patch(self._ASYNC_WRITE, return_value=sentinel_batch) as from_records:
             result = rec.execute(engine, cleanup=False)
 
-        assert result == "batch-result"
-        to_stmts.assert_called_once()
-        assert to_stmts.call_args.kwargs["cleanup"] is False
-        engine.execute_many.assert_called_once()
-        statements_arg = engine.execute_many.call_args.args[0]
-        assert statements_arg == [sentinel_stmt]
+        assert result is sentinel_batch
+        from_records.assert_called_once()
+        args, kwargs = from_records.call_args
+        assert list(args[0]) == [rec]
+        # Executor is resolved off the engine.
+        assert kwargs["executor"] is engine.warehouse.return_value
+        assert kwargs["cleanup"] is False
 
     def test_empty_op_does_nothing(self):
         rec = AsyncInsert(target_full_name="cat.sch.tbl")
         engine = MagicMock()
-        assert rec.execute(engine) is None
-        engine.execute_many.assert_not_called()
+        with patch(self._ASYNC_WRITE) as from_records:
+            assert rec.execute(engine) is None
+        from_records.assert_not_called()
+        engine.warehouse.assert_not_called()
 
     def test_wait_and_raise_error_forwarded(self):
         rec = _make_record()
         engine = MagicMock()
-        engine.execute_many.return_value = "ok"
-
-        with patch.object(
-            type(rec), "to_statements", return_value=[MagicMock()],
-        ):
+        with patch(self._ASYNC_WRITE, return_value=MagicMock()) as from_records:
             rec.execute(engine, wait=False, raise_error=False, cleanup=False)
 
-        _, kwargs = engine.execute_many.call_args
+        _, kwargs = from_records.call_args
         assert kwargs["wait"] is False
         assert kwargs["raise_error"] is False
 
-    def test_cleanup_flag_routes_to_to_statements(self):
-        """cleanup=True/False is forwarded to to_statements, which decides
-        whether the attached paths are marked temporary (and therefore
-        unlinked by the statement-batch wait hook on success)."""
+    def test_cleanup_flag_forwarded(self):
+        """``cleanup=True/False`` flows through to AsyncWrite.from_records,
+        which forwards it to to_statements (and the prepared-statement
+        path decides whether to mark paths temporary)."""
         rec = _make_record()
         engine = MagicMock()
-        engine.execute_many.return_value = "ok"
 
-        with patch.object(
-            type(rec), "to_statements", return_value=[MagicMock()],
-        ) as to_stmts:
+        with patch(self._ASYNC_WRITE, return_value=MagicMock()) as from_records:
             rec.execute(engine, cleanup=True)
-            assert to_stmts.call_args.kwargs["cleanup"] is True
+            assert from_records.call_args.kwargs["cleanup"] is True
 
             rec.execute(engine, cleanup=False)
-            assert to_stmts.call_args.kwargs["cleanup"] is False
+            assert from_records.call_args.kwargs["cleanup"] is False
 
 
 class TestConcat:
@@ -628,63 +637,58 @@ class TestConcat:
     def test_concat_empty_returns_empty_list(self):
         assert AsyncInsert.concat([]) == []
 
-    def test_concat_with_engine_runs_execute_many(self):
+    _ASYNC_WRITE = "yggdrasil.databricks.table.async_write.AsyncWrite.from_records"
+
+    def test_concat_with_engine_builds_async_write(self):
         a = _make_record(target="cat.sch.t1", parquets=("/t1.parquet",),
                          metas=("/t1.json",), ops=("a",), mode="append")
         b = _make_record(target="cat.sch.t2", parquets=("/t2.parquet",),
                          metas=("/t2.json",), ops=("b",), mode="append")
 
         engine = MagicMock()
-        engine.execute_many.return_value = "batch-result"
-
-        # Each merged record produces one prepared statement; mock the
-        # statement-building so the test focuses on the orchestration.
-        with patch.object(
-            AsyncInsert, "to_statements",
-            side_effect=lambda **kw: [MagicMock(name="prepared")],
-        ):
+        sentinel_batch = MagicMock(name="batch")
+        with patch(self._ASYNC_WRITE, return_value=sentinel_batch) as from_records:
             result = AsyncInsert.concat([a, b], engine=engine, cleanup=True)
 
-        assert result == "batch-result"
-        engine.execute_many.assert_called_once()
-        prepared = engine.execute_many.call_args.args[0]
-        # One prepared per merged target.
-        assert len(prepared) == 2
+        assert result is sentinel_batch
+        from_records.assert_called_once()
+        records_arg = list(from_records.call_args.args[0])
+        # One merged record per target.
+        assert len(records_arg) == 2
+        targets = {r.target_full_name for r in records_arg}
+        assert targets == {"cat.sch.t1", "cat.sch.t2"}
+        assert from_records.call_args.kwargs["executor"] is engine.warehouse.return_value
 
     def test_concat_with_engine_forwards_cleanup_flag(self):
         a = _make_record(target="cat.sch.t", parquets=("/a.parquet",),
                          metas=("/a.json",), ops=("a",), mode="append")
         engine = MagicMock()
-        engine.execute_many.return_value = "ok"
 
-        with patch.object(
-            AsyncInsert, "to_statements", return_value=[MagicMock()],
-        ) as to_stmts:
+        with patch(self._ASYNC_WRITE, return_value=MagicMock()) as from_records:
             AsyncInsert.concat([a], engine=engine, cleanup=False)
-            assert to_stmts.call_args.kwargs["cleanup"] is False
+            assert from_records.call_args.kwargs["cleanup"] is False
 
             AsyncInsert.concat([a], engine=engine, cleanup=True)
-            assert to_stmts.call_args.kwargs["cleanup"] is True
+            assert from_records.call_args.kwargs["cleanup"] is True
 
     def test_concat_with_engine_empty_returns_none(self):
         engine = MagicMock()
-        assert AsyncInsert.concat([], engine=engine) is None
-        engine.execute_many.assert_not_called()
+        with patch(self._ASYNC_WRITE) as from_records:
+            assert AsyncInsert.concat([], engine=engine) is None
+        from_records.assert_not_called()
+        engine.warehouse.assert_not_called()
 
     def test_concat_forwards_wait_and_raise_error(self):
         a = _make_record(target="cat.sch.t", parquets=("/a.parquet",),
                          metas=("/a.json",), ops=("a",), mode="append")
         engine = MagicMock()
-        engine.execute_many.return_value = "ok"
 
-        with patch.object(
-            AsyncInsert, "to_statements", return_value=[MagicMock()],
-        ):
+        with patch(self._ASYNC_WRITE, return_value=MagicMock()) as from_records:
             AsyncInsert.concat(
                 [a], engine=engine, wait=False, raise_error=False,
             )
 
-        _, kwargs = engine.execute_many.call_args
+        _, kwargs = from_records.call_args
         assert kwargs["wait"] is False
         assert kwargs["raise_error"] is False
 
@@ -708,19 +712,14 @@ class TestConcat:
                          created_at="2026-05-15T11:00:00+00:00")
 
         engine = MagicMock()
-        engine.execute_many.return_value = "batch"
-
-        # Same target → one merged record → one prepared statement.
-        with patch.object(
-            AsyncInsert, "to_statements", return_value=[MagicMock(name="prepared")],
-        ) as to_stmts:
+        sentinel_batch = MagicMock(name="batch")
+        with patch(self._ASYNC_WRITE, return_value=sentinel_batch) as from_records:
             result = a(engine, b)  # __call__
 
-        assert result == "batch"
-        # Only one merged record after the same-target collapse.
-        assert to_stmts.call_count == 1
-        prepared = engine.execute_many.call_args.args[0]
-        assert len(prepared) == 1
+        assert result is sentinel_batch
+        # Same target → one merged record handed to AsyncWrite.
+        records_arg = list(from_records.call_args.args[0])
+        assert len(records_arg) == 1
 
     def test_call_without_engine_returns_sql_suite(self):
         a = _make_record(target="cat.sch.t1", parquets=("/a.parquet",),
@@ -728,6 +727,69 @@ class TestConcat:
         result = a()
         assert isinstance(result, list)
         assert result[0].startswith("INSERT INTO cat.sch.t1")
+
+
+class TestAsyncWrite:
+    """:class:`AsyncWrite` — unified WarehouseStatementBatch factory."""
+
+    _BATCH = (
+        "yggdrasil.databricks.warehouse.statement.WarehouseStatementBatch"
+    )
+
+    def test_from_records_empty_returns_none(self):
+        executor = MagicMock(name="warehouse")
+        with patch(self._BATCH) as batch_cls:
+            assert AsyncWrite.from_records([], executor=executor) is None
+        batch_cls.assert_not_called()
+
+    def test_from_records_submits_one_batch_with_every_statement(self):
+        a = _make_record(target="cat.sch.t1", parquets=("/a.parquet",),
+                         metas=("/a.json",), ops=("a",))
+        b = _make_record(target="cat.sch.t2", parquets=("/b.parquet",),
+                         metas=("/b.json",), ops=("b",))
+        executor = MagicMock(name="warehouse")
+        batch = MagicMock(name="batch")
+
+        with patch.object(
+            AsyncInsert, "to_statements",
+            side_effect=lambda **kw: [MagicMock(name="stmt")],
+        ) as to_stmts, patch(self._BATCH, return_value=batch) as batch_cls:
+            out = AsyncWrite.from_records([a, b], executor=executor)
+
+        assert out is batch
+        # One batch construction covers every record.
+        batch_cls.assert_called_once()
+        kwargs = batch_cls.call_args.kwargs
+        assert kwargs["executor"] is executor
+        # Two records → two statements in the unified batch.
+        assert len(kwargs["statements"]) == 2
+        assert to_stmts.call_count == 2
+        # wait() fires from from_records by default.
+        batch.wait.assert_called_once()
+
+    def test_from_source_with_engine_resolves_warehouse(self):
+        rec = _make_record(target="cat.sch.t")
+        engine = MagicMock()
+        batch = MagicMock(name="batch")
+
+        with patch.object(
+            AsyncInsert, "to_statements",
+            return_value=[MagicMock(name="stmt")],
+        ), patch(self._BATCH, return_value=batch):
+            out = AsyncWrite.from_source([rec], engine=engine)
+
+        assert out is batch
+        engine.warehouse.assert_called_once()
+
+    def test_from_source_requires_engine_or_executor(self):
+        with pytest.raises(ValueError):
+            AsyncWrite.from_source([_make_record()])
+
+    def test_from_source_empty_returns_none(self):
+        executor = MagicMock(name="warehouse")
+        with patch(self._BATCH) as batch_cls:
+            assert AsyncWrite.from_source([], executor=executor) is None
+        batch_cls.assert_not_called()
 
 
 class TestCleanup:
@@ -785,10 +847,12 @@ class TestStageAsyncInsert:
 
         assert out is parquet_path
         tbl.staging_folder.assert_called_once_with(temporary=False, async_write=True)
-        # parquet + metadata file paths joined off the folder
-        joined = [call.args[0] for call in folder.joinpath.call_args_list]
-        assert any(n.endswith(".parquet") for n in joined)
-        assert any(n.endswith(".json") for n in joined)
+        # Parquet payload joined off the ``data/`` subfolder; JSON
+        # metadata joined off the ``logs/`` subfolder. The
+        # _make_table_with_staging helper enforces the routing.
+        root_joins = [call.args[0] for call in folder.joinpath.call_args_list]
+        assert ASYNC_INSERT_DATA_SUBDIR in root_joins
+        assert ASYNC_INSERT_LOGS_SUBDIR in root_joins
         parquet_path.write_table.assert_called_once()
         meta_path.write_bytes.assert_called_once()
 
@@ -1149,7 +1213,9 @@ class TestSchemaDiscovery:
         assert len(merged) == 1
         assert merged[0].target_full_name == "cat.sch.a"
 
-    def test_apply_schema_executes_each_target(self):
+    _ASYNC_WRITE = "yggdrasil.databricks.table.async_write.AsyncWrite.from_records"
+
+    def test_apply_schema_submits_one_unified_batch(self):
         rec_a = _make_record(target="cat.sch.a", parquets=("/a.parquet",),
                              metas=("/a.json",), ops=("a",))
         rec_b = _make_record(target="cat.sch.b", parquets=("/b.parquet",),
@@ -1160,26 +1226,27 @@ class TestSchemaDiscovery:
         client = self._client_with_volumes([vol_a, vol_b])
 
         engine = MagicMock()
-        engine.execute_many.side_effect = ["result-a", "result-b"]
-
-        # Skip the WarehousePreparedStatement plumbing — the schema-apply
-        # path delegates to record.execute, which we cover separately.
-        with patch.object(
-            AsyncInsert, "to_statements", return_value=[MagicMock()],
-        ):
-            results = AsyncInsert.apply_schema(
+        sentinel_batch = MagicMock(name="batch")
+        with patch(self._ASYNC_WRITE, return_value=sentinel_batch) as from_records:
+            result = AsyncInsert.apply_schema(
                 engine, "cat", "sch", client=client,
             )
 
-        assert results == ["result-a", "result-b"]
-        # One execute_many per target (each record runs its own batch).
-        assert engine.execute_many.call_count == 2
+        assert result is sentinel_batch
+        # One unified AsyncWrite covers every target — not one batch per record.
+        from_records.assert_called_once()
+        records_arg = list(from_records.call_args.args[0])
+        assert {r.target_full_name for r in records_arg} == {
+            "cat.sch.a", "cat.sch.b",
+        }
 
-    def test_apply_schema_no_records_returns_empty(self):
+    def test_apply_schema_no_records_returns_none(self):
         client = self._client_with_volumes([])
         engine = MagicMock()
-        assert AsyncInsert.apply_schema(engine, "cat", "sch", client=client) == []
-        engine.execute_many.assert_not_called()
+        with patch(self._ASYNC_WRITE) as from_records:
+            assert AsyncInsert.apply_schema(engine, "cat", "sch", client=client) is None
+        from_records.assert_not_called()
+        engine.warehouse.assert_not_called()
 
 
 class TestTableInsertAsyncWriteFlag:
