@@ -50,9 +50,9 @@ class PostgresExecutor(
     schema lookups.
     """
 
-    _PREPARED_STATEMENT_CLASS: ClassVar[type[PostgresPreparedStatement]] = PostgresPreparedStatement
-    _STATEMENT_RESULT_CLASS: ClassVar[type[PostgresStatementResult]] = PostgresStatementResult
-    _STATEMENT_BATCH_CLASS: ClassVar[type[PostgresStatementBatch]] = PostgresStatementBatch
+    _PREPARED_CLASS: ClassVar[type[PostgresPreparedStatement]] = PostgresPreparedStatement
+    _RESPONSE_CLASS: ClassVar[type[PostgresStatementResult]] = PostgresStatementResult
+    _BATCH_CLASS: ClassVar[type[PostgresStatementBatch]] = PostgresStatementBatch
 
     _SINGLETON_TTL: ClassVar[Any] = None
 
@@ -139,7 +139,7 @@ class PostgresExecutor(
         start: bool = True
     ) -> PostgresStatementResult:
         """Build a :class:`PostgresStatementResult` and run it eagerly."""
-        result = self._STATEMENT_RESULT_CLASS(
+        result = self._RESPONSE_CLASS(
             statement=statement,
             executor=self,
             connection=self.connection,

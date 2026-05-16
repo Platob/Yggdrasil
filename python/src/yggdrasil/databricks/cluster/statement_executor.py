@@ -123,9 +123,9 @@ class ClusterStatementExecutor(DatabricksResource, StatementExecutor[
     unintended second context.
     """
 
-    _PREPARED_STATEMENT_CLASS: ClassVar[type[ClusterPreparedStatement]] = ClusterPreparedStatement
-    _STATEMENT_RESULT_CLASS: ClassVar[type[ClusterStatementResult]] = ClusterStatementResult
-    _STATEMENT_BATCH_CLASS: ClassVar[type[ClusterStatementBatch]] = ClusterStatementBatch
+    _PREPARED_CLASS: ClassVar[type[ClusterPreparedStatement]] = ClusterPreparedStatement
+    _RESPONSE_CLASS: ClassVar[type[ClusterStatementResult]] = ClusterStatementResult
+    _BATCH_CLASS: ClassVar[type[ClusterStatementBatch]] = ClusterStatementBatch
 
     _SINGLETON_TTL: ClassVar[Any] = None
 
@@ -197,12 +197,12 @@ class ClusterStatementExecutor(DatabricksResource, StatementExecutor[
     # ------------------------------------------------------------------ #
     # Statement preparation
     # ------------------------------------------------------------------ #
-    def _coerce_statement(
+    def prepare(
         self,
         statement: "ClusterPreparedStatement | PreparedStatement | str",
     ) -> ClusterPreparedStatement:
-        coerced = super()._coerce_statement(statement)
-        return self._rewrite_for_select(coerced)
+        prepared = super().prepare(statement)
+        return self._rewrite_for_select(prepared)
 
     def _rewrite_for_select(
         self,

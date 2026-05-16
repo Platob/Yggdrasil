@@ -792,18 +792,19 @@ class Session(Singleton, ABC):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         spark_session: Optional["SparkSession"] = None,
-        lazy: bool = False,
+        start: bool = True,
         **options,
     ) -> Response:
         """Prepare, dispatch, and (optionally) await the response.
 
-        ``lazy=True`` builds the prepared request + response shell
-        without crossing the wire — the
-        :class:`StatementExecutor` override uses the same knob to
-        return an idled :class:`StatementResult` whose backend
-        submission is deferred until :meth:`StatementResult.start`
-        fires. Plain HTTP sessions don't need an idle :class:`Response`
-        (the network call is synchronous), so the base raises a clean
+        ``start=True`` (default) fires the wire call. ``start=False``
+        builds the prepared request + response shell without crossing
+        the wire — the :class:`StatementExecutor` override uses the
+        same knob to return an idled :class:`StatementResult` whose
+        backend submission is deferred until
+        :meth:`StatementResult.start` fires. Plain HTTP sessions don't
+        need an idle :class:`Response` (the network call is
+        synchronous), so the base raises a clean
         ``NotImplementedError`` via :meth:`_build_idle_response`.
         """
         cfg = SendConfig.check_arg(
@@ -816,7 +817,7 @@ class Session(Singleton, ABC):
             spark_session=spark_session,
             **options,
         )
-        if lazy:
+        if not start:
             return self._build_idle_response(request, cfg)
         return self._send(request, cfg)
 
@@ -835,8 +836,8 @@ class Session(Singleton, ABC):
         and SQL.
         """
         raise NotImplementedError(
-            f"{type(self).__name__}.send(lazy=True) is not implemented; "
-            "use the synchronous send path (lazy=False) for HTTP sessions, "
+            f"{type(self).__name__}.send(start=False) is not implemented; "
+            "use the synchronous send path (start=True) for HTTP sessions, "
             "or override _build_idle_response on a custom subclass."
         )
 

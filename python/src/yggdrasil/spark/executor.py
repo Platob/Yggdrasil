@@ -61,9 +61,9 @@ class SparkStatementExecutor(
 
     # Pin the concrete types so the base executor's coercion produces the
     # right subclass and `result.statement` always has the expected shape.
-    _PREPARED_STATEMENT_CLASS: ClassVar[type[SparkPreparedStatement]] = SparkPreparedStatement
-    _STATEMENT_RESULT_CLASS: ClassVar[type[SparkStatementResult]] = SparkStatementResult
-    _STATEMENT_BATCH_CLASS: ClassVar[type[SparkStatementBatch]] = SparkStatementBatch
+    _PREPARED_CLASS: ClassVar[type[SparkPreparedStatement]] = SparkPreparedStatement
+    _RESPONSE_CLASS: ClassVar[type[SparkStatementResult]] = SparkStatementResult
+    _BATCH_CLASS: ClassVar[type[SparkStatementBatch]] = SparkStatementBatch
 
     _SINGLETON_TTL: ClassVar[Any] = None
 
@@ -176,7 +176,7 @@ class SparkStatementExecutor(
             if session is not None:
                 statement.spark_session = session
 
-        result = self._STATEMENT_RESULT_CLASS(statement=statement, executor=self)
+        result = self._RESPONSE_CLASS(statement=statement, executor=self)
         if not start:
             return result
 

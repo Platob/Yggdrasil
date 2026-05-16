@@ -52,9 +52,9 @@ class MongoExecutor(
     database / collection sub-services.
     """
 
-    _PREPARED_STATEMENT_CLASS: ClassVar[type[MongoCommand]] = MongoCommand
-    _STATEMENT_RESULT_CLASS: ClassVar[type[MongoStatementResult]] = MongoStatementResult
-    _STATEMENT_BATCH_CLASS: ClassVar[type[MongoStatementBatch]] = MongoStatementBatch
+    _PREPARED_CLASS: ClassVar[type[MongoCommand]] = MongoCommand
+    _RESPONSE_CLASS: ClassVar[type[MongoStatementResult]] = MongoStatementResult
+    _BATCH_CLASS: ClassVar[type[MongoStatementBatch]] = MongoStatementBatch
 
     _SINGLETON_TTL: ClassVar[Any] = None
 
@@ -122,7 +122,7 @@ class MongoExecutor(
         statement: MongoCommand,
         start: bool = True
     ) -> MongoStatementResult:
-        result = self._STATEMENT_RESULT_CLASS(
+        result = self._RESPONSE_CLASS(
             statement=statement,
             executor=self,
             connection=self.connection,

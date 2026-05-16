@@ -137,7 +137,7 @@ class ClusterStatementResult(StatementResult):
     rewritten through ``INSERT OVERWRITE DIRECTORY``.
     """
 
-    _PREPARED_STATEMENT_CLASS: ClassVar[type[PreparedStatement]] = ClusterPreparedStatement
+    _PREPARED_CLASS: ClassVar[type[PreparedStatement]] = ClusterPreparedStatement
 
     executor: "ClusterStatementExecutor"
     statement: ClusterPreparedStatement
@@ -266,6 +266,6 @@ class ClusterStatementBatch(StatementBatch):
     """Batch of cluster-backed statements.
 
     Inherits the base batch contract unchanged — submission goes
-    through :meth:`ClusterStatementExecutor.submit_statement`; the
-    batch only adds the typed result-class pin.
+    through :meth:`ClusterStatementExecutor.send`; the batch only
+    adds the typed result-class pin.
     """

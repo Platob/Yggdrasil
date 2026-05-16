@@ -367,7 +367,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         ``warehouse_name`` resolves to.
         """
         if isinstance(statement, SparkPreparedStatement):
-            return self.spark.submit_statement(statement, start=start)
+            return self.spark.send(statement, start=start)
 
         if not isinstance(statement, WarehousePreparedStatement):
             statement = WarehousePreparedStatement.from_(statement)
@@ -376,7 +376,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
             warehouse_id=statement.warehouse_id,
             warehouse_name=statement.warehouse_name,
         )
-        return wh.submit_statement(statement, start=start)
+        return wh.send(statement, start=start)
 
     # ------------------------------------------------------------------
     # Public execution surface

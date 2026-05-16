@@ -81,8 +81,8 @@ class SqlExecutor(StatementExecutor, ABC):
     same in-process catalog.
     """
 
-    _PREPARED_STATEMENT_CLASS: ClassVar[type[SqlPreparedStatement]] = SqlPreparedStatement
-    _STATEMENT_RESULT_CLASS: ClassVar[type[SqlStatementResult]] = SqlStatementResult
+    _PREPARED_CLASS: ClassVar[type[SqlPreparedStatement]] = SqlPreparedStatement
+    _RESPONSE_CLASS: ClassVar[type[SqlStatementResult]] = SqlStatementResult
 
     _SINGLETON_TTL: ClassVar[Any] = None
 
@@ -119,7 +119,7 @@ class SqlExecutor(StatementExecutor, ABC):
         one shot — there's no separate "submit then wait" round-
         trip for in-process SQL.
         """
-        result = self._STATEMENT_RESULT_CLASS(
+        result = self._RESPONSE_CLASS(
             statement, executor=self, context=self.context,
         )
         result.start(raise_error=False)

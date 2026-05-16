@@ -167,7 +167,7 @@ class SqlStatementResult(StatementResult[SqlPreparedStatement]):
     :class:`Tabular` has been mutated and you want a fresh view.
     """
 
-    _PREPARED_STATEMENT_CLASS: ClassVar[type[SqlPreparedStatement]] = SqlPreparedStatement
+    _PREPARED_CLASS: ClassVar[type[SqlPreparedStatement]] = SqlPreparedStatement
 
     @classmethod
     def default_media_type(cls) -> "MimeType | None":

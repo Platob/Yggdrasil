@@ -103,7 +103,7 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
     surfaces directly when the caller touches the persisted frame.
     """
 
-    _PREPARED_STATEMENT_CLASS = SparkPreparedStatement
+    _PREPARED_CLASS = SparkPreparedStatement
 
     def __init__(
         self,

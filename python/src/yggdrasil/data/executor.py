@@ -14,8 +14,8 @@ Public surface
 Subclassing
 -----------
 Subclasses pin their concrete types via the three :class:`ClassVar`
-attributes ``_PREPARED_STATEMENT_CLASS``, ``_STATEMENT_RESULT_CLASS``,
-``_STATEMENT_BATCH_CLASS``, and implement :meth:`_submit_statement`.
+attributes ``_PREPARED_CLASS``, ``_RESPONSE_CLASS``,
+``_BATCH_CLASS``, and implement :meth:`_submit_statement`.
 Cross-cutting behavior (logging, retries, metrics) is best added by
 overriding :meth:`_execute` — it sees an already-coerced statement and a
 resolved :class:`ExecutionOptions`, so it doesn't have to re-implement
@@ -181,15 +181,12 @@ class StatementExecutor(Session, Disposable, Generic[PS, SR, SB]):
       :class:`PreparedStatement` subclass (analogue of
       :meth:`Session.prepare_request_before_send`),
     - :meth:`send` — dispatch a prepared statement and return its
-      :class:`StatementResult`. ``lazy=True`` returns an idled
+      :class:`StatementResult`. ``start=False`` returns an idled
       result whose backend submission is deferred until
       :meth:`StatementResult.start` fires — same shape as
-      :meth:`Session.send` with ``lazy=True``,
+      :meth:`Session.send` with ``start=False``,
     - :meth:`execute` / :meth:`execute_many` — kwargs-friendly sugar
       that resolves :class:`ExecutionOptions` and waits.
-
-    ``submit_statement`` is kept as a backward-compatible alias that
-    routes through :meth:`send`.
 
     Singleton + pickle
     ------------------
@@ -215,12 +212,10 @@ class StatementExecutor(Session, Disposable, Generic[PS, SR, SB]):
     The prepared / response / batch types are pinned on the inherited
     :class:`Session` ClassVars — :attr:`Session._PREPARED_CLASS` /
     :attr:`Session._RESPONSE_CLASS` / :attr:`Session._BATCH_CLASS` —
-    overridden here to the SQL-shaped defaults. Older subclasses that
-    pin the historical ``_PREPARED_STATEMENT_CLASS`` /
-    ``_STATEMENT_RESULT_CLASS`` / ``_STATEMENT_BATCH_CLASS`` names still
-    work; :meth:`__init_subclass__` mirrors either set of names onto
-    the other so the prepare → send pipeline reaches the right
-    concrete type regardless of which alias the subclass pinned.
+    overridden here to the SQL-shaped defaults. Backend subclasses
+    (``SQLWarehouse``, ``SparkStatementExecutor``, …) re-pin them to
+    their concrete types so the prepare → send pipeline produces the
+    right shape without per-call coercion.
     """
 
     max_workers: Optional[int] = None
@@ -229,29 +224,6 @@ class StatementExecutor(Session, Disposable, Generic[PS, SR, SB]):
     _PREPARED_CLASS: ClassVar[type[PreparedStatement]] = PreparedStatement
     _RESPONSE_CLASS: ClassVar[type[StatementResult]] = StatementResult
     _BATCH_CLASS: ClassVar[type[StatementBatch]] = StatementBatch
-
-    # Backward-compat aliases (long names that several subclasses pin).
-    # ``__init_subclass__`` keeps the short and long names in lockstep.
-    _PREPARED_STATEMENT_CLASS: ClassVar[type[PreparedStatement]] = PreparedStatement
-    _STATEMENT_RESULT_CLASS: ClassVar[type[StatementResult]] = StatementResult
-    _STATEMENT_BATCH_CLASS: ClassVar[type[StatementBatch]] = StatementBatch
-
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        super().__init_subclass__(**kwargs)
-        # Source-of-truth precedence: the long ``_STATEMENT_*`` name
-        # when the subclass set it explicitly, otherwise the short
-        # alias. Either way the prepare/send pipeline ends up seeing
-        # the right concrete type without the subclass restating both.
-        for short, long in (
-            ("_PREPARED_CLASS", "_PREPARED_STATEMENT_CLASS"),
-            ("_RESPONSE_CLASS", "_STATEMENT_RESULT_CLASS"),
-            ("_BATCH_CLASS", "_STATEMENT_BATCH_CLASS"),
-        ):
-            own = cls.__dict__
-            if long in own and short not in own:
-                setattr(cls, short, own[long])
-            elif short in own and long not in own:
-                setattr(cls, long, own[short])
 
     @classmethod
     def _singleton_key(cls, *args: Any, **kwargs: Any) -> Any:
@@ -319,26 +291,29 @@ class StatementExecutor(Session, Disposable, Generic[PS, SR, SB]):
         :class:`PreparedStatement`, already-typed instance) and
         returns the concrete :attr:`_PREPARED_CLASS` every downstream
         hook expects. Subclasses that need to inject per-statement
-        defaults (warehouse routing, catalog binding) override this —
-        same shape as Session's hook.
+        defaults (warehouse routing, catalog binding, SELECT-rewrite
+        for cluster execution) override this — same shape as Session's
+        hook.
         """
-        return self._coerce_statement(statement)
+        cls = self._PREPARED_CLASS
+        if isinstance(statement, cls):
+            return statement  # type: ignore[return-value]
+        return cls.from_(statement)  # type: ignore[return-value]
 
     def send(
         self,
         statement: "PS | PreparedStatement | str",
         *,
-        lazy: bool = False,
+        start: bool = True,
     ) -> SR:
         """Dispatch *statement* and return its tracking :class:`StatementResult`.
 
-        Mirrors :meth:`Session.send`. ``lazy=False`` (default) routes
-        the prepared statement through :meth:`_submit_statement`
-        eagerly — the result comes back already in flight (or
-        already terminal for synchronous backends). ``lazy=True``
-        returns the idled :class:`StatementResult` whose backend
-        submission is deferred until :meth:`StatementResult.start`
-        fires, matching the Session ``lazy=True`` shape for HTTP.
+        Mirrors :meth:`Session.send`. ``start=True`` (default) fires
+        the backend submission eagerly — the result comes back in
+        flight (or already terminal for synchronous backends).
+        ``start=False`` returns the idled :class:`StatementResult`
+        whose backend submission is deferred until
+        :meth:`StatementResult.start` fires.
 
         The returned result is always bound to this executor — every
         subclass ``_submit_statement`` is supposed to thread
@@ -349,20 +324,10 @@ class StatementExecutor(Session, Disposable, Generic[PS, SR, SB]):
         enforceable from one place instead of audited per backend.
         """
         prepared = self.prepare(statement)
-        result = self._submit_statement(prepared, start=not lazy)
+        result = self._submit_statement(prepared, start=start)
         if getattr(result, "executor", None) is None:
             result.executor = self
         return result
-
-    def submit_statement(self, statement: PS, start: bool = True) -> SR:
-        """Backward-compatible alias for :meth:`send`.
-
-        Older call sites (and most of the codebase) reach for
-        ``executor.submit_statement(...)``; route through
-        :meth:`send` so the lazy / non-lazy plumbing stays in one
-        place.
-        """
-        return self.send(statement, lazy=not start)
 
     @abstractmethod
     def _submit_statement(self, statement: PS, start: bool = True) -> SR:
@@ -390,35 +355,18 @@ class StatementExecutor(Session, Disposable, Generic[PS, SR, SB]):
         raise NotImplementedError(
             f"{type(self).__name__} is a SQL executor; the HTTP "
             "_local_send pathway is not applicable. Submit a "
-            "PreparedStatement via .send() / .submit_statement() / "
-            ".execute() instead."
+            "PreparedStatement via .send() / .execute() instead."
         )
 
     def _build_idle_response(self, request: Any, config: Any) -> Any:
         """Idle-result shim — SQL executors route through
-        :meth:`send(lazy=True)` directly, which builds the idled
+        :meth:`send(start=False)` directly, which builds the idled
         :class:`StatementResult` via :meth:`_submit_statement(start=False)`
         without re-entering this method."""
         raise NotImplementedError(
-            f"{type(self).__name__}: use .send(statement, lazy=True) "
+            f"{type(self).__name__}: use .send(statement, start=False) "
             "to build an idled StatementResult."
         )
-
-    # -------------------------------------------------------------------------
-    # Coercion
-    # -------------------------------------------------------------------------
-
-    def _coerce_statement(self, statement: "PS | PreparedStatement | str") -> PS:
-        """Coerce ``statement`` into ``_PREPARED_STATEMENT_CLASS``.
-
-        Foreign-typed :class:`PreparedStatement` instances are rebuilt so
-        subclasses always see their own concrete type — important when the
-        subclass adds fields (parameters, external tables, …).
-        """
-        cls = self._PREPARED_STATEMENT_CLASS
-        if isinstance(statement, cls):
-            return statement  # type: ignore[return-value]
-        return cls.from_(statement)  # type: ignore[return-value]
 
     # -------------------------------------------------------------------------
     # Single-statement execution
@@ -450,8 +398,8 @@ class StatementExecutor(Session, Disposable, Generic[PS, SR, SB]):
         configuration (parameters, byte limits, routing, etc.).
         """
         opts = self._resolve_options(options, wait=wait, raise_error=raise_error)
-        coerced = self._coerce_statement(statement)
-        return self._execute(coerced, opts)
+        prepared = self.prepare(statement)
+        return self._execute(prepared, opts)
 
     def _execute(self, statement: PS, options: ExecutionOptions, start: bool = True) -> SR:
         """Hot-path execution: submit + wait/raise per ``options``.
@@ -517,7 +465,7 @@ class StatementExecutor(Session, Disposable, Generic[PS, SR, SB]):
         **kwargs: Any,
     ) -> SB:
         """Construct a batch bound to this executor."""
-        return self._STATEMENT_BATCH_CLASS(
+        return self._BATCH_CLASS(
             statements=statements,
             executor=self if executor is None else executor,
             parallel=parallel,

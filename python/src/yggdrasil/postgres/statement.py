@@ -188,7 +188,7 @@ class PostgresStatementResult(StatementResult[PostgresPreparedStatement]):
     ``read_pandas_frame``, …) work out of the box.
     """
 
-    _PREPARED_STATEMENT_CLASS: ClassVar[type[PostgresPreparedStatement]] = PostgresPreparedStatement
+    _PREPARED_CLASS: ClassVar[type[PostgresPreparedStatement]] = PostgresPreparedStatement
 
     def __init__(
         self,
