@@ -120,13 +120,37 @@ class TestWrite:
         kwargs = workspace.workspace.upload.call_args.kwargs
         assert kwargs["path"] == "/Workspace/x"
         assert kwargs["overwrite"] is True
-        assert kwargs["content"].getvalue() == b"abcdef"
+        # Raw bytes (not a pre-built BytesIO) — the SDK wraps them
+        # fresh on every request, so transient-error retries don't
+        # send an empty body from an exhausted stream.
+        assert kwargs["content"] == b"abcdef"
         # ``format`` must be passed: the SDK default is ``SOURCE``,
         # which routes raw bytes through the notebook importer and
         # fails with ``BadRequest: The zip archive contains no items``.
         # ``AUTO`` lets the server inspect the extension/content.
         fmt = kwargs["format"]
         assert getattr(fmt, "name", str(fmt)).upper() == "AUTO"
+
+    def test_upload_resends_full_payload_on_retry(self, workspace, client) -> None:
+        """Transient failures must not exhaust the upload stream.
+
+        Pre-wrapping the payload in a single :class:`io.BytesIO`
+        (the previous shape) consumed the cursor on the first
+        attempt, so any retry after a 5xx / parent-recovery uploaded
+        an empty body — that's how staged workspace ``.py`` files
+        ended up empty in :meth:`Table.async_job`.
+        """
+        from databricks.sdk.errors import InternalError
+
+        workspace.workspace.get_status.side_effect = NotFound()
+        workspace.workspace.upload.side_effect = [InternalError("flaky"), None]
+
+        p = WorkspacePath("/Workspace/y", client=client)
+        p.write_bytes(b"abcdef")
+
+        assert workspace.workspace.upload.call_count == 2
+        for call in workspace.workspace.upload.call_args_list:
+            assert call.kwargs["content"] == b"abcdef"
 
 
 class TestMutators:

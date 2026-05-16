@@ -11,7 +11,6 @@ read-modify-rewrite scheme.
 
 from __future__ import annotations
 
-import io as _stdio
 import logging
 import time
 from typing import Any, ClassVar, Iterator
@@ -344,10 +343,16 @@ class WorkspacePath(DatabricksPath):
         logger.debug(
             "Uploading workspace file %r (%d bytes)", self, len(payload),
         )
+        # Pass raw bytes — the SDK wraps them in a fresh ``BytesIO`` on
+        # every request. Pre-wrapping here would share a single stream
+        # across :meth:`_call_ensuring_parents` / ``retry_sdk_call``
+        # retries; the first request exhausts its cursor and every
+        # follow-up uploads zero bytes, which is how a transient 5xx
+        # or a parent-creation recovery lands an empty workspace file.
         self._call_ensuring_parents(
             self.client.workspace_client().workspace.upload,
             path=self.api_path,
-            content=_stdio.BytesIO(payload),
+            content=payload,
             format=_import_format_auto(),
             overwrite=True,
         )
@@ -417,14 +422,22 @@ class WorkspacePath(DatabricksPath):
         archive_path = build_module_archive(local_root, dest=None)
         try:
             size = archive_path.stat().st_size
-            with open(archive_path, "rb") as fh:
-                target._call_ensuring_parents(
-                    target.client.workspace_client().workspace.upload,
-                    path=target.api_path,
-                    content=fh,
-                    format=_import_format_auto(),
-                    overwrite=overwrite,
-                )
+            upload = target.client.workspace_client().workspace.upload
+
+            def _do_upload() -> None:
+                # Re-open per attempt so ``_call_ensuring_parents`` /
+                # ``retry_sdk_call`` retries always read from byte 0;
+                # otherwise the second attempt would upload an empty
+                # tail after the first attempt's cursor advanced.
+                with open(archive_path, "rb") as fh:
+                    upload(
+                        path=target.api_path,
+                        content=fh,
+                        format=_import_format_auto(),
+                        overwrite=overwrite,
+                    )
+
+            target._call_ensuring_parents(_do_upload)
         finally:
             if local_root != archive_path:
                 try:

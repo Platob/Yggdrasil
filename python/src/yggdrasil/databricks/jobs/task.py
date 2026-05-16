@@ -23,7 +23,7 @@ import json
 import logging
 import textwrap
 from dataclasses import replace as _dc_replace
-from typing import Any, Callable, List, Optional, Sequence, TYPE_CHECKING, Union
+from typing import Any, Callable, List, Optional, Sequence, TYPE_CHECKING, Tuple, Union
 
 from databricks.sdk.service.compute import Environment
 from databricks.sdk.service.jobs import JobEnvironment, SparkPythonTask, Task
@@ -39,6 +39,8 @@ from .introspect import (
 )
 
 if TYPE_CHECKING:
+    from yggdrasil.databricks.client import DatabricksClient
+
     from .job import Job
     from .workspace_pypi import WorkspacePyPI
 
@@ -49,6 +51,7 @@ __all__ = [
     "DEFAULT_ENVIRONMENT_KEY",
     "DEFAULT_ENVIRONMENT_CLIENT",
     "DEFAULT_ENVIRONMENT_DEPENDENCIES",
+    "stage_python_callable",
 ]
 
 LOGGER = logging.getLogger(__name__)
@@ -458,82 +461,120 @@ class JobTask:
         does it for you). :meth:`create` is idempotent — same key
         replaces in place.
         """
-        from yggdrasil.databricks.fs.workspace_path import WorkspacePath
-
-        key = task_key or func.__name__
-        script = _render_callable_script(func, args, kwargs)
-        # Content hash, not a random token: re-staging the same body
-        # with the same bound args lands on the same path so the
-        # workspace doesn't accumulate near-duplicate
-        # ``<key>-<random>.py`` files across iterations. Hashes only
-        # the bits the caller controls — the function source plus
-        # invocation args — so volatile slots like the embedded
-        # ``staged_at`` / ``yggdrasil_version`` metadata don't shift
-        # the digest between otherwise-identical re-stagings.
-        digest = _content_digest(func, args, kwargs)
-
-        # Final layout: ``<staging_root>/<task_key>/main-<digest>.py``.
-        # Grouping by ``task_key`` (not job name) keeps identical
-        # sources staged by different jobs landing on the same file —
-        # the digest disambiguates between revisions.
-        path = WorkspacePath(
-            f"{staging_root.rstrip('/')}/{key}/main-{digest}.py",
-            client=job.client,
+        details, merged_specs, sniffed_env_var_names = stage_python_callable(
+            job.client,
+            func,
+            *args,
+            task_key=task_key,
+            staging_root=staging_root,
+            auto_dependencies=auto_dependencies,
+            extra_dependencies=extra_dependencies,
+            exclude_modules=exclude_modules,
+            workspace_pypi=_resolve_workspace_pypi(workspace_pypi, job),
+            **kwargs,
         )
-
-        LOGGER.debug(
-            "Staging callable %r as raw source at %r",
-            func.__qualname__, path,
-        )
-        path.write_bytes(script.encode())
-
-        # Description carries the formatted signature so the Databricks
-        # UI surfaces "qualname(x: int = 5) -> str" without cracking the
-        # script open; the docstring's first line is prepended when set.
-        signature_str = format_signature(describe_signature(func))
-        doc_line = (func.__doc__ or "").strip().splitlines()[0:1]
-        description = (
-            f"{doc_line[0]} — {signature_str}" if doc_line else signature_str
-        )[:1000]
-
-        details = Task(
-            task_key=key,
-            description=description,
-            spark_python_task=SparkPythonTask(
-                python_file=path.full_path(),
-            ),
-            environment_key=DEFAULT_ENVIRONMENT_KEY,
-        )
-
-        # One AST walk feeds both the auto-dep resolver and the
-        # diagnostics env-var list.
-        sniffed_modules, sniffed_env_vars = sniff_script(script)
-        sniffed_env_var_names = sorted(sniffed_env_vars)
-        publisher = _resolve_workspace_pypi(workspace_pypi, job)
-        derived_specs: list[str] = []
-        if auto_dependencies:
-            derived_specs = dependencies_to_pip_specs(
-                sniffed_modules,
-                exclude=exclude_modules,
-                workspace_pypi=publisher,
-            )
-        merged_specs = _dedupe_preserve(
-            [*(extra_dependencies or ()), *derived_specs],
-        )
-
-        LOGGER.debug(
-            "Sniffed staged task %r imports=%r env_vars=%r — derived "
-            "dependencies %r",
-            key, sorted(sniffed_modules), sniffed_env_var_names, merged_specs,
-        )
-
         return cls(
             job=job,
-            task_key=key,
+            task_key=details.task_key,
             details=details,
             extra_dependencies=merged_specs,
             sniffed_env_vars=sniffed_env_var_names,
         )
+
+def stage_python_callable(
+    client: "DatabricksClient",
+    func: Callable[..., Any],
+    *args: Any,
+    task_key: Optional[str] = None,
+    staging_root: str = DEFAULT_STAGING_ROOT,
+    auto_dependencies: bool = True,
+    extra_dependencies: Optional[Sequence[str]] = None,
+    exclude_modules: Sequence[str] = (),
+    workspace_pypi: Optional["WorkspacePyPI"] = None,
+    **kwargs: Any,
+) -> Tuple[Task, List[str], List[str]]:
+    """Render *func* to a workspace ``.py`` file and return its :class:`Task` spec.
+
+    The job-independent half of :meth:`JobTask.from_callable` — only
+    needs *client* (to write under :data:`DEFAULT_STAGING_ROOT`) and
+    *func*. Returns ``(task, pip_specs, env_var_names)``: the built
+    :class:`Task` (with ``spark_python_task`` pointed at the staged
+    file and ``environment_key=DEFAULT_ENVIRONMENT_KEY``), the
+    auto-derived pip dependencies, and the env-var names the body
+    reads. Used by both :meth:`JobTask.from_callable` (job-bound
+    staging path) and :meth:`AsyncInsertJob.settings` (job-spec
+    auto-staging path).
+    """
+    from yggdrasil.databricks.fs.workspace_path import WorkspacePath
+
+    key = task_key or func.__name__
+    script = _render_callable_script(func, args, kwargs)
+    # Content hash, not a random token: re-staging the same body
+    # with the same bound args lands on the same path so the
+    # workspace doesn't accumulate near-duplicate
+    # ``<key>-<random>.py`` files across iterations. Hashes only
+    # the bits the caller controls — the function source plus
+    # invocation args — so volatile slots like the embedded
+    # ``staged_at`` / ``yggdrasil_version`` metadata don't shift
+    # the digest between otherwise-identical re-stagings.
+    digest = _content_digest(func, args, kwargs)
+
+    # Final layout: ``<staging_root>/<task_key>/main-<digest>.py``.
+    # Grouping by ``task_key`` (not job name) keeps identical
+    # sources staged by different jobs landing on the same file —
+    # the digest disambiguates between revisions.
+    path = WorkspacePath(
+        f"{staging_root.rstrip('/')}/{key}/main-{digest}.py",
+        client=client,
+    )
+
+    LOGGER.debug(
+        "Staging callable %r as raw source at %r",
+        func.__qualname__, path,
+    )
+    path.write_bytes(script.encode())
+
+    # Description carries the formatted signature so the Databricks
+    # UI surfaces "qualname(x: int = 5) -> str" without cracking the
+    # script open; the docstring's first line is prepended when set.
+    signature_str = format_signature(describe_signature(func))
+    doc_line = (func.__doc__ or "").strip().splitlines()[0:1]
+    description = (
+        f"{doc_line[0]} — {signature_str}" if doc_line else signature_str
+    )[:1000]
+
+    details = Task(
+        task_key=key,
+        description=description,
+        spark_python_task=SparkPythonTask(
+            python_file=path.full_path(),
+        ),
+        environment_key=DEFAULT_ENVIRONMENT_KEY,
+    )
+
+    # One AST walk feeds both the auto-dep resolver and the
+    # diagnostics env-var list.
+    sniffed_modules, sniffed_env_vars = sniff_script(script)
+    sniffed_env_var_names = sorted(sniffed_env_vars)
+    derived_specs: list[str] = []
+    if auto_dependencies:
+        derived_specs = dependencies_to_pip_specs(
+            sniffed_modules,
+            exclude=exclude_modules,
+            workspace_pypi=workspace_pypi,
+        )
+    merged_specs = _dedupe_preserve(
+        [*(extra_dependencies or ()), *derived_specs],
+    )
+
+    LOGGER.debug(
+        "Sniffed staged task %r imports=%r env_vars=%r — derived "
+        "dependencies %r",
+        key, sorted(sniffed_modules), sniffed_env_var_names, merged_specs,
+    )
+
+    return details, merged_specs, sniffed_env_var_names
+
 
 def _content_digest(
     func: Callable[..., Any], args: tuple, kwargs: dict,
