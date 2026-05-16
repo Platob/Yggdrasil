@@ -510,7 +510,13 @@ class LocalPath(Path):
 
         ``singleton_ttl`` is accepted for signature compatibility with
         the base :class:`Path` contract; :class:`LocalPath` is not a
-        :class:`Singleton`, so the kwarg has no effect here.
+        :class:`Singleton`, so the kwarg has no effect here. Each
+        :class:`os.DirEntry` already carries ``is_dir`` / ``is_file``
+        / ``stat`` cheaply, so seed every child's stat slot off the
+        DirEntry — that's the fast path the base :class:`Path` uses
+        on ``is_file`` / ``is_dir`` / ``size`` / ``mtime`` calls so
+        an iterdir-and-classify loop doesn't fire an extra
+        :func:`os.stat` per child.
         """
         del singleton_ttl
         try:
@@ -520,8 +526,23 @@ class LocalPath(Path):
 
         for entry in entries:
             child = self._from_url(entry.path)
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+                st = entry.stat(follow_symlinks=False)
+                child._seed_stat_cache(IOStats(
+                    size=int(st.st_size),
+                    mtime=float(st.st_mtime),
+                    mode=int(st.st_mode),
+                    kind=IOKind.DIRECTORY if is_dir else IOKind.FILE,
+                    media_type=child.media_type,
+                ))
+            except OSError:
+                # Race: the entry vanished between scandir and stat.
+                # Skip seeding — :meth:`_stat` falls back to a live
+                # probe, which will report MISSING.
+                is_dir = False
             yield child
-            if recursive and entry.is_dir(follow_symlinks=False):
+            if recursive and is_dir:
                 yield from child._ls(recursive=True)
 
     def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
