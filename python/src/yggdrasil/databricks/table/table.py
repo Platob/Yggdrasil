@@ -45,7 +45,7 @@ from yggdrasil.data.enums import MimeTypes, MimeType, MediaType, MediaTypes, Mod
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema as DataSchema
 from yggdrasil.data.statement import PreparedStatement, StatementResult
-from yggdrasil.databricks.client import DatabricksClient, DatabricksResource
+from yggdrasil.databricks.client import DatabricksClient
 from yggdrasil.databricks.column.column import Column
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.databricks.sql.sql_utils import (
@@ -60,7 +60,7 @@ from yggdrasil.io import URL
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.databricks.path import DatabricksPath
-from yggdrasil.io.path import Path, RemotePath
+from yggdrasil.io.path import Path
 from yggdrasil.io.primitive import ParquetIO
 from yggdrasil.io.tabular import Tabular, O
 from yggdrasil.io.tabular.execution.expr import Predicate, col as expr_col
@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
     from yggdrasil.databricks.warehouse import WarehousePreparedStatement
     from yggdrasil.databricks.table.async_write import AsyncInsert
+    from yggdrasil.data.statement import StatementBatch
 
 
 _READ_ONLY_MODES = frozenset({Mode.AUTO})
@@ -1629,7 +1630,6 @@ class Table(DatabricksPath):
     def infos(self) -> TableInfo:
         """Basic :class:`TableInfo` — TTL-cached."""
         if self._infos is not None and self._is_fresh(self._infos_fetched_at):
-            age = time.time() - (self._infos_fetched_at or 0.0)
             return self._infos
 
         info = self.client.tables.find_table_remote(
@@ -3038,35 +3038,13 @@ class Table(DatabricksPath):
         raise_error: bool = True,
         spark_session: Optional["SparkSession"] = None,
         return_data: bool = False,
-        lazy: bool = False,
         **kwargs
-    ) -> "Tabular | AsyncInsert | None":
+    ) -> "Tabular | None":
         """Insert *data* into this table — thin wrapper over :meth:`insert_into`.
 
-        With ``lazy=True``, the rows are cast to the target schema and
-        dropped (alongside a JSON metadata file describing the
-        operation) under the table's ``stg_<table>/.sql/async/insert``
-        staging folder for a downstream applier to pick up; the SQL
-        insert is *not* executed and the constructed
-        :class:`AsyncInsert` record is returned so the caller can
-        ``execute(engine)`` it later, ``merge_with`` peers, or schedule
-        it via :meth:`AsyncInsert.job`. The record is itself a
-        :class:`WarehouseStatementBatch`, so binding an executor and
-        submitting is a single ``.execute(engine)`` call. See
-        :mod:`.async_write` for the wire format.
+        For the deferred / drop-and-apply-later flow, see
+        :meth:`async_insert`.
         """
-        if lazy:
-            from .async_write import stage_async_insert
-
-            return stage_async_insert(
-                self,
-                data,
-                mode=mode,
-                match_by=match_by,
-                lazy=True,
-                **kwargs,
-            )
-
         return self.insert_into(
             data,
             mode=mode,
@@ -3075,6 +3053,38 @@ class Table(DatabricksPath):
             raise_error=raise_error,
             spark_session=spark_session,
             return_data=return_data,
+            **kwargs,
+        )
+
+    def async_insert(
+        self,
+        data: Any,
+        *,
+        mode: ModeLike = None,
+        match_by: Optional[list[str]] = None,
+        **kwargs,
+    ) -> "AsyncInsert":
+        """Stage *data* as an async insert and return the metadata record.
+
+        Rows are cast to the target schema and dropped (alongside a
+        JSON metadata file describing the operation) under the
+        table's ``stg_<table>/.sql/async/insert`` staging folder for a
+        downstream applier to pick up; the SQL insert is *not*
+        executed. The constructed :class:`AsyncInsert` is itself a
+        :class:`WarehouseStatementBatch`, so binding an executor and
+        submitting is a single ``.execute(engine)`` call. The caller
+        can also ``merge_with`` peers, or schedule the apply via
+        :meth:`AsyncInsert.job`. See :mod:`.async_write` for the wire
+        format.
+        """
+        from .async_write import stage_async_insert
+
+        return stage_async_insert(
+            self,
+            data,
+            mode=mode,
+            match_by=match_by,
+            lazy=True,
             **kwargs,
         )
 

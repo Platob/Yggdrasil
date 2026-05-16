@@ -220,6 +220,36 @@ class TestMkdirRemove:
         assert not d.exists()
 
 
+class TestWaitUntilGone:
+
+    def test_returns_immediately_when_missing(self, tmp_path) -> None:
+        lp = LocalPath(str(tmp_path / "absent"))
+        # Fast path: short timeout because the path is already gone.
+        out = lp.wait_until_gone({"timeout": 1.0, "interval": 0.05})
+        assert out is lp
+
+    def test_observes_deletion_between_polls(self, tmp_path) -> None:
+        import threading
+        p = tmp_path / "vanishing"
+        p.write_bytes(b"x")
+        lp = LocalPath(str(p))
+        assert lp.exists()
+        # Pre-seed the stat cache so the loop is forced to invalidate
+        # between probes — otherwise it could observe the deletion via
+        # a coincidentally-stale cache check rather than a fresh stat.
+        assert lp.size == 1
+        threading.Timer(0.15, p.unlink).start()
+        lp.wait_until_gone({"timeout": 5.0, "interval": 0.05})
+        assert not lp.exists()
+
+    def test_timeout_raises(self, tmp_path) -> None:
+        p = tmp_path / "stays"
+        p.write_bytes(b"x")
+        lp = LocalPath(str(p))
+        with pytest.raises(TimeoutError):
+            lp.wait_until_gone({"timeout": 0.2, "interval": 0.05})
+
+
 class TestIterdir:
 
     def test_lists_children(self, tmp_path) -> None:

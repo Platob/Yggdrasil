@@ -1247,9 +1247,9 @@ class TestSchemaDiscovery:
         engine.warehouse.assert_not_called()
 
 
-class TestTableInsertLazyFlag:
+class TestTableAsyncInsert:
 
-    def test_lazy_routes_through_stage_async_insert(self, monkeypatch):
+    def test_async_insert_routes_through_stage_async_insert(self, monkeypatch):
         tbl, _, _, _ = _make_table_with_staging()
 
         sentinel_record = AsyncInsert(target_full_name="cat.sch.tbl")
@@ -1266,11 +1266,10 @@ class TestTableInsertLazyFlag:
 
         tbl.insert_into = MagicMock(name="should_not_run")  # type: ignore[assignment]
 
-        out = tbl.insert(
+        out = tbl.async_insert(
             "dummy-data",
             mode="append",
             match_by=["id"],
-            lazy=True,
         )
 
         assert out is sentinel_record
@@ -1281,7 +1280,7 @@ class TestTableInsertLazyFlag:
         assert seen["lazy"] is True
         tbl.insert_into.assert_not_called()
 
-    def test_default_falls_through_to_insert_into(self):
+    def test_insert_falls_through_to_insert_into(self):
         tbl, _, _, _ = _make_table_with_staging()
         tbl.insert_into = MagicMock(return_value="sql-result")  # type: ignore[assignment]
         out = tbl.insert("dummy", mode="append")
