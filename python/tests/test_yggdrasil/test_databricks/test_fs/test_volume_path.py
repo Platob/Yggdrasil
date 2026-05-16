@@ -1096,17 +1096,15 @@ class TestS3ServiceArrowFilesystem:
         pytest.importorskip("boto3")
 
         import pyarrow.fs as pafs
-        from yggdrasil.aws.client import AWSClient
-        from yggdrasil.aws.config import AWSConfig
+        from yggdrasil.aws import AWSClient
         from yggdrasil.aws.fs.service import S3Service
 
-        cfg = AWSConfig(
+        client = AWSClient(
             access_key_id="AKIA",
             secret_access_key="secret",
             session_token="tok",
             region="us-east-1",
         )
-        client = AWSClient(config=cfg)
         service = S3Service(client=client)
         fs = service.arrow_filesystem()
         assert isinstance(fs, pafs.S3FileSystem)
@@ -1115,16 +1113,14 @@ class TestS3ServiceArrowFilesystem:
         pytest.importorskip("boto3")
 
         import pyarrow.fs as pafs
-        from yggdrasil.aws.client import AWSClient
-        from yggdrasil.aws.config import AWSConfig
+        from yggdrasil.aws import AWSClient
         from yggdrasil.aws.fs.service import S3Service
 
-        cfg = AWSConfig(
+        client = AWSClient(
             access_key_id="AKIA",
             secret_access_key="secret",
             region="us-east-1",
         )
-        client = AWSClient(config=cfg)
         service = S3Service(client=client)
         # The override region should land on the pyarrow filesystem;
         # there isn't a public reader on S3FileSystem for the region,

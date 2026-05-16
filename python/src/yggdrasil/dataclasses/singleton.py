@@ -220,10 +220,25 @@ class Singleton:
         )
 
     def __getstate__(self) -> dict[str, Any]:
-        return {
-            k: v for k, v in self.__dict__.items()
-            if k not in self._TRANSIENT_STATE_ATTRS
-        }
+        # Capture both ``__dict__`` and ``__slots__`` attrs from every
+        # class in the MRO. Slot-using subclasses (e.g.
+        # :class:`yggdrasil.io.holder.Holder` /
+        # :class:`yggdrasil.io.memory.Memory`) would otherwise lose
+        # every slot value on pickle — ``self.__dict__`` doesn't see
+        # slot attributes, so a bare ``dict(self.__dict__)`` returns
+        # only the non-slotted attributes.
+        state: dict[str, Any] = dict(self.__dict__) if hasattr(self, "__dict__") else {}
+        for klass in type(self).__mro__:
+            for slot in getattr(klass, "__slots__", ()) or ():
+                if slot in ("__dict__", "__weakref__"):
+                    continue
+                try:
+                    state[slot] = getattr(self, slot)
+                except AttributeError:
+                    pass
+        for attr in self._TRANSIENT_STATE_ATTRS:
+            state.pop(attr, None)
+        return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         # ``__new__`` may have returned a live in-process singleton
@@ -232,6 +247,12 @@ class Singleton:
         # in-flight init state survive.
         if getattr(self, "_initialized", False):
             return
-        self.__dict__.update(state)
+        # ``object.__setattr__`` works for both ``__dict__``-backed
+        # and ``__slots__``-backed attributes; assigning via
+        # ``self.__dict__.update`` would silently no-op the slot
+        # ones on a slot-using subclass.
+        for key, value in state.items():
+            object.__setattr__(self, key, value)
         for attr in self._TRANSIENT_STATE_ATTRS:
-            self.__dict__.setdefault(attr, None)
+            if not hasattr(self, attr):
+                object.__setattr__(self, attr, None)

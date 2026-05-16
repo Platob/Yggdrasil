@@ -490,6 +490,89 @@ class TestProperties:
 
 
 # ===================================================================
+# Environment detectors — Databricks / AWS
+# ===================================================================
+
+class TestEnvironmentDetectors:
+    """``in_databricks_notebook`` / ``in_aws`` / ``in_aws_lambda`` /
+    ``in_aws_batch`` route off env vars; clear the relevant keys per
+    case so an inherited CI value doesn't poison the assertion."""
+
+    _DATABRICKS_KEYS = ("DATABRICKS_RUNTIME_VERSION",)
+    _AWS_KEYS = (
+        "AWS_LAMBDA_FUNCTION_NAME",
+        "AWS_BATCH_JOB_ID",
+        "AWS_EXECUTION_ENV",
+        "ECS_CONTAINER_METADATA_URI",
+        "ECS_CONTAINER_METADATA_URI_V4",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    )
+
+    @pytest.fixture(autouse=True)
+    def _clean(self, monkeypatch):
+        for key in self._DATABRICKS_KEYS + self._AWS_KEYS:
+            monkeypatch.delenv(key, raising=False)
+
+    def test_in_databricks_notebook_requires_runtime_and_ipython(
+        self, monkeypatch,
+    ):
+        # No DBR env → False even when IPython is importable.
+        assert PyEnv.in_databricks_notebook() is False
+
+        monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "14.3")
+        # DBR set + no live IPython kernel → False (plain script /
+        # job entry point, not a notebook).
+        monkeypatch.setattr(
+            "IPython.get_ipython", lambda: None, raising=False,
+        )
+        assert PyEnv.in_databricks_notebook() is False
+
+        # DBR set + IPython kernel present → True (notebook cell).
+        monkeypatch.setattr(
+            "IPython.get_ipython", lambda: object(), raising=False,
+        )
+        assert PyEnv.in_databricks_notebook() is True
+
+    def test_in_databricks_notebook_missing_ipython(self, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "14.3")
+        import builtins
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "IPython" or name.startswith("IPython."):
+                raise ImportError("no IPython")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        assert PyEnv.in_databricks_notebook() is False
+
+    def test_in_aws_lambda(self, monkeypatch):
+        assert PyEnv.in_aws_lambda() is False
+        monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "my-func")
+        assert PyEnv.in_aws_lambda() is True
+        assert PyEnv.in_aws() is True
+
+    def test_in_aws_batch(self, monkeypatch):
+        assert PyEnv.in_aws_batch() is False
+        monkeypatch.setenv("AWS_BATCH_JOB_ID", "job-abc-123")
+        assert PyEnv.in_aws_batch() is True
+        assert PyEnv.in_aws() is True
+
+    @pytest.mark.parametrize("var", [
+        "AWS_EXECUTION_ENV",
+        "ECS_CONTAINER_METADATA_URI",
+        "ECS_CONTAINER_METADATA_URI_V4",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    ])
+    def test_in_aws_picks_up_managed_surfaces(self, monkeypatch, var):
+        assert PyEnv.in_aws() is False
+        monkeypatch.setenv(var, "value")
+        assert PyEnv.in_aws() is True
+        assert PyEnv.in_aws_lambda() is False
+        assert PyEnv.in_aws_batch() is False
+
+
+# ===================================================================
 # uv resolution
 # ===================================================================
 

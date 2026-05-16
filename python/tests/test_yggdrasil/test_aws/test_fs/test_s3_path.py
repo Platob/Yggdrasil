@@ -568,19 +568,17 @@ class TestArrowFilesystem:
         pytest.importorskip("boto3")
 
         import pyarrow.fs as pafs
-        from yggdrasil.aws.client import AWSClient
-        from yggdrasil.aws.config import AWSConfig
+        from yggdrasil.aws import AWSClient
         from yggdrasil.aws.fs.service import S3Service
 
         # Build a real AWSClient with static creds and bind an
         # S3Path to its boto client. ``arrow_filesystem`` should
         # snapshot the boto session and hand back pyarrow's S3FS.
-        cfg = AWSConfig(
+        aws = AWSClient(
             access_key_id="AKIA",
             secret_access_key="secret",
             region="us-east-1",
         )
-        aws = AWSClient(config=cfg)
         # Build through S3Service.path so the boto client wiring is
         # the same as production. Pass-through ``service`` lives on
         # ``_client`` thanks to ``S3Service.path``'s constructor.
