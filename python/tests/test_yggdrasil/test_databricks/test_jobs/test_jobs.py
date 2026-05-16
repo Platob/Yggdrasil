@@ -581,7 +581,10 @@ class TestJobTaskFactoryAndDecorate(DatabricksTestCase):
     def test_create_attaches_default_environment_when_task_uses_key(self):
         """A task carrying ``environment_key`` adds a matching :class:`JobEnvironment`
         to the parent job when none is declared yet."""
-        from yggdrasil.databricks.jobs.task import DEFAULT_ENVIRONMENT_KEY
+        from yggdrasil.databricks.jobs.task import (
+            DEFAULT_ENVIRONMENT_CLIENT,
+            DEFAULT_ENVIRONMENT_KEY,
+        )
 
         job = self._job()
         job.settings.tasks = [Task(task_key="seed")]
@@ -596,7 +599,10 @@ class TestJobTaskFactoryAndDecorate(DatabricksTestCase):
         self.assertIsNotNone(envs)
         self.assertEqual(len(envs), 1)
         self.assertEqual(envs[0].environment_key, DEFAULT_ENVIRONMENT_KEY)
-        self.assertIsNotNone(envs[0].spec)
+        self.assertEqual(envs[0].spec.client, DEFAULT_ENVIRONMENT_CLIENT)
+        # The default spec pulls in ``ygg`` so staged
+        # ``from yggdrasil...`` imports resolve at runtime.
+        self.assertIn("ygg", envs[0].spec.dependencies)
 
     def test_create_skips_environment_merge_when_already_declared(self):
         """``environments`` isn't touched when the key already lives on the job."""

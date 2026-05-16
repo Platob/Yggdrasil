@@ -42,6 +42,7 @@ __all__ = [
     "DEFAULT_STAGING_ROOT",
     "DEFAULT_ENVIRONMENT_KEY",
     "DEFAULT_ENVIRONMENT_CLIENT",
+    "DEFAULT_ENVIRONMENT_DEPENDENCIES",
 ]
 
 LOGGER = logging.getLogger(__name__)
@@ -64,6 +65,14 @@ DEFAULT_ENVIRONMENT_KEY = "ygg-default"
 #: pin on every serverless environment spec; ``"1"`` is the broadest
 #: option and matches Databricks' own bundle examples.
 DEFAULT_ENVIRONMENT_CLIENT = "1"
+
+#: Default pip dependencies for the auto-attached serverless
+#: environment. The staged script imports
+#: ``yggdrasil.dataclasses.safe_function.checkargs``, so the runner
+#: needs ``ygg`` (the PyPI distribution name for the ``yggdrasil``
+#: package) on its path — unpinned, so the workspace pulls the
+#: latest release on each run.
+DEFAULT_ENVIRONMENT_DEPENDENCIES: List[str] = ["ygg"]
 
 
 class JobTask:
@@ -428,15 +437,17 @@ def _default_job_environment(environment_key: str) -> JobEnvironment:
 
     Databricks' serverless backend rejects Python tasks unless the
     parent job declares a matching ``environments`` entry with a
-    ``client`` pin (``Environment.spec``). The default carries no
-    dependencies — callers that need extra packages should declare
-    the environment themselves on the job.
+    ``client`` pin (``Environment.spec``). The default pulls in
+    :data:`DEFAULT_ENVIRONMENT_DEPENDENCIES` (``ygg`` from PyPI) so
+    the staged script's ``from yggdrasil...`` imports resolve at
+    runtime. Callers that need extra packages should declare the
+    environment themselves on the job.
     """
     return JobEnvironment(
         environment_key=environment_key,
         spec=Environment(
             client=DEFAULT_ENVIRONMENT_CLIENT,
-            dependencies=[],
+            dependencies=list(DEFAULT_ENVIRONMENT_DEPENDENCIES),
         ),
     )
 
