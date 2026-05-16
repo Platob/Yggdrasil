@@ -11,7 +11,10 @@ details and exposes:
 from __future__ import annotations
 
 import logging
-from typing import Any, ClassVar, Iterator, List, Optional, TYPE_CHECKING, Union
+from dataclasses import replace as _dc_replace
+from typing import (
+    Any, Callable, ClassVar, Iterator, List, Optional, TYPE_CHECKING, Union,
+)
 
 from databricks.sdk.errors import ResourceDoesNotExist
 from databricks.sdk.service.jobs import (
@@ -30,6 +33,7 @@ from ..client import DatabricksResource
 if TYPE_CHECKING:
     from .run import JobRun
     from .service import Jobs
+    from .task import JobTask
 
 
 __all__ = ["Job"]
@@ -65,8 +69,15 @@ class Job(Singleton, DatabricksResource):
         service: "Jobs | None" = None,
         job_id: int | None = None,
         job_name: str | None = None,
+        *,
+        client: Any = None,
         **_kwargs: Any,
     ) -> Any:
+        # Route ``client=...`` through ``client.jobs`` so two ``Job(client=c, ...)``
+        # calls collapse onto the same singleton key instead of stacking distinct
+        # ``Jobs(client=c)`` instances.
+        if service is None and client is not None:
+            service = client.jobs
         return (cls, service, job_id, job_name)
 
     def __init__(
@@ -75,6 +86,7 @@ class Job(Singleton, DatabricksResource):
         job_id: int | None = None,
         job_name: str | None = None,
         *,
+        client: Any = None,
         details: Optional[JobInfo] = None,
         singleton_ttl: Any = ...,
     ):
@@ -82,6 +94,8 @@ class Job(Singleton, DatabricksResource):
         if getattr(self, "_initialized", False):
             return
 
+        if service is None:
+            service = client.jobs if client is not None else None
         if service is None:
             from .service import Jobs
             service = Jobs.current()
@@ -347,3 +361,54 @@ class Job(Singleton, DatabricksResource):
             all_queued_runs=all_queued_runs or None,
         )
         return self
+
+    # ------------------------------------------------------------------ #
+    # Task decorator — Prefect-style registration of Python callables
+    # ------------------------------------------------------------------ #
+    def task(
+        self,
+        func: Optional[Callable[..., Any]] = None,
+        /,
+        *,
+        task_key: Optional[str] = None,
+        **task_fields: Any,
+    ) -> Any:
+        """Register a Python callable as a task on this job.
+
+        Usable bare or parametrized::
+
+            job = Job(service=..., job_id=123)
+
+            @job.task
+            def do(a: str, i: int):
+                print(a, i)
+
+            @job.task(task_key="custom", existing_cluster_id="c-123")
+            def do2(x: int): ...
+
+        Internally calls :meth:`JobTask.from_callable` to pickle the
+        function under the user's workspace, then :meth:`JobTask.create`
+        to push the new task into the job's settings. Any extra
+        ``task_fields`` are layered onto the resulting
+        :class:`databricks.sdk.service.jobs.Task` via
+        :func:`dataclasses.replace` before submission — useful for
+        attaching compute (``new_cluster=`` / ``existing_cluster_id=``
+        / ``job_cluster_key=``), dependencies, retries, etc.
+
+        Returns the original callable so the function stays usable
+        in-process; the :class:`JobTask` handle is attached as
+        ``func._job_task`` for downstream access.
+        """
+        from .task import JobTask
+
+        def _decorate(f: Callable[..., Any]) -> Callable[..., Any]:
+            jt = JobTask.from_callable(self, f, task_key=task_key)
+            if task_fields and jt._details is not None:
+                jt._details = _dc_replace(jt._details, **task_fields)
+            jt.create()
+            f._job_task = jt  # type: ignore[attr-defined]
+            return f
+
+        if func is None:
+            return _decorate
+        return _decorate(func)
