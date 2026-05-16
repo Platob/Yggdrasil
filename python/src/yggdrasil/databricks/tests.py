@@ -141,8 +141,8 @@ class DatabricksTestCase(unittest.TestCase):
     def _clear_databricks_caches(self) -> None:
         from yggdrasil.databricks.catalog.catalog import Catalog
         from yggdrasil.databricks.client import DatabricksClient
+        from yggdrasil.databricks.cluster import service as _cs
         from yggdrasil.databricks.compute import instance_pool as _ip
-        from yggdrasil.databricks.compute import service as _cs
         from yggdrasil.databricks.jobs import service as _js
         from yggdrasil.databricks.jobs.job import Job as _JobResource
         from yggdrasil.databricks.jobs.run import JobRun as _JobRunResource

@@ -71,6 +71,12 @@ _PATH_CLASS_TARGETS: dict[str, tuple[str, str]] = {
     "dbfs+table":     ("yggdrasil.databricks.table.table", "Table"),
     "dbfs+catalog":   ("yggdrasil.databricks.catalog.catalog", "Catalog"),
     "dbfs+schema":    ("yggdrasil.databricks.schema.schema", "Schema"),
+    # Compute resources hang off ``dbks+`` (not ``dbfs+``) because they
+    # are not addressable as filesystems — a cluster is a compute
+    # endpoint with an id, not a path.
+    "dbks+cluster":   ("yggdrasil.databricks.cluster.cluster", "Cluster"),
+    "dbks+serverless-cluster":
+                      ("yggdrasil.databricks.cluster.serverless", "ServerlessCluster"),
     "s3":             ("yggdrasil.aws.fs.path", "S3Path"),
     "http":           ("yggdrasil.io.http_.path", "HTTPPath"),
     "https":          ("yggdrasil.io.http_.path", "HTTPPath"),
@@ -96,6 +102,8 @@ _SCHEME_ALIASES: dict[str, str] = {
     "dbfs+volume":    "dbfs+volume",
     "dbfs+workspace": "dbfs+workspace",
     "dbfs+table":     "dbfs+table",
+    "dbks+cluster":   "dbks+cluster",
+    "dbks+serverless-cluster": "dbks+serverless-cluster",
     "s3":             "s3",
     "s3a":            "s3",
     "s3n":            "s3",
@@ -158,6 +166,18 @@ class Scheme(str, Enum):
     #: (:class:`SQLEngine`); credentials and other ``DatabricksClient``
     #: knobs ride along the URL the same way :attr:`DATABRICKS` does.
     DATABRICKS_TABLE     = "dbfs+table"
+
+    #: Databricks all-purpose cluster addressed as a compute endpoint —
+    #: ``dbks+cluster://[creds@]host/<cluster_id>?…``. Distinct from
+    #: the ``dbfs+`` family because a cluster is a compute resource
+    #: with an id (no path component).
+    DATABRICKS_CLUSTER          = "dbks+cluster"
+
+    #: Databricks serverless cluster — same shape as
+    #: :attr:`DATABRICKS_CLUSTER` but routes to
+    #: :class:`ServerlessCluster` which carries serverless-specific
+    #: defaults and lifecycle behavior.
+    DATABRICKS_SERVERLESS_CLUSTER = "dbks+serverless-cluster"
 
     # ------------------------------------------------------------------
     # Coercion

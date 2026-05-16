@@ -9,10 +9,10 @@ from yggdrasil.databricks.client import (
     DATABRICKS_CLIENT_INIT_NAMES as _YGG_DATABRICKS_CLIENT_INIT_NAMES,
     DatabricksClient as _YGGDatabricksClient,
 )
-from yggdrasil.databricks.compute.cluster import Cluster as _YGGCluster
+from yggdrasil.databricks.cluster.cluster import Cluster as _YGGCluster
 from yggdrasil.databricks.compute.command_execution import CommandExecution as _YGGCommandExecution
 from yggdrasil.databricks.compute.execution_context import ExecutionContext as _YGGExecutionContext
-from yggdrasil.databricks.compute.service import Clusters as _YGGClusters
+from yggdrasil.databricks.cluster.service import Clusters as _YGGClusters
 from yggdrasil.io import BytesIO
 from yggdrasil.pickle.ser.serialized import Serialized
 from yggdrasil.pickle.ser.tags import Tags

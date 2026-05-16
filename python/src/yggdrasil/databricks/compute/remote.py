@@ -12,7 +12,7 @@ from typing import (
 from yggdrasil.data.cast.registry import identity
 
 if TYPE_CHECKING:
-    from .cluster import Cluster
+    from ..cluster.cluster import Cluster
 
 from ..client import DatabricksClient
 

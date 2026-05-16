@@ -23,7 +23,7 @@ from yggdrasil.io.url import URL
 from yggdrasil.pickle.ser import Serialized, dumps
 
 if TYPE_CHECKING:
-    from .cluster import Cluster
+    from ..cluster.cluster import Cluster
     from .command_execution import CommandExecution
 
 __all__ = [
