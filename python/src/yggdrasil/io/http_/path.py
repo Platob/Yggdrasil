@@ -179,7 +179,7 @@ class HTTPPath(RemotePath):
         resp = self.session.send(req)
         if resp.status_code >= 400:
             resp.raise_for_status()
-        self._invalidate_singleton()
+        self.invalidate_singleton()
         return len(body)
 
     # ==================================================================
@@ -214,7 +214,7 @@ class HTTPPath(RemotePath):
                 raise FileNotFoundError(self.url.to_string())
         elif resp.status_code >= 400:
             resp.raise_for_status()
-        self._invalidate_singleton()
+        self.invalidate_singleton()
 
     def _remove_dir(
         self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True

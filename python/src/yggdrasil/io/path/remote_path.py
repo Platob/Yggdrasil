@@ -7,7 +7,7 @@ subclasses no longer reimplement these.
 
 Subclasses implement :meth:`_stat_uncached`; the base wraps it via
 :meth:`_stat` and stores the result on ``self._stat_cached``.
-Mutating ops (writes, deletes) must call :meth:`_invalidate_singleton`
+Mutating ops (writes, deletes) must call :meth:`invalidate_singleton`
 so follow-up reads see fresh metadata. Sister of
 :class:`yggdrasil.io.fs.local_path.LocalPath`: same :class:`Holder`
 substrate, different backing.
@@ -132,10 +132,10 @@ class RemotePath(Path):
     def _stat_uncached(self) -> IOStats:
         """Backend-specific :class:`IOStats` probe. One network call."""
 
-    def _invalidate_singleton(self, remove_global: bool = True) -> None:
+    def invalidate_singleton(self, remove_global: bool = True) -> None:
         """Drop this path's cached :class:`IOStats`, schema, and
-        ``_INSTANCES`` entry — see :meth:`Path._invalidate_singleton`."""
-        super()._invalidate_singleton(remove_global=remove_global)
+        ``_INSTANCES`` entry — see :meth:`Path.invalidate_singleton`."""
+        super().invalidate_singleton(remove_global=remove_global)
         self._unpersist_schema()
 
     # ------------------------------------------------------------------

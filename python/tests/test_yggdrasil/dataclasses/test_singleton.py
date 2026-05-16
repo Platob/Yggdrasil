@@ -127,7 +127,7 @@ class TestInvalidateSingleton(unittest.TestCase):
         inst = _CachingPath("k")
         assert _CachingPath("k") is inst  # sanity: cached
 
-        inst._invalidate_singleton()
+        inst.invalidate_singleton()
 
         rebuilt = _CachingPath("k")
         assert rebuilt is not inst, "cache entry should have been popped"
@@ -135,7 +135,7 @@ class TestInvalidateSingleton(unittest.TestCase):
     def test_remove_global_false_no_op(self) -> None:
         """``remove_global=False`` leaves the cache untouched."""
         inst = _CachingPath("k")
-        inst._invalidate_singleton(remove_global=False)
+        inst.invalidate_singleton(remove_global=False)
         assert _CachingPath("k") is inst
 
     def test_identity_guarded_against_race(self) -> None:
@@ -146,7 +146,7 @@ class TestInvalidateSingleton(unittest.TestCase):
         other = _CachingPath("k", singleton_ttl=False)
         _CachingPath._INSTANCES.set((_CachingPath, "k"), other, ttl=None)
 
-        inst._invalidate_singleton()
+        inst.invalidate_singleton()
 
         # The "other" entry is left alone — only an identity match pops.
         assert _CachingPath._INSTANCES.get((_CachingPath, "k")) is other
@@ -156,4 +156,4 @@ class TestInvalidateSingleton(unittest.TestCase):
         inst = _CachingPath("k", singleton_ttl=False)
         # Force the key off — emulates a hand-rolled deserialiser path.
         object.__delattr__(inst, "_singleton_key_")
-        inst._invalidate_singleton()  # must not raise
+        inst.invalidate_singleton()  # must not raise

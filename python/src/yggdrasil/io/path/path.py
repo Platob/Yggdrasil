@@ -101,7 +101,7 @@ class Path(Holder, os.PathLike, ABC):
         # :meth:`_seed_stat_cache` (from a listing entry that already
         # carries kind / size / mtime) or by a successful probe in
         # subclasses that wrap :meth:`_stat` with caching. Cleared
-        # by :meth:`_invalidate_singleton` after mutating ops so
+        # by :meth:`invalidate_singleton` after mutating ops so
         # follow-up reads see fresh metadata.
         self._stat_cached: IOStats | None = None
         self._stat_cached_at: float = 0.0
@@ -346,18 +346,18 @@ class Path(Holder, os.PathLike, ABC):
         self._stat_cached = stats
         self._stat_cached_at = time.monotonic()
 
-    def _invalidate_singleton(self, remove_global: bool = True) -> None:
+    def invalidate_singleton(self, remove_global: bool = True) -> None:
         """Drop the cached :class:`IOStats` *and* pop self from
         ``_INSTANCES``. Single canonical invalidator for paths.
 
         Mutating ops (writes, deletes) call this so the next read on
         the same logical path picks up fresh state. Subclasses with
         their own caches (schema, table info, column lists) override
-        and chain ``super()._invalidate_singleton(...)``.
+        and chain ``super().invalidate_singleton(...)``.
         """
         self._stat_cached = None
         self._stat_cached_at = 0.0
-        super()._invalidate_singleton(remove_global=remove_global)
+        super().invalidate_singleton(remove_global=remove_global)
 
     def iterdir(self, *, singleton_ttl: Any = False) -> Iterator["Path"]:
         yield from self._ls(recursive=False, singleton_ttl=singleton_ttl)

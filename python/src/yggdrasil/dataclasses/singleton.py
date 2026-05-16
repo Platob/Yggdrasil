@@ -176,7 +176,7 @@ class Singleton:
             cls._INSTANCES.set(key, self, ttl=ttl_arg)
             return self
 
-    def _invalidate_singleton(self, remove_global: bool = True) -> None:
+    def invalidate_singleton(self, remove_global: bool = True) -> None:
         """Pop ``self`` from the per-class ``_INSTANCES`` cache.
 
         Mutating ops on a Singleton-cached object (writes, deletes,
@@ -190,7 +190,7 @@ class Singleton:
         thread is left alone.
 
         ``remove_global=False`` is a no-op. The keyword exists so
-        subclass invalidators (``_invalidate_singleton``,
+        subclass invalidators (``invalidate_singleton``,
         ``_invalidate_entity_tag_cache``, …) can offer the same
         switch without branching at the call site.
         """

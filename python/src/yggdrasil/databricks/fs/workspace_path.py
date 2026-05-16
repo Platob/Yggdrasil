@@ -232,7 +232,7 @@ class WorkspacePath(DatabricksPath):
         except Exception:
             if not missing_ok:
                 raise
-        self._invalidate_singleton()
+        self.invalidate_singleton()
 
     def _remove_dir(
         self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
@@ -250,7 +250,7 @@ class WorkspacePath(DatabricksPath):
         except Exception:
             if not missing_ok:
                 raise
-        self._invalidate_singleton()
+        self.invalidate_singleton()
 
     # ==================================================================
     # Holder I/O — download / upload

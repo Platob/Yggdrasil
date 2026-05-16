@@ -92,7 +92,7 @@ class S3Path(RemotePath):
     matter how many call sites request the same key.
 
     Mutating ops (``put_object`` / ``DeleteObject`` /
-    ``DeleteObjects``) call :meth:`_invalidate_singleton` before
+    ``DeleteObjects``) call :meth:`invalidate_singleton` before
     returning so two consumers sharing the singleton see consistent
     metadata after a write.
     """
@@ -432,7 +432,7 @@ class S3Path(RemotePath):
             if not missing_ok:
                 raise
             return
-        self._invalidate_singleton()
+        self.invalidate_singleton()
 
     def _remove_dir(
         self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
@@ -457,7 +457,7 @@ class S3Path(RemotePath):
                 if missing_ok:
                     return
                 raise
-            self._invalidate_singleton()
+            self.invalidate_singleton()
             return
 
         prefix = self.key
@@ -482,7 +482,7 @@ class S3Path(RemotePath):
             if missing_ok:
                 return
             raise
-        self._invalidate_singleton()
+        self.invalidate_singleton()
 
     def _delete_batch(self, batch: list[dict]) -> None:
         if not batch:
