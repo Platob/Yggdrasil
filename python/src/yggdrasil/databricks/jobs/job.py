@@ -647,7 +647,8 @@ class Job(Singleton, DatabricksResource):
         description: Optional[str] = None,
         permissions: Optional[List[Union[str, JobAccessControlRequest]]] = None,
         tags: Optional[Mapping[str, str]] = None,
-        **task_fields: Any,
+        task_fields: Optional[Mapping[str, Any]] = None,
+        **job_settings: Any,
     ) -> "Job":
         """Build (or upsert) a Job whose only task is the staged Python *func*.
 
@@ -655,9 +656,14 @@ class Job(Singleton, DatabricksResource):
         decoration would have nowhere to land), upserts a Job named
         *name* (defaults to ``func.__name__``), and stages *func*'s
         source as a Python task on it via :meth:`JobTask.from_callable`.
-        Returns the linked :class:`Job` (singleton-cached). Extra
-        ``**task_fields`` flow into :class:`Task` so the caller can
-        attach compute / environment / dependencies at deploy time.
+        Returns the linked :class:`Job` (singleton-cached).
+
+        Job-level settings (``schedule``, ``trigger``, ``parameters``,
+        ``max_concurrent_runs``, …) flow through ``**job_settings`` and
+        land on :meth:`Jobs.create_or_update`. Task-level fields
+        (``new_cluster``, ``existing_cluster_id``, ``environment_key``,
+        …) flow through the ``task_fields`` mapping into the staged
+        :class:`Task`.
 
         This is the single-callable counterpart to the class-level
         :meth:`task_def` / :meth:`pytask_def` decorators: same defer
@@ -681,6 +687,7 @@ class Job(Singleton, DatabricksResource):
             description=resolved_description,
             tags=dict(tags) if tags else None,
             permissions=permissions,
+            **{k: v for k, v in job_settings.items() if v is not None},
         )
         instance = cls._wrap(underlying, service=jobs)
 
@@ -688,7 +695,7 @@ class Job(Singleton, DatabricksResource):
         # decorator path. ``decorate`` calls ``JobTask.create`` so the
         # task lands on the job in one round trip.
         instance.task(
-            resolved_key, order=order, **task_fields,
+            resolved_key, order=order, **(task_fields or {}),
         ).decorate(func)
         return instance
 

@@ -16,12 +16,16 @@ payloads kick the applier without a cron schedule.
 """
 from __future__ import annotations
 
+import contextlib
+import datetime as _dt
 import logging
+import time
 from typing import (
     TYPE_CHECKING,
     Any,
     ClassVar,
     Dict,
+    Iterator,
     List,
     Mapping,
     Optional,
@@ -61,8 +65,11 @@ class AsyncInsertJob:
 
     JOB_NAME_PREFIX: ClassVar[str] = "ygg-async-insert"
     DATA_SUBDIR: ClassVar[str] = "data"
+    LOCK_FILENAME: ClassVar[str] = ".lock"
     DEFAULT_MIN_TIME_BETWEEN_TRIGGERS_SECONDS: ClassVar[int] = 60
     DEFAULT_WAIT_AFTER_LAST_CHANGE_SECONDS: ClassVar[int] = 60
+    DEFAULT_LOCK_TIMEOUT_SECONDS: ClassVar[float] = 600.0
+    DEFAULT_LOCK_POLL_SECONDS: ClassVar[float] = 2.0
 
     def __new__(cls, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
         raise TypeError(
@@ -294,3 +301,144 @@ class AsyncInsertJob:
         if isinstance(pause, str):
             return PauseStatus(pause.upper())
         return pause
+
+    # ------------------------------------------------------------------ #
+    # Lock — coordinate concurrent applier runs against the same table
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    @contextlib.contextmanager
+    def lock(
+        table: "Table",
+        *,
+        path: "VolumePath | str | None" = None,
+        timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+        interval: float = DEFAULT_LOCK_POLL_SECONDS,
+        client: "DatabricksClient | None" = None,
+    ) -> Iterator["VolumePath"]:
+        """Exclusive applier lock on *table*'s staging folder.
+
+        Other processes scanning the same folder block on entry
+        until any pre-existing :attr:`LOCK_FILENAME` (``.lock``) file
+        is removed; then this process claims the lock by creating
+        the file and yields its :class:`VolumePath`. On exit
+        (success or failure) the lock is removed so the next
+        process can proceed.
+
+        ``timeout`` (seconds) caps the wait; ``0`` or negative means
+        wait indefinitely. ``interval`` is the polling cadence.
+        Stale locks (process crashed mid-apply) are cleared by the
+        next caller after ``timeout`` elapses — the wait surfaces a
+        :class:`TimeoutError` which the caller can catch and
+        :meth:`force_unlock` past.
+        """
+        from yggdrasil.databricks.path import DatabricksPath
+
+        if path is None:
+            path = table.staging_folder(temporary=False, async_write=True)
+        elif not hasattr(path, "joinpath"):
+            path = DatabricksPath.from_(path, client=client)
+
+        lock_path = path.joinpath(AsyncInsertJob.LOCK_FILENAME)
+
+        # Wait for any existing lock to be released.
+        deadline = (time.time() + timeout) if timeout and timeout > 0 else None
+        first_wait = True
+        while lock_path.exists():
+            if first_wait:
+                LOGGER.info(
+                    "Waiting for applier lock %r to be released "
+                    "(timeout=%.0fs interval=%.1fs)",
+                    lock_path, timeout, interval,
+                )
+                first_wait = False
+            if deadline is not None and time.time() > deadline:
+                raise TimeoutError(
+                    f"Timed out after {timeout:.0f}s waiting for applier "
+                    f"lock {lock_path!r} to be released."
+                )
+            time.sleep(interval)
+
+        # Claim the lock. The body marker (acquire timestamp) lands
+        # in the file so a stale-lock diagnosis can read when the
+        # holder last started without crawling logs.
+        now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        LOGGER.info("Claiming applier lock %r (acquired_at=%s)", lock_path, now)
+        lock_path.write_bytes(now.encode("utf-8"))
+        try:
+            yield lock_path
+        finally:
+            try:
+                lock_path.remove(missing_ok=True, wait=False, recursive=False)
+                LOGGER.info("Released applier lock %r", lock_path)
+            except Exception:  # noqa: BLE001 — best-effort
+                LOGGER.exception(
+                    "Failed to release applier lock %r; manual cleanup "
+                    "may be required.",
+                    lock_path,
+                )
+
+    @staticmethod
+    def force_unlock(
+        table: "Table",
+        *,
+        path: "VolumePath | str | None" = None,
+        client: "DatabricksClient | None" = None,
+    ) -> None:
+        """Drop a stale ``.lock`` file unconditionally."""
+        from yggdrasil.databricks.path import DatabricksPath
+
+        if path is None:
+            path = table.staging_folder(temporary=False, async_write=True)
+        elif not hasattr(path, "joinpath"):
+            path = DatabricksPath.from_(path, client=client)
+        lock_path = path.joinpath(AsyncInsertJob.LOCK_FILENAME)
+        try:
+            lock_path.remove(missing_ok=True, wait=False, recursive=False)
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Failed to force-unlock %r", lock_path)
+
+    # ------------------------------------------------------------------ #
+    # Default applier — staged onto the job by ``Table.async_job``
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def apply_records(
+        catalog_name: str,
+        schema_name: str,
+        table_name: str,
+    ) -> None:
+        """Default applier task body.
+
+        Resolves the workspace client, looks up the target table,
+        takes an exclusive :meth:`lock` on its staging folder, and
+        applies every staged :class:`AsyncInsert` record against the
+        target via :class:`AsyncWrite`. Concurrent applier runs
+        block on the lock so the staging folder is drained by at
+        most one process at a time.
+
+        Used by :meth:`Table.async_job` as the staged Python task
+        when the job doesn't exist yet — ``inspect.getsource`` is
+        the runtime contract here, so this body must stay
+        self-contained (no module-level closures, no decorators
+        beyond ``@staticmethod``).
+        """
+        from yggdrasil.databricks.client import DatabricksClient
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+        from yggdrasil.databricks.table.async_write import AsyncWrite
+
+        client = DatabricksClient.current()
+        engine = client.sql(
+            catalog_name=catalog_name, schema_name=schema_name,
+        )
+        table = engine.table(table_name)
+
+        with AsyncInsertJob.lock(table):
+            records = AsyncInsertJob.load(table)
+            if not records:
+                return
+            AsyncWrite.from_records(
+                records,
+                executor=engine.warehouse(),
+                client=client,
+                wait=True,
+                raise_error=True,
+            )

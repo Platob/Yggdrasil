@@ -1216,34 +1216,181 @@ class TestTableAsyncJob:
         tbl.service.client.jobs = jobs_svc
         return tbl, jobs_svc
 
-    def test_calls_jobs_get_or_create_with_settings(self):
+    def test_returns_existing_job_when_found(self):
         tbl, jobs_svc = self._table()
-        sentinel = MagicMock(name="Job")
-        jobs_svc.get_or_create.return_value = sentinel
+        existing = MagicMock(name="Job")
+        jobs_svc.find.return_value = existing
 
-        result = tbl.async_job(notebook_path="/Workspace/Users/me/apply")
+        result = tbl.async_job()
+
+        assert result is existing
+        jobs_svc.find.assert_called_once_with(name="ygg-async-insert-cat-sch-tbl")
+        # No create call — existing job was returned.
+        jobs_svc.create_or_update.assert_not_called()
+        jobs_svc.create.assert_not_called()
+
+    def test_stages_apply_records_when_job_missing(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, jobs_svc = self._table()
+        jobs_svc.find.return_value = None
+
+        with patch(
+            "yggdrasil.databricks.jobs.job.Job.from_callable",
+        ) as from_callable:
+            sentinel = MagicMock(name="Job")
+            from_callable.return_value = sentinel
+            result = tbl.async_job()
 
         assert result is sentinel
-        jobs_svc.get_or_create.assert_called_once()
-        _, kwargs = jobs_svc.get_or_create.call_args
-        # Splatted kwargs match AsyncInsertJob.settings(tbl, ...).
+        from_callable.assert_called_once()
+        args, kwargs = from_callable.call_args
+        # Default applier is :func:`AsyncInsertJob.apply_records`.
+        assert args[0] is AsyncInsertJob.apply_records
+        # Settings are splatted into from_callable.
         assert kwargs["name"] == "ygg-async-insert-cat-sch-tbl"
-        assert kwargs["tasks"][0].notebook_task.notebook_path == "/Workspace/Users/me/apply"
-        # File-arrival trigger by default.
+        assert kwargs["service"] is jobs_svc
+        # File-arrival trigger lives in the staged kwargs.
         assert "trigger" in kwargs
+        # ``tasks`` is dropped — from_callable stages the Python task.
+        assert "tasks" not in kwargs
 
-    def test_forwards_overrides_to_settings(self):
+    def test_applier_none_creates_tasksless_job(self):
         tbl, jobs_svc = self._table()
-        jobs_svc.get_or_create.return_value = MagicMock()
+        jobs_svc.find.return_value = None
+        jobs_svc.create.return_value = MagicMock(name="Job")
 
-        tbl.async_job(
-            notebook_path="/p",
-            schedule="0 0 */6 * * ?",
-            file_arrival_trigger=False,
+        tbl.async_job(applier=None)
+
+        jobs_svc.create.assert_called_once()
+        _, kwargs = jobs_svc.create.call_args
+        assert kwargs["name"] == "ygg-async-insert-cat-sch-tbl"
+        # tasks list is present but empty when no applier wanted.
+        assert kwargs["tasks"] == []
+
+    def test_explicit_task_skips_default_applier(self):
+        """Caller-supplied ``task=`` short-circuits the auto-applier."""
+        from databricks.sdk.service.jobs import NotebookTask, Task
+
+        tbl, jobs_svc = self._table()
+        jobs_svc.find.return_value = None
+        jobs_svc.create.return_value = MagicMock(name="Job")
+        custom = Task(
+            task_key="custom",
+            notebook_task=NotebookTask(notebook_path="/Workspace/custom"),
         )
-        _, kwargs = jobs_svc.get_or_create.call_args
+
+        tbl.async_job(task=custom)
+
+        # When tasks is non-empty, no auto-staging — direct create.
+        jobs_svc.create.assert_called_once()
+        _, kwargs = jobs_svc.create.call_args
+        assert kwargs["tasks"] == [custom]
+
+    def test_forwards_overrides_to_from_callable(self):
+        tbl, jobs_svc = self._table()
+        jobs_svc.find.return_value = None
+
+        with patch(
+            "yggdrasil.databricks.jobs.job.Job.from_callable",
+        ) as from_callable:
+            from_callable.return_value = MagicMock()
+            tbl.async_job(
+                schedule="0 0 */6 * * ?",
+                file_arrival_trigger=False,
+            )
+
+        _, kwargs = from_callable.call_args
         assert kwargs["schedule"].quartz_cron_expression == "0 0 */6 * * ?"
         assert "trigger" not in kwargs
+
+
+class TestAsyncInsertJobLock:
+    """:meth:`AsyncInsertJob.lock` coordinates concurrent applier runs.
+
+    Drops a ``.lock`` file under the staging folder on enter,
+    waits for any pre-existing lock to be released first, removes
+    the lock on exit.
+    """
+
+    @staticmethod
+    def _table_with_lock_path():
+        tbl, _, _, _ = _make_table_with_staging()
+        lock_path = MagicMock(spec=VolumePath, name="lock_path")
+        lock_path.exists.return_value = False
+        async_root = MagicMock(spec=VolumePath, name="async_root")
+        async_root.joinpath.return_value = lock_path
+        tbl.staging_folder = MagicMock(return_value=async_root)  # type: ignore[assignment]
+        return tbl, async_root, lock_path
+
+    def test_lock_claims_and_releases_on_exit(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, async_root, lock_path = self._table_with_lock_path()
+        with AsyncInsertJob.lock(tbl, interval=0.01) as path:
+            assert path is lock_path
+            lock_path.write_bytes.assert_called_once()
+            payload = lock_path.write_bytes.call_args.args[0]
+            # Payload is an ISO timestamp — useful for stale-lock diagnosis.
+            assert payload.startswith(b"20")
+        # Lock was released on exit.
+        lock_path.remove.assert_called_once_with(
+            missing_ok=True, wait=False, recursive=False,
+        )
+
+    def test_lock_waits_for_existing_lock_to_disappear(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, _, lock_path = self._table_with_lock_path()
+        # ``exists`` returns True the first 2 polls, then False.
+        lock_path.exists.side_effect = [True, True, False]
+
+        with AsyncInsertJob.lock(tbl, interval=0.001, timeout=10.0):
+            pass
+        # 3 polls happened before claiming.
+        assert lock_path.exists.call_count == 3
+
+    def test_lock_times_out_when_lock_held(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, _, lock_path = self._table_with_lock_path()
+        # ``exists`` never returns False — simulates a stuck holder.
+        lock_path.exists.return_value = True
+
+        with pytest.raises(TimeoutError):
+            with AsyncInsertJob.lock(tbl, interval=0.001, timeout=0.01):
+                pass
+        # No write/release happened (never acquired).
+        lock_path.write_bytes.assert_not_called()
+        lock_path.remove.assert_not_called()
+
+    def test_lock_releases_on_body_exception(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, _, lock_path = self._table_with_lock_path()
+        with pytest.raises(RuntimeError):
+            with AsyncInsertJob.lock(tbl, interval=0.001):
+                raise RuntimeError("boom")
+        # Lock was released on the exception path.
+        lock_path.remove.assert_called_once()
+
+    def test_force_unlock_drops_lock_unconditionally(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, _, lock_path = self._table_with_lock_path()
+        AsyncInsertJob.force_unlock(tbl)
+        lock_path.remove.assert_called_once_with(
+            missing_ok=True, wait=False, recursive=False,
+        )
+
+    def test_lock_path_uses_lock_filename(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, async_root, _ = self._table_with_lock_path()
+        with AsyncInsertJob.lock(tbl, interval=0.001):
+            pass
+        # The lock file is joined under the staging folder via .lock name.
+        async_root.joinpath.assert_called_with(AsyncInsertJob.LOCK_FILENAME)
 
 
 class TestAsyncInsertJobLoad:
