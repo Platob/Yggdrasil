@@ -45,11 +45,31 @@ class MongoExecutor(
         MongoStatementBatch,
     ]
 ):
-    """Run typed :class:`MongoCommand` payloads against a :class:`MongoConnection`."""
+    """Run typed :class:`MongoCommand` payloads against a :class:`MongoConnection`.
 
-    _PREPARED_STATEMENT_CLASS: ClassVar[type[MongoCommand]] = MongoCommand
-    _STATEMENT_RESULT_CLASS: ClassVar[type[MongoStatementResult]] = MongoStatementResult
-    _STATEMENT_BATCH_CLASS: ClassVar[type[MongoStatementBatch]] = MongoStatementBatch
+    Singleton-cached per :class:`MongoConnection` — same connection
+    URI ⇒ same executor, sharing the pymongo client pool and the
+    database / collection sub-services.
+    """
+
+    _PREPARED_CLASS: ClassVar[type[MongoCommand]] = MongoCommand
+    _RESPONSE_CLASS: ClassVar[type[MongoStatementResult]] = MongoStatementResult
+    _BATCH_CLASS: ClassVar[type[MongoStatementBatch]] = MongoStatementBatch
+
+    _SINGLETON_TTL: ClassVar[Any] = None
+
+    @classmethod
+    def _singleton_key(
+        cls,
+        connection: "MongoConnection | str | Any | None" = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        # :class:`MongoConnection` isn't hashable on its own; key on the
+        # canonical URI so same connection string ⇒ same executor and
+        # pymongo pool.
+        normalised = MongoConnection.from_(connection)
+        return (cls, normalised.uri, normalised.default_database)
 
     def __init__(
         self,
@@ -57,8 +77,11 @@ class MongoExecutor(
         *args: Any,
         **kwargs: Any,
     ):
+        if getattr(self, "_initialized", False):
+            return
         super().__init__(*args, **kwargs)
         self.connection: MongoConnection = MongoConnection.from_(connection)
+        self._initialized = True
 
     # ------------------------------------------------------------------
     # Sub-services
@@ -99,7 +122,7 @@ class MongoExecutor(
         statement: MongoCommand,
         start: bool = True
     ) -> MongoStatementResult:
-        result = self._STATEMENT_RESULT_CLASS(
+        result = self._RESPONSE_CLASS(
             statement=statement,
             executor=self,
             connection=self.connection,

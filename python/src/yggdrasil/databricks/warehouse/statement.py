@@ -634,7 +634,7 @@ class WarehouseStatementResult(StatementResult):
     exhausted.
     """
 
-    _PREPARED_STATEMENT_CLASS = WarehousePreparedStatement
+    _PREPARED_CLASS = WarehousePreparedStatement
     _FINAL_TABULAR_IO: ClassVar[bool] = True
 
     @classmethod
@@ -678,8 +678,8 @@ class WarehouseStatementResult(StatementResult):
           budget (2 retries).
 
         Submission-level failures (cold/busy warehouse, transport) aren't
-        seen here — those propagate from ``submit_statement`` and the
-        caller owns the retry decision.
+        seen here — those propagate from :meth:`send` and the caller
+        owns the retry decision.
         """
         if self.iteration >= _RETRYABLE_ITERATION_LIMIT:
             return False
@@ -763,10 +763,7 @@ class WarehouseStatementResult(StatementResult):
             self._response = None
             self._unpersist_schema()
 
-        submitted = self.executor.submit_statement(
-            statement=self.statement,
-            start=True
-        )
+        submitted = self.executor.send(self.statement)
 
         self.statement = submitted.statement
         self.set_api_response(submitted._response)

@@ -441,6 +441,16 @@ class Session(Singleton, ABC):
         "_lock", "_job_pool",
     })
 
+    # Prepared-payload / response / batch types the prepare → send
+    # pipeline emits. HTTP sessions inherit these defaults; SQL
+    # :class:`StatementExecutor` subclasses pin
+    # :class:`PreparedStatement` / :class:`StatementResult` /
+    # :class:`StatementBatch` instead so the same prepare / send
+    # vocabulary covers both transports.
+    _PREPARED_CLASS: ClassVar[type] = PreparedRequest
+    _RESPONSE_CLASS: ClassVar[type] = Response
+    _BATCH_CLASS: ClassVar[type] = ResponseBatch
+
     @classmethod
     def _singleton_key(
         cls,
@@ -782,8 +792,21 @@ class Session(Singleton, ABC):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         spark_session: Optional["SparkSession"] = None,
+        start: bool = True,
         **options,
     ) -> Response:
+        """Prepare, dispatch, and (optionally) await the response.
+
+        ``start=True`` (default) fires the wire call. ``start=False``
+        builds the prepared request + response shell without crossing
+        the wire — the :class:`StatementExecutor` override uses the
+        same knob to return an idled :class:`StatementResult` whose
+        backend submission is deferred until
+        :meth:`StatementResult.start` fires. Plain HTTP sessions don't
+        need an idle :class:`Response` (the network call is
+        synchronous), so the base raises a clean
+        ``NotImplementedError`` via :meth:`_build_idle_response`.
+        """
         cfg = SendConfig.check_arg(
             config,
             wait=wait,
@@ -794,7 +817,29 @@ class Session(Singleton, ABC):
             spark_session=spark_session,
             **options,
         )
+        if not start:
+            return self._build_idle_response(request, cfg)
         return self._send(request, cfg)
+
+    def _build_idle_response(
+        self,
+        request: PreparedRequest,
+        config: SendConfig,
+    ) -> Response:
+        """Return a not-yet-sent response shell for *request*.
+
+        Concrete HTTP sessions don't need an idle :class:`Response`
+        (the network call is synchronous), so the default raises.
+        :class:`StatementExecutor` overrides this to return the
+        standard ``start=False`` :class:`StatementResult` so callers
+        get a uniform "build now, dispatch later" knob across HTTP
+        and SQL.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__}.send(start=False) is not implemented; "
+            "use the synchronous send path (start=True) for HTTP sessions, "
+            "or override _build_idle_response on a custom subclass."
+        )
 
     def prepare_request_before_send(self, request: PreparedRequest) -> PreparedRequest:
         """Session-wide request hook fired once per outbound request.

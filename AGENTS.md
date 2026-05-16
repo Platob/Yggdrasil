@@ -1278,6 +1278,14 @@ Concrete rules, in order of priority:
 
 6. **Keep configs JSON-serializable when feasible.** A config that round-trips through `yggdrasil.pickle.json` (for HTTP payloads, FastAPI bodies, `to_url()` plumbing, debug dumps) is friendlier than one that only pickles. Limit non-JSON members (callables, live handles, file objects) to fields explicitly marked `compare=False, hash=False, repr=False` and document why they exist.
 
+7. **Hold live objects internally; dump URL strings on serialisation.** When a record describes "the X to operate on next" and `X` already has a richer in-process representation (a `DatabricksPath` / `VolumePath`, a `URL`, a `Table`, a `Schema`, an `HTTPSession`), **store the live object** on the instance — don't pre-stringify it and force every consumer to coerce it back via `from_(...)`. The path object is singleton-cached, carries its bound client, knows how to stat / read / unlink itself, and is what callers want when they inspect the record in tests, IDEs, or downstream code. On every serialisation boundary, do the inverse:
+
+   - In **`to_dict` / `to_json_bytes`**, project each path-shaped field through `_path_for_sql(...)` (or `str(obj.url)` for non-path URL-holders) so the wire form is a plain string the receiver can load without importing the path class.
+   - In **`__getstate__` / pickle** (rule 2), the same projection happens alongside the `_TRANSIENT_STATE_ATTRS` filter — the receiver gets strings, lazily rehydrates via `DatabricksPath.from_(...)` when it next needs a live handle.
+   - The on-disk JSON metadata format **does not change** — it's strings on both sides; only the in-memory shape gets richer.
+
+   See `yggdrasil.databricks.table.async_write.AsyncInsert` for the worked example: `parquet_paths` / `metadata_paths` carry live `VolumePath` objects after `stage_async_insert`, `to_dict` and `__getstate__` dump them as URL strings, and `to_statements` / `cleanup` accept either form transparently (`DatabricksPath.from_(p)` short-circuits when `p` is already a path).
+
 When you can't make something picklable (a real socket, a live Spark JVM handle, a memory-mapped buffer larger than a pickle frame), say so explicitly: raise a clear `TypeError("X is not picklable; pass Y instead")` from `__reduce_ex__` so the failure surfaces at the right line instead of inside a Spark worker stack trace 30 minutes later.
 
 ---

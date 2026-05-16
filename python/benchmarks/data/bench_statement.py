@@ -101,9 +101,9 @@ class _FastResult(StatementResult[PreparedStatement]):
 
 
 class _FastExecutor(StatementExecutor[PreparedStatement, _FastResult, StatementBatch]):
-    _PREPARED_STATEMENT_CLASS = PreparedStatement
-    _STATEMENT_RESULT_CLASS = _FastResult
-    _STATEMENT_BATCH_CLASS = StatementBatch
+    _PREPARED_CLASS = PreparedStatement
+    _RESPONSE_CLASS = _FastResult
+    _BATCH_CLASS = StatementBatch
 
     def _submit_statement(self, statement: PreparedStatement, start: bool = True) -> _FastResult:
         return _FastResult(statement, executor=self)

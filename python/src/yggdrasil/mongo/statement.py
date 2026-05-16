@@ -302,7 +302,7 @@ class MongoStatementResult(StatementResult[MongoCommand]):
     :meth:`start` returns.
     """
 
-    _PREPARED_STATEMENT_CLASS: ClassVar[type[MongoCommand]] = MongoCommand
+    _PREPARED_CLASS: ClassVar[type[MongoCommand]] = MongoCommand
 
     def __init__(
         self,

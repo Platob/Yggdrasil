@@ -112,7 +112,7 @@ class TestSelectRewrite(_ExecutorTestBase):
     from a Parquet folder instead of the REPL stdout."""
 
     def _coerce(self, text: str) -> ClusterPreparedStatement:
-        return self.executor._coerce_statement(text)
+        return self.executor.prepare(text)
 
     def test_select_is_wrapped_in_insert_overwrite_directory(self):
         stmt = self._coerce("SELECT 1")
@@ -155,7 +155,7 @@ class TestSelectRewrite(_ExecutorTestBase):
         original_text = stmt.text
         original_path = stmt.output_path
         # Re-coercing an already-wrapped statement is a no-op.
-        again = self.executor._coerce_statement(stmt)
+        again = self.executor.prepare(stmt)
         self.assertEqual(again.text, original_text)
         self.assertIs(again.output_path, original_path)
 
@@ -177,7 +177,7 @@ class TestSubmission(_ExecutorTestBase):
 
     def test_submit_builds_typed_result(self):
         result = self.executor._submit_statement(
-            self.executor._coerce_statement("DROP TABLE IF EXISTS t"),
+            self.executor.prepare("DROP TABLE IF EXISTS t"),
             start=False,
         )
         self.assertIsInstance(result, ClusterStatementResult)
@@ -191,7 +191,7 @@ class TestSubmission(_ExecutorTestBase):
         # the right language / context key.
         self.cluster.command = MagicMock(return_value=MagicMock(name="CommandExecution"))  # type: ignore[assignment]
 
-        stmt = self.executor._coerce_statement("DROP TABLE t")
+        stmt = self.executor.prepare("DROP TABLE t")
         self.executor.submit_command(stmt)
         self.cluster.command.assert_called_once()
         kwargs = self.cluster.command.call_args.kwargs

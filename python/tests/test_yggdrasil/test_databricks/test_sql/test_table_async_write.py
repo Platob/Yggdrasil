@@ -223,6 +223,57 @@ class TestAsyncInsertSerialization:
         loaded = AsyncInsert.from_file(path)
         assert loaded == rec
 
+    def test_to_dict_serializes_path_objects_to_url_strings(self):
+        """Path objects on ``parquet_paths`` / ``metadata_paths`` are
+        dumped via ``_path_for_sql`` so the dict survives orjson."""
+        parquet = MagicMock()
+        parquet.full_path.return_value = "/Volumes/cat/sch/stg/data/x.parquet"
+        meta = MagicMock()
+        meta.full_path.return_value = "/Volumes/cat/sch/stg/logs/x.json"
+        rec = AsyncInsert(
+            target_full_name="cat.sch.tbl",
+            parquet_paths=(parquet,),
+            metadata_paths=(meta,),
+        )
+        data = rec.to_dict()
+        assert data["parquet_paths"] == ["/Volumes/cat/sch/stg/data/x.parquet"]
+        assert data["metadata_paths"] == ["/Volumes/cat/sch/stg/logs/x.json"]
+
+    def test_pickle_drops_executor_and_results(self):
+        """Pickling rehydrates a metadata-only record — the bound
+        warehouse, in-flight results, and schema cache are gone."""
+        import pickle
+
+        rec = _make_record(mode="append")
+        rec.executor = MagicMock(name="warehouse")
+        rec.results["a"] = MagicMock(name="result")
+        rec._cached_schema = MagicMock(name="schema")
+
+        revived = pickle.loads(pickle.dumps(rec))
+        assert revived == rec  # metadata fields preserved
+        assert revived.executor is None
+        assert revived.results == {}
+        assert revived._cached_schema is None
+        assert revived.external_volume_paths == {}
+
+    def test_pickle_path_objects_become_url_strings(self):
+        """Path objects survive the pickle as URL strings (callers
+        coerce them back via ``DatabricksPath.from_`` lazily)."""
+        import pickle
+
+        parquet = MagicMock()
+        parquet.full_path.return_value = "/Volumes/cat/sch/stg/data/x.parquet"
+        meta = MagicMock()
+        meta.full_path.return_value = "/Volumes/cat/sch/stg/logs/x.json"
+        rec = AsyncInsert(
+            target_full_name="cat.sch.tbl",
+            parquet_paths=(parquet,),
+            metadata_paths=(meta,),
+        )
+        revived = pickle.loads(pickle.dumps(rec))
+        assert revived.parquet_paths == ("/Volumes/cat/sch/stg/data/x.parquet",)
+        assert revived.metadata_paths == ("/Volumes/cat/sch/stg/logs/x.json",)
+
 
 class TestAsyncInsertProperties:
 
@@ -433,6 +484,29 @@ class TestMergeClassmethod:
         merged = AsyncInsert.merge(folder)
         assert len(merged) == 1
         assert merged[0].target_full_name == "t1"
+
+    def test_async_insert_root_descends_directly_into_logs(self):
+        """``.sql/async/insert/`` as source descends directly into
+        ``logs/`` — the parent listing (which would just rediscover
+        ``data/`` + ``logs/``) is skipped, saving one round trip."""
+        rec = _make_record(target="t1")
+        json_entry = MagicMock()
+        json_entry.name = "async-1.json"
+        json_entry.read_bytes.return_value = rec.to_json_bytes()
+
+        logs_folder = MagicMock(spec=VolumePath, name="logs_folder")
+        logs_folder.ls.return_value = [json_entry]
+
+        root = MagicMock(spec=VolumePath)
+        root.name = "insert"
+        root.joinpath.return_value = logs_folder
+
+        merged = AsyncInsert.merge(root)
+        assert len(merged) == 1
+        # Parent root was never listed — only ``logs/``.
+        root.ls.assert_not_called()
+        root.joinpath.assert_called_once_with(ASYNC_INSERT_LOGS_SUBDIR)
+        logs_folder.ls.assert_called_once_with(recursive=False)
 
 
 # ---------------------------------------------------------------------------

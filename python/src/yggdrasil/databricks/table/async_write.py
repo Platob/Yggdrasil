@@ -42,6 +42,7 @@ import datetime as _dt
 import logging
 import os
 import time
+from collections import OrderedDict
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -69,6 +70,7 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.jobs.service import Jobs
     from yggdrasil.databricks.sql.engine import SQLEngine
     from yggdrasil.databricks.warehouse import SQLWarehouse
+    from yggdrasil.io.path import Path
     from .table import Table
 
 
@@ -157,16 +159,39 @@ class AsyncInsert(WarehouseStatementBatch):
     (``self.executor is None``, ``self.results`` empty), suitable for
     JSON round-tripping, merging, and :meth:`to_sql` rendering. Pass
     ``executor=`` to submit straight away.
+
+    ``parquet_paths`` / ``metadata_paths`` accept either :class:`str`
+    URLs or live :class:`DatabricksPath` instances; in-memory the
+    record carries whatever it was handed (so :func:`stage_async_insert`
+    can stash the freshly-built :class:`VolumePath` objects without
+    forcing a round-trip through string coercion). On any serialisation
+    path — :meth:`to_dict`, :meth:`to_json_bytes`, pickle via
+    :meth:`__reduce__` — path entries are dumped as their URL strings
+    and the live :attr:`executor` / :attr:`results` are stripped so the
+    output is a clean metadata snapshot.
     """
 
     _METADATA_FIELDS: ClassVar[Tuple[Tuple[str, Any], ...]] = _METADATA_FIELDS
+
+    # Live handles + in-flight state that don't survive pickling — the
+    # bound warehouse, the queue of submitted prepared statements, and
+    # the schema cache rebuild on the receiver. Matches the
+    # ``yggdrasil.io.session.Session`` / ``yggdrasil.aws.AWSClient``
+    # pickle pattern (see ``AGENTS.md`` → "Make objects picklable").
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
+        "executor",
+        "results",
+        "external_volume_paths",
+        "_cached_schema",
+        "start_timestamp",
+    })
 
     def __init__(
         self,
         target_full_name: str = "",
         *,
-        parquet_paths: Tuple[str, ...] = (),
-        metadata_paths: Tuple[str, ...] = (),
+        parquet_paths: Tuple["Path | str", ...] = (),
+        metadata_paths: Tuple["Path | str", ...] = (),
         operation_ids: Tuple[str, ...] = (),
         created_at: str = "",
         target_catalog_name: Optional[str] = None,
@@ -254,6 +279,39 @@ class AsyncInsert(WarehouseStatementBatch):
             f"ops={len(self.operation_ids)}, mode={self.mode!r})"
         )
 
+    def __getstate__(self) -> dict[str, Any]:
+        """Pickle the metadata snapshot — drop the live executor.
+
+        Follows the project's transient-state pattern (see
+        :class:`yggdrasil.io.session.Session`,
+        :class:`yggdrasil.aws.AWSClient`): attributes named in
+        :attr:`_TRANSIENT_STATE_ATTRS` (executor, results, schema cache,
+        …) are stripped from ``__dict__`` so the live warehouse handle
+        and in-flight result map never cross the wire. Path entries on
+        :attr:`parquet_paths` / :attr:`metadata_paths` are dumped as
+        URL strings via :func:`_path_for_sql` — the receiver gets
+        plain strings, ready to coerce lazily through
+        :meth:`DatabricksPath.from_` when it needs a live handle again.
+        """
+        state = {
+            k: v for k, v in self.__dict__.items()
+            if k not in self._TRANSIENT_STATE_ATTRS
+        }
+        state["parquet_paths"] = tuple(_path_for_sql(p) for p in self.parquet_paths)
+        state["metadata_paths"] = tuple(_path_for_sql(p) for p in self.metadata_paths)
+        return state
+
+    def __setstate__(self, state: Mapping[str, Any]) -> None:
+        """Restore *state* and re-init the dropped transient handles."""
+        self.__dict__.update(state)
+        # Reset transients to the same defaults ``WarehouseStatementBatch``
+        # / ``StatementBatch`` set up in ``__init__``.
+        self.executor = None  # type: ignore[assignment]
+        self.results = OrderedDict()
+        self.external_volume_paths = {}
+        self._cached_schema = None
+        self.start_timestamp = None
+
     # ---- derived ---------------------------------------------------------
     @property
     def operation_id(self) -> str:
@@ -290,10 +348,14 @@ class AsyncInsert(WarehouseStatementBatch):
         ucn = self.update_column_names
         zb = self.zorder_by
         pb = self.prune_by
+        # Path entries may be live :class:`DatabricksPath` objects (set
+        # by :func:`stage_async_insert`) — coerce each to its URL string
+        # so the dict survives orjson / pickle. ``_path_for_sql`` is a
+        # no-op for plain strings.
         return {
             "target_full_name": self.target_full_name,
-            "parquet_paths": list(self.parquet_paths),
-            "metadata_paths": list(self.metadata_paths),
+            "parquet_paths": [_path_for_sql(p) for p in self.parquet_paths],
+            "metadata_paths": [_path_for_sql(p) for p in self.metadata_paths],
             "operation_ids": list(self.operation_ids),
             "created_at": self.created_at,
             "target_catalog_name": self.target_catalog_name,
@@ -1352,9 +1414,29 @@ def _iter_records(
         yield source
         return
 
-    # Folder-like: walk for ``*.json`` files, descending into ``logs/``
-    # when present so the staging root works as a source.
+    # Folder-like: walk for ``*.json`` files. The staging root only ever
+    # contains the ``data/`` + ``logs/`` siblings (see
+    # :func:`stage_async_insert`), and every metadata file lives under
+    # ``logs/`` — so when the caller hands the root, skip the parent
+    # listing entirely and descend directly into ``logs/``. Saves one
+    # remote ``ls`` round trip per merged target (the volume listing in
+    # the log shows ~700ms each on a live workspace).
     if hasattr(source, "ls"):
+        source_name = getattr(source, "name", "") or ""
+        if (
+            source_name == "insert"
+            and hasattr(source, "joinpath")
+        ):
+            try:
+                logs_folder = source.joinpath(ASYNC_INSERT_LOGS_SUBDIR)
+                entries = logs_folder.ls(recursive=False)
+            except FileNotFoundError:
+                return
+            for entry in entries:
+                if (getattr(entry, "name", "") or "").endswith(".json"):
+                    yield AsyncInsert.from_file(entry, client=client)
+            return
+
         for entry in source.ls(recursive=False):
             name = getattr(entry, "name", "") or ""
             if name == ASYNC_INSERT_LOGS_SUBDIR and hasattr(entry, "ls"):
@@ -1522,10 +1604,16 @@ def stage_async_insert(
 
     parquet_path.write_table(data, opts, mode=Mode.OVERWRITE)
 
+    # Carry the live :class:`VolumePath` objects on the record so
+    # downstream steps (``to_statements`` / ``cleanup`` / inspection in
+    # tests) reuse the same singleton-cached instance instead of
+    # re-coercing the string back into a path. ``to_dict`` /
+    # ``to_json_bytes`` / pickle still emit URL strings (see ``to_dict``
+    # / ``__reduce__``), so the staged JSON metadata format is unchanged.
     record = AsyncInsert(
         target_full_name=table.full_name(safe=True),
-        parquet_paths=(_path_for_sql(parquet_path),),
-        metadata_paths=(_path_for_sql(meta_path),),
+        parquet_paths=(parquet_path,),
+        metadata_paths=(meta_path,),
         operation_ids=(op_id,),
         created_at=_dt.datetime.now(tz=_dt.timezone.utc).isoformat(),
         target_catalog_name=table.catalog_name,

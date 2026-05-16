@@ -451,7 +451,7 @@ class StatementResult(Tabular, Generic[PS]):
       override
     """
 
-    _PREPARED_STATEMENT_CLASS: ClassVar[type[PreparedStatement]] = PreparedStatement
+    _PREPARED_CLASS: ClassVar[type[PreparedStatement]] = PreparedStatement
 
     @classmethod
     def default_media_type(cls) -> MimeType:
@@ -468,7 +468,7 @@ class StatementResult(Tabular, Generic[PS]):
         **kwargs: Any,
     ):
         self.executor = executor
-        self.statement = self._PREPARED_STATEMENT_CLASS.from_(statement)
+        self.statement = self._PREPARED_CLASS.from_(statement)
         self.key = key or self.statement.key
         self.start_timestamp: int | None = start_timestamp
         self.iteration = iteration or 0
@@ -808,34 +808,34 @@ class StatementBatch(StatementResult[PS], Generic[PS, SR]):
         ``key`` collisions (against pending statements *or* completed
         results) raise :class:`ValueError`.
         """
-        stmt = self.executor._PREPARED_STATEMENT_CLASS.from_(statement)
+        stmt = self.executor._PREPARED_CLASS.from_(statement)
         if key is not None:
             if key in self:
                 raise ValueError(f"Duplicate batch key {key!r}.")
             stmt.key = key
-        self.results[stmt.key] = self.executor.submit_statement(stmt, start=True)
+        self.results[stmt.key] = self.executor.send(stmt)
         return stmt.key
 
     def extend(self, statements: Iterable["PS | str"]) -> list[str]:
         """Enqueue multiple; return the list of assigned keys.
 
         Inlined over :meth:`add` to hoist the ``self.executor`` /
-        ``_PREPARED_STATEMENT_CLASS`` / ``submit_statement`` lookups
-        out of the per-item loop. The auto-key path skips ``add``'s
-        collision check — :meth:`PreparedStatement.__init__` already
-        mints a fresh key per statement, so no duplicates are possible
-        from the auto-keyed path. Callers needing explicit keys still
-        route through :meth:`add`.
+        ``_PREPARED_CLASS`` / ``send`` lookups out of the per-item
+        loop. The auto-key path skips ``add``'s collision check —
+        :meth:`PreparedStatement.__init__` already mints a fresh key
+        per statement, so no duplicates are possible from the
+        auto-keyed path. Callers needing explicit keys still route
+        through :meth:`add`.
         """
         executor = self.executor
-        prepared_cls = executor._PREPARED_STATEMENT_CLASS
-        submit = executor.submit_statement
+        prepared_cls = executor._PREPARED_CLASS
+        send = executor.send
         results = self.results
         keys: list[str] = []
         append = keys.append
         for statement in statements:
             prepared = prepared_cls.from_(statement)
-            results[prepared.key] = submit(prepared, start=True)
+            results[prepared.key] = send(prepared)
             append(prepared.key)
         return keys
 

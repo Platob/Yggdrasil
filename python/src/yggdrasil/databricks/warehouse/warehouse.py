@@ -66,7 +66,6 @@ from yggdrasil.databricks.warehouse.wh_utils import (
     safeEndpointInfo,
     serverless_sibling_spec,
 )
-from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.pyutils.equality import dicts_equal
 from .statement import (
@@ -137,7 +136,6 @@ class DatabricksExecutionOptions(ExecutionOptions):
 
 
 class SQLWarehouse(
-    Singleton,
     DatabricksResource,
     StatementExecutor[
         WarehousePreparedStatement,
@@ -171,9 +169,9 @@ class SQLWarehouse(
 
     # Pin concrete types so base coercion + result construction produce
     # the right subclasses.
-    _PREPARED_STATEMENT_CLASS: ClassVar[type[WarehousePreparedStatement]] = WarehousePreparedStatement
-    _STATEMENT_RESULT_CLASS: ClassVar[type[WarehouseStatementResult]] = WarehouseStatementResult
-    _STATEMENT_BATCH_CLASS: ClassVar[type[WarehouseStatementBatch]] = WarehouseStatementBatch
+    _PREPARED_CLASS: ClassVar[type[WarehousePreparedStatement]] = WarehousePreparedStatement
+    _RESPONSE_CLASS: ClassVar[type[WarehouseStatementResult]] = WarehouseStatementResult
+    _BATCH_CLASS: ClassVar[type[WarehouseStatementBatch]] = WarehouseStatementBatch
 
     # Process-lifetime caching — warehouses are heavyweight (cached
     # ``EndpointInfo``, urllib3 pool); we want the same id under the
@@ -891,7 +889,7 @@ class SQLWarehouse(
         # Hand off to base lifecycle: _execute (overridden above) stages
         # any extra external data, then calls _submit_statement and
         # applies wait / raise_error.
-        coerced = self._coerce_statement(prepared)
+        coerced = self.prepare(prepared)
         return self._execute(coerced, opts)
 
     def _build_options(

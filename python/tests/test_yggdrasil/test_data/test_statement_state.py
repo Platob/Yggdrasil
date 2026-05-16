@@ -34,7 +34,7 @@ class _CountingResult(StatementResult[_StubStatement]):
     collapses N property accesses into one call.
     """
 
-    _PREPARED_STATEMENT_CLASS = _StubStatement
+    _PREPARED_CLASS = _StubStatement
 
     def __init__(self, statement: _StubStatement, *, state: State = State.PENDING, **kwargs: Any) -> None:
         super().__init__(statement=statement, **kwargs)

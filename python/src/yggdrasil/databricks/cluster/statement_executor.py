@@ -58,7 +58,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 from databricks.sdk.service.compute import Language
 
@@ -114,14 +114,37 @@ class ClusterStatementExecutor(DatabricksResource, StatementExecutor[
     Inherits :meth:`execute` / :meth:`execute_many` / :meth:`batch`
     from the base — only :meth:`_submit_statement` is implemented
     locally, plus the SELECT-rewrite helper.
+
+    Singleton-cached on ``(cluster, volume)`` so every statement
+    against the same staging surface lands on one executor — same
+    REPL context, same cluster session, same per-instance cache. The
+    cluster cap of 145 user execution contexts is one of the main
+    reasons for this: an unintended duplicate executor is an
+    unintended second context.
     """
 
-    _PREPARED_STATEMENT_CLASS: ClassVar[type[ClusterPreparedStatement]] = ClusterPreparedStatement
-    _STATEMENT_RESULT_CLASS: ClassVar[type[ClusterStatementResult]] = ClusterStatementResult
-    _STATEMENT_BATCH_CLASS: ClassVar[type[ClusterStatementBatch]] = ClusterStatementBatch
+    _PREPARED_CLASS: ClassVar[type[ClusterPreparedStatement]] = ClusterPreparedStatement
+    _RESPONSE_CLASS: ClassVar[type[ClusterStatementResult]] = ClusterStatementResult
+    _BATCH_CLASS: ClassVar[type[ClusterStatementBatch]] = ClusterStatementBatch
+
+    _SINGLETON_TTL: ClassVar[Any] = None
 
     cluster: "Cluster"
     volume: "Volume"
+
+    @classmethod
+    def _singleton_key(
+        cls,
+        cluster: "Cluster | None" = None,
+        volume: "Volume | None" = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        # Both :class:`Cluster` and :class:`Volume` are singleton-cached
+        # ``DatabricksResource``s, so they hash by their UC identity
+        # already. Pin both — same cluster + same volume ⇒ same
+        # executor, same REPL context.
+        return (cls, cluster, volume)
 
     def __init__(
         self,
@@ -131,6 +154,9 @@ class ClusterStatementExecutor(DatabricksResource, StatementExecutor[
         default_language: Language = Language.SQL,
         default_context_key: Optional[str] = None,
     ):
+        if getattr(self, "_initialized", False):
+            return
+
         # Late import to avoid the cluster module pulling the
         # serverless submodule at import time.
         from .serverless import ServerlessCluster
@@ -159,6 +185,7 @@ class ClusterStatementExecutor(DatabricksResource, StatementExecutor[
             default_context_key
             or f"ygg-cluster-sql:{volume.full_name() if hasattr(volume, 'full_name') else id(volume)}"
         )
+        self._initialized = True
 
     # ------------------------------------------------------------------ #
     # Identity helpers (drive __repr__ via DatabricksResource)
@@ -170,12 +197,12 @@ class ClusterStatementExecutor(DatabricksResource, StatementExecutor[
     # ------------------------------------------------------------------ #
     # Statement preparation
     # ------------------------------------------------------------------ #
-    def _coerce_statement(
+    def prepare(
         self,
         statement: "ClusterPreparedStatement | PreparedStatement | str",
     ) -> ClusterPreparedStatement:
-        coerced = super()._coerce_statement(statement)
-        return self._rewrite_for_select(coerced)
+        prepared = super().prepare(statement)
+        return self._rewrite_for_select(prepared)
 
     def _rewrite_for_select(
         self,
