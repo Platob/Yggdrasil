@@ -5,12 +5,12 @@ import os
 import re
 import socket
 import subprocess
-from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal, Mapping, Optional, Sequence
+from typing import Any, ClassVar, Literal, Mapping, Optional, Sequence
 
 import pyarrow as pa
 
+from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.io.url import URL
 
 # Lazy field caches default to ``...`` (the ``Ellipsis`` singleton)
@@ -32,10 +32,6 @@ __all__ = [
 # ── types ─────────────────────────────────────────────────────────────────────
 
 DatabricksLinkKind = Literal["auto", "job_run", "notebook_id", "workspace_path"]
-
-# ── module-level cache ────────────────────────────────────────────────────────
-
-_CURRENT_CACHE: UserInfo | None = None
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
@@ -77,16 +73,17 @@ USERINFO_STRUCT: pa.StructType = pa.struct(list(USERINFO_SCHEMA))
 # ── class ─────────────────────────────────────────────────────────────────────
 
 
-@dataclass(frozen=True, slots=True)
-class UserInfo:
+class UserInfo(Singleton):
     """Snapshot of the user identity for the current process.
 
     ``hostname`` is populated eagerly (``socket.gethostname()`` is
     cheap and answers reliably without I/O fan-out). Every other
     identity field is a lazy, memoized property:
 
-    - ``key`` / ``email`` shell out (``whoami``, ``whoami /UPN``) and
-      may call the Databricks SDK on DBR clusters.
+    - ``key`` / ``email`` consult the Databricks notebook context
+      (free, in-process) and AWS-managed env vars before shelling
+      out to ``whoami`` / ``whoami /UPN`` or calling the Databricks
+      IAM SDK.
     - ``first_name`` / ``last_name`` are derived from ``email`` —
       free once email has been resolved, but pulling them eagerly
       forces email resolution.
@@ -101,37 +98,131 @@ class UserInfo:
     once a value is resolved — or supplied via :meth:`from_struct_dict`
     or constructor kwargs — it persists for the life of the instance.
 
+    :class:`Singleton` integration:
+
+    - The constructor caches one instance per ``(cls, hostname, key,
+      email, first/last name, product, product version)``. Two
+      ``UserInfo.current()`` calls collapse to the same instance;
+      :meth:`with_email` / :meth:`from_struct_dict` produce
+      different identities and live as separate instances under the
+      same hostname.
+    - Per-process derived caches (``_cwd_cache`` / ``_url_cache`` /
+      ``_git_url_cache``) are listed in
+      :attr:`_TRANSIENT_STATE_ATTRS` so cross-process pickle drops
+      them; the receiver re-derives from its own context.
+
     Construction:
 
-    - :meth:`current` returns the process-wide singleton (preferred).
+    - :meth:`current` returns the singleton for the local hostname.
     - :meth:`from_struct_dict` rebuilds an instance from a wire
       payload, with every supplied field pre-populated so no
       resolution fires on the receiver.
-    - The dataclass constructor accepts the underscore-prefixed
-      cache fields directly — useful for tests and for
-      :func:`dataclasses.replace`.
+    - The constructor accepts the underscore-prefixed cache fields
+      directly — useful for tests and for :meth:`with_email`.
     """
 
-    hostname: str = ""
+    _SINGLETON_TTL: ClassVar[Any] = None
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
+        "_cwd_cache", "_url_cache", "_git_url_cache",
+    })
 
-    # Lazy identity caches. Defaulted to ``...`` so the property
-    # accessors can distinguish "not yet resolved" from "resolved to
-    # ``None``" (a legal value for everything except ``key``). They
-    # participate in :func:`dataclasses.replace` (init=True) so wire
-    # round-trips and ``with_email`` don't need a custom builder.
-    _key: Any = field(default=..., repr=False)
-    _email: Any = field(default=..., repr=False)
-    _first_name: Any = field(default=..., repr=False)
-    _last_name: Any = field(default=..., repr=False)
-    _product: Any = field(default=..., repr=False)
-    _product_version: Any = field(default=..., repr=False)
+    @classmethod
+    def _singleton_key(
+        cls,
+        hostname: str = "",
+        *,
+        _key: Any = ...,
+        _email: Any = ...,
+        _first_name: Any = ...,
+        _last_name: Any = ...,
+        _product: Any = ...,
+        _product_version: Any = ...,
+    ) -> Any:
+        # Identity key includes every wire field so two different
+        # wire payloads on the same host don't collapse into each
+        # other, and ``with_email`` lives as a separate instance.
+        # Per-process slots (cwd/url/git_url) are excluded — they're
+        # local to whoever holds the instance.
+        return (
+            cls, hostname,
+            _key, _email,
+            _first_name, _last_name,
+            _product, _product_version,
+        )
 
-    # Per-process derived caches. ``init=False`` because they
-    # shouldn't travel across the wire — the receiver's filesystem
-    # / runtime is the only context that can answer correctly.
-    _cwd_cache: Any = field(default=..., init=False, repr=False, compare=False)
-    _url_cache: Any = field(default=..., init=False, repr=False, compare=False)
-    _git_url_cache: Any = field(default=..., init=False, repr=False, compare=False)
+    def __init__(
+        self,
+        hostname: str = "",
+        *,
+        _key: Any = ...,
+        _email: Any = ...,
+        _first_name: Any = ...,
+        _last_name: Any = ...,
+        _product: Any = ...,
+        _product_version: Any = ...,
+        singleton_ttl: Any = ...,
+    ) -> None:
+        # ``Singleton.__new__`` may return a cached instance, in
+        # which case ``__init__`` runs a second time — guard so we
+        # don't clobber already-resolved lazy slots.
+        del singleton_ttl
+        if getattr(self, "_initialized", False):
+            return
+
+        self.hostname = hostname
+        self._key = _key
+        self._email = _email
+        self._first_name = _first_name
+        self._last_name = _last_name
+        self._product = _product
+        self._product_version = _product_version
+
+        # Per-process derived caches. They're in
+        # ``_TRANSIENT_STATE_ATTRS`` so cross-process pickle drops
+        # them; the receiver re-derives from its own filesystem /
+        # runtime / dbutils context.
+        self._cwd_cache: Any = ...
+        self._url_cache: Any = ...
+        self._git_url_cache: Any = ...
+
+        self._initialized = True
+
+    def __getnewargs_ex__(self) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """Route unpickling through ``__new__`` with identity kwargs.
+
+        Pickle reconstructs the instance via
+        ``cls.__new__(cls, hostname, **wire_kwargs)``, so the
+        singleton machinery collapses the cross-process restore onto
+        the live in-process instance whose key matches.
+        """
+        return (self.hostname,), {
+            "_key": self._key,
+            "_email": self._email,
+            "_first_name": self._first_name,
+            "_last_name": self._last_name,
+            "_product": self._product,
+            "_product_version": self._product_version,
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        # ``Singleton.__setstate__`` resets transient slots to
+        # ``None``; our property accessors use ``...`` as the
+        # "not yet resolved" sentinel (``None`` is a legal resolved
+        # value for ``url`` / ``git_url``), so re-seed with ``...``
+        # so the receiver re-derives ``cwd`` / ``url`` / ``git_url``
+        # from its own filesystem / runtime instead of caching the
+        # sender's ``None``.
+        if getattr(self, "_initialized", False):
+            return
+        self.__dict__.update(state)
+        for attr in self._TRANSIENT_STATE_ATTRS:
+            self.__dict__[attr] = ...
+
+    def __repr__(self) -> str:
+        return (
+            f"UserInfo(hostname={self.hostname!r}, "
+            f"key={self._key!r}, email={self._email!r})"
+        )
 
     @classmethod
     def current(cls) -> "UserInfo":
@@ -247,11 +338,18 @@ class UserInfo:
 
     def with_email(self, email: str | None) -> "UserInfo":
         first_name, last_name = _names_from_email(email)
-        return replace(
-            self,
+        # The new email lands in :meth:`_singleton_key`, so this
+        # constructor call resolves to a *different* singleton entry
+        # than ``self`` — the original instance keeps its old email
+        # untouched.
+        return UserInfo(
+            self.hostname,
+            _key=self._key,
             _email=email,
             _first_name=first_name,
             _last_name=last_name,
+            _product=self._product,
+            _product_version=self._product_version,
         )
 
     def to_struct_dict(self) -> dict[str, Any]:
@@ -308,20 +406,21 @@ def get_user_info(*, refresh: bool = False) -> UserInfo:
     and persists. ``refresh=True`` drops the cached singleton and
     rebuilds, which also abandons any previously memoized lazy
     fields (the new instance starts unresolved).
+
+    The cache is the per-class :attr:`UserInfo._INSTANCES` slot
+    inherited from :class:`Singleton` — same primitive every other
+    config-keyed singleton in the codebase uses.
     """
-    global _CURRENT_CACHE
-
-    if _CURRENT_CACHE is not None and not refresh:
-        return _CURRENT_CACHE
-
-    info = UserInfo(hostname=socket.gethostname())
-    _CURRENT_CACHE = info
-    return info
+    hostname = socket.gethostname()
+    if refresh:
+        # Pop the matching cache entry so the next construction
+        # builds a fresh instance with unresolved lazy slots.
+        UserInfo(hostname=hostname).invalidate_singleton()
+    return UserInfo(hostname=hostname)
 
 
 def _clear_cache() -> None:
-    global _CURRENT_CACHE
-    _CURRENT_CACHE = None
+    UserInfo._INSTANCES.clear()
 
 
 # ── struct / hash helpers ─────────────────────────────────────────────────────
@@ -364,10 +463,24 @@ def _userinfo_hash(info: "UserInfo") -> int:
 
 
 def _current_compute_url(*, hostname: str, cwd: str) -> URL | None:
-    """Databricks URL when in DBR, otherwise a ``local://`` URL for the cwd."""
+    """URL identifying the compute surface the process is running on.
+
+    Resolution order — first hit wins, so a Databricks notebook
+    running inside a Lambda-shaped container (unlikely but possible
+    in custom environments) still surfaces as the workspace link
+    that's actually meaningful to a human:
+
+    1. Databricks workspace deep-link (DBR runtime).
+    2. AWS Lambda console URL (``AWS_LAMBDA_FUNCTION_NAME``).
+    3. AWS Batch console URL (``AWS_BATCH_JOB_ID``).
+    4. ``local://<hostname>/<cwd>`` fallback.
+    """
     dbx = _databricks_current_url(kind="auto")
     if dbx is not None:
         return dbx
+    aws = _aws_current_url()
+    if aws is not None:
+        return aws
     if not cwd:
         return None
     path = normalize_abs_path_for_url(cwd)
@@ -418,6 +531,102 @@ def _ctx_tags() -> Mapping[str, str]:
         return {str(k): str(v) for k, v in tags.items()}
     except Exception:
         return {}
+
+
+def _databricks_notebook_user() -> str | None:
+    """User email pulled from the notebook ``dbutils`` context.
+
+    The notebook execution context exposes the running user under
+    several conventional tag keys (``user`` is the email-shaped
+    one on modern DBR; ``userName`` predates it on older runtimes).
+    Reading the tag is a pure in-process Java->JSON round trip — no
+    SDK call, no network hop — so we prefer it over
+    :func:`_get_dbx_user` (which issues an ``iam.users`` request).
+    Returns ``None`` outside a notebook or when the tag is empty.
+    """
+    if not os.getenv("DATABRICKS_RUNTIME_VERSION"):
+        return None
+    tags = _ctx_tags()
+    return _pick(tags.get("user"), tags.get("userName"))
+
+
+def _aws_lambda_identity() -> dict[str, str] | None:
+    """Lambda function context from the runtime-injected env vars.
+
+    ``AWS_LAMBDA_FUNCTION_NAME`` is the canonical detector (reserved
+    by the runtime bootstrap, never user-settable). The rest are
+    informational — version, region, log group — and may be absent
+    in custom runtimes, so the keys are populated opportunistically.
+    """
+    name = os.getenv("AWS_LAMBDA_FUNCTION_NAME")
+    if not name:
+        return None
+    info: dict[str, str] = {"function_name": name}
+    for env_key, dict_key in (
+        ("AWS_LAMBDA_FUNCTION_VERSION", "function_version"),
+        ("AWS_REGION", "region"),
+        ("AWS_DEFAULT_REGION", "region"),
+        ("AWS_LAMBDA_LOG_GROUP_NAME", "log_group"),
+        ("AWS_LAMBDA_LOG_STREAM_NAME", "log_stream"),
+    ):
+        value = os.getenv(env_key)
+        if value and dict_key not in info:
+            info[dict_key] = value
+    return info
+
+
+def _aws_batch_identity() -> dict[str, str] | None:
+    """AWS Batch job context from the agent-injected env vars."""
+    job_id = os.getenv("AWS_BATCH_JOB_ID")
+    if not job_id:
+        return None
+    info: dict[str, str] = {"job_id": job_id}
+    for env_key, dict_key in (
+        ("AWS_BATCH_JQ_NAME", "job_queue"),
+        ("AWS_BATCH_CE_NAME", "compute_environment"),
+        ("AWS_BATCH_JOB_ATTEMPT", "attempt"),
+        ("AWS_BATCH_JOB_NODE_INDEX", "node_index"),
+        ("AWS_REGION", "region"),
+        ("AWS_DEFAULT_REGION", "region"),
+    ):
+        value = os.getenv(env_key)
+        if value and dict_key not in info:
+            info[dict_key] = value
+    return info
+
+
+def _aws_current_url() -> URL | None:
+    """Deep-link into the AWS console for the current compute surface.
+
+    Lambda and Batch carry enough env-side context to build a
+    permalink to the function / job in the AWS console; ECS / bare
+    EC2 don't (the metadata URI alone doesn't identify the task in
+    the console), so they fall through to the ``local://`` URL.
+    """
+    lam = _aws_lambda_identity()
+    if lam is not None:
+        region = lam.get("region") or "us-east-1"
+        name = lam["function_name"]
+        return URL.from_dict({
+            "scheme": "https",
+            "host": "console.aws.amazon.com",
+            "path": "/lambda/home",
+            "query": f"region={region}",
+            "fragment": f"/functions/{name}",
+        })
+
+    batch = _aws_batch_identity()
+    if batch is not None:
+        region = batch.get("region") or "us-east-1"
+        return URL.from_dict({
+            "scheme": "https",
+            "host": "console.aws.amazon.com",
+            "path": "/batch/home",
+            "query": f"region={region}",
+            "fragment": f"jobs/detail/{batch['job_id']}",
+        })
+
+    return None
 
 
 # ── path normalization ────────────────────────────────────────────────────────
@@ -665,9 +874,24 @@ def _safe_getcwd() -> str:
 
 def _resolve_key() -> str:
     if os.getenv("DATABRICKS_RUNTIME_VERSION"):
-        dbx_user = _get_dbx_user()
+        # Notebook context first — pure in-process JSON, no SDK round
+        # trip. The SDK path stays as the fallback for jobs / scripts
+        # where ``dbutils`` isn't wired up.
+        dbx_user = _databricks_notebook_user() or _get_dbx_user()
         if dbx_user:
             return dbx_user
+
+    # Serverless / managed-container surfaces: ``whoami`` on Lambda
+    # returns the sandbox user (``sbx_user1051``) and on Batch returns
+    # ``root`` — neither is useful for tagging or attribution. Prefer
+    # the service-side identifier the runtime already injected.
+    lam = _aws_lambda_identity()
+    if lam is not None:
+        return f"lambda:{lam['function_name']}"
+    batch = _aws_batch_identity()
+    if batch is not None:
+        return f"batch:{batch['job_id']}"
+
     whoami = _run_quiet(["whoami"])
     if whoami:
         return whoami.strip()
@@ -680,7 +904,10 @@ def _resolve_email() -> str | None:
 
 def _get_upn_email() -> str | None:
     if os.getenv("DATABRICKS_RUNTIME_VERSION"):
-        dbx_user = _get_dbx_user()
+        # Notebook context first — the ``user`` tag is already an
+        # email on modern DBR; fall back to the SDK only if the
+        # tag is absent (jobs, init scripts).
+        dbx_user = _databricks_notebook_user() or _get_dbx_user()
         if dbx_user and "@" in dbx_user:
             return dbx_user
     upn = _clean_str(_run_quiet(["whoami", "/UPN"]))

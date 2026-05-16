@@ -221,16 +221,16 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
             existing = self._client_cache.get(cache_key)
             if existing is not None:
                 return existing
-            from yggdrasil.aws.config import AWSConfig
+            from yggdrasil.aws.client import AWSClient
             refresher = _ModeBoundRefresher(provider=self, mode=resolved)
             # Discriminator so the AWSClient singleton cache mints a
             # distinct session per (provider, resource, mode) — without
             # it, read and write configs would collapse to one client
             # (refresher itself is excluded from equality).
             refresher_key = f"{type(self).__name__}:{self.key}:{resolved.name}"
-            client = AWSConfig.from_refresher(
+            client = AWSClient.from_refresher(
                 refresher, region=region, refresher_key=refresher_key,
-            ).to_client()
+            )
             self._client_cache[cache_key] = client
             return client
 

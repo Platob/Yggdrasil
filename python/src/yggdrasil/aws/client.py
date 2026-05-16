@@ -1,24 +1,25 @@
 """AWS client / service / resource trio.
 
-Mirrors the Databricks pattern: one client owns the session and
-mints boto3 service clients on demand; service objects bind to a
-client; resource objects bind to a service. The split lets a
-single set of credentials cover an entire tree of objects without
-each one re-resolving auth.
+Mirrors the Databricks pattern: one client owns the configuration
+**and** the session, mints boto3 service clients on demand;
+service objects bind to a client; resource objects bind to a
+service. The split lets a single set of credentials cover an
+entire tree of objects without each one re-resolving auth.
 
 Class summary
 -------------
 
 - :class:`AWSClient` — the analog of :class:`DatabricksClient`.
-  Wraps an :class:`AWSConfig`, owns a lazily-built boto3
-  :class:`Session`, exposes per-service client factories
-  (``s3_client``, ``sts_client``), and per-service
+  Holds every configuration knob directly (no separate
+  ``AWSConfig`` class — :class:`AWSClient` *is* the config).
+  Owns a lazily-built boto3 :class:`Session`, exposes per-service
+  client factories (``s3_client``, ``sts_client``), and per-service
   *service objects* (``self.s3`` returns :class:`S3Service`).
   Has a ``current()`` singleton + URL round-trip.
 
 - :class:`AWSService` — abstract base for service objects. Holds an
-  :class:`AWSClient`, defers shared concerns (session, config,
-  region) to it. Subclasses (:class:`S3Service`, future
+  :class:`AWSClient`, defers shared concerns (session, region) to
+  it. Subclasses (:class:`S3Service`, future
   :class:`DynamoService`, …) layer their own client + behavior on
   top.
 
@@ -26,20 +27,31 @@ Class summary
   (an S3 object, a DynamoDB row). Holds a service; reaches the
   client via ``self.service.client``.
 
-Singleton vs explicit
----------------------
+Singleton & runtime defaults
+----------------------------
+
+:class:`AWSClient` is a :class:`Singleton` keyed on every
+identity-bearing init kwarg, so two callers building a client with
+the same auth share one boto :class:`Session`. Bare ``AWSClient()``
+scrapes the managed-runtime context (AWS Lambda / Batch / ECS /
+EKS env vars: ``AWS_ACCESS_KEY_ID``, ``AWS_REGION``, ``AWS_PROFILE``,
+``AWS_ROLE_ARN``, ``AWS_ROLE_SESSION_NAME``, ``AWS_ENDPOINT_URL``,
+``AWS_S3_ADDRESSING_STYLE``); anything still unset falls through to
+boto3's own credential chain at session-build time.
 
 ``AWSClient.current()`` returns a process-global default. Service
 defaults flow from there: ``S3Service.current()`` builds against
-``AWSClient.current()`` automatically. Pass an explicit client to
-any service / path constructor to escape the singleton (different
+``AWSClient.current()`` automatically. Pass explicit kwargs to any
+service / path constructor to escape the singleton (different
 account, different role, etc.).
 """
 
 from __future__ import annotations
 
-import dataclasses
 import logging
+import os
+import re
+import socket
 import threading
 import uuid
 from abc import ABC
@@ -53,16 +65,25 @@ from typing import (
     TypeVar,
 )
 
+from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.io.url import URL
 from yggdrasil.lazy_imports import boto3_module, botocore_module
 
-from .config import AwsCredentials, AWSConfig
+from .config import (
+    AwsCredentials,
+    CredentialsRefresher,
+    DATABRICKS_SQL_CREDENTIAL_COLUMNS,
+    DatabricksSQLCredentialsRefresher,
+    _coerce_refresher_output,
+    _refresher_to_metadata,
+)
 
 if TYPE_CHECKING:
     import boto3  # noqa: F401
     from botocore.client import BaseClient  # type: ignore[import-untyped]
 
     from .fs.service import S3Service
+    from yggdrasil.databricks.client import DatabricksClient
 
 
 __all__ = [
@@ -86,113 +107,258 @@ _CURRENT_CLIENT: Optional["AWSClient"] = None
 _CURRENT_CLIENT_LOCK: threading.RLock = threading.RLock()
 
 
+# ---------------------------------------------------------------------------
+# Env / runtime helpers
+# ---------------------------------------------------------------------------
+
+
+def _env(name: str) -> Optional[str]:
+    """Return env var if set and non-empty, else ``None``."""
+    value = os.environ.get(name)
+    return value if value else None
+
+
+# STS session names are constrained to ``[\w+=,.@-]{2,64}`` per AWS;
+# strip anything else (Lambda function names allow ``:`` for versions,
+# hostnames can carry dots which are already legal, etc.) so the
+# synthesized name doesn't get rejected at AssumeRole time.
+_SESSION_NAME_INVALID_RE = re.compile(r"[^\w+=,.@-]+")
+
+
+def _runtime_session_name() -> str:
+    """Build a CloudTrail-friendly STS session name from the active runtime.
+
+    Falls through the most informative env vars before landing on
+    ``socket.gethostname()``. ``ygg-`` prefix keeps the synthesized
+    name visibly distinct from user-supplied ones in audit logs.
+    """
+    function_name = _env("AWS_LAMBDA_FUNCTION_NAME")
+    if function_name:
+        raw = f"ygg-lambda-{function_name}"
+    else:
+        batch_job = _env("AWS_BATCH_JOB_ID")
+        if batch_job:
+            raw = f"ygg-batch-{batch_job}"
+        else:
+            try:
+                host = socket.gethostname() or "unknown"
+            except Exception:
+                host = "unknown"
+            raw = f"ygg-{host}"
+    cleaned = _SESSION_NAME_INVALID_RE.sub("-", raw).strip("-")
+    # STS caps session names at 64 chars; truncate from the tail so
+    # the ``ygg-<source>`` prefix stays readable.
+    return cleaned[:64] or "ygg-session"
+
+
 # ===========================================================================
 # AWSClient
 # ===========================================================================
 
 
-class AWSClient:
-    """Top-level AWS client.
+class AWSClient(Singleton):
+    """Merged AWS configuration + session + per-service client factory.
 
-    Owns:
+    Holds every knob needed to mint a boto3 :class:`Session` directly
+    on the instance — there is no separate ``AWSConfig`` class.
+    Equality and hashing follow :meth:`_singleton_key`, which excludes
+    :attr:`refresher` (callables aren't comparable) and lazy / transient
+    session state. Use :attr:`refresher_key` as the discriminator when
+    distinct refreshers must mint distinct clients.
 
-    - a :class:`AWSConfig` (the static config — what credentials
-      and where);
-    - a lazily-built :class:`boto3.Session` (refreshable when
-      ``config.role_arn`` is set);
-    - a per-service boto-client cache (one client per ``(service,
-      overrides)`` tuple);
-    - a per-service service-object cache (``self.s3`` returns one
-      :class:`S3Service` per :class:`AWSClient`).
+    Construction shapes:
 
-    Construction:
-
-        >>> AWSClient()                      # default chain
-        >>> AWSClient(AWSConfig(profile="prod"))
-        >>> AWSClient.from_credentials(creds, region="us-east-1")
-
-    URL round-trip:
-
-        >>> client.to_url()                    # aws://...
-        >>> AWSClient.from_parsed_url(url)
-
-    Identity & singleton caching
-    ----------------------------
-
-    Instances are cached per ``(class, config)`` in :attr:`_INSTANCES`
-    so two callers that build a client with the same config share
-    one boto :class:`Session`, one connection pool, and one boto
-    :class:`BaseClient` cache. ``__init__`` is idempotent — Python
-    always invokes it after :meth:`__new__` returns the cached
-    instance, so the second pass skips reinitialization. Pickling
-    routes through :meth:`__getnewargs__` + :meth:`__setstate__` so
-    a client unpickled in the same process collapses to the live
-    singleton instead of cloning its session and pool.
+    - **Static credentials**: pass ``access_key_id`` /
+      ``secret_access_key`` / optional ``session_token``.
+    - **Profile**: pass ``profile`` (matches ``AWS_PROFILE``); the
+      session resolves through ``~/.aws/credentials``.
+    - **Assume-role**: pass ``role_arn``, optionally with
+      ``role_session_name`` / ``external_id`` / ``duration_seconds``.
+      A refreshable credential provider drives STS AssumeRole on
+      demand.
+    - **SSO (boto3-native)**: pass ``sso_start_url`` / ``sso_region`` /
+      ``sso_account_id`` / ``sso_role_name`` for IAM Identity Center
+      with external-browser device-code auth — boto3's
+      ``SSOTokenProvider`` handles the device-code dance and token
+      cache (typically primed by ``aws sso login``).
+    - **Default chain**: pass nothing. Runtime env vars
+      (``AWS_ACCESS_KEY_ID`` / ``AWS_REGION`` / ``AWS_PROFILE`` /
+      ``AWS_ROLE_ARN`` / ``AWS_ROLE_SESSION_NAME`` / ``AWS_ENDPOINT_URL``
+      / ``AWS_S3_ADDRESSING_STYLE``) are auto-detected so Lambda /
+      Batch / ECS / EKS land with reasonable defaults; anything still
+      empty falls through to boto3's own chain at session-build time.
     """
 
-    # Per-(cls, config) singleton cache. Two AWSClients built with the
-    # same config share the boto session, connection pool, and the
-    # per-service boto-client cache. Subclasses inherit this slot.
-    _INSTANCES: ClassVar[dict[Tuple[type, "AWSConfig"], "AWSClient"]] = {}
-    _INSTANCES_LOCK: ClassVar[threading.Lock] = threading.Lock()
+    # ------------------------------------------------------------------
+    # Singleton wiring
+    # ------------------------------------------------------------------
 
-    # Instance attributes that don't survive pickling — excluded by the
-    # generic :meth:`__getstate__` and rebuilt by :meth:`__setstate__`.
-    # ``_session`` and ``_client_cache`` carry live boto handles; the
-    # rest are cheap rebuilds whose lazy state would just be wrong on
-    # the receiver side.
+    _SINGLETON_TTL: ClassVar[Any] = None
+
+    # Identity-bearing init kwargs in canonical order; matches the
+    # iteration order of :meth:`_singleton_key`'s tuple. ``refresher``
+    # is intentionally absent — callables aren't hashable in a stable
+    # way; carry a ``refresher_key`` instead when two refresher-backed
+    # configs must mint distinct clients.
+    _IDENTITY_FIELDS: ClassVar[tuple[str, ...]] = (
+        "access_key_id", "secret_access_key", "session_token",
+        "region", "profile",
+        "role_arn", "role_session_name", "external_id", "duration_seconds",
+        "endpoint_url", "s3_addressing_style",
+        "sso_start_url", "sso_region", "sso_account_id", "sso_role_name",
+        "refresher_key",
+    )
+
+    # Live boto handles and lazy caches — excluded from pickling.
     _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
         "_session", "_client_cache", "_s3", "_account_id", "_was_connected",
     })
 
-    def __new__(
-        cls: Type[TC],
-        config: Optional[AWSConfig] = None,
-    ) -> TC:
-        if config is None:
-            config = AWSConfig()
-        key = (cls, config)
-        with cls._INSTANCES_LOCK:
-            cached = cls._INSTANCES.get(key)
-            if cached is not None:
-                return cached  # type: ignore[return-value]
-            instance = super().__new__(cls)
-            cls._INSTANCES[key] = instance
-            return instance  # type: ignore[return-value]
+    # Snapshot of the default Databricks SQL credential-column aliases,
+    # kept here so callers can reach it as ``AWSClient.DATABRICKS_SQL_CREDENTIAL_COLUMNS``.
+    DATABRICKS_SQL_CREDENTIAL_COLUMNS = DATABRICKS_SQL_CREDENTIAL_COLUMNS
 
-    def __init__(self, config: Optional[AWSConfig] = None) -> None:
-        # Singleton-cached instances are re-entered on every constructor
-        # call (Python always invokes __init__ after __new__); skip the
-        # second pass so the live session / boto-client cache survive.
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _resolve_init_kwargs(cls, **kwargs: Any) -> dict[str, Any]:
+        """Canonicalise init kwargs against runtime env so
+        :meth:`_singleton_key` and :meth:`__init__` agree on identity.
+
+        ``...`` for a field means "caller didn't pass this — fall
+        through to the env var(s)". Explicit ``None`` keeps ``None``.
+        Mirrors :meth:`DatabricksClient._resolve_init_kwargs`.
+        """
+        def pull(name: str, env: tuple[str, ...]) -> Optional[str]:
+            value = kwargs.get(name, ...)
+            if value is not ...:
+                return value
+            for env_name in env:
+                env_value = _env(env_name)
+                if env_value is not None:
+                    return env_value
+            return None
+
+        resolved: dict[str, Any] = {
+            "access_key_id":     pull("access_key_id",     ("AWS_ACCESS_KEY_ID",)),
+            "secret_access_key": pull("secret_access_key", ("AWS_SECRET_ACCESS_KEY",)),
+            "session_token":     pull("session_token",     ("AWS_SESSION_TOKEN",)),
+            "region":            pull("region",            ("AWS_REGION", "AWS_DEFAULT_REGION")),
+            "profile":           pull("profile",           ("AWS_PROFILE", "AWS_DEFAULT_PROFILE")),
+            "role_arn":          pull("role_arn",          ("AWS_ROLE_ARN",)),
+            "role_session_name": pull("role_session_name", ("AWS_ROLE_SESSION_NAME",)),
+            "external_id":       kwargs.get("external_id", None),
+            "duration_seconds":  kwargs.get("duration_seconds", 3600),
+            "endpoint_url":      pull("endpoint_url",      ("AWS_ENDPOINT_URL",)),
+            "s3_addressing_style": pull("s3_addressing_style", ("AWS_S3_ADDRESSING_STYLE",)),
+            # SSO fields — picked up from the same boto3-native env
+            # convention so a Lambda / EKS task with these set
+            # auto-routes through IAM Identity Center.
+            "sso_start_url":     pull("sso_start_url",     ("AWS_SSO_START_URL",)),
+            "sso_region":        pull("sso_region",        ("AWS_SSO_REGION",)),
+            "sso_account_id":    pull("sso_account_id",    ("AWS_SSO_ACCOUNT_ID",)),
+            "sso_role_name":     pull("sso_role_name",     ("AWS_SSO_ROLE_NAME",)),
+            "refresher_key":     kwargs.get("refresher_key", None),
+        }
+
+        # When an assume-role is in play but neither the caller nor
+        # the env named the STS session, synthesize one from the
+        # active runtime so CloudTrail records the calling workload.
+        if resolved["role_arn"] and not resolved["role_session_name"]:
+            resolved["role_session_name"] = _runtime_session_name()
+
+        return resolved
+
+    @classmethod
+    def _singleton_key(cls, *args: Any, **kwargs: Any) -> Any:
+        # ``__init__`` is keyword-only; positional args would key
+        # differently from the equivalent kwarg call. ``refresher``
+        # is excluded — callables aren't comparable.
+        del args
+        kwargs.pop("refresher", None)
+        kwargs.pop("singleton_ttl", None)
+        resolved = cls._resolve_init_kwargs(**kwargs)
+        return (cls, tuple(resolved[name] for name in cls._IDENTITY_FIELDS))
+
+    def __init__(
+        self,
+        *,
+        access_key_id: Any = ...,
+        secret_access_key: Any = ...,
+        session_token: Any = ...,
+        region: Any = ...,
+        profile: Any = ...,
+        role_arn: Any = ...,
+        role_session_name: Any = ...,
+        external_id: Optional[str] = None,
+        duration_seconds: int = 3600,
+        endpoint_url: Any = ...,
+        s3_addressing_style: Any = ...,
+        sso_start_url: Any = ...,
+        sso_region: Any = ...,
+        sso_account_id: Any = ...,
+        sso_role_name: Any = ...,
+        refresher_key: Optional[str] = None,
+        refresher: Optional[CredentialsRefresher] = None,
+        singleton_ttl: Any = ...,
+    ) -> None:
+        # ``Singleton.__new__`` may return a cached instance, in which
+        # case ``__init__`` runs a second time — guard so we don't
+        # clobber the live session, lazy boto-client cache, or the
+        # refresher the original caller bound.
+        del singleton_ttl
         if getattr(self, "_initialized", False):
             return
-        self.config = config if config is not None else AWSConfig()
+
+        resolved = self._resolve_init_kwargs(
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            session_token=session_token,
+            region=region,
+            profile=profile,
+            role_arn=role_arn,
+            role_session_name=role_session_name,
+            external_id=external_id,
+            duration_seconds=duration_seconds,
+            endpoint_url=endpoint_url,
+            s3_addressing_style=s3_addressing_style,
+            sso_start_url=sso_start_url,
+            sso_region=sso_region,
+            sso_account_id=sso_account_id,
+            sso_role_name=sso_role_name,
+            refresher_key=refresher_key,
+        )
+        for name, value in resolved.items():
+            setattr(self, name, value)
+        self.refresher = refresher
+
+        # Lazy / transient state.
         self._session: Any = None
         self._client_cache: dict = {}
         self._s3: Optional["S3Service"] = None
         self._account_id: Optional[str] = None
         self._was_connected: bool = False
+
         self._initialized = True
 
-    # ------------------------------------------------------------------
-    # Pickling — drop cached handles, route unpickle through __new__
-    # ------------------------------------------------------------------
+    def __getnewargs_ex__(self) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """Route unpickle through ``__new__`` with the identity kwargs.
 
-    def __getnewargs__(self):
-        # Route unpickling through __new__ so a client reconstructed in
-        # the same process with the same config collapses to the live
-        # singleton instead of cloning the boto session / pool.
-        return (self.config,)
+        ``refresher`` rides along so the receiver can invoke it; it's
+        just not part of the singleton key (callables aren't
+        comparable).
+        """
+        kwargs = {name: getattr(self, name) for name in self._IDENTITY_FIELDS}
+        kwargs["refresher"] = self.refresher
+        return (), kwargs
 
-    def __getstate__(self):
-        return {
-            k: v for k, v in self.__dict__.items()
-            if k not in self._TRANSIENT_STATE_ATTRS
-        }
-
-    def __setstate__(self, state):
-        # __new__ may have returned a live singleton — leave its session,
-        # boto-client cache, and lazy service handles untouched.
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        # ``Singleton.__setstate__`` would seed transient slots to
+        # ``None``; we instead want a fully reset session / client
+        # cache so the receiver builds its own boto handles. Mirror
+        # the dunder but use the proper sentinels for our slots.
         if getattr(self, "_initialized", False):
             return
         self.__dict__.update(state)
@@ -202,6 +368,73 @@ class AWSClient:
         self._account_id = None
         self._was_connected = False
         self._initialized = True
+
+    # ------------------------------------------------------------------
+    # Backwards-compat: ``client.config`` once pointed at a separate
+    # AWSConfig instance. Merged class is its own config; alias so
+    # the existing callers (``AWSService.config``, debugging code,
+    # tests) keep working.
+    # ------------------------------------------------------------------
+
+    @property
+    def config(self) -> "AWSClient":
+        return self
+
+    # ==================================================================
+    # Inspection helpers
+    # ==================================================================
+
+    def has_assume_role(self) -> bool:
+        return bool(self.role_arn)
+
+    def has_static_credentials(self) -> bool:
+        return bool(self.access_key_id and self.secret_access_key)
+
+    def has_refresher(self) -> bool:
+        """True iff a :attr:`refresher` callback is wired up.
+
+        Drives :meth:`_build_session` to mint a
+        :class:`RefreshableCredentials`-backed session instead of a
+        static one.
+        """
+        return self.refresher is not None
+
+    def has_sso(self) -> bool:
+        """True iff this client is configured for IAM Identity Center.
+
+        Either :attr:`sso_start_url` alone (token-cache flow primed by
+        ``aws sso login``) or the full role triple
+        (``sso_account_id`` + ``sso_role_name`` + ``sso_region``) is
+        enough — boto3 picks up whichever set is present once the
+        profile is materialised at session-build time.
+        """
+        return bool(
+            self.sso_start_url
+            or (self.sso_account_id and self.sso_role_name)
+        )
+
+    def refresh_metadata(self) -> dict[str, Any]:
+        """Invoke :attr:`refresher` and return botocore-shaped metadata."""
+        if self.refresher is None:
+            raise RuntimeError(
+                "AWSClient.refresh_metadata() requires a refresher; "
+                "none is set. Build the client via "
+                "AWSClient.from_refresher(...) or assign client.refresher."
+            )
+        return dict(_refresher_to_metadata(self.refresher))
+
+    def to_credentials(self) -> AwsCredentials:
+        """Snapshot the static credentials into an :class:`AwsCredentials`.
+
+        Returns the configured static fields; does NOT materialize
+        assumed-role tokens — exporting a live STS token would defeat
+        the auto-refresh that's the whole point of using a role.
+        """
+        return AwsCredentials(
+            access_key_id=self.access_key_id,
+            secret_access_key=self.secret_access_key,
+            session_token=self.session_token,
+        )
 
     # ==================================================================
     # URL contract — mirrors DatabricksClient.url_scheme / to_url
@@ -219,56 +452,44 @@ class AWSClient:
         - Region goes in the host slot (a region is the closest AWS
           analog to a "host" — it parameterizes every endpoint).
         - Static creds go in user:password (when both set).
-        - Everything else goes in the query string.
-
-        Sensitive fields (``secret_access_key``, ``session_token``)
-        are emitted but the rendered URL is intended for
-        config-as-URL plumbing, not logging — :class:`AWSConfig` has
-        ``repr=False`` on those fields for log safety.
+        - Everything else identity-bearing goes in the query string;
+          the secret credential fields are emitted only via userinfo.
         """
         query: dict[str, Any] = {}
-        for f in dataclasses.fields(self.config):
-            if not f.init:
-                continue
-            if f.name in (
-                "access_key_id",
-                "secret_access_key",
-                "session_token",
+        for name in self._IDENTITY_FIELDS:
+            # Region rides the host slot, secrets ride userinfo.
+            if name in (
+                "access_key_id", "secret_access_key", "session_token",
                 "region",
             ):
                 continue
-            value = getattr(self.config, f.name)
+            value = getattr(self, name)
             if value is not None:
-                query[f.name] = value
+                query[name] = value
 
-        # Region in host slot.
-        host = self.config.region or ""
-
+        host = self.region or ""
         url = URL.from_str(f"{scheme or self.url_scheme()}://{host}/")
         url = url.with_query_items(query)
 
-        # Static creds → userinfo. Skip when empty.
-        if self.config.has_static_credentials():
+        if self.has_static_credentials():
             url = url.with_user_password(
-                user=self.config.access_key_id,
-                password=self.config.secret_access_key,
+                user=self.access_key_id,
+                password=self.secret_access_key,
             )
 
         return url
 
     @classmethod
     def parse(cls: Type[TC], obj: Any) -> TC:
-        """Coerce *obj* (str / URL / dict / AWSClient / AWSConfig) to a client."""
+        """Coerce *obj* (str / URL / dict / AWSClient) to a client."""
         if isinstance(obj, cls):
             return obj
-        if isinstance(obj, AWSConfig):
-            return cls(config=obj)
         if isinstance(obj, URL):
             return cls.from_parsed_url(obj)
         if isinstance(obj, str):
             return cls.from_parsed_url(URL.from_str(obj))
         if isinstance(obj, dict):
-            return cls(config=AWSConfig(**obj))
+            return cls(**obj)
         raise ValueError(
             f"Cannot parse {cls.__name__} from {type(obj).__name__}: {obj!r}"
         )
@@ -288,7 +509,11 @@ class AWSClient:
         if url.password:
             kwargs["secret_access_key"] = url.password
 
-        return cls(config=AWSConfig(**kwargs))
+        return cls(**kwargs)
+
+    # ==================================================================
+    # Coercion entry points (formerly on AWSConfig)
+    # ==================================================================
 
     @classmethod
     def from_credentials(
@@ -296,13 +521,83 @@ class AWSClient:
         creds: AwsCredentials,
         *,
         region: Optional[str] = None,
+        endpoint_url: Optional[str] = None,
+        refresher: Optional[CredentialsRefresher] = None,
         **kwargs: Any,
     ) -> TC:
-        """Construct from a static :class:`AwsCredentials`."""
-        return cls(config=AWSConfig.from_credentials(creds, region=region, **kwargs))
+        """Construct from a static :class:`AwsCredentials`.
+
+        Pass ``refresher`` for self-renewing temporary credentials.
+        """
+        return cls(
+            access_key_id=creds.access_key_id,
+            secret_access_key=creds.secret_access_key,
+            session_token=creds.session_token,
+            region=region,
+            endpoint_url=endpoint_url,
+            refresher=refresher,
+            **kwargs,
+        )
+
+    @classmethod
+    def from_refresher(
+        cls: Type[TC],
+        refresher: CredentialsRefresher,
+        *,
+        region: Optional[str] = None,
+        endpoint_url: Optional[str] = None,
+        refresher_key: Optional[str] = None,
+        **kwargs: Any,
+    ) -> TC:
+        """Build a self-refreshing :class:`AWSClient` from a credentials callback."""
+        seed = _coerce_refresher_output(refresher())
+        if isinstance(seed, AwsCredentials):
+            access_key_id = seed.access_key_id
+            secret_access_key = seed.secret_access_key
+            session_token = seed.session_token
+        else:
+            access_key_id = seed.get("access_key")
+            secret_access_key = seed.get("secret_key")
+            session_token = seed.get("token")
+
+        return cls(
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            session_token=session_token,
+            region=region,
+            endpoint_url=endpoint_url,
+            refresher=refresher,
+            refresher_key=refresher_key,
+            **kwargs,
+        )
+
+    @classmethod
+    def from_databricks_sql(
+        cls: Type[TC],
+        query: str,
+        *,
+        client: Optional["DatabricksClient"] = None,
+        region: Optional[str] = None,
+        endpoint_url: Optional[str] = None,
+        columns: Optional[dict[str, str]] = None,
+        **kwargs: Any,
+    ) -> TC:
+        """Build an :class:`AWSClient` that vends credentials from a Databricks SQL row."""
+        refresher = DatabricksSQLCredentialsRefresher(
+            query=query,
+            client=client,
+            columns=dict(columns) if columns else None,
+            column_aliases=dict(cls.DATABRICKS_SQL_CREDENTIAL_COLUMNS),
+        )
+        return cls.from_refresher(
+            refresher,
+            region=region,
+            endpoint_url=endpoint_url,
+            **kwargs,
+        )
 
     # ==================================================================
-    # Singleton
+    # Singleton — process-global default
     # ==================================================================
 
     @classmethod
@@ -310,24 +605,14 @@ class AWSClient:
         """Process-global default :class:`AWSClient`.
 
         ``reset=True`` rebuilds; ``overrides`` are passed to a fresh
-        :class:`AWSConfig`. Mirrors :meth:`DatabricksClient.current`.
-
-        Note: per-config singleton caching in :meth:`__new__` means a
-        rebuilt default landing on the same config still reuses the
-        live boto :class:`Session` / connection pool from the previous
-        ``current()``. Pass ``reset=True`` *and* drop the cached
-        instance via :meth:`AWSClient._INSTANCES.pop` if you need a
-        truly fresh boto handle.
+        constructor. Mirrors :meth:`DatabricksClient.current`.
         """
         global _CURRENT_CLIENT
 
         if reset or _CURRENT_CLIENT is None:
             with _CURRENT_CLIENT_LOCK:
                 if reset or _CURRENT_CLIENT is None:
-                    config = (
-                        AWSConfig(**overrides) if overrides else AWSConfig()
-                    )
-                    _CURRENT_CLIENT = cls(config=config)
+                    _CURRENT_CLIENT = cls(**overrides)
 
         return _CURRENT_CLIENT  # type: ignore[return-value]
 
@@ -345,9 +630,9 @@ class AWSClient:
     def __repr__(self) -> str:
         return (
             f"{type(self).__name__}("
-            f"region={self.config.region!r}, "
-            f"profile={self.config.profile!r}, "
-            f"role_arn={self.config.role_arn!r})"
+            f"region={self.region!r}, "
+            f"profile={self.profile!r}, "
+            f"role_arn={self.role_arn!r})"
         )
 
     def __enter__(self) -> "AWSClient":
@@ -370,18 +655,11 @@ class AWSClient:
         """Eagerly build the boto session. Idempotent."""
         if reset:
             self.close()
-        # Touching the property triggers the lazy build.
         _ = self.session
         return self
 
     def close(self) -> None:
-        """Drop the cached session, all per-service clients, all service objects.
-
-        Boto3 sessions don't have a real ``close()`` — the underlying
-        HTTP connections live in connection pools that GC will reap.
-        Our ``close`` is "let go of references"; subsequent calls
-        rebuild on demand.
-        """
+        """Drop the cached session, all per-service clients, all service objects."""
         self._session = None
         self._client_cache = {}
         self._s3 = None
@@ -396,8 +674,12 @@ class AWSClient:
     def session(self) -> "boto3.Session":
         """Lazily-built boto3 :class:`Session`. Cached.
 
-        - ``config.has_assume_role()`` → :class:`RefreshableCredentials`
+        - :meth:`has_refresher` → :class:`RefreshableCredentials`
+          driven by the user-supplied callback.
+        - :meth:`has_assume_role` → :class:`RefreshableCredentials`
           driven by STS AssumeRole.
+        - :meth:`has_sso` → boto3-native SSO token provider via
+          a transient profile.
         - Otherwise → static / profile / default-chain creds.
         """
         if self._session is None:
@@ -405,12 +687,7 @@ class AWSClient:
         return self._session
 
     def client(self, service: str, **overrides: Any) -> "BaseClient":
-        """Get a boto3 client for *service*. Cached per (service, overrides).
-
-        ``overrides`` are forwarded to :meth:`Session.client` — used
-        for one-off endpoint or signature overrides without rebuilding
-        the whole config.
-        """
+        """Get a boto3 client for *service*. Cached per (service, overrides)."""
         cache_key = (
             service,
             tuple(sorted(overrides.items())) if overrides else (),
@@ -420,22 +697,20 @@ class AWSClient:
             return cached
 
         kwargs: dict[str, Any] = {}
-        if self.config.region:
-            kwargs["region_name"] = self.config.region
-        if self.config.endpoint_url:
-            kwargs["endpoint_url"] = self.config.endpoint_url
-        if service == "s3" and self.config.s3_addressing_style:
+        if self.region:
+            kwargs["region_name"] = self.region
+        if self.endpoint_url:
+            kwargs["endpoint_url"] = self.endpoint_url
+        if service == "s3" and self.s3_addressing_style:
             botocore = botocore_module()
             kwargs["config"] = botocore.config.Config(
-                s3={"addressing_style": self.config.s3_addressing_style}
+                s3={"addressing_style": self.s3_addressing_style}
             )
         kwargs.update(overrides)
 
         boto_client = self.session.client(service, **kwargs)
         self._client_cache[cache_key] = boto_client
         return boto_client
-
-    # Convenience accessors for the boto clients we use most.
 
     def s3_client(self, **overrides: Any) -> "BaseClient":
         return self.client("s3", **overrides)
@@ -449,12 +724,7 @@ class AWSClient:
 
     @property
     def s3(self) -> "S3Service":
-        """The :class:`S3Service` bound to this client. Lazy + cached.
-
-        :class:`AWSService` subclasses are themselves singleton-cached
-        per ``(cls, client)`` — the local ``_s3`` slot just dodges the
-        ``_INSTANCES`` lookup on the hot path.
-        """
+        """The :class:`S3Service` bound to this client. Lazy + cached."""
         if self._s3 is None:
             from .fs.service import S3Service
             self._s3 = S3Service(client=self)
@@ -465,31 +735,22 @@ class AWSClient:
     # ==================================================================
 
     def caller_identity(self) -> dict[str, Any]:
-        """Wrap STS GetCallerIdentity. Returns dict with Account / Arn / UserId.
-
-        Network call; not cached. Use sparingly.
-        """
+        """Wrap STS GetCallerIdentity. Network call; not cached."""
         return self.sts_client().get_caller_identity()
 
     @property
     def account_id(self) -> str:
-        """Resolve the account ID via STS. Cached on the instance.
-
-        Not part of the configured field set on purpose: it's
-        derivable from credentials, and stamping it eagerly would
-        force a network call at construction. The cached value is
-        excluded from pickling — the receiver re-resolves on demand.
-        """
+        """Resolve the account ID via STS. Cached on the instance."""
         if self._account_id is None:
             identity = self.caller_identity()
             self._account_id = identity["Account"]
         return self._account_id
 
     @property
-    def region(self) -> Optional[str]:
-        """Effective region: explicit config first, then session default."""
-        if self.config.region:
-            return self.config.region
+    def effective_region(self) -> Optional[str]:
+        """Configured region first, then boto session default."""
+        if self.region:
+            return self.region
         try:
             return self.session.region_name
         except Exception:
@@ -501,31 +762,19 @@ class AWSClient:
 
     def _build_session(self) -> "boto3.Session":
         boto3 = boto3_module()
-        if self.config.has_refresher():
+        if self.has_refresher():
             return self._build_refresher_session(boto3)
-        if self.config.has_assume_role():
+        if self.has_assume_role():
             return self._build_assume_role_session(boto3)
+        if self.has_sso():
+            return self._build_sso_session(boto3)
         return self._build_simple_session(boto3)
 
     def _build_refresher_session(self, boto3) -> "boto3.Session":
-        """Build a Session whose credentials auto-refresh via
-        :attr:`AWSConfig.refresher`.
-
-        This is the path taken when credentials are vended by an
-        external service (Databricks
-        ``temporary_path_credentials`` / ``temporary_table_credentials``,
-        an STS broker, a custom credential service). The refresher
-        callback is invoked once for the seed metadata and then again
-        on every botocore refresh cycle (~5 min before token expiry),
-        exactly the same wiring as
-        :meth:`_build_assume_role_session` but with a caller-supplied
-        callback rather than a built-in STS AssumeRole driver.
-        """
+        """Build a Session whose credentials auto-refresh via :attr:`refresher`."""
         botocore = botocore_module()
-        refresher = self.config.refresher
+        refresher = self.refresher
         assert refresher is not None  # gated by has_refresher() above
-
-        from .config import _refresher_to_metadata
 
         def refresh():
             return _refresher_to_metadata(refresher)
@@ -541,51 +790,90 @@ class AWSClient:
 
         botocore_session = botocore.session.get_session()
         botocore_session._credentials = refreshable
-        if self.config.region:
-            botocore_session.set_config_variable("region", self.config.region)
+        if self.region:
+            botocore_session.set_config_variable("region", self.region)
 
         return boto3.Session(botocore_session=botocore_session)
 
     def _build_simple_session(self, boto3) -> "boto3.Session":
         """Static / profile / default-chain session."""
         kwargs: dict[str, Any] = {}
-        if self.config.profile:
-            kwargs["profile_name"] = self.config.profile
-        if self.config.access_key_id:
-            kwargs["aws_access_key_id"] = self.config.access_key_id
-        if self.config.secret_access_key:
-            kwargs["aws_secret_access_key"] = self.config.secret_access_key
-        if self.config.session_token:
-            kwargs["aws_session_token"] = self.config.session_token
-        if self.config.region:
-            kwargs["region_name"] = self.config.region
+        if self.profile:
+            kwargs["profile_name"] = self.profile
+        if self.access_key_id:
+            kwargs["aws_access_key_id"] = self.access_key_id
+        if self.secret_access_key:
+            kwargs["aws_secret_access_key"] = self.secret_access_key
+        if self.session_token:
+            kwargs["aws_session_token"] = self.session_token
+        if self.region:
+            kwargs["region_name"] = self.region
         return boto3.Session(**kwargs)
 
-    def _build_assume_role_session(self, boto3) -> "boto3.Session":
-        """Build a Session whose credentials auto-refresh via STS AssumeRole.
+    def _build_sso_session(self, boto3) -> "boto3.Session":
+        """Build a Session that auths through IAM Identity Center (SSO).
 
-        Botocore calls our refresh callback ~5 min before token
-        expiry. The base session — using whatever creds the user
-        gave us (static or profile or default-chain) — drives the
-        STS AssumeRole calls.
+        boto3 reads SSO config from named profiles in
+        ``~/.aws/config``. To avoid mutating the user's on-disk
+        config we materialise the SSO knobs into an in-memory
+        botocore session via ``set_config_variable`` and bind a
+        fresh profile name to it. The ``SSOTokenProvider`` /
+        ``SSOCredentialFetcher`` chain then handles the device-code
+        + external-browser dance (re-using the SSO token cache that
+        ``aws sso login`` populates).
         """
+        botocore = botocore_module()
+        botocore_session = botocore.session.get_session()
+
+        if self.region:
+            botocore_session.set_config_variable("region", self.region)
+
+        # Materialise the SSO knobs as a synthetic profile so
+        # boto3's SSOTokenProvider picks them up exactly as if they
+        # were in ~/.aws/config. The profile name is namespaced
+        # under ``ygg-sso-`` so it doesn't collide with user profiles.
+        profile_name = self.profile or f"ygg-sso-{uuid.uuid4().hex[:8]}"
+        sso_profile: dict[str, Any] = {}
+        if self.sso_start_url:
+            sso_profile["sso_start_url"] = self.sso_start_url
+        if self.sso_region:
+            sso_profile["sso_region"] = self.sso_region
+        if self.sso_account_id:
+            sso_profile["sso_account_id"] = self.sso_account_id
+        if self.sso_role_name:
+            sso_profile["sso_role_name"] = self.sso_role_name
+        if self.region:
+            sso_profile["region"] = self.region
+
+        # ``_build_profile_map`` is the cached profile lookup
+        # botocore's loaders use; injecting our synthetic profile
+        # there is the supported in-memory route.
+        full_config = botocore_session.full_config
+        full_config.setdefault("profiles", {})[profile_name] = sso_profile
+        botocore_session.set_config_variable("profile", profile_name)
+
+        return boto3.Session(botocore_session=botocore_session)
+
+    def _build_assume_role_session(self, boto3) -> "boto3.Session":
+        """Build a Session whose credentials auto-refresh via STS AssumeRole."""
         botocore = botocore_module()
         base_session = self._build_simple_session(boto3)
 
         role_session_name = (
-            self.config.role_session_name
+            self.role_session_name
+            or _runtime_session_name()
             or f"yggdrasil-{uuid.uuid4().hex[:12]}"
         )
 
         def refresh():
             sts = base_session.client("sts")
             assume_kwargs: dict[str, Any] = {
-                "RoleArn": self.config.role_arn,
+                "RoleArn": self.role_arn,
                 "RoleSessionName": role_session_name,
-                "DurationSeconds": int(self.config.duration_seconds),
+                "DurationSeconds": int(self.duration_seconds),
             }
-            if self.config.external_id:
-                assume_kwargs["ExternalId"] = self.config.external_id
+            if self.external_id:
+                assume_kwargs["ExternalId"] = self.external_id
             response = sts.assume_role(**assume_kwargs)
             creds = response["Credentials"]
             expiration = creds["Expiration"]
@@ -610,29 +898,11 @@ class AWSClient:
         )
 
         botocore_session = botocore.session.get_session()
-        # Direct hook: botocore exposes _credentials as the slot
-        # boto3.Session reads on construction. Documented but
-        # private; if the internals shift, this is the line to
-        # adapt.
         botocore_session._credentials = refreshable
-        if self.config.region:
-            botocore_session.set_config_variable("region", self.config.region)
+        if self.region:
+            botocore_session.set_config_variable("region", self.region)
 
         return boto3.Session(botocore_session=botocore_session)
-
-    # ==================================================================
-    # Dunder
-    # ==================================================================
-
-    def __hash__(self) -> int:
-        # Hash on config — two clients with the same config behave
-        # identically, even if their cached sessions differ.
-        return hash((type(self), self.config))
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, AWSClient):
-            return NotImplemented
-        return type(self) is type(other) and self.config == other.config
 
 
 # ===========================================================================
@@ -643,48 +913,25 @@ class AWSClient:
 class AWSService(ABC):
     """Abstract base for AWS service objects.
 
-    A service object is a thin wrapper that binds an
-    :class:`AWSClient` to a particular AWS service (S3, DynamoDB,
-    SQS, …). Subclasses expose the boto client for their service
-    plus any service-specific helpers.
-
-    Mirrors :class:`DatabricksService`: holds a ``client``,
-    delegates shared concerns (region, account_id, session)
-    upstream, supports a ``current()`` singleton, and round-trips
-    via URL.
-
-    Subclass contract
-    -----------------
-
-    Subclasses must define :attr:`service_name` (e.g. ``"s3"``).
-    The default :meth:`client` resolves to
-    ``self.client.client(self.service_name())``. Subclass-specific
-    state (caches, lazy handles) goes in :meth:`__init__` after the
-    ``super().__init__(client=client)`` call and is gated by the
-    inherited ``_initialized`` guard so the singleton's lazy state
-    survives idempotent re-entry from ``cls(client=...)``.
+    A service object binds an :class:`AWSClient` to a particular AWS
+    service (S3, DynamoDB, …). Mirrors :class:`DatabricksService`:
+    holds a ``client``, delegates shared concerns (region,
+    account_id, session) upstream, supports a ``current()``
+    singleton, and round-trips via URL.
 
     Identity & singleton caching
     ----------------------------
 
-    Instances are cached per ``(class, client)`` in :attr:`_INSTANCES`,
-    so ``S3Service(client=c)`` always returns the same handle for a
-    given client. Pickling routes through :meth:`__getnewargs__` so
-    a service unpickled in the same process collapses to the live
-    singleton. Subclasses should add their non-picklable handles to
-    :attr:`_TRANSIENT_STATE_ATTRS` to keep the generic getstate clean.
+    Instances are cached per ``(class, client)`` in
+    :attr:`_INSTANCES`. Pickling routes through
+    :meth:`__getnewargs__` so a service unpickled in the same
+    process collapses to the live singleton. Subclasses add
+    non-picklable handles to :attr:`_TRANSIENT_STATE_ATTRS`.
     """
 
-    # Per-(cls, client) singleton cache, mirrors AWSClient._INSTANCES.
-    # Subclasses inherit this slot — there's one shared dict across
-    # every AWSService subclass so the (cls, client) tuple disambiguates
-    # S3Service, DynamoService, etc. against the same underlying client.
     _INSTANCES: ClassVar[dict[Tuple[type, "AWSClient"], "AWSService"]] = {}
     _INSTANCES_LOCK: ClassVar[threading.Lock] = threading.Lock()
 
-    # Generic getstate excludes these attrs from the pickle payload.
-    # Subclasses extend by overriding the frozenset (use union with the
-    # base set to avoid losing the inherited transients).
     _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset()
 
     _current: ClassVar[Optional["AWSService"]] = None
@@ -705,25 +952,13 @@ class AWSService(ABC):
             return instance  # type: ignore[return-value]
 
     def __init__(self, client: Optional[AWSClient] = None) -> None:
-        # Singleton-cached instances are re-entered on every constructor
-        # call (Python always invokes __init__ after __new__); skip the
-        # second pass so subclass-side caches survive.
         if getattr(self, "_initialized", False):
             return
         self.client: AWSClient = client if client is not None else AWSClient.current()
         self._initialized = True
 
-    # ==================================================================
-    # Subclass identity
-    # ==================================================================
-
     @classmethod
     def service_name(cls) -> str:
-        """The AWS service name (e.g. ``"s3"``, ``"dynamodb"``).
-
-        Default: lowercase the class name with ``Service`` stripped.
-        Subclasses override when the convention doesn't match.
-        """
         name = cls.__name__
         if name.endswith("Service"):
             name = name[:-len("Service")]
@@ -733,23 +968,12 @@ class AWSService(ABC):
     def url_scheme(cls) -> str:
         return f"aws+{cls.service_name()}"
 
-    # ==================================================================
-    # Boto client passthrough
-    # ==================================================================
-
     @property
     def boto_client(self) -> "BaseClient":
-        """The boto3 client for this service. Cached on the AWSClient."""
         return self.client.client(self.service_name())
-
-    # ==================================================================
-    # Singleton
-    # ==================================================================
 
     @classmethod
     def current(cls: Type[TS], *, reset: bool = False) -> TS:
-        """Process-global default service against
-        :meth:`AWSClient.current`."""
         if reset or cls._current is None:
             cls._current = cls(client=AWSClient.current())
         return cls._current  # type: ignore[return-value]
@@ -757,10 +981,6 @@ class AWSService(ABC):
     @classmethod
     def set_current(cls, service: Optional["AWSService"]) -> None:
         cls._current = service
-
-    # ==================================================================
-    # URL round-trip
-    # ==================================================================
 
     def to_url(self, scheme: Optional[str] = None) -> URL:
         return (
@@ -772,10 +992,6 @@ class AWSService(ABC):
     @classmethod
     def from_parsed_url(cls: Type[TS], url: URL) -> TS:
         return cls(client=AWSClient.from_parsed_url(url))
-
-    # ==================================================================
-    # Context manager — defer to the client
-    # ==================================================================
 
     def __enter__(self) -> "AWSService":
         self.client.__enter__()
@@ -789,35 +1005,24 @@ class AWSService(ABC):
         return self
 
     def close(self) -> None:
-        # Service close is a no-op by default; the client owns the
-        # session, and individual services don't carry separate
-        # state. Subclasses with caches override.
         return
 
-    # ==================================================================
-    # Shared-config passthrough
-    # ==================================================================
-
     @property
-    def config(self) -> AWSConfig:
-        return self.client.config
+    def config(self) -> AWSClient:
+        # Back-compat: ``service.config`` used to return the
+        # AWSConfig instance separate from the client. The merged
+        # class IS the config, so just hand back the client.
+        return self.client
 
     @property
     def region(self) -> Optional[str]:
-        return self.client.region
+        return self.client.effective_region
 
     @property
     def account_id(self) -> str:
         return self.client.account_id
 
-    # ==================================================================
-    # Pickling — generic state, route unpickle through __new__
-    # ==================================================================
-
     def __getnewargs__(self):
-        # Route unpickling through __new__ so a service reconstructed in
-        # the same process with the same client collapses to the live
-        # singleton instead of cloning subclass-side caches.
         return (self.client,)
 
     def __getstate__(self):
@@ -827,8 +1032,6 @@ class AWSService(ABC):
         }
 
     def __setstate__(self, state):
-        # __new__ may have returned a live singleton — leave its caches
-        # untouched.
         if getattr(self, "_initialized", False):
             return
         self.__dict__.update(state)
@@ -841,48 +1044,21 @@ class AWSService(ABC):
 
 
 class AWSResource(ABC):
-    """Abstract base for AWS-backed entities.
-
-    A resource binds to a *service*, not directly to a client. A
-    resource (an S3 object, a DynamoDB row) reaches the boto client
-    through ``self.service.boto_client``. Reaches the AWS client
-    through ``self.client`` shorthand.
-
-    Subclasses define ``__init__`` accepting a ``service=`` kwarg
-    (defaulting to the appropriate service's ``current()``) and
-    whatever fields identify the resource (bucket+key for S3,
-    table+pk for DynamoDB, …).
-    """
+    """Abstract base for AWS-backed entities."""
 
     service: AWSService
 
     def __init__(self, service: Optional[AWSService] = None, *args, **kwargs) -> None:
         if service is None:
-            # Resolve the default through whatever AWSService subclass
-            # the resource is keyed against. Subclasses are expected
-            # to override this constructor with their own default;
-            # this base default falls through to the bare AWSService
-            # current — useful for resources that aren't tied to one
-            # service in particular (rare).
             service = AWSService.current()
         self.service = service
         super().__init__(*args, **kwargs)
 
-    # ------------------------------------------------------------------
-    # Pickling — resource subclasses typically chain to super()
-    # ------------------------------------------------------------------
-
     def __getstate__(self):
-        # Subclasses with their own state should override and merge
-        # this dict with their own.
         return {"service": self.service}
 
     def __setstate__(self, state):
         self.service = state["service"]
-
-    # ------------------------------------------------------------------
-    # Convenience
-    # ------------------------------------------------------------------
 
     @property
     def client(self) -> AWSClient:

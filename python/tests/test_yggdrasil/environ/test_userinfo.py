@@ -28,10 +28,10 @@ from yggdrasil.environ.userinfo import (
 
 @pytest.fixture(autouse=True)
 def _clear_userinfo_cache():
-    """Drop the module-level singleton between tests."""
-    userinfo_mod._CURRENT_CACHE = None
+    """Drop the per-class Singleton cache between tests."""
+    UserInfo._INSTANCES.clear()
     yield
-    userinfo_mod._CURRENT_CACHE = None
+    UserInfo._INSTANCES.clear()
 
 
 # ── construction & lazy contract ─────────────────────────────────────────────
@@ -234,3 +234,168 @@ class TestWithEmail:
         assert new.email is None
         assert new.first_name is None
         assert new.last_name is None
+
+
+# ── singleton wiring ──────────────────────────────────────────────────────────
+
+
+class TestSingleton:
+    """``UserInfo`` is a :class:`Singleton` keyed on the full wire
+    identity; in-process pickle collapses to the live instance,
+    cross-process pickle rebuilds with transient slots reset."""
+
+    def test_same_identity_returns_same_instance(self):
+        a = UserInfo(hostname="h", _key="u", _email="a@b.com")
+        b = UserInfo(hostname="h", _key="u", _email="a@b.com")
+        assert a is b
+
+    def test_different_identity_returns_different_instance(self):
+        a = UserInfo(hostname="h", _key="u", _email="a@b.com")
+        b = UserInfo(hostname="h", _key="u", _email="other@b.com")
+        assert a is not b
+
+    def test_inprocess_pickle_preserves_singleton(self):
+        import pickle
+
+        info = UserInfo(hostname="h", _key="u", _email="a@b.com")
+        restored = pickle.loads(pickle.dumps(info))
+        assert restored is info
+
+    def test_crossprocess_pickle_resets_transient(self, monkeypatch):
+        import pickle
+
+        monkeypatch.setattr(userinfo_mod, "_safe_getcwd", lambda: "/tmp")
+        info = UserInfo(hostname="h", _key="u", _email="a@b.com")
+        # Force the transient caches to resolve before pickling so we
+        # can verify they're cleared on the receiver side.
+        _ = info.cwd
+        assert info._cwd_cache == "/tmp"
+
+        blob = pickle.dumps(info)
+        UserInfo._INSTANCES.clear()
+        fresh = pickle.loads(blob)
+        assert fresh is not info
+        assert fresh.hostname == "h"
+        # Per-process derived caches are wiped by ``__setstate__`` so
+        # the receiver re-derives them from its own filesystem.
+        assert fresh._cwd_cache is ...
+        assert fresh._url_cache is ...
+        assert fresh._git_url_cache is ...
+        # Wire fields survived.
+        assert fresh._email == "a@b.com"
+
+    def test_invalidate_singleton_drops_entry(self):
+        info = UserInfo(hostname="h", _key="u", _email="a@b.com")
+        info.invalidate_singleton()
+        again = UserInfo(hostname="h", _key="u", _email="a@b.com")
+        assert again is not info
+
+
+# ── identity grabbers (Databricks notebook / AWS Lambda / AWS Batch) ─────────
+
+
+class TestIdentityGrabbers:
+    """``_resolve_key`` / ``_resolve_email`` / ``_current_compute_url``
+    pull identity from the active managed-runtime env before falling
+    back to ``whoami``."""
+
+    _ENV_KEYS = (
+        "DATABRICKS_RUNTIME_VERSION",
+        "AWS_LAMBDA_FUNCTION_NAME",
+        "AWS_LAMBDA_FUNCTION_VERSION",
+        "AWS_BATCH_JOB_ID",
+        "AWS_BATCH_JQ_NAME",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+    )
+
+    @pytest.fixture(autouse=True)
+    def _clean(self, monkeypatch):
+        for key in self._ENV_KEYS:
+            monkeypatch.delenv(key, raising=False)
+
+    def test_databricks_notebook_user_overrides_whoami(self, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "14.3")
+        monkeypatch.setattr(
+            userinfo_mod, "_ctx_tags",
+            lambda: {"user": "alice@example.com"},
+        )
+        # SDK call must NOT fire when the notebook tag is present.
+        monkeypatch.setattr(
+            userinfo_mod, "_get_dbx_user",
+            lambda: pytest.fail("SDK call should be skipped"),
+        )
+        monkeypatch.setattr(
+            userinfo_mod, "_run_quiet",
+            lambda *_: pytest.fail("whoami should be skipped"),
+        )
+
+        assert userinfo_mod._resolve_key() == "alice@example.com"
+        assert userinfo_mod._resolve_email() == "alice@example.com"
+
+    def test_databricks_falls_back_to_sdk_when_tag_missing(self, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "14.3")
+        monkeypatch.setattr(userinfo_mod, "_ctx_tags", lambda: {})
+        monkeypatch.setattr(
+            userinfo_mod, "_get_dbx_user",
+            lambda: "bob@example.com",
+        )
+        assert userinfo_mod._resolve_key() == "bob@example.com"
+
+    def test_aws_lambda_key_uses_function_name(self, monkeypatch):
+        monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "process-events")
+        # ``whoami`` on Lambda returns sandbox noise — make sure we
+        # short-circuit *before* shelling out.
+        monkeypatch.setattr(
+            userinfo_mod, "_run_quiet",
+            lambda *_: pytest.fail("whoami should be skipped"),
+        )
+        assert userinfo_mod._resolve_key() == "lambda:process-events"
+
+    def test_aws_batch_key_uses_job_id(self, monkeypatch):
+        monkeypatch.setenv("AWS_BATCH_JOB_ID", "job-abc-123")
+        monkeypatch.setattr(
+            userinfo_mod, "_run_quiet",
+            lambda *_: pytest.fail("whoami should be skipped"),
+        )
+        assert userinfo_mod._resolve_key() == "batch:job-abc-123"
+
+    def test_lambda_url_points_at_console(self, monkeypatch):
+        monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "process-events")
+        monkeypatch.setenv("AWS_REGION", "us-west-2")
+        url = userinfo_mod._aws_current_url()
+        assert url is not None
+        s = url.to_string()
+        assert "console.aws.amazon.com/lambda" in s
+        assert "region=us-west-2" in s
+        assert "process-events" in s
+
+    def test_batch_url_points_at_console(self, monkeypatch):
+        monkeypatch.setenv("AWS_BATCH_JOB_ID", "job-abc-123")
+        monkeypatch.setenv("AWS_REGION", "eu-west-1")
+        url = userinfo_mod._aws_current_url()
+        assert url is not None
+        s = url.to_string()
+        assert "console.aws.amazon.com/batch" in s
+        assert "region=eu-west-1" in s
+        assert "job-abc-123" in s
+
+    def test_aws_url_absent_when_no_managed_runtime(self):
+        assert userinfo_mod._aws_current_url() is None
+
+    def test_lambda_identity_dict(self, monkeypatch):
+        monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "f")
+        monkeypatch.setenv("AWS_LAMBDA_FUNCTION_VERSION", "5")
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        info = userinfo_mod._aws_lambda_identity()
+        assert info == {
+            "function_name": "f",
+            "function_version": "5",
+            "region": "us-east-1",
+        }
+
+    def test_batch_identity_dict(self, monkeypatch):
+        monkeypatch.setenv("AWS_BATCH_JOB_ID", "j")
+        monkeypatch.setenv("AWS_BATCH_JQ_NAME", "q")
+        info = userinfo_mod._aws_batch_identity()
+        assert info == {"job_id": "j", "job_queue": "q"}
