@@ -487,6 +487,74 @@ class TestRetryPolicy:
 # ---------------------------------------------------------------------------
 
 
+class TestSingletonCaching:
+    """:class:`S3Path` inherits :class:`Singleton` — two callers asking
+    for the same ``(URL, client)`` share the live instance + warm stat
+    cache. Different URLs or different clients land on distinct
+    instances."""
+
+    def setup_method(self) -> None:
+        # Drop any cached instances so each test starts clean.
+        S3Path._INSTANCES.clear()
+
+    def test_same_url_and_client_returns_same_instance(self, client) -> None:
+        a = S3Path("s3://bucket/key.parquet", client=client)
+        b = S3Path("s3://bucket/key.parquet", client=client)
+        assert a is b
+
+    def test_init_is_idempotent_under_cache_hit(self, client) -> None:
+        # Mutate after construction; the second constructor call must
+        # NOT clobber the live state (preserves bound client + warm
+        # stat cache).
+        a = S3Path("s3://bucket/k", client=client)
+        a._stat_cached = "sentinel-cache"  # type: ignore[assignment]
+        b = S3Path("s3://bucket/k", client=client)
+        assert a is b
+        assert b._stat_cached == "sentinel-cache"
+
+    def test_different_url_returns_different_instance(self, client) -> None:
+        a = S3Path("s3://bucket/k1", client=client)
+        b = S3Path("s3://bucket/k2", client=client)
+        assert a is not b
+
+    def test_different_client_returns_different_instance(self) -> None:
+        c1 = MagicMock()
+        c2 = MagicMock()
+        a = S3Path("s3://bucket/k", client=c1)
+        b = S3Path("s3://bucket/k", client=c2)
+        assert a is not b
+        assert a.client is c1
+        assert b.client is c2
+
+    def test_scheme_aliases_collapse_onto_canonical(self, client) -> None:
+        # ``s3a://`` and ``s3n://`` normalize to ``s3://`` at construction;
+        # the singleton key reflects the canonical URL so all three
+        # spellings share one instance.
+        a = S3Path("s3://bucket/k", client=client)
+        b = S3Path("s3a://bucket/k", client=client)
+        c = S3Path("s3n://bucket/k", client=client)
+        assert a is b is c
+
+    def test_stat_cache_shared_across_constructions(self, client) -> None:
+        # First construction warms the stat cache via _stat(). Re-
+        # constructing returns the same instance, so the second probe
+        # rides the cached entry instead of re-issuing head_object.
+        client.head_object.return_value = {
+            "ContentLength": 42,
+            "LastModified": None,
+            "ContentType": "application/octet-stream",
+        }
+        a = S3Path("s3://bucket/k", client=client)
+        assert a._stat().size == 42
+        assert client.head_object.call_count == 1
+
+        b = S3Path("s3://bucket/k", client=client)
+        assert b._stat().size == 42
+        # Still only one head_object — the second path *is* the first
+        # path, and its stat cache is fresh.
+        assert client.head_object.call_count == 1
+
+
 class TestArrowFilesystem:
 
     def test_arrow_uri_renders_bucket_key(self, client) -> None:

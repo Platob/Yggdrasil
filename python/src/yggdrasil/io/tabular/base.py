@@ -1096,15 +1096,15 @@ class Tabular(ABC, Generic[O]):
     def _write_arrow_table(self, table: pa.Table, options: O) -> None:
         casted = options.cast_arrow_tabular(table)
 
-        # Keep target_field set: downstream writers (delta partition
-        # inference, schema-driven SQL DDL, …) read tags off it. Bind
-        # source_field to the merged target so the per-batch
-        # ``cast_arrow_tabular`` collapses to its bypass instead of
-        # re-running the cast on data we've already shaped.
+        # Keep ``target`` set: downstream writers (delta partition
+        # inference, schema-driven SQL DDL, …) read tags off the
+        # target field. Bind ``source`` to the merged target so the
+        # per-batch ``cast_arrow_tabular`` collapses to its bypass
+        # instead of re-running the cast on data we've already
+        # shaped.
         merged = options.merged
         inner = options.copy(
             source=merged if merged is not None else ...,
-            target=None,
             sync_metadata=False,
             row_size=None,
             byte_size=None,
