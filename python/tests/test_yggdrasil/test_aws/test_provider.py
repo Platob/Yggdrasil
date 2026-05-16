@@ -18,7 +18,7 @@ from typing import Optional
 
 import pytest
 
-from yggdrasil.aws import AWSClient, AWSConfig
+from yggdrasil.aws import AWSClient
 from yggdrasil.aws.config import AwsCredentials
 from yggdrasil.aws.provider import AwsCredentialsProvider
 

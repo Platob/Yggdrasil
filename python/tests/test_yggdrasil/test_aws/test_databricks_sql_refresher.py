@@ -1,5 +1,5 @@
 """Tests for :class:`DatabricksSQLCredentialsRefresher` and the
-:meth:`AWSConfig.from_databricks_sql` constructor.
+:meth:`AWSClient.from_databricks_sql` constructor.
 
 Behavior contract:
 
@@ -26,7 +26,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from yggdrasil.aws import AWSClient, AWSConfig
+from yggdrasil.aws import AWSClient
 from yggdrasil.aws.config import (
     AwsCredentials,
     DatabricksSQLCredentialsRefresher,
@@ -58,7 +58,7 @@ class TestStaticDefaults:
     def test_canonical_column_aliases_present(self) -> None:
         # All four AwsCredentials fields have a default alias tuple,
         # canonical-lowercase-first then AWS-API-JSON-casing.
-        aliases = AWSConfig.DATABRICKS_SQL_CREDENTIAL_COLUMNS
+        aliases = AWSClient.DATABRICKS_SQL_CREDENTIAL_COLUMNS
         assert aliases["access_key_id"] == ("access_key_id", "AccessKeyId")
         assert aliases["secret_access_key"] == (
             "secret_access_key", "SecretAccessKey",
@@ -70,7 +70,7 @@ class TestStaticDefaults:
         # MappingProxyType makes the class-var read-only; subclasses
         # have to replace the whole mapping rather than mutating it.
         with pytest.raises(TypeError):
-            AWSConfig.DATABRICKS_SQL_CREDENTIAL_COLUMNS["foo"] = ("bar",)  # type: ignore[index]
+            AWSClient.DATABRICKS_SQL_CREDENTIAL_COLUMNS["foo"] = ("bar",)  # type: ignore[index]
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +90,7 @@ class TestColumnResolution:
         r = DatabricksSQLCredentialsRefresher(
             query="SELECT * FROM ops.aws_creds",
             client=client,
-            column_aliases=dict(AWSConfig.DATABRICKS_SQL_CREDENTIAL_COLUMNS),
+            column_aliases=dict(AWSClient.DATABRICKS_SQL_CREDENTIAL_COLUMNS),
         )
         creds = r()
         assert isinstance(creds, AwsCredentials)
@@ -109,7 +109,7 @@ class TestColumnResolution:
         r = DatabricksSQLCredentialsRefresher(
             query="Q",
             client=client,
-            column_aliases=dict(AWSConfig.DATABRICKS_SQL_CREDENTIAL_COLUMNS),
+            column_aliases=dict(AWSClient.DATABRICKS_SQL_CREDENTIAL_COLUMNS),
         )
         creds = r()
         assert creds.access_key_id == "AKIA"
@@ -124,7 +124,7 @@ class TestColumnResolution:
                 "access_key_id": "my_key",
                 "secret_access_key": "my_secret",
             },
-            column_aliases=dict(AWSConfig.DATABRICKS_SQL_CREDENTIAL_COLUMNS),
+            column_aliases=dict(AWSClient.DATABRICKS_SQL_CREDENTIAL_COLUMNS),
         )
         creds = r()
         assert creds.access_key_id == "AK"
@@ -143,7 +143,7 @@ class TestColumnResolution:
         r = DatabricksSQLCredentialsRefresher(
             query="Q",
             client=client,
-            column_aliases=dict(AWSConfig.DATABRICKS_SQL_CREDENTIAL_COLUMNS),
+            column_aliases=dict(AWSClient.DATABRICKS_SQL_CREDENTIAL_COLUMNS),
         )
         creds = r()
         assert creds.session_token is None
@@ -160,7 +160,7 @@ class TestColumnResolution:
         r = DatabricksSQLCredentialsRefresher(
             query="Q",
             client=client,
-            column_aliases=dict(AWSConfig.DATABRICKS_SQL_CREDENTIAL_COLUMNS),
+            column_aliases=dict(AWSClient.DATABRICKS_SQL_CREDENTIAL_COLUMNS),
         )
         creds = r()
         assert creds.expiration == "2026-12-31T23:59:59"
@@ -178,7 +178,7 @@ class TestErrorPaths:
         r = DatabricksSQLCredentialsRefresher(
             query="SELECT * FROM ops.aws_creds WHERE role = 'reader'",
             client=client,
-            column_aliases=dict(AWSConfig.DATABRICKS_SQL_CREDENTIAL_COLUMNS),
+            column_aliases=dict(AWSClient.DATABRICKS_SQL_CREDENTIAL_COLUMNS),
         )
         with pytest.raises(RuntimeError, match="returned no rows"):
             r()
@@ -188,7 +188,7 @@ class TestErrorPaths:
         r = DatabricksSQLCredentialsRefresher(
             query="Q",
             client=client,
-            column_aliases=dict(AWSConfig.DATABRICKS_SQL_CREDENTIAL_COLUMNS),
+            column_aliases=dict(AWSClient.DATABRICKS_SQL_CREDENTIAL_COLUMNS),
         )
         with pytest.raises(KeyError) as excinfo:
             r()
@@ -198,7 +198,7 @@ class TestErrorPaths:
         assert "access_key_id" in msg
         assert "AccessKeyId" in msg
         assert "foo" in msg
-        assert "AWSConfig.from_databricks_sql" in msg
+        assert "AWSClient.from_databricks_sql" in msg
 
     def test_explicit_override_missing_column_raises(self) -> None:
         # When the caller explicitly maps to a column that doesn't
@@ -208,7 +208,7 @@ class TestErrorPaths:
             query="Q",
             client=client,
             columns={"access_key_id": "wrong_column"},
-            column_aliases=dict(AWSConfig.DATABRICKS_SQL_CREDENTIAL_COLUMNS),
+            column_aliases=dict(AWSClient.DATABRICKS_SQL_CREDENTIAL_COLUMNS),
         )
         with pytest.raises(KeyError, match="wrong_column"):
             r()
@@ -228,7 +228,7 @@ class TestPicklable:
         r = DatabricksSQLCredentialsRefresher(
             query="SELECT * FROM ops.aws_creds",
             columns={"access_key_id": "k"},
-            column_aliases=dict(AWSConfig.DATABRICKS_SQL_CREDENTIAL_COLUMNS),
+            column_aliases=dict(AWSClient.DATABRICKS_SQL_CREDENTIAL_COLUMNS),
         )
         restored = pickle.loads(pickle.dumps(r))
         assert restored.query == r.query
@@ -246,7 +246,7 @@ class TestPicklable:
 
 
 # ---------------------------------------------------------------------------
-# AWSConfig.from_databricks_sql wires up the refresher correctly
+# AWSClient.from_databricks_sql wires up the refresher correctly
 # ---------------------------------------------------------------------------
 
 
@@ -259,7 +259,7 @@ class TestFromDatabricksSql:
             "session_token": "tok_seed",
             "expiration": "2026-01-01T00:00:00Z",
         }])
-        config = AWSConfig.from_databricks_sql(
+        config = AWSClient.from_databricks_sql(
             "SELECT * FROM ops.aws_creds",
             client=client,
             region="us-east-1",
@@ -277,7 +277,7 @@ class TestFromDatabricksSql:
 
     def test_columns_override_threads_through(self) -> None:
         client = _fake_db_client([{"k": "AK", "s": "shh"}])
-        config = AWSConfig.from_databricks_sql(
+        config = AWSClient.from_databricks_sql(
             "Q",
             client=client,
             columns={"access_key_id": "k", "secret_access_key": "s"},
@@ -298,7 +298,7 @@ class TestFromDatabricksSql:
             "access_key_id": "AK", "secret_access_key": "shh",
             "session_token": "t", "expiration": "2026-12-31T23:59:59Z",
         }])
-        config = AWSConfig.from_databricks_sql("Q", client=client)
+        config = AWSClient.from_databricks_sql("Q", client=client)
         meta = config.refresh_metadata()
         assert meta == {
             "access_key": "AK",
@@ -311,7 +311,7 @@ class TestFromDatabricksSql:
         # The class-var is the extension point — a subclass that
         # overrides DATABRICKS_SQL_CREDENTIAL_COLUMNS gets its aliases
         # snapshotted into every refresher it builds.
-        class MyAWSConfig(AWSConfig):
+        class MyAWSClient(AWSClient):
             DATABRICKS_SQL_CREDENTIAL_COLUMNS = {
                 "access_key_id":     ("AK",),
                 "secret_access_key": ("SK",),
@@ -322,7 +322,7 @@ class TestFromDatabricksSql:
         client = _fake_db_client([{
             "AK": "ak", "SK": "sk", "ST": "st", "EXP": "2027-01-01T00:00:00Z",
         }])
-        config = MyAWSConfig.from_databricks_sql("Q", client=client)
+        config = MyAWSClient.from_databricks_sql("Q", client=client)
         assert config.access_key_id == "ak"
         assert config.secret_access_key == "sk"
         assert config.session_token == "st"

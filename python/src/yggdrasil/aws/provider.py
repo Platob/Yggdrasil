@@ -2,7 +2,7 @@
 
 A provider vends fresh :class:`AwsCredentials` on demand and is
 directly callable, so it slots straight into
-:attr:`AWSConfig.refresher` (which botocore re-invokes ~5 min before
+:attr:`AWSClient.refresher` (which botocore re-invokes ~5 min before
 each STS token expires).
 
 Identity & singleton caching
@@ -97,7 +97,7 @@ class AwsCredentialsProvider(ABC):
 
     def __call__(self, mode: Mode | None = None) -> AwsCredentials:
         """Delegate to :meth:`get_credentials` so the provider doubles
-        as an :attr:`AWSConfig.refresher`."""
+        as an :attr:`AWSClient.refresher`."""
         return self.get_credentials(mode)
 
     # ------------------------------------------------------------------
@@ -118,8 +118,8 @@ class AwsCredentialsProvider(ABC):
             existing = self._client_cache.get(region)
             if existing is not None:
                 return existing
-            from .config import AWSConfig
-            client = AWSConfig.from_refresher(self, region=region).to_client()
+            from .client import AWSClient
+            client = AWSClient.from_refresher(self, region=region)
             self._client_cache[region] = client
             return client
 

@@ -125,12 +125,6 @@ def aws_client_class():
 
 
 @lru_cache(maxsize=1)
-def aws_config_class():
-    from yggdrasil.aws.config import AWSConfig
-    return AWSConfig
-
-
-@lru_cache(maxsize=1)
 def aws_s3_path_class():
     from yggdrasil.aws.fs.path import S3Path
     return S3Path
