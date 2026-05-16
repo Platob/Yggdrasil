@@ -397,11 +397,6 @@ class Volume(DatabricksResource, Singleton):
         :meth:`_ensure_volume` and the read is retried exactly once.
         """
         if not refresh and self._is_fresh():
-            logger.debug(
-                "Cache hit [Volume.info] %s age=%.0fs",
-                self.full_name(),
-                time.time() - (self._infos_fetched_at or 0.0),
-            )
             return self._infos  # type: ignore[return-value]
 
         try:
@@ -703,11 +698,7 @@ class Volume(DatabricksResource, Singleton):
         one create landed.
         """
         ws = self.client.workspace_client()
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "Volume._ensure_volume %s.%s.%s",
-                self.catalog_name, self.schema_name, self.volume_name,
-            )
+        logger.debug("Ensuring volume %r exists", self)
 
         def _create_volume() -> Any:
             return ws.volumes.create(

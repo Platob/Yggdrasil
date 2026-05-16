@@ -129,7 +129,7 @@ class Warehouses(DatabricksService):
         or ``None`` when *raise_error* is False and the warehouse is not found.
         """
         if warehouse_id:
-            LOGGER.debug("find_warehouse: resolving by id=%s", warehouse_id)
+            LOGGER.debug("Resolving warehouse by id %s", warehouse_id)
             return SQLWarehouse(
                 service=self,
                 warehouse_id=warehouse_id,
@@ -139,19 +139,15 @@ class Warehouses(DatabricksService):
         if warehouse_name:
             cached = get_cached_warehouse(client=self.client, warehouse_name=warehouse_name)
             if cached is not None:
-                LOGGER.debug(
-                    "find_warehouse: cache hit name=%r id=%s",
-                    warehouse_name, cached.warehouse_id,
-                )
                 return cached
 
-            LOGGER.debug("find_warehouse: listing warehouses to resolve name=%r", warehouse_name)
+            LOGGER.debug("Listing warehouses to resolve name %r", warehouse_name)
             for warehouse in self.list_warehouses():
                 if warehouse.warehouse_name == warehouse_name:
                     set_cached_warehouse(client=self.client, warehouse=warehouse)
                     return warehouse
 
-            LOGGER.warning("find_warehouse: warehouse %r not found", warehouse_name)
+            LOGGER.warning("Warehouse %r not found in workspace %r", warehouse_name, self.client)
 
             if create:
                 return self.create(
@@ -286,10 +282,7 @@ class Warehouses(DatabricksService):
         )
 
         if found is not None:
-            LOGGER.debug(
-                "create_or_update: updating existing warehouse %r (%s)",
-                name, found.warehouse_id,
-            )
+            LOGGER.debug("Updating existing warehouse %r", found)
             return found.update(
                 name=name,
                 permissions=permissions,
@@ -297,7 +290,7 @@ class Warehouses(DatabricksService):
                 **warehouse_specs,
             )
 
-        LOGGER.debug("create_or_update: warehouse %r not found — creating", name)
+        LOGGER.debug("Warehouse %r not found — creating", name)
         return self.create(
             name=name,
             permissions=permissions,
@@ -325,7 +318,7 @@ class Warehouses(DatabricksService):
         )
 
         LOGGER.debug(
-            "Creating warehouse name=%r serverless=%s cluster_size=%s",
+            "Creating warehouse %r (serverless=%s, cluster_size=%s)",
             details.name, details.enable_serverless_compute, details.cluster_size,
         )
 
@@ -356,9 +349,8 @@ class Warehouses(DatabricksService):
             created.update_permissions(permissions=permissions, wait=wait)
 
         LOGGER.info(
-            "Created warehouse %r (%s) serverless=%s",
-            created.warehouse_name, created.warehouse_id,
-            details.enable_serverless_compute,
+            "Created warehouse %r (serverless=%s)",
+            created, details.enable_serverless_compute,
         )
 
         return created

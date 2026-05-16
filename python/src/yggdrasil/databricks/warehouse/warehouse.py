@@ -442,8 +442,8 @@ class SQLWarehouse(
 
         if wait.timeout:
             LOGGER.debug(
-                "Waiting for warehouse %s (%s) to leave pending state (timeout=%.0fs)",
-                self.warehouse_name, self.warehouse_id, wait.timeout,
+                "Waiting for warehouse %r to leave pending state (timeout=%.0fs)",
+                self, wait.timeout,
             )
             # Refresh once per iteration explicitly — ``is_pending`` reads the
             # cached state, so without this the loop would spin on stale data.
@@ -454,8 +454,7 @@ class SQLWarehouse(
                 wait.sleep(iteration=iteration, start=start)
                 iteration += 1
             LOGGER.debug(
-                "Warehouse %s (%s) ready after %.1fs",
-                self.warehouse_name, self.warehouse_id, time.time() - start,
+                "Warehouse %r ready after %.1fs", self, time.time() - start,
             )
         return self
 
@@ -491,7 +490,7 @@ class SQLWarehouse(
                 wait_cfg = WaitingConfig.from_(wait)
                 response.result(timeout=wait_cfg.timeout_timedelta)
 
-            LOGGER.info("Started warehouse%r", self)
+            LOGGER.info("Started warehouse %r", self)
         return self
 
     def stop(self):
@@ -575,7 +574,7 @@ class SQLWarehouse(
     ) -> "SQLWarehouse":
         """Apply spec changes, skipping the API when already up-to-date."""
         if not warehouse_specs:
-            LOGGER.debug("update: no specs provided for %s — skipping", self.warehouse_name)
+            LOGGER.debug("No update specs provided for warehouse %r — skipping", self)
             return self
 
         wait = WaitingConfig.from_(wait)
@@ -601,10 +600,7 @@ class SQLWarehouse(
         }
 
         if not dicts_equal(existing_details, update_details, keys=_EDIT_ARG_NAMES):
-            LOGGER.debug(
-                "Updating warehouse %s (%s) with %s",
-                self.warehouse_name, self.warehouse_id, update_details,
-            )
+            LOGGER.debug("Updating warehouse %r with %s", self, update_details)
             sdk_client = self.client.workspace_client().warehouses
             if wait.timeout:
                 new_details = sdk_client.edit_and_wait(
@@ -616,10 +612,7 @@ class SQLWarehouse(
                 new_details = EndpointInfo(**update_details)
             self._details = safeEndpointInfo(new_details)
         else:
-            LOGGER.debug(
-                "update: warehouse %s (%s) already up-to-date — skipping API call",
-                self.warehouse_name, self.warehouse_id,
-            )
+            LOGGER.debug("Warehouse %r already up-to-date — skipping update", self)
 
         if permissions:
             self.update_permissions(permissions=permissions, wait=wait)

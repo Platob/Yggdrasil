@@ -155,11 +155,10 @@ class WorkspacePath(DatabricksPath):
             )
         except Exception:
             return
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "workspace.list %s -> %d entries (recursive=%s)",
-                self.api_path, len(entries), recursive,
-            )
+        logger.debug(
+            "Listing workspace directory %r -> %d entries (recursive=%s)",
+            self, len(entries), recursive,
+        )
         for info in entries:
             child_path = getattr(info, "path", None)
             if not child_path:
@@ -202,8 +201,7 @@ class WorkspacePath(DatabricksPath):
     # ==================================================================
 
     def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("workspace.mkdirs %s", self.api_path)
+        logger.debug("Creating workspace directory %r", self)
         try:
             self._call(self.client.workspace_client().workspace.mkdirs, self.api_path)
         except Exception as exc:
@@ -222,8 +220,7 @@ class WorkspacePath(DatabricksPath):
         self._seed_stat_cache(IOStats(kind=IOKind.DIRECTORY))
 
     def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("workspace.delete %s (file)", self.api_path)
+        logger.debug("Deleting workspace file %r", self)
         try:
             self._call(
                 self.client.workspace_client().workspace.delete,
@@ -237,11 +234,10 @@ class WorkspacePath(DatabricksPath):
     def _remove_dir(
         self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
     ) -> None:
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "workspace.delete %s (dir, recursive=%s)",
-                self.api_path, recursive,
-            )
+        logger.debug(
+            "Deleting workspace directory %r (recursive=%s)",
+            self, recursive,
+        )
         try:
             self._call(
                 self.client.workspace_client().workspace.delete,
@@ -272,11 +268,10 @@ class WorkspacePath(DatabricksPath):
             data = body.read()
         except AttributeError:
             data = bytes(body)
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "workspace.download %s -> %d bytes (slice pos=%d n=%s)",
-                self.api_path, len(data), pos, "EOF" if n < 0 else n,
-            )
+        logger.debug(
+            "Downloaded workspace file %r -> %d bytes (slice pos=%d n=%s)",
+            self, len(data), pos, "EOF" if n < 0 else n,
+        )
 
         # ``workspace.download`` always returns the whole object, so its
         # length IS the file size. Seed the stat cache (or refresh the
@@ -331,10 +326,9 @@ class WorkspacePath(DatabricksPath):
         # bytes then fail with ``BadRequest: The zip archive contains
         # no items``. ``AUTO`` lets the server inspect the extension and
         # content to decide between workspace file and notebook.
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "workspace.upload %s -> %d bytes", self.api_path, len(payload),
-            )
+        logger.debug(
+            "Uploading workspace file %r (%d bytes)", self, len(payload),
+        )
         self._call_ensuring_parents(
             self.client.workspace_client().workspace.upload,
             path=self.api_path,

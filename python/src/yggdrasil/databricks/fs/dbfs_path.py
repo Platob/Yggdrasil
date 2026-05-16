@@ -89,11 +89,10 @@ class DBFSPath(DatabricksPath):
             entries = list(self._call(self.client.workspace_client().dbfs.list, self.api_path))
         except Exception:
             return
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "dbfs.list %s -> %d entries (recursive=%s)",
-                self.api_path, len(entries), recursive,
-            )
+        logger.debug(
+            "Listing DBFS directory %r -> %d entries (recursive=%s)",
+            self, len(entries), recursive,
+        )
         for info in entries:
             api_path = getattr(info, "path", None)
             if not api_path:
@@ -126,8 +125,7 @@ class DBFSPath(DatabricksPath):
     # ==================================================================
 
     def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("dbfs.mkdirs %s", self.api_path)
+        logger.debug("Creating DBFS directory %r", self)
         try:
             self._call(self.client.workspace_client().dbfs.mkdirs, self.api_path)
         except Exception as exc:
@@ -136,8 +134,7 @@ class DBFSPath(DatabricksPath):
         self._seed_stat_cache(IOStats(kind=IOKind.DIRECTORY))
 
     def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("dbfs.delete %s (file)", self.api_path)
+        logger.debug("Deleting DBFS file %r", self)
         try:
             self._call(
                 self.client.workspace_client().dbfs.delete, self.api_path, recursive=False,
@@ -150,10 +147,9 @@ class DBFSPath(DatabricksPath):
     def _remove_dir(
         self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
     ) -> None:
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "dbfs.delete %s (dir, recursive=%s)", self.api_path, recursive,
-            )
+        logger.debug(
+            "Deleting DBFS directory %r (recursive=%s)", self, recursive,
+        )
         try:
             self._call(
                 self.client.workspace_client().dbfs.delete, self.api_path, recursive=recursive,
@@ -234,11 +230,10 @@ class DBFSPath(DatabricksPath):
                 # fresh, so the entry deserves a full window before
                 # the next backend probe.
                 self._seed_stat_cache(self._stat_cached)
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "dbfs.read %s pos=%d n=%s -> %d bytes",
-                self.api_path, pos, "EOF" if to_eof else n, len(out),
-            )
+        logger.debug(
+            "Read DBFS file %r pos=%d n=%s -> %d bytes",
+            self, pos, "EOF" if to_eof else n, len(out),
+        )
         return memoryview(bytes(out))
 
     def _write_mv(self, data: memoryview, pos: int) -> int:
@@ -270,10 +265,9 @@ class DBFSPath(DatabricksPath):
 
     def _stream_upload(self, payload: bytes) -> None:
         """Write *payload* to ``self.api_path`` via the streaming SDK."""
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "dbfs.upload %s -> %d bytes", self.api_path, len(payload),
-            )
+        logger.debug(
+            "Uploading DBFS file %r (%d bytes)", self, len(payload),
+        )
         def _do_upload() -> None:
             with self.client.workspace_client().dbfs.open(
                 path=self.api_path, read=False, write=True, overwrite=True,

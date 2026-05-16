@@ -358,7 +358,7 @@ class InstancePools(DatabricksService):
             )
         except Exception:  # noqa: BLE001 - best-effort preload
             LOGGER.debug(
-                "Could not resolve local-Python-matching DBR runtime for pool preload",
+                "Could not resolve local-Python-matching DBR runtime for instance pool preload",
                 exc_info=True,
             )
             return None
@@ -403,7 +403,7 @@ class InstancePools(DatabricksService):
 
         create_kwargs = {k: v for k, v in spec.items() if k in _CREATE_ARG_NAMES}
         LOGGER.debug(
-            "Creating instance pool %s with %s", instance_pool_name, create_kwargs
+            "Creating instance pool %r with %s", instance_pool_name, create_kwargs
         )
 
         try:
@@ -423,7 +423,7 @@ class InstancePools(DatabricksService):
             instance_pool_name=instance_pool_name,
         ).refresh()
 
-        LOGGER.info("Created %s", instance)
+        LOGGER.info("Created instance pool %r", instance)
 
         instance.update_permissions(permissions)
         return instance
@@ -723,12 +723,12 @@ class InstancePool(Singleton, DatabricksResource):
             self.update_permissions(permissions)
             return self
 
-        LOGGER.debug("Updating %s with %s", self, desired_edit)
+        LOGGER.debug("Updating instance pool %r with %s", self, desired_edit)
         self._pools_client().edit(**desired_edit)
 
         self.refresh()
         self.update_permissions(permissions)
-        LOGGER.info("Updated %s", self)
+        LOGGER.info("Updated instance pool %r", self)
         return self
 
     def delete(self) -> None:
@@ -736,11 +736,11 @@ class InstancePool(Singleton, DatabricksResource):
         if not self.instance_pool_id:
             return
 
-        LOGGER.debug("Deleting %s", self)
+        LOGGER.debug("Deleting instance pool %r", self)
         self._pools_client().delete(instance_pool_id=self.instance_pool_id)
         if self.instance_pool_name:
             _NAMED_POOLS.pop(self.instance_pool_name, None)
-        LOGGER.info("Deleted %s", self)
+        LOGGER.info("Deleted instance pool %r", self)
 
     # ------------------------------------------------------------------ #
     # Permissions

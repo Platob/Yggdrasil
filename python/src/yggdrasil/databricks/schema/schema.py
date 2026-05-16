@@ -454,19 +454,13 @@ class Schema(DatabricksPath, Singleton):
         if self._infos is not None:
             age = now - (self._infos_fetched_at or 0.0)
             if self._infos_ttl is None or age < self._infos_ttl:
-                logger.debug(
-                    "Cache hit [Schema._infos] schema=%s age=%.0fs",
-                    self.full_name(), age,
-                )
                 return self._infos
             logger.debug(
-                "Cache expired [Schema._infos] schema=%s age=%.0fs ttl=%.0fs — refreshing",
-                self.full_name(), age, self._infos_ttl,
+                "Cache expired for schema %r (age=%.0fs, ttl=%.0fs) — refreshing",
+                self, age, self._infos_ttl,
             )
 
-        logger.debug(
-            "Remote fetch [Schema._infos] schema=%s", self.full_name(),
-        )
+        logger.debug("Fetching schema info for %r from remote", self)
         infos = self.client.workspace_client().schemas.get(full_name=self.full_name())
         object.__setattr__(self, "_infos", infos)
         object.__setattr__(self, "_infos_fetched_at", now)
@@ -545,8 +539,8 @@ class Schema(DatabricksPath, Singleton):
         """
         uc = self.client.workspace_client().schemas
         logger.debug(
-            "Schema.create: schema=%s storage_root=%s if_not_exists=%s",
-            self.full_name(), storage_root, if_not_exists,
+            "Creating schema %r (storage_root=%s, if_not_exists=%s)",
+            self, storage_root, if_not_exists,
         )
         try:
             info = uc.create(
@@ -561,8 +555,7 @@ class Schema(DatabricksPath, Singleton):
         except DatabricksError as exc:
             if if_not_exists and "already exists" in str(exc).lower():
                 logger.debug(
-                    "Schema.create: schema=%s already exists — soft-resetting cache",
-                    self.full_name(),
+                    "Schema %r already exists — soft-resetting cache", self,
                 )
                 self._reset_cache()
             else:
@@ -602,8 +595,7 @@ class Schema(DatabricksPath, Singleton):
         """
         uc = self.client.workspace_client().schemas
         logger.debug(
-            "Schema.delete: schema=%s force=%s wait=%s",
-            self.full_name(), force, bool(wait),
+            "Deleting schema %r (force=%s, wait=%s)", self, force, bool(wait),
         )
         if wait:
             try:
@@ -885,8 +877,7 @@ class Schema(DatabricksPath, Singleton):
             kwargs["properties"] = properties
 
         logger.debug(
-            "Schema.update: schema=%s fields=%s",
-            self.full_name(), sorted(kwargs.keys()),
+            "Updating schema %r (fields=%s)", self, sorted(kwargs.keys()),
         )
         info = self.client.workspace_client().schemas.update(
             full_name=self.full_name(), **kwargs
@@ -907,14 +898,12 @@ class Schema(DatabricksPath, Singleton):
             raise ValueError("Cannot rename schema to an empty name")
         if new_name == self.schema_name:
             logger.debug(
-                "Schema.rename: no-op — new name matches current %r on %s",
-                new_name, self.full_name(),
+                "Skipping rename of schema %r — new name matches current", self,
             )
             return self
 
         logger.debug(
-            "Schema.rename: %s → %s.%s",
-            self.full_name(), self.catalog_name, new_name,
+            "Renaming schema %r → %s.%s", self, self.catalog_name, new_name,
         )
 
         # Drop the old entity-tag cache key before the rename — the

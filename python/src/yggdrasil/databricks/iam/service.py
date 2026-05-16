@@ -83,8 +83,8 @@ class IAMGroups(IAM):
         members = [_.complex_value for _ in group.members] if group.members else None
 
         logger.debug(
-            "Creating IAM group name=%s client_type=%s",
-            group.name,
+            "Creating IAM group %r (client_type=%s)",
+            group,
             client_type,
         )
 
@@ -127,9 +127,8 @@ class IAMGroups(IAM):
         )
 
         logger.info(
-            "Created IAM group name=%s id=%s client_type=%s",
-            result.name,
-            result.id,
+            "Created IAM group %r (client_type=%s)",
+            result,
             client_type,
         )
         return result
@@ -167,8 +166,8 @@ class IAMGroups(IAM):
             group_id = str(group)
 
         logger.debug(
-            "Deleting IAM group id=%s client_type=%s",
-            group_id,
+            "Deleting IAM group %r (client_type=%s)",
+            group,
             client_type,
         )
 
@@ -181,8 +180,8 @@ class IAMGroups(IAM):
             self.client.workspace_client().groups.delete(group_id)
 
         logger.info(
-            "Deleted IAM group id=%s client_type=%s",
-            group_id,
+            "Deleted IAM group %r (client_type=%s)",
+            group,
             client_type,
         )
 
@@ -251,8 +250,8 @@ class IAMUsers(IAM):
         client_type = client_type or self.client.default_client_type
 
         logger.debug(
-            "Creating IAM user name=%s active=%s client_type=%s",
-            user.name,
+            "Creating IAM user %r (active=%s, client_type=%s)",
+            user,
             user.active,
             client_type,
         )
@@ -288,9 +287,8 @@ class IAMUsers(IAM):
         )
 
         logger.info(
-            "Created IAM user name=%s id=%s client_type=%s",
-            result.name,
-            result.id,
+            "Created IAM user %r (client_type=%s)",
+            result,
             client_type,
         )
         return result
@@ -344,7 +342,7 @@ class IAMUsers(IAM):
                     service=self,
                     client_type=self.client.default_client_type
                 )
-                logger.debug("Got current IAM user name=%s id=%s", result.name, result.id)
+                logger.debug("Resolved current IAM user %r", result)
                 return result
             except DatabricksError as e:
                 if self.client.auth_type == "external-browser":
@@ -381,6 +379,6 @@ class IAMUsers(IAM):
 
         if local_cache:
             os.remove(local_cache)
-            logger.info("Reset local OAuth cache path=%s", local_cache)
+            logger.info("Reset local OAuth cache at path %s", local_cache)
         else:
             logger.info("No local OAuth cache found to reset")

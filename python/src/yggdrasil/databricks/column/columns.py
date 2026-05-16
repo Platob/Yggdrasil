@@ -206,7 +206,7 @@ class Columns(DatabricksService):
         col = col or self.column_name
         assert col, "No column_name: supply it explicitly or include it in location"
 
-        logger.debug("Columns.column: resolving %s.%s.%s.%s", cat, sch, tbl, col)
+        logger.debug("Resolving column %s.%s.%s.%s", cat, sch, tbl, col)
         return self._find_table(cat, sch, tbl).column(col)
 
     def list_columns(
@@ -231,6 +231,6 @@ class Columns(DatabricksService):
         cat, sch, tbl, _ = self._resolve_table_parts(
             location, catalog_name, schema_name, table_name, None
         )
-        logger.debug("Columns.list_columns: %s.%s.%s", cat, sch, tbl)
+        logger.debug("Listing columns on table %s.%s.%s", cat, sch, tbl)
         return self._find_table(cat, sch, tbl).columns
 

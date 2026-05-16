@@ -1698,8 +1698,8 @@ class Table(DatabricksResource, DatabricksPath):
             for col_info in (infos.columns or [])
         ]
         logger.debug(
-            "Table._store_infos: table=%s table_id=%s columns=%d table_type=%s",
-            self.full_name(), getattr(infos, "table_id", None),
+            "Stored info for table %r (id=%s, columns=%d, type=%s)",
+            self, getattr(infos, "table_id", None),
             len(self._columns), getattr(infos, "table_type", None),
         )
         return infos
@@ -1856,8 +1856,7 @@ class Table(DatabricksResource, DatabricksPath):
     def _collect_schema(self, options: CastOptions) -> DataSchema:
         """Return the field schema, optionally enriched with UC metadata."""
         logger.debug(
-            "Table._collect_schema: table=%s columns=%d",
-            self.full_name(), len(self.columns),
+            "Collecting schema for table %r (columns=%d)", self, len(self.columns),
         )
         metadata: dict[bytes, bytes] = {
             b"engine": b"databricks",
@@ -1900,8 +1899,8 @@ class Table(DatabricksResource, DatabricksPath):
         schema = DataSchema.from_fields(fields, metadata=metadata, name=self.table_name, nullable=False)
         self._persist_schema(schema)
         logger.debug(
-            "Table._collect_schema: built schema table=%s fields=%d metadata_keys=%d",
-            self.full_name(), len(fields), len(metadata),
+            "Built schema for table %r (fields=%d, metadata_keys=%d)",
+            self, len(fields), len(metadata),
         )
         return schema
 
@@ -2257,10 +2256,10 @@ class Table(DatabricksResource, DatabricksPath):
 
         statement = "\n".join(sql_parts)
         logger.debug(
-            "Table.sql_create: table=%s or_replace=%s if_not_exists=%s "
-            "columns=%d partition_by=%d cluster_by=%d primary_keys=%d "
-            "data_source_format=%s column_mapping_mode=%s",
-            self.full_name(), or_replace, if_not_exists,
+            "Creating table %r via SQL (or_replace=%s, if_not_exists=%s, "
+            "columns=%d, partition_by=%d, cluster_by=%d, primary_keys=%d, "
+            "data_source_format=%s, column_mapping_mode=%s)",
+            self, or_replace, if_not_exists,
             len(column_definitions), len(partition_by or ()),
             len(cluster_by or ()), len(primary_keys or ()),
             data_source_format, column_mapping_mode,
@@ -2271,9 +2270,8 @@ class Table(DatabricksResource, DatabricksPath):
         except Exception as exc:
             if "SCHEMA_NOT_FOUND" in str(exc):
                 logger.debug(
-                    "Table.sql_create: parent schema missing for %s — auto-creating "
-                    "%s.%s and retrying",
-                    self.full_name(), self.catalog_name, self.schema_name,
+                    "Parent schema missing for table %r — auto-creating %s.%s and retrying",
+                    self, self.catalog_name, self.schema_name,
                 )
                 self.sql.execute(
                     f"CREATE SCHEMA IF NOT EXISTS {quote_ident(self.catalog_name)}.{quote_ident(self.schema_name)}",
@@ -2282,8 +2280,7 @@ class Table(DatabricksResource, DatabricksPath):
                 self.sql.execute(statement, wait=wait_result)
             elif "CONSTRAINT_ALREADY_EXISTS_IN_SCHEMA" in str(exc):
                 logger.debug(
-                    "Table.sql_create: constraint already exists on %s — ignoring",
-                    self.full_name(),
+                    "Constraint already exists on table %r — ignoring", self,
                 )
             else:
                 raise
@@ -2479,8 +2476,8 @@ class Table(DatabricksResource, DatabricksPath):
             from yggdrasil.databricks.constraints.service import TableConstraints
         except ImportError:
             logger.debug(
-                "yggdrasil.databricks.constraints not available; "
-                "skipping post-create constraints on %s", self.full_name(),
+                "yggdrasil.databricks.constraints not available — "
+                "skipping post-create constraints on table %r", self,
             )
             return
 
@@ -2490,8 +2487,8 @@ class Table(DatabricksResource, DatabricksPath):
                 constraints_service.create_constraint(self, cf)
             except Exception:
                 logger.warning(
-                    "Failed to create constraint %r on %s",
-                    cf.name, self.full_name(), exc_info=True,
+                    "Failed to create constraint %r on table %r",
+                    cf.name, self, exc_info=True,
                 )
 
     def api_create(
@@ -2556,9 +2553,9 @@ class Table(DatabricksResource, DatabricksPath):
             merged_properties.update({str(k): str(v) for k, v in properties.items()})
 
         logger.debug(
-            "Table.api_create: table=%s table_type=%s data_source_format=%s "
-            "storage_location=%s columns=%d properties=%d",
-            self.full_name(), table_type, data_source_format,
+            "Creating table %r via API (table_type=%s, data_source_format=%s, "
+            "storage_location=%s, columns=%d, properties=%d)",
+            self, table_type, data_source_format,
             storage_location, len(column_infos), len(merged_properties),
         )
         try:
@@ -2575,8 +2572,7 @@ class Table(DatabricksResource, DatabricksPath):
         except DatabricksError as exc:
             if if_not_exists and "already exists" in str(exc).lower():
                 logger.debug(
-                    "Table.api_create: table=%s already exists — soft-resetting cache",
-                    self.full_name(),
+                    "Table %r already exists — soft-resetting cache", self,
                 )
                 self.invalidate_singleton(remove_global=True)
                 return self
@@ -2730,16 +2726,16 @@ class Table(DatabricksResource, DatabricksPath):
         )
 
         logger.debug(
-            "Table.create_view: view=%s or_replace=%s if_not_exists=%s mode=%s",
-            self.full_name(), bool(or_replace), bool(if_not_exists), parsed_mode,
+            "Creating view %r (or_replace=%s, if_not_exists=%s, mode=%s)",
+            self, bool(or_replace), bool(if_not_exists), parsed_mode,
         )
         try:
             self.sql.execute(statement, wait=wait_result)
         except Exception as exc:
             if "SCHEMA_NOT_FOUND" in str(exc):
                 logger.debug(
-                    "Table.create_view: parent schema missing for %s — auto-creating %s.%s",
-                    self.full_name(), self.catalog_name, self.schema_name,
+                    "Parent schema missing for view %r — auto-creating %s.%s",
+                    self, self.catalog_name, self.schema_name,
                 )
                 self.sql.execute(
                     f"CREATE SCHEMA IF NOT EXISTS "
@@ -2854,13 +2850,14 @@ class Table(DatabricksResource, DatabricksPath):
         raise_error: bool = True,
     ) -> "Table":
         uc = self.client.workspace_client().tables
-        logger.debug(
-            "Table.delete: table=%s wait=%s", self.full_name(), bool(wait),
-        )
+        logger.debug("Deleting table %r (wait=%s)", self, bool(wait))
 
         if wait:
             try:
                 uc.delete(full_name=self.full_name())
+
+                if self._staging_volume:
+                    self._staging_volume.delete(wait=False)
             except DatabricksError:
                 if raise_error:
                     raise
@@ -2868,6 +2865,7 @@ class Table(DatabricksResource, DatabricksPath):
             Job.make(self.delete).fire_and_forget()
 
         self.invalidate_singleton(remove_global=True)
+        logger.info("Deleted table %r", self)
         return self
 
     # =========================================================================
@@ -2917,8 +2915,7 @@ class Table(DatabricksResource, DatabricksPath):
             )
         if target_schema == self.schema_name and target_table == self.table_name:
             logger.debug(
-                "Table.rename: no-op — new name matches current %s",
-                self.full_name(),
+                "Skipping rename of table %r — new name matches current", self,
             )
             return self
 
@@ -2929,8 +2926,8 @@ class Table(DatabricksResource, DatabricksPath):
 
         keyword = "VIEW" if self.is_view else "TABLE"
         logger.debug(
-            "Table.rename: %s %s → %s.%s.%s",
-            keyword, self.full_name(), target_catalog, target_schema, target_table,
+            "Renaming %s %r → %s.%s.%s",
+            keyword, self, target_catalog, target_schema, target_table,
         )
         self.sql.execute(
             f"ALTER {keyword} {self.full_name(safe=True)} RENAME TO {rename_to}"
@@ -3046,8 +3043,8 @@ class Table(DatabricksResource, DatabricksPath):
                 properties=properties,
             )
             logger.debug(
-                "Table.clone[view]: %s → %s.%s.%s replace=%s if_not_exists=%s",
-                self.full_name(), target_catalog, target_schema, target_table,
+                "Cloning view %r → %s.%s.%s (replace=%s, if_not_exists=%s)",
+                self, target_catalog, target_schema, target_table,
                 replace, if_not_exists,
             )
             self.sql.execute(statement)
@@ -3095,8 +3092,8 @@ class Table(DatabricksResource, DatabricksPath):
 
         statement = " ".join(sql_parts)
         logger.debug(
-            "Table.clone: %s → %s.%s.%s deep=%s replace=%s if_not_exists=%s",
-            self.full_name(), target_catalog, target_schema, target_table,
+            "Cloning table %r → %s.%s.%s (deep=%s, replace=%s, if_not_exists=%s)",
+            self, target_catalog, target_schema, target_table,
             deep, replace, if_not_exists,
         )
         self.sql.execute(statement)
@@ -3457,7 +3454,8 @@ class Table(DatabricksResource, DatabricksPath):
         prepared = _prepare_batch(sql_texts)
 
         logger.debug(
-            "Arrow insert -> %s | mode=%s match_by=%s prune_by=%s statements=%d retry=%s",
+            "Arrow insert into table %r (mode=%s, match_by=%s, prune_by=%s, "
+            "statements=%d, retry=%s)",
             target_location, mode_enum, match_by, prune_by, len(prepared),
             retry_active,
         )
@@ -3655,8 +3653,8 @@ class Table(DatabricksResource, DatabricksPath):
         prepared = _prepare_spark_batch(sql_texts)
 
         logger.info(
-            "Spark insert -> %s | mode=%s match_by=%s prune_by=%s "
-            "statements=%d retry=%s anti_join=%s",
+            "Spark insert into table %r (mode=%s, match_by=%s, prune_by=%s, "
+            "statements=%d, retry=%s, anti_join=%s)",
             target_location, mode_enum, match_by, prune_by, len(prepared),
             retry_cfg is not None, anti_join_handled,
         )
@@ -3705,7 +3703,7 @@ class Table(DatabricksResource, DatabricksPath):
                         extra_prepared.extend(_prepare_spark_batch(extra_texts))
                     if extra_prepared:
                         logger.debug(
-                            "Spark dispatch fan-out -> %d target(s) | statements=%d",
+                            "Spark dispatch fan-out to %d target(s) (statements=%d)",
                             len(dispatch_entries), len(extra_prepared),
                         )
                         extra_batch = sql_engine.execute_many(
@@ -3918,7 +3916,7 @@ class Table(DatabricksResource, DatabricksPath):
         prepared = _prepare_batch(sql_texts)
 
         logger.info(
-            "SQL insert -> %s | mode=%s match_by=%s statements=%d retry=%s",
+            "SQL insert into table %r (mode=%s, match_by=%s, statements=%d, retry=%s)",
             target_location, mode_enum, match_by, len(prepared), retry_active,
         )
 
@@ -3967,7 +3965,7 @@ class Table(DatabricksResource, DatabricksPath):
                 extra_prepared.extend(_prepare_batch(extra_texts))
             if extra_prepared:
                 logger.debug(
-                    "SQL dispatch fan-out -> %d target(s) | statements=%d",
+                    "SQL dispatch fan-out to %d target(s) (statements=%d)",
                     len(dispatch_entries), len(extra_prepared),
                 )
                 extra_batch = self.sql.execute_many(

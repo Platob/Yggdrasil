@@ -280,7 +280,7 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
             current = self.client.iam.users.current_user
         except Exception:
             LOGGER.debug(
-                "EXTERNAL_USE_SCHEMA self-grant: current_user lookup failed",
+                "Self-granting EXTERNAL_USE_SCHEMA: current_user lookup failed",
                 exc_info=True,
             )
             return False
@@ -299,14 +299,14 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
             schema.grant(principal, "EXTERNAL_USE_SCHEMA")
         except Exception:
             LOGGER.debug(
-                "EXTERNAL_USE_SCHEMA self-grant: grant() failed on %s.%s for %s",
+                "Self-granting EXTERNAL_USE_SCHEMA on %s.%s for principal %r failed",
                 catalog_name, schema_name, principal, exc_info=True,
             )
             return False
 
         LOGGER.info(
-            "Self-granted EXTERNAL_USE_SCHEMA on %s.%s to %s; retrying credential mint",
-            catalog_name, schema_name, principal,
+            "Self-granted EXTERNAL_USE_SCHEMA on schema %r to principal %r; retrying credential mint",
+            schema, principal,
         )
         return True
 

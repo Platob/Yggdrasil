@@ -219,8 +219,8 @@ class TableConstraints(DatabricksService):
             )
         except (ResourceDoesNotExist, NotFound):
             logger.debug(
-                "Constraint %s on %s already absent",
-                name, table.full_name(safe=False),
+                "Constraint %r on table %r already absent",
+                name, table,
             )
 
     # ------------------------------------------------------------------

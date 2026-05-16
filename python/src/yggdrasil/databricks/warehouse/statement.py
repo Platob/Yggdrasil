@@ -788,10 +788,7 @@ class WarehouseStatementResult(StatementResult):
         wait = WaitingConfig.from_(wait)
 
         if wait:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "statement_execution.cancel_execution %s", self.statement_id,
-                )
+            logger.debug("Cancelling statement %r", self)
             try:
                 self.client.workspace_client().statement_execution.cancel_execution(
                     statement_id=self.statement_id,
@@ -799,7 +796,7 @@ class WarehouseStatementResult(StatementResult):
             except Exception:
                 logger.exception("Failed to cancel statement %r", self.key)
         else:
-            logger.debug("statement_execution.cancel_execution %s (no-wait)", self.statement_id)
+            logger.debug("Cancelling statement %r (no-wait)", self)
             Job.make(self.client.workspace_client().statement_execution.cancel_execution, statement_id=self.statement_id).fire_and_forget()
 
         self._response = None
@@ -867,12 +864,10 @@ class WarehouseStatementResult(StatementResult):
         statement_execution = self.client.workspace_client().statement_execution
         response = statement_execution.get_statement(self.statement_id)
 
-        if logger.isEnabledFor(logging.INFO):
-            if response.status.state in DONE_STATES:
-                logger.info(
-                    "%r finished in state %s",
-                    self, response.status.state,
-                )
+        if response.status.state in DONE_STATES:
+            logger.info(
+                "Statement %r finished in state %s", self, response.status.state,
+            )
         self.set_api_response(response)
         return self
 
@@ -1105,9 +1100,9 @@ class WarehouseStatementResult(StatementResult):
 
         if not yielded_any:
             yield from _empty_arrow_batches(options.target.to_arrow_schema())
-        elif logger.isEnabledFor(logging.INFO):
+        else:
             logger.info(
-                "%r streamed %d batches / %d rows / %d bytes",
+                "Statement %r streamed %d batches / %d rows / %d bytes",
                 self, total_batches, total_rows, total_bytes,
             )
 

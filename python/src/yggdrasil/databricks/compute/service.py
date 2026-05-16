@@ -390,7 +390,7 @@ class Clusters(DatabricksService):
             if k in _CREATE_ARG_NAMES
         }
 
-        LOGGER.debug("Creating Databricks cluster %s with %s", update_details.get("cluster_name"), update_details)
+        LOGGER.debug("Creating Databricks cluster %r with %s", update_details.get("cluster_name"), update_details)
 
         client = self.client.workspace_client().clusters
 
@@ -404,7 +404,7 @@ class Clusters(DatabricksService):
 
         instance = Cluster(service=self).set_details(details=details)
 
-        LOGGER.info("Created %s", instance)
+        LOGGER.info("Created cluster %r", instance)
 
         instance.install_libraries(libraries=libraries, raise_error=False, wait=False)
 
