@@ -131,62 +131,109 @@ def aws_s3_path_class():
 
 
 # ===========================================================================
-# Optional third-party packages — try-import, fall back to runtime install
+# Optional third-party packages — try-import, opt-in install on miss
 # ===========================================================================
 
 
-def _import_or_install(module_name: str, pip_name: str | None = None) -> Any:
-    """Try a plain import; on failure, fall back to the runtime installer.
+#: Process-wide module cache shared by every loader below. Replaces the
+#: per-function :func:`functools.lru_cache` previous design used — that
+#: keyed the cache by call arguments, so ``polars_module()`` and
+#: ``polars_module(install=True)`` ended up as separate entries even
+#: though both resolve the same module. A plain ``dict[name -> module]``
+#: collapses both to one slot and lets the ``install`` kwarg control
+#: only the on-miss path.
+_LAZY_CACHE: "dict[str, Any]" = {}
 
-    The fallback path mirrors what the old per-package ``lib.py``
-    files did — ``PyEnv.runtime_import_module`` will pip-install the
-    package if the runtime allows it, then re-import.
+
+def _lazy_import(
+    module_name: str,
+    pip_name: str | None = None,
+    *,
+    install: bool = False,
+    hint: str | None = None,
+) -> Any:
+    """Cached import with optional pip-install fallback.
+
+    Look *module_name* up in :data:`_LAZY_CACHE`; on miss, run
+    ``importlib.import_module``. When the import raises and *install*
+    is ``True``, hand off to :meth:`PyEnv.runtime_import_module` —
+    which anchors on the active interpreter (``sys.executable``) and
+    routes the install through ``uv pip --python <python>`` or
+    ``<python> -m pip``, so the package lands in the same
+    site-packages the running interpreter already reads from. The
+    historical default was ``install=True`` (every loader auto-pulled
+    its package on first touch); that was too eager — debugging an
+    accidental network install three frames deep into a cast was the
+    main pain point. Default flipped to ``install=False``: callers
+    that genuinely want a side-effect install opt in explicitly.
+
+    *hint* is substituted into the :class:`ImportError` message when
+    the import fails and we are not installing — used by packages
+    whose install string is non-obvious (``pymongoarrow``,
+    ``adbc-driver-postgresql``, …) so the user sees the right
+    ``pip install`` command from the traceback.
     """
+    cached = _LAZY_CACHE.get(module_name)
+    if cached is not None:
+        return cached
     try:
         import importlib
-        return importlib.import_module(module_name)
-    except ImportError:
+        mod = importlib.import_module(module_name)
+    except ImportError as exc:
+        if not install:
+            if hint is not None:
+                raise ImportError(hint) from exc
+            raise
         from yggdrasil.environ import PyEnv
-        return PyEnv.runtime_import_module(
+        mod = PyEnv.runtime_import_module(
             module_name=module_name,
             pip_name=pip_name or module_name,
             install=True,
         )
+    _LAZY_CACHE[module_name] = mod
+    return mod
 
 
-@lru_cache(maxsize=1)
-def polars_module():
-    return _import_or_install("polars", "polars")
+def _import_or_install(
+    module_name: str,
+    pip_name: str | None = None,
+    *,
+    install: bool = False,
+) -> Any:
+    """Back-compat alias for :func:`_lazy_import` — *install* defaults to ``False``.
+
+    Older internal callers spelled this name; kept as a thin alias so a
+    grep-driven cleanup can defer renaming.
+    """
+    return _lazy_import(module_name, pip_name, install=install)
 
 
-@lru_cache(maxsize=1)
-def pandas_module():
-    return _import_or_install("pandas", "pandas")
+def polars_module(*, install: bool = False):
+    return _lazy_import("polars", install=install)
 
 
-@lru_cache(maxsize=1)
-def pyarrow_module():
-    return _import_or_install("pyarrow", "pyarrow")
+def pandas_module(*, install: bool = False):
+    return _lazy_import("pandas", install=install)
 
 
-@lru_cache(maxsize=1)
-def fastapi_module():
-    return _import_or_install("fastapi", "fastapi")
+def pyarrow_module(*, install: bool = False):
+    return _lazy_import("pyarrow", install=install)
 
 
-@lru_cache(maxsize=1)
-def requests_module():
-    return _import_or_install("requests", "requests")
+def fastapi_module(*, install: bool = False):
+    return _lazy_import("fastapi", install=install)
 
 
-@lru_cache(maxsize=1)
-def xxhash_module():
-    return _import_or_install("xxhash", "xxhash")
+def requests_module(*, install: bool = False):
+    return _lazy_import("requests", install=install)
 
 
-@lru_cache(maxsize=1)
-def confluent_kafka_module():
-    return _import_or_install("confluent_kafka", "confluent-kafka")
+def xxhash_module(*, install: bool = False):
+    return _lazy_import("xxhash", install=install)
+
+
+def confluent_kafka_module(*, install: bool = False):
+    return _lazy_import("confluent_kafka", "confluent-kafka", install=install)
 
 
 @lru_cache(maxsize=1)
@@ -195,38 +242,31 @@ def spark_sql_module():
     return sql
 
 
-@lru_cache(maxsize=1)
-def boto3_module():
-    try:
-        import boto3
-        return boto3
-    except ImportError:
-        from yggdrasil.environ import runtime_import_module
-        return runtime_import_module("boto3", install=True)
+def boto3_module(*, install: bool = False):
+    return _lazy_import("boto3", install=install)
 
 
-@lru_cache(maxsize=1)
-def botocore_module():
+_BOTOCORE_HINT = (
+    "yggdrasil.aws requires 'botocore' (a transitive dep of boto3). "
+    "Install boto3 with `pip install boto3` to get it."
+)
+
+
+def botocore_module(*, install: bool = False):
     """Lazy-import botocore.
 
     We want the top-level ``botocore`` module so callers can reach
     ``botocore.exceptions``, ``botocore.config``, ``botocore.credentials``,
     and ``botocore.session`` without triggering separate imports.
+    Touches the four submodules we use after the parent loads so each
+    is registered in ``sys.modules`` for cheap attribute access on
+    later calls.
     """
-    try:
-        import botocore
-        # Touch submodules we use so they're in sys.modules — this
-        # makes ``botocore.exceptions.ClientError`` etc. resolve
-        # without each call paying its own import.
-        import botocore.exceptions  # noqa: F401
-        import botocore.config  # noqa: F401
-        import botocore.credentials  # noqa: F401
-        import botocore.session  # noqa: F401
-    except ImportError as exc:
-        raise ImportError(
-            "yggdrasil.aws requires 'botocore' (a transitive dep of boto3). "
-            "Install boto3 with `pip install boto3` to get it."
-        ) from exc
+    # boto3 is the carrier — botocore ships alongside it. When the
+    # caller asks to install, we route through the ``boto3`` pip name.
+    botocore = _lazy_import("botocore", "boto3", install=install, hint=_BOTOCORE_HINT)
+    for sub in ("botocore.exceptions", "botocore.config", "botocore.credentials", "botocore.session"):
+        _lazy_import(sub, "boto3", install=False, hint=_BOTOCORE_HINT)
     return botocore
 
 
@@ -235,9 +275,8 @@ def botocore_module():
 # ---------------------------------------------------------------------------
 
 
-@lru_cache(maxsize=1)
-def databricks_sdk_module():
-    return _import_or_install("databricks.sdk", "databricks-sdk")
+def databricks_sdk_module(*, install: bool = False):
+    return _lazy_import("databricks.sdk", "databricks-sdk", install=install)
 
 
 @lru_cache(maxsize=1)
@@ -279,22 +318,20 @@ _ADBC_HINT = (
 )
 
 
-@lru_cache(maxsize=1)
-def psycopg_module():
-    try:
-        import psycopg
-    except ImportError as exc:
-        raise ImportError(_PSYCOPG_HINT) from exc
-    return psycopg
+def psycopg_module(*, install: bool = False):
+    return _lazy_import("psycopg", "psycopg[binary]", install=install, hint=_PSYCOPG_HINT)
 
 
-@lru_cache(maxsize=1)
-def adbc_dbapi_module():
-    try:
-        from adbc_driver_postgresql import dbapi
-    except ImportError as exc:
-        raise ImportError(_ADBC_HINT) from exc
-    return dbapi
+def adbc_dbapi_module(*, install: bool = False):
+    # The dbapi submodule lives under ``adbc_driver_postgresql``; we
+    # install the driver package and return its ``dbapi`` attribute.
+    mod = _lazy_import(
+        "adbc_driver_postgresql.dbapi",
+        "adbc-driver-postgresql",
+        install=install,
+        hint=_ADBC_HINT,
+    )
+    return mod
 
 
 def has_psycopg() -> bool:
@@ -331,65 +368,38 @@ _PMA_HINT = (
 )
 
 
-@lru_cache(maxsize=1)
-def pymongo_module():
-    try:
-        import pymongo
-    except ImportError as exc:
-        raise ImportError(_PYMONGO_HINT) from exc
-    return pymongo
+def pymongo_module(*, install: bool = False):
+    return _lazy_import("pymongo", install=install, hint=_PYMONGO_HINT)
 
 
-@lru_cache(maxsize=1)
-def bson_module():
-    try:
-        import bson
-    except ImportError as exc:
-        raise ImportError(_PYMONGO_HINT) from exc
-    return bson
+def bson_module(*, install: bool = False):
+    return _lazy_import("bson", "pymongo", install=install, hint=_PYMONGO_HINT)
 
 
-@lru_cache(maxsize=1)
-def pymongoarrow_module():
-    try:
-        import pymongoarrow
-    except ImportError as exc:
-        raise ImportError(_PMA_HINT) from exc
-    return pymongoarrow
+def pymongoarrow_module(*, install: bool = False):
+    return _lazy_import("pymongoarrow", install=install, hint=_PMA_HINT)
 
 
-@lru_cache(maxsize=1)
-def pymongoarrow_api_module():
-    try:
-        from pymongoarrow import api
-    except ImportError as exc:
-        raise ImportError(_PMA_HINT) from exc
-    return api
+def pymongoarrow_api_module(*, install: bool = False):
+    return _lazy_import("pymongoarrow.api", "pymongoarrow", install=install, hint=_PMA_HINT)
 
 
-@lru_cache(maxsize=1)
-def pymongoarrow_schema_module():
-    try:
-        from pymongoarrow import schema
-    except ImportError as exc:
-        raise ImportError(_PMA_HINT) from exc
-    return schema
+def pymongoarrow_schema_module(*, install: bool = False):
+    return _lazy_import("pymongoarrow.schema", "pymongoarrow", install=install, hint=_PMA_HINT)
 
 
-@lru_cache(maxsize=1)
-def pymongoarrow_writer_module():
+def pymongoarrow_writer_module(*, install: bool = False):
     """``pymongoarrow.writer`` — only present in newer pymongoarrow.
 
     Returns ``None`` when the installed pymongoarrow is too old for
     the writer surface; callers should fall back to
     ``pymongoarrow.api.write`` or the pymongo bulk path.
     """
-    pymongoarrow_module()
+    pymongoarrow_module(install=install)
     try:
-        from pymongoarrow import writer
+        return _lazy_import("pymongoarrow.writer", "pymongoarrow", install=False)
     except ImportError:
         return None
-    return writer
 
 
 def has_pymongo() -> bool:
@@ -422,20 +432,14 @@ _SQLGLOT_HINT = (
 )
 
 
-@lru_cache(maxsize=1)
-def sqlglot_module():
-    try:
-        import sqlglot
-    except ImportError as exc:
-        raise ImportError(_SQLGLOT_HINT) from exc
-    return sqlglot
+def sqlglot_module(*, install: bool = False):
+    return _lazy_import("sqlglot", install=install, hint=_SQLGLOT_HINT)
 
 
-@lru_cache(maxsize=1)
-def sqlglot_expressions():
-    sqlglot_module()
-    from sqlglot import expressions
-    return expressions
+def sqlglot_expressions(*, install: bool = False):
+    return _lazy_import(
+        "sqlglot.expressions", "sqlglot", install=install, hint=_SQLGLOT_HINT,
+    )
 
 
 def has_sqlglot() -> bool:

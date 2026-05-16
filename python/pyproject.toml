@@ -134,6 +134,7 @@ markers = [
   "integration: marks tests that require a live Databricks workspace (skipped when DATABRICKS_HOST is not set)",
   "postgres_integration: marks tests that require a live Postgres instance (skipped when POSTGRES_URI is not set)",
   "mongo_integration: marks tests that require a live MongoDB instance (skipped when MONGO_URI / MONGODB_URI is not set)",
+  "pyenv_install_integration: marks tests that pip-install a real package into the active venv (skipped when YGGDRASIL_PYENV_INSTALL_TEST is not set)",
 ]
 
 [tool.setuptools]
