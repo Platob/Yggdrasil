@@ -33,6 +33,7 @@ from typing import Any, ClassVar, Generic, Iterable, Mapping, Optional, TypeVar
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.disposable import Disposable
+from yggdrasil.io.session import Session
 from .statement import (
     PreparedStatement,
     StatementBatch,
@@ -162,84 +163,206 @@ _DEFAULT_EXECUTION_OPTIONS = ExecutionOptions()
 # ---------------------------------------------------------------------------
 
 
-class StatementExecutor(Singleton, Disposable, ABC, Generic[PS, SR, SB]):
+class StatementExecutor(Session, Disposable, Generic[PS, SR, SB]):
     """Abstract base for backend-specific statement executors.
+
+    A :class:`StatementExecutor` IS a :class:`Session` over a transport
+    that speaks SQL instead of HTTP: the same prepare → send pipeline
+    drives both, and the same singleton-by-config + pickle pattern
+    keeps connection pools and in-flight result maps shared across
+    callers in-process.
 
     Subclasses implement exactly one hook — :meth:`_submit_statement` —
     which turns a coerced :class:`PreparedStatement` into a backend-
-    specific :class:`StatementResult`.  Everything else (coercion,
-    batching, lifecycle, dispose, options resolution) is provided here.
+    specific :class:`StatementResult`. The base provides the
+    Session-shaped surface:
+
+    - :meth:`prepare` — coerce raw input into the typed
+      :class:`PreparedStatement` subclass (analogue of
+      :meth:`Session.prepare_request_before_send`),
+    - :meth:`send` — dispatch a prepared statement and return its
+      :class:`StatementResult`. ``lazy=True`` returns an idled
+      result whose backend submission is deferred until
+      :meth:`StatementResult.start` fires — same shape as
+      :meth:`Session.send` with ``lazy=True``,
+    - :meth:`execute` / :meth:`execute_many` — kwargs-friendly sugar
+      that resolves :class:`ExecutionOptions` and waits.
+
+    ``submit_statement`` is kept as a backward-compatible alias that
+    routes through :meth:`send`.
 
     Singleton + pickle
     ------------------
-    Mirrors the :class:`yggdrasil.io.session.Session` pattern — every
-    concrete executor is singleton-by-config in process (so two callers
-    asking for the same ``SQLEngine(client, catalog, schema)`` /
-    ``PostgresExecutor(connection)`` collapse to one instance, sharing
-    connection pools, sub-service caches, and the in-flight result map)
-    and picklable across Spark workers / multiprocessing forks (live
-    handles drop out via :attr:`_TRANSIENT_STATE_ATTRS`; the receiver
-    rehydrates them lazily on first use). Concrete subclasses opt in by:
+    Concrete subclasses opt into the inherited :class:`Session` /
+    :class:`Singleton` cache by:
 
     1. setting ``_SINGLETON_TTL = None`` (process-lifetime caching),
-    2. overriding :meth:`_singleton_key` to project the identity-bearing
-       constructor arguments into a hashable tuple,
+    2. overriding :meth:`_singleton_key` to project the identity-
+       bearing constructor arguments into a hashable tuple,
     3. guarding ``__init__`` with ``if getattr(self, "_initialized",
        False): return`` so Python's re-entry after a cache hit doesn't
        clobber live state,
     4. extending ``_TRANSIENT_STATE_ATTRS`` with any non-picklable
        handles they hold (locks, urllib3 pools, live SDK sessions).
 
-    The base default — ``_SINGLETON_TTL = ...`` from :class:`Singleton` —
+    The base default — ``_SINGLETON_TTL = ...`` (from :class:`Singleton`) —
     keeps caching opt-in so executor subclasses that genuinely don't
     have a stable identity (a hand-rolled test double, an anonymous
     executor) still work without surprise sharing.
 
     Class-level configuration
     -------------------------
-    ``_PREPARED_STATEMENT_CLASS`` / ``_STATEMENT_RESULT_CLASS`` /
-    ``_STATEMENT_BATCH_CLASS`` let subclasses pin concrete types.  They
-    are :class:`ClassVar` so they don't leak into ``__init__`` or ``__eq__``.
+    The prepared / response / batch types are pinned on the inherited
+    :class:`Session` ClassVars — :attr:`Session._PREPARED_CLASS` /
+    :attr:`Session._RESPONSE_CLASS` / :attr:`Session._BATCH_CLASS` —
+    overridden here to the SQL-shaped defaults. Older subclasses that
+    pin the historical ``_PREPARED_STATEMENT_CLASS`` /
+    ``_STATEMENT_RESULT_CLASS`` / ``_STATEMENT_BATCH_CLASS`` names still
+    work; :meth:`__init_subclass__` mirrors either set of names onto
+    the other so the prepare → send pipeline reaches the right
+    concrete type regardless of which alias the subclass pinned.
     """
 
     max_workers: Optional[int] = None
 
+    # SQL-shaped overrides for the inherited Session ClassVars.
+    _PREPARED_CLASS: ClassVar[type[PreparedStatement]] = PreparedStatement
+    _RESPONSE_CLASS: ClassVar[type[StatementResult]] = StatementResult
+    _BATCH_CLASS: ClassVar[type[StatementBatch]] = StatementBatch
+
+    # Backward-compat aliases (long names that several subclasses pin).
+    # ``__init_subclass__`` keeps the short and long names in lockstep.
     _PREPARED_STATEMENT_CLASS: ClassVar[type[PreparedStatement]] = PreparedStatement
     _STATEMENT_RESULT_CLASS: ClassVar[type[StatementResult]] = StatementResult
     _STATEMENT_BATCH_CLASS: ClassVar[type[StatementBatch]] = StatementBatch
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        # Source-of-truth precedence: the long ``_STATEMENT_*`` name
+        # when the subclass set it explicitly, otherwise the short
+        # alias. Either way the prepare/send pipeline ends up seeing
+        # the right concrete type without the subclass restating both.
+        for short, long in (
+            ("_PREPARED_CLASS", "_PREPARED_STATEMENT_CLASS"),
+            ("_RESPONSE_CLASS", "_STATEMENT_RESULT_CLASS"),
+            ("_BATCH_CLASS", "_STATEMENT_BATCH_CLASS"),
+        ):
+            own = cls.__dict__
+            if long in own and short not in own:
+                setattr(cls, short, own[long])
+            elif short in own and long not in own:
+                setattr(cls, long, own[short])
+
+    @classmethod
+    def _singleton_key(cls, *args: Any, **kwargs: Any) -> Any:
+        """Fall back to the generic :class:`Singleton` key.
+
+        :class:`Session._singleton_key` projects ``base_url`` through
+        :meth:`URL.from_`, which raises on ``None`` — SQL executors
+        don't have an HTTP-style ``base_url``, so the base shape goes
+        back to ``(cls, args, kwargs-items)``. Concrete subclasses
+        (``SQLEngine`` / ``SparkStatementExecutor`` / …) override this
+        to project their own identity-bearing arguments.
+        """
+        return (cls, args, tuple(sorted(kwargs.items())))
+
+    def __new__(
+        cls,
+        *args: Any,
+        singleton_ttl: Any = ...,
+        **kwargs: Any,
+    ) -> "StatementExecutor":
+        # Bypass :class:`Session.__new__` (which gates on a truthy
+        # ``base_url`` for the HTTP path) and route directly through
+        # :meth:`Singleton.__new__`. Executors key off their own
+        # backend identity, not a URL.
+        return Singleton.__new__(cls, *args, singleton_ttl=singleton_ttl, **kwargs)
+
+    def __getnewargs_ex__(self) -> "tuple[tuple, dict]":
+        # Session's default reads ``self.base_url`` / ``self.key`` —
+        # SQL executors don't have those. Hand pickle empty args;
+        # ``__setstate__`` (from :class:`Singleton`) restores the
+        # identity-bearing fields from the pickled ``__dict__``
+        # afterwards.
+        return (), {}
 
     def __init__(self, *args: Any, **kwargs: Any):
         # Idempotent init — Singleton's ``__new__`` may hand back a
         # cache hit Python is about to re-invoke ``__init__`` on, and
         # we don't want to flush whatever state the live instance has.
-        # Subclasses that override should set ``_initialized = True`` at
-        # the end of their own ``__init__`` and start with the same
-        # guard.
+        # Subclasses that override should set ``_initialized = True``
+        # at the end of their own ``__init__`` and start with the
+        # same guard.
         if getattr(self, "_initialized", False):
             return
-        super().__init__()
+        # Skip :class:`Session.__init__` (HTTP fields — base_url /
+        # verify / pool_maxsize / headers / waiting / auth) and route
+        # to :class:`Disposable` directly. SQL executors don't carry
+        # HTTP transport state; the per-backend ``__init__`` handles
+        # its own setup.
+        Disposable.__init__(self)
         self._initialized = True
 
     # -------------------------------------------------------------------------
     # Subclass contract
     # -------------------------------------------------------------------------
 
-    def submit_statement(self, statement: PS, start: bool = True) -> SR:
-        """Submit a statement and return a tracking result.
+    # ------------------------------------------------------------------
+    # Session-shaped surface: prepare / send
+    # ------------------------------------------------------------------
 
-        Ensures the returned :class:`StatementResult` is bound to this
-        executor — every subclass `_submit_statement` is supposed to
-        thread ``executor=self`` through the constructor, but that's
-        easy to forget and downstream code (``StatementResult.wait``,
-        ``retry``, ``raise_for_status``) needs the back-reference to
-        drive the lifecycle. Setting it here when it's missing makes
-        the contract enforceable from one place instead of audited per
-        backend.
+    def prepare(self, statement: "PS | PreparedStatement | str") -> PS:
+        """Coerce *statement* into this executor's prepared-statement type.
+
+        Mirrors :meth:`Session.prepare_request_before_send`: takes
+        whatever the caller passed (raw string, cross-backend
+        :class:`PreparedStatement`, already-typed instance) and
+        returns the concrete :attr:`_PREPARED_CLASS` every downstream
+        hook expects. Subclasses that need to inject per-statement
+        defaults (warehouse routing, catalog binding) override this —
+        same shape as Session's hook.
         """
-        result = self._submit_statement(statement, start=start)
+        return self._coerce_statement(statement)
+
+    def send(
+        self,
+        statement: "PS | PreparedStatement | str",
+        *,
+        lazy: bool = False,
+    ) -> SR:
+        """Dispatch *statement* and return its tracking :class:`StatementResult`.
+
+        Mirrors :meth:`Session.send`. ``lazy=False`` (default) routes
+        the prepared statement through :meth:`_submit_statement`
+        eagerly — the result comes back already in flight (or
+        already terminal for synchronous backends). ``lazy=True``
+        returns the idled :class:`StatementResult` whose backend
+        submission is deferred until :meth:`StatementResult.start`
+        fires, matching the Session ``lazy=True`` shape for HTTP.
+
+        The returned result is always bound to this executor — every
+        subclass ``_submit_statement`` is supposed to thread
+        ``executor=self`` through the constructor, but that's easy
+        to forget and downstream code (``StatementResult.wait``,
+        ``retry``, ``raise_for_status``) needs the back-reference.
+        Setting it here when it's missing makes the contract
+        enforceable from one place instead of audited per backend.
+        """
+        prepared = self.prepare(statement)
+        result = self._submit_statement(prepared, start=not lazy)
         if getattr(result, "executor", None) is None:
             result.executor = self
         return result
+
+    def submit_statement(self, statement: PS, start: bool = True) -> SR:
+        """Backward-compatible alias for :meth:`send`.
+
+        Older call sites (and most of the codebase) reach for
+        ``executor.submit_statement(...)``; route through
+        :meth:`send` so the lazy / non-lazy plumbing stays in one
+        place.
+        """
+        return self.send(statement, lazy=not start)
 
     @abstractmethod
     def _submit_statement(self, statement: PS, start: bool = True) -> SR:
@@ -248,6 +371,38 @@ class StatementExecutor(Singleton, Disposable, ABC, Generic[PS, SR, SB]):
         The result need not have completed — callers use
         :meth:`StatementResult.wait` to block when needed.
         """
+
+    # ------------------------------------------------------------------
+    # Session abstract hooks — SQL executors don't speak HTTP
+    # ------------------------------------------------------------------
+
+    def _local_send(self, request: Any, config: Any) -> Any:
+        """Stubs out the HTTP local-send hook from :class:`Session`.
+
+        :class:`StatementExecutor` IS a :class:`Session` (singleton +
+        pickle + prepare/send pattern) but the transport is SQL, not
+        HTTP — :meth:`_submit_statement` is the analogous concrete
+        hook. Raising here keeps :meth:`Session.send` from accidentally
+        routing a :class:`PreparedRequest` through a SQL executor;
+        :meth:`StatementExecutor.send` drives the prepare → submit
+        pipeline directly without touching this method.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} is a SQL executor; the HTTP "
+            "_local_send pathway is not applicable. Submit a "
+            "PreparedStatement via .send() / .submit_statement() / "
+            ".execute() instead."
+        )
+
+    def _build_idle_response(self, request: Any, config: Any) -> Any:
+        """Idle-result shim — SQL executors route through
+        :meth:`send(lazy=True)` directly, which builds the idled
+        :class:`StatementResult` via :meth:`_submit_statement(start=False)`
+        without re-entering this method."""
+        raise NotImplementedError(
+            f"{type(self).__name__}: use .send(statement, lazy=True) "
+            "to build an idled StatementResult."
+        )
 
     # -------------------------------------------------------------------------
     # Coercion
