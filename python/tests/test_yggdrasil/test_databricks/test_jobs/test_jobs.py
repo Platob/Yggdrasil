@@ -808,6 +808,65 @@ class TestStagedScriptMetadata(DatabricksTestCase):
         self.assertIn("@checkargs\ndef _noop(", script)
         self.assertIn("_noop()", script)
 
+    def _patch_workspace_path(self):
+        """Replace :class:`WorkspacePath` with a recorder MagicMock.
+
+        Returns a ``(patcher, captured)`` pair — the captured dict
+        gets a ``"path"`` entry on every call so tests can assert on
+        the staged path.
+        """
+        from unittest.mock import patch
+
+        captured: dict = {}
+
+        def _fake_workspace_path(path, *, client=None, **_kw):
+            captured["path"] = path
+            handle = MagicMock(name=f"WorkspacePath({path!r})")
+            handle.full_path.return_value = path
+            handle.__repr__ = lambda _self: f"WorkspacePath({path!r})"
+            return handle
+
+        return patch(
+            "yggdrasil.databricks.fs.workspace_path.WorkspacePath",
+            side_effect=_fake_workspace_path,
+        ), captured
+
+    def test_staging_root_default_groups_by_task_key(self):
+        """``DEFAULT_STAGING_ROOT/<task_key>/main-<digest>.py`` layout."""
+        from yggdrasil.databricks.jobs.task import (
+            DEFAULT_STAGING_ROOT, JobTask,
+        )
+
+        # Default is /Workspace/Shared/.ygg/jobs (no per-job template).
+        self.assertEqual(DEFAULT_STAGING_ROOT, "/Workspace/Shared/.ygg/jobs")
+
+        job = MagicMock(name="Job", spec=["client"])
+        patcher, captured = self._patch_workspace_path()
+        with patcher:
+            JobTask.from_callable(job, _signature_fixture, task_key="apply")
+
+        path = captured["path"]
+        self.assertTrue(
+            path.startswith("/Workspace/Shared/.ygg/jobs/apply/main-"), path,
+        )
+        self.assertTrue(path.endswith(".py"))
+
+    def test_staging_root_uses_func_name_as_task_key_default(self):
+        """Task key defaults to ``func.__name__`` when caller omits it."""
+        from yggdrasil.databricks.jobs.task import JobTask
+
+        job = MagicMock(name="Job", spec=["client"])
+        patcher, captured = self._patch_workspace_path()
+        with patcher:
+            JobTask.from_callable(job, _signature_fixture)
+
+        self.assertTrue(
+            captured["path"].startswith(
+                "/Workspace/Shared/.ygg/jobs/_signature_fixture/main-",
+            ),
+            captured["path"],
+        )
+
 
 class TestStagedScriptCapturesLocals(DatabricksTestCase):
     """``_render_callable_script`` inlines locally-referenced helpers + literals."""
