@@ -683,6 +683,31 @@ class TestJobTaskFactoryAndDecorate(DatabricksTestCase):
         jt: JobTask = step._job_task  # type: ignore[attr-defined]
         self.assertEqual(jt.order, 2)
 
+    def test_delete_uses_fields_to_remove(self):
+        """``JobTask.delete`` routes through ``fields_to_remove`` because the
+        Jobs API merges ``new_settings.tasks`` by ``task_key`` rather than
+        replacing it — a shortened task list would leave the target task
+        intact on the server."""
+        job = self._job()
+        job.settings.tasks = [Task(task_key="a"), Task(task_key="b")]
+
+        jt = job.task("a")
+        jt.delete()
+
+        _, kwargs = self.jobs_api.update.call_args
+        self.assertEqual(kwargs["fields_to_remove"], ["tasks/a"])
+        self.assertIsNone(kwargs["new_settings"])
+
+    def test_delete_noop_when_task_already_absent(self):
+        """``delete`` skips the SDK round trip when the key isn't on the job."""
+        job = self._job()
+        job.settings.tasks = [Task(task_key="a")]
+
+        jt = job.task("missing")
+        jt.delete()
+
+        self.jobs_api.update.assert_not_called()
+
     def test_pytask_parametrized_forwards_fields(self):
         job = self._job()
         staged_body = SparkPythonTask(python_file="/from_callable.py")
