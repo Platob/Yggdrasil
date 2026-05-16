@@ -431,71 +431,6 @@ def _resolve_prune_by(
     return None
 
 
-# ---------------------------------------------------------------------------
-# table_dispatch — multi-target insert fan-out
-#
-# A ``table_dispatch`` mapping lets a single insert call also push the same
-# source rows into additional Delta tables, with each target getting its own
-# row-level :class:`Predicate` applied to the source as a ``WHERE`` filter.
-# Resolution accepts either a built :class:`Table` or a dotted location
-# string for keys, and a :class:`Predicate`, raw SQL string, or any other
-# engine expression :meth:`Predicate.from_` knows how to lift for values.
-# ---------------------------------------------------------------------------
-
-
-def _resolve_dispatch_targets(
-    dispatch: "Mapping[Table | str, Predicate | str] | None",
-    *,
-    primary: "Table",
-) -> list[tuple["Table", Predicate]]:
-    """Normalize ``table_dispatch`` into ``[(Table, Predicate), ...]``.
-
-    String keys go through :meth:`Table.from_` against the primary's
-    own ``Tables`` service so callers can pass either a fully-built
-    handle or a dotted location like ``"cat.sch.name"``. String values
-    (or anything else :meth:`Predicate.from_` can lift — Polars / Arrow /
-    Spark expressions) are coerced to a yggdrasil :class:`Predicate`
-    here so the rendering path always sees the canonical AST.
-    A self-dispatch (an entry that resolves to the primary itself)
-    raises — the primary insert already covers that target and
-    silently double-inserting would surprise everyone.
-    """
-    if not dispatch:
-        return []
-    primary_loc = primary.full_name() if primary.table_name else None
-    out: list[tuple[Table, Predicate]] = []
-    for key, predicate in dispatch.items():
-        if isinstance(key, str):
-            target = Table.from_(obj=key, service=primary.service)
-        elif isinstance(key, Table):
-            target = key
-        else:
-            raise TypeError(
-                f"table_dispatch keys must be Table or str (location); "
-                f"got {type(key).__name__}. "
-                f"Pass a Table handle or a dotted 'cat.sch.tbl' location."
-            )
-        if (
-            primary_loc
-            and target.table_name
-            and target.full_name() == primary_loc
-        ):
-            raise ValueError(
-                f"table_dispatch entry {key!r} resolves to the primary "
-                f"target {primary_loc!r}; the primary insert already "
-                f"covers it. Drop the entry or point it at a different table."
-            )
-        # Coerce SQL strings and engine-native expressions into the
-        # canonical Predicate AST. ``Predicate.from_`` is forgiving on
-        # input: existing Predicate passes through, str → from_sql,
-        # polars/pyarrow/pyspark → matching from_*. Anything it can't
-        # lift surfaces with a clear "give me one of: …" error.
-        if not isinstance(predicate, Predicate):
-            predicate = Predicate.from_(predicate)
-        out.append((target, predicate))
-    return out
-
-
 def _build_column_projection(
     fields: "Iterable[Field]",
     *,
@@ -526,23 +461,6 @@ def _build_column_projection(
         col = quote_ident(f.name)
         parts.append(f"{source_alias}.{col}" if source_alias else col)
     return ", ".join(parts)
-
-
-def _render_source_predicate(predicate: "Predicate | None") -> str:
-    """Render a source-side ``WHERE`` fragment for a dispatch predicate.
-
-    Columns render unaliased so the fragment composes onto whatever
-    source projection the caller built (staged Parquet read, temp view,
-    sub-query). Compound expressions get parenthesized so AND/OR
-    nesting stays explicit when the fragment is concatenated.
-    Returns ``""`` when the predicate is ``None``.
-    """
-    if predicate is None:
-        return ""
-    sql = expr_to_sql(predicate, dialect=Dialect.DATABRICKS)
-    if " OR " in sql or " AND " in sql:
-        sql = f"({sql})"
-    return sql
 
 
 def _build_delete_insert_statements(
@@ -3119,7 +3037,6 @@ class Table(DatabricksPath):
         raise_error: bool = True,
         spark_session: Optional["SparkSession"] = None,
         return_data: bool = False,
-        table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
         async_write: bool = False,
         **kwargs
     ) -> "Tabular | VolumePath | None":
@@ -3151,7 +3068,6 @@ class Table(DatabricksPath):
             raise_error=raise_error,
             spark_session=spark_session,
             return_data=return_data,
-            table_dispatch=table_dispatch,
             **kwargs,
         )
 
@@ -3187,8 +3103,7 @@ class Table(DatabricksPath):
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         safe_merge: bool = False,
-        table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
-    ) -> "Tabular | None":
+    ) -> "StatementBatch | Tabular | None":
         """Insert *data* into this table using the most appropriate backend.
 
         Routing:
@@ -3199,25 +3114,13 @@ class Table(DatabricksPath):
           → :meth:`spark_insert`
         - Otherwise → :meth:`arrow_insert` (warehouse path with Volume staging)
 
-        Returns ``None`` by default. With ``return_data=True`` the
-        backend that ran the write hands back its source payload as a
-        :class:`Tabular` — :class:`ArrowTabular` from
-        :meth:`arrow_insert`, :class:`SparkTabular` from
-        :meth:`spark_insert`, the input :class:`StatementResult` from
-        :meth:`sql_insert` — for downstream chaining without
-        re-querying the target.
-
-        ``table_dispatch`` fans the same source rows into additional
-        Delta tables in the same call. Each entry is
-        ``target_or_location -> Predicate``; the predicate is rendered
-        as a source-side ``WHERE`` so only matching rows reach that
-        target. The primary insert (into ``self``) keeps its full mode
-        / match_by / MERGE-fallback behavior; dispatch entries always
-        run as plain ``INSERT INTO ... SELECT ... WHERE`` against the
-        same staged source. Primary runs first; dispatch entries run as
-        a single parallel batch only if the primary succeeds, so a
-        partial fan-out can't leave you with rows in dispatch targets
-        that never made it into the primary.
+        Returns the submitted :class:`StatementBatch` by default. With
+        ``return_data=True`` the backend that ran the write hands back
+        its source payload as a :class:`Tabular` —
+        :class:`ArrowTabular` from :meth:`arrow_insert`,
+        :class:`SparkTabular` from :meth:`spark_insert`, the input
+        :class:`StatementResult` from :meth:`sql_insert` — for
+        downstream chaining without re-querying the target.
         """
         common = dict(
             mode=mode,
@@ -3234,7 +3137,6 @@ class Table(DatabricksPath):
             retry=retry,
             return_data=return_data,
             safe_merge=safe_merge,
-            table_dispatch=table_dispatch,
         )
 
         if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
@@ -3340,8 +3242,7 @@ class Table(DatabricksPath):
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         safe_merge: bool = False,
-        table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
-    ) -> "Tabular | None":
+    ) -> "StatementBatch | Tabular | None":
         """Insert through the warehouse SQL path with staged Parquet.
 
         ``safe_merge`` controls keyed-write strategy:
@@ -3355,16 +3256,10 @@ class Table(DatabricksPath):
           backends without native MERGE or callers that want explicit
           dedup semantics.
 
-        With ``return_data=True``, returns an :class:`ArrowTabular`
-        wrapping the staged source rows so callers can chain on the
-        payload without re-reading from the target.
-
-        ``table_dispatch`` fans the staged Parquet into additional
-        Delta tables. Each ``target -> Predicate`` entry runs as a
-        plain ``INSERT INTO target (cols) SELECT cast_proj FROM
-        {staging} WHERE <predicate>`` against the same staging volume,
-        submitted as a single parallel batch after the primary insert
-        lands.
+        Returns the submitted :class:`StatementBatch` by default. With
+        ``return_data=True``, returns an :class:`ArrowTabular` wrapping
+        the staged source rows so callers can chain on the payload
+        without re-reading from the target.
         """
         from yggdrasil.databricks.warehouse import WarehousePreparedStatement
 
@@ -3379,7 +3274,6 @@ class Table(DatabricksPath):
                 where=where, prune_by=prune_by,
                 retry=retry,
                 return_data=return_data,
-                table_dispatch=table_dispatch,
             )
 
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
@@ -3498,8 +3392,7 @@ class Table(DatabricksPath):
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         safe_merge: bool = False,
-        table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
-    ) -> "Tabular | None":
+    ) -> "StatementBatch | Tabular | None":
         """Insert into this table using Spark.
 
         ``retry`` is applied to DML statements (INSERT/MERGE/DELETE/UPDATE)
@@ -3509,16 +3402,10 @@ class Table(DatabricksPath):
         passing ``retry=True`` (or any :class:`WaitingConfig` arg) makes
         the policy explicit instead of relying on auto-promote.
 
-        With ``return_data=True``, returns a :class:`SparkTabular`
-        wrapping the materialised source DataFrame — handy for
-        chaining downstream transforms without re-querying the
-        target.
-
-        ``table_dispatch`` fans the same registered temp view into
-        additional Delta tables. Each ``target -> Predicate`` entry
-        runs as a plain ``INSERT INTO target SELECT ... FROM view
-        WHERE <predicate>`` against the same view, submitted as a
-        single parallel batch after the primary insert lands.
+        Returns the submitted :class:`StatementBatch` by default. With
+        ``return_data=True``, returns a :class:`SparkTabular` wrapping
+        the materialised source DataFrame — handy for chaining
+        downstream transforms without re-querying the target.
         """
         if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
             return self.sql_insert(
@@ -3532,7 +3419,6 @@ class Table(DatabricksPath):
                 spark_session=spark_session,
                 retry=retry,
                 return_data=return_data,
-                table_dispatch=table_dispatch,
             )
 
         from yggdrasil.spark.cast import any_to_spark_dataframe
@@ -3663,60 +3549,16 @@ class Table(DatabricksPath):
 
         applied_conf = _delta_conf_for(overwrite_schema, spark_options)
 
+        primary_batch = None
         try:
             with sql_engine.spark.scoped_spark_conf(session, applied_conf):
-                _execute_dml(
+                primary_batch = _execute_dml(
                     sql_engine,
                     statements=prepared,
                     wait=wait,
                     raise_error=raise_error,
                     engine_name="spark",
                 )
-
-                dispatch_entries = _resolve_dispatch_targets(
-                    table_dispatch, primary=target,
-                )
-                if dispatch_entries:
-                    extra_prepared: list[SparkPreparedStatement] = []
-                    for extra_target, predicate in dispatch_entries:
-                        extra_target.create(data, mode=schema_mode)
-                        extra_schema = extra_target.collect_schema()
-                        extra_columns = list(extra_schema.field_names())
-                        # Plain column projection — same reasoning as
-                        # the primary spark_insert source SQL.
-                        extra_cols_quoted = ", ".join(
-                            quote_ident(c) for c in extra_columns
-                        )
-                        where_frag = _render_source_predicate(predicate)
-                        where_clause = f" WHERE {where_frag}" if where_frag else ""
-                        extra_source_sql = (
-                            f"SELECT {extra_cols_quoted} "
-                            f"FROM {quote_ident(view_name)}{where_clause}"
-                        )
-                        extra_texts = _build_dml_statements(
-                            target_location=extra_target.full_name(safe=True),
-                            source_sql=extra_source_sql,
-                            columns=extra_columns,
-                            mode=mode_enum,
-                            match_by=match_by,
-                            update_column_names=update_column_names,
-                            prune_predicates=[],
-                        )
-                        extra_prepared.extend(_prepare_spark_batch(extra_texts))
-                    if extra_prepared:
-                        logger.debug(
-                            "Spark dispatch fan-out to %d target(s) (statements=%d)",
-                            len(dispatch_entries), len(extra_prepared),
-                        )
-                        extra_batch = sql_engine.execute_many(
-                            extra_prepared,
-                            wait=wait,
-                            raise_error=False,
-                            engine="spark",
-                            parallel=max(1, len(dispatch_entries)),
-                        )
-                        if raise_error:
-                            extra_batch.raise_for_status()
         finally:
             try:
                 session.catalog.dropTempView(view_name)
@@ -3735,7 +3577,7 @@ class Table(DatabricksPath):
         if return_data:
             from yggdrasil.io.tabular.spark import SparkTabular
             return SparkTabular(data_df)
-        return None
+        return primary_batch
 
     # =========================================================================
     # sql_insert — query source, no staging
@@ -3760,8 +3602,7 @@ class Table(DatabricksPath):
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         safe_merge: bool = False,
-        table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
-    ) -> "Tabular | None":
+    ) -> "StatementBatch | Tabular | None":
         """Insert into this table from a SQL source query.
 
         Smart dispatch:
@@ -3773,18 +3614,12 @@ class Table(DatabricksPath):
            ``MERGE … USING (q)`` with a CAST projection aligning the
            user's query schema to the target.
 
-        With ``return_data=True``, hands back the underlying
+        Returns the submitted :class:`StatementBatch` by default
+        (warehouse fallback) or the chosen backend's batch (Arrow /
+        Spark). With ``return_data=True``, hands back the underlying
         :class:`StatementResult` (or the materialised frame from a
         cached one) so callers can stream the same rows the warehouse
         just inserted.
-
-        ``table_dispatch`` flows through to whichever backend handles
-        the write. On the warehouse fallback path, each
-        ``target -> Predicate`` entry runs as a plain
-        ``INSERT INTO target SELECT cast_proj FROM (source) AS raw_src
-        WHERE <predicate>`` against the same wrapped source query,
-        submitted as a single parallel batch after the primary insert
-        lands.
         """
         common = dict(
             mode=mode,
@@ -3794,7 +3629,6 @@ class Table(DatabricksPath):
             vacuum_hours=vacuum_hours,
             where=where, prune_by=prune_by, prune_values=prune_values,
             retry=retry,
-            table_dispatch=table_dispatch,
         )
 
         if isinstance(statement, StatementResult):
@@ -3819,14 +3653,14 @@ class Table(DatabricksPath):
                 return_data=return_data, **common,
             )
 
-        self._sql_insert_warehouse_fallback(statement, **common)
+        batch = self._sql_insert_warehouse_fallback(statement, **common)
         if return_data and isinstance(statement, StatementResult):
             # The warehouse path doesn't materialise rows on its own,
             # but the caller's :class:`StatementResult` is already a
             # :class:`Tabular` over the same source query — hand it
             # back so ``return_data=True`` stays consistent across paths.
             return statement
-        return None
+        return batch
 
     def _sql_insert_warehouse_fallback(
         self,
@@ -3844,8 +3678,7 @@ class Table(DatabricksPath):
         prune_by: list[str] | str | None,
         prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
-        table_dispatch: "Mapping[Table | str, Predicate | str] | None" = None,
-    ) -> None:
+    ) -> "StatementBatch | None":
         """Warehouse fallback for :meth:`sql_insert`."""
         from yggdrasil.databricks.warehouse import WarehousePreparedStatement
 
@@ -3922,63 +3755,16 @@ class Table(DatabricksPath):
             target_location, mode_enum, match_by, len(prepared), retry_active,
         )
 
-        if prepared:
-            _execute_dml(
-                self.sql,
-                statements=prepared,
-                wait=wait,
-                raise_error=raise_error,
-                engine_name="api",
-            )
+        if not prepared:
+            return None
 
-        dispatch_entries = _resolve_dispatch_targets(table_dispatch, primary=self)
-        if dispatch_entries:
-            extra_prepared: list[WarehousePreparedStatement] = []
-            for extra_target, predicate in dispatch_entries:
-                if not extra_target.exists:
-                    raise ValueError(
-                        "table_dispatch target "
-                        f"{extra_target.full_name()!r} was not found. "
-                        "sql_insert dispatch targets must already exist — "
-                        "create them ahead of time or use arrow_insert / "
-                        "spark_insert which can create on the fly."
-                    )
-                extra_schema = extra_target.collect_schema()
-                extra_fields = list(extra_schema.fields)
-                extra_columns = [f.name for f in extra_fields]
-                extra_projection = _build_column_projection(
-                    extra_fields, source_alias="raw_src",
-                )
-                where_frag = _render_source_predicate(predicate)
-                where_clause = f"\nWHERE {where_frag}" if where_frag else ""
-                extra_source_sql = (
-                    f"SELECT {extra_projection} "
-                    f"FROM (\n{source_prepared.text}\n) AS raw_src{where_clause}"
-                )
-                extra_texts = _build_dml_statements(
-                    target_location=extra_target.full_name(safe=True),
-                    source_sql=extra_source_sql,
-                    columns=extra_columns,
-                    mode=mode_enum,
-                    match_by=match_by,
-                    update_column_names=update_column_names,
-                    prune_predicates=[],
-                )
-                extra_prepared.extend(_prepare_batch(extra_texts))
-            if extra_prepared:
-                logger.debug(
-                    "SQL dispatch fan-out to %d target(s) (statements=%d)",
-                    len(dispatch_entries), len(extra_prepared),
-                )
-                extra_batch = self.sql.execute_many(
-                    extra_prepared,
-                    wait=wait,
-                    raise_error=False,
-                    engine="api",
-                    parallel=max(1, len(dispatch_entries)),
-                )
-                if raise_error:
-                    extra_batch.raise_for_status()
+        return _execute_dml(
+            self.sql,
+            statements=prepared,
+            wait=wait,
+            raise_error=raise_error,
+            engine_name="api",
+        )
 
     # =========================================================================
     # Storage & credentials
