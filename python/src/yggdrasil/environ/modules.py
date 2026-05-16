@@ -32,10 +32,33 @@ __all__ = [
     "DependencyMetadata",
     "PipIndexSettings",
     "module_name_to_project_name",
+    "packages_distributions_cached",
     "resolve_local_lib_path",
     "module_dependencies",
     "get_pip_index_settings",
 ]
+
+
+def packages_distributions_cached() -> Dict[str, List[str]]:
+    """Memoized :func:`importlib.metadata.packages_distributions`.
+
+    Walks every installed distribution exactly once per process and
+    caches the mapping ``{top_level_module: [dist_name, ...]}``. Used
+    by the jobs introspection and workspace-PyPI publishing paths,
+    both of which call this on every staged task and would otherwise
+    re-scan ``site-packages`` for every module they touch.
+    """
+    cached = getattr(packages_distributions_cached, "_cache", None)
+    if cached is None:
+        if ilm is None:
+            cached = {}
+        else:
+            try:
+                cached = dict(ilm.packages_distributions())
+            except Exception:  # noqa: BLE001 — defensive: missing metadata
+                cached = {}
+        packages_distributions_cached._cache = cached  # type: ignore[attr-defined]
+    return cached
 
 
 MODULE_PROJECT_NAMES_ALIASES = {

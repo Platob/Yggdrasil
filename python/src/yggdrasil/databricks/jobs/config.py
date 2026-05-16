@@ -143,7 +143,7 @@ class NotebookConfig:
         # Convert the dict to a dataclass instance
         try:
             return convert(key_values, cls)
-        except Exception as exc:
+        except Exception:
             for field_name, field in class_fields.items():
                 field_value = key_values.get(field_name)
                 field_type = type_hints.get(field_name, Any)

@@ -244,6 +244,102 @@ class Jobs(DatabricksService):
         LOGGER.info("Created job %r", instance)
         return instance
 
+    # ------------------------------------------------------------------ #
+    # UserInfo-driven defaults
+    # ------------------------------------------------------------------ #
+    def userinfo_defaults(
+        self,
+        *,
+        include_git_source: bool = True,
+        include_notifications: bool = True,
+        include_tags: bool = True,
+        notification_events: tuple[str, ...] = ("on_failure",),
+    ) -> dict[str, Any]:
+        """Return a :class:`JobSettings`-shaped dict pulled from :class:`UserInfo`.
+
+        Splat the result into :meth:`create` / :meth:`get_or_create` /
+        :meth:`create_or_update` to pre-fill ``git_source``,
+        ``email_notifications`` and ``tags`` from the running process's
+        identity. Caller-supplied kwargs win on collision::
+
+            defaults = client.jobs.userinfo_defaults()
+            client.jobs.create(name="etl", tasks=tasks, **defaults,
+                               tags={"Env": "prod"})  # Env tag overrides
+
+        Returns an empty dict when no :class:`UserInfo` can be
+        resolved so callers can splat unconditionally.
+        """
+        from yggdrasil.environ import UserInfo
+
+        from .userinfo import userinfo_job_settings
+
+        try:
+            info = UserInfo.current()
+        except Exception:  # noqa: BLE001 — best-effort
+            LOGGER.debug("userinfo_defaults: UserInfo.current() failed", exc_info=True)
+            return {}
+        return userinfo_job_settings(
+            info,
+            include_git_source=include_git_source,
+            include_notifications=include_notifications,
+            include_tags=include_tags,
+            notification_events=notification_events,
+        )
+
+    def create_for_user(
+        self,
+        *,
+        name: str,
+        tasks: Optional[List[Task]] = None,
+        permissions: Optional[list[Union[str, JobAccessControlRequest]]] = None,
+        tags: Optional[dict[str, str]] = None,
+        userinfo_defaults: bool = True,
+        include_git_source: bool = True,
+        include_notifications: bool = True,
+        notification_events: tuple[str, ...] = ("on_failure",),
+        **settings: Any,
+    ) -> "Job":
+        """Sugar over :meth:`create` that pre-fills UserInfo defaults.
+
+        Equivalent to::
+
+            defaults = self.userinfo_defaults(...)
+            self.create(name=name, tasks=tasks, permissions=permissions,
+                        tags=tags, **{**defaults, **settings})
+
+        with the caller's *tags* / *settings* winning on collision —
+        explicit values always beat the auto-derived ones. The
+        per-key toggles route through :meth:`userinfo_defaults` so
+        opting out of (e.g.) auto-notifications doesn't require
+        building the dict by hand.
+        """
+        derived = self.userinfo_defaults(
+            include_git_source=include_git_source,
+            include_notifications=include_notifications,
+            include_tags=True,
+            notification_events=notification_events,
+        ) if userinfo_defaults else {}
+
+        # Caller's explicit tags merge over the auto-derived tag set
+        # (the auto values fill in the keys the caller left out).
+        derived_tags = derived.pop("tags", None)
+        merged_tags: Optional[dict[str, str]]
+        if derived_tags and tags:
+            merged_tags = {**derived_tags, **tags}
+        else:
+            merged_tags = tags or derived_tags
+
+        # Caller-supplied settings win over derived defaults.
+        merged_settings = {**derived, **settings}
+
+        return self.create(
+            name=name,
+            tasks=tasks,
+            permissions=permissions,
+            tags=merged_tags,
+            **merged_settings,
+        )
+
     def get_or_create(
         self,
         job_id: int | None = None,
