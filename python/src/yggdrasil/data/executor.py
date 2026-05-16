@@ -190,8 +190,20 @@ class StatementExecutor(Disposable, ABC, Generic[PS, SR, SB]):
     # -------------------------------------------------------------------------
 
     def submit_statement(self, statement: PS, start: bool = True) -> SR:
-        """Submit a statement and return a tracking result."""
+        """Submit a statement and return a tracking result.
+
+        Ensures the returned :class:`StatementResult` is bound to this
+        executor — every subclass `_submit_statement` is supposed to
+        thread ``executor=self`` through the constructor, but that's
+        easy to forget and downstream code (``StatementResult.wait``,
+        ``retry``, ``raise_for_status``) needs the back-reference to
+        drive the lifecycle. Setting it here when it's missing makes
+        the contract enforceable from one place instead of audited per
+        backend.
+        """
         result = self._submit_statement(statement, start=start)
+        if getattr(result, "executor", None) is None:
+            result.executor = self
         return result
 
     @abstractmethod
