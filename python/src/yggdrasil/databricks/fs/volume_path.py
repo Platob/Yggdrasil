@@ -41,6 +41,7 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional, Tuple
 
 from databricks.sdk.errors import PermissionDenied
@@ -744,7 +745,11 @@ class VolumePath(DatabricksPath):
         self.invalidate_singleton()
 
     def _remove_dir(
-        self, recursive: bool, missing_ok: bool, wait: WaitingConfig,
+        self,
+        recursive: bool,
+        missing_ok: bool,
+        wait: WaitingConfig,
+        pool: "int | ThreadPoolExecutor | None" = None,
     ) -> None:
         logger.info(
             "Deleting volume directory %r (recursive=%s)",
@@ -756,16 +761,42 @@ class VolumePath(DatabricksPath):
         # ``BadRequest: The directory is not empty.`` So when the
         # caller asks for ``recursive=True`` we list + delete contents
         # ourselves, then drop the now-empty directory.
+        #
+        # File deletions for a given directory are fanned out to a
+        # ``ThreadPoolExecutor`` (default 4 workers); the executor is
+        # forwarded through recursive ``_remove_dir`` calls so the
+        # whole subtree shares one pool. Subdirectory recursion stays
+        # synchronous on the caller thread — submitting recursive
+        # calls back onto the same pool would deadlock once every
+        # worker is blocked waiting on its own children.
         if recursive:
-            for child in self._ls(recursive=False):
-                cached = child._stat_cached
-                is_dir = cached is not None and cached.kind is IOKind.DIRECTORY
-                if is_dir:
-                    child._remove_dir(
-                        recursive=True, missing_ok=missing_ok, wait=wait,
-                    )
-                else:
-                    child._remove_file(missing_ok=missing_ok, wait=wait)
+            owns_pool = not isinstance(pool, ThreadPoolExecutor)
+            if owns_pool:
+                executor = ThreadPoolExecutor(
+                    max_workers=pool if isinstance(pool, int) else 4,
+                    thread_name_prefix="volume-rmdir",
+                )
+            else:
+                executor = pool
+            try:
+                file_futures = []
+                for child in self._ls(recursive=False):
+                    cached = child._stat_cached
+                    is_dir = cached is not None and cached.kind is IOKind.DIRECTORY
+                    if is_dir:
+                        child._remove_dir(
+                            recursive=True, missing_ok=missing_ok,
+                            wait=wait, pool=executor,
+                        )
+                    else:
+                        file_futures.append(executor.submit(
+                            child._remove_file, missing_ok=missing_ok, wait=wait,
+                        ))
+                for fut in file_futures:
+                    fut.result()
+            finally:
+                if owns_pool:
+                    executor.shutdown(wait=True)
 
         if logger.isEnabledFor(logging.INFO):
             logger.info(
