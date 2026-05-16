@@ -494,6 +494,11 @@ class TestArrowFilesystem:
         assert p.arrow_uri == "my-bucket/path/to/file.parquet"
 
     def test_arrow_filesystem_returns_pyarrow_s3fs(self) -> None:
+        # Building a real AWSClient pulls in boto3 — skip when the
+        # optional dep is missing instead of letting the install probe
+        # hit the network.
+        pytest.importorskip("boto3")
+
         import pyarrow.fs as pafs
         from yggdrasil.aws.client import AWSClient
         from yggdrasil.aws.config import AWSConfig

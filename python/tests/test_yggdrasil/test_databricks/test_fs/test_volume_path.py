@@ -1011,6 +1011,11 @@ class TestStoragePath:
 class TestVolumeArrowFilesystem:
 
     def test_builds_pyarrow_s3_filesystem(self, workspace, client) -> None:
+        # The credential snapshot path imports boto3 — skip cleanly
+        # when the optional dep is missing instead of letting the
+        # install probe hit the network.
+        pytest.importorskip("boto3")
+
         import pyarrow.fs as pafs
         workspace.volumes.read.return_value = _volume_info(
             storage_location="s3://bkt/u/c/s/v",
@@ -1054,6 +1059,8 @@ class TestS3ServiceArrowFilesystem:
         # credentials snapshot from the boto session and hand it to
         # pyarrow's S3FileSystem. We patch out the actual
         # construction so the test doesn't touch the network.
+        pytest.importorskip("boto3")
+
         import pyarrow.fs as pafs
         from yggdrasil.aws.client import AWSClient
         from yggdrasil.aws.config import AWSConfig
@@ -1071,6 +1078,8 @@ class TestS3ServiceArrowFilesystem:
         assert isinstance(fs, pafs.S3FileSystem)
 
     def test_region_override(self) -> None:
+        pytest.importorskip("boto3")
+
         import pyarrow.fs as pafs
         from yggdrasil.aws.client import AWSClient
         from yggdrasil.aws.config import AWSConfig
