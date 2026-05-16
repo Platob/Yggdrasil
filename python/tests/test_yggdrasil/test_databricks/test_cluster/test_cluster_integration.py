@@ -44,9 +44,12 @@ from yggdrasil.databricks.cluster import (
     Cluster,
     ClusterPreparedStatement,
     ClusterStatementExecutor,
+    ServerlessCluster,
+    ServerlessClusterStatementExecutor,
 )
 from yggdrasil.databricks.volume.volume import Volume
 from yggdrasil.io.url import URLBased
+from yggdrasil.spark.statement import SparkPreparedStatement
 
 from .. import DatabricksIntegrationCase
 
@@ -54,6 +57,7 @@ from .. import DatabricksIntegrationCase
 __all__ = [
     "TestClusterURLIntegration",
     "TestClusterStatementExecutorIntegration",
+    "TestServerlessClusterStatementExecutorIntegration",
 ]
 
 
@@ -82,32 +86,33 @@ class _ClusterIntegrationBase(DatabricksIntegrationCase):
         cluster_name = os.environ.get(
             "DATABRICKS_INTEGRATION_CLUSTER_NAME", "",
         ).strip()
-        if not cluster_id and not cluster_name:
-            raise unittest.SkipTest(
-                "DATABRICKS_INTEGRATION_CLUSTER_ID / "
-                "DATABRICKS_INTEGRATION_CLUSTER_NAME unset — set one of "
-                "them to an all-purpose cluster the test identity can "
-                "attach to."
-            )
 
-        # ``find_cluster`` does the SDK round-trip; if the cluster is
-        # gone or the test identity can't reach it, skip rather than
-        # fail (the suite-level signal is "no live cluster", not
-        # "cluster is broken").
-        try:
-            cls.cluster = cls.client.compute.clusters.find_cluster(
-                cluster_id=cluster_id or None,
-                cluster_name=cluster_name or None,
-                raise_error=True,
-            )
-        except (DatabricksError, ValueError) as exc:
-            raise unittest.SkipTest(
-                f"Cannot reach integration cluster "
-                f"(id={cluster_id!r}, name={cluster_name!r}): {exc}",
-            ) from exc
+        if cluster_id or cluster_name:
+            # ``find_cluster`` does the SDK round-trip; if the cluster is
+            # gone or the test identity can't reach it, skip rather than
+            # fail (the suite-level signal is "no live cluster", not
+            # "cluster is broken").
+            try:
+                cls.cluster = cls.client.compute.clusters.find_cluster(
+                    cluster_id=cluster_id or None,
+                    cluster_name=cluster_name or None,
+                    raise_error=True,
+                )
+            except (DatabricksError, ValueError) as exc:
+                raise unittest.SkipTest(
+                    f"Cannot reach integration cluster "
+                    f"(id={cluster_id!r}, name={cluster_name!r}): {exc}",
+                ) from exc
+        else:
+            # No classic cluster pinned — fall back to serverless. The
+            # bare client already auto-defaults ``serverless_compute_id``
+            # to ``"auto"``, and ``Cluster.__new__`` redirects to
+            # :class:`ServerlessCluster` so the returned handle carries
+            # the serverless-specific lifecycle overrides.
+            cls.cluster = Cluster(service=cls.client.compute.clusters)
 
         # Bring the cluster up if needed — REPL command-execution
-        # requires a RUNNING state.
+        # requires a RUNNING state. Serverless ``start`` is a no-op.
         cls.cluster.start(wait=True)
 
         # Each test class gets its own short-lived volume so a partial
@@ -169,7 +174,25 @@ class TestClusterURLIntegration(DatabricksIntegrationCase):
 
 
 class TestClusterStatementExecutorIntegration(_ClusterIntegrationBase):
-    """End-to-end SQL flow through :class:`ClusterStatementExecutor`."""
+    """End-to-end SQL flow through :class:`ClusterStatementExecutor`.
+
+    Skipped when the resolved cluster is serverless — serverless
+    compute doesn't expose the REPL ``CommandExecution`` API that
+    backs this executor (see
+    :class:`TestServerlessClusterStatementExecutorIntegration` for
+    the Spark-Connect counterpart)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        if isinstance(cls.cluster, ServerlessCluster):
+            raise unittest.SkipTest(
+                "Resolved cluster is serverless — the classic "
+                "ClusterStatementExecutor path is exercised by the "
+                "all-purpose-cluster integration suite (set "
+                "DATABRICKS_INTEGRATION_CLUSTER_ID / "
+                "DATABRICKS_INTEGRATION_CLUSTER_NAME to opt in)."
+            )
 
     def test_non_select_runs_through_cluster_command(self):
         # Smallest possible non-SELECT — a no-op DDL that doesn't
@@ -264,3 +287,51 @@ class TestClusterStatementExecutorIntegration(_ClusterIntegrationBase):
         ctx_a = first.command.context.context_id
         ctx_b = second.command.context.context_id
         self.assertEqual(ctx_a, ctx_b)
+
+
+class TestServerlessClusterStatementExecutorIntegration(_ClusterIntegrationBase):
+    """SQL flow through :class:`ServerlessClusterStatementExecutor`.
+
+    Skipped when the resolved cluster is a classic all-purpose
+    cluster — the REPL-backed path is exercised by
+    :class:`TestClusterStatementExecutorIntegration`. Runs end-to-end
+    only when ``DATABRICKS_INTEGRATION_CLUSTER_ID`` /
+    ``..._CLUSTER_NAME`` are unset (or point at a serverless handle)
+    so the fixture falls back to serverless via
+    :meth:`Cluster.__new__`'s redirect."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        if not isinstance(cls.cluster, ServerlessCluster):
+            raise unittest.SkipTest(
+                "Resolved cluster is classic — the serverless "
+                "Spark-Connect executor only applies when the bound "
+                "client targets serverless compute (the default with "
+                "no DATABRICKS_INTEGRATION_CLUSTER_ID / _NAME)."
+            )
+
+    def test_non_select_runs_through_spark_session(self):
+        executor = ServerlessClusterStatementExecutor(self.cluster, self.volume)
+        stmt = SparkPreparedStatement("SET spark.sql.ansi.enabled = true")
+
+        result = executor.execute(stmt, wait=True, raise_error=True)
+        self.assertTrue(result.done)
+        self.assertFalse(result.failed)
+
+    def test_select_returns_rows_through_spark_connect(self):
+        executor = ServerlessClusterStatementExecutor(self.cluster, self.volume)
+        stmt = SparkPreparedStatement(
+            "SELECT id, CAST(id * 10 AS BIGINT) AS ten_id FROM range(5)",
+        )
+
+        result = executor.execute(stmt, wait=True, raise_error=True)
+        self.assertTrue(result.done)
+        self.assertFalse(result.failed)
+
+        # Spark Connect streams rows back directly — no staging path.
+        table = result.read_arrow_table()
+        self.assertEqual(table.num_rows, 5)
+        self.assertEqual(
+            sorted(table.column_names), ["id", "ten_id"],
+        )

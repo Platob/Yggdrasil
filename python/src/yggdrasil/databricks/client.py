@@ -339,6 +339,16 @@ class DatabricksClient(Singleton, URLBased):
         if resolved["account_id"] and not resolved["host"]:
             resolved["host"] = "https://accounts.cloud.databricks.com"
 
+        # Default to serverless compute when the caller pinned no
+        # classic cluster and didn't already opt into a specific
+        # serverless pool. Setting it here (rather than inside
+        # ``_make_base_config``) bakes the choice into the field
+        # value AND the singleton cache key, so ``client.serverless_compute_id``
+        # reads ``"auto"`` immediately after construction and two
+        # bare clients collapse onto the same instance.
+        if not resolved["cluster_id"] and not resolved["serverless_compute_id"]:
+            resolved["serverless_compute_id"] = "auto"
+
         resolved["host"] = _normalize_host(resolved["host"])
         return resolved
 
@@ -800,9 +810,6 @@ class DatabricksClient(Singleton, URLBased):
                 self.account_id = self.get_account_id()
         else:
             host = self.host
-
-        if not self.cluster_id and not self.serverless_compute_id:
-            self.serverless_compute_id = "auto"
 
         try:
             config = Config(
@@ -1526,13 +1533,11 @@ class DatabricksClient(Singleton, URLBased):
     def is_serverless_compute(self) -> bool:
         """True when this client targets serverless compute.
 
-        A bare client with no ``cluster_id`` always lands on
-        serverless once ``make_config`` flips
-        ``serverless_compute_id`` to ``"auto"``; setting
-        ``cluster_id`` explicitly opts back into the classic
-        compute path. Mirrors the same rule
-        ``_make_base_config`` applies before handing the config
-        off to the SDK.
+        A bare client with no ``cluster_id`` lands on serverless
+        because :meth:`_resolve_init_kwargs` defaults
+        ``serverless_compute_id`` to ``"auto"`` at construction
+        time; setting ``cluster_id`` explicitly opts back into
+        the classic compute path.
         """
         return bool(self.serverless_compute_id) or not self.cluster_id
 

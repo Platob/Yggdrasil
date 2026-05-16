@@ -14,6 +14,7 @@ cluster-driven SQL path.
 
 from .cluster import Cluster
 from .serverless import ServerlessCluster
+from .serverless_executor import ServerlessClusterStatementExecutor
 from .service import Clusters, PYTHON_BY_DBR
 from .statement import ClusterPreparedStatement, ClusterStatementBatch, ClusterStatementResult
 from .statement_executor import ClusterStatementExecutor
@@ -27,4 +28,5 @@ __all__ = [
     "ClusterStatementResult",
     "PYTHON_BY_DBR",
     "ServerlessCluster",
+    "ServerlessClusterStatementExecutor",
 ]

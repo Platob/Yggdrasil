@@ -175,6 +175,50 @@ class Cluster(Singleton, DatabricksResource, URLBased):
     ) -> Any:
         return (cls, service, cluster_id, cluster_name)
 
+    def __new__(
+        cls,
+        service: "Clusters | None" = None,
+        cluster_id: str | None = None,
+        cluster_name: str | None = None,
+        **kwargs: Any,
+    ) -> "Cluster":
+        # When the caller asks for a bare ``Cluster`` against a
+        # serverless-configured client (no classic ``cluster_id`` /
+        # ``cluster_name`` pinned), promote the construction to
+        # :class:`ServerlessCluster` so the returned handle carries
+        # the serverless-specific lifecycle overrides (no-op
+        # ``start`` / ``restart``, library-install rejection,
+        # ``dbks+serverless-cluster://`` URL scheme). Only consults a
+        # service that the caller actually handed us — building one
+        # from ``Clusters.current()`` here would force a
+        # ``DatabricksClient.current()`` round-trip on every
+        # construction, which the bare ``Cluster(cluster_id="...")``
+        # shape neither needs nor expects.
+        if (
+            cls is Cluster
+            and not cluster_id
+            and not cluster_name
+            and service is not None
+        ):
+            client = getattr(service, "client", None)
+            serverless_id = getattr(client, "serverless_compute_id", None)
+            if serverless_id:
+                from .serverless import ServerlessCluster
+                return ServerlessCluster.__new__(
+                    ServerlessCluster,
+                    service=service,
+                    cluster_id=serverless_id,
+                    cluster_name=cluster_name,
+                    **kwargs,
+                )
+        return super().__new__(
+            cls,
+            service=service,
+            cluster_id=cluster_id,
+            cluster_name=cluster_name,
+            **kwargs,
+        )
+
     def __init__(
         self,
         service: Clusters | None = None,
@@ -199,6 +243,18 @@ class Cluster(Singleton, DatabricksResource, URLBased):
         self._details = details
         self._details_refresh_time = details_refresh_time
         self._contexts = contexts or {}
+
+        # ``__new__`` may have promoted this instance to
+        # :class:`ServerlessCluster` because the bound client targets
+        # serverless compute. ``__init__`` is still called with the
+        # original (bare) kwargs, so fill ``cluster_id`` from the
+        # client's ``serverless_compute_id`` here — the serverless
+        # cluster id IS the workspace's serverless pool handle.
+        if not self.cluster_id and not self.cluster_name:
+            client = getattr(self.service, "client", None)
+            serverless_id = getattr(client, "serverless_compute_id", None)
+            if serverless_id:
+                self.cluster_id = serverless_id
 
         if self.cluster_name and not self.cluster_id:
             found = self.service.find_cluster(
