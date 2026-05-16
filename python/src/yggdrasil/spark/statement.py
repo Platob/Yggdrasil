@@ -149,7 +149,7 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
         mapping is purely local-state.
         """
         if not self._started:
-            return State.PENDING
+            return State.IDLE
         if self._failure is not None:
             return State.FAILED
         return State.SUCCEEDED

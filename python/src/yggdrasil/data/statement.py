@@ -790,8 +790,27 @@ class StatementBatch(Tabular, Generic[PS, SR]):
         return stmt.key
 
     def extend(self, statements: Iterable["PS | str"]) -> list[str]:
-        """Enqueue multiple; return the list of assigned keys."""
-        return [self.add(s) for s in statements]
+        """Enqueue multiple; return the list of assigned keys.
+
+        Inlined over :meth:`add` to hoist the ``self.executor`` /
+        ``_PREPARED_STATEMENT_CLASS`` / ``submit_statement`` lookups
+        out of the per-item loop. The auto-key path skips ``add``'s
+        collision check — :meth:`PreparedStatement.__init__` already
+        mints a fresh key per statement, so no duplicates are possible
+        from the auto-keyed path. Callers needing explicit keys still
+        route through :meth:`add`.
+        """
+        executor = self.executor
+        prepared_cls = executor._PREPARED_STATEMENT_CLASS
+        submit = executor.submit_statement
+        results = self.results
+        keys: list[str] = []
+        append = keys.append
+        for statement in statements:
+            prepared = prepared_cls.from_(statement)
+            results[prepared.key] = submit(prepared, start=True)
+            append(prepared.key)
+        return keys
 
     def remove(self, key: str) -> Optional[SR]:
         """Remove an entry by key.
@@ -873,6 +892,14 @@ class StatementBatch(Tabular, Generic[PS, SR]):
         then ``wait()`` without an intermediate ``submit()``.  When
         ``parallel > 1`` the per-result waits run on a thread pool — each
         :meth:`StatementResult.wait` is I/O-bound polling.
+
+        Per-result scratch (:meth:`StatementResult.clear_temporary_resources`)
+        fires from inside :meth:`StatementResult.wait` on success — we
+        don't re-sweep here because the cleanup is idempotent and the
+        re-walk is pure overhead. Batch-wide scratch (e.g. warehouse-
+        level :attr:`external_volume_paths`) stays under the typed
+        :meth:`clear_temporary_resources` override on the subclass and
+        runs when the caller closes / drops the batch.
         """
         if not self.results:
             return self
@@ -894,9 +921,6 @@ class StatementBatch(Tabular, Generic[PS, SR]):
             for result in self.results.values():
                 result.wait(wait=wait, raise_error=raise_error)
 
-        for key, result in self.results.items():
-            if not result.failed:
-                _safe(result.clear_temporary_resources, "clear_temporary_resources", key)
         return self
 
     def retry(

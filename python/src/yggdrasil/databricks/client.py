@@ -19,6 +19,7 @@ from yggdrasil.version import __version__ as ygg_version
 
 if TYPE_CHECKING:
     from .iam import IAM
+    from .jobs.service import Jobs
     from .sql.engine import SQLEngine
     from .table.tables import Tables
     from .column.columns import Columns
@@ -275,6 +276,7 @@ class DatabricksClient(Singleton, URLBased):
         "_workspace", "_sql", "_entity_tags", "_warehouses", "_compute",
         "_secrets", "_iam", "_tables", "_columns_svc",
         "_catalogs", "_schemas", "_volumes", "_genie", "_filesystem",
+        "_jobs",
     })
 
     # Config attributes worth snapshotting for warm restart on another host.
@@ -1466,6 +1468,17 @@ class DatabricksClient(Singleton, URLBased):
         from .volume.volumes import Volumes
         cached = Volumes(client=self)
         self.__dict__["_volumes"] = cached
+        return cached
+
+    @property
+    def jobs(self) -> "Jobs":
+        """Collection-level Databricks Jobs service for this client."""
+        cached = self.__dict__.get("_jobs")
+        if cached is not None:
+            return cached
+        from .jobs.service import Jobs
+        cached = Jobs(client=self)
+        self.__dict__["_jobs"] = cached
         return cached
 
     @property

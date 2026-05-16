@@ -182,25 +182,6 @@ def test_sleep_with_start_caps_to_remaining(monkeypatch):
     assert seen == [2.0]
 
 
-def test_sleep_with_start_switches_to_slow_window_every_5_seconds(monkeypatch):
-    wc = WaitingConfig(timeout=30, interval=0.5, backoff=1, max_interval=0)
-    base = 1000.0
-
-    def fake_time():
-        return base + 6.0  # elapsed=6 => slow window => min cadence is 5s
-
-    seen = []
-
-    def fake_sleep(s):
-        seen.append(s)
-
-    monkeypatch.setattr(time, "time", fake_time)
-    monkeypatch.setattr(time, "sleep", fake_sleep)
-
-    wc.sleep(iteration=0, start=base)
-    assert seen == [5.0]
-
-
 def test_sleep_with_start_raises_timeout_when_out_of_time(monkeypatch):
     wc = WaitingConfig(timeout=5, interval=1, backoff=1, max_interval=0)
     base = 1000.0

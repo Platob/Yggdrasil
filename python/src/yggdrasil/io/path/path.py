@@ -257,7 +257,20 @@ class Path(Holder, os.PathLike, ABC):
         return self
 
     def unlink(self, missing_ok: bool = True, wait: WaitingConfigArg = True) -> None:
-        return self.remove(missing_ok=missing_ok, wait=wait)
+        """Remove the leaf — pathlib-compatible: refuses directories.
+
+        Mirrors :meth:`pathlib.Path.unlink`: succeeds for files,
+        raises :class:`IsADirectoryError` for directories so callers
+        don't accidentally recursive-delete via ``unlink``. Use
+        :meth:`remove` for the directory case.
+        """
+        kind = self._stat().kind
+        if kind == IOKind.DIRECTORY:
+            raise IsADirectoryError(
+                f"{self.full_path()!r} is a directory — use ``remove()`` "
+                "for the recursive-delete path; ``unlink`` is files-only."
+            )
+        return self.remove(missing_ok=missing_ok, wait=wait, recursive=False)
 
     def remove(
         self,
@@ -318,8 +331,16 @@ class Path(Holder, os.PathLike, ABC):
             raise ValueError(f"is_empty: unknown kind {kind!r}")
 
     def touch(self) -> "Path":
+        """Create the path as an empty file if it doesn't exist.
+
+        ``write_bytes(b"")`` short-circuits in the holder fast path
+        (zero bytes, no flush), which would leave a missing file behind
+        — open + close around the empty write so the holder actually
+        materialises the entry on the backing store.
+        """
         if not self.exists():
-            self.write_bytes(b"")
+            with self:
+                self.write_bytes(b"")
         return self
 
     # ==================================================================

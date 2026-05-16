@@ -47,11 +47,12 @@ Filesystem surface
 from __future__ import annotations
 
 import time
+from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterator, Optional
 
 from yggdrasil.data.enums import Scheme
 from yggdrasil.data.enums.media_type import MediaType
-from yggdrasil.dataclasses import WaitingConfig
+from yggdrasil.dataclasses import ExpiringDict, Singleton, WaitingConfig
 from yggdrasil.io.path import RemotePath
 from yggdrasil.io.path._retry import retry_sdk_call
 from yggdrasil.io.io_stats import IOStats, IOKind
@@ -69,7 +70,7 @@ __all__ = ["S3Path"]
 # ---------------------------------------------------------------------------
 
 
-class S3Path(RemotePath):
+class S3Path(Singleton, RemotePath):
     """:class:`Path` over an S3 bucket via a boto3-shaped client.
 
     Construction shapes::
@@ -84,14 +85,85 @@ class S3Path(RemotePath):
     ``list_objects_v2``, ``get_paginator``. Tests use
     :class:`unittest.mock.Mock`; production code passes the boto
     client owned by :class:`S3Service`.
-    """
 
-    __slots__ = ("_client", "_retry_sleep")
+    Inherits :class:`Singleton` with a 5-minute default TTL on every
+    constructed instance: two callers asking for the same
+    ``(s3://bucket/key, client)`` pair inside that window share the
+    live :class:`Holder` — same cached ``IOStats`` from
+    :meth:`_stat`, same retry-sleep injection, same lazily-bound boto
+    client — without growing an unbounded cache over the process
+    lifetime. ``iterdir``-style hot loops naturally age out their
+    entries; long-lived consumers that want stronger sharing pass
+    ``singleton_ttl=None`` for process-lifetime caching. The cache
+    is bounded at 10 000 entries as defence-in-depth against
+    accidental cardinality explosions, and the matching
+    ``stat_cache_ttl`` (also 300s) means a hot read after a hot
+    write rides one ``HeadObject`` no matter how many call sites
+    request the same key.
+
+    Mutating ops (``put_object`` / ``DeleteObject`` /
+    ``DeleteObjects``) call :meth:`_invalidate_stat_cache` before
+    returning so two consumers sharing the singleton see consistent
+    metadata after a write.
+    """
 
     scheme: ClassVar[Scheme] = Scheme.S3
 
     #: URL schemes accepted on input; always normalized to ``s3``.
     _ACCEPTED_SCHEMES: ClassVar[frozenset[str]] = frozenset({"s3", "s3a", "s3n"})
+
+    # Bounded singleton cache with a 5-minute default TTL — keeps
+    # ``iterdir``-style transient paths from leaking, while still
+    # collapsing repeat lookups within the window onto one instance.
+    _SINGLETON_TTL: ClassVar[Any] = 300.0
+    _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
+        default_ttl=300.0, max_size=10_000,
+    )
+    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
+
+    # Stat cache + lazy retry hook are the only non-picklable / per-
+    # process slots; everything else lives in the ``__dict__`` the
+    # parent ``RemotePath`` already provides.
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
+        "_stat_cached", "_stat_cached_at",
+    })
+
+    # ==================================================================
+    # Singleton key
+    # ==================================================================
+
+    @classmethod
+    def _singleton_key(
+        cls,
+        data: Any = None,
+        *,
+        url: URL | None = None,
+        client: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Identity = ``(cls, canonical s3 URL, client)``.
+
+        ``data`` collapses into ``url`` before keying so the string
+        ``"s3://b/k"`` and the equivalent :class:`URL` map to the
+        same singleton. ``client`` is part of the key because two
+        callers binding the same URL to different boto clients
+        (cross-account access, separate test fixtures) must NOT
+        collide — passing ``client=None`` collapses to the lazy-
+        resolved :class:`S3Service` singleton, so production callers
+        share one instance per URL without paying the singleton key
+        for explicit clients.
+        """
+        if url is None and isinstance(data, URL):
+            url = data
+        elif url is None and isinstance(data, str):
+            url = URL.from_(data)
+        if url is None:
+            # No URL → no canonical identity. Fall back to a unique
+            # sentinel so the Singleton machinery doesn't collide
+            # unrelated paths.
+            return (cls, object())
+        normalized = cls._normalize_scheme(URL.from_(url))
+        return (cls, str(normalized), client)
 
     # ==================================================================
     # Construction
@@ -105,8 +177,18 @@ class S3Path(RemotePath):
         client: "BaseClient | Any | None" = None,
         temporary: bool = False,
         retry_sleep: Optional[Callable[[float], None]] = None,
+        singleton_ttl: Any = ...,
         **kwargs: Any,
     ) -> None:
+        # ``singleton_ttl`` is consumed by :meth:`Singleton.__new__`;
+        # accept it here so the constructor signature stays open. The
+        # singleton-cached re-init guard mirrors ``DatabricksPath`` —
+        # the second constructor call collapses onto the live
+        # instance, preserving the bound boto client + warm stat cache.
+        del singleton_ttl
+        if getattr(self, "_initialized", False):
+            return
+
         if url is None and isinstance(data, str):
             url = URL.from_(data)
             data = None
@@ -123,6 +205,7 @@ class S3Path(RemotePath):
         # spy / no-op so retry behavior is observable without burning
         # wall-clock seconds.
         self._retry_sleep: Optional[Callable[[float], None]] = retry_sleep
+        self._initialized = True
 
     @classmethod
     def _normalize_scheme(cls, url: URL) -> URL:
