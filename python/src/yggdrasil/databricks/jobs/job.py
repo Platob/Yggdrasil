@@ -376,12 +376,12 @@ class Job(Singleton, DatabricksResource):
             @job.task(task_key="custom", existing_cluster_id="c-123")
             def do2(x: int): ...
 
-        Internally calls :meth:`JobTask.from_callable` to pickle the
-        function under the user's workspace, then
-        :meth:`JobTask.create_or_update` to push the task into the
-        job's settings — re-decorating the same function during
-        development replaces the previous entry in place instead of
-        raising. Any extra ``task_fields`` are layered onto the
+        Internally calls :meth:`JobTask.from_callable` to stage the
+        function's raw source as a ``.py`` script under the user's
+        workspace, then :meth:`JobTask.create_or_update` to push the
+        task into the job's settings — re-decorating the same function
+        during development replaces the previous entry in place instead
+        of raising. Any extra ``task_fields`` are layered onto the
         resulting :class:`databricks.sdk.service.jobs.Task` via
         :func:`dataclasses.replace` before submission — useful for
         attaching compute (``new_cluster=`` / ``existing_cluster_id=``

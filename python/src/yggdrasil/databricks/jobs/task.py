@@ -6,16 +6,19 @@ the parent job's settings. :class:`JobTask` round-trips every CRUD
 operation through :meth:`Job.update` so the parent's task list stays
 the source of truth.
 
-For Python callables, :meth:`JobTask.from_callable` pickles the bound
-``(func, args, kwargs)`` triple via :mod:`yggdrasil.pickle.dill`, drops
-the pickle + a tiny runner script under the user's personal workspace
-(``/Workspace/Users/<me>/.yggdrasil/jobs/``), and wraps the pair in a
-:class:`SparkPythonTask`. :meth:`Job.task` is the decorator form.
+For Python callables, :meth:`JobTask.from_callable` extracts the raw
+source via :func:`inspect.getsource`, drops a self-contained ``.py``
+script under the user's personal workspace
+(``/Workspace/Users/me/.yggdrasil/jobs/``), and wraps it in a
+:class:`SparkPythonTask`. No pickling — the source is what runs.
+:meth:`Job.task` is the decorator form.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import secrets
+import textwrap
 from dataclasses import replace as _dc_replace
 from typing import Any, Callable, List, Optional, TYPE_CHECKING
 
@@ -29,33 +32,9 @@ __all__ = ["JobTask", "DEFAULT_STAGING_ROOT"]
 
 LOGGER = logging.getLogger(__name__)
 
-#: Default staging area for :meth:`JobTask.from_callable`. The ``<me>``
-#: segment is resolved by :class:`WorkspacePath` to the bound user's
-#: workspace home so the same constant works across environments.
-DEFAULT_STAGING_ROOT = "/Workspace/Users/<me>/.yggdrasil/jobs"
-
-# Runner script staged alongside the pickle. Reads the pickle path from
-# argv[1] (Databricks passes ``SparkPythonTask.parameters`` as argv tail)
-# and calls the captured callable. Kept self-contained so the only
-# yggdrasil dependency at run time is ``yggdrasil.pickle.dill``.
-_RUNNER_SCRIPT = (
-    b'"""yggdrasil JobTask runner. Loads a pickled (func, args, kwargs) '
-    b'triple from sys.argv[1] and invokes it."""\n'
-    b"import sys\n"
-    b"from yggdrasil.pickle import dill\n"
-    b"\n"
-    b"def main() -> None:\n"
-    b"    if len(sys.argv) < 2:\n"
-    b'        raise SystemExit("usage: runner.py <pickle_path>")\n'
-    b'    with open(sys.argv[1], "rb") as f:\n'
-    b"        func, args, kwargs = dill.loads(f.read())\n"
-    b"    result = func(*args, **kwargs)\n"
-    b"    if result is not None:\n"
-    b"        print(result)\n"
-    b"\n"
-    b'if __name__ == "__main__":\n'
-    b"    main()\n"
-)
+#: Default staging area for :meth:`JobTask.from_callable`. Lands under
+#: the bound user's workspace home.
+DEFAULT_STAGING_ROOT = "/Workspace/Users/me/.yggdrasil/jobs"
 
 
 class JobTask:
@@ -214,39 +193,52 @@ class JobTask:
         staging_root: str = DEFAULT_STAGING_ROOT,
         **kwargs: Any,
     ) -> "JobTask":
-        """Pickle *func* + bound *args*/*kwargs* and wrap as a Task.
+        """Stage *func*'s source + bound *args*/*kwargs* as a Python script.
 
-        Pickling goes through :mod:`yggdrasil.pickle.dill` so closures,
-        lambdas, and bound methods round-trip. The pickle and a small
-        runner script land under *staging_root* (default:
-        ``/Workspace/Users/<me>/.yggdrasil/jobs/<task_key>-<rand>``)
-        on the bound user's workspace.
+        Extracts the source via :func:`inspect.getsource`, strips any
+        decorator lines (the runner side has no ``@job.task`` in scope),
+        appends an invocation that passes *args* / *kwargs* as Python
+        literals, and writes the result to a single ``.py`` file under
+        *staging_root* (default:
+        ``/Workspace/Users/me/.yggdrasil/jobs/<task_key>-<rand>.py``).
+        No pickling involved — the script Databricks runs is the exact
+        source of the function.
 
-        The returned :class:`JobTask` is **not** persisted on the job
-        yet — call :meth:`create` (or decorate with :meth:`Job.task`,
-        which does it for you). Compute is also caller-owned: layer
-        ``new_cluster=`` / ``existing_cluster_id=`` / ``job_cluster_key=``
-        through :meth:`update` once the task is registered.
+        *args* / *kwargs* are rendered via :func:`repr`, so they must be
+        types whose ``repr`` round-trips through ``eval`` (built-in
+        scalars, strings, tuples / lists / dicts of the same). Pass
+        nothing at decoration time and let the function read its inputs
+        from job parameters at run time when that's not enough.
+
+        Limitations: ``inspect.getsource`` needs the function to live in
+        an importable source file (no REPL-defined lambdas) and the body
+        must be self-contained — closures, module-level globals, and
+        decorators other than ``@job.task`` are NOT carried over.
+
+        The returned :class:`JobTask` is not persisted on the job yet
+        — call :meth:`create` / :meth:`create_or_update` (or use the
+        :meth:`Job.task` decorator, which does it for you). Compute
+        stays caller-owned: layer ``new_cluster`` / ``existing_cluster_id``
+        / ``job_cluster_key`` via :meth:`update` once the task is
+        registered.
         """
-        from yggdrasil.pickle import dill
         from yggdrasil.databricks.fs.workspace_path import WorkspacePath
 
         key = task_key or func.__name__
         suffix = secrets.token_hex(4)
 
-        base = WorkspacePath(
-            f"{staging_root.rstrip('/')}/{key}-{suffix}",
+        script = _render_callable_script(func, args, kwargs)
+
+        path = WorkspacePath(
+            f"{staging_root.rstrip('/')}/{key}-{suffix}.py",
             client=job.client,
         )
-        runner_path = base.joinpath("runner.py")
-        pickle_path = base.joinpath("payload.pkl")
 
         LOGGER.debug(
-            "Staging callable %r (runner=%r, pickle=%r)",
-            func.__qualname__, runner_path, pickle_path,
+            "Staging callable %r as raw source at %r",
+            func.__qualname__, path,
         )
-        runner_path.write_bytes(_RUNNER_SCRIPT)
-        pickle_path.write_bytes(dill.dumps((func, args, kwargs)))
+        path.write_bytes(script.encode())
 
         doc = (func.__doc__ or "").strip()
         description = doc.splitlines()[0][:140] if doc else None
@@ -255,8 +247,48 @@ class JobTask:
             task_key=key,
             description=description,
             spark_python_task=SparkPythonTask(
-                python_file=runner_path.full_path(),
-                parameters=[pickle_path.full_path()],
+                python_file=path.full_path(),
             ),
         )
         return cls(job=job, task_key=key, details=details)
+
+
+def _render_callable_script(
+    func: Callable[..., Any],
+    args: tuple,
+    kwargs: dict,
+) -> str:
+    """Render *func* + bound *args* / *kwargs* as a runnable ``.py`` script.
+
+    Returns a UTF-8 ``str``; caller encodes for the workspace write.
+    """
+    try:
+        source = textwrap.dedent(inspect.getsource(func))
+    except (OSError, TypeError) as exc:  # built-ins, REPL-defined lambdas
+        raise ValueError(
+            f"Cannot stage {func!r} as a JobTask: inspect.getsource failed "
+            f"({exc!s}). from_callable needs a function defined in an "
+            "importable source file."
+        ) from exc
+
+    # Drop decorator lines preceding ``def`` — the runner has no
+    # ``@job.task`` (or any other decorator from this scope) available.
+    lines = source.splitlines()
+    while lines and lines[0].lstrip().startswith("@"):
+        lines.pop(0)
+    body = "\n".join(lines).rstrip() + "\n"
+
+    call_parts: list[str] = [repr(a) for a in args]
+    call_parts.extend(f"{k}={v!r}" for k, v in kwargs.items())
+    invocation = f"{func.__name__}({', '.join(call_parts)})"
+
+    return (
+        "# Auto-generated by yggdrasil.databricks.jobs.JobTask.from_callable.\n"
+        "# The function body below is the verbatim source of the decorated\n"
+        f"# callable {func.__qualname__!r}; invocation is appended.\n"
+        "\n"
+        f"{body}"
+        "\n"
+        'if __name__ == "__main__":\n'
+        f"    {invocation}\n"
+    )
