@@ -126,7 +126,7 @@ class Genie(DatabricksService):
 
         if conversation_id:
             LOGGER.debug(
-                "Genie.create_message space=%s conversation=%s len=%d",
+                "Creating Genie message in space %s on conversation %s (len=%d)",
                 space_id, conversation_id, len(question),
             )
             waiter = self.api.create_message(
@@ -138,7 +138,7 @@ class Genie(DatabricksService):
             resolved_conversation_id = conversation_id
         else:
             LOGGER.debug(
-                "Genie.start_conversation space=%s len=%d",
+                "Starting Genie conversation in space %s (len=%d)",
                 space_id, len(question),
             )
             waiter = self.api.start_conversation(

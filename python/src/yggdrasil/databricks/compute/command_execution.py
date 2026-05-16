@@ -270,8 +270,8 @@ class CommandExecution:
             yg_shutdown.register(self._unsafe_cancel)
         except Exception:
             LOGGER.debug(
-                "Failed to register shutdown handler for command %s",
-                self.command_id,
+                "Failed to register shutdown handler for command %r",
+                self,
                 exc_info=True,
             )
             return
@@ -294,8 +294,8 @@ class CommandExecution:
             yg_shutdown.unregister(self._unsafe_cancel)
         except Exception:
             LOGGER.debug(
-                "Failed to unregister shutdown handler for command %s",
-                self.command_id,
+                "Failed to unregister shutdown handler for command %r",
+                self,
                 exc_info=True,
             )
         finally:
@@ -405,7 +405,7 @@ class CommandExecution:
         except Exception as exc:
             if raise_error:
                 raise
-            LOGGER.debug("%s failed to cancel command %s: %s", self, command_id, exc)
+            LOGGER.debug("Failed to cancel command %r: %s", self, exc)
         finally:
             self._clear_active_command()
 
@@ -423,8 +423,8 @@ class CommandExecution:
         except BaseException:  # noqa: BLE001 — shutdown hook must not raise
             try:
                 LOGGER.debug(
-                    "Shutdown cancel of command %s failed",
-                    self.command_id,
+                    "Shutdown cancel of command %r failed",
+                    self,
                     exc_info=True,
                 )
             except Exception:
@@ -547,7 +547,7 @@ class CommandExecution:
         except BaseException:  # noqa: BLE001 — cleanup must never raise
             try:
                 LOGGER.debug(
-                    "Failed to clean up remote payload path %s (non-fatal)",
+                    "Failed to clean up remote payload at path %r (non-fatal)",
                     path,
                     exc_info=True,
                 )

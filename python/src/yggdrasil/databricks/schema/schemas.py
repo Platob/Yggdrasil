@@ -255,7 +255,7 @@ class Schemas(DatabricksService):
         uc = self.client.workspace_client().schemas
         matcher = name_matcher(name)
         logger.debug(
-            "Schemas.list: catalog=%s name_filter=%s use_cache=%s",
+            "Listing schemas in catalog %r (name_filter=%s, use_cache=%s)",
             catalog_name, name, use_cache,
         )
 
@@ -290,7 +290,7 @@ class Schemas(DatabricksService):
         Returns ``None`` on miss when ``raise_error=False``.
         """
         full_name = f"{catalog_name}.{schema_name}"
-        logger.debug("Remote fetch [Schemas.find] full_name=%s", full_name)
+        logger.debug("Fetching schema %r from remote", full_name)
         try:
             return self.client.workspace_client().schemas.get(full_name=full_name)
         except DatabricksError as exc:
@@ -333,10 +333,6 @@ class Schemas(DatabricksService):
         if cache_ttl is not None:
             cached = _SCHEMA_INFO_CACHE.get(cache_key)
             if cached is not None:
-                logger.debug(
-                    "Cache hit [Schemas.find] key=%s schema=%s.%s",
-                    cache_key, c, s,
-                )
                 sch = Schema(service=self, catalog_name=c, schema_name=s)
                 object.__setattr__(sch, "_infos", cached)
                 object.__setattr__(sch, "_infos_fetched_at", time.time())
@@ -428,13 +424,9 @@ class Schemas(DatabricksService):
             key = self._cache_key(catalog_name, schema_name)
             try:
                 del _SCHEMA_INFO_CACHE[key]
-                logger.debug(
-                    "Schemas.invalidate: evicted key=%s", key,
-                )
+                logger.debug("Evicted schema cache entry %s", key)
             except KeyError:
-                logger.debug(
-                    "Schemas.invalidate: no entry for key=%s", key,
-                )
+                logger.debug("No schema cache entry for %s — skipping", key)
 
     @classmethod
     def invalidate_all(cls) -> None:

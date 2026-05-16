@@ -205,7 +205,7 @@ class Volumes(DatabricksService):
         Returns ``None`` on miss when ``raise_error=False``.
         """
         full_name = f"{catalog_name}.{schema_name}.{volume_name}"
-        logger.debug("Remote fetch [Volumes.find] full_name=%s", full_name)
+        logger.debug("Fetching volume %s from remote", full_name)
         try:
             return self.client.workspace_client().volumes.read(full_name)
         except DatabricksError as exc:
@@ -291,7 +291,7 @@ class Volumes(DatabricksService):
 
         uc = self.client.workspace_client().volumes
         logger.debug(
-            "Volumes.list: catalog=%s schema=%s name_filter=%s",
+            "Listing volumes in %s.%s (name_filter=%s)",
             catalog_name, schema_name, name,
         )
         for info in uc.list(catalog_name=catalog_name, schema_name=schema_name):

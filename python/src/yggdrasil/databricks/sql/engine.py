@@ -416,7 +416,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
             )
             if retry is not None:
                 logger.debug(
-                    "Ignoring retry on Spark execution path — Spark statements "
+                    "Ignoring retry on Spark execution path; Spark statements "
                     "use driver-side retry, not StatementResult.retry()."
                 )
         else:
@@ -465,7 +465,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         if engine_choice == "spark":
             if retry is not None:
                 logger.debug(
-                    "Ignoring retry on Spark execution path — Spark statements "
+                    "Ignoring retry on Spark execution path; Spark statements "
                     "use driver-side retry, not StatementResult.retry()."
                 )
             return self.spark.execute_many(
@@ -799,7 +799,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         return self.table(
             location,
             catalog_name=catalog_name, schema_name=schema_name, table_name=table_name,
-        ).delete(wait=wait, raise_error=raise_error)
+        ).delete(wait=wait, missing_ok=not raise_error)
 
     def create_table(
         self,

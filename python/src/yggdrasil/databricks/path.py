@@ -41,6 +41,9 @@ from yggdrasil.io.path import RemotePath
 from yggdrasil.io.path._retry import retry_sdk_call
 from yggdrasil.io.url import URL
 
+from .resource import DatabricksResource
+from .service import DatabricksService
+
 
 if TYPE_CHECKING:
     from yggdrasil.databricks.client import DatabricksClient
@@ -247,8 +250,16 @@ def _resolve_databricks_subclass(
 # ===========================================================================
 
 
-class DatabricksPath(RemotePath):
+class DatabricksPath(DatabricksResource, RemotePath):
     """Abstract :class:`RemotePath` for Databricks namespaces.
+
+    Mutualizes the :class:`DatabricksResource` surface — ``self.service``,
+    the inherited ``client`` / ``sql`` properties, generic resource
+    pickling — with :class:`RemotePath`'s URL-keyed singleton machinery.
+    A path is a resource: it has a service, the service has a client,
+    the client routes SDK calls. Subclasses (:class:`DBFSPath`,
+    :class:`VolumePath`, :class:`WorkspacePath`) get the client/sql
+    accessors for free.
 
     Registers under :attr:`Scheme.DBFS` (the ``dbfs://`` family root)
     and acts as the dispatcher: :meth:`from_url` inspects the URL and
@@ -271,12 +282,20 @@ class DatabricksPath(RemotePath):
     #: abstract base; concrete subclasses override.
     namespace_prefix: ClassVar[Optional[str]] = None
 
+    #: :class:`DatabricksService` subclass to use as the default when
+    #: a path is constructed without an explicit ``service=`` / ``client=``.
+    #: Each concrete subclass declares its typed service
+    #: (:class:`DBFSService` / :class:`Volumes` / :class:`Workspaces`)
+    #: so ``self.service`` is always the right collection-level handle.
+    _service_class: ClassVar[type] = DatabricksService
+
     @classmethod
     def _singleton_key(
         cls,
         data: Any = None,
         *,
         url: "URL | None" = None,
+        service: Any = None,
         client: Any = None,
         **kwargs: Any,
     ) -> Any:
@@ -285,9 +304,17 @@ class DatabricksPath(RemotePath):
         ``data`` collapses into ``url`` before keying so ``"/Volumes/x"``
         and ``URL.from_("/Volumes/x")`` map to the same singleton.
         ``client`` is part of the key because the same URL can be
-        backed by different workspaces; passing ``client=None`` collapses
-        to the lazy-resolved :meth:`DatabricksClient.current`.
+        backed by different workspaces; passing ``client=None``
+        (or ``service=None``) collapses to the lazy-resolved
+        :meth:`DatabricksClient.current`. When ``service`` is given,
+        its client wins so two paths bound to different services on
+        the same client still collapse.
         """
+        if client is None and service is not None:
+            try:
+                client = service.client
+            except Exception:
+                client = None
         if url is None and isinstance(data, URL):
             url = data
         elif url is None and isinstance(data, str):
@@ -381,6 +408,7 @@ class DatabricksPath(RemotePath):
         data: Any = None,
         *,
         url: URL | None = None,
+        service: Optional[DatabricksService] = None,
         client: "DatabricksClient | None" = None,
         temporary: bool = False,
         retry_sleep: Optional[Callable[[float], None]] = None,
@@ -396,6 +424,20 @@ class DatabricksPath(RemotePath):
         del singleton_ttl
         if getattr(self, "_initialized", False):
             return
+
+        # Back-compat: callers that pass ``client=`` (the historical
+        # kwarg) get wrapped in the subclass's typed service so the
+        # rest of the path operates against ``self.service`` like
+        # every other :class:`DatabricksResource` —
+        # ``VolumePath`` → :class:`Volumes`,
+        # ``WorkspacePath`` → :class:`Workspaces`,
+        # ``DBFSPath`` → :class:`DBFSService`.
+        if service is None and client is not None:
+            service = self._service_class(client=client)
+        # No service / no client: defer to ``DatabricksResource.__init__``
+        # which calls ``<service_class>.current()`` via the kwarg below.
+        elif service is None:
+            service = self._service_class.current()
 
         # Pre-coerce ``/dbfs/...`` / ``/Volumes/...`` / ``/Workspace/...``
         # into the canonical URL form so the URL parser sees a real
@@ -424,15 +466,14 @@ class DatabricksPath(RemotePath):
                 if not url.scheme:
                     url = url.with_scheme(target_token)
 
-        super().__init__(data=data, url=url, temporary=temporary, **kwargs)
+        # ``DatabricksResource.__init__`` sets ``self.service`` (lazy
+        # default = ``DatabricksService.current()``) and forwards the
+        # rest up the MRO into :class:`Path.__init__` for stat-cache /
+        # URL-binding setup.
+        super().__init__(
+            service=service, data=data, url=url, temporary=temporary, **kwargs,
+        )
 
-        # :class:`DatabricksClient` is the single source of truth.
-        # The SDK workspace handle is always reached through
-        # ``self.client.workspace_client()`` — the path holds no bare
-        # workspace client. ``client=None`` is allowed; the path then
-        # lazy-resolves to :meth:`DatabricksClient.current` on first
-        # touch.
-        self._client: Any = client
         self._retry_sleep: Optional[Callable[[float], None]] = retry_sleep
         self._initialized = True
 
@@ -502,29 +543,19 @@ class DatabricksPath(RemotePath):
         return cls(url=URL.from_(obj), **kwargs)
 
     # ==================================================================
-    # Client binding — DatabricksClient is the single point of access
+    # Client binding — inherited from DatabricksResource
     # ==================================================================
-
-    @property
-    def client(self) -> "DatabricksClient":
-        """The bound :class:`DatabricksClient` aggregator.
-
-        Lazily resolves to :meth:`DatabricksClient.current` when none
-        was injected at construction — production callers usually let
-        this fire so the active workspace selection follows the
-        process-wide singleton. Tests inject a :class:`DatabricksClient`
-        mock at construction (typically a :class:`MagicMock` with
-        ``workspace_client.return_value`` wired to a workspace-shaped
-        mock) so this branch is a no-op.
-        """
-        if self._client is None:
-            from yggdrasil.lazy_imports import databricks_client_class
-            self._client = databricks_client_class().current()
-        return self._client
+    #
+    # ``self.client`` and ``self.sql`` come from :class:`DatabricksResource`
+    # (``self.service.client`` / ``self.client.sql``). Production callers
+    # let ``service`` default to :meth:`DatabricksService.current` and
+    # the active workspace selection follows the process-wide singleton.
+    # Tests inject a :class:`DatabricksClient` mock at construction so
+    # ``service.client`` returns the mock directly.
 
     def with_client(self, client: "DatabricksClient") -> "DatabricksPath":
-        """Replace the bound :class:`DatabricksClient`. Returns *self*."""
-        self._client = client
+        """Rebind to *client* by rebuilding the resource service. Returns *self*."""
+        self.service = self._service_class(client=client)
         return self
 
     @property
@@ -595,9 +626,30 @@ class DatabricksPath(RemotePath):
     def _from_url(self, url: URL) -> "DatabricksPath":
         return type(self)(
             url=url,
-            client=self._client,
+            service=self.service,
             retry_sleep=self._retry_sleep,
         )
+
+    # ==================================================================
+    # Pickling — Singleton-style, filtering transient stat-cache slots
+    # ==================================================================
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Bypass :class:`DatabricksResource`'s non-filtering version so
+        # ``_stat_cached`` / ``_stat_cached_at`` (declared in
+        # ``Path._TRANSIENT_STATE_ATTRS``) actually stay out of the
+        # payload — same convention :class:`Singleton` enforces.
+        return {
+            k: v for k, v in self.__dict__.items()
+            if k not in self._TRANSIENT_STATE_ATTRS
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        if getattr(self, "_initialized", False):
+            return
+        self.__dict__.update(state)
+        for attr in self._TRANSIENT_STATE_ATTRS:
+            self.__dict__.setdefault(attr, None)
 
     # ==================================================================
     # Holder primitives — defaults that work without a fast path

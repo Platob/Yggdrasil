@@ -148,7 +148,7 @@ class NotebookConfig:
                 field_value = key_values.get(field_name)
                 field_type = type_hints.get(field_name, Any)
                 logger.error(
-                    "Failed to cast widget field '%s' to %s (value type=%s)",
+                    "Failed to cast widget field %r to %r (value type=%s)",
                     field_name,
                     field_type,
                     type(field_value).__name__ if field_value is not None else "NoneType",

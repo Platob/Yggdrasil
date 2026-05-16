@@ -52,7 +52,7 @@ class Column:
             f.metadata.update(metadata)
 
         logger.debug(
-            "Column.from_api: parsed %s.%s.%s.%s dtype=%s nullable=%s",
+            "Parsed column %s.%s.%s.%s (dtype=%s, nullable=%s)",
             table.catalog_name, table.schema_name, table.table_name, f.name,
             f.dtype, f.nullable,
         )
@@ -121,12 +121,12 @@ class Column:
         """
         del tag_collation
         if not tags:
-            logger.debug("Column.set_tags: no-op (no tags) on %s", self.entity_name)
+            logger.debug("Setting tags on column %r is a no-op (no tags)", self)
             return self
 
         logger.debug(
-            "Column.set_tags: column=%s keys=%s",
-            self.entity_name, list(tags.keys()),
+            "Setting tags on column %r (keys=%s)",
+            self, list(tags.keys()),
         )
         self.table.client.entity_tags.update_entity_tags(
             tags=tags,
@@ -144,8 +144,8 @@ class Column:
         """Delete column-level tag assignments by key."""
         keys = list(tag_keys)
         logger.debug(
-            "Column.unset_tags: column=%s keys=%s if_exists=%s",
-            self.entity_name, keys, if_exists,
+            "Unsetting tags on column %r (keys=%s, if_exists=%s)",
+            self, keys, if_exists,
         )
         self.table.client.entity_tags.delete_entity_tags(
             entity_type="columns",
@@ -162,14 +162,14 @@ class Column:
             raise ValueError("Cannot rename column to an empty name")
         if new_name == self.name:
             logger.debug(
-                "Column.rename: no-op — new name matches current %r on %s",
-                new_name, self.entity_name,
+                "Renaming column %r is a no-op — new name matches current %r",
+                self, new_name,
             )
             return self
 
         logger.debug(
-            "Column.rename: table=%s %r → %r",
-            self.table.full_name(), self.name, new_name,
+            "Renaming column %r to %r on table %r",
+            self, new_name, self.table,
         )
         self.engine.execute(
             f"ALTER TABLE {self.table.full_name(safe=True)} "

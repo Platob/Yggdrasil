@@ -78,15 +78,15 @@ class Secrets(DatabricksService):
         if not scope.key:
             raise ValueError("Scope must have a key to be created")
 
-        LOGGER.debug("Creating scope %s", scope)
+        LOGGER.debug("Creating secret scope %r", scope)
 
         api = self.client.workspace_client().secrets
 
         try:
             api.create_scope(scope=scope.key)
-            LOGGER.info("Created scope %s", scope)
+            LOGGER.info("Created secret scope %r", scope)
         except ResourceAlreadyExists:
-            LOGGER.debug("Scope %s already exists; skipping create", scope)
+            LOGGER.debug("Secret scope %r already exists — skipping create", scope)
 
         return scope.update(permissions=permissions)
 
@@ -150,13 +150,13 @@ class Secrets(DatabricksService):
         # carries the same base64 we'd otherwise upload, so b64 equality is the
         # safest cheap fingerprint we can compute client-side.
         if target_b64 and existing.b64 == target_b64:
-            LOGGER.debug("Secret %s already at desired value; skipping put_secret", secret)
+            LOGGER.debug("Secret %r already at desired value — skipping put_secret", secret)
             secret.update_timestamp = existing.update_timestamp
             if permissions:
                 secret.scope.update(permissions=permissions)
             return secret
 
-        LOGGER.debug("Creating secret %s", secret)
+        LOGGER.debug("Creating secret %r", secret)
 
         api = self.client.workspace_client().secrets
 
@@ -184,7 +184,7 @@ class Secrets(DatabricksService):
             else:
                 raise
 
-        LOGGER.info("Created secret %s", secret)
+        LOGGER.info("Created secret %r", secret)
 
         if permissions:
             secret.scope.update(permissions=permissions)

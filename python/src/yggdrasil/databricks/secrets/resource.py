@@ -228,10 +228,12 @@ class Scope(DatabricksResource):
 
         existing = self.permission(target.principal)
         if existing == target:
-            LOGGER.debug("Permission %s already set on %s; skipping put_acl", target, self)
+            LOGGER.debug(
+                "ACL %r already set on scope %r — skipping put_acl", target, self,
+            )
             return existing
 
-        LOGGER.debug("Updating ACL for %s: %s", self, target)
+        LOGGER.debug("Updating scope %r ACL to %r", self, target)
 
         self.client.workspace_client().secrets.put_acl(
             scope=self.key,
@@ -239,7 +241,7 @@ class Scope(DatabricksResource):
             permission=target.acl,
         )
 
-        LOGGER.info("Updated ACL for %s: %s", self, target)
+        LOGGER.info("Updated scope %r ACL to %r", self, target)
         return target
 
     def delete_permission(self, principal: str) -> None:
@@ -253,23 +255,23 @@ class Scope(DatabricksResource):
             )
         except NotFound:
             LOGGER.debug(
-                "ACL for principal %r on scope %s does not exist; skipping delete",
-                principal, self.key,
+                "ACL for principal %r on scope %r does not exist — skipping delete",
+                principal, self,
             )
 
     def delete(self) -> None:
         if not self.key:
             raise ValueError("Scope must have a key to be deleted")
 
-        LOGGER.debug("Deleting scope %s", self)
+        LOGGER.debug("Deleting secret scope %r", self)
 
         try:
             self.client.workspace_client().secrets.delete_scope(scope=self.key)
         except NotFound:
-            LOGGER.warning("Scope %s does not exist; skipping delete", self)
+            LOGGER.warning("Secret scope %r does not exist — skipping delete", self)
             return
 
-        LOGGER.info("Deleted scope %s", self)
+        LOGGER.info("Deleted secret scope %r", self)
 
     def secret(self, key: str) -> "Secret":
         return self.service.secret(key, scope=self)
@@ -496,7 +498,7 @@ class Secret(DatabricksResource):
                 try:
                     client = self.client.workspace_client().secrets
 
-                    LOGGER.debug("Updating %s with new value", self)
+                    LOGGER.debug("Updating secret %r with new value", self)
 
                     client.put_secret(
                         scope=self.scope.key,
@@ -507,7 +509,7 @@ class Secret(DatabricksResource):
                     self.b64 = previous_value
                     raise
 
-                LOGGER.info("Updated %s with new value", self)
+                LOGGER.info("Updated secret %r with new value", self)
 
         if permissions:
             self.scope.update(permissions=permissions)
@@ -518,7 +520,7 @@ class Secret(DatabricksResource):
         if not self.scope or not self.scope.key or not self.key:
             raise ValueError("Secret must have both scope and key to be deleted")
 
-        LOGGER.debug("Deleting secret %s", self)
+        LOGGER.debug("Deleting secret %r", self)
 
         try:
             self.client.workspace_client().secrets.delete_secret(
@@ -526,7 +528,7 @@ class Secret(DatabricksResource):
                 key=self.key,
             )
         except NotFound:
-            LOGGER.warning("Secret %s does not exist; skipping delete", self)
+            LOGGER.warning("Secret %r does not exist — skipping delete", self)
             return
 
-        LOGGER.info("Deleted secret %s", self)
+        LOGGER.info("Deleted secret %r", self)

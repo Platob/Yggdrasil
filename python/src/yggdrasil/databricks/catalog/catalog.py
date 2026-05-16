@@ -387,20 +387,13 @@ class Catalog(DatabricksPath, Singleton):
         if self._infos is not None:
             age = now - (self._infos_fetched_at or 0.0)
             if self._infos_ttl is None or age < self._infos_ttl:
-                logger.debug(
-                    "Cache hit [Catalog._infos] catalog=%s age=%.0fs",
-                    self.catalog_name, age,
-                )
                 return self._infos
             logger.debug(
-                "Cache expired [Catalog._infos] catalog=%s age=%.0fs ttl=%.0fs — refreshing",
-                self.catalog_name, age, self._infos_ttl,
+                "Cache expired for catalog %r (age=%.0fs, ttl=%.0fs) — refreshing",
+                self, age, self._infos_ttl,
             )
 
-        logger.debug(
-            "Remote fetch [Catalog._infos] catalog=%s",
-            self.catalog_name,
-        )
+        logger.debug("Fetching catalog info for %r from remote", self)
         infos = self.client.workspace_client().catalogs.get(self.catalog_name)
         object.__setattr__(self, "_infos", infos)
         object.__setattr__(self, "_infos_fetched_at", now)
@@ -445,7 +438,7 @@ class Catalog(DatabricksPath, Singleton):
     def schemas(self) -> Iterator["Schema"]:
         """Iterate over every schema in this catalog (single API call)."""
         from yggdrasil.databricks.schema.schema import Schema as _Schema
-        logger.debug("Catalog.schemas: listing catalog=%s", self.catalog_name)
+        logger.debug("Listing schemas in catalog %r", self)
         for info in self.client.workspace_client().schemas.list(catalog_name=self.catalog_name):
             s = _Schema(
                 service=self.service,
@@ -512,8 +505,8 @@ class Catalog(DatabricksPath, Singleton):
         """
         uc = self.client.workspace_client().catalogs
         logger.debug(
-            "Catalog.create: catalog=%s storage_root=%s if_not_exists=%s",
-            self.catalog_name, storage_root, if_not_exists,
+            "Creating catalog %r (storage_root=%s, if_not_exists=%s)",
+            self, storage_root, if_not_exists,
         )
         try:
             info = uc.create(
@@ -527,8 +520,7 @@ class Catalog(DatabricksPath, Singleton):
         except DatabricksError as exc:
             if if_not_exists and "already exists" in str(exc).lower():
                 logger.debug(
-                    "Catalog.create: catalog=%s already exists — soft-resetting cache",
-                    self.catalog_name,
+                    "Catalog %r already exists — soft-resetting cache", self,
                 )
                 self._reset_cache()
             else:
@@ -568,8 +560,7 @@ class Catalog(DatabricksPath, Singleton):
         """
         uc = self.client.workspace_client().catalogs
         logger.debug(
-            "Catalog.delete: catalog=%s force=%s wait=%s",
-            self.catalog_name, force, bool(wait),
+            "Deleting catalog %r (force=%s, wait=%s)", self, force, bool(wait),
         )
         if wait:
             try:
@@ -689,8 +680,7 @@ class Catalog(DatabricksPath, Singleton):
             kwargs["properties"] = properties
 
         logger.debug(
-            "Catalog.update: catalog=%s fields=%s",
-            self.catalog_name, sorted(kwargs.keys()),
+            "Updating catalog %r (fields=%s)", self, sorted(kwargs.keys()),
         )
         info = self.client.workspace_client().catalogs.update(
             name=self.catalog_name, **kwargs
@@ -708,14 +698,11 @@ class Catalog(DatabricksPath, Singleton):
             raise ValueError("Cannot rename catalog to an empty name")
         if new_name == self.catalog_name:
             logger.debug(
-                "Catalog.rename: no-op — new name matches current %r",
-                self.catalog_name,
+                "Skipping rename of catalog %r — new name matches current", self,
             )
             return self
 
-        logger.debug(
-            "Catalog.rename: %r → %r", self.catalog_name, new_name,
-        )
+        logger.debug("Renaming catalog %r → %r", self, new_name)
 
         # Drop the old entity-tag cache key before the rename — the
         # ``entity_name`` is the key, and after the rename it's dead.

@@ -317,7 +317,7 @@ class Tables(DatabricksService):
         # --- Strategy 1: search by table_id ---------------------------------
         if table_id:
             logger.debug(
-                "Remote fetch [strategy=table_id] id=%s catalog=%s schema=%s",
+                "Fetching table by id=%s in %s.%s",
                 table_id, catalog_name, schema_name,
             )
             try:
@@ -344,7 +344,7 @@ class Tables(DatabricksService):
             if isinstance(table_name, str) and table_name.count(".") == 2
             else f"{catalog_name}.{schema_name}.{table_name}"
         )
-        logger.debug("Remote fetch [strategy=get] full_name=%s", full_name)
+        logger.debug("Fetching table %s via GET", full_name)
         try:
             return uc.get(full_name=full_name)
         except DatabricksError:
@@ -356,7 +356,7 @@ class Tables(DatabricksService):
 
         # --- Strategy 3: case-insensitive list scan -------------------------
         logger.debug(
-            "Remote fetch [strategy=list_scan] catalog=%s schema=%s name=%s",
+            "Scanning %s.%s for table %r (case-insensitive list)",
             catalog_name, schema_name, table_name,
         )
         try:
@@ -525,7 +525,7 @@ class Tables(DatabricksService):
         uc = self.client.workspace_client().tables
         matcher = name_matcher(name)
         logger.debug(
-            "Tables.list_tables: catalog=%s schema=%s name_filter=%s table_types=%s",
+            "Listing tables in %s.%s (name_filter=%s, table_types=%s)",
             catalog_name, schema_name, name,
             sorted(t.value for t in allowed) if allowed is not None else None,
         )
@@ -548,8 +548,7 @@ class Tables(DatabricksService):
             yielded += 1
             yield tb
         logger.debug(
-            "Tables.list_tables: yielded=%d catalog=%s schema=%s",
-            yielded, catalog_name, schema_name,
+            "Listed %d tables in %s.%s", yielded, catalog_name, schema_name,
         )
 
     def list_views(

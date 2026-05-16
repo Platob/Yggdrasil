@@ -129,14 +129,9 @@ class Catalogs(DatabricksService):
         key = self._cache_key(name)
         cached = _CATALOG_INFO_CACHE.get(key)
         if cached is not None:
-            logger.debug(
-                "Cache hit [Catalogs.catalog] key=%s catalog=%s", key, name,
-            )
             object.__setattr__(cat, "_infos", cached)
         else:
-            logger.debug(
-                "Catalogs.catalog: lazy resource catalog=%s (no cached info)", name,
-            )
+            logger.debug("No cached info for catalog %r — returning lazy handle", cat)
         return cat
 
     def schema(self, full_name: str) -> Schema:
@@ -177,8 +172,7 @@ class Catalogs(DatabricksService):
             use_cache: Populate ``_CATALOG_INFO_CACHE`` from results.
         """
         logger.debug(
-            "Catalogs.list_catalogs: name_filter=%s use_cache=%s",
-            name, use_cache,
+            "Listing catalogs (name_filter=%s, use_cache=%s)", name, use_cache,
         )
         matcher = name_matcher(name)
         yielded = 0
@@ -195,7 +189,7 @@ class Catalogs(DatabricksService):
             yielded += 1
             yield cat
         logger.debug(
-            "Catalogs.list_catalogs: yielded=%d name_filter=%s", yielded, name,
+            "Listed %d catalogs (name_filter=%s)", yielded, name,
         )
 
     # ── parse helper ──────────────────────────────────────────────────────────

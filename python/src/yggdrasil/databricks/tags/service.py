@@ -271,13 +271,13 @@ def _retry_call(
                 remaining = policy.deadline - elapsed
                 if remaining <= 0:
                     logger.error(
-                        "[%s] retry deadline exceeded after %.2fs (%d attempts)",
+                        "Retry deadline exceeded for %s after %.2fs (%d attempts)",
                         op, elapsed, attempt,
                     )
                     break
                 delay = min(delay, remaining)
             logger.warning(
-                "[%s] attempt %d/%d failed (%s: %s); sleeping %.2fs%s",
+                "Retrying %s after attempt %d/%d failed (%s: %s); sleeping %.2fs%s",
                 op, attempt, policy.attempts,
                 type(exc).__name__, exc, delay,
                 " [Retry-After]" if hint is not None else "",
@@ -286,7 +286,7 @@ def _retry_call(
 
     assert last_exc is not None  # only reached when a retry path failed
     logger.error(
-        "[%s] giving up after %d attempt(s): %s: %s",
+        "Giving up on %s after %d attempt(s): %s: %s",
         op, policy.attempts, type(last_exc).__name__, last_exc,
     )
     raise last_exc
@@ -444,10 +444,6 @@ class EntityTags(DatabricksService):
         if cache_ttl is not None:
             cached = _TAGS_CACHE.get(cache_key)
             if cached is not None:
-                logger.debug(
-                    "Cache hit [EntityTags.entity_tags] key=%s n=%d",
-                    cache_key, len(cached),
-                )
                 return (
                     {t.tag_key: t.tag_value for t in cached}
                     if as_dict else list(cached)
@@ -845,7 +841,7 @@ class EntityTags(DatabricksService):
                 if not continue_on_error:
                     raise
                 logger.exception(
-                    "[update_entities_tags] %s:%s failed: %s",
+                    "Updating tags on entity %s:%s failed: %s",
                     et, en, exc,
                 )
                 return key, exc

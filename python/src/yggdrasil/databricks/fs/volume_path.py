@@ -96,6 +96,10 @@ class VolumePath(DatabricksPath):
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_VOLUME
     namespace_prefix: ClassVar[str] = "/Volumes/"
 
+    # ``_service_class`` is bound below the class body to avoid the
+    # ``volume.volumes`` → ``volume.volume`` → ``fs.volume_path``
+    # import cycle.
+
     # Process-wide "already swept" set, keyed by ``(catalog, schema, resource)``
     # so concurrent ``staging_path`` calls collapse to one sweep per staging
     # directory. Insert under the lock *before* launching the sweeper thread
@@ -109,6 +113,7 @@ class VolumePath(DatabricksPath):
         *,
         url: "URL | None" = None,
         volume: "Volume | None" = None,
+        service: Any = None,
         client: "DatabricksClient | None" = None,
         **kwargs: Any,
     ) -> None:
@@ -118,10 +123,16 @@ class VolumePath(DatabricksPath):
 
         self._volume: Optional["Volume"] = volume
 
-        if volume is not None:
-            client = volume.client
+        # A bound :class:`Volume` carries both the service and the
+        # client — prefer the Volume's service so the resource stays
+        # navigable (``volume_path.volume`` short-circuits to the
+        # cached instance without re-resolving).
+        if volume is not None and service is None and client is None:
+            service = volume.service
 
-        super().__init__(data=data, client=client, url=url, **kwargs)
+        super().__init__(
+            data=data, service=service, client=client, url=url, **kwargs,
+        )
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self.explore_url!r})"
@@ -552,8 +563,8 @@ class VolumePath(DatabricksPath):
                     deleted += 1
                 except Exception:
                     logger.debug(
-                        "staging sweep: failed to delete %s",
-                        child.full_path(),
+                        "Staging sweep failed to delete %r",
+                        child,
                         exc_info=True,
                     )
         except Exception:
@@ -561,14 +572,14 @@ class VolumePath(DatabricksPath):
             # error — all benign. Log at debug so production logs
             # stay quiet but the trail exists for diagnosis.
             logger.debug(
-                "staging sweep aborted for /%s/%s/tmp_%s/.sql",
+                "Staging sweep aborted for /%s/%s/tmp_%s/.sql",
                 catalog, schema, resource,
                 exc_info=True,
             )
             return
         if deleted or scanned:
             logger.debug(
-                "staging sweep /%s/%s/tmp_%s/.sql: scanned=%d deleted=%d",
+                "Staging sweep /%s/%s/tmp_%s/.sql scanned=%d deleted=%d",
                 catalog, schema, resource, scanned, deleted,
             )
 
@@ -587,8 +598,8 @@ class VolumePath(DatabricksPath):
             entries = self._call(files.list_directory_contents, self.api_path)
         except PermissionDenied as e:
             logger.warning(
-                f"Permission denied listing directory %r: %e",
-                self, e
+                "Permission denied listing volume directory %r: %r",
+                self, e,
             )
             return
         except Exception:
@@ -596,7 +607,7 @@ class VolumePath(DatabricksPath):
         if logger.isEnabledFor(logging.DEBUG):
             entries = list(entries)
             logger.debug(
-                "files.list_directory_contents %r -> %d entries (recursive=%s)",
+                "Listing volume directory %r -> %d entries (recursive=%s)",
                 self, len(entries), recursive,
             )
         for info in entries:
@@ -617,7 +628,7 @@ class VolumePath(DatabricksPath):
             # / class default) pass it through ``iterdir`` / ``ls``.
             child = type(self)(
                 child_path,
-                client=self._client,
+                service=self.service,
                 singleton_ttl=singleton_ttl,
             )
             # The listing entry already carries ``is_directory`` /
@@ -711,8 +722,7 @@ class VolumePath(DatabricksPath):
     # ==================================================================
 
     def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("files.create_directory %s", self.api_path)
+        logger.debug("Creating volume directory %r", self)
         try:
             self._call_ensuring_parents(
                 self.client.workspace_client().files.create_directory, self.api_path,
@@ -722,13 +732,12 @@ class VolumePath(DatabricksPath):
                 raise
         self._seed_stat_cache(IOStats(kind=IOKind.DIRECTORY))
         logger.info(
-            "files.create_directory %s (parents=%s)",
-            self.api_path, parents,
+            "Created volume directory %r (parents=%s)",
+            self, parents,
         )
 
     def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
-        if logger.isEnabledFor(logging.INFO):
-            logger.info("files.delete %s", self.api_path)
+        logger.info("Deleting volume file %r", self)
         try:
             self._call(self.client.workspace_client().files.delete, self.api_path)
         except Exception:
@@ -739,6 +748,10 @@ class VolumePath(DatabricksPath):
     def _remove_dir(
         self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
     ) -> None:
+        logger.info(
+            "Deleting volume directory %r (recursive=%s)",
+            self, recursive,
+        )
         # ``files.delete_directory`` is non-recursive — its docstring is
         # explicit: "To delete a non-empty directory, first delete all
         # of its contents." Hitting it on a non-empty directory returns
@@ -794,11 +807,10 @@ class VolumePath(DatabricksPath):
             data = body.read()
         except AttributeError:
             data = bytes(body)
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "files.download %s -> %d bytes (slice pos=%d n=%s)",
-                self.api_path, len(data), pos, "EOF" if n < 0 else n,
-            )
+        logger.debug(
+            "Downloaded volume file %r -> %d bytes (slice pos=%d n=%s)",
+            self, len(data), pos, "EOF" if n < 0 else n,
+        )
 
         media_type = _media_type_from_response(response)
         try:
@@ -854,17 +866,16 @@ class VolumePath(DatabricksPath):
     def _upload(self, payload: bytes) -> None:
         size = len(payload)
 
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "files.upload %s -> %d bytes", self.api_path, size,
-            )
+        logger.debug(
+            "Uploading volume file %r (%d bytes)", self, size,
+        )
         self._call_ensuring_parents(
             self.client.workspace_client().files.upload,
             file_path=self.api_path,
             contents=_stdio.BytesIO(payload),
             overwrite=True,
         )
-        logger.info("wrote %s (%d bytes)", self, size)
+        logger.info("Wrote %r (%d bytes)", self, size)
         self._seed_stat_cache(IOStats(
             size=len(payload),
             kind=IOKind.FILE,
@@ -955,3 +966,10 @@ def _looks_like_already_exists(exc: BaseException) -> bool:
 def _staging_clean_part(value: str) -> str:
     """Strip backticks/whitespace and forbid ``/`` in path segments."""
     return str(value).strip().strip("`").replace("/", "_")
+
+# Late-bound: ``VolumePath._service_class`` is ``Volumes`` once the
+# volume package finishes importing — avoids the
+# ``fs.volume_path → volume.volumes → volume.volume → fs.volume_path``
+# cycle by deferring the attribute set to module-load tail.
+from ..volume.volumes import Volumes as _Volumes  # noqa: E402
+VolumePath._service_class = _Volumes

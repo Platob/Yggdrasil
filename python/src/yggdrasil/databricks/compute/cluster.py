@@ -439,13 +439,13 @@ class Cluster(Singleton, DatabricksResource):
         if dicts_equal(current, desired, keys=_EDIT_ARG_NAMES):
             return self
 
-        LOGGER.debug("Updating %s with %s", self, desired)
+        LOGGER.debug("Updating cluster %r with %s", self, desired)
 
         self.wait_for_status(wait=wait)
         self.clusters_client().edit(**desired)
         self.update_permissions(permissions=permissions)
 
-        LOGGER.info("Updated %s", self)
+        LOGGER.info("Updated cluster %r", self)
         self.wait_for_status(wait=wait)
         return self
 
@@ -547,7 +547,7 @@ class Cluster(Singleton, DatabricksResource):
         client = self.clusters_client()
         wait = WaitingConfig.from_(wait)
 
-        LOGGER.debug("Starting %s", self)
+        LOGGER.debug("Starting cluster %r", self)
 
         try:
             client.start(cluster_id=self.cluster_id)
@@ -557,7 +557,7 @@ class Cluster(Singleton, DatabricksResource):
                 return self
             client.start(cluster_id=self.cluster_id)
 
-        LOGGER.info("Started %s", self)
+        LOGGER.info("Started cluster %r", self)
         self.wait_for_status(wait=wait)
         return self
 
@@ -578,9 +578,9 @@ class Cluster(Singleton, DatabricksResource):
         if not self.cluster_id:
             return
 
-        LOGGER.debug("Deleting %s", self)
+        LOGGER.debug("Deleting cluster %r", self)
         self.clusters_client().delete(cluster_id=self.cluster_id)
-        LOGGER.info("Deleted %s", self)
+        LOGGER.info("Deleted cluster %r", self)
 
     # ------------------------------------------------------------------ #
     # Execution contexts and commands
@@ -697,8 +697,8 @@ class Cluster(Singleton, DatabricksResource):
 
         if skipped:
             LOGGER.debug(
-                "install_libraries: skipping blacklisted runtime package(s): %s",
-                ", ".join(skipped),
+                "Skipping blacklisted runtime package(s) on cluster %r: %s",
+                self, ", ".join(skipped),
             )
 
         normalized = self._dedupe_uninstalled_libraries(allowed)
@@ -820,7 +820,7 @@ class Cluster(Singleton, DatabricksResource):
                         self._uninstall_libraries(failed)
                     except Exception:
                         LOGGER.exception(
-                            "Failed to uninstall broken libraries %s from %s",
+                            "Failed to uninstall broken libraries %s from cluster %r",
                             failed,
                             self,
                         )
@@ -830,7 +830,9 @@ class Cluster(Singleton, DatabricksResource):
                 if raise_error:
                     raise DatabricksError(message)
 
-                LOGGER.error(message)
+                LOGGER.error(
+                    "Library install failed on cluster %r: %s", self, failed,
+                )
                 return self
 
             running = [

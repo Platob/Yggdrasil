@@ -212,16 +212,14 @@ def _evict_idle_contexts() -> None:
     for _key, ctx in evicted:
         try:
             LOGGER.info(
-                "Auto-closing idle context %s (idle=%.0fs, close_after=%.0fs)",
-                ctx.context_id,
-                now - ctx._last_used_at,
-                ctx.close_after,
+                "Auto-closing idle context %r (idle=%.0fs, close_after=%.0fs)",
+                ctx, now - ctx._last_used_at, ctx.close_after,
             )
             ctx.close(wait=False, raise_error=False)
         except BaseException:  # noqa: BLE001 — reaper must never escape
             try:
                 LOGGER.debug(
-                    "Error auto-closing idle context %s", ctx, exc_info=True,
+                    "Error auto-closing idle context %r", ctx, exc_info=True,
                 )
             except Exception:
                 pass
@@ -523,10 +521,8 @@ class ExecutionContext:
 
             client = self.client.workspace_client().command_execution
             LOGGER.info(
-                "Creating %s context on %s (key=%s)",
-                language.value,
-                self.cluster,
-                context_key or self.context_key,
+                "Creating %s context on cluster %r (key=%s)",
+                language.value, self.cluster, context_key or self.context_key,
             )
 
             try:
@@ -538,7 +534,7 @@ class ExecutionContext:
                 ).response
             except TimeoutError:
                 LOGGER.warning(
-                    "Context creation timed out for %s — ensuring cluster running and retrying",
+                    "Context creation timed out on cluster %r — ensuring it is running and retrying",
                     self.cluster,
                 )
                 self.cluster.ensure_running(wait=True)
@@ -548,9 +544,8 @@ class ExecutionContext:
                 ).response
             except Exception as exc:
                 LOGGER.warning(
-                    "Context creation failed for %s — ensuring cluster running and retrying: %s",
-                    self.cluster,
-                    exc,
+                    "Context creation failed on cluster %r — ensuring it is running and retrying: %r",
+                    self.cluster, exc,
                 )
                 self.cluster.ensure_running(wait=True)
                 created = client.create(
@@ -565,7 +560,7 @@ class ExecutionContext:
             self._created_at = time.time()
             self.touch()
 
-            LOGGER.info("Context created: id=%s on %s", self.context_id, self.cluster)
+            LOGGER.info("Created context %r on cluster %r", self, self.cluster)
 
             return self
 
@@ -579,19 +574,18 @@ class ExecutionContext:
         """Ensure this instance has an open remote execution context."""
         with self._lock:
             if self.context_id and not reset:
-                LOGGER.debug(
-                    "%s already connected (context=%s), reusing",
-                    self, self.context_id,
-                )
+                LOGGER.debug("Context %r already connected — reusing", self)
                 self.touch()
                 return self
 
             if self.context_id and reset:
-                LOGGER.debug("%s resetting connection", self)
+                LOGGER.debug("Resetting connection for context %r", self)
                 self.close(wait=False, raise_error=False)
 
             resolved_language = language or self.language or Language.PYTHON
-            LOGGER.debug("%s connecting with language=%s", self, resolved_language.value)
+            LOGGER.debug(
+                "Connecting context %r with language=%s", self, resolved_language.value,
+            )
 
             return self.create(
                 language=resolved_language,
@@ -618,8 +612,8 @@ class ExecutionContext:
             closing_id = self.context_id
 
             LOGGER.info(
-                "Closing context %s on %s (wait=%s)",
-                closing_id, self.cluster, wait,
+                "Closing context %r on cluster %r (wait=%s)",
+                self, self.cluster, wait,
             )
 
             client = self.client.workspace_client()
@@ -646,7 +640,7 @@ class ExecutionContext:
                     "Suppressed DatabricksError while closing context %s", closing_id,
                 )
             finally:
-                LOGGER.debug("Context %s closed", closing_id)
+                LOGGER.debug("Closed context %s", closing_id)
 
     def _unsafe_close(self) -> None:
         """Shutdown-safe close helper used by process-exit hooks.
@@ -863,7 +857,7 @@ print(p.stdout, flush=True)
             )
             remote_payload_path = str(tmp)
             LOGGER.debug(
-                "Payload too large (%d bytes) — uploaded to DBFS: %s",
+                "Payload too large (%d bytes) — uploaded to DBFS path %r",
                 len(payload),
                 remote_payload_path,
             )
