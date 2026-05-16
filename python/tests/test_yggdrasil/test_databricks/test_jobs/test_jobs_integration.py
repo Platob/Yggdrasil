@@ -23,7 +23,6 @@ Exercises against a real workspace:
 """
 from __future__ import annotations
 
-import os
 import secrets
 from typing import ClassVar, List
 
@@ -34,6 +33,7 @@ from databricks.sdk.service.jobs import (
     Task,
 )
 
+from yggdrasil.databricks.fs.workspace_path import WorkspacePath
 from yggdrasil.databricks.jobs import Job, JobTask
 from yggdrasil.databricks.jobs.task import DEFAULT_STAGING_ROOT
 
@@ -158,7 +158,13 @@ class TestJobTaskIntegration(_JobsIntegrationBase):
         assert jt._details.description.startswith("One-line doc")
 
         path = self._staged_workspace_path(jt._details)
-        assert path.startswith(DEFAULT_STAGING_ROOT)
+        # ``DEFAULT_STAGING_ROOT`` carries the ``<me>`` placeholder;
+        # resolve it through a bound :class:`WorkspacePath` so the
+        # assertion compares against the actual user-home prefix.
+        resolved_root = WorkspacePath(
+            DEFAULT_STAGING_ROOT, client=job.client,
+        ).full_path()
+        assert path.startswith(resolved_root)
         # The staged file is a real workspace object.
         content = self._workspace_read(path).decode()
         assert "def do_something" in content

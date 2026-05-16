@@ -24,7 +24,11 @@ from databricks.sdk.service.jobs import (
 from databricks.sdk.service.jobs import SparkPythonTask, Task
 
 from yggdrasil.databricks.jobs import Job, JobRun
-from yggdrasil.databricks.jobs.task import JobTask, _render_callable_script
+from yggdrasil.databricks.jobs.task import (
+    JobTask,
+    _content_digest,
+    _render_callable_script,
+)
 from yggdrasil.databricks.tests import DatabricksTestCase
 
 
@@ -574,6 +578,53 @@ class TestJobTaskFactoryAndDecorate(DatabricksTestCase):
         moved = next(t for t in tasks if t.task_key == "a")
         self.assertEqual(moved.description, "moved")
 
+    def test_create_attaches_default_environment_when_task_uses_key(self):
+        """A task carrying ``environment_key`` adds a matching :class:`JobEnvironment`
+        to the parent job when none is declared yet."""
+        from yggdrasil.databricks.jobs.task import (
+            DEFAULT_ENVIRONMENT_CLIENT,
+            DEFAULT_ENVIRONMENT_KEY,
+        )
+
+        job = self._job()
+        job.settings.tasks = [Task(task_key="seed")]
+
+        jt = job.task(
+            "step", environment_key=DEFAULT_ENVIRONMENT_KEY,
+        )
+        jt.create()
+
+        _, kwargs = self.jobs_api.update.call_args
+        envs = kwargs["new_settings"].environments
+        self.assertIsNotNone(envs)
+        self.assertEqual(len(envs), 1)
+        self.assertEqual(envs[0].environment_key, DEFAULT_ENVIRONMENT_KEY)
+        self.assertEqual(envs[0].spec.client, DEFAULT_ENVIRONMENT_CLIENT)
+        # The default spec pulls in ``ygg`` so staged
+        # ``from yggdrasil...`` imports resolve at runtime.
+        self.assertIn("ygg", envs[0].spec.dependencies)
+
+    def test_create_skips_environment_merge_when_already_declared(self):
+        """``environments`` isn't touched when the key already lives on the job."""
+        from databricks.sdk.service.compute import Environment
+        from databricks.sdk.service.jobs import JobEnvironment
+
+        job = self._job()
+        job.settings.tasks = [Task(task_key="seed")]
+        job.settings.environments = [
+            JobEnvironment(
+                environment_key="custom",
+                spec=Environment(client="1", dependencies=["pandas"]),
+            ),
+        ]
+
+        jt = job.task("step", environment_key="custom")
+        jt.create()
+
+        _, kwargs = self.jobs_api.update.call_args
+        # No environments update → the field is left off new_settings.
+        self.assertIsNone(kwargs["new_settings"].environments)
+
     def test_task_without_order_keeps_existing_position(self):
         """``order=None`` (default) replaces in place — no shuffle."""
         job = self._job()
@@ -687,6 +738,21 @@ class TestStagedScriptMetadata(DatabricksTestCase):
         self.assertIn("yggdrasil_version", meta)
         self.assertIn("staged_at", meta)
         json.dumps(meta)  # stable JSON shape.
+
+    def test_content_digest_is_stable_for_same_source_and_args(self):
+        """Same callable + same bound args → identical digest across calls."""
+        a = _content_digest(_signature_fixture, (), {"name": "x", "count": 1})
+        b = _content_digest(_signature_fixture, (), {"name": "x", "count": 1})
+        self.assertEqual(a, b)
+        # Kwarg ordering doesn't perturb the digest.
+        c = _content_digest(_signature_fixture, (), {"count": 1, "name": "x"})
+        self.assertEqual(a, c)
+
+    def test_content_digest_changes_with_args(self):
+        """Different bound args → different digest, even for the same callable."""
+        a = _content_digest(_signature_fixture, (), {"name": "x"})
+        b = _content_digest(_signature_fixture, (), {"name": "y"})
+        self.assertNotEqual(a, b)
 
     def test_script_wraps_no_arg_function_with_checkargs(self):
         import ast
