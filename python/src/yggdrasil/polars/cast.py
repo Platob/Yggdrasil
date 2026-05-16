@@ -80,6 +80,18 @@ def any_to_polars_dataframe(
     if isinstance(obj, pl.LazyFrame):
         return cast_polars_dataframe(obj.collect(), opts)
 
+    # Path / URL / Tabular sources route through the Tabular fan-out so
+    # the format leaf (ParquetIO / CsvIO / …) gets to use its native
+    # scanner — and so polars-native readers (``pl.scan_parquet``,
+    # ``pl.read_csv``) fire downstream of :meth:`Tabular.read_polars_frame`
+    # when the leaf has a polars fast path. ``isinstance(Tabular)``
+    # catches Holder / Path / Memory / IO subclasses; string / PathLike
+    # inputs are wrapped into a :class:`Path` by :meth:`Tabular.from_`.
+    from yggdrasil.io.tabular import Tabular, is_tabular_source
+    if is_tabular_source(obj):
+        tabular = obj if isinstance(obj, Tabular) else Tabular.from_(obj)
+        return tabular.read_polars_frame(opts)
+
     # Arrow shapes — isinstance is faster than the namespace probe and
     # covers the vast majority of cross-engine handoffs.
     if isinstance(obj, pa.Table):

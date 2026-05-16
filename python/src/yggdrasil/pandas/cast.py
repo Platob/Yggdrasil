@@ -1,8 +1,12 @@
 """Pandas <-> Arrow casting helpers and converters."""
 
-from typing import Optional
+from typing import Any, Optional
 
-from yggdrasil.arrow.cast import cast_arrow_array, cast_arrow_tabular
+from yggdrasil.arrow.cast import (
+    any_to_arrow_table,
+    cast_arrow_array,
+    cast_arrow_tabular,
+)
 import pyarrow as pa
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.cast.registry import register_converter
@@ -13,6 +17,7 @@ __all__ = [
     "cast_pandas_dataframe",
     "arrow_array_to_pandas_series",
     "arrow_table_to_pandas_dataframe",
+    "any_to_pandas_dataframe",
     "pandas_series_to_arrow_array",
     "pandas_dataframe_to_arrow_table",
 ]
@@ -161,6 +166,43 @@ def arrow_table_to_pandas_dataframe(
         table = cast_arrow_tabular(table, opts)
 
     return table.to_pandas()
+
+
+@register_converter(Any, pandas.DataFrame)
+def any_to_pandas_dataframe(
+    obj: Any,
+    options: Optional[CastOptions] = None,
+) -> pandas.DataFrame:
+    """Convert *any* supported object to a ``pandas.DataFrame``.
+
+    Recognised shapes (in dispatch order):
+
+    * ``pandas.DataFrame`` — passed through to
+      :func:`cast_pandas_dataframe`.
+    * Path / URL ``str``, :class:`os.PathLike`, or
+      :class:`yggdrasil.io.tabular.Tabular` (incl. :class:`Holder` /
+      :class:`Path` / :class:`Memory` / :class:`IO`) — routed through
+      :meth:`Tabular.read_pandas_frame` so format leaves use their
+      native scanners.
+    * Anything else — coerced to a ``pa.Table`` via
+      :func:`yggdrasil.arrow.cast.any_to_arrow_table` and then handed
+      to :func:`arrow_table_to_pandas_dataframe`. This covers
+      polars / spark / Arrow / dict / list-of-dicts / dataclass shapes
+      via the registered converters those modules install on import.
+    """
+    opts = CastOptions.check(options)
+
+    if isinstance(obj, pandas.DataFrame):
+        return cast_pandas_dataframe(obj, opts)
+
+    from yggdrasil.io.tabular import Tabular, is_tabular_source
+    if is_tabular_source(obj):
+        tabular = obj if isinstance(obj, Tabular) else Tabular.from_(obj)
+        return tabular.read_pandas_frame(opts)
+
+    return arrow_table_to_pandas_dataframe(
+        any_to_arrow_table(obj, options=opts), opts,
+    )
 
 
 # ---------------------------------------------------------------------------

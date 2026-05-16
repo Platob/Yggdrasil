@@ -12,7 +12,7 @@ mode. Use these when you want a :class:`Tabular` over data you
 already have in memory and don't want to round-trip through IPC bytes.
 """
 
-from .base import O, Tabular
+from .base import O, Tabular, is_tabular_source
 from yggdrasil.io.tabular.arrow import ArrowTabular
 from yggdrasil.io.tabular.spark import SparkTabular
 from yggdrasil.io.tabular.lazy import LazyTabular
@@ -33,4 +33,5 @@ __all__ = [
     "TabularEngine",
     "TabularEntry",
     "SYSTEM_ENGINE",
+    "is_tabular_source",
 ]
