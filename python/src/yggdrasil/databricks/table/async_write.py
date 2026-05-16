@@ -1,12 +1,15 @@
 """Stage table inserts as Parquet + metadata for asynchronous execution.
 
-When :meth:`Table.insert` is called with ``async_write=True``, the
-caller is not waiting on a warehouse round trip — the rows are cast
-to the target schema, written as Parquet under the table's
+When :meth:`Table.insert` is called with ``lazy=True``, the caller is
+not waiting on a warehouse round trip — the rows are cast to the
+target schema, written as Parquet under the table's
 ``stg_<table>/.sql/async/insert`` staging folder, and a sibling JSON
 file carries an :class:`AsyncInsert` record so a downstream applier
 (typically a job-driven loop) can replay the operation against the
-target table when it's convenient.
+target table when it's convenient. The :class:`AsyncInsert` itself is
+returned: it's a :class:`WarehouseStatementBatch` subclass, so the
+caller can ``.execute(engine)`` straight away (or
+``.merge_with(other)`` peers, or schedule it via :meth:`AsyncInsert.job`).
 
 File layout under the table's async staging folder::
 
@@ -22,7 +25,7 @@ Parquet payloads.
 
 This module lives outside ``table.py`` so the latter doesn't pick up
 async-specific helpers; :meth:`Table.insert` delegates to
-:func:`stage_async_insert` only when ``async_write=True``.
+:func:`stage_async_insert` only when ``lazy=True``.
 
 Multiple staged operations against the same table can be folded into
 one logical insert via :meth:`AsyncInsert.merge` — pure appends fold
@@ -39,10 +42,10 @@ import datetime as _dt
 import logging
 import os
 import time
-from dataclasses import dataclass, fields, replace
 from typing import (
     TYPE_CHECKING,
     Any,
+    ClassVar,
     Iterable,
     List,
     Mapping,
@@ -53,6 +56,7 @@ from typing import (
 
 from yggdrasil.data.enums import Mode
 from yggdrasil.data.options import CastOptions
+from yggdrasil.databricks.warehouse.statement import WarehouseStatementBatch
 from yggdrasil.io.tabular.execution.expr import Predicate
 from yggdrasil.pickle import json as ygg_json
 
@@ -64,9 +68,7 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.jobs.job import Job
     from yggdrasil.databricks.jobs.service import Jobs
     from yggdrasil.databricks.sql.engine import SQLEngine
-    from yggdrasil.databricks.warehouse.statement import (
-        WarehouseStatementBatch,
-    )
+    from yggdrasil.databricks.warehouse import SQLWarehouse
     from .table import Table
 
 
@@ -103,54 +105,154 @@ _OVERWRITE_TOKENS: frozenset[str] = frozenset({"overwrite"})
 
 
 # ---------------------------------------------------------------------------
-# AsyncInsert dataclass
+# AsyncInsert — a deferred table insert that's also an executable
+# WarehouseStatementBatch.
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True, slots=True)
-class AsyncInsert:
-    """Frozen, JSON-serialisable description of a deferred table insert.
+# Ordered list of metadata field names + defaults — drives :meth:`__init__`,
+# :meth:`_replace`, :meth:`to_dict`, :meth:`from_dict`, equality, and the
+# tuple-coercion set in :meth:`from_dict`. Kept module-level so the hot
+# per-record walks don't rebuild it on every call.
+_METADATA_FIELDS: Tuple[Tuple[str, Any], ...] = (
+    ("target_full_name", ""),
+    ("parquet_paths", ()),
+    ("metadata_paths", ()),
+    ("operation_ids", ()),
+    ("created_at", ""),
+    ("target_catalog_name", None),
+    ("target_schema_name", None),
+    ("target_table_name", None),
+    ("target_field_names", None),
+    ("mode", None),
+    ("schema_mode", None),
+    ("overwrite_schema", None),
+    ("match_by", None),
+    ("update_column_names", None),
+    ("zorder_by", None),
+    ("optimize_after_merge", False),
+    ("vacuum_hours", None),
+    ("where", None),
+    ("prune_by", None),
+    ("prune_values", None),
+    ("safe_merge", False),
+    ("version", METADATA_VERSION),
+)
+
+
+class AsyncInsert(WarehouseStatementBatch):
+    """JSON-serialisable description of a deferred table insert.
 
     Records a list of Parquet payloads (one per merged operation, all
     rooted under the same target's async staging folder) plus the
     insert-time parameters needed to replay the operation against the
     target table.
 
-    A single record may carry more than one Parquet path after
-    :meth:`merge` collapses several staged operations into one logical
-    insert. Each contributing operation's id and metadata-file path
-    are preserved on the record so :meth:`cleanup` can remove the
-    whole set after :meth:`execute` succeeds.
+    Also a :class:`WarehouseStatementBatch` — :meth:`execute` plugs in
+    an executor and submits the rendered prepared statements through
+    it, so the same instance flows from "staged-on-disk metadata" to
+    "live in-flight batch" without an intermediate factory.
+
+    Constructed without an executor it sits in metadata-only mode
+    (``self.executor is None``, ``self.results`` empty), suitable for
+    JSON round-tripping, merging, and :meth:`to_sql` rendering. Pass
+    ``executor=`` to submit straight away.
     """
 
-    # ---- identity ---------------------------------------------------------
-    target_full_name: str
-    parquet_paths: Tuple[str, ...] = ()
-    metadata_paths: Tuple[str, ...] = ()
-    operation_ids: Tuple[str, ...] = ()
-    created_at: str = ""
+    _METADATA_FIELDS: ClassVar[Tuple[Tuple[str, Any], ...]] = _METADATA_FIELDS
 
-    # ---- target detail ----------------------------------------------------
-    target_catalog_name: Optional[str] = None
-    target_schema_name: Optional[str] = None
-    target_table_name: Optional[str] = None
-    target_field_names: Optional[Tuple[str, ...]] = None
+    def __init__(
+        self,
+        target_full_name: str = "",
+        *,
+        parquet_paths: Tuple[str, ...] = (),
+        metadata_paths: Tuple[str, ...] = (),
+        operation_ids: Tuple[str, ...] = (),
+        created_at: str = "",
+        target_catalog_name: Optional[str] = None,
+        target_schema_name: Optional[str] = None,
+        target_table_name: Optional[str] = None,
+        target_field_names: Optional[Tuple[str, ...]] = None,
+        mode: Optional[str] = None,
+        schema_mode: Optional[str] = None,
+        overwrite_schema: Optional[bool] = None,
+        match_by: Optional[Tuple[str, ...]] = None,
+        update_column_names: Optional[Tuple[str, ...]] = None,
+        zorder_by: Optional[Tuple[str, ...]] = None,
+        optimize_after_merge: bool = False,
+        vacuum_hours: Optional[int] = None,
+        where: Optional[str] = None,
+        prune_by: Optional[Tuple[str, ...]] = None,
+        prune_values: Optional[Mapping[str, Tuple[Any, ...]]] = None,
+        safe_merge: bool = False,
+        version: int = METADATA_VERSION,
+        executor: "SQLWarehouse | None" = None,
+        parallel: int = 1,
+    ):
+        self.target_full_name = target_full_name
+        self.parquet_paths = parquet_paths
+        self.metadata_paths = metadata_paths
+        self.operation_ids = operation_ids
+        self.created_at = created_at
+        self.target_catalog_name = target_catalog_name
+        self.target_schema_name = target_schema_name
+        self.target_table_name = target_table_name
+        self.target_field_names = target_field_names
+        self.mode = mode
+        self.schema_mode = schema_mode
+        self.overwrite_schema = overwrite_schema
+        self.match_by = match_by
+        self.update_column_names = update_column_names
+        self.zorder_by = zorder_by
+        self.optimize_after_merge = optimize_after_merge
+        self.vacuum_hours = vacuum_hours
+        self.where = where
+        self.prune_by = prune_by
+        self.prune_values = prune_values
+        self.safe_merge = safe_merge
+        self.version = version
 
-    # ---- insert spec ------------------------------------------------------
-    mode: Optional[str] = None
-    schema_mode: Optional[str] = None
-    overwrite_schema: Optional[bool] = None
-    match_by: Optional[Tuple[str, ...]] = None
-    update_column_names: Optional[Tuple[str, ...]] = None
-    zorder_by: Optional[Tuple[str, ...]] = None
-    optimize_after_merge: bool = False
-    vacuum_hours: Optional[int] = None
-    where: Optional[str] = None
-    prune_by: Optional[Tuple[str, ...]] = None
-    prune_values: Optional[Mapping[str, Tuple[Any, ...]]] = None
-    safe_merge: bool = False
+        # WarehouseStatementBatch handles results / external_volume_paths.
+        # No statements are eagerly submitted: rendering only happens once
+        # an executor is bound (via ``execute``) so the metadata-only mode
+        # never touches a warehouse.
+        super().__init__(executor=executor, statements=None, parallel=parallel)
 
-    version: int = METADATA_VERSION
+    # ------------------------------------------------------------------ #
+    # Replace / equality / hash / repr
+    # ------------------------------------------------------------------ #
+    def _replace(self, **changes: Any) -> "AsyncInsert":
+        """Return a copy of this record with *changes* applied.
+
+        Stands in for :func:`dataclasses.replace` now that AsyncInsert
+        is a regular class; carries only the metadata fields so the
+        result is in metadata-only mode regardless of *self*'s state.
+        """
+        kwargs = {name: getattr(self, name) for name, _ in _METADATA_FIELDS}
+        kwargs.update(changes)
+        return type(self)(**kwargs)
+
+    def __eq__(self, other: object) -> bool:
+        if other is self:
+            return True
+        if not isinstance(other, AsyncInsert):
+            return NotImplemented
+        for name, _ in _METADATA_FIELDS:
+            if getattr(self, name) != getattr(other, name):
+                return False
+        return True
+
+    def __hash__(self) -> int:
+        # Identity-only hash keeps records usable as dict keys without
+        # walking every field. ``operation_ids`` + target uniquely
+        # identifies a (merged) record.
+        return hash((self.target_full_name, self.operation_ids))
+
+    def __repr__(self) -> str:
+        return (
+            f"AsyncInsert(target={self.target_full_name!r}, "
+            f"ops={len(self.operation_ids)}, mode={self.mode!r})"
+        )
 
     # ---- derived ---------------------------------------------------------
     @property
@@ -299,8 +401,7 @@ class AsyncInsert:
         # them into ``_extra_cleanup_paths`` via the metadata_paths
         # list — they're listed in the cleanup walk anyway.
         if newer.is_overwrite:
-            return replace(
-                newer,
+            return newer._replace(
                 # ``parquet_paths`` stays the newer's set — older's
                 # Parquet is dropped from the SQL projection. We still
                 # need to clean it up; record it on metadata_paths so
@@ -318,8 +419,7 @@ class AsyncInsert:
         # append rows are pulled into the overwrite scope).
         merged_mode = older.mode if older.is_overwrite else newer.mode or older.mode
 
-        return replace(
-            older,
+        return older._replace(
             parquet_paths=older.parquet_paths + newer.parquet_paths,
             metadata_paths=older.metadata_paths + newer.metadata_paths,
             operation_ids=older.operation_ids + newer.operation_ids,
@@ -395,8 +495,7 @@ class AsyncInsert:
                     tuple(p for r in dropped for p in r.parquet_paths)
                     + tuple(p for r in dropped for p in r.metadata_paths)
                 )
-                head = replace(
-                    head,
+                head = head._replace(
                     metadata_paths=dropped_cleanup + head.metadata_paths,
                     operation_ids=(
                         tuple(o for r in dropped for o in r.operation_ids)
@@ -997,15 +1096,18 @@ class AsyncInsert:
         raise_error: bool = True,
         cleanup: bool = True,
         client: "DatabricksClient | None" = None,
-    ) -> Any:
-        """Run this record against *engine* via an :class:`AsyncWrite` batch.
+    ) -> "AsyncInsert | None":
+        """Submit this record's prepared statements through *engine*.
 
-        Wraps the record in a single-target :class:`AsyncWrite` so
-        every staged Parquet + metadata file rides as an
+        Binds *engine*'s warehouse as :attr:`executor`, renders the
+        record via :meth:`to_statements`, and extends self with the
+        resulting prepared statements (which submits them). Every
+        staged Parquet + metadata file rides as an
         ``external_volume_paths`` entry (marked temporary unless
-        ``cleanup=False``). On success the batch's ``wait`` hook
-        auto-fires ``clear_temporary_resources`` and unlinks every
-        attached path — no explicit :meth:`cleanup` call is needed.
+        ``cleanup=False``); on success :class:`WarehouseStatementBatch`'s
+        ``wait`` hook auto-fires ``clear_temporary_resources`` and
+        unlinks every attached path — no explicit :meth:`cleanup` call
+        is needed.
 
         Empty operations (no Parquet paths) return ``None`` without
         touching *engine*. Set ``cleanup=False`` to attach the files
@@ -1015,14 +1117,14 @@ class AsyncInsert:
         if not self.parquet_paths or not self.target_full_name:
             return None
 
-        return AsyncWrite.from_records(
-            [self],
-            executor=engine.warehouse(),
-            client=client,
-            cleanup=cleanup,
-            wait=wait,
-            raise_error=raise_error,
-        )
+        statements = self.to_statements(client=client, cleanup=cleanup)
+        if not statements:
+            return None
+
+        self.executor = engine.warehouse()
+        self.extend(statements)
+        self.wait(wait=wait, raise_error=raise_error)
+        return self
 
     def cleanup(self, *, client: "DatabricksClient | None" = None) -> None:
         """Force-remove every staged Parquet + metadata file recorded on this op.
@@ -1207,11 +1309,11 @@ class AsyncWrite:
 
 # ---------------------------------------------------------------------------
 # Field-name caches (bake field set at import time so :meth:`from_dict`
-# doesn't re-walk ``fields(AsyncInsert)`` on every call).
+# doesn't re-walk ``_METADATA_FIELDS`` on every call).
 # ---------------------------------------------------------------------------
 
 
-_FIELD_NAMES: frozenset[str] = frozenset(f.name for f in fields(AsyncInsert))
+_FIELD_NAMES: frozenset[str] = frozenset(name for name, _ in _METADATA_FIELDS)
 _TUPLE_FIELD_NAMES: frozenset[str] = frozenset({
     "parquet_paths",
     "metadata_paths",
@@ -1373,7 +1475,8 @@ def stage_async_insert(
     prune_values: Optional[Mapping[str, Any]] = None,
     safe_merge: bool = False,
     operation_id: str | None = None,
-) -> "VolumePath":
+    lazy: bool = False,
+) -> "VolumePath | AsyncInsert":
     """Stage *data* and a sibling :class:`AsyncInsert` metadata file.
 
     The Parquet payload is cast to the target table's existing schema
@@ -1382,9 +1485,11 @@ def stage_async_insert(
     the source rows are written as-is and the metadata records the
     fact so the applier can decide whether to ``CREATE TABLE`` first.
 
-    Returns the :class:`VolumePath` to the staged Parquet file. The
-    sibling metadata file lives at the same stem with a ``.json``
-    suffix.
+    Returns the :class:`VolumePath` to the staged Parquet file by
+    default. With ``lazy=True``, returns the constructed
+    :class:`AsyncInsert` record instead so the caller can ``execute``,
+    ``merge_with``, or schedule it directly without re-reading the
+    sibling metadata file.
     """
     op_id = operation_id or _make_operation_id()
     folder = table.staging_folder(temporary=False, async_write=True)
@@ -1452,7 +1557,7 @@ def stage_async_insert(
         "Staged async insert %s for %r at %r",
         op_id, table, parquet_path,
     )
-    return parquet_path
+    return record if lazy else parquet_path
 
 
 def _resolve_current_client() -> "DatabricksClient":

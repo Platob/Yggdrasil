@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
     from yggdrasil.databricks.warehouse import WarehousePreparedStatement
+    from yggdrasil.databricks.table.async_write import AsyncInsert
 
 
 _READ_ONLY_MODES = frozenset({Mode.AUTO})
@@ -3037,19 +3038,24 @@ class Table(DatabricksPath):
         raise_error: bool = True,
         spark_session: Optional["SparkSession"] = None,
         return_data: bool = False,
-        async_write: bool = False,
+        lazy: bool = False,
         **kwargs
-    ) -> "Tabular | VolumePath | None":
+    ) -> "Tabular | AsyncInsert | None":
         """Insert *data* into this table — thin wrapper over :meth:`insert_into`.
 
-        When ``async_write=True``, the rows are cast to the target schema
-        and dropped (alongside a JSON metadata file describing the
+        With ``lazy=True``, the rows are cast to the target schema and
+        dropped (alongside a JSON metadata file describing the
         operation) under the table's ``stg_<table>/.sql/async/insert``
-        staging folder for a downstream applier to pick up. The SQL
-        insert is *not* executed; the staged Parquet :class:`VolumePath`
-        is returned instead. See :mod:`.async_write` for the wire format.
+        staging folder for a downstream applier to pick up; the SQL
+        insert is *not* executed and the constructed
+        :class:`AsyncInsert` record is returned so the caller can
+        ``execute(engine)`` it later, ``merge_with`` peers, or schedule
+        it via :meth:`AsyncInsert.job`. The record is itself a
+        :class:`WarehouseStatementBatch`, so binding an executor and
+        submitting is a single ``.execute(engine)`` call. See
+        :mod:`.async_write` for the wire format.
         """
-        if async_write:
+        if lazy:
             from .async_write import stage_async_insert
 
             return stage_async_insert(
@@ -3057,6 +3063,7 @@ class Table(DatabricksPath):
                 data,
                 mode=mode,
                 match_by=match_by,
+                lazy=True,
                 **kwargs,
             )
 
