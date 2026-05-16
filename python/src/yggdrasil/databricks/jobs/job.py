@@ -12,20 +12,16 @@ from __future__ import annotations
 
 import logging
 from typing import (
-    Any, Callable, ClassVar, Dict, Iterator, List, Mapping, Optional,
+    Any, Callable, ClassVar, Iterator, List, Mapping, Optional,
     TYPE_CHECKING, Union,
 )
 
 from databricks.sdk.errors import ResourceDoesNotExist
 from databricks.sdk.service.jobs import (
-    CronSchedule,
     Job as JobInfo,
     JobAccessControlRequest,
-    JobParameterDefinition,
     JobSettings,
-    PauseStatus,
     Task,
-    TriggerSettings,
 )
 
 from yggdrasil.dataclasses.singleton import Singleton
@@ -361,7 +357,7 @@ class Job(Singleton, DatabricksResource):
     # ------------------------------------------------------------------ #
     def task(
         self,
-        task_key_or_func: Any,
+        task_key: str,
         /,
         *,
         order: Optional[int] = None,
@@ -369,34 +365,17 @@ class Job(Singleton, DatabricksResource):
     ) -> "JobTask":
         """Construct a :class:`JobTask` handle bound to this job.
 
-        Two call shapes:
-
-        - ``job.task("key", **fields)`` — return an unpersisted
-          :class:`JobTask` with the given task_key + Task fields.
-          Use :meth:`JobTask.create` (idempotent) or
-          :meth:`JobTask.decorate` to push it onto the job.
-        - ``job.task(callable)`` — bare-callable shortcut: derive the
-          task_key from ``callable.__name__``, stage the function's
-          source via :meth:`JobTask.from_callable`, and create-or-update
-          the matching task on the job in one round trip. Existing
-          tasks with a default empty inner-task body are replaced
-          (the new ``spark_python_task`` shape always wins).
-
-        Examples::
+        The returned handle is not yet persisted on the job — call
+        :meth:`JobTask.create` (idempotent: re-creates with the same
+        ``task_key`` replace in place), or use :meth:`JobTask.decorate`
+        to stage a Python callable's source onto it and push it
+        through in one step::
 
             job = client.jobs.get_or_create(job_id=123, name="my-job")
 
-            # Decorator form (existing)
             @job.task("do").decorate
             def do(a: str, i: int):
                 print(a, i)
-
-            # Bare-callable form (new)
-            @job.task
-            def step(x: int): ...
-
-            # Or:
-            job.task(step)
 
             @job.task("do2", order=0, existing_cluster_id="c-123").decorate
             def do2(x: int): ...
@@ -412,23 +391,6 @@ class Job(Singleton, DatabricksResource):
         """
         from .task import JobTask
 
-        # Bare-callable shortcut: ``job.task(my_func)`` stages the
-        # callable on a task derived from ``my_func.__name__``.
-        # Idempotent: re-running replaces the existing task in place
-        # via :meth:`JobTask.create`. ``str`` is callable in Python
-        # but it's also the standard task_key argument, so it stays
-        # on the explicit-key path.
-        if not isinstance(task_key_or_func, str) and callable(task_key_or_func):
-            func = task_key_or_func
-            key = func.__name__
-            # ``decorate`` stages the callable, runs :meth:`JobTask.create`
-            # (idempotent: replaces any existing task with the same key
-            # — including ones whose inner task body was default/empty),
-            # and returns ``func`` with the resulting :class:`JobTask`
-            # bound at ``func._job_task`` for downstream access.
-            return self.task(key, order=order, **task_fields).decorate(func)  # type: ignore[return-value]
-
-        task_key = task_key_or_func
         details = Task(task_key=task_key, **task_fields)
         return JobTask(job=self, task_key=task_key, details=details, order=order)
 
@@ -471,167 +433,6 @@ class Job(Singleton, DatabricksResource):
         return _decorate(func)
 
     # ====================================================================== #
-    # Class-level task decorators — defer staging until a client is linked
-    # ====================================================================== #
-    #
-    # ``@Job.task_def`` and ``@Job.pytask_def`` are the deferred,
-    # class-level cousins of ``Job.task`` / ``Job.pytask`` (the
-    # eager instance-method decorators above). They record the task
-    # spec on the class at definition time without touching the
-    # workspace — there's no client yet. When a client is linked
-    # (via :meth:`deploy` / :meth:`from_callable` / :meth:`get_or_create`),
-    # :meth:`default_tasks` materializes the recorded factories and
-    # :meth:`_stage_pytasks` runs the Python-body stagings.
-    # ------------------------------------------------------------------ #
-
-    @classmethod
-    def task_def(
-        cls,
-        task_key: Optional[str] = None,
-        /,
-        **task_fields: Any,
-    ) -> Callable[[Callable[..., Any]], classmethod]:
-        """Class-level decorator: register a static :class:`Task` factory.
-
-        The decorated function is a classmethod-style factory called
-        as ``func(cls, **context)`` at deploy time; it returns a
-        :class:`Task` (or ``None`` to skip when context is
-        incomplete). Decoration itself is inert — no client needed.
-
-        Use this for tasks whose body lives elsewhere (notebook path,
-        SQL warehouse, …). For tasks whose body IS a Python callable
-        in this codebase, use :meth:`pytask_def` instead.
-
-        Usage::
-
-            class ApplyJob(Job):
-                @Job.task_def("apply")
-                def apply(cls, *, notebook_path=None, **_):
-                    if not notebook_path:
-                        return None
-                    return Task(
-                        task_key="apply",
-                        notebook_task=NotebookTask(notebook_path=notebook_path),
-                    )
-        """
-        def _decorate(func: Any) -> classmethod:
-            underlying = (
-                func.__func__
-                if isinstance(func, (classmethod, staticmethod)) else func
-            )
-            key = task_key or underlying.__name__
-            wrapped = classmethod(underlying)
-            wrapped.__func__._skeleton_task_key = key  # type: ignore[attr-defined]
-            wrapped.__func__._skeleton_task_fields = dict(task_fields)  # type: ignore[attr-defined]
-            wrapped.__func__._skeleton_pytask = False  # type: ignore[attr-defined]
-            return wrapped
-        return _decorate
-
-    @classmethod
-    def pytask_def(
-        cls,
-        func: Optional[Callable[..., Any]] = None,
-        /,
-        *,
-        task_key: Optional[str] = None,
-        order: Optional[int] = None,
-        **task_fields: Any,
-    ) -> Any:
-        """Class-level decorator: stage a Python callable as a task.
-
-        Like :meth:`pytask` but deferred — the callable is recorded
-        on the class at definition time and staged to the workspace
-        only when a client is linked (via :meth:`deploy` /
-        :meth:`from_callable`). Until then no API calls fire.
-
-        Usable bare or parametrized::
-
-            class MyJob(Job):
-                @Job.pytask_def
-                def step(): ...
-
-                @Job.pytask_def(task_key="custom", order=0)
-                def step2(x: int): ...
-        """
-        def _decorate(f: Callable[..., Any]) -> Callable[..., Any]:
-            f._skeleton_pytask = True  # type: ignore[attr-defined]
-            f._skeleton_task_key = task_key or f.__name__  # type: ignore[attr-defined]
-            f._skeleton_task_order = order  # type: ignore[attr-defined]
-            f._skeleton_task_fields = dict(task_fields)  # type: ignore[attr-defined]
-            return f
-
-        if func is None:
-            return _decorate
-        return _decorate(func)
-
-    @classmethod
-    def _iter_task_factories(cls) -> Iterator[Any]:
-        """Yield every ``@task_def`` / ``@pytask_def``-marked attribute on cls.
-
-        Walks the MRO so subclasses inherit the parent's decorations.
-        Names overridden on a child class shadow the parent's entry
-        (standard attribute-lookup semantics).
-        """
-        seen: set[str] = set()
-        for klass in cls.__mro__:
-            for name, attr in vars(klass).items():
-                if name in seen:
-                    continue
-                if isinstance(attr, (classmethod, staticmethod)):
-                    inner = attr.__func__
-                else:
-                    inner = attr
-                if not callable(inner) or not hasattr(
-                    inner, "_skeleton_task_key",
-                ):
-                    continue
-                seen.add(name)
-                # Use ``getattr(cls, name)`` so descriptors (classmethod)
-                # bind correctly.
-                yield getattr(cls, name)
-
-    @classmethod
-    def _collect_task_def_tasks(cls, **context: Any) -> List[Task]:
-        """Walk ``@task_def``-marked factories and materialize their tasks."""
-        out: List[Task] = []
-        for factory in cls._iter_task_factories():
-            inner = getattr(factory, "__func__", factory)
-            if getattr(inner, "_skeleton_pytask", False):
-                continue  # pytask_def runs in :meth:`_stage_pytasks` later
-            result = factory(**context)
-            if result is None:
-                continue
-            if not isinstance(result, Task):
-                raise TypeError(
-                    f"@Job.task_def {inner._skeleton_task_key!r} returned "
-                    f"{type(result).__name__}, expected Task or None"
-                )
-            out.append(result)
-        return out
-
-    def _stage_pytasks(self, **context: Any) -> List["JobTask"]:
-        """Stage every ``@pytask_def``-marked callable onto this Job.
-
-        Walks the class's MRO for pytask markers and pushes each one
-        through the eager :meth:`pytask` decorator now that the
-        instance has a live client. Returns the produced
-        :class:`JobTask` list (mostly for tests).
-        """
-        staged: List["JobTask"] = []
-        for factory in type(self)._iter_task_factories():
-            inner = getattr(factory, "__func__", factory)
-            if not getattr(inner, "_skeleton_pytask", False):
-                continue
-            staged.append(
-                self.task(
-                    inner._skeleton_task_key,
-                    order=inner._skeleton_task_order,
-                    **inner._skeleton_task_fields,
-                ).decorate(inner)._job_task,  # type: ignore[attr-defined]
-            )
-        return staged
-
-    # ====================================================================== #
     # from_callable — build a complete Job from a single Python callable
     # ====================================================================== #
     @classmethod
@@ -665,23 +466,25 @@ class Job(Singleton, DatabricksResource):
         …) flow through the ``task_fields`` mapping into the staged
         :class:`Task`.
 
-        This is the single-callable counterpart to the class-level
-        :meth:`task_def` / :meth:`pytask_def` decorators: same defer
-        semantics — nothing fires until the workspace is in scope.
+        Decoration is deferred — nothing fires until the workspace
+        is in scope. Errors when no client / service can be resolved.
         """
         resolved_name = name or func.__name__
         resolved_key = task_key or func.__name__
 
-        # Resolves :class:`DatabricksClient.current()` when *service* /
-        # *client* are unset; errors when there's no linked client.
-        jobs = cls.resolve_jobs(service=service, client=client, name=resolved_name)
+        # Resolve workspace client → Jobs service. Errors here when
+        # nothing's linked — staging would have nowhere to land.
+        if service is None:
+            if client is None:
+                client = DatabricksClient.current()
+            service = client.jobs
 
         resolved_description = description or (
             (func.__doc__ or "").strip().splitlines()[0]
             if func.__doc__ else None
         )
 
-        underlying = jobs.create_or_update(
+        underlying = service.create_or_update(
             name=resolved_name,
             tasks=[],
             description=resolved_description,
@@ -689,7 +492,12 @@ class Job(Singleton, DatabricksResource):
             permissions=permissions,
             **{k: v for k, v in job_settings.items() if v is not None},
         )
-        instance = cls._wrap(underlying, service=jobs)
+        instance = cls(
+            service=service,
+            job_id=underlying.job_id,
+            job_name=underlying.job_name,
+            details=getattr(underlying, "_details", None),
+        )
 
         # Now that the client is linked, stage *func* via the eager
         # decorator path. ``decorate`` calls ``JobTask.create`` so the
@@ -699,318 +507,3 @@ class Job(Singleton, DatabricksResource):
         ).decorate(func)
         return instance
 
-    # ====================================================================== #
-    # Skeleton — class-level template for subclasses
-    # ====================================================================== #
-    #
-    # ``Job`` itself doubles as the base skeleton: subclasses declare
-    # how each piece of a :class:`JobSettings` is derived by overriding
-    # the ``default_*`` classmethods below, and call
-    # :meth:`deploy` / :meth:`find_for` / :meth:`get_for` /
-    # :meth:`delete_for` / :meth:`create_for` to drive the lifecycle
-    # against the workspace. Every hook receives the caller's
-    # ``**context`` kwargs (e.g. ``table=`` on :class:`AsyncInsertJob`)
-    # so the subclass can look up structural inputs without re-deriving
-    # them at every call site.
-    #
-    # The hooks return ``None`` / ``[]`` by default — a bare ``Job``
-    # carries no skeleton; subclasses opt in by overriding only what
-    # they need. Caller-supplied kwargs on :meth:`deploy` always win
-    # over the hook defaults, so a one-off deviation never requires a
-    # subclass override.
-    # ------------------------------------------------------------------ #
-
-    # Each ``default_*`` hook is also the *resolver* — it owns the
-    # transform from caller kwargs to the resolved :class:`JobSettings`
-    # field. The default implementations are passthroughs (``name=``
-    # → name, ``tasks=`` → tasks, …) plus a few light coercions (cron
-    # string → :class:`CronSchedule`); subclasses override to derive
-    # the same fields from their own context (a :class:`Table`, a
-    # :class:`Volume`, …) while still honoring the caller's overrides.
-    # Hooks receive every :meth:`deploy` keyword via ``**kwargs`` and
-    # return ``None`` / ``[]`` when there's nothing to set.
-
-    @classmethod
-    def default_name(cls, *, name: Optional[str] = None, **_: Any) -> Optional[str]:
-        """Skeleton: resolve the job name. Override on subclasses."""
-        return name
-
-    @classmethod
-    def default_tasks(
-        cls,
-        *,
-        tasks: Optional[List[Task]] = None,
-        **context: Any,
-    ) -> List[Task]:
-        """Skeleton: resolve the task list.
-
-        Combines (in order): caller-supplied ``tasks=`` overrides,
-        and every :meth:`task_def`-decorated factory found on the
-        class. Python-body tasks declared via :meth:`pytask_def`
-        are NOT materialized here — they're staged after the job is
-        created in :meth:`_stage_pytasks`, which needs a live
-        client.
-        """
-        out: List[Task] = list(tasks) if tasks else []
-        out.extend(cls._collect_task_def_tasks(tasks=tasks, **context))
-        return out
-
-    @classmethod
-    def default_schedule(
-        cls,
-        *,
-        schedule: Any = None,
-        schedule_timezone: str = "UTC",
-        schedule_pause_status: Any = None,
-        **_: Any,
-    ) -> Optional[CronSchedule]:
-        """Skeleton: resolve the cron schedule.
-
-        Accepts a pre-built :class:`CronSchedule`, a Quartz cron
-        string (coerced with the matching ``schedule_timezone`` /
-        ``schedule_pause_status`` kwargs), or ``None``.
-        """
-        if schedule is None:
-            return None
-        if isinstance(schedule, CronSchedule):
-            return schedule
-        if isinstance(schedule, str):
-            resolved_pause: Any = schedule_pause_status
-            if isinstance(resolved_pause, str):
-                resolved_pause = PauseStatus(resolved_pause.upper())
-            return CronSchedule(
-                quartz_cron_expression=schedule,
-                timezone_id=schedule_timezone,
-                pause_status=resolved_pause,
-            )
-        raise TypeError(
-            f"{cls.__name__}: ``schedule`` must be a CronSchedule, a "
-            f"Quartz cron string, or None — got {type(schedule).__name__}."
-        )
-
-    @classmethod
-    def default_trigger(
-        cls,
-        *,
-        trigger: Optional[TriggerSettings] = None,
-        **_: Any,
-    ) -> Optional[TriggerSettings]:
-        """Skeleton: resolve :class:`TriggerSettings` (file-arrival / …)."""
-        return trigger
-
-    @classmethod
-    def default_parameters(
-        cls,
-        *,
-        parameters: Optional[List[JobParameterDefinition]] = None,
-        **_: Any,
-    ) -> List[JobParameterDefinition]:
-        """Skeleton: resolve job-level parameter definitions."""
-        return list(parameters) if parameters else []
-
-    @classmethod
-    def default_description(
-        cls,
-        *,
-        description: Optional[str] = None,
-        **_: Any,
-    ) -> Optional[str]:
-        """Skeleton: resolve the job description."""
-        return description
-
-    @classmethod
-    def default_tags(
-        cls,
-        *,
-        tags: Optional[Mapping[str, str]] = None,
-        **_: Any,
-    ) -> Optional[Dict[str, str]]:
-        """Skeleton: resolve the tag map."""
-        return dict(tags) if tags else None
-
-    @classmethod
-    def default_settings(cls, **_: Any) -> Dict[str, Any]:
-        """Skeleton: extra :class:`JobSettings` kwargs (``max_concurrent_runs``, …)."""
-        return {}
-
-    @classmethod
-    def resolve_jobs(
-        cls,
-        *,
-        service: "Jobs | None" = None,
-        client: "DatabricksClient | None" = None,
-        **_context: Any,
-    ) -> "Jobs":
-        """Resolve the :class:`Jobs` service to operate against.
-
-        Override to pull the service from a context-bound resource
-        (e.g. ``table.client.jobs`` on :class:`AsyncInsertJob`); the
-        default falls back to the explicit ``service`` / ``client``
-        argument, then :meth:`DatabricksClient.current`.
-        """
-        if service is not None:
-            return service
-        if client is None:
-            client = DatabricksClient.current()
-        return client.jobs
-
-    @classmethod
-    def _build_skeleton_kwargs(cls, **context: Any) -> Dict[str, Any]:
-        """Resolve every :class:`JobSettings` field via the ``default_*`` hooks.
-
-        ``context`` carries the caller's full :meth:`deploy` kwarg set;
-        each hook reads what it needs and returns the resolved field.
-        Subclasses override hooks to add context-derived defaults
-        without changing this assembly path.
-        """
-        resolved_name = cls.default_name(**context)
-        if not resolved_name:
-            raise ValueError(
-                f"{cls.__name__}: cannot resolve job name; pass ``name=`` "
-                f"or override ``default_name(cls, **context)``."
-            )
-
-        resolved_parameters = cls.default_parameters(**context)
-        resolved_trigger = cls.default_trigger(**context)
-        kwargs: Dict[str, Any] = {
-            "name": resolved_name,
-            "tasks": cls.default_tasks(**context),
-            "schedule": cls.default_schedule(**context),
-            "parameters": resolved_parameters if resolved_parameters else None,
-            "description": cls.default_description(**context),
-            "tags": cls.default_tags(**context),
-            **cls.default_settings(**context),
-        }
-        # Trigger lands conditionally: ``Jobs.create_or_update`` filters
-        # explicit ``None`` values at its SDK boundary, but the keyword
-        # being absent is what most call sites assert on (no trigger
-        # requested → no trigger field in the API payload).
-        if resolved_trigger is not None:
-            kwargs["trigger"] = resolved_trigger
-        return kwargs
-
-    @classmethod
-    def _wrap(
-        cls,
-        underlying: "Job",
-        *,
-        service: "Jobs | None" = None,
-        **context: Any,
-    ) -> "Job":
-        """Build a *cls* instance from an existing :class:`Job`.
-
-        Subclasses override to thread context-bound arguments through
-        their own ``__init__`` (e.g. ``AsyncInsertJob(table=...)``).
-        The default constructs by id / name / details so plain
-        ``Job.deploy(...)`` returns a singleton-cached :class:`Job`.
-        """
-        return cls(
-            service=service,
-            job_id=underlying.job_id,
-            job_name=underlying.job_name,
-            details=getattr(underlying, "_details", None),
-        )
-
-    # ------------------------------------------------------------------ #
-    # Skeleton CRUD
-    # ------------------------------------------------------------------ #
-    @classmethod
-    def deploy(
-        cls,
-        *,
-        service: "Jobs | None" = None,
-        client: "DatabricksClient | None" = None,
-        permissions: Optional[List[Union[str, JobAccessControlRequest]]] = None,
-        **kwargs: Any,
-    ) -> "Job":
-        """Idempotent create-or-update using the class skeleton.
-
-        Every :class:`JobSettings` field is resolved by the matching
-        ``default_*`` classmethod, which receives the full *kwargs*
-        bundle so subclasses can derive fields from structural inputs
-        (a :class:`Table`, a :class:`Volume`, …) while still honoring
-        caller overrides (``name=`` / ``tasks=`` / ``schedule=`` /
-        ``trigger=`` / ``parameters=`` / ``description=`` / ``tags=``
-        and any extra :class:`JobSettings` knobs through
-        :meth:`default_settings`).
-        """
-        jobs = cls.resolve_jobs(service=service, client=client, **kwargs)
-        api_kwargs = cls._build_skeleton_kwargs(**kwargs)
-        underlying = jobs.create_or_update(permissions=permissions, **api_kwargs)
-        LOGGER.info(
-            "Deployed %s %r (job_id=%s)",
-            cls.__name__, api_kwargs["name"], underlying.job_id,
-        )
-        return cls._wrap(underlying, service=jobs, **kwargs)
-
-    @classmethod
-    def create_for(
-        cls,
-        *,
-        service: "Jobs | None" = None,
-        client: "DatabricksClient | None" = None,
-        permissions: Optional[List[Union[str, JobAccessControlRequest]]] = None,
-        **kwargs: Any,
-    ) -> "Job":
-        """Explicit create (errors when the named job already exists)."""
-        jobs = cls.resolve_jobs(service=service, client=client, **kwargs)
-        api_kwargs = cls._build_skeleton_kwargs(**kwargs)
-        underlying = jobs.create(permissions=permissions, **api_kwargs)
-        return cls._wrap(underlying, service=jobs, **kwargs)
-
-    @classmethod
-    def find_for(
-        cls,
-        *,
-        service: "Jobs | None" = None,
-        client: "DatabricksClient | None" = None,
-        **kwargs: Any,
-    ) -> "Job | None":
-        """Find the job for *kwargs* (via :meth:`default_name`), or ``None``."""
-        jobs = cls.resolve_jobs(service=service, client=client, **kwargs)
-        resolved_name = cls.default_name(**kwargs)
-        if not resolved_name:
-            raise ValueError(
-                f"{cls.__name__}.find_for: cannot resolve job name; pass "
-                f"``name=`` or override ``default_name(cls, **context)``."
-            )
-        found = jobs.find(name=resolved_name)
-        if found is None:
-            return None
-        return cls._wrap(found, service=jobs, **kwargs)
-
-    @classmethod
-    def get_for(cls, **kwargs: Any) -> "Job":
-        """Like :meth:`find_for` but raises when the job is absent."""
-        found = cls.find_for(**kwargs)
-        if found is None:
-            raise ValueError(
-                f"No {cls.__name__} found for context {kwargs!r}."
-            )
-        return found
-
-    @classmethod
-    def get_or_create(cls, **kwargs: Any) -> "Job":
-        """Return the existing skeleton-named job, otherwise :meth:`create_for`."""
-        found = cls.find_for(**kwargs)
-        if found is not None:
-            return found
-        return cls.create_for(**kwargs)
-
-    @classmethod
-    def delete_for(
-        cls,
-        *,
-        service: "Jobs | None" = None,
-        client: "DatabricksClient | None" = None,
-        **kwargs: Any,
-    ) -> None:
-        """Delete the job for *kwargs* (no-op when it doesn't exist)."""
-        jobs = cls.resolve_jobs(service=service, client=client, **kwargs)
-        resolved_name = cls.default_name(**kwargs)
-        if not resolved_name:
-            raise ValueError(
-                f"{cls.__name__}.delete_for: cannot resolve job name; pass "
-                f"``name=`` or override ``default_name(cls, **context)``."
-            )
-        jobs.delete(name=resolved_name)

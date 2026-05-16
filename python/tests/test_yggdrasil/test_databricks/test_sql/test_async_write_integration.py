@@ -331,31 +331,3 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
         )
         assert run.is_terminal
 
-    def test_apply_schema_drains_multiple_tables(self):
-        """Two tables in the same schema, each with a staged insert →
-        :meth:`AsyncInsert.apply_schema` drains both in one call."""
-        table_a = self._unique_table("apply_a")
-        table_a.ensure_created(self._sample_schema())
-        table_b = self._unique_table("apply_b")
-        table_b.ensure_created(self._sample_schema())
-
-        table_a.async_insert(self._batch([1, 2], label="a"))
-        table_b.async_insert(self._batch([10, 20], label="b"))
-
-        AsyncInsert.apply_schema(
-            self.engine,
-            self.catalog_name,
-            self.schema_name,
-            client=self.client,
-            wait=True,
-            raise_error=True,
-        )
-
-        rows_a = self.engine.execute(
-            f"SELECT id FROM {table_a.full_name(safe=True)} ORDER BY id"
-        ).to_pylist()
-        rows_b = self.engine.execute(
-            f"SELECT id FROM {table_b.full_name(safe=True)} ORDER BY id"
-        ).to_pylist()
-        assert [r["id"] for r in rows_a] == [1, 2]
-        assert [r["id"] for r in rows_b] == [10, 20]
