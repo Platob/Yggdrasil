@@ -223,6 +223,57 @@ class TestAsyncInsertSerialization:
         loaded = AsyncInsert.from_file(path)
         assert loaded == rec
 
+    def test_to_dict_serializes_path_objects_to_url_strings(self):
+        """Path objects on ``parquet_paths`` / ``metadata_paths`` are
+        dumped via ``_path_for_sql`` so the dict survives orjson."""
+        parquet = MagicMock()
+        parquet.full_path.return_value = "/Volumes/cat/sch/stg/data/x.parquet"
+        meta = MagicMock()
+        meta.full_path.return_value = "/Volumes/cat/sch/stg/logs/x.json"
+        rec = AsyncInsert(
+            target_full_name="cat.sch.tbl",
+            parquet_paths=(parquet,),
+            metadata_paths=(meta,),
+        )
+        data = rec.to_dict()
+        assert data["parquet_paths"] == ["/Volumes/cat/sch/stg/data/x.parquet"]
+        assert data["metadata_paths"] == ["/Volumes/cat/sch/stg/logs/x.json"]
+
+    def test_pickle_drops_executor_and_results(self):
+        """Pickling rehydrates a metadata-only record — the bound
+        warehouse, in-flight results, and schema cache are gone."""
+        import pickle
+
+        rec = _make_record(mode="append")
+        rec.executor = MagicMock(name="warehouse")
+        rec.results["a"] = MagicMock(name="result")
+        rec._cached_schema = MagicMock(name="schema")
+
+        revived = pickle.loads(pickle.dumps(rec))
+        assert revived == rec  # metadata fields preserved
+        assert revived.executor is None
+        assert revived.results == {}
+        assert revived._cached_schema is None
+        assert revived.external_volume_paths == {}
+
+    def test_pickle_path_objects_become_url_strings(self):
+        """Path objects survive the pickle as URL strings (callers
+        coerce them back via ``DatabricksPath.from_`` lazily)."""
+        import pickle
+
+        parquet = MagicMock()
+        parquet.full_path.return_value = "/Volumes/cat/sch/stg/data/x.parquet"
+        meta = MagicMock()
+        meta.full_path.return_value = "/Volumes/cat/sch/stg/logs/x.json"
+        rec = AsyncInsert(
+            target_full_name="cat.sch.tbl",
+            parquet_paths=(parquet,),
+            metadata_paths=(meta,),
+        )
+        revived = pickle.loads(pickle.dumps(rec))
+        assert revived.parquet_paths == ("/Volumes/cat/sch/stg/data/x.parquet",)
+        assert revived.metadata_paths == ("/Volumes/cat/sch/stg/logs/x.json",)
+
 
 class TestAsyncInsertProperties:
 

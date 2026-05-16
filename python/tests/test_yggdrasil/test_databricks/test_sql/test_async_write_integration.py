@@ -26,7 +26,7 @@ from __future__ import annotations
 import os
 import secrets
 import time
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import pyarrow as pa
 from databricks.sdk.errors import DatabricksError
@@ -148,15 +148,19 @@ class _AsyncWriteIntegrationBase(DatabricksIntegrationCase):
             target_table_name=table.table_name,
         )
 
-    def _volume_path(self, full_path: str) -> VolumePath:
-        """Wrap a Unity-style ``/Volumes/cat/sch/...`` string as a :class:`VolumePath`.
+    def _volume_path(self, entry: Any) -> VolumePath:
+        """Return a :class:`VolumePath` for an :class:`AsyncInsert`
+        ``parquet_paths`` / ``metadata_paths`` entry.
 
-        :meth:`Table.async_insert` returns :class:`AsyncInsert` whose
-        ``parquet_paths`` / ``metadata_paths`` are SQL-shaped path
-        strings; the existence / cleanup asserts want the bound
-        :class:`VolumePath` so they can stat against the live volume.
+        :func:`stage_async_insert` now carries the live
+        :class:`VolumePath` on the record — pass it through. Records
+        loaded from disk metadata still hand back strings (URL form
+        ``/Volumes/cat/sch/...``); coerce those into a path bound to
+        the test client.
         """
-        inner = full_path.removeprefix("/Volumes") or "/"
+        if isinstance(entry, VolumePath):
+            return entry
+        inner = entry.removeprefix("/Volumes") or "/"
         return VolumePath(
             url=URL(scheme=VolumePath.scheme, path=inner),
             client=self.client,
