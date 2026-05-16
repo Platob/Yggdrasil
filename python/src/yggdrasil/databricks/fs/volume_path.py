@@ -739,6 +739,23 @@ class VolumePath(DatabricksPath):
     def _remove_dir(
         self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
     ) -> None:
+        # ``files.delete_directory`` is non-recursive — its docstring is
+        # explicit: "To delete a non-empty directory, first delete all
+        # of its contents." Hitting it on a non-empty directory returns
+        # ``BadRequest: The directory is not empty.`` So when the
+        # caller asks for ``recursive=True`` we list + delete contents
+        # ourselves, then drop the now-empty directory.
+        if recursive:
+            for child in self._ls(recursive=False):
+                cached = child._stat_cached
+                is_dir = cached is not None and cached.kind is IOKind.DIRECTORY
+                if is_dir:
+                    child._remove_dir(
+                        recursive=True, missing_ok=missing_ok, wait=wait,
+                    )
+                else:
+                    child._remove_file(missing_ok=missing_ok, wait=wait)
+
         if logger.isEnabledFor(logging.INFO):
             logger.info(
                 "files.delete_directory %s (recursive=%s)",
@@ -755,7 +772,6 @@ class VolumePath(DatabricksPath):
             Job.make(
                 self.client.workspace_client().files.delete_directory,
                 self.api_path,
-                recursive=recursive,
             )
         self.invalidate_singleton()
 
