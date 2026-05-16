@@ -51,7 +51,7 @@ from yggdrasil.data.statement import (
     StatementBatch,
     StatementResult,
 )
-from yggdrasil.dataclasses.waiting import WaitingConfig
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 
 
 # ---------------------------------------------------------------------------
@@ -334,9 +334,14 @@ def _batch_scenarios(repeat: int) -> list[dict]:
         repeat=repeat, inner=50_000,
     ))
     out.append(_time_one(
-        "batch.wait(True, raise_error=False)  all terminal",
-        lambda: submitted.wait(True, raise_error=False),
+        "batch.wait(wait=True, raise_error=False)  all terminal",
+        lambda: submitted.wait(wait=True, raise_error=False),
         repeat=repeat, inner=5_000,
+    ))
+    out.append(_time_one(
+        "batch.wait(wait=False)  short-circuit",
+        lambda: submitted.wait(wait=False),
+        repeat=repeat, inner=200_000,
     ))
     first_key = next(iter(submitted))
     out.append(_time_one(
