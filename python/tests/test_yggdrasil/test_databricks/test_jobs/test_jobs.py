@@ -21,8 +21,16 @@ from databricks.sdk.service.jobs import (
     RunState,
 )
 
+from databricks.sdk.service.jobs import SparkPythonTask, Task
+
 from yggdrasil.databricks.jobs import Job, JobRun
+from yggdrasil.databricks.jobs.task import JobTask, _render_callable_script
 from yggdrasil.databricks.tests import DatabricksTestCase
+
+
+def _signature_fixture(name: str = "alice", count: int = 3) -> str:
+    """Greet someone N times."""
+    return f"hi {name}" * count
 
 
 def _job_info(
@@ -413,6 +421,285 @@ class TestJobRunResource(DatabricksTestCase):
             run.url().to_string(),
             "https://test.databricks.net/#job/1/run/8",
         )
+
+
+class TestJobTaskFactoryAndDecorate(DatabricksTestCase):
+    """:meth:`Job.task` builds a :class:`JobTask`; :meth:`JobTask.decorate` back-fills."""
+
+    def _job(self, *, job_id: int = 42) -> Job:
+        return Job(
+            service=self.jobs,
+            job_id=job_id,
+            job_name="t",
+            details=_job_info(job_id=job_id, name="t"),
+        )
+
+    def test_task_factory_returns_jobtask_with_prebuilt_details(self):
+        job = self._job()
+        jt = job.task("step", description="hi", timeout_seconds=900)
+
+        self.assertIsInstance(jt, JobTask)
+        self.assertIs(jt.job, job)
+        self.assertEqual(jt.task_key, "step")
+        self.assertEqual(jt._details.task_key, "step")
+        self.assertEqual(jt._details.description, "hi")
+        self.assertEqual(jt._details.timeout_seconds, 900)
+
+    def test_decorate_back_fills_only_unset_fields(self):
+        job = self._job()
+        preset_body = SparkPythonTask(python_file="/explicit.py")
+        jt = job.task(
+            "step",
+            description="caller wins",
+            spark_python_task=preset_body,
+            timeout_seconds=600,
+        )
+
+        # Stub from_callable so the test doesn't hit the workspace.
+        staged_body = SparkPythonTask(python_file="/from_callable.py")
+        staged = JobTask(
+            job=job,
+            task_key="step",
+            details=Task(
+                task_key="step",
+                description="from docstring",
+                spark_python_task=staged_body,
+            ),
+        )
+        with self._patch_jobtask_method("from_callable", return_value=staged), \
+                self._patch_jobtask_method("create"):
+            def step():
+                """from docstring"""
+
+            returned = jt.decorate(step)
+
+        self.assertIs(returned, step)
+        self.assertIs(step._job_task, jt)  # type: ignore[attr-defined]
+        # Pre-set fields untouched.
+        self.assertIs(jt._details.spark_python_task, preset_body)
+        self.assertEqual(jt._details.description, "caller wins")
+        self.assertEqual(jt._details.timeout_seconds, 600)
+
+    def test_decorate_fills_in_missing_defaults(self):
+        job = self._job()
+        # No body / description on the handle — decorate should fill both.
+        jt = job.task("step", timeout_seconds=600)
+
+        staged_body = SparkPythonTask(python_file="/from_callable.py")
+        staged = JobTask(
+            job=job,
+            task_key="step",
+            details=Task(
+                task_key="step",
+                description="from docstring",
+                spark_python_task=staged_body,
+            ),
+        )
+        with self._patch_jobtask_method("from_callable", return_value=staged), \
+                self._patch_jobtask_method("create"):
+            def step():
+                """from docstring"""
+
+            jt.decorate(step)
+
+        self.assertIs(jt._details.spark_python_task, staged_body)
+        self.assertEqual(jt._details.description, "from docstring")
+        self.assertEqual(jt._details.timeout_seconds, 600)
+
+    def _patch_jobtask_method(self, name: str, *, return_value: Any = None):
+        from unittest.mock import patch
+        return patch.object(JobTask, name, return_value=return_value)
+
+    def test_pytask_bare_defaults_task_key_to_func_name(self):
+        job = self._job()
+        staged_body = SparkPythonTask(python_file="/from_callable.py")
+
+        def _fake_from_callable(cls, j, f, **_kw):
+            return JobTask(
+                job=j,
+                task_key=f.__name__,
+                details=Task(
+                    task_key=f.__name__,
+                    description="from docstring",
+                    spark_python_task=staged_body,
+                ),
+            )
+
+        from unittest.mock import patch
+        with patch.object(JobTask, "from_callable", classmethod(_fake_from_callable)), \
+                patch.object(JobTask, "create"):
+
+            @job.pytask
+            def step():
+                """from docstring"""
+
+        jt: JobTask = step._job_task  # type: ignore[attr-defined]
+        self.assertEqual(jt.task_key, "step")
+        self.assertIs(jt._details.spark_python_task, staged_body)
+
+    def test_task_order_inserts_at_position_on_create(self):
+        """``order=N`` places the task at slice index N in the job's task list."""
+        job = self._job()
+        # Seed three existing tasks so positions are observable.
+        job.settings.tasks = [
+            Task(task_key="a"),
+            Task(task_key="b"),
+            Task(task_key="c"),
+        ]
+
+        jt = job.task("new", order=1)
+        jt.create()
+
+        _, kwargs = self.jobs_api.update.call_args
+        new_keys = [t.task_key for t in kwargs["new_settings"].tasks]
+        self.assertEqual(new_keys, ["a", "new", "b", "c"])
+
+    def test_task_order_moves_existing_task_to_new_position(self):
+        """``order`` on an idempotent re-create first strips, then reinserts."""
+        job = self._job()
+        job.settings.tasks = [
+            Task(task_key="a"),
+            Task(task_key="b"),
+            Task(task_key="c"),
+        ]
+
+        # Move "a" to the end via order=-1 + a fresh details payload.
+        jt = job.task("a", order=-1, description="moved")
+        jt.create()
+
+        _, kwargs = self.jobs_api.update.call_args
+        tasks = kwargs["new_settings"].tasks
+        keys = [t.task_key for t in tasks]
+        self.assertEqual(keys, ["b", "a", "c"])
+        moved = next(t for t in tasks if t.task_key == "a")
+        self.assertEqual(moved.description, "moved")
+
+    def test_task_without_order_keeps_existing_position(self):
+        """``order=None`` (default) replaces in place — no shuffle."""
+        job = self._job()
+        job.settings.tasks = [
+            Task(task_key="a"),
+            Task(task_key="b"),
+            Task(task_key="c"),
+        ]
+
+        jt = job.task("b", description="updated")
+        jt.create()
+
+        _, kwargs = self.jobs_api.update.call_args
+        keys = [t.task_key for t in kwargs["new_settings"].tasks]
+        self.assertEqual(keys, ["a", "b", "c"])
+
+    def test_pytask_order_forwards_to_jobtask(self):
+        """``@job.pytask(order=…)`` carries through to the JobTask handle."""
+        job = self._job()
+        staged_body = SparkPythonTask(python_file="/from_callable.py")
+
+        def _fake_from_callable(cls, j, f, **_kw):
+            return JobTask(
+                job=j,
+                task_key=_kw.get("task_key") or f.__name__,
+                details=Task(
+                    task_key=_kw.get("task_key") or f.__name__,
+                    spark_python_task=staged_body,
+                ),
+            )
+
+        from unittest.mock import patch
+        with patch.object(JobTask, "from_callable", classmethod(_fake_from_callable)), \
+                patch.object(JobTask, "create"):
+
+            @job.pytask(order=2)
+            def step():
+                """from docstring"""
+
+        jt: JobTask = step._job_task  # type: ignore[attr-defined]
+        self.assertEqual(jt.order, 2)
+
+    def test_pytask_parametrized_forwards_fields(self):
+        job = self._job()
+        staged_body = SparkPythonTask(python_file="/from_callable.py")
+
+        def _fake_from_callable(cls, j, f, **_kw):
+            return JobTask(
+                job=j,
+                task_key=_kw.get("task_key") or f.__name__,
+                details=Task(
+                    task_key=_kw.get("task_key") or f.__name__,
+                    description="from docstring",
+                    spark_python_task=staged_body,
+                ),
+            )
+
+        from unittest.mock import patch
+        with patch.object(JobTask, "from_callable", classmethod(_fake_from_callable)), \
+                patch.object(JobTask, "create"):
+
+            @job.pytask(task_key="custom", description="caller wins", timeout_seconds=600)
+            def step():
+                """from docstring"""
+
+        jt: JobTask = step._job_task  # type: ignore[attr-defined]
+        self.assertEqual(jt.task_key, "custom")
+        self.assertEqual(jt._details.description, "caller wins")
+        self.assertEqual(jt._details.timeout_seconds, 600)
+        # spark_python_task wasn't pre-set, decorate filled it in.
+        self.assertIs(jt._details.spark_python_task, staged_body)
+
+
+class TestStagedScriptMetadata(DatabricksTestCase):
+    """Staged JobTask script: signature metadata + @checkargs wrapping."""
+
+    def test_script_wraps_function_with_checkargs_and_coerces_inputs(self):
+        import ast
+        import json
+
+        script = _render_callable_script(
+            _signature_fixture, (), {"name": "bob", "count": "9"},
+        )
+        ast.parse(script)
+
+        self.assertIn("__yggdrasil_task__", script)
+        self.assertIn(
+            "from yggdrasil.dataclasses.safe_function import checkargs",
+            script,
+        )
+        self.assertIn("Signature: _signature_fixture(name: str", script)
+        # The staged function is re-wrapped with @checkargs so every
+        # call site coerces inputs to annotated types.
+        self.assertIn("@checkargs\ndef _signature_fixture(", script)
+        # Invocation is now a direct call; the decorator handles coercion.
+        self.assertIn("_signature_fixture(name='bob', count='9')", script)
+
+        # Exec end-to-end — @checkargs must coerce "9" → int 9.
+        env: dict = {"__name__": "__main__", "_received": []}
+        patched = script.replace(
+            'return f"hi {name}" * count',
+            '_received.append((name, count, type(count).__name__))\n'
+            '    return f"hi {name}" * count',
+        )
+        exec(compile(patched, "<staged>", "exec"), env)
+        self.assertEqual(env["_received"], [("bob", 9, "int")])
+
+        meta = env["__yggdrasil_task__"]
+        self.assertEqual(meta["qualname"], "_signature_fixture")
+        self.assertEqual(meta["return"], "str")
+        self.assertIn("yggdrasil_version", meta)
+        self.assertIn("staged_at", meta)
+        json.dumps(meta)  # stable JSON shape.
+
+    def test_script_wraps_no_arg_function_with_checkargs(self):
+        import ast
+
+        def _noop() -> None:
+            return None
+
+        script = _render_callable_script(_noop, (), {})
+        ast.parse(script)
+        # @checkargs is always applied — a no-arg function still gets
+        # the decorator so any future widget / argv re-entry is safe.
+        self.assertIn("@checkargs\ndef _noop(", script)
+        self.assertIn("_noop()", script)
 
 
 class TestJobsSubmit(DatabricksTestCase):

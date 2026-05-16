@@ -1,4 +1,4 @@
-"""Live-integration tests for the Jobs/JobTask + ``@job.task`` flow.
+"""Live-integration tests for the Jobs/JobTask + ``@job.task(...).decorate`` flow.
 
 Skipped unless ``DATABRICKS_HOST`` is exported (see
 :class:`DatabricksIntegrationCase`).
@@ -11,10 +11,12 @@ Exercises against a real workspace:
   a ``.py`` script under ``/Workspace/Users/me/.yggdrasil/jobs/``;
   verifies the file actually lands and the script content compiles +
   calls the function.
-- :meth:`JobTask.create_or_update` — re-staging the same ``task_key``
-  replaces the existing entry on the job rather than raising.
-- ``@job.task`` decorator — Prefect-style sugar wires through
-  :meth:`JobTask.from_callable` + :meth:`JobTask.create_or_update`.
+- :meth:`JobTask.create` — re-staging the same ``task_key``
+  replaces the existing entry on the job rather than raising
+  (idempotent).
+- :meth:`Job.task` + :meth:`JobTask.decorate` — Prefect-style sugar
+  wires through :meth:`JobTask.from_callable` + :meth:`JobTask.create`.
+- :meth:`Job.pytask` — single-call fastpath that composes the two.
 - :meth:`JobTask.update` / :meth:`JobTask.delete` — round-trip
   through :meth:`Job.update` and the parent job's settings reflect
   the change.
@@ -115,7 +117,7 @@ class TestJobsGetOrCreate(_JobsIntegrationBase):
 
 
 class TestJobTaskIntegration(_JobsIntegrationBase):
-    """``JobTask`` CRUD + ``@job.task`` decorator against a real workspace."""
+    """``JobTask`` CRUD + ``@job.task(...).decorate`` against a real workspace."""
 
     def _fresh_job(self, prefix: str) -> Job:
         """Make-or-reuse a job seeded with a no-op task so ``update``
@@ -164,12 +166,12 @@ class TestJobTaskIntegration(_JobsIntegrationBase):
         # Sanity-compile.
         compile(content, path, "exec")
 
-    # ---- decorator + create_or_update ------------------------------- #
+    # ---- decorator + idempotent create ------------------------------ #
 
     def test_job_task_decorator_registers_then_re_decorates_in_place(self):
         job = self._fresh_job("decorator")
 
-        @job.task
+        @job.pytask
         def step_one(a: str = "hi"):
             """First decorator pass."""
             print(a)
@@ -184,9 +186,9 @@ class TestJobTaskIntegration(_JobsIntegrationBase):
         task_keys = {t.task_key for t in (job.settings.tasks or [])}
         assert "step_one" in task_keys
 
-        # Re-decorating the same function name with a different body
+        # Re-decorating the same task_key with a different body
         # replaces the entry in place — no duplicate task_key.
-        @job.task
+        @job.pytask
         def step_one(a: str = "hi"):  # noqa: F811 — intentional shadow
             """Second decorator pass — different body, same key."""
             print("rewritten", a)
@@ -196,17 +198,17 @@ class TestJobTaskIntegration(_JobsIntegrationBase):
             t for t in (job.settings.tasks or []) if t.task_key == "step_one"
         ]
         assert len(matching) == 1, (
-            "create_or_update should replace, not duplicate"
+            "JobTask.create should replace, not duplicate, on same key"
         )
         new_path = self._staged_workspace_path(matching[0])
         new_content = self._workspace_read(new_path).decode()
         assert "rewritten" in new_content
 
     def test_job_task_decorator_with_task_fields(self):
-        """``@job.task(task_key=..., description=...)`` layers Task fields on."""
+        """``@job.pytask(task_key=…, description=…)`` layers Task fields on."""
         job = self._fresh_job("decorator_fields")
 
-        @job.task(task_key="custom_key", description="overridden desc")
+        @job.pytask(task_key="custom_key", description="overridden desc")
         def make_it():
             """Original docstring — should be overridden by description=."""
             print("ok")
@@ -227,7 +229,7 @@ class TestJobTaskIntegration(_JobsIntegrationBase):
     def test_job_task_refresh_update_delete(self):
         job = self._fresh_job("crud")
 
-        @job.task
+        @job.pytask
         def crud_target():
             """First version."""
             print("v1")
@@ -256,13 +258,13 @@ class TestJobTaskIntegration(_JobsIntegrationBase):
         # The seed task survives the targeted delete.
         assert "seed" in remaining
 
-    def test_create_or_update_on_handcrafted_task(self):
-        """Non-decorator path: build a Task manually + create_or_update."""
+    def test_create_idempotent_on_handcrafted_task(self):
+        """Non-decorator path: build a Task manually + create (idempotent)."""
         job = self._fresh_job("handcrafted")
 
         condition = _noop_condition_task("noop_extra")
         jt = JobTask(job=job, task_key="noop_extra", details=condition)
-        jt.create_or_update()
+        jt.create()
 
         job.refresh()
         keys = {t.task_key for t in (job.settings.tasks or [])}
@@ -270,13 +272,13 @@ class TestJobTaskIntegration(_JobsIntegrationBase):
 
         # Same key, new details — replaces in place.
         replacement = _noop_condition_task("noop_extra")
-        replacement.description = "replaced via create_or_update"
+        replacement.description = "replaced via create"
         jt2 = JobTask(job=job, task_key="noop_extra", details=replacement)
-        jt2.create_or_update()
+        jt2.create()
 
         job.refresh()
         matching = [
             t for t in (job.settings.tasks or []) if t.task_key == "noop_extra"
         ]
         assert len(matching) == 1
-        assert matching[0].description == "replaced via create_or_update"
+        assert matching[0].description == "replaced via create"

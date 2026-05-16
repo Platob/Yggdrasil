@@ -11,11 +11,14 @@ source via :func:`inspect.getsource`, drops a self-contained ``.py``
 script under the user's personal workspace
 (``/Workspace/Users/me/.yggdrasil/jobs/``), and wraps it in a
 :class:`SparkPythonTask`. No pickling — the source is what runs.
-:meth:`Job.task` is the decorator form.
+:meth:`JobTask.decorate` (chained off :meth:`Job.task`) is the
+decorator form.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import inspect
+import json
 import logging
 import secrets
 import textwrap
@@ -24,11 +27,19 @@ from typing import Any, Callable, List, Optional, TYPE_CHECKING
 
 from databricks.sdk.service.jobs import SparkPythonTask, Task
 
+from yggdrasil.dataclasses.safe_function import (
+    describe_signature,
+    format_signature,
+)
+
 if TYPE_CHECKING:
     from .job import Job
 
 
-__all__ = ["JobTask", "DEFAULT_STAGING_ROOT"]
+__all__ = [
+    "JobTask",
+    "DEFAULT_STAGING_ROOT",
+]
 
 LOGGER = logging.getLogger(__name__)
 
@@ -52,10 +63,18 @@ class JobTask:
         job: "Job",
         task_key: str,
         details: Optional[Task] = None,
+        *,
+        order: Optional[int] = None,
     ) -> None:
         self.job = job
         self.task_key = task_key
         self._details = details
+        #: Optional position to place this task at on :meth:`create` /
+        #: :meth:`create`. ``None`` keeps the existing position
+        #: (or appends when new). Honors Python list-slice indexing, so
+        #: ``0`` lands first and ``-1`` lands second-to-last (insert
+        #: semantics: ``lst[:order] + [t] + lst[order:]``).
+        self.order = order
 
     def __repr__(self) -> str:
         return (
@@ -87,47 +106,23 @@ class JobTask:
     # Write
     # ------------------------------------------------------------------ #
     def create(self) -> "JobTask":
-        """Append this task to the parent job (raises on key collision)."""
+        """Append this task to the parent job — or update the existing entry.
+
+        Idempotent: if a task with the same ``task_key`` already lives
+        on the job, its entry is replaced in place (or moved when
+        :attr:`order` is set); otherwise the task is inserted. Used by
+        :meth:`JobTask.decorate` so re-decorating the same function
+        during development doesn't raise — the staged source on the
+        second pass overwrites the first task entry.
+        """
         if self._details is None:
             raise ValueError(
                 f"Cannot create {self!r}: details is None. Construct with a "
                 "Task or build through :meth:`from_callable`."
             )
         existing = self._existing_tasks()
-        if any(t.task_key == self.task_key for t in existing):
-            raise ValueError(
-                f"Task {self.task_key!r} already exists on {self.job!r}; "
-                "call :meth:`update` or :meth:`create_or_update` instead."
-            )
-        LOGGER.debug("Creating job task %r on %r", self, self.job)
-        self.job.update(tasks=[*existing, self._details])
-        LOGGER.info("Created job task %r", self)
-        return self
-
-    def create_or_update(self) -> "JobTask":
-        """Append this task — or replace the existing one with the same key.
-
-        Used by the :meth:`Job.task` decorator so re-decorating the same
-        function during development doesn't raise; the staged pickle on
-        the second pass overwrites the first task entry in place.
-        """
-        if self._details is None:
-            raise ValueError(
-                f"Cannot create_or_update {self!r}: details is None. "
-                "Construct with a Task or build through :meth:`from_callable`."
-            )
-        existing = self._existing_tasks()
-        new_details = self._details
-        replaced = False
-        new_tasks: List[Task] = []
-        for t in existing:
-            if t.task_key == self.task_key:
-                new_tasks.append(new_details)
-                replaced = True
-            else:
-                new_tasks.append(t)
-        if not replaced:
-            new_tasks.append(new_details)
+        replaced = any(t.task_key == self.task_key for t in existing)
+        new_tasks = self._place(existing, self._details)
 
         LOGGER.debug(
             "%s job task %r on %r",
@@ -180,6 +175,77 @@ class JobTask:
         settings = self.job.settings
         return list((settings.tasks if settings is not None else None) or [])
 
+    def _place(self, existing: List[Task], new_details: Task) -> List[Task]:
+        """Build the new task list with *new_details* placed honoring ``self.order``.
+
+        ``order is None`` keeps the existing task's position (replace
+        in place) or appends when the key is new. An integer ``order``
+        first strips any prior entry for ``self.task_key`` and inserts
+        *new_details* at that slice index (``lst[:order] + [t] +
+        lst[order:]``), so the same call both creates and reorders.
+        """
+        if self.order is None:
+            replaced = False
+            new_tasks: List[Task] = []
+            for t in existing:
+                if t.task_key == self.task_key:
+                    new_tasks.append(new_details)
+                    replaced = True
+                else:
+                    new_tasks.append(t)
+            if not replaced:
+                new_tasks.append(new_details)
+            return new_tasks
+        others = [t for t in existing if t.task_key != self.task_key]
+        return [*others[:self.order], new_details, *others[self.order:]]
+
+    # ------------------------------------------------------------------ #
+    # Decorator: stage a Python callable onto this task
+    # ------------------------------------------------------------------ #
+    def decorate(self, func: Callable[..., Any]) -> Callable[..., Any]:
+        """Stage *func*'s source onto this task and persist it on the job.
+
+        Designed to be chained off :meth:`Job.task` as a decorator::
+
+            @job.task("step_one", description="…").decorate
+            def step_one(): ...
+
+        Stages *func*'s raw source under the user's workspace via
+        :meth:`from_callable`, then back-fills its derived defaults
+        (``spark_python_task``, ``description`` from the docstring)
+        onto :attr:`_details` *only where the caller didn't already
+        set that field* through :meth:`Job.task`. Anything pre-set on
+        the handle — ``spark_python_task=…``, ``description=…``,
+        compute, dependencies, retries, environment_key — wins.
+        Pushes the result through :meth:`create` so a re-decoration
+        replaces the previous entry in place.
+
+        Returns the original callable so the function stays usable
+        in-process; the :class:`JobTask` handle is attached as
+        ``func._job_task`` for downstream access.
+        """
+        staged = type(self).from_callable(
+            self.job, func, task_key=self.task_key,
+        )
+        staged_details = staged._details
+        assert staged_details is not None, (
+            "JobTask.from_callable should always populate _details"
+        )
+        if self._details is None:
+            self._details = staged_details
+        else:
+            # Caller-supplied fields win; decorate only fills in slots
+            # the caller left as None on the pre-built Task.
+            defaults = {
+                k: v for k, v in vars(staged_details).items()
+                if v is not None and getattr(self._details, k, None) is None
+            }
+            if defaults:
+                self._details = _dc_replace(self._details, **defaults)
+        self.create()
+        func._job_task = self  # type: ignore[attr-defined]
+        return func
+
     # ------------------------------------------------------------------ #
     # Factory: from a Python callable
     # ------------------------------------------------------------------ #
@@ -196,10 +262,10 @@ class JobTask:
         """Stage *func*'s source + bound *args*/*kwargs* as a Python script.
 
         Extracts the source via :func:`inspect.getsource`, strips any
-        decorator lines (the runner side has no ``@job.task`` in scope),
-        appends an invocation that passes *args* / *kwargs* as Python
-        literals, and writes the result to a single ``.py`` file under
-        *staging_root* (default:
+        decorator lines (the runner side has no ``@job.task(...).decorate``
+        in scope), appends an invocation that passes *args* / *kwargs*
+        as Python literals, and writes the result to a single ``.py``
+        file under *staging_root* (default:
         ``/Workspace/Users/me/.yggdrasil/jobs/<task_key>-<rand>.py``).
         No pickling involved — the script Databricks runs is the exact
         source of the function.
@@ -213,11 +279,13 @@ class JobTask:
         Limitations: ``inspect.getsource`` needs the function to live in
         an importable source file (no REPL-defined lambdas) and the body
         must be self-contained — closures, module-level globals, and
-        decorators other than ``@job.task`` are NOT carried over.
+        decorators other than ``@job.task(...).decorate`` are NOT
+        carried over.
 
         The returned :class:`JobTask` is not persisted on the job yet
-        — call :meth:`create` / :meth:`create_or_update` (or use the
-        :meth:`Job.task` decorator, which does it for you). Compute
+        — call :meth:`create` (or use :meth:`JobTask.decorate`, which
+        does it for you). :meth:`create` is idempotent — same key
+        replaces in place. Compute
         stays caller-owned: layer ``new_cluster`` / ``existing_cluster_id``
         / ``job_cluster_key`` via :meth:`update` once the task is
         registered.
@@ -240,8 +308,14 @@ class JobTask:
         )
         path.write_bytes(script.encode())
 
-        doc = (func.__doc__ or "").strip()
-        description = doc.splitlines()[0][:140] if doc else None
+        # Description carries the formatted signature so the Databricks
+        # UI surfaces "qualname(x: int = 5) -> str" without cracking the
+        # script open; the docstring's first line is prepended when set.
+        signature_str = format_signature(describe_signature(func))
+        doc_line = (func.__doc__ or "").strip().splitlines()[0:1]
+        description = (
+            f"{doc_line[0]} — {signature_str}" if doc_line else signature_str
+        )[:1000]
 
         details = Task(
             task_key=key,
@@ -260,8 +334,16 @@ def _render_callable_script(
 ) -> str:
     """Render *func* + bound *args* / *kwargs* as a runnable ``.py`` script.
 
-    Returns a UTF-8 ``str``; caller encodes for the workspace write.
+    Embeds a ``__yggdrasil_task__`` metadata block (signature, module,
+    yggdrasil version, staging timestamp) and wraps the function with
+    :func:`yggdrasil.dataclasses.safe_function.checkargs` so every
+    call site — the staged invocation below and any future widget /
+    argv re-entry — type-checks inputs against the function's
+    annotations via :func:`yggdrasil.data.cast.convert`. Returns a
+    UTF-8 ``str``; caller encodes for the workspace write.
     """
+    from yggdrasil.version import __version__ as ygg_version
+
     try:
         source = textwrap.dedent(inspect.getsource(func))
     except (OSError, TypeError) as exc:  # built-ins, REPL-defined lambdas
@@ -272,11 +354,23 @@ def _render_callable_script(
         ) from exc
 
     # Drop decorator lines preceding ``def`` — the runner has no
-    # ``@job.task`` (or any other decorator from this scope) available.
+    # ``@job.task(...).decorate`` (or any other decorator from this
+    # scope) available. We re-apply ``@checkargs`` ourselves below.
     lines = source.splitlines()
     while lines and lines[0].lstrip().startswith("@"):
         lines.pop(0)
-    body = "\n".join(lines).rstrip() + "\n"
+    body = "@checkargs\n" + "\n".join(lines).rstrip() + "\n"
+
+    sig_meta = describe_signature(func)
+    meta_payload = {
+        **sig_meta,
+        "yggdrasil_version": str(ygg_version),
+        "staged_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+    }
+    # JSON-encode for stable shape, then load via ``json.loads`` at
+    # module import — keeps the metadata block readable as JSON
+    # without Python tripping on ``null`` / ``true`` / ``false``.
+    meta_json = json.dumps(meta_payload, indent=2, sort_keys=True)
 
     call_parts: list[str] = [repr(a) for a in args]
     call_parts.extend(f"{k}={v!r}" for k, v in kwargs.items())
@@ -284,8 +378,17 @@ def _render_callable_script(
 
     return (
         "# Auto-generated by yggdrasil.databricks.jobs.JobTask.from_callable.\n"
+        f"# Function: {func.__qualname__}\n"
+        f"# Signature: {format_signature(sig_meta)}\n"
         "# The function body below is the verbatim source of the decorated\n"
-        f"# callable {func.__qualname__!r}; invocation is appended.\n"
+        "# callable, re-wrapped with @checkargs so every call site coerces\n"
+        "# its inputs to the function's annotated types via\n"
+        "# yggdrasil.data.cast.convert. Signature metadata is embedded\n"
+        "# under __yggdrasil_task__.\n"
+        "\n"
+        "import json as _yggdrasil_json\n"
+        "from yggdrasil.dataclasses.safe_function import checkargs\n"
+        f"__yggdrasil_task__ = _yggdrasil_json.loads(r\"\"\"{meta_json}\"\"\")\n"
         "\n"
         f"{body}"
         "\n"
