@@ -1281,6 +1281,7 @@ class URL(os.PathLike):
         setattr_(new, "_str_enc", None)
         setattr_(new, "_str_raw", None)
         setattr_(new, "_anonymized", None)
+        setattr_(new, "_anonymized_cache", None)
         return new
 
     @property
@@ -1496,6 +1497,7 @@ class URL(os.PathLike):
             setattr_(new, "_str_enc", None)
             setattr_(new, "_str_raw", None)
             setattr_(new, "_anonymized", None)
+            setattr_(new, "_anonymized_cache", None)
             return new
         base = self.to_string(encode=True)
         target = ref.to_string(encode=True) if isinstance(ref, URL) else ref
