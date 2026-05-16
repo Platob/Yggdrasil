@@ -648,9 +648,9 @@ class TestJobTaskFactoryAndDecorate(DatabricksTestCase):
 
 
 class TestStagedScriptMetadata(DatabricksTestCase):
-    """Staged JobTask script: signature metadata + check_function_args wiring."""
+    """Staged JobTask script: signature metadata + @checkargs wrapping."""
 
-    def test_script_embeds_signature_metadata_and_routes_through_check(self):
+    def test_script_wraps_function_with_checkargs_and_coerces_inputs(self):
         import ast
         import json
 
@@ -661,14 +661,17 @@ class TestStagedScriptMetadata(DatabricksTestCase):
 
         self.assertIn("__yggdrasil_task__", script)
         self.assertIn(
-            "from yggdrasil.dataclasses.safe_function import check_function_args",
+            "from yggdrasil.dataclasses.safe_function import checkargs",
             script,
         )
         self.assertIn("Signature: _signature_fixture(name: str", script)
-        self.assertIn("check_function_args(_signature_fixture, ", script)
+        # The staged function is re-wrapped with @checkargs so every
+        # call site coerces inputs to annotated types.
+        self.assertIn("@checkargs\ndef _signature_fixture(", script)
+        # Invocation is now a direct call; the decorator handles coercion.
+        self.assertIn("_signature_fixture(name='bob', count='9')", script)
 
-        # Exec end-to-end — runtime path must coerce "9" → int 9 via
-        # check_function_args / yggdrasil.data.cast.convert.
+        # Exec end-to-end — @checkargs must coerce "9" → int 9.
         env: dict = {"__name__": "__main__", "_received": []}
         patched = script.replace(
             'return f"hi {name}" * count',
@@ -685,7 +688,7 @@ class TestStagedScriptMetadata(DatabricksTestCase):
         self.assertIn("staged_at", meta)
         json.dumps(meta)  # stable JSON shape.
 
-    def test_script_without_args_skips_check_call(self):
+    def test_script_wraps_no_arg_function_with_checkargs(self):
         import ast
 
         def _noop() -> None:
@@ -693,8 +696,10 @@ class TestStagedScriptMetadata(DatabricksTestCase):
 
         script = _render_callable_script(_noop, (), {})
         ast.parse(script)
+        # @checkargs is always applied — a no-arg function still gets
+        # the decorator so any future widget / argv re-entry is safe.
+        self.assertIn("@checkargs\ndef _noop(", script)
         self.assertIn("_noop()", script)
-        self.assertNotIn("check_function_args(_noop, ", script)
 
 
 class TestJobsSubmit(DatabricksTestCase):
