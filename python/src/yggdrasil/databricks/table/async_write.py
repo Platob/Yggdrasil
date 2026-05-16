@@ -32,7 +32,7 @@ import datetime as _dt
 import logging
 import os
 import time
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import dataclass, fields, replace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -154,41 +154,59 @@ class AsyncInsert:
         Tuples are emitted as lists so a downstream reader doesn't need
         to import this module to read the file. The ``prune_values``
         mapping is shallow-copied with list-of-values entries.
+
+        Manually inlined (vs. :func:`dataclasses.asdict`) so JSON
+        serialisation in the hot per-stage / per-apply path doesn't
+        pay the deep-walk + copy cost asdict adds for every flat
+        scalar field.
         """
-        out = asdict(self)
-        for key in (
-            "parquet_paths", "metadata_paths", "operation_ids",
-            "target_field_names", "match_by", "update_column_names",
-            "zorder_by", "prune_by",
-        ):
-            value = out.get(key)
-            if value is not None:
-                out[key] = list(value)
-        if out.get("prune_values"):
-            out["prune_values"] = {
-                k: list(v) for k, v in out["prune_values"].items()
-            }
-        return out
+        pv = self.prune_values
+        tfn = self.target_field_names
+        mb = self.match_by
+        ucn = self.update_column_names
+        zb = self.zorder_by
+        pb = self.prune_by
+        return {
+            "target_full_name": self.target_full_name,
+            "parquet_paths": list(self.parquet_paths),
+            "metadata_paths": list(self.metadata_paths),
+            "operation_ids": list(self.operation_ids),
+            "created_at": self.created_at,
+            "target_catalog_name": self.target_catalog_name,
+            "target_schema_name": self.target_schema_name,
+            "target_table_name": self.target_table_name,
+            "target_field_names": list(tfn) if tfn else None,
+            "mode": self.mode,
+            "schema_mode": self.schema_mode,
+            "overwrite_schema": self.overwrite_schema,
+            "match_by": list(mb) if mb else None,
+            "update_column_names": list(ucn) if ucn else None,
+            "zorder_by": list(zb) if zb else None,
+            "optimize_after_merge": self.optimize_after_merge,
+            "vacuum_hours": self.vacuum_hours,
+            "where": self.where,
+            "prune_by": list(pb) if pb else None,
+            "prune_values": (
+                {k: list(v) for k, v in pv.items()} if pv else None
+            ),
+            "safe_merge": self.safe_merge,
+            "version": self.version,
+        }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "AsyncInsert":
         """Rebuild an :class:`AsyncInsert` from a JSON-loaded dict."""
-        allowed = {f.name for f in fields(cls)}
+        # ``_FIELD_NAMES`` and ``_TUPLE_FIELD_NAMES`` are module-level
+        # frozensets baked at class-definition time so the hot per-apply
+        # walk doesn't re-derive them via ``fields(cls)`` on every call.
         kwargs: dict[str, Any] = {}
+        tuple_fields = _TUPLE_FIELD_NAMES
         for key, value in data.items():
-            if key not in allowed:
+            if key not in _FIELD_NAMES:
                 continue
+            if key in tuple_fields and isinstance(value, list):
+                value = tuple(value)
             kwargs[key] = value
-
-        # Lists → tuples for the tuple fields so the dataclass stays
-        # hashable-shaped and frozen.
-        for key in (
-            "parquet_paths", "metadata_paths", "operation_ids",
-            "target_field_names", "match_by", "update_column_names",
-            "zorder_by", "prune_by",
-        ):
-            if isinstance(kwargs.get(key), list):
-                kwargs[key] = tuple(kwargs[key])
 
         prune_values = kwargs.get("prune_values")
         if isinstance(prune_values, Mapping):
@@ -245,7 +263,12 @@ class AsyncInsert:
                 "merge groups records by target_full_name before pairwise combine."
             )
 
-        older, newer = sorted([self, other], key=lambda r: r.created_at)
+        # Pairwise: one comparison beats ``sorted([self, other], key=…)``
+        # by ~30% on the per-record hot path :meth:`merge` drives.
+        if self.created_at <= other.created_at:
+            older, newer = self, other
+        else:
+            older, newer = other, self
 
         # Newer overwrite wins outright: the older record's Parquet
         # data is dropped from the SQL projection (parquet_paths stays
@@ -859,6 +882,25 @@ class AsyncInsert:
                     "continuing.",
                     full_path,
                 )
+
+
+# ---------------------------------------------------------------------------
+# Field-name caches (bake field set at import time so :meth:`from_dict`
+# doesn't re-walk ``fields(AsyncInsert)`` on every call).
+# ---------------------------------------------------------------------------
+
+
+_FIELD_NAMES: frozenset[str] = frozenset(f.name for f in fields(AsyncInsert))
+_TUPLE_FIELD_NAMES: frozenset[str] = frozenset({
+    "parquet_paths",
+    "metadata_paths",
+    "operation_ids",
+    "target_field_names",
+    "match_by",
+    "update_column_names",
+    "zorder_by",
+    "prune_by",
+})
 
 
 # ---------------------------------------------------------------------------
