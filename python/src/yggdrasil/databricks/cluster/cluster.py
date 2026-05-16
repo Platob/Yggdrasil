@@ -46,20 +46,21 @@ from databricks.sdk.service.compute import (
     PythonPyPiLibrary,
     State,
 )
+from yggdrasil.data.enums import Scheme
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.environ.pip_settings import PipIndexSettings
 from yggdrasil.io.headers import DEFAULT_HOSTNAME
-from yggdrasil.io.url import URL
+from yggdrasil.io.url import URL, URLBased
 from yggdrasil.pyutils.equality import dicts_equal
 from yggdrasil.version import VersionInfo
 
-from .execution_context import ExecutionContext
 from .service import Clusters, PYTHON_BY_DBR
 from ..client import DatabricksResource
+from ..compute.execution_context import ExecutionContext
 
 if TYPE_CHECKING:
-    from .command_execution import CommandExecution
+    from ..compute.command_execution import CommandExecution
 
 
 __all__ = ["Cluster"]
@@ -131,7 +132,7 @@ def _normalize_pip_pkg_name(spec: str) -> str:
     return name.replace("_", "-")
 
 
-class Cluster(Singleton, DatabricksResource):
+class Cluster(Singleton, DatabricksResource, URLBased):
     """
     High-level Databricks cluster helper.
 
@@ -152,7 +153,15 @@ class Cluster(Singleton, DatabricksResource):
     callers asking for the same cluster under the same service share
     the live ``ClusterDetails`` cache and the per-cluster execution
     contexts.
+
+    URL-addressable through :class:`URLBased` under
+    :attr:`Scheme.DATABRICKS_CLUSTER` (``dbks+cluster://``): a cluster
+    round-trips through ``dbks+cluster://<host>/<cluster_id>`` so a
+    caller with just the URL can rebuild the live handle via
+    :meth:`URLBased.dispatch` / :meth:`Cluster.from_url`.
     """
+
+    scheme: ClassVar[Scheme] = Scheme.DATABRICKS_CLUSTER
 
     _SINGLETON_TTL: ClassVar[Any] = None
 
@@ -220,6 +229,49 @@ class Cluster(Singleton, DatabricksResource):
     def url(self) -> URL:
         """Deprecated alias for :attr:`explore_url` (method form)."""
         return self.explore_url
+
+    # ------------------------------------------------------------------ #
+    # URLBased contract — round-trippable identity via dbks+cluster://
+    # ------------------------------------------------------------------ #
+    def to_url(self) -> URL:
+        """Render this cluster as ``dbks+cluster://<host>/<cluster_id>``.
+
+        The host comes from the bound :class:`DatabricksClient`; the
+        single path segment is the cluster id. ``cluster_name`` is not
+        emitted — the canonical identity for a cluster is its id, and a
+        consumer that needs the name can refresh from the live details.
+        """
+        host = self.client.base_url.host or ""
+        cid = self.cluster_id or ""
+        return URL.from_(f"{self.scheme.value}://{host}/{cid}")
+
+    @classmethod
+    def from_url(cls, url: "URL | str", **kwargs: Any) -> "Cluster":
+        """Build a :class:`Cluster` from a ``dbks+cluster://host/<id>`` URL.
+
+        Resolves the underlying :class:`DatabricksClient` from the URL
+        host (or :meth:`DatabricksClient.current` when the URL carries
+        no host). The first path segment is the cluster id; trailing
+        segments are tolerated for forward compatibility but ignored.
+        """
+        from ..client import DatabricksClient
+
+        u = URL.from_(url)
+        parts = [p for p in (u.path or "/").lstrip("/").split("/") if p]
+        if not parts:
+            raise ValueError(
+                f"Cannot derive cluster_id from URL {u!r} — expected "
+                f"``{cls.scheme.value}://<host>/<cluster_id>``."
+            )
+        cluster_id = parts[0]
+        client = kwargs.pop("client", None)
+        if client is None:
+            client = (
+                DatabricksClient(host=f"https://{u.host}/")
+                if u.host else DatabricksClient.current()
+            )
+        service = kwargs.pop("service", None) or client.compute.clusters
+        return cls(service=service, cluster_id=cluster_id, **kwargs)
 
     # ------------------------------------------------------------------ #
     # SDK clients

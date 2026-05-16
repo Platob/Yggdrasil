@@ -4,7 +4,7 @@ Instance-pool management helpers for Databricks compute.
 Exposes two coordinated surfaces:
 
 - :class:`InstancePools` — collection-level service mirroring the shape of
-  :class:`yggdrasil.databricks.compute.service.Clusters`. Handles CRUD,
+  :class:`yggdrasil.databricks.cluster.Clusters`. Handles CRUD,
   permissions and find-or-create singleton helpers.
 - :class:`InstancePool` — resource wrapper around a single instance pool with
   state helpers, lifecycle operations, and convenience entry points for
@@ -62,7 +62,7 @@ from yggdrasil.pyutils.equality import dicts_equal
 from ..client import DatabricksClient, DatabricksResource, DatabricksService
 
 if TYPE_CHECKING:
-    from .cluster import Cluster
+    from ..cluster.cluster import Cluster
 
 
 __all__ = [
@@ -206,7 +206,7 @@ def _get_cached_pool_id(client: DatabricksClient, name: str) -> Optional[str]:
 class InstancePools(DatabricksService):
     """Collection-level Databricks instance-pool service.
 
-    Mirrors the shape of :class:`yggdrasil.databricks.compute.service.Clusters`
+    Mirrors the shape of :class:`yggdrasil.databricks.cluster.Clusters`
     so callers can switch between cluster and pool flows with the same vocabulary.
 
     The :attr:`defaults` attribute controls auto-configuration of pools created

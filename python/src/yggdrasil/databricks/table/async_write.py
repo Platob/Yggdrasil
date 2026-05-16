@@ -2,7 +2,7 @@
 
 When :meth:`Table.insert` is called with ``async_write=True``, the
 caller is not waiting on a warehouse round trip — the rows are cast
-to the target schema, written as Parquet next to the table's
+to the target schema, written as Parquet under the table's
 ``stg_<table>/.sql/async/insert`` staging folder, and a sibling JSON
 file carries an :class:`AsyncInsert` record so a downstream applier
 (typically a job-driven loop) can replay the operation against the
@@ -11,8 +11,14 @@ target table when it's convenient.
 File layout under the table's async staging folder::
 
     .sql/async/insert/
-        async-<epoch_ms>-<seed>.parquet   # rows, cast to target schema
-        async-<epoch_ms>-<seed>.json      # operation metadata (orjson)
+        data/async-<epoch_ms>-<seed>.parquet   # rows, cast to target schema
+        logs/async-<epoch_ms>-<seed>.json      # operation metadata (orjson)
+
+Data files and metadata logs live in sibling folders so the applier
+can drain one without listing the other — bulk-deleting ``data/``
+after a successful apply doesn't have to skip past JSON entries, and
+walking ``logs/`` for merge candidates doesn't have to filter out
+Parquet payloads.
 
 This module lives outside ``table.py`` so the latter doesn't pick up
 async-specific helpers; :meth:`Table.insert` delegates to
@@ -22,9 +28,10 @@ Multiple staged operations against the same table can be folded into
 one logical insert via :meth:`AsyncInsert.merge` — pure appends fold
 together, an overwrite drops every earlier op for that target, and
 the resulting record renders to a single ``INSERT INTO`` / ``INSERT
-OVERWRITE`` statement via :meth:`AsyncInsert.to_sql`.
-:meth:`AsyncInsert.execute` runs the SQL and cleans up the staged
-files on success.
+OVERWRITE`` statement via :meth:`AsyncInsert.to_sql`. The unified
+apply path is :class:`AsyncWrite`, a :class:`WarehouseStatementBatch`
+that submits every merged target as one batch of prepared statements
+and unlinks the staged files via the batch's wait-hook on success.
 """
 from __future__ import annotations
 
@@ -57,11 +64,18 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.jobs.job import Job
     from yggdrasil.databricks.jobs.service import Jobs
     from yggdrasil.databricks.sql.engine import SQLEngine
+    from yggdrasil.databricks.warehouse.statement import (
+        WarehouseStatementBatch,
+    )
     from .table import Table
 
 
 __all__ = [
     "AsyncInsert",
+    "AsyncWrite",
+    "ASYNC_INSERT_ROOT",
+    "ASYNC_INSERT_DATA_SUBDIR",
+    "ASYNC_INSERT_LOGS_SUBDIR",
     "METADATA_VERSION",
     "stage_async_insert",
 ]
@@ -73,6 +87,14 @@ LOGGER = logging.getLogger(__name__)
 # breaks existing appliers so the consumer can fail loudly instead of
 # mis-applying an operation.
 METADATA_VERSION = 1
+
+# Staging folder layout — Parquet payloads go under ``data/`` and the
+# JSON metadata logs go under ``logs/``. Sibling folders keep the two
+# concerns separable: appliers walk ``logs/`` for merge candidates and
+# walk ``data/`` for cleanup without filtering past the other.
+ASYNC_INSERT_ROOT: str = ".sql/async/insert"
+ASYNC_INSERT_DATA_SUBDIR: str = "data"
+ASYNC_INSERT_LOGS_SUBDIR: str = "logs"
 
 # Mode tokens, normalized to lowercase. Anything else is treated as an
 # append unless explicitly listed.
@@ -705,21 +727,23 @@ class AsyncInsert:
         *,
         client: "DatabricksClient | None" = None,
     ) -> Iterable["VolumePath"]:
-        """Yield every ``.sql/async/insert`` folder under *schema*'s
-        ``stg_*`` volumes.
+        """Yield the metadata-log folder under every ``stg_*`` volume in *schema*.
 
-        These are the folders :func:`stage_async_insert` writes into;
-        the applier task walks them to discover staged metadata files.
+        :func:`stage_async_insert` writes JSON metadata to
+        ``.sql/async/insert/logs/`` (Parquet payloads live next to it
+        under ``data/``). The applier walks these log folders to
+        discover staged operations.
         """
         client = client or _resolve_current_client()
         volumes = client.volumes.list(
             catalog_name=catalog_name, schema_name=schema_name,
         )
+        log_path = f"{ASYNC_INSERT_ROOT}/{ASYNC_INSERT_LOGS_SUBDIR}"
         for volume in volumes:
             name = getattr(volume, "volume_name", "") or ""
             if not name.startswith("stg_"):
                 continue
-            yield volume.path(".sql/async/insert")
+            yield volume.path(log_path)
 
     @classmethod
     def merge_schema(
@@ -765,30 +789,31 @@ class AsyncInsert:
         wait: Any = True,
         raise_error: bool = True,
         cleanup: bool = True,
-    ) -> List[Any]:
+        parallel: int = 1,
+    ) -> "AsyncWrite | None":
         """Merge + execute every staged async insert under *schema*.
 
-        The single entry point for a schema-level applier task — drain
-        every table's staging folder, run the merged inserts, and
-        clean up the staged files. Returns the list of per-target
-        execute results in the order targets were drained.
+        The single entry point for a schema-level applier task —
+        drain every table's staging folder, submit one unified
+        :class:`AsyncWrite` batch across every target, and clean up
+        the staged files via the batch's wait-hook on success.
+        Returns the resulting :class:`AsyncWrite` (one batch
+        covering every target), or ``None`` when no records are
+        staged.
         """
         records = cls.merge_schema(catalog_name, schema_name, client=client)
         if not records:
-            return []
+            return None
 
-        results: list[Any] = []
-        for record in records:
-            results.append(
-                record.execute(
-                    engine,
-                    wait=wait,
-                    raise_error=raise_error,
-                    cleanup=cleanup,
-                    client=client,
-                )
-            )
-        return results
+        return AsyncWrite.from_records(
+            records,
+            executor=engine.warehouse(),
+            client=client,
+            cleanup=cleanup,
+            wait=wait,
+            raise_error=raise_error,
+            parallel=parallel,
+        )
 
     # ------------------------------------------------------------------ #
     # SQL rendering
@@ -797,14 +822,19 @@ class AsyncInsert:
         r"""Common SQL shape used by both raw-text and prepared paths.
 
         Returns ``None`` when there is nothing to apply (no Parquet
-        payloads or no target). ``parquet_refs`` is the per-payload
-        SQL fragment to splice into ``SELECT * FROM parquet.\`<...>\``
-        — either a literal path or a ``{alias}`` placeholder.
+        payloads or no target). Each entry in ``parquet_refs`` is a
+        full table expression spliced into ``SELECT * FROM <ref>`` —
+        either ``parquet.\`<full_path>\``` for raw SQL or a bare
+        ``{alias}`` placeholder whose substituted ``text_value``
+        already carries the full ``parquet.\`...\``` form. Wrapping
+        is the caller's job so the prepared-statement path doesn't
+        end up double-wrapping (the alias substitution would yield
+        ``parquet.\`parquet.\`<path>\`\``` otherwise).
         """
         if not parquet_refs or not self.target_full_name:
             return None
 
-        selects = [f"SELECT * FROM parquet.`{ref}`" for ref in parquet_refs]
+        selects = [f"SELECT * FROM {ref}" for ref in parquet_refs]
         source = " UNION ALL ".join(selects)
 
         target = self.target_full_name
@@ -830,12 +860,13 @@ class AsyncInsert:
         when no Parquet payloads are recorded.
 
         Useful for inspection / tests. The execution path
-        (:meth:`to_statements`, :meth:`execute`, :meth:`concat`)
-        prefers :class:`WarehousePreparedStatement` so the staged
-        files are cleaned up automatically via the statement
-        lifecycle — see :meth:`to_statements`.
+        (:meth:`to_statements`, :meth:`execute`, :meth:`concat`,
+        :class:`AsyncWrite`) prefers prepared statements so the
+        staged files are cleaned up automatically via the statement
+        lifecycle.
         """
-        sql = self._build_sql(self.parquet_paths)
+        refs = tuple(f"parquet.`{p}`" for p in self.parquet_paths)
+        sql = self._build_sql(refs)
         return [sql] if sql is not None else []
 
     def to_statements(
@@ -931,27 +962,26 @@ class AsyncInsert:
         iterable of in-memory records, or a single
         :class:`AsyncInsert`) through the per-target merge.
 
-        With *engine* supplied: each merged record is rendered via
-        :meth:`to_statements` so the staged Parquet + metadata
-        files attach to the prepared statements as
+        With *engine* supplied: every merged record is wrapped in
+        one unified :class:`AsyncWrite` batch — the staged Parquet
+        + metadata files attach to each prepared statement as
         ``external_volume_paths`` (marked ``temporary=True`` unless
-        ``cleanup=False``). The whole suite is then submitted via
-        ``engine.execute_many``; the statement-batch ``wait`` hook
-        auto-fires ``clear_temporary_resources`` so every attached
-        file is unlinked when the run lands successfully. Returns
-        the resulting ``StatementBatch``.
+        ``cleanup=False``). The batch's ``wait`` hook auto-fires
+        ``clear_temporary_resources`` so every attached file is
+        unlinked when the run lands successfully. Returns the
+        resulting :class:`AsyncWrite`.
 
         Without *engine*: returns the bare list of SQL strings (via
         :meth:`to_sql`) for callers that want to inspect the
         rendered text or run it through a different path. No
         prepared statements are built and no cleanup is wired —
-        :meth:`to_statements` is the call to make for the wire-up.
+        reach for :class:`AsyncWrite` for the wire-up.
 
         Returns
         -------
         list[str]
             When *engine* is ``None``.
-        StatementBatch
+        AsyncWrite
             When *engine* is supplied. Empty input returns ``[]`` /
             ``None`` without touching the engine.
         """
@@ -965,19 +995,11 @@ class AsyncInsert:
                 statements.extend(record.to_sql())
             return statements
 
-        prepared: list[Any] = []
-        for record in merged:
-            prepared.extend(record.to_statements(client=client, cleanup=cleanup))
-
-        if not prepared:
-            return None
-
-        LOGGER.info(
-            "Executing %d-statement async-insert suite across %d target(s)",
-            len(prepared), len(merged),
-        )
-        return engine.execute_many(
-            prepared,
+        return AsyncWrite.from_records(
+            merged,
+            executor=engine.warehouse(),
+            client=client,
+            cleanup=cleanup,
             wait=wait,
             raise_error=raise_error,
         )
@@ -1019,10 +1041,10 @@ class AsyncInsert:
         cleanup: bool = True,
         client: "DatabricksClient | None" = None,
     ) -> Any:
-        """Run this record against *engine* via a :class:`WarehousePreparedStatement`.
+        """Run this record against *engine* via an :class:`AsyncWrite` batch.
 
-        Builds the statement via :meth:`to_statements` so every
-        staged Parquet + metadata file rides as an
+        Wraps the record in a single-target :class:`AsyncWrite` so
+        every staged Parquet + metadata file rides as an
         ``external_volume_paths`` entry (marked temporary unless
         ``cleanup=False``). On success the batch's ``wait`` hook
         auto-fires ``clear_temporary_resources`` and unlinks every
@@ -1033,12 +1055,14 @@ class AsyncInsert:
         without marking them temporary (useful for debugging an
         applier when the staged files should survive the run).
         """
-        statements = self.to_statements(client=client, cleanup=cleanup)
-        if not statements:
+        if not self.parquet_paths or not self.target_full_name:
             return None
 
-        return engine.execute_many(
-            statements,
+        return AsyncWrite.from_records(
+            [self],
+            executor=engine.warehouse(),
+            client=client,
+            cleanup=cleanup,
             wait=wait,
             raise_error=raise_error,
         )
@@ -1076,6 +1100,155 @@ class AsyncInsert:
 
 
 # ---------------------------------------------------------------------------
+# AsyncWrite — unified WarehouseStatementBatch over staged AsyncInsert records
+# ---------------------------------------------------------------------------
+
+
+class AsyncWrite:
+    """Unified :class:`WarehouseStatementBatch` over staged async inserts.
+
+    The single apply path for :class:`AsyncInsert` records. Submits
+    one prepared statement per merged target as one batch, with the
+    contributing Parquet payloads and metadata logs attached as
+    ``temporary`` external volume paths so the batch's wait-hook
+    unlinks them on success.
+
+    Construct via :meth:`from_records` (in-memory records) or
+    :meth:`from_source` (folder :class:`VolumePath` / iterable of
+    metadata files / iterable of records — anything
+    :meth:`AsyncInsert.merge` accepts). Each classmethod returns a
+    submitted :class:`WarehouseStatementBatch` whose ``wait``-hook
+    (auto-fired on success) cleans up the staged files.
+
+    This is a thin factory wrapping :class:`WarehouseStatementBatch`
+    — not a subclass — because :class:`WarehouseStatementBatch`
+    submits statements eagerly in ``__init__``, and the records →
+    statements rendering wants to run *before* construction so empty
+    inputs short-circuit without touching the executor.
+    """
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> "WarehouseStatementBatch":
+        """Constructing ``AsyncWrite(...)`` returns a submitted batch.
+
+        Delegates to :meth:`from_records` when *records* / *source*
+        is supplied; otherwise to :meth:`from_source`. Useful as
+        ``AsyncWrite(records, executor=...)`` shorthand.
+        """
+        if "source" in kwargs:
+            return cls.from_source(*args, **kwargs)
+        return cls.from_records(*args, **kwargs)
+
+    # ------------------------------------------------------------------ #
+    # Construction
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def from_records(
+        cls,
+        records: Iterable[AsyncInsert],
+        *,
+        executor: Any,
+        client: "DatabricksClient | None" = None,
+        cleanup: bool = True,
+        retry: Any = None,
+        parallel: int = 1,
+        wait: Any = True,
+        raise_error: bool = True,
+    ) -> Any:
+        """Build, submit, and (by default) wait on the batch for *records*.
+
+        Each record is rendered via :meth:`AsyncInsert.to_statements`;
+        the resulting prepared statements are submitted as a single
+        :class:`WarehouseStatementBatch`. Empty inputs return
+        ``None`` without touching the executor.
+
+        ``wait=False`` returns the live batch without blocking; the
+        caller owns ``batch.wait(...)``.
+        """
+        # Local import — keeps async_write importable when the
+        # warehouse module isn't ready yet (circular at module load).
+        from yggdrasil.databricks.warehouse.statement import (
+            WarehouseStatementBatch,
+        )
+
+        statements: list[Any] = []
+        record_count = 0
+        for record in records:
+            record_count += 1
+            statements.extend(
+                record.to_statements(
+                    client=client,
+                    cleanup=cleanup,
+                    retry=retry,
+                )
+            )
+
+        if not statements:
+            return None
+
+        LOGGER.info(
+            "Applying %d-statement async-insert batch across %d target(s)",
+            len(statements), record_count,
+        )
+
+        batch = WarehouseStatementBatch(
+            executor=executor,
+            statements=statements,
+            parallel=parallel,
+        )
+        batch.wait(wait=wait, raise_error=raise_error)
+        return batch
+
+    @classmethod
+    def from_source(
+        cls,
+        source: Any,
+        *,
+        engine: "SQLEngine | None" = None,
+        executor: Any = None,
+        client: "DatabricksClient | None" = None,
+        cleanup: bool = True,
+        retry: Any = None,
+        parallel: int = 1,
+        wait: Any = True,
+        raise_error: bool = True,
+    ) -> Any:
+        """Merge *source* through :meth:`AsyncInsert.merge`, then apply.
+
+        ``source`` accepts the same shapes :meth:`AsyncInsert.merge`
+        does (a folder :class:`VolumePath`, an iterable of metadata
+        file paths, an iterable of in-memory records, or a single
+        record). The merged records are submitted via
+        :meth:`from_records`.
+
+        One of *engine* or *executor* is required — pass *engine*
+        to derive the warehouse via :meth:`SQLEngine.warehouse`, or
+        pass an explicit *executor* (a :class:`SQLWarehouse`).
+        """
+        if executor is None:
+            if engine is None:
+                raise ValueError(
+                    "AsyncWrite.from_source needs either ``engine`` or "
+                    "``executor`` — got neither."
+                )
+            executor = engine.warehouse()
+
+        merged = AsyncInsert.merge(source, client=client)
+        if not merged:
+            return None
+
+        return cls.from_records(
+            merged,
+            executor=executor,
+            client=client,
+            cleanup=cleanup,
+            retry=retry,
+            parallel=parallel,
+            wait=wait,
+            raise_error=raise_error,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Field-name caches (bake field set at import time so :meth:`from_dict`
 # doesn't re-walk ``fields(AsyncInsert)`` on every call).
 # ---------------------------------------------------------------------------
@@ -1109,15 +1282,25 @@ def _iter_records(
     Centralised so :meth:`AsyncInsert.merge` accepts the same shapes
     callers naturally have on hand (a folder path, a list of metadata
     files, a list of already-loaded records).
+
+    Folder-like sources are walked for ``*.json`` entries; a
+    ``logs/`` subdirectory is descended into automatically so
+    callers can hand in either the staging root
+    (``.sql/async/insert/``) or the explicit logs folder
+    (``.sql/async/insert/logs/``) and get the same records back.
     """
     if isinstance(source, AsyncInsert):
         yield source
         return
 
-    # Folder-like: walk for ``*.json`` files.
+    # Folder-like: walk for ``*.json`` files, descending into ``logs/``
+    # when present so the staging root works as a source.
     if hasattr(source, "ls"):
         for entry in source.ls(recursive=False):
             name = getattr(entry, "name", "") or ""
+            if name == ASYNC_INSERT_LOGS_SUBDIR and hasattr(entry, "ls"):
+                yield from _iter_records(entry, client=client)
+                continue
             if name.endswith(".json"):
                 yield AsyncInsert.from_file(entry, client=client)
         return
@@ -1249,8 +1432,14 @@ def stage_async_insert(
     op_id = operation_id or _make_operation_id()
     folder = table.staging_folder(temporary=False, async_write=True)
 
-    parquet_path = folder.joinpath(f"{op_id}.parquet")
-    meta_path = folder.joinpath(f"{op_id}.json")
+    # Data and logs live in sibling subfolders so the applier can walk
+    # one without filtering past the other — see the module docstring.
+    parquet_path = folder.joinpath(ASYNC_INSERT_DATA_SUBDIR).joinpath(
+        f"{op_id}.parquet"
+    )
+    meta_path = folder.joinpath(ASYNC_INSERT_LOGS_SUBDIR).joinpath(
+        f"{op_id}.json"
+    )
 
     # Best-effort target schema resolution. ``collect_schema`` raises
     # when the table doesn't exist yet — that's fine, the applier

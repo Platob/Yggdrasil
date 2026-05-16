@@ -8,7 +8,7 @@ import os
 import re
 import time
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 from typing import Any, Callable, Mapping, Optional
@@ -95,46 +95,61 @@ _MODULE_UPLOAD_CACHE: dict[_ModuleUploadCacheKey, _ModuleUploadCacheEntry] = {}
 _MODULE_UPLOAD_CACHE_LOCK = RLock()
 
 
-@dataclass
 class CommandExecution:
-    context: ExecutionContext
-    command_id: str | None = None
+    """A single Databricks REPL command bound to an :class:`ExecutionContext`.
 
-    language: Optional[Language] = field(default=None, repr=False, compare=False, hash=False)
-    command: Optional[str] = field(default=None, repr=False, compare=False, hash=False)
+    Equality / hash key off ``(context.context_id, command_id)`` so two
+    handles to the same in-flight command compare equal. Construction
+    is keyword-only past ``context`` / ``command_id``.
+    """
 
-    pyfunc: Optional[Callable] = field(default=None, repr=False, compare=False, hash=False)
-    environ: Optional[Mapping] = field(default=None, repr=False, compare=False, hash=False)
+    def __init__(
+        self,
+        context: ExecutionContext,
+        command_id: str | None = None,
+        *,
+        language: Optional[Language] = None,
+        command: Optional[str] = None,
+        pyfunc: Optional[Callable] = None,
+        environ: Optional[Mapping] = None,
+        _ser_pyfunc: Optional[Serialized] = None,
+    ):
+        self.context = context
+        self.command_id = command_id
+        self.command = command
+        self.pyfunc = pyfunc
+        self._ser_pyfunc = _ser_pyfunc
+        self._details: Optional[CommandStatusResponse] = None
+        self._remote_payload_path: Optional[str] = None
+        self._shutdown_registered = False
 
-    _ser_pyfunc: Optional[Serialized] = field(default=None, repr=False, compare=False, hash=False)
-    _details: Optional[CommandStatusResponse] = field(default=None, init=False, repr=False, compare=False, hash=False)
-    _remote_payload_path: Optional[str] = field(default=None, init=False, repr=False, compare=False, hash=False)
+        if environ and not isinstance(environ, Mapping):
+            try:
+                environ = dict(environ)
+            except Exception as e:
+                raise ValueError(
+                    f"environ must be a mapping or convertible to dict, got {type(environ)}"
+                ) from e
+        self.environ = environ
 
-    # True iff this instance is currently registered with yg_shutdown. We do
-    # NOT store the registered callback — the registry keys bound methods by
-    # (func, id(instance)) internally, so a bare flag suffices.
-    _shutdown_registered: bool = field(
-        default=False, init=False, repr=False, compare=False, hash=False,
-    )
+        if language is None:
+            language = (
+                Language.PYTHON
+                if pyfunc is not None
+                else (context.language or Language.PYTHON)
+            )
+        self.language = language
 
     def __hash__(self):
         return hash((self.context.context_id, self.command_id))
 
-    def __post_init__(self):
-        if self.environ and not isinstance(self.environ, Mapping):
-            try:
-                self.environ = dict(self.environ)
-            except Exception as e:
-                raise ValueError(
-                    f"environ must be a mapping or convertible to dict, got {type(self.environ)}"
-                ) from e
-
-        if self.language is None:
-            self.language = (
-                Language.PYTHON
-                if self.pyfunc is not None
-                else (self.context.language or Language.PYTHON)
-            )
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, CommandExecution):
+            return NotImplemented
+        return (
+            self.context.context_id == other.context.context_id
+            and self.command_id == other.command_id
+        )
 
     @property
     def client(self):

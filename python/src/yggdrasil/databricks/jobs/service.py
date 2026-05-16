@@ -66,7 +66,7 @@ def _get_cached_job_id(client: DatabricksClient, name: str) -> Optional[int]:
 class Jobs(DatabricksService):
     """Collection-level Databricks Jobs management service.
 
-    Mirrors the shape of :class:`~yggdrasil.databricks.compute.service.Clusters`
+    Mirrors the shape of :class:`~yggdrasil.databricks.cluster.Clusters`
     and :class:`~yggdrasil.databricks.compute.instance_pool.InstancePools` so
     callers can switch between resources with the same vocabulary.
     """

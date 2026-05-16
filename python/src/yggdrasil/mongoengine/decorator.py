@@ -16,7 +16,7 @@ from .lib import (
 
 if TYPE_CHECKING:
     from yggdrasil.databricks import DatabricksClient
-    from yggdrasil.databricks.compute.cluster import Cluster
+    from yggdrasil.databricks.cluster.cluster import Cluster
 
 __all__ = ["with_mongo_connection"]
 
@@ -129,7 +129,7 @@ def with_mongo_connection(
     if databricks is None:
         if cluster is not None:
             from yggdrasil.databricks import DatabricksClient
-            from yggdrasil.databricks.compute.cluster import Cluster
+            from yggdrasil.databricks.cluster.cluster import Cluster
 
             if not isinstance(cluster, Cluster):
                 cluster = (
@@ -142,7 +142,7 @@ def with_mongo_connection(
     if not force_local and databricks is not None:
         from yggdrasil.databricks import DatabricksClient
         from yggdrasil.databricks.compute.execution_context import exclude_env_key
-        from yggdrasil.databricks.compute.cluster import Cluster
+        from yggdrasil.databricks.cluster.cluster import Cluster
 
         databricks = DatabricksClient.parse(databricks)
 
