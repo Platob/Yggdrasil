@@ -1002,323 +1002,467 @@ class TestStageAsyncInsert:
 # ---------------------------------------------------------------------------
 
 
-class TestRecordJob:
-    """:meth:`AsyncInsert.job` create-or-update flow against a mock service.
+class TestAsyncInsertJobSettings:
+    """:meth:`AsyncInsertJob.settings` returns the full kwargs dict.
 
-    The applier job is keyed off ``(target_catalog_name,
-    target_schema_name)`` on the record — one Databricks Job per
-    schema, draining every table whose stg_* volume sits under it.
+    The dict splat into :meth:`Jobs.get_or_create` /
+    :meth:`Jobs.create_or_update` / :meth:`Job.deploy` — every
+    settable :class:`JobSettings` field is resolved from the bound
+    table or caller overrides, and the file-arrival trigger watches
+    the table's own staging data/ folder.
     """
 
     @staticmethod
-    def _mock_jobs():
-        svc = MagicMock(name="Jobs")
-        svc.create_or_update.return_value = MagicMock(name="Job")
-        return svc
-
-    def test_default_job_name_from_table(self):
+    def _table_with_trigger_path(
+        *,
+        trigger_path: str = "/Volumes/cat/sch/stg_tbl/.sql/async/insert/logs",
+    ):
         tbl, _, _, _ = _make_table_with_staging()
-        # Schema-level: name uses (catalog, schema) only — every
-        # table in the same schema shares the same job.
-        assert AsyncInsert.default_job_name(tbl) == "ygg-async-insert-cat-sch"
+        data_folder = MagicMock(spec=VolumePath)
+        data_folder.full_path.return_value = trigger_path
+        async_root = MagicMock(spec=VolumePath)
+        async_root.joinpath.return_value = data_folder
+        tbl.staging_folder = MagicMock(return_value=async_root)  # type: ignore[assignment]
+        return tbl, async_root, data_folder
 
-    def test_default_job_name_from_full_name_string(self):
+    def test_job_name_keyed_off_full_table_triple(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, _, _ = self._table_with_trigger_path()
         assert (
-            AsyncInsert.default_job_name("main.sales.orders")
-            == "ygg-async-insert-main-sales"
+            AsyncInsertJob.job_name(tbl)
+            == "ygg-async-insert-cat-sch-tbl"
         )
 
-    def test_default_job_name_from_cat_sch_string(self):
-        assert AsyncInsert.default_job_name("main.sales") == "ygg-async-insert-main-sales"
+    def test_trigger_url_points_at_async_data_folder(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
 
-    def test_resolve_schema_key_rejects_single_segment(self):
-        with pytest.raises(ValueError):
-            AsyncInsert.resolve_schema_key("solo")
+        tbl, _, _ = self._table_with_trigger_path()
+        assert (
+            AsyncInsertJob.trigger_url(tbl)
+            == "dbfs:/Volumes/cat/sch/stg_tbl/.sql/async/insert/logs/"
+        )
 
-    def test_resolve_schema_key_from_record(self):
-        rec = _make_record(target="main.sales.orders")
-        cat, sch = AsyncInsert.resolve_schema_key(rec.target_full_name)
-        assert (cat, sch) == ("main", "sales")
+    def test_settings_carries_full_job_spec(self):
+        from databricks.sdk.service.jobs import (
+            FileArrivalTriggerConfiguration,
+            TriggerSettings,
+        )
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
 
-    def test_creates_with_schema_identity(self):
-        jobs_svc = self._mock_jobs()
-        rec = _make_record()
-        rec.job(notebook_path="/Workspace/Users/me/apply", jobs=jobs_svc)
-
-        jobs_svc.create_or_update.assert_called_once()
-        _, kwargs = jobs_svc.create_or_update.call_args
-        # Default name is keyed off (catalog, schema); table name is NOT in it.
-        assert kwargs["name"] == "ygg-async-insert-cat-sch"
-        # Description mentions the schema.
-        assert "cat.sch" in kwargs["description"]
-        # The notebook_path shortcut packs a single Task with the
-        # schema identity as base_parameters.
-        tasks = kwargs["tasks"]
+        tbl, _, _ = self._table_with_trigger_path()
+        spec = AsyncInsertJob.settings(
+            tbl, notebook_path="/Workspace/Users/me/apply",
+        )
+        assert spec["name"] == "ygg-async-insert-cat-sch-tbl"
+        assert spec["description"] == "Apply staged async inserts for cat.sch.tbl"
+        # File-arrival trigger built off the staging data folder.
+        trigger = spec["trigger"]
+        assert isinstance(trigger, TriggerSettings)
+        assert isinstance(trigger.file_arrival, FileArrivalTriggerConfiguration)
+        assert (
+            trigger.file_arrival.url
+            == "dbfs:/Volumes/cat/sch/stg_tbl/.sql/async/insert/logs/"
+        )
+        # notebook_path is wrapped in a Task with the table identity.
+        tasks = spec["tasks"]
         assert len(tasks) == 1
-        assert tasks[0].notebook_task.notebook_path == "/Workspace/Users/me/apply"
         base = tasks[0].notebook_task.base_parameters
-        assert base["catalog_name"] == "cat"
-        assert base["schema_name"] == "sch"
-        # No table-level keys leak into the task parameters.
-        assert "target_table_name" not in base
-        # Job-level parameters are schema-level.
-        param_names = {p.name for p in kwargs["parameters"]}
-        assert param_names == {"catalog_name", "schema_name"}
+        assert base == {"catalog_name": "cat", "schema_name": "sch", "table_name": "tbl"}
+        # Job-level parameters carry the table identity by default.
+        param_names = {p.name for p in spec["parameters"]}
+        assert param_names == {"catalog_name", "schema_name", "table_name"}
 
-    def test_keys_same_job_for_two_tables_in_schema(self):
-        """Two records for tables in the same schema → same job name."""
-        jobs_svc = self._mock_jobs()
-        rec_a = _make_record(target="cat.sch.tbl_a")
-        rec_b = _make_record(target="cat.sch.tbl_b")
+    def test_settings_skips_trigger_when_disabled(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
 
-        rec_a.job(notebook_path="/p", jobs=jobs_svc)
-        first_name = jobs_svc.create_or_update.call_args.kwargs["name"]
-        rec_b.job(notebook_path="/p", jobs=jobs_svc)
-        second_name = jobs_svc.create_or_update.call_args.kwargs["name"]
+        tbl, _, _ = self._table_with_trigger_path()
+        spec = AsyncInsertJob.settings(
+            tbl, notebook_path="/p", file_arrival_trigger=False,
+        )
+        assert "trigger" not in spec
 
-        assert first_name == second_name == "ygg-async-insert-cat-sch"
+    def test_settings_debounce_kwargs_flow_through(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
 
-    def test_accepts_explicit_task(self):
+        tbl, _, _ = self._table_with_trigger_path()
+        spec = AsyncInsertJob.settings(
+            tbl,
+            notebook_path="/p",
+            min_time_between_triggers_seconds=120,
+            wait_after_last_change_seconds=30,
+        )
+        fa = spec["trigger"].file_arrival
+        assert fa.min_time_between_triggers_seconds == 120
+        assert fa.wait_after_last_change_seconds == 30
+
+    def test_settings_accepts_explicit_task(self):
         from databricks.sdk.service.jobs import NotebookTask, Task
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
 
-        jobs_svc = self._mock_jobs()
+        tbl, _, _ = self._table_with_trigger_path()
         custom = Task(
             task_key="custom",
             notebook_task=NotebookTask(notebook_path="/Workspace/custom"),
         )
-        _make_record().job(task=custom, jobs=jobs_svc)
-        _, kwargs = jobs_svc.create_or_update.call_args
-        assert kwargs["tasks"] == [custom]
+        spec = AsyncInsertJob.settings(tbl, task=custom)
+        assert spec["tasks"] == [custom]
 
-    def test_accepts_list_of_tasks(self):
+    def test_settings_accepts_list_of_tasks(self):
         from databricks.sdk.service.jobs import NotebookTask, Task
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
 
-        jobs_svc = self._mock_jobs()
+        tbl, _, _ = self._table_with_trigger_path()
         t1 = Task(task_key="a", notebook_task=NotebookTask(notebook_path="/a"))
         t2 = Task(task_key="b", notebook_task=NotebookTask(notebook_path="/b"))
-        _make_record().job(task=[t1, t2], jobs=jobs_svc)
-        _, kwargs = jobs_svc.create_or_update.call_args
-        assert kwargs["tasks"] == [t1, t2]
+        spec = AsyncInsertJob.settings(tbl, task=[t1, t2])
+        assert spec["tasks"] == [t1, t2]
 
-    def test_with_cron_string_builds_cron_schedule(self):
+    def test_settings_coerces_cron_string(self):
         from databricks.sdk.service.jobs import CronSchedule
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
 
-        jobs_svc = self._mock_jobs()
-        _make_record().job(
-            notebook_path="/p",
-            schedule="0 0 */1 * * ?",
-            schedule_timezone="UTC",
-            jobs=jobs_svc,
+        tbl, _, _ = self._table_with_trigger_path()
+        spec = AsyncInsertJob.settings(
+            tbl, notebook_path="/p",
+            schedule="0 0 */1 * * ?", schedule_timezone="UTC",
         )
-        _, kwargs = jobs_svc.create_or_update.call_args
-        assert isinstance(kwargs["schedule"], CronSchedule)
-        assert kwargs["schedule"].quartz_cron_expression == "0 0 */1 * * ?"
-        assert kwargs["schedule"].timezone_id == "UTC"
+        sched = spec["schedule"]
+        assert isinstance(sched, CronSchedule)
+        assert sched.quartz_cron_expression == "0 0 */1 * * ?"
+        assert sched.timezone_id == "UTC"
 
-    def test_with_cron_schedule_passes_through(self):
+    def test_settings_passes_cron_schedule_through(self):
         from databricks.sdk.service.jobs import CronSchedule, PauseStatus
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
 
-        jobs_svc = self._mock_jobs()
+        tbl, _, _ = self._table_with_trigger_path()
         existing = CronSchedule(
             quartz_cron_expression="0 0 0 * * ?",
             timezone_id="Europe/Paris",
             pause_status=PauseStatus.UNPAUSED,
         )
-        _make_record().job(notebook_path="/p", schedule=existing, jobs=jobs_svc)
-        _, kwargs = jobs_svc.create_or_update.call_args
-        assert kwargs["schedule"] is existing
+        spec = AsyncInsertJob.settings(tbl, schedule=existing)
+        assert spec["schedule"] is existing
 
-    def test_pause_status_string_normalises(self):
-        from databricks.sdk.service.jobs import PauseStatus
+    def test_settings_no_schedule_is_none(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
 
-        jobs_svc = self._mock_jobs()
-        _make_record().job(
-            notebook_path="/p",
-            schedule="0 */10 * * * ?",
-            schedule_pause_status="paused",
-            jobs=jobs_svc,
-        )
-        _, kwargs = jobs_svc.create_or_update.call_args
-        assert kwargs["schedule"].pause_status == PauseStatus.PAUSED
+        tbl, _, _ = self._table_with_trigger_path()
+        spec = AsyncInsertJob.settings(tbl, notebook_path="/p")
+        assert spec["schedule"] is None
 
-    def test_no_schedule_passes_none(self):
-        jobs_svc = self._mock_jobs()
-        _make_record().job(notebook_path="/p", jobs=jobs_svc)
-        _, kwargs = jobs_svc.create_or_update.call_args
-        assert kwargs["schedule"] is None
+    def test_settings_merges_caller_parameters(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
 
-    def test_requires_schema_identity(self):
-        # No target_full_name and no overrides → can't resolve schema.
-        rec = AsyncInsert(target_full_name="")
-        with pytest.raises(ValueError):
-            rec.job(jobs=self._mock_jobs())
-
-    def test_explicit_catalog_schema_overrides_record(self):
-        jobs_svc = self._mock_jobs()
-        rec = _make_record(target="cat.sch.tbl")
-        rec.job(
-            catalog_name="main",
-            schema_name="sales",
-            jobs=jobs_svc,
-            notebook_path="/p",
-        )
-        _, kwargs = jobs_svc.create_or_update.call_args
-        assert kwargs["name"] == "ygg-async-insert-main-sales"
-        names = {p.name for p in kwargs["parameters"]}
-        assert names == {"catalog_name", "schema_name"}
-
-    def test_uses_record_target_catalog_schema_fields(self):
-        # When the record carries explicit target_catalog_name /
-        # target_schema_name, those win over parsing target_full_name.
-        jobs_svc = self._mock_jobs()
-        rec = _make_record(
-            target="cat.sch.tbl",  # would parse to ("cat", "sch")
-            target_catalog_name="main",
-            target_schema_name="sales",
-        )
-        rec.job(notebook_path="/p", jobs=jobs_svc)
-        _, kwargs = jobs_svc.create_or_update.call_args
-        assert kwargs["name"] == "ygg-async-insert-main-sales"
-
-    def test_parses_target_full_name_when_record_fields_missing(self):
-        jobs_svc = self._mock_jobs()
-        rec = _make_record(target="main.sales.orders")
-        rec.job(notebook_path="/p", jobs=jobs_svc)
-        _, kwargs = jobs_svc.create_or_update.call_args
-        # Table segment is stripped; schema-level identity only.
-        assert kwargs["name"] == "ygg-async-insert-main-sales"
-
-    def test_merges_caller_parameters(self):
-        jobs_svc = self._mock_jobs()
-        _make_record().job(
+        tbl, _, _ = self._table_with_trigger_path()
+        spec = AsyncInsertJob.settings(
+            tbl,
             notebook_path="/p",
             parameters={"catalog_name": "override", "extra": "yes"},
-            jobs=jobs_svc,
         )
-        _, kwargs = jobs_svc.create_or_update.call_args
-        as_dict = {p.name: p.default for p in kwargs["parameters"]}
-        # Caller wins on collision
+        as_dict = {p.name: p.default for p in spec["parameters"]}
+        # Caller wins on collision.
         assert as_dict["catalog_name"] == "override"
-        # New keys appended
+        # New keys appended.
         assert as_dict["extra"] == "yes"
 
-    def test_invalid_schedule_type_raises(self):
+    def test_settings_rejects_invalid_schedule_type(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, _, _ = self._table_with_trigger_path()
         with pytest.raises(TypeError):
-            _make_record().job(
-                notebook_path="/p", schedule=42, jobs=self._mock_jobs(),
-            )
+            AsyncInsertJob.settings(tbl, notebook_path="/p", schedule=42)
+
+    def test_settings_requires_full_table_identity(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        bare = MagicMock()
+        bare.catalog_name = "cat"
+        bare.schema_name = "sch"
+        bare.table_name = None  # not fully qualified
+        with pytest.raises(ValueError):
+            AsyncInsertJob.job_name(bare)
 
     def test_no_task_logs_warning_and_emits_empty_task_list(self):
-        jobs_svc = self._mock_jobs()
-        _make_record().job(jobs=jobs_svc)
-        _, kwargs = jobs_svc.create_or_update.call_args
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, _, _ = self._table_with_trigger_path()
+        spec = AsyncInsertJob.settings(tbl)
+        assert spec["tasks"] == []
+
+    def test_namespace_class_cannot_be_instantiated(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        with pytest.raises(TypeError):
+            AsyncInsertJob()
+
+
+class TestTableAsyncJob:
+    """:meth:`Table.async_job` routes through :meth:`Jobs.get_or_create`."""
+
+    @staticmethod
+    def _table():
+        tbl, _, _, _ = _make_table_with_staging()
+        data_folder = MagicMock(spec=VolumePath)
+        data_folder.full_path.return_value = (
+            "/Volumes/cat/sch/stg_tbl/.sql/async/insert/logs"
+        )
+        async_root = MagicMock(spec=VolumePath)
+        async_root.joinpath.return_value = data_folder
+        tbl.staging_folder = MagicMock(return_value=async_root)  # type: ignore[assignment]
+        # Pre-build the jobs service mock so client.jobs returns the same one.
+        jobs_svc = MagicMock(name="Jobs")
+        tbl.service.client.jobs = jobs_svc
+        return tbl, jobs_svc
+
+    def test_returns_existing_job_when_found(self):
+        tbl, jobs_svc = self._table()
+        existing = MagicMock(name="Job")
+        jobs_svc.find.return_value = existing
+
+        result = tbl.async_job()
+
+        assert result is existing
+        jobs_svc.find.assert_called_once_with(name="ygg-async-insert-cat-sch-tbl")
+        # No create call — existing job was returned.
+        jobs_svc.create_or_update.assert_not_called()
+        jobs_svc.create.assert_not_called()
+
+    def test_stages_apply_records_when_job_missing(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, jobs_svc = self._table()
+        jobs_svc.find.return_value = None
+
+        with patch(
+            "yggdrasil.databricks.jobs.job.Job.from_callable",
+        ) as from_callable:
+            sentinel = MagicMock(name="Job")
+            from_callable.return_value = sentinel
+            result = tbl.async_job()
+
+        assert result is sentinel
+        from_callable.assert_called_once()
+        args, kwargs = from_callable.call_args
+        # Default applier is :func:`AsyncInsertJob.apply_records`.
+        assert args[0] is AsyncInsertJob.apply_records
+        # Settings are splatted into from_callable.
+        assert kwargs["name"] == "ygg-async-insert-cat-sch-tbl"
+        assert kwargs["service"] is jobs_svc
+        # File-arrival trigger lives in the staged kwargs.
+        assert "trigger" in kwargs
+        # ``tasks`` is dropped — from_callable stages the Python task.
+        assert "tasks" not in kwargs
+
+    def test_applier_none_creates_tasksless_job(self):
+        tbl, jobs_svc = self._table()
+        jobs_svc.find.return_value = None
+        jobs_svc.create.return_value = MagicMock(name="Job")
+
+        tbl.async_job(applier=None)
+
+        jobs_svc.create.assert_called_once()
+        _, kwargs = jobs_svc.create.call_args
+        assert kwargs["name"] == "ygg-async-insert-cat-sch-tbl"
+        # tasks list is present but empty when no applier wanted.
         assert kwargs["tasks"] == []
 
+    def test_explicit_task_skips_default_applier(self):
+        """Caller-supplied ``task=`` short-circuits the auto-applier."""
+        from databricks.sdk.service.jobs import NotebookTask, Task
 
-class TestSchemaDiscovery:
-    """:meth:`AsyncInsert.merge_schema` / :meth:`apply_schema` walk
-    every stg_* volume in a schema and drain its metadata."""
+        tbl, jobs_svc = self._table()
+        jobs_svc.find.return_value = None
+        jobs_svc.create.return_value = MagicMock(name="Job")
+        custom = Task(
+            task_key="custom",
+            notebook_task=NotebookTask(notebook_path="/Workspace/custom"),
+        )
 
-    def _client_with_volumes(self, volumes):
-        client = MagicMock()
-        client.volumes.list.return_value = iter(volumes)
-        return client
+        tbl.async_job(task=custom)
 
-    def _make_volume(self, name: str, *, json_records=()):
-        vol = MagicMock()
-        vol.volume_name = name
-        folder = MagicMock()
-        # Each json_record becomes a path object the folder's ls yields.
-        folder.ls.return_value = [
-            self._json_entry(r) for r in json_records
-        ]
-        vol.path.return_value = folder
-        return vol, folder
+        # When tasks is non-empty, no auto-staging — direct create.
+        jobs_svc.create.assert_called_once()
+        _, kwargs = jobs_svc.create.call_args
+        assert kwargs["tasks"] == [custom]
 
-    def _json_entry(self, record):
-        entry = MagicMock()
-        entry.name = "async-1.json"
-        entry.read_bytes.return_value = record.to_json_bytes()
-        return entry
+    def test_forwards_overrides_to_from_callable(self):
+        tbl, jobs_svc = self._table()
+        jobs_svc.find.return_value = None
 
-    def test_iter_staging_folders_filters_to_stg_prefix(self):
-        rec_a = _make_record(target="cat.sch.a", parquets=("/a.parquet",),
-                             metas=("/a.json",), ops=("a",))
-        vol_a, folder_a = self._make_volume("stg_a", json_records=[rec_a])
-        vol_b, _ = self._make_volume("other_volume", json_records=[])
-
-        client = self._client_with_volumes([vol_a, vol_b])
-        folders = list(AsyncInsert.iter_schema_staging_folders(
-            "cat", "sch", client=client,
-        ))
-        assert folders == [folder_a]
-        # Volume filtering happens before path resolution.
-        vol_b.path.assert_not_called()
-
-    def test_merge_schema_drains_multiple_volumes(self):
-        rec_a = _make_record(target="cat.sch.a", parquets=("/a.parquet",),
-                             metas=("/a.json",), ops=("a",))
-        rec_b = _make_record(target="cat.sch.b", parquets=("/b.parquet",),
-                             metas=("/b.json",), ops=("b",))
-        vol_a, _ = self._make_volume("stg_a", json_records=[rec_a])
-        vol_b, _ = self._make_volume("stg_b", json_records=[rec_b])
-
-        client = self._client_with_volumes([vol_a, vol_b])
-        merged = AsyncInsert.merge_schema("cat", "sch", client=client)
-        names = sorted(r.target_full_name for r in merged)
-        assert names == ["cat.sch.a", "cat.sch.b"]
-
-    def test_merge_schema_returns_empty_for_no_records(self):
-        client = self._client_with_volumes([])
-        assert AsyncInsert.merge_schema("cat", "sch", client=client) == []
-
-    def test_merge_schema_swallows_per_folder_errors(self):
-        rec_a = _make_record(target="cat.sch.a", parquets=("/a.parquet",),
-                             metas=("/a.json",), ops=("a",))
-        vol_a, folder_a = self._make_volume("stg_a", json_records=[rec_a])
-        vol_bad, folder_bad = self._make_volume("stg_bad", json_records=[])
-        folder_bad.ls.side_effect = RuntimeError("boom")
-
-        client = self._client_with_volumes([vol_a, vol_bad])
-        # Bad folder doesn't blow up the whole walk.
-        merged = AsyncInsert.merge_schema("cat", "sch", client=client)
-        assert len(merged) == 1
-        assert merged[0].target_full_name == "cat.sch.a"
-
-    _ASYNC_WRITE = "yggdrasil.databricks.table.async_write.AsyncWrite.from_records"
-
-    def test_apply_schema_submits_one_unified_batch(self):
-        rec_a = _make_record(target="cat.sch.a", parquets=("/a.parquet",),
-                             metas=("/a.json",), ops=("a",))
-        rec_b = _make_record(target="cat.sch.b", parquets=("/b.parquet",),
-                             metas=("/b.json",), ops=("b",))
-        vol_a, _ = self._make_volume("stg_a", json_records=[rec_a])
-        vol_b, _ = self._make_volume("stg_b", json_records=[rec_b])
-
-        client = self._client_with_volumes([vol_a, vol_b])
-
-        engine = MagicMock()
-        sentinel_batch = MagicMock(name="batch")
-        with patch(self._ASYNC_WRITE, return_value=sentinel_batch) as from_records:
-            result = AsyncInsert.apply_schema(
-                engine, "cat", "sch", client=client,
+        with patch(
+            "yggdrasil.databricks.jobs.job.Job.from_callable",
+        ) as from_callable:
+            from_callable.return_value = MagicMock()
+            tbl.async_job(
+                schedule="0 0 */6 * * ?",
+                file_arrival_trigger=False,
             )
 
-        assert result is sentinel_batch
-        # One unified AsyncWrite covers every target — not one batch per record.
-        from_records.assert_called_once()
-        records_arg = list(from_records.call_args.args[0])
-        assert {r.target_full_name for r in records_arg} == {
-            "cat.sch.a", "cat.sch.b",
-        }
+        _, kwargs = from_callable.call_args
+        assert kwargs["schedule"].quartz_cron_expression == "0 0 */6 * * ?"
+        assert "trigger" not in kwargs
 
-    def test_apply_schema_no_records_returns_none(self):
-        client = self._client_with_volumes([])
-        engine = MagicMock()
-        with patch(self._ASYNC_WRITE) as from_records:
-            assert AsyncInsert.apply_schema(engine, "cat", "sch", client=client) is None
-        from_records.assert_not_called()
-        engine.warehouse.assert_not_called()
+
+class TestAsyncInsertJobLock:
+    """:meth:`AsyncInsertJob.lock` coordinates concurrent applier runs.
+
+    Drops a ``.lock`` file under the staging folder on enter,
+    waits for any pre-existing lock to be released first, removes
+    the lock on exit.
+    """
+
+    @staticmethod
+    def _table_with_lock_path():
+        tbl, _, _, _ = _make_table_with_staging()
+        lock_path = MagicMock(spec=VolumePath, name="lock_path")
+        lock_path.exists.return_value = False
+        async_root = MagicMock(spec=VolumePath, name="async_root")
+        async_root.joinpath.return_value = lock_path
+        tbl.staging_folder = MagicMock(return_value=async_root)  # type: ignore[assignment]
+        return tbl, async_root, lock_path
+
+    def test_lock_claims_and_releases_on_exit(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, async_root, lock_path = self._table_with_lock_path()
+        with AsyncInsertJob.lock(tbl, interval=0.01) as path:
+            assert path is lock_path
+            lock_path.write_bytes.assert_called_once()
+            payload = lock_path.write_bytes.call_args.args[0]
+            # Payload is an ISO timestamp — useful for stale-lock diagnosis.
+            assert payload.startswith(b"20")
+        # Lock was released on exit.
+        lock_path.remove.assert_called_once_with(
+            missing_ok=True, wait=False, recursive=False,
+        )
+
+    def test_lock_waits_for_existing_lock_to_disappear(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, _, lock_path = self._table_with_lock_path()
+        # ``exists`` returns True the first 2 polls, then False.
+        lock_path.exists.side_effect = [True, True, False]
+
+        with AsyncInsertJob.lock(tbl, interval=0.001, timeout=10.0):
+            pass
+        # 3 polls happened before claiming.
+        assert lock_path.exists.call_count == 3
+
+    def test_lock_times_out_when_lock_held(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, _, lock_path = self._table_with_lock_path()
+        # ``exists`` never returns False — simulates a stuck holder.
+        lock_path.exists.return_value = True
+
+        with pytest.raises(TimeoutError):
+            with AsyncInsertJob.lock(tbl, interval=0.001, timeout=0.01):
+                pass
+        # No write/release happened (never acquired).
+        lock_path.write_bytes.assert_not_called()
+        lock_path.remove.assert_not_called()
+
+    def test_lock_releases_on_body_exception(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, _, lock_path = self._table_with_lock_path()
+        with pytest.raises(RuntimeError):
+            with AsyncInsertJob.lock(tbl, interval=0.001):
+                raise RuntimeError("boom")
+        # Lock was released on the exception path.
+        lock_path.remove.assert_called_once()
+
+    def test_force_unlock_drops_lock_unconditionally(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, _, lock_path = self._table_with_lock_path()
+        AsyncInsertJob.force_unlock(tbl)
+        lock_path.remove.assert_called_once_with(
+            missing_ok=True, wait=False, recursive=False,
+        )
+
+    def test_lock_path_uses_lock_filename(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, async_root, _ = self._table_with_lock_path()
+        with AsyncInsertJob.lock(tbl, interval=0.001):
+            pass
+        # The lock file is joined under the staging folder via .lock name.
+        async_root.joinpath.assert_called_with(AsyncInsertJob.LOCK_FILENAME)
+
+
+class TestAsyncInsertJobLoad:
+    """:meth:`AsyncInsertJob.load` reads staged records under a folder."""
+
+    def test_load_with_explicit_path(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        rec = _make_record(target="cat.sch.tbl")
+        json_entry = MagicMock()
+        json_entry.name = "async-1.json"
+        json_entry.read_bytes.return_value = rec.to_json_bytes()
+        folder = MagicMock(spec=VolumePath)
+        folder.ls.return_value = [json_entry]
+
+        tbl = MagicMock()
+        tbl.client = MagicMock()
+        records = AsyncInsertJob.load(tbl, path=folder)
+        assert len(records) == 1
+        assert records[0].target_full_name == "cat.sch.tbl"
+
+    def test_load_defaults_to_table_staging_folder(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        rec = _make_record(target="cat.sch.tbl")
+        json_entry = MagicMock()
+        json_entry.name = "async-1.json"
+        json_entry.read_bytes.return_value = rec.to_json_bytes()
+        logs_folder = MagicMock(spec=VolumePath, name="logs_folder")
+        logs_folder.ls.return_value = [json_entry]
+        root = MagicMock(spec=VolumePath)
+        root.name = "insert"
+        root.joinpath.return_value = logs_folder
+
+        tbl = MagicMock()
+        tbl.client = MagicMock()
+        tbl.staging_folder = MagicMock(return_value=root)
+        records = AsyncInsertJob.load(tbl)
+        tbl.staging_folder.assert_called_once_with(
+            temporary=False, async_write=True,
+        )
+        assert len(records) == 1
+
+    def test_load_merge_false_returns_raw_records(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        a = _make_record(
+            target="cat.sch.tbl", parquets=("/a.parquet",),
+            metas=("/a.json",), ops=("a",), mode="append",
+            created_at="2026-05-15T10:00:00+00:00",
+        )
+        b = _make_record(
+            target="cat.sch.tbl", parquets=("/b.parquet",),
+            metas=("/b.json",), ops=("b",), mode="append",
+            created_at="2026-05-15T11:00:00+00:00",
+        )
+        entry_a = MagicMock()
+        entry_a.name = "a.json"
+        entry_a.read_bytes.return_value = a.to_json_bytes()
+        entry_b = MagicMock()
+        entry_b.name = "b.json"
+        entry_b.read_bytes.return_value = b.to_json_bytes()
+        folder = MagicMock(spec=VolumePath)
+        folder.ls.return_value = [entry_a, entry_b]
+
+        tbl = MagicMock()
+        tbl.client = MagicMock()
+        raw = AsyncInsertJob.load(tbl, path=folder, merge=False)
+        assert len(raw) == 2
+        merged = AsyncInsertJob.load(tbl, path=folder, merge=True)
+        assert len(merged) == 1
+        assert merged[0].parquet_paths == ("/a.parquet", "/b.parquet")
 
 
 class TestTableAsyncInsert:

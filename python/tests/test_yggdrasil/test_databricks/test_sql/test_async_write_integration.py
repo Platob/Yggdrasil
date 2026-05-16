@@ -18,8 +18,9 @@ These tests exercise:
 - :meth:`AsyncInsert.to_sql` + :meth:`AsyncInsert.execute` against
   the live SQL engine (data lands in the target table, staged files
   are cleaned up on success),
-- :meth:`AsyncInsert.job` + scheduling against the live
-  Jobs API, plus :meth:`Job.run` for the trigger path.
+- :class:`AsyncInsertJob` create-or-update + scheduling + the
+  file-arrival trigger against the live Jobs API, plus
+  :meth:`Job.run` for the manual trigger path.
 """
 from __future__ import annotations
 
@@ -132,22 +133,6 @@ class _AsyncWriteIntegrationBase(DatabricksIntegrationCase):
             "amount": pa.array([amount] * len(ids), type=pa.float64()),
         })
 
-    @staticmethod
-    def _record_for(table: Table) -> AsyncInsert:
-        """Build a minimal :class:`AsyncInsert` carrying *table*'s schema identity.
-
-        The applier-job test cases don't need any staged payload — they
-        only need a record whose ``target_catalog_name`` /
-        ``target_schema_name`` match the live table so
-        :meth:`AsyncInsert.job` resolves the right schema.
-        """
-        return AsyncInsert(
-            target_full_name=table.full_name(safe=False),
-            target_catalog_name=table.catalog_name,
-            target_schema_name=table.schema_name,
-            target_table_name=table.table_name,
-        )
-
     def _volume_path(self, entry: Any) -> VolumePath:
         """Return a :class:`VolumePath` for an :class:`AsyncInsert`
         ``parquet_paths`` / ``metadata_paths`` entry.
@@ -245,41 +230,53 @@ class TestAsyncWriteIntegration(_AsyncWriteIntegrationBase):
 
 
 class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
-    """Schema-level applier-job find-or-create + scheduling + trigger paths.
+    """Per-table :class:`AsyncInsertJob` create-or-update + scheduling +
+    file-arrival trigger paths.
 
-    The applier job is keyed off ``(catalog, schema)`` — every table
-    in the same schema is drained by the same job.
+    The applier job is keyed off ``(catalog, schema, table)`` — one
+    Databricks Job per target table, fired by file arrival in the
+    table's async staging ``data/`` folder.
     """
 
-    def test_ensure_job_is_keyed_by_schema_not_by_table(self):
-        """Two tables in the same schema → one shared applier job."""
-        table_a = self._unique_table("async_share_a")
-        table_a.ensure_created(self._sample_schema())
-        table_b = self._unique_table("async_share_b")
-        table_b.ensure_created(self._sample_schema())
-
-        first = self._record_for(table_a).job()
-        assert isinstance(first, Job)
-        assert first.job_id is not None
-        type(self).created_jobs.append(first.job_id)
-
-        second = self._record_for(table_b).job()
-        assert second.job_id == first.job_id
-        assert (
-            first.job_name
-            == f"ygg-async-insert-{self.catalog_name}-{self.schema_name}"
+    def test_job_is_keyed_by_table_and_carries_file_arrival_trigger(self):
+        from databricks.sdk.service.jobs import (
+            FileArrivalTriggerConfiguration,
         )
 
-    def test_ensure_job_with_cron_schedule_is_visible_on_the_job(self):
+        table = self._unique_table("async_trig_url")
+        table.ensure_created(self._sample_schema())
+
+        job = table.async_job()
+        assert isinstance(job, Job)
+        assert job.job_id is not None
+        type(self).created_jobs.append(job.job_id)
+        assert job.name == (
+            f"ygg-async-insert-{self.catalog_name}-{self.schema_name}-"
+            f"{table.table_name}"
+        )
+
+        job.refresh()
+        trigger = job.settings.trigger if job.settings else None
+        assert trigger is not None
+        assert isinstance(trigger.file_arrival, FileArrivalTriggerConfiguration)
+        # Trigger points at the table's own async staging data folder.
+        assert (
+            f"/Volumes/{self.catalog_name}/{self.schema_name}/stg_"
+            in trigger.file_arrival.url
+        )
+        assert trigger.file_arrival.url.endswith("/.sql/async/insert/logs/")
+
+    def test_async_job_with_cron_schedule_is_visible_on_the_job(self):
         from databricks.sdk.service.jobs import PauseStatus
 
         table = self._unique_table("async_sched")
         table.ensure_created(self._sample_schema())
 
-        job = self._record_for(table).job(
+        job = table.async_job(
             schedule="0 0 */6 * * ?",          # every 6 hours
             schedule_timezone="UTC",
             schedule_pause_status="paused",    # keep it idle in the test
+            file_arrival_trigger=False,
         )
         type(self).created_jobs.append(job.job_id)
 
@@ -296,8 +293,8 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
         """Trigger the job via :meth:`Job.run`. We attach a no-op
         ``condition_task`` (``1 == 1``) so the run terminates fast —
         Databricks rejects ``run_now`` on an empty-task job with
-        ``InvalidParameterValue``, so the default ``record.job()`` shape
-        is not directly triggerable."""
+        ``InvalidParameterValue``, so the default no-task shape is
+        not directly triggerable."""
         from databricks.sdk.service.jobs import (
             ConditionTask,
             ConditionTaskOp,
@@ -307,7 +304,7 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
         table = self._unique_table("async_trig")
         table.ensure_created(self._sample_schema())
 
-        job = self._record_for(table).job(
+        job = table.async_job(
             task=Task(
                 task_key="noop",
                 condition_task=ConditionTask(
@@ -316,6 +313,7 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
                     right="1",
                 ),
             ),
+            file_arrival_trigger=False,
         )
         if job.job_id not in type(self).created_jobs:
             type(self).created_jobs.append(job.job_id)
@@ -333,31 +331,3 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
         )
         assert run.is_terminal
 
-    def test_apply_schema_drains_multiple_tables(self):
-        """Two tables in the same schema, each with a staged insert →
-        :meth:`AsyncInsert.apply_schema` drains both in one call."""
-        table_a = self._unique_table("apply_a")
-        table_a.ensure_created(self._sample_schema())
-        table_b = self._unique_table("apply_b")
-        table_b.ensure_created(self._sample_schema())
-
-        table_a.async_insert(self._batch([1, 2], label="a"))
-        table_b.async_insert(self._batch([10, 20], label="b"))
-
-        AsyncInsert.apply_schema(
-            self.engine,
-            self.catalog_name,
-            self.schema_name,
-            client=self.client,
-            wait=True,
-            raise_error=True,
-        )
-
-        rows_a = self.engine.execute(
-            f"SELECT id FROM {table_a.full_name(safe=True)} ORDER BY id"
-        ).to_pylist()
-        rows_b = self.engine.execute(
-            f"SELECT id FROM {table_b.full_name(safe=True)} ORDER BY id"
-        ).to_pylist()
-        assert [r["id"] for r in rows_a] == [1, 2]
-        assert [r["id"] for r in rows_b] == [10, 20]

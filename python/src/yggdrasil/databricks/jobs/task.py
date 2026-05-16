@@ -7,9 +7,9 @@ operation through :meth:`Job.update` so the parent's task list stays
 the source of truth.
 
 For Python callables, :meth:`JobTask.from_callable` extracts the raw
-source via :func:`inspect.getsource`, drops a self-contained ``.py``
-script under the user's personal workspace
-(``/Workspace/Users/<me>/.ygg/jobs/``), and wraps it in a
+source via :func:`inspect.getsource`, drops a self-contained
+``main-<digest>.py`` script under
+``/Workspace/Shared/.ygg/jobs/<task_key>/``, and wraps it in a
 :class:`SparkPythonTask`. No pickling — the source is what runs.
 :meth:`JobTask.decorate` (chained off :meth:`Job.task`) is the
 decorator form.
@@ -53,11 +53,14 @@ __all__ = [
 
 LOGGER = logging.getLogger(__name__)
 
-#: Default staging area for :meth:`JobTask.from_callable`. Lands under
-#: the bound user's workspace home; ``<me>`` is resolved to the
-#: workspace client's current user (see
-#: :meth:`WorkspacePath._resolve_me`).
-DEFAULT_STAGING_ROOT = "/Workspace/Users/<me>/.ygg/jobs"
+#: Default staging area for :meth:`JobTask.from_callable`. Lands
+#: under the shared yggdrasil tree so identical sources staged by
+#: different jobs (or different callers) collapse to the same
+#: per-task-key folder. Final layout:
+#: ``/Workspace/Shared/.ygg/jobs/<task_key>/main-<digest>.py``.
+#: ``<me>`` is still resolved via :meth:`WorkspacePath._resolve_me`
+#: when callers override with a user-scoped root.
+DEFAULT_STAGING_ROOT = "/Workspace/Shared/.ygg/jobs"
 
 #: ``environment_key`` auto-attached to staged Python tasks so they
 #: run on serverless workspaces without the caller pre-declaring a
@@ -390,7 +393,7 @@ class JobTask:
         in scope), appends an invocation that passes *args* / *kwargs*
         as Python literals, and writes the result to a single ``.py``
         file under *staging_root* (default:
-        ``/Workspace/Users/<me>/.ygg/jobs/<task_key>-<rand>.py``).
+        ``/Workspace/Shared/.ygg/jobs/<task_key>/main-<digest>.py``).
         No pickling involved — the script Databricks runs is the exact
         source of the function.
 
@@ -469,8 +472,12 @@ class JobTask:
         # the digest between otherwise-identical re-stagings.
         digest = _content_digest(func, args, kwargs)
 
+        # Final layout: ``<staging_root>/<task_key>/main-<digest>.py``.
+        # Grouping by ``task_key`` (not job name) keeps identical
+        # sources staged by different jobs landing on the same file —
+        # the digest disambiguates between revisions.
         path = WorkspacePath(
-            f"{staging_root.rstrip('/')}/{key}-{digest}.py",
+            f"{staging_root.rstrip('/')}/{key}/main-{digest}.py",
             client=job.client,
         )
 
@@ -527,7 +534,6 @@ class JobTask:
             extra_dependencies=merged_specs,
             sniffed_env_vars=sniffed_env_var_names,
         )
-
 
 def _content_digest(
     func: Callable[..., Any], args: tuple, kwargs: dict,

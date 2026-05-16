@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import logging
 from typing import (
-    Any, Callable, ClassVar, Iterator, List, Optional, TYPE_CHECKING, Union,
+    Any, Callable, ClassVar, Iterator, List, Mapping, Optional,
+    TYPE_CHECKING, Union,
 )
 
 from databricks.sdk.errors import ResourceDoesNotExist
@@ -27,7 +28,7 @@ from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io.url import URL
 
-from ..client import DatabricksResource
+from ..client import DatabricksClient, DatabricksResource
 
 if TYPE_CHECKING:
     from .run import JobRun
@@ -430,3 +431,79 @@ class Job(Singleton, DatabricksResource):
         if func is None:
             return _decorate
         return _decorate(func)
+
+    # ====================================================================== #
+    # from_callable — build a complete Job from a single Python callable
+    # ====================================================================== #
+    @classmethod
+    def from_callable(
+        cls,
+        func: Callable[..., Any],
+        *,
+        name: Optional[str] = None,
+        service: "Jobs | None" = None,
+        client: "DatabricksClient | None" = None,
+        task_key: Optional[str] = None,
+        order: Optional[int] = None,
+        description: Optional[str] = None,
+        permissions: Optional[List[Union[str, JobAccessControlRequest]]] = None,
+        tags: Optional[Mapping[str, str]] = None,
+        task_fields: Optional[Mapping[str, Any]] = None,
+        **job_settings: Any,
+    ) -> "Job":
+        """Build (or upsert) a Job whose only task is the staged Python *func*.
+
+        Resolves a workspace client (errors when none can be found —
+        decoration would have nowhere to land), upserts a Job named
+        *name* (defaults to ``func.__name__``), and stages *func*'s
+        source as a Python task on it via :meth:`JobTask.from_callable`.
+        Returns the linked :class:`Job` (singleton-cached).
+
+        Job-level settings (``schedule``, ``trigger``, ``parameters``,
+        ``max_concurrent_runs``, …) flow through ``**job_settings`` and
+        land on :meth:`Jobs.create_or_update`. Task-level fields
+        (``new_cluster``, ``existing_cluster_id``, ``environment_key``,
+        …) flow through the ``task_fields`` mapping into the staged
+        :class:`Task`.
+
+        Decoration is deferred — nothing fires until the workspace
+        is in scope. Errors when no client / service can be resolved.
+        """
+        resolved_name = name or func.__name__
+        resolved_key = task_key or func.__name__
+
+        # Resolve workspace client → Jobs service. Errors here when
+        # nothing's linked — staging would have nowhere to land.
+        if service is None:
+            if client is None:
+                client = DatabricksClient.current()
+            service = client.jobs
+
+        resolved_description = description or (
+            (func.__doc__ or "").strip().splitlines()[0]
+            if func.__doc__ else None
+        )
+
+        underlying = service.create_or_update(
+            name=resolved_name,
+            tasks=[],
+            description=resolved_description,
+            tags=dict(tags) if tags else None,
+            permissions=permissions,
+            **{k: v for k, v in job_settings.items() if v is not None},
+        )
+        instance = cls(
+            service=service,
+            job_id=underlying.job_id,
+            job_name=underlying.job_name,
+            details=getattr(underlying, "_details", None),
+        )
+
+        # Now that the client is linked, stage *func* via the eager
+        # decorator path. ``decorate`` calls ``JobTask.create`` so the
+        # task lands on the job in one round trip.
+        instance.task(
+            resolved_key, order=order, **(task_fields or {}),
+        ).decorate(func)
+        return instance
+

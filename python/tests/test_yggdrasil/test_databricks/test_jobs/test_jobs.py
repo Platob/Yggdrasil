@@ -616,9 +616,11 @@ class TestJobTaskFactoryAndDecorate(DatabricksTestCase):
         self.assertEqual(len(envs), 1)
         self.assertEqual(envs[0].environment_key, DEFAULT_ENVIRONMENT_KEY)
         self.assertEqual(envs[0].spec.client, DEFAULT_ENVIRONMENT_CLIENT)
-        # The default spec pulls in ``ygg`` so staged
-        # ``from yggdrasil...`` imports resolve at runtime.
-        self.assertIn("ygg", envs[0].spec.dependencies)
+        # The default spec pulls in ``ygg`` (currently with the
+        # ``[data,databricks]`` extras — see DEFAULT_ENVIRONMENT_DEPENDENCIES)
+        # so staged ``from yggdrasil...`` imports resolve at runtime.
+        from yggdrasil.databricks.jobs.task import DEFAULT_ENVIRONMENT_DEPENDENCIES
+        self.assertEqual(envs[0].spec.dependencies, DEFAULT_ENVIRONMENT_DEPENDENCIES)
 
     def test_create_skips_environment_merge_when_already_declared(self):
         """``environments`` isn't touched when the key already lives on the job."""
@@ -808,6 +810,65 @@ class TestStagedScriptMetadata(DatabricksTestCase):
         self.assertIn("@checkargs\ndef _noop(", script)
         self.assertIn("_noop()", script)
 
+    def _patch_workspace_path(self):
+        """Replace :class:`WorkspacePath` with a recorder MagicMock.
+
+        Returns a ``(patcher, captured)`` pair — the captured dict
+        gets a ``"path"`` entry on every call so tests can assert on
+        the staged path.
+        """
+        from unittest.mock import patch
+
+        captured: dict = {}
+
+        def _fake_workspace_path(path, *, client=None, **_kw):
+            captured["path"] = path
+            handle = MagicMock(name=f"WorkspacePath({path!r})")
+            handle.full_path.return_value = path
+            handle.__repr__ = lambda _self: f"WorkspacePath({path!r})"
+            return handle
+
+        return patch(
+            "yggdrasil.databricks.fs.workspace_path.WorkspacePath",
+            side_effect=_fake_workspace_path,
+        ), captured
+
+    def test_staging_root_default_groups_by_task_key(self):
+        """``DEFAULT_STAGING_ROOT/<task_key>/main-<digest>.py`` layout."""
+        from yggdrasil.databricks.jobs.task import (
+            DEFAULT_STAGING_ROOT, JobTask,
+        )
+
+        # Default is /Workspace/Shared/.ygg/jobs (no per-job template).
+        self.assertEqual(DEFAULT_STAGING_ROOT, "/Workspace/Shared/.ygg/jobs")
+
+        job = MagicMock(name="Job", spec=["client"])
+        patcher, captured = self._patch_workspace_path()
+        with patcher:
+            JobTask.from_callable(job, _signature_fixture, task_key="apply")
+
+        path = captured["path"]
+        self.assertTrue(
+            path.startswith("/Workspace/Shared/.ygg/jobs/apply/main-"), path,
+        )
+        self.assertTrue(path.endswith(".py"))
+
+    def test_staging_root_uses_func_name_as_task_key_default(self):
+        """Task key defaults to ``func.__name__`` when caller omits it."""
+        from yggdrasil.databricks.jobs.task import JobTask
+
+        job = MagicMock(name="Job", spec=["client"])
+        patcher, captured = self._patch_workspace_path()
+        with patcher:
+            JobTask.from_callable(job, _signature_fixture)
+
+        self.assertTrue(
+            captured["path"].startswith(
+                "/Workspace/Shared/.ygg/jobs/_signature_fixture/main-",
+            ),
+            captured["path"],
+        )
+
 
 class TestStagedScriptCapturesLocals(DatabricksTestCase):
     """``_render_callable_script`` inlines locally-referenced helpers + literals."""
@@ -869,3 +930,77 @@ class TestJobsSubmit(DatabricksTestCase):
         self.assertIsInstance(run, JobRun)
         self.assertEqual(run.run_id, 99)
         self.jobs_api.submit.assert_called_once()
+
+
+class TestJobFromCallable(DatabricksTestCase):
+    """:meth:`Job.from_callable` builds + deploys a Job from a Python func.
+
+    The decoration is deferred — the workspace round trip only fires
+    after :meth:`resolve_jobs` produces a real client. Without a
+    linked client the call surfaces the same error any other deploy
+    path raises.
+    """
+
+    def _patch_workspace_write(self):
+        from unittest.mock import patch
+        return patch(
+            "yggdrasil.databricks.fs.workspace_path.WorkspacePath.write_bytes",
+            return_value=None,
+        )
+
+    def test_creates_job_and_stages_callable(self):
+        from yggdrasil.databricks.jobs.task import DEFAULT_ENVIRONMENT_KEY
+
+        self.jobs_api.create.return_value = MagicMock(job_id=99)
+        self.jobs_api.list.return_value = iter([])
+        # ``create_or_update`` routes through ``find`` then ``create``.
+        # After create, a follow-up ``get`` materializes the details.
+        self.jobs_api.get.return_value = _job_info(
+            job_id=99, name="_signature_fixture", tasks=[],
+        )
+
+        with self._patch_workspace_write():
+            job = Job.from_callable(_signature_fixture, service=self.jobs)
+
+        self.assertIsInstance(job, Job)
+        self.assertEqual(job.job_id, 99)
+        # One create call for the empty job shell.
+        self.jobs_api.create.assert_called_once()
+        # Then JobTask.create pushed an update with the staged python task.
+        self.jobs_api.update.assert_called()
+        _, update_kwargs = self.jobs_api.update.call_args
+        tasks = update_kwargs["new_settings"].tasks
+        self.assertEqual(tasks[0].task_key, "_signature_fixture")
+        self.assertEqual(tasks[0].environment_key, DEFAULT_ENVIRONMENT_KEY)
+
+    def test_uses_func_name_when_name_unset(self):
+        self.jobs_api.create.return_value = MagicMock(job_id=1)
+        self.jobs_api.list.return_value = iter([])
+        self.jobs_api.get.return_value = _job_info(
+            job_id=1, name="_signature_fixture", tasks=[],
+        )
+
+        with self._patch_workspace_write():
+            Job.from_callable(_signature_fixture, service=self.jobs)
+
+        _, create_kwargs = self.jobs_api.create.call_args
+        self.assertEqual(create_kwargs["name"], "_signature_fixture")
+
+    def test_carries_explicit_name_and_description(self):
+        self.jobs_api.create.return_value = MagicMock(job_id=1)
+        self.jobs_api.list.return_value = iter([])
+        self.jobs_api.get.return_value = _job_info(
+            job_id=1, name="my-job", tasks=[],
+        )
+
+        with self._patch_workspace_write():
+            Job.from_callable(
+                _signature_fixture,
+                name="my-job",
+                description="custom description",
+                service=self.jobs,
+            )
+
+        _, create_kwargs = self.jobs_api.create.call_args
+        self.assertEqual(create_kwargs["name"], "my-job")
+        self.assertEqual(create_kwargs["description"], "custom description")

@@ -228,17 +228,28 @@ def resolve_module_dependency(module: str) -> ModuleDependency:
 
     dist_names = packages_distributions_cached().get(top)
     if not dist_names:
-        return ModuleDependency(
-            module=top, project=None, version=None, kind="unknown",
-        )
-
-    dist_name = dist_names[0]
-    try:
-        dist = ilm.distribution(dist_name)
-    except ilm.PackageNotFoundError:
-        return ModuleDependency(
-            module=top, project=dist_name, version=None, kind="unknown",
-        )
+        # ``packages_distributions()`` occasionally misses wheels whose
+        # ``RECORD`` doesn't enumerate the top-level module explicitly
+        # (pyarrow on some installs, etc.). Fall back to a direct
+        # distribution lookup keyed off the module name — most
+        # PyPI projects share the module name with the distribution
+        # name, so this catches the common case before tagging
+        # ``unknown``.
+        try:
+            dist = ilm.distribution(top)
+        except ilm.PackageNotFoundError:
+            return ModuleDependency(
+                module=top, project=None, version=None, kind="unknown",
+            )
+        dist_name = dist.metadata["Name"]
+    else:
+        dist_name = dist_names[0]
+        try:
+            dist = ilm.distribution(dist_name)
+        except ilm.PackageNotFoundError:
+            return ModuleDependency(
+                module=top, project=dist_name, version=None, kind="unknown",
+            )
 
     version = dist.version
     direct_url_raw = None
