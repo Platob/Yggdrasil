@@ -188,11 +188,6 @@ class TestPathForSQL:
 
 class TestAsyncInsertSerialization:
 
-    def test_frozen(self):
-        rec = _make_record()
-        with pytest.raises(Exception):
-            rec.mode = "overwrite"  # type: ignore[misc]
-
     def test_to_dict_then_from_dict_roundtrip(self):
         rec = _make_record(
             mode="append",
@@ -549,56 +544,79 @@ class TestToStatements:
 
 
 class TestExecute:
-    """:meth:`AsyncInsert.execute` routes through :class:`AsyncWrite`."""
+    """:meth:`AsyncInsert.execute` binds an executor and submits.
 
-    _ASYNC_WRITE = "yggdrasil.databricks.table.async_write.AsyncWrite.from_records"
+    AsyncInsert is itself a :class:`WarehouseStatementBatch`, so
+    ``execute`` plugs *engine*'s warehouse in as :attr:`executor`,
+    renders the prepared statements via :meth:`to_statements`, and
+    extends self with them. No intermediate :class:`AsyncWrite` is
+    built — the record IS the batch.
+    """
 
-    def test_runs_via_async_write_from_records(self):
+    def _patched_to_statements(self, sentinel: Any):
+        """Patch :meth:`to_statements` to return a fixed list without
+        hitting :class:`WarehousePreparedStatement.prepare`."""
+        return patch(
+            "yggdrasil.databricks.table.async_write.AsyncInsert.to_statements",
+            return_value=sentinel,
+        )
+
+    def test_binds_executor_and_submits_statements(self):
         rec = _make_record(mode="append")
         engine = MagicMock()
-        sentinel_batch = MagicMock(name="batch")
-        with patch(self._ASYNC_WRITE, return_value=sentinel_batch) as from_records:
+        warehouse = engine.warehouse.return_value
+        stmt = MagicMock(name="prepared")
+        with self._patched_to_statements([stmt]):
+            rec.extend = MagicMock(name="extend")  # type: ignore[assignment]
+            rec.wait = MagicMock(name="wait")  # type: ignore[assignment]
             result = rec.execute(engine, cleanup=False)
 
-        assert result is sentinel_batch
-        from_records.assert_called_once()
-        args, kwargs = from_records.call_args
-        assert list(args[0]) == [rec]
-        # Executor is resolved off the engine.
-        assert kwargs["executor"] is engine.warehouse.return_value
-        assert kwargs["cleanup"] is False
+        assert result is rec
+        assert rec.executor is warehouse
+        rec.extend.assert_called_once_with([stmt])
+        rec.wait.assert_called_once_with(wait=True, raise_error=True)
 
     def test_empty_op_does_nothing(self):
         rec = AsyncInsert(target_full_name="cat.sch.tbl")
         engine = MagicMock()
-        with patch(self._ASYNC_WRITE) as from_records:
+        assert rec.execute(engine) is None
+        engine.warehouse.assert_not_called()
+        assert rec.executor is None
+
+    def test_no_statements_rendered_returns_none(self):
+        rec = _make_record()
+        engine = MagicMock()
+        with self._patched_to_statements([]):
             assert rec.execute(engine) is None
-        from_records.assert_not_called()
+        # Executor wasn't bound when no statements were ready.
+        assert rec.executor is None
         engine.warehouse.assert_not_called()
 
     def test_wait_and_raise_error_forwarded(self):
         rec = _make_record()
         engine = MagicMock()
-        with patch(self._ASYNC_WRITE, return_value=MagicMock()) as from_records:
+        with self._patched_to_statements([MagicMock(name="prepared")]):
+            rec.extend = MagicMock()  # type: ignore[assignment]
+            rec.wait = MagicMock()  # type: ignore[assignment]
             rec.execute(engine, wait=False, raise_error=False, cleanup=False)
 
-        _, kwargs = from_records.call_args
-        assert kwargs["wait"] is False
-        assert kwargs["raise_error"] is False
+        rec.wait.assert_called_once_with(wait=False, raise_error=False)
 
-    def test_cleanup_flag_forwarded(self):
-        """``cleanup=True/False`` flows through to AsyncWrite.from_records,
-        which forwards it to to_statements (and the prepared-statement
-        path decides whether to mark paths temporary)."""
+    def test_cleanup_flag_forwarded_to_to_statements(self):
+        """``cleanup=True/False`` flows through to :meth:`to_statements`,
+        which decides whether to mark attached paths temporary."""
         rec = _make_record()
         engine = MagicMock()
 
-        with patch(self._ASYNC_WRITE, return_value=MagicMock()) as from_records:
-            rec.execute(engine, cleanup=True)
-            assert from_records.call_args.kwargs["cleanup"] is True
-
-            rec.execute(engine, cleanup=False)
-            assert from_records.call_args.kwargs["cleanup"] is False
+        for cleanup in (True, False):
+            with patch(
+                "yggdrasil.databricks.table.async_write.AsyncInsert.to_statements",
+                return_value=[MagicMock(name="prepared")],
+            ) as to_stmts:
+                rec.extend = MagicMock()  # type: ignore[assignment]
+                rec.wait = MagicMock()  # type: ignore[assignment]
+                rec.execute(engine, cleanup=cleanup)
+                assert to_stmts.call_args.kwargs["cleanup"] is cleanup
 
 
 class TestConcat:
@@ -1229,18 +1247,19 @@ class TestSchemaDiscovery:
         engine.warehouse.assert_not_called()
 
 
-class TestTableInsertAsyncWriteFlag:
+class TestTableInsertLazyFlag:
 
-    def test_async_write_routes_through_stage_async_insert(self, monkeypatch):
-        tbl, _, parquet_path, _ = _make_table_with_staging()
+    def test_lazy_routes_through_stage_async_insert(self, monkeypatch):
+        tbl, _, _, _ = _make_table_with_staging()
 
+        sentinel_record = AsyncInsert(target_full_name="cat.sch.tbl")
         seen: dict[str, Any] = {}
 
         def _fake_stage(table, data, **kwargs):
             seen["table"] = table
             seen["data"] = data
             seen.update(kwargs)
-            return parquet_path
+            return sentinel_record
 
         import yggdrasil.databricks.table.async_write as aw
         monkeypatch.setattr(aw, "stage_async_insert", _fake_stage)
@@ -1251,14 +1270,15 @@ class TestTableInsertAsyncWriteFlag:
             "dummy-data",
             mode="append",
             match_by=["id"],
-            async_write=True,
+            lazy=True,
         )
 
-        assert out is parquet_path
+        assert out is sentinel_record
         assert seen["table"] is tbl
         assert seen["data"] == "dummy-data"
         assert seen["mode"] == "append"
         assert seen["match_by"] == ["id"]
+        assert seen["lazy"] is True
         tbl.insert_into.assert_not_called()
 
     def test_default_falls_through_to_insert_into(self):
