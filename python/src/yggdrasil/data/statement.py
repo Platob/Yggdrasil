@@ -700,12 +700,16 @@ SR = TypeVar("SR", bound="StatementResult")
 # ---------------------------------------------------------------------------
 
 
-class StatementBatch(Tabular, Generic[PS, SR]):
+class StatementBatch(StatementResult[PS], Generic[PS, SR]):
     """A pending queue of statements plus a map of in-flight / completed results.
 
-    *Not* a :class:`Tabular` — a batch as a whole has no rows, only its
-    individual results do.  Iterate via :meth:`materialized` (or just walk
-    ``self.results``) to drain results into Arrow, polars, etc.
+    A batch IS a :class:`StatementResult` — its aggregate state is the
+    composite of every child's state (any failed → failed once every
+    child has settled, all done with none failed → succeeded, anything
+    still active → running). This lets a batch flow through APIs that
+    accept a single result, and lets the same lifecycle primitives
+    (``wait``, ``cancel``, ``raise_for_status``) work on either a single
+    statement or a whole batch.
 
     Lifecycle::
 
@@ -730,8 +734,15 @@ class StatementBatch(Tabular, Generic[PS, SR]):
         parallel: int = 1,
         **kwargs: Any,
     ):
-        super().__init__(**kwargs)
+        # A batch has no single statement — set the StatementResult
+        # contract attrs directly so the coercer doesn't try to wrap a
+        # dummy PS that would only end up unused.
         self.executor = executor
+        self.statement = None  # type: ignore[assignment]
+        self.key = "<batch>"
+        self.start_timestamp: Optional[int] = None
+        self.iteration = 0
+        self._cached_schema: Optional[Schema] = None
         self.results = OrderedDict()
 
         if parallel is None:
@@ -743,6 +754,11 @@ class StatementBatch(Tabular, Generic[PS, SR]):
 
         self.parallel = parallel
 
+        # Skip StatementResult.__init__ (no single statement to coerce);
+        # route straight to Tabular for the parent-pointer / static-values
+        # plumbing.
+        Tabular.__init__(self, **kwargs)
+
         if statements:
             self.extend(statements)
 
@@ -751,6 +767,17 @@ class StatementBatch(Tabular, Generic[PS, SR]):
 
     def __hash__(self):
         return hash(tuple(s for s in self.results.keys()))
+
+    @property
+    def text(self) -> str:
+        """Aggregate text — every child's text joined with ``"; "``.
+
+        Overrides :attr:`StatementResult.text` (which dereferences
+        ``self.statement``) because a batch has no single statement.
+        Useful for diagnostics / repr — the executor never reads this
+        for submission.
+        """
+        return "; ".join(r.text for r in self.results.values())
 
     def _collect_schema(self, options: O) -> Schema:
         if options.target:
@@ -966,6 +993,27 @@ class StatementBatch(Tabular, Generic[PS, SR]):
     def failed(self) -> bool:
         return any(result.failed for result in self.results.values())
 
+    def _compute_state(self) -> State:
+        """Aggregate state across children.
+
+        - No children → :attr:`State.IDLE`.
+        - Anything still non-done → :attr:`State.RUNNING` (mirrors
+          :attr:`done` returning ``False`` mid-flight, even when some
+          children have already failed).
+        - All done, any failed → :attr:`State.FAILED`.
+        - All done, none failed → :attr:`State.SUCCEEDED`.
+        """
+        if not self.results:
+            return State.IDLE
+        any_failed = False
+        for result in self.results.values():
+            s = result.state
+            if not s.is_done:
+                return State.RUNNING
+            if s.is_failed:
+                any_failed = True
+        return State.FAILED if any_failed else State.SUCCEEDED
+
     def refresh_status(self) -> "StatementBatch":
         for result in self.results.values():
             result.refresh_status()
@@ -1003,6 +1051,15 @@ class StatementBatch(Tabular, Generic[PS, SR]):
         logger.debug("Re-raising backend failure from batch item %r.", last_key)
         self.results[last_key].raise_for_status()
         return self
+
+    def _raise_for_status(self) -> None:
+        """:class:`StatementResult` abstract hook — delegate to the
+        batch-level :meth:`raise_for_status` which walks failed children
+        directly. The base :meth:`StatementResult.raise_for_status`
+        pathway is bypassed because :meth:`raise_for_status` is
+        overridden above; this method exists to satisfy the abstract
+        contract for callers that go through the base path."""
+        self.raise_for_status()
 
     # -------------------------------------------------------------------------
     # Internals
