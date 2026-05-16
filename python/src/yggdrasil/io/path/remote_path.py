@@ -7,7 +7,7 @@ subclasses no longer reimplement these.
 
 Subclasses implement :meth:`_stat_uncached`; the base wraps it via
 :meth:`_stat` and stores the result on ``self._stat_cached``.
-Mutating ops (writes, deletes) must call :meth:`_invalidate_stat_cache`
+Mutating ops (writes, deletes) must call :meth:`_invalidate_singleton`
 so follow-up reads see fresh metadata. Sister of
 :class:`yggdrasil.io.fs.local_path.LocalPath`: same :class:`Holder`
 substrate, different backing.
@@ -132,16 +132,11 @@ class RemotePath(Path):
     def _stat_uncached(self) -> IOStats:
         """Backend-specific :class:`IOStats` probe. One network call."""
 
-    def _invalidate_stat_cache(self, remove_global: bool = True) -> None:
-        """Drop this path's cached :class:`IOStats` and schema.
-
-        ``remove_global`` is forwarded to :class:`Path` /
-        :class:`Singleton` so the cached instance is popped from
-        ``_INSTANCES`` too — see :meth:`Singleton._invalidate_singleton`.
-        """
-        super()._invalidate_stat_cache(remove_global=remove_global)
+    def _invalidate_singleton(self, remove_global: bool = True) -> None:
+        """Drop this path's cached :class:`IOStats`, schema, and
+        ``_INSTANCES`` entry — see :meth:`Path._invalidate_singleton`."""
+        super()._invalidate_singleton(remove_global=remove_global)
         self._unpersist_schema()
-        logger.debug("Invalidated stat cache for %r", self)
 
     # ------------------------------------------------------------------
     # Resize is a no-op on remote backends — the upload IS the resize

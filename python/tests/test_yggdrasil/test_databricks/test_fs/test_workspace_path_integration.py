@@ -82,7 +82,7 @@ class TestWorkspacePathIntegration(DatabricksIntegrationCase):
         path = self.root / "to-delete.txt"
         path.write_bytes(b"bye")
         path.unlink()
-        path._invalidate_stat_cache()
+        path._invalidate_singleton()
         self.assertIs(path._stat_uncached().kind, IOKind.MISSING)
 
     def test_open_context(self):

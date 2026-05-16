@@ -128,7 +128,7 @@ class S3Service(AWSService):
 
         With no args, drops every listing. Stat caching is mutualized
         on :class:`RemotePath`; call
-        :meth:`RemotePath._invalidate_stat_cache` for that.
+        :meth:`RemotePath._invalidate_singleton` for that.
         """
         if self._ls_cache is None:
             return

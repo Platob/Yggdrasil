@@ -145,7 +145,7 @@ class DBFSPath(DatabricksPath):
         except Exception:
             if not missing_ok:
                 raise
-        self._invalidate_stat_cache()
+        self._invalidate_singleton()
 
     def _remove_dir(
         self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
@@ -161,7 +161,7 @@ class DBFSPath(DatabricksPath):
         except Exception:
             if not missing_ok:
                 raise
-        self._invalidate_stat_cache()
+        self._invalidate_singleton()
 
     # ==================================================================
     # Holder I/O — chunked DBFS read; streaming write

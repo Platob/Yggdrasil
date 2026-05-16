@@ -54,7 +54,7 @@ def _view(
     sql = _RecordingSql(client=client, catalog_name=catalog, schema_name=schema)
     # Stub out cache invalidation so the rename / clone methods don't
     # try to talk to a real workspace when refreshing afterwards.
-    object.__setattr__(t, "_invalidate_stat_cache", lambda *a, **k: None)
+    object.__setattr__(t, "_invalidate_singleton", lambda *a, **k: None)
     infos = TableInfo(
         view_definition=view_definition,
         table_type=TableType.VIEW,

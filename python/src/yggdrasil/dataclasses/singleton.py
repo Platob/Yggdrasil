@@ -32,12 +32,16 @@ in-process singleton.
 
 from __future__ import annotations
 
+import logging
 from threading import RLock
 from typing import Any, ClassVar
 
 from .expiring import ExpiringDict
 
 __all__ = ["Singleton"]
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class Singleton:
@@ -186,7 +190,7 @@ class Singleton:
         thread is left alone.
 
         ``remove_global=False`` is a no-op. The keyword exists so
-        subclass invalidators (``_invalidate_stat_cache``,
+        subclass invalidators (``_invalidate_singleton``,
         ``_invalidate_entity_tag_cache``, …) can offer the same
         switch without branching at the call site.
         """
@@ -200,6 +204,7 @@ class Singleton:
             cached = cls._INSTANCES.get(key)
             if cached is self:
                 cls._INSTANCES.pop(key, None)
+        LOGGER.debug("Invalidated singleton for %r", self)
 
     def __hash__(self) -> int:
         return hash(getattr(self, "_singleton_key_", id(self)))

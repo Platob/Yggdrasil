@@ -265,7 +265,7 @@ class TestParquetOverDBFS:
         # Drop the post-write stat cache so the reader's first probe
         # exercises the real ``get_status`` path against the freshly
         # committed buffer.
-        dbfs._invalidate_stat_cache()
+        dbfs._invalidate_singleton()
         loaded = ParquetIO(holder=dbfs, owns_holder=False).read_arrow_table()
         assert loaded.equals(table)
 
@@ -283,7 +283,7 @@ class TestCsvOverDBFS:
         dbfs = DBFSPath("/dbfs/data.csv", client=client)
 
         CsvIO(holder=dbfs, owns_holder=False).write_arrow_table(table)
-        dbfs._invalidate_stat_cache()
+        dbfs._invalidate_singleton()
         loaded = CsvIO(holder=dbfs, owns_holder=False).read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2, 3]
 
@@ -325,6 +325,6 @@ class TestArrowIPCOverVolume:
 
         vol = VolumePath("/Volumes/c/s/v/data.arrow", client=client)
         ArrowIPCIO(holder=vol, owns_holder=False).write_arrow_table(table)
-        vol._invalidate_stat_cache()
+        vol._invalidate_singleton()
         loaded = ArrowIPCIO(holder=vol, owns_holder=False).read_arrow_table()
         assert loaded.equals(table)

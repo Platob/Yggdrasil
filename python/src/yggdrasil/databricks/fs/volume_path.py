@@ -734,7 +734,7 @@ class VolumePath(DatabricksPath):
         except Exception:
             if not missing_ok:
                 raise
-        self._invalidate_stat_cache()
+        self._invalidate_singleton()
 
     def _remove_dir(
         self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
@@ -757,7 +757,7 @@ class VolumePath(DatabricksPath):
                 self.api_path,
                 recursive=recursive,
             )
-        self._invalidate_stat_cache()
+        self._invalidate_singleton()
 
     # ==================================================================
     # Holder I/O

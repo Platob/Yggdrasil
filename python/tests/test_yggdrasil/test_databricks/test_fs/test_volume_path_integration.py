@@ -85,7 +85,7 @@ class TestVolumePathIntegration(DatabricksIntegrationCase):
         path = self.root / "to-delete.bin"
         path.write_bytes(b"bye")
         path.unlink()
-        path._invalidate_stat_cache()
+        path._invalidate_singleton()
         self.assertIs(path._stat_uncached().kind, IOKind.MISSING)
 
     def test_open_context(self):
