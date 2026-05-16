@@ -133,6 +133,21 @@ class _AsyncWriteIntegrationBase(DatabricksIntegrationCase):
             "amount": pa.array([amount] * len(ids), type=pa.float64()),
         })
 
+    @staticmethod
+    def _wait_until_gone(path, *, timeout: float = 30.0, interval: float = 0.2) -> None:
+        # ``WarehouseStatementBatch.clear_temporary_resources`` fires unlinks
+        # via ``Job.make(...).fire_and_forget()`` and returns before the
+        # ThreadJobs complete, so ``execute(wait=True)`` can land before
+        # cleanup actually finishes — poll briefly instead of asserting.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not path.exists:
+                return
+            time.sleep(interval)
+        raise AssertionError(
+            f"{path!r} still exists after {timeout:.1f}s — cleanup did not run"
+        )
+
 
 class TestAsyncWriteIntegration(_AsyncWriteIntegrationBase):
     """End-to-end stage → merge → execute flow against a real workspace."""
@@ -166,8 +181,8 @@ class TestAsyncWriteIntegration(_AsyncWriteIntegrationBase):
         assert rows[0]["n"] == 4
 
         # Cleanup happened — staged Parquet + metadata files are gone.
-        assert not first.exists
-        assert not second.exists
+        self._wait_until_gone(first)
+        self._wait_until_gone(second)
 
     def test_overwrite_drops_earlier_appends(self):
         table = self._unique_table("async_ovw")
@@ -255,13 +270,31 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
         assert schedule.pause_status == PauseStatus.PAUSED
 
     def test_run_now_returns_job_run(self):
-        """Trigger the job via :meth:`Job.run`. The job has no tasks,
-        so the run terminates fast (with SKIPPED or SUCCESS) — we just
-        verify the trigger plumbing returns a :class:`JobRun`."""
+        """Trigger the job via :meth:`Job.run`. We attach a no-op
+        ``condition_task`` (``1 == 1``) so the run terminates fast —
+        Databricks rejects ``run_now`` on an empty-task job with
+        ``InvalidParameterValue``, so the default ``ensure_job(table)``
+        shape is not directly triggerable."""
+        from databricks.sdk.service.jobs import (
+            ConditionTask,
+            ConditionTaskOp,
+            Task,
+        )
+
         table = self._unique_table("async_trig")
         table.ensure_created(self._sample_schema())
 
-        job = AsyncInsert.ensure_job(table)
+        job = AsyncInsert.ensure_job(
+            table,
+            task=Task(
+                task_key="noop",
+                condition_task=ConditionTask(
+                    op=ConditionTaskOp.EQUAL_TO,
+                    left="1",
+                    right="1",
+                ),
+            ),
+        )
         if job.job_id not in type(self).created_jobs:
             type(self).created_jobs.append(job.job_id)
 
