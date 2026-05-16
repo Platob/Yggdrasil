@@ -1,4 +1,4 @@
-"""Per-table applier job for staged async inserts.
+"""Per-table applier :class:`Job` for staged async inserts.
 
 One Databricks Job per :class:`Table`. The job drains the table's
 ``stg_<table>/.sql/async/insert`` staging folder (via
@@ -7,18 +7,15 @@ fired automatically by a *file-arrival trigger* watching the
 ``data/`` sub-folder — every newly staged Parquet payload kicks the
 applier without needing a cron schedule.
 
-The class is a thin pairing of (:class:`Table`, :class:`Job`):
-
-- :attr:`table` is the source of identity. The job name, the trigger
-  URL, and the notebook base-parameters are derived from it.
-- :attr:`job` is the live :class:`Job` resource for run / refresh /
-  delete.
-
-CRUD classmethods all take a :class:`Table` and route through the
-workspace :class:`Jobs` service — :meth:`find`, :meth:`get`,
-:meth:`create`, :meth:`get_or_create`, :meth:`create_or_update`, and
-:meth:`delete`. Instance helpers :meth:`run`, :meth:`update`, and
-:meth:`refresh` forward to the underlying :class:`Job`.
+:class:`AsyncInsertJob` inherits from :class:`Job` so the full Job
+lifecycle (:meth:`refresh`, :meth:`update`, :meth:`run`,
+:meth:`delete`, :meth:`runs`, :meth:`cancel_all_runs`,
+:meth:`update_permissions`, …) flows through unchanged. The new
+:attr:`table` attribute is the source of identity — job name and
+file-arrival URL are both derived from it. Classmethod CRUD
+(:meth:`find`, :meth:`get`, :meth:`create`, :meth:`get_or_create`,
+:meth:`create_or_update`) accepts a :class:`Table` and wires the
+result back into a singleton-cached :class:`AsyncInsertJob`.
 """
 from __future__ import annotations
 
@@ -37,6 +34,7 @@ from typing import (
 from databricks.sdk.service.jobs import (
     CronSchedule,
     FileArrivalTriggerConfiguration,
+    Job as JobInfo,
     JobAccessControlRequest,
     JobParameterDefinition,
     NotebookTask,
@@ -45,13 +43,14 @@ from databricks.sdk.service.jobs import (
     TriggerSettings,
 )
 
+from yggdrasil.databricks.jobs.job import Job
+
 if TYPE_CHECKING:
     from yggdrasil.databricks.client import DatabricksClient
     from yggdrasil.databricks.fs import VolumePath
-    from yggdrasil.databricks.jobs.job import Job
-    from yggdrasil.databricks.jobs.run import JobRun
     from yggdrasil.databricks.jobs.service import Jobs
 
+    from .async_write import AsyncInsert
     from .table import Table
 
 
@@ -67,40 +66,97 @@ DEFAULT_MIN_TIME_BETWEEN_TRIGGERS_SECONDS: int = 60
 DEFAULT_WAIT_AFTER_LAST_CHANGE_SECONDS: int = 60
 
 
-class AsyncInsertJob:
+class AsyncInsertJob(Job):
     """Applier :class:`Job` bound to a single :class:`Table`.
 
     Identity is keyed off ``(catalog_name, schema_name, table_name)``
     on the bound table — one job per target table, watching the
     table's own ``stg_<table>/.sql/async/insert/data/`` folder via a
     file-arrival trigger.
+
+    Every :class:`Job` method is inherited, so existing call sites
+    (:meth:`run`, :meth:`refresh`, :meth:`update`, :meth:`delete`,
+    :meth:`runs`, :meth:`update_permissions`, …) work unchanged.
     """
 
     JOB_NAME_PREFIX: ClassVar[str] = "ygg-async-insert"
 
-    def __init__(self, table: "Table", job: "Job"):
+    # ------------------------------------------------------------------ #
+    # Construction
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def _singleton_key(
+        cls,
+        table: "Table | None" = None,
+        *,
+        service: "Jobs | None" = None,
+        job_id: int | None = None,
+        job_name: str | None = None,
+        **_kwargs: Any,
+    ) -> Any:
+        # Derive job_name from *table* so two callers with the same
+        # table collapse to one singleton even when the underlying
+        # job_id hasn't been resolved yet.
+        if not job_name and table is not None:
+            try:
+                job_name = cls.job_name_for(table)
+            except ValueError:
+                pass
+        if service is None and table is not None:
+            try:
+                service = cls._resolve_jobs(table, jobs=None, client=None)
+            except Exception:  # noqa: BLE001 — best-effort
+                service = None
+        return (cls, service, job_id, job_name)
+
+    def __init__(
+        self,
+        table: "Table | None" = None,
+        *,
+        service: "Jobs | None" = None,
+        job_id: int | None = None,
+        job_name: str | None = None,
+        details: Optional[JobInfo] = None,
+        singleton_ttl: Any = ...,
+    ):
+        already_initialized = getattr(self, "_initialized", False)
+
+        # Rebind a freshly-supplied table onto a previously-cached
+        # singleton (e.g. instance came from a job_id-only lookup).
+        if already_initialized:
+            if table is not None and getattr(self, "table", None) is None:
+                self.table = table
+            return
+
+        if table is not None and not job_name:
+            job_name = type(self).job_name_for(table)
+        if service is None and table is not None:
+            service = type(self)._resolve_jobs(table, jobs=None, client=None)
+
+        super().__init__(
+            service=service,
+            job_id=job_id,
+            job_name=job_name,
+            details=details,
+            singleton_ttl=singleton_ttl,
+        )
         self.table = table
-        self.job = job
 
     def __repr__(self) -> str:
+        table = getattr(self, "table", None)
+        target = (
+            table.full_name(safe=False)
+            if table is not None and table.table_name else None
+        )
         return (
-            f"AsyncInsertJob(table={self.table.full_name(safe=False)!r}, "
-            f"job_id={self.job.job_id!r})"
+            f"AsyncInsertJob(table={target!r}, job_id={self.job_id!r})"
         )
 
     # ------------------------------------------------------------------ #
     # Identity helpers
     # ------------------------------------------------------------------ #
-    @property
-    def job_id(self) -> Optional[int]:
-        return self.job.job_id
-
-    @property
-    def name(self) -> str:
-        return type(self).job_name(self.table)
-
     @classmethod
-    def job_name(cls, table: "Table") -> str:
+    def job_name_for(cls, table: "Table") -> str:
         """Canonical applier-job name for *table*."""
         cat, sch, tbl = cls._identity(table)
         return f"{cls.JOB_NAME_PREFIX}-{cat}-{sch}-{tbl}"
@@ -140,8 +196,16 @@ class AsyncInsertJob:
     ) -> "AsyncInsertJob | None":
         """Return the applier job bound to *table*, or ``None`` if absent."""
         jobs = cls._resolve_jobs(table, jobs=jobs, client=client)
-        found = jobs.find(name=cls.job_name(table))
-        return cls(table, found) if found is not None else None
+        found = jobs.find(name=cls.job_name_for(table))
+        if found is None:
+            return None
+        return cls(
+            table,
+            service=jobs,
+            job_id=found.job_id,
+            job_name=found.job_name,
+            details=found._details,
+        )
 
     @classmethod
     def get(
@@ -153,7 +217,14 @@ class AsyncInsertJob:
     ) -> "AsyncInsertJob":
         """Like :meth:`find` but raises when the job doesn't exist."""
         jobs = cls._resolve_jobs(table, jobs=jobs, client=client)
-        return cls(table, jobs.get(name=cls.job_name(table)))
+        found = jobs.get(name=cls.job_name_for(table))
+        return cls(
+            table,
+            service=jobs,
+            job_id=found.job_id,
+            job_name=found.job_name,
+            details=found._details,
+        )
 
     @classmethod
     def create(
@@ -185,29 +256,32 @@ class AsyncInsertJob:
     ) -> "AsyncInsertJob":
         """Create the applier job for *table* (errors if it already exists)."""
         jobs = cls._resolve_jobs(table, jobs=jobs, client=client)
+        kwargs = cls._build_create_kwargs(
+            table=table,
+            task=task,
+            notebook_path=notebook_path,
+            notebook_warehouse_id=notebook_warehouse_id,
+            notebook_base_parameters=notebook_base_parameters,
+            schedule=schedule,
+            schedule_timezone=schedule_timezone,
+            schedule_pause_status=schedule_pause_status,
+            file_arrival_trigger=file_arrival_trigger,
+            min_time_between_triggers_seconds=min_time_between_triggers_seconds,
+            wait_after_last_change_seconds=wait_after_last_change_seconds,
+            trigger_pause_status=trigger_pause_status,
+            parameters=parameters,
+            description=description,
+            permissions=permissions,
+            tags=tags,
+            settings=settings,
+        )
+        underlying = jobs.create(**kwargs)
         return cls(
             table,
-            jobs.create(
-                **cls._build_create_kwargs(
-                    table=table,
-                    task=task,
-                    notebook_path=notebook_path,
-                    notebook_warehouse_id=notebook_warehouse_id,
-                    notebook_base_parameters=notebook_base_parameters,
-                    schedule=schedule,
-                    schedule_timezone=schedule_timezone,
-                    schedule_pause_status=schedule_pause_status,
-                    file_arrival_trigger=file_arrival_trigger,
-                    min_time_between_triggers_seconds=min_time_between_triggers_seconds,
-                    wait_after_last_change_seconds=wait_after_last_change_seconds,
-                    trigger_pause_status=trigger_pause_status,
-                    parameters=parameters,
-                    description=description,
-                    permissions=permissions,
-                    tags=tags,
-                    settings=settings,
-                ),
-            ),
+            service=jobs,
+            job_id=underlying.job_id,
+            job_name=underlying.job_name,
+            details=underlying._details,
         )
 
     @classmethod
@@ -284,36 +358,54 @@ class AsyncInsertJob:
             if kwargs.get("schedule") is not None else None,
             len(kwargs.get("tasks") or []),
         )
-        return cls(table, jobs.create_or_update(**kwargs))
+        underlying = jobs.create_or_update(**kwargs)
+        return cls(
+            table,
+            service=jobs,
+            job_id=underlying.job_id,
+            job_name=underlying.job_name,
+            details=underlying._details,
+        )
 
-    @classmethod
-    def delete(
-        cls,
-        table: "Table",
+    # ------------------------------------------------------------------ #
+    # Discover staged inserts
+    # ------------------------------------------------------------------ #
+    def load_from_path(
+        self,
+        path: "VolumePath | str | None" = None,
         *,
-        jobs: "Jobs | None" = None,
-        client: "DatabricksClient | None" = None,
-    ) -> None:
-        """Delete the applier job for *table* (no-op if it does not exist)."""
-        jobs = cls._resolve_jobs(table, jobs=jobs, client=client)
-        jobs.delete(name=cls.job_name(table))
+        merge: bool = True,
+    ) -> List["AsyncInsert"]:
+        """Read the staged :class:`AsyncInsert` records under *path*.
 
-    # ------------------------------------------------------------------ #
-    # Instance forwarders
-    # ------------------------------------------------------------------ #
-    def refresh(self) -> "AsyncInsertJob":
-        self.job.refresh()
-        return self
+        *path* defaults to the bound table's own
+        ``stg_<table>/.sql/async/insert`` staging folder, so an
+        applier task can simply call ``self.load_from_path()`` to
+        discover everything currently queued for the target table.
 
-    def update(self, **kwargs: Any) -> "AsyncInsertJob":
-        self.job.update(**kwargs)
-        return self
+        With ``merge=True`` (the default) returns one merged record
+        per target — every overlapping append folds into a single
+        ``INSERT INTO`` and a trailing overwrite drops everything
+        before it (see :meth:`AsyncInsert.merge`). Pass ``merge=False``
+        to get the raw per-file records back instead, useful when the
+        caller wants to inspect each operation independently.
+        """
+        from .async_write import AsyncInsert, _iter_records
 
-    def run(self, **kwargs: Any) -> "JobRun":
-        return self.job.run(**kwargs)
+        if path is None:
+            if self.table is None:
+                raise ValueError(
+                    f"AsyncInsertJob {self!r} has no bound table; pass an "
+                    "explicit ``path`` to load_from_path."
+                )
+            path = self.table.staging_folder(
+                temporary=False, async_write=True,
+            )
 
-    def delete_job(self) -> None:
-        self.job.delete()
+        client = self.client if self.table is not None else None
+        if merge:
+            return AsyncInsert.merge(path, client=client)
+        return list(_iter_records(path, client=client))
 
     # ------------------------------------------------------------------ #
     # Internals
@@ -370,7 +462,7 @@ class AsyncInsertJob:
         settings: Mapping[str, Any],
     ) -> dict:
         cat, sch, tbl = cls._identity(table)
-        name = cls.job_name(table)
+        name = cls.job_name_for(table)
 
         resolved_tasks = cls._resolve_tasks(
             task=task,

@@ -248,16 +248,17 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
         table.ensure_created(self._sample_schema())
 
         wrapper = AsyncInsertJob.create_or_update(table)
-        assert isinstance(wrapper.job, Job)
-        assert wrapper.job.job_id is not None
-        type(self).created_jobs.append(wrapper.job.job_id)
+        # AsyncInsertJob IS-a Job — singleton-cached, full Job surface.
+        assert isinstance(wrapper, Job)
+        assert wrapper.job_id is not None
+        type(self).created_jobs.append(wrapper.job_id)
         assert wrapper.name == (
             f"ygg-async-insert-{self.catalog_name}-{self.schema_name}-"
             f"{table.table_name}"
         )
 
         wrapper.refresh()
-        trigger = wrapper.job.settings.trigger if wrapper.job.settings else None
+        trigger = wrapper.settings.trigger if wrapper.settings else None
         assert trigger is not None
         assert isinstance(trigger.file_arrival, FileArrivalTriggerConfiguration)
         # Trigger points at the table's own async staging data folder.
@@ -280,10 +281,10 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
             schedule_pause_status="paused",    # keep it idle in the test
             file_arrival_trigger=False,
         )
-        type(self).created_jobs.append(wrapper.job.job_id)
+        type(self).created_jobs.append(wrapper.job_id)
 
         wrapper.refresh()
-        settings = wrapper.job.settings
+        settings = wrapper.settings
         assert settings is not None
         schedule = settings.schedule
         assert schedule is not None
@@ -319,8 +320,8 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
             ),
             file_arrival_trigger=False,
         )
-        if wrapper.job.job_id not in type(self).created_jobs:
-            type(self).created_jobs.append(wrapper.job.job_id)
+        if wrapper.job_id not in type(self).created_jobs:
+            type(self).created_jobs.append(wrapper.job_id)
 
         run = wrapper.run()
         assert isinstance(run, JobRun)
