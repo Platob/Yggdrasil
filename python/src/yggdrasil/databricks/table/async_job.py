@@ -64,7 +64,13 @@ class AsyncInsertJob:
     """
 
     JOB_NAME_PREFIX: ClassVar[str] = "ygg-async-insert"
-    DATA_SUBDIR: ClassVar[str] = "data"
+    # ``stage_async_insert`` writes the Parquet payload under ``data/``
+    # **first**, then the JSON metadata under ``logs/``. The file-arrival
+    # trigger watches ``logs/`` (not ``data/``) so a fire can only happen
+    # after the JSON sibling exists — :meth:`AsyncInsertJob.load` reads
+    # the metadata files and would otherwise miss a record whose JSON
+    # hasn't landed yet.
+    TRIGGER_SUBDIR: ClassVar[str] = "logs"
     LOCK_FILENAME: ClassVar[str] = ".lock"
     DEFAULT_MIN_TIME_BETWEEN_TRIGGERS_SECONDS: ClassVar[int] = 60
     DEFAULT_WAIT_AFTER_LAST_CHANGE_SECONDS: ClassVar[int] = 60
@@ -89,14 +95,22 @@ class AsyncInsertJob:
 
     @staticmethod
     def trigger_folder(table: "Table") -> "VolumePath":
-        """Staging ``data/`` folder watched by the file-arrival trigger."""
+        """Staging ``logs/`` folder watched by the file-arrival trigger.
+
+        Watching the metadata-log folder (not the Parquet data folder)
+        closes the write-order race: :func:`stage_async_insert` writes
+        the Parquet first and the JSON metadata second, so by the time
+        a ``logs/<op>.json`` lands the matching Parquet is already on
+        disk — the applier won't see a metadata-less Parquet or vice
+        versa.
+        """
         return table.staging_folder(temporary=False, async_write=True).joinpath(
-            AsyncInsertJob.DATA_SUBDIR,
+            AsyncInsertJob.TRIGGER_SUBDIR,
         )
 
     @staticmethod
     def trigger_url(table: "Table") -> str:
-        """File-arrival URL — ``dbfs:/Volumes/<cat>/<sch>/<vol>/...data/``."""
+        """File-arrival URL — ``dbfs:/Volumes/<cat>/<sch>/<vol>/...logs/``."""
         path = AsyncInsertJob.trigger_folder(table).full_path()
         if not path.endswith("/"):
             path = path + "/"

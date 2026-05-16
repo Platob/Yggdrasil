@@ -264,7 +264,7 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
             f"/Volumes/{self.catalog_name}/{self.schema_name}/stg_"
             in trigger.file_arrival.url
         )
-        assert trigger.file_arrival.url.endswith("/.sql/async/insert/data/")
+        assert trigger.file_arrival.url.endswith("/.sql/async/insert/logs/")
 
     def test_async_job_with_cron_schedule_is_visible_on_the_job(self):
         from databricks.sdk.service.jobs import PauseStatus

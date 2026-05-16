@@ -1015,7 +1015,7 @@ class TestAsyncInsertJobSettings:
     @staticmethod
     def _table_with_trigger_path(
         *,
-        trigger_path: str = "/Volumes/cat/sch/stg_tbl/.sql/async/insert/data",
+        trigger_path: str = "/Volumes/cat/sch/stg_tbl/.sql/async/insert/logs",
     ):
         tbl, _, _, _ = _make_table_with_staging()
         data_folder = MagicMock(spec=VolumePath)
@@ -1040,7 +1040,7 @@ class TestAsyncInsertJobSettings:
         tbl, _, _ = self._table_with_trigger_path()
         assert (
             AsyncInsertJob.trigger_url(tbl)
-            == "dbfs:/Volumes/cat/sch/stg_tbl/.sql/async/insert/data/"
+            == "dbfs:/Volumes/cat/sch/stg_tbl/.sql/async/insert/logs/"
         )
 
     def test_settings_carries_full_job_spec(self):
@@ -1062,7 +1062,7 @@ class TestAsyncInsertJobSettings:
         assert isinstance(trigger.file_arrival, FileArrivalTriggerConfiguration)
         assert (
             trigger.file_arrival.url
-            == "dbfs:/Volumes/cat/sch/stg_tbl/.sql/async/insert/data/"
+            == "dbfs:/Volumes/cat/sch/stg_tbl/.sql/async/insert/logs/"
         )
         # notebook_path is wrapped in a Task with the table identity.
         tasks = spec["tasks"]
@@ -1206,7 +1206,7 @@ class TestTableAsyncJob:
         tbl, _, _, _ = _make_table_with_staging()
         data_folder = MagicMock(spec=VolumePath)
         data_folder.full_path.return_value = (
-            "/Volumes/cat/sch/stg_tbl/.sql/async/insert/data"
+            "/Volumes/cat/sch/stg_tbl/.sql/async/insert/logs"
         )
         async_root = MagicMock(spec=VolumePath)
         async_root.joinpath.return_value = data_folder
