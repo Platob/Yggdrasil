@@ -11,9 +11,8 @@ details and exposes:
 from __future__ import annotations
 
 import logging
-from dataclasses import replace as _dc_replace
 from typing import (
-    Any, Callable, ClassVar, Iterator, List, Optional, TYPE_CHECKING, Union,
+    Any, ClassVar, Iterator, List, Optional, TYPE_CHECKING, Union,
 )
 
 from databricks.sdk.errors import ResourceDoesNotExist
@@ -353,54 +352,37 @@ class Job(Singleton, DatabricksResource):
         return self
 
     # ------------------------------------------------------------------ #
-    # Task decorator — Prefect-style registration of Python callables
+    # Task factory — Prefect-style registration of Python callables
     # ------------------------------------------------------------------ #
     def task(
         self,
-        func: Optional[Callable[..., Any]] = None,
+        task_key: str,
         /,
-        *,
-        task_key: Optional[str] = None,
         **task_fields: Any,
-    ) -> Any:
-        """Register a Python callable as a task on this job.
+    ) -> "JobTask":
+        """Construct a :class:`JobTask` handle bound to this job.
 
-        Usable bare or parametrized::
+        The returned handle is not yet persisted on the job — call
+        :meth:`JobTask.create` / :meth:`JobTask.create_or_update`, or
+        use :meth:`JobTask.decorate` to stage a Python callable's
+        source onto it and push it through in one step::
 
             job = client.jobs.get_or_create(job_id=123, name="my-job")
 
-            @job.task
+            @job.task("do").decorate
             def do(a: str, i: int):
                 print(a, i)
 
-            @job.task(task_key="custom", existing_cluster_id="c-123")
+            @job.task("do2", existing_cluster_id="c-123").decorate
             def do2(x: int): ...
 
-        Internally calls :meth:`JobTask.from_callable` to stage the
-        function's raw source as a ``.py`` script under the user's
-        workspace, then :meth:`JobTask.create_or_update` to push the
-        task into the job's settings — re-decorating the same function
-        during development replaces the previous entry in place instead
-        of raising. Any extra ``task_fields`` are layered onto the
-        resulting :class:`databricks.sdk.service.jobs.Task` via
-        :func:`dataclasses.replace` before submission — useful for
-        attaching compute (``new_cluster=`` / ``existing_cluster_id=``
-        / ``job_cluster_key=``), dependencies, retries, etc.
-
-        Returns the original callable so the function stays usable
-        in-process; the :class:`JobTask` handle is attached as
-        ``func._job_task`` for downstream access.
+        Extra *task_fields* are forwarded to
+        :class:`databricks.sdk.service.jobs.Task` so you can attach
+        compute (``new_cluster=`` / ``existing_cluster_id=`` /
+        ``job_cluster_key=``), dependencies, retries, description, etc.
+        at construction time.
         """
         from .task import JobTask
 
-        def _decorate(f: Callable[..., Any]) -> Callable[..., Any]:
-            jt = JobTask.from_callable(self, f, task_key=task_key)
-            if task_fields and jt._details is not None:
-                jt._details = _dc_replace(jt._details, **task_fields)
-            jt.create_or_update()
-            f._job_task = jt  # type: ignore[attr-defined]
-            return f
-
-        if func is None:
-            return _decorate
-        return _decorate(func)
+        details = Task(task_key=task_key, **task_fields)
+        return JobTask(job=self, task_key=task_key, details=details)

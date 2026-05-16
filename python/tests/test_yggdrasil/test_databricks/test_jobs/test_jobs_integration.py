@@ -1,4 +1,4 @@
-"""Live-integration tests for the Jobs/JobTask + ``@job.task`` flow.
+"""Live-integration tests for the Jobs/JobTask + ``@job.task(...).decorate`` flow.
 
 Skipped unless ``DATABRICKS_HOST`` is exported (see
 :class:`DatabricksIntegrationCase`).
@@ -13,8 +13,9 @@ Exercises against a real workspace:
   calls the function.
 - :meth:`JobTask.create_or_update` — re-staging the same ``task_key``
   replaces the existing entry on the job rather than raising.
-- ``@job.task`` decorator — Prefect-style sugar wires through
-  :meth:`JobTask.from_callable` + :meth:`JobTask.create_or_update`.
+- :meth:`Job.task` + :meth:`JobTask.decorate` — Prefect-style sugar
+  wires through :meth:`JobTask.from_callable` +
+  :meth:`JobTask.create_or_update`.
 - :meth:`JobTask.update` / :meth:`JobTask.delete` — round-trip
   through :meth:`Job.update` and the parent job's settings reflect
   the change.
@@ -115,7 +116,7 @@ class TestJobsGetOrCreate(_JobsIntegrationBase):
 
 
 class TestJobTaskIntegration(_JobsIntegrationBase):
-    """``JobTask`` CRUD + ``@job.task`` decorator against a real workspace."""
+    """``JobTask`` CRUD + ``@job.task(...).decorate`` against a real workspace."""
 
     def _fresh_job(self, prefix: str) -> Job:
         """Make-or-reuse a job seeded with a no-op task so ``update``
@@ -169,7 +170,7 @@ class TestJobTaskIntegration(_JobsIntegrationBase):
     def test_job_task_decorator_registers_then_re_decorates_in_place(self):
         job = self._fresh_job("decorator")
 
-        @job.task
+        @job.task("step_one").decorate
         def step_one(a: str = "hi"):
             """First decorator pass."""
             print(a)
@@ -184,9 +185,9 @@ class TestJobTaskIntegration(_JobsIntegrationBase):
         task_keys = {t.task_key for t in (job.settings.tasks or [])}
         assert "step_one" in task_keys
 
-        # Re-decorating the same function name with a different body
+        # Re-decorating the same task_key with a different body
         # replaces the entry in place — no duplicate task_key.
-        @job.task
+        @job.task("step_one").decorate
         def step_one(a: str = "hi"):  # noqa: F811 — intentional shadow
             """Second decorator pass — different body, same key."""
             print("rewritten", a)
@@ -203,10 +204,10 @@ class TestJobTaskIntegration(_JobsIntegrationBase):
         assert "rewritten" in new_content
 
     def test_job_task_decorator_with_task_fields(self):
-        """``@job.task(task_key=..., description=...)`` layers Task fields on."""
+        """``@job.task(key, description=...).decorate`` layers Task fields on."""
         job = self._fresh_job("decorator_fields")
 
-        @job.task(task_key="custom_key", description="overridden desc")
+        @job.task("custom_key", description="overridden desc").decorate
         def make_it():
             """Original docstring — should be overridden by description=."""
             print("ok")
@@ -227,7 +228,7 @@ class TestJobTaskIntegration(_JobsIntegrationBase):
     def test_job_task_refresh_update_delete(self):
         job = self._fresh_job("crud")
 
-        @job.task
+        @job.task("crud_target").decorate
         def crud_target():
             """First version."""
             print("v1")

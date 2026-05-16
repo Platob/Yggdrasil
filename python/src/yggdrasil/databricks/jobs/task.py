@@ -11,7 +11,8 @@ source via :func:`inspect.getsource`, drops a self-contained ``.py``
 script under the user's personal workspace
 (``/Workspace/Users/me/.yggdrasil/jobs/``), and wraps it in a
 :class:`SparkPythonTask`. No pickling — the source is what runs.
-:meth:`Job.task` is the decorator form.
+:meth:`JobTask.decorate` (chained off :meth:`Job.task`) is the
+decorator form.
 """
 from __future__ import annotations
 
@@ -107,9 +108,9 @@ class JobTask:
     def create_or_update(self) -> "JobTask":
         """Append this task — or replace the existing one with the same key.
 
-        Used by the :meth:`Job.task` decorator so re-decorating the same
-        function during development doesn't raise; the staged pickle on
-        the second pass overwrites the first task entry in place.
+        Used by :meth:`JobTask.decorate` so re-decorating the same
+        function during development doesn't raise; the staged source
+        on the second pass overwrites the first task entry in place.
         """
         if self._details is None:
             raise ValueError(
@@ -181,6 +182,49 @@ class JobTask:
         return list((settings.tasks if settings is not None else None) or [])
 
     # ------------------------------------------------------------------ #
+    # Decorator: stage a Python callable onto this task
+    # ------------------------------------------------------------------ #
+    def decorate(self, func: Callable[..., Any]) -> Callable[..., Any]:
+        """Stage *func*'s source onto this task and persist it on the job.
+
+        Designed to be chained off :meth:`Job.task` as a decorator::
+
+            @job.task("step_one", description="…").decorate
+            def step_one(): ...
+
+        Stages *func*'s raw source under the user's workspace via
+        :meth:`from_callable`, layers the resulting
+        :class:`SparkPythonTask` onto any fields the caller already
+        passed through :meth:`Job.task` (description, compute, etc.),
+        then pushes the task through :meth:`create_or_update` so a
+        re-decoration replaces the previous entry in place.
+
+        Returns the original callable so the function stays usable
+        in-process; the :class:`JobTask` handle is attached as
+        ``func._job_task`` for downstream access.
+        """
+        staged = type(self).from_callable(
+            self.job, func, task_key=self.task_key,
+        )
+        staged_details = staged._details
+        assert staged_details is not None, (
+            "JobTask.from_callable should always populate _details"
+        )
+        if self._details is not None:
+            self._details = _dc_replace(
+                self._details,
+                spark_python_task=staged_details.spark_python_task,
+                # Honour an explicit description from Job.task(...); fall
+                # back to the staged docstring-derived one.
+                description=self._details.description or staged_details.description,
+            )
+        else:
+            self._details = staged_details
+        self.create_or_update()
+        func._job_task = self  # type: ignore[attr-defined]
+        return func
+
+    # ------------------------------------------------------------------ #
     # Factory: from a Python callable
     # ------------------------------------------------------------------ #
     @classmethod
@@ -196,10 +240,10 @@ class JobTask:
         """Stage *func*'s source + bound *args*/*kwargs* as a Python script.
 
         Extracts the source via :func:`inspect.getsource`, strips any
-        decorator lines (the runner side has no ``@job.task`` in scope),
-        appends an invocation that passes *args* / *kwargs* as Python
-        literals, and writes the result to a single ``.py`` file under
-        *staging_root* (default:
+        decorator lines (the runner side has no ``@job.task(...).decorate``
+        in scope), appends an invocation that passes *args* / *kwargs*
+        as Python literals, and writes the result to a single ``.py``
+        file under *staging_root* (default:
         ``/Workspace/Users/me/.yggdrasil/jobs/<task_key>-<rand>.py``).
         No pickling involved — the script Databricks runs is the exact
         source of the function.
@@ -213,11 +257,12 @@ class JobTask:
         Limitations: ``inspect.getsource`` needs the function to live in
         an importable source file (no REPL-defined lambdas) and the body
         must be self-contained — closures, module-level globals, and
-        decorators other than ``@job.task`` are NOT carried over.
+        decorators other than ``@job.task(...).decorate`` are NOT
+        carried over.
 
         The returned :class:`JobTask` is not persisted on the job yet
-        — call :meth:`create` / :meth:`create_or_update` (or use the
-        :meth:`Job.task` decorator, which does it for you). Compute
+        — call :meth:`create` / :meth:`create_or_update` (or use
+        :meth:`JobTask.decorate`, which does it for you). Compute
         stays caller-owned: layer ``new_cluster`` / ``existing_cluster_id``
         / ``job_cluster_key`` via :meth:`update` once the task is
         registered.
@@ -272,7 +317,8 @@ def _render_callable_script(
         ) from exc
 
     # Drop decorator lines preceding ``def`` — the runner has no
-    # ``@job.task`` (or any other decorator from this scope) available.
+    # ``@job.task(...).decorate`` (or any other decorator from this
+    # scope) available.
     lines = source.splitlines()
     while lines and lines[0].lstrip().startswith("@"):
         lines.pop(0)
