@@ -13,7 +13,7 @@ from __future__ import annotations
 import base64
 import logging
 import time
-from typing import ClassVar, Iterator
+from typing import Any, ClassVar, Iterator
 
 from yggdrasil.data.enums import Scheme
 from yggdrasil.io.io_stats import IOStats, IOKind
@@ -79,7 +79,12 @@ class DBFSPath(DatabricksPath):
     # Listing
     # ==================================================================
 
-    def _ls(self, recursive: bool = False) -> Iterator["DBFSPath"]:
+    def _ls(
+        self,
+        recursive: bool = False,
+        *,
+        singleton_ttl: Any = False,
+    ) -> Iterator["DBFSPath"]:
         try:
             entries = list(self._call(self.client.workspace_client().dbfs.list, self.api_path))
         except Exception:
@@ -93,12 +98,13 @@ class DBFSPath(DatabricksPath):
             api_path = getattr(info, "path", None)
             if not api_path:
                 continue
-            # Listing children skip the ``DatabricksPath._INSTANCES``
-            # cache — see ``Singleton.to_singleton`` for the opt-in.
+            # ``singleton_ttl`` defaults to ``False`` so listing
+            # children stay out of ``DatabricksPath._INSTANCES``;
+            # callers wanting cached children pass it through ``ls``.
             child = type(self)(
                 url=URL(scheme=self.scheme, path=api_path),
                 client=self._client,
-                singleton_ttl=False,
+                singleton_ttl=singleton_ttl,
             )
             # ``dbfs.list`` returns ``is_dir`` / ``file_size`` /
             # ``modification_time`` per entry — seed the child so
@@ -113,7 +119,7 @@ class DBFSPath(DatabricksPath):
             ))
             yield child
             if recursive and is_dir:
-                yield from child._ls(recursive=True)
+                yield from child._ls(recursive=True, singleton_ttl=singleton_ttl)
 
     # ==================================================================
     # Mutators

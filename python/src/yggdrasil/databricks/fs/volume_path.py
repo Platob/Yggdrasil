@@ -576,7 +576,12 @@ class VolumePath(DatabricksPath):
     # Listing
     # ==================================================================
 
-    def _ls(self, recursive: bool = False) -> Iterator["VolumePath"]:
+    def _ls(
+        self,
+        recursive: bool = False,
+        *,
+        singleton_ttl: Any = False,
+    ) -> Iterator["VolumePath"]:
         files = self.client.workspace_client().files
         try:
             entries = self._call(files.list_directory_contents, self.api_path)
@@ -605,16 +610,15 @@ class VolumePath(DatabricksPath):
             # ``child_path.lstrip('/Volumes')`` which strips the *character
             # set* ``/Volumes`` and then yielded ``dbfs+volume://<cat>/...``,
             # which URL-parses ``<cat>`` as a host and drops it.
-            # Skip the ``DatabricksPath`` singleton cache for listing
-            # children — a single ``iterdir`` can yield thousands of
-            # paths the caller iterates once and discards, and we'd
-            # rather not pin them in the bounded ``_INSTANCES`` cache.
-            # Callers who want to keep a particular child around can
-            # promote it explicitly via :meth:`to_singleton`.
+            # ``singleton_ttl`` defaults to ``False`` so the bounded
+            # ``DatabricksPath._INSTANCES`` cache doesn't fill with
+            # thousands of short-lived listing children. Callers that
+            # explicitly want cached children (``singleton_ttl=None``
+            # / class default) pass it through ``iterdir`` / ``ls``.
             child = type(self)(
                 child_path,
                 client=self._client,
-                singleton_ttl=False,
+                singleton_ttl=singleton_ttl,
             )
             # The listing entry already carries ``is_directory`` /
             # ``file_size`` / ``last_modified`` — seed the child's stat
@@ -633,7 +637,7 @@ class VolumePath(DatabricksPath):
             ))
             yield child
             if recursive and is_directory:
-                yield from child._ls(recursive=True)
+                yield from child._ls(recursive=True, singleton_ttl=singleton_ttl)
 
     # ==================================================================
     # Parent / volume auto-creation

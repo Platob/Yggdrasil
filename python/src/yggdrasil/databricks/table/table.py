@@ -1180,8 +1180,14 @@ class Table(DatabricksResource, DatabricksPath):
         if not self.exists:
             raise NotImplementedError("Table is a read-only resource")
 
-    def _ls(self, recursive: bool = False) -> Iterator["Path"]:
-        return
+    def _ls(
+        self,
+        recursive: bool = False,
+        *,
+        singleton_ttl: Any = False,
+    ) -> Iterator["Path"]:
+        del recursive, singleton_ttl
+        return iter(())
 
     def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
         self.delete(wait=wait, raise_error=not missing_ok)

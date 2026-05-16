@@ -383,7 +383,12 @@ class S3Path(Singleton, RemotePath):
     # Listing
     # ==================================================================
 
-    def _ls(self, recursive: bool = False) -> Iterator["S3Path"]:
+    def _ls(
+        self,
+        recursive: bool = False,
+        *,
+        singleton_ttl: Any = False,
+    ) -> Iterator["S3Path"]:
         """List direct (or recursive) children under this prefix."""
         prefix = self.key
         if prefix and not prefix.endswith("/"):
@@ -403,7 +408,7 @@ class S3Path(Singleton, RemotePath):
             for cp in page.get("CommonPrefixes") or ():
                 sub_prefix = cp.get("Prefix")
                 if sub_prefix:
-                    yield self._make_child(sub_prefix)
+                    yield self._make_child(sub_prefix, singleton_ttl=singleton_ttl)
             for obj in page.get("Contents") or ():
                 key = obj.get("Key")
                 if not key:
@@ -414,22 +419,21 @@ class S3Path(Singleton, RemotePath):
                     # treat them as directories that will surface as
                     # CommonPrefixes on a directory walk.
                     continue
-                yield self._make_child(key)
+                yield self._make_child(key, singleton_ttl=singleton_ttl)
 
-    def _make_child(self, key: str) -> "S3Path":
+    def _make_child(self, key: str, *, singleton_ttl: Any = False) -> "S3Path":
         # Skip the ``URL.from_(f"s3://...")`` parse — the bucket/host /
         # scheme are already canonical on ``self.url`` and only the
         # path changes. The ``_replace_path`` clone preserves the
         # invariants without going through :func:`urlsplit` for
         # every child a listing page yields.
         #
-        # ``singleton_ttl=False`` keeps listing children out of the
-        # bounded ``S3Path._INSTANCES`` cache — a single ``_ls`` can
-        # yield thousands of keys the caller iterates once. Callers
-        # promote individual children via :meth:`to_singleton`.
+        # ``singleton_ttl`` defaults to ``False`` so listing children
+        # stay out of the bounded ``S3Path._INSTANCES`` cache; callers
+        # that want cached children thread it through ``ls``.
         cleaned = key.lstrip("/")
         url = self.url._replace_path("/" + cleaned if cleaned else "/")
-        return S3Path(url=url, client=self._client, singleton_ttl=False)
+        return S3Path(url=url, client=self._client, singleton_ttl=singleton_ttl)
 
     # ==================================================================
     # Mutators — mkdir / remove

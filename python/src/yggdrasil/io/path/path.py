@@ -148,8 +148,26 @@ class Path(Holder, os.PathLike, ABC):
         """
 
     @abstractmethod
-    def _ls(self, recursive: bool = False) -> Iterator["Path"]:
-        """Yield children. Empty when missing or not a directory."""
+    def _ls(
+        self,
+        recursive: bool = False,
+        *,
+        singleton_ttl: Any = False,
+    ) -> Iterator["Path"]:
+        """Yield children. Empty when missing or not a directory.
+
+        ``singleton_ttl`` is forwarded to child path construction so
+        backends backed by :class:`Singleton` can opt the listed
+        children out of the per-class ``_INSTANCES`` cache. The
+        default ``False`` mirrors the contract on hot listing call
+        sites: an ``iterdir`` of N entries pays at most one Python
+        allocation per child, with nothing pinned in the bounded
+        singleton cache. Callers that want listing children to share
+        identity with later constructor calls pass ``...`` (class
+        default TTL), ``None`` (process lifetime), or a number of
+        seconds. Backends whose children are not :class:`Singleton`
+        accept and ignore the kwarg.
+        """
 
     @abstractmethod
     def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
@@ -246,11 +264,16 @@ class Path(Holder, os.PathLike, ABC):
         s = self._stat()
         return float(s.mtime or 0.0) if s.kind != IOKind.MISSING else 0.0
 
-    def iterdir(self) -> Iterator["Path"]:
-        yield from self._ls(recursive=False)
+    def iterdir(self, *, singleton_ttl: Any = False) -> Iterator["Path"]:
+        yield from self._ls(recursive=False, singleton_ttl=singleton_ttl)
 
-    def ls(self, *, recursive: bool = False) -> Iterator["Path"]:
-        yield from self._ls(recursive=recursive)
+    def ls(
+        self,
+        *,
+        recursive: bool = False,
+        singleton_ttl: Any = False,
+    ) -> Iterator["Path"]:
+        yield from self._ls(recursive=recursive, singleton_ttl=singleton_ttl)
 
     def mkdir(self, parents: bool = True, exist_ok: bool = True) -> "Path":
         self._mkdir(parents=parents, exist_ok=exist_ok)

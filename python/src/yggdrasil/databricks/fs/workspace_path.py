@@ -143,7 +143,12 @@ class WorkspacePath(DatabricksPath):
     # Listing
     # ==================================================================
 
-    def _ls(self, recursive: bool = False) -> Iterator["WorkspacePath"]:
+    def _ls(
+        self,
+        recursive: bool = False,
+        *,
+        singleton_ttl: Any = False,
+    ) -> Iterator["WorkspacePath"]:
         try:
             entries = list(
                 self._call(self.client.workspace_client().workspace.list, self.api_path)
@@ -166,12 +171,13 @@ class WorkspacePath(DatabricksPath):
                 url_path = url_path[len("/Workspace"):]
             elif url_path.startswith("/Workspace"):
                 url_path = url_path[len("/Workspace"):] or "/"
-            # Listing children skip the ``DatabricksPath._INSTANCES``
-            # cache — see ``Singleton.to_singleton`` for the opt-in.
+            # ``singleton_ttl`` defaults to ``False`` so listing
+            # children stay out of ``DatabricksPath._INSTANCES``;
+            # callers wanting cached children pass it through ``ls``.
             child = type(self)(
                 url=URL(scheme=self.scheme, path=url_path),
                 client=self._client,
-                singleton_ttl=False,
+                singleton_ttl=singleton_ttl,
             )
             ot = getattr(info, "object_type", None)
             is_dir = (
@@ -189,7 +195,7 @@ class WorkspacePath(DatabricksPath):
             ))
             yield child
             if recursive and is_dir:
-                yield from child._ls(recursive=True)
+                yield from child._ls(recursive=True, singleton_ttl=singleton_ttl)
 
     # ==================================================================
     # Mutators

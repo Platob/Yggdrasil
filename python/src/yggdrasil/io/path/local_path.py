@@ -500,8 +500,19 @@ class LocalPath(Path):
             media_type=media_type,
         )
 
-    def _ls(self, recursive: bool = False) -> Iterator["LocalPath"]:
-        """Yield children. Empty when missing or not a directory."""
+    def _ls(
+        self,
+        recursive: bool = False,
+        *,
+        singleton_ttl: Any = False,
+    ) -> Iterator["LocalPath"]:
+        """Yield children. Empty when missing or not a directory.
+
+        ``singleton_ttl`` is accepted for signature compatibility with
+        the base :class:`Path` contract; :class:`LocalPath` is not a
+        :class:`Singleton`, so the kwarg has no effect here.
+        """
+        del singleton_ttl
         try:
             entries = list(os.scandir(self.os_path))
         except (FileNotFoundError, NotADirectoryError):

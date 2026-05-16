@@ -186,8 +186,13 @@ class HTTPPath(RemotePath):
     # Filesystem surface — HTTP has no directory listing
     # ==================================================================
 
-    def _ls(self, recursive: bool = False) -> Iterator["HTTPPath"]:
-        del recursive
+    def _ls(
+        self,
+        recursive: bool = False,
+        *,
+        singleton_ttl: Any = False,
+    ) -> Iterator["HTTPPath"]:
+        del recursive, singleton_ttl
         return iter(())
 
     def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:

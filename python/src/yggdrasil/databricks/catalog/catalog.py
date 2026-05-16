@@ -248,8 +248,13 @@ class Catalog(DatabricksPath, Singleton):
             f"{type(self).__name__} is a logical Unity Catalog resource."
         )
 
-    def _ls(self, recursive: bool = False) -> Iterator["Path"]:
-        del recursive
+    def _ls(
+        self,
+        recursive: bool = False,
+        *,
+        singleton_ttl: Any = False,
+    ) -> Iterator["Path"]:
+        del recursive, singleton_ttl
         return iter(())
 
     def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
