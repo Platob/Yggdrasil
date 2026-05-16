@@ -34,7 +34,9 @@ descriptions, OpenAPI shapes, debug logs) reach for the same surface.
 from __future__ import annotations
 
 import functools
+import importlib
 import inspect
+import logging
 from typing import Any, Callable, Mapping, Optional, TypeVar
 
 __all__ = [
@@ -45,6 +47,83 @@ __all__ = [
 ]
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+LOGGER = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Fast alias prefixes — recognize ``pa.Table`` / ``pl.DataFrame`` /
+# ``pd.DataFrame`` / ``np.ndarray`` shapes when the function's own globals
+# don't have the short alias imported. Best-effort: if the dotted import
+# fails the annotation stays a string and coercion is skipped at the
+# call site.
+# ---------------------------------------------------------------------------
+
+_FAST_ALIAS_PREFIXES: dict[str, str] = {
+    "pa.": "pyarrow.",
+    "pl.": "polars.",
+    "pd.": "pandas.",
+    "np.": "numpy.",
+    "ps.": "pyspark.",
+    "ddf.": "dask.dataframe.",
+}
+
+
+def _expand_alias(name: str) -> str:
+    """Expand a known short alias prefix (``pa.Table`` → ``pyarrow.Table``)."""
+    for short, full in _FAST_ALIAS_PREFIXES.items():
+        if name.startswith(short):
+            return full + name[len(short):]
+    return name
+
+
+def _resolve_str_annotation(s: str, func_globals: Optional[dict[str, Any]] = None) -> Any:
+    """Best-effort: parse a string annotation into a real type.
+
+    Tries, in order:
+
+    1. ``eval`` in *func_globals* + builtins — picks up local imports
+       and aliases declared in the function's own module.
+    2. ``eval`` against ``typing`` for generic shapes like
+       ``Optional[int]`` / ``list[int]`` when *func_globals* doesn't
+       have them in scope.
+    3. Fast alias prefix expansion (``pa.`` → ``pyarrow.``, …) +
+       dotted ``importlib.import_module`` lookup so short forms work
+       even when the function's globals never imported the short
+       alias.
+
+    Returns the original string when every path fails — callers
+    treat that as "unresolved, skip coercion".
+    """
+    candidate = s.strip()
+
+    if func_globals is not None:
+        try:
+            return eval(candidate, func_globals, None)
+        except Exception:
+            pass
+
+    # Generic typing shapes (``Optional[int]``, ``list[int]``, …) live in
+    # the ``typing`` namespace; let them resolve without dragging the
+    # module into every caller's globals.
+    try:
+        import typing as _typing
+        return eval(candidate, dict(_typing.__dict__), None)
+    except Exception:
+        pass
+
+    expanded = _expand_alias(candidate)
+    if "." in expanded:
+        mod_path, _, attr = expanded.rpartition(".")
+        try:
+            mod = importlib.import_module(mod_path)
+            obj = getattr(mod, attr, None)
+            if obj is not None:
+                return obj
+        except Exception:
+            pass
+
+    return s
 
 
 # ---------------------------------------------------------------------------
@@ -78,16 +157,46 @@ def _default_to_str(default: Any) -> tuple[bool, Optional[str]]:
 def _resolved_annotations(func: Callable[..., Any]) -> dict[str, Any]:
     """Resolve string annotations on *func* into real types when possible.
 
-    ``from __future__ import annotations`` (PEP 563) keeps every
-    annotation as a string at runtime; :func:`inspect.get_annotations`
-    with ``eval_str=True`` evaluates them in the function's own
-    module / locals. Failures fall back to the raw string so the
-    caller can still log / display the annotation.
+    Two-pass best effort so a single unresolvable annotation doesn't
+    blow up the rest:
+
+    1. :func:`inspect.get_annotations` with ``eval_str=True`` —
+       evaluates every annotation in the function's globals + builtins
+       in one shot. Fast path when the function's own module imports
+       all the referenced types.
+    2. Per-annotation :func:`_resolve_str_annotation` fallback — tries
+       func globals, then ``typing``, then fast alias-prefix expansion
+       (``pa.Table`` → ``pyarrow.Table``) + dotted module import.
+
+    Anything still left as a string after both passes is returned
+    as-is. The caller (:func:`check_function_args`) treats string
+    annotations as "couldn't resolve, skip coercion" rather than
+    raising — the goal is to coerce what we can and let the rest
+    flow through.
     """
+    raw = dict(getattr(func, "__annotations__", {}) or {})
+    if not raw:
+        return raw
+
+    # Fast path — inspect.get_annotations with eval_str.
     try:
-        return inspect.get_annotations(func, eval_str=True)
-    except Exception:
-        return dict(getattr(func, "__annotations__", {}) or {})
+        return dict(inspect.get_annotations(func, eval_str=True))
+    except Exception as exc:
+        LOGGER.debug(
+            "_resolved_annotations: get_annotations(eval_str=True) failed "
+            "for %r — falling back to per-annotation resolution (%s)",
+            getattr(func, "__qualname__", func), exc,
+        )
+
+    # Per-annotation fallback — partial wins still help.
+    func_globals = getattr(func, "__globals__", None)
+    resolved: dict[str, Any] = {}
+    for name, ann in raw.items():
+        if isinstance(ann, str):
+            resolved[name] = _resolve_str_annotation(ann, func_globals=func_globals)
+        else:
+            resolved[name] = ann
+    return resolved
 
 
 def describe_signature(func: Callable[..., Any]) -> dict[str, Any]:
@@ -199,7 +308,28 @@ def check_function_args(
         ann = resolved.get(name, fallback)
         if ann is inspect.Parameter.empty:
             return value
-        return convert(value, ann)
+        if isinstance(ann, str):
+            # Couldn't resolve the annotation to a real type — pass
+            # the value through. The function decides what to do with
+            # it; we'd rather be permissive than raise a NameError-shaped
+            # surprise from inside the coercion path.
+            LOGGER.debug(
+                "check_function_args: unresolved annotation %r=%r — "
+                "skipping coercion", name, ann,
+            )
+            return value
+        try:
+            return convert(value, ann)
+        except (TypeError, ValueError) as exc:
+            # No converter registered (e.g. ``Union[int, str]``) or the
+            # converter itself raised — pass through so the function
+            # gets the chance to handle it, rather than failing here.
+            LOGGER.debug(
+                "check_function_args: convert(%s -> %r) failed for %r — "
+                "skipping coercion (%s)",
+                type(value).__name__, ann, name, exc,
+            )
+            return value
 
     coerced_args: list[Any] = []
     for i, value in enumerate(args):

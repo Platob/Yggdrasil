@@ -13,6 +13,8 @@ import unittest
 from typing import Optional
 
 from yggdrasil.dataclasses.safe_function import (
+    _expand_alias,
+    _resolve_str_annotation,
     check_function_args,
     checkargs,
     describe_signature,
@@ -426,6 +428,117 @@ class TestSafeFunctionMixedEngines(unittest.TestCase):
         self.assertEqual(out["cutoff"], dt.date(2024, 1, 15))
         self.assertEqual(out["limit"], 50)
         self.assertIsInstance(out["limit"], int)
+
+
+# ---------------------------------------------------------------------------
+# Forgiving annotation resolution — fast aliases + graceful fallback
+# ---------------------------------------------------------------------------
+
+class TestExpandAlias(unittest.TestCase):
+    """Short-prefix aliases resolve to fully-qualified module paths."""
+
+    def test_pyarrow_aliases(self):
+        self.assertEqual(_expand_alias("pa.Table"), "pyarrow.Table")
+        self.assertEqual(_expand_alias("pa.RecordBatch"), "pyarrow.RecordBatch")
+
+    def test_polars_aliases(self):
+        self.assertEqual(_expand_alias("pl.DataFrame"), "polars.DataFrame")
+        self.assertEqual(_expand_alias("pl.LazyFrame"), "polars.LazyFrame")
+
+    def test_pandas_alias(self):
+        self.assertEqual(_expand_alias("pd.DataFrame"), "pandas.DataFrame")
+        self.assertEqual(_expand_alias("pd.Series"), "pandas.Series")
+
+    def test_numpy_alias(self):
+        self.assertEqual(_expand_alias("np.ndarray"), "numpy.ndarray")
+
+    def test_pyspark_alias(self):
+        self.assertEqual(
+            _expand_alias("ps.sql.DataFrame"), "pyspark.sql.DataFrame",
+        )
+
+    def test_unknown_prefix_passes_through(self):
+        # Non-aliased names are returned untouched.
+        self.assertEqual(_expand_alias("int"), "int")
+        self.assertEqual(_expand_alias("my.custom.Type"), "my.custom.Type")
+
+
+class TestResolveStrAnnotation(unittest.TestCase):
+    """:func:`_resolve_str_annotation` walks eval → typing → alias → import."""
+
+    @unittest.skipUnless(_have("pa"), "pyarrow not installed")
+    def test_resolves_fast_alias_without_caller_globals(self):
+        # No ``func_globals`` passed — has to fall through to the
+        # alias-prefix + importlib path.
+        import pyarrow as pa_real
+        self.assertIs(_resolve_str_annotation("pa.Table"), pa_real.Table)
+
+    @unittest.skipUnless(_have("pl"), "polars not installed")
+    def test_resolves_polars_short_form(self):
+        import polars as pl_real
+        self.assertIs(_resolve_str_annotation("pl.DataFrame"), pl_real.DataFrame)
+
+    @unittest.skipUnless(_have("pd"), "pandas not installed")
+    def test_resolves_pandas_short_form(self):
+        import pandas as pd_real
+        self.assertIs(_resolve_str_annotation("pd.DataFrame"), pd_real.DataFrame)
+
+    def test_resolves_typing_generic_without_caller_globals(self):
+        from typing import Optional
+        # ``Optional[int]`` would NameError in an empty globals, but
+        # the typing fallback handles it.
+        self.assertEqual(_resolve_str_annotation("Optional[int]"), Optional[int])
+
+    def test_unresolvable_returns_original_string(self):
+        # No fast alias, no module, no typing match — return the input.
+        out = _resolve_str_annotation("ThisTypeReallyDoesNotExist")
+        self.assertEqual(out, "ThisTypeReallyDoesNotExist")
+        self.assertIsInstance(out, str)
+
+
+@unittest.skipUnless(_have("pa"), "pyarrow not installed")
+class TestCheckargsFallbackPaths(unittest.TestCase):
+    """@checkargs is forgiving: unresolvable annotations + convert failures pass through."""
+
+    def test_short_alias_resolves_when_caller_missing_import(self):
+        # Build a function whose ``__globals__`` do NOT have ``pa`` —
+        # eval_str will NameError on ``pa.Table``, and our fallback
+        # has to kick in via the alias prefix + importlib lookup.
+        ns: dict = {"__builtins__": __builtins__}
+        exec(
+            "def consume(t: 'pa.Table') -> int:\n"
+            "    return t.num_rows\n",
+            ns,
+        )
+        consume = ns["consume"]
+        # Sanity: ``pa`` really isn't in the function's globals.
+        self.assertNotIn("pa", consume.__globals__)
+
+        import pyarrow as pa_real
+        tbl = pa_real.table({"x": [1, 2, 3]})
+        self.assertEqual(checkargs(consume)(tbl), 3)
+
+    def test_unresolvable_annotation_passes_value_through(self):
+        # ``ThisTypeDoesNotExist`` isn't a real type and isn't aliased.
+        # The decorator must not raise — pass the value through as-is.
+        @checkargs
+        def f(x: "ThisTypeDoesNotExist") -> object:  # noqa: F821 — intentional
+            return x
+
+        self.assertEqual(f("hello"), "hello")
+        self.assertEqual(f(42), 42)
+
+    def test_convert_failure_passes_value_through(self):
+        # ``Union[int, str]`` has no registered converter; convert
+        # raises TypeError and our wrapper falls through cleanly.
+        from typing import Union
+
+        @checkargs
+        def f(x: Union[int, str]) -> object:
+            return x
+
+        self.assertEqual(f("hello"), "hello")
+        self.assertEqual(f(42), 42)
 
 
 if __name__ == "__main__":
