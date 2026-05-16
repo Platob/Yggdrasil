@@ -215,7 +215,7 @@ class PostgresStatementResult(StatementResult[PostgresPreparedStatement]):
     def _compute_state(self) -> State:
         """Local-state mapping — Postgres materialises synchronously in :meth:`start`."""
         if not self._started:
-            return State.PENDING
+            return State.IDLE
         if self._failure is not None:
             return State.FAILED
         return State.SUCCEEDED

@@ -27,7 +27,7 @@ from yggdrasil.data.enums.state import State
 class TestCanonicalMembers:
 
     def test_member_count(self) -> None:
-        assert len(State) == 5
+        assert len(State) == 11
 
     def test_members_round_trip_via_int(self) -> None:
         for m in State:
@@ -36,54 +36,89 @@ class TestCanonicalMembers:
     def test_codes_are_stable(self) -> None:
         # Stable codes — these are what get serialized into pickled
         # caches and event payloads. Bumping them is a breaking change.
-        assert int(State.PENDING) == 0
-        assert int(State.RUNNING) == 1
-        assert int(State.SUCCEEDED) == 2
-        assert int(State.FAILED) == 3
-        assert int(State.CANCELED) == 4
+        assert int(State.IDLE) == 0
+        assert int(State.QUEUED) == 1
+        assert int(State.PENDING) == 2
+        assert int(State.ACCEPTED) == 3
+        assert int(State.RUNNING) == 4
+        assert int(State.PARTIAL) == 5
+        assert int(State.SUCCEEDED) == 6
+        assert int(State.REJECTED) == 7
+        assert int(State.FAILED) == 8
+        assert int(State.CANCELED) == 9
+        assert int(State.EXPIRED) == 10
 
 
 class TestPredicates:
     """``is_done`` / ``is_failed`` / ``is_started`` membership semantics."""
 
+    _NON_TERMINAL = (State.IDLE, State.QUEUED, State.PENDING,
+                     State.ACCEPTED, State.RUNNING, State.PARTIAL)
+    _TERMINAL_FAIL = (State.REJECTED, State.FAILED, State.CANCELED, State.EXPIRED)
+    _TERMINAL = (State.SUCCEEDED,) + _TERMINAL_FAIL
+
     def test_done_states(self) -> None:
-        for m in (State.SUCCEEDED, State.FAILED, State.CANCELED):
+        for m in self._TERMINAL:
             assert m.is_done, f"{m.name} should be terminal"
-        for m in (State.PENDING, State.RUNNING):
-            assert not m.is_done
+        for m in self._NON_TERMINAL:
+            assert not m.is_done, f"{m.name} should not be terminal"
 
     def test_failed_states(self) -> None:
-        # CANCELED is failed — the warehouse path raises on cancel.
-        for m in (State.FAILED, State.CANCELED):
-            assert m.is_failed
-        for m in (State.PENDING, State.RUNNING, State.SUCCEEDED):
-            assert not m.is_failed
+        # CANCELED / REJECTED / EXPIRED all count as failed — every
+        # non-success terminal leaves the caller without a result.
+        for m in self._TERMINAL_FAIL:
+            assert m.is_failed, f"{m.name} should be failed-terminal"
+        for m in (State.IDLE, State.QUEUED, State.PENDING,
+                  State.ACCEPTED, State.RUNNING, State.PARTIAL,
+                  State.SUCCEEDED):
+            assert not m.is_failed, f"{m.name} should not be failed"
 
     def test_started_states(self) -> None:
-        # Anything past PENDING counts as started.
-        for m in (State.RUNNING, State.SUCCEEDED, State.FAILED, State.CANCELED):
-            assert m.is_started
-        assert not State.PENDING.is_started
+        # Anything from RUNNING onward counts as started. ACCEPTED is
+        # NOT started — the venue holds the order but execution hasn't
+        # begun.
+        for m in (State.RUNNING, State.PARTIAL, State.SUCCEEDED,
+                  State.REJECTED, State.FAILED, State.CANCELED, State.EXPIRED):
+            assert m.is_started, f"{m.name} should be started"
+        for m in (State.IDLE, State.QUEUED, State.PENDING, State.ACCEPTED):
+            assert not m.is_started, f"{m.name} should not be started"
 
-    def test_pending_only_pending(self) -> None:
-        assert State.PENDING.is_pending
-        for m in (State.RUNNING, State.SUCCEEDED, State.FAILED, State.CANCELED):
-            assert not m.is_pending
+    def test_active_states(self) -> None:
+        # Non-terminal states with backend awareness — what a caller
+        # can meaningfully wait on. IDLE is excluded (no submission yet);
+        # terminal states are excluded (no more transitions).
+        for m in (State.QUEUED, State.PENDING, State.ACCEPTED,
+                  State.RUNNING, State.PARTIAL):
+            assert m.is_active, f"{m.name} should be active"
+        for m in (State.IDLE,) + self._TERMINAL:
+            assert not m.is_active, f"{m.name} should not be active"
 
-    def test_running_only_running(self) -> None:
-        assert State.RUNNING.is_running
-        for m in (State.PENDING, State.SUCCEEDED, State.FAILED, State.CANCELED):
-            assert not m.is_running
-
-    def test_succeeded_only_succeeded(self) -> None:
-        assert State.SUCCEEDED.is_succeeded
-        for m in (State.PENDING, State.RUNNING, State.FAILED, State.CANCELED):
-            assert not m.is_succeeded
-
-    def test_canceled_only_canceled(self) -> None:
-        assert State.CANCELED.is_canceled
-        for m in (State.PENDING, State.RUNNING, State.SUCCEEDED, State.FAILED):
-            assert not m.is_canceled
+    @pytest.mark.parametrize(
+        "member, predicate",
+        [
+            (State.IDLE, "is_idle"),
+            (State.QUEUED, "is_queued"),
+            (State.PENDING, "is_pending"),
+            (State.ACCEPTED, "is_accepted"),
+            (State.RUNNING, "is_running"),
+            (State.PARTIAL, "is_partial"),
+            (State.SUCCEEDED, "is_succeeded"),
+            (State.REJECTED, "is_rejected"),
+            (State.CANCELED, "is_canceled"),
+            (State.EXPIRED, "is_expired"),
+        ],
+    )
+    def test_single_member_predicate_isolates(
+        self, member: State, predicate: str,
+    ) -> None:
+        # Each ``is_<name>`` predicate fires only for its named member.
+        assert getattr(member, predicate)
+        for other in State:
+            if other is member:
+                continue
+            assert not getattr(other, predicate), (
+                f"{predicate} should be False for {other.name}"
+            )
 
 
 class TestFromIdentity:
@@ -92,8 +127,8 @@ class TestFromIdentity:
         for m in State:
             assert State.from_(m) is m
 
-    def test_none_returns_pending(self) -> None:
-        assert State.from_(None) is State.PENDING
+    def test_none_returns_idle(self) -> None:
+        assert State.from_(None) is State.IDLE
 
     def test_none_returns_default_when_supplied(self) -> None:
         assert State.from_(None, default=State.RUNNING) is State.RUNNING
@@ -107,7 +142,7 @@ class TestFromIdentity:
             State.from_(99)
 
     def test_invalid_integer_returns_default(self) -> None:
-        assert State.from_(99, default=State.PENDING) is State.PENDING
+        assert State.from_(99, default=State.IDLE) is State.IDLE
 
 
 class TestFromStringAliases:
@@ -116,15 +151,35 @@ class TestFromStringAliases:
     @pytest.mark.parametrize(
         "token, expected",
         [
-            # Pending family.
+            # Idle — built locally, not yet submitted.
+            ("idle", State.IDLE),
+            ("IDLE", State.IDLE),
+            ("new", State.IDLE),
+            ("draft", State.IDLE),
+            ("not-started", State.IDLE),
+            ("not started", State.IDLE),
+            ("", State.IDLE),
+            # Queued — sitting in a submission queue.
+            ("queued", State.QUEUED),
+            ("waiting", State.QUEUED),
+            ("scheduled", State.QUEUED),
+            # Pending — submitted to backend, awaiting ack.
             ("pending", State.PENDING),
             ("PENDING", State.PENDING),
-            ("queued", State.PENDING),
-            ("waiting", State.PENDING),
             ("submitted", State.PENDING),
-            ("not-started", State.PENDING),
-            ("not started", State.PENDING),
-            ("", State.PENDING),
+            ("sent", State.PENDING),
+            ("pending_new", State.PENDING),
+            # Accepted — acknowledged, parked.
+            ("accepted", State.ACCEPTED),
+            ("ack", State.ACCEPTED),
+            ("working", State.ACCEPTED),
+            ("open", State.ACCEPTED),
+            ("ready", State.ACCEPTED),
+            # Partial — partially filled / streaming.
+            ("partial", State.PARTIAL),
+            ("partially_filled", State.PARTIAL),
+            ("partial_fill", State.PARTIAL),
+            ("streaming", State.PARTIAL),
             # Running family.
             ("running", State.RUNNING),
             ("RUNNING", State.RUNNING),
@@ -141,7 +196,13 @@ class TestFromStringAliases:
             ("ok", State.SUCCEEDED),
             ("finished", State.SUCCEEDED),
             ("CLOSED", State.SUCCEEDED),
-            # Failed family.
+            ("filled", State.SUCCEEDED),
+            ("settled", State.SUCCEEDED),
+            # Rejected — refused at submission / accept.
+            ("rejected", State.REJECTED),
+            ("refused", State.REJECTED),
+            ("denied", State.REJECTED),
+            # Failed family — generic mid-run errors.
             ("failed", State.FAILED),
             ("FAIL", State.FAILED),
             ("error", State.FAILED),
@@ -151,6 +212,12 @@ class TestFromStringAliases:
             ("cancelled", State.CANCELED),
             ("aborted", State.CANCELED),
             ("killed", State.CANCELED),
+            ("stopped", State.CANCELED),
+            # Expired — TTL / day-rollover.
+            ("expired", State.EXPIRED),
+            ("timed_out", State.EXPIRED),
+            ("timeout", State.EXPIRED),
+            ("done_for_day", State.EXPIRED),
         ],
     )
     def test_alias_resolves(self, token: str, expected: State) -> None:
@@ -162,8 +229,8 @@ class TestFromStringAliases:
 
     def test_unknown_string_returns_default(self) -> None:
         assert (
-            State.from_("definitely_not_a_state", default=State.PENDING)
-            is State.PENDING
+            State.from_("definitely_not_a_state", default=State.IDLE)
+            is State.IDLE
         )
 
 
@@ -208,7 +275,7 @@ class TestFromSdkLikeObject:
 class TestIsValid:
 
     def test_valid_inputs(self) -> None:
-        for value in (State.PENDING, 0, "pending", "queued", None, "closed"):
+        for value in (State.IDLE, 0, "idle", "pending", "queued", None, "closed"):
             assert State.is_valid(value)
 
     def test_invalid_inputs(self) -> None:

@@ -224,7 +224,7 @@ class SqlStatementResult(StatementResult[SqlPreparedStatement]):
         implementation since the lifecycle shape is the same.
         """
         if not self._started:
-            return State.PENDING
+            return State.IDLE
         if self._failure is not None:
             return State.FAILED
         return State.SUCCEEDED

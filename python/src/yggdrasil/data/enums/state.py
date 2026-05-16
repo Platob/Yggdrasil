@@ -1,24 +1,39 @@
-"""Backend-agnostic execution state enum.
+"""Backend-agnostic execution + order state enum.
 
 Every async-execution surface in yggdrasil — Databricks SQL warehouse
 statements, Spark jobs, Mongo / Postgres commands, FastAPI long-running
-tasks — reports its progress through a small fixed vocabulary: pending,
-running, succeeded, failed, plus the cancel terminator. Centralizing
-that vocabulary on :class:`State` lets :class:`StatementResult` derive
-``done`` / ``failed`` / ``started`` from a single typed enum and keeps
-the per-backend status mapping in one place.
+tasks — *and* every order-style lifecycle (FIX-protocol order flows,
+trading-venue acknowledgements, transaction state machines) reports
+its progress through one shared vocabulary. Centralizing it on
+:class:`State` lets :class:`StatementResult` and any order resource
+derive ``done`` / ``failed`` / ``started`` from a single typed enum
+and keeps the per-backend status mapping in one place.
+
+Lifecycle ordering (low → high integer codes):
+
+- :attr:`IDLE` — built locally, no submission attempt yet.
+- :attr:`QUEUED` — prepared, sitting in a submission queue.
+- :attr:`PENDING` — handed to a backend / venue, awaiting acknowledgement.
+- :attr:`ACCEPTED` — acknowledged / accepted but not yet executing.
+- :attr:`RUNNING` — actively executing (FIX: working / new).
+- :attr:`PARTIAL` — partially filled / streaming results, still active.
+- :attr:`SUCCEEDED` — terminal, fully filled / completed.
+- :attr:`REJECTED` — terminal, rejected at submission or accept time.
+- :attr:`FAILED` — terminal, errored mid-execution.
+- :attr:`CANCELED` — terminal, user or system abort.
+- :attr:`EXPIRED` — terminal, TTL / done-for-day elapsed.
 
 Parsing accepts:
 
 * :class:`State` (returned as-is);
-* a string alias — ``"pending"``, ``"queued"``, ``"running"``,
+* a string alias — ``"queued"``, ``"pending"``, ``"running"``,
   ``"succeeded"``, ``"completed"``, ``"failed"``, ``"canceled"``,
   ``"closed"``, … (full alias table below). Mixed case, hyphens,
   underscores, and spaces all normalize;
 * an integer code matching a member's value (round-trips with ``int``);
 * an SDK enum that exposes ``.name`` / ``.value`` whose token matches
   an alias (Databricks ``StatementState.SUCCEEDED`` → ``State.SUCCEEDED``);
-* ``None`` — returns *default* if supplied, else :data:`State.PENDING`.
+* ``None`` — returns *default* if supplied, else :data:`State.IDLE`.
 """
 from __future__ import annotations
 
@@ -37,14 +52,33 @@ StateLike = Union["State", str, int, None]
 # synonyms (``completed``, ``finished``), and the human-readable
 # verbs callers reach for (``running``, ``in_progress``, ``ok``).
 _STATE_ALIASES: dict[str, str] = {
-    # Pending — submitted, queued, waiting to start.
-    "": "PENDING",
+    # Idle — built locally, no submission attempt yet.
+    "": "IDLE",
+    "idle": "IDLE",
+    "new": "IDLE",
+    "not_started": "IDLE",
+    "draft": "IDLE",
+    "created": "IDLE",
+
+    # Queued — prepared, sitting in a submission queue.
+    "queued": "QUEUED",
+    "waiting": "QUEUED",
+    "scheduled": "QUEUED",
+
+    # Pending — handed to a backend / venue, awaiting acknowledgement.
     "pending": "PENDING",
-    "queued": "PENDING",
-    "waiting": "PENDING",
     "submitted": "PENDING",
-    "not_started": "PENDING",
-    "scheduled": "PENDING",
+    "pending_new": "PENDING",
+    "sent": "PENDING",
+
+    # Accepted — acknowledged, parked, not yet executing. FIX "working"
+    # / "new" lifecycle, exchange order-book entry, AMQP "ready".
+    "accepted": "ACCEPTED",
+    "ack": "ACCEPTED",
+    "acknowledged": "ACCEPTED",
+    "working": "ACCEPTED",
+    "open": "ACCEPTED",
+    "ready": "ACCEPTED",
 
     # Running — actively executing.
     "running": "RUNNING",
@@ -53,7 +87,14 @@ _STATE_ALIASES: dict[str, str] = {
     "active": "RUNNING",
     "executing": "RUNNING",
 
-    # Succeeded — terminal, no error.
+    # Partial — partially filled / streaming, still active.
+    "partial": "PARTIAL",
+    "partially_filled": "PARTIAL",
+    "partial_fill": "PARTIAL",
+    "partially_complete": "PARTIAL",
+    "streaming": "PARTIAL",
+
+    # Succeeded — terminal, fully completed / filled.
     "succeeded": "SUCCEEDED",
     "success": "SUCCEEDED",
     "completed": "SUCCEEDED",
@@ -61,15 +102,24 @@ _STATE_ALIASES: dict[str, str] = {
     "done": "SUCCEEDED",
     "ok": "SUCCEEDED",
     "finished": "SUCCEEDED",
+    "filled": "SUCCEEDED",
+    "settled": "SUCCEEDED",
     # Databricks' ``CLOSED`` is "result already fetched / TTL elapsed";
     # terminal and not an error — bucket with SUCCEEDED.
     "closed": "SUCCEEDED",
 
-    # Failed — terminal, error.
+    # Rejected — terminal, refused at submission / accept.
+    "rejected": "REJECTED",
+    "reject": "REJECTED",
+    "refused": "REJECTED",
+    "denied": "REJECTED",
+
+    # Failed — terminal, errored mid-execution.
     "failed": "FAILED",
     "fail": "FAILED",
     "error": "FAILED",
     "errored": "FAILED",
+    "broken": "FAILED",
 
     # Canceled — terminal, user / system abort. Sits on the failed
     # side of ``is_failed`` to match the warehouse semantics
@@ -79,6 +129,15 @@ _STATE_ALIASES: dict[str, str] = {
     "aborted": "CANCELED",
     "abort": "CANCELED",
     "killed": "CANCELED",
+    "stopped": "CANCELED",
+
+    # Expired — terminal, TTL / day-rollover elapsed before completion.
+    "expired": "EXPIRED",
+    "expire": "EXPIRED",
+    "timed_out": "EXPIRED",
+    "timeout": "EXPIRED",
+    "ttl_elapsed": "EXPIRED",
+    "done_for_day": "EXPIRED",
 }
 
 
@@ -90,24 +149,39 @@ class State(IntEnum):
     without re-implementing the membership sets per backend.
     """
 
-    PENDING = 0
-    SUBMITTED = 1
-    RUNNING = 2
-    SUCCEEDED = 3
-    FAILED = 4
-    CANCELED = 5
+    IDLE = 0
+    QUEUED = 1
+    PENDING = 2
+    ACCEPTED = 3
+    RUNNING = 4
+    PARTIAL = 5
+    SUCCEEDED = 6
+    REJECTED = 7
+    FAILED = 8
+    CANCELED = 9
+    EXPIRED = 10
 
     # ── Predicates ──────────────────────────────────────────────────────────
 
     @property
-    def is_submitted(self) -> bool:
-        """``True`` for :attr:`SUBMITTED` — submitted but not yet running."""
-        return self is State.SUBMITTED
+    def is_idle(self) -> bool:
+        """``True`` for :attr:`IDLE` — built locally, not submitted yet."""
+        return self is State.IDLE
+
+    @property
+    def is_queued(self) -> bool:
+        """``True`` for :attr:`QUEUED` — prepared, sitting in a submission queue."""
+        return self is State.QUEUED
 
     @property
     def is_pending(self) -> bool:
-        """``True`` for :attr:`PENDING` — submitted but not yet running."""
+        """``True`` for :attr:`PENDING` — handed to a backend, awaiting ack."""
         return self is State.PENDING
+
+    @property
+    def is_accepted(self) -> bool:
+        """``True`` for :attr:`ACCEPTED` — acknowledged but not yet running."""
+        return self is State.ACCEPTED
 
     @property
     def is_running(self) -> bool:
@@ -115,40 +189,71 @@ class State(IntEnum):
         return self is State.RUNNING
 
     @property
+    def is_partial(self) -> bool:
+        """``True`` for :attr:`PARTIAL` — partially filled, still active."""
+        return self is State.PARTIAL
+
+    @property
     def is_started(self) -> bool:
-        """``True`` for anything past :attr:`PENDING`.
+        """``True`` for anything from :attr:`RUNNING` onward.
 
         Mirrors :attr:`StatementResult.started`: once the backend has
-        accepted the submission, ``is_started`` flips and stays ``True``
-        through every terminal state.
+        actually started executing, ``is_started`` flips and stays
+        ``True`` through every terminal state. :attr:`ACCEPTED` is
+        *not* started — the venue holds the order, no execution yet.
         """
-        return self.value >= self.SUBMITTED.value
+        return self.value >= self.RUNNING.value
+
+    @property
+    def is_active(self) -> bool:
+        """``True`` for non-terminal states with backend awareness.
+
+        Covers :attr:`QUEUED` through :attr:`PARTIAL` — anything the
+        caller can reasonably wait on. :attr:`IDLE` is excluded
+        (nothing has been submitted yet) and every terminal state is
+        excluded (no more transitions).
+        """
+        return self in _ACTIVE_STATES
 
     @property
     def is_done(self) -> bool:
-        """``True`` for terminal states (:attr:`SUCCEEDED`, :attr:`FAILED`,
-        :attr:`CANCELED`) — no more transitions expected."""
+        """``True`` for terminal states (:attr:`SUCCEEDED`, :attr:`REJECTED`,
+        :attr:`FAILED`, :attr:`CANCELED`, :attr:`EXPIRED`) — no more
+        transitions expected."""
         return self in _DONE_STATES
 
     @property
     def is_failed(self) -> bool:
-        """``True`` for :attr:`FAILED` / :attr:`CANCELED`.
+        """``True`` for :attr:`REJECTED` / :attr:`FAILED` / :attr:`CANCELED` /
+        :attr:`EXPIRED`.
 
-        Cancellation counts as failed because every backend's
-        ``raise_for_status`` raises on cancel — the caller asked for a
-        result and didn't get one.
+        Every non-success terminal state counts as failed because each
+        one means "the caller asked for a result and didn't get one":
+        cancellation, rejection, mid-run error, or TTL expiry all leave
+        the operation incomplete from the caller's view, and the
+        per-backend ``raise_for_status`` raises on each.
         """
         return self in _FAILED_STATES
 
     @property
     def is_succeeded(self) -> bool:
-        """``True`` for :attr:`SUCCEEDED` — terminal with a result."""
+        """``True`` for :attr:`SUCCEEDED` — terminal with a full result."""
         return self is State.SUCCEEDED
+
+    @property
+    def is_rejected(self) -> bool:
+        """``True`` for :attr:`REJECTED` — refused at submission / accept."""
+        return self is State.REJECTED
 
     @property
     def is_canceled(self) -> bool:
         """``True`` for :attr:`CANCELED`."""
         return self is State.CANCELED
+
+    @property
+    def is_expired(self) -> bool:
+        """``True`` for :attr:`EXPIRED` — TTL / day-rollover terminal."""
+        return self is State.EXPIRED
 
     # ── Coercion ────────────────────────────────────────────────────────────
 
@@ -167,7 +272,7 @@ class State(IntEnum):
         if value is None:
             if default is not ...:
                 return default
-            return cls.PENDING
+            return cls.IDLE
 
         # IntEnum members compare equal to ints; allow integer-code
         # lookups so persisted State codes round-trip.
@@ -220,7 +325,7 @@ class State(IntEnum):
         if not token:
             if default is not ...:
                 return default
-            return cls.PENDING
+            return cls.IDLE
 
         hit = _STATE_LOOKUP.get(token)
         if hit is not None:
@@ -249,20 +354,39 @@ class State(IntEnum):
         return self.name.lower()
 
 
-_DONE_STATES: frozenset["State"] = frozenset(
-    {State.SUCCEEDED, State.FAILED, State.CANCELED}
-)
-_FAILED_STATES: frozenset["State"] = frozenset({State.FAILED, State.CANCELED})
+_DONE_STATES: frozenset["State"] = frozenset({
+    State.SUCCEEDED,
+    State.REJECTED,
+    State.FAILED,
+    State.CANCELED,
+    State.EXPIRED,
+})
+_FAILED_STATES: frozenset["State"] = frozenset({
+    State.REJECTED,
+    State.FAILED,
+    State.CANCELED,
+    State.EXPIRED,
+})
+# Non-terminal states with backend awareness — anything the caller can
+# meaningfully wait on. IDLE is excluded (no submission yet); every
+# terminal state is excluded (no more transitions expected).
+_ACTIVE_STATES: frozenset["State"] = frozenset({
+    State.QUEUED,
+    State.PENDING,
+    State.ACCEPTED,
+    State.RUNNING,
+    State.PARTIAL,
+})
 
 
 def _build_state_lookup() -> dict[str, State]:
     """Pre-compute every accepted spelling → :class:`State` member.
 
     Folds :data:`_STATE_ALIASES` (lower-case keys) with the canonical
-    member names (``"PENDING"`` / ``"RUNNING"`` / …), their upper-case
-    form, and lower-case so :meth:`State._from_str` resolves any
-    common spelling with a single ``dict.get`` and no string
-    allocation.
+    member names (``"QUEUED"`` / ``"PENDING"`` / ``"RUNNING"`` / …),
+    their upper-case form, and lower-case so :meth:`State._from_str`
+    resolves any common spelling with a single ``dict.get`` and no
+    string allocation.
     """
     out: dict[str, State] = {}
     for alias, canonical in _STATE_ALIASES.items():
