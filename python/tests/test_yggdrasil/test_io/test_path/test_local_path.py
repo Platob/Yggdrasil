@@ -295,3 +295,102 @@ class TestTouch:
         assert not lp.exists()
         lp.touch()
         assert lp.exists() and lp.size == 0
+
+
+class TestUpload:
+    """``Path.upload(to)`` accepts Holder / IO / str / PathLike targets."""
+
+    def test_upload_to_holder(self, tmp_path) -> None:
+        from yggdrasil.io.memory import Memory
+
+        src = LocalPath(str(tmp_path / "src.bin"))
+        src.write_bytes(b"payload")
+        mem = Memory()
+        out = src.upload(mem)
+        assert out is mem
+        assert mem.read_bytes() == b"payload"
+
+    def test_upload_to_io_cursor(self, tmp_path) -> None:
+        src = LocalPath(str(tmp_path / "src.bin"))
+        src.write_bytes(b"payload")
+        with BytesIO() as bio:
+            out = src.upload(bio)
+            assert out is bio
+            assert bio.to_bytes() == b"payload"
+
+    def test_upload_to_str_path(self, tmp_path) -> None:
+        src = LocalPath(str(tmp_path / "src.bin"))
+        src.write_bytes(b"payload")
+        out = src.upload(str(tmp_path / "dst.bin"))
+        assert isinstance(out, LocalPath)
+        assert out.read_bytes() == b"payload"
+
+    def test_upload_to_pathlib_path(self, tmp_path) -> None:
+        src = LocalPath(str(tmp_path / "src.bin"))
+        src.write_bytes(b"payload")
+        out = src.upload(pathlib.Path(tmp_path) / "via_pl.bin")
+        assert out.read_bytes() == b"payload"
+
+    def test_upload_to_path_instance(self, tmp_path) -> None:
+        src = LocalPath(str(tmp_path / "src.bin"))
+        src.write_bytes(b"payload")
+        dst = LocalPath(str(tmp_path / "dst.bin"))
+        out = src.upload(dst)
+        assert out is dst
+        assert dst.read_bytes() == b"payload"
+
+    def test_upload_trailing_slash_appends_name(self, tmp_path) -> None:
+        # Trailing-slash target = "into this directory" — source's
+        # filename is joined onto the destination URL.
+        src = LocalPath(str(tmp_path / "src.bin"))
+        src.write_bytes(b"payload")
+        out_dir = tmp_path / "sub"
+        out_dir.mkdir()
+        out = src.upload(str(out_dir) + "/")
+        assert out.name == "src.bin"
+        assert out.read_bytes() == b"payload"
+
+    def test_upload_rejects_unsupported_type(self, tmp_path) -> None:
+        src = LocalPath(str(tmp_path / "src.bin"))
+        src.write_bytes(b"payload")
+        with pytest.raises(TypeError, match="Holder, IO, str, or os.PathLike"):
+            src.upload(42)
+
+
+class TestDownload:
+    """``Path.download(to)`` mirrors upload; ``to=None`` browser-defaults."""
+
+    def test_download_to_explicit_target(self, tmp_path) -> None:
+        src = LocalPath(str(tmp_path / "src.bin"))
+        src.write_bytes(b"payload")
+        out = src.download(str(tmp_path / "dl.bin"))
+        assert out.read_bytes() == b"payload"
+
+    def test_download_default_uses_home_downloads(self, tmp_path, monkeypatch) -> None:
+        # Redirect $HOME so the test never touches the real user's
+        # Downloads folder.
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        src = LocalPath(str(tmp_path / "src.bin"))
+        src.write_bytes(b"payload")
+        out = src.download()
+        assert pathlib.Path(out.os_path).parent == tmp_path / "home" / "Downloads"
+        assert out.name == "src.bin"
+        assert out.read_bytes() == b"payload"
+
+    def test_download_default_resolves_name_conflicts(self, tmp_path, monkeypatch) -> None:
+        # Browser-style: second/third downloads of the same name get
+        # "(1)" / "(2)" inserted before the suffix.
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        src = LocalPath(str(tmp_path / "src.bin"))
+        src.write_bytes(b"payload")
+        first = src.download()
+        second = src.download()
+        third = src.download()
+        assert first.name == "src.bin"
+        assert second.name == "src (1).bin"
+        assert third.name == "src (2).bin"
+        # All three carry the same bytes — conflict resolution doesn't
+        # overwrite the existing file.
+        assert first.read_bytes() == b"payload"
+        assert second.read_bytes() == b"payload"
+        assert third.read_bytes() == b"payload"
