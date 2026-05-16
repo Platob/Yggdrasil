@@ -574,6 +574,47 @@ class TestJobTaskFactoryAndDecorate(DatabricksTestCase):
         moved = next(t for t in tasks if t.task_key == "a")
         self.assertEqual(moved.description, "moved")
 
+    def test_create_attaches_default_environment_when_task_uses_key(self):
+        """A task carrying ``environment_key`` adds a matching :class:`JobEnvironment`
+        to the parent job when none is declared yet."""
+        from yggdrasil.databricks.jobs.task import DEFAULT_ENVIRONMENT_KEY
+
+        job = self._job()
+        job.settings.tasks = [Task(task_key="seed")]
+
+        jt = job.task(
+            "step", environment_key=DEFAULT_ENVIRONMENT_KEY,
+        )
+        jt.create()
+
+        _, kwargs = self.jobs_api.update.call_args
+        envs = kwargs["new_settings"].environments
+        self.assertIsNotNone(envs)
+        self.assertEqual(len(envs), 1)
+        self.assertEqual(envs[0].environment_key, DEFAULT_ENVIRONMENT_KEY)
+        self.assertIsNotNone(envs[0].spec)
+
+    def test_create_skips_environment_merge_when_already_declared(self):
+        """``environments`` isn't touched when the key already lives on the job."""
+        from databricks.sdk.service.compute import Environment
+        from databricks.sdk.service.jobs import JobEnvironment
+
+        job = self._job()
+        job.settings.tasks = [Task(task_key="seed")]
+        job.settings.environments = [
+            JobEnvironment(
+                environment_key="custom",
+                spec=Environment(client="1", dependencies=["pandas"]),
+            ),
+        ]
+
+        jt = job.task("step", environment_key="custom")
+        jt.create()
+
+        _, kwargs = self.jobs_api.update.call_args
+        # No environments update → the field is left off new_settings.
+        self.assertIsNone(kwargs["new_settings"].environments)
+
     def test_task_without_order_keeps_existing_position(self):
         """``order=None`` (default) replaces in place — no shuffle."""
         job = self._job()

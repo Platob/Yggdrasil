@@ -9,7 +9,7 @@ the source of truth.
 For Python callables, :meth:`JobTask.from_callable` extracts the raw
 source via :func:`inspect.getsource`, drops a self-contained ``.py``
 script under the user's personal workspace
-(``/Workspace/Users/me/.yggdrasil/jobs/``), and wraps it in a
+(``/Workspace/Users/<me>/.ygg/jobs/``), and wraps it in a
 :class:`SparkPythonTask`. No pickling — the source is what runs.
 :meth:`JobTask.decorate` (chained off :meth:`Job.task`) is the
 decorator form.
@@ -25,7 +25,8 @@ import textwrap
 from dataclasses import replace as _dc_replace
 from typing import Any, Callable, List, Optional, TYPE_CHECKING
 
-from databricks.sdk.service.jobs import SparkPythonTask, Task
+from databricks.sdk.service.compute import Environment
+from databricks.sdk.service.jobs import JobEnvironment, SparkPythonTask, Task
 
 from yggdrasil.dataclasses.safe_function import (
     describe_signature,
@@ -39,13 +40,30 @@ if TYPE_CHECKING:
 __all__ = [
     "JobTask",
     "DEFAULT_STAGING_ROOT",
+    "DEFAULT_ENVIRONMENT_KEY",
+    "DEFAULT_ENVIRONMENT_CLIENT",
 ]
 
 LOGGER = logging.getLogger(__name__)
 
 #: Default staging area for :meth:`JobTask.from_callable`. Lands under
-#: the bound user's workspace home.
-DEFAULT_STAGING_ROOT = "/Workspace/Users/me/.yggdrasil/jobs"
+#: the bound user's workspace home; ``<me>`` is resolved to the
+#: workspace client's current user (see
+#: :meth:`WorkspacePath._resolve_me`).
+DEFAULT_STAGING_ROOT = "/Workspace/Users/<me>/.ygg/jobs"
+
+#: ``environment_key`` auto-attached to staged Python tasks so they
+#: run on serverless workspaces without the caller pre-declaring a
+#: :class:`JobEnvironment`. The parent job's ``environments`` list is
+#: extended with a matching :class:`JobEnvironment` on
+#: :meth:`JobTask.create` when the key isn't already defined.
+DEFAULT_ENVIRONMENT_KEY = "ygg-default"
+
+#: Minimum serverless client version paired with
+#: :data:`DEFAULT_ENVIRONMENT_KEY`. Databricks requires a ``client``
+#: pin on every serverless environment spec; ``"1"`` is the broadest
+#: option and matches Databricks' own bundle examples.
+DEFAULT_ENVIRONMENT_CLIENT = "1"
 
 
 class JobTask:
@@ -128,7 +146,11 @@ class JobTask:
             "%s job task %r on %r",
             "Updating" if replaced else "Creating", self, self.job,
         )
-        self.job.update(tasks=new_tasks)
+        update_kwargs: dict[str, Any] = {"tasks": new_tasks}
+        merged_envs = self._merged_environments(self._details)
+        if merged_envs is not None:
+            update_kwargs["environments"] = merged_envs
+        self.job.update(**update_kwargs)
         LOGGER.info(
             "%s job task %r",
             "Updated" if replaced else "Created", self,
@@ -152,7 +174,11 @@ class JobTask:
         LOGGER.debug(
             "Updating job task %r (fields=%r)", self, list(fields),
         )
-        self.job.update(tasks=updated)
+        update_kwargs: dict[str, Any] = {"tasks": updated}
+        merged_envs = self._merged_environments(new_details)
+        if merged_envs is not None:
+            update_kwargs["environments"] = merged_envs
+        self.job.update(**update_kwargs)
         self._details = new_details
         LOGGER.info("Updated job task %r", self)
         return self
@@ -198,6 +224,31 @@ class JobTask:
             return new_tasks
         others = [t for t in existing if t.task_key != self.task_key]
         return [*others[:self.order], new_details, *others[self.order:]]
+
+    def _merged_environments(
+        self, task: Task,
+    ) -> Optional[List[JobEnvironment]]:
+        """Return the parent job's ``environments`` extended with *task*'s key.
+
+        Returns ``None`` when *task* doesn't reference an
+        ``environment_key`` or when the key is already declared on the
+        job — in both cases :meth:`Job.update` shouldn't touch the
+        ``environments`` setting. Otherwise returns a new list that
+        preserves the existing entries and appends a default
+        :class:`JobEnvironment` so the serverless backend accepts the
+        task on submit.
+        """
+        env_key = getattr(task, "environment_key", None)
+        if not env_key:
+            return None
+        settings = self.job.settings
+        existing: List[JobEnvironment] = list(
+            (settings.environments if settings is not None else None) or []
+        )
+        if any(getattr(e, "environment_key", None) == env_key for e in existing):
+            return None
+        existing.append(_default_job_environment(env_key))
+        return existing
 
     # ------------------------------------------------------------------ #
     # Decorator: stage a Python callable onto this task
@@ -266,9 +317,21 @@ class JobTask:
         in scope), appends an invocation that passes *args* / *kwargs*
         as Python literals, and writes the result to a single ``.py``
         file under *staging_root* (default:
-        ``/Workspace/Users/me/.yggdrasil/jobs/<task_key>-<rand>.py``).
+        ``/Workspace/Users/<me>/.ygg/jobs/<task_key>-<rand>.py``).
         No pickling involved — the script Databricks runs is the exact
         source of the function.
+
+        The returned task carries
+        ``environment_key=DEFAULT_ENVIRONMENT_KEY`` so it submits cleanly
+        on serverless-default workspaces;
+        :meth:`create` lazily adds a matching
+        :class:`JobEnvironment` to the parent job's ``environments``
+        list when the key isn't already declared. Override with
+        ``environment_key=...`` on the :meth:`Job.task` /
+        :meth:`Job.pytask` call to pin a different serverless env, or
+        replace with cluster-bound compute (``new_cluster=`` /
+        ``existing_cluster_id=`` / ``job_cluster_key=``) via
+        :meth:`Job.task` when running on classic clusters.
 
         *args* / *kwargs* are rendered via :func:`repr`, so they must be
         types whose ``repr`` round-trips through ``eval`` (built-in
@@ -285,10 +348,7 @@ class JobTask:
         The returned :class:`JobTask` is not persisted on the job yet
         — call :meth:`create` (or use :meth:`JobTask.decorate`, which
         does it for you). :meth:`create` is idempotent — same key
-        replaces in place. Compute
-        stays caller-owned: layer ``new_cluster`` / ``existing_cluster_id``
-        / ``job_cluster_key`` via :meth:`update` once the task is
-        registered.
+        replaces in place.
         """
         from yggdrasil.databricks.fs.workspace_path import WorkspacePath
 
@@ -323,8 +383,27 @@ class JobTask:
             spark_python_task=SparkPythonTask(
                 python_file=path.full_path(),
             ),
+            environment_key=DEFAULT_ENVIRONMENT_KEY,
         )
         return cls(job=job, task_key=key, details=details)
+
+
+def _default_job_environment(environment_key: str) -> JobEnvironment:
+    """Build a minimal serverless :class:`JobEnvironment` for *environment_key*.
+
+    Databricks' serverless backend rejects Python tasks unless the
+    parent job declares a matching ``environments`` entry with a
+    ``client`` pin (``Environment.spec``). The default carries no
+    dependencies — callers that need extra packages should declare
+    the environment themselves on the job.
+    """
+    return JobEnvironment(
+        environment_key=environment_key,
+        spec=Environment(
+            client=DEFAULT_ENVIRONMENT_CLIENT,
+            dependencies=[],
+        ),
+    )
 
 
 def _render_callable_script(
