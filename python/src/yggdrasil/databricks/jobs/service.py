@@ -244,6 +244,42 @@ class Jobs(DatabricksService):
         LOGGER.info("Created job %r", instance)
         return instance
 
+    def get_or_create(
+        self,
+        job_id: int | None = None,
+        name: str | None = None,
+        *,
+        tasks: Optional[List[Task]] = None,
+        permissions: Optional[list[Union[str, JobAccessControlRequest]]] = None,
+        tags: Optional[dict[str, str]] = None,
+        **settings: Any,
+    ) -> "Job":
+        """Return the matching job if it exists, otherwise create a new one.
+
+        Unlike :meth:`create_or_update`, the existing job is returned
+        as-is — no settings are pushed back. Use this as the cheap
+        ``client.jobs.get_or_create(job_id, name)`` entry point when
+        you want a :class:`Job` handle and only care about creation on
+        first call.
+        """
+        found = self.find(job_id=job_id, name=name)
+        if found is not None:
+            return found
+
+        if not name:
+            raise ValueError(
+                "Cannot create a new job without name; pass name=... or an "
+                f"existing job_id (received job_id={job_id!r})."
+            )
+
+        return self.create(
+            name=name,
+            tasks=tasks,
+            permissions=permissions,
+            tags=tags,
+            **settings,
+        )
+
     def create_or_update(
         self,
         *,

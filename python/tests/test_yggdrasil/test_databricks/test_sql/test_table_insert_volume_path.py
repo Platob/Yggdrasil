@@ -64,9 +64,8 @@ class TestInsertVolumePath:
         assert tbl.insert_volume_path(temporary=True).temporary is True
 
     def test_target_override_routes_under_other_table(self) -> None:
-        """``target`` swaps the catalog/schema/name segments — used by
-        the dispatch fan-out so each fan-out partner stages next to
-        its own table."""
+        """``target`` swaps the catalog/schema/name segments so a caller
+        can stage rows under a sibling table's volume."""
         tbl = _table("cat", "sch", "primary")
         other = _table("cat2", "sch2", "extra")
         path = tbl.insert_volume_path(other)

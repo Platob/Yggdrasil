@@ -74,6 +74,15 @@ class DatabricksTestCase(unittest.TestCase):
     #: at construction time. No real authentication is ever performed.
     TOKEN: str = "fake-pat-not-a-secret"
 
+    #: Default Unity catalog name handed to tests that need a three-part
+    #: identifier without caring which catalog they target. Override on the
+    #: subclass when a test suite exercises catalog-specific behavior.
+    CATALOG_NAME: str = "main"
+
+    #: Default Unity schema name. Pairs with :attr:`CATALOG_NAME` for the
+    #: ``<catalog>.<schema>.<object>`` shape most Databricks tests build.
+    SCHEMA_NAME: str = "default"
+
     # ------------------------------------------------------------------ #
     # setUp / tearDown
     # ------------------------------------------------------------------ #

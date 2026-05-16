@@ -595,14 +595,8 @@ class SQLEngine(DatabricksService, StatementExecutor):
         prune_by: list[str] | str | None = None,
         prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
-        table_dispatch: Mapping["Table | str", "Predicate | str"] | None = None,
-    ) -> None:
-        """Resolve the target :class:`Table` and call :meth:`Table.insert_into`.
-
-        ``table_dispatch`` is forwarded to the chosen backend so a
-        single call can fan source rows out into additional Delta
-        tables. See :meth:`Table.insert_into` for the contract.
-        """
+    ) -> "StatementBatch | None":
+        """Resolve the target :class:`Table` and call :meth:`Table.insert_into`."""
         target = self._resolve_target(
             location=location, catalog_name=catalog_name,
             schema_name=schema_name, table_name=table_name, table=table,
@@ -626,7 +620,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
             prune_by=prune_by,
             prune_values=prune_values,
             retry=retry,
-            table_dispatch=table_dispatch,
         )
 
     def arrow_insert_into(
@@ -652,8 +645,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         prune_by: list[str] | str | None = None,
         prune_values: Mapping[str, list[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
-        table_dispatch: Mapping["Table | str", "Predicate | str"] | None = None,
-    ) -> None:
+    ) -> "StatementBatch | None":
         """Resolve target and forward to :meth:`Table.arrow_insert`."""
         target = self._resolve_target(
             location=location, catalog_name=catalog_name,
@@ -676,7 +668,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
             prune_by=prune_by,
             prune_values=prune_values,
             retry=retry,
-            table_dispatch=table_dispatch,
         )
 
     def spark_insert_into(
@@ -705,8 +696,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         prune_values: dict[str, tuple[Any, ...]] | None = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         retry: Optional[WaitingConfigArg] = None,
-        table_dispatch: Mapping["Table | str", "Predicate | str"] | None = None,
-    ) -> None:
+    ) -> "StatementBatch | None":
         """Resolve target and forward to :meth:`Table.spark_insert`."""
         target = self._resolve_target(
             location=location, catalog_name=catalog_name,
@@ -731,7 +721,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
             prune_values=prune_values,
             spark_session=spark_session,
             retry=retry,
-            table_dispatch=table_dispatch,
         )
 
     def sql_insert_into(
@@ -756,8 +745,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         prune_by: list[str] | str | None = None,
         prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
-        table_dispatch: Mapping["Table | str", "Predicate | str"] | None = None,
-    ) -> None:
+    ) -> "StatementBatch | None":
         """Resolve target and forward to :meth:`Table.sql_insert`."""
         target = self._resolve_target(
             location=location, catalog_name=catalog_name,
@@ -778,7 +766,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
             prune_by=prune_by,
             prune_values=prune_values,
             retry=retry,
-            table_dispatch=table_dispatch,
         )
 
     # ------------------------------------------------------------------

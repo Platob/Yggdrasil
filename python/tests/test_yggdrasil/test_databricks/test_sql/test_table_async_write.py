@@ -910,22 +910,19 @@ class TestStageAsyncInsert:
 # ---------------------------------------------------------------------------
 
 
-class TestEnsureJob:
-    """:meth:`AsyncInsert.ensure_job` find-or-create flow against a mock service.
+class TestRecordJob:
+    """:meth:`AsyncInsert.job` create-or-update flow against a mock service.
 
-    The applier job is keyed off ``(catalog_name, schema_name)`` — one
-    Databricks Job per schema, draining every table whose stg_*
-    volume sits under it.
+    The applier job is keyed off ``(target_catalog_name,
+    target_schema_name)`` on the record — one Databricks Job per
+    schema, draining every table whose stg_* volume sits under it.
     """
 
-    def _make_table_with_jobs(self):
-        tbl, _, _, _ = _make_table_with_staging()
-        # Replace the jobs service with a mock so we can assert on
-        # ``create_or_update`` args without touching the SDK.
-        jobs_svc = MagicMock(name="Jobs")
-        jobs_svc.create_or_update.return_value = MagicMock(name="Job")
-        tbl.client.jobs = jobs_svc  # type: ignore[attr-defined]
-        return tbl, jobs_svc
+    @staticmethod
+    def _mock_jobs():
+        svc = MagicMock(name="Jobs")
+        svc.create_or_update.return_value = MagicMock(name="Job")
+        return svc
 
     def test_default_job_name_from_table(self):
         tbl, _, _, _ = _make_table_with_staging()
@@ -947,18 +944,14 @@ class TestEnsureJob:
             AsyncInsert.resolve_schema_key("solo")
 
     def test_resolve_schema_key_from_record(self):
-        rec = _make_record(
-            target="main.sales.orders",
-        )
+        rec = _make_record(target="main.sales.orders")
         cat, sch = AsyncInsert.resolve_schema_key(rec.target_full_name)
         assert (cat, sch) == ("main", "sales")
 
-    def test_ensure_job_creates_with_schema_identity(self):
-        tbl, jobs_svc = self._make_table_with_jobs()
-
-        AsyncInsert.ensure_job(
-            tbl, notebook_path="/Workspace/Users/me/apply", jobs=jobs_svc,
-        )
+    def test_creates_with_schema_identity(self):
+        jobs_svc = self._mock_jobs()
+        rec = _make_record()
+        rec.job(notebook_path="/Workspace/Users/me/apply", jobs=jobs_svc)
 
         jobs_svc.create_or_update.assert_called_once()
         _, kwargs = jobs_svc.create_or_update.call_args
@@ -980,102 +973,98 @@ class TestEnsureJob:
         param_names = {p.name for p in kwargs["parameters"]}
         assert param_names == {"catalog_name", "schema_name"}
 
-    def test_ensure_job_keys_same_job_for_two_tables_in_schema(self):
-        """Different tables in the same schema → same job name."""
-        tbl, jobs_svc = self._make_table_with_jobs()
-        AsyncInsert.ensure_job(tbl, notebook_path="/p")
-        first_name = jobs_svc.create_or_update.call_args.kwargs["name"]
+    def test_keys_same_job_for_two_tables_in_schema(self):
+        """Two records for tables in the same schema → same job name."""
+        jobs_svc = self._mock_jobs()
+        rec_a = _make_record(target="cat.sch.tbl_a")
+        rec_b = _make_record(target="cat.sch.tbl_b")
 
-        # A second table in the same schema — different name, same job
-        tbl2 = MagicMock()
-        tbl2.client = tbl.client
-        tbl2.catalog_name = "cat"
-        tbl2.schema_name = "sch"
-        tbl2.table_name = "other"
-        AsyncInsert.ensure_job(tbl2, notebook_path="/p", jobs=jobs_svc)
+        rec_a.job(notebook_path="/p", jobs=jobs_svc)
+        first_name = jobs_svc.create_or_update.call_args.kwargs["name"]
+        rec_b.job(notebook_path="/p", jobs=jobs_svc)
         second_name = jobs_svc.create_or_update.call_args.kwargs["name"]
 
         assert first_name == second_name == "ygg-async-insert-cat-sch"
 
-    def test_ensure_job_accepts_explicit_task(self):
-        tbl, jobs_svc = self._make_table_with_jobs()
+    def test_accepts_explicit_task(self):
         from databricks.sdk.service.jobs import NotebookTask, Task
 
+        jobs_svc = self._mock_jobs()
         custom = Task(
             task_key="custom",
             notebook_task=NotebookTask(notebook_path="/Workspace/custom"),
         )
-        AsyncInsert.ensure_job(tbl, task=custom)
+        _make_record().job(task=custom, jobs=jobs_svc)
         _, kwargs = jobs_svc.create_or_update.call_args
         assert kwargs["tasks"] == [custom]
 
-    def test_ensure_job_accepts_list_of_tasks(self):
-        tbl, jobs_svc = self._make_table_with_jobs()
+    def test_accepts_list_of_tasks(self):
         from databricks.sdk.service.jobs import NotebookTask, Task
 
+        jobs_svc = self._mock_jobs()
         t1 = Task(task_key="a", notebook_task=NotebookTask(notebook_path="/a"))
         t2 = Task(task_key="b", notebook_task=NotebookTask(notebook_path="/b"))
-        AsyncInsert.ensure_job(tbl, task=[t1, t2])
+        _make_record().job(task=[t1, t2], jobs=jobs_svc)
         _, kwargs = jobs_svc.create_or_update.call_args
         assert kwargs["tasks"] == [t1, t2]
 
-    def test_ensure_job_with_cron_string_builds_cron_schedule(self):
+    def test_with_cron_string_builds_cron_schedule(self):
         from databricks.sdk.service.jobs import CronSchedule
 
-        tbl, jobs_svc = self._make_table_with_jobs()
-        AsyncInsert.ensure_job(
-            tbl, notebook_path="/p",
+        jobs_svc = self._mock_jobs()
+        _make_record().job(
+            notebook_path="/p",
             schedule="0 0 */1 * * ?",
             schedule_timezone="UTC",
+            jobs=jobs_svc,
         )
         _, kwargs = jobs_svc.create_or_update.call_args
         assert isinstance(kwargs["schedule"], CronSchedule)
         assert kwargs["schedule"].quartz_cron_expression == "0 0 */1 * * ?"
         assert kwargs["schedule"].timezone_id == "UTC"
 
-    def test_ensure_job_with_cron_schedule_passes_through(self):
+    def test_with_cron_schedule_passes_through(self):
         from databricks.sdk.service.jobs import CronSchedule, PauseStatus
 
-        tbl, jobs_svc = self._make_table_with_jobs()
+        jobs_svc = self._mock_jobs()
         existing = CronSchedule(
             quartz_cron_expression="0 0 0 * * ?",
             timezone_id="Europe/Paris",
             pause_status=PauseStatus.UNPAUSED,
         )
-        AsyncInsert.ensure_job(tbl, notebook_path="/p", schedule=existing)
+        _make_record().job(notebook_path="/p", schedule=existing, jobs=jobs_svc)
         _, kwargs = jobs_svc.create_or_update.call_args
         assert kwargs["schedule"] is existing
 
-    def test_ensure_job_pause_status_string_normalises(self):
+    def test_pause_status_string_normalises(self):
         from databricks.sdk.service.jobs import PauseStatus
 
-        tbl, jobs_svc = self._make_table_with_jobs()
-        AsyncInsert.ensure_job(
-            tbl, notebook_path="/p",
+        jobs_svc = self._mock_jobs()
+        _make_record().job(
+            notebook_path="/p",
             schedule="0 */10 * * * ?",
             schedule_pause_status="paused",
+            jobs=jobs_svc,
         )
         _, kwargs = jobs_svc.create_or_update.call_args
         assert kwargs["schedule"].pause_status == PauseStatus.PAUSED
 
-    def test_ensure_job_no_schedule_passes_none(self):
-        tbl, jobs_svc = self._make_table_with_jobs()
-        AsyncInsert.ensure_job(tbl, notebook_path="/p")
+    def test_no_schedule_passes_none(self):
+        jobs_svc = self._mock_jobs()
+        _make_record().job(notebook_path="/p", jobs=jobs_svc)
         _, kwargs = jobs_svc.create_or_update.call_args
         assert kwargs["schedule"] is None
 
-    def test_ensure_job_requires_schema_identity(self):
+    def test_requires_schema_identity(self):
+        # No target_full_name and no overrides → can't resolve schema.
+        rec = AsyncInsert(target_full_name="")
         with pytest.raises(ValueError):
-            AsyncInsert.ensure_job()
+            rec.job(jobs=self._mock_jobs())
 
-    def test_ensure_job_requires_jobs_when_no_client_reachable(self):
-        with pytest.raises(ValueError):
-            AsyncInsert.ensure_job(target="cat.sch.tbl")
-
-    def test_ensure_job_with_explicit_catalog_schema(self):
-        jobs_svc = MagicMock()
-        jobs_svc.create_or_update.return_value = MagicMock()
-        AsyncInsert.ensure_job(
+    def test_explicit_catalog_schema_overrides_record(self):
+        jobs_svc = self._mock_jobs()
+        rec = _make_record(target="cat.sch.tbl")
+        rec.job(
             catalog_name="main",
             schema_name="sales",
             jobs=jobs_svc,
@@ -1086,35 +1075,33 @@ class TestEnsureJob:
         names = {p.name for p in kwargs["parameters"]}
         assert names == {"catalog_name", "schema_name"}
 
-    def test_ensure_job_with_full_name_string_and_jobs(self):
-        jobs_svc = MagicMock()
-        jobs_svc.create_or_update.return_value = MagicMock()
-        AsyncInsert.ensure_job(
-            target="main.sales.orders",
-            jobs=jobs_svc,
-            notebook_path="/p",
+    def test_uses_record_target_catalog_schema_fields(self):
+        # When the record carries explicit target_catalog_name /
+        # target_schema_name, those win over parsing target_full_name.
+        jobs_svc = self._mock_jobs()
+        rec = _make_record(
+            target="cat.sch.tbl",  # would parse to ("cat", "sch")
+            target_catalog_name="main",
+            target_schema_name="sales",
         )
+        rec.job(notebook_path="/p", jobs=jobs_svc)
+        _, kwargs = jobs_svc.create_or_update.call_args
+        assert kwargs["name"] == "ygg-async-insert-main-sales"
+
+    def test_parses_target_full_name_when_record_fields_missing(self):
+        jobs_svc = self._mock_jobs()
+        rec = _make_record(target="main.sales.orders")
+        rec.job(notebook_path="/p", jobs=jobs_svc)
         _, kwargs = jobs_svc.create_or_update.call_args
         # Table segment is stripped; schema-level identity only.
         assert kwargs["name"] == "ygg-async-insert-main-sales"
 
-    def test_ensure_job_with_async_insert_record_as_target(self):
-        jobs_svc = MagicMock()
-        jobs_svc.create_or_update.return_value = MagicMock()
-        rec = _make_record(
-            target="main.sales.orders",
-        )
-        # Even though the record points at a single table, ensure_job
-        # collapses to the schema-level job.
-        AsyncInsert.ensure_job(target=rec, jobs=jobs_svc, notebook_path="/p")
-        _, kwargs = jobs_svc.create_or_update.call_args
-        assert kwargs["name"] == "ygg-async-insert-main-sales"
-
-    def test_ensure_job_merges_caller_parameters(self):
-        tbl, jobs_svc = self._make_table_with_jobs()
-        AsyncInsert.ensure_job(
-            tbl, notebook_path="/p",
+    def test_merges_caller_parameters(self):
+        jobs_svc = self._mock_jobs()
+        _make_record().job(
+            notebook_path="/p",
             parameters={"catalog_name": "override", "extra": "yes"},
+            jobs=jobs_svc,
         )
         _, kwargs = jobs_svc.create_or_update.call_args
         as_dict = {p.name: p.default for p in kwargs["parameters"]}
@@ -1123,24 +1110,17 @@ class TestEnsureJob:
         # New keys appended
         assert as_dict["extra"] == "yes"
 
-    def test_ensure_job_invalid_schedule_type_raises(self):
-        tbl, jobs_svc = self._make_table_with_jobs()
+    def test_invalid_schedule_type_raises(self):
         with pytest.raises(TypeError):
-            AsyncInsert.ensure_job(tbl, notebook_path="/p", schedule=42)
+            _make_record().job(
+                notebook_path="/p", schedule=42, jobs=self._mock_jobs(),
+            )
 
-    def test_ensure_job_no_task_logs_warning_and_emits_empty_task_list(self):
-        tbl, jobs_svc = self._make_table_with_jobs()
-        AsyncInsert.ensure_job(tbl)
+    def test_no_task_logs_warning_and_emits_empty_task_list(self):
+        jobs_svc = self._mock_jobs()
+        _make_record().job(jobs=jobs_svc)
         _, kwargs = jobs_svc.create_or_update.call_args
         assert kwargs["tasks"] == []
-
-    def test_ensure_applier_job_instance_shortcut(self):
-        jobs_svc = MagicMock()
-        jobs_svc.create_or_update.return_value = MagicMock()
-        rec = _make_record(target="main.sales.orders")
-        rec.ensure_applier_job(jobs=jobs_svc, notebook_path="/p")
-        _, kwargs = jobs_svc.create_or_update.call_args
-        assert kwargs["name"] == "ygg-async-insert-main-sales"
 
 
 class TestSchemaDiscovery:

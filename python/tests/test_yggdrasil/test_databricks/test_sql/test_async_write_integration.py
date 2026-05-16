@@ -18,7 +18,7 @@ These tests exercise:
 - :meth:`AsyncInsert.to_sql` + :meth:`AsyncInsert.execute` against
   the live SQL engine (data lands in the target table, staged files
   are cleaned up on success),
-- :meth:`AsyncInsert.ensure_job` + scheduling against the live
+- :meth:`AsyncInsert.job` + scheduling against the live
   Jobs API, plus :meth:`Job.run` for the trigger path.
 """
 from __future__ import annotations
@@ -133,6 +133,37 @@ class _AsyncWriteIntegrationBase(DatabricksIntegrationCase):
             "amount": pa.array([amount] * len(ids), type=pa.float64()),
         })
 
+    @staticmethod
+    def _record_for(table: Table) -> AsyncInsert:
+        """Build a minimal :class:`AsyncInsert` carrying *table*'s schema identity.
+
+        The applier-job test cases don't need any staged payload — they
+        only need a record whose ``target_catalog_name`` /
+        ``target_schema_name`` match the live table so
+        :meth:`AsyncInsert.job` resolves the right schema.
+        """
+        return AsyncInsert(
+            target_full_name=table.full_name(safe=False),
+            target_catalog_name=table.catalog_name,
+            target_schema_name=table.schema_name,
+            target_table_name=table.table_name,
+        )
+
+    @staticmethod
+    def _wait_until_gone(path, *, timeout: float = 30.0, interval: float = 0.2) -> None:
+        # ``WarehouseStatementBatch.clear_temporary_resources`` fires unlinks
+        # via ``Job.make(...).fire_and_forget()`` and returns before the
+        # ThreadJobs complete, so ``execute(wait=True)`` can land before
+        # cleanup actually finishes — poll briefly instead of asserting.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not path.exists:
+                return
+            time.sleep(interval)
+        raise AssertionError(
+            f"{path!r} still exists after {timeout:.1f}s — cleanup did not run"
+        )
+
 
 class TestAsyncWriteIntegration(_AsyncWriteIntegrationBase):
     """End-to-end stage → merge → execute flow against a real workspace."""
@@ -166,8 +197,8 @@ class TestAsyncWriteIntegration(_AsyncWriteIntegrationBase):
         assert rows[0]["n"] == 4
 
         # Cleanup happened — staged Parquet + metadata files are gone.
-        assert not first.exists
-        assert not second.exists
+        self._wait_until_gone(first)
+        self._wait_until_gone(second)
 
     def test_overwrite_drops_earlier_appends(self):
         table = self._unique_table("async_ovw")
@@ -219,12 +250,12 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
         table_b = self._unique_table("async_share_b")
         table_b.ensure_created(self._sample_schema())
 
-        first = AsyncInsert.ensure_job(table_a)
+        first = self._record_for(table_a).job()
         assert isinstance(first, Job)
         assert first.job_id is not None
         type(self).created_jobs.append(first.job_id)
 
-        second = AsyncInsert.ensure_job(table_b)
+        second = self._record_for(table_b).job()
         assert second.job_id == first.job_id
         assert (
             first.job_name
@@ -237,8 +268,7 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
         table = self._unique_table("async_sched")
         table.ensure_created(self._sample_schema())
 
-        job = AsyncInsert.ensure_job(
-            table,
+        job = self._record_for(table).job(
             schedule="0 0 */6 * * ?",          # every 6 hours
             schedule_timezone="UTC",
             schedule_pause_status="paused",    # keep it idle in the test
@@ -255,13 +285,30 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
         assert schedule.pause_status == PauseStatus.PAUSED
 
     def test_run_now_returns_job_run(self):
-        """Trigger the job via :meth:`Job.run`. The job has no tasks,
-        so the run terminates fast (with SKIPPED or SUCCESS) — we just
-        verify the trigger plumbing returns a :class:`JobRun`."""
+        """Trigger the job via :meth:`Job.run`. We attach a no-op
+        ``condition_task`` (``1 == 1``) so the run terminates fast —
+        Databricks rejects ``run_now`` on an empty-task job with
+        ``InvalidParameterValue``, so the default ``record.job()`` shape
+        is not directly triggerable."""
+        from databricks.sdk.service.jobs import (
+            ConditionTask,
+            ConditionTaskOp,
+            Task,
+        )
+
         table = self._unique_table("async_trig")
         table.ensure_created(self._sample_schema())
 
-        job = AsyncInsert.ensure_job(table)
+        job = self._record_for(table).job(
+            task=Task(
+                task_key="noop",
+                condition_task=ConditionTask(
+                    op=ConditionTaskOp.EQUAL_TO,
+                    left="1",
+                    right="1",
+                ),
+            ),
+        )
         if job.job_id not in type(self).created_jobs:
             type(self).created_jobs.append(job.job_id)
 
