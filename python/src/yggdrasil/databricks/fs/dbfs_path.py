@@ -102,7 +102,7 @@ class DBFSPath(DatabricksPath):
             # callers wanting cached children pass it through ``ls``.
             child = type(self)(
                 url=URL(scheme=self.scheme, path=api_path),
-                client=self._client,
+                service=self.service,
                 singleton_ttl=singleton_ttl,
             )
             # ``dbfs.list`` returns ``is_dir`` / ``file_size`` /

@@ -1057,7 +1057,7 @@ def _build_ygg_properties(
 # Table — per-table resource
 # ===========================================================================
 
-class Table(DatabricksResource, DatabricksPath):
+class Table(DatabricksPath):
     """A single Unity Catalog table — DDL, DML, schema, storage helpers.
 
     Registers under :attr:`Scheme.DATABRICKS_TABLE` (``dbfs+table://``)

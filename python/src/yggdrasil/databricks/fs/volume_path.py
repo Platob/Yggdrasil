@@ -109,6 +109,7 @@ class VolumePath(DatabricksPath):
         *,
         url: "URL | None" = None,
         volume: "Volume | None" = None,
+        service: Any = None,
         client: "DatabricksClient | None" = None,
         **kwargs: Any,
     ) -> None:
@@ -118,10 +119,16 @@ class VolumePath(DatabricksPath):
 
         self._volume: Optional["Volume"] = volume
 
-        if volume is not None:
-            client = volume.client
+        # A bound :class:`Volume` carries both the service and the
+        # client — prefer the Volume's service so the resource stays
+        # navigable (``volume_path.volume`` short-circuits to the
+        # cached instance without re-resolving).
+        if volume is not None and service is None and client is None:
+            service = volume.service
 
-        super().__init__(data=data, client=client, url=url, **kwargs)
+        super().__init__(
+            data=data, service=service, client=client, url=url, **kwargs,
+        )
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self.explore_url!r})"
@@ -617,7 +624,7 @@ class VolumePath(DatabricksPath):
             # / class default) pass it through ``iterdir`` / ``ls``.
             child = type(self)(
                 child_path,
-                client=self._client,
+                service=self.service,
                 singleton_ttl=singleton_ttl,
             )
             # The listing entry already carries ``is_directory`` /

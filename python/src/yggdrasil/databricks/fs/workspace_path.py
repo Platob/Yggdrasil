@@ -175,7 +175,7 @@ class WorkspacePath(DatabricksPath):
             # callers wanting cached children pass it through ``ls``.
             child = type(self)(
                 url=URL(scheme=self.scheme, path=url_path),
-                client=self._client,
+                service=self.service,
                 singleton_ttl=singleton_ttl,
             )
             ot = getattr(info, "object_type", None)
