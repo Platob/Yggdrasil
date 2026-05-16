@@ -37,6 +37,22 @@ def _signature_fixture(name: str = "alice", count: int = 3) -> str:
     return f"hi {name}" * count
 
 
+# --- Fixtures referenced by TestStagedScriptCapturesLocals ----------- #
+
+_CAPTURE_CONSTANT = "value-from-module"
+_CAPTURE_MAP = {"k": 1, "v": [1, 2, 3]}
+
+
+def _capture_helper(prefix: str) -> str:
+    """Helper that the entry callable below references at module scope."""
+    return f"{prefix}::ok"
+
+
+def _capture_entry(suffix: str) -> str:
+    """Entry callable — uses both ``_capture_helper`` and ``_CAPTURE_CONSTANT``."""
+    return _capture_helper(_CAPTURE_CONSTANT) + suffix + str(_CAPTURE_MAP["k"])
+
+
 def _job_info(
     *,
     job_id: int = 1,
@@ -766,6 +782,53 @@ class TestStagedScriptMetadata(DatabricksTestCase):
         # the decorator so any future widget / argv re-entry is safe.
         self.assertIn("@checkargs\ndef _noop(", script)
         self.assertIn("_noop()", script)
+
+
+class TestStagedScriptCapturesLocals(DatabricksTestCase):
+    """``_render_callable_script`` inlines locally-referenced helpers + literals."""
+
+    def test_inlines_same_module_helper_and_literal_constants(self):
+        import ast
+
+        script = _render_callable_script(_capture_entry, (), {"suffix": "z"})
+
+        # AST-valid output and the captured block is present.
+        ast.parse(script)
+        self.assertIn("# --- captured local references ---", script)
+
+        # Helper function source carried verbatim.
+        self.assertIn("def _capture_helper(prefix: str)", script)
+
+        # Literal constants surfaced as ``NAME = repr(value)`` assignments.
+        self.assertIn("_CAPTURE_CONSTANT = 'value-from-module'", script)
+        self.assertIn("_CAPTURE_MAP = {'k': 1, 'v': [1, 2, 3]}", script)
+
+        # End-to-end exec — the staged script runs without NameError
+        # against the helper / constant references.
+        env: dict = {"__name__": "__main__", "_results": []}
+        patched = script.replace(
+            'return _capture_helper(_CAPTURE_CONSTANT) + suffix + str(_CAPTURE_MAP["k"])',
+            '_results.append(_capture_helper(_CAPTURE_CONSTANT) + suffix + str(_CAPTURE_MAP["k"]))\n'
+            '    return _results[-1]',
+        )
+        exec(compile(patched, "<staged>", "exec"), env)
+        self.assertEqual(env["_results"], ["value-from-module::okz1"])
+
+    def test_skips_imported_callables(self):
+        """A reference to a stdlib symbol stays as an import, not inlined."""
+        import ast
+
+        def uses_stdlib():
+            import math
+            return math.sqrt(16)
+
+        script = _render_callable_script(uses_stdlib, (), {})
+        ast.parse(script)
+        # ``math`` reaches the staged script via its in-body import, not
+        # as a captured definition — no top-level ``def sqrt`` or
+        # ``math = ...`` lines.
+        self.assertNotIn("def sqrt(", script)
+        self.assertNotIn("math = ", script)
 
 
 class TestJobsSubmit(DatabricksTestCase):

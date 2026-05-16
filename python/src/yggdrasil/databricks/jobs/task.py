@@ -635,27 +635,20 @@ def _render_callable_script(
     :func:`yggdrasil.dataclasses.safe_function.checkargs` so every
     call site — the staged invocation below and any future widget /
     argv re-entry — type-checks inputs against the function's
-    annotations via :func:`yggdrasil.data.cast.convert`. Returns a
-    UTF-8 ``str``; caller encodes for the workspace write.
+    annotations via :func:`yggdrasil.data.cast.convert`.
+
+    Walks *func*'s globals and closure cells to inline every locally
+    defined helper function + literal constant the body references —
+    so a script staged from a notebook / module that defines its own
+    helper ``def`` blocks doesn't ``NameError`` on the runner side.
+    Imported names are left alone (they ride through the auto-dep
+    path); only same-module callables and literal values are inlined.
+    Returns a UTF-8 ``str``; caller encodes for the workspace write.
     """
     from yggdrasil.version import __version__ as ygg_version
 
-    try:
-        source = textwrap.dedent(inspect.getsource(func))
-    except (OSError, TypeError) as exc:  # built-ins, REPL-defined lambdas
-        raise ValueError(
-            f"Cannot stage {func!r} as a JobTask: inspect.getsource failed "
-            f"({exc!s}). from_callable needs a function defined in an "
-            "importable source file."
-        ) from exc
-
-    # Drop decorator lines preceding ``def`` — the runner has no
-    # ``@job.task(...).decorate`` (or any other decorator from this
-    # scope) available. We re-apply ``@checkargs`` ourselves below.
-    lines = source.splitlines()
-    while lines and lines[0].lstrip().startswith("@"):
-        lines.pop(0)
-    body = "@checkargs\n" + "\n".join(lines).rstrip() + "\n"
+    captured_block = _capture_local_references(func)
+    body = "@checkargs\n" + _function_source(func) + "\n"
 
     sig_meta = describe_signature(func)
     meta_payload = {
@@ -679,15 +672,178 @@ def _render_callable_script(
         "# The function body below is the verbatim source of the decorated\n"
         "# callable, re-wrapped with @checkargs so every call site coerces\n"
         "# its inputs to the function's annotated types via\n"
-        "# yggdrasil.data.cast.convert. Signature metadata is embedded\n"
+        "# yggdrasil.data.cast.convert. Local helpers and constants the body\n"
+        "# references are inlined above. Signature metadata is embedded\n"
         "# under __yggdrasil_task__.\n"
         "\n"
         "import json as _yggdrasil_json\n"
         "from yggdrasil.dataclasses.safe_function import checkargs\n"
         f"__yggdrasil_task__ = _yggdrasil_json.loads(r\"\"\"{meta_json}\"\"\")\n"
         "\n"
+        f"{captured_block}"
         f"{body}"
         "\n"
         'if __name__ == "__main__":\n'
         f"    {invocation}\n"
     )
+
+
+def _function_source(func: Callable[..., Any]) -> str:
+    """Return *func*'s source with decorator lines stripped.
+
+    The runner side has no ``@job.task(...).decorate`` (or any other
+    decorator from the caller's scope) available, and the metadata
+    block / ``@checkargs`` wrap is re-applied at render time, so
+    every leading ``@…`` line is dropped.
+    """
+    try:
+        source = textwrap.dedent(inspect.getsource(func))
+    except (OSError, TypeError) as exc:  # built-ins, REPL-defined lambdas
+        raise ValueError(
+            f"Cannot stage {func!r} as a JobTask: inspect.getsource failed "
+            f"({exc!s}). from_callable needs a function defined in an "
+            "importable source file."
+        ) from exc
+    lines = source.splitlines()
+    while lines and lines[0].lstrip().startswith("@"):
+        lines.pop(0)
+    return "\n".join(lines).rstrip()
+
+
+#: Types we know we can render via ``repr`` and get an ``eval``-safe
+#: round-trip. Anything else (live handles, classes, generators) is
+#: left out of the captured-constants block — the runner will hit a
+#: ``NameError`` which is more honest than an import-time crash from
+#: a non-roundtrippable value.
+_INLINEABLE_LITERAL_TYPES = (
+    int, float, complex, bool, str, bytes, type(None),
+    list, tuple, dict, set, frozenset,
+)
+
+
+def _capture_local_references(func: Callable[..., Any]) -> str:
+    """Inline every locally-defined helper / literal *func* depends on.
+
+    Walks ``func``'s globals + closure cells, classifies each
+    referenced name, and renders the ones we can carry across the
+    process boundary:
+
+    - **Same-module callables** (functions or classes whose
+      ``__module__`` matches ``func.__module__``) are inlined via
+      :func:`inspect.getsource`, then themselves walked transitively
+      so the staged script is self-contained.
+    - **Literal-like values** (numbers, strings, bytes, bool, ``None``,
+      list / tuple / dict / set / frozenset of the same) emit
+      ``NAME = <repr>`` assignments.
+    - **Modules** and **imported callables** are skipped — the
+      auto-dependency path already adds the matching pip requirement,
+      and the staged script's existing ``import`` lines bring them
+      back at runtime.
+
+    Returns the rendered block (trailing newline included) ready to
+    drop above the staged function body. Empty string when no local
+    helpers / constants are referenced.
+    """
+    func_module = getattr(func, "__module__", None)
+    rendered: list[str] = []
+    rendered_names: set[str] = set()
+    queue: list[Callable[..., Any]] = [func]
+    visited: set[int] = {id(func)}
+
+    while queue:
+        current = queue.pop(0)
+        current_module = getattr(current, "__module__", None)
+        try:
+            closure_vars = inspect.getclosurevars(current)
+        except (TypeError, ValueError):
+            continue
+        candidates: dict[str, Any] = {
+            **closure_vars.globals, **closure_vars.nonlocals,
+        }
+        for name, value in candidates.items():
+            if name in rendered_names:
+                continue
+            if name == current.__name__ or name == func.__name__:
+                # Recursive self-reference — the function's own ``def``
+                # already covers it; skip to avoid re-emitting.
+                continue
+
+            kind = _classify_reference(value, owning_module=func_module)
+            if kind == "skip":
+                continue
+            if kind == "literal":
+                rendered.append(f"{name} = {value!r}")
+                rendered_names.add(name)
+                continue
+            if kind == "inline":
+                if id(value) in visited:
+                    continue
+                visited.add(id(value))
+                try:
+                    body = _function_source(value)
+                except ValueError as exc:
+                    LOGGER.debug(
+                        "Skipping inline of %r (referenced by %r): %s",
+                        name, current.__qualname__, exc,
+                    )
+                    continue
+                rendered.append(body)
+                rendered_names.add(name)
+                queue.append(value)
+                continue
+        # Closure cells (free vars) — same classification, different
+        # lookup path. ``getclosurevars`` already merges them under
+        # ``nonlocals`` for the common case; this guard catches the
+        # vars Python doesn't expose there (e.g. cells holding
+        # unhashable values).
+        if current.__closure__ and current.__code__.co_freevars:
+            for fname, cell in zip(
+                current.__code__.co_freevars, current.__closure__,
+            ):
+                if fname in rendered_names:
+                    continue
+                try:
+                    value = cell.cell_contents
+                except ValueError:
+                    continue
+                kind = _classify_reference(value, owning_module=func_module)
+                if kind == "literal":
+                    rendered.append(f"{fname} = {value!r}")
+                    rendered_names.add(fname)
+
+    if not rendered:
+        return ""
+    return (
+        "# --- captured local references --- #\n"
+        + "\n\n".join(rendered).rstrip() + "\n\n"
+    )
+
+
+def _classify_reference(value: Any, *, owning_module: Optional[str]) -> str:
+    """Return ``"inline"`` / ``"literal"`` / ``"skip"`` for a referenced value.
+
+    - Modules and builtins: ``skip`` — the staged script's own
+      ``import`` lines cover them.
+    - Functions / classes defined in the same module as the entry
+      callable: ``inline`` — same source tree, safe to splice.
+    - Functions / classes from other modules: ``skip`` — they ride
+      through the auto-dep path; inlining would either duplicate or
+      bring along incompatible dependencies.
+    - Plain literal-shaped values: ``literal`` — emit via ``repr``.
+    """
+    if inspect.ismodule(value):
+        return "skip"
+    if inspect.isbuiltin(value):
+        return "skip"
+    if inspect.isfunction(value) or inspect.isclass(value):
+        target_module = getattr(value, "__module__", None)
+        if (
+            target_module is not None
+            and owning_module is not None
+            and target_module == owning_module
+        ):
+            return "inline"
+        return "skip"
+    if isinstance(value, _INLINEABLE_LITERAL_TYPES):
+        return "literal"
+    return "skip"
