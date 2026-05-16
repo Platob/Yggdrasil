@@ -85,7 +85,7 @@ class TestVolumePathIntegration(DatabricksIntegrationCase):
         path = self.root / "to-delete.bin"
         path.write_bytes(b"bye")
         path.unlink()
-        path._invalidate_stat_cache()
+        path.invalidate_singleton()
         self.assertIs(path._stat_uncached().kind, IOKind.MISSING)
 
     def test_open_context(self):
@@ -95,6 +95,55 @@ class TestVolumePathIntegration(DatabricksIntegrationCase):
         with (self.root / "context.txt").open("rb") as f:
             content = f.read()
             self.assertEqual(content, b"hello context")
+
+    # ------------------------------------------------------------------
+    # remove() — directory with contents + at the run-scoped root
+    # ------------------------------------------------------------------
+
+    def test_remove_directory_with_contents_recursive(self) -> None:
+        """``remove(recursive=True)`` clears every entry under the
+        directory and then the directory itself. Mirrors what the
+        teardown path needs to do."""
+        sub = self.root / "rm-with-contents"
+        (sub / "a.bin").parent.mkdir(parents=True, exist_ok=True)
+        (sub / "a.bin").write_bytes(b"a")
+        (sub / "b.bin").write_bytes(b"b")
+        (sub / "nested" / "c.bin").parent.mkdir(parents=True, exist_ok=True)
+        (sub / "nested" / "c.bin").write_bytes(b"c")
+
+        sub.remove(recursive=True, missing_ok=False)
+        sub.invalidate_singleton()
+
+        self.assertIs(sub._stat_uncached().kind, IOKind.MISSING)
+        # Parent still resolves; only the targeted sub-tree is gone.
+        self.assertIs(self.root._stat_uncached().kind, IOKind.DIRECTORY)
+
+    def test_remove_root_recursive_then_recreate(self) -> None:
+        """``remove(recursive=True)`` on the run-scoped root drops the
+        whole scratch tree. We immediately rebuild it so the rest of
+        the test class can keep using ``self.root``."""
+        # Populate the root so we exercise the non-empty branch.
+        (self.root / "leaf.bin").write_bytes(b"leaf")
+        (self.root / "dir" / "deep.bin").parent.mkdir(
+            parents=True, exist_ok=True,
+        )
+        (self.root / "dir" / "deep.bin").write_bytes(b"deep")
+
+        self.root.remove(recursive=True, missing_ok=False)
+        self.root.invalidate_singleton()
+        self.assertIs(self.root._stat_uncached().kind, IOKind.MISSING)
+
+        # Rebuild for any subsequent tests in this class.
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.assertIs(self.root._stat_uncached().kind, IOKind.DIRECTORY)
+
+    def test_remove_missing_ok_on_empty_dir(self) -> None:
+        """``remove(missing_ok=True)`` against a never-created path
+        succeeds quietly — the no-op branch the teardown relies on."""
+        ghost = self.root / "never-created"
+        ghost.remove(recursive=True, missing_ok=True)
+        ghost.invalidate_singleton()
+        self.assertIs(ghost._stat_uncached().kind, IOKind.MISSING)
 
     def test_staging_path_round_trip(self) -> None:
         """:meth:`VolumePath.staging_path` is the SQL-engine helper —

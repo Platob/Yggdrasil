@@ -576,7 +576,12 @@ class VolumePath(DatabricksPath):
     # Listing
     # ==================================================================
 
-    def _ls(self, recursive: bool = False) -> Iterator["VolumePath"]:
+    def _ls(
+        self,
+        recursive: bool = False,
+        *,
+        singleton_ttl: Any = False,
+    ) -> Iterator["VolumePath"]:
         files = self.client.workspace_client().files
         try:
             entries = self._call(files.list_directory_contents, self.api_path)
@@ -605,9 +610,15 @@ class VolumePath(DatabricksPath):
             # ``child_path.lstrip('/Volumes')`` which strips the *character
             # set* ``/Volumes`` and then yielded ``dbfs+volume://<cat>/...``,
             # which URL-parses ``<cat>`` as a host and drops it.
+            # ``singleton_ttl`` defaults to ``False`` so the bounded
+            # ``DatabricksPath._INSTANCES`` cache doesn't fill with
+            # thousands of short-lived listing children. Callers that
+            # explicitly want cached children (``singleton_ttl=None``
+            # / class default) pass it through ``iterdir`` / ``ls``.
             child = type(self)(
                 child_path,
                 client=self._client,
+                singleton_ttl=singleton_ttl,
             )
             # The listing entry already carries ``is_directory`` /
             # ``file_size`` / ``last_modified`` — seed the child's stat
@@ -626,7 +637,7 @@ class VolumePath(DatabricksPath):
             ))
             yield child
             if recursive and is_directory:
-                yield from child._ls(recursive=True)
+                yield from child._ls(recursive=True, singleton_ttl=singleton_ttl)
 
     # ==================================================================
     # Parent / volume auto-creation
@@ -723,7 +734,7 @@ class VolumePath(DatabricksPath):
         except Exception:
             if not missing_ok:
                 raise
-        self._invalidate_stat_cache()
+        self.invalidate_singleton()
 
     def _remove_dir(
         self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
@@ -746,7 +757,7 @@ class VolumePath(DatabricksPath):
                 self.api_path,
                 recursive=recursive,
             )
-        self._invalidate_stat_cache()
+        self.invalidate_singleton()
 
     # ==================================================================
     # Holder I/O

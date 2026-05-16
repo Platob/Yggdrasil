@@ -34,6 +34,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar, Iterator, List, Tuple, Optional
 
@@ -76,6 +77,34 @@ class Path(Holder, os.PathLike, ABC):
     """
 
     scheme: ClassVar[str] = ""
+
+    #: TTL on the ``_stat_cached`` slot. ``None`` keeps a seeded
+    #: :class:`IOStats` live for the lifetime of the holder; a
+    #: positive number of seconds bounds the freshness window
+    #: against external mutations. Subclasses with a backing the
+    #: process doesn't own (RemotePath, S3Path, HTTPPath) override
+    #: with a window. :class:`LocalPath` keeps the default since
+    #: :func:`os.stat` is cheap and the seeded slot is only meant to
+    #: ferry listing-side information forward.
+    stat_cache_ttl: ClassVar["float | None"] = None
+
+    # Stat caches are per-process — they don't survive pickling /
+    # cross-host transport. Concrete subclasses extend this set with
+    # their own non-picklable handles (live SDK clients, sockets, …).
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
+        "_stat_cached", "_stat_cached_at",
+    })
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # ``IOStats | None`` cached on the instance — populated by
+        # :meth:`_seed_stat_cache` (from a listing entry that already
+        # carries kind / size / mtime) or by a successful probe in
+        # subclasses that wrap :meth:`_stat` with caching. Cleared
+        # by :meth:`invalidate_singleton` after mutating ops so
+        # follow-up reads see fresh metadata.
+        self._stat_cached: IOStats | None = None
+        self._stat_cached_at: float = 0.0
 
     # ==================================================================
     # Construction / coercion
@@ -148,8 +177,26 @@ class Path(Holder, os.PathLike, ABC):
         """
 
     @abstractmethod
-    def _ls(self, recursive: bool = False) -> Iterator["Path"]:
-        """Yield children. Empty when missing or not a directory."""
+    def _ls(
+        self,
+        recursive: bool = False,
+        *,
+        singleton_ttl: Any = False,
+    ) -> Iterator["Path"]:
+        """Yield children. Empty when missing or not a directory.
+
+        ``singleton_ttl`` is forwarded to child path construction so
+        backends backed by :class:`Singleton` can opt the listed
+        children out of the per-class ``_INSTANCES`` cache. The
+        default ``False`` mirrors the contract on hot listing call
+        sites: an ``iterdir`` of N entries pays at most one Python
+        allocation per child, with nothing pinned in the bounded
+        singleton cache. Callers that want listing children to share
+        identity with later constructor calls pass ``...`` (class
+        default TTL), ``None`` (process lifetime), or a number of
+        seconds. Backends whose children are not :class:`Singleton`
+        accept and ignore the kwarg.
+        """
 
     @abstractmethod
     def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
@@ -188,7 +235,33 @@ class Path(Holder, os.PathLike, ABC):
 
     @property
     def size(self) -> int:
+        # Fast path: a seeded :class:`IOStats` (from a listing entry
+        # or a previous probe) skips the per-call backend round trip.
+        cached = self._stat_cached_fresh()
+        if cached is not None:
+            return int(cached.size)
         return int(self._stat().size)
+
+    def _stat_cached_fresh(self) -> "IOStats | None":
+        """Return the cached :class:`IOStats` when still inside its TTL.
+
+        ``None`` when the slot is empty *or* the entry has expired
+        past :attr:`stat_cache_ttl`. Subclasses that always want a
+        fresh probe (e.g. test scaffolding) override
+        :attr:`stat_cache_ttl` to ``0`` so this method always returns
+        ``None``.
+        """
+        cached = self._stat_cached
+        if cached is None:
+            return None
+        ttl = self.stat_cache_ttl
+        if ttl is None:
+            return cached
+        if ttl <= 0:
+            return None
+        if (time.monotonic() - self._stat_cached_at) <= ttl:
+            return cached
+        return None
 
     def _read_mv(self, n: int, pos: int) -> memoryview:
         bio = self._bread(n, pos, Mode.READ_ONLY)
@@ -233,24 +306,69 @@ class Path(Holder, os.PathLike, ABC):
     # ==================================================================
 
     def exists(self) -> bool:
+        cached = self._stat_cached_fresh()
+        if cached is not None:
+            return cached.kind != IOKind.MISSING
         return self._stat().kind != IOKind.MISSING
 
     def is_file(self) -> bool:
+        cached = self._stat_cached_fresh()
+        if cached is not None:
+            return cached.kind == IOKind.FILE
         return self._stat().kind == IOKind.FILE
 
     def is_dir(self) -> bool:
+        cached = self._stat_cached_fresh()
+        if cached is not None:
+            return cached.kind == IOKind.DIRECTORY
         return self._stat().kind == IOKind.DIRECTORY
 
     @property
     def mtime(self) -> float:
+        cached = self._stat_cached_fresh()
+        if cached is not None:
+            return float(cached.mtime or 0.0) if cached.kind != IOKind.MISSING else 0.0
         s = self._stat()
         return float(s.mtime or 0.0) if s.kind != IOKind.MISSING else 0.0
 
-    def iterdir(self) -> Iterator["Path"]:
-        yield from self._ls(recursive=False)
+    def _seed_stat_cache(self, stats: IOStats) -> None:
+        """Pre-populate :attr:`_stat_cached` with a known :class:`IOStats`.
 
-    def ls(self, *, recursive: bool = False) -> Iterator["Path"]:
-        yield from self._ls(recursive=recursive)
+        Useful for backends that learn metadata as a side-effect of a
+        listing (S3 ``ListObjectsV2`` returns size + mtime per object,
+        Databricks ``Files.list_directory_contents`` returns
+        ``is_directory`` + ``file_size``, ``os.scandir`` exposes
+        ``is_dir`` / ``is_file`` cheaply) or a read / write where the
+        response body's length IS the new size. The next
+        :meth:`size` / :meth:`exists` / :meth:`is_file` / :meth:`is_dir`
+        / :attr:`mtime` call collapses to a local hit.
+        """
+        self._stat_cached = stats
+        self._stat_cached_at = time.monotonic()
+
+    def invalidate_singleton(self, remove_global: bool = True) -> None:
+        """Drop the cached :class:`IOStats` *and* pop self from
+        ``_INSTANCES``. Single canonical invalidator for paths.
+
+        Mutating ops (writes, deletes) call this so the next read on
+        the same logical path picks up fresh state. Subclasses with
+        their own caches (schema, table info, column lists) override
+        and chain ``super().invalidate_singleton(...)``.
+        """
+        self._stat_cached = None
+        self._stat_cached_at = 0.0
+        super().invalidate_singleton(remove_global=remove_global)
+
+    def iterdir(self, *, singleton_ttl: Any = False) -> Iterator["Path"]:
+        yield from self._ls(recursive=False, singleton_ttl=singleton_ttl)
+
+    def ls(
+        self,
+        *,
+        recursive: bool = False,
+        singleton_ttl: Any = False,
+    ) -> Iterator["Path"]:
+        yield from self._ls(recursive=recursive, singleton_ttl=singleton_ttl)
 
     def mkdir(self, parents: bool = True, exist_ok: bool = True) -> "Path":
         self._mkdir(parents=parents, exist_ok=exist_ok)

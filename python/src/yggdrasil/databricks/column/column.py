@@ -181,5 +181,5 @@ class Column:
             "columns", self.entity_name,
         )
         object.__setattr__(self, "name", new_name)
-        self.table._invalidate_stat_cache(remove_global=True)
+        self.table.invalidate_singleton(remove_global=True)
         return self

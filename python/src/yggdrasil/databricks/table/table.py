@@ -1180,8 +1180,14 @@ class Table(DatabricksResource, DatabricksPath):
         if not self.exists:
             raise NotImplementedError("Table is a read-only resource")
 
-    def _ls(self, recursive: bool = False) -> Iterator["Path"]:
-        return
+    def _ls(
+        self,
+        recursive: bool = False,
+        *,
+        singleton_ttl: Any = False,
+    ) -> Iterator["Path"]:
+        del recursive, singleton_ttl
+        return iter(())
 
     def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
         self.delete(wait=wait, raise_error=not missing_ok)
@@ -1645,12 +1651,12 @@ class Table(DatabricksResource, DatabricksPath):
     # Cache management
     # =========================================================================
 
-    def _invalidate_stat_cache(self, remove_global: bool = False) -> None:
+    def invalidate_singleton(self, remove_global: bool = False) -> None:
         object.__setattr__(self, "_infos", None)
         object.__setattr__(self, "_infos_fetched_at", None)
         object.__setattr__(self, "_columns", None)
         self._invalidate_entity_tag_cache()
-        super()._invalidate_stat_cache(remove_global=remove_global)
+        super().invalidate_singleton(remove_global=remove_global)
 
     def _invalidate_entity_tag_cache(self) -> None:
         """Drop cached tag lists for this table and every cached column."""
@@ -2070,7 +2076,7 @@ class Table(DatabricksResource, DatabricksPath):
             executed = True
 
         if executed:
-            self._invalidate_stat_cache(remove_global=True)
+            self.invalidate_singleton(remove_global=True)
 
         return self
 
@@ -2282,7 +2288,7 @@ class Table(DatabricksResource, DatabricksPath):
             else:
                 raise
 
-        self._invalidate_stat_cache(remove_global=True)
+        self.invalidate_singleton(remove_global=True)
 
         # Apply remaining constraints (FK / CHECK) via the SDK post-create.
         # Inline PK was already emitted in DDL — skip it here.
@@ -2572,11 +2578,11 @@ class Table(DatabricksResource, DatabricksPath):
                     "Table.api_create: table=%s already exists — soft-resetting cache",
                     self.full_name(),
                 )
-                self._invalidate_stat_cache(remove_global=True)
+                self.invalidate_singleton(remove_global=True)
                 return self
             raise
 
-        self._invalidate_stat_cache(remove_global=True)
+        self.invalidate_singleton(remove_global=True)
 
         # The SDK endpoint doesn't accept a comment — set it via ALTER
         # TABLE so the behaviour matches sql_create (which embeds COMMENT
@@ -2744,7 +2750,7 @@ class Table(DatabricksResource, DatabricksPath):
             else:
                 raise
 
-        self._invalidate_stat_cache(remove_global=True)
+        self.invalidate_singleton(remove_global=True)
 
         if tags:
             self.set_tags(tags)
@@ -2861,7 +2867,7 @@ class Table(DatabricksResource, DatabricksPath):
         else:
             Job.make(self.delete).fire_and_forget()
 
-        self._invalidate_stat_cache(remove_global=True)
+        self.invalidate_singleton(remove_global=True)
         return self
 
     # =========================================================================
@@ -2929,7 +2935,7 @@ class Table(DatabricksResource, DatabricksPath):
         self.sql.execute(
             f"ALTER {keyword} {self.full_name(safe=True)} RENAME TO {rename_to}"
         )
-        self._invalidate_stat_cache(remove_global=True)
+        self.invalidate_singleton(remove_global=True)
         self.schema_name = target_schema
         self.table_name = target_table
         return self

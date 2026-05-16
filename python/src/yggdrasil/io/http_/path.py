@@ -179,15 +179,20 @@ class HTTPPath(RemotePath):
         resp = self.session.send(req)
         if resp.status_code >= 400:
             resp.raise_for_status()
-        self._invalidate_stat_cache()
+        self.invalidate_singleton()
         return len(body)
 
     # ==================================================================
     # Filesystem surface — HTTP has no directory listing
     # ==================================================================
 
-    def _ls(self, recursive: bool = False) -> Iterator["HTTPPath"]:
-        del recursive
+    def _ls(
+        self,
+        recursive: bool = False,
+        *,
+        singleton_ttl: Any = False,
+    ) -> Iterator["HTTPPath"]:
+        del recursive, singleton_ttl
         return iter(())
 
     def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
@@ -209,7 +214,7 @@ class HTTPPath(RemotePath):
                 raise FileNotFoundError(self.url.to_string())
         elif resp.status_code >= 400:
             resp.raise_for_status()
-        self._invalidate_stat_cache()
+        self.invalidate_singleton()
 
     def _remove_dir(
         self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True

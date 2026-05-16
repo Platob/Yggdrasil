@@ -7,7 +7,7 @@ subclasses no longer reimplement these.
 
 Subclasses implement :meth:`_stat_uncached`; the base wraps it via
 :meth:`_stat` and stores the result on ``self._stat_cached``.
-Mutating ops (writes, deletes) must call :meth:`_invalidate_stat_cache`
+Mutating ops (writes, deletes) must call :meth:`invalidate_singleton`
 so follow-up reads see fresh metadata. Sister of
 :class:`yggdrasil.io.fs.local_path.LocalPath`: same :class:`Holder`
 substrate, different backing.
@@ -18,8 +18,10 @@ from __future__ import annotations
 import logging
 import time
 from abc import abstractmethod
+from threading import RLock
 from typing import Any, ClassVar
 
+from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.io.path.path import Path
 
@@ -44,15 +46,37 @@ class RemotePath(Path):
     Subclasses pick a ``scheme`` (``s3``, ``dbfs``, …), implement the
     five :class:`Holder` primitives against their network client, and
     override :meth:`_stat_uncached` for the metadata probe. Everything
-    else (predicate pins, stat caching) is inherited from this base.
+    else (predicate pins, stat caching, singleton identity caching)
+    is inherited from this base.
+
+    ``RemotePath`` activates the :class:`Singleton` machinery that
+    :class:`Holder` ships deactivated by default: two callers asking
+    for the same URL (and client, where the subclass keys on it)
+    inside the 5-minute window share the live instance — same stat
+    cache, same lazily-bound transport. ``iterdir``-style hot loops
+    pass ``singleton_ttl=False`` to keep the bounded cache from
+    filling with short-lived children; long-lived consumers that
+    want stronger sharing pass ``singleton_ttl=None``.
     """
 
+    # Bound the freshness window for both probe-populated and
+    # listing-seeded entries. ``Path`` ships the slot at ``None``
+    # (live forever) since LocalPath / Memory don't need a TTL;
+    # remote backends pay 5-minute round trips and want a window
+    # that beats credential / consistency drift.
     stat_cache_ttl: ClassVar["float | None"] = _STAT_CACHE_TTL
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self._stat_cached: IOStats | None = None
-        self._stat_cached_at: float = 0.0
+    # Activate the :class:`Singleton` cache for every concrete remote
+    # backend: 5-minute default TTL, bounded at 10 000 entries as
+    # defence-in-depth against accidental cardinality explosions.
+    # The default ``_singleton_key`` includes ``cls`` so S3Path /
+    # DatabricksPath / future Azure paths can share one ``_INSTANCES``
+    # dict without colliding.
+    _SINGLETON_TTL: ClassVar[Any] = _STAT_CACHE_TTL
+    _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
+        default_ttl=_STAT_CACHE_TTL, max_size=10_000,
+    )
+    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
 
     # ------------------------------------------------------------------
     # Backing-shape predicates
@@ -85,13 +109,7 @@ class RemotePath(Path):
         an empty schema. When the cache is warm the cheap ``size``
         read fires unchanged.
         """
-        cached = self._stat_cached
-        if cached is None:
-            return False
-        ttl = self.stat_cache_ttl
-        if ttl is None:
-            return True
-        return (time.monotonic() - self._stat_cached_at) <= ttl
+        return self._stat_cached_fresh() is not None
 
     def _stat(self) -> IOStats:
         """Cached :class:`IOStats` probe.
@@ -103,35 +121,22 @@ class RemotePath(Path):
         result. Subclasses override :meth:`_stat_uncached`, never
         this.
         """
-        cached = self._stat_cached
+        cached = self._stat_cached_fresh()
         if cached is not None:
-            ttl = self.stat_cache_ttl
-            if ttl is None or (time.monotonic() - self._stat_cached_at) <= ttl:
-                return cached
+            return cached
         result = self._stat_uncached()
-        self._stat_cached = result
-        self._stat_cached_at = time.monotonic()
+        self._seed_stat_cache(result)
         return result
 
     @abstractmethod
     def _stat_uncached(self) -> IOStats:
         """Backend-specific :class:`IOStats` probe. One network call."""
 
-    def _invalidate_stat_cache(self, remove_global: bool = True) -> None:
-        """Drop this path's cached entry. Call after writes / deletes.
-
-        ``remove_global`` is accepted for backward compatibility with
-        the legacy singleton-cache invalidation path; it is now a
-        no-op since :class:`RemotePath` no longer maintains a
-        process-wide instance cache.
-        """
-        del remove_global
-        self._stat_cached = None
-        self._stat_cached_at = 0.0
-
+    def invalidate_singleton(self, remove_global: bool = True) -> None:
+        """Drop this path's cached :class:`IOStats`, schema, and
+        ``_INSTANCES`` entry — see :meth:`Path.invalidate_singleton`."""
+        super().invalidate_singleton(remove_global=remove_global)
         self._unpersist_schema()
-
-        logger.debug(f"Invalidated stat cache for {self!r}")
 
     # ------------------------------------------------------------------
     # Resize is a no-op on remote backends — the upload IS the resize
@@ -192,20 +197,3 @@ class RemotePath(Path):
         if existing is not None and existing.kind != IOKind.MISSING:
             return
         ancestor._seed_stat_cache(IOStats(kind=IOKind.DIRECTORY))
-
-    def _seed_stat_cache(self, stats: IOStats) -> None:
-        """Pre-populate the cache with a known :class:`IOStats`.
-
-        Useful for backends that learn metadata as a side-effect of a
-        listing (S3 ``ListObjectsV2`` returns size + mtime per object,
-        Databricks ``dbutils.fs.ls`` returns size) or a read/write
-        (the response body's length IS the file size). Stamps the
-        cache time so the entry observes the same TTL budget as one
-        produced by :meth:`_stat_uncached`. Passing the existing
-        ``self._stat_cached`` (after an in-place mutation) is the
-        canonical way to refresh the TTL — the assignment is a no-op,
-        the timestamp moves. The next :meth:`_stat` call on the
-        warmed path is a local hit.
-        """
-        self._stat_cached = stats
-        self._stat_cached_at = time.monotonic()

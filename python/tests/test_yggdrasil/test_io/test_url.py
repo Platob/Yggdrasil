@@ -58,6 +58,69 @@ class TestFromStr:
         assert u.fragment == "a=1&b=2"
 
 
+class TestTrailingSlashPreserved:
+    """A trailing ``/`` on the path tells filesystems / S3 / blob
+    backends "this is a directory / prefix, not a leaf". Parsing must
+    not silently strip it — every URL listing / staging / mkdir helper
+    keys off the trailing-slash distinction.
+    """
+
+    def test_https_dir_path_keeps_trailing_slash(self):
+        u = URL.from_str("https://example.com/foo/")
+        assert u.path == "/foo/"
+        assert u.to_string() == "https://example.com/foo/"
+
+    def test_https_nested_dir_path_keeps_trailing_slash(self):
+        u = URL.from_str("https://example.com/a/b/c/")
+        assert u.path == "/a/b/c/"
+        assert u.to_string().endswith("/a/b/c/")
+
+    def test_https_root_keeps_trailing_slash(self):
+        u = URL.from_str("https://example.com/")
+        assert u.path == "/"
+        assert u.to_string() == "https://example.com/"
+
+    def test_https_no_trailing_slash_stays_unsuffixed(self):
+        u = URL.from_str("https://example.com/foo")
+        assert u.path == "/foo"
+        assert not u.path.endswith("//")
+        assert u.to_string() == "https://example.com/foo"
+
+    def test_s3_prefix_keeps_trailing_slash(self):
+        u = URL.from_str("s3://bucket/folder/")
+        assert u.path == "/folder/"
+        assert u.to_string() == "s3://bucket/folder/"
+
+    def test_s3_root_keeps_trailing_slash(self):
+        u = URL.from_str("s3://bucket/")
+        assert u.path == "/"
+        assert u.to_string() == "s3://bucket/"
+
+    def test_file_url_dir_keeps_trailing_slash(self):
+        u = URL.from_str("file:///tmp/dir/")
+        assert u.path == "/tmp/dir/"
+        assert u.to_string() == "file:///tmp/dir/"
+
+    def test_dbfs_volume_dir_keeps_trailing_slash(self):
+        u = URL.from_str("dbfs://Volumes/cat/sch/vol/")
+        assert u.path.endswith("/")
+
+    def test_query_does_not_swallow_trailing_slash(self):
+        u = URL.from_str("https://example.com/foo/?x=1")
+        assert u.path == "/foo/"
+        assert u.query == "x=1"
+
+    def test_fragment_does_not_swallow_trailing_slash(self):
+        u = URL.from_str("https://example.com/foo/#frag")
+        assert u.path == "/foo/"
+        assert u.fragment == "frag"
+
+    def test_roundtrip_preserves_trailing_slash(self):
+        original = "s3://bucket/some/dir/"
+        u = URL.from_str(original)
+        assert URL.from_str(u.to_string()).path == "/some/dir/"
+
+
 class TestFromPathlib:
     def test_pathlib_path_becomes_file_url(self, tmp_path):
         u = URL.from_pathlib(tmp_path)

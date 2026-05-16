@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Union, Any, ClassVar, IO, Iterable, Iterator
 
 import pyarrow as pa
 
+from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.tabular.base import O, Tabular
 
@@ -131,7 +132,7 @@ def _resolve_subclass(
     return Memory
 
 
-class Holder(URLBased, Tabular[O], Disposable):
+class Holder(Singleton, URLBased, Tabular[O], Disposable):
     """Position-addressable byte holder + :class:`Disposable` lifecycle
     + :class:`Tabular` view of its bytes.
 
@@ -252,7 +253,21 @@ class Holder(URLBased, Tabular[O], Disposable):
                 **kwargs,
             )
 
-        return super().__new__(cls)
+        # Forward construction args to :class:`Singleton.__new__` so the
+        # default ``_singleton_key`` (or a subclass override) can read
+        # ``url`` / ``data`` / ``client`` off them. Concrete leaves that
+        # opt out of caching (``_SINGLETON_TTL = ...`` on
+        # :class:`Holder` itself) short-circuit before this matters.
+        return super().__new__(
+            cls,
+            data=data,
+            stat=stat,
+            scheme=scheme,
+            url=url,
+            binary=binary,
+            path=path,
+            **kwargs,
+        )
 
     def __init__(
         self,

@@ -1690,7 +1690,7 @@ class _ArrowOutputStreamContext:
                         # invalidate the holder's cached stat — the next
                         # ``size`` / ``mtime`` probe re-reads from disk.
                         invalidate = getattr(
-                            holder, "_invalidate_stat_cache", None,
+                            holder, "invalidate_singleton", None,
                         )
                         if callable(invalidate):
                             invalidate()
@@ -1728,7 +1728,7 @@ class _ArrowOutputStreamContext:
                 pass
             holder = self._parent._holder
             if holder is not None:
-                invalidate = getattr(holder, "_invalidate_stat_cache", None)
+                invalidate = getattr(holder, "invalidate_singleton", None)
                 if callable(invalidate):
                     invalidate()
             return
