@@ -14,6 +14,8 @@ import unittest
 from typing import Optional
 
 from yggdrasil.dataclasses.safe_function import (
+    _annotation_to_str,
+    _canonical_module_path,
     _expand_alias,
     _resolve_str_annotation,
     check_function_args,
@@ -758,6 +760,114 @@ class TestSafeFunctionMisc(unittest.TestCase):
         wrapped = checkargs(lambda x, y: x + y)
         self.assertEqual(wrapped("a", "b"), "ab")
         self.assertEqual(wrapped(1, 2), 3)
+
+
+class TestCanonicalModulePath(unittest.TestCase):
+    """Non-builtin types render with their shortest canonical import path."""
+
+    def test_builtin_returns_empty(self):
+        self.assertEqual(_canonical_module_path(int), "")
+        self.assertEqual(_canonical_module_path(str), "")
+        self.assertEqual(_canonical_module_path(list), "")
+
+    def test_stdlib_module(self):
+        self.assertEqual(_canonical_module_path(dt.date), "datetime")
+        self.assertEqual(_canonical_module_path(dt.datetime), "datetime")
+
+    def test_pathlib_path(self):
+        from pathlib import Path
+        self.assertEqual(_canonical_module_path(Path), "pathlib")
+
+    @unittest.skipUnless(_have("pa"), "pyarrow not installed")
+    def test_pyarrow_table_collapses_to_top_level(self):
+        # Real __module__ is ``pyarrow.lib``; we want the top-level
+        # ``pyarrow.Table`` users actually type.
+        self.assertEqual(_canonical_module_path(pa.Table), "pyarrow")
+        self.assertEqual(_canonical_module_path(pa.RecordBatch), "pyarrow")
+        self.assertEqual(_canonical_module_path(pa.Array), "pyarrow")
+
+    @unittest.skipUnless(_have("pl"), "polars not installed")
+    def test_polars_dataframe_collapses_to_top_level(self):
+        # Real __module__ is ``polars.dataframe.frame``.
+        self.assertEqual(_canonical_module_path(pl.DataFrame), "polars")
+        self.assertEqual(_canonical_module_path(pl.LazyFrame), "polars")
+        self.assertEqual(_canonical_module_path(pl.Series), "polars")
+
+    @unittest.skipUnless(_have("pd"), "pandas not installed")
+    def test_pandas_dataframe_collapses_to_top_level(self):
+        # Real __module__ is ``pandas.core.frame``.
+        self.assertEqual(_canonical_module_path(pd.DataFrame), "pandas")
+        self.assertEqual(_canonical_module_path(pd.Series), "pandas")
+
+
+class TestAnnotationToStr(unittest.TestCase):
+    """:func:`_annotation_to_str` renders builtins bare, non-builtins fully-qualified."""
+
+    def test_builtin_types_render_bare_name(self):
+        self.assertEqual(_annotation_to_str(int), "int")
+        self.assertEqual(_annotation_to_str(str), "str")
+        self.assertEqual(_annotation_to_str(bool), "bool")
+        self.assertEqual(_annotation_to_str(list), "list")
+
+    def test_stdlib_types_render_with_module(self):
+        self.assertEqual(_annotation_to_str(dt.date), "datetime.date")
+        self.assertEqual(_annotation_to_str(dt.datetime), "datetime.datetime")
+
+    @unittest.skipUnless(_have("pa") and _have("pl") and _have("pd"),
+                         "pa / pl / pd all required")
+    def test_dataframe_types_render_with_top_level_module(self):
+        self.assertEqual(_annotation_to_str(pa.Table), "pyarrow.Table")
+        self.assertEqual(_annotation_to_str(pl.DataFrame), "polars.DataFrame")
+        self.assertEqual(_annotation_to_str(pd.DataFrame), "pandas.DataFrame")
+
+    def test_typing_generic_round_trips_via_repr(self):
+        from typing import Optional, List
+        self.assertEqual(_annotation_to_str(Optional[int]), "typing.Optional[int]")
+        self.assertEqual(_annotation_to_str(List[int]), "typing.List[int]")
+
+    def test_none_and_empty_become_none(self):
+        self.assertIsNone(_annotation_to_str(None))
+        self.assertIsNone(_annotation_to_str(inspect.Parameter.empty))
+
+    def test_string_annotation_passes_through(self):
+        # PEP 563 strings the resolver couldn't crack stay verbatim.
+        self.assertEqual(_annotation_to_str("Unresolved"), "Unresolved")
+
+
+@unittest.skipUnless(_have("pa") and _have("pl") and _have("pd"),
+                     "pa / pl / pd all required")
+class TestDescribeSignatureCanonicalPaths(unittest.TestCase):
+    """End-to-end: signature metadata for a mixed-engine function carries full paths."""
+
+    def test_format_signature_uses_canonical_paths(self):
+        def f(
+            t: pa.Table,
+            df: pl.DataFrame,
+            pdf: pd.DataFrame,
+            cutoff: dt.date,
+            n: int,
+        ) -> pa.Table:
+            return t
+
+        # qualname carries the enclosing test scope; assert on the
+        # parameter / return shape rather than the leading qualname.
+        rendered = format_signature(describe_signature(f))
+        self.assertTrue(
+            rendered.endswith(
+                "(t: pyarrow.Table, df: polars.DataFrame, pdf: pandas.DataFrame, "
+                "cutoff: datetime.date, n: int) -> pyarrow.Table"
+            ),
+            rendered,
+        )
+
+    def test_describe_signature_metadata_carries_canonical_paths(self):
+        def f(t: pa.Table, n: int) -> pl.DataFrame:
+            return pl.from_arrow(t)
+        meta = describe_signature(f)
+        params = {p["name"]: p for p in meta["parameters"]}
+        self.assertEqual(params["t"]["annotation"], "pyarrow.Table")
+        self.assertEqual(params["n"]["annotation"], "int")
+        self.assertEqual(meta["return"], "polars.DataFrame")
 
 
 if __name__ == "__main__":

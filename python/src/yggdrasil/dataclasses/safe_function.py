@@ -141,8 +141,53 @@ def _resolve_str_annotation(s: str, func_globals: Optional[dict[str, Any]] = Non
 # Signature description (small, JSON-friendly)
 # ---------------------------------------------------------------------------
 
+def _canonical_module_path(cls: type) -> str:
+    """Return the shortest module path that re-exposes *cls* by qualname.
+
+    Type ``__module__`` often points at the internal C-extension /
+    private submodule (``pyarrow.lib.Table``,
+    ``polars.dataframe.frame.DataFrame``,
+    ``pandas.core.frame.DataFrame``) rather than the canonical import
+    path users actually type (``pyarrow.Table``, ``polars.DataFrame``,
+    ``pandas.DataFrame``). Walk the dotted module hierarchy from the
+    shortest prefix down and pick the first one whose attribute
+    lookup along ``__qualname__`` yields the same class. Falls back to
+    ``cls.__module__`` when nothing matches.
+    """
+    mod = getattr(cls, "__module__", None)
+    if not mod or mod == "builtins":
+        return ""
+    qualname = getattr(cls, "__qualname__", None) or getattr(cls, "__name__", None)
+    if not qualname:
+        return mod
+    parts = mod.split(".")
+    for i in range(1, len(parts) + 1):
+        candidate = ".".join(parts[:i])
+        try:
+            module = importlib.import_module(candidate)
+        except Exception:
+            continue
+        obj: Any = module
+        for seg in qualname.split("."):
+            obj = getattr(obj, seg, None)
+            if obj is None:
+                break
+        if obj is cls:
+            return candidate
+    return mod
+
+
 def _annotation_to_str(ann: Any) -> Optional[str]:
-    """Render a parameter annotation as a short, JSON-friendly string."""
+    """Render a parameter annotation as a short, JSON-friendly string.
+
+    Builtins (``int`` / ``str`` / ``bool`` / ``list`` / …) render as
+    their bare name. Non-builtin classes render with their full
+    canonical module path via :func:`_canonical_module_path`, so
+    ``pyarrow.Table`` / ``polars.DataFrame`` / ``pandas.DataFrame``
+    survive into the staged task metadata as the dotted import names
+    a reader would type. PEP 563 strings and typing generics
+    (``Optional[int]``, ``list[int]``) round-trip via :func:`repr`.
+    """
     if ann is inspect.Parameter.empty or ann is None:
         return None
     if isinstance(ann, str):
@@ -150,8 +195,9 @@ def _annotation_to_str(ann: Any) -> Optional[str]:
         # forms arrive as a plain string already — keep them verbatim.
         return ann
     if isinstance(ann, type):
-        mod = getattr(ann, "__module__", "builtins")
-        return ann.__qualname__ if mod == "builtins" else f"{mod}.{ann.__qualname__}"
+        qualname = getattr(ann, "__qualname__", None) or ann.__name__
+        mod = _canonical_module_path(ann)
+        return qualname if not mod else f"{mod}.{qualname}"
     return repr(ann)
 
 
