@@ -285,6 +285,16 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
 
         session = spark_session or self.statement.spark_session
         if session is None:
+            # Give the bound executor first crack at materialising a
+            # session — subclasses like
+            # :class:`ServerlessClusterStatementExecutor` route
+            # through ``client.spark()`` here so the right Spark
+            # Connect endpoint (serverless / classic) is picked
+            # before the generic :meth:`PyEnv.spark_session` fallback.
+            resolver = getattr(self.executor, "resolve_session", None)
+            if resolver is not None:
+                session = resolver(self.statement, create=True)
+        if session is None:
             session = PyEnv.spark_session(create=True, import_error=True)
 
         try:

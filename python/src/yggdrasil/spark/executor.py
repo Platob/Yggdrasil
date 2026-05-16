@@ -125,22 +125,36 @@ class SparkStatementExecutor(
     # -------------------------------------------------------------------------
 
     def _submit_statement(self, statement: SparkPreparedStatement, start: bool = True) -> SparkStatementResult:
-        """Build a :class:`SparkStatementResult` and run it eagerly.
+        """Build a :class:`SparkStatementResult` and optionally run it.
 
-        Spark execution is synchronous; the result handle is terminal by
-        the time it returns.  Errors during ``session.sql`` are stored on
-        the result (``result.failed`` becomes True); the base executor's
-        ``_execute`` decides whether to raise based on its options.
+        Spark execution is synchronous; when *start* is True the result
+        handle comes back terminal — errors during ``session.sql`` are
+        captured on the result (``result.failed`` becomes True) and the
+        base executor's ``_execute`` decides whether to re-raise. When
+        *start* is False the result is returned in its idle state so
+        the caller (typically :class:`StatementBatch`) can drive the
+        ``start`` / ``wait`` lifecycle itself.
+
+        Plumbs a :class:`SparkSession` onto the statement up front via
+        :meth:`resolve_session` so subclasses that build their session
+        lazily (e.g. :class:`ServerlessClusterStatementExecutor` going
+        through ``client.spark()``) get a chance to install their own
+        before :meth:`SparkStatementResult.start` falls back to
+        :meth:`PyEnv.spark_session`.
         """
-        # If the statement didn't carry a session and the executor has one,
-        # plumb it onto the statement so SparkStatementResult.start can
-        # read it without re-running session resolution.
-        if statement.spark_session is None and self.spark_session is not None:
-            statement.spark_session = self.spark_session
+        if statement.spark_session is None:
+            session = self.resolve_session(statement, create=False)
+            if session is None and self.spark_session is not None:
+                session = self.spark_session
+            if session is not None:
+                statement.spark_session = session
+
+        result = self._STATEMENT_RESULT_CLASS(statement=statement, executor=self)
+        if not start:
+            return result
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("Spark executing:\n%s", statement.text)
-        result = self._STATEMENT_RESULT_CLASS(statement=statement, executor=self)
         # raise_error=False: errors are recorded on the result; the base
         # executor's _execute calls raise_for_status afterwards if needed.
         result.start(wait=False, raise_error=False)
