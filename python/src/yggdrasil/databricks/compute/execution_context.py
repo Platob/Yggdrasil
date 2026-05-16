@@ -352,7 +352,12 @@ class ExecutionContext:
     context_key: Optional[str] = dc.field(default=None, repr=False, compare=False, hash=False)
     language: Optional[Language] = dc.field(default=None, repr=False, compare=False, hash=False)
     temporary: bool = dc.field(default=False, repr=False, compare=False, hash=False)
-    close_after: float | None = dc.field(default=1800.0, repr=False, compare=False, hash=False)
+    # Idle-eviction window. The background reaper closes pooled
+    # contexts that go this many seconds without a command — actual
+    # remote-handle cleanup, not just cache forgetting. 15 minutes
+    # keeps the REPL warm across a multi-step job while still freeing
+    # the cluster-side context when work pauses.
+    close_after: float | None = dc.field(default=900.0, repr=False, compare=False, hash=False)
 
     _remote_metadata: Optional[RemoteMetadata] = dc.field(
         default=None, init=False, repr=False, compare=False, hash=False,
@@ -465,7 +470,7 @@ class ExecutionContext:
         context_key: str | None = None,
         temporary: bool = False,
         reset: bool = False,
-        close_after: float | None = 1800.0,
+        close_after: float | None = 900.0,
     ) -> "ExecutionContext":
         """Return a pooled execution context, creating it if needed."""
         key = cls._pool_key(
