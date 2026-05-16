@@ -34,11 +34,9 @@ wired to a workspace-shaped mock). There is no alternate
 
 from __future__ import annotations
 
-from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Optional, Tuple
 
 from yggdrasil.data.enums import Scheme
-from yggdrasil.dataclasses import ExpiringDict, Singleton
 from yggdrasil.io.path import RemotePath
 from yggdrasil.io.path._retry import retry_sdk_call
 from yggdrasil.io.url import URL
@@ -249,7 +247,7 @@ def _resolve_databricks_subclass(
 # ===========================================================================
 
 
-class DatabricksPath(Singleton, RemotePath):
+class DatabricksPath(RemotePath):
     """Abstract :class:`RemotePath` for Databricks namespaces.
 
     Registers under :attr:`Scheme.DBFS` (the ``dbfs://`` family root)
@@ -261,15 +259,9 @@ class DatabricksPath(Singleton, RemotePath):
     :class:`VolumePath`, ``/Workspace/...`` → :class:`WorkspacePath`,
     everything else → :class:`DBFSPath`).
 
-    Inherits :class:`Singleton` with a 300-second default TTL on
-    every constructed instance: two callers asking for the same URL
-    inside that window share the live :class:`Holder` (same cached
-    stat, same lazy-bound client) without growing an unbounded cache
-    over the process lifetime. ``iterdir``-style hot loops naturally
-    age out their entries; long-lived consumers that want stronger
-    sharing pass ``singleton_ttl=None`` for process-lifetime caching.
-    The cache is also bounded at 10 000 entries as a defense-in-depth
-    against accidental cardinality explosions.
+    Singleton identity caching, the 5-minute default TTL, and the
+    bounded ``_INSTANCES`` dict all come from :class:`RemotePath` —
+    see its docstring for the policy.
     """
 
     scheme: ClassVar[Scheme] = Scheme.DBFS
@@ -278,22 +270,6 @@ class DatabricksPath(Singleton, RemotePath):
     #: (``/dbfs/``, ``/Workspace/``, ``/Volumes/``). Empty on the
     #: abstract base; concrete subclasses override.
     namespace_prefix: ClassVar[Optional[str]] = None
-
-    # Bounded singleton cache with a 5-minute default TTL — keeps
-    # ``iterdir``-style transient paths from leaking, while still
-    # collapsing repeat lookups within the window onto one instance.
-    _SINGLETON_TTL: ClassVar[Any] = 300.0
-    _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
-        default_ttl=300.0, max_size=10_000,
-    )
-    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
-
-    # Stat caches and the lazy ``_volume`` / ``_session`` slots are
-    # subclass-specific; the base only carries the live SDK client and
-    # the optional retry-sleep callback.
-    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
-        "_stat_cached", "_stat_cached_at",
-    })
 
     @classmethod
     def _singleton_key(

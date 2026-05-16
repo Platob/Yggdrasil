@@ -18,8 +18,10 @@ from __future__ import annotations
 import logging
 import time
 from abc import abstractmethod
+from threading import RLock
 from typing import Any, ClassVar
 
+from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.io.path.path import Path
 
@@ -44,10 +46,37 @@ class RemotePath(Path):
     Subclasses pick a ``scheme`` (``s3``, ``dbfs``, …), implement the
     five :class:`Holder` primitives against their network client, and
     override :meth:`_stat_uncached` for the metadata probe. Everything
-    else (predicate pins, stat caching) is inherited from this base.
+    else (predicate pins, stat caching, singleton identity caching)
+    is inherited from this base.
+
+    ``RemotePath`` activates the :class:`Singleton` machinery that
+    :class:`Holder` ships deactivated by default: two callers asking
+    for the same URL (and client, where the subclass keys on it)
+    inside the 5-minute window share the live instance — same stat
+    cache, same lazily-bound transport. ``iterdir``-style hot loops
+    pass ``singleton_ttl=False`` to keep the bounded cache from
+    filling with short-lived children; long-lived consumers that
+    want stronger sharing pass ``singleton_ttl=None``.
     """
 
     stat_cache_ttl: ClassVar["float | None"] = _STAT_CACHE_TTL
+
+    # Activate the :class:`Singleton` cache for every concrete remote
+    # backend: 5-minute default TTL, bounded at 10 000 entries as
+    # defence-in-depth against accidental cardinality explosions.
+    # The default ``_singleton_key`` includes ``cls`` so S3Path /
+    # DatabricksPath / future Azure paths can share one ``_INSTANCES``
+    # dict without colliding.
+    _SINGLETON_TTL: ClassVar[Any] = _STAT_CACHE_TTL
+    _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
+        default_ttl=_STAT_CACHE_TTL, max_size=10_000,
+    )
+    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
+
+    # Stat caches are per-process, not part of the pickled identity.
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
+        "_stat_cached", "_stat_cached_at",
+    })
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)

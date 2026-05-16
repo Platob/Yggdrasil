@@ -47,12 +47,11 @@ Filesystem surface
 from __future__ import annotations
 
 import time
-from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterator, Optional
 
 from yggdrasil.data.enums import Scheme
 from yggdrasil.data.enums.media_type import MediaType
-from yggdrasil.dataclasses import ExpiringDict, Singleton, WaitingConfig
+from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io.path import RemotePath
 from yggdrasil.io.path._retry import retry_sdk_call
 from yggdrasil.io.io_stats import IOStats, IOKind
@@ -70,7 +69,7 @@ __all__ = ["S3Path"]
 # ---------------------------------------------------------------------------
 
 
-class S3Path(Singleton, RemotePath):
+class S3Path(RemotePath):
     """:class:`Path` over an S3 bucket via a boto3-shaped client.
 
     Construction shapes::
@@ -86,20 +85,11 @@ class S3Path(Singleton, RemotePath):
     :class:`unittest.mock.Mock`; production code passes the boto
     client owned by :class:`S3Service`.
 
-    Inherits :class:`Singleton` with a 5-minute default TTL on every
-    constructed instance: two callers asking for the same
-    ``(s3://bucket/key, client)`` pair inside that window share the
-    live :class:`Holder` — same cached ``IOStats`` from
-    :meth:`_stat`, same retry-sleep injection, same lazily-bound boto
-    client — without growing an unbounded cache over the process
-    lifetime. ``iterdir``-style hot loops naturally age out their
-    entries; long-lived consumers that want stronger sharing pass
-    ``singleton_ttl=None`` for process-lifetime caching. The cache
-    is bounded at 10 000 entries as defence-in-depth against
-    accidental cardinality explosions, and the matching
-    ``stat_cache_ttl`` (also 300s) means a hot read after a hot
-    write rides one ``HeadObject`` no matter how many call sites
-    request the same key.
+    Singleton identity caching, the 5-minute default TTL, and the
+    bounded ``_INSTANCES`` dict are inherited from
+    :class:`RemotePath`. The matching ``stat_cache_ttl`` (also 300s)
+    means a hot read after a hot write rides one ``HeadObject`` no
+    matter how many call sites request the same key.
 
     Mutating ops (``put_object`` / ``DeleteObject`` /
     ``DeleteObjects``) call :meth:`_invalidate_stat_cache` before
@@ -111,22 +101,6 @@ class S3Path(Singleton, RemotePath):
 
     #: URL schemes accepted on input; always normalized to ``s3``.
     _ACCEPTED_SCHEMES: ClassVar[frozenset[str]] = frozenset({"s3", "s3a", "s3n"})
-
-    # Bounded singleton cache with a 5-minute default TTL — keeps
-    # ``iterdir``-style transient paths from leaking, while still
-    # collapsing repeat lookups within the window onto one instance.
-    _SINGLETON_TTL: ClassVar[Any] = 300.0
-    _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
-        default_ttl=300.0, max_size=10_000,
-    )
-    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
-
-    # Stat cache + lazy retry hook are the only non-picklable / per-
-    # process slots; everything else lives in the ``__dict__`` the
-    # parent ``RemotePath`` already provides.
-    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
-        "_stat_cached", "_stat_cached_at",
-    })
 
     # ==================================================================
     # Singleton key
