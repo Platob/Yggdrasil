@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
     from yggdrasil.databricks.warehouse import WarehousePreparedStatement
+    from yggdrasil.databricks.jobs.job import Job as DatabricksJob
     from yggdrasil.databricks.table.async_write import AsyncInsert
     from yggdrasil.data.statement import StatementBatch
 
@@ -2956,6 +2957,24 @@ class Table(DatabricksPath):
             spark_session=spark_session,
             return_data=return_data,
             **kwargs,
+        )
+
+    def async_job(self, **overrides: Any) -> "DatabricksJob":
+        """Get-or-create the per-table applier :class:`Job` for async inserts.
+
+        Routes through :meth:`Jobs.get_or_create` with the kwargs
+        produced by :meth:`AsyncInsertJob.settings` — one Databricks
+        Job per ``(catalog, schema, table)`` triple, watching this
+        table's own ``stg_<table>/.sql/async/insert/data/`` folder via
+        a file-arrival trigger. ``**overrides`` flow into
+        :meth:`AsyncInsertJob.settings` for per-deploy knobs (
+        ``notebook_path=``, ``schedule=``, ``file_arrival_trigger=``,
+        ``parameters=``, …).
+        """
+        from .async_job import AsyncInsertJob
+
+        return self.client.jobs.get_or_create(
+            **AsyncInsertJob.settings(self, **overrides)
         )
 
     def async_insert(

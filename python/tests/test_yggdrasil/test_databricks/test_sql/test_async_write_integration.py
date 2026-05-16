@@ -36,7 +36,6 @@ from yggdrasil.databricks.fs import VolumePath
 from yggdrasil.databricks.jobs.job import Job
 from yggdrasil.databricks.jobs.run import JobRun
 from yggdrasil.databricks.sql.engine import SQLEngine
-from yggdrasil.databricks.table.async_job import AsyncInsertJob
 from yggdrasil.databricks.table.async_write import AsyncInsert
 from yggdrasil.databricks.table.table import Table
 from yggdrasil.io.url import URL
@@ -247,18 +246,17 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
         table = self._unique_table("async_trig_url")
         table.ensure_created(self._sample_schema())
 
-        wrapper = AsyncInsertJob.create_or_update(table)
-        # AsyncInsertJob IS-a Job — singleton-cached, full Job surface.
-        assert isinstance(wrapper, Job)
-        assert wrapper.job_id is not None
-        type(self).created_jobs.append(wrapper.job_id)
-        assert wrapper.name == (
+        job = table.async_job()
+        assert isinstance(job, Job)
+        assert job.job_id is not None
+        type(self).created_jobs.append(job.job_id)
+        assert job.name == (
             f"ygg-async-insert-{self.catalog_name}-{self.schema_name}-"
             f"{table.table_name}"
         )
 
-        wrapper.refresh()
-        trigger = wrapper.settings.trigger if wrapper.settings else None
+        job.refresh()
+        trigger = job.settings.trigger if job.settings else None
         assert trigger is not None
         assert isinstance(trigger.file_arrival, FileArrivalTriggerConfiguration)
         # Trigger points at the table's own async staging data folder.
@@ -268,23 +266,22 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
         )
         assert trigger.file_arrival.url.endswith("/.sql/async/insert/data/")
 
-    def test_create_or_update_with_cron_schedule_is_visible_on_the_job(self):
+    def test_async_job_with_cron_schedule_is_visible_on_the_job(self):
         from databricks.sdk.service.jobs import PauseStatus
 
         table = self._unique_table("async_sched")
         table.ensure_created(self._sample_schema())
 
-        wrapper = AsyncInsertJob.create_or_update(
-            table,
+        job = table.async_job(
             schedule="0 0 */6 * * ?",          # every 6 hours
             schedule_timezone="UTC",
             schedule_pause_status="paused",    # keep it idle in the test
             file_arrival_trigger=False,
         )
-        type(self).created_jobs.append(wrapper.job_id)
+        type(self).created_jobs.append(job.job_id)
 
-        wrapper.refresh()
-        settings = wrapper.settings
+        job.refresh()
+        settings = job.settings
         assert settings is not None
         schedule = settings.schedule
         assert schedule is not None
@@ -293,12 +290,11 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
         assert schedule.pause_status == PauseStatus.PAUSED
 
     def test_run_now_returns_job_run(self):
-        """Trigger the job via :meth:`AsyncInsertJob.run`. We attach a
-        no-op ``condition_task`` (``1 == 1``) so the run terminates
-        fast — Databricks rejects ``run_now`` on an empty-task job
-        with ``InvalidParameterValue``, so the default
-        ``AsyncInsertJob.create_or_update`` shape (no task) is not
-        directly triggerable."""
+        """Trigger the job via :meth:`Job.run`. We attach a no-op
+        ``condition_task`` (``1 == 1``) so the run terminates fast —
+        Databricks rejects ``run_now`` on an empty-task job with
+        ``InvalidParameterValue``, so the default no-task shape is
+        not directly triggerable."""
         from databricks.sdk.service.jobs import (
             ConditionTask,
             ConditionTaskOp,
@@ -308,8 +304,7 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
         table = self._unique_table("async_trig")
         table.ensure_created(self._sample_schema())
 
-        wrapper = AsyncInsertJob.create_or_update(
-            table,
+        job = table.async_job(
             task=Task(
                 task_key="noop",
                 condition_task=ConditionTask(
@@ -320,10 +315,10 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
             ),
             file_arrival_trigger=False,
         )
-        if wrapper.job_id not in type(self).created_jobs:
-            type(self).created_jobs.append(wrapper.job_id)
+        if job.job_id not in type(self).created_jobs:
+            type(self).created_jobs.append(job.job_id)
 
-        run = wrapper.run()
+        run = job.run()
         assert isinstance(run, JobRun)
         assert run.run_id is not None
 
