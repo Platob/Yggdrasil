@@ -361,7 +361,7 @@ class Job(Singleton, DatabricksResource):
     # ------------------------------------------------------------------ #
     def task(
         self,
-        task_key: str,
+        task_key_or_func: Any,
         /,
         *,
         order: Optional[int] = None,
@@ -369,17 +369,34 @@ class Job(Singleton, DatabricksResource):
     ) -> "JobTask":
         """Construct a :class:`JobTask` handle bound to this job.
 
-        The returned handle is not yet persisted on the job — call
-        :meth:`JobTask.create` (idempotent: re-creates with the same
-        ``task_key`` replace in place), or use :meth:`JobTask.decorate`
-        to stage a Python callable's source onto it and push it
-        through in one step::
+        Two call shapes:
+
+        - ``job.task("key", **fields)`` — return an unpersisted
+          :class:`JobTask` with the given task_key + Task fields.
+          Use :meth:`JobTask.create` (idempotent) or
+          :meth:`JobTask.decorate` to push it onto the job.
+        - ``job.task(callable)`` — bare-callable shortcut: derive the
+          task_key from ``callable.__name__``, stage the function's
+          source via :meth:`JobTask.from_callable`, and create-or-update
+          the matching task on the job in one round trip. Existing
+          tasks with a default empty inner-task body are replaced
+          (the new ``spark_python_task`` shape always wins).
+
+        Examples::
 
             job = client.jobs.get_or_create(job_id=123, name="my-job")
 
+            # Decorator form (existing)
             @job.task("do").decorate
             def do(a: str, i: int):
                 print(a, i)
+
+            # Bare-callable form (new)
+            @job.task
+            def step(x: int): ...
+
+            # Or:
+            job.task(step)
 
             @job.task("do2", order=0, existing_cluster_id="c-123").decorate
             def do2(x: int): ...
@@ -395,6 +412,23 @@ class Job(Singleton, DatabricksResource):
         """
         from .task import JobTask
 
+        # Bare-callable shortcut: ``job.task(my_func)`` stages the
+        # callable on a task derived from ``my_func.__name__``.
+        # Idempotent: re-running replaces the existing task in place
+        # via :meth:`JobTask.create`. ``str`` is callable in Python
+        # but it's also the standard task_key argument, so it stays
+        # on the explicit-key path.
+        if not isinstance(task_key_or_func, str) and callable(task_key_or_func):
+            func = task_key_or_func
+            key = func.__name__
+            # ``decorate`` stages the callable, runs :meth:`JobTask.create`
+            # (idempotent: replaces any existing task with the same key
+            # — including ones whose inner task body was default/empty),
+            # and returns ``func`` with the resulting :class:`JobTask`
+            # bound at ``func._job_task`` for downstream access.
+            return self.task(key, order=order, **task_fields).decorate(func)  # type: ignore[return-value]
+
+        task_key = task_key_or_func
         details = Task(task_key=task_key, **task_fields)
         return JobTask(job=self, task_key=task_key, details=details, order=order)
 
@@ -437,6 +471,228 @@ class Job(Singleton, DatabricksResource):
         return _decorate(func)
 
     # ====================================================================== #
+    # Class-level task decorators — defer staging until a client is linked
+    # ====================================================================== #
+    #
+    # ``@Job.task_def`` and ``@Job.pytask_def`` are the deferred,
+    # class-level cousins of ``Job.task`` / ``Job.pytask`` (the
+    # eager instance-method decorators above). They record the task
+    # spec on the class at definition time without touching the
+    # workspace — there's no client yet. When a client is linked
+    # (via :meth:`deploy` / :meth:`from_callable` / :meth:`get_or_create`),
+    # :meth:`default_tasks` materializes the recorded factories and
+    # :meth:`_stage_pytasks` runs the Python-body stagings.
+    # ------------------------------------------------------------------ #
+
+    @classmethod
+    def task_def(
+        cls,
+        task_key: Optional[str] = None,
+        /,
+        **task_fields: Any,
+    ) -> Callable[[Callable[..., Any]], classmethod]:
+        """Class-level decorator: register a static :class:`Task` factory.
+
+        The decorated function is a classmethod-style factory called
+        as ``func(cls, **context)`` at deploy time; it returns a
+        :class:`Task` (or ``None`` to skip when context is
+        incomplete). Decoration itself is inert — no client needed.
+
+        Use this for tasks whose body lives elsewhere (notebook path,
+        SQL warehouse, …). For tasks whose body IS a Python callable
+        in this codebase, use :meth:`pytask_def` instead.
+
+        Usage::
+
+            class ApplyJob(Job):
+                @Job.task_def("apply")
+                def apply(cls, *, notebook_path=None, **_):
+                    if not notebook_path:
+                        return None
+                    return Task(
+                        task_key="apply",
+                        notebook_task=NotebookTask(notebook_path=notebook_path),
+                    )
+        """
+        def _decorate(func: Any) -> classmethod:
+            underlying = (
+                func.__func__
+                if isinstance(func, (classmethod, staticmethod)) else func
+            )
+            key = task_key or underlying.__name__
+            wrapped = classmethod(underlying)
+            wrapped.__func__._skeleton_task_key = key  # type: ignore[attr-defined]
+            wrapped.__func__._skeleton_task_fields = dict(task_fields)  # type: ignore[attr-defined]
+            wrapped.__func__._skeleton_pytask = False  # type: ignore[attr-defined]
+            return wrapped
+        return _decorate
+
+    @classmethod
+    def pytask_def(
+        cls,
+        func: Optional[Callable[..., Any]] = None,
+        /,
+        *,
+        task_key: Optional[str] = None,
+        order: Optional[int] = None,
+        **task_fields: Any,
+    ) -> Any:
+        """Class-level decorator: stage a Python callable as a task.
+
+        Like :meth:`pytask` but deferred — the callable is recorded
+        on the class at definition time and staged to the workspace
+        only when a client is linked (via :meth:`deploy` /
+        :meth:`from_callable`). Until then no API calls fire.
+
+        Usable bare or parametrized::
+
+            class MyJob(Job):
+                @Job.pytask_def
+                def step(): ...
+
+                @Job.pytask_def(task_key="custom", order=0)
+                def step2(x: int): ...
+        """
+        def _decorate(f: Callable[..., Any]) -> Callable[..., Any]:
+            f._skeleton_pytask = True  # type: ignore[attr-defined]
+            f._skeleton_task_key = task_key or f.__name__  # type: ignore[attr-defined]
+            f._skeleton_task_order = order  # type: ignore[attr-defined]
+            f._skeleton_task_fields = dict(task_fields)  # type: ignore[attr-defined]
+            return f
+
+        if func is None:
+            return _decorate
+        return _decorate(func)
+
+    @classmethod
+    def _iter_task_factories(cls) -> Iterator[Any]:
+        """Yield every ``@task_def`` / ``@pytask_def``-marked attribute on cls.
+
+        Walks the MRO so subclasses inherit the parent's decorations.
+        Names overridden on a child class shadow the parent's entry
+        (standard attribute-lookup semantics).
+        """
+        seen: set[str] = set()
+        for klass in cls.__mro__:
+            for name, attr in vars(klass).items():
+                if name in seen:
+                    continue
+                if isinstance(attr, (classmethod, staticmethod)):
+                    inner = attr.__func__
+                else:
+                    inner = attr
+                if not callable(inner) or not hasattr(
+                    inner, "_skeleton_task_key",
+                ):
+                    continue
+                seen.add(name)
+                # Use ``getattr(cls, name)`` so descriptors (classmethod)
+                # bind correctly.
+                yield getattr(cls, name)
+
+    @classmethod
+    def _collect_task_def_tasks(cls, **context: Any) -> List[Task]:
+        """Walk ``@task_def``-marked factories and materialize their tasks."""
+        out: List[Task] = []
+        for factory in cls._iter_task_factories():
+            inner = getattr(factory, "__func__", factory)
+            if getattr(inner, "_skeleton_pytask", False):
+                continue  # pytask_def runs in :meth:`_stage_pytasks` later
+            result = factory(**context)
+            if result is None:
+                continue
+            if not isinstance(result, Task):
+                raise TypeError(
+                    f"@Job.task_def {inner._skeleton_task_key!r} returned "
+                    f"{type(result).__name__}, expected Task or None"
+                )
+            out.append(result)
+        return out
+
+    def _stage_pytasks(self, **context: Any) -> List["JobTask"]:
+        """Stage every ``@pytask_def``-marked callable onto this Job.
+
+        Walks the class's MRO for pytask markers and pushes each one
+        through the eager :meth:`pytask` decorator now that the
+        instance has a live client. Returns the produced
+        :class:`JobTask` list (mostly for tests).
+        """
+        staged: List["JobTask"] = []
+        for factory in type(self)._iter_task_factories():
+            inner = getattr(factory, "__func__", factory)
+            if not getattr(inner, "_skeleton_pytask", False):
+                continue
+            staged.append(
+                self.task(
+                    inner._skeleton_task_key,
+                    order=inner._skeleton_task_order,
+                    **inner._skeleton_task_fields,
+                ).decorate(inner)._job_task,  # type: ignore[attr-defined]
+            )
+        return staged
+
+    # ====================================================================== #
+    # from_callable — build a complete Job from a single Python callable
+    # ====================================================================== #
+    @classmethod
+    def from_callable(
+        cls,
+        func: Callable[..., Any],
+        *,
+        name: Optional[str] = None,
+        service: "Jobs | None" = None,
+        client: "DatabricksClient | None" = None,
+        task_key: Optional[str] = None,
+        order: Optional[int] = None,
+        description: Optional[str] = None,
+        permissions: Optional[List[Union[str, JobAccessControlRequest]]] = None,
+        tags: Optional[Mapping[str, str]] = None,
+        **task_fields: Any,
+    ) -> "Job":
+        """Build (or upsert) a Job whose only task is the staged Python *func*.
+
+        Resolves a workspace client (errors when none can be found —
+        decoration would have nowhere to land), upserts a Job named
+        *name* (defaults to ``func.__name__``), and stages *func*'s
+        source as a Python task on it via :meth:`JobTask.from_callable`.
+        Returns the linked :class:`Job` (singleton-cached). Extra
+        ``**task_fields`` flow into :class:`Task` so the caller can
+        attach compute / environment / dependencies at deploy time.
+
+        This is the single-callable counterpart to the class-level
+        :meth:`task_def` / :meth:`pytask_def` decorators: same defer
+        semantics — nothing fires until the workspace is in scope.
+        """
+        resolved_name = name or func.__name__
+        resolved_key = task_key or func.__name__
+
+        # Resolves :class:`DatabricksClient.current()` when *service* /
+        # *client* are unset; errors when there's no linked client.
+        jobs = cls.resolve_jobs(service=service, client=client, name=resolved_name)
+
+        resolved_description = description or (
+            (func.__doc__ or "").strip().splitlines()[0]
+            if func.__doc__ else None
+        )
+
+        underlying = jobs.create_or_update(
+            name=resolved_name,
+            tasks=[],
+            description=resolved_description,
+            tags=dict(tags) if tags else None,
+            permissions=permissions,
+        )
+        instance = cls._wrap(underlying, service=jobs)
+
+        # Now that the client is linked, stage *func* via the eager
+        # decorator path. ``decorate`` calls ``JobTask.create`` so the
+        # task lands on the job in one round trip.
+        instance.task(
+            resolved_key, order=order, **task_fields,
+        ).decorate(func)
+        return instance
+
+    # ====================================================================== #
     # Skeleton — class-level template for subclasses
     # ====================================================================== #
     #
@@ -477,10 +733,20 @@ class Job(Singleton, DatabricksResource):
         cls,
         *,
         tasks: Optional[List[Task]] = None,
-        **_: Any,
+        **context: Any,
     ) -> List[Task]:
-        """Skeleton: resolve the task list (empty unless overridden)."""
-        return list(tasks) if tasks else []
+        """Skeleton: resolve the task list.
+
+        Combines (in order): caller-supplied ``tasks=`` overrides,
+        and every :meth:`task_def`-decorated factory found on the
+        class. Python-body tasks declared via :meth:`pytask_def`
+        are NOT materialized here — they're staged after the job is
+        created in :meth:`_stage_pytasks`, which needs a live
+        client.
+        """
+        out: List[Task] = list(tasks) if tasks else []
+        out.extend(cls._collect_task_def_tasks(tasks=tasks, **context))
+        return out
 
     @classmethod
     def default_schedule(

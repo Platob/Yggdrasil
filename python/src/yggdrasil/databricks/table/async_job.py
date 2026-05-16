@@ -213,8 +213,15 @@ class AsyncInsertJob(Job):
             return None
         return cls.job_name_for(table)
 
-    @classmethod
-    def default_tasks(
+    # The "apply" task is declared once via the deferred class-level
+    # decorator — no API calls fire at class-definition time. At deploy
+    # the factory runs with the resolved context: caller can pass an
+    # explicit ``task=`` (verbatim Task / list of Tasks) or a
+    # ``notebook_path=`` (wrapped in a NotebookTask with the bound
+    # table's identity as base parameters). When neither is supplied
+    # the factory returns ``None`` and the job lands tasks-less.
+    @Job.task_def("apply")
+    def _apply_task(
         cls,
         *,
         table: "Table | None" = None,
@@ -223,11 +230,9 @@ class AsyncInsertJob(Job):
         notebook_warehouse_id: Optional[str] = None,
         notebook_base_parameters: Optional[Mapping[str, str]] = None,
         **_context: Any,
-    ) -> List[Task]:
+    ) -> Any:
         if task is not None:
-            if isinstance(task, Task):
-                return [task]
-            return list(task)
+            return task if isinstance(task, Task) else None
 
         if notebook_path and table is not None:
             cat, sch, tbl = cls._identity(table)
@@ -240,25 +245,28 @@ class AsyncInsertJob(Job):
                 base_params.update(
                     {str(k): str(v) for k, v in notebook_base_parameters.items()}
                 )
-            return [
-                Task(
-                    task_key="apply",
-                    notebook_task=NotebookTask(
-                        notebook_path=notebook_path,
-                        warehouse_id=notebook_warehouse_id,
-                        base_parameters=base_params,
-                    ),
-                )
-            ]
-
-        if table is not None:
-            LOGGER.warning(
-                "AsyncInsertJob skeleton built without ``task`` or "
-                "``notebook_path`` — the resulting job for %s will have no "
-                "tasks. Attach tasks later via ``Jobs.create_or_update(...)``.",
-                table.full_name(safe=False),
+            return Task(
+                task_key="apply",
+                notebook_task=NotebookTask(
+                    notebook_path=notebook_path,
+                    warehouse_id=notebook_warehouse_id,
+                    base_parameters=base_params,
+                ),
             )
-        return []
+
+        return None
+
+    @classmethod
+    def default_tasks(
+        cls,
+        *,
+        task: Any = None,
+        **context: Any,
+    ) -> List[Task]:
+        """Honor ``task=[...]`` lists; otherwise fall through to ``@task_def``."""
+        if isinstance(task, list):
+            return list(task)
+        return super().default_tasks(task=task, **context)
 
     @classmethod
     def default_trigger(
