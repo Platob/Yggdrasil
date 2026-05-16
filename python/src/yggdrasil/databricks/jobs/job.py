@@ -52,15 +52,12 @@ class Job(Singleton, DatabricksResource):
 
     Notes
     -----
-    Inherits :class:`Singleton` (``_SINGLETON_TTL = 300``) so two
+    Inherits :class:`Singleton` (``_SINGLETON_TTL = None``) so two
     callers asking for the same job under the same service collapse to
-    one instance — same cached :class:`JobInfo`, same permission state
-    — for up to 5 minutes; entries auto-evict after that window so a
-    long-running process doesn't pin stale handles against deleted /
-    renamed jobs.
+    one instance — same cached :class:`JobInfo`, same permission state.
     """
 
-    _SINGLETON_TTL: ClassVar[Any] = 300.0
+    _SINGLETON_TTL: ClassVar[Any] = None
 
     @classmethod
     def _singleton_key(

@@ -352,10 +352,7 @@ class ExecutionContext:
     context_key: Optional[str] = dc.field(default=None, repr=False, compare=False, hash=False)
     language: Optional[Language] = dc.field(default=None, repr=False, compare=False, hash=False)
     temporary: bool = dc.field(default=False, repr=False, compare=False, hash=False)
-    # 5-minute idle TTL matches :class:`Cluster` / :class:`Job` singleton
-    # caches — keeps the pooled remote REPL handle alive for a short burst
-    # of follow-up commands without holding it open across multi-step jobs.
-    close_after: float | None = dc.field(default=300.0, repr=False, compare=False, hash=False)
+    close_after: float | None = dc.field(default=1800.0, repr=False, compare=False, hash=False)
 
     _remote_metadata: Optional[RemoteMetadata] = dc.field(
         default=None, init=False, repr=False, compare=False, hash=False,
@@ -468,7 +465,7 @@ class ExecutionContext:
         context_key: str | None = None,
         temporary: bool = False,
         reset: bool = False,
-        close_after: float | None = 300.0,
+        close_after: float | None = 1800.0,
     ) -> "ExecutionContext":
         """Return a pooled execution context, creating it if needed."""
         key = cls._pool_key(

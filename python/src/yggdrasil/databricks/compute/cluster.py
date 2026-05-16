@@ -148,15 +148,13 @@ class Cluster(Singleton, DatabricksResource):
     Notes
     -----
     ``Cluster`` caches ``ClusterDetails`` and refreshes them lazily.
-    Inherits :class:`Singleton` (``_SINGLETON_TTL = 300``) so two
+    Inherits :class:`Singleton` (``_SINGLETON_TTL = None``) so two
     callers asking for the same cluster under the same service share
     the live ``ClusterDetails`` cache and the per-cluster execution
-    contexts for up to 5 minutes; entries auto-evict after that
-    window so a long-running process doesn't pin stale handles
-    against deleted / replaced clusters.
+    contexts.
     """
 
-    _SINGLETON_TTL: ClassVar[Any] = 300.0
+    _SINGLETON_TTL: ClassVar[Any] = None
 
     @classmethod
     def _singleton_key(
