@@ -1414,9 +1414,29 @@ def _iter_records(
         yield source
         return
 
-    # Folder-like: walk for ``*.json`` files, descending into ``logs/``
-    # when present so the staging root works as a source.
+    # Folder-like: walk for ``*.json`` files. The staging root only ever
+    # contains the ``data/`` + ``logs/`` siblings (see
+    # :func:`stage_async_insert`), and every metadata file lives under
+    # ``logs/`` — so when the caller hands the root, skip the parent
+    # listing entirely and descend directly into ``logs/``. Saves one
+    # remote ``ls`` round trip per merged target (the volume listing in
+    # the log shows ~700ms each on a live workspace).
     if hasattr(source, "ls"):
+        source_name = getattr(source, "name", "") or ""
+        if (
+            source_name == "insert"
+            and hasattr(source, "joinpath")
+        ):
+            try:
+                logs_folder = source.joinpath(ASYNC_INSERT_LOGS_SUBDIR)
+                entries = logs_folder.ls(recursive=False)
+            except FileNotFoundError:
+                return
+            for entry in entries:
+                if (getattr(entry, "name", "") or "").endswith(".json"):
+                    yield AsyncInsert.from_file(entry, client=client)
+            return
+
         for entry in source.ls(recursive=False):
             name = getattr(entry, "name", "") or ""
             if name == ASYNC_INSERT_LOGS_SUBDIR and hasattr(entry, "ls"):

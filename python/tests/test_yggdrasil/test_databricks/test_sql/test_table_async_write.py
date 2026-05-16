@@ -485,6 +485,29 @@ class TestMergeClassmethod:
         assert len(merged) == 1
         assert merged[0].target_full_name == "t1"
 
+    def test_async_insert_root_descends_directly_into_logs(self):
+        """``.sql/async/insert/`` as source descends directly into
+        ``logs/`` — the parent listing (which would just rediscover
+        ``data/`` + ``logs/``) is skipped, saving one round trip."""
+        rec = _make_record(target="t1")
+        json_entry = MagicMock()
+        json_entry.name = "async-1.json"
+        json_entry.read_bytes.return_value = rec.to_json_bytes()
+
+        logs_folder = MagicMock(spec=VolumePath, name="logs_folder")
+        logs_folder.ls.return_value = [json_entry]
+
+        root = MagicMock(spec=VolumePath)
+        root.name = "insert"
+        root.joinpath.return_value = logs_folder
+
+        merged = AsyncInsert.merge(root)
+        assert len(merged) == 1
+        # Parent root was never listed — only ``logs/``.
+        root.ls.assert_not_called()
+        root.joinpath.assert_called_once_with(ASYNC_INSERT_LOGS_SUBDIR)
+        logs_folder.ls.assert_called_once_with(recursive=False)
+
 
 # ---------------------------------------------------------------------------
 # Execute + cleanup
