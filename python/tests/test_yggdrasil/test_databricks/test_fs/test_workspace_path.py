@@ -94,6 +94,14 @@ class TestRead:
 
         p = WorkspacePath("/Workspace/x", client=client)
         assert p.read_bytes() == b"hello"
+        # ``format`` must be passed: the SDK default is ``SOURCE``,
+        # which routes through the notebook export path and returns
+        # zero bytes for binary workspace files (``.whl``, ``.zip``,
+        # ``.parquet``). ``AUTO`` lets the server pick the right
+        # export shape based on extension/content.
+        kwargs = workspace.workspace.download.call_args.kwargs
+        fmt = kwargs["format"]
+        assert getattr(fmt, "name", str(fmt)).upper() == "AUTO"
 
     def test_missing_raises(self, workspace, client) -> None:
         workspace.workspace.get_status.return_value = _file_status(5)

@@ -220,14 +220,22 @@ class JobTask:
         return self
 
     def delete(self) -> None:
-        """Remove this task from the parent job (no-op if already absent)."""
+        """Remove this task from the parent job (no-op if already absent).
+
+        Routed through ``fields_to_remove=["tasks/<task_key>"]`` rather
+        than a partial ``tasks=[…]`` update: the Jobs API documents
+        that ``new_settings`` arrays are merged by their unique key
+        (``task_key`` for tasks, ``job_cluster_key`` for clusters),
+        so submitting a shortened task list would silently leave the
+        deleted entry intact. ``fields_to_remove`` with the nested
+        ``tasks/<key>`` path is the only supported deletion mechanism.
+        """
         existing = self._existing_tasks()
-        remaining = [t for t in existing if t.task_key != self.task_key]
-        if len(remaining) == len(existing):
+        if not any(t.task_key == self.task_key for t in existing):
             LOGGER.debug("Job task %r already absent from %r", self, self.job)
             return
         LOGGER.debug("Deleting job task %r", self)
-        self.job.update(tasks=remaining)
+        self.job.update(fields_to_remove=[f"tasks/{self.task_key}"])
         LOGGER.info("Deleted job task %r", self)
 
     # ------------------------------------------------------------------ #

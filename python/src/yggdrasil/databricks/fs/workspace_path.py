@@ -261,8 +261,18 @@ class WorkspacePath(DatabricksPath):
         if n == 0:
             return memoryview(b"")
         try:
+            # ``format`` defaults to ``ExportFormat.SOURCE`` in the SDK,
+            # which routes through the notebook export path and returns
+            # an empty body for binary workspace files (``.whl``,
+            # ``.zip``, ``.parquet``, …). ``AUTO`` mirrors what
+            # :meth:`_upload` passes on the import side so the same
+            # extension/content sniff drives the export — notebooks
+            # come back as source, workspace files come back as their
+            # raw bytes.
             response = self._call(
-                self.client.workspace_client().workspace.download, self.api_path,
+                self.client.workspace_client().workspace.download,
+                self.api_path,
+                format=_export_format_auto(),
             )
         except Exception as exc:
             if _looks_like_not_found(exc):
@@ -509,5 +519,20 @@ def _import_format_auto() -> Any:
     try:
         from databricks.sdk.service.workspace import ImportFormat
         return ImportFormat.AUTO
+    except Exception:
+        return "AUTO"
+
+
+def _export_format_auto() -> Any:
+    """Resolve the SDK's ``ExportFormat.AUTO`` enum, falling back to a string.
+
+    Mirror of :func:`_import_format_auto` for the download side —
+    ``ExportFormat`` is a sibling enum on the workspace SDK and
+    accepts ``"AUTO"`` as a literal string when the enum import is
+    unavailable (mocked test environments).
+    """
+    try:
+        from databricks.sdk.service.workspace import ExportFormat
+        return ExportFormat.AUTO
     except Exception:
         return "AUTO"
