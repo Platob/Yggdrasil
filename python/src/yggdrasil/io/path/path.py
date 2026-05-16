@@ -492,6 +492,46 @@ class Path(Holder, os.PathLike, ABC):
         return self
 
     # ==================================================================
+    # Byte transfer — optimized hooks for Path-to-Path and Path-to-Holder
+    # ==================================================================
+
+    def _transfer_to(self, target: "Holder | IO") -> None:
+        """Path-side override of :meth:`Holder._transfer_to`.
+
+        Two filesystem-aware fast paths skip materialising the full
+        payload into Python bytes:
+
+        1. **Local→local** — both ends back a local file: hand off to
+           :func:`shutil.copyfile`, which uses ``sendfile`` /
+           ``copy_file_range`` / ``fclonefileat`` under the hood.
+        2. **Local→remote holder** — self is a local file, target is
+           a non-IO :class:`Holder` (any remote :class:`Path`, a
+           :class:`Memory`, …): stream via
+           :meth:`Holder.write_local_path` so a multi-GB file
+           uploads in :data:`_COPY_CHUNK`-sized chunks instead of
+           one giant in-memory ``read_bytes()``.
+
+        Everything else falls back to the generic
+        :meth:`Holder._transfer_to` (bytes copy).
+        """
+        from yggdrasil.io.base import IO  # local to break the import cycle
+
+        if isinstance(target, IO):
+            return super()._transfer_to(target)
+        if (
+            isinstance(target, Path)
+            and self.is_local_path
+            and target.is_local_path
+        ):
+            import shutil
+            shutil.copyfile(os.fspath(self), os.fspath(target))
+            return
+        if self.is_local_path:
+            target.write_local_path(os.fspath(self))
+            return
+        return super()._transfer_to(target)
+
+    # ==================================================================
     # Module upload / import — share local Python packages over the wire
     # ==================================================================
 

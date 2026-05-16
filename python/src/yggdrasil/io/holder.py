@@ -1080,6 +1080,102 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         return self.write_bytes(payload, pos=pos)
 
     # ------------------------------------------------------------------
+    # Byte transfer — upload / download to any byte sink
+    # ------------------------------------------------------------------
+
+    def upload(self, to: Any) -> "Holder | IO":
+        """Copy this holder's bytes into *to*.
+
+        *to* accepts any of:
+
+        - :class:`Holder` (incl. any :class:`Path` subclass) — bytes
+          are spliced into the holder at offset 0.
+        - :class:`IO` cursor — bytes are written at the cursor's
+          current position via :meth:`IO.write_bytes`.
+        - ``str`` / :class:`os.PathLike` — coerced via
+          ``Path.from_(to)`` and treated as a holder.
+
+        When the resolved target is a :class:`Path` whose URL ends
+        in a trailing ``/`` (directory shape), this holder's
+        filename (``self.url.name`` or ``"download"`` for nameless
+        holders) is joined onto it. No remote ``stat`` is issued —
+        the trailing slash is a purely local, ``cp``-style hint.
+
+        Returns the resolved target so chains like
+        ``src.upload(dst).read_bytes()`` work.
+
+        Subclasses with a faster move (e.g. local→local via
+        ``sendfile``, local→remote chunked stream) override
+        :meth:`_transfer_to`, not this method.
+        """
+        target = self._resolve_transfer_target(to)
+        self._transfer_to(target)
+        return target
+
+    def download(self, to: Any = None) -> "Holder | IO":
+        """Copy this holder's bytes to a local target.
+
+        Same *to* coercion as :meth:`upload`. When *to* is
+        :data:`None`, bytes land in the user's ``~/Downloads``
+        folder under :attr:`url.name` (or ``"download"`` for
+        nameless holders), with browser-style ``(1)`` / ``(2)`` /
+        … suffixes appended on name conflict. Returns the resolved
+        target.
+        """
+        if to is None:
+            to = _default_download_target(self._transfer_filename())
+        return self.upload(to)
+
+    def _resolve_transfer_target(self, to: Any) -> "Holder | IO":
+        """Coerce a transfer target into a :class:`Holder` or :class:`IO`.
+
+        Handles the four input shapes accepted by :meth:`upload` and
+        :meth:`download`. The trailing-slash directory hint is
+        applied uniformly: a target whose URL ends in ``/`` gets
+        ``self.url.name`` joined onto it before bytes are written.
+        """
+        from yggdrasil.io.base import IO
+        from yggdrasil.io.path.path import Path
+
+        if isinstance(to, IO):
+            return to
+        if isinstance(to, Path):
+            return to / self._transfer_filename() if _looks_like_directory(to.url) else to
+        if isinstance(to, Holder):
+            return to
+        if isinstance(to, (str, os.PathLike)):
+            target = Path.from_(to)
+            return target / self._transfer_filename() if _looks_like_directory(target.url) else target
+        raise TypeError(
+            f"Holder.upload/download: expected a Holder, IO, str, or "
+            f"os.PathLike target; got {type(to).__name__}: {to!r}"
+        )
+
+    def _transfer_filename(self) -> str:
+        """Filename used when joining onto a directory-shaped target.
+
+        :class:`Memory` holders address themselves with auto-minted
+        ``mem://<host>/<hex_addr>`` URLs whose ``name`` is the
+        object address — useless as a download filename. Fall back
+        to ``"download"`` for memory-backed holders and any holder
+        whose URL has no nameable segment.
+        """
+        if self.is_memory:
+            return "download"
+        return self.url.name or "download"
+
+    def _transfer_to(self, target: "Holder | IO") -> None:
+        """Default transfer: pull self's bytes, push into *target*.
+
+        Subclasses override to take advantage of backend-side fast
+        paths (e.g. :class:`Path` uses :func:`shutil.copyfile` for
+        local-to-local and :meth:`write_local_path` for
+        local-to-remote so neither path materialises the full
+        payload).
+        """
+        target.write_bytes(self.read_bytes())
+
+    # ------------------------------------------------------------------
     # Hashing — full-payload digests over the durable bytes.
     # ------------------------------------------------------------------
     #
@@ -1147,6 +1243,44 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
 
     def __bytes__(self) -> bytes:
         return self.read_bytes()
+
+
+def _looks_like_directory(url: URL) -> bool:
+    """Trailing-slash check: ``True`` iff *url*'s path ends in ``/``.
+
+    Used by :meth:`Holder._resolve_transfer_target` to apply
+    ``cp``-style "into this directory" semantics without a remote
+    stat round trip. The canonical signal is an empty trailing
+    element in :attr:`URL.parts`.
+    """
+    parts = url.parts
+    return bool(parts) and parts[-1] == ""
+
+
+def _default_download_target(name: str) -> "Holder":
+    """Resolve a fresh :class:`LocalPath` under ``~/Downloads`` for *name*.
+
+    Browser-style default: drop the file under the user's
+    Downloads folder, and on a name clash append ``(1)``, ``(2)``,
+    … before the suffix until a free slot is found. The directory
+    is created on demand; the file itself is not.
+    """
+    from yggdrasil.io.path.local_path import LocalPath
+
+    downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+    os.makedirs(downloads_dir, exist_ok=True)
+
+    candidate = os.path.join(downloads_dir, name)
+    if not os.path.exists(candidate):
+        return LocalPath(candidate)
+
+    stem, suffix = os.path.splitext(name)
+    i = 1
+    while True:
+        candidate = os.path.join(downloads_dir, f"{stem} ({i}){suffix}")
+        if not os.path.exists(candidate):
+            return LocalPath(candidate)
+        i += 1
 
 
 def _as_byte_mv(data: Union[bytes, bytearray, memoryview]) -> memoryview:
