@@ -793,23 +793,18 @@ class AsyncInsert:
     # ------------------------------------------------------------------ #
     # SQL rendering
     # ------------------------------------------------------------------ #
-    def to_sql(self) -> List[str]:
-        r"""Render the operation as one or more SQL statements.
+    def _build_sql(self, parquet_refs: Sequence[str]) -> Optional[str]:
+        r"""Common SQL shape used by both raw-text and prepared paths.
 
-        The current implementation emits a single statement: an
-        ``INSERT INTO`` (append) or ``INSERT OVERWRITE`` (overwrite)
-        whose source is the staged Parquet payloads read via
-        ``parquet.\`<path>\``. Multiple paths are unioned with
-        ``UNION ALL``. Returns an empty list when no Parquet payloads
-        are recorded.
+        Returns ``None`` when there is nothing to apply (no Parquet
+        payloads or no target). ``parquet_refs`` is the per-payload
+        SQL fragment to splice into ``SELECT * FROM parquet.\`<...>\``
+        — either a literal path or a ``{alias}`` placeholder.
         """
-        if not self.parquet_paths or not self.target_full_name:
-            return []
+        if not parquet_refs or not self.target_full_name:
+            return None
 
-        selects = [
-            f"SELECT * FROM parquet.`{path}`"
-            for path in self.parquet_paths
-        ]
+        selects = [f"SELECT * FROM parquet.`{ref}`" for ref in parquet_refs]
         source = " UNION ALL ".join(selects)
 
         target = self.target_full_name
@@ -817,13 +812,103 @@ class AsyncInsert:
             cols = ", ".join(f"`{c}`" for c in self.target_field_names)
             target = f"{target} ({cols})"
 
-        if self.is_overwrite:
-            prefix = f"INSERT OVERWRITE {target}"
-        else:
-            prefix = f"INSERT INTO {target}"
-
+        prefix = (
+            f"INSERT OVERWRITE {target}"
+            if self.is_overwrite
+            else f"INSERT INTO {target}"
+        )
         where = f" WHERE {self.where}" if self.where else ""
-        return [f"{prefix} {source}{where}"]
+        return f"{prefix} {source}{where}"
+
+    def to_sql(self) -> List[str]:
+        r"""Render the operation as one or more raw SQL strings.
+
+        Emits a single statement: ``INSERT INTO`` (append) or
+        ``INSERT OVERWRITE`` (overwrite) whose source is the staged
+        Parquet payloads read via ``parquet.\`<path>\``. Multiple
+        paths are unioned with ``UNION ALL``. Returns an empty list
+        when no Parquet payloads are recorded.
+
+        Useful for inspection / tests. The execution path
+        (:meth:`to_statements`, :meth:`execute`, :meth:`concat`)
+        prefers :class:`WarehousePreparedStatement` so the staged
+        files are cleaned up automatically via the statement
+        lifecycle — see :meth:`to_statements`.
+        """
+        sql = self._build_sql(self.parquet_paths)
+        return [sql] if sql is not None else []
+
+    def to_statements(
+        self,
+        *,
+        client: "DatabricksClient | None" = None,
+        retry: Any = None,
+        cleanup: bool = True,
+    ) -> List[Any]:
+        """Render the operation as a list of :class:`WarehousePreparedStatement`.
+
+        Each Parquet payload + every contributing metadata file are
+        attached to the statement as ``external_volume_paths`` (with
+        ``temporary=True`` when ``cleanup=True``), so the statement
+        lifecycle owns cleanup: on success
+        :meth:`WarehousePreparedStatement.clear_temporary_resources`
+        — auto-fired by :meth:`StatementResult.wait` and
+        :meth:`StatementBatch.wait` — unlinks every attached
+        temporary path. On failure the same hook runs from
+        :meth:`StatementResult.raise_for_status`.
+
+        Aliases follow ``__p0__ / __p1__ / …`` for the Parquet
+        payloads referenced by SQL and ``__m0__ / __m1__ / …`` for
+        the metadata files that are attached purely for cleanup
+        (they never appear in the substituted text).
+
+        Pass ``cleanup=False`` to attach the same paths without
+        marking them temporary — useful when debugging an applier
+        and the staged files should survive the run.
+        """
+        from yggdrasil.databricks.path import DatabricksPath
+        from yggdrasil.databricks.warehouse.statement import (
+            WarehousePreparedStatement,
+        )
+
+        parquet_aliases = [f"__p{i}__" for i in range(len(self.parquet_paths))]
+        # Build SQL against ``{alias}`` placeholders. Empty payload
+        # returns no statements.
+        sql = self._build_sql(
+            tuple(f"{{{alias}}}" for alias in parquet_aliases),
+        )
+        if sql is None:
+            return []
+
+        ext_paths: dict[str, Any] = {}
+        for alias, full_path in zip(parquet_aliases, self.parquet_paths):
+            path = DatabricksPath.from_(full_path, client=client)
+            if cleanup:
+                # Mutate the (singleton-cached) path so the statement
+                # batch's ``clear_temporary_resources`` walks it on
+                # success and unlinks the file. The path is about to
+                # be deleted; no other code should be holding it.
+                path.temporary = True
+            ext_paths[alias] = path
+
+        for i, full_path in enumerate(self.metadata_paths):
+            # ``__m{i}__`` aliases don't appear in SQL — they ride
+            # the statement purely so the lifecycle hook removes the
+            # metadata files alongside the Parquet payloads.
+            path = DatabricksPath.from_(full_path, client=client)
+            if cleanup:
+                path.temporary = True
+            ext_paths[f"__m{i}__"] = path
+
+        stmt = WarehousePreparedStatement.prepare(
+            sql,
+            client=client,
+            external_volume_paths=ext_paths,
+            catalog_name=self.target_catalog_name,
+            schema_name=self.target_schema_name,
+            retry=retry,
+        )
+        return [stmt]
 
     # ------------------------------------------------------------------ #
     # Concat — render a batch-execution suite across many records
@@ -844,57 +929,58 @@ class AsyncInsert:
         Pipes everything :meth:`merge` accepts (a folder
         :class:`VolumePath`, an iterable of metadata file paths, an
         iterable of in-memory records, or a single
-        :class:`AsyncInsert`) through the per-target merge and then
-        each merged record's :meth:`to_sql`. The returned list is the
-        ordered batch of statements ready to feed to
-        :meth:`SQLEngine.execute_many` — one ``INSERT INTO`` /
-        ``INSERT OVERWRITE`` per drained target.
+        :class:`AsyncInsert`) through the per-target merge.
 
-        When *engine* is supplied the suite is submitted to it via
-        ``engine.execute_many`` (one round trip carrying every
-        statement) and the returned ``StatementBatch`` is handed
-        back. On success every contributing record's staged Parquet
-        + metadata file is cleaned up (set ``cleanup=False`` to keep
-        them around).
+        With *engine* supplied: each merged record is rendered via
+        :meth:`to_statements` so the staged Parquet + metadata
+        files attach to the prepared statements as
+        ``external_volume_paths`` (marked ``temporary=True`` unless
+        ``cleanup=False``). The whole suite is then submitted via
+        ``engine.execute_many``; the statement-batch ``wait`` hook
+        auto-fires ``clear_temporary_resources`` so every attached
+        file is unlinked when the run lands successfully. Returns
+        the resulting ``StatementBatch``.
+
+        Without *engine*: returns the bare list of SQL strings (via
+        :meth:`to_sql`) for callers that want to inspect the
+        rendered text or run it through a different path. No
+        prepared statements are built and no cleanup is wired —
+        :meth:`to_statements` is the call to make for the wire-up.
 
         Returns
         -------
         list[str]
             When *engine* is ``None``.
         StatementBatch
-            When *engine* is supplied — whatever the engine's
-            ``execute_many`` returns. Empty input returns an empty
-            list / ``None`` without touching the engine.
+            When *engine* is supplied. Empty input returns ``[]`` /
+            ``None`` without touching the engine.
         """
         merged = cls.merge(source, client=client)
         if not merged:
             return [] if engine is None else None
 
-        statements: list[str] = []
-        for record in merged:
-            statements.extend(record.to_sql())
-
         if engine is None:
+            statements: list[str] = []
+            for record in merged:
+                statements.extend(record.to_sql())
             return statements
 
-        if not statements:
+        prepared: list[Any] = []
+        for record in merged:
+            prepared.extend(record.to_statements(client=client, cleanup=cleanup))
+
+        if not prepared:
             return None
 
         LOGGER.info(
             "Executing %d-statement async-insert suite across %d target(s)",
-            len(statements), len(merged),
+            len(prepared), len(merged),
         )
-        batch = engine.execute_many(
-            statements,
+        return engine.execute_many(
+            prepared,
             wait=wait,
             raise_error=raise_error,
         )
-
-        if cleanup:
-            for record in merged:
-                record.cleanup(client=client)
-
-        return batch
 
     def __call__(
         self,
@@ -933,35 +1019,44 @@ class AsyncInsert:
         cleanup: bool = True,
         client: "DatabricksClient | None" = None,
     ) -> Any:
-        """Run the rendered SQL against *engine*; clean up staged files on success.
+        """Run this record against *engine* via a :class:`WarehousePreparedStatement`.
 
-        Returns the last :class:`StatementResult` produced (or the only
-        one in the typical single-statement case). Empty operations
-        (no Parquet paths) return ``None`` without touching *engine*.
-        Set ``cleanup=False`` to keep the staged files around (useful
-        for debugging an applier).
+        Builds the statement via :meth:`to_statements` so every
+        staged Parquet + metadata file rides as an
+        ``external_volume_paths`` entry (marked temporary unless
+        ``cleanup=False``). On success the batch's ``wait`` hook
+        auto-fires ``clear_temporary_resources`` and unlinks every
+        attached path — no explicit :meth:`cleanup` call is needed.
+
+        Empty operations (no Parquet paths) return ``None`` without
+        touching *engine*. Set ``cleanup=False`` to attach the files
+        without marking them temporary (useful for debugging an
+        applier when the staged files should survive the run).
         """
-        statements = self.to_sql()
+        statements = self.to_statements(client=client, cleanup=cleanup)
         if not statements:
             return None
 
-        results: list[Any] = []
-        for sql in statements:
-            results.append(
-                engine.execute(sql, wait=wait, raise_error=raise_error),
-            )
-
-        if cleanup:
-            self.cleanup(client=client)
-
-        return results[-1] if len(results) == 1 else results
+        return engine.execute_many(
+            statements,
+            wait=wait,
+            raise_error=raise_error,
+        )
 
     def cleanup(self, *, client: "DatabricksClient | None" = None) -> None:
-        """Remove every staged Parquet + metadata file recorded on this op.
+        """Force-remove every staged Parquet + metadata file recorded on this op.
 
         Best-effort: missing files are tolerated, individual delete
         failures are logged and swallowed so a partial cleanup
         doesn't mask the (already-successful) execute.
+
+        The normal apply path (:meth:`execute` / :meth:`concat` with
+        an engine) no longer calls this — staged files ride the
+        :class:`WarehousePreparedStatement` lifecycle and get
+        unlinked automatically when the statement batch lands
+        successfully. Keep this method for abandoned-record cleanup
+        (e.g. an applier sweep that wants to drop stale metadata
+        files without going through SQL).
         """
         from yggdrasil.databricks.path import DatabricksPath
 
