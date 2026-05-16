@@ -435,6 +435,36 @@ class Path(Holder, os.PathLike, ABC):
 
     rm = remove
 
+    def wait_until_gone(self, wait: WaitingConfigArg = True) -> "Path":
+        """Block until :meth:`exists` reports ``False`` or *wait* expires.
+
+        Polls the backend with a fresh probe each iteration — the
+        stat cache is invalidated between checks so a TTL'd hit
+        can't mask a deletion that landed after the cache was
+        filled. Useful when a fire-and-forget unlink (e.g.
+        ``WarehouseStatementBatch.clear_temporary_resources``) means
+        the caller can't observe completion through the original
+        operation's return value.
+
+        Raises :class:`TimeoutError` when *wait*'s deadline elapses
+        and the path is still present.
+        """
+        cfg = WaitingConfig.from_(wait)
+        start = time.monotonic()
+        iteration = 0
+        while True:
+            self._stat_cached = None
+            self._stat_cached_at = 0.0
+            if not self.exists():
+                return self
+            if cfg.timeout > 0 and (time.monotonic() - start) >= cfg.timeout:
+                raise TimeoutError(
+                    f"{self.full_path()!r} still exists after "
+                    f"{cfg.timeout:.1f}s — wait_until_gone deadline expired"
+                )
+            cfg.sleep(iteration)
+            iteration += 1
+
     def is_empty(self):
         stat = self._stat()
         kind = stat.kind

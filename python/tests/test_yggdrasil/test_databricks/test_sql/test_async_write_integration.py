@@ -13,7 +13,7 @@ partial failure leaves at most one orphan in the workspace.
 
 These tests exercise:
 
-- :func:`stage_async_insert` against a real Volume staging path,
+- :meth:`Table.async_insert` against a real Volume staging path,
 - :meth:`AsyncInsert.merge` reading the staged JSON metadata back,
 - :meth:`AsyncInsert.to_sql` + :meth:`AsyncInsert.execute` against
   the live SQL engine (data lands in the target table, staged files
@@ -31,14 +31,13 @@ from typing import ClassVar
 import pyarrow as pa
 from databricks.sdk.errors import DatabricksError
 
+from yggdrasil.databricks.fs import VolumePath
 from yggdrasil.databricks.jobs.job import Job
 from yggdrasil.databricks.jobs.run import JobRun
 from yggdrasil.databricks.sql.engine import SQLEngine
-from yggdrasil.databricks.table.async_write import (
-    AsyncInsert,
-    stage_async_insert,
-)
+from yggdrasil.databricks.table.async_write import AsyncInsert
 from yggdrasil.databricks.table.table import Table
+from yggdrasil.io.url import URL
 
 from .. import DatabricksIntegrationCase
 
@@ -149,19 +148,18 @@ class _AsyncWriteIntegrationBase(DatabricksIntegrationCase):
             target_table_name=table.table_name,
         )
 
-    @staticmethod
-    def _wait_until_gone(path, *, timeout: float = 30.0, interval: float = 0.2) -> None:
-        # ``WarehouseStatementBatch.clear_temporary_resources`` fires unlinks
-        # via ``Job.make(...).fire_and_forget()`` and returns before the
-        # ThreadJobs complete, so ``execute(wait=True)`` can land before
-        # cleanup actually finishes — poll briefly instead of asserting.
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if not path.exists:
-                return
-            time.sleep(interval)
-        raise AssertionError(
-            f"{path!r} still exists after {timeout:.1f}s — cleanup did not run"
+    def _volume_path(self, full_path: str) -> VolumePath:
+        """Wrap a Unity-style ``/Volumes/cat/sch/...`` string as a :class:`VolumePath`.
+
+        :meth:`Table.async_insert` returns :class:`AsyncInsert` whose
+        ``parquet_paths`` / ``metadata_paths`` are SQL-shaped path
+        strings; the existence / cleanup asserts want the bound
+        :class:`VolumePath` so they can stat against the live volume.
+        """
+        inner = full_path.removeprefix("/Volumes") or "/"
+        return VolumePath(
+            url=URL(scheme=VolumePath.scheme, path=inner),
+            client=self.client,
         )
 
 
@@ -173,10 +171,12 @@ class TestAsyncWriteIntegration(_AsyncWriteIntegrationBase):
         table.ensure_created(self._sample_schema())
 
         # Stage two independent async inserts on the same target.
-        first = stage_async_insert(table, self._batch([1, 2], label="a"))
-        second = stage_async_insert(table, self._batch([3, 4], label="b"))
-        assert first.exists
-        assert second.exists
+        first = table.async_insert(self._batch([1, 2], label="a"))
+        second = table.async_insert(self._batch([3, 4], label="b"))
+        first_parquet = self._volume_path(first.parquet_paths[0])
+        second_parquet = self._volume_path(second.parquet_paths[0])
+        assert first_parquet.exists()
+        assert second_parquet.exists()
 
         # Both metadata records list the same target.
         folder = table.staging_folder(temporary=False, async_write=True)
@@ -197,8 +197,12 @@ class TestAsyncWriteIntegration(_AsyncWriteIntegrationBase):
         assert rows[0]["n"] == 4
 
         # Cleanup happened — staged Parquet + metadata files are gone.
-        self._wait_until_gone(first)
-        self._wait_until_gone(second)
+        # ``WarehouseStatementBatch.clear_temporary_resources`` fires
+        # unlinks via ``Job.make(...).fire_and_forget()`` and returns
+        # before the ThreadJobs complete, so ``execute(wait=True)`` can
+        # land before cleanup finishes — poll instead of asserting.
+        first_parquet.wait_until_gone({"timeout": 30.0, "interval": 0.2})
+        second_parquet.wait_until_gone({"timeout": 30.0, "interval": 0.2})
 
     def test_overwrite_drops_earlier_appends(self):
         table = self._unique_table("async_ovw")
@@ -211,12 +215,12 @@ class TestAsyncWriteIntegration(_AsyncWriteIntegrationBase):
 
         # Stage an append, then an overwrite — the overwrite drops the
         # append's data from the SQL projection.
-        stage_async_insert(table, self._batch([10, 11], label="appended"), mode="append")
+        table.async_insert(self._batch([10, 11], label="appended"), mode="append")
         # Tiny sleep so the created_at ordering is unambiguous when the
         # second op is staged in the same millisecond bucket.
         time.sleep(0.05)
-        stage_async_insert(
-            table, self._batch([100, 101], label="overwritten"), mode="overwrite",
+        table.async_insert(
+            self._batch([100, 101], label="overwritten"), mode="overwrite",
         )
 
         records = AsyncInsert.merge(
@@ -333,8 +337,8 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
         table_b = self._unique_table("apply_b")
         table_b.ensure_created(self._sample_schema())
 
-        stage_async_insert(table_a, self._batch([1, 2], label="a"))
-        stage_async_insert(table_b, self._batch([10, 20], label="b"))
+        table_a.async_insert(self._batch([1, 2], label="a"))
+        table_b.async_insert(self._batch([10, 20], label="b"))
 
         AsyncInsert.apply_schema(
             self.engine,

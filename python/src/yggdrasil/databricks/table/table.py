@@ -3038,35 +3038,13 @@ class Table(DatabricksPath):
         raise_error: bool = True,
         spark_session: Optional["SparkSession"] = None,
         return_data: bool = False,
-        lazy: bool = False,
         **kwargs
-    ) -> "Tabular | AsyncInsert | None":
+    ) -> "Tabular | None":
         """Insert *data* into this table — thin wrapper over :meth:`insert_into`.
 
-        With ``lazy=True``, the rows are cast to the target schema and
-        dropped (alongside a JSON metadata file describing the
-        operation) under the table's ``stg_<table>/.sql/async/insert``
-        staging folder for a downstream applier to pick up; the SQL
-        insert is *not* executed and the constructed
-        :class:`AsyncInsert` record is returned so the caller can
-        ``execute(engine)`` it later, ``merge_with`` peers, or schedule
-        it via :meth:`AsyncInsert.job`. The record is itself a
-        :class:`WarehouseStatementBatch`, so binding an executor and
-        submitting is a single ``.execute(engine)`` call. See
-        :mod:`.async_write` for the wire format.
+        For the deferred / drop-and-apply-later flow, see
+        :meth:`async_insert`.
         """
-        if lazy:
-            from .async_write import stage_async_insert
-
-            return stage_async_insert(
-                self,
-                data,
-                mode=mode,
-                match_by=match_by,
-                lazy=True,
-                **kwargs,
-            )
-
         return self.insert_into(
             data,
             mode=mode,
@@ -3075,6 +3053,38 @@ class Table(DatabricksPath):
             raise_error=raise_error,
             spark_session=spark_session,
             return_data=return_data,
+            **kwargs,
+        )
+
+    def async_insert(
+        self,
+        data: Any,
+        *,
+        mode: ModeLike = None,
+        match_by: Optional[list[str]] = None,
+        **kwargs,
+    ) -> "AsyncInsert":
+        """Stage *data* as an async insert and return the metadata record.
+
+        Rows are cast to the target schema and dropped (alongside a
+        JSON metadata file describing the operation) under the
+        table's ``stg_<table>/.sql/async/insert`` staging folder for a
+        downstream applier to pick up; the SQL insert is *not*
+        executed. The constructed :class:`AsyncInsert` is itself a
+        :class:`WarehouseStatementBatch`, so binding an executor and
+        submitting is a single ``.execute(engine)`` call. The caller
+        can also ``merge_with`` peers, or schedule the apply via
+        :meth:`AsyncInsert.job`. See :mod:`.async_write` for the wire
+        format.
+        """
+        from .async_write import stage_async_insert
+
+        return stage_async_insert(
+            self,
+            data,
+            mode=mode,
+            match_by=match_by,
+            lazy=True,
             **kwargs,
         )
 
