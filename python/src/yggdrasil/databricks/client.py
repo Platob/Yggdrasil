@@ -107,6 +107,25 @@ _ENV_DEFAULTS: dict[str, str] = {
 }
 
 
+# Default urllib3 pool sizing applied to every SDK ``Config`` we build.
+#
+# The SDK's own defaults (`max_connection_pools=20`,
+# `max_connections_per_pool=20`, `pool_block=True`) are too tight for
+# the typical yggdrasil workload: volume IO (``files.upload`` /
+# ``dbfs.read``) and SQL statement-execution traffic share a single
+# :class:`requests.Session` inside the workspace client (see
+# ``databricks/sdk/_base_client.py``), so a handful of in-flight volume
+# transfers pin every connection slot and ``execute_statement`` queues
+# behind them. Bumping the per-pool size gives both traffic classes
+# enough headroom that statement submission doesn't stall on volume IO.
+#
+# Callers can override via ``DatabricksClient(max_connection_pools=...,
+# max_connections_per_pool=...)`` if they have a different workload
+# shape.
+_DEFAULT_MAX_CONNECTION_POOLS = 32
+_DEFAULT_MAX_CONNECTIONS_PER_POOL = 64
+
+
 # Static defaults applied when the caller passes ``...`` and the slot
 # has no environment fallback.
 _STATIC_DEFAULTS: dict[str, Any] = {
@@ -117,6 +136,8 @@ _STATIC_DEFAULTS: dict[str, Any] = {
     "debug_truncate_bytes": None,
     "debug_headers": None,
     "rate_limit": None,
+    "max_connection_pools": _DEFAULT_MAX_CONNECTION_POOLS,
+    "max_connections_per_pool": _DEFAULT_MAX_CONNECTIONS_PER_POOL,
     "product": "yggdrasil",
     "product_version": ygg_version,
 }
@@ -236,6 +257,8 @@ class DatabricksClient(Singleton, URLBased):
     debug_truncate_bytes: Optional[int]
     debug_headers: bool | None
     rate_limit: Optional[int]
+    max_connection_pools: Optional[int]
+    max_connections_per_pool: Optional[int]
     product: Optional[str]
     product_version: Optional[str]
 
@@ -363,6 +386,8 @@ class DatabricksClient(Singleton, URLBased):
         debug_truncate_bytes: Any = ...,
         debug_headers: Any = ...,
         rate_limit: Any = ...,
+        max_connection_pools: Any = ...,
+        max_connections_per_pool: Any = ...,
         product: Any = ...,
         product_version: Any = ...,
         singleton_ttl: "int | None" = ...,
@@ -402,6 +427,8 @@ class DatabricksClient(Singleton, URLBased):
             debug_truncate_bytes=debug_truncate_bytes,
             debug_headers=debug_headers,
             rate_limit=rate_limit,
+            max_connection_pools=max_connection_pools,
+            max_connections_per_pool=max_connections_per_pool,
             product=product,
             product_version=product_version,
         )
@@ -803,6 +830,8 @@ class DatabricksClient(Singleton, URLBased):
                 debug_truncate_bytes=self.debug_truncate_bytes,
                 debug_headers=self.debug_headers,
                 rate_limit=self.rate_limit,
+                max_connection_pools=self.max_connection_pools,
+                max_connections_per_pool=self.max_connections_per_pool,
                 product=self.product,
                 product_version=self.product_version,
             )
@@ -903,6 +932,7 @@ class DatabricksClient(Singleton, URLBased):
             "google_credentials", "google_service_account",
             "http_timeout_seconds", "retry_timeout_seconds", "debug_truncate_bytes",
             "debug_headers", "rate_limit",
+            "max_connection_pools", "max_connections_per_pool",
         ):
             value = getattr(config, key, None)
             if value is not None:
