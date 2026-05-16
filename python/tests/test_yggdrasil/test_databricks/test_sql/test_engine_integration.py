@@ -117,7 +117,7 @@ class _SQLIntegrationBase(DatabricksIntegrationCase):
         try:
             for full_name in cls.created_tables:
                 try:
-                    cls.engine.table(full_name).delete(raise_error=False)
+                    cls.engine.table(full_name).delete(missing_ok=True)
                 except DatabricksError:
                     pass
         finally:

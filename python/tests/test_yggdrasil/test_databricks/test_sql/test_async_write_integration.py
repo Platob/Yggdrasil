@@ -97,7 +97,7 @@ class _AsyncWriteIntegrationBase(DatabricksIntegrationCase):
         try:
             for full_name in cls.created_tables:
                 try:
-                    cls.engine.table(full_name).delete(raise_error=False)
+                    cls.engine.table(full_name).delete(missing_ok=True)
                 except DatabricksError:
                     pass
             for job_id in cls.created_jobs:

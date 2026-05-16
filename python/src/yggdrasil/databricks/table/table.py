@@ -1190,10 +1190,10 @@ class Table(DatabricksResource, DatabricksPath):
         return iter(())
 
     def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
-        self.delete(wait=wait, raise_error=not missing_ok)
+        self.delete(wait=wait, missing_ok=missing_ok)
 
     def _remove_dir(self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
-        self.delete(wait=wait, raise_error=not missing_ok)
+        self.delete(wait=wait, missing_ok=missing_ok)
 
     def full_path(self) -> str:
         return self.full_name()
@@ -2847,7 +2847,7 @@ class Table(DatabricksResource, DatabricksPath):
         self,
         *,
         wait: WaitingConfigArg = True,
-        raise_error: bool = True,
+        missing_ok: bool = False,
     ) -> "Table":
         uc = self.client.workspace_client().tables
         logger.debug("Deleting table %r (wait=%s)", self, bool(wait))
@@ -2859,7 +2859,7 @@ class Table(DatabricksResource, DatabricksPath):
                 if self._staging_volume:
                     self._staging_volume.delete(wait=False)
             except DatabricksError:
-                if raise_error:
+                if not missing_ok:
                     raise
         else:
             Job.make(self.delete).fire_and_forget()
@@ -3383,7 +3383,7 @@ class Table(DatabricksResource, DatabricksPath):
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
 
         if mode_enum == Mode.OVERWRITE and not match_by:
-            self.delete(wait=True, raise_error=False)
+            self.delete(wait=True, missing_ok=True)
 
         target = self.create(data, mode=schema_mode)
         target_location = target.full_name(safe=True)
@@ -3542,7 +3542,7 @@ class Table(DatabricksResource, DatabricksPath):
         wait = True if PyEnv.in_databricks() else wait
 
         if mode_enum == Mode.OVERWRITE and not match_by:
-            self.delete(wait=True, raise_error=False)
+            self.delete(wait=True, missing_ok=True)
 
         target = self.create(data, mode=schema_mode)
         target_location = target.full_name(safe=True)
@@ -3853,7 +3853,7 @@ class Table(DatabricksResource, DatabricksPath):
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
 
         if mode_enum == Mode.OVERWRITE and not match_by:
-            self.delete(wait=True, raise_error=False)
+            self.delete(wait=True, missing_ok=True)
 
         if not self.exists:
             raise ValueError(

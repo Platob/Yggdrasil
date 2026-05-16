@@ -799,7 +799,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         return self.table(
             location,
             catalog_name=catalog_name, schema_name=schema_name, table_name=table_name,
-        ).delete(wait=wait, raise_error=raise_error)
+        ).delete(wait=wait, missing_ok=not raise_error)
 
     def create_table(
         self,
