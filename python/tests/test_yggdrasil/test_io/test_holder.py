@@ -479,3 +479,94 @@ class TestPathTransferOptimization:
         assert out is mem
         assert seen == [src.os_path]
         assert mem.read_bytes() == b"payload"
+
+
+class TestPathDirectoryTransfer:
+    """``Path.upload`` / ``Path.download`` recurse on directory sources."""
+
+    def test_directory_upload_creates_target_and_copies_leaves(
+        self, tmp_path,
+    ) -> None:
+        src = LocalPath(str(tmp_path / "src"))
+        src.mkdir()
+        (src / "a.bin").write_bytes(b"a")
+        (src / "b.bin").write_bytes(b"b")
+
+        dst = LocalPath(str(tmp_path / "dst"))
+        out = src.upload(dst)
+
+        assert out == dst
+        assert dst.is_dir()
+        assert (dst / "a.bin").read_bytes() == b"a"
+        assert (dst / "b.bin").read_bytes() == b"b"
+
+    def test_directory_upload_recurses_into_subdirectories(
+        self, tmp_path,
+    ) -> None:
+        src = LocalPath(str(tmp_path / "src"))
+        (src / "sub").mkdir(parents=True)
+        (src / "top.bin").write_bytes(b"top")
+        (src / "sub" / "leaf.bin").write_bytes(b"leaf")
+
+        dst = LocalPath(str(tmp_path / "dst"))
+        src.upload(dst)
+
+        assert (dst / "top.bin").read_bytes() == b"top"
+        assert (dst / "sub").is_dir()
+        assert (dst / "sub" / "leaf.bin").read_bytes() == b"leaf"
+
+    def test_trailing_slash_target_nests_under_dst(self, tmp_path) -> None:
+        # cp -r src dst/  →  dst/src/...
+        src = LocalPath(str(tmp_path / "src"))
+        src.mkdir()
+        (src / "a.bin").write_bytes(b"a")
+
+        dst_dir = tmp_path / "dst"
+        dst_dir.mkdir()
+        out = src.upload(str(dst_dir) + "/")
+
+        assert out.name == "src"
+        assert (out / "a.bin").read_bytes() == b"a"
+
+    def test_empty_directory_creates_empty_target(self, tmp_path) -> None:
+        src = LocalPath(str(tmp_path / "src"))
+        src.mkdir()
+
+        dst = LocalPath(str(tmp_path / "dst"))
+        out = src.upload(dst)
+
+        assert out.is_dir()
+        assert not any(out.iterdir())
+
+    def test_directory_into_io_cursor_raises(self, tmp_path) -> None:
+        from yggdrasil.io.bytes_io import BytesIO
+
+        src = LocalPath(str(tmp_path / "src"))
+        src.mkdir()
+        (src / "a.bin").write_bytes(b"a")
+
+        with BytesIO() as bio:
+            with pytest.raises(IsADirectoryError, match="IO cursor"):
+                src.upload(bio)
+
+    def test_directory_into_memory_raises(self, tmp_path) -> None:
+        src = LocalPath(str(tmp_path / "src"))
+        src.mkdir()
+        (src / "a.bin").write_bytes(b"a")
+
+        with pytest.raises(IsADirectoryError, match="target must be a Path"):
+            src.upload(Memory())
+
+    def test_default_download_creates_directory_under_downloads(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        src = LocalPath(str(tmp_path / "src"))
+        src.mkdir()
+        (src / "leaf.bin").write_bytes(b"leaf")
+
+        out = src.download()
+
+        assert out.is_dir()
+        assert out.name == "src"
+        assert (out / "leaf.bin").read_bytes() == b"leaf"
