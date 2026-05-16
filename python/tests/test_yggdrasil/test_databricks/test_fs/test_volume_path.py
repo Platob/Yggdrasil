@@ -269,6 +269,40 @@ class TestListing:
         ]
         assert all(isinstance(c, VolumePath) for c in children)
 
+    def test_iterdir_does_not_persist_children_as_singletons(
+        self, workspace, client,
+    ) -> None:
+        # ``_ls`` builds children with ``singleton_ttl=False`` so an
+        # iterdir-style hot loop doesn't pin thousands of short-lived
+        # paths in the bounded ``DatabricksPath._INSTANCES`` cache.
+        from yggdrasil.databricks.path import DatabricksPath
+        DatabricksPath._INSTANCES.clear()
+        cache_size_before = len(list(DatabricksPath._INSTANCES.keys()))
+
+        workspace.files.list_directory_contents.return_value = [
+            SimpleNamespace(
+                path="/Volumes/c/s/v/folder/ephemeral.bin",
+                is_directory=False,
+            ),
+            SimpleNamespace(
+                path="/Volumes/c/s/v/folder/also_ephemeral.bin",
+                is_directory=False,
+            ),
+        ]
+        p = VolumePath("/Volumes/c/s/v/folder", client=client)
+        # Force materialisation so the listing actually runs.
+        children = list(p.iterdir())
+        assert len(children) == 2
+
+        # No listing child ended up cached. ``p`` itself may or may not
+        # have landed depending on construction path, but the children
+        # explicitly opt out.
+        keys_after = list(DatabricksPath._INSTANCES.keys())
+        for k in keys_after:
+            assert "ephemeral.bin" not in repr(k), (
+                f"listing children should not enter _INSTANCES, found {k!r}"
+            )
+
     def test_iterdir_seeds_child_stat(self, workspace, client) -> None:
         # ``list_directory_contents`` already carries ``is_directory``
         # + ``file_size`` per entry, so every child's stat cache must

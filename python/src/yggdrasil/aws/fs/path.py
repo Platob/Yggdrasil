@@ -422,9 +422,14 @@ class S3Path(Singleton, RemotePath):
         # path changes. The ``_replace_path`` clone preserves the
         # invariants without going through :func:`urlsplit` for
         # every child a listing page yields.
+        #
+        # ``singleton_ttl=False`` keeps listing children out of the
+        # bounded ``S3Path._INSTANCES`` cache — a single ``_ls`` can
+        # yield thousands of keys the caller iterates once. Callers
+        # promote individual children via :meth:`to_singleton`.
         cleaned = key.lstrip("/")
         url = self.url._replace_path("/" + cleaned if cleaned else "/")
-        return self._from_url(url)
+        return S3Path(url=url, client=self._client, singleton_ttl=False)
 
     # ==================================================================
     # Mutators — mkdir / remove

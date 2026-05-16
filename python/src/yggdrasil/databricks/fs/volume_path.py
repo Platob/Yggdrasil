@@ -605,9 +605,16 @@ class VolumePath(DatabricksPath):
             # ``child_path.lstrip('/Volumes')`` which strips the *character
             # set* ``/Volumes`` and then yielded ``dbfs+volume://<cat>/...``,
             # which URL-parses ``<cat>`` as a host and drops it.
+            # Skip the ``DatabricksPath`` singleton cache for listing
+            # children — a single ``iterdir`` can yield thousands of
+            # paths the caller iterates once and discards, and we'd
+            # rather not pin them in the bounded ``_INSTANCES`` cache.
+            # Callers who want to keep a particular child around can
+            # promote it explicitly via :meth:`to_singleton`.
             child = type(self)(
                 child_path,
                 client=self._client,
+                singleton_ttl=False,
             )
             # The listing entry already carries ``is_directory`` /
             # ``file_size`` / ``last_modified`` — seed the child's stat

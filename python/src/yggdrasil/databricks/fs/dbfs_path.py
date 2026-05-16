@@ -93,9 +93,12 @@ class DBFSPath(DatabricksPath):
             api_path = getattr(info, "path", None)
             if not api_path:
                 continue
+            # Listing children skip the ``DatabricksPath._INSTANCES``
+            # cache — see ``Singleton.to_singleton`` for the opt-in.
             child = type(self)(
                 url=URL(scheme=self.scheme, path=api_path),
                 client=self._client,
+                singleton_ttl=False,
             )
             # ``dbfs.list`` returns ``is_dir`` / ``file_size`` /
             # ``modification_time`` per entry — seed the child so

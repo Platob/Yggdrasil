@@ -89,6 +89,13 @@ class Singleton:
         #   - omitted (``...``) → fall back to the subclass's
         #     ``_SINGLETON_TTL`` ClassVar (default ``...`` on the
         #     base = no caching at all).
+        #   - ``False``          → skip the cache for this call, even
+        #     when the subclass default would cache. Used by hot
+        #     listing paths (``iterdir`` / ``_ls`` / ``glob``) that
+        #     produce many short-lived child instances we don't want
+        #     to keep around. The instance is still stamped with its
+        #     singleton key so :meth:`to_singleton` can promote it
+        #     into the cache later if the caller decides to keep it.
         #   - ``None``           → register without expiry (live for
         #     the process lifetime); same shape as the long-running
         #     MSAL / Databricks SDK ``_INSTANCES`` caches.
@@ -97,10 +104,14 @@ class Singleton:
         #     instance per short-lived workload don't leak.
         if singleton_ttl is ...:
             singleton_ttl = cls._SINGLETON_TTL
-        if singleton_ttl is ...:
-            return super().__new__(cls)
 
         key = cls._singleton_key(*args, **kwargs)
+
+        if singleton_ttl is ... or singleton_ttl is False:
+            instance = super().__new__(cls)
+            object.__setattr__(instance, "_singleton_key_", key)
+            return instance
+
         with cls._INSTANCES_LOCK:
             existing = cls._INSTANCES.get(key)
             if existing is not None:
@@ -117,6 +128,49 @@ class Singleton:
             )
             cls._INSTANCES.set(key, instance, ttl=ttl_arg)
             return instance
+
+    def to_singleton(self, ttl: Any = ...) -> "Singleton":
+        """Promote this instance into the per-class ``_INSTANCES`` cache.
+
+        Hot listing paths (``iterdir`` / ``_ls`` / ``glob``) build
+        children with ``singleton_ttl=False`` so the bounded cache
+        doesn't fill up with thousands of short-lived entries. When a
+        caller decides one of those children is worth keeping around
+        (handing it to a long-running worker, returning it from an
+        API), :meth:`to_singleton` registers ``self`` into the cache
+        so the next constructor call with the same key collapses to
+        the same instance.
+
+        ``ttl`` defaults to the subclass's ``_SINGLETON_TTL``
+        (``...`` = no caching, ``None`` = process lifetime, or a
+        seconds count). When a different instance is already cached
+        under this key, that pre-existing one wins and is returned
+        unchanged — the cache is the source of truth.
+        """
+        if ttl is ...:
+            ttl = type(self)._SINGLETON_TTL
+        if ttl is ... or ttl is False:
+            return self
+
+        key = getattr(self, "_singleton_key_", None)
+        if key is None:
+            # Instance bypassed ``__new__`` (e.g. raw ``object.__new__``
+            # or a hand-rolled deserialiser); without the key we can't
+            # register it. Leave it uncached.
+            return self
+
+        cls = type(self)
+        with cls._INSTANCES_LOCK:
+            existing = cls._INSTANCES.get(key)
+            if existing is not None:
+                return existing
+            ttl_arg = (
+                float(ttl)
+                if isinstance(ttl, int) and not isinstance(ttl, bool)
+                else ttl
+            )
+            cls._INSTANCES.set(key, self, ttl=ttl_arg)
+            return self
 
     def __hash__(self) -> int:
         return hash(getattr(self, "_singleton_key_", id(self)))

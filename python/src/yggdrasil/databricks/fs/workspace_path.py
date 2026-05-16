@@ -166,9 +166,12 @@ class WorkspacePath(DatabricksPath):
                 url_path = url_path[len("/Workspace"):]
             elif url_path.startswith("/Workspace"):
                 url_path = url_path[len("/Workspace"):] or "/"
+            # Listing children skip the ``DatabricksPath._INSTANCES``
+            # cache — see ``Singleton.to_singleton`` for the opt-in.
             child = type(self)(
                 url=URL(scheme=self.scheme, path=url_path),
                 client=self._client,
+                singleton_ttl=False,
             )
             ot = getattr(info, "object_type", None)
             is_dir = (
