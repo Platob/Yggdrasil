@@ -612,24 +612,25 @@ class InstancePool(Singleton, DatabricksResource):
     # ------------------------------------------------------------------ #
     # Display / identity
     # ------------------------------------------------------------------ #
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}({self.url()!r})"
-
     def __str__(self) -> str:
-        return self.url().to_string()
+        return self.explore_url.to_string()
 
     def __hash__(self) -> int:
-        return hash(self.url())
+        return hash(self.explore_url)
 
     def __eq__(self, other: Any) -> bool:
-        return isinstance(other, InstancePool) and self.url() == other.url()
+        return isinstance(other, InstancePool) and self.explore_url == other.explore_url
 
-    def url(self) -> URL:
-        """Return the Databricks workspace UI URL for this pool."""
-        return URL.from_str(
-            f"{self.client.base_url.to_string().rstrip('/')}"
+    @property
+    def explore_url(self) -> URL:
+        """Workspace UI URL pointing at this instance pool's page."""
+        return self.client.base_url.with_path(
             f"/compute/instance-pools/{self.instance_pool_id or 'unknown'}"
         )
+
+    def url(self) -> URL:
+        """Deprecated alias for :attr:`explore_url` (method form)."""
+        return self.explore_url
 
     # ------------------------------------------------------------------ #
     # SDK client

@@ -102,22 +102,17 @@ class Job(Singleton, DatabricksResource):
     # ------------------------------------------------------------------ #
     # Identity / display
     # ------------------------------------------------------------------ #
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}({self.url().to_string()!r})"
-
     def __str__(self) -> str:
-        return self.url().to_string()
-
-    def url(self) -> URL:
-        """Return the workspace UI URL for this job."""
-        return URL.from_str(
-            f"{self.client.base_url.to_string().rstrip('/')}/jobs/{self.job_id or 'unknown'}"
-        )
+        return self.explore_url.to_string()
 
     @property
     def explore_url(self) -> URL:
-        """Alias for :meth:`url` — symmetry with other Databricks resources."""
-        return self.url()
+        """Workspace UI URL pointing at this job's run history."""
+        return self.client.base_url.with_path(f"/jobs/{self.job_id or 'unknown'}")
+
+    def url(self) -> URL:
+        """Deprecated alias for :attr:`explore_url` (method form)."""
+        return self.explore_url
 
     # ------------------------------------------------------------------ #
     # Details

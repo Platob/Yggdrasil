@@ -112,21 +112,29 @@ class JobRun(Singleton, DatabricksResource):
     # ------------------------------------------------------------------ #
     # Identity / display
     # ------------------------------------------------------------------ #
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}({self.url().to_string()!r})"
-
     def __str__(self) -> str:
-        return self.url().to_string()
+        return self.explore_url.to_string()
 
-    def url(self) -> URL:
-        """Return the workspace UI URL for this run."""
+    @property
+    def explore_url(self) -> URL:
+        """Workspace UI URL pointing at this run's output page.
+
+        Prefers the ``run_page_url`` carried on the SDK ``RunInfo``
+        when details are cached (that URL is the canonical link the
+        UI hands out — it includes the job_id segment); falls back
+        to the synthetic ``/jobs/runs/<run_id>`` path otherwise.
+        """
         details = self._details
         page_url = getattr(details, "run_page_url", None) if details else None
         if page_url:
             return URL.from_str(page_url)
-        return URL.from_str(
-            f"{self.client.base_url.to_string().rstrip('/')}/jobs/runs/{self.run_id or 'unknown'}"
+        return self.client.base_url.with_path(
+            f"/jobs/runs/{self.run_id or 'unknown'}"
         )
+
+    def url(self) -> URL:
+        """Deprecated alias for :attr:`explore_url` (method form)."""
+        return self.explore_url
 
     # ------------------------------------------------------------------ #
     # Details
