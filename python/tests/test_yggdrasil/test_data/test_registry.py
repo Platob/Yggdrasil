@@ -437,3 +437,219 @@ class TestEnumEdgeCases:
 
         assert convert("RED", Color) is Color.RED
         assert convert("red", Color) is Color.RED
+
+
+# ---------------------------------------------------------------------------
+# Enum lookup cache — populated on first call, reused per Enum class
+# ---------------------------------------------------------------------------
+
+
+class TestEnumLookupCache:
+    """_enum_lookup_cache builds name/value maps once per Enum class and
+    reuses them on every subsequent call, making repeated conversions O(1)."""
+
+    def test_cache_populated_after_first_call(self) -> None:
+        from yggdrasil.data.cast.registry import _enum_lookup_cache
+
+        class _Fruit(enum.Enum):
+            APPLE = 1
+            BANANA = 2
+
+        _enum_lookup_cache.pop(_Fruit, None)
+        convert("apple", _Fruit)
+        assert _Fruit in _enum_lookup_cache
+
+    def test_cache_returns_same_entry_on_repeated_calls(self) -> None:
+        from yggdrasil.data.cast.registry import _enum_lookup_cache
+
+        class _Color(enum.Enum):
+            RED = 1
+
+        _enum_lookup_cache.pop(_Color, None)
+        convert("red", _Color)
+        entry_first = _enum_lookup_cache[_Color]
+        convert("red", _Color)
+        assert _enum_lookup_cache[_Color] is entry_first
+
+    def test_different_enum_classes_get_separate_cache_entries(self) -> None:
+        from yggdrasil.data.cast.registry import _enum_lookup_cache
+
+        class _A(enum.Enum):
+            X = 1
+
+        class _B(enum.Enum):
+            X = 2
+
+        _enum_lookup_cache.pop(_A, None)
+        _enum_lookup_cache.pop(_B, None)
+        convert("x", _A)
+        convert("x", _B)
+        assert _enum_lookup_cache[_A] is not _enum_lookup_cache[_B]
+
+
+# ---------------------------------------------------------------------------
+# Wildcard Any → T converters
+# ---------------------------------------------------------------------------
+
+
+class TestWildcardAny:
+    """Converters registered with from_hint=Any (or object) match any source
+    type and are stored in _any_registry, not _registry."""
+
+    def test_any_source_converter_is_dispatched(self) -> None:
+        from typing import Any as TypingAny
+
+        class _Target:
+            def __init__(self, v: str) -> None:
+                self.v = v
+
+        @register_converter(TypingAny, _Target)
+        def anything_to_target(value: object, opts: Any) -> _Target:
+            return _Target(str(value))
+
+        result = convert(42, _Target)
+        assert isinstance(result, _Target)
+        assert result.v == "42"
+
+    def test_exact_match_beats_wildcard(self) -> None:
+        from typing import Any as TypingAny
+
+        class _Tgt:
+            pass
+
+        calls: list[str] = []
+
+        @register_converter(TypingAny, _Tgt)
+        def wild(v: object, opts: Any) -> _Tgt:
+            calls.append("wild")
+            return _Tgt()
+
+        @register_converter(str, _Tgt)
+        def exact(v: str, opts: Any) -> _Tgt:
+            calls.append("exact")
+            return _Tgt()
+
+        convert("hello", _Tgt)
+        assert calls == ["exact"]
+
+
+# ---------------------------------------------------------------------------
+# str_to_float / str_to_bool — default_value via duck-typed opts
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultValueOption:
+    """The str_to_float and str_to_bool converters honor a ``default_value``
+    attribute on the options object for empty-string inputs.  This is accessed
+    via ``getattr(opts, 'default_value', None)`` so any duck-typed opts works
+    — the converter functions are called directly here to bypass the
+    ``CastOptions.check`` normalization that ``convert()`` applies."""
+
+    def test_str_to_float_empty_uses_default_via_duck_opts(self) -> None:
+        from yggdrasil.data.cast.registry import str_to_float
+
+        class _Opts:
+            default_value = 0.0
+
+        assert str_to_float("", _Opts()) == 0.0
+
+    def test_str_to_bool_empty_uses_default_via_duck_opts(self) -> None:
+        from yggdrasil.data.cast.registry import str_to_bool
+
+        class _Opts:
+            default_value = False
+
+        assert str_to_bool("", _Opts()) is False
+
+    def test_str_to_float_non_empty_ignores_default(self) -> None:
+        from yggdrasil.data.cast.registry import str_to_float
+
+        class _Opts:
+            default_value = 99.0
+
+        assert str_to_float("3.14", _Opts()) == pytest.approx(3.14)
+
+
+# ---------------------------------------------------------------------------
+# unwrap_optional / is_runtime_value — documented utility functions
+# ---------------------------------------------------------------------------
+
+
+class TestHintUtilities:
+
+    def test_unwrap_optional_pipe_syntax(self) -> None:
+        from yggdrasil.data.cast.registry import unwrap_optional
+
+        is_opt, base = unwrap_optional(int | None)
+        assert is_opt is True
+        assert base is int
+
+    def test_unwrap_optional_typing_Optional(self) -> None:
+        from typing import Optional
+        from yggdrasil.data.cast.registry import unwrap_optional
+
+        is_opt, base = unwrap_optional(Optional[str])
+        assert is_opt is True
+        assert base is str
+
+    def test_unwrap_optional_non_optional_passthrough(self) -> None:
+        from yggdrasil.data.cast.registry import unwrap_optional
+
+        is_opt, base = unwrap_optional(int)
+        assert is_opt is False
+        assert base is int
+
+    def test_is_runtime_value_class_is_false(self) -> None:
+        from yggdrasil.data.cast.registry import is_runtime_value
+
+        assert is_runtime_value(int) is False
+        assert is_runtime_value(str) is False
+
+    def test_is_runtime_value_instance_is_true(self) -> None:
+        from yggdrasil.data.cast.registry import is_runtime_value
+
+        assert is_runtime_value(42) is True
+        assert is_runtime_value([]) is True
+        assert is_runtime_value("hello") is True
+
+    def test_is_runtime_value_generic_alias_is_false(self) -> None:
+        from yggdrasil.data.cast.registry import is_runtime_value
+
+        assert is_runtime_value(list[int]) is False
+
+
+# ---------------------------------------------------------------------------
+# _find_cache — composition path hits cache on second call
+# ---------------------------------------------------------------------------
+
+
+class TestCompositionCache:
+    """One-hop composed converters are also stored in _find_cache so the
+    composition scan only runs once per (from_type, to_type) pair."""
+
+    def test_composed_result_is_cached(self) -> None:
+        from yggdrasil.data.cast.registry import _find_cache, find_converter
+
+        class _P:
+            def __init__(self, n: int) -> None:
+                self.n = n
+
+        class _Q:
+            def __init__(self, s: str) -> None:
+                self.s = s
+
+        @register_converter(_P, _Q)
+        def p_to_q(v: _P, opts: Any) -> _Q:
+            return _Q(str(v.n))
+
+        @register_converter(_Q, float)
+        def q_to_float(v: _Q, opts: Any) -> float:
+            return float(v.s)
+
+        _find_cache.pop((_P, float), None)
+        c1 = find_converter(_P, float)
+        assert c1 is not None
+        assert (_P, float) in _find_cache
+
+        c2 = find_converter(_P, float)
+        assert c2 is c1

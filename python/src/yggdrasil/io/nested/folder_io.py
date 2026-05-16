@@ -49,6 +49,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Iterator
 
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.enums import MimeTypes, Mode
@@ -512,6 +513,8 @@ class FolderIO(Tabular[FolderOptions]):
     ) -> None:
         if not all(c in batch.schema.names for c in match_by):
             return
+        # to_pylist() is justified here: building a Python set[tuple] of hashable
+        # row keys is the genuine endpoint — Arrow has no native hash-set primitive.
         cols = [batch.column(c).to_pylist() for c in match_by]
         for row in zip(*cols):
             keys.add(row)
@@ -529,6 +532,23 @@ class FolderIO(Tabular[FolderOptions]):
             yield from self._batch_filter_drop(batch, match_by, drop_keys)
 
     @staticmethod
+    def _key_keep_mask(
+        batch: "pa.RecordBatch",
+        match_by: "list[str]",
+        drop_keys: "set[tuple]",
+    ) -> "pa.BooleanArray":
+        """Boolean keep-mask for a **single** match column via ``pc.is_in``.
+
+        Builds the drop value-set as a typed Arrow array and delegates
+        membership testing to the Arrow C++ hash kernel — no Python row loop.
+        Call only when ``len(match_by) == 1``; ``_batch_filter_drop`` routes
+        multi-column keys through an Arrow LEFT ANTI join instead.
+        """
+        col = batch.column(match_by[0])
+        drop_arr = pa.array([k[0] for k in drop_keys], type=col.type)
+        return pc.invert(pc.is_in(col, value_set=drop_arr))
+
+    @staticmethod
     def _batch_filter_drop(
         batch: pa.RecordBatch,
         match_by: "list[str]",
@@ -539,18 +559,35 @@ class FolderIO(Tabular[FolderOptions]):
         if not all(c in batch.schema.names for c in match_by):
             yield batch
             return
-        cols = [batch.column(c).to_pylist() for c in match_by]
-        mask = [row not in drop_keys for row in zip(*cols)]
-        if all(mask):
-            yield batch
-            return
-        if not any(mask):
-            return
-        keep_idx = [i for i, m in enumerate(mask) if m]
-        table = pa.Table.from_batches([batch]).take(keep_idx).combine_chunks()
-        for inner in table.to_batches():
-            if inner.num_rows > 0:
-                yield inner
+        if len(match_by) == 1:
+            # Single column: pc.is_in on the typed column — pure C++ hash kernel.
+            keep_mask = FolderIO._key_keep_mask(batch, match_by, drop_keys)
+            if pc.all(keep_mask).as_py():
+                yield batch
+                return
+            if not pc.any(keep_mask).as_py():
+                return
+            filtered = batch.filter(keep_mask)
+            if filtered.num_rows > 0:
+                yield filtered
+        else:
+            # Multi-column: Arrow LEFT ANTI join handles type-native multi-key
+            # equality without a Python row loop or string-encoding round-trip.
+            drop_table = pa.table({
+                c: pa.array([k[i] for k in drop_keys], type=batch.schema.field(c).type)
+                for i, c in enumerate(match_by)
+            })
+            kept = pa.Table.from_batches([batch]).join(
+                drop_table, keys=match_by, join_type="left anti",
+            )
+            if kept.num_rows == batch.num_rows:
+                yield batch
+                return
+            if kept.num_rows == 0:
+                return
+            for b in kept.to_batches():
+                if b.num_rows > 0:
+                    yield b
 
     def _iter_existing_filtered(
         self,

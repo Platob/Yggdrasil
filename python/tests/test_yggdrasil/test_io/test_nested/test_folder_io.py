@@ -402,6 +402,88 @@ class TestDelete:
         assert deleted == 2
         assert sorted(folder.read_arrow_table().column("id").to_pylist()) == [1, 2]
 
+
+# ---------------------------------------------------------------------------
+# _batch_filter_drop — unit tests for the vectorised keep-mask
+# ---------------------------------------------------------------------------
+
+
+class TestBatchFilterDrop:
+    """White-box tests for the Arrow-compute keep-mask in _batch_filter_drop
+    and the _key_keep_mask helper it delegates to."""
+
+    @staticmethod
+    def _batch(data: dict) -> pa.RecordBatch:
+        return pa.record_batch(data)
+
+    def test_empty_drop_keys_passes_all_rows(self) -> None:
+        batch = self._batch({"id": [1, 2, 3]})
+        result = list(FolderIO._batch_filter_drop(batch, ["id"], set()))
+        assert result == [batch]
+
+    def test_empty_batch_yields_nothing(self) -> None:
+        batch = pa.record_batch({"id": pa.array([], type=pa.int64())})
+        result = list(FolderIO._batch_filter_drop(batch, ["id"], {(1,)}))
+        assert result == []
+
+    def test_all_rows_dropped_yields_nothing(self) -> None:
+        batch = self._batch({"id": [1, 2, 3]})
+        drop = {(1,), (2,), (3,)}
+        result = list(FolderIO._batch_filter_drop(batch, ["id"], drop))
+        assert result == []
+
+    def test_partial_drop_keeps_correct_rows(self) -> None:
+        batch = self._batch({"id": [1, 2, 3, 4], "v": ["a", "b", "c", "d"]})
+        drop = {(2,), (4,)}
+        (kept,) = list(FolderIO._batch_filter_drop(batch, ["id"], drop))
+        assert kept.column("id").to_pylist() == [1, 3]
+        assert kept.column("v").to_pylist() == ["a", "c"]
+
+    def test_missing_match_column_passes_batch_through(self) -> None:
+        batch = self._batch({"id": [1, 2, 3]})
+        result = list(FolderIO._batch_filter_drop(batch, ["no_such_col"], {(1,)}))
+        assert result == [batch]
+
+    def test_no_rows_dropped_yields_original_batch_object(self) -> None:
+        batch = self._batch({"id": [10, 20]})
+        result = list(FolderIO._batch_filter_drop(batch, ["id"], {(99,)}))
+        assert result[0] is batch
+
+    def test_multi_column_single_pair_dropped(self) -> None:
+        batch = self._batch({
+            "a": [1, 1, 2],
+            "b": ["x", "y", "x"],
+        })
+        drop = {(1, "x")}
+        (kept,) = list(FolderIO._batch_filter_drop(batch, ["a", "b"], drop))
+        assert kept.column("a").to_pylist() == [1, 2]
+        assert kept.column("b").to_pylist() == ["y", "x"]
+
+    def test_multi_column_no_false_positives(self) -> None:
+        # (1, "y") and (2, "x") are NOT in drop_keys — only their
+        # individual components overlap with the dropped pair (1, "x").
+        batch = self._batch({
+            "a": [1, 1, 2, 2],
+            "b": ["x", "y", "x", "z"],
+        })
+        drop = {(1, "x")}
+        (kept,) = list(FolderIO._batch_filter_drop(batch, ["a", "b"], drop))
+        assert kept.num_rows == 3
+
+    def test_key_keep_mask_single_column(self) -> None:
+        batch = self._batch({"id": [10, 20, 30, 40]})
+        mask = FolderIO._key_keep_mask(batch, ["id"], {(20,), (40,)})
+        assert mask.to_pylist() == [True, False, True, False]
+
+    def test_large_batch_partial_drop(self) -> None:
+        n = 10_000
+        ids = list(range(n))
+        batch = self._batch({"id": ids})
+        drop = {(i,) for i in range(0, n, 2)}
+        (kept,) = list(FolderIO._batch_filter_drop(batch, ["id"], drop))
+        assert kept.num_rows == n // 2
+        assert kept.column("id").to_pylist() == list(range(1, n, 2))
+
     def test_delete_accepts_sql_string(self, tmp_path) -> None:
         # SQL-string predicates round-trip through the SQL lifter,
         # which depends on the optional :mod:`sqlglot` extra.

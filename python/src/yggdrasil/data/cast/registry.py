@@ -144,13 +144,16 @@ def register_converter(from_hint: Any, to_hint: Any) -> Callable[[F], F]:
 
 
 def unwrap_optional(hint: Any) -> tuple[bool, Any]:
-    """
-    Return (is_optional, base_hint) for Optional[T] / T | None.
+    """Return ``(is_optional, base_hint)`` for ``Optional[T]`` / ``T | None``.
 
-    Examples:
-      int | None -> (True, int)
-      int | None -> (True, int)
-      int -> (False, int)
+    Handles both the legacy ``Optional[T]`` spelling and the 3.10+
+    ``T | None`` union syntax.  Non-optional hints pass through unchanged.
+
+    Examples::
+
+        int | None  ->  (True, int)
+        Optional[str]  ->  (True, str)
+        int  ->  (False, int)
     """
     origin = get_origin(hint)
     if origin in {Union, types.UnionType}:
@@ -162,10 +165,11 @@ def unwrap_optional(hint: Any) -> tuple[bool, Any]:
 
 
 def iter_mro(tp: Any) -> Iterable[Any]:
-    """
-    Yield (tp, ...) including MRO if tp is class-like; else yield (tp,).
+    """Yield *tp* plus its MRO if *tp* is a class, otherwise yield *(tp,)*.
 
-    This keeps lookups deterministic and cheap.
+    Non-class hints (generics, ``Any``, forward refs) have no ``__mro__``;
+    returning a singleton keeps the MRO cross-product scan in
+    :func:`find_converter` consistent — callers never need a branch.
     """
     try:
         mro = getattr(tp, "__mro__", None)
@@ -175,11 +179,12 @@ def iter_mro(tp: Any) -> Iterable[Any]:
 
 
 def type_matches(actual: Any, registered: Any) -> bool:
-    """
-    True if `actual` can use converter registered for `registered`.
+    """True if *actual* may use the converter registered for *registered*.
 
-    This is slightly more permissive than plain `==` because it supports
-    issubclass checks for class-like keys.
+    Beyond plain ``==`` / ``is``, this accepts subclass relationships so
+    a converter registered for ``A`` also fires for ``B(A)``. The
+    ``issubclass`` call is guarded against ``TypeError`` raised for
+    non-class keys (e.g. generic aliases, ``typing.Any``).
     """
     if actual is registered:
         return True
@@ -299,10 +304,12 @@ def find_converter(from_type: Any, to_hint: Any, check_namespace: bool = True) -
 
 
 def is_runtime_value(x: Any) -> bool:
-    """
-    True for runtime values (42, [], MyClass()), False for type hints.
+    """True when *x* is a runtime value, not a type hint.
 
-    Used by some downstream logic that wants to distinguish "value" vs "hint".
+    Classes and generic aliases (``list[int]``, ``Optional[str]``) are hints;
+    everything else (``42``, ``[]``, ``MyClass()``) is a value.  Used by
+    callers that accept either form and need to branch between "dispatch on
+    type of *x*" vs "dispatch on *x* itself as the target type".
     """
     if inspect.isclass(x):
         return False

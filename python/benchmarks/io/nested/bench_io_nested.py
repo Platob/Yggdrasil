@@ -249,6 +249,57 @@ def _folder_scenarios(repeat: int, tmp_root: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Merge-dedup scenarios — _batch_filter_drop keep-mask performance
+# ---------------------------------------------------------------------------
+
+
+def _merge_dedup_scenarios(repeat: int) -> list[dict]:
+    """Benchmark the Arrow-compute keep-mask path in _batch_filter_drop.
+
+    Each scenario builds a RecordBatch of *rows* rows and a drop-set of
+    *drop_frac* × rows keys, then calls _batch_filter_drop.  The interesting
+    axis is how many rows are checked, not how many are dropped — the
+    pc.is_in C++ kernel scales O(batch_rows) with a constant lookup cost
+    for the value_set regardless of its size (hash table built once).
+    """
+    from yggdrasil.io.nested.folder_io import FolderIO
+
+    out: list[dict] = []
+
+    def _make_batch(rows: int) -> pa.RecordBatch:
+        return pa.record_batch({
+            "id": pa.array(range(rows), type=pa.int64()),
+            "name": pa.array([f"row-{i}" for i in range(rows)], type=pa.string()),
+        })
+
+    def _drop_set_single(rows: int, frac: float) -> "set[tuple]":
+        step = max(1, int(1 / frac)) if frac > 0 else rows + 1
+        return {(i,) for i in range(0, rows, step)}
+
+    def _drop_set_multi(rows: int, frac: float) -> "set[tuple]":
+        step = max(1, int(1 / frac)) if frac > 0 else rows + 1
+        return {(i, f"row-{i}") for i in range(0, rows, step)}
+
+    for rows in (1_000, 50_000):
+        for label_sfx, match_by, make_drop in [
+            ("single-col", ["id"], _drop_set_single),
+            ("multi-col", ["id", "name"], _drop_set_multi),
+        ]:
+            for frac, drop_label in [(0.0, "keep-all"), (0.5, "half-drop"), (1.0, "drop-all")]:
+                batch = _make_batch(rows)
+                drop = make_drop(rows, frac)
+                tag = f"filter-drop {rows:>6}r {label_sfx:12s} {drop_label}"
+                out.append(_time_one(
+                    tag,
+                    lambda b=batch, m=match_by, d=drop: list(FolderIO._batch_filter_drop(b, m, d)),
+                    repeat=repeat,
+                    inner=max(1, 500 // max(1, rows // 1_000)),
+                ))
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -257,6 +308,7 @@ def scenarios(repeat: int, tmp_root: str) -> list[dict]:
     return [
         *_zip_scenarios(repeat),
         *_folder_scenarios(repeat, tmp_root),
+        *_merge_dedup_scenarios(repeat),
     ]
 
 
