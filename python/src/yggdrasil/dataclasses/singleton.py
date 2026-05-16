@@ -172,6 +172,35 @@ class Singleton:
             cls._INSTANCES.set(key, self, ttl=ttl_arg)
             return self
 
+    def _invalidate_singleton(self, remove_global: bool = True) -> None:
+        """Pop ``self`` from the per-class ``_INSTANCES`` cache.
+
+        Mutating ops on a Singleton-cached object (writes, deletes,
+        schema invalidations on a Databricks table, ``put_object`` on
+        an :class:`S3Path`) want to make sure the next caller asking
+        for the same key gets a fresh build rather than collapsing
+        onto this stale handle — that's what ``remove_global=True``
+        (the default) does. The pop is :meth:`identity-guarded`:
+        only an entry that still points at ``self`` is removed, so
+        a concurrent re-construction that already raced past this
+        thread is left alone.
+
+        ``remove_global=False`` is a no-op. The keyword exists so
+        subclass invalidators (``_invalidate_stat_cache``,
+        ``_invalidate_entity_tag_cache``, …) can offer the same
+        switch without branching at the call site.
+        """
+        if not remove_global:
+            return
+        key = getattr(self, "_singleton_key_", None)
+        if key is None:
+            return
+        cls = type(self)
+        with cls._INSTANCES_LOCK:
+            cached = cls._INSTANCES.get(key)
+            if cached is self:
+                cls._INSTANCES.pop(key, None)
+
     def __hash__(self) -> int:
         return hash(getattr(self, "_singleton_key_", id(self)))
 

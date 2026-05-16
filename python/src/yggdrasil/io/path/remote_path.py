@@ -133,17 +133,15 @@ class RemotePath(Path):
         """Backend-specific :class:`IOStats` probe. One network call."""
 
     def _invalidate_stat_cache(self, remove_global: bool = True) -> None:
-        """Drop this path's cached entry. Call after writes / deletes.
+        """Drop this path's cached :class:`IOStats` and schema.
 
-        ``remove_global`` is accepted for backward compatibility with
-        the legacy singleton-cache invalidation path; it is now a
-        no-op since :class:`RemotePath` no longer maintains a
-        process-wide instance cache.
+        ``remove_global`` is forwarded to :class:`Path` /
+        :class:`Singleton` so the cached instance is popped from
+        ``_INSTANCES`` too — see :meth:`Singleton._invalidate_singleton`.
         """
-        del remove_global
-        super()._invalidate_stat_cache()
+        super()._invalidate_stat_cache(remove_global=remove_global)
         self._unpersist_schema()
-        logger.debug(f"Invalidated stat cache for {self!r}")
+        logger.debug("Invalidated stat cache for %r", self)
 
     # ------------------------------------------------------------------
     # Resize is a no-op on remote backends — the upload IS the resize

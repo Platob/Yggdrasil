@@ -346,10 +346,19 @@ class Path(Holder, os.PathLike, ABC):
         self._stat_cached = stats
         self._stat_cached_at = time.monotonic()
 
-    def _invalidate_stat_cache(self) -> None:
-        """Drop the cached :class:`IOStats`. Call after writes / deletes."""
+    def _invalidate_stat_cache(self, remove_global: bool = True) -> None:
+        """Drop the cached :class:`IOStats`. Call after writes / deletes.
+
+        Also pops ``self`` from the :class:`Singleton` ``_INSTANCES``
+        cache when ``remove_global`` is True (default) so the next
+        constructor call rebuilds rather than handing the stale
+        handle back. Pass ``remove_global=False`` to keep the cached
+        identity around — useful when only metadata changed but the
+        handle is otherwise still valid.
+        """
         self._stat_cached = None
         self._stat_cached_at = 0.0
+        self._invalidate_singleton(remove_global=remove_global)
 
     def iterdir(self, *, singleton_ttl: Any = False) -> Iterator["Path"]:
         yield from self._ls(recursive=False, singleton_ttl=singleton_ttl)
