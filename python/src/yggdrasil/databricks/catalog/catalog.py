@@ -257,18 +257,18 @@ class Catalog(DatabricksPath, Singleton):
         del recursive, singleton_ttl
         return iter(())
 
-    def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
+    def _mkdir(self, parents: bool, exist_ok: bool) -> None:
         del parents
         self.ensure_created() if exist_ok else self.create(if_not_exists=False)
 
-    def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
+    def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
         self.delete(wait=wait, raise_error=not missing_ok)
 
     def _remove_dir(
         self,
-        recursive: bool = True,
-        missing_ok: bool = True,
-        wait: WaitingConfig = True,
+        recursive: bool,
+        missing_ok: bool,
+        wait: WaitingConfig,
     ) -> None:
         self.delete(force=recursive, wait=wait, raise_error=not missing_ok)
 
@@ -325,9 +325,6 @@ class Catalog(DatabricksPath, Singleton):
     def full_name(self, safe: bool = None) -> str:
         """Return the catalog name (single-part identifier)."""
         return quote_ident(self.catalog_name) if safe else self.catalog_name
-
-    def __repr__(self) -> str:
-        return f"Catalog<{self.url.to_string()!r}>"
 
     def __str__(self) -> str:
         return self.catalog_name or ""

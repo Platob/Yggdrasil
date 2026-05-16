@@ -286,9 +286,6 @@ class SQLWarehouse(
             warehouse_name=warehouse_name,
         )
 
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}({self.explore_url.to_string()!r})"
-
     def __str__(self) -> str:
         return self.warehouse_id or self.warehouse_name or f"{self.__class__.__name__}(<not initialized>)"
 

@@ -96,7 +96,7 @@ class VolumePath(DatabricksPath):
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_VOLUME
     namespace_prefix: ClassVar[str] = "/Volumes/"
 
-    # ``_service_class`` is bound below the class body to avoid the
+    # ``_SERVICE_CLASS`` is bound below the class body to avoid the
     # ``volume.volumes`` → ``volume.volume`` → ``fs.volume_path``
     # import cycle.
 
@@ -134,11 +134,8 @@ class VolumePath(DatabricksPath):
             data=data, service=service, client=client, url=url, **kwargs,
         )
 
-    def __repr__(self) -> str:
-        return f"{type(self).__name__}({self.explore_url!r})"
-
     @property
-    def explore_url(self):
+    def explore_url(self) -> URL:
         return self.volume.explore_url.add_param(
             key="volumePath",
             value=self.full_path(),
@@ -559,7 +556,7 @@ class VolumePath(DatabricksPath):
                 if end_epoch_s >= now:
                     continue
                 try:
-                    child._remove_file(missing_ok=True)
+                    child._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
                     deleted += 1
                 except Exception:
                     logger.debug(
@@ -721,7 +718,7 @@ class VolumePath(DatabricksPath):
     # Mutators
     # ==================================================================
 
-    def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
+    def _mkdir(self, parents: bool, exist_ok: bool) -> None:
         logger.debug("Creating volume directory %r", self)
         try:
             self._call_ensuring_parents(
@@ -736,7 +733,8 @@ class VolumePath(DatabricksPath):
             self, parents,
         )
 
-    def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
+    def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
+        del wait
         logger.info("Deleting volume file %r", self)
         try:
             self._call(self.client.workspace_client().files.delete, self.api_path)
@@ -746,7 +744,7 @@ class VolumePath(DatabricksPath):
         self.invalidate_singleton()
 
     def _remove_dir(
-        self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
+        self, recursive: bool, missing_ok: bool, wait: WaitingConfig,
     ) -> None:
         logger.info(
             "Deleting volume directory %r (recursive=%s)",
@@ -905,7 +903,7 @@ class VolumePath(DatabricksPath):
         return n
 
     def _clear(self) -> None:
-        self._remove_file(missing_ok=True)
+        self._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
 
 
 # ---------------------------------------------------------------------------
@@ -967,9 +965,9 @@ def _staging_clean_part(value: str) -> str:
     """Strip backticks/whitespace and forbid ``/`` in path segments."""
     return str(value).strip().strip("`").replace("/", "_")
 
-# Late-bound: ``VolumePath._service_class`` is ``Volumes`` once the
+# Late-bound: ``VolumePath._SERVICE_CLASS`` is ``Volumes`` once the
 # volume package finishes importing — avoids the
 # ``fs.volume_path → volume.volumes → volume.volume → fs.volume_path``
 # cycle by deferring the attribute set to module-load tail.
 from ..volume.volumes import Volumes as _Volumes  # noqa: E402
-VolumePath._service_class = _Volumes
+VolumePath._SERVICE_CLASS = _Volumes

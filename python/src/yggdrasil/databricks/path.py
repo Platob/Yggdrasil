@@ -287,7 +287,7 @@ class DatabricksPath(DatabricksResource, RemotePath):
     #: Each concrete subclass declares its typed service
     #: (:class:`DBFSService` / :class:`Volumes` / :class:`Workspaces`)
     #: so ``self.service`` is always the right collection-level handle.
-    _service_class: ClassVar[type] = DatabricksService
+    _SERVICE_CLASS: ClassVar[type] = DatabricksService
 
     @classmethod
     def _singleton_key(
@@ -433,11 +433,11 @@ class DatabricksPath(DatabricksResource, RemotePath):
         # ``WorkspacePath`` → :class:`Workspaces`,
         # ``DBFSPath`` → :class:`DBFSService`.
         if service is None and client is not None:
-            service = self._service_class(client=client)
+            service = self._SERVICE_CLASS(client=client)
         # No service / no client: defer to ``DatabricksResource.__init__``
         # which calls ``<service_class>.current()`` via the kwarg below.
         elif service is None:
-            service = self._service_class.current()
+            service = self._SERVICE_CLASS.current()
 
         # Pre-coerce ``/dbfs/...`` / ``/Volumes/...`` / ``/Workspace/...``
         # into the canonical URL form so the URL parser sees a real
@@ -555,7 +555,7 @@ class DatabricksPath(DatabricksResource, RemotePath):
 
     def with_client(self, client: "DatabricksClient") -> "DatabricksPath":
         """Rebind to *client* by rebuilding the resource service. Returns *self*."""
-        self.service = self._service_class(client=client)
+        self.service = self._SERVICE_CLASS(client=client)
         return self
 
     @property
@@ -721,15 +721,6 @@ class DatabricksPath(DatabricksResource, RemotePath):
         if not payload:
             return 0
         return self._write_mv(memoryview(payload), pos)
-
-    # ==================================================================
-    # Repr
-    # ==================================================================
-
-    def __repr__(self) -> str:
-        marker = ", temporary=True" if self.temporary else ""
-        return f"{type(self).__name__}({self.full_path()!r}{marker})"
-
 
 # ---------------------------------------------------------------------------
 # Error duck-typing — module-private; subclasses keep their own variants

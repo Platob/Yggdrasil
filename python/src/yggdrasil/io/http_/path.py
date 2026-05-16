@@ -195,7 +195,7 @@ class HTTPPath(RemotePath):
         del recursive, singleton_ttl
         return iter(())
 
-    def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
+    def _mkdir(self, parents: bool, exist_ok: bool) -> None:
         del parents, exist_ok
         raise NotImplementedError(
             f"{type(self).__name__} cannot create directories — HTTP has "
@@ -203,10 +203,11 @@ class HTTPPath(RemotePath):
             "s3://, dbfs:/) for the destination."
         )
 
-    def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
+    def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
         from .request import HTTPRequest
         from ..send_config import SendConfig
 
+        del wait
         req = HTTPRequest.prepare("DELETE", self.url)
         resp = self.session.send(req, SendConfig(raise_error=False))
         if resp.status_code == 404:
@@ -217,9 +218,9 @@ class HTTPPath(RemotePath):
         self.invalidate_singleton()
 
     def _remove_dir(
-        self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
+        self, recursive: bool, missing_ok: bool, wait: WaitingConfig,
     ) -> None:
-        del recursive, missing_ok
+        del recursive, missing_ok, wait
         raise NotImplementedError(
             f"{type(self).__name__} cannot remove directories — HTTP has "
             "no directory concept."

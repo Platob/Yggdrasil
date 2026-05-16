@@ -201,23 +201,25 @@ class Cluster(Singleton, DatabricksResource):
 
         self._initialized = True
 
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}({self.url()!r})"
-
     def __str__(self) -> str:
-        return self.url().to_string()
+        return self.explore_url.to_string()
 
     def __hash__(self):
-        return hash(self.url())
+        return hash(self.explore_url)
 
     def __eq__(self, other):
-        return isinstance(other, Cluster) and self.url() == other.url()
+        return isinstance(other, Cluster) and self.explore_url == other.explore_url
+
+    @property
+    def explore_url(self) -> URL:
+        """Workspace UI URL pointing at this cluster's compute page."""
+        return self.client.base_url.with_path(
+            f"/compute/clusters/{self.cluster_id or 'unknown'}"
+        )
 
     def url(self) -> URL:
-        """Return the Databricks workspace URL for this cluster."""
-        return URL.from_str(
-            f"{self.client.base_url.to_string().rstrip('/')}/compute/clusters/{self.cluster_id or 'unknown'}"
-        )
+        """Deprecated alias for :attr:`explore_url` (method form)."""
+        return self.explore_url
 
     # ------------------------------------------------------------------ #
     # SDK clients

@@ -199,16 +199,16 @@ class Path(Holder, os.PathLike, ABC):
         """
 
     @abstractmethod
-    def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
+    def _mkdir(self, parents: bool, exist_ok: bool) -> None:
         """Create directory at this path."""
 
     @abstractmethod
-    def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
+    def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
         """Unlink the file at this path."""
 
     @abstractmethod
     def _remove_dir(
-        self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
+        self, recursive: bool, missing_ok: bool, wait: WaitingConfig,
     ) -> None:
         """Remove the directory at this path."""
 
@@ -299,7 +299,7 @@ class Path(Holder, os.PathLike, ABC):
 
     def _clear(self) -> None:
         """:class:`Holder` primitive: drop the backing entirely (idempotent)."""
-        self._remove_file(missing_ok=True)
+        self._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
 
     # ==================================================================
     # Filesystem surface — thin wrappers over the abstract hooks

@@ -413,7 +413,7 @@ class S3Path(RemotePath):
     # Mutators — mkdir / remove
     # ==================================================================
 
-    def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
+    def _mkdir(self, parents: bool, exist_ok: bool) -> None:
         """No-op — S3 has no directory concept.
 
         Pure-prefix directories materialize when a child object
@@ -422,7 +422,8 @@ class S3Path(RemotePath):
         """
         del parents, exist_ok
 
-    def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
+    def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
+        del wait
         try:
             self._call(
                 self.client.delete_object,
@@ -435,7 +436,7 @@ class S3Path(RemotePath):
         self.invalidate_singleton()
 
     def _remove_dir(
-        self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
+        self, recursive: bool, missing_ok: bool, wait: WaitingConfig,
     ) -> None:
         """Bulk-delete every object under the prefix.
 
@@ -689,7 +690,7 @@ class S3Path(RemotePath):
 
     def _clear(self) -> None:
         """``DeleteObject``. Idempotent."""
-        self._remove_file(missing_ok=True)
+        self._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
 
     # ==================================================================
     # _bread / _bwrite — fallbacks the base class declares abstract

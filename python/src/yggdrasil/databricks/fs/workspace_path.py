@@ -44,7 +44,7 @@ class WorkspacePath(DatabricksPath):
 
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_WORKSPACE
     namespace_prefix: ClassVar[str] = "/Workspace/"
-    _service_class: ClassVar[type] = Workspaces
+    _SERVICE_CLASS: ClassVar[type] = Workspaces
 
     # ==================================================================
     # Path rendering
@@ -202,7 +202,8 @@ class WorkspacePath(DatabricksPath):
     # Mutators
     # ==================================================================
 
-    def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
+    def _mkdir(self, parents: bool, exist_ok: bool) -> None:
+        del parents
         logger.debug("Creating workspace directory %r", self)
         try:
             self._call(self.client.workspace_client().workspace.mkdirs, self.api_path)
@@ -221,7 +222,8 @@ class WorkspacePath(DatabricksPath):
             raise
         self._seed_stat_cache(IOStats(kind=IOKind.DIRECTORY))
 
-    def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
+    def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
+        del wait
         logger.debug("Deleting workspace file %r", self)
         try:
             self._call(
@@ -234,8 +236,9 @@ class WorkspacePath(DatabricksPath):
         self.invalidate_singleton()
 
     def _remove_dir(
-        self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True
+        self, recursive: bool, missing_ok: bool, wait: WaitingConfig,
     ) -> None:
+        del wait
         logger.debug(
             "Deleting workspace directory %r (recursive=%s)",
             self, recursive,
@@ -448,7 +451,7 @@ class WorkspacePath(DatabricksPath):
         return n
 
     def _clear(self) -> None:
-        self._remove_file(missing_ok=True)
+        self._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
 
 
 # ---------------------------------------------------------------------------

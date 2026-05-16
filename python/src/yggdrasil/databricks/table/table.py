@@ -1176,7 +1176,8 @@ class Table(DatabricksPath):
     def _bread(self, n: int, pos: int, mode: Mode) -> BytesIO:
         raise NotImplementedError("Table is a read-only resource")
 
-    def _mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
+    def _mkdir(self, parents: bool, exist_ok: bool) -> None:
+        del parents, exist_ok
         if not self.exists:
             raise NotImplementedError("Table is a read-only resource")
 
@@ -1189,10 +1190,11 @@ class Table(DatabricksPath):
         del recursive, singleton_ttl
         return iter(())
 
-    def _remove_file(self, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
+    def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
         self.delete(wait=wait, missing_ok=missing_ok)
 
-    def _remove_dir(self, recursive: bool = True, missing_ok: bool = True, wait: WaitingConfig = True) -> None:
+    def _remove_dir(self, recursive: bool, missing_ok: bool, wait: WaitingConfig) -> None:
+        del recursive
         self.delete(wait=wait, missing_ok=missing_ok)
 
     def full_path(self) -> str:
