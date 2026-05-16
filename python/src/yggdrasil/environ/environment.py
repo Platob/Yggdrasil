@@ -700,11 +700,71 @@ class PyEnv:
         return os.getenv("DATABRICKS_RUNTIME_VERSION")
 
     @classmethod
+    def in_databricks_notebook(cls) -> bool:
+        """``True`` when running inside a Databricks **notebook** cell.
+
+        Notebook execution drives Python via an IPython kernel; a
+        Databricks job's plain entry point does not. The combination
+        of ``DATABRICKS_RUNTIME_VERSION`` + a live IPython instance is
+        the standard heuristic — the same signal ``dbutils`` itself
+        uses to surface its notebook-only helpers.
+        """
+        if not cls.in_databricks():
+            return False
+        try:
+            from IPython import get_ipython
+        except ImportError:
+            return False
+        return get_ipython() is not None
+
+    @classmethod
     def can_access_databricks(cls):
         return (
             cls.in_databricks
             or "DATABRICKS_HOST" in os.environ.keys()
             or "DATABRICKS_CLUSTER_ID" in os.environ.keys()
+        )
+
+    @classmethod
+    def in_aws_lambda(cls) -> bool:
+        """``True`` when running inside the AWS Lambda runtime.
+
+        ``AWS_LAMBDA_FUNCTION_NAME`` is set on every Lambda invocation
+        by the runtime bootstrap and is documented as reserved — it is
+        not user-settable and never leaks to non-Lambda environments,
+        making it the canonical detector.
+        """
+        return "AWS_LAMBDA_FUNCTION_NAME" in os.environ
+
+    @classmethod
+    def in_aws_batch(cls) -> bool:
+        """``True`` when running inside an AWS Batch job container.
+
+        ``AWS_BATCH_JOB_ID`` is injected into every Batch container by
+        the Batch agent and is the canonical detector.
+        """
+        return "AWS_BATCH_JOB_ID" in os.environ
+
+    @classmethod
+    def in_aws(cls) -> bool:
+        """``True`` when running on an AWS-managed compute surface.
+
+        Detects AWS Lambda, AWS Batch, AWS ECS / Fargate, and AWS
+        CodeBuild via the env vars those services inject. Bare EC2 is
+        **not** covered — there's no environment-side signal for it
+        (callers needing that should hit IMDS).
+        """
+        return (
+            cls.in_aws_lambda()
+            or cls.in_aws_batch()
+            # AWS_EXECUTION_ENV is set by Lambda, CodeBuild, and some
+            # CodePipeline / SageMaker images; ECS injects the metadata
+            # URI; the credentials-relative-URI is set on any compute
+            # surface using a task / instance role.
+            or "AWS_EXECUTION_ENV" in os.environ
+            or "ECS_CONTAINER_METADATA_URI_V4" in os.environ
+            or "ECS_CONTAINER_METADATA_URI" in os.environ
+            or "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI" in os.environ
         )
 
     @classmethod
