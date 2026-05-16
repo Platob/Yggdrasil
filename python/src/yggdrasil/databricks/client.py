@@ -1635,7 +1635,24 @@ class DatabricksClient(Singleton, URLBased):
         - *cache_dir* — local scratch dir used by the classic
           compute fallback (and for wheel materialization when
           no explicit *registry* is passed).
+
+        When a :class:`pyspark.sql.SparkSession` is already active
+        in the process (notebook driver, an outer
+        ``client.spark()`` call, a Databricks Job task), that
+        session is returned as-is — dependency classification and
+        wheel publishing are skipped, since the active session's
+        environment is already fixed. The client is still stashed
+        on it as ``session.ygg_client`` so downstream helpers find
+        the same auth.
         """
+        try:
+            from pyspark.sql import SparkSession  # noqa
+            active = SparkSession.getActiveSession()
+        except Exception:
+            active = None
+        if active is not None:
+            return self._bind_spark_session(active)
+
         from databricks.connect import DatabricksSession  # noqa
 
         deps = list(dependencies)
@@ -1665,14 +1682,20 @@ class DatabricksClient(Singleton, URLBased):
             if local_paths:
                 session.addArtifacts(*local_paths, pyfile=True)
 
-        # Stash the client on the session so downstream
-        # ``client.spark(...)``-returned consumers can grab it
-        # without re-resolving ``DatabricksClient.current()``.
+        return self._bind_spark_session(session)
+
+    def _bind_spark_session(self, session: "Any") -> "Any":
+        """Stash ``self`` on *session* as ``ygg_client`` and return it.
+
+        Downstream ``client.spark(...)`` consumers (UDFs,
+        :class:`DynamicFrame` extensions, ad-hoc resource lookups)
+        pull the bound client off the session instead of
+        re-resolving :meth:`DatabricksClient.current`.
+        """
         try:
             session.ygg_client = self  # type: ignore[attr-defined]
         except Exception:
             pass
-
         return session
 
     def _resolve_registry(
