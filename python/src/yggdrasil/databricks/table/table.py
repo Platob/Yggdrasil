@@ -45,7 +45,7 @@ from yggdrasil.data.enums import MimeTypes, MimeType, MediaType, MediaTypes, Mod
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema as DataSchema
 from yggdrasil.data.statement import PreparedStatement, StatementResult
-from yggdrasil.databricks.client import DatabricksClient, DatabricksResource
+from yggdrasil.databricks.client import DatabricksClient
 from yggdrasil.databricks.column.column import Column
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.databricks.sql.sql_utils import (
@@ -60,7 +60,7 @@ from yggdrasil.io import URL
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.databricks.path import DatabricksPath
-from yggdrasil.io.path import Path, RemotePath
+from yggdrasil.io.path import Path
 from yggdrasil.io.primitive import ParquetIO
 from yggdrasil.io.tabular import Tabular, O
 from yggdrasil.io.tabular.execution.expr import Predicate, col as expr_col
@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
     from yggdrasil.databricks.warehouse import WarehousePreparedStatement
     from yggdrasil.databricks.table.async_write import AsyncInsert
+    from yggdrasil.data.statement import StatementBatch
 
 
 _READ_ONLY_MODES = frozenset({Mode.AUTO})
@@ -1629,7 +1630,6 @@ class Table(DatabricksPath):
     def infos(self) -> TableInfo:
         """Basic :class:`TableInfo` — TTL-cached."""
         if self._infos is not None and self._is_fresh(self._infos_fetched_at):
-            age = time.time() - (self._infos_fetched_at or 0.0)
             return self._infos
 
         info = self.client.tables.find_table_remote(
