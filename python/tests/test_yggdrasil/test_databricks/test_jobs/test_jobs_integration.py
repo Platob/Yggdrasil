@@ -11,11 +11,11 @@ Exercises against a real workspace:
   a ``.py`` script under ``/Workspace/Users/me/.yggdrasil/jobs/``;
   verifies the file actually lands and the script content compiles +
   calls the function.
-- :meth:`JobTask.create_or_update` — re-staging the same ``task_key``
-  replaces the existing entry on the job rather than raising.
+- :meth:`JobTask.create` — re-staging the same ``task_key``
+  replaces the existing entry on the job rather than raising
+  (idempotent).
 - :meth:`Job.task` + :meth:`JobTask.decorate` — Prefect-style sugar
-  wires through :meth:`JobTask.from_callable` +
-  :meth:`JobTask.create_or_update`.
+  wires through :meth:`JobTask.from_callable` + :meth:`JobTask.create`.
 - :meth:`Job.pytask` — single-call fastpath that composes the two.
 - :meth:`JobTask.update` / :meth:`JobTask.delete` — round-trip
   through :meth:`Job.update` and the parent job's settings reflect
@@ -166,7 +166,7 @@ class TestJobTaskIntegration(_JobsIntegrationBase):
         # Sanity-compile.
         compile(content, path, "exec")
 
-    # ---- decorator + create_or_update ------------------------------- #
+    # ---- decorator + idempotent create ------------------------------ #
 
     def test_job_task_decorator_registers_then_re_decorates_in_place(self):
         job = self._fresh_job("decorator")
@@ -198,7 +198,7 @@ class TestJobTaskIntegration(_JobsIntegrationBase):
             t for t in (job.settings.tasks or []) if t.task_key == "step_one"
         ]
         assert len(matching) == 1, (
-            "create_or_update should replace, not duplicate"
+            "JobTask.create should replace, not duplicate, on same key"
         )
         new_path = self._staged_workspace_path(matching[0])
         new_content = self._workspace_read(new_path).decode()
@@ -258,13 +258,13 @@ class TestJobTaskIntegration(_JobsIntegrationBase):
         # The seed task survives the targeted delete.
         assert "seed" in remaining
 
-    def test_create_or_update_on_handcrafted_task(self):
-        """Non-decorator path: build a Task manually + create_or_update."""
+    def test_create_idempotent_on_handcrafted_task(self):
+        """Non-decorator path: build a Task manually + create (idempotent)."""
         job = self._fresh_job("handcrafted")
 
         condition = _noop_condition_task("noop_extra")
         jt = JobTask(job=job, task_key="noop_extra", details=condition)
-        jt.create_or_update()
+        jt.create()
 
         job.refresh()
         keys = {t.task_key for t in (job.settings.tasks or [])}
@@ -272,13 +272,13 @@ class TestJobTaskIntegration(_JobsIntegrationBase):
 
         # Same key, new details — replaces in place.
         replacement = _noop_condition_task("noop_extra")
-        replacement.description = "replaced via create_or_update"
+        replacement.description = "replaced via create"
         jt2 = JobTask(job=job, task_key="noop_extra", details=replacement)
-        jt2.create_or_update()
+        jt2.create()
 
         job.refresh()
         matching = [
             t for t in (job.settings.tasks or []) if t.task_key == "noop_extra"
         ]
         assert len(matching) == 1
-        assert matching[0].description == "replaced via create_or_update"
+        assert matching[0].description == "replaced via create"

@@ -53,10 +53,18 @@ class JobTask:
         job: "Job",
         task_key: str,
         details: Optional[Task] = None,
+        *,
+        order: Optional[int] = None,
     ) -> None:
         self.job = job
         self.task_key = task_key
         self._details = details
+        #: Optional position to place this task at on :meth:`create` /
+        #: :meth:`create`. ``None`` keeps the existing position
+        #: (or appends when new). Honors Python list-slice indexing, so
+        #: ``0`` lands first and ``-1`` lands second-to-last (insert
+        #: semantics: ``lst[:order] + [t] + lst[order:]``).
+        self.order = order
 
     def __repr__(self) -> str:
         return (
@@ -88,47 +96,23 @@ class JobTask:
     # Write
     # ------------------------------------------------------------------ #
     def create(self) -> "JobTask":
-        """Append this task to the parent job (raises on key collision)."""
+        """Append this task to the parent job — or update the existing entry.
+
+        Idempotent: if a task with the same ``task_key`` already lives
+        on the job, its entry is replaced in place (or moved when
+        :attr:`order` is set); otherwise the task is inserted. Used by
+        :meth:`JobTask.decorate` so re-decorating the same function
+        during development doesn't raise — the staged source on the
+        second pass overwrites the first task entry.
+        """
         if self._details is None:
             raise ValueError(
                 f"Cannot create {self!r}: details is None. Construct with a "
                 "Task or build through :meth:`from_callable`."
             )
         existing = self._existing_tasks()
-        if any(t.task_key == self.task_key for t in existing):
-            raise ValueError(
-                f"Task {self.task_key!r} already exists on {self.job!r}; "
-                "call :meth:`update` or :meth:`create_or_update` instead."
-            )
-        LOGGER.debug("Creating job task %r on %r", self, self.job)
-        self.job.update(tasks=[*existing, self._details])
-        LOGGER.info("Created job task %r", self)
-        return self
-
-    def create_or_update(self) -> "JobTask":
-        """Append this task — or replace the existing one with the same key.
-
-        Used by :meth:`JobTask.decorate` so re-decorating the same
-        function during development doesn't raise; the staged source
-        on the second pass overwrites the first task entry in place.
-        """
-        if self._details is None:
-            raise ValueError(
-                f"Cannot create_or_update {self!r}: details is None. "
-                "Construct with a Task or build through :meth:`from_callable`."
-            )
-        existing = self._existing_tasks()
-        new_details = self._details
-        replaced = False
-        new_tasks: List[Task] = []
-        for t in existing:
-            if t.task_key == self.task_key:
-                new_tasks.append(new_details)
-                replaced = True
-            else:
-                new_tasks.append(t)
-        if not replaced:
-            new_tasks.append(new_details)
+        replaced = any(t.task_key == self.task_key for t in existing)
+        new_tasks = self._place(existing, self._details)
 
         LOGGER.debug(
             "%s job task %r on %r",
@@ -181,6 +165,30 @@ class JobTask:
         settings = self.job.settings
         return list((settings.tasks if settings is not None else None) or [])
 
+    def _place(self, existing: List[Task], new_details: Task) -> List[Task]:
+        """Build the new task list with *new_details* placed honoring ``self.order``.
+
+        ``order is None`` keeps the existing task's position (replace
+        in place) or appends when the key is new. An integer ``order``
+        first strips any prior entry for ``self.task_key`` and inserts
+        *new_details* at that slice index (``lst[:order] + [t] +
+        lst[order:]``), so the same call both creates and reorders.
+        """
+        if self.order is None:
+            replaced = False
+            new_tasks: List[Task] = []
+            for t in existing:
+                if t.task_key == self.task_key:
+                    new_tasks.append(new_details)
+                    replaced = True
+                else:
+                    new_tasks.append(t)
+            if not replaced:
+                new_tasks.append(new_details)
+            return new_tasks
+        others = [t for t in existing if t.task_key != self.task_key]
+        return [*others[:self.order], new_details, *others[self.order:]]
+
     # ------------------------------------------------------------------ #
     # Decorator: stage a Python callable onto this task
     # ------------------------------------------------------------------ #
@@ -199,8 +207,8 @@ class JobTask:
         set that field* through :meth:`Job.task`. Anything pre-set on
         the handle — ``spark_python_task=…``, ``description=…``,
         compute, dependencies, retries, environment_key — wins.
-        Pushes the result through :meth:`create_or_update` so a
-        re-decoration replaces the previous entry in place.
+        Pushes the result through :meth:`create` so a re-decoration
+        replaces the previous entry in place.
 
         Returns the original callable so the function stays usable
         in-process; the :class:`JobTask` handle is attached as
@@ -224,7 +232,7 @@ class JobTask:
             }
             if defaults:
                 self._details = _dc_replace(self._details, **defaults)
-        self.create_or_update()
+        self.create()
         func._job_task = self  # type: ignore[attr-defined]
         return func
 
@@ -265,8 +273,9 @@ class JobTask:
         carried over.
 
         The returned :class:`JobTask` is not persisted on the job yet
-        — call :meth:`create` / :meth:`create_or_update` (or use
-        :meth:`JobTask.decorate`, which does it for you). Compute
+        — call :meth:`create` (or use :meth:`JobTask.decorate`, which
+        does it for you). :meth:`create` is idempotent — same key
+        replaces in place. Compute
         stays caller-owned: layer ``new_cluster`` / ``existing_cluster_id``
         / ``job_cluster_key`` via :meth:`update` once the task is
         registered.

@@ -358,14 +358,17 @@ class Job(Singleton, DatabricksResource):
         self,
         task_key: str,
         /,
+        *,
+        order: Optional[int] = None,
         **task_fields: Any,
     ) -> "JobTask":
         """Construct a :class:`JobTask` handle bound to this job.
 
         The returned handle is not yet persisted on the job — call
-        :meth:`JobTask.create` / :meth:`JobTask.create_or_update`, or
-        use :meth:`JobTask.decorate` to stage a Python callable's
-        source onto it and push it through in one step::
+        :meth:`JobTask.create` (idempotent: re-creates with the same
+        ``task_key`` replace in place), or use :meth:`JobTask.decorate`
+        to stage a Python callable's source onto it and push it
+        through in one step::
 
             job = client.jobs.get_or_create(job_id=123, name="my-job")
 
@@ -373,19 +376,22 @@ class Job(Singleton, DatabricksResource):
             def do(a: str, i: int):
                 print(a, i)
 
-            @job.task("do2", existing_cluster_id="c-123").decorate
+            @job.task("do2", order=0, existing_cluster_id="c-123").decorate
             def do2(x: int): ...
 
         Extra *task_fields* are forwarded to
         :class:`databricks.sdk.service.jobs.Task` so you can attach
         compute (``new_cluster=`` / ``existing_cluster_id=`` /
         ``job_cluster_key=``), dependencies, retries, description, etc.
-        at construction time.
+        at construction time. *order* (when set) pins the task's
+        position in the job's task list on the next
+        :meth:`~JobTask.create` — slice semantics, so ``0``
+        lands first and ``-1`` lands second-to-last.
         """
         from .task import JobTask
 
         details = Task(task_key=task_key, **task_fields)
-        return JobTask(job=self, task_key=task_key, details=details)
+        return JobTask(job=self, task_key=task_key, details=details, order=order)
 
     def pytask(
         self,
@@ -393,31 +399,33 @@ class Job(Singleton, DatabricksResource):
         /,
         *,
         task_key: Optional[str] = None,
+        order: Optional[int] = None,
         **task_fields: Any,
     ) -> Any:
         """Fastpath: stage a Python callable as a task in one decorator.
 
         Composes :meth:`Job.task` + :meth:`JobTask.decorate` into a
         single Prefect-style decorator. Equivalent to chaining
-        ``@job.task(key, **fields).decorate``, but shorter for the
-        common case where you just want the function staged.
+        ``@job.task(key, order=…, **fields).decorate``, but shorter
+        for the common case where you just want the function staged.
 
         Usable bare or parametrized::
 
             @job.pytask
             def step(): ...
 
-            @job.pytask(task_key="custom", description="…", environment_key="env-1")
+            @job.pytask(task_key="custom", order=0, environment_key="env-1")
             def step(): ...
 
         Bare form defaults ``task_key`` to ``func.__name__``. Any extra
         *task_fields* flow into :meth:`Job.task` so the same
         caller-wins / decorate-back-fills semantics apply: explicit
-        fields beat the docstring-derived defaults.
+        fields beat the docstring-derived defaults. *order* (when set)
+        pins the resulting task's position in the job's task list.
         """
         def _decorate(f: Callable[..., Any]) -> Callable[..., Any]:
             key = task_key or f.__name__
-            return self.task(key, **task_fields).decorate(f)
+            return self.task(key, order=order, **task_fields).decorate(f)
 
         if func is None:
             return _decorate

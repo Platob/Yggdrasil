@@ -462,7 +462,7 @@ class TestJobTaskFactoryAndDecorate(DatabricksTestCase):
             ),
         )
         with self._patch_jobtask_method("from_callable", return_value=staged), \
-                self._patch_jobtask_method("create_or_update"):
+                self._patch_jobtask_method("create"):
             def step():
                 """from docstring"""
 
@@ -491,7 +491,7 @@ class TestJobTaskFactoryAndDecorate(DatabricksTestCase):
             ),
         )
         with self._patch_jobtask_method("from_callable", return_value=staged), \
-                self._patch_jobtask_method("create_or_update"):
+                self._patch_jobtask_method("create"):
             def step():
                 """from docstring"""
 
@@ -522,7 +522,7 @@ class TestJobTaskFactoryAndDecorate(DatabricksTestCase):
 
         from unittest.mock import patch
         with patch.object(JobTask, "from_callable", classmethod(_fake_from_callable)), \
-                patch.object(JobTask, "create_or_update"):
+                patch.object(JobTask, "create"):
 
             @job.pytask
             def step():
@@ -531,6 +531,85 @@ class TestJobTaskFactoryAndDecorate(DatabricksTestCase):
         jt: JobTask = step._job_task  # type: ignore[attr-defined]
         self.assertEqual(jt.task_key, "step")
         self.assertIs(jt._details.spark_python_task, staged_body)
+
+    def test_task_order_inserts_at_position_on_create(self):
+        """``order=N`` places the task at slice index N in the job's task list."""
+        job = self._job()
+        # Seed three existing tasks so positions are observable.
+        job.settings.tasks = [
+            Task(task_key="a"),
+            Task(task_key="b"),
+            Task(task_key="c"),
+        ]
+
+        jt = job.task("new", order=1)
+        jt.create()
+
+        _, kwargs = self.jobs_api.update.call_args
+        new_keys = [t.task_key for t in kwargs["new_settings"].tasks]
+        self.assertEqual(new_keys, ["a", "new", "b", "c"])
+
+    def test_task_order_moves_existing_task_to_new_position(self):
+        """``order`` on an idempotent re-create first strips, then reinserts."""
+        job = self._job()
+        job.settings.tasks = [
+            Task(task_key="a"),
+            Task(task_key="b"),
+            Task(task_key="c"),
+        ]
+
+        # Move "a" to the end via order=-1 + a fresh details payload.
+        jt = job.task("a", order=-1, description="moved")
+        jt.create()
+
+        _, kwargs = self.jobs_api.update.call_args
+        tasks = kwargs["new_settings"].tasks
+        keys = [t.task_key for t in tasks]
+        self.assertEqual(keys, ["b", "a", "c"])
+        moved = next(t for t in tasks if t.task_key == "a")
+        self.assertEqual(moved.description, "moved")
+
+    def test_task_without_order_keeps_existing_position(self):
+        """``order=None`` (default) replaces in place — no shuffle."""
+        job = self._job()
+        job.settings.tasks = [
+            Task(task_key="a"),
+            Task(task_key="b"),
+            Task(task_key="c"),
+        ]
+
+        jt = job.task("b", description="updated")
+        jt.create()
+
+        _, kwargs = self.jobs_api.update.call_args
+        keys = [t.task_key for t in kwargs["new_settings"].tasks]
+        self.assertEqual(keys, ["a", "b", "c"])
+
+    def test_pytask_order_forwards_to_jobtask(self):
+        """``@job.pytask(order=…)`` carries through to the JobTask handle."""
+        job = self._job()
+        staged_body = SparkPythonTask(python_file="/from_callable.py")
+
+        def _fake_from_callable(cls, j, f, **_kw):
+            return JobTask(
+                job=j,
+                task_key=_kw.get("task_key") or f.__name__,
+                details=Task(
+                    task_key=_kw.get("task_key") or f.__name__,
+                    spark_python_task=staged_body,
+                ),
+            )
+
+        from unittest.mock import patch
+        with patch.object(JobTask, "from_callable", classmethod(_fake_from_callable)), \
+                patch.object(JobTask, "create"):
+
+            @job.pytask(order=2)
+            def step():
+                """from docstring"""
+
+        jt: JobTask = step._job_task  # type: ignore[attr-defined]
+        self.assertEqual(jt.order, 2)
 
     def test_pytask_parametrized_forwards_fields(self):
         job = self._job()
@@ -549,7 +628,7 @@ class TestJobTaskFactoryAndDecorate(DatabricksTestCase):
 
         from unittest.mock import patch
         with patch.object(JobTask, "from_callable", classmethod(_fake_from_callable)), \
-                patch.object(JobTask, "create_or_update"):
+                patch.object(JobTask, "create"):
 
             @job.pytask(task_key="custom", description="caller wins", timeout_seconds=600)
             def step():
