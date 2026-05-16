@@ -478,6 +478,144 @@ class TestExecute:
         assert kwargs["raise_error"] is False
 
 
+class TestConcat:
+    """:meth:`AsyncInsert.concat` and the matching ``__call__`` shortcut."""
+
+    def test_concat_records_into_sql_suite(self):
+        a = _make_record(target="cat.sch.t1", parquets=("/t1.parquet",),
+                         metas=("/t1.json",), ops=("a",), mode="append")
+        b = _make_record(target="cat.sch.t2", parquets=("/t2.parquet",),
+                         metas=("/t2.json",), ops=("b",), mode="append")
+
+        suite = AsyncInsert.concat([a, b])
+        # One statement per target — order follows the merge result.
+        assert len(suite) == 2
+        assert all(s.startswith("INSERT INTO ") for s in suite)
+        # Both targets covered (merge groups by target).
+        assert any("t1" in s for s in suite)
+        assert any("t2" in s for s in suite)
+
+    def test_concat_merges_appends_for_same_target(self):
+        """Two appends on the same target collapse to one UNION-ALL INSERT."""
+        a = _make_record(target="cat.sch.t", parquets=("/a.parquet",),
+                         metas=("/a.json",), ops=("a",), mode="append",
+                         created_at="2026-05-15T10:00:00+00:00")
+        b = _make_record(target="cat.sch.t", parquets=("/b.parquet",),
+                         metas=("/b.json",), ops=("b",), mode="append",
+                         created_at="2026-05-15T11:00:00+00:00")
+
+        suite = AsyncInsert.concat([a, b])
+        assert len(suite) == 1
+        # Both parquets ride a single statement via UNION ALL.
+        assert "UNION ALL" in suite[0]
+        assert "/a.parquet" in suite[0]
+        assert "/b.parquet" in suite[0]
+
+    def test_concat_empty_returns_empty_list(self):
+        assert AsyncInsert.concat([]) == []
+
+    def test_concat_with_engine_runs_execute_many(self):
+        a = _make_record(target="cat.sch.t1", parquets=("/t1.parquet",),
+                         metas=("/t1.json",), ops=("a",), mode="append")
+        b = _make_record(target="cat.sch.t2", parquets=("/t2.parquet",),
+                         metas=("/t2.json",), ops=("b",), mode="append")
+
+        engine = MagicMock()
+        engine.execute_many.return_value = "batch-result"
+
+        # Cleanup hits DatabricksPath — patch the factory.
+        with patch(
+            "yggdrasil.databricks.path.DatabricksPath.from_",
+        ) as from_:
+            from_.return_value = MagicMock()
+            result = AsyncInsert.concat([a, b], engine=engine, cleanup=True)
+
+        assert result == "batch-result"
+        engine.execute_many.assert_called_once()
+        statements = engine.execute_many.call_args.args[0]
+        assert len(statements) == 2
+        # cleanup ran across both records (1 parquet + 1 meta each = 4 paths).
+        assert from_.call_count == 4
+
+    def test_concat_with_engine_skips_cleanup_when_disabled(self):
+        a = _make_record(target="cat.sch.t", parquets=("/a.parquet",),
+                         metas=("/a.json",), ops=("a",), mode="append")
+
+        engine = MagicMock()
+        engine.execute_many.return_value = "ok"
+
+        with patch(
+            "yggdrasil.databricks.path.DatabricksPath.from_",
+        ) as from_:
+            AsyncInsert.concat([a], engine=engine, cleanup=False)
+
+        from_.assert_not_called()
+
+    def test_concat_with_engine_empty_returns_none(self):
+        engine = MagicMock()
+        assert AsyncInsert.concat([], engine=engine) is None
+        engine.execute_many.assert_not_called()
+
+    def test_concat_forwards_wait_and_raise_error(self):
+        a = _make_record(target="cat.sch.t", parquets=("/a.parquet",),
+                         metas=("/a.json",), ops=("a",), mode="append")
+        engine = MagicMock()
+        engine.execute_many.return_value = "ok"
+
+        with patch(
+            "yggdrasil.databricks.path.DatabricksPath.from_",
+        ) as from_:
+            from_.return_value = MagicMock()
+            AsyncInsert.concat(
+                [a], engine=engine, wait=False, raise_error=False,
+            )
+
+        _, kwargs = engine.execute_many.call_args
+        assert kwargs["wait"] is False
+        assert kwargs["raise_error"] is False
+
+    def test_concat_accepts_folder_volumepath(self):
+        rec = _make_record(target="cat.sch.t")
+        json_entry = MagicMock()
+        json_entry.name = "x.json"
+        json_entry.read_bytes.return_value = rec.to_json_bytes()
+        folder = MagicMock(spec=VolumePath)
+        folder.ls.return_value = [json_entry]
+
+        suite = AsyncInsert.concat(folder)
+        assert len(suite) == 1
+        assert suite[0].startswith("INSERT INTO cat.sch.t")
+
+    def test_call_runs_concat_against_engine(self):
+        a = _make_record(target="cat.sch.t", parquets=("/a.parquet",),
+                         metas=("/a.json",), ops=("a",), mode="append")
+        b = _make_record(target="cat.sch.t", parquets=("/b.parquet",),
+                         metas=("/b.json",), ops=("b",), mode="append",
+                         created_at="2026-05-15T11:00:00+00:00")
+
+        engine = MagicMock()
+        engine.execute_many.return_value = "batch"
+
+        with patch(
+            "yggdrasil.databricks.path.DatabricksPath.from_",
+        ) as from_:
+            from_.return_value = MagicMock()
+            result = a(engine, b)  # __call__
+
+        assert result == "batch"
+        # Same target → one merged INSERT
+        statements = engine.execute_many.call_args.args[0]
+        assert len(statements) == 1
+        assert "UNION ALL" in statements[0]
+
+    def test_call_without_engine_returns_sql_suite(self):
+        a = _make_record(target="cat.sch.t1", parquets=("/a.parquet",),
+                         metas=("/a.json",), ops=("a",), mode="append")
+        result = a()
+        assert isinstance(result, list)
+        assert result[0].startswith("INSERT INTO cat.sch.t1")
+
+
 class TestCleanup:
 
     def test_removes_all_paths(self):

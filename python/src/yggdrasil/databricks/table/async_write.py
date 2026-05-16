@@ -826,6 +826,102 @@ class AsyncInsert:
         return [f"{prefix} {source}{where}"]
 
     # ------------------------------------------------------------------ #
+    # Concat — render a batch-execution suite across many records
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def concat(
+        cls,
+        source: Any,
+        *,
+        engine: "SQLEngine | None" = None,
+        client: "DatabricksClient | None" = None,
+        wait: Any = True,
+        raise_error: bool = True,
+        cleanup: bool = True,
+    ) -> Any:
+        """Concatenate staged operations into the SQL suite that applies them.
+
+        Pipes everything :meth:`merge` accepts (a folder
+        :class:`VolumePath`, an iterable of metadata file paths, an
+        iterable of in-memory records, or a single
+        :class:`AsyncInsert`) through the per-target merge and then
+        each merged record's :meth:`to_sql`. The returned list is the
+        ordered batch of statements ready to feed to
+        :meth:`SQLEngine.execute_many` — one ``INSERT INTO`` /
+        ``INSERT OVERWRITE`` per drained target.
+
+        When *engine* is supplied the suite is submitted to it via
+        ``engine.execute_many`` (one round trip carrying every
+        statement) and the returned ``StatementBatch`` is handed
+        back. On success every contributing record's staged Parquet
+        + metadata file is cleaned up (set ``cleanup=False`` to keep
+        them around).
+
+        Returns
+        -------
+        list[str]
+            When *engine* is ``None``.
+        StatementBatch
+            When *engine* is supplied — whatever the engine's
+            ``execute_many`` returns. Empty input returns an empty
+            list / ``None`` without touching the engine.
+        """
+        merged = cls.merge(source, client=client)
+        if not merged:
+            return [] if engine is None else None
+
+        statements: list[str] = []
+        for record in merged:
+            statements.extend(record.to_sql())
+
+        if engine is None:
+            return statements
+
+        if not statements:
+            return None
+
+        LOGGER.info(
+            "Executing %d-statement async-insert suite across %d target(s)",
+            len(statements), len(merged),
+        )
+        batch = engine.execute_many(
+            statements,
+            wait=wait,
+            raise_error=raise_error,
+        )
+
+        if cleanup:
+            for record in merged:
+                record.cleanup(client=client)
+
+        return batch
+
+    def __call__(
+        self,
+        engine: "SQLEngine | None" = None,
+        *others: "AsyncInsert",
+        client: "DatabricksClient | None" = None,
+        wait: Any = True,
+        raise_error: bool = True,
+        cleanup: bool = True,
+    ) -> Any:
+        """Shorthand for :meth:`concat` keyed off this record.
+
+        ``record(engine, *others)`` is equivalent to
+        ``AsyncInsert.concat([record, *others], engine=engine, …)``,
+        so a caller that just staged an insert can apply it (plus
+        any peers) without re-typing the class name.
+        """
+        return type(self).concat(
+            [self, *others],
+            engine=engine,
+            client=client,
+            wait=wait,
+            raise_error=raise_error,
+            cleanup=cleanup,
+        )
+
+    # ------------------------------------------------------------------ #
     # Execution
     # ------------------------------------------------------------------ #
     def execute(
