@@ -2975,9 +2975,9 @@ class Table(DatabricksPath):
         executed. The constructed :class:`AsyncInsert` is itself a
         :class:`WarehouseStatementBatch`, so binding an executor and
         submitting is a single ``.execute(engine)`` call. The caller
-        can also ``merge_with`` peers, or schedule the apply via
-        :meth:`AsyncInsert.job`. See :mod:`.async_write` for the wire
-        format.
+        can also ``merge_with`` peers, or schedule the apply via the
+        per-table :class:`AsyncInsertJob` in :mod:`.async_job`. See
+        :mod:`.async_write` for the wire format.
         """
         from .async_write import stage_async_insert
 
