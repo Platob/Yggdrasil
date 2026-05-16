@@ -50,6 +50,13 @@ class SparkStatementExecutor(
     Lazy resolution means the executor is cheap to construct even in
     environments where pyspark isn't installed; the import only fires
     when a statement actually runs.
+
+    Singleton-cached for the process lifetime — Spark is a per-JVM
+    singleton already, so two callers asking for a Spark executor
+    share one instance. The pinned ``spark_session`` is rebindable in
+    place; it doesn't participate in singleton identity (raw
+    ``SparkSession`` objects aren't reliably hashable across processes
+    anyway).
     """
 
     # Pin the concrete types so the base executor's coercion produces the
@@ -58,14 +65,34 @@ class SparkStatementExecutor(
     _STATEMENT_RESULT_CLASS: ClassVar[type[SparkStatementResult]] = SparkStatementResult
     _STATEMENT_BATCH_CLASS: ClassVar[type[SparkStatementBatch]] = SparkStatementBatch
 
+    _SINGLETON_TTL: ClassVar[Any] = None
+
+    # ``spark_session`` is rebindable live state, not identity. The
+    # SparkSession itself is a per-JVM singleton already.
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({"spark_session"})
+
+    @classmethod
+    def _singleton_key(cls, *args: Any, **kwargs: Any) -> Any:
+        # One executor per (sub)class — Spark sessions are JVM-scoped
+        # singletons, so multiple Python-side executors for the same
+        # process would just share state anyway.
+        return (cls,)
+
     def __init__(
         self,
         spark_session: Optional["SparkSession"] = None,
         *args,
         **kwargs,
     ):
+        if getattr(self, "_initialized", False):
+            # Re-pin the session if the caller passed one; otherwise
+            # leave whatever's already cached intact.
+            if spark_session is not None:
+                self.spark_session = spark_session
+            return
         super().__init__(*args, **kwargs)
         self.spark_session = spark_session
+        self._initialized = True
 
     @classmethod
     def default(cls) -> "SparkStatementExecutor":

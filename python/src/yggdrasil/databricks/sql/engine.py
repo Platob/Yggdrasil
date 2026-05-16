@@ -32,6 +32,7 @@ import time
 from typing import (
     TYPE_CHECKING,
     Any,
+    ClassVar,
     Dict,
     Iterable,
     Literal,
@@ -195,7 +196,36 @@ class SQLEngine(DatabricksService, StatementExecutor):
     Routing (:meth:`_pick_engine`): explicit override → caller-supplied
     session → executor's own session → environment session → fall back to
     warehouse API.
+
+    Singleton-cached by ``(client, catalog_name, schema_name,
+    default_warehouse)`` so two callers asking for the same scope share
+    the same Spark sub-executor, the same lazy ``default_warehouse``
+    resolution, and the same sub-service caches (catalogs / schemas /
+    tables route through ``self.client``, which is itself singleton-
+    cached). The ``spark`` field doesn't participate in identity —
+    callers that pass a custom Spark executor onto an existing engine
+    re-bind it in place.
     """
+
+    # Cache scoped engines for the process lifetime. ``client`` already
+    # carries the workspace identity, so two callers asking for the same
+    # ``(client, catalog, schema)`` collapse to one engine.
+    _SINGLETON_TTL: ClassVar[Any] = None
+
+    @classmethod
+    def _singleton_key(
+        cls,
+        client=None,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        default_warehouse: Optional[SQLWarehouse] = None,
+        spark: Optional[SparkStatementExecutor] = None,
+        **kwargs: Any,
+    ) -> Any:
+        # ``spark`` is rebindable; the warehouse is identity-bearing
+        # (different warehouses ⇒ different engine). ``client`` carries
+        # the workspace identity.
+        return (cls, client, catalog_name, schema_name, default_warehouse)
 
     def __init__(
         self,
@@ -205,12 +235,15 @@ class SQLEngine(DatabricksService, StatementExecutor):
         default_warehouse: Optional[SQLWarehouse] = None,
         spark: Optional[SparkStatementExecutor] = None,
     ):
+        if getattr(self, "_initialized", False):
+            return
         super().__init__(client=client)
         self.catalog_name = catalog_name
         self.schema_name = schema_name
         self.default_warehouse = default_warehouse
         self.spark = spark if spark is not None else SparkStatementExecutor()
         self._last_default_wh_check = 0.0
+        self._initialized = True
 
     # ------------------------------------------------------------------
     # Sub-services

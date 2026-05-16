@@ -75,14 +75,32 @@ class SqlExecutor(StatementExecutor, ABC):
     is satisfied by building a fresh :class:`SqlStatementResult` and
     handing it back — the result drives this executor's :meth:`run`
     on first read via its own ``start`` lifecycle.
+
+    Singleton-cached on ``(cls, context)`` so callers re-issuing
+    ``yggdrasil.sql.sql(...)`` reuse the same executor bound to the
+    same in-process catalog.
     """
 
     _PREPARED_STATEMENT_CLASS: ClassVar[type[SqlPreparedStatement]] = SqlPreparedStatement
     _STATEMENT_RESULT_CLASS: ClassVar[type[SqlStatementResult]] = SqlStatementResult
 
+    _SINGLETON_TTL: ClassVar[Any] = None
+
+    @classmethod
+    def _singleton_key(
+        cls,
+        context: "SqlContext | None" = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        return (cls, context or default_context)
+
     def __init__(self, context: "SqlContext | None" = None) -> None:
+        if getattr(self, "_initialized", False):
+            return
         super().__init__()
         self.context: SqlContext = context or default_context
+        self._initialized = True
 
     # ------------------------------------------------------------------
     # StatementExecutor contract

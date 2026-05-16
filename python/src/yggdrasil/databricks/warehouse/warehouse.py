@@ -66,7 +66,6 @@ from yggdrasil.databricks.warehouse.wh_utils import (
     safeEndpointInfo,
     serverless_sibling_spec,
 )
-from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.pyutils.equality import dicts_equal
 from .statement import (
@@ -137,7 +136,6 @@ class DatabricksExecutionOptions(ExecutionOptions):
 
 
 class SQLWarehouse(
-    Singleton,
     DatabricksResource,
     StatementExecutor[
         WarehousePreparedStatement,

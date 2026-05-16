@@ -42,11 +42,35 @@ class PostgresExecutor(
         PostgresStatementBatch,
     ]
 ):
-    """Run statements against a :class:`PostgresConnection`."""
+    """Run statements against a :class:`PostgresConnection`.
+
+    Singleton-cached per :class:`PostgresConnection` — two callers
+    opening an executor against the same connection string share the
+    libpq / psycopg pool, the catalog sub-services, and any cached
+    schema lookups.
+    """
 
     _PREPARED_STATEMENT_CLASS: ClassVar[type[PostgresPreparedStatement]] = PostgresPreparedStatement
     _STATEMENT_RESULT_CLASS: ClassVar[type[PostgresStatementResult]] = PostgresStatementResult
     _STATEMENT_BATCH_CLASS: ClassVar[type[PostgresStatementBatch]] = PostgresStatementBatch
+
+    _SINGLETON_TTL: ClassVar[Any] = None
+
+    @classmethod
+    def _singleton_key(
+        cls,
+        connection: "PostgresConnection | str | None" = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        # :class:`PostgresConnection` doesn't have a hashable identity
+        # of its own (it inherits ``Disposable`` and would hash by
+        # ``id``), so two ``PostgresConnection.from_(uri)`` calls with
+        # the same URI would not collapse. Key on the normalised URI
+        # instead — same string ⇒ same executor, same psycopg/ADBC
+        # connection pool.
+        normalised = PostgresConnection.from_(connection)
+        return (cls, normalised.uri)
 
     def __init__(
         self,
@@ -54,8 +78,11 @@ class PostgresExecutor(
         *args: Any,
         **kwargs: Any,
     ):
+        if getattr(self, "_initialized", False):
+            return
         super().__init__(*args, **kwargs)
         self.connection: PostgresConnection = PostgresConnection.from_(connection)
+        self._initialized = True
 
     # ------------------------------------------------------------------
     # Sub-services — placed here so the engine's catalog/schemas/tables

@@ -30,6 +30,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar, Generic, Iterable, Mapping, Optional, TypeVar
 
+from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.disposable import Disposable
 from .statement import (
@@ -161,13 +162,38 @@ _DEFAULT_EXECUTION_OPTIONS = ExecutionOptions()
 # ---------------------------------------------------------------------------
 
 
-class StatementExecutor(Disposable, ABC, Generic[PS, SR, SB]):
+class StatementExecutor(Singleton, Disposable, ABC, Generic[PS, SR, SB]):
     """Abstract base for backend-specific statement executors.
 
     Subclasses implement exactly one hook — :meth:`_submit_statement` —
     which turns a coerced :class:`PreparedStatement` into a backend-
     specific :class:`StatementResult`.  Everything else (coercion,
     batching, lifecycle, dispose, options resolution) is provided here.
+
+    Singleton + pickle
+    ------------------
+    Mirrors the :class:`yggdrasil.io.session.Session` pattern — every
+    concrete executor is singleton-by-config in process (so two callers
+    asking for the same ``SQLEngine(client, catalog, schema)`` /
+    ``PostgresExecutor(connection)`` collapse to one instance, sharing
+    connection pools, sub-service caches, and the in-flight result map)
+    and picklable across Spark workers / multiprocessing forks (live
+    handles drop out via :attr:`_TRANSIENT_STATE_ATTRS`; the receiver
+    rehydrates them lazily on first use). Concrete subclasses opt in by:
+
+    1. setting ``_SINGLETON_TTL = None`` (process-lifetime caching),
+    2. overriding :meth:`_singleton_key` to project the identity-bearing
+       constructor arguments into a hashable tuple,
+    3. guarding ``__init__`` with ``if getattr(self, "_initialized",
+       False): return`` so Python's re-entry after a cache hit doesn't
+       clobber live state,
+    4. extending ``_TRANSIENT_STATE_ATTRS`` with any non-picklable
+       handles they hold (locks, urllib3 pools, live SDK sessions).
+
+    The base default — ``_SINGLETON_TTL = ...`` from :class:`Singleton` —
+    keeps caching opt-in so executor subclasses that genuinely don't
+    have a stable identity (a hand-rolled test double, an anonymous
+    executor) still work without surprise sharing.
 
     Class-level configuration
     -------------------------
@@ -183,7 +209,16 @@ class StatementExecutor(Disposable, ABC, Generic[PS, SR, SB]):
     _STATEMENT_BATCH_CLASS: ClassVar[type[StatementBatch]] = StatementBatch
 
     def __init__(self, *args: Any, **kwargs: Any):
+        # Idempotent init — Singleton's ``__new__`` may hand back a
+        # cache hit Python is about to re-invoke ``__init__`` on, and
+        # we don't want to flush whatever state the live instance has.
+        # Subclasses that override should set ``_initialized = True`` at
+        # the end of their own ``__init__`` and start with the same
+        # guard.
+        if getattr(self, "_initialized", False):
+            return
         super().__init__()
+        self._initialized = True
 
     # -------------------------------------------------------------------------
     # Subclass contract
