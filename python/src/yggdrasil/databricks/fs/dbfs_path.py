@@ -20,6 +20,7 @@ from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 
 from ..path import DatabricksPath
+from .service import DBFSService
 
 
 __all__ = ["DBFSPath"]
@@ -36,6 +37,7 @@ class DBFSPath(DatabricksPath):
 
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_DBFS
     namespace_prefix: ClassVar[str] = "/dbfs/"
+    _service_class: ClassVar[type] = DBFSService
 
     # ==================================================================
     # Path rendering

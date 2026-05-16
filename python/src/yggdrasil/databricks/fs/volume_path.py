@@ -96,6 +96,10 @@ class VolumePath(DatabricksPath):
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_VOLUME
     namespace_prefix: ClassVar[str] = "/Volumes/"
 
+    # ``_service_class`` is bound below the class body to avoid the
+    # ``volume.volumes`` → ``volume.volume`` → ``fs.volume_path``
+    # import cycle.
+
     # Process-wide "already swept" set, keyed by ``(catalog, schema, resource)``
     # so concurrent ``staging_path`` calls collapse to one sweep per staging
     # directory. Insert under the lock *before* launching the sweeper thread
@@ -941,3 +945,10 @@ def _looks_like_already_exists(exc: BaseException) -> bool:
 def _staging_clean_part(value: str) -> str:
     """Strip backticks/whitespace and forbid ``/`` in path segments."""
     return str(value).strip().strip("`").replace("/", "_")
+
+# Late-bound: ``VolumePath._service_class`` is ``Volumes`` once the
+# volume package finishes importing — avoids the
+# ``fs.volume_path → volume.volumes → volume.volume → fs.volume_path``
+# cycle by deferring the attribute set to module-load tail.
+from ..volume.volumes import Volumes as _Volumes  # noqa: E402
+VolumePath._service_class = _Volumes

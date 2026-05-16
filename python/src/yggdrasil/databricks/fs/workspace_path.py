@@ -22,6 +22,7 @@ from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 
 from ..path import DatabricksPath
+from ..workspaces.service import Workspaces
 
 
 __all__ = ["WorkspacePath"]
@@ -43,6 +44,7 @@ class WorkspacePath(DatabricksPath):
 
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_WORKSPACE
     namespace_prefix: ClassVar[str] = "/Workspace/"
+    _service_class: ClassVar[type] = Workspaces
 
     # ==================================================================
     # Path rendering

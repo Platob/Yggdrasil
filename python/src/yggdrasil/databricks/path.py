@@ -282,6 +282,13 @@ class DatabricksPath(DatabricksResource, RemotePath):
     #: abstract base; concrete subclasses override.
     namespace_prefix: ClassVar[Optional[str]] = None
 
+    #: :class:`DatabricksService` subclass to use as the default when
+    #: a path is constructed without an explicit ``service=`` / ``client=``.
+    #: Each concrete subclass declares its typed service
+    #: (:class:`DBFSService` / :class:`Volumes` / :class:`Workspaces`)
+    #: so ``self.service`` is always the right collection-level handle.
+    _service_class: ClassVar[type] = DatabricksService
+
     @classmethod
     def _singleton_key(
         cls,
@@ -419,11 +426,18 @@ class DatabricksPath(DatabricksResource, RemotePath):
             return
 
         # Back-compat: callers that pass ``client=`` (the historical
-        # kwarg) get wrapped in the generic :class:`DatabricksService`
-        # so the rest of the path operates against ``self.service``
-        # like every other :class:`DatabricksResource`.
+        # kwarg) get wrapped in the subclass's typed service so the
+        # rest of the path operates against ``self.service`` like
+        # every other :class:`DatabricksResource` —
+        # ``VolumePath`` → :class:`Volumes`,
+        # ``WorkspacePath`` → :class:`Workspaces`,
+        # ``DBFSPath`` → :class:`DBFSService`.
         if service is None and client is not None:
-            service = DatabricksService(client=client)
+            service = self._service_class(client=client)
+        # No service / no client: defer to ``DatabricksResource.__init__``
+        # which calls ``<service_class>.current()`` via the kwarg below.
+        elif service is None:
+            service = self._service_class.current()
 
         # Pre-coerce ``/dbfs/...`` / ``/Volumes/...`` / ``/Workspace/...``
         # into the canonical URL form so the URL parser sees a real
@@ -541,7 +555,7 @@ class DatabricksPath(DatabricksResource, RemotePath):
 
     def with_client(self, client: "DatabricksClient") -> "DatabricksPath":
         """Rebind to *client* by rebuilding the resource service. Returns *self*."""
-        self.service = DatabricksService(client=client)
+        self.service = self._service_class(client=client)
         return self
 
     @property
