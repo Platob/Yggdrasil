@@ -1,6 +1,7 @@
 """Mock-driven tests for :class:`VolumePath`."""
 from __future__ import annotations
 
+import io
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -217,9 +218,12 @@ class TestWrite:
         kwargs = workspace.files.upload.call_args.kwargs
         assert kwargs["file_path"] == "/Volumes/c/s/v/x"
         assert kwargs["overwrite"] is True
-        # Bytes input rides through unbuffered — the SDK builds a
-        # fresh PUT body per request from the same bytes object.
-        assert kwargs["contents"] == b"abcdef"
+        # ``FilesExt.upload`` probes ``contents.seekable()`` — bytes
+        # are wrapped in a fresh ``BytesIO`` so the SDK sees a
+        # seekable stream rather than a raw bytes object.
+        sent = kwargs["contents"]
+        assert isinstance(sent, io.BytesIO)
+        assert sent.getvalue() == b"abcdef"
 
     def test_stream_input_routes_through_upload(self, workspace, client) -> None:
         """Caller-supplied ``BinaryIO`` is coerced to a yggdrasil
@@ -279,7 +283,8 @@ class TestWrite:
         p = VolumePath("/Volumes/c/s/v/x", client=client)
         p.pwrite(b"XX", 1)
         sent = workspace.files.upload.call_args.kwargs["contents"]
-        assert sent == b"aXXde"
+        assert isinstance(sent, io.BytesIO)
+        assert sent.getvalue() == b"aXXde"
 
 
 class TestMutators:

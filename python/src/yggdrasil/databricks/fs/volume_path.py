@@ -35,6 +35,7 @@ quota burn for the bulk transfer.
 from __future__ import annotations
 
 import datetime as dt
+import io
 import logging
 import os
 import re
@@ -921,12 +922,12 @@ class VolumePath(DatabricksPath):
         """Upload *content* through ``files.upload`` with retry semantics.
 
         Accepts either a bytes-like payload or a seekable binary
-        stream. Streams ride through to the SDK verbatim — no
-        eager ``read()`` into a buffer — and get rewound to origin
-        on every retry so transient-error / parent-recovery
-        re-tries PUT the full body, not an empty tail. Bytes-like
-        payloads pass through directly; ``FilesExt.upload`` builds
-        a fresh PUT body per request from the same ``bytes``.
+        stream. ``FilesExt.upload`` requires a ``BinaryIO`` — it
+        probes ``contents.seekable()`` — so bytes-like payloads are
+        wrapped in a fresh :class:`io.BytesIO` per attempt, and
+        seekable streams are rewound to origin on every retry so
+        transient-error / parent-recovery re-tries PUT the full
+        body, not an empty tail.
 
         Returns the byte count when known (bytes-like input) or
         ``-1`` when the input is a stream of unknown length.
@@ -946,8 +947,17 @@ class VolumePath(DatabricksPath):
                 stream.seek(0)
                 upload(file_path=api_path, contents=stream, overwrite=True)
         else:
+            # ``FilesExt.upload`` calls ``contents.seekable()`` — wrap
+            # raw bytes in a fresh ``BytesIO`` each attempt so retries
+            # always PUT the full body from offset zero.
+            payload = bytes(content)
+
             def _do_upload() -> None:
-                upload(file_path=api_path, contents=content, overwrite=True)
+                upload(
+                    file_path=api_path,
+                    contents=io.BytesIO(payload),
+                    overwrite=True,
+                )
 
         self._call_ensuring_parents(_do_upload)
         if size >= 0:
