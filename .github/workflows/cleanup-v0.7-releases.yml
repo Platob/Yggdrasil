@@ -1,0 +1,158 @@
+# ============================================================================
+# cleanup-v0.7-releases.yml
+#
+# One-shot, manually-triggered cleanup of all ``v0.7.*`` GitHub Releases
+# and git tags **except** the one to keep (default ``v0.7.73``).
+#
+# How to run
+# ----------
+#   Actions → "🧹 Cleanup v0.7.x releases" → Run workflow.
+#   Leave ``keep`` at the default to retain only v0.7.73, or pass another
+#   tag to retain a different patch. Set ``dry_run=true`` first to see the
+#   delete list before the destructive run.
+#
+# What it does
+# ------------
+#   For every git tag matching ``v0.7.*`` other than ``keep``:
+#     1. ``gh release delete <tag> --cleanup-tag --yes`` — removes the
+#        GitHub Release **and** the git tag in one call.
+#     2. Falls back to ``git push origin :refs/tags/<tag>`` if the tag
+#        existed without a Release attached.
+#
+# What it does NOT do
+# -------------------
+#   PyPI yanking is not automated (no public API). The summary surfaces
+#   the per-version ``pypi.org/manage/...`` links so the maintainer can
+#   yank each release in one click if needed.
+# ============================================================================
+
+name: 🧹 Cleanup v0.7.x releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: "Tag to keep (everything else under v0.7.* will be deleted)"
+        required: true
+        default: "v0.7.73"
+        type: string
+      dry_run:
+        description: "Only print the delete list; do not actually delete"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+concurrency:
+  group: cleanup-v0.7
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    name: Delete v0.7.x releases + tags (except ${{ inputs.keep }})
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Fetch tags so the local ref list mirrors the remote.
+          fetch-tags: true
+
+      - name: Resolve delete list
+        id: list
+        env:
+          KEEP: ${{ inputs.keep }}
+        run: |
+          # All v0.7.* tags (local mirror of remote after the checkout step),
+          # minus the tag we want to keep.
+          TAGS=$(git tag -l 'v0.7.*' --sort=v:refname | grep -vx "$KEEP" || true)
+          if [ -z "$TAGS" ]; then
+            echo "Nothing to delete — no v0.7.* tags other than $KEEP."
+            echo "tags=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          COUNT=$(echo "$TAGS" | wc -l | tr -d ' ')
+          echo "🗑  Will delete $COUNT tag(s) (keeping $KEEP):"
+          echo "$TAGS" | sed 's/^/   - /'
+          # Serialize as space-separated for the next step.
+          ONELINE=$(echo "$TAGS" | tr '\n' ' ')
+          echo "tags=$ONELINE" >> "$GITHUB_OUTPUT"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Delete GitHub Releases + git tags
+        if: steps.list.outputs.tags != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN:  ${{ inputs.dry_run }}
+          TAGS:     ${{ steps.list.outputs.tags }}
+        run: |
+          set -u
+          FAILED=()
+          DELETED=()
+          SKIPPED=()
+          for TAG in $TAGS; do
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "🟡 [dry-run] would delete release+tag $TAG"
+              SKIPPED+=("$TAG")
+              continue
+            fi
+            echo "::group::Deleting $TAG"
+            # --cleanup-tag removes the git tag along with the release.
+            # If no release exists, fall back to plain tag deletion so we
+            # still drop stray tags that never had a release attached.
+            if gh release delete "$TAG" --cleanup-tag --yes 2>/tmp/err; then
+              echo "✅ release+tag $TAG"
+              DELETED+=("$TAG")
+            else
+              if grep -qiE 'release not found|not found' /tmp/err; then
+                if git push origin ":refs/tags/$TAG" 2>/tmp/err2; then
+                  echo "✅ tag $TAG (no release was attached)"
+                  DELETED+=("$TAG")
+                else
+                  echo "❌ failed to push-delete tag $TAG"
+                  cat /tmp/err2
+                  FAILED+=("$TAG")
+                fi
+              else
+                echo "❌ failed to delete release $TAG"
+                cat /tmp/err
+                FAILED+=("$TAG")
+              fi
+            fi
+            echo "::endgroup::"
+          done
+
+          {
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "## 🟡 Dry run — nothing was deleted"
+              echo ""
+              echo "Tags that **would** be deleted (${#SKIPPED[@]}):"
+              for T in "${SKIPPED[@]}"; do echo "- \`$T\`"; done
+              echo ""
+              echo "Re-run with **dry_run = false** to actually delete."
+            else
+              echo "## 🧹 Cleanup of v0.7.x complete"
+              echo ""
+              echo "**Deleted (${#DELETED[@]})**"
+              for T in "${DELETED[@]}"; do
+                V="${T#v}"
+                echo "- \`$T\` — PyPI yank: https://pypi.org/manage/project/ygg/release/${V}/"
+              done
+              if [ "${#FAILED[@]}" -gt 0 ]; then
+                echo ""
+                echo "**Failed (${#FAILED[@]})**"
+                for T in "${FAILED[@]}"; do echo "- \`$T\`"; done
+              fi
+              echo ""
+              echo "_PyPI does not expose a public yank API; use the manage links above to yank manually._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${#FAILED[@]}" -gt 0 ]; then exit 1; fi

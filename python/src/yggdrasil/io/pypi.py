@@ -33,6 +33,7 @@ from __future__ import annotations
 import importlib.metadata as ilm
 import logging
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -465,7 +466,41 @@ class PyPIPath:
                 f"Wheel build produced no .whl files under {tmp!r} for "
                 f"{local_root!r}; check the package metadata."
             )
-        return wheels[0]
+        except FileNotFoundError as exc:
+            errors.append(f"pip wheel not invokable: {exc}")
+
+        wheels = sorted(tmp.glob("*.whl"))
+        if wheels:
+            return wheels[0]
+
+        # Builder 2: ``uv build --wheel`` for uv-managed venvs where
+        # pip isn't installed (``uv venv`` doesn't ship pip).
+        uv_exe = shutil.which("uv")
+        if uv_exe is not None:
+            uv_cmd = [
+                uv_exe, "build", "--wheel",
+                "--out-dir", str(tmp),
+                "--python", sys.executable,
+                str(local_root),
+            ]
+            LOGGER.debug("Building wheel for %r via %s", local_root, " ".join(uv_cmd))
+            try:
+                subprocess.run(uv_cmd, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as exc:
+                errors.append(
+                    f"uv build exited {exc.returncode}: "
+                    f"{(exc.stderr or exc.stdout or '').strip()}"
+                )
+            wheels = sorted(tmp.glob("*.whl"))
+            if wheels:
+                return wheels[0]
+        else:
+            errors.append("uv build unavailable: ``uv`` not on PATH")
+
+        raise RuntimeError(
+            f"Failed to build wheel for {local_root!r}; tried pip wheel "
+            f"and uv build. Errors: " + " | ".join(errors)
+        )
 
 
 def _artefact_version_matches(filename: str, version: str) -> bool:

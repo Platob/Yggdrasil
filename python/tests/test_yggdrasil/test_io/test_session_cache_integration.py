@@ -1,45 +1,49 @@
-"""Integration tests for the :class:`Session` cache pipeline.
+"""End-to-end integration tests for the :class:`Session` cache pipeline.
 
-Drives the staged ``send_many`` pipeline end-to-end with a
-:class:`StubSession` transport and the URL-mirrored fast-path
-local cache (one ``.arrow`` per ``public_hash`` under the cache
-root), plus a hand-rolled fake remote :class:`Tabular` for the
-remote-cache flow.
+The session cache has two backends that share one pipeline:
 
-Coverage:
+* **Local fast-path** — on-disk Arrow IPC files at
+  ``<root>/<METHOD>/<host>/<seg>/.../<public_hash>.arrow`` (one
+  ``stat`` + decode per request). Enabled via ``CacheConfig.path``
+  or implicitly by a ``received_*`` window.
+* **Remote** — a :class:`Tabular` (Databricks Table / SQL warehouse
+  view / Spark Delta backend) read via batch ``sql.execute`` and
+  written via ``Tabular.insert``. Enabled via ``CacheConfig.tabular``.
 
-* ``Session._remote_write_group_key`` actually splits responses by
-  every dimension that affects the insert call (table, mode,
-  match_by, wait, anonymize) — collapsing on any one of those would
-  silently drop per-request config divergence on the floor.
-* ``Session._split_local_cache`` groups by the effective config's
-  resolved ``path``, so a per-request override pointing at a
-  different cache folder lands in its own bucket instead of bleeding
-  into the session-level one.
-* ``Session.send_many`` end-to-end with a mix of cache hits and
-  misses: hits skip the network, the writeback persists the misses,
-  and a re-run of the same batch reads everything from disk.
-* Per-request ``local_cache_config`` override survives the batch
-  pipeline (a request pointing at a fresh empty folder must miss
-  the pre-seeded session cache).
-* ``received_from`` / ``received_to`` window rejection: a fast-path
-  row outside the window is treated as a miss.
-* The fast-path ``public_hash`` keys two POSTs with distinct bodies
-  to distinct files so they can't alias each other through the
-  cache.
-* ``_cleanup_local_fast_path`` unlinks ``.arrow`` files older than
-  the configured TTL and is throttled by an in-tree sentinel.
-* Remote-cache integration (no Databricks required): fake
-  :class:`Tabular` with ``sql.execute`` returning seeded Arrow rows
-  exercises ``_load_remote_cached_response``,
-  ``_store_remote_cached_response``, the
-  ``TABLE_OR_VIEW_NOT_FOUND`` recovery, and the
-  ``mirror_local_to_remote`` writeback.
+This file drives the full pipeline (``Session.send`` and
+``Session.send_many``) through both backends — independently and
+combined — using :class:`StubSession` to stand in for the network
+transport and :class:`_FakeRemoteTabular` to stand in for the
+remote backend. The unit-level contracts of the private helpers
+(``_local_fast_path_relative``, ``_cleanup_local_fast_path``,
+``_remote_write_group_key``, ``_maybe_autocompress_body_for_cache``)
+live in ``test_session_cache_internals.py``.
+
+Coverage targets (each appears in at least one ``send`` and one
+``send_many`` test):
+
+* **Local-only.** Hit skips network. Miss falls through and the
+  fire-and-forget writeback lands on disk. UPSERT skips the lookup.
+  ``received_from`` / ``received_to`` and ``received_ttl`` filter
+  stale rows. Failure responses (status >= 400) don't persist.
+  Per-request overrides win. Distinct POST bodies don't alias.
+  Concurrent writeback against many distinct ``public_hash`` files
+  is race-free.
+* **Remote-only.** Hit skips network. Miss writes back via
+  ``Tabular.insert`` with the configured mode / match_by / wait /
+  prune. UPSERT skips both the SQL lookup and the writeback.
+  ``TABLE_OR_VIEW_NOT_FOUND`` triggers ``Tabular.create`` then
+  retries the lookup. ``_split_remote_cache`` issues one batched
+  ``sql.execute`` per distinct table. Per-request overrides win.
+* **Combined.** Local short-circuits before remote. Local miss +
+  remote hit backfills the local cache. ``mirror_local_to_remote``
+  pushes local hits to remote; the default keeps remote silent. A
+  full miss against both layers performs a single network fetch
+  and writes back to both.
 """
 from __future__ import annotations
 
 import datetime as dt
-import os
 import time
 from pathlib import Path
 from typing import Any, Iterator
@@ -52,66 +56,60 @@ from yggdrasil.io.response import Response
 from yggdrasil.io.send_config import CacheConfig
 from yggdrasil.io.session import (
     Session,
-    _BODY_AUTOCOMPRESS_MIN_SIZE,
-    _FAST_PATH_SEGMENT_MAX_BYTES,
-    _cleanup_local_fast_path,
     _local_fast_path_relative,
-    _maybe_autocompress_body_for_cache,
-    _safe_fast_path_segment,
+    _store_fast_path_arrow_batch,
 )
 
 from ._helpers import StubSession, make_request, make_response
 
 
 # ---------------------------------------------------------------------------
-# Singleton-cache hygiene — keeps StubSessions from leaking between tests.
+# Singleton-cache hygiene
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture(autouse=True)
 def _clear_session_singleton_cache():
+    """Keep ``StubSession`` instances from leaking across tests.
+
+    :class:`Session` is a per-``(class, base_url, key)`` singleton, so
+    a fixture that built a session with ``base_url=None`` in one test
+    would otherwise hand the live instance — and its in-flight
+    fire-and-forget jobs — to the next.
+    """
     Session._INSTANCES.clear()
     yield
     Session._INSTANCES.clear()
 
 
-def _local_cache(tmp_path: Path, **overrides: Any) -> CacheConfig:
+# ---------------------------------------------------------------------------
+# Cache builders
+# ---------------------------------------------------------------------------
+
+
+def _local_cfg(root: Path | str, **overrides: Any) -> CacheConfig:
     overrides.setdefault("mode", Mode.APPEND)
-    return CacheConfig(path=str(tmp_path), **overrides)
+    return CacheConfig(path=str(root), **overrides)
 
 
-def _wait_for_readable(cache: CacheConfig, *, timeout: float = 3.0) -> bool:
-    """Poll until the URL-mirrored fast-path tree under the cache root holds an entry.
+def _remote_cfg(tab: "_FakeRemoteTabular", **overrides: Any) -> CacheConfig:
+    overrides.setdefault("mode", Mode.APPEND)
+    overrides.setdefault("request_by", ["public_url_hash"])
+    overrides.setdefault("wait", False)
+    return CacheConfig(tabular=tab, **overrides)
 
-    The session writes responses via a fire-and-forget Job, so the
-    file may not be on disk immediately after :meth:`Session.send`
-    returns. We watch for any non-hidden ``.arrow`` file anywhere
-    under the cache root.
+
+# ---------------------------------------------------------------------------
+# Seeding + polling helpers
+# ---------------------------------------------------------------------------
+
+
+def _seed_local(cache: CacheConfig, response: Response) -> None:
+    """Synchronously plant *response* in the URL-mirrored fast-path tree.
+
+    Bypasses the session's fire-and-forget writeback so a test can
+    assert read-side behaviour without racing the daemon writer.
     """
-    from pathlib import Path as _P
-
-    deadline = time.monotonic() + timeout
-    root = _P(cache.path)
-    while time.monotonic() < deadline:
-        try:
-            if root.exists() and any(
-                p.is_file() and not p.name.startswith(".")
-                for p in root.rglob("*.arrow")
-            ):
-                return True
-        except OSError:
-            pass
-        time.sleep(0.05)
-    return False
-
-
-def _seed(cache: CacheConfig, response: Response) -> None:
-    """Synchronously write a response into the cache, no fire-and-forget race."""
-    from yggdrasil.io.session import (
-        _local_fast_path_relative,
-        _store_fast_path_arrow_batch,
-    )
-
     req = response.request
     rel = _local_fast_path_relative(req.method, req.url, req.public_hash)
     _store_fast_path_arrow_batch(
@@ -119,502 +117,42 @@ def _seed(cache: CacheConfig, response: Response) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# _remote_write_group_key
-# ---------------------------------------------------------------------------
+def _seed_remote(tab: "_FakeRemoteTabular", response: Response) -> None:
+    """Seed *response* into the fake remote so the next lookup returns it."""
+    tab.rows.append(response.to_arrow_batch(parse=False))
 
 
-class _StubTabular:
-    """Minimal Tabular-like object — only attributes the group key reads."""
+def _wait_for_local(cache: CacheConfig, *, count: int = 1, timeout: float = 5.0) -> int:
+    """Poll until at least *count* live ``.arrow`` files land in *cache*.
 
-    def __init__(self, name: str) -> None:
-        self._name = name
-
-    def full_name(self, safe: bool = False) -> str:
-        return self._name
-
-
-class TestRemoteWriteGroupKey:
-
-    def _cfg(self, **overrides: Any) -> CacheConfig:
-        # ``tabular`` bypasses ``__post_init__`` validation and is what
-        # ``_remote_write_group_key`` actually reads — a stub is enough.
-        return CacheConfig(
-            tabular=_StubTabular(overrides.pop("name", "ws.cache.responses")),
-            mode=overrides.pop("mode", Mode.APPEND),
-            request_by=overrides.pop("request_by", ["public_url_hash"]),
-            response_by=overrides.pop("response_by", None),
-            anonymize=overrides.pop("anonymize", "remove"),
-            wait=overrides.pop("wait", False),
-        )
-
-    def test_identical_configs_share_group(self) -> None:
-        a = self._cfg()
-        b = self._cfg()
-        assert Session._remote_write_group_key(a) == Session._remote_write_group_key(b)
-
-    def test_distinct_table_splits(self) -> None:
-        a = self._cfg(name="ws.a.responses")
-        b = self._cfg(name="ws.b.responses")
-        assert Session._remote_write_group_key(a) != Session._remote_write_group_key(b)
-
-    def test_distinct_mode_splits(self) -> None:
-        a = self._cfg(mode=Mode.APPEND)
-        b = self._cfg(mode=Mode.UPSERT)
-        assert Session._remote_write_group_key(a) != Session._remote_write_group_key(b)
-
-    def test_distinct_match_by_splits(self) -> None:
-        a = self._cfg(request_by=["public_url_hash"])
-        b = self._cfg(request_by=["public_url_hash", "method"])
-        assert Session._remote_write_group_key(a) != Session._remote_write_group_key(b)
-
-    def test_distinct_wait_splits(self) -> None:
-        a = self._cfg(wait=False)
-        b = self._cfg(wait=True)
-        assert Session._remote_write_group_key(a) != Session._remote_write_group_key(b)
-
-    def test_distinct_anonymize_splits(self) -> None:
-        a = self._cfg(anonymize="remove")
-        b = self._cfg(anonymize="redact")
-        assert Session._remote_write_group_key(a) != Session._remote_write_group_key(b)
-
-
-# ---------------------------------------------------------------------------
-# Fast-path URL-mirrored layout (_local_fast_path_relative)
-# ---------------------------------------------------------------------------
-
-
-class TestFastPathLocalLayout:
-
-    def test_layout_mirrors_method_host_and_path(self) -> None:
-        req = make_request("https://api.example.com/v1/users/42", method="GET")
-        rel = _local_fast_path_relative(req.method, req.url, req.public_hash)
-        parts = rel.split(os.sep)
-        # Expected: GET / api.example.com / v1 / users / 42 / <16hex>.arrow
-        assert parts[:5] == ["GET", "api.example.com", "v1", "users", "42"]
-        assert parts[-1].endswith(".arrow")
-        assert len(parts[-1]) == len("0123456789abcdef.arrow")
-
-    def test_leaf_filename_is_public_hash_hex(self) -> None:
-        req = make_request("https://example.com/x")
-        rel = _local_fast_path_relative(req.method, req.url, req.public_hash)
-        leaf = rel.rsplit(os.sep, 1)[-1]
-        expected = f"{req.public_hash & 0xFFFFFFFFFFFFFFFF:016x}.arrow"
-        assert leaf == expected
-
-    def test_root_path_yields_method_and_host_only(self) -> None:
-        req = make_request("https://example.com/", method="POST")
-        rel = _local_fast_path_relative(req.method, req.url, req.public_hash)
-        parts = rel.split(os.sep)
-        # No real path segments between host and the .arrow leaf.
-        assert parts[0] == "POST"
-        assert parts[1] == "example.com"
-        assert parts[-1].endswith(".arrow")
-        assert len(parts) == 3
-
-    def test_distinct_paths_land_in_distinct_dirs(self) -> None:
-        a = make_request("https://example.com/api/users")
-        b = make_request("https://example.com/api/orders")
-        rel_a = _local_fast_path_relative(a.method, a.url, a.public_hash)
-        rel_b = _local_fast_path_relative(b.method, b.url, b.public_hash)
-        assert rel_a.rsplit(os.sep, 1)[0] != rel_b.rsplit(os.sep, 1)[0]
-
-    def test_same_path_different_query_share_dir_not_file(self) -> None:
-        a = make_request("https://example.com/api/items?id=1")
-        b = make_request("https://example.com/api/items?id=2")
-        rel_a = _local_fast_path_relative(a.method, a.url, a.public_hash)
-        rel_b = _local_fast_path_relative(b.method, b.url, b.public_hash)
-        # Same directory tree (URL path mirrors), distinct leaf files
-        # because public_hash mixes query string in.
-        assert rel_a.rsplit(os.sep, 1)[0] == rel_b.rsplit(os.sep, 1)[0]
-        assert rel_a != rel_b
-
-    def test_long_segment_is_hashed(self) -> None:
-        long_seg = "x" * 256
-        req = make_request(f"https://example.com/api/{long_seg}/end")
-        rel = _local_fast_path_relative(req.method, req.url, req.public_hash)
-        parts = rel.split(os.sep)
-        # The "api", "end", and method/host parts stay short; the rogue
-        # segment should be folded under the per-segment byte cap.
-        for p in parts:
-            assert len(p.encode("utf-8")) <= max(
-                _FAST_PATH_SEGMENT_MAX_BYTES, len("0123456789abcdef.arrow"),
-            )
-        # And the folded segment must still distinguish two long but
-        # different tokens at the same position.
-        other = make_request(f"https://example.com/api/{'y' * 256}/end")
-        rel_other = _local_fast_path_relative(
-            other.method, other.url, other.public_hash,
-        )
-        assert rel != rel_other
-
-    def test_unsafe_chars_are_replaced(self) -> None:
-        # Backslashes and reserved chars should never appear as path
-        # separators in the result — they must be sanitized.
-        out = _safe_fast_path_segment('a\\b:c*d?e"f<g>h|i')
-        assert "\\" not in out
-        assert ":" not in out
-        assert "*" not in out
-        assert "?" not in out
-        assert '"' not in out
-        assert "<" not in out
-        assert ">" not in out
-        assert "|" not in out
-
-    def test_empty_segment_normalizes_to_placeholder(self) -> None:
-        # ``""`` and ``"   "`` would otherwise produce an empty
-        # directory name; the helper has to fall back to a sentinel.
-        assert _safe_fast_path_segment("") == "_"
-        assert _safe_fast_path_segment("   ") in {"_", " "}  # rstrip→empty→"_"
-
-    def test_method_defaults_when_missing(self) -> None:
-        # Defensive: a request without an explicit method should still
-        # produce a valid relative path (the leaf hex tells uniqueness).
-        url = make_request("https://example.com/x").url
-        rel = _local_fast_path_relative(None, url, 0xDEADBEEF)
-        assert rel.split(os.sep)[0] == "GET"
-
-
-# ---------------------------------------------------------------------------
-# Fast-path TTL cleanup walker (_cleanup_local_fast_path)
-# ---------------------------------------------------------------------------
-
-
-class TestCleanupLocalFastPath:
-
-    def _write_arrow(self, path: Path, mtime_offset: float = 0.0) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Minimal Arrow IPC payload — just an empty batch, contents
-        # don't matter for the cleanup walker.
-        sink = pa.BufferOutputStream()
-        schema = pa.schema([("x", pa.int64())])
-        with pa.ipc.new_stream(sink, schema):
-            pass
-        path.write_bytes(sink.getvalue().to_pybytes())
-        if mtime_offset:
-            now = time.time()
-            os.utime(path, (now + mtime_offset, now + mtime_offset))
-
-    def test_unlinks_files_older_than_ttl(self, tmp_path) -> None:
-        old = tmp_path / "GET" / "host" / "stale.arrow"
-        fresh = tmp_path / "GET" / "host" / "fresh.arrow"
-        # Backdate ``old`` so its mtime sits an hour outside the TTL.
-        self._write_arrow(old, mtime_offset=-3600)
-        self._write_arrow(fresh)
-
-        removed = _cleanup_local_fast_path(
-            str(tmp_path), ttl_seconds=60.0, throttle_seconds=0.0,
-        )
-        assert removed == 1
-        assert not old.exists()
-        assert fresh.exists()
-
-    def test_throttled_by_sentinel(self, tmp_path) -> None:
-        # Two back-to-back calls inside the throttle window: the
-        # second must short-circuit (return 0) even though there's a
-        # fresh stale file to unlink.
-        first_stale = tmp_path / "GET" / "host" / "a.arrow"
-        self._write_arrow(first_stale, mtime_offset=-3600)
-        first_removed = _cleanup_local_fast_path(
-            str(tmp_path), ttl_seconds=60.0, throttle_seconds=60.0,
-        )
-        assert first_removed == 1
-
-        second_stale = tmp_path / "GET" / "host" / "b.arrow"
-        self._write_arrow(second_stale, mtime_offset=-3600)
-        second_removed = _cleanup_local_fast_path(
-            str(tmp_path), ttl_seconds=60.0, throttle_seconds=60.0,
-        )
-        # Throttled: walker doesn't even look, so b.arrow stays.
-        assert second_removed == 0
-        assert second_stale.exists()
-
-    def test_missing_root_is_no_op(self, tmp_path) -> None:
-        ghost = tmp_path / "no-such-dir"
-        assert _cleanup_local_fast_path(str(ghost), ttl_seconds=60.0) == 0
-
-    def test_skips_hidden_tmp_files(self, tmp_path) -> None:
-        # Tmp files written by _store_fast_path_arrow_batch start with
-        # a dot — the cleanup walker must not touch them or it'd race
-        # with concurrent writes.
-        live = tmp_path / "GET" / "host" / ".x.tmp.arrow"
-        live.parent.mkdir(parents=True, exist_ok=True)
-        live.write_bytes(b"in-flight")
-        os.utime(live, (time.time() - 3600, time.time() - 3600))
-
-        removed = _cleanup_local_fast_path(
-            str(tmp_path), ttl_seconds=60.0, throttle_seconds=0.0,
-        )
-        assert removed == 0
-        assert live.exists()
-
-
-# ---------------------------------------------------------------------------
-# _maybe_autocompress_body_for_cache
-# ---------------------------------------------------------------------------
-
-
-class TestMaybeAutocompressBodyForCache:
-    """Smart body gzipping run before cache persistence.
-
-    Pinned behavior:
-
-    * threshold is :data:`_BODY_AUTOCOMPRESS_MIN_SIZE` (skip below);
-    * skip when ``Content-Encoding`` is already set (no recompress);
-    * skip when the resolved MIME is not in the compressible set —
-      binary entropy-dense formats (image/png, parquet, …) don't
-      benefit and we don't want to burn CPU on them;
-    * skip when the gzip ratio is < 10% — random / already-compact
-      input bails out so the read side doesn't pay decompress cost
-      for ~no savings;
-    * on a hit, the swap is consistent: the buffer carries the gzipped
-      bytes, ``Content-Encoding`` is ``gzip``, ``Content-Length``
-      matches the new size, ``media_type.codec`` reflects the encoding.
+    The local writeback is fire-and-forget on the job pool. A polling
+    helper beats a fixed ``sleep`` — slow CI machines get the time
+    they need; fast ones don't pay it.
     """
-
-    def _big_json(self, size: int) -> bytes:
-        # JSON-shaped repetitive bytes — highly compressible and just
-        # over the autocompress threshold by default.
-        chunk = b'{"key":"value"}'
-        repeats = size // len(chunk) + 1
-        return chunk * repeats
-
-    def test_small_body_below_threshold_skips(self) -> None:
-        resp = make_response(body=b'{"k":1}' * 100)  # well under 1 MiB
-        before = resp.buffer.size
-        _maybe_autocompress_body_for_cache(resp)
-        assert resp.buffer.size == before
-        assert resp.headers.get("Content-Encoding") is None
-
-    def test_already_encoded_body_skips(self) -> None:
-        big = self._big_json(_BODY_AUTOCOMPRESS_MIN_SIZE + 1024)
-        resp = make_response(
-            body=big,
-            headers={"Content-Encoding": "br"},
-        )
-        before = resp.buffer.size
-        _maybe_autocompress_body_for_cache(resp)
-        assert resp.buffer.size == before
-        assert resp.headers.get("Content-Encoding") == "br"
-
-    def test_binary_mime_skips(self) -> None:
-        big = self._big_json(_BODY_AUTOCOMPRESS_MIN_SIZE + 1024)
-        resp = make_response(body=big, content_type="image/png")
-        before = resp.buffer.size
-        _maybe_autocompress_body_for_cache(resp)
-        assert resp.buffer.size == before
-        assert resp.headers.get("Content-Encoding") is None
-
-    def test_text_outside_enum_skips(self) -> None:
-        # ``text/css`` is not in the compressible :class:`MimeTypes` set
-        # — strict enum membership keeps the rule predictable; add a
-        # MIME to the set in one place rather than maintaining a string
-        # prefix list at every caller.
-        big = self._big_json(_BODY_AUTOCOMPRESS_MIN_SIZE + 1024)
-        resp = make_response(body=big, content_type="text/css")
-        _maybe_autocompress_body_for_cache(resp)
-        assert resp.headers.get("Content-Encoding") is None
-
-    def test_random_bytes_ratio_bailout(self) -> None:
-        # ``os.urandom`` is incompressible — the gzip output is within
-        # 1% of the input, well above the 10% bail threshold. The
-        # helper has to skip so we don't pay decompress cost on read
-        # for ~no storage win.
-        random = os.urandom(_BODY_AUTOCOMPRESS_MIN_SIZE + 1024)
-        resp = make_response(body=random, content_type="text/plain")
-        _maybe_autocompress_body_for_cache(resp)
-        assert resp.headers.get("Content-Encoding") is None
-
-    def test_large_json_gets_compressed(self) -> None:
-        big = self._big_json(_BODY_AUTOCOMPRESS_MIN_SIZE + 1024)
-        resp = make_response(body=big, content_type="application/json")
-        before = resp.buffer.size
-        _maybe_autocompress_body_for_cache(resp)
-        assert resp.headers.get("Content-Encoding") == "gzip"
-        assert resp.buffer.size < before
-        # Content-Length must be resynced to the compressed bytes —
-        # otherwise the cache row's headers would lie about the payload
-        # and the read-side codec dispatch would break.
-        assert resp.headers.get("Content-Length") == str(resp.buffer.size)
-        assert resp.media_type.codec is not None
-        assert resp.media_type.codec.name == "gzip"
-
-    def test_large_csv_gets_compressed(self) -> None:
-        csv = (b"col1,col2\n1,2\n" * (
-            _BODY_AUTOCOMPRESS_MIN_SIZE // len(b"col1,col2\n1,2\n") + 1
-        ))
-        resp = make_response(body=csv, content_type="text/csv")
-        before = resp.buffer.size
-        _maybe_autocompress_body_for_cache(resp)
-        assert resp.headers.get("Content-Encoding") == "gzip"
-        assert resp.buffer.size < before
+    deadline = time.monotonic() + timeout
+    root = Path(cache.path)
+    last = 0
+    while time.monotonic() < deadline:
+        try:
+            last = sum(
+                1 for p in root.rglob("*.arrow")
+                if p.is_file() and not p.name.startswith(".")
+            )
+        except OSError:
+            last = 0
+        if last >= count:
+            return last
+        time.sleep(0.05)
+    return last
 
 
 # ---------------------------------------------------------------------------
-# send_many end-to-end through the local cache
-# ---------------------------------------------------------------------------
-
-
-class TestSendManyLocalCacheIntegration:
-
-    def test_mixed_hits_and_misses(self, tmp_path) -> None:
-        # Pre-seed two of three URLs; the third must reach the
-        # network. Streamed output must include all three responses.
-        cache = _local_cache(tmp_path)
-
-        seeded_a = make_request("https://example.com/a")
-        seeded_b = make_request("https://example.com/b")
-        miss = make_request("https://example.com/c")
-
-        _seed(cache, make_response(request=seeded_a, body=b'{"k":"a"}'))
-        _seed(cache, make_response(request=seeded_b, body=b'{"k":"b"}'))
-
-        s = StubSession()
-        s.queue(make_response(request=miss, body=b'{"k":"c"}'))
-
-        out = list(s.send_many(
-            iter([seeded_a, seeded_b, miss]),
-            local_cache=cache,
-        ))
-        assert {r.json()["k"] for r in out} == {"a", "b", "c"}
-        # Only the miss touched the wire.
-        assert len(s.calls) == 1
-        assert s.calls[0].url.path == "/c"
-
-    def test_writeback_round_trip_via_send_many(self, tmp_path) -> None:
-        # First batch goes to the network; second batch reads from
-        # disk. The fire-and-forget writeback must finish before the
-        # second batch runs — poll the cache instead of sleeping.
-        cache = _local_cache(tmp_path)
-        s = StubSession()
-        req = make_request("https://example.com/x")
-        s.queue(make_response(request=req, body=b'{"v":"first"}'))
-
-        first = list(s.send_many(iter([req]), local_cache=cache))
-        assert first[0].json() == {"v": "first"}
-        assert _wait_for_readable(cache), "writeback never landed"
-
-        second = list(s.send_many(iter([req]), local_cache=cache))
-        assert len(s.calls) == 1, "second batch must hit disk, not network"
-        assert second[0].json() == {"v": "first"}
-
-    def test_per_request_local_cache_override_misses_pre_seeded_session(
-        self, tmp_path,
-    ) -> None:
-        # Session-level cache holds a row that *would* satisfy the
-        # request; per-request override points at an empty alt
-        # folder, so the batch must miss and refetch from the
-        # network.
-        session_cache = _local_cache(tmp_path / "session")
-        seed_req = make_request("https://example.com/x")
-        _seed(session_cache, make_response(request=seed_req, body=b'{"v":"cached"}'))
-
-        alt_dir = tmp_path / "alt"
-        alt_dir.mkdir()
-        per_req_cache = _local_cache(alt_dir)
-        req = seed_req.copy(local_cache_config=per_req_cache)
-
-        s = StubSession()
-        s.queue(make_response(request=req, body=b'{"v":"network"}'))
-
-        out = list(s.send_many(iter([req]), local_cache=session_cache))
-        assert len(s.calls) == 1
-        assert out[0].json() == {"v": "network"}
-
-    def test_filter_response_outside_window_misses(self, tmp_path) -> None:
-        # The cached row is too old for the configured received_from
-        # window — must be treated as a miss even though the
-        # match-by tuple matches.
-        old = dt.datetime(2010, 1, 1, tzinfo=dt.timezone.utc)
-        cache = _local_cache(
-            tmp_path,
-            received_from=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
-            received_to=dt.datetime(2030, 1, 1, tzinfo=dt.timezone.utc),
-        )
-        req = make_request("https://example.com/x")
-        _seed(cache, make_response(request=req, body=b'{"v":"old"}', received_at=old))
-
-        s = StubSession()
-        s.queue(make_response(request=req, body=b'{"v":"fresh"}'))
-
-        out = list(s.send_many(iter([req]), local_cache=cache))
-        assert len(s.calls) == 1
-        assert out[0].json() == {"v": "fresh"}
-
-    def test_post_body_distinct_bodies_dont_alias(self, tmp_path) -> None:
-        # Fast-path files are keyed by ``public_hash`` (xxh3_64 over
-        # method + anonymized URL + headers + body), so two POSTs to
-        # the same URL with different bodies land at distinct
-        # ``.arrow`` files. The seeded body must not be served to
-        # the request that carries different bytes.
-        cache = _local_cache(tmp_path)
-        url = "https://example.com/echo"
-        req_a = make_request(url, method="POST", body=b"payload-A")
-        req_b = make_request(url, method="POST", body=b"payload-B")
-        _seed(cache, make_response(request=req_a, body=b'{"got":"A"}'))
-
-        s = StubSession()
-        s.queue(make_response(request=req_b, body=b'{"got":"B"}'))
-
-        out = list(s.send_many(iter([req_a, req_b]), local_cache=cache))
-        # req_a hits the seeded file, req_b misses and goes to network.
-        assert len(s.calls) == 1
-        assert s.calls[0].buffer.to_bytes() == b"payload-B"
-        assert {r.json()["got"] for r in out} == {"A", "B"}
-
-
-# ---------------------------------------------------------------------------
-# Concurrent local-cache writeback
-# ---------------------------------------------------------------------------
-
-
-class TestConcurrentWriteback:
-
-    def test_send_many_writeback_eventually_consistent(self, tmp_path) -> None:
-        # Many simultaneous writes against distinct request identities
-        # must not race — each public_hash maps to a unique fast-path
-        # filename so concurrent fire-and-forget workers can't trample
-        # each other. Polling the cache for the expected file count is
-        # the reliable way to wait for the daemon writers.
-        cache = _local_cache(tmp_path)
-        s = StubSession()
-        n = 8
-        reqs = [make_request(f"https://example.com/p{i}") for i in range(n)]
-        s.queue(*[
-            make_response(request=r, body=f'{{"i":{i}}}'.encode())
-            for i, r in enumerate(reqs)
-        ])
-        list(s.send_many(iter(reqs), local_cache=cache))
-
-        deadline = time.monotonic() + 5.0
-        root = Path(cache.path)
-        last_count = 0
-        while time.monotonic() < deadline:
-            try:
-                last_count = sum(
-                    1 for p in root.rglob("*.arrow")
-                    if p.is_file() and not p.name.startswith(".")
-                )
-            except OSError:
-                last_count = 0
-            if last_count >= n:
-                break
-            time.sleep(0.05)
-        assert last_count >= n
-
-
-# ---------------------------------------------------------------------------
-# Remote-cache integration via a fake Tabular
+# Fake remote tabular
 # ---------------------------------------------------------------------------
 
 
 class _FakeStatementResult:
-    """Minimal :class:`StatementResult` stand-in.
-
-    Only the surface ``Session._load_remote_cached_response`` /
-    ``_lookup_remote_table`` actually use is implemented:
-    ``read_arrow_batches`` returning an iterator of record batches.
-    """
+    """Stand-in for :class:`StatementResult` — exposes ``read_arrow_batches``."""
 
     def __init__(self, batches: list[pa.RecordBatch]) -> None:
         self._batches = batches
@@ -624,29 +162,30 @@ class _FakeStatementResult:
 
 
 class _FakeSql:
+    """SQL surface backing :class:`_FakeRemoteTabular`.
+
+    Each call records the query and optionally raises
+    ``TABLE_OR_VIEW_NOT_FOUND`` to exercise the create-on-first-miss
+    recovery in :meth:`Session._load_remote_cached_response`.
+    """
+
     def __init__(self, parent: "_FakeRemoteTabular") -> None:
         self._parent = parent
 
     def execute(self, query: str, *, spark_session: Any = None) -> _FakeStatementResult:
         self._parent.queries.append(query)
         if self._parent.raise_table_not_found and not self._parent.created:
-            # Simulate Databricks' first-touch failure when the cache
-            # table doesn't exist yet — the session catches this
-            # exact substring and recovers via ``create``.
             raise RuntimeError("[TABLE_OR_VIEW_NOT_FOUND] table missing")
-        # Return any rows that have been stored so far via
-        # :meth:`_FakeRemoteTabular.insert`.
         return _FakeStatementResult(list(self._parent.rows))
 
 
 class _FakeRemoteTabular:
-    """Hand-rolled remote Tabular for cache-flow tests.
+    """In-memory Tabular double for the remote-cache flow.
 
-    Tracks every ``sql.execute`` query, every ``insert`` call, and
-    holds the seeded rows in memory so a subsequent lookup can
-    return them. The CacheConfig holding it satisfies
-    :meth:`CacheConfig.is_remote` so :meth:`remote_cache_enabled`
-    fires.
+    Holds seeded rows (a list of :class:`pa.RecordBatch`) and records
+    every ``sql.execute`` query, every ``insert`` call, and whether
+    ``create`` was called. Insert appends new batches into ``rows``
+    so a subsequent lookup returns everything that was written.
     """
 
     def __init__(self, name: str = "ws.cache.responses") -> None:
@@ -657,14 +196,13 @@ class _FakeRemoteTabular:
         self.created = False
         self.raise_table_not_found = False
         self.sql = _FakeSql(self)
-        self.path = name  # str works for dict-key purposes
+        self.path = name  # dict-key proxy for ``Session._split_remote_cache``
 
     def full_name(self, safe: bool = False) -> str:
         return self._name
 
     def create(self, schema: pa.Schema, if_not_exists: bool = False) -> None:
         self.created = True
-        # Once "created" the next sql.execute returns rows normally.
         self.raise_table_not_found = False
 
     def insert(
@@ -678,9 +216,6 @@ class _FakeRemoteTabular:
         prune_by: Any = None,
         spark_session: Any = None,
     ) -> None:
-        # Normalise both ``RecordBatch`` and ``Table`` inputs into a
-        # list of batches we can store (the session passes both
-        # shapes depending on the code path).
         if isinstance(batch, pa.Table):
             new_batches = batch.to_batches()
         elif isinstance(batch, pa.RecordBatch):
@@ -689,28 +224,275 @@ class _FakeRemoteTabular:
             new_batches = []
         self.inserts.append({
             "mode": mode,
-            "match_by": match_by,
+            "match_by": tuple(match_by) if match_by else None,
             "wait": wait,
             "rows": sum(b.num_rows for b in new_batches),
+            "prune_keys": tuple(sorted(prune_values.keys())) if prune_values else (),
         })
         self.rows.extend(new_batches)
 
 
-def _remote_cfg(tab: _FakeRemoteTabular, **overrides: Any) -> CacheConfig:
-    return CacheConfig(
-        tabular=tab,
-        mode=overrides.pop("mode", Mode.APPEND),
-        request_by=overrides.pop("request_by", ["public_url_hash"]),
-        wait=overrides.pop("wait", False),
-        **overrides,
-    )
+# ===========================================================================
+# Local cache — single request via ``Session.send``
+# ===========================================================================
 
 
-class TestRemoteCacheIntegration:
+class TestLocalCacheSend:
 
-    def test_remote_miss_then_writeback(self) -> None:
-        # Empty remote → first send goes to network; the response is
-        # written back via ``insert``.
+    def test_hit_skips_network(self, tmp_path) -> None:
+        cache = _local_cfg(tmp_path)
+        req = make_request("https://example.com/x")
+        _seed_local(cache, make_response(request=req, body=b'{"v":"cached"}'))
+
+        s = StubSession()
+        out = s.send(req, local_cache=cache)
+        assert len(s.calls) == 0
+        assert out.json() == {"v": "cached"}
+
+    def test_miss_writes_back(self, tmp_path) -> None:
+        cache = _local_cfg(tmp_path)
+        req = make_request("https://example.com/x")
+        s = StubSession()
+        s.queue(make_response(request=req, body=b'{"v":"fresh"}'))
+
+        out = s.send(req, local_cache=cache)
+        assert len(s.calls) == 1
+        assert out.json() == {"v": "fresh"}
+        assert _wait_for_local(cache) >= 1
+
+        # Second send hits the freshly written disk row, not the network.
+        out2 = s.send(req, local_cache=cache)
+        assert len(s.calls) == 1
+        assert out2.json() == {"v": "fresh"}
+
+    def test_failure_response_not_persisted(self, tmp_path) -> None:
+        cache = _local_cfg(tmp_path)
+        req = make_request("https://example.com/oops")
+        s = StubSession()
+        s.queue(make_response(request=req, status_code=500, body=b"boom"))
+
+        # ``raise_error=False`` so the test owns the assertions —
+        # ``_store_local_cached_response`` early-exits on
+        # ``response.ok=False`` so the writeback never fires.
+        s.send(req, local_cache=cache, raise_error=False)
+
+        # Give any spurious fire-and-forget job time to land before
+        # asserting nothing's there. 0.2s is plenty — the writeback is
+        # microseconds on tmpfs.
+        time.sleep(0.2)
+        assert _wait_for_local(cache, timeout=0.1) == 0
+
+    def test_upsert_skips_lookup_and_refetches(self, tmp_path) -> None:
+        cache = _local_cfg(tmp_path, mode=Mode.UPSERT)
+        req = make_request("https://example.com/x")
+        _seed_local(cache, make_response(request=req, body=b'{"v":"cached"}'))
+
+        s = StubSession()
+        s.queue(make_response(request=req, body=b'{"v":"fresh"}'))
+
+        out = s.send(req, local_cache=cache)
+        # UPSERT bypasses the read — the network must fire.
+        assert len(s.calls) == 1
+        assert out.json() == {"v": "fresh"}
+
+    def test_received_window_filters_stale_row(self, tmp_path) -> None:
+        cache = _local_cfg(
+            tmp_path,
+            received_from=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+            received_to=dt.datetime(2030, 1, 1, tzinfo=dt.timezone.utc),
+        )
+        req = make_request("https://example.com/x")
+        _seed_local(cache, make_response(
+            request=req,
+            body=b'{"v":"old"}',
+            received_at=dt.datetime(2010, 1, 1, tzinfo=dt.timezone.utc),
+        ))
+
+        s = StubSession()
+        s.queue(make_response(request=req, body=b'{"v":"fresh"}'))
+
+        out = s.send(req, local_cache=cache)
+        assert len(s.calls) == 1
+        assert out.json() == {"v": "fresh"}
+
+    def test_received_ttl_derived_window_filters_stale_row(self, tmp_path) -> None:
+        # ``received_ttl`` with no explicit ``received_to`` resolves to
+        # ``now() - ttl`` → ``now()``. An mtime an hour in the past is
+        # stale even with a short ttl.
+        cache = _local_cfg(tmp_path, received_ttl=dt.timedelta(minutes=10))
+        req = make_request("https://example.com/x")
+        old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
+        _seed_local(cache, make_response(
+            request=req, body=b'{"v":"old"}', received_at=old,
+        ))
+
+        s = StubSession()
+        s.queue(make_response(request=req, body=b'{"v":"fresh"}'))
+        out = s.send(req, local_cache=cache)
+        assert len(s.calls) == 1
+        assert out.json() == {"v": "fresh"}
+
+    def test_per_request_override_wins(self, tmp_path) -> None:
+        # Session-level cache holds a row that would match; per-request
+        # cache points at a fresh empty folder, so the send must miss
+        # and refetch.
+        session_cache = _local_cfg(tmp_path / "session")
+        seed_req = make_request("https://example.com/x")
+        _seed_local(
+            session_cache,
+            make_response(request=seed_req, body=b'{"v":"cached"}'),
+        )
+
+        alt = tmp_path / "alt"
+        alt.mkdir()
+        req = seed_req.copy(local_cache_config=_local_cfg(alt))
+
+        s = StubSession()
+        s.queue(make_response(request=req, body=b'{"v":"network"}'))
+
+        out = s.send(req, local_cache=session_cache)
+        assert len(s.calls) == 1
+        assert out.json() == {"v": "network"}
+
+    def test_distinct_post_bodies_do_not_alias(self, tmp_path) -> None:
+        # ``public_hash`` mixes the body in, so two POSTs to the same
+        # URL with different bytes hash to distinct ``.arrow`` leaves.
+        cache = _local_cfg(tmp_path)
+        url = "https://example.com/echo"
+        req_a = make_request(url, method="POST", body=b"payload-A")
+        req_b = make_request(url, method="POST", body=b"payload-B")
+        _seed_local(cache, make_response(request=req_a, body=b'{"got":"A"}'))
+
+        s = StubSession()
+        s.queue(make_response(request=req_b, body=b'{"got":"B"}'))
+
+        out_a = s.send(req_a, local_cache=cache)
+        out_b = s.send(req_b, local_cache=cache)
+        assert out_a.json() == {"got": "A"}
+        assert out_b.json() == {"got": "B"}
+        # Only req_b touched the wire.
+        assert len(s.calls) == 1
+        assert s.calls[0].buffer.to_bytes() == b"payload-B"
+
+
+# ===========================================================================
+# Local cache — batched via ``Session.send_many``
+# ===========================================================================
+
+
+class TestLocalCacheSendMany:
+
+    def test_mixed_hits_and_misses(self, tmp_path) -> None:
+        cache = _local_cfg(tmp_path)
+
+        a = make_request("https://example.com/a")
+        b = make_request("https://example.com/b")
+        c = make_request("https://example.com/c")
+
+        _seed_local(cache, make_response(request=a, body=b'{"k":"a"}'))
+        _seed_local(cache, make_response(request=b, body=b'{"k":"b"}'))
+
+        s = StubSession()
+        s.queue(make_response(request=c, body=b'{"k":"c"}'))
+
+        out = list(s.send_many(iter([a, b, c]), local_cache=cache))
+        assert {r.json()["k"] for r in out} == {"a", "b", "c"}
+        assert len(s.calls) == 1
+        assert s.calls[0].url.path == "/c"
+
+    def test_writeback_round_trip(self, tmp_path) -> None:
+        cache = _local_cfg(tmp_path)
+        s = StubSession()
+        req = make_request("https://example.com/x")
+        s.queue(make_response(request=req, body=b'{"v":"first"}'))
+
+        list(s.send_many(iter([req]), local_cache=cache))
+        assert _wait_for_local(cache) >= 1, "writeback never landed"
+
+        # Second batch comes off disk.
+        out = list(s.send_many(iter([req]), local_cache=cache))
+        assert len(s.calls) == 1, "second batch must hit disk, not network"
+        assert out[0].json() == {"v": "first"}
+
+    def test_failure_response_not_persisted(self, tmp_path) -> None:
+        cache = _local_cfg(tmp_path)
+        req = make_request("https://example.com/x")
+        s = StubSession()
+        s.queue(make_response(request=req, status_code=500, body=b"boom"))
+
+        # ``raise_error=False`` keeps the iterator yielding the 5xx
+        # rather than blowing up — the contract under test is the
+        # writeback gate, not the error policy.
+        list(s.send_many(iter([req]), local_cache=cache, raise_error=False))
+
+        time.sleep(0.2)
+        assert _wait_for_local(cache, timeout=0.1) == 0
+
+    def test_per_request_override_routes_to_alt_path(self, tmp_path) -> None:
+        # Two requests share one batch but each carries its own
+        # per-request cache pointing at a separate folder. The
+        # session-level cache holds neither row — both must miss
+        # the session cache and write back into their respective
+        # alt folders.
+        a_dir = tmp_path / "a"; a_dir.mkdir()
+        b_dir = tmp_path / "b"; b_dir.mkdir()
+        session_cache = _local_cfg(tmp_path / "session")
+
+        a = make_request("https://example.com/a").copy(
+            local_cache_config=_local_cfg(a_dir),
+        )
+        b = make_request("https://example.com/b").copy(
+            local_cache_config=_local_cfg(b_dir),
+        )
+
+        s = StubSession()
+        s.queue(
+            make_response(request=a, body=b'{"k":"a"}'),
+            make_response(request=b, body=b'{"k":"b"}'),
+        )
+        list(s.send_many(iter([a, b]), local_cache=session_cache))
+
+        # Each per-request cache got its own writeback; the
+        # session-level cache stayed empty.
+        assert _wait_for_local(_local_cfg(a_dir)) >= 1
+        assert _wait_for_local(_local_cfg(b_dir)) >= 1
+        assert _wait_for_local(session_cache, timeout=0.1) == 0
+
+    def test_concurrent_writebacks_dont_collide(self, tmp_path) -> None:
+        # ``public_hash`` keys give every distinct request its own
+        # ``.arrow`` leaf, so concurrent fire-and-forget writers can't
+        # trample each other even under load.
+        cache = _local_cfg(tmp_path)
+        s = StubSession()
+        n = 8
+        reqs = [make_request(f"https://example.com/p{i}") for i in range(n)]
+        s.queue(*[
+            make_response(request=r, body=f'{{"i":{i}}}'.encode())
+            for i, r in enumerate(reqs)
+        ])
+        list(s.send_many(iter(reqs), local_cache=cache))
+        assert _wait_for_local(cache, count=n) >= n
+
+
+# ===========================================================================
+# Remote cache — single request via ``Session.send``
+# ===========================================================================
+
+
+class TestRemoteCacheSend:
+
+    def test_hit_skips_network(self) -> None:
+        tab = _FakeRemoteTabular()
+        cfg = _remote_cfg(tab)
+        req = make_request("https://example.com/x")
+        _seed_remote(tab, make_response(request=req, body=b'{"v":"cached"}'))
+
+        s = StubSession()
+        out = s.send(req, remote_cache=cfg)
+        assert len(s.calls) == 0
+        assert out.json() == {"v": "cached"}
+
+    def test_miss_writes_back_via_insert(self) -> None:
         tab = _FakeRemoteTabular()
         cfg = _remote_cfg(tab)
         s = StubSession()
@@ -718,29 +500,31 @@ class TestRemoteCacheIntegration:
         s.queue(make_response(request=req, body=b'{"v":1}'))
 
         s.send(req, remote_cache=cfg)
-
         assert len(s.calls) == 1, "remote miss must touch the network"
         assert tab.queries, "lookup query must run before the network fetch"
-        assert any(call["rows"] == 1 for call in tab.inserts), (
-            "successful response must be written back to the remote cache"
-        )
+        assert tab.inserts, "successful response must write back via insert"
+        # Insert call carries the configured knobs.
+        i = tab.inserts[0]
+        assert i["mode"] == Mode.APPEND
+        # ``wait`` is normalized to a :class:`WaitingConfig`; bool
+        # coercion drives the actual "block until visible" behavior.
+        assert not i["wait"]
+        # Pruning keys the MERGE on both the partition column and the
+        # exact row identity — both keys are int64 so the IN literal
+        # stays compact.
+        assert i["prune_keys"] == ("partition_key", "public_hash")
 
-    def test_remote_hit_skips_network(self) -> None:
-        # Pre-seed the fake remote with a row matching the request.
+    def test_failure_response_not_persisted(self) -> None:
         tab = _FakeRemoteTabular()
         cfg = _remote_cfg(tab)
-        req = make_request("https://example.com/x")
-        seeded = make_response(request=req, body=b'{"v":"cached"}')
-        tab.rows.append(seeded.to_arrow_batch(parse=False))
-
         s = StubSession()
-        out = s.send(req, remote_cache=cfg)
-        assert len(s.calls) == 0, "remote hit must skip the network"
-        assert out.json() == {"v": "cached"}
+        req = make_request("https://example.com/x")
+        s.queue(make_response(request=req, status_code=500, body=b"boom"))
+
+        s.send(req, remote_cache=cfg, raise_error=False)
+        assert tab.inserts == [], "5xx response must not write back to remote"
 
     def test_table_or_view_not_found_recovers(self) -> None:
-        # First lookup raises TABLE_OR_VIEW_NOT_FOUND; the session
-        # must call ``create`` and retry the lookup transparently.
         tab = _FakeRemoteTabular()
         tab.raise_table_not_found = True
         cfg = _remote_cfg(tab)
@@ -750,89 +534,269 @@ class TestRemoteCacheIntegration:
 
         s.send(req, remote_cache=cfg)
         assert tab.created, "missing table must be created on first miss"
+        # The lookup query was re-executed after ``create`` — first
+        # call raised, second one came back empty so the network fired.
+        assert len(tab.queries) >= 2
+        assert len(s.calls) == 1
 
-    def test_remote_hit_backfills_local_cache(self, tmp_path) -> None:
-        # Remote has the row; local cache is empty. After the send,
-        # the local cache must have been written back so a subsequent
-        # offline send hits disk.
-        tab = _FakeRemoteTabular()
-        remote_cfg = _remote_cfg(tab)
-        local = _local_cache(tmp_path)
-        req = make_request("https://example.com/x")
-        seeded = make_response(request=req, body=b'{"v":"from-remote"}')
-        tab.rows.append(seeded.to_arrow_batch(parse=False))
-
-        s = StubSession()
-        s.send(req, remote_cache=remote_cfg, local_cache=local)
-        assert len(s.calls) == 0
-
-        # Backfill is fire-and-forget — poll the cache before the
-        # offline check.
-        assert _wait_for_readable(local), "remote hit must backfill local cache"
-        out = s.send(req, local_cache=local)
-        assert out.json() == {"v": "from-remote"}
-
-    def test_mirror_local_to_remote_writes_pre_network(self, tmp_path) -> None:
-        # ``mirror_local_to_remote=True`` — a local cache hit during
-        # ``send_many`` must produce a remote insert *without* going
-        # to the network.
-        tab = _FakeRemoteTabular()
-        remote_cfg = _remote_cfg(tab, mirror_local_to_remote=True)
-        local = _local_cache(tmp_path)
-        req = make_request("https://example.com/x")
-        _seed(local, make_response(request=req, body=b'{"v":"local"}'))
-
-        s = StubSession()
-        list(s.send_many(
-            iter([req]),
-            local_cache=local,
-            remote_cache=remote_cfg,
-        ))
-        assert len(s.calls) == 0, "local hit must not touch the network"
-        # The mirror path goes through ``_persist_remote`` →
-        # ``insert`` with ``mode=APPEND``; assert at least one
-        # writeback fired with our row.
-        assert any(call["rows"] >= 1 for call in tab.inserts), (
-            "mirror_local_to_remote must push the local hit upstream"
-        )
-
-    def test_mirror_disabled_keeps_remote_silent(self, tmp_path) -> None:
-        # Default config — no mirror flag — keeps the remote
-        # untouched on a local-only batch.
-        tab = _FakeRemoteTabular()
-        remote_cfg = _remote_cfg(tab)  # mirror_local_to_remote defaults to False
-        local = _local_cache(tmp_path)
-        req = make_request("https://example.com/x")
-        _seed(local, make_response(request=req, body=b'{"v":"local"}'))
-
-        s = StubSession()
-        list(s.send_many(
-            iter([req]),
-            local_cache=local,
-            remote_cache=remote_cfg,
-        ))
-        assert tab.inserts == [], (
-            "default config must not push local-only hits to remote"
-        )
-
-    def test_upsert_mode_disables_remote_cache_path(self) -> None:
-        # ``CacheConfig.cache_enabled`` is gated on ``mode in (APPEND, AUTO)``,
-        # so :attr:`remote_cache_enabled` is False for UPSERT and the entire
-        # remote cache flow short-circuits — no lookup query, no writeback
-        # insert. This pins that contract: a caller who wants UPSERT today
-        # gets *no* cache activity (not "always refetch + write back").
+    def test_upsert_skips_both_lookup_and_writeback(self) -> None:
+        # ``CacheConfig.cache_enabled`` gates the remote flow on
+        # ``mode in (APPEND, AUTO)``, so UPSERT short-circuits the
+        # whole remote cache: no lookup query, no writeback insert.
         tab = _FakeRemoteTabular()
         cfg = _remote_cfg(tab, mode=Mode.UPSERT)
-        seed_req = make_request("https://example.com/x")
-        tab.rows.append(
-            make_response(request=seed_req, body=b'{"v":"old"}').to_arrow_batch(parse=False)
-        )
+        req = make_request("https://example.com/x")
+        _seed_remote(tab, make_response(request=req, body=b'{"v":"old"}'))
 
         s = StubSession()
-        s.queue(make_response(request=seed_req, body=b'{"v":"fresh"}'))
-        out = s.send(seed_req, remote_cache=cfg)
+        s.queue(make_response(request=req, body=b'{"v":"fresh"}'))
+        out = s.send(req, remote_cache=cfg)
 
         assert len(s.calls) == 1, "UPSERT must always go to the network"
         assert out.json() == {"v": "fresh"}
         assert tab.queries == [], "UPSERT must not issue a lookup query"
         assert tab.inserts == [], "UPSERT short-circuits the writeback too"
+
+    def test_per_request_override_routes_to_alt_table(self) -> None:
+        # Session-level config holds the cached row in tab_a;
+        # per-request config points at tab_b which is empty. The
+        # request must miss and refetch from the network.
+        tab_a = _FakeRemoteTabular(name="ws.a.responses")
+        tab_b = _FakeRemoteTabular(name="ws.b.responses")
+        req = make_request("https://example.com/x")
+        _seed_remote(tab_a, make_response(request=req, body=b'{"v":"a"}'))
+
+        req_with_override = req.copy(remote_cache_config=_remote_cfg(tab_b))
+        s = StubSession()
+        s.queue(make_response(request=req_with_override, body=b'{"v":"network"}'))
+
+        out = s.send(req_with_override, remote_cache=_remote_cfg(tab_a))
+        assert len(s.calls) == 1
+        assert out.json() == {"v": "network"}
+        # tab_b got the writeback, tab_a stays untouched.
+        assert tab_a.inserts == []
+        assert tab_b.inserts and tab_b.inserts[0]["rows"] == 1
+
+    def test_wait_flag_propagates_to_insert(self) -> None:
+        tab = _FakeRemoteTabular()
+        cfg = _remote_cfg(tab, wait=True)
+        s = StubSession()
+        req = make_request("https://example.com/x")
+        s.queue(make_response(request=req, body=b'{"v":1}'))
+
+        s.send(req, remote_cache=cfg)
+        assert tab.inserts and bool(tab.inserts[0]["wait"]) is True
+
+
+# ===========================================================================
+# Remote cache — batched via ``Session.send_many``
+# ===========================================================================
+
+
+class TestRemoteCacheSendMany:
+
+    def test_batched_hits_and_misses(self) -> None:
+        # Two requests share one remote table. One row is pre-seeded;
+        # the other is a miss that should fire one network call and
+        # write back into the same table.
+        tab = _FakeRemoteTabular()
+        cfg = _remote_cfg(tab)
+        hit_req = make_request("https://example.com/a")
+        miss_req = make_request("https://example.com/b")
+        _seed_remote(tab, make_response(request=hit_req, body=b'{"k":"a"}'))
+
+        s = StubSession()
+        s.queue(make_response(request=miss_req, body=b'{"k":"b"}'))
+
+        out = list(s.send_many(iter([hit_req, miss_req]), remote_cache=cfg))
+        assert {r.json()["k"] for r in out} == {"a", "b"}
+        assert len(s.calls) == 1, "only the miss touches the network"
+        # ``_split_remote_cache`` issues one batched SQL lookup per
+        # distinct table.
+        assert len(tab.queries) == 1
+        # Writeback fires for the network result.
+        assert any(call["rows"] == 1 for call in tab.inserts)
+
+    def test_distinct_tables_each_get_one_lookup(self) -> None:
+        # Two requests, two distinct per-request remote tables.
+        # ``_split_remote_cache`` must issue one ``sql.execute`` per
+        # table — never collapse them.
+        tab_a = _FakeRemoteTabular(name="ws.a.responses")
+        tab_b = _FakeRemoteTabular(name="ws.b.responses")
+
+        req_a = make_request("https://example.com/a").copy(
+            remote_cache_config=_remote_cfg(tab_a),
+        )
+        req_b = make_request("https://example.com/b").copy(
+            remote_cache_config=_remote_cfg(tab_b),
+        )
+        _seed_remote(tab_a, make_response(request=req_a, body=b'{"k":"a"}'))
+        _seed_remote(tab_b, make_response(request=req_b, body=b'{"k":"b"}'))
+
+        s = StubSession()
+        out = list(s.send_many(iter([req_a, req_b])))
+        assert {r.json()["k"] for r in out} == {"a", "b"}
+        assert len(s.calls) == 0, "both rows hit their respective tables"
+        assert len(tab_a.queries) == 1
+        assert len(tab_b.queries) == 1
+
+    def test_writeback_groups_split_by_mode(self) -> None:
+        # APPEND + UPSERT in the same batch — APPEND should write back,
+        # UPSERT should short-circuit (see ``cache_enabled`` gate),
+        # leaving exactly one insert call on the table.
+        tab = _FakeRemoteTabular()
+        append_cfg = _remote_cfg(tab, mode=Mode.APPEND)
+        upsert_cfg = _remote_cfg(tab, mode=Mode.UPSERT)
+
+        a = make_request("https://example.com/a").copy(
+            remote_cache_config=append_cfg,
+        )
+        b = make_request("https://example.com/b").copy(
+            remote_cache_config=upsert_cfg,
+        )
+        s = StubSession()
+        s.queue(
+            make_response(request=a, body=b'{"k":"a"}'),
+            make_response(request=b, body=b'{"k":"b"}'),
+        )
+        list(s.send_many(iter([a, b])))
+
+        # Two network calls (UPSERT always misses), one writeback
+        # group (only APPEND persists).
+        assert len(s.calls) == 2
+        assert len(tab.inserts) == 1
+        assert tab.inserts[0]["mode"] == Mode.APPEND
+        assert tab.inserts[0]["rows"] == 1
+
+
+# ===========================================================================
+# Combined local + remote
+# ===========================================================================
+
+
+class TestCombinedCacheIntegration:
+
+    def test_local_hit_short_circuits_before_remote(self, tmp_path) -> None:
+        # Local cache holds the row → the remote table should never
+        # be queried, and the network should never fire.
+        local = _local_cfg(tmp_path)
+        tab = _FakeRemoteTabular()
+        remote = _remote_cfg(tab)
+        req = make_request("https://example.com/x")
+        _seed_local(local, make_response(request=req, body=b'{"v":"local"}'))
+
+        s = StubSession()
+        out = s.send(req, local_cache=local, remote_cache=remote)
+        assert out.json() == {"v": "local"}
+        assert len(s.calls) == 0
+        assert tab.queries == [], "local hit must short-circuit before remote"
+
+    def test_remote_hit_backfills_local(self, tmp_path) -> None:
+        # Local empty, remote populated → the remote hit is written
+        # back into the local fast-path cache so a subsequent local-only
+        # send is offline.
+        local = _local_cfg(tmp_path)
+        tab = _FakeRemoteTabular()
+        remote = _remote_cfg(tab)
+        req = make_request("https://example.com/x")
+        _seed_remote(tab, make_response(request=req, body=b'{"v":"from-remote"}'))
+
+        s = StubSession()
+        s.send(req, local_cache=local, remote_cache=remote)
+        assert len(s.calls) == 0
+
+        assert _wait_for_local(local) >= 1, "remote hit must backfill local"
+        out = s.send(req, local_cache=local)
+        assert out.json() == {"v": "from-remote"}
+
+    def test_full_miss_fetches_once_and_writes_back_to_both(self, tmp_path) -> None:
+        # Neither layer has the row → one network call, both layers
+        # take the writeback.
+        local = _local_cfg(tmp_path)
+        tab = _FakeRemoteTabular()
+        remote = _remote_cfg(tab)
+        req = make_request("https://example.com/x")
+        s = StubSession()
+        s.queue(make_response(request=req, body=b'{"v":"network"}'))
+
+        s.send(req, local_cache=local, remote_cache=remote)
+        assert len(s.calls) == 1
+        assert _wait_for_local(local) >= 1
+        assert tab.inserts and tab.inserts[0]["rows"] == 1
+
+    def test_mirror_local_to_remote_pushes_local_hit_upstream(self, tmp_path) -> None:
+        # ``mirror_local_to_remote=True`` — during ``send_many``, a
+        # local hit must produce a remote insert without going to the
+        # network.
+        local = _local_cfg(tmp_path)
+        tab = _FakeRemoteTabular()
+        remote = _remote_cfg(tab, mirror_local_to_remote=True)
+        req = make_request("https://example.com/x")
+        _seed_local(local, make_response(request=req, body=b'{"v":"local"}'))
+
+        s = StubSession()
+        list(s.send_many(
+            iter([req]),
+            local_cache=local,
+            remote_cache=remote,
+        ))
+        assert len(s.calls) == 0, "local hit must not touch the network"
+        assert any(call["rows"] >= 1 for call in tab.inserts), (
+            "mirror_local_to_remote must push the local hit upstream"
+        )
+
+    def test_mirror_disabled_keeps_remote_silent_on_local_hit(self, tmp_path) -> None:
+        # Default config — no mirror flag — leaves the remote untouched
+        # on a batch satisfied entirely by the local cache.
+        local = _local_cfg(tmp_path)
+        tab = _FakeRemoteTabular()
+        remote = _remote_cfg(tab)  # mirror_local_to_remote defaults to False
+        req = make_request("https://example.com/x")
+        _seed_local(local, make_response(request=req, body=b'{"v":"local"}'))
+
+        s = StubSession()
+        list(s.send_many(
+            iter([req]),
+            local_cache=local,
+            remote_cache=remote,
+        ))
+        assert tab.inserts == [], (
+            "default config must not push local-only hits to remote"
+        )
+
+    def test_send_many_mixes_local_hit_remote_hit_and_full_miss(
+        self, tmp_path,
+    ) -> None:
+        # One batch covering all three stages of the pipeline:
+        # * ``a`` lands on local;
+        # * ``b`` lands on remote (and should backfill local);
+        # * ``c`` misses both and goes to the network.
+        # End state: all three responses come back; exactly one
+        # network call; both backends carry ``c``.
+        local = _local_cfg(tmp_path)
+        tab = _FakeRemoteTabular()
+        remote = _remote_cfg(tab)
+        a = make_request("https://example.com/a")
+        b = make_request("https://example.com/b")
+        c = make_request("https://example.com/c")
+
+        _seed_local(local, make_response(request=a, body=b'{"k":"a"}'))
+        _seed_remote(tab, make_response(request=b, body=b'{"k":"b"}'))
+
+        s = StubSession()
+        s.queue(make_response(request=c, body=b'{"k":"c"}'))
+
+        out = list(s.send_many(
+            iter([a, b, c]),
+            local_cache=local,
+            remote_cache=remote,
+        ))
+        assert {r.json()["k"] for r in out} == {"a", "b", "c"}
+        assert len(s.calls) == 1
+        assert s.calls[0].url.path == "/c"
+        # ``b`` backfills local (one .arrow), ``c`` writes back to
+        # local too (another) — and ``c`` lands in remote as well.
+        assert _wait_for_local(local, count=2) >= 2
+        # Remote got the network-miss writeback for ``c`` (``b`` was
+        # already there and the miss-then-writeback path covers ``c``).
+        assert any(call["rows"] >= 1 for call in tab.inserts)

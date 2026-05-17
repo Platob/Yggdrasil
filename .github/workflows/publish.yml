@@ -22,6 +22,11 @@
 # confirmed manually (no public API); the workflow summary links the
 # release management page.
 #
+# Cleanup also fires automatically when the new version is a patch bump
+# of the previous tag (same ``MAJOR.MINOR``) — e.g. 1.2.3 → 1.2.4 drops
+# 1.2.3, but 1.2.5 → 1.3.0 keeps the 1.2.x series. The marker stays as
+# the opt-in for cross-minor cleanup.
+#
 # PyPI setup required
 # -------------------
 # environment "pypi" with trusted publisher OR secret PYPI_API_TOKEN.
@@ -126,12 +131,13 @@ jobs:
             echo "⏭️  Skipping – version already on PyPI and force=false."
           fi
 
-      # Convention: any commit on the push that carries the literal token
-      # ``!cleanup-prev-release`` in its message asks CI to remove the
-      # previous release after this one publishes (GitHub tag + release,
-      # and a PyPI yank for the previous version). The marker is opt-in
-      # per push so routine releases stay non-destructive.
-      - name: Detect cleanup-prev-release marker
+      # Cleanup fires when either (a) any commit on the push carries the
+      # literal token ``!cleanup-prev-release`` (opt-in, cross-minor), or
+      # (b) the previous tag shares the new version's MAJOR.MINOR — i.e.
+      # the new release is a patch bump and the previous patch in that
+      # series is superseded. Routine minor/major bumps stay
+      # non-destructive unless the marker is set.
+      - name: Detect cleanup trigger (marker or same-minor patch bump)
         id: cleanup
         env:
           CURRENT: ${{ steps.meta.outputs.version }}
@@ -142,9 +148,9 @@ jobs:
           if git log --format='%B' ${{ github.event.before }}..${{ github.sha }} 2>/dev/null \
                | grep -qF "$MARKER" \
              || git log -1 --format='%B' ${{ github.sha }} | grep -qF "$MARKER"; then
-            CLEANUP=true
+            MARKER_FOUND=true
           else
-            CLEANUP=false
+            MARKER_FOUND=false
           fi
 
           # Resolve previous tag: highest semver v* tag below the current
@@ -152,12 +158,32 @@ jobs:
           PREV=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname \
                  | grep -vx "v$CURRENT" \
                  | head -n1)
+
+          # Same-minor check: drop the previous tag if it shares MAJOR.MINOR
+          # with the new version (1.2.3 → 1.2.4 cleans 1.2.3; 1.2.5 → 1.3.0
+          # does not). Empty PREV (first release) leaves the flag false.
+          SAME_MINOR=false
+          if [ -n "$PREV" ]; then
+            CURRENT_MM=$(echo "$CURRENT"   | awk -F. '{print $1"."$2}')
+            PREV_MM=$(echo "${PREV#v}" | awk -F. '{print $1"."$2}')
+            if [ "$CURRENT_MM" = "$PREV_MM" ]; then
+              SAME_MINOR=true
+            fi
+          fi
+
+          if [ "$MARKER_FOUND" = "true" ] || [ "$SAME_MINOR" = "true" ]; then
+            CLEANUP=true
+          else
+            CLEANUP=false
+          fi
+
           echo "cleanup_previous=$CLEANUP" >> "$GITHUB_OUTPUT"
           echo "previous_tag=$PREV" >> "$GITHUB_OUTPUT"
           if [ "$CLEANUP" = "true" ]; then
-            echo "🧹 Cleanup marker found; previous_tag=${PREV:-<none>}"
+            REASON="marker=$MARKER_FOUND same_minor=$SAME_MINOR"
+            echo "🧹 Cleanup will run ($REASON); previous_tag=${PREV:-<none>}"
           else
-            echo "ℹ️  No !cleanup-prev-release marker; previous release will be kept."
+            echo "ℹ️  No cleanup trigger (no !cleanup-prev-release marker, previous tag ${PREV:-<none>} not same-minor); previous release will be kept."
           fi
 
   # --------------------------------------------------------------------------
@@ -364,15 +390,17 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # --------------------------------------------------------------------------
-  # cleanup-previous — opt-in via !cleanup-prev-release commit marker
+  # cleanup-previous — fires on !cleanup-prev-release marker or same-minor
   # --------------------------------------------------------------------------
   #
-  # When any commit on the push carries the literal token
-  # ``!cleanup-prev-release`` in its message, this job deletes the prior
-  # ``vX.Y.Z`` git tag + GitHub Release and yanks the prior PyPI version.
-  # The marker is opt-in per push so routine releases stay non-destructive.
-  # PyPI's public API does not expose a yank endpoint; the maintainer-side
-  # yank link is surfaced in the workflow summary as the source of truth.
+  # Runs when the detect job decided either (a) any commit on the push
+  # carries the literal token ``!cleanup-prev-release``, or (b) the
+  # previous tag shares MAJOR.MINOR with the new version (patch bump).
+  # Deletes the prior ``vX.Y.Z`` git tag + GitHub Release and surfaces
+  # the PyPI yank URL for the prior version. Routine cross-minor releases
+  # stay non-destructive unless the marker is set. PyPI's public API
+  # does not expose a yank endpoint; the maintainer-side yank link is
+  # surfaced in the workflow summary as the source of truth.
   cleanup-previous:
     name: Cleanup previous release
     runs-on: ubuntu-latest

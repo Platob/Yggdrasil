@@ -21,9 +21,6 @@ Public API
    PyEnv
    safe_pip_name
    runtime_import_module
-   SYSTEM_LIBS
-   PIP_MODULE_NAME_MAPPINGS
-   CURRENT_PYENV
 """
 from __future__ import annotations
 
@@ -53,9 +50,7 @@ if TYPE_CHECKING:
 __all__ = [
     "runtime_import_module",
     "PyEnv",
-    "PIP_MODULE_NAME_MAPPINGS",
-    "CURRENT_PYENV",
-    "SYSTEM_LIBS",
+    "safe_pip_name",
 ]
 
 logger = logging.getLogger(__name__)
@@ -78,223 +73,6 @@ _PY_VERSION_RE = re.compile(
 )
 
 CURRENT_PYENV: PyEnv | None = None
-
-SYSTEM_LIBS: frozenset[str] = frozenset({
-    # Core Python / packaging
-    "pip",
-    "setuptools",
-    "wheel",
-    "packaging",
-    "importlib-metadata",
-    "zipp",
-    "typing-extensions",
-    "typing-inspection",
-    "annotated-types",
-    "annotated-doc",
-    "iniconfig",
-    "pluggy",
-    "platformdirs",
-    "pathspec",
-    "filelock",
-    "distro",
-    "six",
-    "decorator",
-    "wrapt",
-    "deprecated",
-    "future",
-    "more-itertools",
-    "toolz",
-    "attrs",
-    "rpds-py",
-    "referencing",
-    "jsonschema",
-    "jsonschema-specifications",
-    "blessed",
-    # Networking / HTTP
-    "certifi",
-    "charset-normalizer",
-    "idna",
-    "urllib3",
-    "requests",
-    "requests-toolbelt",
-    "httpx-sse",
-    "httpcore",
-    "h11",
-    "anyio",
-    "sniffio",
-    "aiofiles",
-    "aiosignal",
-    "aiohappyeyeballs",
-    "frozenlist",
-    "multidict",
-    "yarl",
-    "propcache",
-    "websocket-client",
-    "dnspython",
-    "brotli",
-    "greenlet",
-    "gpustat",
-    "h5py",
-    "librt",
-    "nvidia-ml-py",
-    "opencv-python",
-    "proglog",
-    "pydub",
-    "requests-kerberos",
-    "watch",
-    "wcwidth",
-    "av",
-    "uvicorn",
-    "ansicon",
-    "absl-py",
-    # Crypto / Auth
-    "cryptography",
-    "cffi",
-    "pycparser",
-    "pyopenssl",
-    "oauthlib",
-    "requests-oauthlib",
-    "pyasn1",
-    "pyasn1-modules",
-    "rsa",
-    "id",
-    # Serialization / Data formats
-    "pyyaml",
-    "tomlkit",
-    "jiter",
-    "jinja2",
-    "markupsafe",
-    "grpcio",
-    "grpcio-status",
-    "googleapis-common-protos",
-    "proto-plus",
-    "cloudpickle",
-    "multiprocess",
-    "locket",
-    "partd",
-    # Stdlib extensions
-    "python-dateutil",
-    "tzlocal",
-    "isodate",
-    "aniso8601",
-    "regex",
-    "click",
-    "rich",
-    "pygments",
-    "markdown",
-    "markdown-it-py",
-    "mdurl",
-    "nh3",
-    "colorama",
-    "tqdm",
-    "psutil",
-    "gitpython",
-    "gitdb",
-    "smmap",
-    "loguru",
-    "sentry-sdk",
-    "python-dotenv",
-    "pydantic-core",
-    "pydantic-settings",
-    "aiohttp",
-    "cachetools",
-    # Build / Dev / CI tools
-    "build",
-    "pyproject-hooks",
-    "black",
-    "mypy",
-    "mypy-extensions",
-    "ruff",
-    "pytest",
-    "pytest-asyncio",
-    "pathlib2",
-    "semantic-version",
-    "twine",
-    "readme-renderer",
-    "docutils",
-    "rfc3986",
-    "keyring",
-    "jaraco-classes",
-    "jaraco-context",
-    "jaraco-functools",
-    "uv",
-    # Numeric / Scientific
-    "sympy",
-    "mpmath",
-    "arro3-core",
-    "polars-runtime-32",
-    "xarray",
-    "contourpy",
-    "cycler",
-    "fonttools",
-    "kiwisolver",
-    "pyparsing",
-    "matplotlib",
-    "pillow",
-    "imageio",
-    # Cloud / Object storage
-    "botocore",
-    "jmespath",
-    "s3transfer",
-    "google-auth",
-    "google-auth-oauthlib",
-    "google-api-core",
-    "google-cloud-core",
-    "google-cloud-storage",
-    "google-cloud-storage-control",
-    "google-resumable-media",
-    "google-crc32c",
-    "googleapis-common-protos",
-    "grpc-google-iam-v1",
-    # ML / AI
-    "torch",
-    "torchvision",
-    "torchdata",
-    "tokenizers",
-    "safetensors",
-    "sentencepiece",
-    "datasets",
-    "huggingface-hub",
-    "hf-xet",
-    "accelerate",
-    "peft",
-    "diffusers",
-    "timm",
-    "einops",
-    "tensorboard",
-    "tensorboard-data-server",
-    "wandb",
-    "networkx",
-    # Web / API frameworks
-    "starlette",
-    "uvicorn",
-    "werkzeug",
-    "itsdangerous",
-    "blinker",
-    "python-multipart",
-    "sse-starlette",
-    "gradio",
-    "gradio-client",
-    "safehttpx",
-    "mcp",
-    "openai",
-    # Spark / Big data
-    "pyspark",
-    "py4j",
-    "delta-spark",
-    # Misc utilities
-    "beautifulsoup4",
-    "soupsieve",
-    "filelock",
-    "typer",
-    "typer-slim",
-    "shellingham",
-    "remote-pdb",
-    "groovy",
-    "pytokens",
-    "unitycatalog",
-    "pyproject-hooks",
-})
 
 
 def safe_pip_name(
@@ -718,14 +496,6 @@ class PyEnv:
         return get_ipython() is not None
 
     @classmethod
-    def can_access_databricks(cls):
-        return (
-            cls.in_databricks
-            or "DATABRICKS_HOST" in os.environ.keys()
-            or "DATABRICKS_CLUSTER_ID" in os.environ.keys()
-        )
-
-    @classmethod
     def in_aws_lambda(cls) -> bool:
         """``True`` when running inside the AWS Lambda runtime.
 
@@ -754,17 +524,18 @@ class PyEnv:
         **not** covered — there's no environment-side signal for it
         (callers needing that should hit IMDS).
         """
+        env = os.environ
+        # AWS_EXECUTION_ENV is set by Lambda, CodeBuild, and some
+        # CodePipeline / SageMaker images; ECS injects the metadata
+        # URI; the credentials-relative-URI is set on any compute
+        # surface using a task / instance role.
         return (
-            cls.in_aws_lambda()
-            or cls.in_aws_batch()
-            # AWS_EXECUTION_ENV is set by Lambda, CodeBuild, and some
-            # CodePipeline / SageMaker images; ECS injects the metadata
-            # URI; the credentials-relative-URI is set on any compute
-            # surface using a task / instance role.
-            or "AWS_EXECUTION_ENV" in os.environ
-            or "ECS_CONTAINER_METADATA_URI_V4" in os.environ
-            or "ECS_CONTAINER_METADATA_URI" in os.environ
-            or "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI" in os.environ
+            "AWS_LAMBDA_FUNCTION_NAME" in env
+            or "AWS_BATCH_JOB_ID" in env
+            or "AWS_EXECUTION_ENV" in env
+            or "ECS_CONTAINER_METADATA_URI_V4" in env
+            or "ECS_CONTAINER_METADATA_URI" in env
+            or "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI" in env
         )
 
     @classmethod
@@ -777,9 +548,8 @@ class PyEnv:
         caller wants to talk to a remote workspace; the SDK reads the same
         env vars to resolve auth and target compute.
         """
-        if cls.in_databricks():
-            return False
-        return "DATABRICKS_HOST" in os.environ
+        env = os.environ
+        return "DATABRICKS_RUNTIME_VERSION" not in env and "DATABRICKS_HOST" in env
 
     @classmethod
     def spark_session(
@@ -1509,6 +1279,11 @@ class PyEnv:
             if not pip_name:
                 raise ValueError("Provide at least one of module_name or pip_name.")
             module_name = pip_name.replace("-", "_")
+
+        if use_cache and not upgrade and module_name in self._checked_modules:
+            cached = sys.modules.get(module_name)
+            if cached is not None:
+                return cached
 
         if not upgrade:
             try:
