@@ -1016,9 +1016,16 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
                     f"{cls.__name__} via path dispatch. Got {obj!r}."
                 ) from exc
 
-        # Fallback: hand the raw ``obj`` to the constructor's
-        # ``data=`` channel.
-        return cls(data=obj, url=url, **kwargs)
+        # No recognised shape — bail out loudly. Routing an
+        # arbitrary value through the ``data=`` channel silently
+        # creates an empty IO (the constructor's seed loop only
+        # touches bytes-like / path / URL / IO inputs), which masks
+        # caller bugs at the boundary.
+        raise TypeError(
+            f"Cannot wrap {type(obj).__name__} as a {cls.__name__}. "
+            "Accepted: IO, bytes-like, str / PathLike / URL, or a "
+            f"file-like object with a ``read`` method. Got {obj!r}."
+        )
 
     @classmethod
     def from_url(cls, url: URL, **kwargs) -> "IO":
@@ -2635,20 +2642,20 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         """
         from yggdrasil.io.path.path import Path
 
-        source = _coerce_transfer_endpoint(src)
+        source = IO.from_(src)
         target = _join_dir_hint(self, source)
         if isinstance(source, Path) and source.is_dir():
             # Directory tree: only a :class:`Path` target can hold
             # it. ``size`` / ``offset`` slicing is a file-only knob.
             if size != -1 or offset != 0:
                 raise IsADirectoryError(
-                    f"Holder.upload: source {source.full_path()!r} is "
+                    f"IO.upload: source {source.full_path()!r} is "
                     f"a directory; size / offset slicing applies to "
                     f"file uploads only."
                 )
             if not isinstance(target, Path):
                 raise IsADirectoryError(
-                    f"Holder.upload: source {source.full_path()!r} is "
+                    f"IO.upload: source {source.full_path()!r} is "
                     f"a directory; target must be a Path to hold the "
                     f"tree, got {type(target).__name__}."
                 )
@@ -2658,17 +2665,16 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             return target
         if size < 0 and offset == 0:
             # Whole-source: defer to ``write_bytes`` type dispatch —
-            # bytes → ``write_mv``, :class:`Holder` → ``write_holder``
+            # bytes → ``write_mv``, :class:`IO` → ``write_holder``
             # (Path target uses :meth:`Path._write_holder` to fire
             # the ``_transfer_to`` fast paths: ``shutil.copyfile``
-            # for local→local, ``write_local_path`` for local→remote),
-            # IO → ``write_stream`` (path subclass overrides splice
-            # in their atomic-upload SDK call). ``overwrite=True``
-            # truncates any tail past the source's length.
+            # for local→local, ``write_local_path`` for local→remote).
+            # ``overwrite=True`` truncates any tail past the source's
+            # length.
             target.write_bytes(source, overwrite=True)
         else:
             target.write_bytes(
-                _read_slice_from_source(source, size=size, offset=offset),
+                source.read_bytes(size=size, offset=offset),
                 overwrite=True,
             )
         return target
@@ -2692,18 +2698,18 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
 
         if to is None:
             to = _default_download_target(self.url.name)
-        target = _join_dir_hint(_coerce_transfer_endpoint(to), self)
+        target = _join_dir_hint(IO.from_(to), self)
 
         if isinstance(self, Path) and self.is_dir():
             if size != -1 or offset != 0:
                 raise IsADirectoryError(
-                    f"Holder.download: source {self.full_path()!r} is "
+                    f"IO.download: source {self.full_path()!r} is "
                     f"a directory; size / offset slicing applies to "
                     f"file downloads only."
                 )
             if not isinstance(target, Path):
                 raise IsADirectoryError(
-                    f"Holder.download: source {self.full_path()!r} is "
+                    f"IO.download: source {self.full_path()!r} is "
                     f"a directory; target must be a Path to hold the "
                     f"tree, got {type(target).__name__}."
                 )
@@ -2716,7 +2722,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             target.write_bytes(self, overwrite=True)
         else:
             target.write_bytes(
-                _read_slice_from_source(self, size=size, offset=offset),
+                self.read_bytes(size=size, offset=offset),
                 overwrite=True,
             )
         return target
@@ -3384,26 +3390,6 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         return True
 
 
-def _coerce_transfer_endpoint(value: Any) -> "IO":
-    """Coerce a transfer endpoint into an :class:`IO`.
-
-    Used by :meth:`IO.upload` / :meth:`IO.download` to accept three
-    input shapes — :class:`IO`, ``str``, :class:`os.PathLike` —
-    regardless of whether the value names the source or the target
-    side.
-    """
-    from yggdrasil.io.path.path import Path
-
-    if isinstance(value, IO):
-        return value
-    if isinstance(value, (str, os.PathLike)):
-        return Path.from_(value)
-    raise TypeError(
-        f"IO.upload/download: expected an IO, str, or "
-        f"os.PathLike endpoint; got {type(value).__name__}: {value!r}"
-    )
-
-
 def _looks_like_directory(url: URL) -> bool:
     """Trailing-slash check: ``True`` iff *url*'s path ends in ``/``.
 
@@ -3432,23 +3418,6 @@ def _join_dir_hint(
     if isinstance(dst, Path) and _looks_like_directory(dst.url):
         return dst / src._transfer_filename()
     return dst
-
-
-def _read_slice_from_source(
-    source: "IO", *, size: int, offset: int,
-) -> bytes:
-    """Pull ``[offset, offset+size)`` bytes from a coerced transfer source.
-
-    Cursor sources (``_parent is not None``) :meth:`seek` to *offset*
-    (when non-zero) and consume *size* bytes from the cursor;
-    storage sources use the positional :meth:`read_bytes`.
-    ``size < 0`` means "to EOF" in both cases.
-    """
-    if source._parent is not None:
-        if offset:
-            source.seek(offset)
-        return source.read() if size < 0 else source.read(size)
-    return source.read_bytes(size=size, offset=offset)
 
 
 def _default_download_target(name: str) -> "IO":
