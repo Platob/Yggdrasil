@@ -245,12 +245,38 @@ _VIEW_PROBES: tuple = _resolve_view_probes()
 _VIEW_TYPE_CACHE: "dict[Any, bool]" = {}
 
 #: Memo of "does this schema have any top-level view-typed column?"
-#: Keyed by ``pa.Schema``. The recursive walk is correct but pays the
-#: full Python frame dispatch on every column on every call. Caching
-#: lets a hot rechunk pipeline (where every batch shares one schema
-#: reference) collapse the container check to one dict lookup + one
-#: native ``.nbytes`` call.
+#: Keyed by the lifted :class:`yggdrasil.data.Schema` (a.k.a.
+#: :class:`StructField`), which is hashable by design — unlike
+#: :class:`pa.Schema`, whose ``__hash__`` raises ``TypeError:
+#: unhashable type: 'dict'`` whenever schema metadata carries dict
+#: values (routine after a Spark Connect round trip). The lifted
+#: ``Schema`` strips the unhashable-shaped metadata via its own
+#: ``__hash__`` so the cache key stays stable across calls that
+#: share the same logical schema even when ``pa.Schema`` itself
+#: refuses to hash.
 _SCHEMA_TOP_VIEW_CACHE: "dict[Any, bool]" = {}
+
+
+def _schema_cache_key(schema: Any) -> Any:
+    """Hashable key for *schema* — lifts to ygg :class:`Schema` on demand.
+
+    Tries the cheap path first (``pa.Schema`` is usually hashable),
+    falls back to ``Schema.from_arrow_schema(schema)`` for the unhashable-
+    metadata case. Returns ``None`` when neither path produces a
+    hashable key — the caller then skips the cache entirely.
+    """
+    try:
+        hash(schema)
+        return schema
+    except TypeError:
+        pass
+    except Exception:
+        return None
+    try:
+        from yggdrasil.data.schema import Schema
+        return Schema.from_arrow_schema(schema)
+    except Exception:
+        return None
 
 
 def _schema_has_top_view(schema: Any) -> bool:
@@ -260,20 +286,13 @@ def _schema_has_top_view(schema: Any) -> bool:
     top-level type of each column matters (a nested type wrapping a
     view-typed leaf is *not* caught here — same as the recursive
     walk, which short-circuits on view-ness only at the top of each
-    leaf array). Result is memoized per :class:`pa.Schema`.
+    leaf array). Result is memoized via :func:`_schema_cache_key`.
     """
-    # ``pa.Schema.__hash__`` raises ``TypeError: unhashable type: 'dict'``
-    # when the schema's metadata carries dict values (e.g. nested ygg
-    # metadata that round-trips through Spark Connect without bytes
-    # serialization). The cache GET path must tolerate that too — not just
-    # the SET path — otherwise an otherwise-fine batch crashes the
-    # rechunker on the first lookup.
-    try:
-        cached = _SCHEMA_TOP_VIEW_CACHE.get(schema)
-    except TypeError:
-        cached = None
-    if cached is not None:
-        return cached
+    key = _schema_cache_key(schema)
+    if key is not None:
+        cached = _SCHEMA_TOP_VIEW_CACHE.get(key)
+        if cached is not None:
+            return cached
     result = False
     try:
         for field in schema:
@@ -284,10 +303,11 @@ def _schema_has_top_view(schema: Any) -> bool:
         # Defensive — non-Schema objects shouldn't reach here, but a
         # walk-failure shouldn't crash the rechunker.
         result = True  # bail to the safe recursive path
-    try:
-        _SCHEMA_TOP_VIEW_CACHE[schema] = result
-    except TypeError:
-        pass
+    if key is not None:
+        try:
+            _SCHEMA_TOP_VIEW_CACHE[key] = result
+        except TypeError:
+            pass
     return result
 
 

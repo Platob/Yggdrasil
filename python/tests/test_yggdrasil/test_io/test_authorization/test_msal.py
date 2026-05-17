@@ -547,7 +547,7 @@ class TestPickle:
         a = _build_msal_auth()
         a._auth_app = object()  # type: ignore[assignment]
         state = a.__getstate__()
-        for transient in MSALAuth.TRANSIENT_STATE_ATTRS:
+        for transient in MSALAuth._TRANSIENT_STATE_ATTRS:
             assert transient not in state, (
                 f"transient attr {transient!r} leaked into pickle state"
             )
