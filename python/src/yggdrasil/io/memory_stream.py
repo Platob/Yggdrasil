@@ -225,6 +225,17 @@ class MemoryStream(Holder):
     def is_remote_path(self) -> bool:
         return False
 
+    @property
+    def is_streaming(self) -> bool:
+        """True while EOF hasn't been reached on the source feed.
+
+        :attr:`size` reflects only the bytes pulled so far, so
+        cursor-anchored readers (:class:`IO.read`) need to
+        bypass the standard ``cap at size`` clamp until the
+        source signals EOF.
+        """
+        return not self._eof
+
     # ------------------------------------------------------------------
     # Pull machinery
     # ------------------------------------------------------------------

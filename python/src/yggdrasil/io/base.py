@@ -203,6 +203,14 @@ def _resolve_format_target(
     return Tabular.class_for_media_type(mt, default=None)
 
 
+#: Default window size for :class:`MemoryStream` holders created
+#: by :meth:`IO.from_` over non-local file-like sources. Large
+#: enough that short-lived streams stay entirely in-window and
+#: random-read callers never trip eviction; small enough that a
+#: long-lived stream doesn't quietly buffer the whole payload.
+_STREAM_WINDOW_BYTES = 64 * 1024 * 1024  # 64 MiB
+
+
 def _local_path_for_handle(obj: Any) -> Optional[str]:
     """Return the on-disk path for a local file handle, or ``None``.
 
@@ -490,7 +498,7 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
             # disk on demand instead of draining the handle into
             # ``Memory``. Anonymous streams (``io.BytesIO``,
             # socket-backed handles, ``<stdin>``-style names) fall
-            # through to the drain branch below.
+            # through to the :class:`MemoryStream` branch below.
             local_path = _local_path_for_handle(obj)
             if local_path is not None:
                 from yggdrasil.io.path.local_path import LocalPath
@@ -501,20 +509,22 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
                     mode=mode,
                     **kwargs,
                 )
-            mem = Memory()
-            mem.acquire()
-            try:
-                pos = 0
-                while True:
-                    chunk = obj.read(64 * 1024)
-                    if not chunk:
-                        break
-                    mem.pwrite(chunk, pos)
-                    pos += len(chunk)
-            except BaseException:
-                mem.close()
-                raise
-            return cls(holder=mem, owns_holder=True, mode=mode, **kwargs)
+            # Non-local file-like → :class:`MemoryStream` over the
+            # source. Pulls lazily on read so a 10 GB urllib3
+            # response stream never gets materialised into Python
+            # bytes upfront; the window slides forward as the
+            # consumer reads. ``byte_size`` is a soft cap on the
+            # buffered window — pick a generous default so
+            # short-lived sources stay fully in-window and
+            # ``random read`` callers don't trip eviction surprises.
+            from yggdrasil.io.memory_stream import MemoryStream
+
+            return cls(
+                holder=MemoryStream(obj, byte_size=_STREAM_WINDOW_BYTES),
+                owns_holder=True,
+                mode=mode,
+                **kwargs,
+            )
 
         # Path-like — route through the ``IO(path=...)`` __new__
         # which already does scheme-aware holder dispatch (file →
@@ -1143,18 +1153,34 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
 
         Stdlib :meth:`io.RawIOBase.read` semantic: ``size < 0`` /
         ``None`` reads to EOF; otherwise reads up to ``size``
-        bytes, returning fewer at EOF. The holder's ``read_bytes``
-        would raise on an out-of-range window, so cap to remaining
-        before dispatching.
+        bytes, returning fewer at EOF.
+
+        Two paths:
+
+        - Static holders (:class:`Memory`, :class:`Path`) know
+          their full size up front; cap the request at
+          ``self.size - self._pos`` before dispatching so the
+          holder's strict ``read_bytes`` doesn't trip on an
+          out-of-range window.
+        - Streaming holders (:class:`MemoryStream` over a live
+          source — ``holder.is_streaming``) lazily pull bytes;
+          ``size`` reflects only what's been pulled so far, so
+          forward the request unclamped and let the holder pull
+          until it has enough or signals EOF.
         """
-        remaining = max(0, self.size - self._pos)
+        holder = self._active()
         if size is None or size < 0:
-            size = remaining
+            out = holder.read_bytes(-1, offset=self._pos)
+        elif holder.is_streaming:
+            if size == 0:
+                return b""
+            out = holder.read_bytes(size, offset=self._pos)
         else:
-            size = min(size, remaining)
-        if size == 0:
-            return b""
-        out = self._active().read_bytes(size, offset=self._pos)
+            remaining = max(0, holder.size - self._pos)
+            capped = min(size, remaining)
+            if capped == 0:
+                return b""
+            out = holder.read_bytes(capped, offset=self._pos)
         self._pos += len(out)
         return out
 

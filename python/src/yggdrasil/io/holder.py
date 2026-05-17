@@ -972,6 +972,25 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
     def is_remote(self) -> bool:
         return self.is_remote_path
 
+    @property
+    def is_streaming(self) -> bool:
+        """True when :attr:`size` reflects only the bytes pulled so far.
+
+        Streaming holders (:class:`MemoryStream` over a live
+        source) lazily pull bytes on read; their :attr:`size`
+        grows as the cursor advances and may underreport the
+        eventual total. Static holders (:class:`Memory`,
+        :class:`Path`) know their full size up front so the
+        default is ``False``.
+
+        :class:`IO.read` checks this flag to decide whether to
+        cap the requested byte count at :attr:`size` (static
+        case — out-of-range reads would raise) or pass the
+        request through unclamped (streaming case — the holder
+        pulls until it has enough or EOF).
+        """
+        return False
+
     # ------------------------------------------------------------------
     # Cursorless I/O — the canonical surface :class:`BytesIO` consumes
     # ------------------------------------------------------------------
