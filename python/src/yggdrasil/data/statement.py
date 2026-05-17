@@ -45,7 +45,7 @@ import pyarrow as pa
 from yggdrasil.data import Mode
 from yggdrasil.data.enums import MimeType, MimeTypes, State
 from yggdrasil.data.schema import Schema
-from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg, ElapsedWarner
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.tabular import Tabular, O
 
@@ -668,6 +668,7 @@ class StatementResult(Tabular, Generic[PS]):
             self, wait_cfg.timeout, self.iteration,
         )
         wait_start = time.time()
+        warner = ElapsedWarner(logger, self)
 
         while True:
             # Poll to terminal for the current submission.
@@ -676,6 +677,7 @@ class StatementResult(Tabular, Generic[PS]):
             while not state.is_done:
                 wait_cfg.sleep(iteration=0, start=start, max_interval=5)
                 state = self._compute_state()
+                warner.check(time.time() - wait_start)
 
             if state.is_failed and self.retryable:
                 logger.info(

@@ -1,10 +1,20 @@
 import datetime as dt
+import logging
 import random
 import time
 from dataclasses import dataclass
 from typing import Optional, Union
 
-__all__ = ["WaitingConfig", "WaitingConfigArg", "DEFAULT_WAITING_CONFIG"]
+__all__ = ["WaitingConfig", "WaitingConfigArg", "DEFAULT_WAITING_CONFIG", "ElapsedWarner"]
+
+# Thresholds for escalating log messages during polling loops.
+# Entries must be in descending order — first match wins.
+_WARN_THRESHOLDS: tuple[tuple[float, int], ...] = (
+    (300.0, logging.WARNING),  # ≥ 5 min → WARNING
+    (60.0, logging.INFO),      # ≥ 1 min → INFO
+)
+# How often to re-emit a WARNING when a poll is still running past 5 min.
+_WARN_REPEAT_INTERVAL: float = 300.0
 
 
 def _safe_seconds_tick(ticks: Union[int, float, dt.timedelta]):
@@ -267,6 +277,58 @@ class WaitingConfig:
         delay = _JITTER_RNG.uniform(0, max_interval)
         if delay > 0:
             time.sleep(delay)
+
+
+class ElapsedWarner:
+    """Emit rate-limited, escalating log messages during long polling loops.
+
+    Call :meth:`check` on every poll iteration with the seconds elapsed
+    since the operation started.  The first time *elapsed* crosses a
+    threshold the matching level is logged; after 5 minutes the WARNING
+    is repeated every :data:`_WARN_REPEAT_INTERVAL` seconds so the user
+    keeps getting a heartbeat without console flooding.
+
+    Usage::
+
+        warner = ElapsedWarner(logger, self)
+        start = time.time()
+        while not done:
+            sleep()
+            warner.check(time.time() - start)
+    """
+
+    __slots__ = ("_logger", "_subject", "_last_emitted_at", "_max_level")
+
+    def __init__(self, logger: logging.Logger, subject: object) -> None:
+        self._logger = logger
+        self._subject = subject
+        self._last_emitted_at: float = -1.0
+        self._max_level: int = logging.NOTSET
+
+    def check(self, elapsed: float) -> None:
+        """Emit a log message if *elapsed* crosses a new threshold."""
+        target_level = logging.NOTSET
+        for threshold, level in _WARN_THRESHOLDS:
+            if elapsed >= threshold:
+                target_level = level
+                break
+
+        if target_level == logging.NOTSET:
+            return
+
+        if self._last_emitted_at >= 0:
+            since_last = elapsed - self._last_emitted_at
+            if target_level <= self._max_level and since_last < _WARN_REPEAT_INTERVAL:
+                return
+
+        self._logger.log(
+            target_level,
+            "Still waiting on %r (elapsed=%.0fs)",
+            self._subject,
+            elapsed,
+        )
+        self._last_emitted_at = elapsed
+        self._max_level = max(self._max_level, target_level)
 
 
 DEFAULT_WAITING_CONFIG = WaitingConfig()

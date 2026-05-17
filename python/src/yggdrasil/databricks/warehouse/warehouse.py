@@ -66,7 +66,7 @@ from yggdrasil.databricks.warehouse.wh_utils import (
     safeEndpointInfo,
     serverless_sibling_spec,
 )
-from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg, ElapsedWarner
 from yggdrasil.pyutils.equality import dicts_equal
 from .statement import (
     WarehousePreparedStatement,
@@ -440,6 +440,7 @@ class SQLWarehouse(
                 "Waiting for warehouse %r to leave pending state (timeout=%.0fs)",
                 self, wait.timeout,
             )
+            warner = ElapsedWarner(LOGGER, self)
             # Refresh once per iteration explicitly — ``is_pending`` reads the
             # cached state, so without this the loop would spin on stale data.
             while True:
@@ -448,6 +449,7 @@ class SQLWarehouse(
                     break
                 wait.sleep(iteration=iteration, start=start)
                 iteration += 1
+                warner.check(time.time() - start)
             LOGGER.debug(
                 "Warehouse %r ready after %.1fs", self, time.time() - start,
             )

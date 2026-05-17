@@ -26,7 +26,7 @@ from databricks.sdk.service.jobs import (
 )
 
 from yggdrasil.dataclasses.singleton import Singleton
-from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg, ElapsedWarner
 from yggdrasil.io.url import URL
 
 from ..client import DatabricksResource
@@ -219,6 +219,7 @@ class JobRun(Singleton, DatabricksResource):
 
         start = time.time()
         iteration = 0
+        warner = ElapsedWarner(LOGGER, self)
 
         while True:
             self.refresh()
@@ -226,6 +227,7 @@ class JobRun(Singleton, DatabricksResource):
                 break
             wait_cfg.sleep(iteration=iteration, start=start)
             iteration += 1
+            warner.check(time.time() - start)
 
         if raise_error and not self.is_successful:
             state = self.state
