@@ -12,6 +12,7 @@ pytest.importorskip("fastexcel")  # noqa: E402
 from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.io.path.local_path import LocalPath
 from yggdrasil.io.primitive.xlsx_io import XlsxIO, XlsxOptions, XlsxSheetIO
+from yggdrasil.io.holder import Holder
 from yggdrasil.io.tabular import Tabular
 
 
@@ -26,7 +27,7 @@ class TestRegistration:
         assert XlsxIO.mime_type is MimeTypes.XLSX
 
     def test_registry(self) -> None:
-        assert Tabular.class_for_media_type(MimeTypes.XLSX) is XlsxIO
+        assert Holder.class_for_media_type(MimeTypes.XLSX) is XlsxIO
 
 
 class TestRoundTrip:

@@ -42,13 +42,14 @@ satisfy it without lying.
 Format registry
 ---------------
 
-Concrete byte-backed leaves (ParquetIO, CsvIO, ArrowIPCIO, …)
-declare :attr:`Tabular.mime_type` at the class level and the
-:meth:`__init_subclass__` hook auto-registers them in
-:data:`_TABULAR_REGISTRY`. :meth:`Tabular.for_holder` resolves a
-holder's :class:`MediaType` to the right concrete leaf and
-constructs ``Cls(holder=holder)``. Mirror of the ``scheme``-based
-dispatch on :class:`Holder`.
+The byte-backed format registry (ParquetIO, CsvIO, ArrowIPCIO, …)
+lives on :class:`Holder` — each leaf declares
+:attr:`Holder.mime_type` at the class level and
+:meth:`Holder.__init_subclass__` auto-registers it in
+:data:`yggdrasil.io.holder._HOLDER_FORMAT_REGISTRY`. Look up via
+:meth:`Holder.class_for_media_type` /
+:meth:`Holder.for_holder`. Mirror of the ``scheme``-based
+dispatch on :class:`URLBased`.
 """
 
 from __future__ import annotations
@@ -57,7 +58,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Iterator, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Iterator, TypeVar
 
 import pyarrow as pa
 
@@ -188,26 +189,6 @@ class TabularStaticValues(Mapping):
     def __repr__(self) -> str:
         return f"TabularStaticValues({dict(self)!r})"
 
-_TABULAR_REGISTRY: "dict[str, type[Tabular]]" = {}
-_TABULAR_REGISTRY_BOOTSTRAPPED: bool = False
-
-
-def _bootstrap_tabular_registry() -> None:
-    """Force-load every concrete :class:`Tabular` leaf package once.
-
-    Each leaf module registers its ``mime_type`` via
-    :meth:`Tabular.__init_subclass__` on import, so importing the
-    leaf packages is enough to populate :data:`_TABULAR_REGISTRY`.
-    Idempotent — the module-level flag short-circuits repeat calls.
-    """
-    global _TABULAR_REGISTRY_BOOTSTRAPPED
-    if _TABULAR_REGISTRY_BOOTSTRAPPED:
-        return
-    _TABULAR_REGISTRY_BOOTSTRAPPED = True
-    import yggdrasil.io.primitive  # noqa: F401
-    import yggdrasil.io.nested  # noqa: F401
-
-
 class Tabular(ABC, Generic[O]):
     """Pure interface — Arrow record-batch source/sink + engine fan-out.
 
@@ -220,38 +201,12 @@ class Tabular(ABC, Generic[O]):
     Concrete implementers add whatever substrate they need (a
     holder + cursor for byte-backed shapes, a session reference
     for catalog-backed shapes, etc.) and override the two batch
-    hooks. Format-specific leaves (ParquetIO, CsvIO, ArrowIPCIO, …)
-    additionally declare :attr:`mime_type` to register against the
-    process-wide :data:`_TABULAR_REGISTRY` — :meth:`for_holder` uses
-    that registry to dispatch from a holder's :class:`MediaType` to
-    the right concrete leaf at runtime.
+    hooks. The byte-backed format registry (ParquetIO, CsvIO,
+    ArrowIPCIO, …) lives on :class:`Holder` — each leaf declares
+    :attr:`Holder.mime_type` at the class level and
+    :meth:`Holder.__init_subclass__` auto-registers it. Look up via
+    :meth:`Holder.class_for_media_type` / :meth:`Holder.for_holder`.
     """
-
-    #: Format identity for the registry. Subclasses set to a concrete
-    #: :class:`MimeType` (``MimeTypes.PARQUET``, ``MimeTypes.CSV``, …)
-    #: to claim that mime in :data:`_TABULAR_REGISTRY`. ``None`` (the
-    #: abstract default) opts out of registration — :class:`Tabular`
-    #: itself and intermediate abstracts (:class:`BytesIO`,
-    #: :class:`NestedIO`) leave it unset so they don't shadow the
-    #: real format leaves. Mirrors :attr:`Holder.scheme`.
-    mime_type: "ClassVar[MimeType | None]" = None
-
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        """Auto-register concrete subclasses keyed on :attr:`mime_type`."""
-        super().__init_subclass__(**kwargs)
-        mt = cls.mime_type
-        if mt is None:
-            return
-        key = mt.name
-        existing = _TABULAR_REGISTRY.get(key)
-        if existing is not None and existing is not cls:
-            raise RuntimeError(
-                f"Duplicate Tabular mime_type {mt.value!r}: "
-                f"{cls.__name__} clashes with {existing.__name__}. "
-                "If the override is intentional, clear the slot first "
-                "via _TABULAR_REGISTRY.pop(...) at module-load time."
-            )
-        _TABULAR_REGISTRY[key] = cls
 
     def __init__(
         self,
@@ -421,99 +376,8 @@ class Tabular(ABC, Generic[O]):
         return not self.matches_static(predicate)
 
     # ==================================================================
-    # Format registry — MediaType → Tabular subclass dispatch
+    # Coercion entry point — delegates to the format registry on Holder
     # ==================================================================
-
-    @classmethod
-    def class_for_media_type(
-        cls,
-        media_type: "MediaType | MimeType | str | Any",
-        *,
-        default: Any = ...,
-    ) -> "type[Tabular]":
-        """Resolve a :class:`MediaType` (or coercible) to its Tabular class.
-
-        Looks up :attr:`MediaType.mime_type`'s name in
-        :data:`_TABULAR_REGISTRY`. Codec is orthogonal — Parquet
-        compressed with zstd or snappy still resolves to
-        :class:`ParquetIO`; the codec layer is the holder's concern.
-
-        Returns *default* on miss when supplied; otherwise raises
-        :class:`KeyError` with a list of registered names.
-        """
-        mt = MediaType.from_(media_type, default=None)
-        if mt is None:
-            if default is ...:
-                raise KeyError(
-                    f"Cannot coerce {media_type!r} to a MediaType "
-                    "for Tabular registry lookup."
-                )
-            return default
-
-        hit = _TABULAR_REGISTRY.get(mt.mime_type.name)
-        if hit is not None:
-            return hit
-
-        # Miss may just mean the leaf package hasn't been imported
-        # yet — force the side-effect bootstrap once and retry. This
-        # is what catches nested leaves (ZipIO / FolderIO / DeltaIO)
-        # for callers that never touched ``yggdrasil.io.nested``.
-        if not _TABULAR_REGISTRY_BOOTSTRAPPED:
-            _bootstrap_tabular_registry()
-            hit = _TABULAR_REGISTRY.get(mt.mime_type.name)
-            if hit is not None:
-                return hit
-
-        if default is ...:
-            raise KeyError(
-                f"No Tabular registered for {mt.mime_type.value!r}. "
-                f"Registered: {sorted(_TABULAR_REGISTRY)}."
-            )
-        return default
-
-    @classmethod
-    def for_holder(
-        cls,
-        holder: "Holder",
-        *,
-        media_type: "MediaType | MimeType | str | None" = None,
-        default: Any = ...,
-        **kwargs: Any,
-    ) -> "Tabular":
-        """Build the right :class:`Tabular` subclass for *holder*.
-
-        Resolution order for the format discriminator:
-
-        1. The explicit *media_type* kwarg, when supplied.
-        2. ``holder.stat().media_type`` — set by the holder from its
-           URL extension, magic-byte sniff, or content-type header.
-
-        The resolved class is instantiated as ``Cls(holder=holder,
-        **kwargs)`` — every registered Tabular leaf is expected to
-        accept ``holder=`` (true for :class:`BytesIO` subclasses,
-        which is what the registry actually contains).
-
-        On lookup miss, falls back to *default* when supplied. With
-        no default, raises :class:`KeyError`.
-        """
-        mt = media_type
-        if mt is None:
-            stats = getattr(holder, "stat", None)
-            if callable(stats):
-                mt = getattr(stats(), "media_type", None)
-
-        if mt is None:
-            if default is ...:
-                raise KeyError(
-                    f"No media_type on {holder!r}; pass media_type= "
-                    "explicitly or seed the holder's IOStats."
-                )
-            return default
-
-        target = cls.class_for_media_type(mt, default=default)
-        if target is default and default is not ...:
-            return default
-        return target(holder=holder, **kwargs)
 
     @classmethod
     def from_(
@@ -531,9 +395,9 @@ class Tabular(ABC, Generic[O]):
         * :class:`Tabular` (incl. :class:`Holder` / :class:`Path` /
           :class:`Memory` / :class:`IO`) — returned as-is. When
           *media_type* is supplied and *obj* is a :class:`Holder`,
-          :meth:`for_holder` is invoked so the caller can override the
-          format leaf the holder's stamped MediaType would otherwise
-          dispatch to.
+          :meth:`Holder.for_holder` is invoked so the caller can
+          override the format leaf the holder's stamped MediaType
+          would otherwise dispatch to.
         * ``str`` / :class:`os.PathLike` — coerced via
           :meth:`Path.from_`, which scheme-dispatches to the right
           concrete subclass (:class:`LocalPath`, :class:`S3Path`,
@@ -552,7 +416,7 @@ class Tabular(ABC, Generic[O]):
 
         if isinstance(obj, Tabular):
             if media_type is not None and isinstance(obj, Holder):
-                return cls.for_holder(obj, media_type=media_type, **kwargs)
+                return Holder.for_holder(obj, media_type=media_type, **kwargs)
             return obj
 
         if isinstance(obj, (str, os.PathLike)):
@@ -567,7 +431,7 @@ class Tabular(ABC, Generic[O]):
             from yggdrasil.io.path import Path as YggPath
             path = YggPath.from_(obj)
             if media_type is not None:
-                return cls.for_holder(path, media_type=media_type, **kwargs)
+                return Holder.for_holder(path, media_type=media_type, **kwargs)
             return path
 
         read = getattr(obj, "read", None)
@@ -584,7 +448,7 @@ class Tabular(ABC, Generic[O]):
             data = read()
             if isinstance(data, str):
                 data = data.encode()
-            return cls.for_holder(
+            return Holder.for_holder(
                 Memory(binary=data), media_type=media_type, **kwargs,
             )
 
@@ -595,11 +459,6 @@ class Tabular(ABC, Generic[O]):
             "Pass a Tabular, a path / URL (str or os.PathLike), or "
             "a file-like object with media_type=."
         )
-
-    @classmethod
-    def registered_classes(cls) -> "dict[str, type[Tabular]]":
-        """Snapshot of the registry — debugging / introspection only."""
-        return dict(_TABULAR_REGISTRY)
 
     # ==================================================================
     # Options

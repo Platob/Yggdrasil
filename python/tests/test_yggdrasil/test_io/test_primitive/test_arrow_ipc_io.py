@@ -11,7 +11,7 @@
   the ``ArrowIPCIO(holder=...)`` shape;
 * mode dispatch — OVERWRITE / APPEND / IGNORE / ERROR_IF_EXISTS /
   AUTO behave the way the docstring claims;
-* :meth:`Tabular.for_holder` resolves a holder with the IPC media
+* :meth:`Holder.for_holder` resolves a holder with the IPC media
   type to :class:`ArrowIPCIO`.
 """
 from __future__ import annotations
@@ -26,6 +26,7 @@ from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.path.local_path import LocalPath
 from yggdrasil.io.primitive.arrow_ipc_io import ArrowIPCIO, ArrowIPCOptions
+from yggdrasil.io.holder import Holder
 from yggdrasil.io.tabular import Tabular
 
 
@@ -42,7 +43,7 @@ class TestRegistration:
         assert ArrowIPCIO.mime_type is MimeTypes.ARROW_IPC
 
     def test_registry_resolves_to_arrow_ipc_io(self) -> None:
-        cls = Tabular.class_for_media_type(MimeTypes.ARROW_IPC)
+        cls = Holder.class_for_media_type(MimeTypes.ARROW_IPC)
         assert cls is ArrowIPCIO
 
     def test_options_class(self) -> None:
@@ -348,7 +349,7 @@ class TestCompressionOption:
 
 
 class TestTabularForHolder:
-    """`Tabular.for_holder` dispatches a holder to the right leaf."""
+    """`Holder.for_holder` dispatches a holder to the right leaf."""
 
     def test_holder_with_explicit_media_type(self, tmp_path, table) -> None:
         # Seed the holder's IOStats with the IPC media type so dispatch
@@ -357,7 +358,7 @@ class TestTabularForHolder:
         target = LocalPath(str(tmp_path / "x.arrow"))
         target.media_type = MediaType.from_(MimeTypes.ARROW_IPC)
 
-        leaf = Tabular.for_holder(target)
+        leaf = Holder.for_holder(target)
         assert isinstance(leaf, ArrowIPCIO)
 
 

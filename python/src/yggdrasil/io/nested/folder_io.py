@@ -54,6 +54,7 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.data.enums.media_type import MediaType, MediaTypes
 from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.io.holder import Holder
 from yggdrasil.io.tabular.base import Tabular
 
 if TYPE_CHECKING:
@@ -93,8 +94,15 @@ class FolderOptions(CastOptions):
             object.__setattr__(self, "child_media_type", coerced)
 
 
-class FolderIO(Tabular[FolderOptions]):
-    """:class:`Tabular` over a directory of tabular files."""
+class FolderIO(Holder[FolderOptions]):
+    """:class:`Tabular` over a directory of tabular files.
+
+    Inherits :class:`Holder` so it registers in the cross-cutting
+    media-type registry alongside byte-backed leaves. The byte
+    primitives raise :class:`NotImplementedError` — a folder is a
+    logical container, not a positional buffer; navigate via
+    :meth:`iter_children` / :meth:`read_arrow_batches` instead.
+    """
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.FOLDER
 
@@ -129,12 +137,9 @@ class FolderIO(Tabular[FolderOptions]):
         :attr:`Tabular.static_values` parent chain — no extra
         per-batch stamping needed to assert the column equality.
         """
-        super().__init__(
-            tabular_parent=tabular_parent,
-            static_values=static_values,
-            **kwargs,
-        )
-
+        # Resolve the path first; we hand the folder's URL up to
+        # :class:`Holder` so the URL-keyed surfaces (singleton key,
+        # repr, equality) line up with the underlying path.
         raw = path if path is not None else data
         if raw is None:
             raise ValueError(
@@ -145,8 +150,68 @@ class FolderIO(Tabular[FolderOptions]):
         from yggdrasil.io.path.path import Path as _Path
         self.path: "Path" = raw if isinstance(raw, _Path) else _Path.from_(raw)
 
+        # Don't forward ``data`` / ``path`` / ``binary`` — Holder
+        # would try to seed bytes from the directory path. The folder
+        # is identity-only at this layer.
+        super().__init__(
+            url=self.path.url,
+            tabular_parent=tabular_parent,
+            static_values=static_values,
+            **kwargs,
+        )
+
     def __repr__(self) -> str:
         return f"{type(self).__name__}(path={self.path!r})"
+
+    # ==================================================================
+    # Holder byte primitives — folder is a directory, not a buffer
+    # ==================================================================
+
+    def _read_mv(self, n: int, pos: int) -> memoryview:
+        raise NotImplementedError(
+            f"{type(self).__name__} is a directory — not a positional "
+            "byte buffer. Use iter_children() / read_arrow_batches() "
+            "to walk its tabular leaves."
+        )
+
+    def _write_mv(self, data: "memoryview", pos: int) -> int:
+        raise NotImplementedError(
+            f"{type(self).__name__} is a directory. Use make_child() / "
+            "write_arrow_batches() to mint a tabular leaf inside it."
+        )
+
+    def reserve(self, n: int) -> None:
+        raise NotImplementedError(f"{type(self).__name__} is a directory.")
+
+    def truncate(self, n: int) -> int:
+        raise NotImplementedError(f"{type(self).__name__} is a directory.")
+
+    def _clear(self) -> None:
+        raise NotImplementedError(f"{type(self).__name__} is a directory.")
+
+    @property
+    def size(self) -> int:
+        # Folders don't have a size in the Holder sense; the byte
+        # primitives all raise, so report 0 for stat-like callers.
+        return 0
+
+    def _stat(self) -> "IOStats":
+        # Delegate to the underlying path's stat — a folder's
+        # metadata (existence, mtime, kind=DIRECTORY) lives on the
+        # backing :class:`Path`. Override of :class:`Holder._stat`.
+        return self.path.stat()
+
+    @property
+    def is_local_path(self) -> bool:
+        return self.path.is_local_path
+
+    @property
+    def is_remote_path(self) -> bool:
+        return self.path.is_remote_path
+
+    @property
+    def is_memory(self) -> bool:
+        return False
 
     # ==================================================================
     # Context-manager protocol — folder leaves are stateless w.r.t.
@@ -224,7 +289,7 @@ class FolderIO(Tabular[FolderOptions]):
         if mt is None:
             return None
         try:
-            cls = Tabular.class_for_media_type(mt, default=None)
+            cls = Holder.class_for_media_type(mt, default=None)
         except Exception:
             cls = None
         if cls is None:
@@ -247,7 +312,7 @@ class FolderIO(Tabular[FolderOptions]):
         in the same millisecond.
 
         The :class:`Tabular` leaf is dispatched directly from the
-        media type via :meth:`Tabular.class_for_media_type`, so the
+        media type via :meth:`Holder.class_for_media_type`, so the
         write path doesn't go through the path-extension reverse-
         lookup. A media type with no registered leaf falls back to
         a raw :class:`BytesIO` so non-tabular extensions still get a
@@ -266,10 +331,7 @@ class FolderIO(Tabular[FolderOptions]):
         name = f"part-{epoch_ms}-{seed}{suffix}"
 
         child_path = self.path / name
-        # Side-effect import: ensures every primitive leaf has
-        # registered itself in the Tabular registry before lookup.
-        import yggdrasil.io.primitive  # noqa: F401
-        cls = Tabular.class_for_media_type(opts.child_media_type, default=None)
+        cls = Holder.class_for_media_type(opts.child_media_type, default=None)
         if cls is None:
             leaf: "Tabular" = BytesIO(holder=child_path, owns_holder=False)
         else:
@@ -645,7 +707,7 @@ class FolderIO(Tabular[FolderOptions]):
         if deleted == 0:
             return 0
 
-        leaf_path = getattr(child, "_holder", None)
+        leaf_path = getattr(child, "_parent", None)
         if survivors:
             # Mixed: write survivors first, then drop the original. A
             # failed rewrite leaves the original intact.

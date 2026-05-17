@@ -219,10 +219,11 @@ class IO(Holder, BinaryIO, Generic[T, O]):
     # do not redeclare them here, redeclaring a slot in a subclass
     # shadows the parent's at the descriptor level and breaks Holder's
     # default initialisation.
-    __slots__ = (
-        "_holder",
-        "_owns_holder",
-    )
+    # ``_parent`` / ``_owns_parent`` live on :class:`Holder` after the
+    # Holder ↔ IO merge — :class:`IO` is a thin cursor on top of the
+    # parent slot. No IO-local storage past what Holder already
+    # provides.
+    __slots__ = ()
 
     def __new__(
         cls,
@@ -235,6 +236,8 @@ class IO(Holder, BinaryIO, Generic[T, O]):
         path: Any = None,
         binary: Any = None,
         url: Any = None,
+        parent: "Holder | None" = None,
+        cursor: bool = False,  # noqa: ARG002 — marker; parent already encodes the relation
         **kwargs: Any,
     ):
         """Allocate the instance and resolve a holder.
@@ -254,7 +257,16 @@ class IO(Holder, BinaryIO, Generic[T, O]):
         recognise (file-like objects, backend-specific shapes) are
         left for the subclass ``__init__`` to drain — ``_holder``
         stays ``None`` until the subclass populates it.
+
+        ``parent=h`` is accepted as an alias for ``holder=h`` — the
+        cursor pattern (``IO(parent=byte_holder, cursor=True)``) routes
+        to the same dispatch as the legacy ``IO(holder=byte_holder)``.
         """
+        # ``parent`` is the canonical cursor-binding name; ``holder``
+        # is the legacy alias. Resolve before validation so either path
+        # below sees a populated ``holder``.
+        if parent is not None and holder is None:
+            holder = parent
         # Validate up front so the dispatch redirect (which may skip
         # __init__ when target isn't a subclass of cls) doesn't lose
         # the conflicting-args guards.
@@ -290,14 +302,14 @@ class IO(Holder, BinaryIO, Generic[T, O]):
         if type(instance) is not cls:
             return instance
 
-        instance._holder = holder
-        instance._owns_holder = bool(owns_holder)
+        instance._parent = holder
+        instance._owns_parent = bool(owns_holder)
         if holder is None:
             try:
-                instance._holder = Holder(
+                instance._parent = Holder(
                     data=data, path=path, binary=binary, url=url,
                 )
-                instance._owns_holder = True
+                instance._owns_parent = True
             except TypeError:
                 # Subclass may have richer drain logic (e.g. file-like
                 # objects in :meth:`from_`). Leave the slots at their
@@ -316,6 +328,8 @@ class IO(Holder, BinaryIO, Generic[T, O]):
         path: Any = None,
         binary: Any = None,
         url: Any = None,
+        parent: "Holder | None" = None,
+        cursor: bool = False,  # noqa: ARG002 — marker only
         **kwargs: Any,
     ) -> None:
         """Construct a cursor over a :class:`Holder`. Does NOT open.
@@ -352,10 +366,10 @@ class IO(Holder, BinaryIO, Generic[T, O]):
         # binary, url, bytes-like data, all-None → empty Memory). The
         # only shape it can't drain is a file-like ``data`` argument —
         # :meth:`from_` handles that drain into a fresh Memory holder.
-        if self._holder is None:
+        if self._parent is None:
             tmp = self.from_(data, mode=mode)
-            self._holder = tmp._holder
-            self._owns_holder = True
+            self._parent = tmp._parent
+            self._owns_parent = True
 
         # Stamp media type onto the holder's IOStats — gives the codec
         # auto-handling path something to inspect, and makes the buffer
@@ -365,7 +379,7 @@ class IO(Holder, BinaryIO, Generic[T, O]):
                 from yggdrasil.data.enums.media_type import MediaType
                 mt = MediaType.from_(media_type, default=None)
                 if mt is not None:
-                    self._holder.media_type = mt
+                    self._parent.media_type = mt
             except Exception:
                 pass
 
@@ -405,7 +419,7 @@ class IO(Holder, BinaryIO, Generic[T, O]):
             # Different IO subclass over the same byte substrate —
             # borrow the holder rather than drain (drain would advance
             # ``obj``'s cursor and miss any bytes already consumed).
-            return cls(holder=obj._holder, owns_holder=False, mode=mode, **kwargs)
+            return cls(holder=obj._parent, owns_holder=False, mode=mode, **kwargs)
 
         if isinstance(obj, Holder):
             return cls(holder=obj, owns_holder=False, mode=mode, **kwargs)
@@ -519,7 +533,7 @@ class IO(Holder, BinaryIO, Generic[T, O]):
     @property
     def holder(self) -> "Holder":
         """The bound :class:`Holder`."""
-        return self._holder
+        return self._parent
 
     @property
     def url(self):
@@ -528,7 +542,7 @@ class IO(Holder, BinaryIO, Generic[T, O]):
     @property
     def owns_holder(self) -> bool:
         """Whether closing self also closes the holder."""
-        return self._owns_holder
+        return self._owns_parent
 
     def remaining_bytes(self) -> int:
         return self.holder.size - self.tell()
@@ -553,22 +567,22 @@ class IO(Holder, BinaryIO, Generic[T, O]):
         - :data:`Mode.READ_ONLY` / :data:`Mode.AUTO` / default —
           cursor at 0, durable bytes untouched.
 
-        Note: must NOT call ``self._holder.open()`` — that's the
+        Note: must NOT call ``self._parent.open()`` — that's the
         IO-returning convenience and would recurse.
         """
-        if self._owns_holder:
-            self._holder.acquire()
+        if self._owns_parent:
+            self._parent.acquire()
 
-        if self._mode is Mode.ERROR_IF_EXISTS and self._holder.size > 0:
+        if self._mode is Mode.ERROR_IF_EXISTS and self._parent.size > 0:
             raise FileExistsError(
                 f"{type(self).__name__} opened with mode={self._mode!r} "
-                f"but holder is non-empty ({self._holder.size} bytes)."
+                f"but holder is non-empty ({self._parent.size} bytes)."
             )
 
         if self._mode in (Mode.OVERWRITE, Mode.TRUNCATE):
-            self._holder.truncate(0)
+            self._parent.truncate(0)
 
-        self._pos = self._holder.size if self._mode.appendable else 0
+        self._pos = self._parent.size if self._mode.appendable else 0
 
     def _release(self) -> None:
         """Release the durable holder when ``self`` owns it.
@@ -577,9 +591,9 @@ class IO(Holder, BinaryIO, Generic[T, O]):
         no IO-side scratch to tear down. Holders honor their own
         :attr:`temporary` flag and discard the payload at close time.
         """
-        if self._owns_holder:
+        if self._owns_parent:
             try:
-                self._holder.close()
+                self._parent.close()
             except Exception:
                 pass
 
@@ -588,13 +602,13 @@ class IO(Holder, BinaryIO, Generic[T, O]):
     def _active(self) -> "Holder":
         """The holder this cursor reads / writes against.
 
-        Returns ``self._holder`` directly — the IO is a pure cursor
+        Returns ``self._parent`` directly — the IO is a pure cursor
         over a single holder. Subclasses that need a side effect
         before every byte-level access (lazy materialization in
         :class:`ZipEntryIO` / :class:`XlsxSheetIO`) override this
         hook to drive the side effect, then ``return super()._active()``.
         """
-        return self._holder
+        return self._parent
 
     # ==================================================================
     # Holder abstract-method implementations — delegate to ``_active()``
@@ -652,7 +666,7 @@ class IO(Holder, BinaryIO, Generic[T, O]):
         parent buffer.
         """
         if size is None:
-            v = type(self)(holder=self._holder, owns_holder=False, mode=mode)
+            v = type(self)(holder=self._parent, owns_holder=False, mode=mode)
             v._pos = int(pos)
             return v
         if size < 0:
@@ -674,7 +688,7 @@ class IO(Holder, BinaryIO, Generic[T, O]):
         ``stat().media_type`` to opt the buffer into codec
         round-tripping.
         """
-        holder = self._holder
+        holder = self._parent
         if holder is None:
             return None
         try:
@@ -880,9 +894,9 @@ class IO(Holder, BinaryIO, Generic[T, O]):
 
     def __repr__(self) -> str:
         state = "acquired" if self._acquired else "idle"
-        own = "owns" if self._owns_holder else "borrows"
+        own = "owns" if self._owns_parent else "borrows"
         return (
-            f"<{type(self).__name__} {state} {own} holder={self._holder!r} "
+            f"<{type(self).__name__} {state} {own} holder={self._parent!r} "
             f"pos={self._pos} mode={self._mode!r}>"
         )
 
@@ -946,7 +960,7 @@ class IO(Holder, BinaryIO, Generic[T, O]):
 
     @property
     def name(self) -> str:
-        return str(self._holder.url)
+        return str(self._parent.url)
 
     @property
     def media_type(self):
@@ -957,7 +971,7 @@ class IO(Holder, BinaryIO, Generic[T, O]):
         backend probe on remote holders for no extra information.
         """
         try:
-            return self._holder.media_type
+            return self._parent.media_type
         except Exception:
             return None
 
@@ -974,14 +988,14 @@ class IO(Holder, BinaryIO, Generic[T, O]):
             payload = self.to_bytes()
             return type(self)(payload, media_type=mt)
         if mt is not None:
-            self._holder.media_type = mt
+            self._parent.media_type = mt
         return self
 
     def as_media(self, media_type: Any = None) -> "IO":
         """Return a typed Tabular leaf bound to this buffer's holder.
 
         Resolution: explicit *media_type* wins; otherwise the buffer's
-        stamped media type (``self._holder.stat().media_type``) is used.
+        stamped media type (``self._parent.stat().media_type``) is used.
         The leaf borrows the same :class:`Holder` so durable bytes are
         shared without a copy. When ``self`` is already an instance of
         the resolved leaf class, returns ``self`` unchanged.
@@ -989,16 +1003,12 @@ class IO(Holder, BinaryIO, Generic[T, O]):
         Raises :class:`KeyError` when no media type can be resolved or
         the resolved type has no registered Tabular leaf.
         """
-        # Side-effect import: every primitive leaf registers its
-        # mime_type on import.
-        import yggdrasil.io.primitive  # noqa: F401
-        from yggdrasil.io.tabular.base import Tabular
         from yggdrasil.data.enums.media_type import MediaType
 
         mt = MediaType.from_(media_type, default=None) if media_type is not None else None
         if mt is None:
             try:
-                mt = self._holder.media_type
+                mt = self._parent.media_type
             except Exception:
                 mt = None
         if mt is None:
@@ -1008,11 +1018,11 @@ class IO(Holder, BinaryIO, Generic[T, O]):
                 "holder's IOStats via with_media_type()."
             )
 
-        target = Tabular.class_for_media_type(mt)
+        target = Holder.class_for_media_type(mt)
         if isinstance(self, target):
             return self
         return target(
-            holder=self._holder,
+            holder=self._parent,
             owns_holder=False,
             mode=self._mode,
             media_type=mt,
@@ -1031,17 +1041,17 @@ class IO(Holder, BinaryIO, Generic[T, O]):
         with an ``assert not closed`` and would otherwise refuse to
         write into a fresh, never-explicitly-opened IO.
         """
-        return self._holder is None
+        return self._parent is None
 
     def isatty(self) -> bool:
         return False
 
     def fileno(self) -> int:
         """Underlying fd if the holder exposes one. Raises otherwise."""
-        fileno = getattr(self._holder, "fileno", None)
+        fileno = getattr(self._parent, "fileno", None)
         if fileno is None:
             raise OSError(
-                f"{type(self).__name__} over {type(self._holder).__name__} "
+                f"{type(self).__name__} over {type(self._parent).__name__} "
                 "has no underlying file descriptor."
             )
         return fileno()
@@ -1364,7 +1374,7 @@ class IO(Holder, BinaryIO, Generic[T, O]):
         cheap no-op.
         """
         try:
-            self._holder.flush()
+            self._parent.flush()
         except Exception:
             pass
 
@@ -1392,7 +1402,7 @@ class IO(Holder, BinaryIO, Generic[T, O]):
         ``time.time()`` (and one optional flush) per write op instead
         of one per batch.
         """
-        holder = getattr(self, "_holder", None)
+        holder = getattr(self, "_parent", None)
         if holder is None:
             return
         try:
@@ -1538,7 +1548,7 @@ class IO(Holder, BinaryIO, Generic[T, O]):
 
         if mt is not None and not cached:
             try:
-                self._holder.media_type = mt
+                self._parent.media_type = mt
             except Exception:
                 pass
 
@@ -1546,7 +1556,7 @@ class IO(Holder, BinaryIO, Generic[T, O]):
             buf = mt.codec.decompress(self)
             inner_mt = MediaType(mime_type=mt.mime_type, codec=None)
             try:
-                buf._holder.media_type = inner_mt
+                buf._parent.media_type = inner_mt
             except Exception:
                 pass
             mt = inner_mt
@@ -1572,9 +1582,7 @@ class IO(Holder, BinaryIO, Generic[T, O]):
                     pass
             return _json.loads(text)
 
-        import yggdrasil.io.primitive  # noqa: F401  -- register leaves
-        from yggdrasil.io.tabular.base import Tabular
-        leaf_cls = Tabular.class_for_media_type(mt, default=None)
+        leaf_cls = Holder.class_for_media_type(mt, default=None)
         if leaf_cls is None:
             text = buf.to_bytes().decode("utf-8", errors="replace")
             if not text.strip():
@@ -1582,7 +1590,7 @@ class IO(Holder, BinaryIO, Generic[T, O]):
             return _json.loads(text)
         leaf = (
             buf if isinstance(buf, leaf_cls)
-            else leaf_cls(holder=buf._holder, owns_holder=False)
+            else leaf_cls(holder=buf._parent, owns_holder=False)
         )
         return leaf.read_pylist()
 
@@ -1709,7 +1717,7 @@ class _FormatInputContext:
 
     def __enter__(self) -> "Any":
         if self._parent._codec() is None:
-            holder = self._parent._holder
+            holder = self._parent._parent
             if holder is not None and getattr(holder, "is_local_path", False):
                 full_path = getattr(holder, "full_path", None)
                 if callable(full_path):
@@ -1770,7 +1778,7 @@ class _ArrowInputStreamContext:
         codec = parent._codec()
 
         if codec is None:
-            holder = parent._holder
+            holder = parent._parent
             if holder is not None and getattr(holder, "is_local_path", False):
                 full_path = getattr(holder, "full_path", None)
                 if callable(full_path):
@@ -1842,7 +1850,7 @@ class _ArrowOutputStreamContext:
     def __enter__(self) -> "pa.NativeFile":
         parent = self._parent
         if parent._codec() is None:
-            holder = parent._holder
+            holder = parent._parent
             if holder is not None and getattr(holder, "is_local_path", False):
                 full_path = getattr(holder, "full_path", None)
                 if callable(full_path):
@@ -1897,7 +1905,7 @@ class _ArrowOutputStreamContext:
                 sink.close()
             except Exception:
                 pass
-            holder = self._parent._holder
+            holder = self._parent._parent
             if holder is not None:
                 invalidate = getattr(holder, "invalidate_singleton", None)
                 if callable(invalidate):

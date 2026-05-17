@@ -60,6 +60,7 @@ from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.data.enums.media_type import MediaType
 from yggdrasil.data.enums.mime_type import MimeType
 from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.io.holder import Holder
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.tabular.base import Tabular
 
@@ -69,16 +70,14 @@ __all__ = ["ZipIO", "ZipOptions", "ZipEntryIO"]
 
 def _registered_tabular_extensions() -> "list[str]":
     """Return a sorted list of extensions a zip entry name can carry
-    that will dispatch to a registered :class:`Tabular` leaf.
+    that will dispatch to a registered format leaf.
 
     Used by the read- and write-side errors so the message points at
     actual valid suffixes for the current registry state instead of a
     hard-coded sample.
     """
-    from yggdrasil.io.tabular.base import _TABULAR_REGISTRY
-
     out: "set[str]" = set()
-    for name in _TABULAR_REGISTRY:
+    for name in Holder.registered_classes():
         mt = MediaType.from_(name, default=None)
         if mt is None:
             continue
@@ -94,8 +93,6 @@ def _describe_entry_resolution_failure(entry_name: str) -> str:
     extension, (2) extension maps to a non-tabular mime, (3)
     extension maps to a tabular mime with no registered leaf.
     """
-    from yggdrasil.io.tabular.base import Tabular
-
     try:
         mt = MediaType.from_(entry_name, default=None)
     except Exception:
@@ -106,13 +103,13 @@ def _describe_entry_resolution_failure(entry_name: str) -> str:
             "entry name (no recognized extension)"
         )
     try:
-        cls = Tabular.class_for_media_type(mt, default=None)
+        cls = Holder.class_for_media_type(mt, default=None)
     except Exception:
         cls = None
     if cls is None:
         return (
             f"{entry_name!r}: MediaType {mt.mime_type.value!r} has no "
-            "registered Tabular leaf"
+            "registered Holder leaf"
         )
     return (
         f"{entry_name!r}: resolved to {cls.__name__} — unexpected, "
@@ -147,7 +144,7 @@ class ZipEntryIO(BytesIO):
     the entries the caller actually touches.
 
     Tabular hooks dispatch on the entry name's extension via
-    :class:`Tabular.class_for_media_type`, so a parquet entry's
+    :meth:`Holder.class_for_media_type`, so a parquet entry's
     :meth:`read_arrow_batches` runs the parquet reader against the
     entry bytes — no extra wiring.
     """
@@ -195,7 +192,7 @@ class ZipEntryIO(BytesIO):
         with self._zip_parent.view(pos=0) as v:
             with zipfile.ZipFile(v, "r") as zf:
                 payload = zf.read(self.entry_name)
-        self._holder.write_bytes(payload, 0)
+        self._parent.write_bytes(payload, 0)
         # Track in case the directory hint was missing or out of date.
         self._uncompressed_size = len(payload)
         self._materialized = True
@@ -207,7 +204,7 @@ class ZipEntryIO(BytesIO):
     @property
     def size(self) -> int:
         if self._materialized:
-            return self._holder.size
+            return self._parent.size
         if self._uncompressed_size is not None:
             return int(self._uncompressed_size)
         # Probe the central directory once; only fired when neither
@@ -251,7 +248,7 @@ class ZipEntryIO(BytesIO):
         if mt is None:
             return None
         try:
-            cls = Tabular.class_for_media_type(mt, default=None)
+            cls = Holder.class_for_media_type(mt, default=None)
         except Exception:
             cls = None
         if cls is None or cls is ZipEntryIO:
@@ -260,7 +257,7 @@ class ZipEntryIO(BytesIO):
         # tabular leaf — it'll read bytes off it directly.
         if not self._materialized:
             self._materialize()
-        return cls(holder=self._holder, owns_holder=False)
+        return cls(holder=self._parent, owns_holder=False)
 
     def _read_arrow_batches(self, options) -> Iterator[pa.RecordBatch]:
         leaf = self._resolve_leaf()
@@ -471,7 +468,7 @@ class ZipIO(BytesIO):
         inner_cls = None
         if inner_mt is not None:
             try:
-                inner_cls = Tabular.class_for_media_type(inner_mt, default=None)
+                inner_cls = Holder.class_for_media_type(inner_mt, default=None)
             except Exception:
                 inner_cls = None
         if inner_cls is None:

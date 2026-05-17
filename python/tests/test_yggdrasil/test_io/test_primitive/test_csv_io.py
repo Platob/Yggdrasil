@@ -12,6 +12,7 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.io.path.local_path import LocalPath
 from yggdrasil.io.primitive.csv_io import CsvIO, CsvOptions
+from yggdrasil.io.holder import Holder
 from yggdrasil.io.tabular import Tabular
 
 
@@ -87,7 +88,7 @@ class TestRegistration:
         assert CsvIO.mime_type is MimeTypes.CSV
 
     def test_registry(self) -> None:
-        assert Tabular.class_for_media_type(MimeTypes.CSV) is CsvIO
+        assert Holder.class_for_media_type(MimeTypes.CSV) is CsvIO
 
 
 class TestRoundTrip:

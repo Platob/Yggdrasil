@@ -61,7 +61,7 @@ class TestIterChildren:
         ParquetIO(holder=__class__._lp(tmp_path / ".hidden.parquet"), owns_holder=False).write_arrow_table(table)
         ParquetIO(holder=__class__._lp(tmp_path / "real.parquet"), owns_holder=False).write_arrow_table(table)
         folder = FolderIO(path=str(tmp_path))
-        names = [c._holder.name for c in folder.iter_children()]
+        names = [c._parent.name for c in folder.iter_children()]
         assert "real.parquet" in names[0]
         assert all(".hidden" not in n for n in names)
 
@@ -160,8 +160,8 @@ class TestMakeChild:
             options=FolderOptions(child_media_type="parquet"),
         )
         # Fresh path under tmp_path with the correct extension.
-        assert os.fspath(child._holder).startswith(str(tmp_path))
-        assert os.fspath(child._holder).endswith(".parquet")
+        assert os.fspath(child._parent).startswith(str(tmp_path))
+        assert os.fspath(child._parent).endswith(".parquet")
         # Class is the ParquetIO leaf — make_child wired the format.
         assert isinstance(child, ParquetIO)
 

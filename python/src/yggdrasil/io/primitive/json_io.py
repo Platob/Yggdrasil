@@ -239,7 +239,7 @@ class JsonIO(IO[bytes, JsonOptions]):
 
     def _read_arrow_dataset(self, options: JsonOptions) -> "pds.Dataset":
         pds = pyarrow_dataset_module()
-        holder = self._holder
+        holder = self._parent
         if holder is not None and getattr(holder, "is_local_path", False):
             full_path = getattr(holder, "full_path", None)
             if full_path is not None:

@@ -24,6 +24,7 @@ from yggdrasil.io.nested.zip_io import ZipEntryIO, ZipIO, ZipOptions
 from yggdrasil.io.path.local_path import LocalPath
 from yggdrasil.io.primitive.csv_io import CsvIO
 from yggdrasil.io.primitive.parquet_io import ParquetIO
+from yggdrasil.io.holder import Holder
 from yggdrasil.io.tabular import Tabular
 
 
@@ -38,12 +39,12 @@ class TestRegistration:
         assert ZipIO.mime_type is MimeTypes.ZIP
 
     def test_registry(self) -> None:
-        assert Tabular.class_for_media_type(MimeTypes.ZIP) is ZipIO
+        assert Holder.class_for_media_type(MimeTypes.ZIP) is ZipIO
 
     def test_registry_lazy_bootstrap_without_nested_import(self) -> None:
         # Caller never touches ``yggdrasil.io.nested`` — the registry
         # still resolves ``application/zip`` to :class:`ZipIO` because
-        # :meth:`Tabular.class_for_media_type` self-bootstraps every
+        # :meth:`Holder.class_for_media_type` self-bootstraps every
         # leaf package on a miss. Regression for the response-body
         # dispatch failure where ``Response.open(mode="rb")`` over an
         # ``application/zip`` body fell back to a plain :class:`IO`
@@ -56,8 +57,8 @@ class TestRegistration:
             import sys
             mods = [m for m in sys.modules if m.startswith('yggdrasil.io.nested')]
             assert not mods, f'unexpected pre-loaded nested modules: {mods}'
-            from yggdrasil.io.tabular.base import Tabular
-            target = Tabular.class_for_media_type('application/zip')
+            from yggdrasil.io.holder import Holder
+            target = Holder.class_for_media_type('application/zip')
             print(target.__module__ + '.' + target.__name__)
             """
         )

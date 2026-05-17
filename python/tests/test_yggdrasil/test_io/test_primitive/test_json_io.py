@@ -9,6 +9,7 @@ import pytest
 from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.io.path.local_path import LocalPath
 from yggdrasil.io.primitive.json_io import JsonIO, JsonOptions
+from yggdrasil.io.holder import Holder
 from yggdrasil.io.tabular import Tabular
 
 
@@ -23,7 +24,7 @@ class TestRegistration:
         assert JsonIO.mime_type is MimeTypes.JSON
 
     def test_registry(self) -> None:
-        assert Tabular.class_for_media_type(MimeTypes.JSON) is JsonIO
+        assert Holder.class_for_media_type(MimeTypes.JSON) is JsonIO
 
 
 class TestRoundTrip:

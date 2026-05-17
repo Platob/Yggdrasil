@@ -46,7 +46,7 @@ def test_io_read_from_seekable_stream_restores_position() -> None:
 
 def _media_type_of(buf: BytesIO):
     """Read the buffer's media type via the public stat surface."""
-    return buf._holder.stat().media_type
+    return buf._parent.stat().media_type
 
 
 def test_ygg_bytesio_media_type_roundtrip() -> None:

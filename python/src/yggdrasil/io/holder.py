@@ -40,11 +40,11 @@ import pathlib
 import struct
 import time
 from abc import abstractmethod
-from typing import TYPE_CHECKING, Union, Any, IO, Iterable, Iterator
+from typing import TYPE_CHECKING, ClassVar, Union, Any, IO, Iterable, Iterator
 
 import pyarrow as pa
 
-from yggdrasil.data.enums import MediaType
+from yggdrasil.data.enums import MediaType, MimeType
 from yggdrasil.data.enums.mode import Mode
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.disposable import Disposable
@@ -144,6 +144,32 @@ def _resolve_subclass(
     return Memory
 
 
+#: Format-leaf registry: :class:`MimeType` name → concrete
+#: :class:`Holder` subclass that owns it. Mirror of the
+#: :data:`_URL_BASED_REGISTRY` (scheme → :class:`URLBased` subclass)
+#: that lives on :class:`URLBased`. Populated lazily by
+#: :meth:`Holder.__init_subclass__` whenever a subclass declares a
+#: concrete :attr:`mime_type`.
+_HOLDER_FORMAT_REGISTRY: "dict[str, type[Holder]]" = {}
+_HOLDER_FORMAT_REGISTRY_BOOTSTRAPPED: bool = False
+
+
+def _bootstrap_holder_format_registry() -> None:
+    """Force-load every concrete format-leaf package once.
+
+    Each leaf module registers its ``mime_type`` via
+    :meth:`Holder.__init_subclass__` on import, so importing the leaf
+    packages is enough to populate :data:`_HOLDER_FORMAT_REGISTRY`.
+    Idempotent — the module-level flag short-circuits repeat calls.
+    """
+    global _HOLDER_FORMAT_REGISTRY_BOOTSTRAPPED
+    if _HOLDER_FORMAT_REGISTRY_BOOTSTRAPPED:
+        return
+    _HOLDER_FORMAT_REGISTRY_BOOTSTRAPPED = True
+    import yggdrasil.io.primitive  # noqa: F401
+    import yggdrasil.io.nested  # noqa: F401
+
+
 def _resolve_format_target(
     cls: type,
     *,
@@ -152,7 +178,7 @@ def _resolve_format_target(
     data: Any,
     holder: "Holder | None",
 ) -> "type | None":
-    """Resolve the registered :class:`Tabular` class for the given inputs.
+    """Resolve the registered format-leaf class for the given inputs.
 
     Resolution priority:
 
@@ -163,15 +189,10 @@ def _resolve_format_target(
     4. *holder*'s stamped ``media_type``.
 
     Returns ``None`` when no media type can be resolved or no registered
-    leaf exists for the resolved type. Side-effect-imports
-    :mod:`yggdrasil.io.primitive` so every concrete leaf's
-    ``mime_type`` claim is in the registry by the time we look up.
+    leaf exists for the resolved type. Uses
+    :meth:`Holder.class_for_media_type` for the registry lookup, which
+    bootstraps the leaf packages on a cold miss.
     """
-    # Side-effect import: ensures every leaf module has registered its
-    # mime_type by the time we hit the registry.
-    import yggdrasil.io.primitive  # noqa: F401
-    from yggdrasil.io.tabular.base import Tabular
-
     mt = (
         MediaType.from_(media_type, default=None)
         if media_type is not None else None
@@ -202,7 +223,7 @@ def _resolve_format_target(
 
     if mt is None:
         return None
-    return Tabular.class_for_media_type(mt, default=None)
+    return Holder.class_for_media_type(mt, default=None)
 
 
 class Holder(Singleton, URLBased, Tabular[O], Disposable):
@@ -246,6 +267,39 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
     #: :meth:`URLBased.__init_subclass__` register them in the
     #: cross-cutting :data:`_URL_BASED_REGISTRY`.
 
+    #: Format identity for the media-type registry. Subclasses set to a
+    #: concrete :class:`MimeType` (``MimeTypes.PARQUET``,
+    #: ``MimeTypes.CSV``, ``MimeTypes.FOLDER``, …) to claim that mime
+    #: in :data:`_HOLDER_FORMAT_REGISTRY`. ``None`` (the abstract
+    #: default) opts out of registration — :class:`Holder` itself and
+    #: intermediate abstracts (:class:`IO`, :class:`BytesIO`,
+    #: :class:`Memory`, :class:`LocalPath`, :class:`Path`) leave it
+    #: unset so they don't shadow the real format leaves. Mirrors
+    #: :attr:`scheme`.
+    mime_type: "ClassVar[MimeType | None]" = None
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Auto-register concrete subclasses keyed on :attr:`mime_type`.
+
+        Mirrors :meth:`URLBased.__init_subclass__`'s scheme-side
+        registration. Intermediate abstracts that don't claim a
+        :class:`MimeType` are silently skipped.
+        """
+        super().__init_subclass__(**kwargs)
+        mt = cls.mime_type
+        if mt is None:
+            return
+        key = mt.name
+        existing = _HOLDER_FORMAT_REGISTRY.get(key)
+        if existing is not None and existing is not cls:
+            raise RuntimeError(
+                f"Duplicate Holder mime_type {mt.value!r}: "
+                f"{cls.__name__} clashes with {existing.__name__}. "
+                "If the override is intentional, clear the slot first "
+                "via _HOLDER_FORMAT_REGISTRY.pop(...) at module-load time."
+            )
+        _HOLDER_FORMAT_REGISTRY[key] = cls
+
     __slots__ = (
         "_url",
         "_size",
@@ -269,11 +323,49 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         # explicit mode kwarg.
         "_pos",
         "_mode",
+        # Cursor / wrapping. ``_parent`` is the underlying byte holder
+        # this one delegates to (``LocalPath`` underneath a
+        # :class:`ParquetIO` cursor, :class:`Memory` underneath a
+        # :class:`BytesIO`, …). ``None`` on top-level storage leaves
+        # (:class:`Memory`, :class:`LocalPath`, :class:`VolumePath`, …)
+        # that own their bytes directly. ``_owns_parent`` decides
+        # whether closing this Holder also closes the parent —
+        # ``True`` on the cursor returned by :meth:`Holder.open` so
+        # ``with path.open() as cursor:`` releases the path on exit.
+        "_parent",
+        "_owns_parent",
     )
 
     # ------------------------------------------------------------------
     # URLBased — round-trip through a :class:`URL`
     # ------------------------------------------------------------------
+
+    @property
+    def parent(self) -> "Holder | None":
+        """The underlying :class:`Holder` this one wraps, or ``None``.
+
+        Set on cursors returned by :meth:`open` (and on format leaves
+        constructed with ``parent=`` / ``holder=``). Top-level storage
+        leaves (:class:`Memory`, :class:`LocalPath`, …) return
+        ``None`` — they own their bytes directly.
+        """
+        return getattr(self, "_parent", None)
+
+    @property
+    def parents(self) -> "Iterator[Holder]":
+        """Walk the parent chain from this Holder outward.
+
+        Yields :attr:`parent` first, then ``parent.parent``, and so on
+        until a top-level storage holder is reached. Empty when this
+        Holder has no parent. Useful for "find the underlying byte
+        substrate" / "is there a path anywhere in the chain" queries
+        without hand-coding the ``while h.parent is not None`` walk
+        at every call site.
+        """
+        current = self.parent
+        while current is not None:
+            yield current
+            current = current.parent
 
     def to_url(self) -> "URL":
         """The canonical :class:`URL` that addresses this holder."""
@@ -327,9 +419,23 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
            registry maps onto IO leaves.
 
         Non-routing kwargs (``stat``, ``temporary``, ``media_type``,
-        ``holder``, ``auto_open``, …) ride through ``**kwargs`` so
-        subclass ``__new__`` and the eventual ``__init__`` see them.
+        ``holder`` / ``parent``, ``auto_open``, …) ride through
+        ``**kwargs`` so subclass ``__new__`` and the eventual
+        ``__init__`` see them. ``parent=h`` is accepted as an alias
+        for ``holder=h`` — the cursor pattern ``Holder(parent=self,
+        cursor=True)`` lands at the same dispatch as
+        ``Holder(holder=self)``.
         """
+        # ``parent`` alias → ``holder`` (and a no-op ``cursor`` flag
+        # is consumed here too: it's a marker that this Holder is a
+        # cursor over its parent; the parent slot already encodes the
+        # relationship, so no extra state is needed).
+        if "parent" in kwargs and kwargs.get("holder") is None:
+            kwargs["holder"] = kwargs.pop("parent")
+        else:
+            kwargs.pop("parent", None)
+        kwargs.pop("cursor", None)
+
         if cls is Holder:
             target = _resolve_subclass(
                 scheme=scheme, url=url, binary=binary, path=path, data=data,
@@ -450,6 +556,16 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         # ``write()``. Default ``Mode.AUTO`` matches ``"rb+"``.
         self._pos: int = 0
         self._mode: Mode = Mode.AUTO
+        # Parent / wrapping defaults — top-level storage holders own
+        # their bytes (no parent). Cursor / format-leaf subclasses set
+        # ``_parent`` in their own ``__new__`` (before ``__init__``
+        # runs), so respect any pre-set value here instead of
+        # clobbering it.
+        try:
+            self._parent  # noqa: B018  -- slot probe
+        except AttributeError:
+            self._parent = None
+            self._owns_parent = False
         if stat is not None and stat.media_type is not None:
             self._media_type = stat.media_type
         else:
@@ -574,6 +690,105 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
     def from_bytes(cls, data: bytes, **kwargs) -> Holder:
         """Create a new holder from bytes."""
         return cls(binary=data, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Format registry — MediaType → Holder subclass dispatch
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def class_for_media_type(
+        cls,
+        media_type: "MediaType | MimeType | str | Any",
+        *,
+        default: Any = ...,
+    ) -> "type":
+        """Resolve a :class:`MediaType` (or coercible) to its format leaf.
+
+        Looks up :attr:`MediaType.mime_type`'s name in
+        :data:`_HOLDER_FORMAT_REGISTRY`. Codec is orthogonal — Parquet
+        compressed with zstd or snappy still resolves to
+        :class:`ParquetIO`; the codec layer is the holder's concern.
+
+        The returned class is a :class:`Tabular` subclass — typically a
+        :class:`Holder` byte-backed leaf, occasionally a non-Holder
+        leaf (:class:`FolderIO`, :class:`DeltaIO`). Returns *default*
+        on miss when supplied; otherwise raises :class:`KeyError` with
+        the list of registered names.
+        """
+        mt = MediaType.from_(media_type, default=None)
+        if mt is None:
+            if default is ...:
+                raise KeyError(
+                    f"Cannot coerce {media_type!r} to a MediaType "
+                    "for Holder format-registry lookup."
+                )
+            return default
+
+        hit = _HOLDER_FORMAT_REGISTRY.get(mt.mime_type.name)
+        if hit is not None:
+            return hit
+
+        # Miss may just mean the leaf package hasn't been imported
+        # yet — force the side-effect bootstrap once and retry. This
+        # is what catches nested leaves (ZipIO / FolderIO / DeltaIO)
+        # for callers that never touched ``yggdrasil.io.nested``.
+        if not _HOLDER_FORMAT_REGISTRY_BOOTSTRAPPED:
+            _bootstrap_holder_format_registry()
+            hit = _HOLDER_FORMAT_REGISTRY.get(mt.mime_type.name)
+            if hit is not None:
+                return hit
+
+        if default is ...:
+            raise KeyError(
+                f"No Holder registered for {mt.mime_type.value!r}. "
+                f"Registered: {sorted(_HOLDER_FORMAT_REGISTRY)}."
+            )
+        return default
+
+    @classmethod
+    def for_holder(
+        cls,
+        holder: "Holder",
+        *,
+        media_type: "MediaType | MimeType | str | None" = None,
+        default: Any = ...,
+        **kwargs: Any,
+    ) -> "Tabular":
+        """Build the right format leaf for *holder*.
+
+        Resolution order for the format discriminator:
+
+        1. The explicit *media_type* kwarg, when supplied.
+        2. ``holder.stat().media_type`` — set by the holder from its
+           URL extension, magic-byte sniff, or content-type header.
+
+        The resolved class is instantiated as ``Cls(holder=holder,
+        **kwargs)``. On lookup miss, falls back to *default* when
+        supplied; otherwise raises :class:`KeyError`.
+        """
+        mt = media_type
+        if mt is None:
+            stats = getattr(holder, "stat", None)
+            if callable(stats):
+                mt = getattr(stats(), "media_type", None)
+
+        if mt is None:
+            if default is ...:
+                raise KeyError(
+                    f"No media_type on {holder!r}; pass media_type= "
+                    "explicitly or seed the holder's IOStats."
+                )
+            return default
+
+        target = cls.class_for_media_type(mt, default=default)
+        if target is default and default is not ...:
+            return default
+        return target(holder=holder, **kwargs)
+
+    @classmethod
+    def registered_classes(cls) -> "dict[str, type]":
+        """Snapshot of the registry — debugging / introspection only."""
+        return dict(_HOLDER_FORMAT_REGISTRY)
 
     # ------------------------------------------------------------------
     # Abstract primitives
@@ -992,14 +1207,23 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         from .base import IO as _IO
 
         self.acquire()
-        return _IO.from_holder(
-            holder=self,
+        # Cursor pattern: a fresh Holder bound to ``self`` as its
+        # parent, format-dispatched by :meth:`Holder.__new__` based
+        # on ``media_type`` (explicit override or this holder's
+        # stamped one). ``cursor=True`` is a marker the construction
+        # path consumes; the parent slot already encodes the
+        # cursor↔parent relationship.
+        cursor = _IO(
+            parent=self,
+            cursor=True,
             owns_holder=owns_holder,
             mode=mode,
-            auto_open=auto_open,
             media_type=self.media_type if media_type is None else media_type,
             **kwargs,
         )
+        if auto_open:
+            cursor.acquire()
+        return cursor
 
     def __enter__(self) -> "Holder":
         """``with holder:`` yields the holder, not a cursor.

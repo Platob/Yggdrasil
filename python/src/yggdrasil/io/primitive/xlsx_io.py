@@ -207,7 +207,7 @@ class XlsxSheetIO(IO[bytes, XlsxOptions]):
                 quoting_style="none", quoting_header="none",
             ),
         )
-        self._holder.write_bytes(sink.getvalue(), 0)
+        self._parent.write_bytes(sink.getvalue(), 0)
         self._materialized = True
 
     def _active(self):
@@ -219,7 +219,7 @@ class XlsxSheetIO(IO[bytes, XlsxOptions]):
     def size(self) -> int:
         if not self._materialized:
             self._materialize()
-        return self._holder.size
+        return self._parent.size
 
     # ==================================================================
     # Tabular hooks
@@ -312,7 +312,7 @@ class XlsxSheetIO(IO[bytes, XlsxOptions]):
             wb_out.close()
 
         self._materialized = False
-        self._holder.write_bytes(b"", 0)
+        self._parent.write_bytes(b"", 0)
 
     def __repr__(self) -> str:
         state = "materialized" if self._materialized else "lazy"

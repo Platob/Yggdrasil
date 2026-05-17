@@ -9,6 +9,7 @@ from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.path.local_path import LocalPath
 from yggdrasil.io.primitive.parquet_io import ParquetIO, ParquetOptions
+from yggdrasil.io.holder import Holder
 from yggdrasil.io.tabular import Tabular
 
 
@@ -25,7 +26,7 @@ class TestRegistration:
         assert ParquetIO.mime_type is MimeTypes.PARQUET
 
     def test_registry_resolves(self) -> None:
-        assert Tabular.class_for_media_type(MimeTypes.PARQUET) is ParquetIO
+        assert Holder.class_for_media_type(MimeTypes.PARQUET) is ParquetIO
 
     def test_options_class(self) -> None:
         assert ParquetIO.options_class() is ParquetOptions

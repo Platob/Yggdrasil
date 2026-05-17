@@ -203,7 +203,7 @@ class CsvIO(IO[bytes, CsvOptions]):
     # ==================================================================
 
     def _local_path_str(self) -> "str | None":
-        holder = self._holder
+        holder = self._parent
         if holder is None or not getattr(holder, "is_local_path", False):
             return None
         full_path = getattr(holder, "full_path", None)

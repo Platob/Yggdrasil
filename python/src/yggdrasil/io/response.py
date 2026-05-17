@@ -266,7 +266,7 @@ def _coerce_buffer(
     elif isinstance(obj, Holder):
         holder = obj
     elif isinstance(obj, IO):
-        holder = obj._holder
+        holder = obj._parent
     else:
         holder = Holder.from_(obj)
 
@@ -645,7 +645,8 @@ class Response(Tabular["ResponseOptions"]):
         # to the deterministic single-row metadata projection that
         # matches :data:`RESPONSE_ARROW_SCHEMA` (envelope mime
         # :attr:`MimeTypes.HTTP_RESPONSE`).
-        if options.parse and Tabular.class_for_media_type(
+        from yggdrasil.io.holder import Holder
+        if options.parse and Holder.class_for_media_type(
             self.media_type.mime_type, default=None,
         ) is not None:
             with self.open(mode="rb") as b:

@@ -383,7 +383,7 @@ class TestWritePaths:
 
     def test_write_update_stat_false_skips_per_write_dirty(self) -> None:
         b = BytesIO(b"seed")
-        holder = b._holder
+        holder = b._parent
         # Pre-acquired memory holder seeded above is clean to start.
         holder.clear_dirty()
         # In-place overwrites (no resize) with update_stat=False
@@ -619,7 +619,7 @@ class TestAsMedia:
 
         b = BytesIO(b'{"x": 1}')
         mio = b.as_media(MimeTypes.JSON)
-        assert mio._holder is b._holder
+        assert mio._parent is b._parent
 
     def test_no_media_type_raises_keyerror(self) -> None:
         b = BytesIO(b"hello")

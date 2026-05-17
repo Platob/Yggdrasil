@@ -89,7 +89,7 @@ class ParquetIO(IO[bytes, ParquetOptions]):
         ``None`` opts out and the caller routes through the
         file-like view path.
         """
-        holder = self._holder
+        holder = self._parent
         if holder is None:
             return None
         if not getattr(holder, "is_local_path", False):
