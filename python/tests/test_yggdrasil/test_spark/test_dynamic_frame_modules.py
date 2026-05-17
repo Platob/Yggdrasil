@@ -125,6 +125,15 @@ class TestEnsureInstalled:
         from yggdrasil.spark.frame import DynamicFrame
 
         session = MagicMock(name="SparkSession")
+        # ``MagicMock`` auto-creates non-None attributes for every probed
+        # name, including ``ygg_client``. That trips the production
+        # ``_install_modules_on_executors`` branch that wraps a real
+        # ``WorkspacePyPIRegistry`` around the (mock) client, which then
+        # publishes through the actual filesystem instead of the
+        # ``fake_build_archive`` monkeypatch this fixture sets up. Pin
+        # ``ygg_client = None`` so the registry path stays inert and the
+        # archive shim drives the call.
+        session.ygg_client = None
         df = MagicMock()
         df.sparkSession = session
 

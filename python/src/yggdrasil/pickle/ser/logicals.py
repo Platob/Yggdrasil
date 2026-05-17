@@ -58,6 +58,7 @@ M_PREC = b"p"      # decimal precision
 M_UNIT = b"u"      # time/datetime/timedelta unit
 M_TZ = b"z"        # timezone text
 M_KIND = b"k"      # subtype discriminator
+M_DECIMAL_FORMAT = b"df"   # decimal payload format: absent/"i" = int64 triplet, "s" = UTF-8 string
 
 # compact path metadata keys
 M_PATH_MODE = b"pm"   # path mode: p / f / dz
@@ -589,7 +590,15 @@ class LogicalSerialized(Serialized[T], Generic[T]):
     ) -> Serialized[object] | None:
         # ------------------------------------------------------------------
         # Decimal
-        # payload: int64 coefficient
+        # payload: int64 triplet (coefficient, precision, scale) — the
+        # fast 24-byte path that covers every practical financial /
+        # measurement value. When the coefficient overflows int64 (eg
+        # 22-digit Pi expansions, scientific constants, hash values)
+        # we fall back to a UTF-8 string of the Decimal's full
+        # representation — variable-length but covers Python's
+        # arbitrary-precision range. The decoder distinguishes the two
+        # by payload length: exactly 24 bytes ⇒ triplet, anything else
+        # ⇒ string-decode via ``Decimal(payload.decode())``.
         # meta: s=scale, p=precision(optional)
         # ------------------------------------------------------------------
         if isinstance(obj, Decimal):
@@ -599,20 +608,34 @@ class LogicalSerialized(Serialized[T], Generic[T]):
                 coefficient = -coefficient
 
             precision = len(digits)
-            scale = -exponent
+            scale = -exponent if isinstance(exponent, int) else 0
 
-            for name, value in (
-                    ("coefficient", coefficient),
-                    ("precision", precision),
-                    ("scale", scale),
-            ):
-                if not (-0x8000000000000000 <= value <= 0x7FFFFFFFFFFFFFFF):
-                    raise OverflowError(f"Decimal {name} does not fit int64 payload")
+            # ``exponent`` can be a string for special values
+            # (``Decimal("Infinity")`` etc.) — the int64 path doesn't
+            # apply there, fall through to the string payload.
+            fits_int64 = (
+                isinstance(exponent, int)
+                and -0x8000000000000000 <= coefficient <= 0x7FFFFFFFFFFFFFFF
+                and -0x8000000000000000 <= precision <= 0x7FFFFFFFFFFFFFFF
+                and -0x8000000000000000 <= scale <= 0x7FFFFFFFFFFFFFFF
+            )
+            if fits_int64:
+                payload = _pack_i64_triplet(coefficient, precision, scale)
+                effective_metadata = metadata
+            else:
+                payload = str(obj).encode("utf-8")
+                # ``b'df': b's'`` flags string format on the decode side.
+                # Mark explicitly rather than sniffing the payload length —
+                # a 22-digit Decimal happens to encode as 24 bytes (same
+                # width as the int64 triplet), so length alone is not a
+                # reliable discriminator.
+                effective_metadata = dict(metadata or {})
+                effective_metadata[M_DECIMAL_FORMAT] = b"s"
 
             return Serialized.build(
                 tag=Tags.DECIMAL,
-                data=_pack_i64_triplet(coefficient, precision, scale),
-                metadata=metadata,
+                data=payload,
+                metadata=effective_metadata,
                 codec=codec,
             )
 
@@ -880,13 +903,21 @@ class DecimalSerialized(LogicalSerialized[Decimal]):
 
     @property
     def value(self) -> Decimal:
-        coefficient, precision, scale = _unpack_i64_triplet(
-            self.decode(),
+        data = self.decode()
+        # Format flag — encoded by ``from_python_object`` in metadata so
+        # the int64 triplet (24 bytes, exact) and the UTF-8 string form
+        # (variable length, may also be 24 bytes for some inputs like
+        # the 22-digit Pi expansion) stay unambiguously distinguishable.
+        fmt = _metadata_bytes(self.metadata, M_DECIMAL_FORMAT)
+        if fmt == b"s":
+            return Decimal(data.decode("utf-8"))
+        # Default: int64 triplet (the original on-wire shape for every
+        # pre-string-fallback build). Old payloads have no ``df`` flag.
+        coefficient, _precision, scale = _unpack_i64_triplet(
+            data,
             tag_name="DECIMAL",
         )
-
-        value = Decimal(coefficient).scaleb(-scale)
-        return value
+        return Decimal(coefficient).scaleb(-scale)
 
 
 @dataclass(frozen=True, slots=True)
