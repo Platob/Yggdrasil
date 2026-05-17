@@ -149,6 +149,13 @@ def _to_pandas_no_arrow(df: "pyspark_sql.DataFrame"):
     ``sun.misc.Unsafe``) directly, which means a single broken JVM can
     take down every ``toPandas`` call in the process.  Toggling the
     arrow conf for the duration of this one call sidesteps that.
+
+    Databricks Connect / Spark Connect lock this conf server-side
+    (``[CONFIG_NOT_AVAILABLE] Configuration spark.sql.execution.arrow.pyspark.enabled
+    is not available``). When the toggle fails — for any reason —
+    fall straight through to ``df.toPandas()``; the Connect path
+    serves Arrow IPC over gRPC anyway, so the JVM-Unsafe trap this
+    function is guarding against doesn't apply.
     """
     spark = df.sparkSession
     arrow_key = "spark.sql.execution.arrow.pyspark.enabled"
@@ -158,6 +165,11 @@ def _to_pandas_no_arrow(df: "pyspark_sql.DataFrame"):
         prev = None
     try:
         spark.conf.set(arrow_key, "false")
+    except Exception:
+        # Conf is locked (Spark Connect / Databricks Connect / managed cluster).
+        # Skip the toggle dance entirely and just collect.
+        return df.toPandas()
+    try:
         return df.toPandas()
     finally:
         if prev is None:
@@ -166,7 +178,10 @@ def _to_pandas_no_arrow(df: "pyspark_sql.DataFrame"):
             except Exception:
                 pass
         else:
-            spark.conf.set(arrow_key, prev)
+            try:
+                spark.conf.set(arrow_key, prev)
+            except Exception:
+                pass
 
 
 def _log_arrow_path_fallback(api: str, exc: BaseException) -> None:
