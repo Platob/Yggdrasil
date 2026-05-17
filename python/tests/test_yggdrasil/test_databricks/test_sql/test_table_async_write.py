@@ -1259,6 +1259,31 @@ class TestTableAsyncJob:
         jobs_svc.create_or_update.assert_not_called()
         jobs_svc.create.assert_not_called()
 
+    def test_force_redeploys_even_when_job_exists(self):
+        """``force=True`` skips the short-circuit and re-pushes settings.
+
+        Needed after upgrading ``yggdrasil`` so an existing job's stale
+        task spec (e.g. a previously-staged ``SparkPythonTask`` whose
+        ``apply_records()`` invocation can't see the Job's
+        ``{{job.parameters.*}}`` bindings) gets replaced with the
+        latest renderer's output — the widget-driven notebook task in
+        this case.
+        """
+        tbl, jobs_svc = self._table()
+        existing = MagicMock(name="StaleJob")
+        # find() would return the stale job, but force=True must skip it.
+        jobs_svc.find.return_value = existing
+        fresh = MagicMock(name="FreshJob")
+        jobs_svc.create_or_update.return_value = fresh
+
+        result = tbl.async_job(force=True)
+
+        assert result is fresh
+        # The stale job lookup is skipped entirely — we go straight to
+        # create_or_update so the workspace receives the rebuilt spec.
+        jobs_svc.find.assert_not_called()
+        jobs_svc.create_or_update.assert_called_once()
+
     def test_stages_apply_records_when_job_missing(self):
         from databricks.sdk.service.jobs import NotebookTask
 
