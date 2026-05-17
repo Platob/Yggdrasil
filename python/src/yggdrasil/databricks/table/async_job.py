@@ -19,7 +19,9 @@ from __future__ import annotations
 import contextlib
 import datetime as _dt
 import logging
+import re
 import time
+from dataclasses import replace as _dc_replace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -62,6 +64,22 @@ __all__ = ["AsyncInsertJob", "AsyncApplierTaskType"]
 LOGGER = logging.getLogger(__name__)
 
 
+#: Sanitize an identifier (catalog / schema / table) into the
+#: ``[A-Za-z0-9_]`` shape Databricks accepts for ``task_key`` —
+#: dots, hyphens, spaces collapse to underscores; everything else
+#: outside the alphabet drops. Lower-cased so jobs spanning
+#: case-different identifiers still land at the same key.
+_TASK_KEY_SANITIZE_RE = re.compile(r"[^A-Za-z0-9_]+")
+
+
+def _slug_for_task_key(*parts: str) -> str:
+    """Join *parts* with ``_`` after sanitising each into ``[A-Za-z0-9_]``."""
+    return "_".join(
+        _TASK_KEY_SANITIZE_RE.sub("_", part).strip("_").lower()
+        for part in parts
+    )
+
+
 class AsyncInsertJob:
     """Namespace for the per-table async-insert applier job spec.
 
@@ -71,7 +89,16 @@ class AsyncInsertJob:
     folder.
     """
 
-    JOB_NAME_PREFIX: ClassVar[str] = "ygg-async-insert"
+    #: Prefix for every auto-generated artefact name (job name, task
+    #: key, staging folder). Two bracketed tokens land first so the
+    #: Databricks UI job list and the workspace tree make
+    #: ``yggdrasil``-deployed jobs visually scannable and identify
+    #: their flavour at a glance: ``[YGG]`` tags the deployer,
+    #: ``[ASYNC]`` tags the role (async-insert applier) — the eye
+    #: can group on both without expanding the entry, where the old
+    #: ``ygg-async-insert-`` slug-style prefix vanished into the rest
+    #: of the name.
+    JOB_NAME_PREFIX: ClassVar[str] = "[YGG][ASYNC]"
     # ``stage_async_insert`` writes the Parquet payload under ``data/``
     # **first**, then the JSON metadata under ``logs/``. The file-arrival
     # trigger watches ``logs/`` (not ``data/``) so a fire can only happen
@@ -97,9 +124,45 @@ class AsyncInsertJob:
     # ------------------------------------------------------------------ #
     @staticmethod
     def job_name(table: "Table") -> str:
-        """Canonical applier-job name for *table*."""
+        """Canonical applier-job name for *table*.
+
+        Format: ``[YGG][ASYNC] Maintain <catalog>.<schema>.<table>``.
+        ``[YGG]`` tags the deployer (yggdrasil), ``[ASYNC]`` tags the
+        role (async-insert applier), and the verb-first body reads
+        as a sentence so an operator scanning the Databricks UI's
+        job list can tell what each entry actually does without
+        expanding it.
+        """
         cat, sch, tbl = AsyncInsertJob._identity(table)
-        return f"{AsyncInsertJob.JOB_NAME_PREFIX}-{cat}-{sch}-{tbl}"
+        return f"{AsyncInsertJob.JOB_NAME_PREFIX} Maintain {cat}.{sch}.{tbl}"
+
+    @staticmethod
+    def task_key(table: "Table") -> str:
+        """Canonical applier-task key for *table*.
+
+        ``task_key`` lives in the Job spec and must match Databricks'
+        identifier shape (alphanumeric + ``_-``, no spaces / dots),
+        so this is the slug equivalent of :meth:`job_name`:
+        ``maintain__<catalog>_<schema>_<table>``. Encoding the table
+        triple into the key gives the Databricks UI's per-task
+        sub-tree a human-readable label and keeps the staged
+        workspace folder
+        (``/Workspace/Shared/.ygg/jobs/<task_key>/main-<digest>.py``)
+        identifiable to a specific table — which the old
+        ``apply_records`` key collapsed across every applier.
+        """
+        cat, sch, tbl = AsyncInsertJob._identity(table)
+        slug = _slug_for_task_key(cat, sch, tbl)
+        return f"maintain__{slug}"
+
+    @staticmethod
+    def task_description(table: "Table") -> str:
+        """Human-readable task description: what this task does, on which table."""
+        cat, sch, tbl = AsyncInsertJob._identity(table)
+        return (
+            f"Maintain {cat}.{sch}.{tbl} — apply staged async-insert records "
+            f"into the target table."
+        )
 
     @staticmethod
     def trigger_folder(table: "Table") -> "VolumePath":
@@ -218,7 +281,7 @@ class AsyncInsertJob:
             ),
             "description": (
                 description
-                or f"Apply staged async inserts for {cat}.{sch}.{tbl}"
+                or AsyncInsertJob.task_description(table)
             ),
             "tags": dict(tags) if tags else None,
         }
@@ -314,7 +377,8 @@ class AsyncInsertJob:
                 )
             return [
                 Task(
-                    task_key="apply",
+                    task_key=AsyncInsertJob.task_key(table),
+                    description=AsyncInsertJob.task_description(table)[:1000],
                     notebook_task=NotebookTask(
                         notebook_path=notebook_path,
                         warehouse_id=notebook_warehouse_id,
@@ -337,6 +401,8 @@ class AsyncInsertJob:
         applier: Any,
         *,
         task_type: AsyncApplierTaskType,
+        task_key: Optional[str] = None,
+        description: Optional[str] = None,
     ) -> tuple[List[Task], List[Any]]:
         """Render *applier*'s source as the requested task flavour.
 
@@ -386,7 +452,24 @@ class AsyncInsertJob:
                 f"'notebook' or 'spark' — got {task_type!r}."
             )
 
-        details, extra_deps, _ = stager(client, applier)
+        # Per-table ``task_key`` lands on the Databricks UI sub-tree
+        # *and* on the staged file path
+        # (``/Workspace/Shared/.ygg/jobs/<task_key>/main-<digest>.py``),
+        # so every table's applier lives in its own workspace folder
+        # — the old ``apply_records`` key collapsed every table's
+        # staged source onto one path, which then collided on
+        # re-upload (notebook ↔ source format) when the staging
+        # flavour changed.
+        resolved_task_key = task_key or AsyncInsertJob.task_key(table)
+        details, extra_deps, _ = stager(
+            client, applier, task_key=resolved_task_key,
+        )
+        # Replace the auto-derived description (function docstring +
+        # signature) with the table-aware sentence so the Databricks
+        # UI's task description reads as "what does this task do, on
+        # which table" — same information density as the job name.
+        resolved_description = description or AsyncInsertJob.task_description(table)
+        details = _dc_replace(details, description=resolved_description[:1000])
         env_key = getattr(details, "environment_key", None) or DEFAULT_ENVIRONMENT_KEY
         environment = _default_job_environment(
             env_key,

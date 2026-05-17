@@ -948,12 +948,32 @@ def _render_callable_notebook(
     # without it the annotation expressions run at class-body time and
     # raise ``NameError`` for typing names (``ClassVar`` / ``Optional`` /
     # …) that the staged file doesn't otherwise import.
+    # The ``logging.basicConfig`` line ensures the notebook's ``LOGGER``
+    # output actually surfaces under each cell in the Databricks UI —
+    # the workspace's default Python root logger is configured at
+    # ``WARNING`` so a bare ``LOGGER.info(...)`` from the staged body
+    # would otherwise vanish. The ``force=True`` kwarg replaces any
+    # pre-existing handler (which Databricks may have installed) so
+    # the formatter we want wins.
     metadata_cell = (
         "from __future__ import annotations\n"
         "\n"
         "import json as _yggdrasil_json\n"
+        "import logging as _yggdrasil_logging\n"
         "from yggdrasil.dataclasses.safe_function import checkargs\n"
         f"__yggdrasil_task__ = _yggdrasil_json.loads(r\"\"\"{meta_json}\"\"\")\n"
+        "_yggdrasil_logging.basicConfig(\n"
+        "    level=_yggdrasil_logging.INFO,\n"
+        "    format='%(asctime)s | %(levelname)s | %(name)s | %(message)s',\n"
+        "    force=True,\n"
+        ")\n"
+        "_YGG_LOGGER = _yggdrasil_logging.getLogger('yggdrasil.task')\n"
+        "_YGG_LOGGER.info(\n"
+        "    'Loaded staged task %r (yggdrasil=%s, staged_at=%s)',\n"
+        "    __yggdrasil_task__.get('qualname'),\n"
+        "    __yggdrasil_task__.get('yggdrasil_version'),\n"
+        "    __yggdrasil_task__.get('staged_at'),\n"
+        ")\n"
     )
 
     invocation_cell = _render_invocation_cell(func, args, kwargs)
@@ -1043,14 +1063,17 @@ def _render_invocation_cell(
     if not parts:
         invocation = f"{func.__name__}()"
     elif unbound:
-        joined = ",\n    ".join(parts)
-        invocation = f"{func.__name__}(\n    {joined},\n)"
+        joined = ",\n        ".join(parts)
+        invocation = f"{func.__name__}(\n        {joined},\n    )"
     else:
         invocation = f"{func.__name__}({', '.join(parts)})"
 
-    if not unbound:
-        return invocation + "\n"
-    return (
+    # Wrap the invocation in a Starting / Finished log pair so the
+    # Databricks UI's per-cell output makes it obvious *where* in the
+    # task run a failure happened — a bare ``apply_records(...)``
+    # cell that throws halfway shows only the traceback; the log
+    # frame makes "what was about to happen" explicit.
+    widget_helper = (
         "def _yggdrasil_widget(name):\n"
         "    # ``dbutils`` is injected by the Databricks notebook host;\n"
         "    # the fallback keeps a local ``python`` re-run from blowing\n"
@@ -1060,7 +1083,17 @@ def _render_invocation_cell(
         "    except Exception:\n"
         "        return None\n"
         "\n"
-        f"{invocation}\n"
+    ) if unbound else ""
+
+    return (
+        f"{widget_helper}"
+        f"_YGG_LOGGER.info('Starting %s', {func.__qualname__!r})\n"
+        f"try:\n"
+        f"    _ygg_result = {invocation}\n"
+        f"except Exception:\n"
+        f"    _YGG_LOGGER.exception('Failed %s', {func.__qualname__!r})\n"
+        f"    raise\n"
+        f"_YGG_LOGGER.info('Finished %s', {func.__qualname__!r})\n"
     )
 
 

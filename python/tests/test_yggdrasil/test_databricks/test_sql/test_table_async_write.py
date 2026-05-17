@@ -1029,9 +1029,31 @@ class TestAsyncInsertJobSettings:
         from yggdrasil.databricks.table.async_job import AsyncInsertJob
 
         tbl, _, _ = self._table_with_trigger_path()
+        # ``[YGG][ASYNC]`` prefix tags ``yggdrasil``-deployed
+        # async-insert jobs in the Databricks UI; verb-first body
+        # reads as a sentence so the job list shows what each entry
+        # does at a glance.
         assert (
             AsyncInsertJob.job_name(tbl)
-            == "ygg-async-insert-cat-sch-tbl"
+            == "[YGG][ASYNC] Maintain cat.sch.tbl"
+        )
+
+    def test_task_key_and_description_are_table_aware(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, _, _ = self._table_with_trigger_path()
+        # ``task_key`` is sanitised to the Databricks identifier
+        # alphabet (``[A-Za-z0-9_-]``) and slugs the table triple so
+        # the per-task workspace folder
+        # (``/Workspace/Shared/.ygg/jobs/<task_key>/main-<digest>.py``)
+        # identifies the specific table.
+        assert AsyncInsertJob.task_key(tbl) == "maintain__cat_sch_tbl"
+        # Description is the human sentence — same shape as the job
+        # name body — so the Databricks UI's task panel reads as
+        # "what this task does, on which table".
+        assert AsyncInsertJob.task_description(tbl) == (
+            "Maintain cat.sch.tbl — apply staged async-insert records "
+            "into the target table."
         )
 
     def test_trigger_url_points_at_async_data_folder(self):
@@ -1054,8 +1076,11 @@ class TestAsyncInsertJobSettings:
         spec = AsyncInsertJob.settings(
             tbl, notebook_path="/Workspace/Users/me/apply",
         )
-        assert spec["name"] == "ygg-async-insert-cat-sch-tbl"
-        assert spec["description"] == "Apply staged async inserts for cat.sch.tbl"
+        assert spec["name"] == "[YGG][ASYNC] Maintain cat.sch.tbl"
+        assert spec["description"] == (
+            "Maintain cat.sch.tbl — apply staged async-insert records "
+            "into the target table."
+        )
         # File-arrival trigger built off the staging data folder.
         trigger = spec["trigger"]
         assert isinstance(trigger, TriggerSettings)
@@ -1196,7 +1221,16 @@ class TestAsyncInsertJobSettings:
         # and wired as a ``NotebookTask``.
         assert len(spec["tasks"]) == 1
         task = spec["tasks"][0]
-        assert task.task_key == "apply_records"
+        # Task key slugs the table triple so the per-task staging
+        # folder and the Databricks UI sub-tree both identify the
+        # specific table.
+        assert task.task_key == "maintain__cat_sch_tbl"
+        # Description tells the operator which table this task
+        # maintains — same shape as the job name body.
+        assert task.description == (
+            "Maintain cat.sch.tbl — apply staged async-insert records "
+            "into the target table."
+        )
         assert isinstance(task.notebook_task, NotebookTask)
         assert task.spark_python_task is None
         # The notebook lands under the per-task-key staging folder and
@@ -1289,7 +1323,7 @@ class TestTableAsyncJob:
         result = tbl.async_job()
 
         assert result is existing
-        jobs_svc.find.assert_called_once_with(name="ygg-async-insert-cat-sch-tbl")
+        jobs_svc.find.assert_called_once_with(name="[YGG][ASYNC] Maintain cat.sch.tbl")
         # No create call — existing job was returned.
         jobs_svc.create_or_update.assert_not_called()
         jobs_svc.create.assert_not_called()
@@ -1332,7 +1366,7 @@ class TestTableAsyncJob:
         assert result is sentinel
         jobs_svc.create_or_update.assert_called_once()
         _, kwargs = jobs_svc.create_or_update.call_args
-        assert kwargs["name"] == "ygg-async-insert-cat-sch-tbl"
+        assert kwargs["name"] == "[YGG][ASYNC] Maintain cat.sch.tbl"
         # File-arrival trigger lives in the spec.
         assert "trigger" in kwargs
         # Default applier was staged → ``tasks`` carries a NotebookTask
@@ -1353,7 +1387,7 @@ class TestTableAsyncJob:
 
         jobs_svc.create_or_update.assert_called_once()
         _, kwargs = jobs_svc.create_or_update.call_args
-        assert kwargs["name"] == "ygg-async-insert-cat-sch-tbl"
+        assert kwargs["name"] == "[YGG][ASYNC] Maintain cat.sch.tbl"
         # tasks list is present but empty when no applier wanted.
         assert kwargs["tasks"] == []
         assert "environments" not in kwargs
@@ -1592,3 +1626,48 @@ class TestTableAsyncInsert:
         out = tbl.insert("dummy", mode="append")
         assert out == "sql-result"
         tbl.insert_into.assert_called_once()
+
+    def test_async_insert_precheck_raises_when_job_missing(self, monkeypatch):
+        """Staging without a deployed applier rots — pre-check raises loudly.
+
+        ``Jobs.find`` returning ``None`` means there's no consumer for
+        the staged payload; the precheck surfaces that *before* any
+        workspace round trip so the caller can't accidentally drop
+        rows into the void.
+        """
+        tbl, _, _, _ = _make_table_with_staging()
+        # Pre-built jobs service mock — find() returns None to simulate
+        # a missing applier job.
+        jobs_svc = MagicMock(name="Jobs")
+        jobs_svc.find.return_value = None
+        tbl.service.client.jobs = jobs_svc
+
+        import yggdrasil.databricks.table.async_write as aw
+        stage = MagicMock(name="stage_async_insert")
+        monkeypatch.setattr(aw, "stage_async_insert", stage)
+
+        with pytest.raises(RuntimeError, match="no applier job named"):
+            tbl.async_insert("dummy")
+        # The stager never ran — failure must happen before the
+        # workspace round trip.
+        stage.assert_not_called()
+        jobs_svc.find.assert_called_once_with(name="[YGG][ASYNC] Maintain cat.sch.tbl")
+
+    def test_async_insert_precheck_skipped_with_require_job_false(self, monkeypatch):
+        """``require_job=False`` lets the caller stage payloads ahead of the applier."""
+        tbl, _, _, _ = _make_table_with_staging()
+        jobs_svc = MagicMock(name="Jobs")
+        # find() would return None — without the opt-out, the precheck
+        # would raise; with require_job=False it must not even be called.
+        jobs_svc.find.return_value = None
+        tbl.service.client.jobs = jobs_svc
+
+        sentinel = AsyncInsert(target_full_name="cat.sch.tbl")
+        import yggdrasil.databricks.table.async_write as aw
+        monkeypatch.setattr(
+            aw, "stage_async_insert", MagicMock(return_value=sentinel),
+        )
+
+        out = tbl.async_insert("dummy", require_job=False)
+        assert out is sentinel
+        jobs_svc.find.assert_not_called()

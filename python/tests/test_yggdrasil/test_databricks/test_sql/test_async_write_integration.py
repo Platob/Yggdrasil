@@ -252,7 +252,7 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
         assert job.job_id is not None
         type(self).created_jobs.append(job.job_id)
         assert job.name == (
-            f"ygg-async-insert-{self.catalog_name}-{self.schema_name}-"
+            f"[YGG][ASYNC] Maintain {self.catalog_name}.{self.schema_name}."
             f"{table.table_name}"
         )
 
