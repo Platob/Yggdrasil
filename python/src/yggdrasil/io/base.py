@@ -203,6 +203,36 @@ def _resolve_format_target(
     return Tabular.class_for_media_type(mt, default=None)
 
 
+def _local_path_for_handle(obj: Any) -> Optional[str]:
+    """Return the on-disk path for a local file handle, or ``None``.
+
+    Recognises real file handles (``open("...", "rb")``,
+    ``pathlib.Path.open()``) by their string ``.name`` attribute —
+    stdlib file objects expose the underlying path there. Filters
+    out anonymous streams whose ``.name`` is an int fd (sockets,
+    pipes) or a bracketed sentinel (``"<stdin>"``, ``"<fdopen>"``)
+    and anything whose ``.name`` doesn't actually exist on disk.
+
+    Used by :meth:`IO.from_` to scrap the drain-into-Memory step
+    for live local files — the resulting :class:`LocalPath`
+    reads from the file system on demand, so a multi-GB handle
+    never gets materialised.
+    """
+    import os as _os
+
+    name = getattr(obj, "name", None)
+    if not isinstance(name, str):
+        return None
+    if name.startswith("<") and name.endswith(">"):
+        return None
+    try:
+        if not _os.path.isfile(name):
+            return None
+    except (OSError, ValueError):
+        return None
+    return name
+
+
 # ===========================================================================
 # IO[T, O]
 # ===========================================================================
@@ -414,14 +444,19 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
     def from_(cls, obj: Any, *, mode: ModeLike = "rb+", **kwargs: Any) -> "IO":
         """Auto-route *obj* to the right holder, return an owning IO.
 
-        - :class:`IO` — pass through (idempotent).
+        - :class:`IO` — pass through (idempotent) or borrow holder.
         - :class:`Holder` — borrow into a fresh IO.
         - bytes-like (``bytes`` / ``bytearray`` / ``memoryview``) —
           wrap in a fresh :class:`Memory`.
         - path-like (``str`` / ``pathlib.Path`` / ``URL``) — wrap in
           a fresh holder via :class:`Holder` registry dispatch (file,
           s3, dbfs, …).
-        - file-like (has ``read``) — drain into a fresh
+        - local file handle (``open("...", "rb")`` — anything with
+          a ``.name`` attribute pointing at an existing local file)
+          — wrap as a :class:`LocalPath` instead of draining; the
+          path holder reads from the file system on demand so a
+          multi-GB handle never gets materialised into memory.
+        - other file-like (has ``read``) — drain into a fresh
           :class:`Memory`.
 
         The returned IO always owns its holder unless *obj* was
@@ -448,6 +483,24 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
             )
 
         if hasattr(obj, "read") and not isinstance(obj, (str, bytes)):
+            # Live local file handle (``open("path", "rb")``,
+            # ``pathlib.Path.open()``) carries a string ``.name``
+            # pointing at the on-disk file. Recognise and route
+            # through :class:`LocalPath` so the holder reads from
+            # disk on demand instead of draining the handle into
+            # ``Memory``. Anonymous streams (``io.BytesIO``,
+            # socket-backed handles, ``<stdin>``-style names) fall
+            # through to the drain branch below.
+            local_path = _local_path_for_handle(obj)
+            if local_path is not None:
+                from yggdrasil.io.path.local_path import LocalPath
+
+                return cls(
+                    holder=LocalPath(local_path),
+                    owns_holder=True,
+                    mode=mode,
+                    **kwargs,
+                )
             mem = Memory()
             mem.acquire()
             try:
@@ -463,17 +516,25 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
                 raise
             return cls(holder=mem, owns_holder=True, mode=mode, **kwargs)
 
-        # Path-like — let Holder dispatch decide the scheme via its
-        # __new__ registry routing.
-        try:
-            holder = Holder(data=obj)
-            return cls(holder=holder, owns_holder=True, mode=mode, **kwargs)
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"Cannot wrap {type(obj).__name__} as a {cls.__name__}. "
-                f"Accepted: IO, Holder, bytes-like, file-like, "
-                f"str/PurePath/URL. Got {obj!r}."
-            ) from exc
+        # Path-like — route through the ``IO(path=...)`` __new__
+        # which already does scheme-aware holder dispatch (file →
+        # LocalPath, s3 → S3Path, dbfs+volume → VolumePath, …).
+        from yggdrasil.io.url import URL as _URL
+
+        if isinstance(obj, (str, pathlib.PurePath, _URL)):
+            try:
+                return cls(path=obj, mode=mode, **kwargs)
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    f"Cannot wrap {type(obj).__name__} as a "
+                    f"{cls.__name__} via path dispatch. Got {obj!r}."
+                ) from exc
+
+        raise TypeError(
+            f"Cannot wrap {type(obj).__name__} as a {cls.__name__}. "
+            f"Accepted: IO, Holder, bytes-like, file-like, "
+            f"str/PurePath/URL. Got {obj!r}."
+        )
 
     @classmethod
     def from_holder(

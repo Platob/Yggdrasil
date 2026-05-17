@@ -94,6 +94,101 @@ class TestConstruction:
         b = BytesIO.from_(src)
         assert b.to_bytes() == b"piped-bytes"
 
+    def test_from_bytes(self) -> None:
+        b = BytesIO.from_(b"raw-bytes")
+        assert b.to_bytes() == b"raw-bytes"
+        assert b.owns_holder
+
+    def test_from_bytearray(self) -> None:
+        b = BytesIO.from_(bytearray(b"mutable-bytes"))
+        assert b.to_bytes() == b"mutable-bytes"
+
+    def test_from_memoryview(self) -> None:
+        b = BytesIO.from_(memoryview(b"view-bytes"))
+        assert b.to_bytes() == b"view-bytes"
+
+    def test_from_holder_borrows(self) -> None:
+        mem = Memory(b"holder-bytes")
+        b = BytesIO.from_(mem)
+        assert b.to_bytes() == b"holder-bytes"
+        # Holder borrowed, not owned — caller is responsible for it.
+        assert not b.owns_holder
+        assert b.holder is mem
+
+    def test_from_other_io_borrows_holder(self) -> None:
+        """Different :class:`IO` subclass over the same holder reuses
+        the byte substrate — no drain (which would advance the source
+        cursor and miss any bytes already consumed)."""
+        a = BytesIO(b"shared-bytes")
+        a.read(3)  # advance source cursor to 3
+        b = BytesIO.from_(a)
+        # ``a`` was already the calling class → identity (idempotent).
+        assert b is a
+
+    def test_from_pathlib_path(self, tmp_path) -> None:
+        import pathlib
+        from yggdrasil.io.path.local_path import LocalPath
+
+        target = tmp_path / "data.bin"
+        target.write_bytes(b"on-disk-bytes")
+        b = BytesIO.from_(pathlib.Path(target))
+        assert isinstance(b.holder, LocalPath)
+        assert b.to_bytes() == b"on-disk-bytes"
+
+    def test_from_str_path(self, tmp_path) -> None:
+        from yggdrasil.io.path.local_path import LocalPath
+
+        target = tmp_path / "data.bin"
+        target.write_bytes(b"str-path-bytes")
+        b = BytesIO.from_(str(target))
+        assert isinstance(b.holder, LocalPath)
+        assert b.to_bytes() == b"str-path-bytes"
+
+    def test_from_local_file_handle_wraps_as_local_path(self, tmp_path) -> None:
+        """``open("path", "rb")`` carries the file path on ``.name``;
+        :meth:`IO.from_` recognises it and routes through
+        :class:`LocalPath` instead of draining the handle into
+        :class:`Memory`. Result: huge file handles never get
+        materialised."""
+        from yggdrasil.io.memory import Memory
+        from yggdrasil.io.path.local_path import LocalPath
+
+        target = tmp_path / "huge.bin"
+        target.write_bytes(b"file-handle-bytes")
+
+        with open(target, "rb") as fh:
+            b = BytesIO.from_(fh)
+
+        # Holder is the local path, not a drained Memory.
+        assert isinstance(b.holder, LocalPath)
+        assert not isinstance(b.holder, Memory)
+        assert b.to_bytes() == b"file-handle-bytes"
+
+    def test_from_anonymous_stream_falls_back_to_memory(self) -> None:
+        """Stdlib :class:`io.BytesIO` has no ``.name`` → drains into
+        :class:`Memory` (the existing file-like path)."""
+        from yggdrasil.io.memory import Memory
+
+        b = BytesIO.from_(io.BytesIO(b"anonymous"))
+        assert isinstance(b.holder, Memory)
+        assert b.to_bytes() == b"anonymous"
+
+    def test_from_stream_with_fake_name_falls_back_to_memory(self) -> None:
+        """Sentinel ``.name`` like ``"<fdopen>"`` is not a real path —
+        coercion falls through to the drain branch instead of
+        crashing on a missing-file check."""
+        from yggdrasil.io.memory import Memory
+
+        src = io.BytesIO(b"sentinel")
+        src.name = "<fdopen>"  # type: ignore[attr-defined]
+        b = BytesIO.from_(src)
+        assert isinstance(b.holder, Memory)
+        assert b.to_bytes() == b"sentinel"
+
+    def test_from_unsupported_type_raises(self) -> None:
+        with pytest.raises(TypeError, match="Cannot wrap"):
+            BytesIO.from_(42)
+
     def test_path_kwarg_dispatches_via_extension(self, tmp_path) -> None:
         """``BytesIO(path=...)`` lands on the format leaf for the URL's
         extension. Closes the bug where the ``__new__`` dispatch only
