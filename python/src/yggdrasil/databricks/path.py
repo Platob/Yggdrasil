@@ -40,10 +40,8 @@ from yggdrasil.data.enums import Scheme
 from yggdrasil.io.path import RemotePath
 from yggdrasil.io.path._retry import retry_sdk_call
 from yggdrasil.io.url import URL
-
 from .resource import DatabricksResource
 from .service import DatabricksService
-
 
 if TYPE_CHECKING:
     from yggdrasil.databricks.client import DatabricksClient
@@ -65,7 +63,6 @@ _POSIX_NAMESPACES: dict[str, str] = {
     "Volumes":   Scheme.DATABRICKS_VOLUME.value,
     "Workspace": Scheme.DATABRICKS_WORKSPACE.value,
 }
-
 
 def _looks_like_posix(value: str) -> bool:
     if not isinstance(value, str) or not value.startswith("/"):
@@ -280,7 +277,7 @@ class DatabricksPath(DatabricksResource, RemotePath):
     #: Canonical POSIX prefix for the legacy string shape
     #: (``/dbfs/``, ``/Workspace/``, ``/Volumes/``). Empty on the
     #: abstract base; concrete subclasses override.
-    namespace_prefix: ClassVar[Optional[str]] = None
+    NAMESPACE_PREFIX: ClassVar[Optional[str]] = None
 
     #: :class:`DatabricksService` subclass to use as the default when
     #: a path is constructed without an explicit ``service=`` / ``client=``.
@@ -415,27 +412,12 @@ class DatabricksPath(DatabricksResource, RemotePath):
         singleton_ttl: Any = ...,
         **kwargs: Any,
     ) -> None:
-        # Singleton-cached instances are re-entered on every constructor
-        # call (Python always invokes ``__init__`` after ``__new__``);
-        # skip the second pass so the live SDK client binding and stat
-        # cache survive. ``singleton_ttl`` is consumed by
-        # :meth:`Singleton.__new__`; accept it here so callers passing
-        # the opt-in cache flag don't trip the ``__init__`` signature.
         del singleton_ttl
         if getattr(self, "_initialized", False):
             return
 
-        # Back-compat: callers that pass ``client=`` (the historical
-        # kwarg) get wrapped in the subclass's typed service so the
-        # rest of the path operates against ``self.service`` like
-        # every other :class:`DatabricksResource` —
-        # ``VolumePath`` → :class:`Volumes`,
-        # ``WorkspacePath`` → :class:`Workspaces`,
-        # ``DBFSPath`` → :class:`DBFSService`.
         if service is None and client is not None:
             service = self._SERVICE_CLASS(client=client)
-        # No service / no client: defer to ``DatabricksResource.__init__``
-        # which calls ``<service_class>.current()`` via the kwarg below.
         elif service is None:
             service = self._SERVICE_CLASS.current()
 
@@ -453,10 +435,6 @@ class DatabricksPath(DatabricksResource, RemotePath):
             data = None
         if url is not None:
             url = URL.from_(url)
-            # Un-qualified ``dbfs://`` family URLs whose path leads with
-            # ``/Volumes/`` / ``/Workspace/`` belong to a concrete
-            # surface — rewrite once so the URL path is the *suffix*
-            # below the namespace prefix that ``full_path()`` re-adds.
             url = _strip_dbfs_family_prefix(url)
             target_scheme = self.scheme
             if target_scheme is not None:
@@ -466,12 +444,9 @@ class DatabricksPath(DatabricksResource, RemotePath):
                 if not url.scheme:
                     url = url.with_scheme(target_token)
 
-        # ``DatabricksResource.__init__`` sets ``self.service`` (lazy
-        # default = ``DatabricksService.current()``) and forwards the
-        # rest up the MRO into :class:`Path.__init__` for stat-cache /
-        # URL-binding setup.
         super().__init__(
-            service=service, data=data, url=url, temporary=temporary, **kwargs,
+            service=service, data=data, url=url, temporary=temporary,
+            **kwargs,
         )
 
         self._retry_sleep: Optional[Callable[[float], None]] = retry_sleep
@@ -582,52 +557,6 @@ class DatabricksPath(DatabricksResource, RemotePath):
             return retry_sdk_call(func, *args, sleep=self._retry_sleep, **kwargs)
         return retry_sdk_call(func, *args, **kwargs)
 
-    def _call_ensuring_parents(self, func, *args, **kwargs):
-        """Like :meth:`_call`, but auto-creates missing parents on NotFound.
-
-        Used by mutating ops (``upload``, ``mkdirs``, ``create_directory``)
-        where the request can fail purely because an intermediate
-        directory — or, for Volume paths, the Unity Catalog volume
-        itself — does not exist yet. On the first NotFound-shaped
-        failure we hand off to :meth:`_ensure_parents` (subclass hook
-        for catalog/schema/volume creation, then a recursive parent
-        ``mkdir``) and retry exactly once. The triggering exception
-        is forwarded so subclasses can short-circuit the recovery
-        path — e.g. ``VolumePath`` skips its cheap
-        ``files.create_directory`` probe when the SDK has already
-        named the volume itself as missing. Other errors propagate.
-        """
-        try:
-            return self._call(func, *args, **kwargs)
-        except Exception as exc:
-            if not _looks_like_parent_missing(exc):
-                raise
-            if not self._ensure_parents(exc):
-                raise
-            return self._call(func, *args, **kwargs)
-
-    def _ensure_parents(self, exc: BaseException | None = None) -> bool:
-        """Best-effort create of every directory above *self*.
-
-        Returns ``True`` if any creation actually happened (so the
-        caller knows a retry is worth attempting). Subclasses extend
-        this — :class:`VolumePath` first creates the catalog / schema
-        / managed volume, then recurses into ``parent.mkdir``. The
-        optional *exc* carries the failure that triggered the
-        recovery, letting subclasses tailor the create chain to the
-        specific NotFound shape (e.g. "Volume … does not exist" vs
-        a generic missing-directory message).
-        """
-        del exc
-        parent = self.parent
-        if parent.url == self.url:
-            return False
-        try:
-            parent._mkdir(parents=True, exist_ok=True)
-            return True
-        except Exception:
-            return False
-
     # ==================================================================
     # Sibling paths inherit the same workspace client
     # ==================================================================
@@ -650,14 +579,14 @@ class DatabricksPath(DatabricksResource, RemotePath):
         # payload — same convention :class:`Singleton` enforces.
         return {
             k: v for k, v in self.__dict__.items()
-            if k not in self._TRANSIENT_STATE_ATTRS
+            if k not in self.TRANSIENT_STATE_ATTRS
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         if getattr(self, "_initialized", False):
             return
         self.__dict__.update(state)
-        for attr in self._TRANSIENT_STATE_ATTRS:
+        for attr in self.TRANSIENT_STATE_ATTRS:
             self.__dict__.setdefault(attr, None)
 
     # ==================================================================

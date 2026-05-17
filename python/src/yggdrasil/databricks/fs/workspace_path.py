@@ -42,7 +42,7 @@ class WorkspacePath(DatabricksPath):
     """Path under ``/Workspace/...`` via the Workspace API."""
 
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_WORKSPACE
-    namespace_prefix: ClassVar[str] = "/Workspace/"
+    NAMESPACE_PREFIX: ClassVar[str] = "/Workspace/"
     _SERVICE_CLASS: ClassVar[type] = Workspaces
 
     # ==================================================================
@@ -188,7 +188,7 @@ class WorkspacePath(DatabricksPath):
             # / ``size`` / ``exists()`` per child don't each issue a
             # follow-up ``workspace.get_status`` round trip.
             mtime_ms = getattr(info, "modified_at", None) or 0
-            child._seed_stat_cache(IOStats(
+            child._persist_stat_cache(IOStats(
                 kind=IOKind.DIRECTORY if is_dir else IOKind.FILE,
                 size=0 if is_dir else int(getattr(info, "size", 0) or 0),
                 mtime=float(mtime_ms) / 1000.0 if mtime_ms else 0.0,
@@ -210,16 +210,16 @@ class WorkspacePath(DatabricksPath):
             if _looks_like_already_exists(exc):
                 if not exist_ok:
                     raise
-                self._seed_stat_cache(IOStats(kind=IOKind.DIRECTORY))
+                self._persist_stat_cache(IOStats(kind=IOKind.DIRECTORY))
                 return
             if _looks_like_protected_parent(exc):
                 # Hitting a protected ancestor (e.g. ``/Workspace/Users``)
                 # is fine if the leaf already landed — fall through and
                 # let downstream ops succeed.
-                self._seed_stat_cache(IOStats(kind=IOKind.DIRECTORY))
+                self._persist_stat_cache(IOStats(kind=IOKind.DIRECTORY))
                 return
             raise
-        self._seed_stat_cache(IOStats(kind=IOKind.DIRECTORY))
+        self._persist_stat_cache(IOStats(kind=IOKind.DIRECTORY))
 
     def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
         del wait
@@ -293,7 +293,7 @@ class WorkspacePath(DatabricksPath):
         # so the next ``size`` / ``exists`` lookup is local.
         media_type = _media_type_from_response(response)
         if self._stat_cached is None:
-            self._seed_stat_cache(IOStats(
+            self._persist_stat_cache(IOStats(
                 size=len(data),
                 kind=IOKind.FILE,
                 media_type=media_type,
@@ -305,7 +305,7 @@ class WorkspacePath(DatabricksPath):
             # Re-stamp the TTL — this download IS the freshest size we
             # could observe; the entry should outlive the original
             # probe's window from this point on.
-            self._seed_stat_cache(self._stat_cached)
+            self._persist_stat_cache(self._stat_cached)
 
         if pos:
             data = data[pos:]
@@ -407,7 +407,7 @@ class WorkspacePath(DatabricksPath):
 
         self._call_ensuring_parents(_do_upload)
         if size >= 0:
-            self._seed_stat_cache(IOStats(
+            self._persist_stat_cache(IOStats(
                 size=size,
                 kind=IOKind.FILE,
                 mtime=time.time(),
@@ -490,7 +490,7 @@ class WorkspacePath(DatabricksPath):
                 except OSError:
                     pass
 
-        target._seed_stat_cache(IOStats(
+        target._persist_stat_cache(IOStats(
             size=int(size),
             kind=IOKind.FILE,
             mtime=time.time(),

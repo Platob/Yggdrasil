@@ -1040,7 +1040,7 @@ class TestAsyncInsertJobSettings:
         tbl, _, _ = self._table_with_trigger_path()
         assert (
             AsyncInsertJob.trigger_url(tbl)
-            == "dbfs:/Volumes/cat/sch/stg_tbl/.sql/async/insert/logs/"
+            == "/Volumes/cat/sch/stg_tbl/.sql/async/insert/logs/"
         )
 
     def test_settings_carries_full_job_spec(self):
@@ -1062,7 +1062,7 @@ class TestAsyncInsertJobSettings:
         assert isinstance(trigger.file_arrival, FileArrivalTriggerConfiguration)
         assert (
             trigger.file_arrival.url
-            == "dbfs:/Volumes/cat/sch/stg_tbl/.sql/async/insert/logs/"
+            == "/Volumes/cat/sch/stg_tbl/.sql/async/insert/logs/"
         )
         # notebook_path is wrapped in a Task with the table identity.
         tasks = spec["tasks"]

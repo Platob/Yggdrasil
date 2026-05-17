@@ -346,7 +346,9 @@ class Tables(DatabricksService):
         )
         logger.debug("Fetching table %s via GET", full_name)
         try:
-            return uc.get(full_name=full_name)
+            found = uc.get(full_name=full_name)
+            logger.info("Fetched table %s via GET", full_name)
+            return found
         except DatabricksError:
             pass  # fall through to list scan
         except Exception as exc:

@@ -70,7 +70,7 @@ class Singleton:
     # Attribute names that don't survive pickling. Subclasses
     # extend with their own non-picklable handles (live SDK clients,
     # connection pools, lazy service caches).
-    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset()
+    TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset()
 
     @classmethod
     def _singleton_key(cls, *args: Any, **kwargs: Any) -> Any:
@@ -236,7 +236,7 @@ class Singleton:
                     state[slot] = getattr(self, slot)
                 except AttributeError:
                     pass
-        for attr in self._TRANSIENT_STATE_ATTRS:
+        for attr in self.TRANSIENT_STATE_ATTRS:
             state.pop(attr, None)
         return state
 
@@ -253,6 +253,6 @@ class Singleton:
         # ones on a slot-using subclass.
         for key, value in state.items():
             object.__setattr__(self, key, value)
-        for attr in self._TRANSIENT_STATE_ATTRS:
+        for attr in self.TRANSIENT_STATE_ATTRS:
             if not hasattr(self, attr):
                 object.__setattr__(self, attr, None)

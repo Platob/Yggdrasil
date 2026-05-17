@@ -36,7 +36,7 @@ class DBFSPath(DatabricksPath):
     """Path under ``/dbfs/...`` via the DBFS SDK API."""
 
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_DBFS
-    namespace_prefix: ClassVar[str] = "/dbfs/"
+    NAMESPACE_PREFIX: ClassVar[str] = "/dbfs/"
     _SERVICE_CLASS: ClassVar[type] = DBFSService
 
     # ==================================================================
@@ -113,7 +113,7 @@ class DBFSPath(DatabricksPath):
             # each fire a follow-up ``dbfs.get_status`` round trip.
             is_dir = bool(getattr(info, "is_dir", False))
             mtime_ms = getattr(info, "modification_time", None) or 0
-            child._seed_stat_cache(IOStats(
+            child._persist_stat_cache(IOStats(
                 kind=IOKind.DIRECTORY if is_dir else IOKind.FILE,
                 size=0 if is_dir else int(getattr(info, "file_size", 0) or 0),
                 mtime=float(mtime_ms) / 1000.0 if mtime_ms else 0.0,
@@ -134,7 +134,7 @@ class DBFSPath(DatabricksPath):
         except Exception as exc:
             if not exist_ok and _looks_like_already_exists(exc):
                 raise
-        self._seed_stat_cache(IOStats(kind=IOKind.DIRECTORY))
+        self._persist_stat_cache(IOStats(kind=IOKind.DIRECTORY))
 
     def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
         del wait
@@ -224,7 +224,7 @@ class DBFSPath(DatabricksPath):
         # next ``size`` / ``exists`` / ``is_file`` lookup is local.
         if pos == 0 and hit_eof:
             if self._stat_cached is None:
-                self._seed_stat_cache(IOStats(
+                self._persist_stat_cache(IOStats(
                     size=offset,
                     kind=IOKind.FILE,
                     media_type=self.media_type,
@@ -234,7 +234,7 @@ class DBFSPath(DatabricksPath):
                 # Re-stamp the TTL — the data we just folded in is
                 # fresh, so the entry deserves a full window before
                 # the next backend probe.
-                self._seed_stat_cache(self._stat_cached)
+                self._persist_stat_cache(self._stat_cached)
         logger.debug(
             "Read DBFS file %r pos=%d n=%s -> %d bytes",
             self, pos, "EOF" if to_eof else n, len(out),
@@ -341,7 +341,7 @@ class DBFSPath(DatabricksPath):
         # and any concurrent reader on the singleton path sees the
         # post-write metadata without a fresh ``dbfs.get_status``.
         if size >= 0:
-            self._seed_stat_cache(IOStats(
+            self._persist_stat_cache(IOStats(
                 size=size,
                 kind=IOKind.FILE,
                 mtime=time.time(),

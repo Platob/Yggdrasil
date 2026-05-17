@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import inspect
 import logging
+import re
 from typing import Any, Iterator, List, Optional, TYPE_CHECKING, Union
 
 from databricks.sdk import JobsAPI
-from databricks.sdk.errors import ResourceDoesNotExist
+from databricks.sdk.errors import ResourceDoesNotExist, InvalidParameterValue
 from databricks.sdk.service.jobs import (
     JobAccessControlRequest,
     JobPermissionLevel,
@@ -29,7 +30,6 @@ from databricks.sdk.service.jobs import (
 
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
-
 from ..client import DatabricksClient, DatabricksService
 
 if TYPE_CHECKING:
@@ -47,6 +47,15 @@ _SUBMIT_ARG_NAMES = set(inspect.signature(JobsAPI.submit).parameters.keys())
 # host -> ExpiringDict(job_name -> job_id)
 _NAME_ID_CACHE: dict[str, ExpiringDict[str, int]] = {}
 _NAMED_JOBS: ExpiringDict[tuple[str, str], "Job"] = ExpiringDict(default_ttl=7200.0)
+_VOLUME_PATH_RE = re.compile(r"/Volumes/(?P<catalog>[^/]+)/(?P<schema>[^/]+)/(?P<volume>[^/]+)")
+
+
+def _parse_volume(message: str) -> tuple[str, str, str] | None:
+    """Extract (catalog, schema, volume) from an InvalidParameterValue message."""
+    m = _VOLUME_PATH_RE.search(message)
+    if m is None:
+        return None
+    return m["catalog"], m["schema"], m["volume"]
 
 
 def _set_cached_job_id(client: DatabricksClient, name: str, job_id: int) -> None:
@@ -230,7 +239,19 @@ class Jobs(DatabricksService):
             ]
 
         LOGGER.debug("Creating job %r with spec %s", name, create_kwargs)
-        response = self._jobs_api().create(**create_kwargs)
+        try:
+            response = self._jobs_api().create(**create_kwargs)
+        except InvalidParameterValue as e:
+            parsed = _parse_volume(str(e))
+            if parsed is None:
+                raise
+            catalog_name, schema_name, volume_name = parsed
+            self.volumes.volume(
+                catalog_name=catalog_name,
+                schema_name=schema_name,
+                volume_name=volume_name,
+            ).create()
+            response = self._jobs_api().create(**create_kwargs)
 
         job_id = response.job_id
         _set_cached_job_id(self.client, name, job_id)

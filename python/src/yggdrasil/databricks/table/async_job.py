@@ -110,11 +110,11 @@ class AsyncInsertJob:
 
     @staticmethod
     def trigger_url(table: "Table") -> str:
-        """File-arrival URL — ``dbfs:/Volumes/<cat>/<sch>/<vol>/...logs/``."""
+        """File-arrival URL — ``/Volumes/<cat>/<sch>/<vol>/...logs/``."""
         path = AsyncInsertJob.trigger_folder(table).full_path()
         if not path.endswith("/"):
             path = path + "/"
-        return f"dbfs:{path}"
+        return path
 
     @staticmethod
     def settings(

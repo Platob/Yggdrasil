@@ -188,22 +188,7 @@ class TabularStaticValues(Mapping):
     def __repr__(self) -> str:
         return f"TabularStaticValues({dict(self)!r})"
 
-
-# Process-wide registry mapping :class:`MimeType` name → concrete
-# :class:`Tabular` subclass. Populated by :meth:`Tabular.__init_subclass__`
-# when a subclass declares :attr:`Tabular.mime_type`. Mirror of
-# :data:`yggdrasil.io.url._URL_BASED_REGISTRY` — same shape, same
-# rules: declarative class-level discriminator, populated at import
-# time, looked up by the factory classmethods.
 _TABULAR_REGISTRY: "dict[str, type[Tabular]]" = {}
-
-# Side-effect bootstrap flag — :meth:`Tabular.class_for_media_type`
-# flips this on the first registry miss to force every concrete leaf
-# package to load (primitive ParquetIO / CsvIO / … *and* nested ZipIO
-# / FolderIO / DeltaIO). Without the nested side-effect import a
-# holder stamped ``application/zip`` would fall through to a plain
-# :class:`IO` and raise ``NotImplementedError`` from
-# ``_read_arrow_batches`` — see ``test_nested_leaves_register_lazily``.
 _TABULAR_REGISTRY_BOOTSTRAPPED: bool = False
 
 
@@ -295,20 +280,7 @@ class Tabular(ABC, Generic[O]):
         """
         super().__init__()
         self.tabular_parent: "Tabular | None" = tabular_parent
-        # Per-instance schema cache. ``...`` means "not yet collected";
-        # populated lazily by :meth:`collect_schema`, updated by every
-        # writer path with the schema it just wrote, and dropped by
-        # :meth:`close` so the next reopen re-collects from the source.
-        # Named ``_schema_cache`` (not ``_schema``) so subclasses that
-        # already own a ``_schema`` attribute (YGGFolderIO's bound
-        # partition schema, ArrowTabular's stamped read schema)
-        # don't collide.
         self._schema_cache: "Schema | Any" = ...
-        # Constructor-seeded constants the implementer already knows
-        # — read by the default :meth:`_resolve_static_value` /
-        # :meth:`_known_static_keys` hooks. Subclasses with discovery
-        # logic (Parquet stats, sidecars, …) override the hooks
-        # without touching this slot.
         self._static_value_seed: "dict[str, Any]" = (
             dict(static_values) if static_values else {}
         )

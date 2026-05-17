@@ -2115,8 +2115,6 @@ class Table(DatabricksPath):
             else:
                 raise
 
-        self.invalidate_singleton(remove_global=True)
-
         # Apply remaining constraints (FK / CHECK) via the SDK post-create.
         # Inline PK was already emitted in DDL — skip it here.
         self._apply_post_create_constraints(schema_info)
@@ -2398,11 +2396,8 @@ class Table(DatabricksPath):
                 logger.debug(
                     "Table %r already exists — soft-resetting cache", self,
                 )
-                self.invalidate_singleton(remove_global=True)
                 return self
             raise
-
-        self.invalidate_singleton(remove_global=True)
 
         # The SDK endpoint doesn't accept a comment — set it via ALTER
         # TABLE so the behaviour matches sql_create (which embeds COMMENT
@@ -2569,8 +2564,6 @@ class Table(DatabricksPath):
                 self.sql.execute(statement, wait=wait_result)
             else:
                 raise
-
-        self.invalidate_singleton(remove_global=True)
 
         if tags:
             self.set_tags(tags)

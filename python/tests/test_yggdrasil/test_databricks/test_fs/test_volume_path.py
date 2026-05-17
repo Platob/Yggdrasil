@@ -903,7 +903,6 @@ class TestVolumeInfoNotFoundRecovery:
 
     def test_creates_volume_on_not_found_then_re_reads(self, workspace, client) -> None:
         # First ``volumes.read`` raises NotFound; the recovery path
-        # creates the volume (via ``_ensure_volume``) and retries.
         first_call = {"done": False}
 
         def read(full_name):
@@ -929,9 +928,6 @@ class TestVolumeInfoNotFoundRecovery:
         assert create_kwargs["name"] == "vol"
 
     def test_recovery_also_creates_missing_schema(self, workspace, client) -> None:
-        # Volume create itself fails with NotFound first (schema
-        # missing); ``_ensure_volume`` then walks up and creates the
-        # schema before retrying. The final ``volumes.read`` succeeds.
         read_outcomes = [NotFound("missing"), _volume_info(volume_id="vid")]
 
         def read(full_name):
@@ -957,9 +953,6 @@ class TestVolumeInfoNotFoundRecovery:
         p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
         info = p.volume_info()
         assert info.volume_id == "vid"
-        # Schema must have been created during recovery — the volume
-        # create's NotFound told ``_ensure_volume`` to walk one rung
-        # up the UC hierarchy before retrying.
         workspace.schemas.create.assert_called_once()
 
     def test_propagates_other_errors_unchanged(self, workspace, client) -> None:

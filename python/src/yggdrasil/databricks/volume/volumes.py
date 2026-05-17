@@ -211,15 +211,6 @@ class Volumes(DatabricksService):
         :meth:`Volume.create` so the managed-volume-type default and
         the post-create ``_store_infos`` cache warm-up live in one
         place.
-
-        When the first ``volumes.create`` returns ``NotFound`` because
-        the parent schema (or catalog) is missing, the call falls
-        through to :meth:`Volume._ensure_schema_and_catalog` for a
-        bottom-up create and then retries the volume create with the
-        caller's *comment* / *storage_location* / *volume_type* args
-        intact. Callers reaching for "create a volume" from outside
-        the resource (recovery paths, scripts, tests) should prefer
-        this over a raw ``ws.volumes.create(...)`` call.
         """
         volume = self.volume(
             location=location,
@@ -237,11 +228,6 @@ class Volumes(DatabricksService):
         except Exception as exc:
             if not _looks_like_not_found(exc):
                 raise
-        # Parent missing — bottom-up create of schema (and catalog if
-        # needed), then retry the volume create. ``if_not_exists=True``
-        # on the retry absorbs the AlreadyExists race when another
-        # caller created the volume concurrently.
-        volume._ensure_schema_and_catalog()
         return volume.create(**create_kwargs, if_not_exists=True)
 
     # ── remote fetch ──────────────────────────────────────────────────────────

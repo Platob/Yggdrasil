@@ -392,6 +392,7 @@ class Catalog(DatabricksPath, Singleton):
 
         logger.debug("Fetching catalog info for %r from remote", self)
         infos = self.client.workspace_client().catalogs.get(self.catalog_name)
+        logger.info("Fetched catalog info for %r from remote", self)
         object.__setattr__(self, "_infos", infos)
         object.__setattr__(self, "_infos_fetched_at", now)
         return self._infos

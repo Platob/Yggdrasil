@@ -173,7 +173,7 @@ class TestVolumeIntegration(_SchemaFixture):
                 catalog_name=cls.catalog_name,
                 schema_name=cls.schema_name,
             ).volume(volume_name=cls.volume_name)
-            cls.volume._ensure_volume()
+            cls.volume.create()
         except (DatabricksError, PermissionDenied) as exc:
             raise unittest.SkipTest(
                 f"Cannot create volume "
@@ -227,7 +227,6 @@ class TestVolumePathDispatchIntegration(_SchemaFixture):
                 catalog_name=cls.catalog_name,
                 schema_name=cls.schema_name,
             ).volume(volume_name=cls.volume_name)
-            cls.volume._ensure_volume()
         except (DatabricksError, PermissionDenied) as exc:
             raise unittest.SkipTest(
                 f"Cannot create volume for VolumePath dispatch test: {exc}."

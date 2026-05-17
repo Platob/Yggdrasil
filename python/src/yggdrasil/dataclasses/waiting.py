@@ -222,7 +222,6 @@ class WaitingConfig:
         - if start is provided and timeout > 0:
             * raise TimeoutError if already out of time
             * cap sleep so we don't oversleep past timeout
-            * alternate fast/slow windows every 5s of elapsed time
         """
         if iteration < 0:
             raise ValueError(f"iteration must be >= 0, got {iteration}")
@@ -289,10 +288,3 @@ _FALSE_WAITING_CONFIG = WaitingConfig(
     retries=8,
 )
 
-
-# Threshold past which :meth:`WaitingConfig.sleep` switches from the
-# fast (per-iteration computed) cadence to a slow polling cadence —
-# saves cycles for long-running waits where sub-second poll resolution
-# stops being useful.
-_FAST_WINDOW_SECONDS = 5.0
-_SLOW_WINDOW_INTERVAL = 5.0

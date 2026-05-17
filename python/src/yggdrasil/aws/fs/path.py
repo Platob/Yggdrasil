@@ -584,7 +584,7 @@ class S3Path(RemotePath):
             mtime = _mtime_from_response(response)
             media_type = _media_type_from_response(response)
             if self._stat_cached is None:
-                self._seed_stat_cache(IOStats(
+                self._persist_stat_cache(IOStats(
                     size=total,
                     kind=IOKind.FILE,
                     mtime=mtime,
@@ -598,7 +598,7 @@ class S3Path(RemotePath):
                     self._stat_cached.media_type = media_type
                 # Reset the TTL window so the fresh data we just folded
                 # in lives a full ``stat_cache_ttl`` before re-probing.
-                self._seed_stat_cache(self._stat_cached)
+                self._persist_stat_cache(self._stat_cached)
 
         return memoryview(data or b"")
 
@@ -634,7 +634,7 @@ class S3Path(RemotePath):
             self.client.put_object,
             Bucket=self.bucket, Key=self.key, Body=payload,
         )
-        self._seed_stat_cache(IOStats(
+        self._persist_stat_cache(IOStats(
             size=len(payload),
             kind=IOKind.FILE,
             mtime=time.time(),
@@ -675,7 +675,7 @@ class S3Path(RemotePath):
             self.client.put_object,
             Bucket=self.bucket, Key=self.key, Body=payload,
         )
-        self._seed_stat_cache(IOStats(
+        self._persist_stat_cache(IOStats(
             size=len(payload),
             kind=IOKind.FILE,
             mtime=time.time(),
@@ -727,7 +727,7 @@ class S3Path(RemotePath):
             self.client.put_object(
                 Bucket=self.bucket, Key=self.key, Body=payload,
             )
-            self._seed_stat_cache(IOStats(
+            self._persist_stat_cache(IOStats(
                 size=len(payload),
                 kind=IOKind.FILE,
                 mtime=time.time(),

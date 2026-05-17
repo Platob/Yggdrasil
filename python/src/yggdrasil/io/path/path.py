@@ -78,31 +78,11 @@ class Path(Holder, os.PathLike, ABC):
 
     scheme: ClassVar[str] = ""
 
-    #: TTL on the ``_stat_cached`` slot. ``None`` keeps a seeded
-    #: :class:`IOStats` live for the lifetime of the holder; a
-    #: positive number of seconds bounds the freshness window
-    #: against external mutations. Subclasses with a backing the
-    #: process doesn't own (RemotePath, S3Path, HTTPPath) override
-    #: with a window. :class:`LocalPath` keeps the default since
-    #: :func:`os.stat` is cheap and the seeded slot is only meant to
-    #: ferry listing-side information forward.
-    stat_cache_ttl: ClassVar["float | None"] = None
-
-    # Stat caches are per-process — they don't survive pickling /
-    # cross-host transport. Concrete subclasses extend this set with
-    # their own non-picklable handles (live SDK clients, sockets, …).
-    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
-        "_stat_cached", "_stat_cached_at",
-    })
+    STAT_CACHE_TTL: ClassVar["float | None"] = None
+    TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset()
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        # ``IOStats | None`` cached on the instance — populated by
-        # :meth:`_seed_stat_cache` (from a listing entry that already
-        # carries kind / size / mtime) or by a successful probe in
-        # subclasses that wrap :meth:`_stat` with caching. Cleared
-        # by :meth:`invalidate_singleton` after mutating ops so
-        # follow-up reads see fresh metadata.
         self._stat_cached: IOStats | None = None
         self._stat_cached_at: float = 0.0
 
@@ -144,9 +124,14 @@ class Path(Holder, os.PathLike, ABC):
             return LocalPath(url=url, **kwargs)
         return cls(url=url, **kwargs)
 
-    def _from_url(self, url: URL) -> "Path":
+    def _from_url(
+        self,
+        url: URL,
+        singleton_ttl: Any = ...,
+        **kwargs
+    ) -> "Path":
         """Build a sibling :class:`Path` of the same concrete type."""
-        return type(self)(url=url)
+        return type(self)(url=url, singleton_ttl=singleton_ttl, **kwargs)
 
     # ==================================================================
     # Backing-shape predicates
@@ -254,7 +239,7 @@ class Path(Holder, os.PathLike, ABC):
         cached = self._stat_cached
         if cached is None:
             return None
-        ttl = self.stat_cache_ttl
+        ttl = self.STAT_CACHE_TTL
         if ttl is None:
             return cached
         if ttl <= 0:
@@ -331,7 +316,7 @@ class Path(Holder, os.PathLike, ABC):
         s = self._stat()
         return float(s.mtime or 0.0) if s.kind != IOKind.MISSING else 0.0
 
-    def _seed_stat_cache(self, stats: IOStats) -> None:
+    def _persist_stat_cache(self, stats: IOStats) -> None:
         """Pre-populate :attr:`_stat_cached` with a known :class:`IOStats`.
 
         Useful for backends that learn metadata as a side-effect of a
@@ -746,8 +731,8 @@ class Path(Holder, os.PathLike, ABC):
         return self._from_url(self.url.parent)
 
     @property
-    def parents(self) -> Tuple["Path", ...]:
-        return tuple(self._from_url(u) for u in self.url.parents)
+    def parents(self) -> Iterator["Path"]:
+        return (self._from_url(u) for u in self.url.parents)
 
     @property
     def is_absolute(self) -> bool:

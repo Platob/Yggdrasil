@@ -49,7 +49,6 @@ class TestVolumePathIntegration(DatabricksIntegrationCase):
             f"{cls.base_root}/run-{secrets.token_hex(4)}",
             client=cls.client,
         )
-        cls.root.mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -105,18 +104,15 @@ class TestVolumePathIntegration(DatabricksIntegrationCase):
         directory and then the directory itself. Mirrors what the
         teardown path needs to do."""
         sub = self.root / "rm-with-contents"
-        (sub / "a.bin").parent.mkdir(parents=True, exist_ok=True)
         (sub / "a.bin").write_bytes(b"a")
         (sub / "b.bin").write_bytes(b"b")
-        (sub / "nested" / "c.bin").parent.mkdir(parents=True, exist_ok=True)
         (sub / "nested" / "c.bin").write_bytes(b"c")
 
         sub.remove(recursive=True, missing_ok=False)
-        sub.invalidate_singleton()
 
-        self.assertIs(sub._stat_uncached().kind, IOKind.MISSING)
+        self.assertIs(sub.stat().kind, IOKind.MISSING)
         # Parent still resolves; only the targeted sub-tree is gone.
-        self.assertIs(self.root._stat_uncached().kind, IOKind.DIRECTORY)
+        self.assertIs(self.root.stat().kind, IOKind.DIRECTORY)
 
     def test_remove_root_recursive_then_recreate(self) -> None:
         """``remove(recursive=True)`` on the run-scoped root drops the
@@ -130,20 +126,18 @@ class TestVolumePathIntegration(DatabricksIntegrationCase):
         (self.root / "dir" / "deep.bin").write_bytes(b"deep")
 
         self.root.remove(recursive=True, missing_ok=False)
-        self.root.invalidate_singleton()
-        self.assertIs(self.root._stat_uncached().kind, IOKind.MISSING)
+        self.assertIs(self.root.stat().kind, IOKind.MISSING)
 
         # Rebuild for any subsequent tests in this class.
         self.root.mkdir(parents=True, exist_ok=True)
-        self.assertIs(self.root._stat_uncached().kind, IOKind.DIRECTORY)
+        self.assertIs(self.root.stat().kind, IOKind.DIRECTORY)
 
     def test_remove_missing_ok_on_empty_dir(self) -> None:
         """``remove(missing_ok=True)`` against a never-created path
         succeeds quietly — the no-op branch the teardown relies on."""
         ghost = self.root / "never-created"
         ghost.remove(recursive=True, missing_ok=True)
-        ghost.invalidate_singleton()
-        self.assertIs(ghost._stat_uncached().kind, IOKind.MISSING)
+        self.assertIs(ghost.stat().kind, IOKind.MISSING)
 
     def test_table_insert_volume_path_round_trip(self) -> None:
         """:meth:`Table.insert_volume_path` is the SQL-engine staging

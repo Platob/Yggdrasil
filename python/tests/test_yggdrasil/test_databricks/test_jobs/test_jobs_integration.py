@@ -8,7 +8,7 @@ Exercises against a real workspace:
 - :meth:`Jobs.get_or_create` — first call creates, second call returns
   the same handle without pushing settings back.
 - :meth:`JobTask.from_callable` — stages the function's raw source as
-  a ``.py`` script under ``/Workspace/Users/me/.yggdrasil/jobs/``;
+  a ``.py`` script under ``/Workspace/Users/<me>/.ygg/jobs/``;
   verifies the file actually lands and the script content compiles +
   calls the function.
 - :meth:`JobTask.create` — re-staging the same ``task_key``

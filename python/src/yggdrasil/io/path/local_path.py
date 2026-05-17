@@ -529,7 +529,7 @@ class LocalPath(Path):
             try:
                 is_dir = entry.is_dir(follow_symlinks=False)
                 st = entry.stat(follow_symlinks=False)
-                child._seed_stat_cache(IOStats(
+                child._persist_stat_cache(IOStats(
                     size=int(st.st_size),
                     mtime=float(st.st_mtime),
                     mode=int(st.st_mode),

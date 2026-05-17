@@ -64,7 +64,7 @@ class RemotePath(Path):
     # (live forever) since LocalPath / Memory don't need a TTL;
     # remote backends pay 5-minute round trips and want a window
     # that beats credential / consistency drift.
-    stat_cache_ttl: ClassVar["float | None"] = _STAT_CACHE_TTL
+    STAT_CACHE_TTL: ClassVar["float | None"] = _STAT_CACHE_TTL
 
     # Activate the :class:`Singleton` cache for every concrete remote
     # backend: 5-minute default TTL, bounded at 10 000 entries as
@@ -125,7 +125,7 @@ class RemotePath(Path):
         if cached is not None:
             return cached
         result = self._stat_uncached()
-        self._seed_stat_cache(result)
+        self._persist_stat_cache(result)
         return result
 
     @abstractmethod
@@ -155,45 +155,3 @@ class RemotePath(Path):
         if n < 0:
             raise ValueError(f"resize size must be >= 0, got {n!r}")
         return n
-
-    # ------------------------------------------------------------------
-    # Ancestor existence — propagate from a known-existing child
-    # ------------------------------------------------------------------
-
-    @property
-    def parent(self) -> "Path":
-        p = super().parent
-        self._propagate_existence_to_ancestor(p)
-        return p
-
-    @property
-    def parents(self) -> "Tuple[Path, ...]":
-        ps = super().parents
-        for ancestor in ps:
-            self._propagate_existence_to_ancestor(ancestor)
-        return ps
-
-    def _propagate_existence_to_ancestor(self, ancestor: "Path") -> None:
-        """Seed *ancestor*'s stat cache as a DIRECTORY when ``self`` exists.
-
-        If this path's stat cache reports a present object (file or
-        directory), every ancestor on the URL must be a directory:
-        the backend can't host the child otherwise. Seeding the
-        ancestor lets a follow-up ``parent.exists()`` /
-        ``parent.is_dir()`` collapse into a local hit — no
-        ``head_object`` / ``get_status`` / ``get_metadata`` round
-        trip just to confirm the obvious.
-
-        Only fires when *ancestor* is itself a :class:`RemotePath` and
-        has no fresh cached entry of its own (we never overwrite a
-        backend-confirmed stat with the inferred one).
-        """
-        if not isinstance(ancestor, RemotePath):
-            return
-        cached = self._stat_cached
-        if cached is None or cached.kind == IOKind.MISSING:
-            return
-        existing = ancestor._stat_cached
-        if existing is not None and existing.kind != IOKind.MISSING:
-            return
-        ancestor._seed_stat_cache(IOStats(kind=IOKind.DIRECTORY))

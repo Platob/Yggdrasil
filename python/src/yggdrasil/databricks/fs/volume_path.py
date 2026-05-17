@@ -42,7 +42,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional
 
-from databricks.sdk.errors import PermissionDenied
+from databricks.sdk.errors import PermissionDenied, NotFound
 
 from yggdrasil.concurrent import Job
 from yggdrasil.data.cast import any_to_datetime, parse_http_date
@@ -51,8 +51,8 @@ from yggdrasil.data.enums.media_type import MediaType
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
-from ..path import DatabricksPath
 from ..client import DatabricksClient
+from ..path import DatabricksPath
 
 if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
@@ -70,6 +70,9 @@ __all__ = ["VolumePath", "VolumeCredentialsRefresher"]
 
 
 logger = logging.getLogger(__name__)
+_VOLUME_DOTTED_NAME_RE = re.compile(
+    r"Volume\s+'(?P<catalog>[\w-]+)\.(?P<schema>[\w-]+)\.(?P<volume>[\w-]+)'"
+)
 
 
 class VolumePath(DatabricksPath):
@@ -84,7 +87,7 @@ class VolumePath(DatabricksPath):
     """
 
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_VOLUME
-    namespace_prefix: ClassVar[str] = "/Volumes/"
+    NAMESPACE_PREFIX: ClassVar[str] = "/Volumes/"
 
     # ``_SERVICE_CLASS`` is bound below the class body to avoid the
     # ``volume.volumes`` → ``volume.volume`` → ``fs.volume_path``
@@ -114,7 +117,8 @@ class VolumePath(DatabricksPath):
             service = volume.service
 
         super().__init__(
-            data=data, service=service, client=client, url=url, **kwargs,
+            data=data, service=service, client=client, url=url,
+            **kwargs,
         )
 
     @property
@@ -242,6 +246,7 @@ class VolumePath(DatabricksPath):
         """
         if self._volume is not None:
             return self._volume
+
         triple = self._split_volume()
         if triple is None:
             raise ValueError(
@@ -249,18 +254,10 @@ class VolumePath(DatabricksPath):
                 f"/Volumes/<cat>/<sch>/<vol>/... — got {self.full_path()!r}."
             )
         catalog, schema, volume_name = triple
-        # Construct the Volume singleton directly rather than routing
-        # through ``client.volumes.volume(...)`` — VolumePath callers
-        # frequently pass a mocked or partially-configured client, and
-        # the SDK round trips that matter (``volumes.read`` /
-        # ``volumes.create``) hit ``client.workspace_client()`` either
-        # way. The singleton dance in :class:`Volume.__new__` still
-        # collapses to the same instance across every path on this UC
-        # volume.
         from yggdrasil.databricks.volume.volume import Volume
-        from yggdrasil.databricks.volume.volumes import Volumes
+
         self._volume = Volume(
-            service=Volumes(client=self.client),
+            service=self.client.volumes,
             catalog_name=catalog,
             schema_name=schema,
             volume_name=volume_name,
@@ -415,7 +412,7 @@ class VolumePath(DatabricksPath):
             # API with N extra ``get_metadata`` round trips. (0.6.21
             # already did this; the rewrite dropped it.)
             is_directory = bool(getattr(info, "is_directory", False))
-            child._seed_stat_cache(IOStats(
+            child._persist_stat_cache(IOStats(
                 kind=IOKind.DIRECTORY if is_directory else IOKind.FILE,
                 size=0 if is_directory else int(
                     getattr(info, "file_size", 0) or 0,
@@ -426,80 +423,19 @@ class VolumePath(DatabricksPath):
             if recursive and is_directory:
                 yield from child._ls(recursive=True, singleton_ttl=singleton_ttl)
 
-    # ==================================================================
-    # Parent / volume auto-creation
-    # ==================================================================
-
-    def _ensure_parents(self, exc: BaseException | None = None) -> bool:
-        """Recovery hook for ``_call_ensuring_parents`` after NotFound.
-
-        Cheap-path first: if *self* lives strictly below the volume
-        root, try a single ``files.create_directory`` on the parent
-        — that's the common case where only a sub-directory was
-        missing. Only if that call also fails NotFound (which
-        indicates the volume itself doesn't exist) do we fall back
-        to :meth:`_ensure_volume` and a parent ``mkdir`` retry. No
-        upfront ``catalogs.get`` / ``schemas.get`` / ``volumes.read``
-        probes — blind creates swallow ``AlreadyExists`` so the
-        idempotent path costs at most three SDK calls.
-
-        When the triggering *exc* already named the Unity Catalog
-        volume as the missing resource (e.g. Databricks surfaces
-        ``NotFound: Volume 'cat.sch.vol' does not exist``), the
-        cheap probe is skipped entirely — it would just NotFound
-        again — and ``_ensure_volume`` runs first, shaving one SDK
-        round trip off the recovery.
-        """
-        triple = self._split_volume()
-        if triple is None:
-            return False
-
-        parent = self.parent
-        pparts = [p for p in (parent.url.path or "/").lstrip("/").split("/") if p]
-        has_subdir = len(pparts) > 3  # parent strictly below ``/cat/sch/vol``
-        volume_missing = exc is not None and _looks_like_volume_not_found(exc)
-
-        if has_subdir and not volume_missing:
-            try:
-                self._call(
-                    self.client.workspace_client().files.create_directory, parent.api_path,
+    def _call_ensuring_parents(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return self._call(func, *args, **kwargs)
+        except NotFound as exc:
+            message = exc.args[0]
+            m = _VOLUME_DOTTED_NAME_RE.search(message)
+            if m is not None:
+                c, s, n = m["catalog"], m["schema"], m["volume"]
+                self.client.volumes.create(
+                    catalog_name=c,
+                    schema_name=s,
+                    volume_name=n,
                 )
-                return True
-            except Exception as inner:
-                if _looks_like_already_exists(inner):
-                    return True
-                if not _looks_like_not_found(inner):
-                    raise
-                # Parent missing because volume itself is missing —
-                # fall through to volume creation.
-
-        self._ensure_volume()
-
-        if has_subdir:
-            try:
-                self._call(
-                    self.client.workspace_client().files.create_directory, parent.api_path,
-                )
-            except Exception as inner:
-                if not _looks_like_already_exists(inner):
-                    raise
-        return True
-
-    def _ensure_volume(self) -> bool:
-        """Bottom-up create of the missing pieces of catalog / schema / volume.
-
-        Delegates to :meth:`Volume._ensure_volume` — the actual
-        recovery logic lives on the singleton resource so both
-        ``VolumePath`` writes and direct ``Volume.read_info`` calls
-        share one implementation.
-
-        Returns ``False`` if the URL path doesn't address a volume
-        (recovery isn't applicable); otherwise returns whatever the
-        underlying :meth:`Volume._ensure_volume` returns.
-        """
-        if self._split_volume() is None:
-            return False
-        return self.volume._ensure_volume()
 
     # ==================================================================
     # Mutators
@@ -511,14 +447,14 @@ class VolumePath(DatabricksPath):
             self._call_ensuring_parents(
                 self.client.workspace_client().files.create_directory, self.api_path,
             )
+            logger.info(
+                "Created volume directory %r (parents=%s)",
+                self, parents,
+            )
         except Exception as exc:
             if not exist_ok and _looks_like_already_exists(exc):
                 raise
-        self._seed_stat_cache(IOStats(kind=IOKind.DIRECTORY))
-        logger.info(
-            "Created volume directory %r (parents=%s)",
-            self, parents,
-        )
+        self._persist_stat_cache(IOStats(kind=IOKind.DIRECTORY))
 
     def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
         del wait
@@ -634,7 +570,7 @@ class VolumePath(DatabricksPath):
             mtime = None
         mtime = mtime.timestamp() if mtime else time.time()
         if not self._stat_cached:
-            self._seed_stat_cache(stats=IOStats(
+            self._persist_stat_cache(stats=IOStats(
                 size=len(data),
                 kind=IOKind.FILE,
                 mtime=mtime,
@@ -648,7 +584,7 @@ class VolumePath(DatabricksPath):
             # Re-stamp the TTL — this download IS the freshest size we
             # could observe; the entry should outlive the original
             # probe's window from this point on.
-            self._seed_stat_cache(self._stat_cached)
+            self._persist_stat_cache(self._stat_cached)
 
         if pos:
             data = data[pos:]
@@ -720,9 +656,17 @@ class VolumePath(DatabricksPath):
 
         if hasattr(content, "seek"):
             stream = content
+            try:
+                pos = content.tell()
+                if size == -1:
+                    content.seek(0, io.SEEK_END)
+                    size = content.tell()
+                    content.seek(pos, io.SEEK_SET)
+            except:
+                pos = 0
 
             def _do_upload() -> None:
-                stream.seek(0)
+                stream.seek(pos)
                 upload(file_path=api_path, contents=stream, overwrite=True)
         else:
             # ``FilesExt.upload`` calls ``contents.seekable()`` — wrap
@@ -739,7 +683,7 @@ class VolumePath(DatabricksPath):
 
         self._call_ensuring_parents(_do_upload)
         if size >= 0:
-            self._seed_stat_cache(IOStats(
+            self._persist_stat_cache(IOStats(
                 size=size,
                 kind=IOKind.FILE,
                 mtime=time.time(),

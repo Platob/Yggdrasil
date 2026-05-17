@@ -3,7 +3,6 @@
 The fast path here is "two callers asking for the same UC volume
 collapse to one singleton with one cached VolumeInfo". The
 secondary path is the 5-minute TTL refresh and the cascade
-helpers (``_ensure_volume``).
 """
 from __future__ import annotations
 

@@ -79,7 +79,6 @@ import tempfile
 import time
 from collections.abc import Iterable
 from typing import (
-    TYPE_CHECKING,
     Any,
     Generic,
     Iterator,
@@ -93,11 +92,8 @@ import pyarrow as pa
 from yggdrasil.data.enums.mode import Mode, ModeLike
 from yggdrasil.data.options import CastOptions
 from yggdrasil.disposable import Disposable
+from yggdrasil.io.holder import Holder
 from yggdrasil.io.tabular import Tabular
-
-if TYPE_CHECKING:
-    from yggdrasil.io.holder import Holder
-
 
 __all__ = ["IO", "BytesLike", "T", "O"]
 
@@ -361,9 +357,8 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         instance._holder = holder
         instance._owns_holder = bool(owns_holder)
         if holder is None:
-            from yggdrasil.io.holder import Holder as _Holder
             try:
-                instance._holder = _Holder(
+                instance._holder = Holder(
                     data=data, path=path, binary=binary, url=url,
                 )
                 instance._owns_holder = True
@@ -589,6 +584,10 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
     def holder(self) -> "Holder":
         """The bound :class:`Holder`."""
         return self._holder
+
+    @property
+    def url(self):
+        return self.holder.url
 
     @property
     def owns_holder(self) -> bool:
@@ -1326,16 +1325,16 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         ``Path.from_(src)``. Returns *self* so cursor-chained
         writes work (``io.upload(src).write(b)``).
         """
-        from yggdrasil.io.holder import (
-            _coerce_transfer_endpoint,
-            _read_slice_from_source,
-        )
+        if offset is None:
+            offset = self.tell()
+        else:
+            offset = self.tell() + offset
 
-        source = _coerce_transfer_endpoint(src)
-        self.write_bytes(
-            _read_slice_from_source(source, size=size, offset=offset),
+        return self.holder.upload(
+            src=src,
+            size=size,
+            offset=offset
         )
-        return self
 
     def download(
         self, to: Any = None, *, size: int = -1, offset: int = 0,
@@ -1357,38 +1356,17 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         ``str`` / :class:`os.PathLike`). Returns the resolved
         target.
         """
-        from yggdrasil.io.holder import (
-            _coerce_transfer_endpoint,
-            _default_download_target,
-            _join_dir_hint,
-            _read_slice_from_source,
+        if offset is None:
+            offset = self.tell()
+        else:
+            offset = self.tell() + offset
+
+        return self.holder.download(
+            to=to,
+            size=size,
+            offset=offset
         )
 
-        # ``offset`` on self is cursor-relative — the helper does the
-        # absolute seek + read pair, advancing the cursor past the
-        # bytes it consumed.
-        payload = _read_slice_from_source(
-            self, size=size, offset=self._pos + offset,
-        )
-
-        if to is None:
-            to = _default_download_target(self._transfer_filename())
-        target = _join_dir_hint(_coerce_transfer_endpoint(to), self)
-        target.write_bytes(payload)
-        return target
-
-    def _transfer_filename(self) -> str:
-        """Filename used when joining onto a directory-shaped target.
-
-        Delegates to the bound :class:`Holder` so an IO over a
-        :class:`LocalPath` carries the path's basename through
-        ``cp``-style directory targets. IO cursors over
-        :class:`Memory` fall back to ``"download"`` like the
-        holder side.
-        """
-        if self._holder is None:
-            return "download"
-        return self._holder._transfer_filename()
 
     def writelines(self, lines: Any) -> None:
         for line in lines:

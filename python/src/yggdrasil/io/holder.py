@@ -40,19 +40,20 @@ import pathlib
 import struct
 import time
 from abc import abstractmethod
-from typing import TYPE_CHECKING, Union, Any, ClassVar, IO, Iterable, Iterator
+from typing import TYPE_CHECKING, Union, Any, IO, Iterable, Iterator
 
 import pyarrow as pa
 
+from yggdrasil.data.enums import MediaType
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.tabular.base import O, Tabular
-
-from .io_stats import IOStats, IOKind
+from .io_stats import IOStats
 from .url import URL, URLBased
+from ..data import ModeLike
 
 if TYPE_CHECKING:
-    from yggdrasil.io.bytes_io import BytesIO
+    pass
 
 __all__ = ["Holder"]
 
@@ -288,6 +289,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         binary: bytes | bytearray | memoryview | None = None,
         path: PathLike | None = None,
         temporary: bool = False,
+        singleton_ttl: Any = ...,
         **kwargs,
     ):
         """Initialize the holder.
@@ -304,7 +306,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         media_type) when they already know it — saves a backend probe
         on the first :meth:`stat` call.
         """
-        super().__init__(**kwargs)
+        super().__init__(singleton_ttl=singleton_ttl, **kwargs)
 
         self._url: URL | None = None
         if url is not None:
@@ -324,20 +326,9 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         if stat is not None and stat.media_type is not None:
             self._media_type = stat.media_type
         else:
-            # Defer the ``url.infer_media_type`` resolve to the first
-            # :attr:`media_type` read. Sibling-construction shapes
-            # (Path.parent / Path.joinpath / Path.parents) build a
-            # fresh holder per step and don't observe ``media_type``
-            # in between — paying for the mime walk on every step was
-            # the dominant cost of path traversal. ``...`` is the
-            # project-wide "not yet computed" sentinel.
             self._media_type = ...
         self.temporary: bool = bool(temporary)
 
-        # ``url=`` only fixes identity; payload-bearing seeds
-        # (binary / path / data) are still routed below. Skip ``data``
-        # if it duplicates an explicit binary/path seed — caller already
-        # picked their lane.
         for prio in (binary, path, data):
             if prio is not None:
                 self._init_from(prio)
@@ -1569,15 +1560,11 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         reads to EOF, ``size>=0`` caps the byte count, ``offset``
         is the starting offset. Returns the resolved target.
         """
-        from yggdrasil.io.path.path import Path
-
         if to is None:
-            to = _default_download_target(self._transfer_filename())
+            to = _default_download_target(self.url.name)
         target = _join_dir_hint(_coerce_transfer_endpoint(to), self)
+
         if isinstance(self, Path) and self.is_dir():
-            # Symmetric with :meth:`upload` — delegate to the
-            # destination-side recurse: ``target.upload(self)``
-            # knows how to ``mkdir`` and walk *self*'s children.
             if size != -1 or offset != 0:
                 raise IsADirectoryError(
                     f"Holder.download: source {self.full_path()!r} is "
@@ -1603,20 +1590,6 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
                 overwrite=True,
             )
         return target
-
-
-    def _transfer_filename(self) -> str:
-        """Filename used when joining onto a directory-shaped target.
-
-        :class:`Memory` holders address themselves with auto-minted
-        ``mem://<host>/<hex_addr>`` URLs whose ``name`` is the
-        object address — useless as a download filename. Fall back
-        to ``"download"`` for memory-backed holders and any holder
-        whose URL has no nameable segment.
-        """
-        if self.is_memory:
-            return "download"
-        return self.url.name or "download"
 
     def _transfer_to(self, target: "Holder | IO") -> None:
         """Default transfer: pull self's bytes, push into *target*.
@@ -1766,36 +1739,6 @@ def _read_slice_from_source(
             source.seek(offset)
         return source.read() if size < 0 else source.read(size)
     return source.read_bytes(size=size, offset=offset)
-
-
-def _join_dir_hint(
-    dst: "Holder | IO", src: "Holder | IO",
-) -> "Holder | IO":
-    """Apply ``cp``-style directory hint when *dst* is a slash-terminated Path.
-
-    ``dst_dir_slash.upload(src)`` lands at ``dst_dir/<src.name>``;
-    a non-Path *dst* (Memory, IO cursor) or a non-directory path
-    is returned untouched. The source's filename is taken from
-    :meth:`Holder._transfer_filename` so :class:`Memory` /
-    nameless holders fall back to ``"download"``.
-    """
-    from yggdrasil.io.path.path import Path
-
-    if isinstance(dst, Path) and _looks_like_directory(dst.url):
-        return dst / src._transfer_filename()  # type: ignore[union-attr]
-    return dst
-
-
-def _looks_like_directory(url: URL) -> bool:
-    """Trailing-slash check: ``True`` iff *url*'s path ends in ``/``.
-
-    Used by the upload/download directory-hint helpers to apply
-    ``cp``-style "into this directory" semantics without a remote
-    stat round trip. The canonical signal is an empty trailing
-    element in :attr:`URL.parts`.
-    """
-    parts = url.parts
-    return bool(parts) and parts[-1] == ""
 
 
 def _default_download_target(name: str) -> "Holder":

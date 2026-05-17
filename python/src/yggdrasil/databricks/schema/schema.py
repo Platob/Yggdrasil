@@ -459,6 +459,7 @@ class Schema(DatabricksPath, Singleton):
 
         logger.debug("Fetching schema info for %r from remote", self)
         infos = self.client.workspace_client().schemas.get(full_name=self.full_name())
+        logger.info("Fetched schema info for %r from remote", self)
         object.__setattr__(self, "_infos", infos)
         object.__setattr__(self, "_infos_fetched_at", now)
         return self._infos

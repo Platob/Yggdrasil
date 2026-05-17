@@ -1223,7 +1223,7 @@ Concrete rules, in order of priority:
 
    def __getstate__(self):
        return {k: v for k, v in self.__dict__.items()
-               if k not in self._TRANSIENT_STATE_ATTRS}
+               if k not in self.TRANSIENT_STATE_ATTRS}
 
    def __setstate__(self, state):
        if getattr(self, "_initialized", False):
