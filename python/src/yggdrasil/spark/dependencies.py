@@ -1,4 +1,4 @@
-"""Function-dependency scanning for :class:`DynamicFrame`.
+"""Function-dependency scanning for :class:`Dataset`.
 
 Lives in its own module — without a top-level ``pyspark`` import —
 so the scan logic stays testable in lean environments (Spark

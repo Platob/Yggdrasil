@@ -1,10 +1,10 @@
-"""Tests for the :class:`DynamicFrame` function-dependency scan.
+"""Tests for the :class:`Dataset` function-dependency scan.
 
 The scan helper :func:`function_top_modules` lives in
 :mod:`yggdrasil.spark.dependencies` — a pyspark-free module — so
 the bulk of the test surface runs even when pyspark isn't
 installed. The integration tests that exercise the full
-``DynamicFrame._ensure_installed`` flow skip when pyspark is
+``Dataset._ensure_installed`` flow skip when pyspark is
 unavailable.
 """
 from __future__ import annotations
@@ -88,7 +88,7 @@ class TestFunctionTopModules:
 
 
 # ---------------------------------------------------------------------------
-# DynamicFrame integration — only runs when pyspark is available
+# Dataset integration — only runs when pyspark is available
 # ---------------------------------------------------------------------------
 
 
@@ -101,17 +101,17 @@ pyspark_required = pytest.mark.skipif(
 class TestInstalledModulesSeed:
 
     def test_constructor_accepts_seed(self) -> None:
-        from yggdrasil.spark.frame import DynamicFrame
+        from yggdrasil.spark.frame import Dataset
 
         df = MagicMock()
-        frame = DynamicFrame(df, installed_modules={"ygg", "polars"})
+        frame = Dataset(df, installed_modules={"ygg", "polars"})
         assert frame.installed_modules == {"ygg", "polars"}
 
     def test_default_is_empty_set(self) -> None:
-        from yggdrasil.spark.frame import DynamicFrame
+        from yggdrasil.spark.frame import Dataset
 
         df = MagicMock()
-        frame = DynamicFrame(df)
+        frame = Dataset(df)
         assert frame.installed_modules == set()
         assert isinstance(frame.installed_modules, set)
 
@@ -121,8 +121,8 @@ class TestEnsureInstalled:
 
     @pytest.fixture
     def fake_frame(self, monkeypatch):
-        """``DynamicFrame`` bound to a mocked Spark session."""
-        from yggdrasil.spark.frame import DynamicFrame
+        """``Dataset`` bound to a mocked Spark session."""
+        from yggdrasil.spark.frame import Dataset
 
         session = MagicMock(name="SparkSession")
         # ``MagicMock`` auto-creates non-None attributes for every probed
@@ -149,7 +149,7 @@ class TestEnsureInstalled:
             return pathlib.Path(f"/fake/{root.name}.zip")
 
         monkeypatch.setattr(_module_pack, "build_module_archive", fake_build_archive)
-        return DynamicFrame(df), session
+        return Dataset(df), session
 
     def test_no_modules_in_function_still_ships_yggdrasil(self, fake_frame) -> None:
         """Even a closure with no third-party deps must ship ygg to executors.

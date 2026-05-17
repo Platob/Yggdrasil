@@ -28,7 +28,7 @@ from yggdrasil.spark.dependencies import (
 )
 
 __all__ = [
-    "DynamicFrame",
+    "Dataset",
     "is_dynamic_schema",
 ]
 
@@ -283,10 +283,10 @@ def _install_modules_on_executors(
 
 
 # ---------------------------------------------------------------------------
-# DynamicFrame
+# Dataset
 # ---------------------------------------------------------------------------
 
-class DynamicFrame:
+class Dataset:
     """Spark DataFrame wrapper with an optional yggdrasil Schema.
 
     Two modes:
@@ -302,7 +302,7 @@ class DynamicFrame:
 
     Any attribute not defined here is proxied to the underlying ``DataFrame``
     via ``__getattr__``; ``DataFrame`` results are re-wrapped as
-    ``DynamicFrame`` carrying the lifted Arrow schema.
+    ``Dataset`` carrying the lifted Arrow schema.
     """
 
     __slots__ = ('df', 'schema', 'installed_modules')
@@ -324,7 +324,7 @@ class DynamicFrame:
         # ``df.apply(f).map(g).filter(h)`` only round-trips each
         # module once per frame lineage. Tests and call sites that
         # know exactly which modules to ship can seed this directly
-        # (``DynamicFrame(df, installed_modules={"ygg", "polars"})``)
+        # (``Dataset(df, installed_modules={"ygg", "polars"})``)
         # to bypass the scan.
         self.installed_modules: set[str] = (
             set(installed_modules) if installed_modules else set()
@@ -384,12 +384,12 @@ class DynamicFrame:
         *,
         spark_session: SparkSession | None = None,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "DynamicFrame":
+    ) -> "Dataset":
         """Build a frame from an in-memory iterable.
 
         ``schema=None`` pickles each element into a dynamic frame.
         ``schema=<Schema>`` casts the iterable on the driver and returns a
-        typed ``DynamicFrame`` whose underlying ``DataFrame`` matches
+        typed ``Dataset`` whose underlying ``DataFrame`` matches
         ``schema``.
         """
         if spark_session is None:
@@ -428,7 +428,7 @@ class DynamicFrame:
         *,
         spark_session: SparkSession | None = None,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "DynamicFrame":
+    ) -> "Dataset":
         """Distribute ``function`` over ``inputs`` via ``mapInArrow``.
 
         ``schema=None`` returns a dynamic frame of pickled outputs.
@@ -619,7 +619,7 @@ class DynamicFrame:
         ``addPyFile`` overrides the stale install.
 
         Returns the set of modules now known-installed on *session* — useful
-        as the ``installed_modules`` seed for fresh :class:`DynamicFrame`
+        as the ``installed_modules`` seed for fresh :class:`Dataset`
         instances so the next transform skips the re-scan.
         """
         cache = _PER_SESSION_INSTALLED_MODULES.setdefault(id(session), set())
@@ -640,7 +640,7 @@ class DynamicFrame:
             installed = _install_modules_on_executors(session, new_modules)
         except Exception as exc:  # pragma: no cover - defensive
             LOGGER.warning(
-                "DynamicFrame: failed to install %s on executors: %s",
+                "Dataset: failed to install %s on executors: %s",
                 sorted(new_modules), exc,
             )
             return set(cache)
@@ -687,7 +687,7 @@ class DynamicFrame:
         schema: Schema | None = None,
         *,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "DynamicFrame":
+    ) -> "Dataset":
         """1:1 map over rows.
 
         Input rows are unpickled objects (dynamic mode) or row-dicts
@@ -748,7 +748,7 @@ class DynamicFrame:
         schema: Schema | None = None,
         *,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "DynamicFrame":
+    ) -> "Dataset":
         """Map ``function`` over each row, optionally casting against ``schema``.
 
         Without a schema this is :meth:`map`. With a schema, ``function``
@@ -796,7 +796,7 @@ class DynamicFrame:
         schema: Schema | None = None,
         *,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "DynamicFrame":
+    ) -> "Dataset":
         """Drop rows where ``predicate(row)`` is false.
 
         Predicate sees unpickled objects (dynamic mode) or row-dicts
@@ -879,7 +879,7 @@ class DynamicFrame:
         schema: Schema | None = None,
         *,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "DynamicFrame":
+    ) -> "Dataset":
         """Explode rows of iterables into one row per element.
 
         Only meaningful in dynamic mode — typed rows are dicts, not
@@ -938,8 +938,8 @@ class DynamicFrame:
         schema: Schema,
         *,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "DynamicFrame":
-        """Materialise rows against ``schema`` as a typed ``DynamicFrame``."""
+    ) -> "Dataset":
+        """Materialise rows against ``schema`` as a typed ``Dataset``."""
         self._ensure_installed()
         schema = Schema.from_any(schema)
         is_dynamic_in = self.is_dynamic
@@ -968,7 +968,7 @@ class DynamicFrame:
             installed_modules=self.installed_modules,
         )
 
-    def to_dynamic(self, *, byte_size: int = 128 * 1024 * 1024) -> "DynamicFrame":
+    def to_dynamic(self, *, byte_size: int = 128 * 1024 * 1024) -> "Dataset":
         """Drop typing: re-pickle row-dicts back into a dynamic frame.
 
         No-op when already dynamic. Useful before applying transforms
@@ -1047,19 +1047,19 @@ class DynamicFrame:
 # ---------------------------------------------------------------------------
 
 def _wrap(value: Any) -> Any:
-    """Wrap ``DataFrame`` results as ``DynamicFrame``; pass others through."""
+    """Wrap ``DataFrame`` results as ``Dataset``; pass others through."""
     if isinstance(value, DataFrame):
-        return DynamicFrame(df=value, schema=Schema.from_any(value.schema))
+        return Dataset(df=value, schema=Schema.from_any(value.schema))
     return value
 
 
 class _ProxiedCallable:
     """Bound-method shim that wraps DataFrame return values.
 
-    Returned by :meth:`DynamicFrame.__getattr__` for callable attributes
+    Returned by :meth:`Dataset.__getattr__` for callable attributes
     on the underlying ``DataFrame``. Calling it forwards args/kwargs and
     runs the result through :func:`_wrap` so chained DataFrame ops stay
-    inside ``DynamicFrame``. Nested attribute access (e.g.
+    inside ``Dataset``. Nested attribute access (e.g.
     ``df.groupBy("x").agg(...)``) works because intermediate non-DF
     objects (``GroupedData``, ``Column``) pass through unchanged and
     their methods aren't proxied — only the final ``DataFrame`` they
