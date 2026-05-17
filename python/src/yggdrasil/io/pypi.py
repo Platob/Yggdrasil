@@ -1,5 +1,5 @@
 """
-:class:`PathPyPI` — managed PEP 503 simple index at any :class:`Path` root.
+:class:`PyPIPath` — managed PEP 503 simple index at any :class:`Path` root.
 
 A drop-in "package artifactory" that publishes Python distributions
 under a yggdrasil :class:`~yggdrasil.io.path.path.Path` root —
@@ -9,13 +9,13 @@ by ``pip install --extra-index-url=<root>``.
 
 Two ingestion shapes:
 
-- :meth:`PathPyPI.publish` — build a real ``pip`` wheel for a local
+- :meth:`PyPIPath.publish` — build a real ``pip`` wheel for a local
   module (importable name or source path) and upload the versioned
   wheel under ``<root>/<normalized-project>/<wheel>.whl``. This is
   the pip-installable path: the wheel filename carries the version,
   the index page lists every uploaded wheel, and re-publishing the
   same source short-circuits when the target already exists.
-- :meth:`PathPyPI.publish_archive` — zip a module via
+- :meth:`PyPIPath.publish_archive` — zip a module via
   :meth:`Path.upload_module` and drop the archive under the same
   versioned layout. Used when the artefact ships as a raw zip
   (Spark ``addArtifacts(pyfile=True)``, ``sys.path`` extension)
@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 
 
 __all__ = [
-    "PathPyPI",
+    "PyPIPath",
     "parse_wheel_filename",
     "normalize_pep503_name",
 ]
@@ -78,7 +78,7 @@ def parse_wheel_filename(name: str) -> tuple[Optional[str], Optional[str]]:
     return match.group("dist"), match.group("version")
 
 
-class PathPyPI:
+class PyPIPath:
     """A PEP 503 simple index hosted at *root* (any yggdrasil :class:`Path`).
 
     Parameters
@@ -95,13 +95,13 @@ class PathPyPI:
     --------
     Local index for testing::
 
-        pypi = PathPyPI("/tmp/my-index")
+        pypi = PyPIPath("/tmp/my-index")
         pypi.publish("my_local_pkg")
         # → /tmp/my-index/my-local-pkg/my_local_pkg-0.1.0-py3-none-any.whl
 
     Layered S3 index::
 
-        pypi = PathPyPI("s3://wheels.example.com/simple")
+        pypi = PyPIPath("s3://wheels.example.com/simple")
         pypi.publish("internal_lib")
     """
 
@@ -473,7 +473,7 @@ def _artefact_version_matches(filename: str, version: str) -> bool:
     _, parsed = parse_wheel_filename(filename)
     if parsed is not None:
         return parsed == version
-    # ``{name}-{version}.zip`` shape from :meth:`PathPyPI.publish_archive`.
+    # ``{name}-{version}.zip`` shape from :meth:`PyPIPath.publish_archive`.
     stem = filename.rsplit(".", 1)[0]
     if stem.endswith(".tar"):
         stem = stem[:-4]

@@ -20,7 +20,7 @@ from .userinfo import (
     userinfo_tags,
 )
 from .workspace_pypi import DEFAULT_WORKSPACE_PYPI_ROOT, WorkspacePyPI
-from yggdrasil.io.pypi import PathPyPI
+from yggdrasil.io.pypi import PyPIPath
 
 __all__ = [
     "DEFAULT_WORKSPACE_PYPI_ROOT",
@@ -30,7 +30,7 @@ __all__ = [
     "JobTask",
     "ModuleDependency",
     "NotebookConfig",
-    "PathPyPI",
+    "PyPIPath",
     "WidgetType",
     "WorkspacePyPI",
     "dependencies_to_pip_specs",

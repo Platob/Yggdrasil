@@ -1,4 +1,4 @@
-"""Unit tests for the generic :class:`PathPyPI` artefact index."""
+"""Unit tests for the generic :class:`PyPIPath` artefact index."""
 from __future__ import annotations
 
 import shutil
@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path as _LocalPath
 
 from yggdrasil.io.pypi import (
-    PathPyPI,
+    PyPIPath,
     normalize_pep503_name,
     parse_wheel_filename,
 )
@@ -30,8 +30,8 @@ class TestNormalizeAndParse(unittest.TestCase):
         self.assertEqual(parse_wheel_filename("not-a-wheel.zip"), (None, None))
 
 
-class TestPathPyPILocal(unittest.TestCase):
-    """Exercise PathPyPI end-to-end against a LocalPath root."""
+class TestPyPIPathLocal(unittest.TestCase):
+    """Exercise PyPIPath end-to-end against a LocalPath root."""
 
     def setUp(self) -> None:
         self.tmp = _LocalPath(tempfile.mkdtemp(prefix="ygg-pypi-test-"))
@@ -61,7 +61,7 @@ class TestPathPyPILocal(unittest.TestCase):
 
     def test_publish_uploads_wheel_and_index(self):
         pkg_root = self._make_pkg()
-        pypi = PathPyPI(str(self.root))
+        pypi = PyPIPath(str(self.root))
 
         published = pypi.publish("tiny_pkg", source_path=str(pkg_root))
 
@@ -79,7 +79,7 @@ class TestPathPyPILocal(unittest.TestCase):
     def test_publish_is_idempotent_on_wheel_upload(self):
         """Re-publishing the same source skips re-uploading the wheel."""
         pkg_root = self._make_pkg()
-        pypi = PathPyPI(str(self.root))
+        pypi = PyPIPath(str(self.root))
 
         first = pypi.publish("tiny_pkg", source_path=str(pkg_root))
         wheel_target = self.root / "tiny-pkg" / _LocalPath(first.full_path()).name
@@ -101,7 +101,7 @@ class TestPathPyPILocal(unittest.TestCase):
         import sys
 
         pkg_root = self._make_pkg()
-        pypi = PathPyPI(str(self.root))
+        pypi = PyPIPath(str(self.root))
         pypi.publish("tiny_pkg", source_path=str(pkg_root))
 
         # Ensure the package isn't in sys.modules / sys.path already
@@ -117,13 +117,13 @@ class TestPathPyPILocal(unittest.TestCase):
             importlib.invalidate_caches()
 
     def test_import_module_unknown_raises(self):
-        pypi = PathPyPI(str(self.root))
+        pypi = PyPIPath(str(self.root))
         with self.assertRaises(ModuleNotFoundError):
             pypi.import_module("nonexistent_pkg")
 
     def test_publish_archive_uses_upload_module(self):
         pkg_root = self._make_pkg() / "tiny_pkg"
-        pypi = PathPyPI(str(self.root))
+        pypi = PyPIPath(str(self.root))
 
         target = pypi.publish_archive(
             str(pkg_root), name="tiny_pkg", version="0.4.2",
