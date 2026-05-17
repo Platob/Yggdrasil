@@ -690,27 +690,26 @@ class Volume(DatabricksResource, Singleton):
 
         Used by :meth:`read_info` when ``volumes.read`` returns
         ``NotFound``, and by :class:`VolumePath` when a write hits a
-        missing target. Each ``create`` swallows ``AlreadyExists`` so
-        concurrent creators don't fight; returns ``True`` if at least
-        one create landed.
+        missing target. Routes the volume create through
+        :meth:`create` (which centralises the managed-volume default
+        and warms the ``VolumeInfo`` cache via ``_store_infos``);
+        ``AlreadyExists`` is swallowed so concurrent creators don't
+        fight. Returns ``True`` if at least one create landed.
         """
         ws = self.client.workspace_client()
         logger.debug("Ensuring volume %r exists", self)
 
-        def _create_volume() -> Any:
-            return ws.volumes.create(
-                catalog_name=self.catalog_name,
-                schema_name=self.schema_name,
-                name=self.volume_name,
-                volume_type=_managed_volume_type(),
-            )
-
         # 1) Try volume only — common case where catalog + schema exist.
+        # ``if_not_exists=False`` so AlreadyExists surfaces here and we
+        # can distinguish "already there" (return False) from "newly
+        # created" (return True); the ``self.create`` wrapper still
+        # owns the SDK call and the post-create cache warm-up.
         try:
-            _create_volume()
+            self.create(if_not_exists=False)
             return True
         except Exception as exc:
             if _looks_like_already_exists(exc):
+                self._reset_cache()
                 return False
             if not _looks_like_not_found(exc):
                 raise
@@ -733,7 +732,7 @@ class Volume(DatabricksResource, Singleton):
             else:
                 raise
 
-        _safe_create(_create_volume)
+        _safe_create(lambda: self.create(if_not_exists=False))
         return True
 
     # ── grants ────────────────────────────────────────────────────────────────
