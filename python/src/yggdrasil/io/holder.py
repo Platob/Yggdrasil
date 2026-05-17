@@ -681,6 +681,15 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         if holder is not None:
             instance._parent = holder
             instance._owns_parent = bool(owns_holder)
+        elif isinstance(data, IO):
+            # Cursor-over-IO: borrow the parent's storage rather than
+            # reconstructing one. ``BytesIO(other_bytes_io)`` shares the
+            # same byte substrate; the new cursor owns nothing of its
+            # own beyond the position. ``_resolve_subclass(data=IO)``
+            # would return ``type(data)`` and route us back into this
+            # branch — infinite recursion.
+            instance._parent = data._parent if data._parent is not None else data
+            instance._owns_parent = False
         elif not getattr(cls, "scheme", None):
             # Cursor-only leaf without an explicit ``holder=`` — mint
             # the storage parent via the scheme registry directly so
@@ -1189,7 +1198,21 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         the holder's internal cursor (:attr:`tell`), advancing it past
         the bytes returned. ``cursor=False`` (default) keeps the
         cursor-less positional contract — the cursor is untouched.
+
+        Cursor IOs (those wrapping a :attr:`parent` storage) delegate
+        the whole call through :meth:`_active` so the parent's
+        bounds-check uses its own size — avoids a redundant ``stat``
+        probe on remote backings when the cursor has no local size
+        cache, and routes through any subclass ``_active`` override
+        (lazy materialization on :class:`ZipEntryFile`, …).
         """
+        if self._parent is not None:
+            if cursor:
+                offset = self._pos
+            out = self._active().read_mv(size, offset)
+            if cursor:
+                self._pos = offset + len(out)
+            return out
         if cursor:
             offset = self._pos
         total = self.size
@@ -1285,7 +1308,22 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         is then responsible for calling :meth:`_touch_stat` (or
         re-statting via the path-side ``_stat`` for filesystem
         backends) once the loop finishes.
+
+        Cursor IOs (those wrapping a :attr:`parent` storage) delegate
+        the whole call through :meth:`_active` so the parent's
+        resize / bounds-check / dirty-marking fires once, on the
+        backing storage — the cursor only advances its own ``_pos``.
         """
+        if self._parent is not None:
+            if cursor:
+                offset = self._pos
+            written = self._active().write_mv(
+                data, offset, size=size, overwrite=overwrite,
+                update_stat=update_stat,
+            )
+            if cursor:
+                self._pos = offset + written
+            return written
         if cursor:
             offset = self._pos
         if size >= 0 and len(data) > size:
@@ -2650,6 +2688,8 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         reads to EOF, ``size>=0`` caps the byte count, ``offset``
         is the starting offset. Returns the resolved target.
         """
+        from yggdrasil.io.path.path import Path
+
         if to is None:
             to = _default_download_target(self.url.name)
         target = _join_dir_hint(_coerce_transfer_endpoint(to), self)
@@ -2691,6 +2731,19 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         payload).
         """
         target.write_bytes(self.read_bytes())
+
+    def _transfer_filename(self) -> str:
+        """Filename used when joining onto a directory-shaped target.
+
+        :class:`Memory` IOs address themselves with auto-minted
+        ``mem://<host>/<hex_addr>`` URLs whose ``name`` is the
+        object address — useless as a download filename. Fall back
+        to ``"download"`` for memory-backed IOs and any IO whose
+        URL has no nameable segment.
+        """
+        if self.is_memory:
+            return "download"
+        return self.url.name or "download"
 
     # ------------------------------------------------------------------
     # Hashing — full-payload digests over the durable bytes.
@@ -3349,6 +3402,36 @@ def _coerce_transfer_endpoint(value: Any) -> "IO":
         f"IO.upload/download: expected an IO, str, or "
         f"os.PathLike endpoint; got {type(value).__name__}: {value!r}"
     )
+
+
+def _looks_like_directory(url: URL) -> bool:
+    """Trailing-slash check: ``True`` iff *url*'s path ends in ``/``.
+
+    Used by the upload/download directory-hint helpers to apply
+    ``cp``-style "into this directory" semantics without a remote
+    stat round trip. The canonical signal is an empty trailing
+    element in :attr:`URL.parts`.
+    """
+    parts = url.parts
+    return bool(parts) and parts[-1] == ""
+
+
+def _join_dir_hint(
+    dst: "IO", src: "IO",
+) -> "IO":
+    """Apply ``cp``-style directory hint when *dst* is a slash-terminated Path.
+
+    ``dst_dir_slash.upload(src)`` lands at ``dst_dir/<src.name>``;
+    a non-Path *dst* (:class:`Memory`, cursor IO) or a non-directory
+    path is returned untouched. The source's filename is taken from
+    :meth:`IO._transfer_filename` so :class:`Memory` / nameless IOs
+    fall back to ``"download"``.
+    """
+    from yggdrasil.io.path.path import Path
+
+    if isinstance(dst, Path) and _looks_like_directory(dst.url):
+        return dst / src._transfer_filename()
+    return dst
 
 
 def _read_slice_from_source(
