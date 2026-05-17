@@ -3133,30 +3133,23 @@ class Table(DatabricksPath):
         per-table :class:`AsyncInsertJob` in :mod:`.async_job`. See
         :mod:`.async_write` for the wire format.
 
-        ``require_job`` (default ``True``) pre-checks that the per-table
+        ``require_job`` (default ``True``) ensures the per-table
         applier Job exists before any staging round trip — without one,
         staged payloads sit in the table's
         ``stg_<table>/.sql/async/insert/`` folder forever with no
-        consumer. The lookup rides through :meth:`Jobs.find`, which
-        caches the ``name → job_id`` mapping for 60 s, so the steady-state
-        cost is sub-millisecond. Pass ``require_job=False`` to stage
-        anyway (e.g. seeding payloads before
-        :meth:`Table.async_job` deploys the applier from a different
-        process).
+        consumer. The check rides through :meth:`Table.async_job`,
+        whose :meth:`Jobs.find` lookup caches the ``name → job_id``
+        mapping for 60 s; the steady-state cost is sub-millisecond.
+        A missing job is auto-deployed via :meth:`Table.async_job`
+        with default settings — pass ``require_job=False`` to skip the
+        check entirely (e.g. seeding payloads before
+        :meth:`Table.async_job` deploys a tuned applier from a
+        different process).
         """
-        from .async_job import AsyncInsertJob
         from .async_write import stage_async_insert
 
         if require_job:
-            job_name = AsyncInsertJob.job_name(self)
-            if self.client.jobs.find(name=job_name) is None:
-                raise RuntimeError(
-                    f"async_insert: no applier job named {job_name!r} found. "
-                    "Call ``table.async_job()`` first to deploy the "
-                    "per-table applier — staged payloads without a running "
-                    "job accumulate in the staging folder with no consumer. "
-                    "Pass ``require_job=False`` to stage anyway."
-                )
+            self.async_job()
 
         return stage_async_insert(
             self,

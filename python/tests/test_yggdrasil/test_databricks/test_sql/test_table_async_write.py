@@ -1627,40 +1627,34 @@ class TestTableAsyncInsert:
         assert out == "sql-result"
         tbl.insert_into.assert_called_once()
 
-    def test_async_insert_precheck_raises_when_job_missing(self, monkeypatch):
-        """Staging without a deployed applier rots — pre-check raises loudly.
+    def test_async_insert_auto_creates_job_when_missing(self, monkeypatch):
+        """Staging without a deployed applier auto-deploys the per-table job.
 
-        ``Jobs.find`` returning ``None`` means there's no consumer for
-        the staged payload; the precheck surfaces that *before* any
-        workspace round trip so the caller can't accidentally drop
-        rows into the void.
+        ``require_job=True`` (the default) routes through
+        :meth:`Table.async_job`, which is idempotent — a pre-existing
+        job short-circuits, a missing one is created with default
+        settings so staged payloads always land in front of a live
+        consumer.
         """
         tbl, _, _, _ = _make_table_with_staging()
-        # Pre-built jobs service mock — find() returns None to simulate
-        # a missing applier job.
-        jobs_svc = MagicMock(name="Jobs")
-        jobs_svc.find.return_value = None
-        tbl.service.client.jobs = jobs_svc
+        async_job = MagicMock(name="async_job", return_value=MagicMock(name="Job"))
+        tbl.async_job = async_job  # type: ignore[assignment]
 
+        sentinel = AsyncInsert(target_full_name="cat.sch.tbl")
         import yggdrasil.databricks.table.async_write as aw
-        stage = MagicMock(name="stage_async_insert")
+        stage = MagicMock(name="stage_async_insert", return_value=sentinel)
         monkeypatch.setattr(aw, "stage_async_insert", stage)
 
-        with pytest.raises(RuntimeError, match="no applier job named"):
-            tbl.async_insert("dummy")
-        # The stager never ran — failure must happen before the
-        # workspace round trip.
-        stage.assert_not_called()
-        jobs_svc.find.assert_called_once_with(name="[YGG][ASYNC] Maintain cat.sch.tbl")
+        out = tbl.async_insert("dummy")
+        assert out is sentinel
+        async_job.assert_called_once_with()
+        stage.assert_called_once()
 
     def test_async_insert_precheck_skipped_with_require_job_false(self, monkeypatch):
         """``require_job=False`` lets the caller stage payloads ahead of the applier."""
         tbl, _, _, _ = _make_table_with_staging()
-        jobs_svc = MagicMock(name="Jobs")
-        # find() would return None — without the opt-out, the precheck
-        # would raise; with require_job=False it must not even be called.
-        jobs_svc.find.return_value = None
-        tbl.service.client.jobs = jobs_svc
+        async_job = MagicMock(name="async_job")
+        tbl.async_job = async_job  # type: ignore[assignment]
 
         sentinel = AsyncInsert(target_full_name="cat.sch.tbl")
         import yggdrasil.databricks.table.async_write as aw
@@ -1670,4 +1664,4 @@ class TestTableAsyncInsert:
 
         out = tbl.async_insert("dummy", require_job=False)
         assert out is sentinel
-        jobs_svc.find.assert_not_called()
+        async_job.assert_not_called()
