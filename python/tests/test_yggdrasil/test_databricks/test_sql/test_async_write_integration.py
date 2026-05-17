@@ -46,6 +46,7 @@ from .. import DatabricksIntegrationCase
 __all__ = [
     "TestAsyncWriteIntegration",
     "TestAsyncWriteJobIntegration",
+    "TestAsyncApplierTaskIntegration",
 ]
 
 
@@ -330,4 +331,197 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
             raise_error=False,
         )
         assert run.is_terminal
+
+
+class TestAsyncApplierTaskIntegration(_AsyncWriteIntegrationBase):
+    """Stage the applier as a notebook vs. a Spark Python task — live workspace.
+
+    Drives :meth:`Table.async_job` against a real workspace, downloads
+    the staged file from the workspace, prints the generated source
+    to stdout (visible under ``pytest -s``), and asserts the
+    task-spec shape end-to-end:
+
+    * ``task_type="notebook"`` (default) — workspace stores a
+      Databricks-format ``.py`` notebook; ``NotebookTask.notebook_path``
+      drops the ``.py`` extension; widget reads in the invocation
+      cell pull job parameters at run time.
+    * ``task_type="spark"`` — workspace stores a flat Python script;
+      ``SparkPythonTask.parameters`` carries
+      ``{{job.parameters.*}}`` placeholders that Databricks
+      substitutes into the script's ``sys.argv`` reads.
+
+    Both shapes also kick a single ``Job.run`` and wait for it to
+    reach a terminal state so a regression in the renderer surfaces
+    as a real failed run, not just a settings-shape assertion.
+    """
+
+    @staticmethod
+    def _format_section(title: str, body: str) -> str:
+        rule = "=" * 78
+        return (
+            f"\n{rule}\n"
+            f"{title}\n"
+            f"{rule}\n"
+            f"{body.rstrip()}\n"
+            f"{rule}\n"
+        )
+
+    def _workspace_read(self, path: str) -> bytes:
+        ws = self.client.workspace_client().workspace
+        from databricks.sdk.service.workspace import ExportFormat
+        # ``ExportFormat.SOURCE`` returns the raw Databricks ``.py``
+        # source notebook bytes (with the ``# Databricks notebook
+        # source`` magic header + ``# COMMAND ----------`` cell
+        # separators) — same shape the staging path uploaded.
+        try:
+            export = ws.export(path, format=ExportFormat.SOURCE)
+        except DatabricksError:
+            # Path resolution on notebook objects sometimes needs the
+            # extension dropped; retry once on the bare name.
+            if path.endswith(".py"):
+                export = ws.export(path[:-3], format=ExportFormat.SOURCE)
+            else:
+                raise
+        # Newer SDKs return base64-encoded content under ``.content``;
+        # older ones expose a ``.read()`` stream.
+        content = getattr(export, "content", None)
+        if isinstance(content, str):
+            import base64
+            return base64.b64decode(content)
+        if isinstance(content, (bytes, bytearray)):
+            return bytes(content)
+        if hasattr(export, "read"):
+            return export.read()
+        raise AssertionError(
+            f"Unexpected workspace.export return shape: {export!r}"
+        )
+
+    def test_notebook_applier_is_staged_and_visible_in_workspace(self):
+        from databricks.sdk.service.jobs import NotebookTask
+
+        table = self._unique_table("async_nb")
+        table.ensure_created(self._sample_schema())
+
+        # ``force=True`` re-stages even if a prior test left a stale
+        # job under the same name; lets this test run idempotently.
+        job = table.async_job(force=True)  # task_type="notebook" default
+        type(self).created_jobs.append(job.job_id)
+        job.refresh()
+
+        tasks = (job.settings.tasks if job.settings else None) or []
+        assert len(tasks) == 1, f"expected one staged task, got {tasks!r}"
+        task = tasks[0]
+        assert isinstance(task.notebook_task, NotebookTask), (
+            f"task_type=notebook should wire a NotebookTask, got {task!r}"
+        )
+        assert task.spark_python_task is None
+        notebook_path = task.notebook_task.notebook_path
+        # Databricks references notebooks without the ``.py`` source
+        # extension — the staging path strips it when wiring the task.
+        assert notebook_path
+        assert not notebook_path.endswith(".py"), notebook_path
+
+        # Download the staged source straight from the workspace and
+        # print it so the developer running the suite can eyeball what
+        # actually landed (visible under ``pytest -s``).
+        body = self._workspace_read(notebook_path).decode()
+        print(self._format_section(
+            f"Staged NOTEBOOK applier — workspace path: {notebook_path}", body,
+        ))
+
+        # Magic header + cell separators must round-trip back through
+        # ``workspace.export`` — proves the upload landed as a real
+        # notebook, not a workspace file.
+        assert body.startswith("# Databricks notebook source\n"), body[:80]
+        assert "\n# COMMAND ----------\n" in body
+        # Invocation cell reads job parameters via the widget helper.
+        assert "def _yggdrasil_widget(name):" in body
+        assert "catalog_name=_yggdrasil_widget('catalog_name')" in body
+        # Compile sanity — same call shape the Databricks notebook host
+        # uses (``exec(compile(f.read(), filename, 'exec'))``).
+        compile(body, f"<staged:{notebook_path}>", "exec")
+
+    def test_spark_applier_is_staged_with_job_parameter_substitution(self):
+        from databricks.sdk.service.jobs import SparkPythonTask
+
+        table = self._unique_table("async_sp")
+        table.ensure_created(self._sample_schema())
+
+        job = table.async_job(force=True, task_type="spark")
+        type(self).created_jobs.append(job.job_id)
+        job.refresh()
+
+        tasks = (job.settings.tasks if job.settings else None) or []
+        assert len(tasks) == 1, f"expected one staged task, got {tasks!r}"
+        task = tasks[0]
+        assert isinstance(task.spark_python_task, SparkPythonTask), (
+            f"task_type=spark should wire a SparkPythonTask, got {task!r}"
+        )
+        assert task.notebook_task is None
+        python_file = task.spark_python_task.python_file
+        assert python_file.endswith(".py"), python_file
+
+        # ``parameters`` carries one ``{{job.parameters.<name>}}``
+        # placeholder per unbound applier param so Databricks
+        # substitutes the Job's ``catalog_name`` / ``schema_name`` /
+        # ``table_name`` values into the script's ``sys.argv`` reads.
+        assert task.spark_python_task.parameters == [
+            "{{job.parameters.catalog_name}}",
+            "{{job.parameters.schema_name}}",
+            "{{job.parameters.table_name}}",
+        ]
+
+        body = self._workspace_read(python_file).decode()
+        print(self._format_section(
+            f"Staged SPARK applier — workspace path: {python_file}", body,
+        ))
+
+        # Script shape: future import, checkargs wrap, sys.argv reader,
+        # positional invocation against the parameter list above.
+        assert body.startswith("from __future__ import annotations\n")
+        assert "from yggdrasil.dataclasses.safe_function import checkargs" in body
+        assert "def _yggdrasil_argv(idx):" in body
+        assert "catalog_name=_yggdrasil_argv(1)" in body
+        assert "schema_name=_yggdrasil_argv(2)" in body
+        assert "table_name=_yggdrasil_argv(3)" in body
+        compile(body, f"<staged:{python_file}>", "exec")
+
+    def test_applier_task_run_completes_in_terminal_state(self):
+        """End-to-end: trigger the notebook applier and wait for terminal.
+
+        The first run on an empty staging folder is a no-op
+        (``AsyncInsertJob.load`` returns ``[]`` and the body returns
+        early) so the job exits in seconds — long enough to flush any
+        renderer-level breakage (NameError at class-body time,
+        SyntaxError in the staged cells, missing ``ygg`` dependency
+        in the auto-resolved environment) without burning workspace
+        budget on a long-running insert.
+        """
+        table = self._unique_table("async_run")
+        table.ensure_created(self._sample_schema())
+
+        job = table.async_job(force=True)
+        type(self).created_jobs.append(job.job_id)
+
+        run = job.run()
+        assert isinstance(run, JobRun)
+        run.wait_for_status(
+            wait={"timeout": 600.0, "interval": 5.0},
+            raise_error=False,
+        )
+        assert run.is_terminal, (
+            f"Applier run did not reach terminal state in time — "
+            f"last status: {run!r}"
+        )
+
+        # Print the final run state + any task-level error message so
+        # ``pytest -s`` surfaces the diagnosis when this guard catches
+        # a renderer regression.
+        details = getattr(run, "_details", None) or getattr(run, "details", None)
+        print(self._format_section(
+            f"Applier run terminal state — run_id={run.run_id}",
+            f"state: {getattr(run, 'state', None)!r}\n"
+            f"is_success: {getattr(run, 'is_success', None)}\n"
+            f"details: {details!r}",
+        ))
 

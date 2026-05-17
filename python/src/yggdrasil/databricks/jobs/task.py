@@ -26,7 +26,12 @@ from dataclasses import replace as _dc_replace
 from typing import Any, Callable, List, Optional, Sequence, TYPE_CHECKING, Tuple, Union
 
 from databricks.sdk.service.compute import Environment
-from databricks.sdk.service.jobs import JobEnvironment, SparkPythonTask, Task
+from databricks.sdk.service.jobs import (
+    JobEnvironment,
+    NotebookTask,
+    SparkPythonTask,
+    Task,
+)
 
 from yggdrasil.dataclasses.safe_function import (
     describe_signature,
@@ -52,6 +57,7 @@ __all__ = [
     "DEFAULT_ENVIRONMENT_CLIENT",
     "DEFAULT_ENVIRONMENT_DEPENDENCIES",
     "stage_python_callable",
+    "stage_python_notebook_callable",
 ]
 
 LOGGER = logging.getLogger(__name__)
@@ -72,11 +78,12 @@ DEFAULT_STAGING_ROOT = "/Workspace/Shared/.ygg/jobs"
 #: :meth:`JobTask.create` when the key isn't already defined.
 DEFAULT_ENVIRONMENT_KEY = "ygg-default"
 
-#: Minimum serverless client version paired with
-#: :data:`DEFAULT_ENVIRONMENT_KEY`. Databricks requires a ``client``
-#: pin on every serverless environment spec; ``"1"`` is the broadest
-#: option and matches Databricks' own bundle examples.
-DEFAULT_ENVIRONMENT_CLIENT = "1"
+#: Serverless client version paired with :data:`DEFAULT_ENVIRONMENT_KEY`.
+#: Databricks requires a ``client`` pin on every serverless environment
+#: spec; ``"5"`` is the current latest workspace default (Python 3.12
+#: + the modern pip resolver), and matches what the workspace UI's
+#: "Configure environment" dialog shows under "Environment version".
+DEFAULT_ENVIRONMENT_CLIENT = "5"
 
 #: Default pip dependencies for the auto-attached serverless
 #: environment. The staged script imports
@@ -543,11 +550,27 @@ def stage_python_callable(
         f"{doc_line[0]} — {signature_str}" if doc_line else signature_str
     )[:1000]
 
+    # SparkPythonTask has no widget surface — the only channel for
+    # passing per-run values into the script is the ordered
+    # ``parameters`` list (Databricks delivers it as ``sys.argv[1:]``).
+    # Wire one placeholder per parameter the caller left unbound,
+    # using ``{{job.parameters.<name>}}`` substitution so the Job's
+    # own :class:`JobParameterDefinition`s feed in at run time. The
+    # rendered script's ``sys.argv``-reading invocation positions
+    # match this list 1:1.
+    _, unbound_param_names = _classify_invocation_params(func, args, kwargs)
+    spark_parameters = (
+        [f"{{{{job.parameters.{name}}}}}" for name in unbound_param_names]
+        if unbound_param_names
+        else None
+    )
+
     details = Task(
         task_key=key,
         description=description,
         spark_python_task=SparkPythonTask(
             python_file=path.full_path(),
+            parameters=spark_parameters,
         ),
         environment_key=DEFAULT_ENVIRONMENT_KEY,
     )
@@ -569,6 +592,108 @@ def stage_python_callable(
 
     LOGGER.debug(
         "Sniffed staged task %r imports=%r env_vars=%r — derived "
+        "dependencies %r",
+        key, sorted(sniffed_modules), sniffed_env_var_names, merged_specs,
+    )
+
+    return details, merged_specs, sniffed_env_var_names
+
+
+def stage_python_notebook_callable(
+    client: "DatabricksClient",
+    func: Callable[..., Any],
+    *args: Any,
+    task_key: Optional[str] = None,
+    staging_root: str = DEFAULT_STAGING_ROOT,
+    auto_dependencies: bool = True,
+    extra_dependencies: Optional[Sequence[str]] = None,
+    exclude_modules: Sequence[str] = (),
+    workspace_pypi: Optional["WorkspacePyPI"] = None,
+    **kwargs: Any,
+) -> Tuple[Task, List[str], List[str]]:
+    """Render *func* as a Databricks ``.py`` notebook and return its :class:`Task` spec.
+
+    Notebook-flavoured sibling of :func:`stage_python_callable`. The
+    same signature metadata, captured-local inlining,
+    ``@checkargs`` wrap, and pip-spec sniffing apply — but the staged
+    object is a Databricks-format ``.py`` notebook source (cells
+    separated by ``# COMMAND ----------`` after a ``# Databricks
+    notebook source`` magic header) and the returned :class:`Task`
+    points at it via :class:`NotebookTask` instead of
+    :class:`SparkPythonTask`. The imports / metadata block, captured
+    locals, decorated function definition, and runtime invocation
+    each land in their own cell so the Databricks UI surfaces
+    stdout, exceptions, and ``LOGGER`` lines under the cell that
+    produced them — much cleaner for diagnosing an applier run than
+    the single-stream output of a Python task.
+
+    The invocation cell renders bound *args* / *kwargs* as ``repr``'d
+    literals exactly like the script path; unbound parameters fall
+    back to ``dbutils.widgets.get(name)`` at runtime so Databricks
+    job parameters flow through automatically (a tiny
+    ``_yggdrasil_widget`` helper is emitted inline to swallow
+    ``NameError`` for local re-runs outside a notebook host).
+    """
+    from yggdrasil.databricks.fs.workspace_path import WorkspacePath
+
+    key = task_key or func.__name__
+    source = _render_callable_notebook(func, args, kwargs)
+    digest = _content_digest(func, args, kwargs)
+
+    # ``.py`` extension paired with the ``# Databricks notebook
+    # source`` magic header on line 1 — the workspace ``import``
+    # path's ``format=AUTO`` detection routes that combination to
+    # the notebook importer (per the SDK's content sniff), so the
+    # uploaded object lands as a notebook rather than a workspace
+    # file. Databricks strips the ``.py`` extension when storing
+    # the notebook; :class:`NotebookTask` points at the bare path
+    # below.
+    upload_path = WorkspacePath(
+        f"{staging_root.rstrip('/')}/{key}/main-{digest}.py",
+        client=client,
+    )
+    LOGGER.debug(
+        "Staging callable %r as Databricks notebook at %r",
+        func.__qualname__, upload_path,
+    )
+    upload_path.write_bytes(source.encode())
+
+    signature_str = format_signature(describe_signature(func))
+    doc_line = (func.__doc__ or "").strip().splitlines()[0:1]
+    description = (
+        f"{doc_line[0]} — {signature_str}" if doc_line else signature_str
+    )[:1000]
+
+    notebook_path = upload_path.full_path()
+    if notebook_path.endswith(".py"):
+        # Notebooks are referenced without the source extension —
+        # Databricks stores ``main-<digest>.py`` as a notebook at
+        # ``main-<digest>`` and the Jobs API resolves the bare
+        # workspace path.
+        notebook_path = notebook_path[:-3]
+
+    details = Task(
+        task_key=key,
+        description=description,
+        notebook_task=NotebookTask(notebook_path=notebook_path),
+        environment_key=DEFAULT_ENVIRONMENT_KEY,
+    )
+
+    sniffed_modules, sniffed_env_vars = sniff_script(source)
+    sniffed_env_var_names = sorted(sniffed_env_vars)
+    derived_specs: list[str] = []
+    if auto_dependencies:
+        derived_specs = dependencies_to_pip_specs(
+            sniffed_modules,
+            exclude=exclude_modules,
+            workspace_pypi=workspace_pypi,
+        )
+    merged_specs = _dedupe_preserve(
+        [*(extra_dependencies or ()), *derived_specs],
+    )
+
+    LOGGER.debug(
+        "Sniffed staged notebook %r imports=%r env_vars=%r — derived "
         "dependencies %r",
         key, sorted(sniffed_modules), sniffed_env_var_names, merged_specs,
     )
@@ -716,11 +841,19 @@ def _render_callable_script(
     # without Python tripping on ``null`` / ``true`` / ``false``.
     meta_json = json.dumps(meta_payload, indent=2, sort_keys=True)
 
-    call_parts: list[str] = [repr(a) for a in args]
-    call_parts.extend(f"{k}={v!r}" for k, v in kwargs.items())
-    invocation = f"{func.__name__}({', '.join(call_parts)})"
+    invocation_block = _render_invocation_script(func, args, kwargs)
 
     return (
+        # ``from __future__ import annotations`` must lead every staged
+        # file: the captured-locals block inlines class bodies verbatim
+        # (e.g. ``AsyncInsertJob.JOB_NAME_PREFIX: ClassVar[str] = …``)
+        # whose annotations the original source file evaluates lazily
+        # via PEP 563. Without the future import in scope here the
+        # annotation expressions run at class-body time and raise
+        # ``NameError`` for typing names like ``ClassVar`` / ``Optional``
+        # that the staged file doesn't otherwise import.
+        "from __future__ import annotations\n"
+        "\n"
         "# Auto-generated by yggdrasil.databricks.jobs.JobTask.from_callable.\n"
         f"# Function: {func.__qualname__}\n"
         f"# Signature: {format_signature(sig_meta)}\n"
@@ -738,6 +871,247 @@ def _render_callable_script(
         f"{captured_block}"
         f"{body}"
         "\n"
+        f"{invocation_block}"
+    )
+
+
+#: Databricks notebook cell separator. The workspace import sniff
+#: keys off ``# Databricks notebook source`` on line 1 and splits the
+#: file into cells on each ``# COMMAND ----------`` line — same
+#: convention the workspace UI emits when exporting a notebook to
+#: ``.py`` source format.
+_NOTEBOOK_HEADER = "# Databricks notebook source"
+_NOTEBOOK_CELL_SEPARATOR = "\n# COMMAND ----------\n\n"
+
+
+def _render_callable_notebook(
+    func: Callable[..., Any],
+    args: tuple,
+    kwargs: dict,
+) -> str:
+    """Render *func* + bound *args* / *kwargs* as a Databricks ``.py`` notebook.
+
+    Same body content as :func:`_render_callable_script` (signature
+    metadata, captured locals, ``@checkargs``-wrapped function,
+    runtime invocation) — just split across notebook cells. Cell
+    layout:
+
+    1. Markdown header (``# MAGIC %md``) describing what the
+       notebook does and the captured signature.
+    2. Imports + the ``__yggdrasil_task__`` metadata block.
+    3. Captured local references — only emitted when *func* actually
+       has same-module helpers / literal constants to carry across.
+    4. The ``@checkargs``-wrapped function definition.
+    5. Invocation. Bound *args* / *kwargs* render as literals;
+       unbound parameters fall back to
+       ``dbutils.widgets.get(name)`` so Databricks job parameters
+       flow through automatically. A tiny ``_yggdrasil_widget``
+       helper swallows ``NameError`` for local re-runs outside a
+       notebook host.
+    """
+    from yggdrasil.version import __version__ as ygg_version
+
+    captured_block = _capture_local_references(func)
+    body = "@checkargs\n" + _function_source(func) + "\n"
+
+    sig_meta = describe_signature(func)
+    meta_payload = {
+        **sig_meta,
+        "yggdrasil_version": str(ygg_version),
+        "staged_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+    }
+    meta_json = json.dumps(meta_payload, indent=2, sort_keys=True)
+
+    sig_str = format_signature(sig_meta)
+    header_cell = (
+        "# MAGIC %md\n"
+        f"# MAGIC # {func.__qualname__}\n"
+        "# MAGIC\n"
+        "# MAGIC Auto-generated by "
+        "``yggdrasil.databricks.jobs.stage_python_notebook_callable``.\n"
+        f"# MAGIC Signature: ``{sig_str}``\n"
+        "# MAGIC\n"
+        "# MAGIC The body below is the verbatim source of the decorated\n"
+        "# MAGIC callable, re-wrapped with ``@checkargs`` so every call\n"
+        "# MAGIC site coerces its inputs to the function's annotated types\n"
+        "# MAGIC via ``yggdrasil.data.cast.convert``. Signature metadata\n"
+        "# MAGIC is embedded under ``__yggdrasil_task__``.\n"
+    )
+
+    # ``from __future__ import annotations`` leads the first executable
+    # cell: the captured-locals block below inlines class bodies
+    # verbatim (e.g. ``AsyncInsertJob.JOB_NAME_PREFIX: ClassVar[str] = …``)
+    # whose annotations the original module evaluates lazily via
+    # PEP 563. Databricks compiles the whole ``.py`` notebook source as
+    # one ``exec(compile(f.read(), ...))`` block, so a future import in
+    # the first code cell is in scope for every cell that follows —
+    # without it the annotation expressions run at class-body time and
+    # raise ``NameError`` for typing names (``ClassVar`` / ``Optional`` /
+    # …) that the staged file doesn't otherwise import.
+    metadata_cell = (
+        "from __future__ import annotations\n"
+        "\n"
+        "import json as _yggdrasil_json\n"
+        "from yggdrasil.dataclasses.safe_function import checkargs\n"
+        f"__yggdrasil_task__ = _yggdrasil_json.loads(r\"\"\"{meta_json}\"\"\")\n"
+    )
+
+    invocation_cell = _render_invocation_cell(func, args, kwargs)
+
+    cells: list[str] = [header_cell, metadata_cell]
+    if captured_block:
+        cells.append(captured_block.rstrip() + "\n")
+    cells.append(body.rstrip() + "\n")
+    cells.append(invocation_cell)
+
+    return (
+        _NOTEBOOK_HEADER + "\n"
+        + _NOTEBOOK_CELL_SEPARATOR.join(c.rstrip() + "\n" for c in cells)
+    )
+
+
+def _classify_invocation_params(
+    func: Callable[..., Any], args: tuple, kwargs: dict,
+) -> Tuple[List[Tuple[str, Optional[str]]], List[str]]:
+    """Split *func*'s parameters into ``(bound_parts, unbound_names)``.
+
+    Returns:
+
+    * ``bound_parts`` — list of ``(name, literal_repr)`` for parameters
+      the caller supplied at stage time (positional or keyword);
+      ``literal_repr`` is the ``repr``'d Python literal the rendered
+      script should emit. ``name`` is ``None`` for positional-only
+      slots so the invocation can keep them positional.
+    * ``unbound_names`` — list (in signature order) of parameter names
+      the caller left for runtime resolution. ``VAR_POSITIONAL`` /
+      ``VAR_KEYWORD`` slots are skipped; trailing keyword overrides
+      not matching a parameter name fall through to ``bound_parts``
+      as ``(k, repr(v))``.
+
+    The two renderers share this so the SparkPythonTask path
+    (``stage_python_callable``) and the NotebookTask path
+    (``stage_python_notebook_callable``) plumb job parameters
+    consistently — the script wires ``unbound_names`` into
+    ``SparkPythonTask.parameters`` placeholders + ``sys.argv`` reads,
+    the notebook wires the same names into ``dbutils.widgets.get``.
+    """
+    sig = inspect.signature(func)
+    remaining_kwargs = dict(kwargs)
+    bound_parts: List[Tuple[str, Optional[str]]] = []
+    unbound_names: List[str] = []
+    pos_consumed = 0
+    for name, p in sig.parameters.items():
+        if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
+            continue
+        if pos_consumed < len(args) and p.kind in (
+            p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD,
+        ):
+            bound_parts.append((name, repr(args[pos_consumed])))
+            pos_consumed += 1
+        elif name in remaining_kwargs:
+            bound_parts.append((name, repr(remaining_kwargs.pop(name))))
+        else:
+            unbound_names.append(name)
+    for k, v in remaining_kwargs.items():
+        bound_parts.append((k, repr(v)))
+    return bound_parts, unbound_names
+
+
+def _render_invocation_cell(
+    func: Callable[..., Any], args: tuple, kwargs: dict,
+) -> str:
+    """Render the notebook invocation cell — literals for bound args, widgets for the rest.
+
+    Positional / keyword parameters supplied via *args* / *kwargs* at
+    stage time render as ``repr``'d literals (same shape as the
+    script path's single-line ``func(a=…, b=…)`` invocation).
+    Parameters the caller left unbound — the common case for the
+    async-insert applier, whose ``catalog_name`` / ``schema_name`` /
+    ``table_name`` come from Databricks job parameters at run time —
+    fall back to ``_yggdrasil_widget(name)`` which reads
+    ``dbutils.widgets.get(name)`` and tolerates a missing ``dbutils``
+    binding (returns ``None``) so a local ``python -m`` re-run still
+    parses.
+    """
+    bound, unbound = _classify_invocation_params(func, args, kwargs)
+    parts: list[str] = [
+        f"{name}={literal}" if name is not None else literal
+        for name, literal in bound
+    ]
+    parts.extend(f"{name}=_yggdrasil_widget({name!r})" for name in unbound)
+
+    if not parts:
+        invocation = f"{func.__name__}()"
+    elif unbound:
+        joined = ",\n    ".join(parts)
+        invocation = f"{func.__name__}(\n    {joined},\n)"
+    else:
+        invocation = f"{func.__name__}({', '.join(parts)})"
+
+    if not unbound:
+        return invocation + "\n"
+    return (
+        "def _yggdrasil_widget(name):\n"
+        "    # ``dbutils`` is injected by the Databricks notebook host;\n"
+        "    # the fallback keeps a local ``python`` re-run from blowing\n"
+        "    # up before the function body sees the value.\n"
+        "    try:\n"
+        "        return dbutils.widgets.get(name)  # type: ignore[name-defined]  # noqa: F821\n"
+        "    except Exception:\n"
+        "        return None\n"
+        "\n"
+        f"{invocation}\n"
+    )
+
+
+def _render_invocation_script(
+    func: Callable[..., Any], args: tuple, kwargs: dict,
+) -> str:
+    """Render the script invocation block — sys.argv reads for unbound params.
+
+    SparkPythonTask has no widget surface, so unbound parameters
+    resolve at runtime by reading the matching positional slot from
+    ``sys.argv`` — the staging path sets
+    ``SparkPythonTask.parameters`` to a list of
+    ``{{job.parameters.<name>}}`` placeholders in the same order this
+    helper emits ``sys.argv[i]`` reads, so the Job's
+    :class:`JobParameterDefinition`s feed straight through to the
+    function call. Bound *args* / *kwargs* render as ``repr``'d
+    literals.
+
+    The returned block is indented for placement under
+    ``if __name__ == "__main__":`` — the caller is responsible for
+    the outer guard.
+    """
+    bound, unbound = _classify_invocation_params(func, args, kwargs)
+    parts: list[str] = [
+        f"{name}={literal}" if name is not None else literal
+        for name, literal in bound
+    ]
+    parts.extend(
+        f"{name}=_yggdrasil_argv({idx + 1})"
+        for idx, name in enumerate(unbound)
+    )
+
+    if not parts:
+        invocation = f"{func.__name__}()"
+    elif unbound:
+        joined = ",\n        ".join(parts)
+        invocation = f"{func.__name__}(\n        {joined},\n    )"
+    else:
+        invocation = f"{func.__name__}({', '.join(parts)})"
+
+    if not unbound:
+        return f'if __name__ == "__main__":\n    {invocation}\n'
+    return (
+        "def _yggdrasil_argv(idx):\n"
+        "    # SparkPythonTask passes the task's ``parameters`` list as\n"
+        "    # ``sys.argv[1:]`` — index lookups stay tolerant of a short\n"
+        "    # argv so a local ``python <script>`` re-run still parses\n"
+        "    # (the function body sees ``None`` for the missing slot).\n"
+        "    import sys\n"
+        "    return sys.argv[idx] if 0 <= idx < len(sys.argv) else None\n"
+        "\n\n"
         'if __name__ == "__main__":\n'
         f"    {invocation}\n"
     )
@@ -812,8 +1186,26 @@ def _capture_local_references(func: Callable[..., Any]) -> str:
             closure_vars = inspect.getclosurevars(current)
         except (TypeError, ValueError):
             continue
+        # ``inspect.getclosurevars`` walks ``co_names`` (the names the
+        # function loads via ``LOAD_GLOBAL`` *and* the attribute /
+        # IMPORT_FROM targets it touches) and classifies every hit as
+        # "global" — including names that the function body actually
+        # imports locally (``from X import Y`` emits ``IMPORT_FROM`` on
+        # ``co_names[Y]`` followed by ``STORE_FAST`` into
+        # ``co_varnames[Y]``). Inlining those names re-emits a stale
+        # copy of the class / helper *and* leaves its dependencies
+        # (other module-level imports — ``contextlib``, ``LOGGER``,
+        # ``time``, …) unbrought, so the staged file blows up at
+        # class-body time. Drop anything whose name lives in the
+        # function's locals: the staged callable's own
+        # ``from … import …`` line handles it at runtime.
+        local_names = set(current.__code__.co_varnames)
         candidates: dict[str, Any] = {
-            **closure_vars.globals, **closure_vars.nonlocals,
+            name: value
+            for name, value in {
+                **closure_vars.globals, **closure_vars.nonlocals,
+            }.items()
+            if name not in local_names
         }
         for name, value in candidates.items():
             if name in rendered_names:

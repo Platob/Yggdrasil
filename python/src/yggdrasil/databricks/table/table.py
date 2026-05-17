@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
     from yggdrasil.databricks.warehouse import WarehousePreparedStatement
     from yggdrasil.databricks.jobs.job import Job as DatabricksJob
+    from yggdrasil.databricks.table.async_job import AsyncApplierTaskType
     from yggdrasil.databricks.table.async_write import AsyncInsert
     from yggdrasil.data.statement import StatementBatch
 
@@ -3045,6 +3046,8 @@ class Table(DatabricksPath):
         self,
         *,
         applier: Any = ...,
+        task_type: "AsyncApplierTaskType" = "notebook",
+        force: bool = False,
         **overrides: Any,
     ) -> "DatabricksJob":
         """Get-or-create the per-table applier :class:`Job` for async inserts.
@@ -3062,21 +3065,49 @@ class Table(DatabricksPath):
         the source is uploaded under
         ``/Workspace/Shared/.ygg/jobs/<key>/main-<digest>.py`` and a
         matching :class:`JobEnvironment` lands on ``environments``.
+        ``task_type`` picks the flavour:
+
+        * ``"notebook"`` (default) — Databricks notebook with cells
+          (imports + metadata, captured locals, the ``@checkargs``
+          body, widget-driven invocation that pulls
+          ``catalog_name`` / ``schema_name`` / ``table_name`` from
+          the Job's parameters via ``dbutils.widgets.get``). The UI
+          shows stdout / ``LOGGER`` lines under the cell that
+          produced them.
+        * ``"spark"`` — flat ``SparkPythonTask`` script wired with
+          ``parameters=["{{job.parameters.<name>}}", …]`` so the
+          rendered ``sys.argv`` reads still pick up the Job's
+          parameters at run time. Single-stream logs.
+
         Pass ``applier=my_func`` to stage a custom callable instead,
         or ``applier=None`` to leave the job tasks-less.
+
+        By default a pre-existing Job with the matching name
+        short-circuits the deploy — useful when the same table is
+        wired up from multiple processes. Pass ``force=True`` to
+        always re-stage the applier and push the rebuilt settings
+        through :meth:`Jobs.create_or_update` instead — the call to
+        make after upgrading ``yggdrasil`` so the staged task picks
+        up the latest renderer (e.g. the notebook conversion replaces
+        a previously-staged ``SparkPythonTask`` whose ``apply_records()``
+        invocation can't see the job's ``{{job.parameters.*}}``
+        bindings).
         """
         from .async_job import AsyncInsertJob
 
         jobs = self.client.jobs
 
-        # Pre-check before staging the applier — an existing job
-        # short-circuits the workspace write entirely.
-        prelim_name = AsyncInsertJob.job_name(self)
-        found = jobs.find(name=prelim_name)
-        if found is not None:
-            return found
+        if not force:
+            # Pre-check before staging the applier — an existing job
+            # short-circuits the workspace write entirely.
+            prelim_name = AsyncInsertJob.job_name(self)
+            found = jobs.find(name=prelim_name)
+            if found is not None:
+                return found
 
-        settings = AsyncInsertJob.settings(self, applier=applier, **overrides)
+        settings = AsyncInsertJob.settings(
+            self, applier=applier, task_type=task_type, **overrides,
+        )
         name = settings.pop("name")
         return jobs.create_or_update(name=name, **settings)
 

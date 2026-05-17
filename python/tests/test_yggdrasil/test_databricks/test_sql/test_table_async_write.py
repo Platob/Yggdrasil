@@ -1185,25 +1185,66 @@ class TestAsyncInsertJobSettings:
             AsyncInsertJob.job_name(bare)
 
     def test_default_applier_is_auto_staged(self):
-        from databricks.sdk.service.jobs import SparkPythonTask
+        from databricks.sdk.service.jobs import NotebookTask
         from yggdrasil.databricks.table.async_job import AsyncInsertJob
 
         tbl, _, _ = self._table_with_trigger_path()
         spec = AsyncInsertJob.settings(tbl)
         # No explicit ``task=``/``notebook_path=`` → default applier
-        # (:func:`AsyncInsertJob.apply_records`) is staged and wired
-        # as a ``SparkPythonTask``.
+        # (:func:`AsyncInsertJob.apply_records`) is staged as a
+        # Databricks notebook so log lines surface per cell in the UI,
+        # and wired as a ``NotebookTask``.
         assert len(spec["tasks"]) == 1
         task = spec["tasks"][0]
         assert task.task_key == "apply_records"
-        assert isinstance(task.spark_python_task, SparkPythonTask)
-        assert task.spark_python_task.python_file.endswith(".py")
+        assert isinstance(task.notebook_task, NotebookTask)
+        assert task.spark_python_task is None
+        # The notebook lands under the per-task-key staging folder and
+        # the workspace strips the ``.py`` source extension when
+        # storing the notebook.
+        assert task.notebook_task.notebook_path
+        assert not task.notebook_task.notebook_path.endswith(".py")
         # Matching ``JobEnvironment`` lands on the settings so a direct
         # ``Jobs.create_or_update(**settings)`` call resolves the
         # ``yggdrasil`` imports without a follow-up update.
         assert spec["environments"]
         env = spec["environments"][0]
         assert env.environment_key == task.environment_key
+
+    def test_task_type_spark_stages_spark_python_task(self):
+        """``task_type='spark'`` routes through ``stage_python_callable``."""
+        from databricks.sdk.service.jobs import NotebookTask, SparkPythonTask
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, _, _ = self._table_with_trigger_path()
+        spec = AsyncInsertJob.settings(tbl, task_type="spark")
+        assert len(spec["tasks"]) == 1
+        task = spec["tasks"][0]
+        # The Spark Python flavour wires a SparkPythonTask, *not* a
+        # NotebookTask.
+        assert isinstance(task.spark_python_task, SparkPythonTask)
+        assert not isinstance(task.notebook_task, NotebookTask)
+        assert task.spark_python_task.python_file.endswith(".py")
+        # ``SparkPythonTask.parameters`` plumbs the Job's parameters
+        # into the script's ``sys.argv`` reads via
+        # ``{{job.parameters.<name>}}`` substitution — without this
+        # the rendered ``apply_records(catalog_name=…, schema_name=…,
+        # table_name=…)`` invocation can't see the per-run values.
+        params = task.spark_python_task.parameters
+        assert params == [
+            "{{job.parameters.catalog_name}}",
+            "{{job.parameters.schema_name}}",
+            "{{job.parameters.table_name}}",
+        ]
+        # Matching JobEnvironment still lands on the settings.
+        assert spec["environments"]
+
+    def test_task_type_invalid_raises(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, _, _ = self._table_with_trigger_path()
+        with pytest.raises(ValueError, match="task_type"):
+            AsyncInsertJob.settings(tbl, task_type="lambda")
 
     def test_applier_none_emits_empty_task_list(self):
         from yggdrasil.databricks.table.async_job import AsyncInsertJob
@@ -1253,8 +1294,33 @@ class TestTableAsyncJob:
         jobs_svc.create_or_update.assert_not_called()
         jobs_svc.create.assert_not_called()
 
+    def test_force_redeploys_even_when_job_exists(self):
+        """``force=True`` skips the short-circuit and re-pushes settings.
+
+        Needed after upgrading ``yggdrasil`` so an existing job's stale
+        task spec (e.g. a previously-staged ``SparkPythonTask`` whose
+        ``apply_records()`` invocation can't see the Job's
+        ``{{job.parameters.*}}`` bindings) gets replaced with the
+        latest renderer's output — the widget-driven notebook task in
+        this case.
+        """
+        tbl, jobs_svc = self._table()
+        existing = MagicMock(name="StaleJob")
+        # find() would return the stale job, but force=True must skip it.
+        jobs_svc.find.return_value = existing
+        fresh = MagicMock(name="FreshJob")
+        jobs_svc.create_or_update.return_value = fresh
+
+        result = tbl.async_job(force=True)
+
+        assert result is fresh
+        # The stale job lookup is skipped entirely — we go straight to
+        # create_or_update so the workspace receives the rebuilt spec.
+        jobs_svc.find.assert_not_called()
+        jobs_svc.create_or_update.assert_called_once()
+
     def test_stages_apply_records_when_job_missing(self):
-        from databricks.sdk.service.jobs import SparkPythonTask
+        from databricks.sdk.service.jobs import NotebookTask
 
         tbl, jobs_svc = self._table()
         jobs_svc.find.return_value = None
@@ -1269,12 +1335,13 @@ class TestTableAsyncJob:
         assert kwargs["name"] == "ygg-async-insert-cat-sch-tbl"
         # File-arrival trigger lives in the spec.
         assert "trigger" in kwargs
-        # Default applier was staged → ``tasks`` carries a SparkPythonTask
-        # pointed at the workspace ``.py`` file, plus a matching env.
+        # Default applier was staged → ``tasks`` carries a NotebookTask
+        # (notebook cells surface logs per-cell in the UI), plus a
+        # matching env.
         assert len(kwargs["tasks"]) == 1
         task = kwargs["tasks"][0]
-        assert isinstance(task.spark_python_task, SparkPythonTask)
-        assert task.spark_python_task.python_file.endswith(".py")
+        assert isinstance(task.notebook_task, NotebookTask)
+        assert task.spark_python_task is None
         assert kwargs["environments"]
 
     def test_applier_none_creates_tasksless_job(self):

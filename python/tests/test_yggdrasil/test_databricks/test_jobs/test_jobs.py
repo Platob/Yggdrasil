@@ -27,6 +27,7 @@ from yggdrasil.databricks.jobs import Job, JobRun
 from yggdrasil.databricks.jobs.task import (
     JobTask,
     _content_digest,
+    _render_callable_notebook,
     _render_callable_script,
 )
 from yggdrasil.databricks.tests import DatabricksTestCase
@@ -797,6 +798,30 @@ class TestStagedScriptMetadata(DatabricksTestCase):
         b = _content_digest(_signature_fixture, (), {"name": "y"})
         self.assertNotEqual(a, b)
 
+    def test_script_invocation_reads_sys_argv_for_unbound_params(self):
+        """Unbound params resolve at runtime via ``sys.argv`` reads.
+
+        SparkPythonTask has no widget surface — the script's only
+        channel for per-run values is ``sys.argv``. The staging path
+        wires ``SparkPythonTask.parameters`` to
+        ``{{job.parameters.<name>}}`` placeholders so the rendered
+        invocation's ``sys.argv[i]`` reads pick up the Job's
+        :class:`JobParameterDefinition`s at run time.
+        """
+        import ast
+
+        def _three_params(catalog_name: str, schema_name: str, table_name: str) -> None:
+            return None
+
+        script = _render_callable_script(_three_params, (), {})
+        ast.parse(script)
+        # Helper emitted once.
+        self.assertIn("def _yggdrasil_argv(idx):", script)
+        # Positional matching follows signature order.
+        self.assertIn("catalog_name=_yggdrasil_argv(1)", script)
+        self.assertIn("schema_name=_yggdrasil_argv(2)", script)
+        self.assertIn("table_name=_yggdrasil_argv(3)", script)
+
     def test_script_wraps_no_arg_function_with_checkargs(self):
         import ast
 
@@ -900,6 +925,53 @@ class TestStagedScriptCapturesLocals(DatabricksTestCase):
         exec(compile(patched, "<staged>", "exec"), env)
         self.assertEqual(env["_results"], ["value-from-module::okz1"])
 
+    def test_skips_names_imported_inside_function_body(self):
+        """Local ``from X import Y`` shadows the global ref — don't re-inline.
+
+        ``inspect.getclosurevars`` walks ``co_names`` and classifies
+        every hit as "global", including names the function body
+        imports locally via ``from X import Y`` (those produce an
+        ``IMPORT_FROM`` op on ``co_names[Y]`` followed by
+        ``STORE_FAST`` into ``co_varnames[Y]``). Inlining such a name
+        re-emits a stale copy of the helper / class *and* drags its
+        transitive deps with it — which is what blew up the staged
+        async-insert applier with ``NameError: ClassVar`` when the
+        inlined ``AsyncInsertJob`` class body referenced typing names
+        the staged file didn't otherwise carry.
+        """
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        # ``apply_records`` references ``AsyncInsertJob`` via a local
+        # ``from yggdrasil.databricks.table.async_job import ...`` inside
+        # its body — the staged script must NOT emit a duplicate class
+        # block at module scope.
+        script = _render_callable_script(AsyncInsertJob.apply_records, (), {})
+        self.assertNotIn("class AsyncInsertJob", script)
+        # Same protection holds for the notebook rendering.
+        notebook = _render_callable_notebook(
+            AsyncInsertJob.apply_records, (), {},
+        )
+        self.assertNotIn("class AsyncInsertJob", notebook)
+
+        # End-to-end: the staged notebook compiles + executes its
+        # top-level definitions without ``NameError``. The function
+        # body itself still needs a live workspace at call time, so
+        # the widget-driven invocation cell ends up calling
+        # ``apply_records`` with empty strings — but the failure path
+        # then sits in the function body, not at class-body / module
+        # import time, which is what the regression guards.
+        ns = {"__name__": "__staged__"}
+        try:
+            exec(compile(notebook, "<staged>", "exec"), ns)
+        except AssertionError:
+            # ``engine.table('')`` asserts a non-empty catalog — that's
+            # the function body running, which means the staged file's
+            # top-level executed cleanly. Good enough for the
+            # regression.
+            pass
+        self.assertIn("apply_records", ns)
+        self.assertTrue(callable(ns["apply_records"]))
+
     def test_skips_imported_callables(self):
         """A reference to a stdlib symbol stays as an import, not inlined."""
         import ast
@@ -915,6 +987,143 @@ class TestStagedScriptCapturesLocals(DatabricksTestCase):
         # ``math = ...`` lines.
         self.assertNotIn("def sqrt(", script)
         self.assertNotIn("math = ", script)
+
+
+class TestStagedNotebookCallable(DatabricksTestCase):
+    """``stage_python_notebook_callable`` renders cells + wires a NotebookTask."""
+
+    def test_notebook_has_databricks_header_and_cell_separators(self):
+        import ast
+
+        source = _render_callable_notebook(
+            _signature_fixture, (), {"name": "bob"},
+        )
+        # Databricks magic header on line 1 — the workspace import
+        # path's content sniff keys off this to route the upload as a
+        # notebook instead of a workspace file.
+        self.assertTrue(source.startswith("# Databricks notebook source\n"))
+        # Cell separator emitted between every logical section.
+        self.assertIn("\n# COMMAND ----------\n", source)
+        # Markdown header cell uses the ``# MAGIC %md`` convention.
+        self.assertIn("# MAGIC %md", source)
+        # Captured metadata + checkargs wrap still land in their own cells.
+        self.assertIn("__yggdrasil_task__", source)
+        self.assertIn(
+            "from yggdrasil.dataclasses.safe_function import checkargs",
+            source,
+        )
+        self.assertIn("@checkargs\ndef _signature_fixture(", source)
+        # Source still parses as valid Python (cell separators are comments).
+        ast.parse(source)
+
+    def test_notebook_widget_fallback_when_args_unbound(self):
+        """Unbound parameters fall back to ``dbutils.widgets.get`` reads."""
+        import ast
+
+        def _three_params(catalog_name: str, schema_name: str, table_name: str) -> None:
+            return None
+
+        source = _render_callable_notebook(_three_params, (), {})
+        ast.parse(source)
+        # The widget helper is emitted exactly once and the invocation
+        # routes every parameter through it.
+        self.assertIn("def _yggdrasil_widget(name):", source)
+        self.assertIn("catalog_name=_yggdrasil_widget('catalog_name')", source)
+        self.assertIn("schema_name=_yggdrasil_widget('schema_name')", source)
+        self.assertIn("table_name=_yggdrasil_widget('table_name')", source)
+
+    def test_notebook_bound_args_render_as_literals(self):
+        """Bound *args*/*kwargs* render as literals — no widget helper."""
+        source = _render_callable_notebook(
+            _signature_fixture, (), {"name": "bob", "count": 2},
+        )
+        self.assertIn("_signature_fixture(name='bob', count=2)", source)
+        self.assertNotIn("_yggdrasil_widget", source)
+
+    def test_notebook_source_compiles_for_representative_callables(self):
+        """Every staged notebook must round-trip through ``compile()``.
+
+        The Databricks notebook task host loads the staged ``.py`` via
+        ``exec(compile(f.read(), filename, 'exec'))`` (the traceback the
+        applier surfaced was rooted in that call). If the rendered
+        source has a ``SyntaxError`` — unbalanced cell, broken
+        ``__yggdrasil_task__`` JSON heredoc, stray ``@`` after the
+        captured-locals block, anything — the workspace run fails
+        before the first ``LOGGER`` line, which is exactly the silent
+        regression class this test guards.
+
+        Covers the three shapes the renderer emits:
+
+        1. Simple no-helper / no-widget callable.
+        2. Bound-args invocation (literal-only cell).
+        3. Captured-locals + widget invocation
+           (``AsyncInsertJob.apply_records`` — the path that hit
+           ``NameError: ClassVar`` in production).
+        """
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        cases: list[tuple[str, Any, tuple, dict]] = [
+            ("plain", _signature_fixture, (), {}),
+            ("bound_args", _signature_fixture, (), {"name": "bob", "count": 2}),
+            ("captured_locals", _capture_entry, (), {"suffix": "z"}),
+            ("widget_fallback", AsyncInsertJob.apply_records, (), {}),
+        ]
+        for label, func, args, kwargs in cases:
+            with self.subTest(case=label):
+                source = _render_callable_notebook(func, args, kwargs)
+                # ``compile`` is a stricter check than ``ast.parse``:
+                # it runs the same compile pipeline the Databricks host
+                # invokes, so anything ``ast.parse`` waves through but
+                # the bytecode compiler rejects (future-import
+                # placement, ``return`` outside a function, …) shows up
+                # here.
+                compile(source, f"<staged-notebook:{label}>", "exec")
+
+    def test_stage_python_notebook_callable_returns_notebook_task(self):
+        """End-to-end staging produces a Task w/ NotebookTask + env_key."""
+        from unittest.mock import patch
+        from databricks.sdk.service.jobs import NotebookTask
+        from yggdrasil.databricks.jobs.task import (
+            DEFAULT_ENVIRONMENT_KEY,
+            stage_python_notebook_callable,
+        )
+
+        captured: dict = {}
+
+        def _fake_workspace_path(path, *, client=None, **_kw):
+            captured["path"] = path
+            captured.setdefault("bodies", []).append(None)
+            handle = MagicMock(name=f"WorkspacePath({path!r})")
+            handle.full_path.return_value = path
+
+            def _write_bytes(b: bytes) -> None:
+                captured["bodies"][-1] = b
+            handle.write_bytes = _write_bytes
+            return handle
+
+        with patch(
+            "yggdrasil.databricks.fs.workspace_path.WorkspacePath",
+            side_effect=_fake_workspace_path,
+        ):
+            details, _, _ = stage_python_notebook_callable(
+                MagicMock(name="DatabricksClient"),
+                _signature_fixture,
+                task_key="apply",
+            )
+
+        # Uploaded as ``.py`` (so the workspace's content sniff routes
+        # the bytes to the notebook importer), referenced without the
+        # extension in the NotebookTask.
+        self.assertTrue(captured["path"].endswith(".py"))
+        self.assertIsInstance(details.notebook_task, NotebookTask)
+        self.assertIsNone(details.spark_python_task)
+        self.assertFalse(details.notebook_task.notebook_path.endswith(".py"))
+        self.assertEqual(details.task_key, "apply")
+        self.assertEqual(details.environment_key, DEFAULT_ENVIRONMENT_KEY)
+        # The uploaded body is a Databricks ``.py`` notebook source.
+        body = captured["bodies"][0].decode()
+        self.assertTrue(body.startswith("# Databricks notebook source\n"))
+        self.assertIn("\n# COMMAND ----------\n", body)
 
 
 class TestJobsSubmit(DatabricksTestCase):
