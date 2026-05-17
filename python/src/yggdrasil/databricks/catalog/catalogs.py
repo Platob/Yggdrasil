@@ -28,6 +28,7 @@ A module-level :class:`ExpiringDict` (``_CATALOG_INFO_CACHE``) keyed by
 from __future__ import annotations
 
 import logging
+import time
 from typing import Iterator, Optional, Union
 
 from databricks.sdk.service.catalog import CatalogInfo
@@ -130,6 +131,7 @@ class Catalogs(DatabricksService):
         cached = _CATALOG_INFO_CACHE.get(key)
         if cached is not None:
             object.__setattr__(cat, "_infos", cached)
+            object.__setattr__(cat, "_infos_fetched_at", time.time())
         else:
             logger.debug("No cached info for catalog %r — returning lazy handle", cat)
         return cat

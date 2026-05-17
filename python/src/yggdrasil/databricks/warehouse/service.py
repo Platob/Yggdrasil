@@ -48,7 +48,7 @@ def set_cached_warehouse(
     client: DatabricksClient,
     warehouse: "SQLWarehouse",
 ) -> None:
-    host = client.base_url.to_string()
+    host = (client.host if client else None) or "default"
     existing = CACHE_MAP.get(host)
     if existing is None:
         existing = CACHE_MAP[host] = ExpiringDict(default_ttl=3600)
@@ -59,7 +59,7 @@ def get_cached_warehouse(
     client: DatabricksClient,
     warehouse_name: str,
 ) -> Optional["SQLWarehouse"]:
-    host = client.base_url.to_string()
+    host = (client.host if client else None) or "default"
     existing = CACHE_MAP.get(host)
     return existing.get(warehouse_name) if existing else None
 

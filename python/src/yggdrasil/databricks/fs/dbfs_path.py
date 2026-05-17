@@ -146,6 +146,7 @@ class DBFSPath(DatabricksPath):
         except Exception:
             if not missing_ok:
                 raise
+        logger.info("Deleted DBFS file %r", self)
         self.invalidate_singleton()
 
     def _remove_dir(
