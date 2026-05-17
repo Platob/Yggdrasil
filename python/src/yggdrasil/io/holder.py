@@ -1389,28 +1389,51 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
     ) -> int:
         """Splice *src*'s bytes into this holder starting at ``offset``.
 
-        Default implementation: small payloads (under
-        :data:`_INLINE_WRITE_THRESHOLD`, currently 4 MiB) splice
-        through :meth:`write_mv` in one shot — backends with a
-        cheap whole-blob write skip the chunked read/write loop.
-        Larger payloads open an :class:`IO[bytes]` cursor on
-        *src* and hand it to :meth:`_write_stream`, so backends
-        with an atomic streaming uploader can replace the
-        default chunked drain.
+        Routing:
+
+        - *src* is a :class:`Path` and we're at ``offset == 0``
+          with no slicing → defer to :meth:`Holder._transfer_to`
+          on *src* so the source-side fast paths fire
+          (:func:`shutil.copyfile` for local→local,
+          :meth:`Holder.write_local_path` for local→remote).
+        - Sub-threshold payloads (under
+          :data:`_INLINE_WRITE_THRESHOLD`, currently 4 MiB)
+          splice through :meth:`write_mv` in one shot.
+        - Larger payloads open an :class:`IO[bytes]` cursor on
+          *src* and hand it to :meth:`_write_stream`, so backends
+          with an atomic streaming uploader can replace the
+          default chunked drain.
 
         ``size>=0`` caps the byte count pulled from *src*. The
         decision boundary (inline vs stream) uses
         ``min(src.size, size)`` so a 5 MiB source with
         ``size=1024`` still goes through the inline fast path.
-        ``overwrite`` forwards into whichever branch fires.
-        ``batch_size`` controls the streaming chunk size when
-        the threshold path is taken.
+        ``overwrite`` truncates the tail past
+        ``offset + bytes_written``; ``batch_size`` controls the
+        streaming chunk size when the threshold path is taken.
 
         Override when a backend can splice a foreign holder
         without going through Python bytes (e.g. an S3
         ``CopyObject`` when ``self`` and *src* share an
         underlying bucket).
         """
+        from yggdrasil.io.path.path import Path
+
+        if (
+            offset == 0
+            and size < 0
+            and isinstance(src, Path)
+            and type(src)._transfer_to is not Holder._transfer_to
+        ):
+            # Path source with a specialised ``_transfer_to``
+            # (LocalPath, AWS S3Path, …) → defer to its fast
+            # paths instead of the generic inline / stream loop.
+            src._transfer_to(self)
+            written = src.size
+            if overwrite and written < self.size:
+                self.truncate(written)
+            return written
+
         src_size = src.size
         effective = src_size if size < 0 else min(src_size, size)
         if effective < _INLINE_WRITE_THRESHOLD:
@@ -1472,7 +1495,6 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         ``sendfile``, local→remote chunked stream) override
         :meth:`_transfer_to`, not this method.
         """
-        from yggdrasil.io.base import IO
         from yggdrasil.io.path.path import Path
 
         source = _coerce_transfer_endpoint(src)
@@ -1496,15 +1518,20 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
             for child in source.iterdir():
                 (target / child.name).upload(child)
             return target
-        if not isinstance(source, IO) and size < 0 and offset == 0:
-            # Whole-payload :class:`Holder` source → defer to the
-            # backend-aware fast path (``shutil.copyfile``,
-            # ``write_local_path``, …). Sliced or IO sources fall
-            # through to the byte-pump below.
-            source._transfer_to(target)
+        if size < 0 and offset == 0:
+            # Whole-source: defer to ``write_bytes`` type dispatch —
+            # bytes → ``write_mv``, :class:`Holder` → ``write_holder``
+            # (Path target uses :meth:`Path._write_holder` to fire
+            # the ``_transfer_to`` fast paths: ``shutil.copyfile``
+            # for local→local, ``write_local_path`` for local→remote),
+            # IO → ``write_stream`` (path subclass overrides splice
+            # in their atomic-upload SDK call). ``overwrite=True``
+            # truncates any tail past the source's length.
+            target.write_bytes(source, overwrite=True)
         else:
             target.write_bytes(
                 _read_slice_from_source(source, size=size, offset=offset),
+                overwrite=True,
             )
         return target
 
@@ -1546,10 +1573,15 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
                 )
             return target.upload(self)
         if size < 0 and offset == 0:
-            self._transfer_to(target)
+            # Whole-source: defer to ``target.write_bytes(self)``
+            # so the byte-pump goes through the same dispatch as
+            # ``upload`` — Path target picks up the local fast
+            # paths via :meth:`Path._write_holder`.
+            target.write_bytes(self, overwrite=True)
         else:
             target.write_bytes(
                 _read_slice_from_source(self, size=size, offset=offset),
+                overwrite=True,
             )
         return target
 
