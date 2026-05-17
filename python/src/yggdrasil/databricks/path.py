@@ -591,25 +591,34 @@ class DatabricksPath(DatabricksResource, RemotePath):
         itself — does not exist yet. On the first NotFound-shaped
         failure we hand off to :meth:`_ensure_parents` (subclass hook
         for catalog/schema/volume creation, then a recursive parent
-        ``mkdir``) and retry exactly once. Other errors propagate.
+        ``mkdir``) and retry exactly once. The triggering exception
+        is forwarded so subclasses can short-circuit the recovery
+        path — e.g. ``VolumePath`` skips its cheap
+        ``files.create_directory`` probe when the SDK has already
+        named the volume itself as missing. Other errors propagate.
         """
         try:
             return self._call(func, *args, **kwargs)
         except Exception as exc:
             if not _looks_like_parent_missing(exc):
                 raise
-            if not self._ensure_parents():
+            if not self._ensure_parents(exc):
                 raise
             return self._call(func, *args, **kwargs)
 
-    def _ensure_parents(self) -> bool:
+    def _ensure_parents(self, exc: BaseException | None = None) -> bool:
         """Best-effort create of every directory above *self*.
 
         Returns ``True`` if any creation actually happened (so the
         caller knows a retry is worth attempting). Subclasses extend
         this — :class:`VolumePath` first creates the catalog / schema
-        / managed volume, then recurses into ``parent.mkdir``.
+        / managed volume, then recurses into ``parent.mkdir``. The
+        optional *exc* carries the failure that triggered the
+        recovery, letting subclasses tailor the create chain to the
+        specific NotFound shape (e.g. "Volume … does not exist" vs
+        a generic missing-directory message).
         """
+        del exc
         parent = self.parent
         if parent.url == self.url:
             return False

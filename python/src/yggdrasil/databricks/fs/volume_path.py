@@ -651,7 +651,7 @@ class VolumePath(DatabricksPath):
     # Parent / volume auto-creation
     # ==================================================================
 
-    def _ensure_parents(self) -> bool:
+    def _ensure_parents(self, exc: BaseException | None = None) -> bool:
         """Recovery hook for ``_call_ensuring_parents`` after NotFound.
 
         Cheap-path first: if *self* lives strictly below the volume
@@ -663,6 +663,13 @@ class VolumePath(DatabricksPath):
         upfront ``catalogs.get`` / ``schemas.get`` / ``volumes.read``
         probes — blind creates swallow ``AlreadyExists`` so the
         idempotent path costs at most three SDK calls.
+
+        When the triggering *exc* already named the Unity Catalog
+        volume as the missing resource (e.g. Databricks surfaces
+        ``NotFound: Volume 'cat.sch.vol' does not exist``), the
+        cheap probe is skipped entirely — it would just NotFound
+        again — and ``_ensure_volume`` runs first, shaving one SDK
+        round trip off the recovery.
         """
         triple = self._split_volume()
         if triple is None:
@@ -671,17 +678,18 @@ class VolumePath(DatabricksPath):
         parent = self.parent
         pparts = [p for p in (parent.url.path or "/").lstrip("/").split("/") if p]
         has_subdir = len(pparts) > 3  # parent strictly below ``/cat/sch/vol``
+        volume_missing = exc is not None and _looks_like_volume_not_found(exc)
 
-        if has_subdir:
+        if has_subdir and not volume_missing:
             try:
                 self._call(
                     self.client.workspace_client().files.create_directory, parent.api_path,
                 )
                 return True
-            except Exception as exc:
-                if _looks_like_already_exists(exc):
+            except Exception as inner:
+                if _looks_like_already_exists(inner):
                     return True
-                if not _looks_like_not_found(exc):
+                if not _looks_like_not_found(inner):
                     raise
                 # Parent missing because volume itself is missing —
                 # fall through to volume creation.
@@ -693,8 +701,8 @@ class VolumePath(DatabricksPath):
                 self._call(
                     self.client.workspace_client().files.create_directory, parent.api_path,
                 )
-            except Exception as exc:
-                if not _looks_like_already_exists(exc):
+            except Exception as inner:
+                if not _looks_like_already_exists(inner):
                     raise
         return True
 
@@ -1024,6 +1032,28 @@ def _looks_like_not_found(exc: BaseException) -> bool:
     if isinstance(exc, FileNotFoundError):
         return True
     return "does not exist" in str(exc).lower()
+
+
+# ``\bvolume\b`` matches the bare word; ``/Volumes/`` in a directory-missing
+# path lowercases to ``/volumes/`` and ``volumes`` (with the trailing ``s``)
+# does *not* satisfy the second word boundary — so this stays clear of the
+# path-prefix false positive.
+_VOLUME_TOKEN_RE = re.compile(r"\bvolume\b", re.IGNORECASE)
+
+
+def _looks_like_volume_not_found(exc: BaseException) -> bool:
+    """True when *exc* names the Unity Catalog volume itself as missing.
+
+    Distinct from a missing sub-directory inside an existing volume:
+    Databricks' Files API surfaces the former as a NotFound carrying
+    the word ``Volume`` (e.g. ``Volume 'cat.sch.vol' does not exist``),
+    while a missing sub-path mentions ``Path``/``directory`` instead.
+    Used by :meth:`VolumePath._ensure_parents` to skip the cheap
+    ``files.create_directory`` probe and create the volume directly.
+    """
+    if not _looks_like_not_found(exc):
+        return False
+    return _VOLUME_TOKEN_RE.search(str(exc)) is not None
 
 
 def _looks_like_already_exists(exc: BaseException) -> bool:

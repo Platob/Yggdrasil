@@ -247,6 +247,79 @@ class TestVolumesDictAccess:
             Volumes(client=client)["uploads"]
 
 
+class TestVolumesServiceCreate:
+    """``client.volumes.create(...)`` should auto-create the parent
+    schema (and catalog) when the volume create fails NotFound on
+    them — not punt the recovery to the caller."""
+
+    def test_simple_create_delegates_to_volume(self, workspace, client):
+        # Happy path: catalog + schema already exist, single
+        # ``volumes.create`` lands.
+        workspace.volumes.create.return_value = _info()
+        v = Volumes(client=client).create(
+            catalog_name="cat", schema_name="sch", volume_name="vol",
+        )
+        assert isinstance(v, Volume)
+        workspace.volumes.create.assert_called_once()
+        workspace.schemas.create.assert_not_called()
+        workspace.catalogs.create.assert_not_called()
+
+    def test_schema_missing_creates_schema_then_volume(self, workspace, client):
+        # First ``volumes.create`` fails because the schema doesn't
+        # exist; the service must create the schema and retry the
+        # volume — without forcing the caller to handle NotFound.
+        volume_creates = [NotFound("Schema does not exist"), _info()]
+
+        def vol_create(**_kw):
+            r = volume_creates.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        workspace.volumes.create.side_effect = vol_create
+
+        v = Volumes(client=client).create(
+            catalog_name="cat", schema_name="sch", volume_name="vol",
+        )
+        assert isinstance(v, Volume)
+        workspace.schemas.create.assert_called_once_with(
+            name="sch", catalog_name="cat",
+        )
+        workspace.catalogs.create.assert_not_called()
+        assert workspace.volumes.create.call_count == 2
+
+    def test_catalog_missing_creates_catalog_schema_then_volume(
+        self, workspace, client,
+    ):
+        # Cascade goes one level deeper: schema create itself raises
+        # NotFound, so the catalog must be created too. After that,
+        # schema and volume retries land.
+        volume_creates = [NotFound("Schema does not exist"), _info()]
+        schema_creates = [NotFound("Catalog does not exist"), None]
+
+        def vol_create(**_kw):
+            r = volume_creates.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        def schema_create(**_kw):
+            r = schema_creates.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        workspace.volumes.create.side_effect = vol_create
+        workspace.schemas.create.side_effect = schema_create
+
+        Volumes(client=client).create(
+            catalog_name="cat", schema_name="sch", volume_name="vol",
+        )
+        workspace.catalogs.create.assert_called_once_with(name="cat")
+        assert workspace.schemas.create.call_count == 2
+        assert workspace.volumes.create.call_count == 2
+
+
 class TestVolumePathDelegation:
     """:class:`VolumePath` reads metadata via its :class:`Volume`
     singleton, so the SDK call count collapses to one per

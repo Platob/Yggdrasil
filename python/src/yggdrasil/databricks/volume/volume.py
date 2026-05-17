@@ -685,55 +685,71 @@ class Volume(DatabricksResource, Singleton):
         self._reset_cache()
         return self
 
-    def _ensure_volume(self) -> bool:
-        """Bottom-up create of any missing catalog / schema / volume.
+    def _ensure_schema_and_catalog(self) -> None:
+        """Best-effort create of the parent schema (and catalog if needed).
 
-        Used by :meth:`read_info` when ``volumes.read`` returns
-        ``NotFound``, and by :class:`VolumePath` when a write hits a
-        missing target. Each ``create`` swallows ``AlreadyExists`` so
-        concurrent creators don't fight; returns ``True`` if at least
-        one create landed.
+        Mirrors :meth:`_ensure_volume`'s middle/last legs without
+        touching the volume itself — so :meth:`Volumes.create` can
+        recover from a "schema missing" NotFound and then retry the
+        volume create with the *caller's* args (comment,
+        storage_location, volume_type) intact, rather than letting
+        :meth:`_ensure_volume` materialise a default-managed volume
+        on the way up.
         """
         ws = self.client.workspace_client()
-        logger.debug("Ensuring volume %r exists", self)
-
-        def _create_volume() -> Any:
-            return ws.volumes.create(
-                catalog_name=self.catalog_name,
-                schema_name=self.schema_name,
-                name=self.volume_name,
-                volume_type=_managed_volume_type(),
-            )
-
-        # 1) Try volume only — common case where catalog + schema exist.
-        try:
-            _create_volume()
-            return True
-        except Exception as exc:
-            if _looks_like_already_exists(exc):
-                return False
-            if not _looks_like_not_found(exc):
-                raise
-            # Fall through: a parent (schema or catalog) is missing.
-
-        # 2) Schema may be missing — create it, then retry volume.
         try:
             ws.schemas.create(name=self.schema_name, catalog_name=self.catalog_name)
         except Exception as exc:
             if _looks_like_already_exists(exc):
-                pass
-            elif _looks_like_not_found(exc):
-                # 3) Catalog also missing — create catalog, then schema.
+                return
+            if _looks_like_not_found(exc):
+                # Catalog also missing — create catalog, then schema.
                 _safe_create(lambda: ws.catalogs.create(name=self.catalog_name))
                 _safe_create(
                     lambda: ws.schemas.create(
                         name=self.schema_name, catalog_name=self.catalog_name,
                     ),
                 )
-            else:
-                raise
+                return
+            raise
 
-        _safe_create(_create_volume)
+    def _ensure_volume(self) -> bool:
+        """Bottom-up create of any missing catalog / schema / volume.
+
+        Used by :meth:`read_info` when ``volumes.read`` returns
+        ``NotFound``, and by :class:`VolumePath` when a write hits a
+        missing target. Routes the volume create through
+        :meth:`create` (which warms ``_store_infos``) and delegates
+        parent creation to :meth:`_ensure_schema_and_catalog`;
+        ``AlreadyExists`` is swallowed so concurrent creators don't
+        fight. Returns ``True`` if at least one create landed.
+
+        ``self.create`` rather than ``self.service.create`` here on
+        purpose: :meth:`Volumes.create` calls ``_ensure_volume`` for
+        its own bottom-up recovery, so routing back through the
+        service would recurse.
+        """
+        logger.debug("Ensuring volume %r exists", self)
+
+        # 1) Try volume only — common case where catalog + schema exist.
+        # ``if_not_exists=False`` so AlreadyExists surfaces here and
+        # we can distinguish "already there" (return False) from
+        # "newly created" (return True).
+        try:
+            self.create(if_not_exists=False)
+            return True
+        except Exception as exc:
+            if _looks_like_already_exists(exc):
+                self._reset_cache()
+                return False
+            if not _looks_like_not_found(exc):
+                raise
+            # Fall through: a parent (schema or catalog) is missing.
+
+        # 2) Schema (and maybe catalog) missing — create them, then
+        #    retry the volume.
+        self._ensure_schema_and_catalog()
+        _safe_create(lambda: self.create(if_not_exists=False))
         return True
 
     # ── grants ────────────────────────────────────────────────────────────────
