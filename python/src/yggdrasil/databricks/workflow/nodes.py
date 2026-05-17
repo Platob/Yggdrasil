@@ -97,18 +97,41 @@ class TaskNode:
     def _resolve_deps(self) -> List["TaskNode"]:
         """Extract upstream :class:`TaskNode` references from args/kwargs.
 
-        Walks every positional and keyword value, deduplicates by
-        instance id (a node referenced by both ``args`` and ``kwargs``
-        only registers one edge), and returns them in first-appearance
-        order — handy when the resulting :class:`TaskDependency` list
-        is rendered in the Databricks UI.
+        Walks every positional and keyword value (recursing into
+        ``list`` / ``tuple`` / ``set`` / ``dict`` containers so a
+        downstream task receiving a list of mapped futures still
+        infers the right edges — the common reducer pattern after
+        :meth:`WorkflowTask.map`), deduplicates by instance id (a node
+        referenced multiple times only registers one edge), and
+        returns them in first-appearance order — handy when the
+        resulting :class:`TaskDependency` list is rendered in the
+        Databricks UI.
         """
         out: List[TaskNode] = []
         seen: set[int] = set()
+
+        def _walk(value: Any) -> None:
+            if isinstance(value, TaskNode):
+                if id(value) not in seen:
+                    seen.add(id(value))
+                    out.append(value)
+                return
+            # Containers a flow body realistically threads upstream
+            # futures through. Skip strings/bytes — they iterate as
+            # characters and never contain TaskNodes.
+            if isinstance(value, (str, bytes, bytearray)):
+                return
+            if isinstance(value, dict):
+                for v in value.values():
+                    _walk(v)
+                return
+            if isinstance(value, (list, tuple, set, frozenset)):
+                for v in value:
+                    _walk(v)
+                return
+
         for value in (*self.args, *self.kwargs.values()):
-            if isinstance(value, TaskNode) and id(value) not in seen:
-                seen.add(id(value))
-                out.append(value)
+            _walk(value)
         return out
 
     def __repr__(self) -> str:
