@@ -61,6 +61,8 @@ run = daily_etl.run(date="2025-01-15", wait=True)
     - [4.20 Cross-workspace secrets](#420-cross-workspace-secrets)
     - [4.21 The auto-derived `[YGG][project/version]` prefix](#421-the-auto-derived-yggprojectversion-prefix)
     - [4.22 Source-attribution metadata (tags + descriptions)](#422-source-attribution-metadata-tags-descriptions)
+    - [4.23 Parallel fan-out with `.map(...)`](#423-parallel-fan-out-with-map)
+    - [4.24 File-arrival triggers (`@flow(file_trigger=...)`)](#424-file-arrival-triggers-flowfile_trigger)
 5. [The `ygg` runtime module](#5-the-ygg-runtime-module)
 6. [API reference](#6-api-reference)
 7. [Limitations](#7-limitations)
@@ -695,6 +697,161 @@ Need to add custom tags? `metadata.collect_source_metadata(func, extra={"team": 
 
 The git probe is best-effort and cached per source-file directory — N tasks in one flow trigger at most one `git` subprocess invocation per file's repo root. Missing git, non-git source trees, detached HEADs, and unfamiliar remote URLs all degrade gracefully.
 
+### 4.23 Parallel fan-out with `.map(...)`
+
+Tasks expose a `.map(iterable, *constants, **kw_constants)` method that fans the body out over an iterable in parallel. The same call shape adapts to both execution modes:
+
+| Mode | What happens | Returns |
+| ---- | ------------ | ------- |
+| **Local** (no active trace) | The body runs across a `concurrent.futures.ThreadPoolExecutor` (default) or `ProcessPoolExecutor` (`pool="process"`), preserving input order. `SecretRef` defaults resolve once up-front so per-item submissions don't pay a Secrets round-trip each. | `list` of results. |
+| **Trace** (inside `@flow`) | One `TaskNode` is registered per element — the Databricks scheduler runs the resulting tasks in parallel, subject to the job's `max_concurrent_runs` and the cluster's slot capacity. Auto-suffix gives every node a unique `task_key` (`step`, `step_2`, …). | `list[TaskNode]`. |
+
+Local fan-out — same shape as a list comprehension but parallelised through a thread pool:
+
+```python
+from yggdrasil.databricks.workflow import task
+
+@task(pool="thread", max_workers=8)
+def fetch(url: str) -> bytes:
+    import urllib.request
+    return urllib.request.urlopen(url).read()
+
+bodies = fetch.map([
+    "https://example.com/a",
+    "https://example.com/b",
+    "https://example.com/c",
+])
+# bodies == [b"<page a>", b"<page b>", b"<page c>"]
+```
+
+Inside a flow — one Databricks task per element, all running in parallel after the upstream completes:
+
+```python
+from yggdrasil.databricks.workflow import flow, task
+
+@task
+def list_partitions(date: str) -> list[str]:
+    return [f"/Volumes/raw/{date}/p{i}.parquet" for i in range(8)]
+
+@task
+def process(partition: str, target: str) -> int:
+    # ... heavy per-partition work ...
+    return 42
+
+@task
+def total(counts: list[int]) -> int:
+    return sum(counts)
+
+@flow(name="partitioned-load")
+def partitioned_load(date: str = "2025-01-01", target: str = "main.dim.events"):
+    parts = list_partitions(date)         # 1 task
+    # NOTE: ``.map`` must iterate at trace time — pass a literal /
+    # flow-parameter-typed iterable, not a TaskNode. For dynamic
+    # fan-out from an upstream task's value, use the Databricks
+    # ``ForEachTask`` primitive via the ``**job_settings`` passthrough.
+    counts = process.map(
+        ["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8"],
+        target=target,
+    )                                     # 8 tasks, parallel
+    total(counts)                         # 1 reducer, depends_on=all 8
+```
+
+The downstream reducer sees the list of `TaskNode` futures as a single argument; `TaskNode._resolve_deps` walks `list` / `tuple` / `dict` containers so each mapped node becomes a `depends_on` edge automatically — no manual wiring.
+
+Pool flavours:
+
+| `pool` | Executor | When to reach for it |
+| ------ | -------- | -------------------- |
+| `"thread"` (default) | `ThreadPoolExecutor` | I/O-bound bodies — HTTP, Databricks SDK calls, SQL warehouse round trips, `requests.get`, blob storage reads/writes. Most task workloads. |
+| `"process"` | `ProcessPoolExecutor` | CPU-bound bodies — heavy numpy / pyarrow / regex work. The task function and arguments must be picklable; with the `@task` decorator shadowing the function's module-level name, this typically requires the `ygg[pickle]` extra (installs `dill`, which patches the multiprocessing pickler at import time). |
+
+Per-call overrides:
+
+```python
+fetch.map(urls, pool="thread", max_workers=16)             # one-off bump
+fetch.map(urls, executor=existing_thread_pool)             # reuse a pool
+```
+
+When an external executor is supplied, `.map(...)` does **not** shut it down on return — caller owns the lifetime.
+
+### 4.24 File-arrival triggers (`@flow(file_trigger=...)`)
+
+A `@flow` runs on whatever signals you wire onto its `JobSettings` — `schedule=` for cron, plus a `file_trigger=` for the Databricks file-arrival trigger that fires whenever new files land at a workspace path or Volumes URL. Both can coexist (the job runs on whichever fires first).
+
+Simple string form — just point at the directory:
+
+```python
+from yggdrasil.databricks.workflow import flow, task
+
+@task
+def ingest(): ...
+
+@flow(name="on-file-arrival", file_trigger="/Volumes/main/landing/inbox/")
+def on_file_arrival():
+    ingest()
+```
+
+Dict form — opt into the debounce knobs:
+
+```python
+@flow(
+    name="on-file-arrival",
+    file_trigger={
+        "url": "/Volumes/main/landing/inbox/",
+        "min_time_between_triggers_seconds": 60,    # don't refire within 60s
+        "wait_after_last_change_seconds": 30,       # wait for batch to settle
+    },
+)
+def on_file_arrival():
+    ingest()
+```
+
+Pre-built SDK objects pass through verbatim:
+
+```python
+from databricks.sdk.service.jobs import (
+    FileArrivalTriggerConfiguration, TriggerSettings, PauseStatus,
+)
+
+@flow(
+    name="on-file-arrival",
+    file_trigger=FileArrivalTriggerConfiguration(
+        url="/Volumes/main/landing/inbox/",
+        wait_after_last_change_seconds=30,
+    ),
+)
+def on_file_arrival(): ...
+
+# Full TriggerSettings — wire model / periodic / table_update triggers
+# alongside the file-arrival shorthand:
+@flow(
+    name="multi-trigger",
+    file_trigger=TriggerSettings(
+        file_arrival=FileArrivalTriggerConfiguration(url="/Volumes/x/"),
+        pause_status=PauseStatus.PAUSED,
+    ),
+)
+def multi_trigger(): ...
+```
+
+The flow's `pause_status` (set via `@flow(pause_status="PAUSED")`) flows through into the coerced `TriggerSettings` for the string / dict / `FileArrivalTriggerConfiguration` shapes — paused-on-deploy means the trigger doesn't fire until an operator unpauses it. The pre-built `TriggerSettings` form is pass-through; we don't second-guess the caller's choice.
+
+Cron + file-arrival together — the job runs on either signal:
+
+```python
+@flow(
+    name="dual-signal",
+    schedule="0 0 6 * * ?",                              # daily 06:00
+    file_trigger="/Volumes/main/landing/urgent/",        # plus on file arrival
+)
+def dual_signal():
+    ingest()
+```
+
+Conflict guard: pass either `file_trigger=...` (the shorthand) **or** `trigger=...` via `**job_settings` (the raw `TriggerSettings`) — both target the same `JobSettings.trigger` slot and the decorator raises rather than silently picking a side.
+
+> **Task-level note.** Databricks file-arrival triggers are job-level (one trigger per job), so the kwarg lives on `@flow`, not on `@task`. A flow whose body declares a single task is the canonical pattern for "this task fires on file arrival." For task-level fan-out triggered by an upstream task's listing, use `.map(...)` ([4.23](#423-parallel-fan-out-with-map)) or wire a Databricks `ForEachTask` through the `**job_settings` passthrough.
+
 ---
 
 ## 5) The `ygg` runtime module
@@ -719,7 +876,7 @@ The constant `ygg.RETURN_VALUE_KEY` (`"__ygg_return__"`) is the key under which 
 
 ## 6) API reference
 
-### `flow(func=None, *, name=None, schedule=None, timezone="UTC", pause_status=None, parameters=None, tags=None, permissions=None, prefix=True, client=None, **job_settings)`
+### `flow(func=None, *, name=None, schedule=None, file_trigger=None, timezone="UTC", pause_status=None, parameters=None, tags=None, permissions=None, prefix=True, client=None, **job_settings)`
 
 Decorator factory. Returns a `Flow`. Usable bare (`@flow`) or parametrised (`@flow(name=…)`).
 
@@ -727,14 +884,15 @@ Decorator factory. Returns a `Flow`. Usable bare (`@flow`) or parametrised (`@fl
 | -------- | ------ |
 | `name` | Flow / Job name. Defaults to `func.__name__`. |
 | `schedule` | Quartz cron string or pre-built `CronSchedule`. |
+| `file_trigger` | File-arrival trigger config. Accepts a workspace path / Volumes URL string, a dict of `FileArrivalTriggerConfiguration` kwargs (`url` required; `min_time_between_triggers_seconds`, `wait_after_last_change_seconds` optional), a pre-built `FileArrivalTriggerConfiguration`, or a full `TriggerSettings`. Mutually exclusive with passing `trigger=…` through `**job_settings`. See [4.24](#424-file-arrival-triggers-flowfile_trigger). |
 | `timezone` | Time zone for cron coercion. Default `"UTC"`. |
-| `pause_status` | `"PAUSED"` / `"UNPAUSED"` / `PauseStatus`. |
+| `pause_status` | `"PAUSED"` / `"UNPAUSED"` / `PauseStatus`. Applied to both the cron schedule and the coerced `file_trigger`. |
 | `parameters` | Extra `JobParameterDefinition` entries beyond the auto-derived ones. |
 | `tags` | Job tags. Auto-derived `ygg.*` metadata tags are merged under these (caller wins). |
 | `permissions` | ACL entries; same shape as `Jobs.create`. |
 | `prefix` | `True` (default) → auto `[YGG][project/version] ` prefix; `False` → bare name; `str` → literal prefix. |
 | `client` | Pin a target `DatabricksClient`. Per-call `deploy(client=…)` / `run(client=…)` still wins. |
-| `**job_settings` | Forwarded verbatim to `JobSettings` — `timeout_seconds`, `max_concurrent_runs`, `email_notifications`, `webhook_notifications`, `notification_settings`, `health`, `git_source`, `job_clusters`, `trigger`, `queue`, `run_as`, `format`, … |
+| `**job_settings` | Forwarded verbatim to `JobSettings` — `timeout_seconds`, `max_concurrent_runs`, `email_notifications`, `webhook_notifications`, `notification_settings`, `health`, `git_source`, `job_clusters`, `trigger` (only when `file_trigger` is unset), `queue`, `run_as`, `format`, … |
 
 ### `Flow.deploy(*, service=None, client=None, userinfo_defaults=False, trace_overrides=None, **extra_job_settings) -> Job`
 
@@ -754,7 +912,7 @@ Run the flow body locally (no trace, no workspace round-trip). The body's `@task
 
 ---
 
-### `task(func=None, *, task_key=None, task_type="spark", retries=None, environment_key=..., existing_cluster_id=None, job_cluster_key=None, new_cluster=None, client=None, **task_fields)`
+### `task(func=None, *, task_key=None, task_type="spark", retries=None, environment_key=..., existing_cluster_id=None, job_cluster_key=None, new_cluster=None, pool=None, max_workers=None, client=None, **task_fields)`
 
 Decorator factory. Returns a `WorkflowTask`.
 
@@ -765,12 +923,18 @@ Decorator factory. Returns a `WorkflowTask`.
 | `retries` | `Task.max_retries`. |
 | `environment_key` | `Task.environment_key`. Default `"ygg-default"`. Set to a different key (and declare the matching `JobEnvironment` on the flow), or `None` to leave it off. |
 | `existing_cluster_id` / `job_cluster_key` / `new_cluster` | The three classic-compute bindings on `Task`. Setting any clears `environment_key`. |
+| `pool` | Default executor flavour for `WorkflowTask.map(...)` in local mode — `"thread"` (default) for I/O-bound bodies, `"process"` for CPU-bound bodies. Ignored in trace mode (Databricks' scheduler owns parallelism there). See [4.23](#423-parallel-fan-out-with-map). |
+| `max_workers` | Default worker count for `.map(...)`'s local-mode pool. `None` defers to the executor's own default. Per-call `.map(max_workers=…)` overrides this. |
 | `client` | Override the staging workspace (where the `.py` is written) for this one task. Rare — the deployed Job still runs in the flow's workspace. |
 | `**task_fields` | `Task.description`, `Task.timeout_seconds`, `Task.run_if`, `Task.email_notifications`, `Task.webhook_notifications`, `Task.health`, `Task.disabled`, `Task.libraries`, … |
 
 ### `WorkflowTask.__call__(*args, **kwargs)`
 
 Outside a trace: resolve `SecretRef` args/defaults and call the wrapped function. Inside a trace: register a `TaskNode` and return it.
+
+### `WorkflowTask.map(iterable, *constants, pool=None, max_workers=None, executor=None, **kw_constants) -> list`
+
+Prefect-style parallel fan-out. Outside a trace, runs the body across a `ThreadPoolExecutor` (or `ProcessPoolExecutor` with `pool="process"`), returning a `list` of results in input order. Inside a trace, registers one `TaskNode` per element of *iterable* — the Databricks scheduler runs those tasks in parallel. *constants* / *kw_constants* pass through on every call. See [4.23](#423-parallel-fan-out-with-map).
 
 ### `WorkflowTask.after(*upstreams)`
 
@@ -809,7 +973,7 @@ Returns `"ygg.secret('<scope>', '<key>')"` (or the `host=`-suffixed form when pi
 
 - **Function source must come from an importable file.** `inspect.getsource` is the staging contract — lambdas, REPL-defined functions, and dynamically generated code won't stage. (Same constraint as `Job.from_callable`.)
 - **Closures are limited.** Same-module callables and literal constants the body references *are* inlined into the staged source. Names imported from other modules ride through the auto-dep path (pip install + import) — they're not inlined. Closure cells holding non-literal values are skipped.
-- **Trace mode is single-threaded.** A flow body runs sequentially in trace mode; conditional branches based on values that are `TaskNode`s won't work (you'd be branching on a future, not a value). Build branches statically — call `@task` decorators inside `if` blocks that depend on **deploy-time inputs**, not on task results.
+- **Trace mode is single-threaded.** A flow body runs sequentially in trace mode; conditional branches based on values that are `TaskNode`s won't work (you'd be branching on a future, not a value). Build branches statically — call `@task` decorators inside `if` blocks that depend on **deploy-time inputs**, not on task results. For fan-out of N parallel tasks over a known iterable, use [`WorkflowTask.map(...)`](#423-parallel-fan-out-with-map) — the iterable must be materialisable at trace time (a literal list, a flow parameter, etc.), not a `TaskNode`.
 - **Return-value passthrough uses `dbutils.jobs.taskValues`.** Values must be JSON-serialisable (Databricks restriction); large payloads should be passed via paths instead.
 - **One `Job` per flow.** Multi-job orchestration (one flow triggering another job's run) is doable by calling `Jobs` directly inside a task body, but isn't a first-class workflow primitive yet.
 

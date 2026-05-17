@@ -48,9 +48,11 @@ from typing import (
 
 from databricks.sdk.service.jobs import (
     CronSchedule,
+    FileArrivalTriggerConfiguration,
     JobParameterDefinition,
     PauseStatus,
     Task,
+    TriggerSettings,
 )
 
 from .context import TraceContext
@@ -198,6 +200,80 @@ def _coerce_schedule(
     )
 
 
+def _coerce_file_trigger(
+    file_trigger: Any,
+    *,
+    pause_status: Any,
+) -> Optional[TriggerSettings]:
+    """Coerce *file_trigger* into a Databricks :class:`TriggerSettings`.
+
+    Accepts four shapes so flow authors can pick the most ergonomic
+    form for the call site:
+
+    * ``None`` — no file-arrival trigger; return ``None``.
+    * ``str`` — a workspace path / Volumes URL the trigger watches.
+      Equivalent to ``FileArrivalTriggerConfiguration(url=<str>)`` with
+      Databricks-side defaults for the debounce settings.
+    * ``dict`` — keys forwarded verbatim to
+      :class:`FileArrivalTriggerConfiguration` (``url``,
+      ``min_time_between_triggers_seconds``,
+      ``wait_after_last_change_seconds``). ``url`` is required.
+    * :class:`FileArrivalTriggerConfiguration` — wrapped into a
+      :class:`TriggerSettings` with the flow's ``pause_status`` applied.
+    * :class:`TriggerSettings` — returned untouched. Lets callers wire
+      ``model`` / ``periodic`` / ``table_update`` triggers in alongside
+      the file-arrival shorthand.
+
+    The flow's ``pause_status`` is normalized to a :class:`PauseStatus`
+    member and threaded onto the resulting :class:`TriggerSettings` so
+    a paused-on-deploy flow doesn't fire its trigger until the operator
+    unpauses it.
+    """
+    if file_trigger is None:
+        return None
+
+    if isinstance(file_trigger, TriggerSettings):
+        # Pass-through. Caller takes full ownership of the trigger
+        # shape — we don't second-guess ``pause_status`` here because
+        # the caller already had the chance to set it on the object.
+        return file_trigger
+
+    resolved_pause = pause_status
+    if isinstance(resolved_pause, str):
+        resolved_pause = PauseStatus(resolved_pause.upper())
+
+    if isinstance(file_trigger, FileArrivalTriggerConfiguration):
+        return TriggerSettings(
+            file_arrival=file_trigger,
+            pause_status=resolved_pause,
+        )
+
+    if isinstance(file_trigger, str):
+        return TriggerSettings(
+            file_arrival=FileArrivalTriggerConfiguration(url=file_trigger),
+            pause_status=resolved_pause,
+        )
+
+    if isinstance(file_trigger, Mapping):
+        if "url" not in file_trigger:
+            raise ValueError(
+                f"flow(file_trigger={dict(file_trigger)!r}): a dict trigger "
+                "config must include 'url' — the workspace path or Volumes "
+                "URL the Databricks scheduler watches for new files "
+                "(e.g. '/Volumes/main/landing/inbox/')."
+            )
+        return TriggerSettings(
+            file_arrival=FileArrivalTriggerConfiguration(**dict(file_trigger)),
+            pause_status=resolved_pause,
+        )
+
+    raise TypeError(
+        f"flow(file_trigger={file_trigger!r}): expected a workspace path "
+        "string, a dict of FileArrivalTriggerConfiguration kwargs, a "
+        "FileArrivalTriggerConfiguration, a TriggerSettings, or None."
+    )
+
+
 class Flow:
     """A workflow flow — a function whose body describes a Databricks DAG.
 
@@ -217,13 +293,27 @@ class Flow:
         Job name. Defaults to ``func.__name__``.
     schedule
         Quartz cron string or :class:`CronSchedule`. Wired into
-        :class:`JobSettings.schedule`.
+        :class:`JobSettings.schedule`. Mutually compatible with
+        ``file_trigger`` — Databricks runs the job on either signal.
+    file_trigger
+        File-arrival trigger config. Accepts a workspace path string
+        (``"/Volumes/main/landing/inbox/"``) for the simple case, a
+        dict of :class:`FileArrivalTriggerConfiguration` kwargs (``url``
+        is required; ``min_time_between_triggers_seconds`` /
+        ``wait_after_last_change_seconds`` are optional debounce knobs),
+        a pre-built :class:`FileArrivalTriggerConfiguration`, or a full
+        :class:`TriggerSettings` (lets you wire model / periodic /
+        table-update triggers alongside the file-arrival shorthand).
+        The flow's ``pause_status`` is applied automatically when the
+        trigger is coerced from anything other than a
+        :class:`TriggerSettings`.
     timezone
         Time zone for cron coercion. Ignored when ``schedule`` is
         already a :class:`CronSchedule`.
     pause_status
         ``"UNPAUSED"`` / ``"PAUSED"`` (or the matching :class:`PauseStatus`).
-        Default ``None`` → Databricks default (unpaused).
+        Default ``None`` → Databricks default (unpaused). Applied to
+        both the cron schedule and any coerced ``file_trigger``.
     parameters
         Extra job parameters not derived from the flow signature.
         Merge into the auto-derived list; caller wins on collision.
@@ -240,6 +330,7 @@ class Flow:
         *,
         name: Optional[str] = None,
         schedule: Any = None,
+        file_trigger: Any = None,
         timezone: str = "UTC",
         pause_status: Any = None,
         parameters: Optional[Mapping[str, Any]] = None,
@@ -249,10 +340,27 @@ class Flow:
         client: Optional["DatabricksClient"] = None,
         **job_settings: Any,
     ) -> None:
+        # Fail loudly on the one configuration collision we can't
+        # silently reconcile — ``file_trigger`` lowers into the same
+        # ``trigger`` slot on :class:`JobSettings` that the
+        # ``**job_settings`` passthrough exposes.
+        if file_trigger is not None and "trigger" in job_settings:
+            raise ValueError(
+                "@flow: pass either file_trigger=... (the ergonomic "
+                "shorthand) or trigger=... (a pre-built TriggerSettings via "
+                "**job_settings), not both — they target the same "
+                "JobSettings.trigger slot."
+            )
+
         self.func = func
         self.__wrapped__ = func
         self.name = name or func.__name__
         self.schedule = schedule
+        #: File-arrival trigger config. Same shapes as the
+        #: :func:`flow` decorator's ``file_trigger`` kwarg —
+        #: :func:`_coerce_file_trigger` resolves it into a
+        #: :class:`TriggerSettings` at deploy time.
+        self.file_trigger = file_trigger
         self.timezone = timezone
         self.pause_status = pause_status
         self.parameters = dict(parameters) if parameters else {}
@@ -436,6 +544,11 @@ class Flow:
         )
         if schedule is not None:
             settings["schedule"] = schedule
+        trigger = _coerce_file_trigger(
+            self.file_trigger, pause_status=self.pause_status,
+        )
+        if trigger is not None:
+            settings["trigger"] = trigger
 
         # Description: caller-supplied wins; otherwise lead with the
         # flow's docstring (if any) and trail with the metadata footer
@@ -622,6 +735,7 @@ def flow(
     *,
     name: Optional[str] = None,
     schedule: Any = None,
+    file_trigger: Any = None,
     timezone: str = "UTC",
     pause_status: Any = None,
     parameters: Optional[Mapping[str, Any]] = None,
@@ -653,6 +767,13 @@ def flow(
     the bare :attr:`Flow.name`, or a string literal to pin a custom
     prefix.
 
+    ``file_trigger`` registers a Databricks file-arrival trigger on
+    the deployed Job — pass a workspace path / Volumes URL string for
+    the simple case, or a dict / :class:`FileArrivalTriggerConfiguration`
+    / :class:`TriggerSettings` for full control. ``schedule`` and
+    ``file_trigger`` are independent — wiring both gives a job that
+    runs on whichever signal fires first.
+
     ``client`` pins a target :class:`DatabricksClient`. When omitted
     the active :meth:`DatabricksClient.current` wins — usually
     what you want. Set it explicitly when the flow always targets
@@ -665,6 +786,7 @@ def flow(
             f,
             name=name,
             schedule=schedule,
+            file_trigger=file_trigger,
             timezone=timezone,
             pause_status=pause_status,
             parameters=parameters,

@@ -23,12 +23,15 @@ a Databricks task.
 """
 from __future__ import annotations
 
+import concurrent.futures as cf
 import functools
 import inspect
 import logging
-from typing import Any, Callable, Mapping, Optional, TYPE_CHECKING
+from typing import Any, Callable, Iterable, List, Mapping, Optional, TYPE_CHECKING
 
 from databricks.sdk.service.jobs import TaskDependency
+
+from contextlib import nullcontext
 
 from .context import current_trace
 from .metadata import collect_source_metadata, describe_metadata
@@ -43,6 +46,32 @@ if TYPE_CHECKING:
 
 
 __all__ = ["WorkflowTask", "task"]
+
+#: Recognised pool flavours for :attr:`WorkflowTask.pool` / :meth:`WorkflowTask.map`.
+#: ``"thread"`` → :class:`concurrent.futures.ThreadPoolExecutor` (default; best
+#: for I/O-bound task bodies — Databricks SDK calls, HTTP, SQL warehouse round
+#: trips). ``"process"`` → :class:`concurrent.futures.ProcessPoolExecutor`
+#: (CPU-bound work; requires the task function and arguments to be picklable).
+_POOL_EXECUTORS: dict[str, type[cf.Executor]] = {
+    "thread": cf.ThreadPoolExecutor,
+    "process": cf.ProcessPoolExecutor,
+}
+
+
+def _resolve_executor_cls(pool: Optional[str]) -> type[cf.Executor]:
+    """Map a ``"thread"`` / ``"process"`` token to the matching executor class."""
+    if pool is None:
+        return cf.ThreadPoolExecutor
+    try:
+        return _POOL_EXECUTORS[pool]
+    except KeyError as exc:
+        raise ValueError(
+            f"WorkflowTask.map(pool={pool!r}): expected 'thread' or 'process'. "
+            "'thread' uses a ThreadPoolExecutor (best for I/O-bound work — "
+            "Databricks SDK calls, HTTP, SQL warehouses); 'process' uses a "
+            "ProcessPoolExecutor (CPU-bound work; task fn + args must be "
+            "picklable)."
+        ) from exc
 
 LOGGER = logging.getLogger(__name__)
 
@@ -84,6 +113,20 @@ class WorkflowTask:
         Compute bindings. At most one should be set per task; clears
         ``environment_key`` if set so the task runs on classic
         compute rather than serverless.
+    pool
+        Default parallel-pool flavour for :meth:`map`. ``"thread"``
+        (default) → :class:`concurrent.futures.ThreadPoolExecutor`,
+        which fits I/O-bound task bodies (Databricks SDK calls, HTTP,
+        SQL warehouses). ``"process"`` →
+        :class:`concurrent.futures.ProcessPoolExecutor` for CPU-bound
+        work; the task function and arguments must be picklable. The
+        per-call ``WorkflowTask.map(pool=...)`` override wins.
+    max_workers
+        Default worker count for :meth:`map`'s local-mode pool.
+        ``None`` (default) defers to the executor's default
+        (``min(32, os.cpu_count() + 4)`` for threads,
+        ``os.cpu_count()`` for processes). Per-call
+        ``WorkflowTask.map(max_workers=...)`` overrides this.
     task_fields
         Catch-all forwarded to :class:`databricks.sdk.service.jobs.Task`
         — ``description``, ``timeout_seconds``, ``run_if``,
@@ -101,6 +144,8 @@ class WorkflowTask:
         existing_cluster_id: Optional[str] = None,
         job_cluster_key: Optional[str] = None,
         new_cluster: Any = None,
+        pool: Optional[str] = None,
+        max_workers: Optional[int] = None,
         client: Optional["DatabricksClient"] = None,
         **task_fields: Any,
     ) -> None:
@@ -129,6 +174,18 @@ class WorkflowTask:
         self.existing_cluster_id = existing_cluster_id
         self.job_cluster_key = job_cluster_key
         self.new_cluster = new_cluster
+        # Validate the pool flavour up-front so a typo at decoration
+        # time fails loudly with a helpful message instead of much later
+        # at :meth:`map` call time.
+        if pool is not None:
+            _resolve_executor_cls(pool)
+        #: Default executor flavour for :meth:`map` — ``"thread"`` /
+        #: ``"process"`` / ``None``. ``None`` means "fall back to
+        #: ``ThreadPoolExecutor`` unless :meth:`map` overrides it".
+        self.pool = pool
+        #: Default ``max_workers`` passed to the local-mode executor in
+        #: :meth:`map`. ``None`` defers to the executor's own default.
+        self.max_workers = max_workers
         #: Override the staging workspace for this task. When set,
         #: :meth:`stage` writes the staged ``.py`` to *this* client's
         #: workspace instead of the parent flow's. Useful for tasks
@@ -170,6 +227,180 @@ class WorkflowTask:
             kwargs=dict(kwargs),
         )
         return trace.register(node)
+
+    # ------------------------------------------------------------------ #
+    # Parallel fan-out — Prefect-style ``.map`` over an iterable
+    # ------------------------------------------------------------------ #
+    def map(
+        self,
+        iterable: Iterable[Any],
+        *constants: Any,
+        pool: Optional[str] = None,
+        max_workers: Optional[int] = None,
+        executor: Optional[cf.Executor] = None,
+        **kw_constants: Any,
+    ) -> List[Any]:
+        """Fan the task out across *iterable* in parallel.
+
+        Prefect-style mapping. The task is applied once per element of
+        *iterable*; the remaining ``*constants`` / ``**kw_constants`` are
+        passed through unchanged on every call. The behaviour depends on
+        whether a :class:`TraceContext` is active:
+
+        * **Local mode** (no active trace). The function runs in-process
+          across a :class:`concurrent.futures.ThreadPoolExecutor` (or
+          :class:`~concurrent.futures.ProcessPoolExecutor` if
+          ``pool="process"``), preserving input order. Returns a
+          ``list`` of results — same shape as ``[self(item, *constants,
+          **kw_constants) for item in iterable]`` but executed in
+          parallel. :class:`SecretRef` args/defaults resolve the same
+          way :meth:`__call__` resolves them, so unit tests need no
+          workspace mock.
+
+        * **Trace mode** (inside ``Flow.trace`` / ``Flow.deploy``). One
+          :class:`TaskNode` is registered per element, with the auto-
+          suffix collision logic from :class:`TraceContext` producing
+          unique task keys (``step``, ``step_2``, ``step_3``, …). The
+          Databricks scheduler runs the resulting tasks in parallel
+          (subject to the job's ``max_concurrent_runs`` and the
+          cluster's slot capacity). Returns a ``list`` of
+          :class:`TaskNode` futures — pass it to a downstream task
+          (``reduce(results)``) to build a fan-in.
+
+        Parameters
+        ----------
+        iterable
+            The per-call dimension. Materialised into a list up-front
+            so the length is known at submission time; pass a generator
+            only when the body fits in memory.
+        *constants
+            Positional args passed unchanged on every call. Typically
+            configuration the per-item body needs (target paths, table
+            names, etc.).
+        pool
+            Override the task's default :attr:`pool` flavour.
+            ``"thread"`` (default) for I/O-bound bodies, ``"process"``
+            for CPU-bound bodies. Ignored in trace mode — Databricks'
+            own scheduler handles the parallelism there.
+        max_workers
+            Override the task's default :attr:`max_workers`. ``None``
+            defers to the executor's own default. Ignored in trace mode.
+        executor
+            Pre-built executor to submit into. When supplied, the
+            decorator does not shut it down on exit — caller owns the
+            lifetime. Mutually exclusive with ``pool`` / ``max_workers``
+            (those would build a fresh executor; passing one here means
+            "reuse this one instead"). Ignored in trace mode.
+        **kw_constants
+            Keyword args passed unchanged on every call.
+
+        Raises
+        ------
+        TypeError
+            *iterable* is not iterable.
+        ValueError
+            ``pool`` isn't ``"thread"`` / ``"process"``.
+
+        Examples
+        --------
+        Local fan-out over an in-memory list::
+
+            @task(pool="thread", max_workers=8)
+            def fetch(url: str) -> bytes:
+                import urllib.request
+                return urllib.request.urlopen(url).read()
+
+            bodies = fetch.map(["https://a", "https://b", "https://c"])
+
+        Inside a flow — one Databricks task per element::
+
+            @task
+            def process(date: str, table: str) -> int: ...
+
+            @task
+            def reduce(counts: list[int]) -> int:
+                return sum(counts)
+
+            @flow(name="backfill")
+            def backfill(target: str = "main.dim.events"):
+                dates = ["2025-01-01", "2025-01-02", "2025-01-03"]
+                counts = process.map(dates, table=target)
+                reduce(counts)
+        """
+        items = list(iterable)
+        trace = current_trace()
+
+        if trace is None:
+            return self._map_local(
+                items,
+                constants,
+                kw_constants,
+                pool=pool,
+                max_workers=max_workers,
+                executor=executor,
+            )
+
+        # Trace mode: one TaskNode per element. The trace context
+        # auto-suffixes colliding ``task_key``s (``step``, ``step_2``,
+        # …) so the staged Databricks tasks land at unique keys.
+        nodes: List[TaskNode] = []
+        for item in items:
+            node = TaskNode(
+                spec=self,
+                task_key=self.task_key,
+                args=(item, *constants),
+                kwargs=dict(kw_constants),
+            )
+            nodes.append(trace.register(node))
+        return nodes
+
+    def _map_local(
+        self,
+        items: List[Any],
+        constants: tuple,
+        kw_constants: dict,
+        *,
+        pool: Optional[str],
+        max_workers: Optional[int],
+        executor: Optional[cf.Executor],
+    ) -> List[Any]:
+        """Run the task body across *items* using a local pool.
+
+        Resolves :class:`SecretRef` args/defaults once (same as
+        :meth:`__call__`) so the per-item submission pays only the
+        function call, not a per-item secret round-trip. Submits
+        :attr:`func` directly to the executor — no local-closure
+        wrapper, so ``ProcessPoolExecutor`` can pickle the call
+        target as long as the task function and arguments are
+        themselves picklable. Returns results in input order — same
+        shape as a list comprehension but parallelised through the
+        configured executor.
+        """
+        # Resolve any SecretRef in the broadcast args once; per-item
+        # submissions can then reuse the materialised values without
+        # paying a Databricks Secrets round-trip per call.
+        resolved_constants, resolved_kw = self._resolve_local_secrets(
+            constants, kw_constants,
+        )
+
+        pool_flavour = pool if pool is not None else self.pool
+        executor_cls = _resolve_executor_cls(pool_flavour)
+        workers = max_workers if max_workers is not None else self.max_workers
+
+        # Caller-supplied executor: reuse it without shutting it down.
+        # No caller-supplied executor: build a fresh one and tear it
+        # down on the way out.
+        if executor is not None:
+            ex_ctx: Any = nullcontext(executor)
+        else:
+            ex_ctx = executor_cls(max_workers=workers)
+
+        with ex_ctx as ex:
+            futures = [
+                ex.submit(self.func, item, *resolved_constants, **resolved_kw)
+                for item in items
+            ]
+            return [f.result() for f in futures]
 
     # ------------------------------------------------------------------ #
     # Local secret resolution — feeds both __call__ and tests
@@ -401,6 +632,8 @@ def task(
     existing_cluster_id: Optional[str] = None,
     job_cluster_key: Optional[str] = None,
     new_cluster: Any = None,
+    pool: Optional[str] = None,
+    max_workers: Optional[int] = None,
     client: Optional["DatabricksClient"] = None,
     **task_fields: Any,
 ) -> Any:
@@ -427,6 +660,14 @@ def task(
     the default serverless env). Any unrecognised kwarg falls through
     to ``task_fields`` and lands on the :class:`Task` directly
     (``description``, ``timeout_seconds``, ``run_if``, …).
+
+    ``pool`` / ``max_workers`` configure :meth:`WorkflowTask.map`'s
+    local-mode executor — ``"thread"`` (default) for I/O-bound bodies
+    that fan out via HTTP / SQL / Databricks SDK calls, ``"process"``
+    for CPU-bound bodies. Defaults are overridable per-call on
+    ``.map(pool=..., max_workers=...)``. The trace-mode behaviour of
+    ``.map`` (one Databricks task per element) is unaffected by these
+    kwargs — Databricks' own scheduler handles the parallelism there.
     """
     def _wrap(f: Callable[..., Any]) -> WorkflowTask:
         return WorkflowTask(
@@ -438,6 +679,8 @@ def task(
             existing_cluster_id=existing_cluster_id,
             job_cluster_key=job_cluster_key,
             new_cluster=new_cluster,
+            pool=pool,
+            max_workers=max_workers,
             client=client,
             **task_fields,
         )
