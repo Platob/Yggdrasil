@@ -901,6 +901,53 @@ class TestStagedScriptCapturesLocals(DatabricksTestCase):
         exec(compile(patched, "<staged>", "exec"), env)
         self.assertEqual(env["_results"], ["value-from-module::okz1"])
 
+    def test_skips_names_imported_inside_function_body(self):
+        """Local ``from X import Y`` shadows the global ref — don't re-inline.
+
+        ``inspect.getclosurevars`` walks ``co_names`` and classifies
+        every hit as "global", including names the function body
+        imports locally via ``from X import Y`` (those produce an
+        ``IMPORT_FROM`` op on ``co_names[Y]`` followed by
+        ``STORE_FAST`` into ``co_varnames[Y]``). Inlining such a name
+        re-emits a stale copy of the helper / class *and* drags its
+        transitive deps with it — which is what blew up the staged
+        async-insert applier with ``NameError: ClassVar`` when the
+        inlined ``AsyncInsertJob`` class body referenced typing names
+        the staged file didn't otherwise carry.
+        """
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        # ``apply_records`` references ``AsyncInsertJob`` via a local
+        # ``from yggdrasil.databricks.table.async_job import ...`` inside
+        # its body — the staged script must NOT emit a duplicate class
+        # block at module scope.
+        script = _render_callable_script(AsyncInsertJob.apply_records, (), {})
+        self.assertNotIn("class AsyncInsertJob", script)
+        # Same protection holds for the notebook rendering.
+        notebook = _render_callable_notebook(
+            AsyncInsertJob.apply_records, (), {},
+        )
+        self.assertNotIn("class AsyncInsertJob", notebook)
+
+        # End-to-end: the staged notebook compiles + executes its
+        # top-level definitions without ``NameError``. The function
+        # body itself still needs a live workspace at call time, so
+        # the widget-driven invocation cell ends up calling
+        # ``apply_records`` with empty strings — but the failure path
+        # then sits in the function body, not at class-body / module
+        # import time, which is what the regression guards.
+        ns = {"__name__": "__staged__"}
+        try:
+            exec(compile(notebook, "<staged>", "exec"), ns)
+        except AssertionError:
+            # ``engine.table('')`` asserts a non-empty catalog — that's
+            # the function body running, which means the staged file's
+            # top-level executed cleanly. Good enough for the
+            # regression.
+            pass
+        self.assertIn("apply_records", ns)
+        self.assertTrue(callable(ns["apply_records"]))
+
     def test_skips_imported_callables(self):
         """A reference to a stdlib symbol stays as an import, not inlined."""
         import ast
