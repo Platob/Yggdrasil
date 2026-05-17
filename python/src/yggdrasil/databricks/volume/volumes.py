@@ -35,7 +35,7 @@ from databricks.sdk.service.catalog import VolumeInfo
 
 from yggdrasil.databricks.client import DatabricksService
 
-from .volume import Volume
+from .volume import Volume, _looks_like_not_found
 
 __all__ = ["Volumes"]
 
@@ -202,7 +202,7 @@ class Volumes(DatabricksService):
         volume_type=None,
         if_not_exists: bool = True,
     ) -> Volume:
-        """Create a volume by name and return the bound :class:`Volume`.
+        """Create a volume by name, auto-creating missing schema / catalog.
 
         Service-level entry point matching :meth:`Warehouses.create` —
         resolves the catalog / schema / volume parts (from *location*
@@ -210,21 +210,39 @@ class Volumes(DatabricksService):
         materialises the :class:`Volume` singleton, then delegates to
         :meth:`Volume.create` so the managed-volume-type default and
         the post-create ``_store_infos`` cache warm-up live in one
-        place. Callers reaching for "create a volume" from outside the
-        resource (recovery paths, scripts, tests) should prefer this
-        over a raw ``ws.volumes.create(...)`` call.
+        place.
+
+        When the first ``volumes.create`` returns ``NotFound`` because
+        the parent schema (or catalog) is missing, the call falls
+        through to :meth:`Volume._ensure_schema_and_catalog` for a
+        bottom-up create and then retries the volume create with the
+        caller's *comment* / *storage_location* / *volume_type* args
+        intact. Callers reaching for "create a volume" from outside
+        the resource (recovery paths, scripts, tests) should prefer
+        this over a raw ``ws.volumes.create(...)`` call.
         """
-        return self.volume(
+        volume = self.volume(
             location=location,
             catalog_name=catalog_name,
             schema_name=schema_name,
             volume_name=volume_name,
-        ).create(
+        )
+        create_kwargs = dict(
             comment=comment,
             storage_location=storage_location,
             volume_type=volume_type,
-            if_not_exists=if_not_exists,
         )
+        try:
+            return volume.create(**create_kwargs, if_not_exists=if_not_exists)
+        except Exception as exc:
+            if not _looks_like_not_found(exc):
+                raise
+        # Parent missing — bottom-up create of schema (and catalog if
+        # needed), then retry the volume create. ``if_not_exists=True``
+        # on the retry absorbs the AlreadyExists race when another
+        # caller created the volume concurrently.
+        volume._ensure_schema_and_catalog()
+        return volume.create(**create_kwargs, if_not_exists=True)
 
     # ── remote fetch ──────────────────────────────────────────────────────────
 
