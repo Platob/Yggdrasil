@@ -817,6 +817,18 @@ def any_to_arrow_table(
             merged_schema = options.merged or Schema.empty()
             return pa.Table.from_batches([], schema=merged_schema.to_arrow_schema())
 
+        # Dataclass rows aren't mappings: ``pa.Table.from_pylist`` rejects
+        # them, and the per-item fallback below would route each scalar
+        # through ``pl.DataFrame(single_dataclass)`` — also unsupported.
+        # Normalize to dicts up front when the first item is a dataclass.
+        if is_dataclass(obj[0]) and not isinstance(obj[0], type):
+            obj = [
+                dataclasses.asdict(x)
+                if is_dataclass(x) and not isinstance(x, type)
+                else x
+                for x in obj
+            ]
+
         try:
             table = pa.Table.from_pylist(obj)
         except Exception:

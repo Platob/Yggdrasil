@@ -160,6 +160,8 @@ class TestEnsureInstalled:
         function does. Without auto-shipping it, a cluster running an older
         ygg surfaces as ``UnpicklingError: invalid load key, 'Y'``.
         """
+        import pathlib
+
         frame, session = fake_frame
 
         def fn(x):
@@ -168,10 +170,12 @@ class TestEnsureInstalled:
         new = frame._ensure_installed(fn)
         assert "yggdrasil" in new
         session.addArtifacts.assert_called_with(
-            "/fake/yggdrasil.zip", pyfile=True,
+            str(pathlib.Path("/fake/yggdrasil.zip")), pyfile=True,
         )
 
     def test_third_party_modules_get_shipped(self, fake_frame) -> None:
+        import pathlib
+
         frame, session = fake_frame
         import yggdrasil
 
@@ -181,7 +185,7 @@ class TestEnsureInstalled:
         new = frame._ensure_installed(fn)
         assert "yggdrasil" in new
         session.addArtifacts.assert_called_with(
-            "/fake/yggdrasil.zip", pyfile=True,
+            str(pathlib.Path("/fake/yggdrasil.zip")), pyfile=True,
         )
         assert "yggdrasil" in frame.installed_modules
 
