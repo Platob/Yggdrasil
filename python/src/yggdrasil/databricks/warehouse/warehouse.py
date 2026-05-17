@@ -86,6 +86,10 @@ __all__ = [
 
 LOGGER = logging.getLogger(__name__)
 
+# Emit a WARNING when a warehouse takes unusually long to leave pending state.
+_WAREHOUSE_STARTUP_WARN_FIRST: float = 120.0    # first warning after 2 minutes
+_WAREHOUSE_STARTUP_WARN_INTERVAL: float = 120.0  # repeat every 2 minutes
+
 
 # ---------------------------------------------------------------------------
 # DatabricksExecutionOptions
@@ -440,12 +444,20 @@ class SQLWarehouse(
                 "Waiting for warehouse %r to leave pending state (timeout=%.0fs)",
                 self, wait.timeout,
             )
+            _next_warn_at = start + _WAREHOUSE_STARTUP_WARN_FIRST
             # Refresh once per iteration explicitly — ``is_pending`` reads the
             # cached state, so without this the loop would spin on stale data.
             while True:
                 self.refresh()
                 if not self.is_pending:
                     break
+                now = time.time()
+                if now >= _next_warn_at:
+                    LOGGER.warning(
+                        "Warehouse %r still starting after %.0fs",
+                        self, now - start,
+                    )
+                    _next_warn_at = now + _WAREHOUSE_STARTUP_WARN_INTERVAL
                 wait.sleep(iteration=iteration, start=start)
                 iteration += 1
             LOGGER.debug(

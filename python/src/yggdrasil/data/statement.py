@@ -54,6 +54,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Emit a WARNING when a statement has been waiting longer than this (seconds).
+_LONG_RUNNING_WARN_FIRST: float = 300.0     # first warning after 5 minutes
+_LONG_RUNNING_WARN_INTERVAL: float = 300.0  # repeat every 5 minutes
+
 __all__ = [
     "BatchConcatMode",
     "ExternalStatementData",
@@ -668,12 +672,20 @@ class StatementResult(Tabular, Generic[PS]):
             self, wait_cfg.timeout, self.iteration,
         )
         wait_start = time.time()
+        _next_warn_at = wait_start + _LONG_RUNNING_WARN_FIRST
 
         while True:
             # Poll to terminal for the current submission.
             start = time.time()
             state = self.state
             while not state.is_done:
+                now = time.time()
+                if now >= _next_warn_at:
+                    logger.warning(
+                        "Statement %r still waiting after %.0fs (state=%s)",
+                        self, now - wait_start, state,
+                    )
+                    _next_warn_at = now + _LONG_RUNNING_WARN_INTERVAL
                 wait_cfg.sleep(iteration=0, start=start, max_interval=5)
                 state = self._compute_state()
 
