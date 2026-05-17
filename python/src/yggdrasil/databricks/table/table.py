@@ -1926,9 +1926,37 @@ class Table(DatabricksPath):
         table_type: TableType | None = None,
         data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
         if_not_exists: bool = True,
+        or_replace: bool = False,
         record_ygg_properties: bool = True,
     ) -> "Table":
         mode = Mode.from_(mode, default=Mode.AUTO)
+
+        # ``or_replace=True`` — one-shot atomic replacement via
+        # ``CREATE OR REPLACE TABLE ... USING <format>``. Saves a round
+        # trip versus delete + recreate and removes the intermediate
+        # "table missing" window the warehouse used to see between the
+        # two calls. OR REPLACE is supported for managed Delta tables;
+        # external / explicit-storage paths fall through to the legacy
+        # drop + recreate (UC's tables.create API has no replace verb).
+        if or_replace:
+            is_managed_delta = (
+                (table_type is None or table_type == TableType.MANAGED)
+                and storage_location is None
+                and data_source_format == DataSourceFormat.DELTA
+            )
+            if is_managed_delta:
+                result = self.sql_create(
+                    definition,
+                    comment=comment,
+                    if_not_exists=False,
+                    or_replace=True,
+                    properties=properties,
+                    data_source_format=data_source_format,
+                    record_ygg_properties=record_ygg_properties,
+                )
+                self.invalidate_singleton(remove_global=True)
+                return result
+            self.delete(wait=True, missing_ok=True, delete_staging=False)
 
         if self.exists:
             if mode == Mode.ERROR_IF_EXISTS:
@@ -3237,10 +3265,11 @@ class Table(DatabricksPath):
 
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
 
-        if mode_enum == Mode.OVERWRITE and not match_by:
-            self.delete(wait=True, missing_ok=True, delete_staging=False)
-
-        target = self.create(data, mode=schema_mode)
+        target = self.create(
+            data,
+            mode=schema_mode,
+            or_replace=(mode_enum == Mode.OVERWRITE and not match_by),
+        )
         target_location = target.full_name(safe=True)
         existing_schema = target.collect_schema()
         cast_options = CastOptions.check(options=cast_options).with_target(existing_schema)
@@ -3388,10 +3417,11 @@ class Table(DatabricksPath):
         # TODO: Fix async databricks notebook.
         wait = True if PyEnv.in_databricks() else wait
 
-        if mode_enum == Mode.OVERWRITE and not match_by:
-            self.delete(wait=True, missing_ok=True, delete_staging=False)
-
-        target = self.create(data, mode=schema_mode)
+        target = self.create(
+            data,
+            mode=schema_mode,
+            or_replace=(mode_enum == Mode.OVERWRITE and not match_by),
+        )
         target_location = target.full_name(safe=True)
         existing_schema = target.collect_schema()
         cast_options = CastOptions.check(options=cast_options).check_target(
