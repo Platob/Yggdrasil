@@ -663,6 +663,12 @@ class StatementResult(Tabular, Generic[PS]):
                 self.raise_for_status()
             return self
 
+        logger.debug(
+            "Waiting on %r (timeout=%s, iteration=%d)",
+            self, wait_cfg.timeout, self.iteration,
+        )
+        wait_start = time.time()
+
         while True:
             # Poll to terminal for the current submission.
             start = time.time()
@@ -681,6 +687,11 @@ class StatementResult(Tabular, Generic[PS]):
                 continue
 
             break
+
+        logger.debug(
+            "Waited %.1fs on %r (state=%s, iteration=%d)",
+            time.time() - wait_start, self, state, self.iteration,
+        )
 
         if raise_error:
             self.raise_for_status()

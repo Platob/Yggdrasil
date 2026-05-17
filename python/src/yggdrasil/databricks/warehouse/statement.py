@@ -755,19 +755,32 @@ class WarehouseStatementResult(StatementResult):
         """
         if self.started:
             if not reset:
+                logger.debug(
+                    "Skipping start for statement %r — already started", self,
+                )
                 return self
 
+            logger.debug(
+                "Resetting statement %r before resubmit (iteration=%d)",
+                self, self.iteration,
+            )
             self.cancel(wait=False)
 
             self.statement_id = None
             self._response = None
             self._unpersist_schema()
 
+        logger.debug("Submitting statement on %r", self.executor)
         submitted = self.executor.send(self.statement)
 
         self.statement = submitted.statement
         self.set_api_response(submitted._response)
         self.iteration = self.iteration + 1
+        logger.debug(
+            "Submitted statement %r (iteration=%d, state=%s)",
+            self, self.iteration,
+            submitted._response.status.state if submitted._response else None,
+        )
 
         return self
 
@@ -858,13 +871,24 @@ class WarehouseStatementResult(StatementResult):
         if self._response is not None and self._response.status.state in DONE_STATES:
             return self
 
+        cached_state = (
+            self._response.status.state if self._response is not None else None
+        )
         statement_execution = self.client.workspace_client().statement_execution
         response = statement_execution.get_statement(self.statement_id)
+        new_state = response.status.state
 
-        if response.status.state in DONE_STATES:
+        if new_state in DONE_STATES:
             logger.info(
-                "Statement %r finished in state %s", self, response.status.state,
+                "Statement %r finished in state %s", self, new_state,
             )
+        elif cached_state != new_state:
+            logger.debug(
+                "Polled statement %r (state=%s, prev=%s)",
+                self, new_state, cached_state,
+            )
+        else:
+            logger.debug("Polled statement %r (state=%s)", self, new_state)
         self.set_api_response(response)
         return self
 
