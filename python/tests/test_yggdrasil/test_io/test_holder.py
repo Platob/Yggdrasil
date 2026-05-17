@@ -376,6 +376,74 @@ class TestHolderTabular:
         ]
 
 
+class TestWriteHolder:
+    """``Holder.write_holder`` size-aware splice — inline below 4 MiB,
+    chunked stream above."""
+
+    def test_small_holder_writes_inline_via_write_mv(self) -> None:
+        """Sub-threshold payloads go through one ``write_mv`` call —
+        backends with cheap whole-blob writes skip the stream loop."""
+        src = Memory()
+        src.write_bytes(b"small-payload")  # 13 bytes, well under 4 MiB
+
+        dst = Memory()
+        calls: list[int] = []
+        original = type(dst).write_mv
+
+        def _spy(self, data, offset, *, update_stat=True):
+            if self is dst:
+                calls.append(len(data))
+            return original(self, data, offset, update_stat=update_stat)
+
+        from unittest.mock import patch
+
+        with patch.object(type(dst), "write_mv", _spy):
+            dst.write_holder(src)
+
+        assert dst.read_bytes() == b"small-payload"
+        # Exactly one write_mv into dst — single-shot inline.
+        assert calls == [len(b"small-payload")]
+
+    def test_large_holder_streams_via_chunks(self) -> None:
+        """Above-threshold payloads route through ``_write_stream`` —
+        chunked 1 MiB writes instead of one giant ``write_mv``."""
+        payload = b"x" * (5 * 1024 * 1024)  # 5 MiB > 4 MiB threshold
+        src = Memory()
+        src.write_bytes(payload)
+
+        dst = Memory()
+        calls: list[int] = []
+        original = type(dst).write_mv
+
+        def _spy(self, data, offset, *, update_stat=True):
+            if self is dst:
+                calls.append(len(data))
+            return original(self, data, offset, update_stat=update_stat)
+
+        from unittest.mock import patch
+
+        with patch.object(type(dst), "write_mv", _spy):
+            dst.write_holder(src)
+
+        assert dst.read_bytes() == payload
+        # 5 MiB in 1 MiB chunks → 5 writes; never a single 5 MiB blob.
+        assert all(c <= 1024 * 1024 for c in calls)
+        assert sum(calls) == 5 * 1024 * 1024
+
+    def test_write_bytes_dispatches_holder_input(self) -> None:
+        """``write_bytes(holder)`` routes through ``write_holder``."""
+        src = Memory()
+        src.write_bytes(b"hello")
+        dst = Memory()
+        dst.write_bytes(src)
+        assert dst.read_bytes() == b"hello"
+
+    def test_rejects_non_holder_source(self) -> None:
+        dst = Memory()
+        with pytest.raises(TypeError, match="Holder source"):
+            dst.write_holder(b"not-a-holder")  # type: ignore[arg-type]
+
+
 class TestHolderTransfer:
     """``Holder.upload`` / ``Holder.download`` accept Holder/IO/str/PathLike.
 

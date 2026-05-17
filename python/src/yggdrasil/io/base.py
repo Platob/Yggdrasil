@@ -1164,6 +1164,18 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         self._pos += n
         return n
 
+    def write_holder(self, src: Any) -> int:
+        """Splice another :class:`Holder`'s bytes into self at the cursor.
+
+        Cursor-anchored wrapper around :meth:`Holder.write_holder` —
+        small payloads land in one :meth:`Holder.write_mv` call,
+        large ones stream through :meth:`Holder._write_stream`.
+        Cursor advances by the byte count.
+        """
+        n = self._active().write_holder(src, offset=self._pos)
+        self._pos += n
+        return n
+
     def upload(
         self, src: Any, *, size: int = -1, offset: int = 0,
     ) -> "IO":
