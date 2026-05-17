@@ -869,18 +869,19 @@ class VolumePath(DatabricksPath):
             data = data[:n]
         return memoryview(data)
 
-    def _write_stream(self, src: Any, *, offset: int) -> int:
+    def _write_stream(self, src: Any, *, offset: int, size: int = -1) -> int:
         """Override the base chunked stream — Volumes wants one PUT.
 
         The Files API does whole-object PUTs only, so a chunked
         :meth:`Holder._write_stream` would issue one RMW per
         chunk. Hand the live :class:`IO[bytes]` to :meth:`_upload`
         which does seek-on-retry around a single ``files.upload``
-        call. Non-zero ``offset`` falls back to the chunked base
-        path because the API can't splice at a range.
+        call. ``size>=0`` (capped read) or non-zero ``offset``
+        fall back to the chunked base path because the API can't
+        splice at a range.
         """
-        if offset != 0:
-            return super()._write_stream(src, offset=offset)
+        if offset != 0 or size >= 0:
+            return super()._write_stream(src, offset=offset, size=size)
         return self._upload(src)
 
     def _write_mv(self, data: memoryview, pos: int) -> int:

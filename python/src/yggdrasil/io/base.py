@@ -1141,16 +1141,25 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
             return self.write_stream(b)
         return self.write_bytes(memoryview(b), update_stat=update_stat)
 
-    def write_bytes(self, b: BytesLike, *, update_stat: bool = True) -> int:
-        """Splice *b* at the cursor, advance, return bytes written."""
+    def write_bytes(
+        self, b: BytesLike, *, size: int = -1, update_stat: bool = True,
+    ) -> int:
+        """Splice *b* at the cursor, advance, return bytes written.
+
+        ``size>=0`` caps the byte count written. The cap is
+        applied via a slice of the input buffer before the
+        ``write_mv`` call (zero-copy for ``memoryview`` / ``bytes``).
+        """
         mv = _as_byte_mv(b)
+        if size >= 0 and len(mv) > size:
+            mv = mv[:size]
         if len(mv) == 0:
             return 0
         n = self._active().write_mv(mv, self._pos, update_stat=update_stat)
         self._pos += n
         return n
 
-    def write_stream(self, src: Any) -> int:
+    def write_stream(self, src: Any, *, size: int = -1) -> int:
         """Drain a binary source into self at the cursor.
 
         Cursor-anchored wrapper around :meth:`Holder.write_stream` —
@@ -1158,21 +1167,22 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         real :class:`IO[bytes]` and dispatches to
         :meth:`Holder._write_stream`; this thin wrapper just
         advances the cursor by the bytes the holder reported
-        writing.
+        writing. ``size>=0`` caps the byte count drained from *src*.
         """
-        n = self._active().write_stream(src, offset=self._pos)
+        n = self._active().write_stream(src, offset=self._pos, size=size)
         self._pos += n
         return n
 
-    def write_holder(self, src: Any) -> int:
+    def write_holder(self, src: Any, *, size: int = -1) -> int:
         """Splice another :class:`Holder`'s bytes into self at the cursor.
 
         Cursor-anchored wrapper around :meth:`Holder.write_holder` —
         small payloads land in one :meth:`Holder.write_mv` call,
         large ones stream through :meth:`Holder._write_stream`.
-        Cursor advances by the byte count.
+        ``size>=0`` caps the byte count pulled from *src*. Cursor
+        advances by the byte count.
         """
-        n = self._active().write_holder(src, offset=self._pos)
+        n = self._active().write_holder(src, offset=self._pos, size=size)
         self._pos += n
         return n
 

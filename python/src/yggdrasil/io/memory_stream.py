@@ -337,15 +337,25 @@ class MemoryStream(Holder):
         local = pos - self._window_start
         return memoryview(self._buf)[local : local + n]
 
-    def write_mv(self, data: memoryview, pos: int) -> int:
+    def write_mv(
+        self,
+        data: memoryview,
+        pos: int = 0,
+        *,
+        size: int = -1,
+        update_stat: bool = True,
+    ) -> int:
         """Splice bytes at ``pos``. Appends past current end extend the
         stream and may slide the window; in-window writes overwrite.
 
-        Writes behind :attr:`window_start` raise — the target bytes
-        have already been evicted.
+        ``size>=0`` slices the input buffer to at most ``size``
+        bytes before the splice. Writes behind :attr:`window_start`
+        raise — the target bytes have already been evicted.
         """
-        size = self.size
-        pos = _resolve_pos(pos, size)
+        if size >= 0 and len(data) > size:
+            data = data[:size]
+        total = self.size
+        pos = _resolve_pos(pos, total)
         if pos < 0:
             raise ValueError(
                 f"Position {pos} is out of bounds for MemoryStream"
@@ -355,9 +365,9 @@ class MemoryStream(Holder):
                 f"Cannot write at position {pos}: behind the live window "
                 f"start {self._window_start}."
             )
-        if pos > size:
+        if pos > total:
             raise ValueError(
-                f"Cannot write at position {pos}: past current end {size} "
+                f"Cannot write at position {pos}: past current end {total} "
                 f"(stream is append-or-overwrite, not sparse)."
             )
 
@@ -373,7 +383,7 @@ class MemoryStream(Holder):
             self._buf.extend(b"\x00" * (local_end - len(self._buf)))
 
         written = self._write_mv(data, pos)
-        if written > 0:
+        if written > 0 and update_stat:
             self._slide_window()
             self._touch_stat(size=self.size)
             self.mark_dirty()

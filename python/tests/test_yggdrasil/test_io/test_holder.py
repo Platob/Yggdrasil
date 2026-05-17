@@ -324,10 +324,12 @@ class TestWriteStream:
         calls: list[int] = []
         original = type(m).write_mv
 
-        def _spy(self, data, offset, *, update_stat=True):
+        def _spy(self, data, offset, *, size=-1, update_stat=True):
             if self is m:
                 calls.append(len(data))
-            return original(self, data, offset, update_stat=update_stat)
+            return original(
+                self, data, offset, size=size, update_stat=update_stat,
+            )
 
         with patch.object(type(m), "write_mv", _spy):
             m.write_stream(_stdio.BytesIO(b"x" * (4 * 1024 * 1024)))
@@ -390,10 +392,12 @@ class TestWriteHolder:
         calls: list[int] = []
         original = type(dst).write_mv
 
-        def _spy(self, data, offset, *, update_stat=True):
+        def _spy(self, data, offset, *, size=-1, update_stat=True):
             if self is dst:
                 calls.append(len(data))
-            return original(self, data, offset, update_stat=update_stat)
+            return original(
+                self, data, offset, size=size, update_stat=update_stat,
+            )
 
         from unittest.mock import patch
 
@@ -415,10 +419,12 @@ class TestWriteHolder:
         calls: list[int] = []
         original = type(dst).write_mv
 
-        def _spy(self, data, offset, *, update_stat=True):
+        def _spy(self, data, offset, *, size=-1, update_stat=True):
             if self is dst:
                 calls.append(len(data))
-            return original(self, data, offset, update_stat=update_stat)
+            return original(
+                self, data, offset, size=size, update_stat=update_stat,
+            )
 
         from unittest.mock import patch
 
@@ -442,6 +448,35 @@ class TestWriteHolder:
         dst = Memory()
         with pytest.raises(TypeError, match="Holder source"):
             dst.write_holder(b"not-a-holder")  # type: ignore[arg-type]
+
+    def test_size_caps_bytes_from_holder_source(self) -> None:
+        """``size>=0`` caps the byte count pulled from a Holder source."""
+        src = Memory()
+        src.write_bytes(b"abcdefghij")  # 10 bytes
+        dst = Memory()
+        dst.write_holder(src, size=4)
+        assert dst.read_bytes() == b"abcd"
+
+    def test_size_caps_bytes_in_write_bytes_dispatch(self) -> None:
+        """``write_bytes(holder, size=N)`` forwards the cap to write_holder."""
+        src = Memory()
+        src.write_bytes(b"abcdefghij")
+        dst = Memory()
+        dst.write_bytes(src, size=3)
+        assert dst.read_bytes() == b"abc"
+
+    def test_size_caps_bytes_in_stream_dispatch(self) -> None:
+        """``write_stream(src, size=N)`` stops reading after N bytes."""
+        import io as _stdio
+        dst = Memory()
+        dst.write_stream(_stdio.BytesIO(b"abcdefghij"), size=5)
+        assert dst.read_bytes() == b"abcde"
+
+    def test_size_caps_bytes_in_write_mv(self) -> None:
+        """``write_mv(data, size=N)`` slices the buffer before splicing."""
+        dst = Memory()
+        dst.write_mv(memoryview(b"abcdefghij"), size=2)
+        assert dst.read_bytes() == b"ab"
 
 
 class TestHolderTransfer:

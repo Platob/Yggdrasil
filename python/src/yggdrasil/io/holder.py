@@ -496,25 +496,32 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         """
 
     def write_mv(
-        self, data: memoryview, offset: int = 0, *, update_stat: bool = True,
+        self,
+        data: memoryview,
+        offset: int = 0,
+        *,
+        size: int = -1,
+        update_stat: bool = True,
     ) -> int:
-        """Splice ``data`` at ``pos``, pre-growing the holder as needed.
+        """Splice ``data`` at ``offset``, pre-growing the holder as needed.
+
+        ``size`` caps the byte count written — ``size=-1`` (default)
+        writes all of ``data``; ``size>=0`` writes
+        ``min(len(data), size)`` bytes. Caps via a slice of
+        ``data`` (zero-copy on ``memoryview`` / ``bytes``), so
+        downstream pipelines that only need the first N bytes of
+        a larger buffer skip the trailing tail.
 
         Pipeline:
 
-        1. Normalize ``pos`` (``-1`` → append, ``-N`` → ``size - N``).
-        2. Pre-grow visible :attr:`size` to cover the splice via
-           :meth:`resize` — one call to the size-management primitive
-           instead of nudging size up inside ``_write_mv``.
-        3. Hand the normalized ``(data, pos)`` to :meth:`_write_mv`,
-           which now only has to put bytes down at a valid range.
-        4. Mark dirty + bump cached mtime if anything was written.
-
-        Doing the resize up front means ``_write_mv`` implementations
-        across backends don't each reimplement the grow logic. It also
-        gives subclasses with a cheap grow path (S3 multipart capacity
-        hint, ``ftruncate`` on local fd) a chance to skip the work
-        ``_write_mv`` would have done byte-by-byte.
+        1. Slice ``data`` to ``size`` if capped.
+        2. Normalize ``offset`` (``-1`` → append, ``-N`` →
+           ``self.size - N``).
+        3. Pre-grow visible :attr:`size` to cover the splice via
+           :meth:`resize`.
+        4. Hand the normalized ``(data, offset)`` to
+           :meth:`_write_mv`.
+        5. Mark dirty + bump cached mtime if anything was written.
 
         ``update_stat=False`` skips the post-write
         :meth:`_touch_stat` and :meth:`mark_dirty` calls. Use it for
@@ -524,6 +531,8 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         re-statting via the path-side ``_stat`` for filesystem
         backends) once the loop finishes.
         """
+        if size >= 0 and len(data) > size:
+            data = data[:size]
         total = self.size
         offset = _resolve_pos(offset, total)
         if offset < 0:
@@ -983,8 +992,17 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         self,
         data: Any,
         offset: int = 0,
+        *,
+        size: int = -1,
     ) -> int:
         """Splice ``data`` at ``offset``. Returns bytes written.
+
+        ``size`` caps the byte count written — ``size=-1``
+        (default) writes the entire source; ``size>=0`` writes at
+        most ``size`` bytes. The cap is forwarded into each
+        type-directed branch so a stream source stops reading
+        after ``size`` bytes (no over-pull) and a bytes-like
+        source slices its tail off before dispatching.
 
         Type-directed dispatch — bytes-like payloads
         (:class:`bytes`, :class:`bytearray`, :class:`memoryview`,
@@ -993,19 +1011,17 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         through :meth:`write_holder` (size-aware: small payloads
         write inline, large ones stream); file-like sources
         (anything exposing ``.read``) drain through
-        :meth:`write_stream` so backends with an atomic
-        whole-object uploader can push a single request instead
-        of buffering. Subclasses override :meth:`_write_mv`,
-        :meth:`_write_stream`, and / or :meth:`_write_holder`
-        rather than this dispatch.
+        :meth:`write_stream`. Subclasses override
+        :meth:`_write_mv`, :meth:`_write_stream`, and / or
+        :meth:`_write_holder` rather than this dispatch.
         """
         if isinstance(data, str):
             data = data.encode("utf-8")
         if isinstance(data, Holder):
-            return self.write_holder(data, offset=offset)
+            return self.write_holder(data, offset=offset, size=size)
         if hasattr(data, "read"):
-            return self.write_stream(data, offset=offset)
-        return self.write_mv(_as_byte_mv(data), offset)
+            return self.write_stream(data, offset=offset, size=size)
+        return self.write_mv(_as_byte_mv(data), offset, size=size)
 
     def read_text(
         self,
@@ -1183,7 +1199,9 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
                     remaining -= written
         return total
 
-    def write_stream(self, src: Any, *, offset: int = 0) -> int:
+    def write_stream(
+        self, src: Any, *, offset: int = 0, size: int = -1,
+    ) -> int:
         """Drain a binary source into this holder at ``offset``.
 
         Public entry point: accepts a yggdrasil :class:`IO[bytes]`,
@@ -1192,6 +1210,10 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         carrying a ``.read``. Non-:class:`IO` sources are coerced
         via :meth:`IO.from_` so subclass-side :meth:`_write_stream`
         always receives a real :class:`IO[bytes]`.
+
+        ``size`` caps the byte count drained from *src* —
+        ``size=-1`` (default) reads to EOF; ``size>=0`` stops at
+        ``size`` bytes (no over-pull from the source).
         """
         if offset < 0:
             raise ValueError("write_stream offset must be >= 0")
@@ -1199,15 +1221,19 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         from yggdrasil.io.bytes_io import BytesIO as _YggBytesIO
 
         io_src = src if isinstance(src, _IO) else _YggBytesIO.from_(src)
-        return self._write_stream(io_src, offset=offset)
+        return self._write_stream(io_src, offset=offset, size=size)
 
-    def _write_stream(self, src: "IO[bytes]", *, offset: int) -> int:
+    def _write_stream(
+        self, src: "IO[bytes]", *, offset: int, size: int = -1,
+    ) -> int:
         """Splice ``src``'s bytes into this holder starting at ``offset``.
 
         Default implementation: real chunked streaming — read
         :data:`_COPY_CHUNK` bytes at a time and splice each chunk
         through :meth:`write_bytes`, so multi-GB sources never
         materialise as a single :class:`bytes` object in Python.
+        ``size>=0`` caps the byte count so the source stops
+        being read once the limit is reached.
 
         Subclass override hook: backends with an atomic
         whole-object upload (Volumes ``files.upload``, Workspace
@@ -1221,24 +1247,37 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         """
         cursor = offset
         total = 0
+        remaining = size if size >= 0 else None
         while True:
-            chunk = src.read(_COPY_CHUNK)
+            if remaining is not None:
+                if remaining <= 0:
+                    break
+                chunk_size = min(_COPY_CHUNK, remaining)
+            else:
+                chunk_size = _COPY_CHUNK
+            chunk = src.read(chunk_size)
             if not chunk:
                 break
             n = self.write_bytes(chunk, offset=cursor)
             cursor += n
             total += n
+            if remaining is not None:
+                remaining -= n
         return total
 
-    def write_holder(self, src: "Holder", *, offset: int = 0) -> int:
+    def write_holder(
+        self, src: "Holder", *, offset: int = 0, size: int = -1,
+    ) -> int:
         """Splice another :class:`Holder`'s bytes into this one at ``offset``.
 
         Public entry point: validates the inputs, then dispatches
-        to :meth:`_write_holder`. Subclasses override the private
-        hook to swap in a backend-aware fast path (Workspace /
-        Volumes / S3 can hand the source straight to their
-        atomic-upload SDK call without ever materialising the
-        bytes in Python).
+        to :meth:`_write_holder`. ``size`` caps the byte count
+        pulled from *src* — ``size=-1`` (default) writes the
+        whole source; ``size>=0`` writes the first ``size`` bytes.
+        Subclasses override the private hook to swap in a
+        backend-aware fast path (Workspace / Volumes / S3 can
+        hand the source straight to their atomic-upload SDK call
+        without ever materialising the bytes in Python).
         """
         if offset < 0:
             raise ValueError("write_holder offset must be >= 0")
@@ -1248,9 +1287,11 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
                 f"{type(src).__name__}. Pass through `write_bytes` for "
                 f"bytes-like / IO / stream inputs."
             )
-        return self._write_holder(src, offset=offset)
+        return self._write_holder(src, offset=offset, size=size)
 
-    def _write_holder(self, src: "Holder", *, offset: int) -> int:
+    def _write_holder(
+        self, src: "Holder", *, offset: int, size: int = -1,
+    ) -> int:
         """Splice *src*'s bytes into this holder starting at ``offset``.
 
         Default implementation: small payloads (under
@@ -1262,17 +1303,24 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         with an atomic streaming uploader can replace the
         default chunked drain.
 
+        ``size>=0`` caps the byte count pulled from *src*. The
+        decision boundary (inline vs stream) uses
+        ``min(src.size, size)`` so a 5 MiB source with
+        ``size=1024`` still goes through the inline fast path.
+
         Override when a backend can splice a foreign holder
         without going through Python bytes (e.g. an S3
         ``CopyObject`` when ``self`` and *src* share an
         underlying bucket).
         """
-        if src.size < _INLINE_WRITE_THRESHOLD:
-            return self.write_mv(src.read_mv(-1, 0), offset)
+        src_size = src.size
+        effective = src_size if size < 0 else min(src_size, size)
+        if effective < _INLINE_WRITE_THRESHOLD:
+            return self.write_mv(src.read_mv(effective, 0), offset)
         from yggdrasil.io.bytes_io import BytesIO as _YggBytesIO
 
         with _YggBytesIO(holder=src, mode="rb") as io_src:
-            return self._write_stream(io_src, offset=offset)
+            return self._write_stream(io_src, offset=offset, size=effective)
 
     # ------------------------------------------------------------------
     # Byte transfer — upload / download to any byte sink

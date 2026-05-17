@@ -241,7 +241,7 @@ class DBFSPath(DatabricksPath):
         )
         return memoryview(bytes(out))
 
-    def _write_stream(self, src: Any, *, offset: int) -> int:
+    def _write_stream(self, src: Any, *, offset: int, size: int = -1) -> int:
         """Override the base chunked stream — one ``dbfs.open`` session.
 
         :meth:`_stream_upload` already pipes the live
@@ -249,11 +249,12 @@ class DBFSPath(DatabricksPath):
         ``dbfs.open(write=True)`` handle with ``_DBFS_CHUNK``-sized
         writes, so the base :meth:`Holder._write_stream` (which
         opens a new DBFS session per chunk) is a strict loss
-        here. Non-zero ``offset`` falls back to the chunked base
-        path because DBFS can't splice at a range.
+        here. ``size>=0`` (capped read) or non-zero ``offset``
+        fall back to the chunked base path because DBFS can't
+        splice at a range.
         """
-        if offset != 0:
-            return super()._write_stream(src, offset=offset)
+        if offset != 0 or size >= 0:
+            return super()._write_stream(src, offset=offset, size=size)
         return self._stream_upload(src)
 
     def _write_mv(self, data: memoryview, pos: int) -> int:
