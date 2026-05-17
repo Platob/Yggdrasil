@@ -285,6 +285,47 @@ class TestListing:
         assert children[0].full_path() == "/dbfs/folder/a.parquet"
         assert children[1].full_path() == "/dbfs/folder/sub"
 
+    def test_iterdir_seeds_child_stat(self, workspace, client) -> None:
+        # ``dbfs.list`` already carries ``is_dir`` / ``file_size`` /
+        # ``modification_time`` per entry — seed each child so follow-up
+        # ``size`` / ``is_file()`` / ``exists()`` calls don't each fire
+        # a separate ``dbfs.get_status`` round trip.
+        workspace.dbfs.list.return_value = [
+            SimpleNamespace(
+                path="/folder/a.parquet",
+                is_dir=False,
+                file_size=2048,
+                modification_time=5_000,
+            ),
+            SimpleNamespace(
+                path="/folder/sub",
+                is_dir=True,
+                file_size=0,
+                modification_time=0,
+            ),
+        ]
+        p = DBFSPath("/dbfs/folder", client=client)
+        children = list(p.iterdir())
+        assert children[0].size == 2048
+        assert children[0].is_file() is True
+        assert children[1].is_dir() is True
+        workspace.dbfs.get_status.assert_not_called()
+
+    def test_read_seeds_stat_cache(self, workspace, client) -> None:
+        # After a whole-file read, ``_stat_cached`` must carry the actual
+        # byte count so the next ``size`` / ``exists`` lookup is local —
+        # no follow-up ``dbfs.get_status`` probe.
+        workspace.dbfs.read.side_effect = [
+            SimpleNamespace(data=base64.b64encode(b"hello").decode()),
+            # Second call (EOF sentinel) returns an empty page.
+            SimpleNamespace(data=None),
+        ]
+        p = DBFSPath("/dbfs/x.bin", client=client)
+        data = p.read_bytes()
+        assert data == b"hello"
+        assert p.size == 5
+        workspace.dbfs.get_status.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Retry policy

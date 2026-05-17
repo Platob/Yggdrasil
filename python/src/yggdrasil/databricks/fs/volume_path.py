@@ -42,7 +42,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional
 
-from databricks.sdk.errors import PermissionDenied, NotFound
+from databricks.sdk.errors import PermissionDenied
 
 from yggdrasil.concurrent import Job
 from yggdrasil.data.cast import any_to_datetime, parse_http_date
@@ -52,7 +52,7 @@ from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 from ..client import DatabricksClient
-from ..path import DatabricksPath, _looks_like_parent_missing
+from ..path import DatabricksPath
 
 if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
@@ -620,11 +620,10 @@ class VolumePath(DatabricksPath):
                 if owns_pool:
                     executor.shutdown(wait=True)
 
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "files.delete_directory %s (recursive=%s)",
-                self.api_path, recursive,
-            )
+        logger.info(
+            "files.delete_directory %s (recursive=%s)",
+            self.api_path, recursive,
+        )
 
         if wait:
             try:
@@ -762,7 +761,7 @@ class VolumePath(DatabricksPath):
                     content.seek(0, io.SEEK_END)
                     size = content.tell()
                     content.seek(pos, io.SEEK_SET)
-            except:
+            except Exception:
                 pos = 0
 
             def _do_upload() -> None:
