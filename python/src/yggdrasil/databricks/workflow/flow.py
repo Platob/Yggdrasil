@@ -54,6 +54,11 @@ from databricks.sdk.service.jobs import (
 )
 
 from .context import TraceContext
+from .metadata import (
+    collect_source_metadata,
+    describe_metadata,
+    metadata_tags,
+)
 from .nodes import FlowParam, TaskNode
 
 if TYPE_CHECKING:
@@ -69,14 +74,105 @@ LOGGER = logging.getLogger(__name__)
 def _resolve_jobs_service(
     service: Optional["Jobs"],
     client: Optional["DatabricksClient"],
+    *,
+    fallback_client: Optional["DatabricksClient"] = None,
 ) -> "Jobs":
-    """Pick a :class:`Jobs` service from caller hints, falling back to the current client."""
+    """Pick a :class:`Jobs` service from caller hints.
+
+    Precedence: explicit *service* → explicit *client* →
+    *fallback_client* (typically the one pinned on the decorator) →
+    :meth:`DatabricksClient.current`. That order lets a caller
+    override a flow's pinned workspace per-call while still respecting
+    the default the decorator declared.
+    """
     if service is not None:
         return service
-    if client is None:
-        from yggdrasil.databricks.client import DatabricksClient
-        client = DatabricksClient.current()
-    return client.jobs
+    if client is not None:
+        return client.jobs
+    if fallback_client is not None:
+        return fallback_client.jobs
+    from yggdrasil.databricks.client import DatabricksClient
+    return DatabricksClient.current().jobs
+
+
+def _build_auto_prefix(func: Optional[Callable[..., Any]] = None) -> str:
+    """Compose ``[YGG][<project>/<version>]`` from :meth:`UserInfo.current`.
+
+    Resolution order, picking the *first* non-empty source for each
+    field:
+
+    1. **Project**: ``UserInfo.product`` (PEP 621 name from the nearest
+       ``pyproject.toml``) → ``UserInfo.hostname`` → ``"ygg"``.
+    2. **Version**: ``UserInfo.product_version`` → the *func*'s git
+       commit short hash (when *func* lives in a checkout) →
+       ``"ygg-<yggdrasil version>"``.
+
+    Best-effort: any exception in :class:`UserInfo` resolution falls
+    through to the hostname / yggdrasil-version fallbacks, so a deploy
+    on a stripped-down image (no ``pyproject.toml``, no git remote)
+    still gets a meaningful prefix instead of failing.
+    """
+    project: Optional[str] = None
+    version: Optional[str] = None
+
+    try:
+        from yggdrasil.environ import UserInfo
+
+        info = UserInfo.current()
+        project = info.product or info.hostname
+        version = info.product_version
+    except Exception:  # noqa: BLE001 — best-effort, prefix isn't load-bearing
+        LOGGER.debug("UserInfo lookup for auto-prefix failed", exc_info=True)
+
+    if not version and func is not None:
+        try:
+            meta = collect_source_metadata(func)
+        except Exception:  # noqa: BLE001
+            meta = None
+        if meta and meta.git_commit:
+            version = meta.git_commit[:12]
+
+    if not version:
+        try:
+            from yggdrasil.version import __version__ as ygg_version
+            version = f"ygg-{ygg_version}"
+        except Exception:  # noqa: BLE001
+            version = "dev"
+
+    project = project or "ygg"
+    return f"[YGG][{project}/{version}]"
+
+
+def _apply_prefix(
+    policy: Any,
+    name: str,
+    func: Optional[Callable[..., Any]] = None,
+) -> str:
+    """Apply the configured prefix policy to *name*.
+
+    * ``policy=True`` (default) — auto-derive ``[YGG][project/version]`` via
+      :func:`_build_auto_prefix`.
+    * ``policy=False`` / ``policy=None`` — return *name* unchanged.
+    * ``policy=<str>`` — use the literal string as the prefix; a
+      trailing space is added if missing so the rendered name stays
+      readable.
+    """
+    if not policy:
+        return name
+    if policy is True:
+        prefix = _build_auto_prefix(func)
+    elif isinstance(policy, str):
+        prefix = policy
+    else:
+        raise TypeError(
+            f"@flow(prefix={policy!r}): expected True, False, None, or a "
+            "string literal."
+        )
+    if not prefix:
+        return name
+    if not prefix.endswith(" "):
+        prefix = prefix + " "
+    return f"{prefix}{name}"
 
 
 def _coerce_schedule(
@@ -149,6 +245,8 @@ class Flow:
         parameters: Optional[Mapping[str, Any]] = None,
         tags: Optional[Mapping[str, str]] = None,
         permissions: Optional[Iterable[Any]] = None,
+        prefix: Any = True,
+        client: Optional["DatabricksClient"] = None,
         **job_settings: Any,
     ) -> None:
         self.func = func
@@ -160,9 +258,46 @@ class Flow:
         self.parameters = dict(parameters) if parameters else {}
         self.tags = dict(tags) if tags else None
         self.permissions = list(permissions) if permissions else None
+        #: Name-prefix policy. ``True`` (default) auto-derives the
+        #: ``[YGG][<project>/<version>] `` prefix from
+        #: :meth:`UserInfo.current` so deployed jobs are scannable in
+        #: the Databricks UI ("which project / version shipped this?").
+        #: ``False`` opts out — :attr:`deployed_name` equals
+        #: :attr:`name`. A string literal is used verbatim as the
+        #: prefix (must include the trailing space if you want one).
+        self.prefix = prefix
+        #: Target workspace for :meth:`deploy` / :meth:`run`. When
+        #: ``None``, the active :meth:`DatabricksClient.current` wins —
+        #: that's the right default for code that wants to follow
+        #: whatever workspace the caller has in scope (env vars,
+        #: ``with DatabricksClient(...)`` block, …). Pin a specific
+        #: client at ``@flow(client=…)`` time when the flow always
+        #: targets one workspace ("prod-eu") regardless of how the
+        #: caller is set up.
+        self.client = client
         self.job_settings = dict(job_settings)
         self._signature = inspect.signature(func)
         functools.update_wrapper(self, func)
+
+    # ------------------------------------------------------------------ #
+    # Deployed name — :attr:`name` with the configured prefix applied
+    # ------------------------------------------------------------------ #
+    @property
+    def deployed_name(self) -> str:
+        """Job name as it actually lands on the Databricks workspace.
+
+        With the default ``prefix=True`` policy this returns
+        ``"[YGG][<project>/<version>] <name>"`` where ``<project>``
+        and ``<version>`` come from :meth:`UserInfo.current` —
+        ``UserInfo.product`` (the PEP 621 project name parsed from
+        the nearest ``pyproject.toml``) falling back to
+        ``UserInfo.hostname``, and ``UserInfo.product_version``
+        falling back to the source-file git commit short hash and
+        finally to ``ygg-<yggdrasil version>``. With ``prefix=False``
+        the raw :attr:`name` is returned; with a string ``prefix=``
+        the literal is prepended.
+        """
+        return _apply_prefix(self.prefix, self.name, self.func)
 
     # ------------------------------------------------------------------ #
     # Run mode (no trace) — the flow function behaves as plain Python
@@ -264,7 +399,7 @@ class Flow:
         ``parameters`` carry the defaults and each run can override
         them.
         """
-        jobs = _resolve_jobs_service(service, client)
+        jobs = _resolve_jobs_service(service, client, fallback_client=self.client)
         nodes = self.trace(**(trace_overrides or {}))
         if not nodes:
             raise RuntimeError(
@@ -275,8 +410,19 @@ class Flow:
         tasks, environments = self._stage_nodes(jobs.client, nodes)
         job_parameters = self._build_job_parameters(nodes, trace_overrides or {})
 
+        # Auto-derive source attribution from the flow function — module,
+        # source path / line, yggdrasil version, and (when the file lives
+        # inside a git checkout) the current commit + an HTTPS link to the
+        # exact line on the hosting provider. These land on:
+        #   * job tags    — ``ygg.module`` / ``ygg.git_commit`` /
+        #                    ``ygg.source_url`` etc. for UI search,
+        #   * job description — appended as a human-readable footer so
+        #                       operators can jump straight to the source.
+        flow_metadata = collect_source_metadata(self.func)
+        deployed_name = self.deployed_name
+
         settings: Dict[str, Any] = {
-            "name": self.name,
+            "name": deployed_name,
             "tasks": tasks,
             **self.job_settings,
             **extra_job_settings,
@@ -291,11 +437,35 @@ class Flow:
         if schedule is not None:
             settings["schedule"] = schedule
 
-        merged_tags = dict(self.tags) if self.tags else None
+        # Description: caller-supplied wins; otherwise lead with the
+        # flow's docstring (if any) and trail with the metadata footer
+        # so the Databricks UI surfaces the source link without forcing
+        # the operator to crack the staged file open.
+        existing_description = settings.get("description")
+        metadata_footer = describe_metadata(flow_metadata, prefix="Flow source")
+        if existing_description is None:
+            doc_line = flow_metadata.docstring
+            parts = [p for p in (doc_line, metadata_footer) if p]
+            if parts:
+                settings["description"] = "\n\n".join(parts)[:4096]
+        elif metadata_footer and metadata_footer not in str(existing_description):
+            settings["description"] = (
+                f"{existing_description}\n\n{metadata_footer}"
+            )[:4096]
+
+        merged_tags: Optional[dict] = dict(self.tags) if self.tags else None
+        derived_tags = metadata_tags(flow_metadata)
+        derived_tags["ygg.flow"] = self.name
+        if derived_tags:
+            # Caller-supplied tags win on collision — auto-derived
+            # values only fill in keys the caller didn't pin.
+            merged_tags = {**derived_tags, **(merged_tags or {})}
+
         merged_permissions = list(self.permissions) if self.permissions else None
 
         LOGGER.debug(
-            "Deploying flow %r (%d task(s))", self.name, len(nodes),
+            "Deploying flow %r as job name %r (%d task(s))",
+            self.name, deployed_name, len(nodes),
         )
         if userinfo_defaults:
             defaults = jobs.userinfo_defaults()
@@ -306,7 +476,7 @@ class Flow:
             settings = {**defaults, **settings}
 
         job = jobs.create_or_update(
-            name=self.name,
+            name=deployed_name,
             tasks=tasks,
             tags=merged_tags,
             permissions=merged_permissions,
@@ -426,13 +596,17 @@ class Flow:
         :class:`databricks.sdk.service.jobs.JobsAPI.run_now`'s
         ``job_parameters`` map.
         """
-        jobs = _resolve_jobs_service(service, client)
-        job = jobs.find(name=self.name)
+        jobs = _resolve_jobs_service(service, client, fallback_client=self.client)
+        # The deployed Job lives under :attr:`deployed_name` (the
+        # prefix-applied form), not the raw :attr:`name` — look it up
+        # under the same key :meth:`deploy` registered.
+        target_name = self.deployed_name
+        job = jobs.find(name=target_name)
         if job is None:
             if not deploy_if_missing:
                 raise RuntimeError(
-                    f"Flow.run({self.name!r}): job not found in workspace "
-                    f"{jobs.client.base_url.to_string()!r} and "
+                    f"Flow.run({self.name!r}): job {target_name!r} not found "
+                    f"in workspace {jobs.client.base_url.to_string()!r} and "
                     "deploy_if_missing=False — call .deploy() first."
                 )
             job = self.deploy(service=jobs)
@@ -453,6 +627,8 @@ def flow(
     parameters: Optional[Mapping[str, Any]] = None,
     tags: Optional[Mapping[str, str]] = None,
     permissions: Optional[Iterable[Any]] = None,
+    prefix: Any = True,
+    client: Optional["DatabricksClient"] = None,
     **job_settings: Any,
 ) -> Any:
     """Decorate a Python function as a Databricks workflow flow.
@@ -469,6 +645,20 @@ def flow(
     wrapped function as plain Python, so tests don't need a workspace.
     Calling ``my_flow.deploy()`` traces the body and upserts a
     Databricks Job; ``my_flow.run()`` triggers it.
+
+    ``prefix`` controls the deployed job-name prefix. The default
+    (``True``) auto-derives ``[YGG][<project>/<version>] `` via
+    :meth:`UserInfo.current` so deployed jobs are scannable in the
+    Databricks UI by owning project. Pass ``False`` to deploy under
+    the bare :attr:`Flow.name`, or a string literal to pin a custom
+    prefix.
+
+    ``client`` pins a target :class:`DatabricksClient`. When omitted
+    the active :meth:`DatabricksClient.current` wins — usually
+    what you want. Set it explicitly when the flow always targets
+    one workspace ("prod-eu") regardless of how the caller's
+    environment is configured. Per-call overrides on
+    :meth:`Flow.deploy` / :meth:`Flow.run` still take precedence.
     """
     def _wrap(f: Callable[..., Any]) -> Flow:
         return Flow(
@@ -480,6 +670,8 @@ def flow(
             parameters=parameters,
             tags=tags,
             permissions=permissions,
+            prefix=prefix,
+            client=client,
             **job_settings,
         )
 

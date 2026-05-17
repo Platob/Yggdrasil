@@ -11,13 +11,13 @@ Stack:
   :class:`Job` via :meth:`Jobs.create_or_update`. ``flow.run()`` then
   triggers it.
 * :func:`secret` builds a :class:`SecretRef` placeholder that
-  resolves at runtime via :func:`runtime.secret` — cleartext never
+  resolves at runtime via :func:`ygg.secret` — cleartext never
   lives on disk in the staged source.
-* :mod:`runtime` holds the helpers the staged tasks call:
-  :func:`runtime.secret`, :func:`runtime.task_value`,
-  :func:`runtime.publish_return`. Imported on every staged script
-  via ``from yggdrasil.databricks.workflow import runtime as
-  _ygg_runtime``.
+* :mod:`ygg` holds the helpers the staged tasks call:
+  :func:`ygg.secret`, :func:`ygg.task_value`,
+  :func:`ygg.publish_return`. Every staged script imports it via
+  ``from yggdrasil.databricks.workflow import ygg``; the alias
+  :data:`runtime` is preserved for callers who pinned the old name.
 
 Worked example::
 
@@ -42,12 +42,17 @@ Worked example::
 """
 from __future__ import annotations
 
-from . import runtime
+from . import ygg
 from .context import TraceContext, current_trace
 from .flow import Flow, flow
 from .nodes import FlowParam, TaskNode
 from .resources import SecretRef, secret
 from .task import WorkflowTask, task
+
+#: Alias kept so the rare external caller pinned to ``runtime`` keeps
+#: working — :mod:`ygg` is the canonical name and what every staged
+#: script imports.
+runtime = ygg
 
 __all__ = [
     "Flow",
@@ -61,4 +66,5 @@ __all__ = [
     "runtime",
     "secret",
     "task",
+    "ygg",
 ]

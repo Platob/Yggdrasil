@@ -50,7 +50,7 @@ class TestSecretRefRepr(unittest.TestCase):
     def test_repr_calls_runtime_secret(self) -> None:
         self.assertEqual(
             repr(SecretRef(scope="vendor", key="api-key")),
-            "_ygg_runtime.secret('vendor', 'api-key')",
+            "ygg.secret('vendor', 'api-key')",
         )
 
     def test_repr_escapes_special_characters(self) -> None:

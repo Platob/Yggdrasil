@@ -56,13 +56,13 @@ class FlowParam:
 
     def __repr__(self) -> str:
         # Mirrors :class:`SecretRef.__repr__`: the staged script imports
-        # ``_ygg_runtime`` and ``task_value`` doubles as the generic
-        # "read a binding by name" helper outside the unbound-parameter
+        # ``ygg`` and ``task_value`` doubles as the generic "read a
+        # binding by name" helper outside the unbound-parameter
         # plumbing path. Realistically this repr is rarely emitted —
-        # :func:`Flow._stage_node_args` strips :class:`FlowParam` values
+        # :func:`filter_trace_values` strips :class:`FlowParam` values
         # so they flow through SparkPythonTask.parameters — but the
         # fallback is here for completeness.
-        return f"_ygg_runtime.task_value({self.name!r})"
+        return f"ygg.task_value({self.name!r})"
 
 
 @dataclass(slots=True)
@@ -113,12 +113,12 @@ class TaskNode:
 
     def __repr__(self) -> str:
         # Same trick as :class:`SecretRef`: the staged script imports
-        # ``_ygg_runtime``, so embedding the literal call here lets the
-        # existing :func:`_classify_invocation_params` path render
-        # downstream invocations without a special case. Downstream
-        # tasks that take this node as an argument see
-        # ``_ygg_runtime.task_value('<task_key>')`` at the call site.
-        return f"_ygg_runtime.task_value({self.task_key!r})"
+        # ``ygg``, so embedding the literal call here lets the existing
+        # :func:`_classify_invocation_params` path render downstream
+        # invocations without a special case. Downstream tasks that
+        # take this node as an argument see
+        # ``ygg.task_value('<task_key>')`` at the call site.
+        return f"ygg.task_value({self.task_key!r})"
 
     def __eq__(self, other: object) -> bool:
         return self is other

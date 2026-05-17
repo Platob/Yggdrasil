@@ -31,6 +31,7 @@ from typing import Any, Callable, Mapping, Optional, TYPE_CHECKING
 from databricks.sdk.service.jobs import TaskDependency
 
 from .context import current_trace
+from .metadata import collect_source_metadata, describe_metadata
 from .nodes import TaskNode
 from .resources import SecretRef
 
@@ -100,6 +101,7 @@ class WorkflowTask:
         existing_cluster_id: Optional[str] = None,
         job_cluster_key: Optional[str] = None,
         new_cluster: Any = None,
+        client: Optional["DatabricksClient"] = None,
         **task_fields: Any,
     ) -> None:
         if task_type not in ("spark", "notebook"):
@@ -127,6 +129,14 @@ class WorkflowTask:
         self.existing_cluster_id = existing_cluster_id
         self.job_cluster_key = job_cluster_key
         self.new_cluster = new_cluster
+        #: Override the staging workspace for this task. When set,
+        #: :meth:`stage` writes the staged ``.py`` to *this* client's
+        #: workspace instead of the parent flow's. Useful for tasks
+        #: whose source must live alongside a different workspace's
+        #: secrets / volumes — the deployed Job still runs on the
+        #: parent flow's workspace cluster, so that cluster must be
+        #: able to read the staging path.
+        self.client = client
         self.task_fields = dict(task_fields)
         functools.update_wrapper(self, func)
 
@@ -180,7 +190,7 @@ class WorkflowTask:
         string when called locally — same shape the staged invocation
         sees on a Databricks cluster.
 
-        Raises :class:`RuntimeError` (via :func:`runtime.secret`) when
+        Raises :class:`RuntimeError` (via :func:`ygg.secret`) when
         no :class:`DatabricksClient` can be resolved — that's the
         signal to wire one in (``DatabricksClient(host=…, token=…)``
         as a context manager) or to mock the secret in tests by
@@ -293,7 +303,7 @@ class WorkflowTask:
         )
 
         # Promote SecretRef defaults to explicit kwargs so the staged
-        # invocation reads ``api_key=_ygg_runtime.secret('scope', 'key')``
+        # invocation reads ``api_key=ygg.secret('scope', 'key')``
         # instead of relying on the function default. The default
         # ``api_key: str = secret(...)`` would otherwise be a SecretRef
         # at call time, which the @checkargs wrap would reject before
@@ -319,8 +329,12 @@ class WorkflowTask:
         else:
             stage_fn = stage_python_callable
 
+        # Per-task client override wins; otherwise the flow's
+        # workspace receives the staged source.
+        staging_client = self.client if self.client is not None else client
+
         details, _deps, _env_names = stage_fn(
-            client,
+            staging_client,
             self.func,
             *bound_args,
             task_key=node.task_key,
@@ -349,6 +363,25 @@ class WorkflowTask:
                 for upstream in node.depends_on
             ]
 
+        # Append a source-attribution footer to whatever description
+        # ``stage_python_callable`` derived from the function signature.
+        # Operators reading the Databricks UI's task list get the
+        # GitHub link, git commit, and module path inline — no need to
+        # crack the staged file open.
+        task_metadata = collect_source_metadata(self.func)
+        metadata_footer = describe_metadata(task_metadata, prefix="Task source")
+        if metadata_footer:
+            current_desc = overrides.get("description") or getattr(
+                details, "description", None,
+            ) or ""
+            if metadata_footer not in current_desc:
+                joined = (
+                    f"{current_desc}\n\n{metadata_footer}"
+                    if current_desc else metadata_footer
+                )
+                # Databricks Task.description has a 1000-char hard cap.
+                overrides["description"] = joined[:1000]
+
         if overrides:
             details = _dc_replace(details, **{
                 k: v for k, v in overrides.items() if v is not None
@@ -368,6 +401,7 @@ def task(
     existing_cluster_id: Optional[str] = None,
     job_cluster_key: Optional[str] = None,
     new_cluster: Any = None,
+    client: Optional["DatabricksClient"] = None,
     **task_fields: Any,
 ) -> Any:
     """Decorate a Python callable as a Databricks workflow task.
@@ -404,6 +438,7 @@ def task(
             existing_cluster_id=existing_cluster_id,
             job_cluster_key=job_cluster_key,
             new_cluster=new_cluster,
+            client=client,
             **task_fields,
         )
 
@@ -415,14 +450,14 @@ def task(
 def _materialise_secret(value: Any) -> Any:
     """Return *value*, replacing a :class:`SecretRef` with its cleartext.
 
-    Routes through :func:`runtime.secret` so the same code path runs
+    Routes through :func:`ygg.secret` so the same code path runs
     locally and on the cluster — the cluster picks the in-process
     Databricks-injected ``DatabricksClient.current()``; locally the
     caller supplies one via environment variables, a profile, or
     Databricks Connect.
     """
     if isinstance(value, SecretRef):
-        from . import runtime
+        from . import ygg
 
-        return runtime.secret(value.scope, value.key)
+        return ygg.secret(value.scope, value.key)
     return value

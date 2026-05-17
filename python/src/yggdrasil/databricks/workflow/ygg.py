@@ -1,9 +1,14 @@
-"""Runtime helpers callable from staged workflow tasks.
+"""The ``ygg`` runtime module — helpers callable from staged workflow tasks.
 
-Tasks staged by :mod:`yggdrasil.databricks.workflow` lean on three
-runtime affordances that must be available *inside* the cluster
-process — not at deploy time, when the staging happens on the
-authoring machine:
+This module is the cluster-side surface every staged task imports as
+``ygg``. The renderer in :mod:`yggdrasil.databricks.jobs.task` adds
+``from yggdrasil.databricks.workflow import ygg`` to every staged
+script; :func:`SecretRef.__repr__` and :func:`TaskNode.__repr__` emit
+literal ``ygg.secret(...)`` / ``ygg.task_value(...)`` expressions so
+the existing :func:`stage_python_callable` rendering pipeline doesn't
+need a special-case hook.
+
+Three runtime affordances live here:
 
 * :func:`secret` resolves ``{secrets/<scope>/<key>}`` at call time
   against :meth:`DatabricksClient.current`. Used to materialise a
@@ -19,17 +24,21 @@ authoring machine:
   invocation so its return value lands on the run's task-values map
   for downstream tasks.
 
-The renderers in :mod:`yggdrasil.databricks.workflow.task` add a
-``from yggdrasil.databricks.workflow import runtime as _ygg_runtime``
-import to every staged script; :func:`SecretRef.__repr__` and
-:func:`TaskNode.__repr__` emit literal Python that calls into those
-three helpers so the existing :func:`stage_python_callable` rendering
-pipeline doesn't need a special-case hook.
+Users can also import the same surface inside a task body for explicit
+use::
+
+    from yggdrasil.databricks.workflow import ygg
+
+    @task
+    def step():
+        api_key = ygg.secret("vendor", "key")
+        upstream = ygg.task_value("extract")
+        ...
 """
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 __all__ = [
     "RETURN_VALUE_KEY",
@@ -47,20 +56,31 @@ LOGGER = logging.getLogger(__name__)
 RETURN_VALUE_KEY = "__ygg_return__"
 
 
-def secret(scope: str, key: str) -> str:
+def secret(scope: str, key: str, *, host: Optional[str] = None) -> str:
     """Resolve ``{secrets/<scope>/<key>}`` against the current workspace client.
 
     Returns the decoded string value. Raises :class:`RuntimeError`
     when no :class:`DatabricksClient` is bound to the current process
     (the staged task ran outside a Databricks cluster and no client
     was explicitly registered).
+
+    ``host`` (optional) targets a workspace other than the
+    process-default :meth:`DatabricksClient.current`. A fresh
+    :class:`DatabricksClient` is built for that host on the spot,
+    inheriting authentication from the environment (token, OAuth
+    client credentials, profile) the same way the default client
+    does. Used to make a single staged task resolve secrets from a
+    workspace different from the one it's running in.
     """
     from yggdrasil.databricks.client import DatabricksClient
 
-    client = DatabricksClient.current()
+    if host:
+        client = DatabricksClient(host=host)
+    else:
+        client = DatabricksClient.current()
     if client is None:
         raise RuntimeError(
-            f"yggdrasil.databricks.workflow.runtime.secret({scope!r}, {key!r}): "
+            f"yggdrasil.databricks.workflow.ygg.secret({scope!r}, {key!r}): "
             "no DatabricksClient is bound to the current process — staged "
             "tasks resolve secrets via DatabricksClient.current(). Run inside "
             "a Databricks task or wrap the call in a DatabricksClient context."
@@ -110,7 +130,7 @@ def publish_return(
     normally. The original *value* is always returned so the wrapped
     invocation reads naturally:
 
-        _ygg_result = _ygg_runtime.publish_return(func(...))
+        _ygg_result = ygg.publish_return(func(...))
     """
     from yggdrasil.databricks.jobs.inputs import get_dbutils
 
