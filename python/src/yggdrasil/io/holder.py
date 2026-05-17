@@ -972,12 +972,25 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
 
     def write_bytes(
         self,
-        data: Union[bytes, bytearray, memoryview, str],
+        data: Any,
         offset: int = 0,
     ) -> int:
-        """Splice bytes-like ``data`` at ``offset``. Returns bytes written."""
+        """Splice ``data`` at ``offset``. Returns bytes written.
+
+        Type-directed dispatch — bytes-like payloads
+        (:class:`bytes`, :class:`bytearray`, :class:`memoryview`,
+        and ``str`` after UTF-8 encoding) splice through
+        :meth:`write_mv`; file-like sources (anything exposing
+        ``.read``) drain through :meth:`write_stream` so backends
+        with an atomic whole-object uploader can push a single
+        request instead of buffering the payload. Subclasses
+        override :meth:`_write_mv` and/or :meth:`write_stream`
+        rather than this dispatch.
+        """
         if isinstance(data, str):
             data = data.encode("utf-8")
+        if hasattr(data, "read"):
+            return self.write_stream(data, offset=offset)
         return self.write_mv(_as_byte_mv(data), offset)
 
     def read_text(

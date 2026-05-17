@@ -869,31 +869,6 @@ class VolumePath(DatabricksPath):
             data = data[:n]
         return memoryview(data)
 
-    def write_bytes(self, data: Any, offset: int = 0) -> int:
-        """Fast-path whole-blob write straight through :meth:`_upload`.
-
-        The Files API does whole-object PUTs only — no range writes —
-        so the common ``offset=0`` shape is a single
-        ``files.upload`` round trip. Bypassing :meth:`Holder.write_mv`
-        / :meth:`_write_mv` skips the resize + dirty-flag bookkeeping
-        :class:`Holder` adds for streaming backends and lets the
-        payload ride the seek-on-retry closure in :meth:`_upload`
-        directly. Non-zero ``offset`` still routes through the base
-        read-modify-rewrite path (pull existing object, splice,
-        re-upload).
-        """
-        if offset != 0:
-            return super().write_bytes(data, offset=offset)
-        if isinstance(data, str):
-            data = data.encode("utf-8")
-        if not hasattr(data, "__len__"):
-            return self._upload(data)
-        n = len(data)
-        if n == 0:
-            return 0
-        self._upload(data)
-        return n
-
     def write_stream(self, src: Any, *, offset: int = 0) -> int:
         """Override the base chunked stream — Volumes wants one PUT.
 

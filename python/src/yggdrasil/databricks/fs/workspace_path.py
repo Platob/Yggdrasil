@@ -313,31 +313,6 @@ class WorkspacePath(DatabricksPath):
             data = data[:n]
         return memoryview(data)
 
-    def write_bytes(self, data: Any, offset: int = 0) -> int:
-        """Fast-path whole-blob write straight through :meth:`_upload`.
-
-        The Workspace API has no positional / range write — every
-        mutation is a full re-upload. Bypassing :meth:`Holder.write_mv`
-        and :meth:`_write_mv` for the common ``offset=0`` case skips
-        the ``resize`` / ``_touch_stat`` / ``mark_dirty`` round-trip
-        :class:`Holder` adds for streaming backends and lands the
-        payload on ``workspace.upload`` in one call. Non-zero
-        ``offset`` still routes through the base read-modify-rewrite
-        path.
-        """
-        if offset != 0:
-            return super().write_bytes(data, offset=offset)
-        if isinstance(data, str):
-            data = data.encode("utf-8")
-        if not hasattr(data, "__len__"):
-            # IO stream — :meth:`_upload` rewinds on retry.
-            return self._upload(data)
-        n = len(data)
-        if n == 0:
-            return 0
-        self._upload(data)
-        return n
-
     def write_stream(self, src: Any, *, offset: int = 0) -> int:
         """Override the base chunked stream — Workspace wants one PUT.
 
