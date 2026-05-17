@@ -798,6 +798,30 @@ class TestStagedScriptMetadata(DatabricksTestCase):
         b = _content_digest(_signature_fixture, (), {"name": "y"})
         self.assertNotEqual(a, b)
 
+    def test_script_invocation_reads_sys_argv_for_unbound_params(self):
+        """Unbound params resolve at runtime via ``sys.argv`` reads.
+
+        SparkPythonTask has no widget surface — the script's only
+        channel for per-run values is ``sys.argv``. The staging path
+        wires ``SparkPythonTask.parameters`` to
+        ``{{job.parameters.<name>}}`` placeholders so the rendered
+        invocation's ``sys.argv[i]`` reads pick up the Job's
+        :class:`JobParameterDefinition`s at run time.
+        """
+        import ast
+
+        def _three_params(catalog_name: str, schema_name: str, table_name: str) -> None:
+            return None
+
+        script = _render_callable_script(_three_params, (), {})
+        ast.parse(script)
+        # Helper emitted once.
+        self.assertIn("def _yggdrasil_argv(idx):", script)
+        # Positional matching follows signature order.
+        self.assertIn("catalog_name=_yggdrasil_argv(1)", script)
+        self.assertIn("schema_name=_yggdrasil_argv(2)", script)
+        self.assertIn("table_name=_yggdrasil_argv(3)", script)
+
     def test_script_wraps_no_arg_function_with_checkargs(self):
         import ast
 

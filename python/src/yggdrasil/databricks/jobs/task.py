@@ -550,11 +550,27 @@ def stage_python_callable(
         f"{doc_line[0]} — {signature_str}" if doc_line else signature_str
     )[:1000]
 
+    # SparkPythonTask has no widget surface — the only channel for
+    # passing per-run values into the script is the ordered
+    # ``parameters`` list (Databricks delivers it as ``sys.argv[1:]``).
+    # Wire one placeholder per parameter the caller left unbound,
+    # using ``{{job.parameters.<name>}}`` substitution so the Job's
+    # own :class:`JobParameterDefinition`s feed in at run time. The
+    # rendered script's ``sys.argv``-reading invocation positions
+    # match this list 1:1.
+    _, unbound_param_names = _classify_invocation_params(func, args, kwargs)
+    spark_parameters = (
+        [f"{{{{job.parameters.{name}}}}}" for name in unbound_param_names]
+        if unbound_param_names
+        else None
+    )
+
     details = Task(
         task_key=key,
         description=description,
         spark_python_task=SparkPythonTask(
             python_file=path.full_path(),
+            parameters=spark_parameters,
         ),
         environment_key=DEFAULT_ENVIRONMENT_KEY,
     )
@@ -825,9 +841,7 @@ def _render_callable_script(
     # without Python tripping on ``null`` / ``true`` / ``false``.
     meta_json = json.dumps(meta_payload, indent=2, sort_keys=True)
 
-    call_parts: list[str] = [repr(a) for a in args]
-    call_parts.extend(f"{k}={v!r}" for k, v in kwargs.items())
-    invocation = f"{func.__name__}({', '.join(call_parts)})"
+    invocation_block = _render_invocation_script(func, args, kwargs)
 
     return (
         # ``from __future__ import annotations`` must lead every staged
@@ -857,8 +871,7 @@ def _render_callable_script(
         f"{captured_block}"
         f"{body}"
         "\n"
-        'if __name__ == "__main__":\n'
-        f"    {invocation}\n"
+        f"{invocation_block}"
     )
 
 
@@ -957,10 +970,57 @@ def _render_callable_notebook(
     )
 
 
+def _classify_invocation_params(
+    func: Callable[..., Any], args: tuple, kwargs: dict,
+) -> Tuple[List[Tuple[str, Optional[str]]], List[str]]:
+    """Split *func*'s parameters into ``(bound_parts, unbound_names)``.
+
+    Returns:
+
+    * ``bound_parts`` — list of ``(name, literal_repr)`` for parameters
+      the caller supplied at stage time (positional or keyword);
+      ``literal_repr`` is the ``repr``'d Python literal the rendered
+      script should emit. ``name`` is ``None`` for positional-only
+      slots so the invocation can keep them positional.
+    * ``unbound_names`` — list (in signature order) of parameter names
+      the caller left for runtime resolution. ``VAR_POSITIONAL`` /
+      ``VAR_KEYWORD`` slots are skipped; trailing keyword overrides
+      not matching a parameter name fall through to ``bound_parts``
+      as ``(k, repr(v))``.
+
+    The two renderers share this so the SparkPythonTask path
+    (``stage_python_callable``) and the NotebookTask path
+    (``stage_python_notebook_callable``) plumb job parameters
+    consistently — the script wires ``unbound_names`` into
+    ``SparkPythonTask.parameters`` placeholders + ``sys.argv`` reads,
+    the notebook wires the same names into ``dbutils.widgets.get``.
+    """
+    sig = inspect.signature(func)
+    remaining_kwargs = dict(kwargs)
+    bound_parts: List[Tuple[str, Optional[str]]] = []
+    unbound_names: List[str] = []
+    pos_consumed = 0
+    for name, p in sig.parameters.items():
+        if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
+            continue
+        if pos_consumed < len(args) and p.kind in (
+            p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD,
+        ):
+            bound_parts.append((name, repr(args[pos_consumed])))
+            pos_consumed += 1
+        elif name in remaining_kwargs:
+            bound_parts.append((name, repr(remaining_kwargs.pop(name))))
+        else:
+            unbound_names.append(name)
+    for k, v in remaining_kwargs.items():
+        bound_parts.append((k, repr(v)))
+    return bound_parts, unbound_names
+
+
 def _render_invocation_cell(
     func: Callable[..., Any], args: tuple, kwargs: dict,
 ) -> str:
-    """Render the invocation cell — literals for bound args, widgets for the rest.
+    """Render the notebook invocation cell — literals for bound args, widgets for the rest.
 
     Positional / keyword parameters supplied via *args* / *kwargs* at
     stage time render as ``repr``'d literals (same shape as the
@@ -973,35 +1033,22 @@ def _render_invocation_cell(
     binding (returns ``None``) so a local ``python -m`` re-run still
     parses.
     """
-    sig = inspect.signature(func)
-    remaining_kwargs = dict(kwargs)
-    parts: list[str] = []
-    pos_consumed = 0
-    needs_widget_helper = False
-    for name, p in sig.parameters.items():
-        if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
-            continue
-        if pos_consumed < len(args) and p.kind in (
-            p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD,
-        ):
-            parts.append(repr(args[pos_consumed]))
-            pos_consumed += 1
-        elif name in remaining_kwargs:
-            parts.append(f"{name}={remaining_kwargs.pop(name)!r}")
-        else:
-            parts.append(f"{name}=_yggdrasil_widget({name!r})")
-            needs_widget_helper = True
-    parts.extend(f"{k}={v!r}" for k, v in remaining_kwargs.items())
+    bound, unbound = _classify_invocation_params(func, args, kwargs)
+    parts: list[str] = [
+        f"{name}={literal}" if name is not None else literal
+        for name, literal in bound
+    ]
+    parts.extend(f"{name}=_yggdrasil_widget({name!r})" for name in unbound)
 
     if not parts:
         invocation = f"{func.__name__}()"
-    elif needs_widget_helper:
+    elif unbound:
         joined = ",\n    ".join(parts)
         invocation = f"{func.__name__}(\n    {joined},\n)"
     else:
         invocation = f"{func.__name__}({', '.join(parts)})"
 
-    if not needs_widget_helper:
+    if not unbound:
         return invocation + "\n"
     return (
         "def _yggdrasil_widget(name):\n"
@@ -1014,6 +1061,59 @@ def _render_invocation_cell(
         "        return None\n"
         "\n"
         f"{invocation}\n"
+    )
+
+
+def _render_invocation_script(
+    func: Callable[..., Any], args: tuple, kwargs: dict,
+) -> str:
+    """Render the script invocation block — sys.argv reads for unbound params.
+
+    SparkPythonTask has no widget surface, so unbound parameters
+    resolve at runtime by reading the matching positional slot from
+    ``sys.argv`` — the staging path sets
+    ``SparkPythonTask.parameters`` to a list of
+    ``{{job.parameters.<name>}}`` placeholders in the same order this
+    helper emits ``sys.argv[i]`` reads, so the Job's
+    :class:`JobParameterDefinition`s feed straight through to the
+    function call. Bound *args* / *kwargs* render as ``repr``'d
+    literals.
+
+    The returned block is indented for placement under
+    ``if __name__ == "__main__":`` — the caller is responsible for
+    the outer guard.
+    """
+    bound, unbound = _classify_invocation_params(func, args, kwargs)
+    parts: list[str] = [
+        f"{name}={literal}" if name is not None else literal
+        for name, literal in bound
+    ]
+    parts.extend(
+        f"{name}=_yggdrasil_argv({idx + 1})"
+        for idx, name in enumerate(unbound)
+    )
+
+    if not parts:
+        invocation = f"{func.__name__}()"
+    elif unbound:
+        joined = ",\n        ".join(parts)
+        invocation = f"{func.__name__}(\n        {joined},\n    )"
+    else:
+        invocation = f"{func.__name__}({', '.join(parts)})"
+
+    if not unbound:
+        return f'if __name__ == "__main__":\n    {invocation}\n'
+    return (
+        "def _yggdrasil_argv(idx):\n"
+        "    # SparkPythonTask passes the task's ``parameters`` list as\n"
+        "    # ``sys.argv[1:]`` — index lookups stay tolerant of a short\n"
+        "    # argv so a local ``python <script>`` re-run still parses\n"
+        "    # (the function body sees ``None`` for the missing slot).\n"
+        "    import sys\n"
+        "    return sys.argv[idx] if 0 <= idx < len(sys.argv) else None\n"
+        "\n\n"
+        'if __name__ == "__main__":\n'
+        f"    {invocation}\n"
     )
 
 

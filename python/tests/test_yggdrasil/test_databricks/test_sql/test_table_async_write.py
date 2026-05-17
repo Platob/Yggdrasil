@@ -1211,6 +1211,41 @@ class TestAsyncInsertJobSettings:
         env = spec["environments"][0]
         assert env.environment_key == task.environment_key
 
+    def test_task_type_spark_stages_spark_python_task(self):
+        """``task_type='spark'`` routes through ``stage_python_callable``."""
+        from databricks.sdk.service.jobs import NotebookTask, SparkPythonTask
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, _, _ = self._table_with_trigger_path()
+        spec = AsyncInsertJob.settings(tbl, task_type="spark")
+        assert len(spec["tasks"]) == 1
+        task = spec["tasks"][0]
+        # The Spark Python flavour wires a SparkPythonTask, *not* a
+        # NotebookTask.
+        assert isinstance(task.spark_python_task, SparkPythonTask)
+        assert not isinstance(task.notebook_task, NotebookTask)
+        assert task.spark_python_task.python_file.endswith(".py")
+        # ``SparkPythonTask.parameters`` plumbs the Job's parameters
+        # into the script's ``sys.argv`` reads via
+        # ``{{job.parameters.<name>}}`` substitution — without this
+        # the rendered ``apply_records(catalog_name=…, schema_name=…,
+        # table_name=…)`` invocation can't see the per-run values.
+        params = task.spark_python_task.parameters
+        assert params == [
+            "{{job.parameters.catalog_name}}",
+            "{{job.parameters.schema_name}}",
+            "{{job.parameters.table_name}}",
+        ]
+        # Matching JobEnvironment still lands on the settings.
+        assert spec["environments"]
+
+    def test_task_type_invalid_raises(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, _, _ = self._table_with_trigger_path()
+        with pytest.raises(ValueError, match="task_type"):
+            AsyncInsertJob.settings(tbl, task_type="lambda")
+
     def test_applier_none_emits_empty_task_list(self):
         from yggdrasil.databricks.table.async_job import AsyncInsertJob
 
