@@ -866,6 +866,20 @@ def _render_callable_script(
         "\n"
         "import json as _yggdrasil_json\n"
         "from yggdrasil.dataclasses.safe_function import checkargs\n"
+        # ``ygg`` carries the runtime helpers the workflow layer leans
+        # on — ygg.secret() resolves a SecretRef against the current
+        # workspace client, ygg.task_value() reads a value an upstream
+        # task published via dbutils.jobs.taskValues, ygg.publish_return()
+        # wraps the staged invocation so this task's return surfaces on
+        # the task-values map. Imported unconditionally so every staged
+        # script can read SecretRef / TaskNode reprs as plain Python
+        # without a special-case rendering hook. ``secret`` is also
+        # re-imported here so a SecretRef expressed as a default
+        # (``api_key: str = secret('vendor', 'key')``) parses at module
+        # load — the staged invocation always passes an explicit value
+        # so the default itself never reaches the function body.
+        "from yggdrasil.databricks.workflow import ygg\n"
+        "from yggdrasil.databricks.workflow.resources import secret  # noqa: F401\n"
         f"__yggdrasil_task__ = _yggdrasil_json.loads(r\"\"\"{meta_json}\"\"\")\n"
         "\n"
         f"{captured_block}"
@@ -961,6 +975,11 @@ def _render_callable_notebook(
         "import json as _yggdrasil_json\n"
         "import logging as _yggdrasil_logging\n"
         "from yggdrasil.dataclasses.safe_function import checkargs\n"
+        # ``ygg`` carries the workflow runtime helpers — see the matching
+        # script renderer for the rationale; imported in every staged
+        # notebook so SecretRef / TaskNode reprs evaluate cleanly.
+        "from yggdrasil.databricks.workflow import ygg\n"
+        "from yggdrasil.databricks.workflow.resources import secret  # noqa: F401\n"
         f"__yggdrasil_task__ = _yggdrasil_json.loads(r\"\"\"{meta_json}\"\"\")\n"
         "_yggdrasil_logging.basicConfig(\n"
         "    level=_yggdrasil_logging.INFO,\n"
@@ -1089,7 +1108,14 @@ def _render_invocation_cell(
         f"{widget_helper}"
         f"_YGG_LOGGER.info('Starting %s', {func.__qualname__!r})\n"
         f"try:\n"
-        f"    _ygg_result = {invocation}\n"
+        # ``ygg.publish_return`` forwards the return value (transparent
+        # passthrough) and, when ``dbutils`` is available, mirrors it
+        # onto the run's task-values map so downstream tasks in the
+        # same Databricks Job can read it back via ``ygg.task_value``
+        # / ``dbutils.jobs.taskValues.get``. Silent no-op outside a
+        # Databricks runtime so local re-runs of the staged source
+        # still terminate normally.
+        f"    _ygg_result = ygg.publish_return({invocation})\n"
         f"except Exception:\n"
         f"    _YGG_LOGGER.exception('Failed %s', {func.__qualname__!r})\n"
         f"    raise\n"
@@ -1134,8 +1160,15 @@ def _render_invocation_script(
     else:
         invocation = f"{func.__name__}({', '.join(parts)})"
 
+    # ``ygg.publish_return`` wraps the invocation so the staged function's
+    # return value lands on ``dbutils.jobs.taskValues`` for downstream
+    # tasks to read via ``ygg.task_value``. Silent no-op outside Databricks
+    # so local ``python <script>`` re-runs still terminate normally.
     if not unbound:
-        return f'if __name__ == "__main__":\n    {invocation}\n'
+        return (
+            'if __name__ == "__main__":\n'
+            f"    ygg.publish_return({invocation})\n"
+        )
     return (
         "def _yggdrasil_argv(idx):\n"
         "    # SparkPythonTask passes the task's ``parameters`` list as\n"
@@ -1146,7 +1179,7 @@ def _render_invocation_script(
         "    return sys.argv[idx] if 0 <= idx < len(sys.argv) else None\n"
         "\n\n"
         'if __name__ == "__main__":\n'
-        f"    {invocation}\n"
+        f"    ygg.publish_return({invocation})\n"
     )
 
 

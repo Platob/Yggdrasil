@@ -179,6 +179,7 @@ nav:
           - secrets: modules/databricks/secrets/README.md
           - iam: modules/databricks/iam/README.md
           - jobs: modules/databricks/jobs/README.md
+          - workflow: modules/databricks/workflow/README.md
           - account: modules/databricks/account/README.md
           - genie: modules/databricks/genie/README.md
       - Utilities:

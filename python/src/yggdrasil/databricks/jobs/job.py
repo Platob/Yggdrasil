@@ -432,6 +432,32 @@ class Job(Singleton, DatabricksResource):
             return _decorate
         return _decorate(func)
 
+    def deploy(
+        self,
+        *,
+        tasks: Optional[List[Task]] = None,
+        permissions: Optional[List[Union[str, JobAccessControlRequest]]] = None,
+        tags: Optional[dict[str, str]] = None,
+        **settings: Any,
+    ) -> "Job":
+        """Full upsert — patch this job's settings, replacing tasks wholesale.
+
+        Thin wrapper over :meth:`Jobs.create_or_update` that routes
+        through this instance's ``job_id`` / ``job_name`` identity, so
+        the same singleton handle survives across multiple deploy
+        passes. Use this from workflow-style code that re-stages tasks
+        every run; :meth:`update` is the partial-update sibling for
+        callers who only want to touch a couple of fields.
+        """
+        return self.service.create_or_update(
+            job_id=self.job_id,
+            name=self.job_name,
+            tasks=tasks,
+            permissions=permissions,
+            tags=tags,
+            **settings,
+        )
+
     # ====================================================================== #
     # from_callable — build a complete Job from a single Python callable
     # ====================================================================== #
