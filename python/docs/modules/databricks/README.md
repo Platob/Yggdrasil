@@ -153,4 +153,5 @@ with ExecutionContext(cluster=cluster) as ctx:
 - [iam](iam/README.md)
 - [genie](genie/README.md)
 - [jobs](jobs/README.md)
+- [workflow](workflow/README.md) — Prefect-style `@flow` / `@task` API
 - [account](account/README.md)
