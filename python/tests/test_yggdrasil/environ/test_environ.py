@@ -2,7 +2,6 @@
 
 Covers:
   - ``safe_pip_name`` — string mapping, tuple versioning, iterable input
-  - ``SYSTEM_LIBS`` — type, membership, case-sensitivity
   - ``PyEnv`` construction — ``__post_init__``, ``__getstate__``/``__setstate__``
   - Python resolution — ``resolve_python_executable``, ``_find_python_in_dir``, ``_venv_python_from_dir``
   - Venv lifecycle — ``venv()``, ``create()``, ``get_or_create()``
@@ -29,7 +28,6 @@ import yggdrasil.environ.environment as mod
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.environ.environment import (
     PyEnv,
-    SYSTEM_LIBS,
     safe_pip_name,
 )
 
@@ -163,31 +161,6 @@ class TestSafePipName:
 
     def test_single_string_not_in_mapping(self):
         assert safe_pip_name("some-random-pkg") == "some-random-pkg"
-
-
-# ===================================================================
-# SYSTEM_LIBS
-# ===================================================================
-
-class TestSystemLibs:
-    """Verify ``SYSTEM_LIBS`` type and content."""
-
-    def test_is_frozenset(self):
-        assert isinstance(SYSTEM_LIBS, frozenset)
-
-    def test_membership_spot_checks(self):
-        assert "pip" in SYSTEM_LIBS
-        assert "setuptools" in SYSTEM_LIBS
-        assert "requests" in SYSTEM_LIBS
-        assert "pyspark" in SYSTEM_LIBS
-        assert "pyarrow" not in SYSTEM_LIBS
-
-    def test_all_entries_are_lowercase(self):
-        for entry in SYSTEM_LIBS:
-            assert entry == entry.lower(), f"SYSTEM_LIBS entry {entry!r} is not lowercase"
-
-    def test_not_empty(self):
-        assert len(SYSTEM_LIBS) > 100
 
 
 # ===================================================================

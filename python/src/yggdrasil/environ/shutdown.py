@@ -27,17 +27,10 @@ Design notes
 Typical usage
 -------------
 
-    from yggdrasil.environ.shutdown import on_shutdown, shutdown_registry
+    from yggdrasil.environ import shutdown as yg_shutdown
 
-    @on_shutdown
-    def cleanup():
-        print("cleanup called")
-
-    @on_shutdown(priority=100)
-    def flush_metrics():
-        print("flush first")
-
-    shutdown_registry.unregister(cleanup)
+    yg_shutdown.register(cleanup)
+    yg_shutdown.unregister(cleanup)
 """
 
 from __future__ import annotations
@@ -498,43 +491,6 @@ shutdown_registry = ShutdownRegistry()
 shutdown_registry.install()
 
 
-@overload
-def on_shutdown(callback: F) -> F: ...
-
-
-@overload
-def on_shutdown(
-    callback: None = None,
-    *,
-    priority: int = 0,
-    pass_reason: bool = False,
-) -> Callable[[F], F]: ...
-
-
-def on_shutdown(
-    callback: Callback | None = None,
-    *,
-    priority: int = 0,
-    pass_reason: bool = False,
-):
-    """
-    Module-level decorator/helper backed by the shared registry.
-
-    Usage:
-        @on_shutdown
-        def cleanup(): ...
-
-        @on_shutdown(priority=100, pass_reason=True)
-        def cleanup(reason: str): ...
-    """
-    return shutdown_registry.register(
-        callback,
-        priority=priority,
-        pass_reason=pass_reason,
-        install=True,
-    )
-
-
 def register(
     callback: Callback | None = None,
     *,
@@ -555,12 +511,5 @@ def register(
 def unregister(callback: Callback) -> bool:
     """
     Convenience alias for the shared registry unregister().
-    """
-    return shutdown_registry.unregister(callback)
-
-
-def unregister_shutdown(callback: Callback) -> bool:
-    """
-    Backward-compatible alias for unregister().
     """
     return shutdown_registry.unregister(callback)
