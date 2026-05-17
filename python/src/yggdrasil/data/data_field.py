@@ -2198,7 +2198,23 @@ class Field(BaseChildrenFields):
             return cls.from_str(obj)
 
         if isinstance(obj, Mapping):
-            return cls.from_dict(obj)
+            # ``from_dict`` expects a *schema* dict (``{"name": ..., "dtype": ...}``
+            # / ``{"type_text": ...}`` shape) — handing it an *instance* dict
+            # like ``{"id": 1, "name": "alice"}`` raises because no schema
+            # keys resolve. That's exactly what ``Schema.from_(row_dict)``
+            # call sites (e.g. ``DynamicFrame.infer_schema``) hand us. Try
+            # the schema-dict route first, fall back to Arrow's struct
+            # inference from the row instance.
+            field_obj = cls.from_dict(obj, default=None)
+            if field_obj is not None:
+                return field_obj
+            try:
+                table = pa.Table.from_pylist([dict(obj)])
+            except Exception:
+                # Mixed / non-Arrow-compatible values — let the original
+                # schema-dict error fire so the caller sees the real reason.
+                return cls.from_dict(obj)
+            return cls.from_arrow(table.schema)
 
         if hasattr(obj, "value"):
             return cls.from_any(obj.value)

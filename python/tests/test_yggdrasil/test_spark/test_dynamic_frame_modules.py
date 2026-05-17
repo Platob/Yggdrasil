@@ -142,15 +142,25 @@ class TestEnsureInstalled:
         monkeypatch.setattr(_module_pack, "build_module_archive", fake_build_archive)
         return DynamicFrame(df), session
 
-    def test_no_modules_in_function_is_noop(self, fake_frame) -> None:
+    def test_no_modules_in_function_still_ships_yggdrasil(self, fake_frame) -> None:
+        """Even a closure with no third-party deps must ship ygg to executors.
+
+        UDFs always go through ``mapInArrow`` which unpickles
+        ``yggdrasil.pickle`` bytes on the executor — so ``yggdrasil`` is a
+        load-time dependency of every transform regardless of what the user
+        function does. Without auto-shipping it, a cluster running an older
+        ygg surfaces as ``UnpicklingError: invalid load key, 'Y'``.
+        """
         frame, session = fake_frame
 
         def fn(x):
             return x + 1
 
         new = frame._ensure_installed(fn)
-        assert new == set()
-        session.addArtifacts.assert_not_called()
+        assert "yggdrasil" in new
+        session.addArtifacts.assert_called_with(
+            "/fake/yggdrasil.zip", pyfile=True,
+        )
 
     def test_third_party_modules_get_shipped(self, fake_frame) -> None:
         frame, session = fake_frame

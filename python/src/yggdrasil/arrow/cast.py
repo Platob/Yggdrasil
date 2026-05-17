@@ -262,7 +262,16 @@ def _schema_has_top_view(schema: Any) -> bool:
     walk, which short-circuits on view-ness only at the top of each
     leaf array). Result is memoized per :class:`pa.Schema`.
     """
-    cached = _SCHEMA_TOP_VIEW_CACHE.get(schema)
+    # ``pa.Schema.__hash__`` raises ``TypeError: unhashable type: 'dict'``
+    # when the schema's metadata carries dict values (e.g. nested ygg
+    # metadata that round-trips through Spark Connect without bytes
+    # serialization). The cache GET path must tolerate that too — not just
+    # the SET path — otherwise an otherwise-fine batch crashes the
+    # rechunker on the first lookup.
+    try:
+        cached = _SCHEMA_TOP_VIEW_CACHE.get(schema)
+    except TypeError:
+        cached = None
     if cached is not None:
         return cached
     result = False
