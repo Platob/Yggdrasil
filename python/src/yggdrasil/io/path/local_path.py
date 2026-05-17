@@ -366,8 +366,16 @@ class LocalPath(Path):
 
     @property
     def os_path(self) -> str:
-        """The local filesystem path as a string. Alias for :meth:`full_path`."""
-        return os.fspath(self.url)
+        """The local filesystem path as a string. Alias for :meth:`full_path`.
+
+        Always returns the OS-native form — backslashes on Windows,
+        forward slashes elsewhere — matching :meth:`pathlib.Path.__fspath__`
+        and what tools that compare against ``str(pathlib.Path(...))``
+        expect. The underlying ``URL.__fspath__`` is POSIX-style by
+        contract; we apply :func:`os.path.normpath` here so callers
+        of ``LocalPath`` get the platform-canonical shape.
+        """
+        return os.path.normpath(os.fspath(self.url))
 
     def full_path(self) -> str:
         """Backend-native string form — :class:`Path` hook."""

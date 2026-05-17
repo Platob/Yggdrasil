@@ -2369,7 +2369,14 @@ class Session(Singleton, ABC):
         # request per partition, capped at ``defaultParallelism * 8`` so
         # huge request lists don't explode into thousands of micro-tasks
         # whose scheduler overhead dominates the actual fetch.
-        default_par = max(spark.sparkContext.defaultParallelism, 1)
+        #
+        # ``sparkContext`` isn't reachable from a Spark Connect proxy
+        # (``PySparkAttributeError(JVM_ATTRIBUTE_NOT_SUPPORTED)``); fall
+        # back to a sensible default for the partition fan-out.
+        try:
+            default_par = max(spark.sparkContext.defaultParallelism, 1)
+        except Exception:
+            default_par = 8
         n_parts = max(1, min(len(req_rows), default_par * 8))
         request_df = spark.createDataFrame(req_rows, req_schema).repartition(n_parts)
 
@@ -2388,7 +2395,18 @@ class Session(Singleton, ABC):
         # rather than re-shipping a closure-captured copy per partition.
         # Session.__getstate__ / __setstate__ make this pickle-safe by
         # dropping the threading.RLock and JobPoolExecutor.
-        session_bc = spark.sparkContext.broadcast(self)
+        #
+        # Spark Connect doesn't expose ``sparkContext.broadcast`` either —
+        # in that mode the session is captured by the closure
+        # (``_send_partition`` references ``self`` via the bound method
+        # context) and pickled by Spark Connect's RPC framing on the way
+        # out, which is the same wire trip ``broadcast`` would have made.
+        try:
+            session_bc = spark.sparkContext.broadcast(self)
+            _session_for_partition = None  # use session_bc.value on the executor
+        except Exception:
+            session_bc = None
+            _session_for_partition = self  # closure-captured, pickled by Spark Connect
         response_spark_schema = RESPONSE_SCHEMA.to_spark_schema()
 
         def _send_partition(
@@ -2396,7 +2414,10 @@ class Session(Singleton, ABC):
         ) -> Iterator[pa.RecordBatch]:
             import pickle as _pickle
 
-            session = session_bc.value
+            session = (
+                session_bc.value if session_bc is not None
+                else _session_for_partition
+            )
             for batch in batches:
                 partition_requests = [
                     _pickle.loads(buf).attach_session(session)
