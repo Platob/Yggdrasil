@@ -35,7 +35,6 @@ quota burn for the bulk transfer.
 from __future__ import annotations
 
 import datetime as dt
-import io as _stdio
 import logging
 import os
 import re
@@ -887,11 +886,13 @@ class VolumePath(DatabricksPath):
             return super().write_bytes(data, pos=pos)
         if isinstance(data, str):
             data = data.encode("utf-8")
-        payload = bytes(data)
-        if not payload:
+        if not hasattr(data, "__len__"):
+            return self._upload(data)
+        n = len(data)
+        if n == 0:
             return 0
-        self._upload(payload)
-        return len(payload)
+        self._upload(data)
+        return n
 
     def _write_mv(self, data: memoryview, pos: int) -> int:
         n = len(data)
@@ -915,34 +916,50 @@ class VolumePath(DatabricksPath):
         self._upload(payload)
         return n
 
-    def _upload(self, payload: bytes) -> None:
-        size = len(payload)
+    def _upload(self, content: Any) -> int:
+        """Upload *content* through ``files.upload`` with retry semantics.
 
+        Accepts either a bytes-like payload or a seekable binary
+        stream. Streams ride through to the SDK verbatim — no
+        eager ``read()`` into a buffer — and get rewound to origin
+        on every retry so transient-error / parent-recovery
+        re-tries PUT the full body, not an empty tail. Bytes-like
+        payloads pass through directly; ``FilesExt.upload`` builds
+        a fresh PUT body per request from the same ``bytes``.
+
+        Returns the byte count when known (bytes-like input) or
+        ``-1`` when the input is a stream of unknown length.
+        """
+        size = len(content) if hasattr(content, "__len__") else -1
         logger.debug(
-            "Uploading volume file %r (%d bytes)", self, size,
+            "Uploading volume file %r (%s bytes)",
+            self, size if size >= 0 else "?",
         )
-        # Same seek-on-retry shape as :meth:`WorkspacePath._upload`:
-        # ``FilesExt.upload`` forwards ``contents`` to a PUT body
-        # whose first read empties the cursor, so retries fired by
-        # :meth:`_call_ensuring_parents` / :func:`retry_sdk_call`
-        # would otherwise upload zero bytes.
-        contents = _stdio.BytesIO(payload)
         upload = self.client.workspace_client().files.upload
         api_path = self.api_path
 
-        def _do_upload() -> None:
-            contents.seek(0)
-            upload(file_path=api_path, contents=contents, overwrite=True)
+        if hasattr(content, "seek"):
+            stream = content
+
+            def _do_upload() -> None:
+                stream.seek(0)
+                upload(file_path=api_path, contents=stream, overwrite=True)
+        else:
+            def _do_upload() -> None:
+                upload(file_path=api_path, contents=content, overwrite=True)
 
         self._call_ensuring_parents(_do_upload)
-        logger.info("Wrote %r (%d bytes)", self, size)
-        self._seed_stat_cache(IOStats(
-            size=len(payload),
-            kind=IOKind.FILE,
-            mtime=time.time(),
-            media_type=self.media_type,
-        ))
-        return None
+        if size >= 0:
+            logger.info("Wrote %r (%d bytes)", self, size)
+            self._seed_stat_cache(IOStats(
+                size=size,
+                kind=IOKind.FILE,
+                mtime=time.time(),
+                media_type=self.media_type,
+            ))
+        else:
+            logger.info("Wrote %r (stream)", self)
+        return size
 
     def truncate(self, n: int) -> int:
         if n < 0:

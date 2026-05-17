@@ -372,43 +372,60 @@ class TestHolderTabular:
 
 
 class TestHolderTransfer:
-    """``Holder.upload`` / ``Holder.download`` accept Holder/IO/str/PathLike."""
+    """``Holder.upload`` / ``Holder.download`` accept Holder/IO/str/PathLike.
 
-    def test_memory_uploads_to_str_path(self, tmp_path) -> None:
+    ``dst.upload(src)`` pulls *src*'s bytes into *dst* (the
+    receiver's content becomes the source's). The mirror
+    ``src.download(target)`` keeps the old src→target direction.
+    """
+
+    def test_path_pulls_bytes_from_memory(self, tmp_path) -> None:
         mem = Memory()
         mem.write_bytes(b"payload")
-        out = mem.upload(str(tmp_path / "dst.bin"))
-        assert isinstance(out, LocalPath)
-        assert out.read_bytes() == b"payload"
+        dst = LocalPath(str(tmp_path / "dst.bin"))
+        out = dst.upload(mem)
+        assert out is dst
+        assert dst.read_bytes() == b"payload"
 
-    def test_memory_uploads_to_io_cursor(self) -> None:
+    def test_path_pulls_bytes_from_str_source(self, tmp_path) -> None:
+        # Source is a str/PathLike → coerced via ``Path.from_``.
+        src_path = tmp_path / "src.bin"
+        src_path.write_bytes(b"payload")
+        dst = LocalPath(str(tmp_path / "dst.bin"))
+        out = dst.upload(str(src_path))
+        assert out is dst
+        assert dst.read_bytes() == b"payload"
+
+    def test_memory_pulls_bytes_from_io_cursor(self) -> None:
         from yggdrasil.io.bytes_io import BytesIO
 
-        mem = Memory()
-        mem.write_bytes(b"payload")
         with BytesIO() as bio:
+            bio.write_bytes(b"payload")
+            bio.seek(0)  # Caller positions the cursor; upload reads from there.
+            mem = Memory()
             out = mem.upload(bio)
-            assert out is bio
-            assert bio.to_bytes() == b"payload"
+        assert out is mem
+        assert mem.read_bytes() == b"payload"
 
-    def test_memory_uploads_to_holder(self) -> None:
+    def test_memory_pulls_bytes_from_holder(self) -> None:
         # Holder→Holder via the abstract path; both ends are in-process
         # Memory, so the generic bytes-copy fallback runs.
         src = Memory()
         src.write_bytes(b"payload")
         dst = Memory()
-        out = src.upload(dst)
+        out = dst.upload(src)
         assert out is dst
         assert dst.read_bytes() == b"payload"
 
     def test_trailing_slash_target_appends_filename(self, tmp_path) -> None:
-        # The trailing-slash directory hint also applies when the
-        # source is a Memory holder — the fallback filename is
-        # "download" because Memory URLs carry no meaningful name.
+        # The trailing-slash directory hint applies on the target side
+        # — the source's filename is joined onto the directory. Memory
+        # URLs carry no meaningful name so the fallback is "download".
         mem = Memory()
         mem.write_bytes(b"payload")
         (tmp_path / "sub").mkdir()
-        out = mem.upload(str(tmp_path / "sub") + "/")
+        dst_dir = LocalPath(str(tmp_path / "sub") + "/")
+        out = dst_dir.upload(mem)
         assert out.name == "download"
         assert out.read_bytes() == b"payload"
 
@@ -424,11 +441,35 @@ class TestHolderTransfer:
         assert out.name == "download"
         assert out.read_bytes() == b"payload"
 
-    def test_upload_rejects_unsupported_type(self) -> None:
+    def test_upload_rejects_unsupported_source_type(self) -> None:
         mem = Memory()
-        mem.write_bytes(b"payload")
         with pytest.raises(TypeError, match="Holder, IO, str, or os.PathLike"):
             mem.upload(42)
+
+    def test_upload_slices_source_with_n_and_pos(self) -> None:
+        src = Memory()
+        src.write_bytes(b"abcdef")
+        dst = Memory()
+        dst.upload(src, n=3, pos=2)
+        # 3 bytes starting at offset 2 → "cde".
+        assert dst.read_bytes() == b"cde"
+
+    def test_download_slices_source_with_n_and_pos(self) -> None:
+        src = Memory()
+        src.write_bytes(b"abcdef")
+        dst = Memory()
+        src.download(dst, n=2, pos=4)
+        assert dst.read_bytes() == b"ef"
+
+    def test_upload_from_io_honors_pos(self) -> None:
+        from yggdrasil.io.bytes_io import BytesIO
+
+        with BytesIO() as bio:
+            bio.write_bytes(b"abcdef")
+            # ``pos`` seeks the cursor; ``n`` caps the read.
+            mem = Memory()
+            mem.upload(bio, n=2, pos=1)
+        assert mem.read_bytes() == b"bc"
 
 
 class TestPathTransferOptimization:
@@ -453,16 +494,19 @@ class TestPathTransferOptimization:
 
         src = LocalPath(str(tmp_path / "src.bin"))
         src.write_bytes(b"payload")
-        out = src.upload(str(tmp_path / "dst.bin"))
-        assert calls == [(src.os_path, out.os_path)]
-        assert out.read_bytes() == b"payload"
+        dst = LocalPath(str(tmp_path / "dst.bin"))
+        out = dst.upload(src)
+        assert out is dst
+        assert calls == [(src.os_path, dst.os_path)]
+        assert dst.read_bytes() == b"payload"
 
     def test_local_to_holder_uses_write_local_path(
         self, tmp_path, monkeypatch,
     ) -> None:
-        # When self is local and target is a non-IO holder (here
-        # Memory), the override routes through Holder.write_local_path
-        # so multi-GB transfers don't materialise the whole payload.
+        # When the source is local and the destination is a non-IO
+        # holder (here Memory), the Path._transfer_to override routes
+        # through Holder.write_local_path so multi-GB transfers don't
+        # materialise the whole payload.
         seen: list[str] = []
         real = Memory.write_local_path
 
@@ -475,7 +519,7 @@ class TestPathTransferOptimization:
         src = LocalPath(str(tmp_path / "src.bin"))
         src.write_bytes(b"payload")
         mem = Memory()
-        out = src.upload(mem)
+        out = mem.upload(src)
         assert out is mem
         assert seen == [src.os_path]
         assert mem.read_bytes() == b"payload"
@@ -493,7 +537,7 @@ class TestPathDirectoryTransfer:
         (src / "b.bin").write_bytes(b"b")
 
         dst = LocalPath(str(tmp_path / "dst"))
-        out = src.upload(dst)
+        out = dst.upload(src)
 
         assert out == dst
         assert dst.is_dir()
@@ -509,7 +553,7 @@ class TestPathDirectoryTransfer:
         (src / "sub" / "leaf.bin").write_bytes(b"leaf")
 
         dst = LocalPath(str(tmp_path / "dst"))
-        src.upload(dst)
+        dst.upload(src)
 
         assert (dst / "top.bin").read_bytes() == b"top"
         assert (dst / "sub").is_dir()
@@ -523,7 +567,7 @@ class TestPathDirectoryTransfer:
 
         dst_dir = tmp_path / "dst"
         dst_dir.mkdir()
-        out = src.upload(str(dst_dir) + "/")
+        out = LocalPath(str(dst_dir) + "/").upload(src)
 
         assert out.name == "src"
         assert (out / "a.bin").read_bytes() == b"a"
@@ -533,21 +577,10 @@ class TestPathDirectoryTransfer:
         src.mkdir()
 
         dst = LocalPath(str(tmp_path / "dst"))
-        out = src.upload(dst)
+        out = dst.upload(src)
 
         assert out.is_dir()
         assert not any(out.iterdir())
-
-    def test_directory_into_io_cursor_raises(self, tmp_path) -> None:
-        from yggdrasil.io.bytes_io import BytesIO
-
-        src = LocalPath(str(tmp_path / "src"))
-        src.mkdir()
-        (src / "a.bin").write_bytes(b"a")
-
-        with BytesIO() as bio:
-            with pytest.raises(IsADirectoryError, match="IO cursor"):
-                src.upload(bio)
 
     def test_directory_into_memory_raises(self, tmp_path) -> None:
         src = LocalPath(str(tmp_path / "src"))
@@ -555,7 +588,7 @@ class TestPathDirectoryTransfer:
         (src / "a.bin").write_bytes(b"a")
 
         with pytest.raises(IsADirectoryError, match="target must be a Path"):
-            src.upload(Memory())
+            Memory().upload(src)
 
     def test_default_download_creates_directory_under_downloads(
         self, tmp_path, monkeypatch,

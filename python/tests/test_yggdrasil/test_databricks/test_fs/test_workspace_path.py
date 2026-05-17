@@ -120,9 +120,10 @@ class TestWrite:
         kwargs = workspace.workspace.upload.call_args.kwargs
         assert kwargs["path"] == "/Workspace/x"
         assert kwargs["overwrite"] is True
-        # Stream is rewound to origin per attempt so retries POST the
-        # full payload, not an empty tail.
-        assert kwargs["content"].getvalue() == b"abcdef"
+        # Bytes input rides through as bytes — no unnecessary
+        # ``BytesIO`` buffering. The SDK builds a fresh multipart
+        # body per request, so cursor state never crosses retries.
+        assert kwargs["content"] == b"abcdef"
         # ``format`` must be passed: the SDK default is ``SOURCE``,
         # which routes raw bytes through the notebook importer and
         # fails with ``BadRequest: The zip archive contains no items``.
@@ -130,18 +131,35 @@ class TestWrite:
         fmt = kwargs["format"]
         assert getattr(fmt, "name", str(fmt)).upper() == "AUTO"
 
-    def test_upload_resends_full_payload_on_retry(self, workspace, client) -> None:
-        """Transient failures must not exhaust the upload stream.
+    def test_stream_input_rides_through_unbuffered(self, workspace, client) -> None:
+        """Caller-supplied ``BinaryIO`` is forwarded to the SDK, not
+        drained into a ``bytes`` buffer before the call."""
+        import io
 
-        The previous shape pre-wrapped the payload in a single
-        :class:`io.BytesIO` and passed it to ``_call_ensuring_parents``
-        directly. After the first POST the cursor sat at EOF, so any
-        retry from :func:`retry_sdk_call` (transient 5xx) or the
-        parent-recovery path uploaded an empty body — that's how
-        staged workspace ``.py`` files ended up zero bytes in
-        :meth:`Table.async_job`. The seek-on-retry shape reads
-        every attempt's content from byte 0.
+        workspace.workspace.get_status.side_effect = NotFound()
+        stream = io.BytesIO(b"streamed-payload")
+        p = WorkspacePath("/Workspace/z", client=client)
+        p.write_bytes(stream)
+
+        kwargs = workspace.workspace.upload.call_args.kwargs
+        # The same BytesIO the caller passed reaches the SDK.
+        assert kwargs["content"] is stream
+        # The closure ``seek(0)``s before each attempt — the cursor
+        # is back at the start by the time the SDK reads it.
+        assert stream.tell() == 0
+
+    def test_stream_input_seeks_to_origin_on_retry(self, workspace, client) -> None:
+        """Transient failures must rewind a caller-supplied stream.
+
+        A live IO input ridden through ``_upload`` would otherwise
+        be left at EOF after the first POST drained it, and the
+        retry (transient 5xx via :func:`retry_sdk_call`, or
+        parent-recovery via :meth:`_call_ensuring_parents`) would
+        upload an empty tail. The closure ``seek(0)``s the stream
+        on every attempt so the retry reads the full body.
         """
+        import io
+
         from databricks.sdk.errors import InternalError
 
         seen: list[bytes] = []
@@ -149,21 +167,20 @@ class TestWrite:
 
         def upload_side_effect(**kwargs: object) -> None:
             calls["n"] += 1
-            # First attempt: drain the stream to EOF (mimics what
-            # ``WorkspaceExt.upload`` does inside its multipart POST),
-            # then raise — retry must re-seek before re-reading.
-            content = kwargs["content"]
-            content.read()  # type: ignore[union-attr]
+            stream = kwargs["content"]
+            stream.read()  # type: ignore[union-attr] — drain to EOF
             if calls["n"] == 1:
                 raise InternalError("flaky")
-            content.seek(0)
-            seen.append(content.read())  # type: ignore[union-attr]
+            stream.seek(0)
+            seen.append(stream.read())  # type: ignore[union-attr]
 
         workspace.workspace.get_status.side_effect = NotFound()
         workspace.workspace.upload.side_effect = upload_side_effect
 
         with patch("yggdrasil.io.path._retry.time.sleep"):
-            WorkspacePath("/Workspace/y", client=client).write_bytes(b"abcdef")
+            WorkspacePath("/Workspace/y", client=client).write_bytes(
+                io.BytesIO(b"abcdef"),
+            )
 
         assert calls["n"] == 2
         # Despite the first attempt draining the cursor, the second

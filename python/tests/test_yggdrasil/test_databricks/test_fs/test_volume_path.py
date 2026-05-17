@@ -217,19 +217,27 @@ class TestWrite:
         kwargs = workspace.files.upload.call_args.kwargs
         assert kwargs["file_path"] == "/Volumes/c/s/v/x"
         assert kwargs["overwrite"] is True
-        # ``contents`` is a stdlib ``BytesIO`` — read it for the
-        # payload we sent.
-        assert kwargs["contents"].getvalue() == b"abcdef"
+        # Bytes input rides through unbuffered — the SDK builds a
+        # fresh PUT body per request from the same bytes object.
+        assert kwargs["contents"] == b"abcdef"
 
-    def test_upload_resends_full_payload_on_retry(self, workspace, client) -> None:
-        """Transient ``files.upload`` failures must rewind the stream.
+    def test_stream_input_rides_through_unbuffered(self, workspace, client) -> None:
+        import io
 
-        ``FilesExt.upload`` forwards ``contents`` to a PUT body whose
-        first read empties the cursor. Without a per-attempt
-        :meth:`seek(0)` the second try (transient 5xx via
-        :func:`retry_sdk_call` or NotFound parent-recovery via
-        :meth:`_call_ensuring_parents`) would PUT zero bytes.
-        """
+        workspace.files.get_metadata.side_effect = NotFound()
+        workspace.files.get_directory_metadata.side_effect = NotFound()
+        stream = io.BytesIO(b"streamed-payload")
+        p = VolumePath("/Volumes/c/s/v/x", client=client)
+        p.write_bytes(stream)
+
+        kwargs = workspace.files.upload.call_args.kwargs
+        # Caller-supplied stream reaches ``FilesExt.upload`` verbatim.
+        assert kwargs["contents"] is stream
+        assert stream.tell() == 0
+
+    def test_stream_input_seeks_to_origin_on_retry(self, workspace, client) -> None:
+        """Transient ``files.upload`` failures must rewind a stream input."""
+        import io
         from unittest.mock import patch
 
         from databricks.sdk.errors import InternalError
@@ -242,17 +250,19 @@ class TestWrite:
 
         def upload_side_effect(**kwargs: object) -> None:
             calls["n"] += 1
-            contents = kwargs["contents"]
-            contents.read()  # type: ignore[union-attr] — drain to EOF
+            stream = kwargs["contents"]
+            stream.read()  # type: ignore[union-attr]
             if calls["n"] == 1:
                 raise InternalError("flaky")
-            contents.seek(0)
-            seen.append(contents.read())  # type: ignore[union-attr]
+            stream.seek(0)
+            seen.append(stream.read())  # type: ignore[union-attr]
 
         workspace.files.upload.side_effect = upload_side_effect
 
         with patch("yggdrasil.io.path._retry.time.sleep"):
-            VolumePath("/Volumes/c/s/v/x", client=client).write_bytes(b"abcdef")
+            VolumePath("/Volumes/c/s/v/x", client=client).write_bytes(
+                io.BytesIO(b"abcdef"),
+            )
 
         assert calls["n"] == 2
         assert seen == [b"abcdef"]
@@ -263,7 +273,7 @@ class TestWrite:
         workspace.files.download.return_value = SimpleNamespace(contents=body)
         p = VolumePath("/Volumes/c/s/v/x", client=client)
         p.pwrite(b"XX", 1)
-        sent = workspace.files.upload.call_args.kwargs["contents"].getvalue()
+        sent = workspace.files.upload.call_args.kwargs["contents"]
         assert sent == b"aXXde"
 
 

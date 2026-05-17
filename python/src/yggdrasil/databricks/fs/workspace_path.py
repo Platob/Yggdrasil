@@ -11,7 +11,6 @@ read-modify-rewrite scheme.
 
 from __future__ import annotations
 
-import io as _stdio
 import logging
 import time
 from typing import Any, ClassVar, Iterator
@@ -329,11 +328,14 @@ class WorkspacePath(DatabricksPath):
             return super().write_bytes(data, pos=pos)
         if isinstance(data, str):
             data = data.encode("utf-8")
-        payload = bytes(data)
-        if not payload:
+        if not hasattr(data, "__len__"):
+            # IO stream — :meth:`_upload` rewinds on retry.
+            return self._upload(data)
+        n = len(data)
+        if n == 0:
             return 0
-        self._upload(payload)
-        return len(payload)
+        self._upload(data)
+        return n
 
     def _write_mv(self, data: memoryview, pos: int) -> int:
         n = len(data)
@@ -356,41 +358,60 @@ class WorkspacePath(DatabricksPath):
         self._upload(payload)
         return n
 
-    def _upload(self, payload: bytes) -> None:
-        # ``format`` defaults to ``ImportFormat.SOURCE`` in the Databricks
-        # SDK, which routes through the notebook importer — non-notebook
-        # bytes then fail with ``BadRequest: The zip archive contains
-        # no items``. ``AUTO`` lets the server inspect the extension and
-        # content to decide between workspace file and notebook.
+    def _upload(self, content: Any) -> int:
+        """Upload *content* through ``workspace.upload`` with retry semantics.
+
+        Accepts either a bytes-like payload (``bytes`` /
+        ``bytearray`` / ``memoryview``) or a seekable binary stream.
+        Streams ride through to the SDK verbatim — no eager
+        ``read()`` into a buffer — and get rewound to origin on
+        every retry so transient-error / parent-recovery re-tries
+        POST the full body, not an empty tail. Bytes-like payloads
+        are passed through directly; ``WorkspaceExt.upload`` builds
+        a fresh multipart body per request from the same ``bytes``.
+
+        ``format=AUTO`` is the import-side hint — the SDK default
+        is ``SOURCE``, which routes raw bytes through the notebook
+        importer and fails with ``BadRequest: The zip archive
+        contains no items``.
+
+        Returns the byte count when known (bytes-like input) or
+        ``-1`` when the input is a stream of unknown length.
+        """
+        size = len(content) if hasattr(content, "__len__") else -1
         logger.debug(
-            "Uploading workspace file %r (%d bytes)", self, len(payload),
+            "Uploading workspace file %r (%s bytes)",
+            self, size if size >= 0 else "?",
         )
-        # Shared stream rewound per attempt: ``WorkspaceExt.upload``
-        # forwards ``content`` to a multipart POST whose first read
-        # empties the cursor, so any retry from
-        # :meth:`_call_ensuring_parents` / :func:`retry_sdk_call`
-        # would otherwise upload an empty body. Seek-to-origin
-        # before every attempt is cheaper than reallocating the
-        # buffer and works uniformly for the bytes / stream split
-        # the SDK accepts.
-        content = _stdio.BytesIO(payload)
         upload = self.client.workspace_client().workspace.upload
         api_path = self.api_path
         fmt = _import_format_auto()
 
-        def _do_upload() -> None:
-            content.seek(0)
-            upload(
-                path=api_path, content=content, format=fmt, overwrite=True,
-            )
+        if hasattr(content, "seek"):
+            stream = content
+
+            def _do_upload() -> None:
+                # IO inputs ride through unbuffered; rewind to
+                # origin on every attempt so the multipart POST
+                # reads the full body even on a retry.
+                stream.seek(0)
+                upload(path=api_path, content=stream, format=fmt, overwrite=True)
+        else:
+            def _do_upload() -> None:
+                # Bytes-like input — ``WorkspaceExt.upload`` will
+                # build a fresh ``BytesIO`` per request, so no
+                # cursor state crosses retry attempts.
+                upload(path=api_path, content=content, format=fmt, overwrite=True)
 
         self._call_ensuring_parents(_do_upload)
-        self._seed_stat_cache(IOStats(
-            size=len(payload),
-            kind=IOKind.FILE,
-            mtime=time.time(),
-            media_type=self.media_type,
-        ))
+        if size >= 0:
+            self._seed_stat_cache(IOStats(
+                size=size,
+                kind=IOKind.FILE,
+                mtime=time.time(),
+                media_type=self.media_type,
+            ))
+        return size
 
     # ==================================================================
     # Module upload — stream directly through ``workspace.upload``
@@ -451,24 +472,12 @@ class WorkspacePath(DatabricksPath):
         archive_path = build_module_archive(local_root, dest=None)
         try:
             size = archive_path.stat().st_size
-            upload = target.client.workspace_client().workspace.upload
-            fmt = _import_format_auto()
-            api_path = target.api_path
-
             with open(archive_path, "rb") as fh:
-                def _do_upload() -> None:
-                    # Seek back to origin per attempt so retries
-                    # don't upload an empty tail after the first
-                    # POST advanced the cursor to EOF.
-                    fh.seek(0)
-                    upload(
-                        path=api_path,
-                        content=fh,
-                        format=fmt,
-                        overwrite=overwrite,
-                    )
-
-                target._call_ensuring_parents(_do_upload)
+                # Hand the live file handle to ``_upload`` — it owns
+                # the seek-on-retry contract, so a large archive
+                # never gets read into a Python ``bytes`` object
+                # before the upload.
+                target._upload(fh)
         finally:
             if local_root != archive_path:
                 try:

@@ -256,11 +256,13 @@ class DBFSPath(DatabricksPath):
             return super().write_bytes(data, pos=pos)
         if isinstance(data, str):
             data = data.encode("utf-8")
-        payload = bytes(data)
-        if not payload:
+        if not hasattr(data, "__len__"):
+            return self._stream_upload(data)
+        n = len(data)
+        if n == 0:
             return 0
-        self._stream_upload(payload)
-        return len(payload)
+        self._stream_upload(data)
+        return n
 
     def _write_mv(self, data: memoryview, pos: int) -> int:
         """Splice via download → in-memory splice → re-upload.
@@ -289,32 +291,67 @@ class DBFSPath(DatabricksPath):
         self._stream_upload(payload)
         return n
 
-    def _stream_upload(self, payload: bytes) -> None:
-        """Write *payload* to ``self.api_path`` via the streaming SDK."""
+    def _stream_upload(self, content: Any) -> int:
+        """Write *content* to ``self.api_path`` via the streaming SDK.
+
+        Accepts either a bytes-like payload or a seekable binary
+        stream. The stream is rewound to origin on every attempt so
+        ``retry_sdk_call`` retries re-stream the full body. Bytes
+        inputs are sliced into ``_DBFS_CHUNK`` chunks; stream
+        inputs are pulled lazily with ``read(_DBFS_CHUNK)``, so a
+        large source never lands as a single :class:`bytes` buffer
+        in Python.
+
+        Returns the byte count when known (bytes-like input) or
+        ``-1`` when the input is a stream of unknown length.
+        """
+        size = len(content) if hasattr(content, "__len__") else -1
         logger.debug(
-            "Uploading DBFS file %r (%d bytes)", self, len(payload),
+            "Uploading DBFS file %r (%s bytes)",
+            self, size if size >= 0 else "?",
         )
-        def _do_upload() -> None:
-            with self.client.workspace_client().dbfs.open(
-                path=self.api_path, read=False, write=True, overwrite=True,
-            ) as fh:
-                offset = 0
-                n = len(payload)
-                while offset < n:
-                    chunk = payload[offset : offset + _DBFS_CHUNK]
-                    fh.write(chunk)
-                    offset += len(chunk)
+        api_path = self.api_path
+        dbfs = self.client.workspace_client().dbfs
+
+        if hasattr(content, "seek"):
+            stream = content
+
+            def _do_upload() -> None:
+                stream.seek(0)
+                with dbfs.open(
+                    path=api_path, read=False, write=True, overwrite=True,
+                ) as fh:
+                    while True:
+                        chunk = stream.read(_DBFS_CHUNK)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+        else:
+            payload = content
+
+            def _do_upload() -> None:
+                with dbfs.open(
+                    path=api_path, read=False, write=True, overwrite=True,
+                ) as fh:
+                    offset = 0
+                    n = len(payload)
+                    while offset < n:
+                        fh.write(payload[offset : offset + _DBFS_CHUNK])
+                        offset += _DBFS_CHUNK
+
         self._call(_do_upload)
         # The upload just established the object's full size; seed
         # the cache so the next ``size`` / ``exists`` lookup is local
         # and any concurrent reader on the singleton path sees the
         # post-write metadata without a fresh ``dbfs.get_status``.
-        self._seed_stat_cache(IOStats(
-            size=len(payload),
-            kind=IOKind.FILE,
-            mtime=time.time(),
-            media_type=self.media_type,
-        ))
+        if size >= 0:
+            self._seed_stat_cache(IOStats(
+                size=size,
+                kind=IOKind.FILE,
+                mtime=time.time(),
+                media_type=self.media_type,
+            ))
+        return size
 
     def truncate(self, n: int) -> int:
         if n < 0:

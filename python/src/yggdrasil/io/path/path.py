@@ -495,50 +495,6 @@ class Path(Holder, os.PathLike, ABC):
     # Byte transfer — optimized hooks for Path-to-Path and Path-to-Holder
     # ==================================================================
 
-    def upload(self, to: Any) -> "Holder | IO":
-        """Path-side override of :meth:`Holder.upload` that recurses on directories.
-
-        File case: defers to :meth:`Holder.upload` (single-byte transfer
-        through :meth:`_transfer_to`).
-
-        Directory case: the resolved target is treated as the destination
-        directory — created via ``mkdir(parents=True, exist_ok=True)`` —
-        and every child of *self* is uploaded under it, preserving the
-        tree shape. The trailing-slash hint on *to* still applies, so
-        ``src_dir.upload(dst + "/")`` lands at
-        ``dst/<src_dir.name>/...`` (``cp -r``-style "into this
-        directory") while ``src_dir.upload(dst)`` writes the contents
-        directly under *dst*. Empty directories produce an empty
-        directory at the target. The target must be a :class:`Path` —
-        :class:`IO` cursors and :class:`Memory` holders can't represent
-        a tree, so those raise :class:`IsADirectoryError`.
-        """
-        if not self.is_dir():
-            return super().upload(to)
-
-        from yggdrasil.io.base import IO
-
-        if isinstance(to, IO):
-            raise IsADirectoryError(
-                f"Path.upload: {self.full_path()!r} is a directory; "
-                f"can't upload a tree into an IO cursor. Pass a "
-                f"directory-shaped Path target (e.g. a LocalPath or "
-                f"another remote path) instead."
-            )
-
-        target = self._resolve_transfer_target(to)
-        if not isinstance(target, Path):
-            raise IsADirectoryError(
-                f"Path.upload: {self.full_path()!r} is a directory; "
-                f"target must be a Path to hold the tree, got "
-                f"{type(target).__name__}."
-            )
-
-        target.mkdir(parents=True, exist_ok=True)
-        for child in self.iterdir():
-            child.upload(target / child.name)
-        return target
-
     def _transfer_to(self, target: "Holder | IO") -> None:
         """Path-side override of :meth:`Holder._transfer_to`.
 

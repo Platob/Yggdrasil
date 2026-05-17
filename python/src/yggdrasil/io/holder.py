@@ -1083,73 +1083,126 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
     # Byte transfer — upload / download to any byte sink
     # ------------------------------------------------------------------
 
-    def upload(self, to: Any) -> "Holder | IO":
-        """Copy this holder's bytes into *to*.
+    def upload(
+        self, src: Any, *, n: int = -1, pos: int = 0,
+    ) -> "Holder":
+        """Upload *src*'s bytes into this holder.
 
-        *to* accepts any of:
+        Symmetric to :meth:`download` but indexed from the
+        destination side — ``dst.upload(src)`` makes the
+        destination's content equal to the source's.
 
-        - :class:`Holder` (incl. any :class:`Path` subclass) — bytes
-          are spliced into the holder at offset 0.
-        - :class:`IO` cursor — bytes are written at the cursor's
-          current position via :meth:`IO.write_bytes`.
+        *src* accepts any of:
+
+        - :class:`Holder` (incl. any :class:`Path` subclass) —
+          its bytes are pulled starting at *pos*.
+        - :class:`IO` cursor — *pos* (if non-zero) seeks before
+          ``read()``; otherwise the cursor's current position is
+          honoured.
         - ``str`` / :class:`os.PathLike` — coerced via
-          ``Path.from_(to)`` and treated as a holder.
+          ``Path.from_(src)`` and treated as a holder.
 
-        When the resolved target is a :class:`Path` whose URL ends
-        in a trailing ``/`` (directory shape), this holder's
-        filename (``self.url.name`` or ``"download"`` for nameless
-        holders) is joined onto it. No remote ``stat`` is issued —
-        the trailing slash is a purely local, ``cp``-style hint.
+        *n* and *pos* slice the source: ``n=-1`` (default) reads
+        to EOF, ``n>=0`` caps the byte count, ``pos`` is the
+        starting offset. Slicing forces the whole-payload fast
+        path in :meth:`_transfer_to` to defer to a bytes copy
+        (the backend-specific shortcuts — ``shutil.copyfile``,
+        ``write_local_path`` — don't expose a window).
 
-        Returns the resolved target so chains like
-        ``src.upload(dst).read_bytes()`` work.
+        When *self* is a :class:`Path` whose URL ends in a
+        trailing ``/`` (directory shape), the source's filename
+        (``src.url.name`` or ``"download"`` for nameless holders)
+        is joined onto it. No remote ``stat`` is issued — the
+        trailing slash is a purely local, ``cp``-style hint.
+
+        Returns the resolved destination so chains like
+        ``dst.upload(src).read_bytes()`` work.
 
         Subclasses with a faster move (e.g. local→local via
         ``sendfile``, local→remote chunked stream) override
         :meth:`_transfer_to`, not this method.
         """
-        target = self._resolve_transfer_target(to)
-        self._transfer_to(target)
-        return target
-
-    def download(self, to: Any = None) -> "Holder | IO":
-        """Copy this holder's bytes to a local target.
-
-        Same *to* coercion as :meth:`upload`. When *to* is
-        :data:`None`, bytes land in the user's ``~/Downloads``
-        folder under :attr:`url.name` (or ``"download"`` for
-        nameless holders), with browser-style ``(1)`` / ``(2)`` /
-        … suffixes appended on name conflict. Returns the resolved
-        target.
-        """
-        if to is None:
-            to = _default_download_target(self._transfer_filename())
-        return self.upload(to)
-
-    def _resolve_transfer_target(self, to: Any) -> "Holder | IO":
-        """Coerce a transfer target into a :class:`Holder` or :class:`IO`.
-
-        Handles the four input shapes accepted by :meth:`upload` and
-        :meth:`download`. The trailing-slash directory hint is
-        applied uniformly: a target whose URL ends in ``/`` gets
-        ``self.url.name`` joined onto it before bytes are written.
-        """
         from yggdrasil.io.base import IO
         from yggdrasil.io.path.path import Path
 
-        if isinstance(to, IO):
-            return to
-        if isinstance(to, Path):
-            return to / self._transfer_filename() if _looks_like_directory(to.url) else to
-        if isinstance(to, Holder):
-            return to
-        if isinstance(to, (str, os.PathLike)):
-            target = Path.from_(to)
-            return target / self._transfer_filename() if _looks_like_directory(target.url) else target
-        raise TypeError(
-            f"Holder.upload/download: expected a Holder, IO, str, or "
-            f"os.PathLike target; got {type(to).__name__}: {to!r}"
-        )
+        source = _coerce_transfer_endpoint(src)
+        target = _join_dir_hint(self, source)
+        if isinstance(source, Path) and source.is_dir():
+            # Directory tree: only a :class:`Path` target can hold
+            # it. ``n`` / ``pos`` slicing is a file-only knob.
+            if n != -1 or pos != 0:
+                raise IsADirectoryError(
+                    f"Holder.upload: source {source.full_path()!r} is "
+                    f"a directory; n / pos slicing applies to file "
+                    f"uploads only."
+                )
+            if not isinstance(target, Path):
+                raise IsADirectoryError(
+                    f"Holder.upload: source {source.full_path()!r} is "
+                    f"a directory; target must be a Path to hold the "
+                    f"tree, got {type(target).__name__}."
+                )
+            target.mkdir(parents=True, exist_ok=True)
+            for child in source.iterdir():
+                (target / child.name).upload(child)
+            return target
+        if isinstance(source, IO):
+            # IO cursors aren't :class:`Holder` — no ``_transfer_to``
+            # to inherit. Pull from the cursor (after an optional
+            # ``seek``) and write into the target.
+            if pos:
+                source.seek(pos)
+            payload = source.read() if n < 0 else source.read(n)
+            target.write_bytes(payload)
+        elif n < 0 and pos == 0:
+            source._transfer_to(target)
+        else:
+            target.write_bytes(source.read_bytes(n=n, pos=pos))
+        return target
+
+    def download(
+        self, to: Any = None, *, n: int = -1, pos: int = 0,
+    ) -> "Holder | IO":
+        """Copy this holder's bytes to a local target.
+
+        When *to* is :data:`None`, bytes land in the user's
+        ``~/Downloads`` folder under :attr:`url.name` (or
+        ``"download"`` for nameless holders), with browser-style
+        ``(1)`` / ``(2)`` / … suffixes appended on name conflict.
+        Otherwise *to* accepts the same shapes as :meth:`upload`
+        (:class:`Holder`, :class:`IO`, ``str`` / :class:`os.PathLike`).
+        *n* and *pos* slice this holder: ``n=-1`` (default) reads
+        to EOF, ``n>=0`` caps the byte count, ``pos`` is the
+        starting offset. Returns the resolved target.
+        """
+        from yggdrasil.io.path.path import Path
+
+        if to is None:
+            to = _default_download_target(self._transfer_filename())
+        target = _join_dir_hint(_coerce_transfer_endpoint(to), self)
+        if isinstance(self, Path) and self.is_dir():
+            # Symmetric with :meth:`upload` — delegate to the
+            # destination-side recurse: ``target.upload(self)``
+            # knows how to ``mkdir`` and walk *self*'s children.
+            if n != -1 or pos != 0:
+                raise IsADirectoryError(
+                    f"Holder.download: source {self.full_path()!r} is "
+                    f"a directory; n / pos slicing applies to file "
+                    f"downloads only."
+                )
+            if not isinstance(target, Path):
+                raise IsADirectoryError(
+                    f"Holder.download: source {self.full_path()!r} is "
+                    f"a directory; target must be a Path to hold the "
+                    f"tree, got {type(target).__name__}."
+                )
+            return target.upload(self)
+        if n < 0 and pos == 0:
+            self._transfer_to(target)
+        else:
+            target.write_bytes(self.read_bytes(n=n, pos=pos))
+        return target
+
 
     def _transfer_filename(self) -> str:
         """Filename used when joining onto a directory-shaped target.
@@ -1245,10 +1298,49 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         return self.read_bytes()
 
 
+def _coerce_transfer_endpoint(value: Any) -> "Holder | IO":
+    """Coerce a transfer endpoint into a :class:`Holder` or :class:`IO`.
+
+    Used by :meth:`Holder.upload` / :meth:`Holder.download` to
+    accept the same four input shapes — :class:`Holder`,
+    :class:`IO`, ``str``, :class:`os.PathLike` — regardless of
+    whether the value names the source or the target side.
+    """
+    from yggdrasil.io.base import IO
+    from yggdrasil.io.path.path import Path
+
+    if isinstance(value, (Holder, IO)):
+        return value
+    if isinstance(value, (str, os.PathLike)):
+        return Path.from_(value)
+    raise TypeError(
+        f"Holder.upload/download: expected a Holder, IO, str, or "
+        f"os.PathLike endpoint; got {type(value).__name__}: {value!r}"
+    )
+
+
+def _join_dir_hint(
+    dst: "Holder | IO", src: "Holder | IO",
+) -> "Holder | IO":
+    """Apply ``cp``-style directory hint when *dst* is a slash-terminated Path.
+
+    ``dst_dir_slash.upload(src)`` lands at ``dst_dir/<src.name>``;
+    a non-Path *dst* (Memory, IO cursor) or a non-directory path
+    is returned untouched. The source's filename is taken from
+    :meth:`Holder._transfer_filename` so :class:`Memory` /
+    nameless holders fall back to ``"download"``.
+    """
+    from yggdrasil.io.path.path import Path
+
+    if isinstance(dst, Path) and _looks_like_directory(dst.url):
+        return dst / src._transfer_filename()  # type: ignore[union-attr]
+    return dst
+
+
 def _looks_like_directory(url: URL) -> bool:
     """Trailing-slash check: ``True`` iff *url*'s path ends in ``/``.
 
-    Used by :meth:`Holder._resolve_transfer_target` to apply
+    Used by the upload/download directory-hint helpers to apply
     ``cp``-style "into this directory" semantics without a remote
     stat round trip. The canonical signal is an empty trailing
     element in :attr:`URL.parts`.
