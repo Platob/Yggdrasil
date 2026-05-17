@@ -611,7 +611,7 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
         )
         # Pre-condition: table really doesn't exist.
         with self.assertRaises(NotFound):
-            self.engine.table(ghost).infos  # noqa: B018 — assert raises
+            _ = self.engine.table(ghost).infos  # noqa: B018 — assert raises
 
         # ``drop_table`` swallows the NotFound and returns cleanly.
         self.engine.drop_table(ghost, raise_error=False)
@@ -1035,7 +1035,7 @@ class TestSQLInsertFillMissingColumns(_SQLIntegrationBase):
         table.ensure_created(wide)
         LOGGER.debug(
             "Created wide target for overwrite test %r (remote_columns=%r)",
-            table, table.schema.names,
+            table, table.collect_schema().names,
         )
 
         # Seed so the OVERWRITE actually replaces something.
@@ -1054,7 +1054,7 @@ class TestSQLInsertFillMissingColumns(_SQLIntegrationBase):
         table.insert(seed, mode=Mode.OVERWRITE)
         LOGGER.debug(
             "Seeded overwrite test %r (remote_columns=%r, rows=%r)",
-            table, table.schema.names, self._read_rows(table),
+            table, table.collect_schema().names, self._read_rows(table),
         )
 
         partial = pa.table(
@@ -1069,9 +1069,17 @@ class TestSQLInsertFillMissingColumns(_SQLIntegrationBase):
             [n for n in wide.names if n not in partial.schema.names],
         )
         table.insert(partial, mode=Mode.OVERWRITE)
-        LOGGER.debug(
-            "Overwrote partial source %r (remote_columns=%r, rows=%r)",
-            table, table.schema.names, self._read_rows(table),
+
+        result = self.engine.execute(
+            f"SELECT id, label FROM {table.full_name(safe=True)} ORDER BY id"
+        ).to_pylist()
+
+        self.assertEqual(
+            result,
+            [
+                {"id": 5, "label": "fresh-a"},
+                {"id": 6, "label": "fresh-b"},
+            ],
         )
 
     # ------------------------------------------------------------------

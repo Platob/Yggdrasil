@@ -1696,6 +1696,11 @@ class DatabricksClient(Singleton, URLBased):
             session.ygg_client = self  # type: ignore[attr-defined]
         except Exception:
             pass
+
+        from yggdrasil.environ import PyEnv
+
+        PyEnv.set_spark_session(session)
+
         return session
 
     def _resolve_registry(
