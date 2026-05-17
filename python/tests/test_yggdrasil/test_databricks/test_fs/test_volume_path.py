@@ -140,8 +140,31 @@ class TestStat:
     def test_missing(self, workspace, client) -> None:
         workspace.files.get_metadata.side_effect = NotFound()
         workspace.files.get_directory_metadata.side_effect = NotFound()
+        workspace.files.list_directory_contents.side_effect = NotFound()
         p = VolumePath("/Volumes/c/s/v/x", client=client)
         assert p._stat_uncached().kind is IOKind.MISSING
+
+    def test_implicit_directory_visible_through_listing(
+        self, workspace, client,
+    ) -> None:
+        # ``files.upload("/.../parent/file.bin")`` against a parent
+        # the caller never explicitly mkdir'd silently materialises
+        # the file but leaves ``get_directory_metadata(parent)``
+        # returning NotFound. Listing still enumerates the children,
+        # so ``_stat`` falls back to ``list_directory_contents`` and
+        # reports the parent as ``DIRECTORY``. Without this,
+        # ``remove(parent, recursive=True, missing_ok=False)`` would
+        # raise against a directory the caller just wrote into.
+        workspace.files.get_metadata.side_effect = NotFound()
+        workspace.files.get_directory_metadata.side_effect = NotFound()
+        workspace.files.list_directory_contents.return_value = iter([
+            SimpleNamespace(
+                path="/Volumes/c/s/v/parent/file.bin",
+                is_directory=False,
+            ),
+        ])
+        p = VolumePath("/Volumes/c/s/v/parent", client=client)
+        assert p._stat_uncached().kind is IOKind.DIRECTORY
 
 
 class TestRead:
