@@ -1185,19 +1185,25 @@ class TestAsyncInsertJobSettings:
             AsyncInsertJob.job_name(bare)
 
     def test_default_applier_is_auto_staged(self):
-        from databricks.sdk.service.jobs import SparkPythonTask
+        from databricks.sdk.service.jobs import NotebookTask
         from yggdrasil.databricks.table.async_job import AsyncInsertJob
 
         tbl, _, _ = self._table_with_trigger_path()
         spec = AsyncInsertJob.settings(tbl)
         # No explicit ``task=``/``notebook_path=`` → default applier
-        # (:func:`AsyncInsertJob.apply_records`) is staged and wired
-        # as a ``SparkPythonTask``.
+        # (:func:`AsyncInsertJob.apply_records`) is staged as a
+        # Databricks notebook so log lines surface per cell in the UI,
+        # and wired as a ``NotebookTask``.
         assert len(spec["tasks"]) == 1
         task = spec["tasks"][0]
         assert task.task_key == "apply_records"
-        assert isinstance(task.spark_python_task, SparkPythonTask)
-        assert task.spark_python_task.python_file.endswith(".py")
+        assert isinstance(task.notebook_task, NotebookTask)
+        assert task.spark_python_task is None
+        # The notebook lands under the per-task-key staging folder and
+        # the workspace strips the ``.py`` source extension when
+        # storing the notebook.
+        assert task.notebook_task.notebook_path
+        assert not task.notebook_task.notebook_path.endswith(".py")
         # Matching ``JobEnvironment`` lands on the settings so a direct
         # ``Jobs.create_or_update(**settings)`` call resolves the
         # ``yggdrasil`` imports without a follow-up update.
@@ -1254,7 +1260,7 @@ class TestTableAsyncJob:
         jobs_svc.create.assert_not_called()
 
     def test_stages_apply_records_when_job_missing(self):
-        from databricks.sdk.service.jobs import SparkPythonTask
+        from databricks.sdk.service.jobs import NotebookTask
 
         tbl, jobs_svc = self._table()
         jobs_svc.find.return_value = None
@@ -1269,12 +1275,13 @@ class TestTableAsyncJob:
         assert kwargs["name"] == "ygg-async-insert-cat-sch-tbl"
         # File-arrival trigger lives in the spec.
         assert "trigger" in kwargs
-        # Default applier was staged → ``tasks`` carries a SparkPythonTask
-        # pointed at the workspace ``.py`` file, plus a matching env.
+        # Default applier was staged → ``tasks`` carries a NotebookTask
+        # (notebook cells surface logs per-cell in the UI), plus a
+        # matching env.
         assert len(kwargs["tasks"]) == 1
         task = kwargs["tasks"][0]
-        assert isinstance(task.spark_python_task, SparkPythonTask)
-        assert task.spark_python_task.python_file.endswith(".py")
+        assert isinstance(task.notebook_task, NotebookTask)
+        assert task.spark_python_task is None
         assert kwargs["environments"]
 
     def test_applier_none_creates_tasksless_job(self):

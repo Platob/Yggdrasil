@@ -27,6 +27,7 @@ from yggdrasil.databricks.jobs import Job, JobRun
 from yggdrasil.databricks.jobs.task import (
     JobTask,
     _content_digest,
+    _render_callable_notebook,
     _render_callable_script,
 )
 from yggdrasil.databricks.tests import DatabricksTestCase
@@ -915,6 +916,104 @@ class TestStagedScriptCapturesLocals(DatabricksTestCase):
         # ``math = ...`` lines.
         self.assertNotIn("def sqrt(", script)
         self.assertNotIn("math = ", script)
+
+
+class TestStagedNotebookCallable(DatabricksTestCase):
+    """``stage_python_notebook_callable`` renders cells + wires a NotebookTask."""
+
+    def test_notebook_has_databricks_header_and_cell_separators(self):
+        import ast
+
+        source = _render_callable_notebook(
+            _signature_fixture, (), {"name": "bob"},
+        )
+        # Databricks magic header on line 1 — the workspace import
+        # path's content sniff keys off this to route the upload as a
+        # notebook instead of a workspace file.
+        self.assertTrue(source.startswith("# Databricks notebook source\n"))
+        # Cell separator emitted between every logical section.
+        self.assertIn("\n# COMMAND ----------\n", source)
+        # Markdown header cell uses the ``# MAGIC %md`` convention.
+        self.assertIn("# MAGIC %md", source)
+        # Captured metadata + checkargs wrap still land in their own cells.
+        self.assertIn("__yggdrasil_task__", source)
+        self.assertIn(
+            "from yggdrasil.dataclasses.safe_function import checkargs",
+            source,
+        )
+        self.assertIn("@checkargs\ndef _signature_fixture(", source)
+        # Source still parses as valid Python (cell separators are comments).
+        ast.parse(source)
+
+    def test_notebook_widget_fallback_when_args_unbound(self):
+        """Unbound parameters fall back to ``dbutils.widgets.get`` reads."""
+        import ast
+
+        def _three_params(catalog_name: str, schema_name: str, table_name: str) -> None:
+            return None
+
+        source = _render_callable_notebook(_three_params, (), {})
+        ast.parse(source)
+        # The widget helper is emitted exactly once and the invocation
+        # routes every parameter through it.
+        self.assertIn("def _yggdrasil_widget(name):", source)
+        self.assertIn("catalog_name=_yggdrasil_widget('catalog_name')", source)
+        self.assertIn("schema_name=_yggdrasil_widget('schema_name')", source)
+        self.assertIn("table_name=_yggdrasil_widget('table_name')", source)
+
+    def test_notebook_bound_args_render_as_literals(self):
+        """Bound *args*/*kwargs* render as literals — no widget helper."""
+        source = _render_callable_notebook(
+            _signature_fixture, (), {"name": "bob", "count": 2},
+        )
+        self.assertIn("_signature_fixture(name='bob', count=2)", source)
+        self.assertNotIn("_yggdrasil_widget", source)
+
+    def test_stage_python_notebook_callable_returns_notebook_task(self):
+        """End-to-end staging produces a Task w/ NotebookTask + env_key."""
+        from unittest.mock import patch
+        from databricks.sdk.service.jobs import NotebookTask
+        from yggdrasil.databricks.jobs.task import (
+            DEFAULT_ENVIRONMENT_KEY,
+            stage_python_notebook_callable,
+        )
+
+        captured: dict = {}
+
+        def _fake_workspace_path(path, *, client=None, **_kw):
+            captured["path"] = path
+            captured.setdefault("bodies", []).append(None)
+            handle = MagicMock(name=f"WorkspacePath({path!r})")
+            handle.full_path.return_value = path
+
+            def _write_bytes(b: bytes) -> None:
+                captured["bodies"][-1] = b
+            handle.write_bytes = _write_bytes
+            return handle
+
+        with patch(
+            "yggdrasil.databricks.fs.workspace_path.WorkspacePath",
+            side_effect=_fake_workspace_path,
+        ):
+            details, _, _ = stage_python_notebook_callable(
+                MagicMock(name="DatabricksClient"),
+                _signature_fixture,
+                task_key="apply",
+            )
+
+        # Uploaded as ``.py`` (so the workspace's content sniff routes
+        # the bytes to the notebook importer), referenced without the
+        # extension in the NotebookTask.
+        self.assertTrue(captured["path"].endswith(".py"))
+        self.assertIsInstance(details.notebook_task, NotebookTask)
+        self.assertIsNone(details.spark_python_task)
+        self.assertFalse(details.notebook_task.notebook_path.endswith(".py"))
+        self.assertEqual(details.task_key, "apply")
+        self.assertEqual(details.environment_key, DEFAULT_ENVIRONMENT_KEY)
+        # The uploaded body is a Databricks ``.py`` notebook source.
+        body = captured["bodies"][0].decode()
+        self.assertTrue(body.startswith("# Databricks notebook source\n"))
+        self.assertIn("\n# COMMAND ----------\n", body)
 
 
 class TestJobsSubmit(DatabricksTestCase):

@@ -157,13 +157,19 @@ class AsyncInsertJob:
           the table identity as ``base_parameters``.
         - ``applier=<callable>`` (default
           :func:`AsyncInsertJob.apply_records`) — stages the callable's
-          raw source as a workspace ``.py`` file via
-          :func:`stage_python_callable` and returns a
-          :class:`SparkPythonTask` pointed at it. The resulting
-          ``environments`` entry lands on the returned dict so a direct
-          ``Jobs.create_or_update(**settings)`` call is sufficient
-          (no follow-up :meth:`Job.update`). Pass ``applier=None`` to
-          opt out — the returned ``tasks=[]`` is left empty.
+          raw source as a Databricks-format ``.py`` notebook via
+          :func:`stage_python_notebook_callable` and returns a
+          :class:`NotebookTask` pointed at it. Cell layout — imports +
+          metadata, captured locals, the ``@checkargs``-wrapped
+          function, and the runtime invocation — lets the Databricks
+          UI show stdout / ``LOGGER`` lines under the cell that
+          produced them, which is the whole point of preferring a
+          notebook over a Python-script task for this surface. The
+          resulting ``environments`` entry lands on the returned
+          dict so a direct ``Jobs.create_or_update(**settings)`` call
+          is sufficient (no follow-up :meth:`Job.update`). Pass
+          ``applier=None`` to opt out — the returned ``tasks=[]`` is
+          left empty.
         """
         cat, sch, tbl = AsyncInsertJob._identity(table)
 
@@ -306,18 +312,25 @@ class AsyncInsertJob:
     def _stage_applier(
         table: "Table", applier: Any,
     ) -> tuple[List[Task], List[Any]]:
-        """Render *applier*'s source to a workspace ``.py`` and wire its task.
+        """Render *applier*'s source to a workspace notebook and wire its task.
 
-        Returns ``([task], [job_environment])`` — the task points at the
-        staged file via :class:`SparkPythonTask` and the environment
-        carries the sniffed pip specs so the parent Job's serverless
-        backend resolves the ``yggdrasil`` imports at run time.
+        Stages the callable as a Databricks-format ``.py`` notebook
+        (imports + metadata, captured locals, the ``@checkargs``-wrapped
+        function, and the runtime invocation each in their own cell)
+        so the Databricks UI surfaces stdout, exceptions, and
+        ``LOGGER`` lines under the cell that produced them — much
+        cleaner for diagnosing an applier run than the single-stream
+        output of a Spark Python task. Returns ``([task],
+        [job_environment])`` — the task points at the staged notebook
+        via :class:`NotebookTask` and the environment carries the
+        sniffed pip specs so the parent Job's serverless backend
+        resolves the ``yggdrasil`` imports at run time.
         """
         from yggdrasil.databricks.jobs.task import (
             DEFAULT_ENVIRONMENT_DEPENDENCIES,
             DEFAULT_ENVIRONMENT_KEY,
             _default_job_environment,
-            stage_python_callable,
+            stage_python_notebook_callable,
         )
 
         client = getattr(table, "client", None)
@@ -329,7 +342,7 @@ class AsyncInsertJob:
                 "or attach a client to the table first."
             )
 
-        details, extra_deps, _ = stage_python_callable(
+        details, extra_deps, _ = stage_python_notebook_callable(
             client, applier,
         )
         env_key = getattr(details, "environment_key", None) or DEFAULT_ENVIRONMENT_KEY
