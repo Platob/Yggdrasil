@@ -246,7 +246,7 @@ def _lift(node: Any) -> Expression:
     )
 
 
-_MISSING: Any = object()
+_MISSING: Any = ...
 
 
 def _try_field_name(node: Any, pc) -> "str | None":  # type: ignore[no-untyped-def]
