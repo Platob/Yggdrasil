@@ -203,12 +203,6 @@ def _resolve_format_target(
     return Tabular.class_for_media_type(mt, default=None)
 
 
-#: Default window size for :class:`MemoryStream` holders created
-#: by :meth:`IO.from_` over non-local file-like sources. Large
-#: enough that short-lived streams stay entirely in-window and
-#: random-read callers never trip eviction; small enough that a
-#: long-lived stream doesn't quietly buffer the whole payload.
-_STREAM_WINDOW_BYTES = 64 * 1024 * 1024  # 64 MiB
 
 
 def _local_path_for_handle(obj: Any) -> Optional[str]:
@@ -510,17 +504,17 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
                     **kwargs,
                 )
             # Non-local file-like → :class:`MemoryStream` over the
-            # source. Pulls lazily on read so a 10 GB urllib3
-            # response stream never gets materialised into Python
-            # bytes upfront; the window slides forward as the
-            # consumer reads. ``byte_size`` is a soft cap on the
-            # buffered window — pick a generous default so
-            # short-lived sources stay fully in-window and
-            # ``random read`` callers don't trip eviction surprises.
+            # source. Pulls lazily on read; cold bytes above the
+            # in-memory threshold spill to a tempfile so a 10 GB
+            # urllib3 response stream never gets materialised into
+            # Python bytes upfront. Defaults: 128 MiB in-memory
+            # window, 2 GiB total retention — large enough that
+            # short-lived sources stay fully resident and random-read
+            # callers don't trip eviction.
             from yggdrasil.io.memory_stream import MemoryStream
 
             return cls(
-                holder=MemoryStream(obj, byte_size=_STREAM_WINDOW_BYTES),
+                holder=MemoryStream(obj),
                 owns_holder=True,
                 mode=mode,
                 **kwargs,
