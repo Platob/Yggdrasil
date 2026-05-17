@@ -188,6 +188,22 @@ class VolumePath(DatabricksPath):
                     media_type=_media_type_from_response(info),
                 )
             return IOStats(kind=IOKind.DIRECTORY, size=0, mtime=_mtime(info))
+        # Implicit-directory fallback. ``files.upload`` to a brand-new
+        # ``/Volumes/<...>/parent/file.bin`` silently materialises the
+        # file without creating an explicit ``parent`` entry, so
+        # ``get_directory_metadata(parent)`` returns NotFound even
+        # though listing the path enumerates ``file.bin``. Without
+        # this probe, ``remove(parent, recursive=True, missing_ok=False)``
+        # raises ``FileNotFoundError`` against a parent that the caller
+        # just wrote into. One extra round trip pays for the negative
+        # case only — both metadata probes already missed.
+        try:
+            entries = self._call(files.list_directory_contents, api_path)
+            first = next(iter(entries), None)
+        except Exception:
+            first = None
+        if first is not None:
+            return IOStats(kind=IOKind.DIRECTORY, size=0, mtime=0.0)
         return IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
 
     @property
