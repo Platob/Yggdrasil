@@ -15,7 +15,7 @@ Used by :meth:`DatabricksClient.spark` to wire serverless deps
 into :class:`DatabricksEnv.withDependencies`:
 
 - Public PyPI distributions go through verbatim
-  (``"ygg==0.7.73"``); the cluster's pip handles them.
+  (``"ygg==0.7.74"``); the cluster's pip handles them.
 - Editable / private distributions get a wheel built locally
   (``pip wheel <name> --no-deps``), uploaded to the workspace
   registry once, then downloaded back to a local cache and
@@ -98,7 +98,7 @@ class DependencyInfo:
         source: Filesystem location of the source tree (editable /
             local) or ``None`` for public deps.
         spec: The pip install spec for public deps
-            (``"ygg==0.7.73"``); ``None`` for everything else.
+            (``"ygg==0.7.74"``); ``None`` for everything else.
     """
 
     name: str
@@ -225,7 +225,7 @@ def classify_dependency(
 
     Accepts the same shapes as the rest of the path API:
 
-    - ``"ygg"`` / ``"ygg==0.7.73"`` — already a pip spec. Spec
+    - ``"ygg"`` / ``"ygg==0.7.74"`` — already a pip spec. Spec
       with an operator goes straight to ``PUBLIC``. A bare name
       consults ``importlib.metadata`` (and, when
       ``check_public=True``, ``pypi.org``) to pick between

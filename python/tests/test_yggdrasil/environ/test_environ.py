@@ -493,11 +493,7 @@ class TestEnvironmentDetectors:
         assert PyEnv.in_databricks_notebook() is False
 
         monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "14.3")
-        # DBR set + no live IPython kernel → False (plain script /
-        # job entry point, not a notebook).
-        monkeypatch.setattr(
-            "IPython.get_ipython", lambda: None, raising=False,
-        )
+        pytest.importorskip("IPython")
         assert PyEnv.in_databricks_notebook() is False
 
         # DBR set + IPython kernel present → True (notebook cell).

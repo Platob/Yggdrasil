@@ -1541,18 +1541,6 @@ class DatabricksClient(Singleton, URLBased):
         """
         return bool(self.serverless_compute_id) or not self.cluster_id
 
-    @classmethod
-    def default_ygg_spec(cls) -> str:
-        """Default ``ygg`` pip spec for :meth:`spark`.
-
-        Pinned to the driver's installed version with the
-        ``[data, databricks]`` extras so executors see the same
-        ygg the driver is using — no surprise drift from
-        whatever PyPI's latest happens to be when the cluster
-        installs it.
-        """
-        return f"ygg[data,databricks]=={ygg_version}"
-
     def spark(
         self,
         *dependencies: "Any",
@@ -1573,7 +1561,7 @@ class DatabricksClient(Singleton, URLBased):
         Each *dependency* is classified once via
         :func:`classify_dependency`:
 
-        - Public PyPI specs (``"ygg[data,databricks]==0.7.73"``,
+        - Public PyPI specs (``"ygg[data,databricks]==0.7.74"``,
           ``"numpy>=1.0"``, …) ride straight to the cluster via
           :meth:`DatabricksEnv.withDependencies`. ``ygg`` is
           always declared via :meth:`default_ygg_spec` — pinned
@@ -1587,7 +1575,7 @@ class DatabricksClient(Singleton, URLBased):
         - Editable installs (``pip install -e .``) get their
           local working copy built into a wheel whose version
           carries the local hostname
-          (``0.7.73+host.<host>``). The wheel lives at
+          (``0.7.74+host.<host>``). The wheel lives at
           ``/Workspace/Users/<me>/.ygg/pypi/simple/<pkg>/<wheel>``
           (overridable via *registry*) and is re-uploaded on every
           load so the registry slot tracks the developer's
@@ -1657,7 +1645,7 @@ class DatabricksClient(Singleton, URLBased):
 
         deps = list(dependencies)
         if not any(_is_ygg_dep(d) for d in deps):
-            deps.insert(0, self.default_ygg_spec())
+            deps.insert(0, f"ygg[data,databricks]=={ygg_version}")
 
         registry_obj = self._resolve_registry(registry, cache_dir=cache_dir)
         specs, _remotes = registry_obj.publish_many(deps, check_public=check_public)

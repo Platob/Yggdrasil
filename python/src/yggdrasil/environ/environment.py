@@ -774,7 +774,8 @@ class PyEnv:
                 install_java=install_java,
             )
 
-        return DatabricksSession.builder.getOrCreate()
+        from yggdrasil.databricks import DatabricksClient
+        return DatabricksClient.current().spark()
 
     @classmethod
     def set_spark_session(cls, spark_session: "SparkSession"):

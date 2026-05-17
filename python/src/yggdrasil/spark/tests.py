@@ -123,7 +123,7 @@ def _get_test_spark(
 
     session = PyEnv.spark_session(
         create=True,
-        connect=False,
+        connect=True,
         install_java=True,
         local_setup=True,
         extra_config=merged_config,

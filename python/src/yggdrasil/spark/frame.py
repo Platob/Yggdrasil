@@ -14,7 +14,7 @@ from yggdrasil.environ import PyEnv
 # cluster needs ygg installed for the unpickle side; that's exactly
 # what ``DatabricksClient.spark`` auto-declares via
 # ``DatabricksEnv.withDependencies("ygg")``.
-from yggdrasil.pickle import dumps, loads
+from yggdrasil.pickle.ser import dumps, loads
 
 LOGGER = logging.getLogger(__name__)
 

@@ -259,7 +259,7 @@ def _execute_dml(
     statements: list,
     wait: WaitingConfigArg,
     raise_error: bool,
-    engine_name: Literal["api", "spark"],
+    engine: Literal["api", "spark"],
 ):
     """Submit DML statements through *sql_engine* and surface failures.
 
@@ -279,7 +279,7 @@ def _execute_dml(
     once the budget is exhausted or the failure isn't retryable.
     """
     batch = sql_engine.execute_many(
-        statements, wait=wait, raise_error=False, engine=engine_name,
+        statements, wait=wait, raise_error=False, engine=engine,
     )
     if raise_error and batch.failed:
         batch.retry(wait=wait, raise_error=True)
@@ -3264,6 +3264,7 @@ class Table(DatabricksPath):
         self,
         data,
         *,
+        engine: Literal["api", "spark"] | None = None,
         mode: Mode | str | None = None,
         schema_mode: Mode | str | None = None,
         cast_options: Optional[CastOptions] = None,
@@ -3400,7 +3401,7 @@ class Table(DatabricksPath):
             statements=prepared,
             wait=wait,
             raise_error=raise_error,
-            engine="api",
+            engine=engine,
         )
 
         return output_data if return_data else batch
@@ -3598,7 +3599,7 @@ class Table(DatabricksPath):
                     statements=prepared,
                     wait=wait,
                     raise_error=raise_error,
-                    engine_name="spark",
+                    engine="spark",
                 )
         finally:
             try:
@@ -3707,6 +3708,7 @@ class Table(DatabricksPath):
         self,
         statement: "PreparedStatement | StatementResult | str",
         *,
+        engine: Optional[Literal["api", "spark"]] = None,
         mode: Mode | str | None,
         match_by: Optional[list[str]],
         update_column_names: Optional[list[str]],
@@ -3804,7 +3806,7 @@ class Table(DatabricksPath):
             statements=prepared,
             wait=wait,
             raise_error=raise_error,
-            engine_name="api",
+            engine=engine,
         )
 
     # =========================================================================

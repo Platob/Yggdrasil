@@ -2,12 +2,12 @@
 # cleanup-v0.7-releases.yml
 #
 # One-shot, manually-triggered cleanup of all ``v0.7.*`` GitHub Releases
-# and git tags **except** the one to keep (default ``v0.7.73``).
+# and git tags **except** the one to keep (default ``v0.7.74``).
 #
 # How to run
 # ----------
 #   Actions → "🧹 Cleanup v0.7.x releases" → Run workflow.
-#   Leave ``keep`` at the default to retain only v0.7.73, or pass another
+#   Leave ``keep`` at the default to retain only v0.7.74, or pass another
 #   tag to retain a different patch. Set ``dry_run=true`` first to see the
 #   delete list before the destructive run.
 #
@@ -34,7 +34,7 @@ on:
       keep:
         description: "Tag to keep (everything else under v0.7.* will be deleted)"
         required: true
-        default: "v0.7.73"
+        default: "v0.7.74"
         type: string
       dry_run:
         description: "Only print the delete list; do not actually delete"
