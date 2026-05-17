@@ -324,11 +324,11 @@ class TestWriteStream:
         calls: list[int] = []
         original = type(m).write_mv
 
-        def _spy(self, data, offset, *, size=-1, update_stat=True):
+        def _spy(self, data, offset, *, size=-1, overwrite=False, update_stat=True):
             if self is m:
                 calls.append(len(data))
             return original(
-                self, data, offset, size=size, update_stat=update_stat,
+                self, data, offset, size=size, overwrite=overwrite, update_stat=update_stat,
             )
 
         with patch.object(type(m), "write_mv", _spy):
@@ -392,11 +392,11 @@ class TestWriteHolder:
         calls: list[int] = []
         original = type(dst).write_mv
 
-        def _spy(self, data, offset, *, size=-1, update_stat=True):
+        def _spy(self, data, offset, *, size=-1, overwrite=False, update_stat=True):
             if self is dst:
                 calls.append(len(data))
             return original(
-                self, data, offset, size=size, update_stat=update_stat,
+                self, data, offset, size=size, overwrite=overwrite, update_stat=update_stat,
             )
 
         from unittest.mock import patch
@@ -419,11 +419,11 @@ class TestWriteHolder:
         calls: list[int] = []
         original = type(dst).write_mv
 
-        def _spy(self, data, offset, *, size=-1, update_stat=True):
+        def _spy(self, data, offset, *, size=-1, overwrite=False, update_stat=True):
             if self is dst:
                 calls.append(len(data))
             return original(
-                self, data, offset, size=size, update_stat=update_stat,
+                self, data, offset, size=size, overwrite=overwrite, update_stat=update_stat,
             )
 
         from unittest.mock import patch
@@ -477,6 +477,41 @@ class TestWriteHolder:
         dst = Memory()
         dst.write_mv(memoryview(b"abcdefghij"), size=2)
         assert dst.read_bytes() == b"ab"
+
+    def test_overwrite_drops_tail(self) -> None:
+        """``write_bytes(data, overwrite=True)`` truncates trailing bytes."""
+        dst = Memory()
+        dst.write_bytes(b"x" * 100)
+        assert dst.size == 100
+        dst.write_bytes(b"new", overwrite=True)
+        # Tail gone — holder is exactly the new payload.
+        assert dst.size == 3
+        assert dst.read_bytes() == b"new"
+
+    def test_overwrite_with_offset_preserves_head(self) -> None:
+        """``overwrite=True`` at non-zero offset keeps bytes before the
+        offset and truncates everything after the new write."""
+        dst = Memory()
+        dst.write_bytes(b"ABCDEFGHIJ")
+        dst.write_bytes(b"xy", offset=3, overwrite=True)
+        # Bytes [0,3) preserved, [3,5) replaced, [5,10) dropped.
+        assert dst.read_bytes() == b"ABCxy"
+
+    def test_overwrite_through_write_holder_dispatch(self) -> None:
+        src = Memory()
+        src.write_bytes(b"short")
+        dst = Memory()
+        dst.write_bytes(b"x" * 50)
+        dst.write_bytes(src, overwrite=True)
+        # write_bytes(Holder) → write_holder → write_mv with overwrite.
+        assert dst.read_bytes() == b"short"
+
+    def test_overwrite_through_write_stream_dispatch(self) -> None:
+        import io as _stdio
+        dst = Memory()
+        dst.write_bytes(b"x" * 50)
+        dst.write_stream(_stdio.BytesIO(b"streamed"), overwrite=True)
+        assert dst.read_bytes() == b"streamed"
 
     def test_batch_size_drives_chunked_reads(self) -> None:
         """``write_stream(src, batch_size=N)`` reads N bytes per chunk."""

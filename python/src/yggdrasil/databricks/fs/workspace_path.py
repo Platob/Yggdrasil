@@ -324,6 +324,10 @@ class WorkspacePath(DatabricksPath):
         :meth:`_upload`, which already seek-rewinds on retry and
         the SDK builds the multipart body lazily — multi-GB
         sources never materialise as a Python ``bytes`` object.
+        The atomic PUT inherently replaces the object, so
+        ``overwrite=True`` (the natural semantic of a single-shot
+        upload) needs no extra round trip — that's the whole
+        point of letting the caller signal it.
 
         ``size>=0`` (capped read) or non-zero ``offset`` fall
         back to the chunked base path because the API can't

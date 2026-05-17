@@ -343,14 +343,18 @@ class MemoryStream(Holder):
         offset: int = 0,
         *,
         size: int = -1,
+        overwrite: bool = False,
         update_stat: bool = True,
     ) -> int:
         """Splice bytes at ``offset``. Appends past current end extend the
         stream and may slide the window; in-window writes overwrite.
 
         ``size>=0`` slices the input buffer to at most ``size``
-        bytes before the splice. Writes behind :attr:`window_start`
-        raise — the target bytes have already been evicted.
+        bytes before the splice. ``overwrite=True`` truncates the
+        tail past ``offset + len(data)`` after the splice (same
+        contract as :meth:`Holder.write_mv`). Writes behind
+        :attr:`window_start` raise — the target bytes have
+        already been evicted.
         """
         if size >= 0 and len(data) > size:
             data = data[:size]
@@ -383,6 +387,10 @@ class MemoryStream(Holder):
             self._buf.extend(b"\x00" * (local_end - len(self._buf)))
 
         written = self._write_mv(data, offset)
+        if overwrite and end < self.size:
+            # Drop trailing bytes past the spliced range — collapses
+            # ``truncate + write`` into one call.
+            self.truncate(end)
         if written > 0 and update_stat:
             self._slide_window()
             self._touch_stat(size=self.size)

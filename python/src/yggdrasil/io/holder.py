@@ -501,6 +501,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         offset: int = 0,
         *,
         size: int = -1,
+        overwrite: bool = False,
         update_stat: bool = True,
     ) -> int:
         """Splice ``data`` at ``offset``, pre-growing the holder as needed.
@@ -512,6 +513,15 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         downstream pipelines that only need the first N bytes of
         a larger buffer skip the trailing tail.
 
+        ``overwrite`` declares that this write replaces the
+        holder's tail past ``offset + size`` — after the splice,
+        :attr:`size` is set to ``offset + size``. Callers that
+        currently do ``truncate(0)`` followed by ``write_bytes(...)``
+        collapse to a single ``write_bytes(..., overwrite=True)``,
+        which on whole-blob remote backends saves a SDK round
+        trip (the atomic upload at ``offset == 0`` already
+        replaces the object — no preceding truncate needed).
+
         Pipeline:
 
         1. Slice ``data`` to ``size`` if capped.
@@ -521,7 +531,8 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
            :meth:`resize`.
         4. Hand the normalized ``(data, offset)`` to
            :meth:`_write_mv`.
-        5. Mark dirty + bump cached mtime if anything was written.
+        5. Truncate tail past ``offset + n`` when ``overwrite``.
+        6. Mark dirty + bump cached mtime if anything was written.
 
         ``update_stat=False`` skips the post-write
         :meth:`_touch_stat` and :meth:`mark_dirty` calls. Use it for
@@ -542,17 +553,29 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
             )
 
         n = len(data)
+        end = offset + n
         if n == 0:
+            if overwrite and end < total:
+                self.truncate(end)
+                if update_stat:
+                    self._touch_stat(size=self.size)
+                    self.mark_dirty()
             return 0
 
         # Pre-grow the visible size so _write_mv just lays bytes down
         # at a known-valid range. resize() is a no-op when offset+n
         # <= size (in-place overwrite case), so the fast path stays fast.
-        end = offset + n
         if end > total:
             self.resize(end)
 
         written = self._write_mv(data, offset)
+        # ``overwrite`` drops any tail beyond the spliced range —
+        # collapses ``truncate(0) + write_bytes(...)`` into one call
+        # and lets whole-blob remote backends skip the preceding
+        # truncate SDK round trip (the atomic upload at ``offset
+        # == 0`` already replaces the object).
+        if overwrite and end < self.size:
+            self.truncate(end)
 
         if written > 0 and update_stat:
             self._touch_stat(size=max(end, self.size))
@@ -994,6 +1017,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         offset: int = 0,
         *,
         size: int = -1,
+        overwrite: bool = False,
     ) -> int:
         """Splice ``data`` at ``offset``. Returns bytes written.
 
@@ -1003,6 +1027,12 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         type-directed branch so a stream source stops reading
         after ``size`` bytes (no over-pull) and a bytes-like
         source slices its tail off before dispatching.
+
+        ``overwrite`` declares that this write replaces every
+        byte from ``offset`` onward. The holder ends at
+        ``offset + bytes_written`` regardless of its prior size,
+        and whole-blob remote backends collapse the implied
+        ``truncate(...) + write(...)`` pair into one SDK call.
 
         Type-directed dispatch — bytes-like payloads
         (:class:`bytes`, :class:`bytearray`, :class:`memoryview`,
@@ -1018,10 +1048,16 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         if isinstance(data, str):
             data = data.encode("utf-8")
         if isinstance(data, Holder):
-            return self.write_holder(data, offset=offset, size=size)
+            return self.write_holder(
+                data, offset=offset, size=size, overwrite=overwrite,
+            )
         if hasattr(data, "read"):
-            return self.write_stream(data, offset=offset, size=size)
-        return self.write_mv(_as_byte_mv(data), offset, size=size)
+            return self.write_stream(
+                data, offset=offset, size=size, overwrite=overwrite,
+            )
+        return self.write_mv(
+            _as_byte_mv(data), offset, size=size, overwrite=overwrite,
+        )
 
     def read_text(
         self,
@@ -1205,6 +1241,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         *,
         offset: int = 0,
         size: int = -1,
+        overwrite: bool = False,
         batch_size: int = _COPY_CHUNK,
     ) -> int:
         """Drain a binary source into this holder at ``offset``.
@@ -1219,6 +1256,11 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         ``size`` caps the byte count drained from *src* —
         ``size=-1`` (default) reads to EOF; ``size>=0`` stops at
         ``size`` bytes (no over-pull from the source).
+
+        ``overwrite`` truncates the holder's tail past
+        ``offset + bytes_written``; whole-blob remote backends
+        get a single atomic PUT instead of an explicit truncate
+        followed by a write.
 
         ``batch_size`` is the read/write chunk size for the
         default streaming path (:data:`_COPY_CHUNK`, 1 MiB).
@@ -1235,7 +1277,11 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
 
         io_src = src if isinstance(src, _IO) else _YggBytesIO.from_(src)
         return self._write_stream(
-            io_src, offset=offset, size=size, batch_size=batch_size,
+            io_src,
+            offset=offset,
+            size=size,
+            overwrite=overwrite,
+            batch_size=batch_size,
         )
 
     def _write_stream(
@@ -1244,6 +1290,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         *,
         offset: int,
         size: int = -1,
+        overwrite: bool = False,
         batch_size: int = _COPY_CHUNK,
     ) -> int:
         """Splice ``src``'s bytes into this holder starting at ``offset``.
@@ -1253,7 +1300,9 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         through :meth:`write_bytes`, so multi-GB sources never
         materialise as a single :class:`bytes` object in Python.
         ``size>=0`` caps the byte count so the source stops
-        being read once the limit is reached.
+        being read once the limit is reached. ``overwrite=True``
+        truncates the tail beyond the final cursor on the last
+        chunk so the holder ends exactly where the stream did.
 
         Subclass override hook: backends with an atomic
         whole-object upload (Volumes ``files.upload``, Workspace
@@ -1283,6 +1332,8 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
             total += n
             if remaining is not None:
                 remaining -= n
+        if overwrite and cursor < self.size:
+            self.truncate(cursor)
         return total
 
     def write_holder(
@@ -1291,6 +1342,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         *,
         offset: int = 0,
         size: int = -1,
+        overwrite: bool = False,
         batch_size: int = _COPY_CHUNK,
     ) -> int:
         """Splice another :class:`Holder`'s bytes into this one at ``offset``.
@@ -1299,8 +1351,11 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         to :meth:`_write_holder`. ``size`` caps the byte count
         pulled from *src* — ``size=-1`` (default) writes the
         whole source; ``size>=0`` writes the first ``size`` bytes.
-        ``batch_size`` is forwarded to the streaming path for
-        above-threshold payloads.
+        ``overwrite`` truncates the tail past
+        ``offset + bytes_written`` (collapses ``truncate(...) +
+        write_holder(...)`` into one operation for whole-blob
+        remote backends). ``batch_size`` is forwarded to the
+        streaming path for above-threshold payloads.
 
         Subclasses override the private hook to swap in a
         backend-aware fast path (Workspace / Volumes / S3 can
@@ -1316,7 +1371,11 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
                 f"bytes-like / IO / stream inputs."
             )
         return self._write_holder(
-            src, offset=offset, size=size, batch_size=batch_size,
+            src,
+            offset=offset,
+            size=size,
+            overwrite=overwrite,
+            batch_size=batch_size,
         )
 
     def _write_holder(
@@ -1325,6 +1384,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         *,
         offset: int,
         size: int = -1,
+        overwrite: bool = False,
         batch_size: int = _COPY_CHUNK,
     ) -> int:
         """Splice *src*'s bytes into this holder starting at ``offset``.
@@ -1342,6 +1402,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         decision boundary (inline vs stream) uses
         ``min(src.size, size)`` so a 5 MiB source with
         ``size=1024`` still goes through the inline fast path.
+        ``overwrite`` forwards into whichever branch fires.
         ``batch_size`` controls the streaming chunk size when
         the threshold path is taken.
 
@@ -1353,12 +1414,18 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         src_size = src.size
         effective = src_size if size < 0 else min(src_size, size)
         if effective < _INLINE_WRITE_THRESHOLD:
-            return self.write_mv(src.read_mv(effective, 0), offset)
+            return self.write_mv(
+                src.read_mv(effective, 0), offset, overwrite=overwrite,
+            )
         from yggdrasil.io.bytes_io import BytesIO as _YggBytesIO
 
         with _YggBytesIO(holder=src, mode="rb") as io_src:
             return self._write_stream(
-                io_src, offset=offset, size=effective, batch_size=batch_size,
+                io_src,
+                offset=offset,
+                size=effective,
+                overwrite=overwrite,
+                batch_size=batch_size,
             )
 
     # ------------------------------------------------------------------
