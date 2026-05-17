@@ -39,6 +39,7 @@ class DatabricksIntegrationCase(unittest.TestCase):
 
     client: ClassVar[DatabricksClient]
     workspace: ClassVar[Any]
+    spark: ClassVar[Any] = None
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -53,3 +54,13 @@ class DatabricksIntegrationCase(unittest.TestCase):
             )
         cls.client = DatabricksClient()
         cls.workspace = cls.client.workspace_client()
+
+        # Best-effort Spark Connect bootstrap — leaves ``cls.spark = None``
+        # when ``databricks-connect`` isn't installed or the workspace
+        # can't hand back a session. Subclasses that genuinely need Spark
+        # should guard on ``cls.spark`` (or call ``client.spark()`` directly
+        # and let it raise) instead of relying on this slot.
+        try:
+            cls.spark = cls.client.spark()
+        except Exception:
+            cls.spark = None
