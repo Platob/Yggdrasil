@@ -14,6 +14,11 @@ its parameters from whichever channel the caller used:
 * :func:`read_job_parameters` returns every ``getCurrentBindings()``
   entry — the union of widget values and ``{{job.parameters.*}}``
   substitutions exposed through ``dbutils.notebook.entry_point``.
+* :func:`task_parameters` rolls all three plus the ``DATABRICKS_*``
+  process environment into a single :class:`TaskParameters` snapshot —
+  one call returns ``(args, kwargs, env)`` so a staged callable can
+  resolve every input channel without picking the right reader by
+  hand.
 
 Every reader returns a ``dict[str, str]`` — strings are the native
 shape on the Databricks side. Splat the result into a
@@ -34,14 +39,18 @@ from __future__ import annotations
 
 import builtins
 import logging
+import os
 import sys
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional, Sequence, Tuple, Union
 
 __all__ = [
+    "TaskParameters",
     "get_dbutils",
     "read_argv",
     "read_widgets",
     "read_job_parameters",
+    "task_parameters",
 ]
 
 LOGGER = logging.getLogger(__name__)
@@ -176,3 +185,140 @@ def read_job_parameters() -> dict[str, str]:
         return {str(k): str(bindings.get(k)) for k in bindings.keySet()}
     # In-process fakes / unit tests can hand back a plain dict.
     return {str(k): str(v) for k, v in dict(bindings).items()}
+
+
+#: Default env-var prefixes captured by :func:`task_parameters` into
+#: :attr:`TaskParameters.env`. Covers the per-run identity vars
+#: Databricks injects into a task's process environment
+#: (``DATABRICKS_JOB_ID`` / ``DATABRICKS_RUN_ID`` /
+#: ``DATABRICKS_TASK_KEY`` / …) plus anything the task spec adds via
+#: ``spark_env_vars`` with the same prefix.
+DEFAULT_TASK_ENV_PREFIXES: Tuple[str, ...] = ("DATABRICKS_",)
+
+
+@dataclass(frozen=True)
+class TaskParameters:
+    """Snapshot of a Databricks task's runtime inputs across every channel.
+
+    A staged callable receives values through up to three channels —
+    positional ``sys.argv`` (``SparkPythonTask.parameters``), named
+    bindings (notebook widgets + ``{{job.parameters.*}}``
+    substitutions), and the task's process environment. This struct
+    rolls all three into one place so callers don't have to pick the
+    right reader by hand.
+
+    Attributes:
+        args: Positional tokens from ``sys.argv[1:]`` — every entry
+            that isn't a ``--flag`` / ``--key=value`` pair. Preserves
+            order so ``SparkPythonTask.parameters`` indexing still
+            works.
+        kwargs: Named bindings, layered (lowest precedence first):
+            ``dbutils.notebook.entry_point.getCurrentBindings()`` (the
+            union of widget values and ``{{job.parameters.*}}``
+            substitutions) overlaid with ``--key=value`` / ``--key
+            value`` / ``--flag`` pairs parsed from ``sys.argv``. Argv
+            wins on collision — a caller who passed ``--foo=cli`` on
+            the command line means it.
+        env: Process environment variables whose key starts with one
+            of the configured prefixes (default ``DATABRICKS_``).
+    """
+
+    args: Tuple[str, ...] = ()
+    kwargs: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
+
+
+def task_parameters(
+    *,
+    argv: Optional[list[str]] = None,
+    env_prefix: Union[str, Sequence[str]] = DEFAULT_TASK_ENV_PREFIXES,
+    require_dbutils: bool = False,
+) -> TaskParameters:
+    """Collect every input channel a Databricks task exposes into one snapshot.
+
+    Reads, in order:
+
+    1. ``sys.argv[1:]`` (or *argv* when supplied) — positional tokens
+       land in :attr:`TaskParameters.args`, ``--key=value`` / ``--key
+       value`` / ``--flag`` pairs land in :attr:`kwargs`.
+    2. ``dbutils.notebook.entry_point.getCurrentBindings()`` — the
+       union of widget values and ``{{job.parameters.*}}``
+       substitutions. Merged into :attr:`kwargs` *under* the argv
+       layer, so an explicit ``--key=cli`` overrides a job-parameter
+       binding of the same name. Silently skipped when ``dbutils`` is
+       not on the path (typical local re-run); set *require_dbutils*
+       to raise :class:`RuntimeError` instead.
+    3. ``os.environ`` — keys starting with any *env_prefix* (default
+       ``DATABRICKS_``) land in :attr:`env`. Pass an empty tuple to
+       skip the env capture entirely, or a custom prefix list to also
+       pick up ``spark_env_vars`` your task spec sets with a different
+       prefix.
+
+    Pass the *argv* / *env_prefix* kwargs explicitly in unit tests so
+    the snapshot doesn't pick up the harness's own ``sys.argv`` /
+    ``os.environ``.
+    """
+    raw_argv = sys.argv[1:] if argv is None else list(argv)
+    args_list: list[str] = []
+    kwargs: dict[str, str] = {}
+    i = 0
+    while i < len(raw_argv):
+        token = raw_argv[i]
+        if token.startswith("--"):
+            tail = token[2:]
+            if "=" in tail:
+                key, value = tail.split("=", 1)
+                kwargs[key] = value
+                i += 1
+                continue
+            if i + 1 < len(raw_argv) and not raw_argv[i + 1].startswith("--"):
+                kwargs[tail] = raw_argv[i + 1]
+                i += 2
+                continue
+            kwargs[tail] = "true"
+            i += 1
+            continue
+        args_list.append(token)
+        i += 1
+
+    bindings: dict[str, str] = {}
+    dbutils = get_dbutils()
+    if dbutils is None:
+        if require_dbutils:
+            raise RuntimeError(
+                "task_parameters(require_dbutils=True): dbutils is not "
+                "available — this snapshot only includes argv + env. Run "
+                "inside a Databricks task or drop require_dbutils."
+            )
+    else:
+        try:
+            bindings = read_job_parameters()
+        except RuntimeError as exc:
+            # ``getCurrentBindings()`` is only wired inside a notebook
+            # run; SparkPythonTask invocations have dbutils on the
+            # path but no notebook entry point. Fall back to widgets
+            # if any are declared, otherwise carry on with argv-only.
+            LOGGER.debug(
+                "task_parameters: getCurrentBindings() unavailable (%s) — "
+                "falling back to argv + env only", exc,
+            )
+    # argv wins on collision: an explicit ``--key=cli`` is the caller
+    # overriding the job parameter for this run.
+    merged_kwargs = {**bindings, **kwargs}
+
+    prefixes: Tuple[str, ...] = (
+        (env_prefix,) if isinstance(env_prefix, str) else tuple(env_prefix)
+    )
+    if prefixes:
+        env = {
+            k: v for k, v in os.environ.items()
+            if any(k.startswith(p) for p in prefixes)
+        }
+    else:
+        env = {}
+
+    return TaskParameters(
+        args=tuple(args_list),
+        kwargs=merged_kwargs,
+        env=env,
+    )
