@@ -231,14 +231,25 @@ class TestLocalPathPrimitives:
 
 
 class TestParentChain:
-    """:attr:`parent` exposes the underlying byte holder; :attr:`parents`
-    iterates the cursor chain out to the root storage."""
+    """:attr:`parent` returns the cursor parent first, then URL parent;
+    :class:`Memory` skips the URL branch."""
 
-    def test_top_level_storage_has_no_parent(self) -> None:
+    def test_memory_has_no_parent(self) -> None:
+        # Memory's URL is synthetic (mem://...); URL branch is skipped.
         assert Memory(b"x").parent is None
         assert list(Memory(b"x").parents) == []
 
-    def test_open_cursor_has_parent_set_to_storage(self) -> None:
+    def test_local_path_walks_url_parents(self, tmp_path) -> None:
+        lp = LocalPath(str(tmp_path / "sub" / "data.parquet"))
+        # parent is the directory above (a sibling LocalPath).
+        parent = lp.parent
+        assert isinstance(parent, LocalPath)
+        assert str(parent.url.path).rstrip("/").endswith("sub")
+        # parents walks all the way to /
+        chain = [p.url for p in lp.parents]
+        assert len(chain) >= 2  # at least the dir + root
+
+    def test_open_cursor_parent_is_storage(self) -> None:
         mem = Memory(b"hello")
         with mem.open("rb") as cursor:
             assert cursor.parent is mem
@@ -269,6 +280,26 @@ class TestParentChain:
         mem = Memory(b"legacy")
         cursor = IO(holder=mem, mode="rb")
         assert cursor.parent is mem
+
+
+class TestJoinpath:
+    """``Holder.joinpath`` lifts URL.joinpath onto URL-shaped Holders."""
+
+    def test_local_path_joinpath(self, tmp_path) -> None:
+        lp = LocalPath(str(tmp_path))
+        child = lp.joinpath("sub", "data.csv")
+        assert isinstance(child, LocalPath)
+        assert "sub/data.csv" in str(child.url)
+
+    def test_truediv_syntactic_sugar(self, tmp_path) -> None:
+        lp = LocalPath(str(tmp_path))
+        child = lp / "sub" / "x.bin"
+        assert isinstance(child, LocalPath)
+        assert "sub/x.bin" in str(child.url)
+
+    def test_memory_joinpath_raises(self) -> None:
+        with pytest.raises(ValueError, match="joinpath is only"):
+            Memory().joinpath("x")
 
 
 class TestOpenFormatDispatch:

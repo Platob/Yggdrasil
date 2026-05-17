@@ -719,20 +719,15 @@ class Path(Holder, os.PathLike, ABC):
     def suffixes(self) -> List[str]:
         return ["." + e for e in self.url.extensions]
 
-    @property
-    def parent(self) -> "Path":
-        return self._from_url(self.url.parent)
-
-    @property
-    def parents(self) -> Iterator["Path"]:
-        return (self._from_url(u) for u in self.url.parents)
+    # ``parent`` / ``parents`` / ``joinpath`` / ``__truediv__`` all
+    # live on :class:`Holder` — Path inherits them unchanged. The
+    # URL-parent branch in :attr:`Holder.parent` matches Path's
+    # filesystem-navigation semantics; :class:`Memory` overrides
+    # :meth:`_url_parent` to opt out (its URLs are synthetic).
 
     @property
     def is_absolute(self) -> bool:
         return self.url.is_absolute
-
-    def joinpath(self, *segments: Any) -> "Path":
-        return self._from_url(self.url.joinpath(*segments))
 
     def with_name(self, name: str) -> "Path":
         if not name or "/" in name:
@@ -746,9 +741,6 @@ class Path(Holder, os.PathLike, ABC):
 
     def with_stem(self, stem: str) -> "Path":
         return self.with_name(stem + self.suffix)
-
-    def __truediv__(self, other: Any) -> "Path":
-        return self.joinpath(other)
 
     def __rtruediv__(self, other: Any) -> "Path":
         return Path.from_(other) / self

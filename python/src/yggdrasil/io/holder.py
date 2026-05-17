@@ -342,30 +342,73 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
 
     @property
     def parent(self) -> "Holder | None":
-        """The underlying :class:`Holder` this one wraps, or ``None``.
+        """The Holder one level up — cursor parent first, else URL parent.
 
-        Set on cursors returned by :meth:`open` (and on format leaves
-        constructed with ``parent=`` / ``holder=``). Top-level storage
-        leaves (:class:`Memory`, :class:`LocalPath`, …) return
-        ``None`` — they own their bytes directly.
+        Resolution order:
+
+        1. The cursor parent (``self._parent``, set by
+           :meth:`Holder.open` and by format-leaf construction with
+           ``parent=`` / ``holder=``). When set, this Holder is a
+           cursor and the parent is its backing storage.
+        2. The URL parent — a sibling Holder of the same concrete
+           class at ``self.url.parent``. Used by URL-shaped storage
+           leaves (:class:`Path` / :class:`LocalPath` / remote paths)
+           to walk up the filesystem.
+
+        Returns ``None`` when neither applies (top-level storage
+        with no URL hierarchy — e.g., :class:`Memory`, which
+        overrides :meth:`_url_parent` to skip the URL branch).
         """
-        return getattr(self, "_parent", None)
+        if self._parent is not None:
+            return self._parent
+        return self._url_parent()
+
+    def _url_parent(self) -> "Holder | None":
+        """Hook: the URL-parent sibling, or ``None`` when not applicable.
+
+        Default behaviour for URL-shaped Holders: returns
+        ``self._from_url(self.url.parent)`` when the parent URL is
+        distinct from ``self.url`` (i.e., not at the root). Subclasses
+        without a meaningful URL hierarchy (:class:`Memory`'s
+        synthetic ``mem://...`` URLs) override to return ``None``.
+        """
+        if self._url is None:
+            return None
+        parent_url = self._url.parent
+        if parent_url == self._url:
+            return None
+        return self._from_url(parent_url)
 
     @property
     def parents(self) -> "Iterator[Holder]":
-        """Walk the parent chain from this Holder outward.
+        """Walk the parent chain outward, yielding one Holder per step.
 
-        Yields :attr:`parent` first, then ``parent.parent``, and so on
-        until a top-level storage holder is reached. Empty when this
-        Holder has no parent. Useful for "find the underlying byte
-        substrate" / "is there a path anywhere in the chain" queries
-        without hand-coding the ``while h.parent is not None`` walk
-        at every call site.
+        Each step follows :attr:`parent` — cursor parent first, then
+        URL parent (when applicable), terminating when ``.parent``
+        returns ``None``. Empty on top-level non-URL storage
+        (:class:`Memory`).
         """
         current = self.parent
         while current is not None:
             yield current
             current = current.parent
+
+    def joinpath(self, *segments: Any) -> "Holder":
+        """Build a sibling Holder at ``self.url`` joined with *segments*.
+
+        URL-shaped Holders (:class:`LocalPath`, remote paths) use
+        this to mint a child path; :class:`Memory` and other
+        non-URL leaves raise :class:`ValueError`.
+        """
+        if self._url is None:
+            raise ValueError(
+                f"{type(self).__name__} has no URL — joinpath is only "
+                "defined for URL-shaped holders (paths, remotes)."
+            )
+        return self._from_url(self._url.joinpath(*segments))
+
+    def __truediv__(self, other: Any) -> "Holder":
+        return self.joinpath(other)
 
     def to_url(self) -> "URL":
         """The canonical :class:`URL` that addresses this holder."""

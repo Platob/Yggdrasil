@@ -285,6 +285,14 @@ class Memory(Holder):
     def is_remote_path(self) -> bool:
         return False
 
+    def _url_parent(self) -> None:
+        # Memory's URL is a synthetic ``mem://vm/0x...`` identity
+        # token — it has no meaningful filesystem-style parent.
+        # Skip the URL-parent branch so :attr:`Holder.parent` returns
+        # ``None`` on a top-level Memory (only the cursor branch can
+        # surface a non-None parent for a Memory subclass).
+        return None
+
     @property
     def is_spilled(self) -> bool:
         """True when the backing has migrated to an mmap'd temp file."""
