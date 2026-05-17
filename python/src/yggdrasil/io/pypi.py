@@ -371,32 +371,98 @@ class PathPyPI:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _build_wheel(local_root: LocalPath) -> LocalPath:
-        """Build a wheel for *local_root* via ``pip wheel --no-deps``.
+        """Build a wheel for *local_root* in a temp dir; return the wheel path.
 
-        Uses pip (always present alongside the active interpreter) so
-        we don't take a hard dependency on :mod:`build` / ``hatch``.
-        The wheel lands in a temp dir; the caller reads + uploads
-        immediately, after which the temp dir is reclaimed by the GC.
+        Backend resolution, in order:
+
+        1. ``pip wheel --no-deps`` — standard CPython. Always works when
+           the active interpreter ships pip (``ensurepip``-seeded venvs,
+           system Python, conda, ``python -m venv`` defaults).
+        2. ``python -m build --wheel`` — PEP 517 reference builder. Used
+           when pip is missing (``uv venv`` without ``--seed`` doesn't
+           install pip) but the ``build`` package is importable.
+        3. ``python -m ensurepip --upgrade`` + retry ``pip wheel`` —
+           last-resort bootstrap. Lets a freshly-cut uv venv recover
+           without the caller having to ``pip install build`` first.
+
+        Every backend writes to the same temp dir; the caller reads
+        + uploads, GC reclaims. Returns the *first* ``.whl`` produced
+        (a clean source tree yields exactly one).
         """
+        import importlib.util
+
         tmp = LocalPath(tempfile.mkdtemp(prefix="ygg-pypi-"))
-        cmd = [
-            sys.executable, "-m", "pip", "wheel",
-            "--no-deps", "--quiet",
-            "--wheel-dir", str(tmp),
-            str(local_root),
-        ]
-        LOGGER.debug("Building wheel for %r via %s", local_root, " ".join(cmd))
-        try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(
-                f"Failed to build wheel for {local_root!r}: pip wheel exited "
-                f"{exc.returncode}.\nstdout: {exc.stdout}\nstderr: {exc.stderr}"
-            ) from exc
+
+        attempts: list[tuple[str, list[str]]] = []
+        if importlib.util.find_spec("pip") is not None:
+            attempts.append(("pip wheel", [
+                sys.executable, "-m", "pip", "wheel",
+                "--no-deps", "--quiet",
+                "--wheel-dir", str(tmp),
+                str(local_root),
+            ]))
+        if importlib.util.find_spec("build") is not None:
+            attempts.append(("python -m build", [
+                sys.executable, "-m", "build", "--wheel",
+                "--outdir", str(tmp),
+                str(local_root),
+            ]))
+
+        errors: list[str] = []
+        for name, cmd in attempts:
+            LOGGER.debug("Building wheel for %r via %s", local_root, name)
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+                break
+            except subprocess.CalledProcessError as exc:
+                errors.append(
+                    f"{name} exited {exc.returncode}: "
+                    f"stdout={exc.stdout!r} stderr={exc.stderr!r}"
+                )
+                continue
+            except FileNotFoundError as exc:
+                errors.append(f"{name}: binary not on PATH ({exc})")
+                continue
+        else:
+            # No backend was *callable*. Try the ensurepip bootstrap before
+            # giving up — that's the recovery path for uv-cut venvs.
+            LOGGER.debug(
+                "No wheel builder available for %r; trying python -m ensurepip",
+                local_root,
+            )
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "ensurepip", "--upgrade"],
+                    check=True, capture_output=True, text=True,
+                )
+            except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+                stderr = getattr(exc, "stderr", "") or str(exc)
+                errors.append(f"ensurepip bootstrap: {stderr}")
+                raise RuntimeError(
+                    f"Failed to build wheel for {local_root!r}: no wheel "
+                    f"backend available. Tried: " + "; ".join(errors) + ". "
+                    f"Install one with `pip install build` or seed pip via "
+                    f"`python -m ensurepip --upgrade`."
+                ) from exc
+            cmd = [
+                sys.executable, "-m", "pip", "wheel",
+                "--no-deps", "--quiet",
+                "--wheel-dir", str(tmp),
+                str(local_root),
+            ]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError(
+                    f"Failed to build wheel for {local_root!r}: pip wheel "
+                    f"exited {exc.returncode} after ensurepip bootstrap.\n"
+                    f"stdout: {exc.stdout}\nstderr: {exc.stderr}"
+                ) from exc
+
         wheels = sorted(tmp.glob("*.whl"))
         if not wheels:
             raise RuntimeError(
-                f"pip wheel produced no .whl files under {tmp!r} for "
+                f"Wheel build produced no .whl files under {tmp!r} for "
                 f"{local_root!r}; check the package metadata."
             )
         return wheels[0]
