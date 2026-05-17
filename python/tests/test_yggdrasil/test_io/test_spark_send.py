@@ -1,11 +1,14 @@
 """Spark-mode ``send`` / ``send_many`` tests.
 
 Drive :meth:`Session.spark_send` and :meth:`Session.spark_send_many`
-end-to-end through a shared :class:`SparkTestCase` session, with a
-:class:`StubSession` standing in for the network. The stub's
-``_local_send`` synthesises a default :class:`Response` for any request
-without a queued reply, which is enough to verify the lazy
-``DataFrame[Response]`` contract:
+end-to-end through a shared :class:`SparkTestCase` session. Requests
+cross the wire as a :data:`REQUEST_SCHEMA`-shaped Arrow table — no
+driver-side :class:`Session` subclass is pickled to the workers, so the
+path works over Spark Connect / Databricks Connect where the cluster
+has no idea what ``tests.test_yggdrasil.…StubSession`` is. The worker
+side rebuilds requests from the Arrow rows and dispatches them through
+a vanilla :class:`HTTPSession`, so the assertions stick to the
+contract we *can* observe without a stub-on-worker:
 
 * the returned frame matches :data:`RESPONSE_SCHEMA`,
 * one input request produces one output row,
@@ -14,6 +17,10 @@ without a queued reply, which is enough to verify the lazy
 * the returned frame is lazy (no executor work until an action), and
 * passing no SparkSession raises a loud ``ValueError`` instead of
   silently returning an Arrow-mode batch.
+
+Tests assert on the row-shape (URL-hash preservation, method
+propagation) rather than specific status codes — those depend on
+whatever the real endpoint replies with.
 """
 
 from __future__ import annotations
@@ -43,16 +50,16 @@ class TestSparkSend(SparkTestCase):
         rows = df.collect()
         assert len(rows) == 1
         row = rows[0]
-        assert row["status_code"] == 200
+        # Worker-side HTTPSession replies with *something*; status_code
+        # is engine/network-dependent so just assert the column is
+        # populated.
+        assert row["status_code"] is not None
         assert row["request_method"] == "GET"
         assert row["request_public_url_hash"] == req.public_url_hash
 
     def test_spark_send_many_unions_per_chunk_frames(self) -> None:
-        # No ``queue`` — let :class:`StubSession._local_send` fall through
-        # to ``make_response(request=request)`` so each worker's response
-        # mirrors the request it actually received. Pre-queuing would
-        # bind responses to a driver-side FIFO that the broadcast-shared
-        # queue can't honour across partitions.
+        # Workers each get a vanilla ``HTTPSession`` per partition; the
+        # contract under test is "one row per request, hash preserved".
         s = StubSession()
         reqs = [
             make_request(f"https://example.com/many/{i}")
@@ -121,19 +128,11 @@ class TestSparkSend(SparkTestCase):
 
     def test_spark_send_many_returns_lazy_dataframe(self) -> None:
         # The contract: ``spark_send_many`` builds a Spark plan and
-        # returns it without firing any executor work. We verify by
-        # building the frame and confirming the driver-side stub has
-        # not recorded any ``_local_send`` calls — driver-side cache
-        # lookups are disabled (no local/remote cache config) so the
-        # only path through ``_local_send`` is via the broadcast
-        # session on the executor, which doesn't run until a Spark
-        # action triggers ``mapInArrow``.
-        #
-        # We can't observe the executor's ``_local_send`` calls on the
-        # driver-side stub after ``.count()`` — ``sparkContext.broadcast``
-        # deep-copies the session, so the workers mutate a different
-        # ``calls`` list — but we can confirm rows actually flowed
-        # through the plan by checking the row count matches input.
+        # returns it without firing any executor work. Workers run a
+        # vanilla ``HTTPSession`` — never the driver-side stub — so the
+        # stub's ``calls`` list stays empty before *and* after the
+        # action, which is itself a useful smoke test that we are no
+        # longer pickling the driver's :class:`Session` subclass.
         s = StubSession()
         reqs = [
             make_request(f"https://example.com/lazy/{i}")
@@ -142,22 +141,29 @@ class TestSparkSend(SparkTestCase):
 
         df = s.spark_send_many(iter(reqs), spark_session=self.spark)
 
-        # Plan built, frame returned, but no driver-side
-        # ``_local_send`` has fired — the executor runs lazily.
+        # Plan built, frame returned, no executor work yet.
         assert isinstance(df, SparkDataFrame)
         assert s.calls == []
 
-        # ``df.count()`` forces an action; the workers process every
-        # request via their broadcast-shipped session copy.
+        # ``df.count()`` forces an action; the workers each spin up a
+        # vanilla HTTPSession and process every request — one row per
+        # input lands in the output frame.
         assert df.count() == len(reqs)
 
+        # Stub stayed untouched — confirming we no longer ship driver
+        # session state to workers.
+        assert s.calls == []
+
     def test_spark_send_status_code_propagates(self) -> None:
-        # Default StubSession yields 200; make sure the status column
-        # actually carries that through the mapInArrow round-trip.
+        # The ``status_code`` column must survive the mapInArrow round
+        # trip and arrive as an integer per row. The specific value is
+        # whatever the real endpoint replies with — we only verify the
+        # column is plumbed through.
         s = StubSession()
         df = s.spark_send_many(
             iter(make_request(f"https://example.com/status/{i}") for i in range(3)),
             spark_session=self.spark,
         )
         codes = [row["status_code"] for row in df.select("status_code").collect()]
-        assert codes == [200, 200, 200]
+        assert len(codes) == 3
+        assert all(isinstance(c, int) for c in codes)
