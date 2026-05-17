@@ -44,7 +44,7 @@ class TestConstruction:
     def test_url_input(self, tmp_path) -> None:
         url = URL.from_(tmp_path / "u.bin")
         lp = LocalPath(url=url)
-        assert os.fspath(url) == lp.os_path
+        assert os.path.normpath(os.fspath(url)) == lp.os_path
 
     def test_bare_constructor_mints_staging(self) -> None:
         lp = LocalPath()

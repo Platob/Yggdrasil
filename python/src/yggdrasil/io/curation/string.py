@@ -329,8 +329,17 @@ class StringCurator(Curator):
         # ``%z`` only matches cells that actually have an offset, so on
         # naive inputs the aware coalesce returns all nulls and we fall
         # through to the naive catalogue.
+        #
+        # ``pc.strptime``'s ``%z`` flag is platform-dependent: Linux's glibc
+        # accepts ``+02:00`` (with colon) and ``Z``, while the Windows /
+        # bundled MSVC strptime only accepts ``+0200`` (no colon) and
+        # treats ``Z`` as a literal. Normalize ISO-8601 offsets to the
+        # most portable shape — colon-stripped offset, ``Z`` → ``+0000`` —
+        # before handing the array to the aware-format catalogue so the
+        # same input parses identically across platforms.
+        aware_input = _normalize_iso_offsets(array)
         aware = self._coalesce_strptime(
-            array, _TIMESTAMP_FORMATS_AWARE, unit=self.timestamp_unit
+            aware_input, _TIMESTAMP_FORMATS_AWARE, unit=self.timestamp_unit
         )
         if aware is not None:
             tz_str = self.target_tz or "UTC"
@@ -403,3 +412,33 @@ class StringCurator(Curator):
         if pc.any(regressions).as_py():
             return None
         return out
+
+
+# ``%z`` is platform-dependent in ``pc.strptime``: Linux glibc parses
+# ``+02:00`` and ``Z``, the Windows CRT only accepts ``+0200``. Two
+# vectorised replacements bring every ISO-8601 input to the portable
+# shape:
+#   - ``(?<=[+-]\d{2}):(?=\d{2}$)`` — drop the colon in the offset
+#     suffix (``+02:00`` → ``+0200``).
+#   - trailing ``Z`` → ``+0000``.
+# Done as ``pc.replace_substring_regex`` so the whole array stays in
+# Arrow C++ — no per-row Python hop.
+_ISO_OFFSET_COLON_RE = r"([+-]\d{2}):(\d{2})$"
+_ISO_Z_RE = r"Z$"
+
+
+def _normalize_iso_offsets(array: pa.Array) -> pa.Array:
+    """Strip colons from ISO-8601 offsets and rewrite ``Z`` as ``+0000``.
+
+    ``pc.strptime``'s ``%z`` flag works against the host C runtime, so
+    the offset shapes glibc / musl / MSVC accept differ. Normalizing
+    the input here lets every platform parse with the same
+    ``%Y-%m-%dT%H:%M:%S%z`` catalogue.
+    """
+    if array.type != pa.string() and array.type != pa.large_string():
+        return array
+    out = pc.replace_substring_regex(
+        array, pattern=_ISO_OFFSET_COLON_RE, replacement=r"\1\2"
+    )
+    out = pc.replace_substring_regex(out, pattern=_ISO_Z_RE, replacement="+0000")
+    return out

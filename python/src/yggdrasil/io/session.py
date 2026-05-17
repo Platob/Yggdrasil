@@ -2339,28 +2339,34 @@ class Session(Singleton, ABC):
     ) -> "SparkDataFrame":
         """Stage 3 on Spark: scatter misses to workers via mapInArrow.
 
-        Each Spark partition becomes one `send_many` call on the executor,
-        fanning out via the session's local thread pool. Per-request remote
-        cache configs are stripped (driver concern); per-request local cache
-        configs are dropped on workers (they see only the session config).
+        Requests cross the wire as an Arrow table with the canonical
+        :data:`~yggdrasil.io.request.REQUEST_SCHEMA` — deterministic
+        columns, no pickled Python objects, no driver-side
+        :class:`Session` subclass dragged into the worker's pickle
+        graph. That's the path that survives Spark Connect / Databricks
+        Connect, where the cluster's interpreter has no idea what
+        ``tests.test_yggdrasil.…StubSession`` is and the cloudpickle
+        round-trip fails with ``ModuleNotFoundError``.
 
-        The session is shipped to executors via ``sparkContext.broadcast``
-        — once per executor instead of once per task closure — and
-        re-attached to each request on the worker via
-        :meth:`PreparedRequest.attach_session`. Requests cross the wire
-        as a single pickled-bytes column; pickle preserves the full
-        :class:`PreparedRequest` (closures, buffer, cache configs)
-        without the per-engine schema dance the Arrow round-trip needed.
+        Each Spark partition becomes one :meth:`Session.send_many` call
+        on the executor — built against a vanilla :class:`HTTPSession`
+        the worker constructs locally — fanning out via that session's
+        thread pool. Both local and remote cache configs are forwarded:
+        workers consult the same caches as the driver, so a request the
+        driver fan-out missed but a peer worker has already cached can
+        still short-circuit before hitting the network.
         """
-        import pickle
+        from yggdrasil.io.http_.session import HTTPSession
 
-        from pyspark.sql.types import BinaryType, StructField, StructType
+        if not misses:
+            return self._cached_empty_spark_frame(spark)
 
-        req_schema = StructType([StructField("request", BinaryType(), nullable=False)])
-        req_rows = [
-            (pickle.dumps(r.copy(remote_cache_config=None), protocol=pickle.HIGHEST_PROTOCOL),)
-            for r in misses
-        ]
+        # One C++-side struct walk turns the request list into a single
+        # Arrow table that matches REQUEST_SCHEMA column-for-column.
+        # No per-row pickle, no closure capture of ``self``.
+        request_table = pa.Table.from_batches(
+            [PreparedRequest.values_to_arrow_batch(misses)]
+        )
 
         # Spread requests across many partitions so mapInArrow scatters
         # across the whole cluster instead of piling them onto a handful
@@ -2377,57 +2383,39 @@ class Session(Singleton, ABC):
             default_par = max(spark.sparkContext.defaultParallelism, 1)
         except Exception:
             default_par = 8
-        n_parts = max(1, min(len(req_rows), default_par * 8))
-        request_df = spark.createDataFrame(req_rows, req_schema).repartition(n_parts)
+        n_parts = max(1, min(len(misses), default_par * 8))
+        request_df = spark.createDataFrame(request_table).repartition(n_parts)
 
-        # Per-executor send config: remote cache disabled (driver-only),
-        # local cache passthrough, no spark session, raise_error=False so
-        # individual failures don't blow up the whole partition.
+        # Per-executor send config: keep both local and remote cache
+        # configs so the worker's send_many can short-circuit on cache
+        # hits the driver-side fan-out didn't already catch. No spark
+        # session — the worker runs the Python path. ``raise_error=False``
+        # so individual failures don't blow up the whole partition.
         send_config = config.to_send_config(
-            with_remote_cache=False,
+            with_remote_cache=True,
             with_local_cache=True,
             with_spark=False,
             raise_error=False,
         )
 
-        # Broadcast the session so every executor receives the
-        # (pickle-safe) session state once and reuses it across tasks,
-        # rather than re-shipping a closure-captured copy per partition.
-        # Session.__getstate__ / __setstate__ make this pickle-safe by
-        # dropping the threading.RLock and JobPoolExecutor.
-        #
-        # Spark Connect doesn't expose ``sparkContext.broadcast`` either —
-        # in that mode the session is captured by the closure
-        # (``_send_partition`` references ``self`` via the bound method
-        # context) and pickled by Spark Connect's RPC framing on the way
-        # out, which is the same wire trip ``broadcast`` would have made.
-        try:
-            session_bc = spark.sparkContext.broadcast(self)
-            _session_for_partition = None  # use session_bc.value on the executor
-        except Exception:
-            session_bc = None
-            _session_for_partition = self  # closure-captured, pickled by Spark Connect
         response_spark_schema = RESPONSE_SCHEMA.to_spark_schema()
 
         def _send_partition(
             batches: Iterator[pa.RecordBatch],
         ) -> Iterator[pa.RecordBatch]:
-            import pickle as _pickle
-
-            session = (
-                session_bc.value if session_bc is not None
-                else _session_for_partition
-            )
+            # Vanilla HTTPSession built per-partition. Singleton-cached
+            # by ``(cls, config)`` so all partitions on the same executor
+            # share one connection pool.
+            session = HTTPSession()
             for batch in batches:
-                partition_requests = [
-                    _pickle.loads(buf).attach_session(session)
-                    for buf in batch.column("request").to_pylist()
-                ]
+                partition_requests = list(PreparedRequest.from_arrow(batch))
                 if not partition_requests:
                     continue
 
                 def _row_batches() -> Iterator[pa.RecordBatch]:
-                    for resp in session.send_many(iter(partition_requests), send_config):
+                    for resp in session.send_many(
+                        iter(partition_requests), send_config,
+                    ):
                         yield resp.to_arrow_batch(parse=False)
 
                 yield from rechunk_arrow_batches(
