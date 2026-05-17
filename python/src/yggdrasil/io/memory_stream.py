@@ -53,7 +53,7 @@ from .holder import Holder, _resolve_pos
 __all__ = ["MemoryStream"]
 
 
-_DEFAULT_PULL_CHUNK = 64 * 1024
+_DEFAULT_PULL_CHUNK = 1024 * 1024  # 1 MiB
 
 #: In-memory window cap. Bytes beyond this spill to a tempfile.
 _DEFAULT_SPILL_THRESHOLD = 128 * 1024 * 1024  # 128 MiB
