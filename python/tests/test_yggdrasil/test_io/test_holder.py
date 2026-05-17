@@ -324,11 +324,12 @@ class TestWriteStream:
         calls: list[int] = []
         original = type(m).write_mv
 
-        def _spy(self, data, offset, *, size=-1, overwrite=False, update_stat=True):
+        def _spy(self, data, offset, *, size=-1, overwrite=False, update_stat=True, cursor=False):
             if self is m:
                 calls.append(len(data))
             return original(
-                self, data, offset, size=size, overwrite=overwrite, update_stat=update_stat,
+                self, data, offset, size=size, overwrite=overwrite,
+                update_stat=update_stat, cursor=cursor,
             )
 
         with patch.object(type(m), "write_mv", _spy):
@@ -392,11 +393,12 @@ class TestWriteHolder:
         calls: list[int] = []
         original = type(dst).write_mv
 
-        def _spy(self, data, offset, *, size=-1, overwrite=False, update_stat=True):
+        def _spy(self, data, offset, *, size=-1, overwrite=False, update_stat=True, cursor=False):
             if self is dst:
                 calls.append(len(data))
             return original(
-                self, data, offset, size=size, overwrite=overwrite, update_stat=update_stat,
+                self, data, offset, size=size, overwrite=overwrite,
+                update_stat=update_stat, cursor=cursor,
             )
 
         from unittest.mock import patch
@@ -419,11 +421,12 @@ class TestWriteHolder:
         calls: list[int] = []
         original = type(dst).write_mv
 
-        def _spy(self, data, offset, *, size=-1, overwrite=False, update_stat=True):
+        def _spy(self, data, offset, *, size=-1, overwrite=False, update_stat=True, cursor=False):
             if self is dst:
                 calls.append(len(data))
             return original(
-                self, data, offset, size=size, overwrite=overwrite, update_stat=update_stat,
+                self, data, offset, size=size, overwrite=overwrite,
+                update_stat=update_stat, cursor=cursor,
             )
 
         from unittest.mock import patch

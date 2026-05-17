@@ -80,6 +80,7 @@ import time
 from collections.abc import Iterable
 from typing import (
     Any,
+    BinaryIO,
     Generic,
     Iterator,
     Optional,
@@ -236,14 +237,36 @@ def _local_path_for_handle(obj: Any) -> Optional[str]:
 # ===========================================================================
 
 
-class IO(Tabular[O], Disposable, Generic[T, O]):
-    """Cursor + bytes surface + tabular view over a managed :class:`Holder`.
+class IO(Holder, BinaryIO, Generic[T, O]):
+    """Cursor + bytes surface + tabular view, IS-A :class:`Holder`.
 
-    The IO is a **pure seekable cursor** over the bound holder: every
-    read / write / truncate dispatches straight through to the
-    holder's positional API, so the holder remains the single source
-    of truth for the durable bytes. There is no IO-side scratch
-    buffer — the IO carries only the cursor and the mode.
+    After the Holder ↔ IO merge, :class:`IO` inherits from
+    :class:`Holder` directly — every IO instance IS a Holder, with
+    the same storage primitives (``_read_mv`` / ``_write_mv`` /
+    ``reserve`` / ``truncate`` / ``_clear`` / ``size`` / ``_stat``)
+    and the same opt-in seekable cursor (``_pos`` / ``_mode``)
+    exposed through ``cursor=True`` on the byte primitives.
+
+    Also subclasses :class:`typing.BinaryIO` so external libraries
+    that type-check against the stdlib file-like interface (pandas,
+    pyarrow, zipfile, …) accept Yggdrasil byte buffers without a
+    separate facade — the previous ``BytesIO`` shim is gone, every
+    caller goes through :class:`IO` directly. :attr:`mode` returns
+    the POSIX string (``"rb"`` / ``"wb+"`` / …) instead of the typed
+    :class:`Mode` enum so pandas/zipfile's ``"b" in handle.mode``
+    sniffs work; the typed value is still available via ``self._mode``.
+
+    Two layered patterns survive the merge for backward compat:
+
+    - **Self-storing IO** — the default. :class:`BytesIO` and the
+      format leaves (:class:`ParquetIO`, :class:`CsvIO`, …) carry
+      their own bytes via the inherited Holder primitives.
+    - **Holder-wrapping IO** — opt-in via ``IO(holder=other_holder)``.
+      The IO keeps a separate ``_holder`` pointer (e.g. a
+      :class:`LocalPath` underneath a :class:`ParquetIO` cursor) and
+      ``_active()`` redirects every byte op there. This is how
+      ``LocalPath("data.parquet").open()`` produces a format-aware
+      cursor against a path-backed buffer without copying bytes.
 
     Mode-aware but format-agnostic at this layer. Mode controls
     cursor position (:data:`Mode.APPEND` → EOF), :meth:`readable` /
@@ -253,16 +276,17 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
 
     The two :class:`Tabular` batch hooks default to
     :class:`NotImplementedError` — a plain :class:`IO` doesn't know
-    what its bytes encode. Subclasses (ParquetIO, CsvIO, ArrowIPCIO,
-    …) override the hooks to do format-specific decoding against the
-    same holder.
+    what its bytes encode. Format leaves override the hooks against
+    the same byte buffer.
     """
 
+    # ``_pos`` and ``_mode`` live on :class:`Holder` after the merge —
+    # do not redeclare them here, redeclaring a slot in a subclass
+    # shadows the parent's at the descriptor level and breaks Holder's
+    # default initialisation.
     __slots__ = (
         "_holder",
         "_owns_holder",
-        "_pos",
-        "_mode",
     )
 
     def __new__(
@@ -660,6 +684,43 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         """
         return self._holder
 
+    # ==================================================================
+    # Holder abstract-method implementations — delegate to ``_active()``
+    # ==================================================================
+    #
+    # After the Holder ↔ IO merge :class:`IO` is itself a Holder, but
+    # the bytes still live in the wrapped ``_active()`` holder rather
+    # than on the IO instance. These thin shims keep the inherited
+    # storage primitives functional by routing through the active
+    # holder; format leaves and ``BytesIO`` inherit them unchanged.
+
+    def _read_mv(self, n: int, pos: int) -> memoryview:
+        return self._active()._read_mv(n, pos)
+
+    def _write_mv(self, data: memoryview, pos: int) -> int:
+        return self._active()._write_mv(data, pos)
+
+    def reserve(self, n: int) -> None:
+        self._active().reserve(n)
+
+    def _clear(self) -> None:
+        self._active()._clear()
+
+    def _stat(self):
+        return self._active()._stat()
+
+    @property
+    def is_memory(self) -> bool:
+        return self._active().is_memory
+
+    @property
+    def is_local_path(self) -> bool:
+        return self._active().is_local_path
+
+    @property
+    def is_remote_path(self) -> bool:
+        return self._active().is_remote_path
+
     def view(
         self,
         *,
@@ -950,16 +1011,16 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
     # ==================================================================
 
     @property
-    def mode(self) -> Mode:
-        """Normalized :class:`Mode` for this handle.
+    def mode(self) -> str:
+        """POSIX mode string — stdlib :class:`typing.BinaryIO` parity.
 
-        Stored as an enum so predicates like :meth:`readable`,
-        :meth:`writable`, :meth:`appendable` route through one
-        canonical token instead of re-parsing strings at every
-        call site. The original POSIX form is recoverable via
-        ``self.mode.os_mode``.
+        pandas / pyarrow / zipfile inspect ``.mode`` for substrings
+        like ``"b"`` to dispatch binary vs text reads, so this
+        surface returns the os-mode form (``"rb+"`` / ``"wb+"`` /
+        ``"ab+"`` / ``"xb+"``) rather than the typed :class:`Mode`
+        enum. The typed value is available via ``self._mode``.
         """
-        return self._mode
+        return self._mode.os_mode
 
     def readable(self) -> bool:
         return self._mode.readable

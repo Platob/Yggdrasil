@@ -1,21 +1,18 @@
-"""Stdlib :class:`typing.BinaryIO`-compatible facade over :class:`IO`.
+"""Convenience alias :class:`BytesIO` over :class:`IO`.
 
-:class:`BytesIO` is a thin shim that pairs the rich :class:`IO`
-substrate (holder + cursor + format helpers) with the
-:class:`typing.BinaryIO` protocol, so external libraries that
-type-check against the stdlib file-like interface (pandas,
-pyarrow, zipfile, …) continue to accept Yggdrasil byte buffers.
-
-The only divergence from :class:`IO` is the :attr:`mode` property,
-which returns the POSIX mode string (``"rb"`` / ``"wb+"`` / …)
-instead of the typed :class:`Mode` enum — pandas and friends
-test ``"b" in handle.mode`` to dispatch binary vs text reads.
-The typed mode is still available via ``self._mode``.
+After the Holder ↔ IO merge, :class:`IO` itself inherits from
+:class:`typing.BinaryIO` and exposes the POSIX ``.mode`` string, so
+external libraries that type-check against the stdlib file-like
+interface (pandas, pyarrow, zipfile, …) accept it directly.
+:class:`BytesIO` survives as a one-line, ergonomic shorthand for the
+``IO[bytes, O]`` parameterisation — call sites that want the
+"this is a binary buffer" intent in the type name keep working
+without going through ``IO`` and threading the generic.
 """
 
 from __future__ import annotations
 
-from typing import BinaryIO, TypeVar
+from typing import TypeVar
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.io.base import IO
@@ -26,24 +23,12 @@ __all__ = ["BytesIO"]
 O = TypeVar("O", bound=CastOptions)
 
 
-class BytesIO(IO[bytes, O], BinaryIO):
-    """:class:`IO` parameterised on :class:`bytes` with stdlib parity.
+class BytesIO(IO[bytes, O]):
+    """Convenience alias — :class:`IO` parameterised on :class:`bytes`.
 
-    Construction is unchanged from :class:`IO` — every shape
+    Every construction shape inherited from :class:`IO`
     (``BytesIO(b"..")``, ``BytesIO(path=...)``, ``BytesIO(holder=...)``,
     ``BytesIO(media_type=...)``) routes through :meth:`IO.__new__`'s
-    format dispatch, so format-specific calls land on the registered
-    leaf (:class:`ParquetIO`, :class:`CsvIO`, …) automatically.
+    format dispatch, so format-specific calls still land on the
+    registered leaf (:class:`ParquetIO`, :class:`CsvIO`, …) automatically.
     """
-
-    @property
-    def mode(self) -> str:
-        """POSIX mode string — stdlib :class:`IO[bytes]` parity.
-
-        pandas / pyarrow / zipfile inspect ``.mode`` for substrings
-        like ``"b"`` to dispatch binary vs text reads, so this surface
-        returns the os-mode form (``"rb+"`` / ``"wb+"`` / ``"ab+"`` /
-        ``"xb+"``) instead of the :class:`Mode` enum. The typed mode
-        is still available via ``self._mode``.
-        """
-        return self._mode.os_mode

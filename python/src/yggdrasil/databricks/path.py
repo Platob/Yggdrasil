@@ -598,7 +598,13 @@ class DatabricksPath(DatabricksResource, RemotePath):
         if n < 0:
             raise ValueError(f"reserve size must be >= 0, got {n!r}")
 
-    def read_mv(self, size: int = -1, offset: int = 0) -> memoryview:
+    def read_mv(
+        self,
+        size: int = -1,
+        offset: int = 0,
+        *,
+        cursor: bool = False,
+    ) -> memoryview:
         """Range read with an aggressive whole-file fast path.
 
         The base :meth:`Holder.read_mv` runs ``self.size`` (an
@@ -615,6 +621,8 @@ class DatabricksPath(DatabricksResource, RemotePath):
         probe entirely. Partial / positional reads keep the base
         bounds check so out-of-range windows still raise.
         """
+        if cursor:
+            offset = self._pos
         if size < 0 and offset == 0:
             # ``FileNotFoundError`` propagates — semantics match the
             # base ``Holder.read_mv`` which would raise on a stat
@@ -622,8 +630,11 @@ class DatabricksPath(DatabricksResource, RemotePath):
             # fallback (used by base ``Path`` methods like
             # :meth:`truncate`) is the only place that swallows it
             # into an empty buffer.
-            return self._read_mv(-1, 0)
-        return super().read_mv(size, offset)
+            out = self._read_mv(-1, 0)
+            if cursor:
+                self._pos = len(out)
+            return out
+        return super().read_mv(size, offset, cursor=cursor)
 
     def _bread(self, n: int, pos: int, mode):  # pragma: no cover - thin shim
         """Fallback whole-file read into a fresh :class:`BytesIO`.

@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Union, Any, IO, Iterable, Iterator
 import pyarrow as pa
 
 from yggdrasil.data.enums import MediaType
+from yggdrasil.data.enums.mode import Mode
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.tabular.base import O, Tabular
@@ -197,6 +198,16 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         "_xxh3_64_cached",
         "_xxh3_64_size",
         "_xxh3_64_mtime",
+        # Cursor + mode state — pulled up from the former :class:`IO`
+        # subclass after the Holder ↔ IO merge so every Holder gains
+        # an opt-in seekable cursor. Read/write primitives advance
+        # ``_pos`` when invoked with ``cursor=True``; ``cursor=False``
+        # (the default) keeps the positional, cursor-less contract.
+        # ``_mode`` defaults to :data:`Mode.AUTO` (``"rb+"`` semantics)
+        # so direct holder access stays read/write-able without an
+        # explicit mode kwarg.
+        "_pos",
+        "_mode",
     )
 
     # ------------------------------------------------------------------
@@ -249,7 +260,14 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         ``auto_open``, …) ride through ``**kwargs`` so subclass
         ``__new__`` and the eventual ``__init__`` see them.
         """
-        if cls.__subclasses__() and not cls.__subclasses__().__contains__(cls):
+        # Scheme/data dispatch fires only on the abstract :class:`Holder`
+        # itself. After the Holder ↔ IO merge, :class:`IO` is also a
+        # Holder subclass and has its own concrete subclasses
+        # (``BytesIO``, ``ParquetIO``, …); those go through
+        # :meth:`IO.__new__`'s format dispatch, not the scheme registry.
+        # Concrete storage leaves (Memory, LocalPath, …) have no
+        # subclasses of their own, so they fall through to allocation.
+        if cls is Holder:
             target = _resolve_subclass(
                 scheme=scheme, url=url, binary=binary, path=path, data=data,
             )
@@ -323,6 +341,12 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         self._xxh3_64_cached: int = 0
         self._xxh3_64_size: int = -1
         self._xxh3_64_mtime: float = -1.0
+        # Cursor + mode — opt-in seekable surface. ``_pos`` only moves
+        # when a caller passes ``cursor=True`` to a read/write primitive
+        # or drives the holder through stdlib-style ``read()`` /
+        # ``write()``. Default ``Mode.AUTO`` matches ``"rb+"``.
+        self._pos: int = 0
+        self._mode: Mode = Mode.AUTO
         if stat is not None and stat.media_type is not None:
             self._media_type = stat.media_type
         else:
@@ -452,7 +476,22 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
     # Abstract primitives
     # ------------------------------------------------------------------
 
-    def read_mv(self, size: int = -1, offset: int = 0) -> memoryview:
+    def read_mv(
+        self,
+        size: int = -1,
+        offset: int = 0,
+        *,
+        cursor: bool = False,
+    ) -> memoryview:
+        """Slice ``size`` bytes from ``offset`` as a :class:`memoryview`.
+
+        ``cursor=True`` ignores the explicit *offset* and reads from
+        the holder's internal cursor (:attr:`tell`), advancing it past
+        the bytes returned. ``cursor=False`` (default) keeps the
+        cursor-less positional contract — the cursor is untouched.
+        """
+        if cursor:
+            offset = self._pos
         total = self.size
         offset = _resolve_pos(offset, total)
         if offset < 0 or offset > total:
@@ -468,7 +507,10 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
                 f"{type(self).__name__} of size {total}"
             )
 
-        return self._read_mv(size, offset)
+        out = self._read_mv(size, offset)
+        if cursor:
+            self._pos = offset + size
+        return out
 
     @abstractmethod
     def _read_mv(self, n: int, pos: int) -> memoryview:
@@ -494,6 +536,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         size: int = -1,
         overwrite: bool = False,
         update_stat: bool = True,
+        cursor: bool = False,
     ) -> int:
         """Splice ``data`` at ``offset``, pre-growing the holder as needed.
 
@@ -533,6 +576,8 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         re-statting via the path-side ``_stat`` for filesystem
         backends) once the loop finishes.
         """
+        if cursor:
+            offset = self._pos
         if size >= 0 and len(data) > size:
             data = data[:size]
         total = self.size
@@ -571,6 +616,8 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         if written > 0 and update_stat:
             self._touch_stat(size=max(end, self.size))
             self.mark_dirty()
+        if cursor:
+            self._pos = offset + written
         return written
 
     @abstractmethod
@@ -986,9 +1033,13 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
     # Cursorless I/O — the canonical surface :class:`BytesIO` consumes
     # ------------------------------------------------------------------
 
-    def pread(self, n: int, pos: int) -> bytes:
-        """Positional read. Returns at most ``n`` bytes at *pos*."""
-        return bytes(self.read_mv(n, pos))
+    def pread(self, n: int, pos: int, *, cursor: bool = False) -> bytes:
+        """Positional read. Returns at most ``n`` bytes at *pos*.
+
+        ``cursor=True`` reads from the internal cursor instead of *pos*
+        and advances it past the bytes returned.
+        """
+        return bytes(self.read_mv(n, pos, cursor=cursor))
 
     def pwrite(
         self,
@@ -996,13 +1047,19 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         pos: int,
         *,
         update_stat: bool = True,
+        cursor: bool = False,
     ) -> int:
         """Positionally write. Returns bytes actually written.
 
         ``update_stat=False`` defers the post-write stat refresh to
         the caller — see :meth:`write_mv` for the bulk-write rationale.
+        ``cursor=True`` writes at the internal cursor instead of *pos*
+        and advances it by the bytes written.
         """
-        return self.write_mv(_as_byte_mv(data), pos, update_stat=update_stat)
+        return self.write_mv(
+            _as_byte_mv(data), pos,
+            update_stat=update_stat, cursor=cursor,
+        )
 
     def memoryview(self) -> memoryview:
         """View over the holder's visible bytes."""
@@ -1012,14 +1069,21 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
     # Bytes / text convenience surface
     # ------------------------------------------------------------------
 
-    def read_bytes(self, size: int = -1, offset: int = 0) -> bytes:
+    def read_bytes(
+        self,
+        size: int = -1,
+        offset: int = 0,
+        *,
+        cursor: bool = False,
+    ) -> bytes:
         """Read ``size`` bytes starting at ``offset`` as :class:`bytes`.
 
         ``size=-1`` reads to EOF; ``offset`` accepts negative
         indices via :func:`_resolve_pos` (``-1`` → ``size``,
-        ``-N`` → ``self.size - N``).
+        ``-N`` → ``self.size - N``). ``cursor=True`` reads from the
+        internal cursor and advances it past the bytes returned.
         """
-        return bytes(self.read_mv(size, offset))
+        return bytes(self.read_mv(size, offset, cursor=cursor))
 
     def write_bytes(
         self,
@@ -1028,6 +1092,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         *,
         size: int = -1,
         overwrite: bool = False,
+        cursor: bool = False,
     ) -> int:
         """Splice ``data`` at ``offset``. Returns bytes written.
 
@@ -1060,13 +1125,16 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         if isinstance(data, Holder):
             return self.write_holder(
                 data, offset=offset, size=size, overwrite=overwrite,
+                cursor=cursor,
             )
         if hasattr(data, "read"):
             return self.write_stream(
                 data, offset=offset, size=size, overwrite=overwrite,
+                cursor=cursor,
             )
         return self.write_mv(
             _as_byte_mv(data), offset, size=size, overwrite=overwrite,
+            cursor=cursor,
         )
 
     def read_text(
@@ -1076,9 +1144,15 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         *,
         size: int = -1,
         offset: int = 0,
+        cursor: bool = False,
     ) -> str:
-        """Decode ``size`` bytes at ``offset`` as text."""
-        return self.read_bytes(size, offset).decode(encoding, errors=errors)
+        """Decode ``size`` bytes at ``offset`` as text.
+
+        ``cursor=True`` reads from the internal cursor and advances it.
+        """
+        return self.read_bytes(
+            size, offset, cursor=cursor,
+        ).decode(encoding, errors=errors)
 
     def write_text(
         self,
@@ -1087,43 +1161,56 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         errors: str = "strict",
         *,
         offset: int = 0,
+        cursor: bool = False,
     ) -> int:
-        """Encode ``text`` and splice at ``offset``. Returns bytes written."""
+        """Encode ``text`` and splice at ``offset``. Returns bytes written.
+
+        ``cursor=True`` writes at the internal cursor and advances it.
+        """
         return self.write_bytes(
-            text.encode(encoding, errors=errors), offset,
+            text.encode(encoding, errors=errors), offset, cursor=cursor,
         )
 
     # ------------------------------------------------------------------
     # Cursorless read/write primitives — IO subclasses add cursor
     # ------------------------------------------------------------------
 
-    def readinto(self, buffer: Any, *, offset: int = 0) -> int:
+    def readinto(
+        self, buffer: Any, *, offset: int = 0, cursor: bool = False,
+    ) -> int:
         """Fill *buffer* with bytes starting at ``offset``.
 
         Returns the number of bytes written into *buffer* —
         ``min(len(buffer), self.size - offset)``. Matches the
-        stdlib :meth:`io.RawIOBase.readinto` shape but stays
-        cursorless; subclasses with a cursor (``IO``) wrap this
-        and advance after the call.
+        stdlib :meth:`io.RawIOBase.readinto` shape. ``cursor=True``
+        reads from the internal cursor and advances it.
         """
         mv = memoryview(buffer)
         capacity = len(mv)
         if capacity == 0:
             return 0
+        if cursor:
+            offset = self._pos
         chunk = self.read_bytes(capacity, offset)
         n = len(chunk)
         if n:
             mv[:n] = chunk
+        if cursor:
+            self._pos = offset + n
         return n
 
-    def readline(self, limit: int = -1, *, offset: int = 0) -> bytes:
+    def readline(
+        self, limit: int = -1, *, offset: int = 0, cursor: bool = False,
+    ) -> bytes:
         """Read up to the next newline starting at ``offset``.
 
         Returns the line including the trailing ``\\n`` (or short
-        when EOF lands first). ``limit >= 0`` caps the byte
-        count. Cursorless — :class:`IO` subclasses wrap this and
-        advance the cursor by the returned length.
+        when EOF lands first). ``limit >= 0`` caps the byte count.
+        ``cursor=True`` reads from the internal cursor and advances
+        it past the returned line.
         """
+        if cursor:
+            offset = self._pos
         total = self.size
         if offset >= total:
             return b""
@@ -1134,54 +1221,115 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
             return b""
         chunk = self.read_bytes(chunk_len, offset)
         nl = chunk.find(b"\n")
-        return chunk if nl == -1 else chunk[: nl + 1]
+        line = chunk if nl == -1 else chunk[: nl + 1]
+        if cursor:
+            self._pos = offset + len(line)
+        return line
 
-    def readlines(self, hint: int = -1, *, offset: int = 0) -> list[bytes]:
-        """Read every line from ``offset`` to EOF (or until ``hint`` bytes)."""
+    def readlines(
+        self, hint: int = -1, *, offset: int = 0, cursor: bool = False,
+    ) -> list[bytes]:
+        """Read every line from ``offset`` to EOF (or until ``hint`` bytes).
+
+        ``cursor=True`` reads from the internal cursor and advances it
+        past the bytes consumed.
+        """
         lines: list[bytes] = []
-        cursor = offset
+        scan = self._pos if cursor else offset
         total = 0
         while True:
-            line = self.readline(offset=cursor)
+            line = self.readline(offset=scan)
             if not line:
                 break
             lines.append(line)
             total += len(line)
-            cursor += len(line)
+            scan += len(line)
             if hint is not None and hint > 0 and total >= hint:
                 break
+        if cursor:
+            self._pos = scan
         return lines
+
+    # ------------------------------------------------------------------
+    # Cursor — opt-in seekable surface
+    # ------------------------------------------------------------------
+
+    def tell(self) -> int:
+        """Current cursor position."""
+        return self._pos
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        """Seek the internal cursor to *offset* relative to *whence*.
+
+        Mirrors :meth:`io.IOBase.seek` with two ergonomic deviations:
+
+        * ``seek(-1, SEEK_SET)`` is a "go to end" sentinel — pairs
+          with ``read(-1)`` / "read all". Any other negative
+          ``SEEK_SET`` offset raises :class:`ValueError`.
+        * ``SEEK_CUR`` / ``SEEK_END`` with a negative offset that
+          would land before byte 0 clamps to 0 instead of raising.
+        """
+        offset = int(offset)
+        size = self.size
+        if whence == 0:  # SEEK_SET
+            if offset == -1:
+                self._pos = size
+            elif offset < 0:
+                raise ValueError(
+                    f"Negative SEEK_SET offset {offset!r} is invalid; "
+                    f"use SEEK_END to count from the end."
+                )
+            else:
+                self._pos = offset
+        elif whence == 1:  # SEEK_CUR
+            self._pos = max(0, self._pos + offset)
+        elif whence == 2:  # SEEK_END
+            self._pos = max(0, size + offset)
+        else:
+            raise ValueError(f"Invalid whence: {whence!r}")
+        return self._pos
+
+    def seekable(self) -> bool:
+        return True
 
     # ---- structured binary helpers — fixed-width little-endian ---------
 
-    def _read_struct(self, fmt: str, n: int, offset: int) -> Any:
-        return struct.unpack(fmt, self.read_bytes(n, offset))[0]
+    def _read_struct(
+        self, fmt: str, n: int, offset: int, *, cursor: bool = False,
+    ) -> Any:
+        return struct.unpack(
+            fmt, self.read_bytes(n, offset, cursor=cursor),
+        )[0]
 
-    def _write_struct(self, fmt: str, value: Any, offset: int) -> int:
-        return self.write_bytes(struct.pack(fmt, value), offset)
+    def _write_struct(
+        self, fmt: str, value: Any, offset: int, *, cursor: bool = False,
+    ) -> int:
+        return self.write_bytes(
+            struct.pack(fmt, value), offset, cursor=cursor,
+        )
 
-    def read_int8(self, *, offset: int = 0) -> int: return self._read_struct("<b", 1, offset)
-    def write_int8(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<b", int(v), offset)
-    def read_uint8(self, *, offset: int = 0) -> int: return self._read_struct("<B", 1, offset)
-    def write_uint8(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<B", int(v), offset)
-    def read_int16(self, *, offset: int = 0) -> int: return self._read_struct("<h", 2, offset)
-    def write_int16(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<h", int(v), offset)
-    def read_uint16(self, *, offset: int = 0) -> int: return self._read_struct("<H", 2, offset)
-    def write_uint16(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<H", int(v), offset)
-    def read_int32(self, *, offset: int = 0) -> int: return self._read_struct("<i", 4, offset)
-    def write_int32(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<i", int(v), offset)
-    def read_uint32(self, *, offset: int = 0) -> int: return self._read_struct("<I", 4, offset)
-    def write_uint32(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<I", int(v), offset)
-    def read_int64(self, *, offset: int = 0) -> int: return self._read_struct("<q", 8, offset)
-    def write_int64(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<q", int(v), offset)
-    def read_uint64(self, *, offset: int = 0) -> int: return self._read_struct("<Q", 8, offset)
-    def write_uint64(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<Q", int(v), offset)
-    def read_f32(self, *, offset: int = 0) -> float: return self._read_struct("<f", 4, offset)
-    def write_f32(self, v: float, *, offset: int = 0) -> int: return self._write_struct("<f", float(v), offset)
-    def read_f64(self, *, offset: int = 0) -> float: return self._read_struct("<d", 8, offset)
-    def write_f64(self, v: float, *, offset: int = 0) -> int: return self._write_struct("<d", float(v), offset)
-    def read_bool(self, *, offset: int = 0) -> bool: return bool(self.read_uint8(offset=offset))
-    def write_bool(self, v: bool, *, offset: int = 0) -> int: return self.write_uint8(1 if v else 0, offset=offset)
+    def read_int8(self, *, offset: int = 0, cursor: bool = False) -> int: return self._read_struct("<b", 1, offset, cursor=cursor)
+    def write_int8(self, v: int, *, offset: int = 0, cursor: bool = False) -> int: return self._write_struct("<b", int(v), offset, cursor=cursor)
+    def read_uint8(self, *, offset: int = 0, cursor: bool = False) -> int: return self._read_struct("<B", 1, offset, cursor=cursor)
+    def write_uint8(self, v: int, *, offset: int = 0, cursor: bool = False) -> int: return self._write_struct("<B", int(v), offset, cursor=cursor)
+    def read_int16(self, *, offset: int = 0, cursor: bool = False) -> int: return self._read_struct("<h", 2, offset, cursor=cursor)
+    def write_int16(self, v: int, *, offset: int = 0, cursor: bool = False) -> int: return self._write_struct("<h", int(v), offset, cursor=cursor)
+    def read_uint16(self, *, offset: int = 0, cursor: bool = False) -> int: return self._read_struct("<H", 2, offset, cursor=cursor)
+    def write_uint16(self, v: int, *, offset: int = 0, cursor: bool = False) -> int: return self._write_struct("<H", int(v), offset, cursor=cursor)
+    def read_int32(self, *, offset: int = 0, cursor: bool = False) -> int: return self._read_struct("<i", 4, offset, cursor=cursor)
+    def write_int32(self, v: int, *, offset: int = 0, cursor: bool = False) -> int: return self._write_struct("<i", int(v), offset, cursor=cursor)
+    def read_uint32(self, *, offset: int = 0, cursor: bool = False) -> int: return self._read_struct("<I", 4, offset, cursor=cursor)
+    def write_uint32(self, v: int, *, offset: int = 0, cursor: bool = False) -> int: return self._write_struct("<I", int(v), offset, cursor=cursor)
+    def read_int64(self, *, offset: int = 0, cursor: bool = False) -> int: return self._read_struct("<q", 8, offset, cursor=cursor)
+    def write_int64(self, v: int, *, offset: int = 0, cursor: bool = False) -> int: return self._write_struct("<q", int(v), offset, cursor=cursor)
+    def read_uint64(self, *, offset: int = 0, cursor: bool = False) -> int: return self._read_struct("<Q", 8, offset, cursor=cursor)
+    def write_uint64(self, v: int, *, offset: int = 0, cursor: bool = False) -> int: return self._write_struct("<Q", int(v), offset, cursor=cursor)
+    def read_f32(self, *, offset: int = 0, cursor: bool = False) -> float: return self._read_struct("<f", 4, offset, cursor=cursor)
+    def write_f32(self, v: float, *, offset: int = 0, cursor: bool = False) -> int: return self._write_struct("<f", float(v), offset, cursor=cursor)
+    def read_f64(self, *, offset: int = 0, cursor: bool = False) -> float: return self._read_struct("<d", 8, offset, cursor=cursor)
+    def write_f64(self, v: float, *, offset: int = 0, cursor: bool = False) -> int: return self._write_struct("<d", float(v), offset, cursor=cursor)
+    def read_bool(self, *, offset: int = 0, cursor: bool = False) -> bool: return bool(self.read_uint8(offset=offset, cursor=cursor))
+    def write_bool(self, v: bool, *, offset: int = 0, cursor: bool = False) -> int: return self.write_uint8(1 if v else 0, offset=offset, cursor=cursor)
 
     # ------------------------------------------------------------------
     # Local-path bridge
@@ -1194,6 +1342,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         pos: int = 0,
         n: int = -1,
         chunk_size: int = _COPY_CHUNK,
+        cursor: bool = False,
     ) -> int:
         """Load ``path``'s bytes into this holder at ``pos``.
 
@@ -1205,6 +1354,8 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         size is known up front (``n >= 0`` or local stat available),
         so the inner loop only writes — no per-chunk grow.
         """
+        if cursor:
+            pos = self._pos
         if pos < 0:
             raise ValueError("write_local_path pos must be >= 0")
         os_path = os.fspath(path)
@@ -1224,7 +1375,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
             self.resize(target_end)
 
         total = 0
-        cursor = pos
+        write_pos = pos
         remaining = n if n >= 0 else None
         with open(os_path, "rb") as fh:
             while True:
@@ -1236,13 +1387,15 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
                 chunk = fh.read(want)
                 if not chunk:
                     break
-                written = self.write_mv(memoryview(chunk), cursor)
+                written = self.write_mv(memoryview(chunk), write_pos)
                 if written == 0:
                     break
-                cursor += written
+                write_pos += written
                 total += written
                 if remaining is not None:
                     remaining -= written
+        if cursor and total:
+            self._pos = pos + total
         return total
 
     def write_stream(
@@ -1253,6 +1406,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         size: int = -1,
         overwrite: bool = False,
         batch_size: int = _COPY_CHUNK,
+        cursor: bool = False,
     ) -> int:
         """Drain a binary source into this holder at ``offset``.
 
@@ -1278,6 +1432,8 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         per-call overhead dominates, or down to bound peak
         memory on a slow consumer.
         """
+        if cursor:
+            offset = self._pos
         if offset < 0:
             raise ValueError("write_stream offset must be >= 0")
         if batch_size <= 0:
@@ -1286,13 +1442,16 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         from yggdrasil.io.bytes_io import BytesIO as _YggBytesIO
 
         io_src = src if isinstance(src, _IO) else _YggBytesIO.from_(src)
-        return self._write_stream(
+        n = self._write_stream(
             io_src,
             offset=offset,
             size=size,
             overwrite=overwrite,
             batch_size=batch_size,
         )
+        if cursor:
+            self._pos = offset + n
+        return n
 
     def _write_stream(
         self,
@@ -1324,7 +1483,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         :meth:`write_stream` does the coercion so subclass code
         gets a stable type.
         """
-        cursor = offset
+        write_pos = offset
         total = 0
         remaining = size if size >= 0 else None
         while True:
@@ -1337,13 +1496,13 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
             chunk = src.read(chunk_size)
             if not chunk:
                 break
-            n = self.write_bytes(chunk, offset=cursor)
-            cursor += n
+            n = self.write_bytes(chunk, offset=write_pos)
+            write_pos += n
             total += n
             if remaining is not None:
                 remaining -= n
-        if overwrite and cursor < self.size:
-            self.truncate(cursor)
+        if overwrite and write_pos < self.size:
+            self.truncate(write_pos)
         return total
 
     def write_holder(
@@ -1354,6 +1513,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         size: int = -1,
         overwrite: bool = False,
         batch_size: int = _COPY_CHUNK,
+        cursor: bool = False,
     ) -> int:
         """Splice another :class:`Holder`'s bytes into this one at ``offset``.
 
@@ -1372,6 +1532,8 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         hand the source straight to their atomic-upload SDK call
         without ever materialising the bytes in Python).
         """
+        if cursor:
+            offset = self._pos
         if offset < 0:
             raise ValueError("write_holder offset must be >= 0")
         if not isinstance(src, Holder):
@@ -1380,13 +1542,16 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
                 f"{type(src).__name__}. Pass through `write_bytes` for "
                 f"bytes-like / IO / stream inputs."
             )
-        return self._write_holder(
+        n = self._write_holder(
             src,
             offset=offset,
             size=size,
             overwrite=overwrite,
             batch_size=batch_size,
         )
+        if cursor:
+            self._pos = offset + n
+        return n
 
     def _write_holder(
         self,
