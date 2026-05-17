@@ -487,59 +487,35 @@ class VolumePath(DatabricksPath):
     def _ensure_volume(self) -> bool:
         """Top-down create of the missing pieces of catalog / schema / volume.
 
-        Tries ``volumes.create`` first (the common case is that the
-        catalog + schema already exist and only the volume is
-        missing). If that NotFounds with "Schema …", create the
-        schema and retry the volume; if schema creation NotFounds
-        with "Catalog …", create the catalog, retry the schema,
-        retry the volume. ``AlreadyExists`` on any level is swallowed
-        — the desired state is reached either way.
+        Routes the volume create through :meth:`Volume.create` so the
+        managed-volume-type default (``VolumeType.MANAGED`` enum, not
+        a bare ``"MANAGED"`` string the SDK rejects) lives in one
+        place. ``AlreadyExists`` is swallowed by ``if_not_exists=True``;
+        if the volume create NotFounds because schema (or catalog) is
+        missing, falls through to :func:`_ensure_parents_for` to
+        materialise the parents before a single retry.
         """
-        triple = self._split_volume()
-        if triple is None:
+        if self._split_volume() is None:
             return False
-        c, s, n = triple
-        ws = self.client.workspace_client()
+        volume = self.volume
 
         try:
-            ws.volumes.create(
-                catalog_name=c, schema_name=s, name=n,
-                volume_type="MANAGED",
-            )
+            volume.create(if_not_exists=True)
             return True
         except Exception as exc:
             if _looks_like_already_exists(exc):
                 return True
             if not _looks_like_not_found(exc):
                 raise
-            # Schema (or catalog) is missing — recurse down.
 
+        from yggdrasil.databricks.volume.volumes import _ensure_parents_for
+        _ensure_parents_for(
+            self.client.workspace_client(),
+            catalog_name=volume.catalog_name,
+            schema_name=volume.schema_name,
+        )
         try:
-            ws.schemas.create(name=s, catalog_name=c)
-        except Exception as exc:
-            if _looks_like_already_exists(exc):
-                pass
-            elif _looks_like_not_found(exc):
-                # Catalog also missing.
-                try:
-                    ws.catalogs.create(name=c)
-                except Exception as inner:
-                    if not _looks_like_already_exists(inner):
-                        raise
-                try:
-                    ws.schemas.create(name=s, catalog_name=c)
-                except Exception as inner:
-                    if not _looks_like_already_exists(inner):
-                        raise
-            else:
-                raise
-
-        # Retry the volume now that catalog + schema exist.
-        try:
-            ws.volumes.create(
-                catalog_name=c, schema_name=s, name=n,
-                volume_type="MANAGED",
-            )
+            volume.create(if_not_exists=True)
         except Exception as exc:
             if not _looks_like_already_exists(exc):
                 raise
