@@ -691,6 +691,27 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         """Create a new holder from bytes."""
         return cls(binary=data, **kwargs)
 
+    def _from_url(self, url: URL, **kwargs: Any) -> "Holder":
+        """Build a sibling :class:`Holder` for *url* relative to this one.
+
+        * **Cursor** (this Holder wraps a parent storage —
+          ``self._parent is not None``): build at *url* directly,
+          reusing the concrete cursor class. The cursor's parent
+          already encodes the storage context, so the new sibling
+          points at the requested URL with the same shape.
+        * **Top-level storage** (``self._parent is None``): build at
+          ``url.parent`` instead. The storage represents a container,
+          so the natural "sibling-from-URL" is the container that
+          would *hold* the addressed URL, not the URL itself.
+
+        :class:`Path` overrides this hook (every Path is a top-level
+        storage but addresses a specific URL, not its container) and
+        returns ``type(self)(url=url)`` unchanged — see
+        :meth:`Path._from_url`.
+        """
+        target = url if self._parent is not None else url.parent
+        return type(self)(url=target, **kwargs)
+
     # ------------------------------------------------------------------
     # Format registry — MediaType → Holder subclass dispatch
     # ------------------------------------------------------------------
