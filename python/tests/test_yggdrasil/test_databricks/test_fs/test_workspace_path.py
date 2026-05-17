@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -120,13 +120,77 @@ class TestWrite:
         kwargs = workspace.workspace.upload.call_args.kwargs
         assert kwargs["path"] == "/Workspace/x"
         assert kwargs["overwrite"] is True
-        assert kwargs["content"].getvalue() == b"abcdef"
+        # Bytes input rides through as bytes — no unnecessary
+        # ``BytesIO`` buffering. The SDK builds a fresh multipart
+        # body per request, so cursor state never crosses retries.
+        assert kwargs["content"] == b"abcdef"
         # ``format`` must be passed: the SDK default is ``SOURCE``,
         # which routes raw bytes through the notebook importer and
         # fails with ``BadRequest: The zip archive contains no items``.
         # ``AUTO`` lets the server inspect the extension/content.
         fmt = kwargs["format"]
         assert getattr(fmt, "name", str(fmt)).upper() == "AUTO"
+
+    def test_stream_input_routes_through_upload(self, workspace, client) -> None:
+        """Caller-supplied ``BinaryIO`` is coerced to a yggdrasil
+        :class:`IO[bytes]` by the public :meth:`Holder.write_stream`
+        and lands on the single ``workspace.upload`` request via
+        :meth:`_write_stream`."""
+        import io
+
+        from yggdrasil.io.base import IO as _IO
+
+        workspace.workspace.get_status.side_effect = NotFound()
+        stream = io.BytesIO(b"streamed-payload")
+        p = WorkspacePath("/Workspace/z", client=client)
+        p.write_bytes(stream)
+
+        kwargs = workspace.workspace.upload.call_args.kwargs
+        # SDK sees the coerced yggdrasil IO[bytes] — that IS a
+        # BinaryIO, so ``workspace.upload`` happily consumes it.
+        assert isinstance(kwargs["content"], _IO)
+        # And only one upload call (no chunked RMW loop).
+        assert workspace.workspace.upload.call_count == 1
+
+    def test_stream_input_seeks_to_origin_on_retry(self, workspace, client) -> None:
+        """Transient failures must rewind a caller-supplied stream.
+
+        A live IO input ridden through ``_upload`` would otherwise
+        be left at EOF after the first POST drained it, and the
+        retry (transient 5xx via :func:`retry_sdk_call`, or
+        parent-recovery via :meth:`_call_ensuring_parents`) would
+        upload an empty tail. The closure ``seek(0)``s the stream
+        on every attempt so the retry reads the full body.
+        """
+        import io
+
+        from databricks.sdk.errors import InternalError
+
+        seen: list[bytes] = []
+        calls = {"n": 0}
+
+        def upload_side_effect(**kwargs: object) -> None:
+            calls["n"] += 1
+            stream = kwargs["content"]
+            stream.read()  # type: ignore[union-attr] — drain to EOF
+            if calls["n"] == 1:
+                raise InternalError("flaky")
+            stream.seek(0)
+            seen.append(stream.read())  # type: ignore[union-attr]
+
+        workspace.workspace.get_status.side_effect = NotFound()
+        workspace.workspace.upload.side_effect = upload_side_effect
+
+        with patch("yggdrasil.io.path._retry.time.sleep"):
+            WorkspacePath("/Workspace/y", client=client).write_bytes(
+                io.BytesIO(b"abcdef"),
+            )
+
+        assert calls["n"] == 2
+        # Despite the first attempt draining the cursor, the second
+        # attempt POSTed the full payload because the closure
+        # ``seek(0)``s the shared stream on every call.
+        assert seen == [b"abcdef"]
 
 
 class TestMutators:

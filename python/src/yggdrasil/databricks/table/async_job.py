@@ -124,6 +124,7 @@ class AsyncInsertJob:
         notebook_path: Optional[str] = None,
         notebook_warehouse_id: Optional[str] = None,
         notebook_base_parameters: Optional[Mapping[str, str]] = None,
+        applier: Any = ...,
         schedule: Any = None,
         schedule_timezone: str = "UTC",
         schedule_pause_status: Any = None,
@@ -147,19 +148,38 @@ class AsyncInsertJob:
         caller's overrides. Cron strings are coerced to
         :class:`CronSchedule`; file-arrival trigger watches the table's
         own staging ``data/`` folder unless ``file_arrival_trigger=False``.
+
+        Task wiring follows the first of:
+
+        - ``task=...`` — caller-built :class:`Task` / iterable of tasks
+          drops in verbatim.
+        - ``notebook_path=...`` — wraps a :class:`NotebookTask` carrying
+          the table identity as ``base_parameters``.
+        - ``applier=<callable>`` (default
+          :func:`AsyncInsertJob.apply_records`) — stages the callable's
+          raw source as a workspace ``.py`` file via
+          :func:`stage_python_callable` and returns a
+          :class:`SparkPythonTask` pointed at it. The resulting
+          ``environments`` entry lands on the returned dict so a direct
+          ``Jobs.create_or_update(**settings)`` call is sufficient
+          (no follow-up :meth:`Job.update`). Pass ``applier=None`` to
+          opt out — the returned ``tasks=[]`` is left empty.
         """
         cat, sch, tbl = AsyncInsertJob._identity(table)
 
+        tasks, environments = AsyncInsertJob._resolve_tasks(
+            table=table,
+            task=task,
+            notebook_path=notebook_path,
+            notebook_warehouse_id=notebook_warehouse_id,
+            notebook_base_parameters=notebook_base_parameters,
+            applier=applier,
+            cat=cat, sch=sch, tbl=tbl,
+        )
+
         out: Dict[str, Any] = {
             "name": AsyncInsertJob.job_name(table),
-            "tasks": AsyncInsertJob._resolve_tasks(
-                table=table,
-                task=task,
-                notebook_path=notebook_path,
-                notebook_warehouse_id=notebook_warehouse_id,
-                notebook_base_parameters=notebook_base_parameters,
-                cat=cat, sch=sch, tbl=tbl,
-            ),
+            "tasks": tasks,
             "schedule": AsyncInsertJob._resolve_schedule(
                 schedule=schedule,
                 timezone_id=schedule_timezone,
@@ -174,6 +194,8 @@ class AsyncInsertJob:
             ),
             "tags": dict(tags) if tags else None,
         }
+        if environments:
+            out["environments"] = environments
         if file_arrival_trigger:
             out["trigger"] = TriggerSettings(
                 file_arrival=FileArrivalTriggerConfiguration(
@@ -237,10 +259,19 @@ class AsyncInsertJob:
         notebook_path: Optional[str],
         notebook_warehouse_id: Optional[str],
         notebook_base_parameters: Optional[Mapping[str, str]],
+        applier: Any,
         cat: str, sch: str, tbl: str,
-    ) -> List[Task]:
+    ) -> tuple[List[Task], List[Any]]:
+        """Return ``(tasks, environments)`` for the requested wiring.
+
+        ``environments`` is populated only when staging an applier
+        callable — the matching :class:`JobEnvironment` carries the
+        sniffed pip dependencies so a direct
+        ``Jobs.create_or_update(**settings)`` call resolves them
+        without a follow-up :meth:`Job.update`.
+        """
         if task is not None:
-            return [task] if isinstance(task, Task) else list(task)
+            return ([task] if isinstance(task, Task) else list(task)), []
 
         if notebook_path:
             base_params: Dict[str, str] = {
@@ -261,15 +292,52 @@ class AsyncInsertJob:
                         base_parameters=base_params,
                     ),
                 )
-            ]
+            ], []
 
-        LOGGER.warning(
-            "AsyncInsertJob.settings called without ``task`` or "
-            "``notebook_path`` — the resulting job for %s will have no "
-            "tasks. Attach tasks later via ``Jobs.create_or_update(...)``.",
-            table.full_name(safe=False),
+        if applier is None:
+            return [], []
+
+        if applier is ...:
+            applier = AsyncInsertJob.apply_records
+
+        return AsyncInsertJob._stage_applier(table, applier)
+
+    @staticmethod
+    def _stage_applier(
+        table: "Table", applier: Any,
+    ) -> tuple[List[Task], List[Any]]:
+        """Render *applier*'s source to a workspace ``.py`` and wire its task.
+
+        Returns ``([task], [job_environment])`` — the task points at the
+        staged file via :class:`SparkPythonTask` and the environment
+        carries the sniffed pip specs so the parent Job's serverless
+        backend resolves the ``yggdrasil`` imports at run time.
+        """
+        from yggdrasil.databricks.jobs.task import (
+            DEFAULT_ENVIRONMENT_DEPENDENCIES,
+            DEFAULT_ENVIRONMENT_KEY,
+            _default_job_environment,
+            stage_python_callable,
         )
-        return []
+
+        client = getattr(table, "client", None)
+        if client is None:
+            raise ValueError(
+                f"AsyncInsertJob.settings(applier=...) needs a workspace "
+                f"client to stage the callable — got {table!r} with no "
+                "``client`` attribute. Pass ``applier=None`` to opt out "
+                "or attach a client to the table first."
+            )
+
+        details, extra_deps, _ = stage_python_callable(
+            client, applier,
+        )
+        env_key = getattr(details, "environment_key", None) or DEFAULT_ENVIRONMENT_KEY
+        environment = _default_job_environment(
+            env_key,
+            dependencies=[*DEFAULT_ENVIRONMENT_DEPENDENCIES, *extra_deps],
+        )
+        return [details], [environment]
 
     @staticmethod
     def _resolve_schedule(

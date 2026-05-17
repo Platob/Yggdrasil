@@ -1184,12 +1184,36 @@ class TestAsyncInsertJobSettings:
         with pytest.raises(ValueError):
             AsyncInsertJob.job_name(bare)
 
-    def test_no_task_logs_warning_and_emits_empty_task_list(self):
+    def test_default_applier_is_auto_staged(self):
+        from databricks.sdk.service.jobs import SparkPythonTask
         from yggdrasil.databricks.table.async_job import AsyncInsertJob
 
         tbl, _, _ = self._table_with_trigger_path()
         spec = AsyncInsertJob.settings(tbl)
+        # No explicit ``task=``/``notebook_path=`` → default applier
+        # (:func:`AsyncInsertJob.apply_records`) is staged and wired
+        # as a ``SparkPythonTask``.
+        assert len(spec["tasks"]) == 1
+        task = spec["tasks"][0]
+        assert task.task_key == "apply_records"
+        assert isinstance(task.spark_python_task, SparkPythonTask)
+        assert task.spark_python_task.python_file.endswith(".py")
+        # Matching ``JobEnvironment`` lands on the settings so a direct
+        # ``Jobs.create_or_update(**settings)`` call resolves the
+        # ``yggdrasil`` imports without a follow-up update.
+        assert spec["environments"]
+        env = spec["environments"][0]
+        assert env.environment_key == task.environment_key
+
+    def test_applier_none_emits_empty_task_list(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        tbl, _, _ = self._table_with_trigger_path()
+        spec = AsyncInsertJob.settings(tbl, applier=None)
+        # Opting out of the auto-applier leaves ``tasks=[]`` for the
+        # caller to fill in externally.
         assert spec["tasks"] == []
+        assert "environments" not in spec
 
     def test_namespace_class_cannot_be_instantiated(self):
         from yggdrasil.databricks.table.async_job import AsyncInsertJob
@@ -1230,43 +1254,42 @@ class TestTableAsyncJob:
         jobs_svc.create.assert_not_called()
 
     def test_stages_apply_records_when_job_missing(self):
-        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+        from databricks.sdk.service.jobs import SparkPythonTask
 
         tbl, jobs_svc = self._table()
         jobs_svc.find.return_value = None
+        sentinel = MagicMock(name="Job")
+        jobs_svc.create_or_update.return_value = sentinel
 
-        with patch(
-            "yggdrasil.databricks.jobs.job.Job.from_callable",
-        ) as from_callable:
-            sentinel = MagicMock(name="Job")
-            from_callable.return_value = sentinel
-            result = tbl.async_job()
+        result = tbl.async_job()
 
         assert result is sentinel
-        from_callable.assert_called_once()
-        args, kwargs = from_callable.call_args
-        # Default applier is :func:`AsyncInsertJob.apply_records`.
-        assert args[0] is AsyncInsertJob.apply_records
-        # Settings are splatted into from_callable.
+        jobs_svc.create_or_update.assert_called_once()
+        _, kwargs = jobs_svc.create_or_update.call_args
         assert kwargs["name"] == "ygg-async-insert-cat-sch-tbl"
-        assert kwargs["service"] is jobs_svc
-        # File-arrival trigger lives in the staged kwargs.
+        # File-arrival trigger lives in the spec.
         assert "trigger" in kwargs
-        # ``tasks`` is dropped — from_callable stages the Python task.
-        assert "tasks" not in kwargs
+        # Default applier was staged → ``tasks`` carries a SparkPythonTask
+        # pointed at the workspace ``.py`` file, plus a matching env.
+        assert len(kwargs["tasks"]) == 1
+        task = kwargs["tasks"][0]
+        assert isinstance(task.spark_python_task, SparkPythonTask)
+        assert task.spark_python_task.python_file.endswith(".py")
+        assert kwargs["environments"]
 
     def test_applier_none_creates_tasksless_job(self):
         tbl, jobs_svc = self._table()
         jobs_svc.find.return_value = None
-        jobs_svc.create.return_value = MagicMock(name="Job")
+        jobs_svc.create_or_update.return_value = MagicMock(name="Job")
 
         tbl.async_job(applier=None)
 
-        jobs_svc.create.assert_called_once()
-        _, kwargs = jobs_svc.create.call_args
+        jobs_svc.create_or_update.assert_called_once()
+        _, kwargs = jobs_svc.create_or_update.call_args
         assert kwargs["name"] == "ygg-async-insert-cat-sch-tbl"
         # tasks list is present but empty when no applier wanted.
         assert kwargs["tasks"] == []
+        assert "environments" not in kwargs
 
     def test_explicit_task_skips_default_applier(self):
         """Caller-supplied ``task=`` short-circuits the auto-applier."""
@@ -1274,7 +1297,7 @@ class TestTableAsyncJob:
 
         tbl, jobs_svc = self._table()
         jobs_svc.find.return_value = None
-        jobs_svc.create.return_value = MagicMock(name="Job")
+        jobs_svc.create_or_update.return_value = MagicMock(name="Job")
         custom = Task(
             task_key="custom",
             notebook_task=NotebookTask(notebook_path="/Workspace/custom"),
@@ -1283,24 +1306,22 @@ class TestTableAsyncJob:
         tbl.async_job(task=custom)
 
         # When tasks is non-empty, no auto-staging — direct create.
-        jobs_svc.create.assert_called_once()
-        _, kwargs = jobs_svc.create.call_args
+        jobs_svc.create_or_update.assert_called_once()
+        _, kwargs = jobs_svc.create_or_update.call_args
         assert kwargs["tasks"] == [custom]
+        assert "environments" not in kwargs
 
-    def test_forwards_overrides_to_from_callable(self):
+    def test_forwards_overrides_to_create_or_update(self):
         tbl, jobs_svc = self._table()
         jobs_svc.find.return_value = None
+        jobs_svc.create_or_update.return_value = MagicMock()
 
-        with patch(
-            "yggdrasil.databricks.jobs.job.Job.from_callable",
-        ) as from_callable:
-            from_callable.return_value = MagicMock()
-            tbl.async_job(
-                schedule="0 0 */6 * * ?",
-                file_arrival_trigger=False,
-            )
+        tbl.async_job(
+            schedule="0 0 */6 * * ?",
+            file_arrival_trigger=False,
+        )
 
-        _, kwargs = from_callable.call_args
+        _, kwargs = jobs_svc.create_or_update.call_args
         assert kwargs["schedule"].quartz_cron_expression == "0 0 */6 * * ?"
         assert "trigger" not in kwargs
 

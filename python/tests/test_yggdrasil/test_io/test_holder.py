@@ -307,31 +307,38 @@ class TestWriteStream:
         assert n == 5
         assert (tmp_path / "out.bin").read_bytes() == b"hello"
 
-    def test_atomic_single_write_for_remote_like_backend(self) -> None:
-        """Stream-write must hit ``_write_mv`` exactly once.
+    def test_default_streams_in_chunks(self) -> None:
+        """Default :meth:`Holder._write_stream` is real chunked streaming.
 
-        Remote backends (VolumePath / S3Path) implement ``_write_mv``
-        as an atomic upload + read-modify-rewrite for non-zero pos —
-        anything that chunks a stream into per-chunk
-        ``write_mv(...,pos=cursor)`` calls would devolve into N
-        downloads + N uploads. This test pins the contract.
+        Multi-MB sources splice into the target through
+        :data:`_COPY_CHUNK`-sized (1 MiB) ``write_mv`` calls. Remote
+        backends that prefer a single atomic PUT (Volumes,
+        Workspace, DBFS) override :meth:`_write_stream` to pass
+        the IO straight to their backend uploader; this test pins
+        the default.
         """
         import io as _stdio
+        from unittest.mock import patch
+
         m = Memory()
         calls: list[int] = []
-        original = type(m)._write_mv
+        original = type(m).write_mv
 
-        def _spy(self, data, pos):
-            calls.append(len(data))
-            return original(self, data, pos)
+        def _spy(self, data, offset, *, size=-1, overwrite=False, update_stat=True):
+            if self is m:
+                calls.append(len(data))
+            return original(
+                self, data, offset, size=size, overwrite=overwrite, update_stat=update_stat,
+            )
 
-        type(m)._write_mv = _spy
-        try:
+        with patch.object(type(m), "write_mv", _spy):
             m.write_stream(_stdio.BytesIO(b"x" * (4 * 1024 * 1024)))
-        finally:
-            type(m)._write_mv = original
 
-        assert calls == [4 * 1024 * 1024]
+        # 4 MiB source, 1 MiB chunk → 4 round trips to the target's
+        # ``write_mv``. (The coercion drain into a wrapper holder
+        # may issue additional smaller writes against a DIFFERENT
+        # Memory instance — ignored by the ``self is m`` filter.)
+        assert calls == [1024 * 1024] * 4
 
     def test_empty_stream_is_noop(self) -> None:
         import io as _stdio
@@ -340,11 +347,11 @@ class TestWriteStream:
         assert n == 0
         assert m.read_bytes() == b"keep"
 
-    def test_negative_pos_raises(self) -> None:
+    def test_negative_offset_raises(self) -> None:
         import io as _stdio
         m = Memory()
-        with pytest.raises(ValueError, match="pos must be >= 0"):
-            m.write_stream(_stdio.BytesIO(b"x"), pos=-1)
+        with pytest.raises(ValueError, match="offset must be >= 0"):
+            m.write_stream(_stdio.BytesIO(b"x"), offset=-1)
 
 
 class TestHolderTabular:
@@ -371,44 +378,228 @@ class TestHolderTabular:
         ]
 
 
-class TestHolderTransfer:
-    """``Holder.upload`` / ``Holder.download`` accept Holder/IO/str/PathLike."""
+class TestWriteHolder:
+    """``Holder.write_holder`` size-aware splice — inline below 4 MiB,
+    chunked stream above."""
 
-    def test_memory_uploads_to_str_path(self, tmp_path) -> None:
-        mem = Memory()
-        mem.write_bytes(b"payload")
-        out = mem.upload(str(tmp_path / "dst.bin"))
-        assert isinstance(out, LocalPath)
-        assert out.read_bytes() == b"payload"
+    def test_small_holder_writes_inline_via_write_mv(self) -> None:
+        """Sub-threshold payloads go through one ``write_mv`` call —
+        backends with cheap whole-blob writes skip the stream loop."""
+        src = Memory()
+        src.write_bytes(b"small-payload")  # 13 bytes, well under 4 MiB
 
-    def test_memory_uploads_to_io_cursor(self) -> None:
+        dst = Memory()
+        calls: list[int] = []
+        original = type(dst).write_mv
+
+        def _spy(self, data, offset, *, size=-1, overwrite=False, update_stat=True):
+            if self is dst:
+                calls.append(len(data))
+            return original(
+                self, data, offset, size=size, overwrite=overwrite, update_stat=update_stat,
+            )
+
+        from unittest.mock import patch
+
+        with patch.object(type(dst), "write_mv", _spy):
+            dst.write_holder(src)
+
+        assert dst.read_bytes() == b"small-payload"
+        # Exactly one write_mv into dst — single-shot inline.
+        assert calls == [len(b"small-payload")]
+
+    def test_large_holder_streams_via_chunks(self) -> None:
+        """Above-threshold payloads route through ``_write_stream`` —
+        chunked 1 MiB writes instead of one giant ``write_mv``."""
+        payload = b"x" * (5 * 1024 * 1024)  # 5 MiB > 4 MiB threshold
+        src = Memory()
+        src.write_bytes(payload)
+
+        dst = Memory()
+        calls: list[int] = []
+        original = type(dst).write_mv
+
+        def _spy(self, data, offset, *, size=-1, overwrite=False, update_stat=True):
+            if self is dst:
+                calls.append(len(data))
+            return original(
+                self, data, offset, size=size, overwrite=overwrite, update_stat=update_stat,
+            )
+
+        from unittest.mock import patch
+
+        with patch.object(type(dst), "write_mv", _spy):
+            dst.write_holder(src)
+
+        assert dst.read_bytes() == payload
+        # 5 MiB in 1 MiB chunks → 5 writes; never a single 5 MiB blob.
+        assert all(c <= 1024 * 1024 for c in calls)
+        assert sum(calls) == 5 * 1024 * 1024
+
+    def test_write_bytes_dispatches_holder_input(self) -> None:
+        """``write_bytes(holder)`` routes through ``write_holder``."""
+        src = Memory()
+        src.write_bytes(b"hello")
+        dst = Memory()
+        dst.write_bytes(src)
+        assert dst.read_bytes() == b"hello"
+
+    def test_rejects_non_holder_source(self) -> None:
+        dst = Memory()
+        with pytest.raises(TypeError, match="Holder source"):
+            dst.write_holder(b"not-a-holder")  # type: ignore[arg-type]
+
+    def test_size_caps_bytes_from_holder_source(self) -> None:
+        """``size>=0`` caps the byte count pulled from a Holder source."""
+        src = Memory()
+        src.write_bytes(b"abcdefghij")  # 10 bytes
+        dst = Memory()
+        dst.write_holder(src, size=4)
+        assert dst.read_bytes() == b"abcd"
+
+    def test_size_caps_bytes_in_write_bytes_dispatch(self) -> None:
+        """``write_bytes(holder, size=N)`` forwards the cap to write_holder."""
+        src = Memory()
+        src.write_bytes(b"abcdefghij")
+        dst = Memory()
+        dst.write_bytes(src, size=3)
+        assert dst.read_bytes() == b"abc"
+
+    def test_size_caps_bytes_in_stream_dispatch(self) -> None:
+        """``write_stream(src, size=N)`` stops reading after N bytes."""
+        import io as _stdio
+        dst = Memory()
+        dst.write_stream(_stdio.BytesIO(b"abcdefghij"), size=5)
+        assert dst.read_bytes() == b"abcde"
+
+    def test_size_caps_bytes_in_write_mv(self) -> None:
+        """``write_mv(data, size=N)`` slices the buffer before splicing."""
+        dst = Memory()
+        dst.write_mv(memoryview(b"abcdefghij"), size=2)
+        assert dst.read_bytes() == b"ab"
+
+    def test_overwrite_drops_tail(self) -> None:
+        """``write_bytes(data, overwrite=True)`` truncates trailing bytes."""
+        dst = Memory()
+        dst.write_bytes(b"x" * 100)
+        assert dst.size == 100
+        dst.write_bytes(b"new", overwrite=True)
+        # Tail gone — holder is exactly the new payload.
+        assert dst.size == 3
+        assert dst.read_bytes() == b"new"
+
+    def test_overwrite_with_offset_preserves_head(self) -> None:
+        """``overwrite=True`` at non-zero offset keeps bytes before the
+        offset and truncates everything after the new write."""
+        dst = Memory()
+        dst.write_bytes(b"ABCDEFGHIJ")
+        dst.write_bytes(b"xy", offset=3, overwrite=True)
+        # Bytes [0,3) preserved, [3,5) replaced, [5,10) dropped.
+        assert dst.read_bytes() == b"ABCxy"
+
+    def test_overwrite_through_write_holder_dispatch(self) -> None:
+        src = Memory()
+        src.write_bytes(b"short")
+        dst = Memory()
+        dst.write_bytes(b"x" * 50)
+        dst.write_bytes(src, overwrite=True)
+        # write_bytes(Holder) → write_holder → write_mv with overwrite.
+        assert dst.read_bytes() == b"short"
+
+    def test_overwrite_through_write_stream_dispatch(self) -> None:
+        import io as _stdio
+        dst = Memory()
+        dst.write_bytes(b"x" * 50)
+        dst.write_stream(_stdio.BytesIO(b"streamed"), overwrite=True)
+        assert dst.read_bytes() == b"streamed"
+
+    def test_batch_size_drives_chunked_reads(self) -> None:
+        """``write_stream(src, batch_size=N)`` reads N bytes per chunk."""
         from yggdrasil.io.bytes_io import BytesIO
 
+        with BytesIO() as src:
+            src.write_bytes(b"x" * 32)
+            src.seek(0)
+
+            reads: list[int] = []
+            original = src.read
+
+            def spy_read(size=-1):
+                chunk = original(size)
+                reads.append(len(chunk))
+                return chunk
+
+            src.read = spy_read  # type: ignore[method-assign]
+
+            dst = Memory()
+            dst.write_stream(src, batch_size=8)
+
+        # 32-byte source consumed in 8-byte chunks → 4 reads of 8 +
+        # one trailing 0-byte EOF read.
+        assert [n for n in reads if n > 0] == [8, 8, 8, 8]
+
+    def test_batch_size_must_be_positive(self) -> None:
+        dst = Memory()
+        with pytest.raises(ValueError, match="batch_size must be > 0"):
+            import io as _stdio
+            dst.write_stream(_stdio.BytesIO(b"x"), batch_size=0)
+
+
+class TestHolderTransfer:
+    """``Holder.upload`` / ``Holder.download`` accept Holder/IO/str/PathLike.
+
+    ``dst.upload(src)`` pulls *src*'s bytes into *dst* (the
+    receiver's content becomes the source's). The mirror
+    ``src.download(target)`` keeps the old src→target direction.
+    """
+
+    def test_path_pulls_bytes_from_memory(self, tmp_path) -> None:
         mem = Memory()
         mem.write_bytes(b"payload")
-        with BytesIO() as bio:
-            out = mem.upload(bio)
-            assert out is bio
-            assert bio.to_bytes() == b"payload"
+        dst = LocalPath(str(tmp_path / "dst.bin"))
+        out = dst.upload(mem)
+        assert out is dst
+        assert dst.read_bytes() == b"payload"
 
-    def test_memory_uploads_to_holder(self) -> None:
+    def test_path_pulls_bytes_from_str_source(self, tmp_path) -> None:
+        # Source is a str/PathLike → coerced via ``Path.from_``.
+        src_path = tmp_path / "src.bin"
+        src_path.write_bytes(b"payload")
+        dst = LocalPath(str(tmp_path / "dst.bin"))
+        out = dst.upload(str(src_path))
+        assert out is dst
+        assert dst.read_bytes() == b"payload"
+
+    def test_memory_pulls_bytes_from_io_cursor(self) -> None:
+        from yggdrasil.io.bytes_io import BytesIO
+
+        with BytesIO() as bio:
+            bio.write_bytes(b"payload")
+            bio.seek(0)  # Caller positions the cursor; upload reads from there.
+            mem = Memory()
+            out = mem.upload(bio)
+        assert out is mem
+        assert mem.read_bytes() == b"payload"
+
+    def test_memory_pulls_bytes_from_holder(self) -> None:
         # Holder→Holder via the abstract path; both ends are in-process
         # Memory, so the generic bytes-copy fallback runs.
         src = Memory()
         src.write_bytes(b"payload")
         dst = Memory()
-        out = src.upload(dst)
+        out = dst.upload(src)
         assert out is dst
         assert dst.read_bytes() == b"payload"
 
     def test_trailing_slash_target_appends_filename(self, tmp_path) -> None:
-        # The trailing-slash directory hint also applies when the
-        # source is a Memory holder — the fallback filename is
-        # "download" because Memory URLs carry no meaningful name.
+        # The trailing-slash directory hint applies on the target side
+        # — the source's filename is joined onto the directory. Memory
+        # URLs carry no meaningful name so the fallback is "download".
         mem = Memory()
         mem.write_bytes(b"payload")
         (tmp_path / "sub").mkdir()
-        out = mem.upload(str(tmp_path / "sub") + "/")
+        dst_dir = LocalPath(str(tmp_path / "sub") + "/")
+        out = dst_dir.upload(mem)
         assert out.name == "download"
         assert out.read_bytes() == b"payload"
 
@@ -424,11 +615,137 @@ class TestHolderTransfer:
         assert out.name == "download"
         assert out.read_bytes() == b"payload"
 
-    def test_upload_rejects_unsupported_type(self) -> None:
+    def test_upload_rejects_unsupported_source_type(self) -> None:
         mem = Memory()
-        mem.write_bytes(b"payload")
         with pytest.raises(TypeError, match="Holder, IO, str, or os.PathLike"):
             mem.upload(42)
+
+    def test_upload_slices_source_with_size_and_offset(self) -> None:
+        src = Memory()
+        src.write_bytes(b"abcdef")
+        dst = Memory()
+        dst.upload(src, size=3, offset=2)
+        # 3 bytes starting at offset 2 → "cde".
+        assert dst.read_bytes() == b"cde"
+
+    def test_download_slices_source_with_size_and_offset(self) -> None:
+        src = Memory()
+        src.write_bytes(b"abcdef")
+        dst = Memory()
+        src.download(dst, size=2, offset=4)
+        assert dst.read_bytes() == b"ef"
+
+    def test_upload_from_io_honors_offset(self) -> None:
+        from yggdrasil.io.bytes_io import BytesIO
+
+        with BytesIO() as bio:
+            bio.write_bytes(b"abcdef")
+            # ``offset`` seeks the cursor; ``size`` caps the read.
+            mem = Memory()
+            mem.upload(bio, size=2, offset=1)
+        assert mem.read_bytes() == b"bc"
+
+
+class TestIOTransfer:
+    """``IO.upload`` / ``IO.download`` are cursor-anchored mirrors of Holder's."""
+
+    def test_io_upload_writes_at_cursor_and_advances(self) -> None:
+        from yggdrasil.io.bytes_io import BytesIO
+
+        src = Memory()
+        src.write_bytes(b"src-payload")
+
+        with BytesIO() as io:
+            io.write_bytes(b"PRE-")
+            cursor_before = io.tell()
+            io.upload(src)
+            # Cursor advanced by the written byte count.
+            assert io.tell() == cursor_before + src.size
+            io.seek(0)
+            assert io.read() == b"PRE-src-payload"
+
+    def test_io_upload_slices_source_by_size_and_offset(self) -> None:
+        from yggdrasil.io.bytes_io import BytesIO
+
+        src = Memory()
+        src.write_bytes(b"abcdef")
+
+        with BytesIO() as io:
+            io.upload(src, size=3, offset=2)
+            io.seek(0)
+            assert io.read() == b"cde"
+
+    def test_io_download_reads_from_cursor(self) -> None:
+        from yggdrasil.io.bytes_io import BytesIO
+
+        with BytesIO() as io:
+            io.write_bytes(b"abcdef")
+            io.seek(2)  # cursor at 'c'
+            dst = Memory()
+            io.download(dst, size=3)
+            assert dst.read_bytes() == b"cde"
+            # Cursor advanced past the read.
+            assert io.tell() == 5
+
+    def test_io_download_offset_is_cursor_relative(self) -> None:
+        from yggdrasil.io.bytes_io import BytesIO
+
+        with BytesIO() as io:
+            io.write_bytes(b"abcdef")
+            io.seek(1)
+            dst = Memory()
+            # cursor=1 + offset=2 → read starts at index 3 → "de"
+            io.download(dst, size=2, offset=2)
+            assert dst.read_bytes() == b"de"
+
+    def test_io_write_holder_advances_cursor(self) -> None:
+        """``IO.write_holder(src)`` splices at cursor and advances."""
+        from yggdrasil.io.bytes_io import BytesIO
+
+        src = Memory()
+        src.write_bytes(b"src-bytes")  # 9 bytes
+        with BytesIO() as io:
+            io.write_bytes(b"PRE-")
+            cursor_before = io.tell()
+            io.write_holder(src)
+            assert io.tell() == cursor_before + src.size
+            io.seek(0)
+            assert io.read() == b"PRE-src-bytes"
+
+    def test_io_write_holder_honors_size_cap(self) -> None:
+        from yggdrasil.io.bytes_io import BytesIO
+
+        src = Memory()
+        src.write_bytes(b"abcdefghij")
+        with BytesIO() as io:
+            io.write_holder(src, size=4)
+            assert io.tell() == 4
+            io.seek(0)
+            assert io.read() == b"abcd"
+
+    def test_io_write_stream_honors_batch_size(self) -> None:
+        """``IO.write_stream(src, batch_size=N)`` threads through Holder."""
+        from yggdrasil.io.bytes_io import BytesIO
+
+        with BytesIO() as src:
+            src.write_bytes(b"x" * 16)
+            src.seek(0)
+
+            reads: list[int] = []
+            original = src.read
+
+            def spy_read(size=-1):
+                chunk = original(size)
+                reads.append(len(chunk))
+                return chunk
+
+            src.read = spy_read  # type: ignore[method-assign]
+
+            with BytesIO() as dst:
+                dst.write_stream(src, batch_size=4)
+
+        # 16 bytes / 4-byte batches → 4 reads of 4.
+        assert [n for n in reads if n > 0] == [4, 4, 4, 4]
 
 
 class TestPathTransferOptimization:
@@ -453,16 +770,19 @@ class TestPathTransferOptimization:
 
         src = LocalPath(str(tmp_path / "src.bin"))
         src.write_bytes(b"payload")
-        out = src.upload(str(tmp_path / "dst.bin"))
-        assert calls == [(src.os_path, out.os_path)]
-        assert out.read_bytes() == b"payload"
+        dst = LocalPath(str(tmp_path / "dst.bin"))
+        out = dst.upload(src)
+        assert out is dst
+        assert calls == [(src.os_path, dst.os_path)]
+        assert dst.read_bytes() == b"payload"
 
     def test_local_to_holder_uses_write_local_path(
         self, tmp_path, monkeypatch,
     ) -> None:
-        # When self is local and target is a non-IO holder (here
-        # Memory), the override routes through Holder.write_local_path
-        # so multi-GB transfers don't materialise the whole payload.
+        # When the source is local and the destination is a non-IO
+        # holder (here Memory), the Path._transfer_to override routes
+        # through Holder.write_local_path so multi-GB transfers don't
+        # materialise the whole payload.
         seen: list[str] = []
         real = Memory.write_local_path
 
@@ -475,7 +795,7 @@ class TestPathTransferOptimization:
         src = LocalPath(str(tmp_path / "src.bin"))
         src.write_bytes(b"payload")
         mem = Memory()
-        out = src.upload(mem)
+        out = mem.upload(src)
         assert out is mem
         assert seen == [src.os_path]
         assert mem.read_bytes() == b"payload"
@@ -493,7 +813,7 @@ class TestPathDirectoryTransfer:
         (src / "b.bin").write_bytes(b"b")
 
         dst = LocalPath(str(tmp_path / "dst"))
-        out = src.upload(dst)
+        out = dst.upload(src)
 
         assert out == dst
         assert dst.is_dir()
@@ -509,7 +829,7 @@ class TestPathDirectoryTransfer:
         (src / "sub" / "leaf.bin").write_bytes(b"leaf")
 
         dst = LocalPath(str(tmp_path / "dst"))
-        src.upload(dst)
+        dst.upload(src)
 
         assert (dst / "top.bin").read_bytes() == b"top"
         assert (dst / "sub").is_dir()
@@ -523,7 +843,7 @@ class TestPathDirectoryTransfer:
 
         dst_dir = tmp_path / "dst"
         dst_dir.mkdir()
-        out = src.upload(str(dst_dir) + "/")
+        out = LocalPath(str(dst_dir) + "/").upload(src)
 
         assert out.name == "src"
         assert (out / "a.bin").read_bytes() == b"a"
@@ -533,21 +853,10 @@ class TestPathDirectoryTransfer:
         src.mkdir()
 
         dst = LocalPath(str(tmp_path / "dst"))
-        out = src.upload(dst)
+        out = dst.upload(src)
 
         assert out.is_dir()
         assert not any(out.iterdir())
-
-    def test_directory_into_io_cursor_raises(self, tmp_path) -> None:
-        from yggdrasil.io.bytes_io import BytesIO
-
-        src = LocalPath(str(tmp_path / "src"))
-        src.mkdir()
-        (src / "a.bin").write_bytes(b"a")
-
-        with BytesIO() as bio:
-            with pytest.raises(IsADirectoryError, match="IO cursor"):
-                src.upload(bio)
 
     def test_directory_into_memory_raises(self, tmp_path) -> None:
         src = LocalPath(str(tmp_path / "src"))
@@ -555,7 +864,7 @@ class TestPathDirectoryTransfer:
         (src / "a.bin").write_bytes(b"a")
 
         with pytest.raises(IsADirectoryError, match="target must be a Path"):
-            src.upload(Memory())
+            Memory().upload(src)
 
     def test_default_download_creates_directory_under_downloads(
         self, tmp_path, monkeypatch,

@@ -141,16 +141,16 @@ class TestSeekable:
     def test_reread_within_window(self) -> None:
         s = MemoryStream(b"abcdefghij", byte_size=64)
         # Force a pull.
-        assert s.read_bytes(n=5, pos=0) == b"abcde"
+        assert s.read_bytes(size=5, offset=0) == b"abcde"
         # Seek back inside the window — same bytes come back.
-        assert s.read_bytes(n=3, pos=2) == b"cde"
-        assert s.read_bytes(n=10, pos=0) == b"abcdefghij"
+        assert s.read_bytes(size=3, offset=2) == b"cde"
+        assert s.read_bytes(size=10, offset=0) == b"abcdefghij"
 
     def test_read_past_window_start_raises(self) -> None:
         s = MemoryStream(b"x" * 200, byte_size=64)
-        s._pull_to_eof()  # window is now [136, 200)
-        with pytest.raises(ValueError, match="behind the live window"):
-            s.read_bytes(n=10, pos=0)
+        s._pull_to_eof()  # retained is now [136, 200)
+        with pytest.raises(ValueError, match="behind the retained region"):
+            s.read_bytes(size=10, offset=0)
 
     def test_read_within_window_after_slide(self) -> None:
         # Emit 200 bytes through a 64-byte window; bytes [136, 200)
@@ -160,8 +160,8 @@ class TestSeekable:
         s._pull_to_eof()
         assert s.window_start == 136
         # Position at window_start is the first valid offset.
-        assert s.read_bytes(n=10, pos=136) == payload[136:146]
-        assert s.read_bytes(n=64, pos=136) == payload[136:200]
+        assert s.read_bytes(size=10, offset=136) == payload[136:146]
+        assert s.read_bytes(size=64, offset=136) == payload[136:200]
 
     def test_seek_end_sentinel(self) -> None:
         s = MemoryStream(b"hello", byte_size=64)
@@ -174,38 +174,38 @@ class TestSeekable:
         # Drain so size is known.
         s.read_bytes()
         # pos=-2 -> size-2 = 4 -> "ef"
-        assert s.read_bytes(n=2, pos=-2) == b"ef"
+        assert s.read_bytes(size=2, offset=-2) == b"ef"
 
 
 class TestEOF:
     def test_read_to_eof_with_negative_n(self) -> None:
         s = MemoryStream(b"abcdef", byte_size=64)
-        assert s.read_bytes(n=-1, pos=0) == b"abcdef"
+        assert s.read_bytes(size=-1, offset=0) == b"abcdef"
         assert s.eof
 
     def test_read_more_than_available_caps_at_eof(self) -> None:
         s = MemoryStream(b"abc", byte_size=64)
         # Asking for 100 bytes returns only 3.
-        assert s.read_bytes(n=100, pos=0) == b"abc"
+        assert s.read_bytes(size=100, offset=0) == b"abc"
 
     def test_partial_pull_then_eof(self) -> None:
         # Source yields one chunk then signals EOF on the next call.
         chunks = iter([b"first", b""])
         s = MemoryStream(lambda n: next(chunks, b""), byte_size=64)
-        assert s.read_bytes(n=10, pos=0) == b"first"
+        assert s.read_bytes(size=10, offset=0) == b"first"
         assert s.eof
 
 
 class TestWrite:
     def test_append_at_end(self) -> None:
         s = MemoryStream(byte_size=64)
-        n = s.write_bytes(b"hello", pos=0)
+        n = s.write_bytes(b"hello", offset=0)
         assert n == 5
-        assert s.read_bytes(n=5, pos=0) == b"hello"
+        assert s.read_bytes(size=5, offset=0) == b"hello"
 
     def test_append_slides_window(self) -> None:
         s = MemoryStream(byte_size=8)
-        s.write_bytes(b"abcdefghij", pos=0)  # 10 bytes
+        s.write_bytes(b"abcdefghij", offset=0)  # 10 bytes
         assert s.size == 10
         assert s.window_start == 2
         assert bytes(s.memoryview()) == b"cdefghij"
@@ -213,19 +213,19 @@ class TestWrite:
     def test_overwrite_within_window(self) -> None:
         s = MemoryStream(b"abcdef", byte_size=64)
         s.read_bytes()
-        s.write_bytes(b"XY", pos=2)
-        assert s.read_bytes(n=6, pos=0) == b"abXYef"
+        s.write_bytes(b"XY", offset=2)
+        assert s.read_bytes(size=6, offset=0) == b"abXYef"
 
     def test_write_behind_window_raises(self) -> None:
         s = MemoryStream(byte_size=4)
-        s.write_bytes(b"abcdefgh", pos=0)  # window = [4, 8)
+        s.write_bytes(b"abcdefgh", offset=0)  # window = [4, 8)
         with pytest.raises(ValueError, match="behind the live window"):
-            s.write_bytes(b"!", pos=0)
+            s.write_bytes(b"!", offset=0)
 
     def test_write_past_end_raises(self) -> None:
         s = MemoryStream(byte_size=64)
         with pytest.raises(ValueError, match="past current end"):
-            s.write_bytes(b"x", pos=10)
+            s.write_bytes(b"x", offset=10)
 
 
 class TestTruncateClearReserve:
@@ -241,12 +241,12 @@ class TestTruncateClearReserve:
         s.read_bytes()
         s.truncate(6)
         assert s.size == 6
-        assert s.read_bytes(n=6, pos=0) == b"abc\x00\x00\x00"
+        assert s.read_bytes(size=6, offset=0) == b"abc\x00\x00\x00"
 
     def test_truncate_below_window_start_raises(self) -> None:
         s = MemoryStream(byte_size=4)
-        s.write_bytes(b"abcdefgh", pos=0)  # window_start = 4
-        with pytest.raises(ValueError, match="behind the live window start"):
+        s.write_bytes(b"abcdefgh", offset=0)  # spill_start = 4
+        with pytest.raises(ValueError, match="behind the retained region"):
             s.truncate(2)
 
     def test_truncate_negative_raises(self) -> None:
@@ -256,7 +256,7 @@ class TestTruncateClearReserve:
 
     def test_clear_resets_window(self) -> None:
         s = MemoryStream(byte_size=4)
-        s.write_bytes(b"abcdef", pos=0)
+        s.write_bytes(b"abcdef", offset=0)
         s.clear()
         assert s.size == 0
         assert s.window_start == 0
@@ -271,6 +271,94 @@ class TestTruncateClearReserve:
         s = MemoryStream(byte_size=64)
         with pytest.raises(ValueError, match="reserve size must be >= 0"):
             s.reserve(-1)
+
+
+class TestSpill:
+    """``spill_threshold`` caps in-memory bytes; cold bytes spill to disk.
+
+    Spill only activates when ``byte_size > spill_threshold``;
+    otherwise the holder collapses to the legacy single-window
+    eviction shape (covered by :class:`TestWindowSlide`).
+    """
+
+    def test_no_spill_below_threshold(self) -> None:
+        # 100 bytes total, threshold 1 KiB → wholly in-memory.
+        s = MemoryStream(b"x" * 100, byte_size=4096, spill_threshold=1024)
+        s._pull_to_eof()
+        assert not s.has_spill
+        assert s.spill_start == 0
+        assert s.window_start == 0
+
+    def test_spill_above_threshold_keeps_bytes_readable(self) -> None:
+        # 300 bytes, in-memory cap 100, total budget 1 KiB → cold
+        # bytes spill to disk but stay readable.
+        payload = bytes(range(256)) + b"abcdefghijklmnopqrstuvwxyz" * 2  # 308 bytes
+        payload = payload[:300]
+        s = MemoryStream(payload, byte_size=1024, spill_threshold=100)
+        s._pull_to_eof()
+
+        assert s.has_spill
+        # Total retention fits in 1 KiB → spill_start stayed at 0.
+        assert s.spill_start == 0
+        # In-memory window is the trailing ≤ 100 bytes; spill holds
+        # the head.
+        assert s.window_start <= 200
+        assert s.size == 300
+
+        # Reads from the spill region still return the original bytes.
+        assert s.read_bytes(size=10, offset=0) == payload[:10]
+        # Cross-boundary read — spans spill into memory.
+        cross_start = s.window_start - 5
+        assert s.read_bytes(size=10, offset=cross_start) == payload[
+            cross_start:cross_start + 10
+        ]
+        # In-memory read.
+        assert s.read_bytes(size=20, offset=s.window_start) == payload[
+            s.window_start:s.window_start + 20
+        ]
+
+    def test_retention_cap_evicts_oldest(self) -> None:
+        # 500 bytes, in-memory 50, total 200. Once spill + memory
+        # would exceed 200, the oldest spilled bytes are evicted —
+        # reads behind ``spill_start`` raise.
+        payload = bytes((i % 256) for i in range(500))
+        s = MemoryStream(payload, byte_size=200, spill_threshold=50)
+        s._pull_to_eof()
+
+        # Total retention bounded at 200 bytes.
+        assert s.size - s.spill_start <= 200
+        assert s.spill_start == 500 - (s.size - s.spill_start)
+
+        # Reads in the retained region work and return the right slice.
+        head = s.spill_start
+        assert s.read_bytes(size=10, offset=head) == payload[head:head + 10]
+
+        # Reads behind ``spill_start`` raise — the bytes are gone.
+        with pytest.raises(ValueError, match="behind the retained region"):
+            s.read_bytes(size=10, offset=0)
+
+    def test_clear_drops_spill_file(self) -> None:
+        s = MemoryStream(b"x" * 300, byte_size=1024, spill_threshold=100)
+        s._pull_to_eof()
+        assert s.has_spill
+        s.clear()
+        assert not s.has_spill
+        assert s.size == 0
+        assert s.window_start == 0
+        assert s.spill_start == 0
+
+    def test_truncate_into_spill_drops_memory_and_shrinks_spill(self) -> None:
+        s = MemoryStream(b"x" * 300, byte_size=1024, spill_threshold=100)
+        s._pull_to_eof()
+        spill_size = s.window_start - s.spill_start
+        assert spill_size > 0
+        # Truncate to a point inside the spill region.
+        target = s.spill_start + spill_size // 2
+        s.truncate(target)
+        assert s.size == target
+        # In-memory window dropped, spill shrunk.
+        assert s.window_start == target
+        assert len(s.memoryview()) == 0
 
 
 class TestHolderIntegration:

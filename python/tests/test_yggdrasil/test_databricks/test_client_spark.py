@@ -154,7 +154,7 @@ class TestWorkspacePyPIRegistry:
         store: dict[str, bytes] = {}
         writes: list[str] = []
 
-        def fake_write_bytes(self, data, pos=0):
+        def fake_write_bytes(self, data, offset=0):
             store[self.full_path()] = bytes(data)
             writes.append(self.full_path())
             return len(data)
@@ -165,9 +165,9 @@ class TestWorkspacePyPIRegistry:
         def fake_exists(self):
             return self.full_path() in store
 
-        def fake_read_bytes(self, n=-1, pos=0):
+        def fake_read_bytes(self, size=-1, offset=0):
             data = store[self.full_path()]
-            return data if n < 0 else data[pos:pos + n]
+            return data if size < 0 else data[offset:offset + size]
 
         monkeypatch.setattr(WorkspacePath, "write_bytes", fake_write_bytes)
         monkeypatch.setattr(WorkspacePath, "mkdir", fake_mkdir)

@@ -2975,50 +2975,28 @@ class Table(DatabricksPath):
         (``schedule=``, ``file_arrival_trigger=``, ``parameters=``,
         …).
 
-        When the job is missing the default
-        :func:`AsyncInsertJob.apply_records` callable is staged as
-        the task body — its source is uploaded under the workspace
-        user's ``.ygg/jobs/`` folder via
-        :meth:`JobTask.from_callable`. Pass ``applier=my_func`` to
-        stage a custom callable instead, or ``applier=None`` to
-        leave the job tasks-less (useful when wiring tasks
-        externally via a notebook_path override).
+        :meth:`AsyncInsertJob.settings` auto-stages
+        :func:`AsyncInsertJob.apply_records` as the default task —
+        the source is uploaded under
+        ``/Workspace/Shared/.ygg/jobs/<key>/main-<digest>.py`` and a
+        matching :class:`JobEnvironment` lands on ``environments``.
+        Pass ``applier=my_func`` to stage a custom callable instead,
+        or ``applier=None`` to leave the job tasks-less.
         """
-        from yggdrasil.databricks.jobs.job import Job
         from .async_job import AsyncInsertJob
 
-        settings = AsyncInsertJob.settings(self, **overrides)
-        name = settings.pop("name")
         jobs = self.client.jobs
 
-        # Existing job → return it unchanged.
-        found = jobs.find(name=name)
+        # Pre-check before staging the applier — an existing job
+        # short-circuits the workspace write entirely.
+        prelim_name = AsyncInsertJob.job_name(self)
+        found = jobs.find(name=prelim_name)
         if found is not None:
             return found
 
-        # Resolve applier default. ``...`` (sentinel) → fall back to
-        # ``AsyncInsertJob.apply_records`` unless the caller already
-        # wired tasks through ``settings`` (an explicit
-        # ``task=``/``notebook_path=`` override on the deploy kwargs).
-        explicit_tasks = bool(settings.get("tasks"))
-        if applier is ...:
-            applier = None if explicit_tasks else AsyncInsertJob.apply_records
-
-        if applier is None:
-            # No applier wanted — create with whatever tasks settings
-            # produced (possibly empty).
-            return jobs.create(name=name, **settings)
-
-        # Drop the (empty) tasks list — ``from_callable`` will stage
-        # the applier as a real Python task on top of the otherwise-
-        # tasks-less job.
-        settings.pop("tasks", None)
-        return Job.from_callable(
-            applier,
-            name=name,
-            service=jobs,
-            **settings,
-        )
+        settings = AsyncInsertJob.settings(self, applier=applier, **overrides)
+        name = settings.pop("name")
+        return jobs.create_or_update(name=name, **settings)
 
     def async_insert(
         self,

@@ -316,7 +316,13 @@ class TestArrowIPCOverVolume:
             )
 
         def upload(*, file_path, contents, overwrite):
-            store["buf"] = contents.getvalue()
+            # ``contents`` is bytes when caller passes a bytes-like
+            # payload, otherwise a stream — accept both shapes.
+            store["buf"] = (
+                bytes(contents)
+                if isinstance(contents, (bytes, bytearray, memoryview))
+                else contents.read()
+            )
 
         ws.files.get_metadata.side_effect = get_metadata
         ws.files.get_directory_metadata.side_effect = get_directory_metadata

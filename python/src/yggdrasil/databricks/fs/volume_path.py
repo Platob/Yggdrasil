@@ -35,7 +35,6 @@ quota burn for the bulk transfer.
 from __future__ import annotations
 
 import datetime as dt
-import io as _stdio
 import logging
 import os
 import re
@@ -870,6 +869,24 @@ class VolumePath(DatabricksPath):
             data = data[:n]
         return memoryview(data)
 
+    def _write_stream(
+        self, src: Any, *, offset: int, size: int = -1, **kwargs: Any,
+    ) -> int:
+        """Override the base chunked stream — Volumes wants one PUT.
+
+        The Files API does whole-object PUTs only, so a chunked
+        :meth:`Holder._write_stream` would issue one RMW per
+        chunk. Hand the live :class:`IO[bytes]` to :meth:`_upload`
+        which does seek-on-retry around a single ``files.upload``
+        call. ``size>=0`` (capped read) or non-zero ``offset``
+        fall back to the chunked base path because the API can't
+        splice at a range. ``batch_size`` only matters for that
+        fallback — the atomic upload doesn't chunk.
+        """
+        if offset != 0 or size >= 0:
+            return super()._write_stream(src, offset=offset, size=size, **kwargs)
+        return self._upload(src)
+
     def _write_mv(self, data: memoryview, pos: int) -> int:
         n = len(data)
         if n == 0:
@@ -892,26 +909,50 @@ class VolumePath(DatabricksPath):
         self._upload(payload)
         return n
 
-    def _upload(self, payload: bytes) -> None:
-        size = len(payload)
+    def _upload(self, content: Any) -> int:
+        """Upload *content* through ``files.upload`` with retry semantics.
 
+        Accepts either a bytes-like payload or a seekable binary
+        stream. Streams ride through to the SDK verbatim — no
+        eager ``read()`` into a buffer — and get rewound to origin
+        on every retry so transient-error / parent-recovery
+        re-tries PUT the full body, not an empty tail. Bytes-like
+        payloads pass through directly; ``FilesExt.upload`` builds
+        a fresh PUT body per request from the same ``bytes``.
+
+        Returns the byte count when known (bytes-like input) or
+        ``-1`` when the input is a stream of unknown length.
+        """
+        size = len(content) if hasattr(content, "__len__") else -1
         logger.debug(
-            "Uploading volume file %r (%d bytes)", self, size,
+            "Uploading volume file %r (%s bytes)",
+            self, size if size >= 0 else "?",
         )
-        self._call_ensuring_parents(
-            self.client.workspace_client().files.upload,
-            file_path=self.api_path,
-            contents=_stdio.BytesIO(payload),
-            overwrite=True,
-        )
-        logger.info("Wrote %r (%d bytes)", self, size)
-        self._seed_stat_cache(IOStats(
-            size=len(payload),
-            kind=IOKind.FILE,
-            mtime=time.time(),
-            media_type=self.media_type,
-        ))
-        return None
+        upload = self.client.workspace_client().files.upload
+        api_path = self.api_path
+
+        if hasattr(content, "seek"):
+            stream = content
+
+            def _do_upload() -> None:
+                stream.seek(0)
+                upload(file_path=api_path, contents=stream, overwrite=True)
+        else:
+            def _do_upload() -> None:
+                upload(file_path=api_path, contents=content, overwrite=True)
+
+        self._call_ensuring_parents(_do_upload)
+        if size >= 0:
+            self._seed_stat_cache(IOStats(
+                size=size,
+                kind=IOKind.FILE,
+                mtime=time.time(),
+                media_type=self.media_type,
+            ))
+            logger.info("Uploaded volume file %r (size=%d)", self, size)
+        else:
+            logger.info("Uploaded volume file %r (size=stream)", self)
+        return size
 
     def truncate(self, n: int) -> int:
         if n < 0:

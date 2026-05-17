@@ -217,9 +217,60 @@ class TestWrite:
         kwargs = workspace.files.upload.call_args.kwargs
         assert kwargs["file_path"] == "/Volumes/c/s/v/x"
         assert kwargs["overwrite"] is True
-        # ``contents`` is a stdlib ``BytesIO`` — read it for the
-        # payload we sent.
-        assert kwargs["contents"].getvalue() == b"abcdef"
+        # Bytes input rides through unbuffered — the SDK builds a
+        # fresh PUT body per request from the same bytes object.
+        assert kwargs["contents"] == b"abcdef"
+
+    def test_stream_input_routes_through_upload(self, workspace, client) -> None:
+        """Caller-supplied ``BinaryIO`` is coerced to a yggdrasil
+        :class:`IO[bytes]` and lands on one ``files.upload`` call."""
+        import io
+
+        from yggdrasil.io.base import IO as _IO
+
+        workspace.files.get_metadata.side_effect = NotFound()
+        workspace.files.get_directory_metadata.side_effect = NotFound()
+        stream = io.BytesIO(b"streamed-payload")
+        p = VolumePath("/Volumes/c/s/v/x", client=client)
+        p.write_bytes(stream)
+
+        kwargs = workspace.files.upload.call_args.kwargs
+        # SDK sees the yggdrasil IO[bytes] wrapper; one upload, no
+        # chunked RMW loop.
+        assert isinstance(kwargs["contents"], _IO)
+        assert workspace.files.upload.call_count == 1
+
+    def test_stream_input_seeks_to_origin_on_retry(self, workspace, client) -> None:
+        """Transient ``files.upload`` failures must rewind a stream input."""
+        import io
+        from unittest.mock import patch
+
+        from databricks.sdk.errors import InternalError
+
+        workspace.files.get_metadata.side_effect = NotFound()
+        workspace.files.get_directory_metadata.side_effect = NotFound()
+
+        seen: list[bytes] = []
+        calls = {"n": 0}
+
+        def upload_side_effect(**kwargs: object) -> None:
+            calls["n"] += 1
+            stream = kwargs["contents"]
+            stream.read()  # type: ignore[union-attr]
+            if calls["n"] == 1:
+                raise InternalError("flaky")
+            stream.seek(0)
+            seen.append(stream.read())  # type: ignore[union-attr]
+
+        workspace.files.upload.side_effect = upload_side_effect
+
+        with patch("yggdrasil.io.path._retry.time.sleep"):
+            VolumePath("/Volumes/c/s/v/x", client=client).write_bytes(
+                io.BytesIO(b"abcdef"),
+            )
+
+        assert calls["n"] == 2
+        assert seen == [b"abcdef"]
 
     def test_pwrite_does_rmw(self, workspace, client) -> None:
         workspace.files.get_metadata.return_value = _file_meta(5)
@@ -227,7 +278,7 @@ class TestWrite:
         workspace.files.download.return_value = SimpleNamespace(contents=body)
         p = VolumePath("/Volumes/c/s/v/x", client=client)
         p.pwrite(b"XX", 1)
-        sent = workspace.files.upload.call_args.kwargs["contents"].getvalue()
+        sent = workspace.files.upload.call_args.kwargs["contents"]
         assert sent == b"aXXde"
 
 

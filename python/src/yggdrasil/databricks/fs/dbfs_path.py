@@ -241,6 +241,25 @@ class DBFSPath(DatabricksPath):
         )
         return memoryview(bytes(out))
 
+    def _write_stream(
+        self, src: Any, *, offset: int, size: int = -1, **kwargs: Any,
+    ) -> int:
+        """Override the base chunked stream — one ``dbfs.open`` session.
+
+        :meth:`_stream_upload` already pipes the live
+        :class:`IO[bytes]` through a single
+        ``dbfs.open(write=True)`` handle with ``_DBFS_CHUNK``-sized
+        writes, so the base :meth:`Holder._write_stream` (which
+        opens a new DBFS session per chunk) is a strict loss
+        here. ``size>=0`` (capped read) or non-zero ``offset``
+        fall back to the chunked base path because DBFS can't
+        splice at a range. ``batch_size`` only matters for the
+        fallback path; ``_stream_upload`` uses ``_DBFS_CHUNK``.
+        """
+        if offset != 0 or size >= 0:
+            return super()._write_stream(src, offset=offset, size=size, **kwargs)
+        return self._stream_upload(src)
+
     def _write_mv(self, data: memoryview, pos: int) -> int:
         """Splice via download → in-memory splice → re-upload.
 
@@ -268,32 +287,70 @@ class DBFSPath(DatabricksPath):
         self._stream_upload(payload)
         return n
 
-    def _stream_upload(self, payload: bytes) -> None:
-        """Write *payload* to ``self.api_path`` via the streaming SDK."""
+    def _stream_upload(self, content: Any) -> int:
+        """Write *content* to ``self.api_path`` via the streaming SDK.
+
+        Accepts either a bytes-like payload or a seekable binary
+        stream. The stream is rewound to origin on every attempt so
+        ``retry_sdk_call`` retries re-stream the full body. Bytes
+        inputs are sliced into ``_DBFS_CHUNK`` chunks; stream
+        inputs are pulled lazily with ``read(_DBFS_CHUNK)``, so a
+        large source never lands as a single :class:`bytes` buffer
+        in Python.
+
+        Returns the byte count when known (bytes-like input) or
+        ``-1`` when the input is a stream of unknown length.
+        """
+        size = len(content) if hasattr(content, "__len__") else -1
         logger.debug(
-            "Uploading DBFS file %r (%d bytes)", self, len(payload),
+            "Uploading DBFS file %r (%s bytes)",
+            self, size if size >= 0 else "?",
         )
-        def _do_upload() -> None:
-            with self.client.workspace_client().dbfs.open(
-                path=self.api_path, read=False, write=True, overwrite=True,
-            ) as fh:
-                offset = 0
-                n = len(payload)
-                while offset < n:
-                    chunk = payload[offset : offset + _DBFS_CHUNK]
-                    fh.write(chunk)
-                    offset += len(chunk)
+        api_path = self.api_path
+        dbfs = self.client.workspace_client().dbfs
+
+        if hasattr(content, "seek"):
+            stream = content
+
+            def _do_upload() -> None:
+                stream.seek(0)
+                with dbfs.open(
+                    path=api_path, read=False, write=True, overwrite=True,
+                ) as fh:
+                    while True:
+                        chunk = stream.read(_DBFS_CHUNK)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+        else:
+            payload = content
+
+            def _do_upload() -> None:
+                with dbfs.open(
+                    path=api_path, read=False, write=True, overwrite=True,
+                ) as fh:
+                    offset = 0
+                    n = len(payload)
+                    while offset < n:
+                        fh.write(payload[offset : offset + _DBFS_CHUNK])
+                        offset += _DBFS_CHUNK
+
         self._call(_do_upload)
         # The upload just established the object's full size; seed
         # the cache so the next ``size`` / ``exists`` lookup is local
         # and any concurrent reader on the singleton path sees the
         # post-write metadata without a fresh ``dbfs.get_status``.
-        self._seed_stat_cache(IOStats(
-            size=len(payload),
-            kind=IOKind.FILE,
-            mtime=time.time(),
-            media_type=self.media_type,
-        ))
+        if size >= 0:
+            self._seed_stat_cache(IOStats(
+                size=size,
+                kind=IOKind.FILE,
+                mtime=time.time(),
+                media_type=self.media_type,
+            ))
+            logger.info("Uploaded DBFS file %r (size=%d)", self, size)
+        else:
+            logger.info("Uploaded DBFS file %r (size=stream)", self)
+        return size
 
     def truncate(self, n: int) -> int:
         if n < 0:

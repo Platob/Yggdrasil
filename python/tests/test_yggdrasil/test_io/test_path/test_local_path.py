@@ -298,63 +298,66 @@ class TestTouch:
 
 
 class TestUpload:
-    """``Path.upload(to)`` accepts Holder / IO / str / PathLike targets."""
+    """``Path.upload(src)`` pulls *src*'s bytes into the destination path."""
 
-    def test_upload_to_holder(self, tmp_path) -> None:
+    def test_upload_from_holder(self, tmp_path) -> None:
         from yggdrasil.io.memory import Memory
 
-        src = LocalPath(str(tmp_path / "src.bin"))
-        src.write_bytes(b"payload")
         mem = Memory()
-        out = src.upload(mem)
-        assert out is mem
-        assert mem.read_bytes() == b"payload"
-
-    def test_upload_to_io_cursor(self, tmp_path) -> None:
-        src = LocalPath(str(tmp_path / "src.bin"))
-        src.write_bytes(b"payload")
-        with BytesIO() as bio:
-            out = src.upload(bio)
-            assert out is bio
-            assert bio.to_bytes() == b"payload"
-
-    def test_upload_to_str_path(self, tmp_path) -> None:
-        src = LocalPath(str(tmp_path / "src.bin"))
-        src.write_bytes(b"payload")
-        out = src.upload(str(tmp_path / "dst.bin"))
-        assert isinstance(out, LocalPath)
-        assert out.read_bytes() == b"payload"
-
-    def test_upload_to_pathlib_path(self, tmp_path) -> None:
-        src = LocalPath(str(tmp_path / "src.bin"))
-        src.write_bytes(b"payload")
-        out = src.upload(pathlib.Path(tmp_path) / "via_pl.bin")
-        assert out.read_bytes() == b"payload"
-
-    def test_upload_to_path_instance(self, tmp_path) -> None:
-        src = LocalPath(str(tmp_path / "src.bin"))
-        src.write_bytes(b"payload")
+        mem.write_bytes(b"payload")
         dst = LocalPath(str(tmp_path / "dst.bin"))
-        out = src.upload(dst)
+        out = dst.upload(mem)
         assert out is dst
         assert dst.read_bytes() == b"payload"
 
-    def test_upload_trailing_slash_appends_name(self, tmp_path) -> None:
-        # Trailing-slash target = "into this directory" — source's
-        # filename is joined onto the destination URL.
+    def test_upload_from_io_cursor(self, tmp_path) -> None:
+        with BytesIO() as bio:
+            bio.write_bytes(b"payload")
+            bio.seek(0)  # Read starts at the cursor's position.
+            dst = LocalPath(str(tmp_path / "dst.bin"))
+            out = dst.upload(bio)
+        assert out is dst
+        assert dst.read_bytes() == b"payload"
+
+    def test_upload_from_str_path(self, tmp_path) -> None:
+        src_path = tmp_path / "src.bin"
+        src_path.write_bytes(b"payload")
+        dst = LocalPath(str(tmp_path / "dst.bin"))
+        out = dst.upload(str(src_path))
+        assert out is dst
+        assert dst.read_bytes() == b"payload"
+
+    def test_upload_from_pathlib_path(self, tmp_path) -> None:
+        src_path = tmp_path / "src.bin"
+        src_path.write_bytes(b"payload")
+        dst = LocalPath(str(tmp_path / "via_pl.bin"))
+        out = dst.upload(pathlib.Path(src_path))
+        assert out.read_bytes() == b"payload"
+
+    def test_upload_from_path_instance(self, tmp_path) -> None:
+        src = LocalPath(str(tmp_path / "src.bin"))
+        src.write_bytes(b"payload")
+        dst = LocalPath(str(tmp_path / "dst.bin"))
+        out = dst.upload(src)
+        assert out is dst
+        assert dst.read_bytes() == b"payload"
+
+    def test_upload_trailing_slash_appends_source_name(self, tmp_path) -> None:
+        # Trailing slash on self = "into this directory" — the
+        # source's filename is joined onto the destination URL.
         src = LocalPath(str(tmp_path / "src.bin"))
         src.write_bytes(b"payload")
         out_dir = tmp_path / "sub"
         out_dir.mkdir()
-        out = src.upload(str(out_dir) + "/")
+        dst = LocalPath(str(out_dir) + "/")
+        out = dst.upload(src)
         assert out.name == "src.bin"
         assert out.read_bytes() == b"payload"
 
-    def test_upload_rejects_unsupported_type(self, tmp_path) -> None:
-        src = LocalPath(str(tmp_path / "src.bin"))
-        src.write_bytes(b"payload")
+    def test_upload_rejects_unsupported_source_type(self, tmp_path) -> None:
+        dst = LocalPath(str(tmp_path / "dst.bin"))
         with pytest.raises(TypeError, match="Holder, IO, str, or os.PathLike"):
-            src.upload(42)
+            dst.upload(42)
 
 
 class TestDownload:

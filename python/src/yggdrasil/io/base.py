@@ -72,11 +72,9 @@ directly). Effects on top of a holder:
 
 from __future__ import annotations
 
-import base64
 import io as _stdlib_io
 import os
 import pathlib
-import struct
 import tempfile
 import time
 from collections.abc import Iterable
@@ -203,6 +201,38 @@ def _resolve_format_target(
     if mt is None:
         return None
     return Tabular.class_for_media_type(mt, default=None)
+
+
+
+
+def _local_path_for_handle(obj: Any) -> Optional[str]:
+    """Return the on-disk path for a local file handle, or ``None``.
+
+    Recognises real file handles (``open("...", "rb")``,
+    ``pathlib.Path.open()``) by their string ``.name`` attribute —
+    stdlib file objects expose the underlying path there. Filters
+    out anonymous streams whose ``.name`` is an int fd (sockets,
+    pipes) or a bracketed sentinel (``"<stdin>"``, ``"<fdopen>"``)
+    and anything whose ``.name`` doesn't actually exist on disk.
+
+    Used by :meth:`IO.from_` to scrap the drain-into-Memory step
+    for live local files — the resulting :class:`LocalPath`
+    reads from the file system on demand, so a multi-GB handle
+    never gets materialised.
+    """
+    import os as _os
+
+    name = getattr(obj, "name", None)
+    if not isinstance(name, str):
+        return None
+    if name.startswith("<") and name.endswith(">"):
+        return None
+    try:
+        if not _os.path.isfile(name):
+            return None
+    except (OSError, ValueError):
+        return None
+    return name
 
 
 # ===========================================================================
@@ -416,14 +446,19 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
     def from_(cls, obj: Any, *, mode: ModeLike = "rb+", **kwargs: Any) -> "IO":
         """Auto-route *obj* to the right holder, return an owning IO.
 
-        - :class:`IO` — pass through (idempotent).
+        - :class:`IO` — pass through (idempotent) or borrow holder.
         - :class:`Holder` — borrow into a fresh IO.
         - bytes-like (``bytes`` / ``bytearray`` / ``memoryview``) —
           wrap in a fresh :class:`Memory`.
         - path-like (``str`` / ``pathlib.Path`` / ``URL``) — wrap in
           a fresh holder via :class:`Holder` registry dispatch (file,
           s3, dbfs, …).
-        - file-like (has ``read``) — drain into a fresh
+        - local file handle (``open("...", "rb")`` — anything with
+          a ``.name`` attribute pointing at an existing local file)
+          — wrap as a :class:`LocalPath` instead of draining; the
+          path holder reads from the file system on demand so a
+          multi-GB handle never gets materialised into memory.
+        - other file-like (has ``read``) — drain into a fresh
           :class:`Memory`.
 
         The returned IO always owns its holder unless *obj* was
@@ -450,32 +485,60 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
             )
 
         if hasattr(obj, "read") and not isinstance(obj, (str, bytes)):
-            mem = Memory()
-            mem.acquire()
-            try:
-                pos = 0
-                while True:
-                    chunk = obj.read(64 * 1024)
-                    if not chunk:
-                        break
-                    mem.pwrite(chunk, pos)
-                    pos += len(chunk)
-            except BaseException:
-                mem.close()
-                raise
-            return cls(holder=mem, owns_holder=True, mode=mode, **kwargs)
+            # Live local file handle (``open("path", "rb")``,
+            # ``pathlib.Path.open()``) carries a string ``.name``
+            # pointing at the on-disk file. Recognise and route
+            # through :class:`LocalPath` so the holder reads from
+            # disk on demand instead of draining the handle into
+            # ``Memory``. Anonymous streams (``io.BytesIO``,
+            # socket-backed handles, ``<stdin>``-style names) fall
+            # through to the :class:`MemoryStream` branch below.
+            local_path = _local_path_for_handle(obj)
+            if local_path is not None:
+                from yggdrasil.io.path.local_path import LocalPath
 
-        # Path-like — let Holder dispatch decide the scheme via its
-        # __new__ registry routing.
-        try:
-            holder = Holder(data=obj)
-            return cls(holder=holder, owns_holder=True, mode=mode, **kwargs)
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"Cannot wrap {type(obj).__name__} as a {cls.__name__}. "
-                f"Accepted: IO, Holder, bytes-like, file-like, "
-                f"str/PurePath/URL. Got {obj!r}."
-            ) from exc
+                return cls(
+                    holder=LocalPath(local_path),
+                    owns_holder=True,
+                    mode=mode,
+                    **kwargs,
+                )
+            # Non-local file-like → :class:`MemoryStream` over the
+            # source. Pulls lazily on read; cold bytes above the
+            # in-memory threshold spill to a tempfile so a 10 GB
+            # urllib3 response stream never gets materialised into
+            # Python bytes upfront. Defaults: 128 MiB in-memory
+            # window, 2 GiB total retention — large enough that
+            # short-lived sources stay fully resident and random-read
+            # callers don't trip eviction.
+            from yggdrasil.io.memory_stream import MemoryStream
+
+            return cls(
+                holder=MemoryStream(obj),
+                owns_holder=True,
+                mode=mode,
+                **kwargs,
+            )
+
+        # Path-like — route through the ``IO(path=...)`` __new__
+        # which already does scheme-aware holder dispatch (file →
+        # LocalPath, s3 → S3Path, dbfs+volume → VolumePath, …).
+        from yggdrasil.io.url import URL as _URL
+
+        if isinstance(obj, (str, pathlib.PurePath, _URL)):
+            try:
+                return cls(path=obj, mode=mode, **kwargs)
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    f"Cannot wrap {type(obj).__name__} as a "
+                    f"{cls.__name__} via path dispatch. Got {obj!r}."
+                ) from exc
+
+        raise TypeError(
+            f"Cannot wrap {type(obj).__name__} as a {cls.__name__}. "
+            f"Accepted: IO, Holder, bytes-like, file-like, "
+            f"str/PurePath/URL. Got {obj!r}."
+        )
 
     @classmethod
     def from_holder(
@@ -1080,17 +1143,38 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
     # ==================================================================
 
     def read(self, size: int = -1) -> bytes:
-        remaining = max(0, self.size - self._pos)
+        """Read up to *size* bytes from the cursor, advancing past them.
+
+        Stdlib :meth:`io.RawIOBase.read` semantic: ``size < 0`` /
+        ``None`` reads to EOF; otherwise reads up to ``size``
+        bytes, returning fewer at EOF.
+
+        Two paths:
+
+        - Static holders (:class:`Memory`, :class:`Path`) know
+          their full size up front; cap the request at
+          ``self.size - self._pos`` before dispatching so the
+          holder's strict ``read_bytes`` doesn't trip on an
+          out-of-range window.
+        - Streaming holders (:class:`MemoryStream` over a live
+          source — ``holder.is_streaming``) lazily pull bytes;
+          ``size`` reflects only what's been pulled so far, so
+          forward the request unclamped and let the holder pull
+          until it has enough or signals EOF.
+        """
+        holder = self._active()
         if size is None or size < 0:
-            size = remaining
+            out = holder.read_bytes(-1, offset=self._pos)
+        elif holder.is_streaming:
+            if size == 0:
+                return b""
+            out = holder.read_bytes(size, offset=self._pos)
         else:
-            # Cap to remaining bytes — stdlib ``IOBase.read`` returns
-            # fewer than *size* when EOF is reached, so we do the same
-            # rather than asking the holder for an out-of-range slice.
-            size = min(size, remaining)
-        if size == 0:
-            return b""
-        out = self._active().pread(size, self._pos)
+            remaining = max(0, holder.size - self._pos)
+            capped = min(size, remaining)
+            if capped == 0:
+                return b""
+            out = holder.read_bytes(capped, offset=self._pos)
         self._pos += len(out)
         return out
 
@@ -1099,60 +1183,33 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         return self.read(-1)
 
     def readinto(self, b: Any) -> int:
-        mv = memoryview(b)
-        n = len(mv)
-        if n == 0:
-            return 0
-        chunk = self._active().pread(n, self._pos)
-        got = len(chunk)
-        if got:
-            mv[:got] = chunk
-            self._pos += got
+        """Fill *b* from the cursor, advance, return bytes written."""
+        got = self._active().readinto(b, offset=self._pos)
+        self._pos += got
         return got
 
     def readinto1(self, b: Any) -> int:
         return self.readinto(b)
 
     def readline(self, limit: int = -1) -> bytes:
-        size = self.size
-        if self._pos >= size:
-            return b""
-        if limit is None or limit < 0:
-            chunk_len = size - self._pos
-        else:
-            chunk_len = min(limit, size - self._pos)
-        if chunk_len <= 0:
-            return b""
-
-        chunk = self._active().pread(chunk_len, self._pos)
-        nl = chunk.find(b"\n")
-        if nl == -1:
-            self._pos += len(chunk)
-            return chunk
-
-        line = chunk[: nl + 1]
+        """Read up to the next newline from the cursor, advancing past it."""
+        line = self._active().readline(limit, offset=self._pos)
         self._pos += len(line)
         return line
 
     def readlines(self, hint: int = -1) -> list[bytes]:
-        lines: list[bytes] = []
-        total = 0
-        while True:
-            line = self.readline()
-            if not line:
-                break
-            lines.append(line)
-            total += len(line)
-            if hint is not None and hint > 0 and total >= hint:
-                break
+        lines = self._active().readlines(hint, offset=self._pos)
+        self._pos += sum(len(line) for line in lines)
         return lines
 
     def write(self, b: Any, *, update_stat: bool = True) -> int:
         """Write *b* at the cursor, advancing it.
 
         Accepts bytes-like, ``str`` (UTF-8), ``io.BytesIO``, or any
-        file-like with ``.read``. The buffer-protocol fallback catches
-        things like :class:`pyarrow.Buffer` that aren't
+        file-like with ``.read``. File-like sources route through
+        :meth:`write_stream` so backends with an atomic whole-object
+        upload push a single request. The buffer-protocol fallback
+        catches things like :class:`pyarrow.Buffer` that aren't
         bytes/bytearray/memoryview but ARE memoryview-able.
         """
         if b is None:
@@ -1162,22 +1219,176 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         if isinstance(b, (bytes, bytearray, memoryview)):
             return self.write_bytes(b, update_stat=update_stat)
         if hasattr(b, "read"):
-            total = 0
-            while True:
-                chunk = b.read(1024 * 1024)
-                if not chunk:
-                    break
-                total += self.write_bytes(chunk, update_stat=update_stat)
-            return total
+            return self.write_stream(b)
         return self.write_bytes(memoryview(b), update_stat=update_stat)
 
-    def write_bytes(self, b: BytesLike, *, update_stat: bool = True) -> int:
+    def write_bytes(
+        self,
+        b: BytesLike,
+        *,
+        size: int = -1,
+        overwrite: bool = False,
+        update_stat: bool = True,
+    ) -> int:
+        """Splice *b* at the cursor, advance, return bytes written.
+
+        ``size>=0`` caps the byte count written. The cap is
+        applied via a slice of the input buffer before the
+        ``write_mv`` call (zero-copy for ``memoryview`` / ``bytes``).
+        ``overwrite`` truncates the tail past the new cursor —
+        replaces ``truncate(self.tell()) + write_bytes(...)`` and
+        lets whole-blob remote backends skip the pre-truncate
+        SDK round trip.
+        """
         mv = _as_byte_mv(b)
-        if len(mv) == 0:
+        if size >= 0 and len(mv) > size:
+            mv = mv[:size]
+        if len(mv) == 0 and not overwrite:
             return 0
-        n = self._active().pwrite(mv, self._pos, update_stat=update_stat)
+        n = self._active().write_mv(
+            mv, self._pos, overwrite=overwrite, update_stat=update_stat,
+        )
         self._pos += n
         return n
+
+    def write_stream(
+        self,
+        src: Any,
+        *,
+        size: int = -1,
+        overwrite: bool = False,
+        batch_size: int | None = None,
+    ) -> int:
+        """Drain a binary source into self at the cursor.
+
+        Cursor-anchored wrapper around :meth:`Holder.write_stream` —
+        the holder's public ``write_stream`` coerces *src* to a
+        real :class:`IO[bytes]` and dispatches to
+        :meth:`Holder._write_stream`; this thin wrapper just
+        advances the cursor by the bytes the holder reported
+        writing. ``size>=0`` caps the byte count drained from *src*;
+        ``overwrite`` truncates the tail past the new cursor;
+        ``batch_size`` tunes the per-chunk read/write size on the
+        default streaming path (``None`` keeps the 1 MiB default).
+        """
+        kwargs: dict[str, Any] = {
+            "offset": self._pos, "size": size, "overwrite": overwrite,
+        }
+        if batch_size is not None:
+            kwargs["batch_size"] = batch_size
+        n = self._active().write_stream(src, **kwargs)
+        self._pos += n
+        return n
+
+    def write_holder(
+        self,
+        src: Any,
+        *,
+        size: int = -1,
+        overwrite: bool = False,
+        batch_size: int | None = None,
+    ) -> int:
+        """Splice another :class:`Holder`'s bytes into self at the cursor.
+
+        Cursor-anchored wrapper around :meth:`Holder.write_holder` —
+        small payloads land in one :meth:`Holder.write_mv` call,
+        large ones stream through :meth:`Holder._write_stream`.
+        ``size>=0`` caps the byte count pulled from *src*;
+        ``overwrite`` truncates the tail past the new cursor;
+        ``batch_size`` is forwarded to the streaming path when
+        the holder exceeds the inline threshold. Cursor advances
+        by the byte count.
+        """
+        kwargs: dict[str, Any] = {
+            "offset": self._pos, "size": size, "overwrite": overwrite,
+        }
+        if batch_size is not None:
+            kwargs["batch_size"] = batch_size
+        n = self._active().write_holder(src, **kwargs)
+        self._pos += n
+        return n
+
+    def upload(
+        self, src: Any, *, size: int = -1, offset: int = 0,
+    ) -> "IO":
+        """Pull *src*'s bytes into this IO at the current cursor.
+
+        Cursor-anchored counterpart to :meth:`Holder.upload` —
+        ``io.upload(src)`` writes *src*'s bytes starting at the
+        IO's current position and advances the cursor by the
+        number of bytes written. *size* / *offset* slice the
+        **source** (same as :meth:`Holder.upload`): ``size=-1``
+        reads to EOF, ``size>=0`` caps the count, ``offset`` is
+        the position inside *src* to start reading from.
+
+        *src* accepts a :class:`Holder`, another :class:`IO`
+        cursor, or a ``str`` / :class:`os.PathLike` coerced via
+        ``Path.from_(src)``. Returns *self* so cursor-chained
+        writes work (``io.upload(src).write(b)``).
+        """
+        from yggdrasil.io.holder import (
+            _coerce_transfer_endpoint,
+            _read_slice_from_source,
+        )
+
+        source = _coerce_transfer_endpoint(src)
+        self.write_bytes(
+            _read_slice_from_source(source, size=size, offset=offset),
+        )
+        return self
+
+    def download(
+        self, to: Any = None, *, size: int = -1, offset: int = 0,
+    ) -> "Holder | IO":
+        """Push bytes from this IO (cursor-relative) into *to*.
+
+        Cursor-anchored counterpart to :meth:`Holder.download`.
+        ``offset`` is **relative to the current cursor**:
+        ``offset=0`` reads from the cursor's current position,
+        ``offset=N`` skips N bytes forward first. ``size=-1``
+        reads to EOF, ``size>=0`` caps the count. The cursor
+        advances past the bytes that were actually read.
+
+        When *to* is :data:`None`, bytes land in
+        ``~/Downloads/<name>`` (browser-style; falls back to
+        ``"download"`` for cursorless / nameless holders).
+        Otherwise *to* accepts the same shapes as
+        :meth:`Holder.download` (:class:`Holder`, :class:`IO`,
+        ``str`` / :class:`os.PathLike`). Returns the resolved
+        target.
+        """
+        from yggdrasil.io.holder import (
+            _coerce_transfer_endpoint,
+            _default_download_target,
+            _join_dir_hint,
+            _read_slice_from_source,
+        )
+
+        # ``offset`` on self is cursor-relative — the helper does the
+        # absolute seek + read pair, advancing the cursor past the
+        # bytes it consumed.
+        payload = _read_slice_from_source(
+            self, size=size, offset=self._pos + offset,
+        )
+
+        if to is None:
+            to = _default_download_target(self._transfer_filename())
+        target = _join_dir_hint(_coerce_transfer_endpoint(to), self)
+        target.write_bytes(payload)
+        return target
+
+    def _transfer_filename(self) -> str:
+        """Filename used when joining onto a directory-shaped target.
+
+        Delegates to the bound :class:`Holder` so an IO over a
+        :class:`LocalPath` carries the path's basename through
+        ``cp``-style directory targets. IO cursors over
+        :class:`Memory` fall back to ``"download"`` like the
+        holder side.
+        """
+        if self._holder is None:
+            return "download"
+        return self._holder._transfer_filename()
 
     def writelines(self, lines: Any) -> None:
         for line in lines:
@@ -1243,26 +1454,23 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
             pass
 
     # ==================================================================
-    # Convenience drains
+    # Convenience drains — cursorless pass-throughs to the holder
     # ==================================================================
 
     def to_bytes(self) -> bytes:
         """Whole-payload snapshot from the active holder. Cursor untouched."""
-        return self._active().read_bytes()
+        return self._active().to_bytes()
 
     def getvalue(self) -> bytes:
         """Stdlib-compatible alias for :meth:`to_bytes`."""
-        return self.to_bytes()
+        return self._active().getvalue()
 
     def decode(self, encoding: str = "utf-8", errors: str = "replace") -> str:
         """Decode the whole payload as text. Cursor untouched."""
-        return self.to_bytes().decode(encoding, errors=errors)
+        return self._active().decode(encoding, errors=errors)
 
     def to_base64(self, urlsafe: bool = True) -> str:
-        b = self.to_bytes()
-        if urlsafe:
-            return base64.urlsafe_b64encode(b).decode("ascii")
-        return base64.b64encode(b).decode("ascii")
+        return self._active().to_base64(urlsafe=urlsafe)
 
     # ==================================================================
     # Iteration
@@ -1278,41 +1486,53 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         return line
 
     # ==================================================================
-    # Structured binary I/O — fixed-width little-endian primitives
+    # Structured binary I/O — cursor-anchored wrappers over Holder
     # ==================================================================
+    #
+    # Every primitive defers to the cursorless equivalent on the
+    # bound holder. The holder reads / writes at ``self._pos`` and
+    # the IO advances the cursor by the fixed-width count.
 
-    def _read_exact(self, n: int) -> bytes:
-        data = self.read(n)
-        if len(data) != n:
-            raise EOFError(f"expected {n} bytes, got {len(data)}")
-        return data
+    def _read_struct(self, method: str, width: int) -> Any:
+        value = getattr(self._active(), method)(offset=self._pos)
+        self._pos += width
+        return value
 
-    def read_int8(self) -> int: return struct.unpack("<b", self._read_exact(1))[0]
-    def write_int8(self, v: int) -> int: return self.write_bytes(struct.pack("<b", int(v)))
-    def read_uint8(self) -> int: return struct.unpack("<B", self._read_exact(1))[0]
-    def write_uint8(self, v: int) -> int: return self.write_bytes(struct.pack("<B", int(v)))
-    def read_int16(self) -> int: return struct.unpack("<h", self._read_exact(2))[0]
-    def write_int16(self, v: int) -> int: return self.write_bytes(struct.pack("<h", int(v)))
-    def read_uint16(self) -> int: return struct.unpack("<H", self._read_exact(2))[0]
-    def write_uint16(self, v: int) -> int: return self.write_bytes(struct.pack("<H", int(v)))
-    def read_int32(self) -> int: return struct.unpack("<i", self._read_exact(4))[0]
-    def write_int32(self, v: int) -> int: return self.write_bytes(struct.pack("<i", int(v)))
-    def read_uint32(self) -> int: return struct.unpack("<I", self._read_exact(4))[0]
-    def write_uint32(self, v: int) -> int: return self.write_bytes(struct.pack("<I", int(v)))
-    def read_int64(self) -> int: return struct.unpack("<q", self._read_exact(8))[0]
-    def write_int64(self, v: int) -> int: return self.write_bytes(struct.pack("<q", int(v)))
-    def read_uint64(self) -> int: return struct.unpack("<Q", self._read_exact(8))[0]
-    def write_uint64(self, v: int) -> int: return self.write_bytes(struct.pack("<Q", int(v)))
-    def read_f32(self) -> float: return struct.unpack("<f", self._read_exact(4))[0]
-    def write_f32(self, v: float) -> int: return self.write_bytes(struct.pack("<f", float(v)))
-    def read_f64(self) -> float: return struct.unpack("<d", self._read_exact(8))[0]
-    def write_f64(self, v: float) -> int: return self.write_bytes(struct.pack("<d", float(v)))
+    def _write_struct(self, method: str, value: Any, width: int) -> int:
+        getattr(self._active(), method)(value, offset=self._pos)
+        self._pos += width
+        return width
+
+    def read_int8(self) -> int: return self._read_struct("read_int8", 1)
+    def write_int8(self, v: int) -> int: return self._write_struct("write_int8", v, 1)
+    def read_uint8(self) -> int: return self._read_struct("read_uint8", 1)
+    def write_uint8(self, v: int) -> int: return self._write_struct("write_uint8", v, 1)
+    def read_int16(self) -> int: return self._read_struct("read_int16", 2)
+    def write_int16(self, v: int) -> int: return self._write_struct("write_int16", v, 2)
+    def read_uint16(self) -> int: return self._read_struct("read_uint16", 2)
+    def write_uint16(self, v: int) -> int: return self._write_struct("write_uint16", v, 2)
+    def read_int32(self) -> int: return self._read_struct("read_int32", 4)
+    def write_int32(self, v: int) -> int: return self._write_struct("write_int32", v, 4)
+    def read_uint32(self) -> int: return self._read_struct("read_uint32", 4)
+    def write_uint32(self, v: int) -> int: return self._write_struct("write_uint32", v, 4)
+    def read_int64(self) -> int: return self._read_struct("read_int64", 8)
+    def write_int64(self, v: int) -> int: return self._write_struct("write_int64", v, 8)
+    def read_uint64(self) -> int: return self._read_struct("read_uint64", 8)
+    def write_uint64(self, v: int) -> int: return self._write_struct("write_uint64", v, 8)
+    def read_f32(self) -> float: return self._read_struct("read_f32", 4)
+    def write_f32(self, v: float) -> int: return self._write_struct("write_f32", v, 4)
+    def read_f64(self) -> float: return self._read_struct("read_f64", 8)
+    def write_f64(self, v: float) -> int: return self._write_struct("write_f64", v, 8)
     def read_bool(self) -> bool: return bool(self.read_uint8())
     def write_bool(self, v: bool) -> int: return self.write_uint8(1 if v else 0)
 
     def read_bytes_u32(self) -> bytes:
         """Length-prefixed (uint32 LE) bytes blob."""
-        return self._read_exact(self.read_uint32())
+        n = self.read_uint32()
+        data = self.read(n)
+        if len(data) != n:
+            raise EOFError(f"expected {n} bytes, got {len(data)}")
+        return data
 
     def write_bytes_u32(self, data: BytesLike) -> int:
         mv = memoryview(data)

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import struct
 import time
 from abc import abstractmethod
 from typing import TYPE_CHECKING, Union, Any, ClassVar, IO, Iterable, Iterator
@@ -60,6 +61,15 @@ PathLike = Union[str, "os.PathLike[str]", pathlib.PurePath]
 
 
 _COPY_CHUNK = 1024 * 1024
+
+#: Byte threshold under which :meth:`Holder._write_holder` writes
+#: the source's full payload in one :meth:`write_mv` call — above
+#: this, the default opens a cursor and streams chunks through
+#: :meth:`_write_stream`. 4 MiB is the natural break: small payloads
+#: are cheap to materialise; large ones risk doubling peak RSS on
+#: copy. Backends with an atomic uploader (Workspace, Volumes, S3)
+#: override :meth:`_write_holder` and ignore this constant.
+_INLINE_WRITE_THRESHOLD = 4 * 1024 * 1024
 
 
 def _resolve_pos(pos: int, size: int) -> int:
@@ -412,13 +422,13 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
             return False
 
     def _init_from_file_like(self, data: IO[bytes]) -> None:
-        pos = 0
+        offset = 0
         while True:
             chunk = data.read(_COPY_CHUNK)
             if not chunk:
                 break
-            self.write_bytes(chunk, pos=pos)
-            pos += len(chunk)
+            self.write_bytes(chunk, offset=offset)
+            offset += len(chunk)
 
     # ------------------------------------------------------------------
     # Constructors
@@ -451,23 +461,23 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
     # Abstract primitives
     # ------------------------------------------------------------------
 
-    def read_mv(self, n: int, pos: int) -> memoryview:
-        size = self.size
-        pos = _resolve_pos(pos, size)
-        if pos < 0 or pos > size:
+    def read_mv(self, size: int = -1, offset: int = 0) -> memoryview:
+        total = self.size
+        offset = _resolve_pos(offset, total)
+        if offset < 0 or offset > total:
             raise ValueError(
-                f"Position {pos} is out of bounds for "
-                f"{type(self).__name__} of size {size}"
+                f"Offset {offset} is out of bounds for "
+                f"{type(self).__name__} of size {total}"
             )
-        if n < 0:
-            n = size - pos
-        if n < 0 or pos + n > size:
+        if size < 0:
+            size = total - offset
+        if size < 0 or offset + size > total:
             raise ValueError(
-                f"Range [{pos}, {pos + n}) is out of bounds for "
-                f"{type(self).__name__} of size {size}"
+                f"Range [{offset}, {offset + size}) is out of bounds for "
+                f"{type(self).__name__} of size {total}"
             )
 
-        return self._read_mv(n, pos)
+        return self._read_mv(size, offset)
 
     @abstractmethod
     def _read_mv(self, n: int, pos: int) -> memoryview:
@@ -486,25 +496,43 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         """
 
     def write_mv(
-        self, data: memoryview, pos: int, *, update_stat: bool = True,
+        self,
+        data: memoryview,
+        offset: int = 0,
+        *,
+        size: int = -1,
+        overwrite: bool = False,
+        update_stat: bool = True,
     ) -> int:
-        """Splice ``data`` at ``pos``, pre-growing the holder as needed.
+        """Splice ``data`` at ``offset``, pre-growing the holder as needed.
+
+        ``size`` caps the byte count written — ``size=-1`` (default)
+        writes all of ``data``; ``size>=0`` writes
+        ``min(len(data), size)`` bytes. Caps via a slice of
+        ``data`` (zero-copy on ``memoryview`` / ``bytes``), so
+        downstream pipelines that only need the first N bytes of
+        a larger buffer skip the trailing tail.
+
+        ``overwrite`` declares that this write replaces the
+        holder's tail past ``offset + size`` — after the splice,
+        :attr:`size` is set to ``offset + size``. Callers that
+        currently do ``truncate(0)`` followed by ``write_bytes(...)``
+        collapse to a single ``write_bytes(..., overwrite=True)``,
+        which on whole-blob remote backends saves a SDK round
+        trip (the atomic upload at ``offset == 0`` already
+        replaces the object — no preceding truncate needed).
 
         Pipeline:
 
-        1. Normalize ``pos`` (``-1`` → append, ``-N`` → ``size - N``).
-        2. Pre-grow visible :attr:`size` to cover the splice via
-           :meth:`resize` — one call to the size-management primitive
-           instead of nudging size up inside ``_write_mv``.
-        3. Hand the normalized ``(data, pos)`` to :meth:`_write_mv`,
-           which now only has to put bytes down at a valid range.
-        4. Mark dirty + bump cached mtime if anything was written.
-
-        Doing the resize up front means ``_write_mv`` implementations
-        across backends don't each reimplement the grow logic. It also
-        gives subclasses with a cheap grow path (S3 multipart capacity
-        hint, ``ftruncate`` on local fd) a chance to skip the work
-        ``_write_mv`` would have done byte-by-byte.
+        1. Slice ``data`` to ``size`` if capped.
+        2. Normalize ``offset`` (``-1`` → append, ``-N`` →
+           ``self.size - N``).
+        3. Pre-grow visible :attr:`size` to cover the splice via
+           :meth:`resize`.
+        4. Hand the normalized ``(data, offset)`` to
+           :meth:`_write_mv`.
+        5. Truncate tail past ``offset + n`` when ``overwrite``.
+        6. Mark dirty + bump cached mtime if anything was written.
 
         ``update_stat=False`` skips the post-write
         :meth:`_touch_stat` and :meth:`mark_dirty` calls. Use it for
@@ -514,26 +542,40 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         re-statting via the path-side ``_stat`` for filesystem
         backends) once the loop finishes.
         """
-        size = self.size
-        pos = _resolve_pos(pos, size)
-        if pos < 0:
+        if size >= 0 and len(data) > size:
+            data = data[:size]
+        total = self.size
+        offset = _resolve_pos(offset, total)
+        if offset < 0:
             raise ValueError(
-                f"Position {pos} is out of bounds for "
-                f"{type(self).__name__} of size {size}"
+                f"Offset {offset} is out of bounds for "
+                f"{type(self).__name__} of size {total}"
             )
 
         n = len(data)
+        end = offset + n
         if n == 0:
+            if overwrite and end < total:
+                self.truncate(end)
+                if update_stat:
+                    self._touch_stat(size=self.size)
+                    self.mark_dirty()
             return 0
 
         # Pre-grow the visible size so _write_mv just lays bytes down
-        # at a known-valid range. resize() is a no-op when pos+n <= size
-        # (in-place overwrite case), so the fast path stays fast.
-        end = pos + n
-        if end > size:
+        # at a known-valid range. resize() is a no-op when offset+n
+        # <= size (in-place overwrite case), so the fast path stays fast.
+        if end > total:
             self.resize(end)
 
-        written = self._write_mv(data, pos)
+        written = self._write_mv(data, offset)
+        # ``overwrite`` drops any tail beyond the spliced range —
+        # collapses ``truncate(0) + write_bytes(...)`` into one call
+        # and lets whole-blob remote backends skip the preceding
+        # truncate SDK round trip (the atomic upload at ``offset
+        # == 0`` already replaces the object).
+        if overwrite and end < self.size:
+            self.truncate(end)
 
         if written > 0 and update_stat:
             self._touch_stat(size=max(end, self.size))
@@ -930,6 +972,25 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
     def is_remote(self) -> bool:
         return self.is_remote_path
 
+    @property
+    def is_streaming(self) -> bool:
+        """True when :attr:`size` reflects only the bytes pulled so far.
+
+        Streaming holders (:class:`MemoryStream` over a live
+        source) lazily pull bytes on read; their :attr:`size`
+        grows as the cursor advances and may underreport the
+        eventual total. Static holders (:class:`Memory`,
+        :class:`Path`) know their full size up front so the
+        default is ``False``.
+
+        :class:`IO.read` checks this flag to decide whether to
+        cap the requested byte count at :attr:`size` (static
+        case — out-of-range reads would raise) or pass the
+        request through unclamped (streaming case — the holder
+        pulls until it has enough or EOF).
+        """
+        return False
+
     # ------------------------------------------------------------------
     # Cursorless I/O — the canonical surface :class:`BytesIO` consumes
     # ------------------------------------------------------------------
@@ -960,30 +1021,73 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
     # Bytes / text convenience surface
     # ------------------------------------------------------------------
 
-    def read_bytes(self, n: int = -1, pos: int = 0) -> bytes:
-        """Read ``n`` bytes at ``pos`` as :class:`bytes`."""
-        return bytes(self.read_mv(n, pos))
+    def read_bytes(self, size: int = -1, offset: int = 0) -> bytes:
+        """Read ``size`` bytes starting at ``offset`` as :class:`bytes`.
+
+        ``size=-1`` reads to EOF; ``offset`` accepts negative
+        indices via :func:`_resolve_pos` (``-1`` → ``size``,
+        ``-N`` → ``self.size - N``).
+        """
+        return bytes(self.read_mv(size, offset))
 
     def write_bytes(
         self,
-        data: Union[bytes, bytearray, memoryview, str],
-        pos: int = 0,
+        data: Any,
+        offset: int = 0,
+        *,
+        size: int = -1,
+        overwrite: bool = False,
     ) -> int:
-        """Splice bytes-like ``data`` at ``pos``. Returns bytes written."""
+        """Splice ``data`` at ``offset``. Returns bytes written.
+
+        ``size`` caps the byte count written — ``size=-1``
+        (default) writes the entire source; ``size>=0`` writes at
+        most ``size`` bytes. The cap is forwarded into each
+        type-directed branch so a stream source stops reading
+        after ``size`` bytes (no over-pull) and a bytes-like
+        source slices its tail off before dispatching.
+
+        ``overwrite`` declares that this write replaces every
+        byte from ``offset`` onward. The holder ends at
+        ``offset + bytes_written`` regardless of its prior size,
+        and whole-blob remote backends collapse the implied
+        ``truncate(...) + write(...)`` pair into one SDK call.
+
+        Type-directed dispatch — bytes-like payloads
+        (:class:`bytes`, :class:`bytearray`, :class:`memoryview`,
+        and ``str`` after UTF-8 encoding) splice through
+        :meth:`write_mv`; other :class:`Holder` instances route
+        through :meth:`write_holder` (size-aware: small payloads
+        write inline, large ones stream); file-like sources
+        (anything exposing ``.read``) drain through
+        :meth:`write_stream`. Subclasses override
+        :meth:`_write_mv`, :meth:`_write_stream`, and / or
+        :meth:`_write_holder` rather than this dispatch.
+        """
         if isinstance(data, str):
             data = data.encode("utf-8")
-        return self.write_mv(_as_byte_mv(data), pos)
+        if isinstance(data, Holder):
+            return self.write_holder(
+                data, offset=offset, size=size, overwrite=overwrite,
+            )
+        if hasattr(data, "read"):
+            return self.write_stream(
+                data, offset=offset, size=size, overwrite=overwrite,
+            )
+        return self.write_mv(
+            _as_byte_mv(data), offset, size=size, overwrite=overwrite,
+        )
 
     def read_text(
         self,
         encoding: str = "utf-8",
         errors: str = "strict",
         *,
-        n: int = -1,
-        pos: int = 0,
+        size: int = -1,
+        offset: int = 0,
     ) -> str:
-        """Decode ``n`` bytes at ``pos`` as text."""
-        return self.read_bytes(n, pos).decode(encoding, errors=errors)
+        """Decode ``size`` bytes at ``offset`` as text."""
+        return self.read_bytes(size, offset).decode(encoding, errors=errors)
 
     def write_text(
         self,
@@ -991,12 +1095,102 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         encoding: str = "utf-8",
         errors: str = "strict",
         *,
-        pos: int = 0,
+        offset: int = 0,
     ) -> int:
-        """Encode ``text`` and splice at ``pos``. Returns bytes written."""
+        """Encode ``text`` and splice at ``offset``. Returns bytes written."""
         return self.write_bytes(
-            text.encode(encoding, errors=errors), pos,
+            text.encode(encoding, errors=errors), offset,
         )
+
+    # ------------------------------------------------------------------
+    # Cursorless read/write primitives — IO subclasses add cursor
+    # ------------------------------------------------------------------
+
+    def readinto(self, buffer: Any, *, offset: int = 0) -> int:
+        """Fill *buffer* with bytes starting at ``offset``.
+
+        Returns the number of bytes written into *buffer* —
+        ``min(len(buffer), self.size - offset)``. Matches the
+        stdlib :meth:`io.RawIOBase.readinto` shape but stays
+        cursorless; subclasses with a cursor (``IO``) wrap this
+        and advance after the call.
+        """
+        mv = memoryview(buffer)
+        capacity = len(mv)
+        if capacity == 0:
+            return 0
+        chunk = self.read_bytes(capacity, offset)
+        n = len(chunk)
+        if n:
+            mv[:n] = chunk
+        return n
+
+    def readline(self, limit: int = -1, *, offset: int = 0) -> bytes:
+        """Read up to the next newline starting at ``offset``.
+
+        Returns the line including the trailing ``\\n`` (or short
+        when EOF lands first). ``limit >= 0`` caps the byte
+        count. Cursorless — :class:`IO` subclasses wrap this and
+        advance the cursor by the returned length.
+        """
+        total = self.size
+        if offset >= total:
+            return b""
+        chunk_len = total - offset
+        if limit is not None and limit >= 0:
+            chunk_len = min(limit, chunk_len)
+        if chunk_len <= 0:
+            return b""
+        chunk = self.read_bytes(chunk_len, offset)
+        nl = chunk.find(b"\n")
+        return chunk if nl == -1 else chunk[: nl + 1]
+
+    def readlines(self, hint: int = -1, *, offset: int = 0) -> list[bytes]:
+        """Read every line from ``offset`` to EOF (or until ``hint`` bytes)."""
+        lines: list[bytes] = []
+        cursor = offset
+        total = 0
+        while True:
+            line = self.readline(offset=cursor)
+            if not line:
+                break
+            lines.append(line)
+            total += len(line)
+            cursor += len(line)
+            if hint is not None and hint > 0 and total >= hint:
+                break
+        return lines
+
+    # ---- structured binary helpers — fixed-width little-endian ---------
+
+    def _read_struct(self, fmt: str, n: int, offset: int) -> Any:
+        return struct.unpack(fmt, self.read_bytes(n, offset))[0]
+
+    def _write_struct(self, fmt: str, value: Any, offset: int) -> int:
+        return self.write_bytes(struct.pack(fmt, value), offset)
+
+    def read_int8(self, *, offset: int = 0) -> int: return self._read_struct("<b", 1, offset)
+    def write_int8(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<b", int(v), offset)
+    def read_uint8(self, *, offset: int = 0) -> int: return self._read_struct("<B", 1, offset)
+    def write_uint8(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<B", int(v), offset)
+    def read_int16(self, *, offset: int = 0) -> int: return self._read_struct("<h", 2, offset)
+    def write_int16(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<h", int(v), offset)
+    def read_uint16(self, *, offset: int = 0) -> int: return self._read_struct("<H", 2, offset)
+    def write_uint16(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<H", int(v), offset)
+    def read_int32(self, *, offset: int = 0) -> int: return self._read_struct("<i", 4, offset)
+    def write_int32(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<i", int(v), offset)
+    def read_uint32(self, *, offset: int = 0) -> int: return self._read_struct("<I", 4, offset)
+    def write_uint32(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<I", int(v), offset)
+    def read_int64(self, *, offset: int = 0) -> int: return self._read_struct("<q", 8, offset)
+    def write_int64(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<q", int(v), offset)
+    def read_uint64(self, *, offset: int = 0) -> int: return self._read_struct("<Q", 8, offset)
+    def write_uint64(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<Q", int(v), offset)
+    def read_f32(self, *, offset: int = 0) -> float: return self._read_struct("<f", 4, offset)
+    def write_f32(self, v: float, *, offset: int = 0) -> int: return self._write_struct("<f", float(v), offset)
+    def read_f64(self, *, offset: int = 0) -> float: return self._read_struct("<d", 8, offset)
+    def write_f64(self, v: float, *, offset: int = 0) -> int: return self._write_struct("<d", float(v), offset)
+    def read_bool(self, *, offset: int = 0) -> bool: return bool(self.read_uint8(offset=offset))
+    def write_bool(self, v: bool, *, offset: int = 0) -> int: return self.write_uint8(1 if v else 0, offset=offset)
 
     # ------------------------------------------------------------------
     # Local-path bridge
@@ -1060,96 +1254,356 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
                     remaining -= written
         return total
 
-    def write_stream(self, src: IO[bytes], *, pos: int = 0) -> int:
-        """Drain a binary file-like ``src`` into this holder at ``pos``.
+    def write_stream(
+        self,
+        src: Any,
+        *,
+        offset: int = 0,
+        size: int = -1,
+        overwrite: bool = False,
+        batch_size: int = _COPY_CHUNK,
+    ) -> int:
+        """Drain a binary source into this holder at ``offset``.
 
-        Mirrors :meth:`write_local_path` for IO-shaped sources
-        (:class:`io.BytesIO`, ``open(..., "rb")``, urllib3 responses,
-        :class:`yggdrasil.io.tabular.parquet_io.ParquetIO`). Reads the
-        full payload once and commits it via a single
-        :meth:`write_bytes`, so backends whose ``_write_mv`` implements
-        an atomic upload at ``pos == 0`` (Files API ``upload``, S3
-        ``PutObject``) push a single request rather than chunked
-        read-modify-rewrites.
+        Public entry point: accepts a yggdrasil :class:`IO[bytes]`,
+        a stdlib :class:`typing.BinaryIO` (``io.BytesIO``,
+        ``open(..., "rb")``, urllib3 responses, …), or any file-like
+        carrying a ``.read``. Non-:class:`IO` sources are coerced
+        via :meth:`IO.from_` so subclass-side :meth:`_write_stream`
+        always receives a real :class:`IO[bytes]`.
+
+        ``size`` caps the byte count drained from *src* —
+        ``size=-1`` (default) reads to EOF; ``size>=0`` stops at
+        ``size`` bytes (no over-pull from the source).
+
+        ``overwrite`` truncates the holder's tail past
+        ``offset + bytes_written``; whole-blob remote backends
+        get a single atomic PUT instead of an explicit truncate
+        followed by a write.
+
+        ``batch_size`` is the read/write chunk size for the
+        default streaming path (:data:`_COPY_CHUNK`, 1 MiB).
+        Tune up for high-throughput remote sinks where the
+        per-call overhead dominates, or down to bound peak
+        memory on a slow consumer.
         """
-        if pos < 0:
-            raise ValueError("write_stream pos must be >= 0")
-        payload = src.read()
-        if not payload:
-            return 0
-        return self.write_bytes(payload, pos=pos)
+        if offset < 0:
+            raise ValueError("write_stream offset must be >= 0")
+        if batch_size <= 0:
+            raise ValueError("write_stream batch_size must be > 0")
+        from yggdrasil.io.base import IO as _IO
+        from yggdrasil.io.bytes_io import BytesIO as _YggBytesIO
+
+        io_src = src if isinstance(src, _IO) else _YggBytesIO.from_(src)
+        return self._write_stream(
+            io_src,
+            offset=offset,
+            size=size,
+            overwrite=overwrite,
+            batch_size=batch_size,
+        )
+
+    def _write_stream(
+        self,
+        src: "IO[bytes]",
+        *,
+        offset: int,
+        size: int = -1,
+        overwrite: bool = False,
+        batch_size: int = _COPY_CHUNK,
+    ) -> int:
+        """Splice ``src``'s bytes into this holder starting at ``offset``.
+
+        Default implementation: real chunked streaming — read
+        ``batch_size`` bytes at a time and splice each chunk
+        through :meth:`write_bytes`, so multi-GB sources never
+        materialise as a single :class:`bytes` object in Python.
+        ``size>=0`` caps the byte count so the source stops
+        being read once the limit is reached. ``overwrite=True``
+        truncates the tail beyond the final cursor on the last
+        chunk so the holder ends exactly where the stream did.
+
+        Subclass override hook: backends with an atomic
+        whole-object upload (Volumes ``files.upload``, Workspace
+        ``workspace.upload``, S3 ``PutObject``) replace this with
+        a single request that consumes *src* directly — the
+        chunked default is a strict loss for those.
+
+        *src* is always a real :class:`IO[bytes]`; the public
+        :meth:`write_stream` does the coercion so subclass code
+        gets a stable type.
+        """
+        cursor = offset
+        total = 0
+        remaining = size if size >= 0 else None
+        while True:
+            if remaining is not None:
+                if remaining <= 0:
+                    break
+                chunk_size = min(batch_size, remaining)
+            else:
+                chunk_size = batch_size
+            chunk = src.read(chunk_size)
+            if not chunk:
+                break
+            n = self.write_bytes(chunk, offset=cursor)
+            cursor += n
+            total += n
+            if remaining is not None:
+                remaining -= n
+        if overwrite and cursor < self.size:
+            self.truncate(cursor)
+        return total
+
+    def write_holder(
+        self,
+        src: "Holder",
+        *,
+        offset: int = 0,
+        size: int = -1,
+        overwrite: bool = False,
+        batch_size: int = _COPY_CHUNK,
+    ) -> int:
+        """Splice another :class:`Holder`'s bytes into this one at ``offset``.
+
+        Public entry point: validates the inputs, then dispatches
+        to :meth:`_write_holder`. ``size`` caps the byte count
+        pulled from *src* — ``size=-1`` (default) writes the
+        whole source; ``size>=0`` writes the first ``size`` bytes.
+        ``overwrite`` truncates the tail past
+        ``offset + bytes_written`` (collapses ``truncate(...) +
+        write_holder(...)`` into one operation for whole-blob
+        remote backends). ``batch_size`` is forwarded to the
+        streaming path for above-threshold payloads.
+
+        Subclasses override the private hook to swap in a
+        backend-aware fast path (Workspace / Volumes / S3 can
+        hand the source straight to their atomic-upload SDK call
+        without ever materialising the bytes in Python).
+        """
+        if offset < 0:
+            raise ValueError("write_holder offset must be >= 0")
+        if not isinstance(src, Holder):
+            raise TypeError(
+                f"write_holder: expected a Holder source, got "
+                f"{type(src).__name__}. Pass through `write_bytes` for "
+                f"bytes-like / IO / stream inputs."
+            )
+        return self._write_holder(
+            src,
+            offset=offset,
+            size=size,
+            overwrite=overwrite,
+            batch_size=batch_size,
+        )
+
+    def _write_holder(
+        self,
+        src: "Holder",
+        *,
+        offset: int,
+        size: int = -1,
+        overwrite: bool = False,
+        batch_size: int = _COPY_CHUNK,
+    ) -> int:
+        """Splice *src*'s bytes into this holder starting at ``offset``.
+
+        Routing:
+
+        - *src* is a :class:`Path` and we're at ``offset == 0``
+          with no slicing → defer to :meth:`Holder._transfer_to`
+          on *src* so the source-side fast paths fire
+          (:func:`shutil.copyfile` for local→local,
+          :meth:`Holder.write_local_path` for local→remote).
+        - Sub-threshold payloads (under
+          :data:`_INLINE_WRITE_THRESHOLD`, currently 4 MiB)
+          splice through :meth:`write_mv` in one shot.
+        - Larger payloads open an :class:`IO[bytes]` cursor on
+          *src* and hand it to :meth:`_write_stream`, so backends
+          with an atomic streaming uploader can replace the
+          default chunked drain.
+
+        ``size>=0`` caps the byte count pulled from *src*. The
+        decision boundary (inline vs stream) uses
+        ``min(src.size, size)`` so a 5 MiB source with
+        ``size=1024`` still goes through the inline fast path.
+        ``overwrite`` truncates the tail past
+        ``offset + bytes_written``; ``batch_size`` controls the
+        streaming chunk size when the threshold path is taken.
+
+        Override when a backend can splice a foreign holder
+        without going through Python bytes (e.g. an S3
+        ``CopyObject`` when ``self`` and *src* share an
+        underlying bucket).
+        """
+        from yggdrasil.io.path.path import Path
+
+        if (
+            offset == 0
+            and size < 0
+            and isinstance(src, Path)
+            and type(src)._transfer_to is not Holder._transfer_to
+        ):
+            # Path source with a specialised ``_transfer_to``
+            # (LocalPath, AWS S3Path, …) → defer to its fast
+            # paths instead of the generic inline / stream loop.
+            src._transfer_to(self)
+            written = src.size
+            if overwrite and written < self.size:
+                self.truncate(written)
+            return written
+
+        src_size = src.size
+        effective = src_size if size < 0 else min(src_size, size)
+        if effective < _INLINE_WRITE_THRESHOLD:
+            return self.write_mv(
+                src.read_mv(effective, 0), offset, overwrite=overwrite,
+            )
+        from yggdrasil.io.bytes_io import BytesIO as _YggBytesIO
+
+        with _YggBytesIO(holder=src, mode="rb") as io_src:
+            return self._write_stream(
+                io_src,
+                offset=offset,
+                size=effective,
+                overwrite=overwrite,
+                batch_size=batch_size,
+            )
 
     # ------------------------------------------------------------------
     # Byte transfer — upload / download to any byte sink
     # ------------------------------------------------------------------
 
-    def upload(self, to: Any) -> "Holder | IO":
-        """Copy this holder's bytes into *to*.
+    def upload(
+        self, src: Any, *, size: int = -1, offset: int = 0,
+    ) -> "Holder":
+        """Upload *src*'s bytes into this holder.
 
-        *to* accepts any of:
+        Symmetric to :meth:`download` but indexed from the
+        destination side — ``dst.upload(src)`` makes the
+        destination's content equal to the source's.
 
-        - :class:`Holder` (incl. any :class:`Path` subclass) — bytes
-          are spliced into the holder at offset 0.
-        - :class:`IO` cursor — bytes are written at the cursor's
-          current position via :meth:`IO.write_bytes`.
+        *src* accepts any of:
+
+        - :class:`Holder` (incl. any :class:`Path` subclass) —
+          its bytes are pulled starting at *offset*.
+        - :class:`IO` cursor — *offset* (if non-zero) seeks
+          before ``read()``; otherwise the cursor's current
+          position is honoured.
         - ``str`` / :class:`os.PathLike` — coerced via
-          ``Path.from_(to)`` and treated as a holder.
+          ``Path.from_(src)`` and treated as a holder.
 
-        When the resolved target is a :class:`Path` whose URL ends
-        in a trailing ``/`` (directory shape), this holder's
-        filename (``self.url.name`` or ``"download"`` for nameless
-        holders) is joined onto it. No remote ``stat`` is issued —
-        the trailing slash is a purely local, ``cp``-style hint.
+        *size* and *offset* slice the source: ``size=-1`` (default)
+        reads to EOF, ``size>=0`` caps the byte count, ``offset``
+        is the starting offset. Slicing forces the whole-payload
+        fast path in :meth:`_transfer_to` to defer to a bytes
+        copy (the backend-specific shortcuts —
+        ``shutil.copyfile``, ``write_local_path`` — don't expose
+        a window).
 
-        Returns the resolved target so chains like
-        ``src.upload(dst).read_bytes()`` work.
+        When *self* is a :class:`Path` whose URL ends in a
+        trailing ``/`` (directory shape), the source's filename
+        (``src.url.name`` or ``"download"`` for nameless holders)
+        is joined onto it. No remote ``stat`` is issued — the
+        trailing slash is a purely local, ``cp``-style hint.
+
+        Returns the resolved destination so chains like
+        ``dst.upload(src).read_bytes()`` work.
 
         Subclasses with a faster move (e.g. local→local via
         ``sendfile``, local→remote chunked stream) override
         :meth:`_transfer_to`, not this method.
         """
-        target = self._resolve_transfer_target(to)
-        self._transfer_to(target)
-        return target
-
-    def download(self, to: Any = None) -> "Holder | IO":
-        """Copy this holder's bytes to a local target.
-
-        Same *to* coercion as :meth:`upload`. When *to* is
-        :data:`None`, bytes land in the user's ``~/Downloads``
-        folder under :attr:`url.name` (or ``"download"`` for
-        nameless holders), with browser-style ``(1)`` / ``(2)`` /
-        … suffixes appended on name conflict. Returns the resolved
-        target.
-        """
-        if to is None:
-            to = _default_download_target(self._transfer_filename())
-        return self.upload(to)
-
-    def _resolve_transfer_target(self, to: Any) -> "Holder | IO":
-        """Coerce a transfer target into a :class:`Holder` or :class:`IO`.
-
-        Handles the four input shapes accepted by :meth:`upload` and
-        :meth:`download`. The trailing-slash directory hint is
-        applied uniformly: a target whose URL ends in ``/`` gets
-        ``self.url.name`` joined onto it before bytes are written.
-        """
-        from yggdrasil.io.base import IO
         from yggdrasil.io.path.path import Path
 
-        if isinstance(to, IO):
-            return to
-        if isinstance(to, Path):
-            return to / self._transfer_filename() if _looks_like_directory(to.url) else to
-        if isinstance(to, Holder):
-            return to
-        if isinstance(to, (str, os.PathLike)):
-            target = Path.from_(to)
-            return target / self._transfer_filename() if _looks_like_directory(target.url) else target
-        raise TypeError(
-            f"Holder.upload/download: expected a Holder, IO, str, or "
-            f"os.PathLike target; got {type(to).__name__}: {to!r}"
-        )
+        source = _coerce_transfer_endpoint(src)
+        target = _join_dir_hint(self, source)
+        if isinstance(source, Path) and source.is_dir():
+            # Directory tree: only a :class:`Path` target can hold
+            # it. ``size`` / ``offset`` slicing is a file-only knob.
+            if size != -1 or offset != 0:
+                raise IsADirectoryError(
+                    f"Holder.upload: source {source.full_path()!r} is "
+                    f"a directory; size / offset slicing applies to "
+                    f"file uploads only."
+                )
+            if not isinstance(target, Path):
+                raise IsADirectoryError(
+                    f"Holder.upload: source {source.full_path()!r} is "
+                    f"a directory; target must be a Path to hold the "
+                    f"tree, got {type(target).__name__}."
+                )
+            target.mkdir(parents=True, exist_ok=True)
+            for child in source.iterdir():
+                (target / child.name).upload(child)
+            return target
+        if size < 0 and offset == 0:
+            # Whole-source: defer to ``write_bytes`` type dispatch —
+            # bytes → ``write_mv``, :class:`Holder` → ``write_holder``
+            # (Path target uses :meth:`Path._write_holder` to fire
+            # the ``_transfer_to`` fast paths: ``shutil.copyfile``
+            # for local→local, ``write_local_path`` for local→remote),
+            # IO → ``write_stream`` (path subclass overrides splice
+            # in their atomic-upload SDK call). ``overwrite=True``
+            # truncates any tail past the source's length.
+            target.write_bytes(source, overwrite=True)
+        else:
+            target.write_bytes(
+                _read_slice_from_source(source, size=size, offset=offset),
+                overwrite=True,
+            )
+        return target
+
+    def download(
+        self, to: Any = None, *, size: int = -1, offset: int = 0,
+    ) -> "Holder | IO":
+        """Copy this holder's bytes to a local target.
+
+        When *to* is :data:`None`, bytes land in the user's
+        ``~/Downloads`` folder under :attr:`url.name` (or
+        ``"download"`` for nameless holders), with browser-style
+        ``(1)`` / ``(2)`` / … suffixes appended on name conflict.
+        Otherwise *to* accepts the same shapes as :meth:`upload`
+        (:class:`Holder`, :class:`IO`, ``str`` / :class:`os.PathLike`).
+        *size* and *offset* slice this holder: ``size=-1`` (default)
+        reads to EOF, ``size>=0`` caps the byte count, ``offset``
+        is the starting offset. Returns the resolved target.
+        """
+        from yggdrasil.io.path.path import Path
+
+        if to is None:
+            to = _default_download_target(self._transfer_filename())
+        target = _join_dir_hint(_coerce_transfer_endpoint(to), self)
+        if isinstance(self, Path) and self.is_dir():
+            # Symmetric with :meth:`upload` — delegate to the
+            # destination-side recurse: ``target.upload(self)``
+            # knows how to ``mkdir`` and walk *self*'s children.
+            if size != -1 or offset != 0:
+                raise IsADirectoryError(
+                    f"Holder.download: source {self.full_path()!r} is "
+                    f"a directory; size / offset slicing applies to "
+                    f"file downloads only."
+                )
+            if not isinstance(target, Path):
+                raise IsADirectoryError(
+                    f"Holder.download: source {self.full_path()!r} is "
+                    f"a directory; target must be a Path to hold the "
+                    f"tree, got {type(target).__name__}."
+                )
+            return target.upload(self)
+        if size < 0 and offset == 0:
+            # Whole-source: defer to ``target.write_bytes(self)``
+            # so the byte-pump goes through the same dispatch as
+            # ``upload`` — Path target picks up the local fast
+            # paths via :meth:`Path._write_holder`.
+            target.write_bytes(self, overwrite=True)
+        else:
+            target.write_bytes(
+                _read_slice_from_source(self, size=size, offset=offset),
+                overwrite=True,
+            )
+        return target
+
 
     def _transfer_filename(self) -> str:
         """Filename used when joining onto a directory-shaped target.
@@ -1186,6 +1640,29 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
     def to_bytes(self) -> bytes:
         """Full payload as :class:`bytes` — alias for ``read_bytes()``."""
         return self.read_bytes()
+
+    def getvalue(self) -> bytes:
+        """Stdlib :class:`io.BytesIO` parity — alias for :meth:`to_bytes`."""
+        return self.to_bytes()
+
+    def decode(self, encoding: str = "utf-8", errors: str = "replace") -> str:
+        """Decode the whole payload as text. Cursorless — does not seek."""
+        return self.to_bytes().decode(encoding, errors=errors)
+
+    def to_base64(self, urlsafe: bool = True) -> str:
+        """Return the payload base64-encoded as an ASCII ``str``.
+
+        ``urlsafe=True`` (default) uses :func:`base64.urlsafe_b64encode`
+        — ``-`` / ``_`` in place of ``+`` / ``/`` so the result drops
+        cleanly into a URL or filename. ``urlsafe=False`` falls back
+        to the standard alphabet.
+        """
+        import base64
+
+        b = self.to_bytes()
+        if urlsafe:
+            return base64.urlsafe_b64encode(b).decode("ascii")
+        return base64.b64encode(b).decode("ascii")
 
     def xxh3_64(self):
         """Return an :class:`xxhash.xxh3_64` instance over the payload.
@@ -1245,10 +1722,74 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         return self.read_bytes()
 
 
+def _coerce_transfer_endpoint(value: Any) -> "Holder | IO":
+    """Coerce a transfer endpoint into a :class:`Holder` or :class:`IO`.
+
+    Used by :meth:`Holder.upload` / :meth:`Holder.download` to
+    accept the same four input shapes — :class:`Holder`,
+    :class:`IO`, ``str``, :class:`os.PathLike` — regardless of
+    whether the value names the source or the target side.
+    """
+    from yggdrasil.io.base import IO
+    from yggdrasil.io.path.path import Path
+
+    if isinstance(value, (Holder, IO)):
+        return value
+    if isinstance(value, (str, os.PathLike)):
+        return Path.from_(value)
+    raise TypeError(
+        f"Holder.upload/download: expected a Holder, IO, str, or "
+        f"os.PathLike endpoint; got {type(value).__name__}: {value!r}"
+    )
+
+
+def _read_slice_from_source(
+    source: "Holder | IO", *, size: int, offset: int,
+) -> bytes:
+    """Pull ``[offset, offset+size)`` bytes from a coerced transfer source.
+
+    Hides the :class:`Holder` vs :class:`IO` split for the
+    upload/download read side:
+
+    - :class:`Holder` sources use ``read_bytes(size, offset)``
+      — cursorless positional read.
+    - :class:`IO` sources :meth:`~IO.seek` to ``offset`` (when
+      non-zero) and consume ``size`` bytes from the cursor, so
+      the caller-supplied stream position is the natural origin.
+
+    ``size < 0`` means "to EOF" in both cases.
+    """
+    from yggdrasil.io.base import IO
+
+    if isinstance(source, IO):
+        if offset:
+            source.seek(offset)
+        return source.read() if size < 0 else source.read(size)
+    return source.read_bytes(size=size, offset=offset)
+
+
+def _join_dir_hint(
+    dst: "Holder | IO", src: "Holder | IO",
+) -> "Holder | IO":
+    """Apply ``cp``-style directory hint when *dst* is a slash-terminated Path.
+
+    ``dst_dir_slash.upload(src)`` lands at ``dst_dir/<src.name>``;
+    a non-Path *dst* (Memory, IO cursor) or a non-directory path
+    is returned untouched. The source's filename is taken from
+    :meth:`Holder._transfer_filename` so :class:`Memory` /
+    nameless holders fall back to ``"download"``.
+    """
+    from yggdrasil.io.path.path import Path
+
+    if isinstance(dst, Path) and _looks_like_directory(dst.url):
+        return dst / src._transfer_filename()  # type: ignore[union-attr]
+    return dst
+
+
 def _looks_like_directory(url: URL) -> bool:
     """Trailing-slash check: ``True`` iff *url*'s path ends in ``/``.
 
-    Used by :meth:`Holder._resolve_transfer_target` to apply
+    Used by the upload/download directory-hint helpers to apply
     ``cp``-style "into this directory" semantics without a remote
     stat round trip. The canonical signal is an empty trailing
     element in :attr:`URL.parts`.
