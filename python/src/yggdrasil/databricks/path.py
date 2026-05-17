@@ -51,6 +51,25 @@ __all__ = ["DatabricksPath"]
 
 
 # ---------------------------------------------------------------------------
+# Cross-method stash for the URL ``__new__`` normalizes
+# ---------------------------------------------------------------------------
+
+# Keyed by ``id(instance)``: lives only between the call to
+# :meth:`DatabricksPath.__new__` and the matching :meth:`__init__`
+# (Python guarantees the latter runs synchronously on the same thread
+# immediately after). ``__init__`` always pops what ``__new__``
+# stashed, so the dict stays bounded by the count of currently
+# in-flight constructions.
+#
+# The stash deliberately lives outside ``self.__dict__``: writing the
+# slot into the instance dict and then popping it leaves a "dummy"
+# entry in CPython's internal hash table that every subsequent
+# attribute lookup probes past — measured at +30% on the hot
+# ``_stat_cached_fresh`` / ``size`` / ``exists`` reads.
+_PENDING_URL_STASH: dict[int, "URL"] = {}
+
+
+# ---------------------------------------------------------------------------
 # Legacy POSIX coercion
 # ---------------------------------------------------------------------------
 
@@ -355,15 +374,31 @@ class DatabricksPath(DatabricksResource, RemotePath):
         the eventual ``object.__new__`` allocation — normalize the
         seed into a URL kwarg first so a POSIX-string construction
         (``VolumePath("/Volumes/cat/sch/vol/x")``) lands on the
-        same canonical URL as the URL-shaped one.
+        same canonical URL as the URL-shaped one. The normalized
+        URL is then stashed on the instance so :meth:`__init__`
+        can skip the second parse.
         """
         if cls is not DatabricksPath:
+            normalized: "URL | None" = None
             if url is None and data is not None:
                 _, normalized = _resolve_databricks_subclass(data=data)
                 if normalized is not None:
                     url = normalized
                     data = None
-            return super().__new__(cls, data=data, url=url, **kwargs)
+            instance = super().__new__(cls, data=data, url=url, **kwargs)
+            # Stash the normalized URL so the upcoming ``__init__``
+            # skips the redundant ``_coerce_to_url_str`` +
+            # ``URL.from_`` + ``_strip_dbfs_family_prefix`` chain that
+            # would otherwise re-derive the same value from the same
+            # POSIX seed. Only stash when we actually computed the
+            # normalization here — explicit URL kwargs still need
+            # ``__init__`` to run ``_strip_dbfs_family_prefix`` on
+            # them. On a singleton cache hit ``_initialized`` is
+            # already True; ``__init__`` short-circuits and never
+            # reads the slot.
+            if normalized is not None and not getattr(instance, "_initialized", False):
+                _PENDING_URL_STASH[id(instance)] = normalized
+            return instance
 
         target, normalized = _resolve_databricks_subclass(data=data, url=url)
         # Byte-shaped Path subclasses (DBFSPath / VolumePath /
@@ -385,7 +420,20 @@ class DatabricksPath(DatabricksResource, RemotePath):
                 if normalized is not None:
                     data = None
                     url = normalized
-                return target.__new__(target, data=data, url=url, **kwargs)
+                instance = target.__new__(target, data=data, url=url, **kwargs)
+                # The dispatcher just normalized the seed via
+                # ``_resolve_databricks_subclass``; stash it on the
+                # target instance so the auto-fired ``__init__``
+                # skips the re-parse. ``target.__new__`` itself
+                # only re-stashes when it had to do the work
+                # locally — here ``url=`` arrived pre-normalized
+                # so the inner ``__new__`` doesn't see the
+                # POSIX seed.
+                if normalized is not None and not getattr(
+                    instance, "_initialized", False,
+                ):
+                    _PENDING_URL_STASH[id(instance)] = normalized
+                return instance
 
         # Resource-shaped or off-family target — construct eagerly via
         # ``from_url`` so the returned object is fully initialized.
@@ -421,28 +469,45 @@ class DatabricksPath(DatabricksResource, RemotePath):
         elif service is None:
             service = self._SERVICE_CLASS.current()
 
-        # Pre-coerce ``/dbfs/...`` / ``/Volumes/...`` / ``/Workspace/...``
-        # into the canonical URL form so the URL parser sees a real
-        # scheme.
-        if data is not None:
-            data = _coerce_to_url_str(data)
+        # ``__new__`` already normalized POSIX-string seeds into a
+        # canonical URL and stashed the result on the instance — pick
+        # it up and skip the ``_coerce_to_url_str`` + ``URL.from_`` +
+        # ``_strip_dbfs_family_prefix`` chain we'd otherwise repeat.
+        # The stash is keyed to the seed that produced it, so callers
+        # passing an explicit ``url=`` kwarg still go through the
+        # parse path below (no stash was made for that case). The
+        # stash lives in a process-wide id-keyed dict, not on
+        # ``self.__dict__``, so popping it doesn't leave a dummy
+        # slot that every later ``_stat_cached_fresh`` / ``size`` /
+        # ``exists`` hit has to probe past — CPython retains dummy
+        # entries from popped keys until the dict is rebuilt.
+        pending = _PENDING_URL_STASH.pop(id(self), None)
+        if pending is not None:
+            url = pending
+            data = None
+        else:
+            # Pre-coerce ``/dbfs/...`` / ``/Volumes/...`` /
+            # ``/Workspace/...`` into the canonical URL form so the URL
+            # parser sees a real scheme.
+            if data is not None:
+                data = _coerce_to_url_str(data)
 
-        if url is None and isinstance(data, str):
-            url = URL.from_(data)
-            data = None
-        if url is None and isinstance(data, URL):
-            url = data
-            data = None
-        if url is not None:
-            url = URL.from_(url)
-            url = _strip_dbfs_family_prefix(url)
-            target_scheme = self.scheme
-            if target_scheme is not None:
-                target_token = target_scheme.value if isinstance(
-                    target_scheme, Scheme,
-                ) else str(target_scheme)
-                if not url.scheme:
-                    url = url.with_scheme(target_token)
+            if url is None and isinstance(data, str):
+                url = URL.from_(data)
+                data = None
+            if url is None and isinstance(data, URL):
+                url = data
+                data = None
+            if url is not None:
+                url = URL.from_(url)
+                url = _strip_dbfs_family_prefix(url)
+                target_scheme = self.scheme
+                if target_scheme is not None:
+                    target_token = target_scheme.value if isinstance(
+                        target_scheme, Scheme,
+                    ) else str(target_scheme)
+                    if not url.scheme:
+                        url = url.with_scheme(target_token)
 
         super().__init__(
             service=service, data=data, url=url, temporary=temporary,
