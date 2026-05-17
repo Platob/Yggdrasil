@@ -205,7 +205,7 @@ def scenarios(repeat: int) -> list[dict]:
 
     # Stat — cold (single HeadObject round-trip via mock).
     def stat_cold() -> None:
-        primed._invalidate_stat_cache()
+        primed.invalidate_singleton(remove_global=False)
         primed.exists()
 
     out.append(_time_one(
@@ -216,7 +216,7 @@ def scenarios(repeat: int) -> list[dict]:
 
     # _read_mv — bench a small ranged GET through the mock so the
     # ContentRange seed path in :meth:`_read_mv` runs.
-    primed._invalidate_stat_cache()
+    primed.invalidate_singleton(remove_global=False)
     out.append(_time_one(
         "S3Path._read_mv(4096) via mock GetObject",
         lambda: primed._read_mv(4096, 0),

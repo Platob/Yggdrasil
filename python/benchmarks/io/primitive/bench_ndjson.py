@@ -1,4 +1,4 @@
-"""Benchmark :class:`NDJsonIO` — newline-delimited JSON.
+"""Benchmark :class:`NDJSONFile` — newline-delimited JSON.
 
 NDJson is per-row encode-cost dominated: serializing 50k rows is
 expensive, but reading via :mod:`pyarrow.json` is fast (vectorised).
@@ -18,7 +18,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from yggdrasil.io.primitive.ndjson_io import NDJsonIO
+from yggdrasil.io.primitive.ndjson_file import NDJSONFile
 
 from _common import (  # type: ignore[import-not-found]
     bench_roundtrip,
@@ -30,11 +30,11 @@ from _common import (  # type: ignore[import-not-found]
 
 def scenarios(repeat: int) -> list[dict]:
     out: list[dict] = []
-    out.extend(bench_roundtrip("ndjson flat 1k", NDJsonIO, flat_table(1_000),
+    out.extend(bench_roundtrip("ndjson flat 1k", NDJSONFile, flat_table(1_000),
                                repeat=repeat, inner=100))
-    out.extend(bench_roundtrip("ndjson flat 50k", NDJsonIO, flat_table(50_000),
+    out.extend(bench_roundtrip("ndjson flat 50k", NDJSONFile, flat_table(50_000),
                                repeat=repeat, inner=10))
-    out.extend(bench_roundtrip("ndjson nested 10k", NDJsonIO, nested_table(10_000),
+    out.extend(bench_roundtrip("ndjson nested 10k", NDJSONFile, nested_table(10_000),
                                repeat=repeat, inner=20))
     return out
 

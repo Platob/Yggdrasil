@@ -1,4 +1,4 @@
-"""Benchmark :class:`JsonIO` — single top-level JSON array.
+"""Benchmark :class:`JSONFile` — single top-level JSON array.
 
 JSON is the slowest write path of the primitive set (one large
 top-level array serialized in one shot). Production shapes covered:
@@ -17,7 +17,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from yggdrasil.io.primitive.json_io import JsonIO
+from yggdrasil.io.primitive.json_file import JSONFile
 
 from _common import (  # type: ignore[import-not-found]
     bench_roundtrip,
@@ -29,11 +29,11 @@ from _common import (  # type: ignore[import-not-found]
 
 def scenarios(repeat: int) -> list[dict]:
     out: list[dict] = []
-    out.extend(bench_roundtrip("json flat 1k", JsonIO, flat_table(1_000),
+    out.extend(bench_roundtrip("json flat 1k", JSONFile, flat_table(1_000),
                                repeat=repeat, inner=100))
-    out.extend(bench_roundtrip("json flat 50k", JsonIO, flat_table(50_000),
+    out.extend(bench_roundtrip("json flat 50k", JSONFile, flat_table(50_000),
                                repeat=repeat, inner=5))
-    out.extend(bench_roundtrip("json nested 10k", JsonIO, nested_table(10_000),
+    out.extend(bench_roundtrip("json nested 10k", JSONFile, nested_table(10_000),
                                repeat=repeat, inner=10))
     return out
 
