@@ -630,12 +630,23 @@ class AsyncInsertJob:
 
         Resolves the workspace client, looks up the target table,
         takes an exclusive :meth:`lock` on its staging folder, and
-        applies every staged :class:`AsyncInsert` record by handing
-        the merged records + engine to :meth:`AsyncInsert.concat`
-        (the engine picks the execution path — warehouse, Spark,
-        whatever it's wired to). Concurrent applier runs block on
-        the lock so the staging folder is drained by at most one
-        process at a time.
+        applies every staged :class:`AsyncInsert` record by rendering
+        each as one or more SQL strings and submitting them through
+        :meth:`SQLEngine.execute`. The engine auto-picks Spark vs the
+        warehouse API per statement via :meth:`SQLEngine._pick_engine`
+        — when a :class:`SparkSession` is reachable (the typical
+        notebook-task context, where the staged notebook runs on a
+        Databricks cluster) every ``INSERT`` lands on that cluster;
+        the warehouse API path is the fall-back only when no session
+        exists.
+
+        Concurrent applier runs block on the lock so the staging
+        folder is drained by at most one process at a time. Staged
+        Parquet + metadata files are removed via
+        :meth:`AsyncInsert.cleanup` after each record's statements
+        land — the warehouse ``external_volume_paths`` lifecycle
+        hook only fires on the API path, so this explicit sweep keeps
+        the staging folder bounded on the Spark path too.
 
         Used by :meth:`Table.async_job` as the staged Python task
         when the job doesn't exist yet — ``inspect.getsource`` is
@@ -645,7 +656,6 @@ class AsyncInsertJob:
         """
         from yggdrasil.databricks.client import DatabricksClient
         from yggdrasil.databricks.table.async_job import AsyncInsertJob
-        from yggdrasil.databricks.table.async_write import AsyncInsert
 
         client = DatabricksClient.current()
         engine = client.sql(
@@ -657,10 +667,7 @@ class AsyncInsertJob:
             records = AsyncInsertJob.load(table)
             if not records:
                 return
-            AsyncInsert.concat(
-                records,
-                engine=engine,
-                client=client,
-                wait=True,
-                raise_error=True,
-            )
+            for record in records:
+                for sql in record.to_sql():
+                    engine.execute(sql, wait=True, raise_error=True)
+                record.cleanup(client=client)
