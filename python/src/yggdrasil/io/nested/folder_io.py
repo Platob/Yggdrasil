@@ -54,7 +54,7 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.data.enums.media_type import MediaType, MediaTypes
 from yggdrasil.io.bytes_io import BytesIO
-from yggdrasil.io.holder import Holder
+from yggdrasil.io.holder import IO
 from yggdrasil.io.tabular.base import Tabular
 
 if TYPE_CHECKING:
@@ -94,7 +94,7 @@ class FolderOptions(CastOptions):
             object.__setattr__(self, "child_media_type", coerced)
 
 
-class FolderIO(Holder[FolderOptions]):
+class FolderIO(IO[bytes, FolderOptions]):
     """:class:`Tabular` over a directory of tabular files.
 
     Inherits :class:`Holder` so it registers in the cross-cutting
@@ -289,7 +289,7 @@ class FolderIO(Holder[FolderOptions]):
         if mt is None:
             return None
         try:
-            cls = Holder.class_for_media_type(mt, default=None)
+            cls = IO.class_for_media_type(mt, default=None)
         except Exception:
             cls = None
         if cls is None:
@@ -312,7 +312,7 @@ class FolderIO(Holder[FolderOptions]):
         in the same millisecond.
 
         The :class:`Tabular` leaf is dispatched directly from the
-        media type via :meth:`Holder.class_for_media_type`, so the
+        media type via :meth:`IO.class_for_media_type`, so the
         write path doesn't go through the path-extension reverse-
         lookup. A media type with no registered leaf falls back to
         a raw :class:`BytesIO` so non-tabular extensions still get a
@@ -331,7 +331,7 @@ class FolderIO(Holder[FolderOptions]):
         name = f"part-{epoch_ms}-{seed}{suffix}"
 
         child_path = self.path / name
-        cls = Holder.class_for_media_type(opts.child_media_type, default=None)
+        cls = IO.class_for_media_type(opts.child_media_type, default=None)
         if cls is None:
             leaf: "Tabular" = BytesIO(holder=child_path, owns_holder=False)
         else:

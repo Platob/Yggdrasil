@@ -42,7 +42,6 @@ from yggdrasil.data.enums import Mode
 from yggdrasil.dataclasses import WaitingConfigArg, WaitingConfig
 from yggdrasil.io.base import IO
 from yggdrasil.io.bytes_io import BytesIO
-from yggdrasil.io.holder import Holder
 from yggdrasil.io.io_stats import IOKind, IOStats, TimeLike
 from yggdrasil.io.url import URL
 
@@ -56,7 +55,7 @@ __all__ = ["Path"]
 TS_PATTERN = re.compile(r'-(\d+)-(\d+)-')
 
 
-class Path(Holder, os.PathLike, ABC):
+class Path(IO, os.PathLike, ABC):
     """Abstract URL-addressed byte holder with filesystem semantics.
 
     Two layers, no shared state between them:
@@ -664,8 +663,7 @@ class Path(Holder, os.PathLike, ABC):
         Raises :class:`KeyError` when the path's media type isn't
         registered as a tabular format.
         """
-        from yggdrasil.io.holder import Holder
-        return Holder.for_holder(self, media_type=media_type)
+        return IO.for_holder(self, media_type=media_type)
 
     # ==================================================================
     # open(mode) — returns a BytesIO bound to self
@@ -685,8 +683,8 @@ class Path(Holder, os.PathLike, ABC):
         …) ride through to :meth:`Holder.open`.
         """
         if mode is None:
-            return Holder.open(self, **kwargs)
-        return Holder.open(self, mode=Mode.from_(mode).os_mode, **kwargs)
+            return IO.open(self, **kwargs)
+        return IO.open(self, mode=Mode.from_(mode).os_mode, **kwargs)
 
     # ==================================================================
     # Pure-path API — all delegated to URL

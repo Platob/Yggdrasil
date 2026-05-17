@@ -197,20 +197,26 @@ def _metadata_text(
 
 def _encode_media_type(obj: io.IOBase) -> bytes | None:
     """Return compact ``b"MIME_NAME"`` or ``b"MIME_NAME+codec"`` for the media type, or *None*."""
-    # yggdrasil :class:`BytesIO` carries its media type on the
-    # holder's :class:`IOStats` — go through ``stat()`` (rather than
-    # touching a private slot) so the lookup survives future
-    # holder refactors.
+    # yggdrasil :class:`IO` carries its media type either directly
+    # (storage IO — :class:`Memory` / :class:`Path`) or on the bound
+    # ``_parent`` (cursor / format-leaf IO). Probe both, and read
+    # through the :attr:`media_type` property when available so the
+    # lazy URL-extension resolution fires.
     mt = None
-    holder = getattr(obj, "_holder", None)
-    if holder is not None:
-        try:
-            mt = holder.stat().media_type
-        except Exception:
-            mt = None
+    try:
+        mt = obj.media_type
+    except Exception:
+        mt = None
+    if mt is None:
+        parent = getattr(obj, "_parent", None)
+        if parent is not None:
+            try:
+                mt = parent.media_type
+            except Exception:
+                mt = None
     if mt is None:
         mt = getattr(obj, "_media_type", None)
-        # ``...`` is the lazy-resolution sentinel on :class:`Holder` —
+        # ``...`` is the lazy-resolution sentinel on :class:`IO` —
         # a holder whose media_type slot was never observed. Treat it
         # the same as a real ``None`` so the encoder skips the field
         # instead of emitting a malformed wire byte for the Ellipsis.

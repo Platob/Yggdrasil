@@ -56,7 +56,7 @@ from yggdrasil.data.enums import Scheme
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.io_stats import IOKind, IOStats
 
-from .holder import Holder
+from .holder import IO
 
 
 __all__ = ["Memory"]
@@ -69,7 +69,7 @@ __all__ = ["Memory"]
 _MIN_MMAP_BYTES = 1
 
 
-class Memory(Holder):
+class Memory(IO):
     """Fully memory-resident byte holder, with optional mmap auto-spill.
 
     Construction shapes (in addition to those inherited from
