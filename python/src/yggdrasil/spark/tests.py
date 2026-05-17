@@ -36,24 +36,25 @@ skip the class hierarchy if you prefer::
 
 Design notes
 ------------
-- The SparkSession is created lazily on first use and reused for the
-  lifetime of the Python process. ``tearDownClass`` never stops it.
+- Session creation goes through :meth:`PyEnv.spark_session` with
+  ``connect=False`` (force local-only — tests must not accidentally hit a
+  Databricks workspace just because ``DATABRICKS_HOST`` happens to be set
+  in the environment). ``tearDownClass`` never stops the session.
 - Because the session is shared, ``spark_extra_config`` only takes effect
-  for the *first* class that triggers creation. If you need a bespoke
-  session, call ``reset_global_session()`` explicitly (expensive).
+  for the *first* class that triggers creation.
 - Arrow interop uses ``spark.sql.execution.arrow.pyspark.enabled=true``
   by default — zero-copy-ish transfer for supported types.
 """
 from __future__ import annotations
 
 import logging
-import os
 import shutil
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Iterable
+
+from yggdrasil.environ import PyEnv
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -61,23 +62,19 @@ if TYPE_CHECKING:
 
 __all__ = [
     "SparkTestCase",
-    "get_spark",
-    "reset_global_session",
 ]
 
 LOGGER = logging.getLogger(__name__)
 
-# Module-level singleton — created once, reused everywhere.
-_global_spark: "SparkSession | None" = None
+# Process-wide scratch dir for warehouse + spark.local.dir, created on first
+# SparkTestCase setup and torn down at process exit by ``shutil.rmtree``.
 _global_tmpdir: Path | None = None
 
 
-# ---------------------------------------------------------------------------
-# Session lifecycle
-# ---------------------------------------------------------------------------
-def _default_config(warehouse_dir: Path) -> dict[str, str]:
+def _default_config(warehouse_dir: Path, app_name: str) -> dict[str, str]:
     """Sensible defaults for local-mode integration tests."""
     return {
+        "spark.app.name": app_name,
         "spark.driver.host": "localhost",
         "spark.driver.bindAddress": "127.0.0.1",
         # Tiny shuffle partitions — we're not doing real work here.
@@ -99,86 +96,48 @@ def _default_config(warehouse_dir: Path) -> dict[str, str]:
     }
 
 
-def _quiet_loggers() -> None:
-    """Mute the chattiest Spark/py4j loggers at the Python level."""
-    for name in (
-        "py4j",
-        "py4j.clientserver",
-        "py4j.java_gateway",
-        "pyspark",
-    ):
-        logging.getLogger(name).setLevel(logging.WARNING)
-
-
-def get_spark(
+def _get_test_spark(
     app_name: str = "yggdrasil-test",
     extra_config: dict[str, str] | None = None,
 ) -> "SparkSession":
-    """Return the global test SparkSession, creating it on first call.
+    """Return the shared test SparkSession, creating it on first call.
 
-    Subsequent calls ignore ``app_name`` and ``extra_config`` — the first
-    caller wins. Use :func:`reset_global_session` if you need a fresh one.
+    Delegates to :meth:`PyEnv.spark_session` so the test base, the rest of
+    ``yggdrasil``, and downstream callers all read from one cache. Forces
+    ``connect=False`` so a stray ``DATABRICKS_HOST`` in the test environment
+    doesn't redirect tests to a remote workspace.
     """
-    global _global_spark, _global_tmpdir
+    global _global_tmpdir
 
-    if _global_spark is not None:
-        return _global_spark
+    cached = PyEnv.spark_session()
+    if cached is not None:
+        return cached
 
-    from yggdrasil.spark.setup import (
-        configure_java_compat,
-        ensure_hadoop_home,
-        ensure_java,
-    )
+    if _global_tmpdir is None:
+        _global_tmpdir = Path(tempfile.mkdtemp(prefix="ygg-spark-test-"))
 
-    # Make sure we have a compatible JDK (downloads Zulu 21 if needed).
-    ensure_java(auto_download=True)
-    # Windows needs Hadoop native binaries for local-mode Spark.
-    ensure_hadoop_home()
-    # JVM compat flags for Java 17+.
-    configure_java_compat()
-
-    # PySpark 4.x workers need to know which Python to use, otherwise they
-    # can pick up a different interpreter and crash on startup.
-    os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
-    os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
-
-    # Process-wide scratch dir for warehouse + spark.local.dir.
-    _global_tmpdir = Path(tempfile.mkdtemp(prefix="ygg-spark-test-"))
-
-    from pyspark.sql import SparkSession
-
-    merged_config = _default_config(_global_tmpdir)
-    merged_config["spark.app.name"] = app_name
+    merged_config = _default_config(_global_tmpdir, app_name=app_name)
     if extra_config:
         merged_config.update(extra_config)
 
-    builder = SparkSession.builder.master("local[*]")
-    for k, v in merged_config.items():
-        builder = builder.config(k, v)
+    session = PyEnv.spark_session(
+        create=True,
+        connect=False,
+        install_java=True,
+        local_setup=True,
+        extra_config=merged_config,
+        import_error=True,
+    )
+    if session is None:
+        raise RuntimeError("PyEnv.spark_session returned None for the test session")
 
-    _global_spark = builder.getOrCreate()
-    _global_spark.sparkContext.setLogLevel("WARN")
-    _quiet_loggers()
+    session.sparkContext.setLogLevel("WARN")
     LOGGER.info(
         "Global test SparkSession ready — version %s, scratch=%s",
-        _global_spark.version,
+        session.version,
         _global_tmpdir,
     )
-    return _global_spark
-
-
-def reset_global_session() -> None:
-    """Stop and discard the global session. Call sparingly — it's expensive."""
-    global _global_spark, _global_tmpdir
-    if _global_spark is not None:
-        try:
-            _global_spark.stop()
-        except Exception:
-            LOGGER.exception("Error stopping global SparkSession")
-        _global_spark = None
-    if _global_tmpdir is not None and _global_tmpdir.exists():
-        shutil.rmtree(_global_tmpdir, ignore_errors=True)
-        _global_tmpdir = None
+    return session
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +188,7 @@ class SparkTestCase(unittest.TestCase):
             )
 
         try:
-            cls.spark = get_spark(
+            cls.spark = _get_test_spark(
                 app_name=cls.spark_app_name,
                 extra_config=cls.spark_extra_config,
             )
@@ -376,7 +335,7 @@ try:
     @pytest.fixture(scope="session")
     def spark() -> "SparkSession":
         """Session-scoped pytest fixture exposing the shared SparkSession."""
-        return get_spark()
+        return _get_test_spark()
 
     @pytest.fixture()
     def spark_tmp_path(tmp_path: Path) -> Path:

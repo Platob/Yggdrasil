@@ -47,7 +47,14 @@ __all__ = [
     "get_java_version",
     "get_java_version_from_bin",
     "spark_home_dir",
+    "quiet_spark_loggers",
 ]
+
+
+def quiet_spark_loggers() -> None:
+    """Mute the chattiest Spark / py4j loggers at the Python level."""
+    for name in ("py4j", "py4j.clientserver", "py4j.java_gateway", "pyspark"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 LOGGER = logging.getLogger(__name__)
 
