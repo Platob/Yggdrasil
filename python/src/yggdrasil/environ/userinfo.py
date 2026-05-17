@@ -22,11 +22,7 @@ from yggdrasil.io.url import URL
 
 __all__ = [
     "UserInfo",
-    "USERINFO_SCHEMA",
     "USERINFO_STRUCT",
-    "get_user_info",
-    "normalize_abs_path_for_url",
-    "parse_name_from_email",
 ]
 
 # ── types ─────────────────────────────────────────────────────────────────────
@@ -417,10 +413,6 @@ def get_user_info(*, refresh: bool = False) -> UserInfo:
         # builds a fresh instance with unresolved lazy slots.
         UserInfo(hostname=hostname).invalidate_singleton()
     return UserInfo(hostname=hostname)
-
-
-def _clear_cache() -> None:
-    UserInfo._INSTANCES.clear()
 
 
 # ── struct / hash helpers ─────────────────────────────────────────────────────
