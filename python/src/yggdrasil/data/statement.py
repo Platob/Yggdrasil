@@ -54,6 +54,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_SLOW_WARN_THRESHOLD = 300.0   # seconds before the first long-running warning
+_SLOW_WARN_INTERVAL = 300.0    # seconds between subsequent warnings
+
 __all__ = [
     "BatchConcatMode",
     "ExternalStatementData",
@@ -668,6 +671,7 @@ class StatementResult(Tabular, Generic[PS]):
             self, wait_cfg.timeout, self.iteration,
         )
         wait_start = time.time()
+        _next_warn_at = wait_start + _SLOW_WARN_THRESHOLD
 
         while True:
             # Poll to terminal for the current submission.
@@ -676,6 +680,13 @@ class StatementResult(Tabular, Generic[PS]):
             while not state.is_done:
                 wait_cfg.sleep(iteration=0, start=start, max_interval=5)
                 state = self._compute_state()
+                now = time.time()
+                if not state.is_done and now >= _next_warn_at:
+                    logger.warning(
+                        "Statement %r still running (elapsed=%.0fs, state=%s)",
+                        self, now - wait_start, state,
+                    )
+                    _next_warn_at = now + _SLOW_WARN_INTERVAL
 
             if state.is_failed and self.retryable:
                 logger.info(

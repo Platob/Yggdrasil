@@ -13,7 +13,6 @@ __all__ = [
 ]
 
 COLUMN_TYPE_MAP = {
-    # ColumnTypeName.ARRAY: ArrayType.from_item(Field.make_default_field()),
     ColumnTypeName.BINARY: BinaryType(),
     ColumnTypeName.BOOLEAN: BooleanType(),
     ColumnTypeName.BYTE: IntegerType(byte_size=1),
@@ -27,12 +26,9 @@ COLUMN_TYPE_MAP = {
     ColumnTypeName.INT: IntegerType(byte_size=4),
     ColumnTypeName.INTERVAL: DurationType(),
     ColumnTypeName.LONG: IntegerType(byte_size=8),
-    # ColumnTypeName.MAP: MapType.from_key_value(Field.make_default_field(), Field.make_default_field()),
     ColumnTypeName.NULL: NullType(),
     ColumnTypeName.SHORT: FloatingPointType(byte_size=2),
     ColumnTypeName.STRING: StringType(),
-    # ColumnTypeName.STRUCT: StructType.empty(),
-    # ColumnTypeName.TABLE_TYPE: StructType.empty(),
     ColumnTypeName.TIMESTAMP: TimestampType(unit="us", tz="UTC"),
     ColumnTypeName.TIMESTAMP_NTZ: TimestampType(unit="us"),
     ColumnTypeName.USER_DEFINED_TYPE: ObjectType(),
@@ -40,7 +36,6 @@ COLUMN_TYPE_MAP = {
 }
 
 COLUMN_INFO_TYPE_MAP = {
-    # ColumnInfoTypeName.ARRAY: ArrayType.from_item(Field.make_default_field()),
     ColumnInfoTypeName.BINARY: BinaryType(),
     ColumnInfoTypeName.BOOLEAN: BooleanType(),
     ColumnInfoTypeName.BYTE: IntegerType(byte_size=1),
@@ -52,11 +47,9 @@ COLUMN_INFO_TYPE_MAP = {
     ColumnInfoTypeName.INT: IntegerType(byte_size=4),
     ColumnInfoTypeName.INTERVAL: DurationType(),
     ColumnInfoTypeName.LONG: IntegerType(byte_size=8),
-    # ColumnInfoTypeName.MAP: MapType.from_key_value(Field.make_default_field(), Field.make_default_field()),
     ColumnInfoTypeName.NULL: NullType(),
     ColumnInfoTypeName.SHORT: FloatingPointType(byte_size=2),
     ColumnInfoTypeName.STRING: StringType(),
-    # ColumnInfoTypeName.STRUCT: StructType.empty(),
     ColumnInfoTypeName.TIMESTAMP: TimestampType(unit="us", tz="UTC"),
     ColumnInfoTypeName.USER_DEFINED_TYPE: ObjectType(),
 }
@@ -139,13 +132,6 @@ def parse_catalog_column_info_field(obj: CatalogColumnInfo) -> Field:
     name = obj.name or ""
     nullable = bool(obj.nullable) if obj.nullable is not None else True
     dtype = ObjectType()
-
-    if isinstance(dtype, DecimalType):
-        precision = 38 if obj.type_precision is None else obj.type_precision
-        scale = 18 if obj.type_scale is None else obj.type_scale
-        if precision is not None and scale is not None:
-            dtype = DecimalType(precision=precision, scale=scale)
-
     metadata = {}
     partition_by = False
 
