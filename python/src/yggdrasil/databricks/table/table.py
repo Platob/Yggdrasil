@@ -3158,25 +3158,23 @@ class Table(DatabricksPath):
         target: "Table | None" = None,
         *,
         temporary: bool = True,
-        max_lifetime: float | None = 3600,
     ) -> VolumePath:
-        """Mint the staging :class:`VolumePath` used by :meth:`arrow_insert`.
+        """Mint a fresh Parquet staging path under the target table's
+        :attr:`staging_volume`.
 
-        Wraps :meth:`VolumePath.staging_path` with this table's
-        catalog/schema/name and workspace client. Lifted out of
-        :meth:`arrow_insert` so callers — and tests — can pre-mint
-        or swap the staging location without driving the full
-        insert. ``target`` defaults to ``self``; pass another
+        Roots the file at ``<staging_volume>/.sql/tmp/tmp-<epoch_ms>-<seed>.parquet``
+        (same shape as :meth:`staging_folder` but with a unique leaf
+        per call). ``target`` defaults to ``self``; pass another
         :class:`Table` when the staging hierarchy needs to live next
-        to a different table (e.g. dispatch fan-out).
+        to a different table (e.g. dispatch fan-out). Lifted out of
+        :meth:`arrow_insert` so callers — and tests — can pre-mint or
+        swap the staging location without driving the full insert.
         """
         target = target if target is not None else self
-        return VolumePath.staging_path(
-            client=self.client,
-            catalog_name=target.catalog_name,
-            schema_name=target.schema_name,
-            resource_name=target.table_name,
-            max_lifetime=max_lifetime,
+        seed = uuid.uuid4().hex[:8]
+        leaf = f"tmp-{int(time.time() * 1000)}-{seed}.parquet"
+        return target.staging_volume.path(
+            f".sql/tmp/{leaf}",
             temporary=temporary,
         )
 

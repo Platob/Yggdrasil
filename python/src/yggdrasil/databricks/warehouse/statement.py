@@ -56,7 +56,8 @@ from databricks.sdk.service.sql import (
 
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.data import Schema
-from yggdrasil.data.enums import MimeType, MimeTypes
+from yggdrasil.data.enums import MimeType, MimeTypes, Mode
+from yggdrasil.data.enums.media_type import MediaTypes
 from yggdrasil.data.enums.state import State
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.statement import (
@@ -262,8 +263,9 @@ class WarehousePreparedStatement(PreparedStatement):
 
         - an existing :class:`VolumePath` — passed through.
         - tabular data (Arrow / polars / pandas / list / dict) — staged as
-          Parquet onto a fresh :meth:`VolumePath.staging_path` under the
-          supplied ``catalog_name`` / ``schema_name``.
+          Parquet onto a fresh :meth:`Table.insert_volume_path` under the
+          supplied ``catalog_name`` / ``schema_name`` (alias becomes the
+          table-name segment when ``resource_name`` is unset).
         - an :class:`ExternalStatementData` wrapping either of the above —
           the underlying value is unwrapped and processed as if passed
           directly.  ``text_value``-only entries (no tabular bound) are
@@ -357,25 +359,41 @@ class WarehousePreparedStatement(PreparedStatement):
         """Stage tabular ``value`` to a fresh Parquet volume.  Override
         in subclasses for custom file formats / staging policies.
 
-        Single-shot through :meth:`VolumePath.staging_path` with
-        ``tabular=`` — that factory handles the Parquet write *and*
-        unlinks the path on write failure when ``temporary=True``, so
-        we don't repeat the cleanup here.
+        Mints the staging path through :meth:`Table.insert_volume_path`
+        on a transient :class:`Table` keyed by ``(catalog, schema,
+        resource_name or alias)`` — same per-table ``stg_<table>``
+        volume layout the warehouse insert path uses — then writes the
+        Parquet payload, unlinking the path on write failure when
+        ``temporary=True``.
         """
+        from yggdrasil.databricks.table.table import Table
+
+        if not catalog_name or not schema_name:
+            raise ValueError(
+                f"external_data[{alias!r}]: staging tabular value requires "
+                f"catalog_name and schema_name; got catalog_name={catalog_name!r}, "
+                f"schema_name={schema_name!r}"
+            )
+
+        table = Table(
+            service=client.tables,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=resource_name or alias,
+        )
+        staged = table.insert_volume_path(temporary=temporary)
         try:
-            return VolumePath.staging_path(
-                catalog_name=catalog_name,
-                schema_name=schema_name,
-                resource_name=resource_name or alias,
-                temporary=temporary,
-                tabular=value,
-                client=client
+            staged.as_media(media_type=MediaTypes.PARQUET).write_table(
+                value, mode=Mode.OVERWRITE,
             )
         except Exception as e:
+            if staged.temporary:
+                staged.clear()
             raise RuntimeError(
                 f"Failed to stage external_data[{alias!r}] "
                 f"({type(value).__name__}) as Parquet: {e}"
             ) from e
+        return staged
 
     # ------------------------------------------------------------------
     # Coercion / preparation

@@ -1,6 +1,7 @@
 """Mock-driven tests for :class:`VolumePath`."""
 from __future__ import annotations
 
+import io
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -217,9 +218,12 @@ class TestWrite:
         kwargs = workspace.files.upload.call_args.kwargs
         assert kwargs["file_path"] == "/Volumes/c/s/v/x"
         assert kwargs["overwrite"] is True
-        # Bytes input rides through unbuffered — the SDK builds a
-        # fresh PUT body per request from the same bytes object.
-        assert kwargs["contents"] == b"abcdef"
+        # ``FilesExt.upload`` probes ``contents.seekable()`` — bytes
+        # are wrapped in a fresh ``BytesIO`` so the SDK sees a
+        # seekable stream rather than a raw bytes object.
+        sent = kwargs["contents"]
+        assert isinstance(sent, io.BytesIO)
+        assert sent.getvalue() == b"abcdef"
 
     def test_stream_input_routes_through_upload(self, workspace, client) -> None:
         """Caller-supplied ``BinaryIO`` is coerced to a yggdrasil
@@ -279,7 +283,8 @@ class TestWrite:
         p = VolumePath("/Volumes/c/s/v/x", client=client)
         p.pwrite(b"XX", 1)
         sent = workspace.files.upload.call_args.kwargs["contents"]
-        assert sent == b"aXXde"
+        assert isinstance(sent, io.BytesIO)
+        assert sent.getvalue() == b"aXXde"
 
 
 class TestMutators:
@@ -382,57 +387,6 @@ class TestListing:
         assert children[1].is_dir() is True
         workspace.files.get_metadata.assert_not_called()
         workspace.files.get_directory_metadata.assert_not_called()
-
-
-class TestStagingPath:
-
-    def test_default_layout(self, workspace, client) -> None:
-        p = VolumePath.staging_path(
-            catalog_name="cat",
-            schema_name="sch",
-            resource_name="tbl",
-            client=client,
-        )
-        full = p.full_path()
-        assert full.startswith("/Volumes/cat/sch/tmp_tbl/.sql/")
-        assert full.endswith(".parquet")
-        assert p.temporary is True
-        assert p.workspace_client is workspace
-
-    def test_temporary_false(self, workspace, client) -> None:
-        p = VolumePath.staging_path(
-            catalog_name="cat",
-            schema_name="sch",
-            temporary=False,
-            client=client,
-        )
-        assert p.temporary is False
-        assert "/cat/sch/tmp_default/.sql/" in p.full_path()
-
-    def test_unique_per_call(self, workspace, client) -> None:
-        a = VolumePath.staging_path(
-            catalog_name="c", schema_name="s", client=client,
-        )
-        b = VolumePath.staging_path(
-            catalog_name="c", schema_name="s", client=client,
-        )
-        assert a.full_path() != b.full_path()
-
-    def test_client_aggregator(self, workspace, client) -> None:
-        p = VolumePath.staging_path(
-            catalog_name="c", schema_name="s", client=client,
-        )
-        assert p.workspace_client is workspace
-
-    def test_segments_are_sanitized(self, workspace, client) -> None:
-        p = VolumePath.staging_path(
-            catalog_name="`cat`",
-            schema_name="  sch  ",
-            resource_name="a/b",
-            client=client,
-        )
-        full = p.full_path()
-        assert "/cat/sch/tmp_a_b/.sql/" in full
 
 
 class TestVolumeAutoCreate:
