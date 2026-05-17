@@ -768,13 +768,29 @@ class PyEnv:
         )
 
     @classmethod
+    def should_use_databricks_connect(cls) -> bool:
+        """``True`` when the caller is outside Databricks but configured to reach a workspace.
+
+        Inside Databricks runtime the regular ``SparkSession`` is already
+        wired by the runtime — no Connect needed. Outside Databricks, the
+        presence of ``DATABRICKS_HOST`` is the canonical signal that the
+        caller wants to talk to a remote workspace; the SDK reads the same
+        env vars to resolve auth and target compute.
+        """
+        if cls.in_databricks():
+            return False
+        return "DATABRICKS_HOST" in os.environ
+
+    @classmethod
     def spark_session(
         cls,
         obj: Any = None,
         *,
         create: bool = False,
+        connect: bool | None = None,
         import_error: bool = False,
         install_spark: bool = False,
+        install_java: bool = False,
         local_setup: bool = True,
         extra_config: dict[str, str] | None = None,
     ) -> "SparkSession | None":
@@ -783,10 +799,15 @@ class PyEnv:
         Resolution order:
         1. Return the cached session if already resolved.
         2. Check for an active SparkSession in the current process.
-        3. Try connecting via DatabricksClient (if available).
-        4. Bootstrap a local session using ``yggdrasil.spark.setup`` utilities
-           (winutils, JVM compat flags, etc.) when *local_setup* is True.
-        5. Fall back to bare ``SparkSession.builder.getOrCreate()``.
+        3. When *create* is True, pick the build path:
+           - ``connect=True`` (or ``None`` + :meth:`should_use_databricks_connect`)
+             → :meth:`_bootstrap_connect_session` (``databricks.connect``).
+           - Otherwise → :meth:`_bootstrap_session` (local PySpark with the
+             ``yggdrasil.spark.setup`` helpers when *local_setup* is True).
+
+        For richer Databricks Connect wiring (wheel publishing, ``DatabricksEnv``,
+        ``addArtifacts``), use :meth:`DatabricksClient.spark` — it delegates the
+        final ``getOrCreate()`` back here so the cache stays consistent.
         """
         # ------------------------------------------------------------------
         # Explicit-argument dispatch
@@ -821,9 +842,23 @@ class PyEnv:
         if active is not None:
             cls._SPARK_SESSION = active
         elif create:
-            cls._SPARK_SESSION = cls._bootstrap_session(
-                SparkSession, local_setup=local_setup, extra_config=extra_config
-            )
+            use_connect = connect if connect is not None else cls.should_use_databricks_connect()
+            if use_connect:
+                cls._SPARK_SESSION = cls._bootstrap_connect_session(
+                    import_error=connect is True or import_error,
+                    fallback_local=connect is None,
+                    SparkSession=SparkSession,
+                    local_setup=local_setup,
+                    extra_config=extra_config,
+                    install_java=install_java,
+                )
+            else:
+                cls._SPARK_SESSION = cls._bootstrap_session(
+                    SparkSession,
+                    local_setup=local_setup,
+                    extra_config=extra_config,
+                    install_java=install_java,
+                )
         else:
             cls._SPARK_SESSION = None
 
@@ -887,6 +922,7 @@ class PyEnv:
         *,
         local_setup: bool,
         extra_config: dict[str, str] | None,
+        install_java: bool = False,
     ) -> "SparkSession":
         """Create a local SparkSession, preferring yggdrasil.spark.setup helpers."""
         if not local_setup:
@@ -897,11 +933,21 @@ class PyEnv:
                 configure_java_compat,
                 create_local_session,
                 ensure_hadoop_home,
+                ensure_java,
+                quiet_spark_loggers,
             )
 
+            if install_java:
+                ensure_java(auto_download=True)
             ensure_hadoop_home()
             configure_java_compat()
-            return create_local_session(extra_config=extra_config)
+            # PySpark 4.x workers need an explicit Python interpreter
+            # otherwise they can pick up a different one and crash on startup.
+            os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
+            os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
+            session = create_local_session(extra_config=extra_config)
+            quiet_spark_loggers()
+            return session
         except Exception:
             logger.warning(
                 "PyEnv.spark_session: local setup bootstrap failed, "
@@ -909,6 +955,49 @@ class PyEnv:
                 exc_info=True,
             )
             return SparkSession.builder.getOrCreate()
+
+    @classmethod
+    def _bootstrap_connect_session(
+        cls,
+        *,
+        import_error: bool,
+        fallback_local: bool,
+        SparkSession: "type[SparkSession]",
+        local_setup: bool,
+        extra_config: dict[str, str] | None,
+        install_java: bool,
+    ) -> "SparkSession":
+        """Build a Databricks Connect SparkSession.
+
+        Uses the ``DATABRICKS_*`` env vars the SDK already reads to resolve
+        host / auth / target compute. When ``databricks-connect`` isn't
+        installed and *fallback_local* is True, fall back to a local
+        session; otherwise raise (or swallow per *import_error*).
+        """
+        try:
+            from databricks.connect import DatabricksSession
+        except ImportError:
+            if not fallback_local:
+                if import_error:
+                    raise
+                return cls._bootstrap_session(
+                    SparkSession,
+                    local_setup=local_setup,
+                    extra_config=extra_config,
+                    install_java=install_java,
+                )
+            logger.debug(
+                "PyEnv.spark_session: databricks-connect not installed, "
+                "falling back to local PySpark"
+            )
+            return cls._bootstrap_session(
+                SparkSession,
+                local_setup=local_setup,
+                extra_config=extra_config,
+                install_java=install_java,
+            )
+
+        return DatabricksSession.builder.getOrCreate()
 
     @classmethod
     def set_spark_session(cls, spark_session: "SparkSession"):
