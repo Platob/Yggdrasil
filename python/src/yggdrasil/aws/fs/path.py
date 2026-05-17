@@ -508,7 +508,13 @@ class S3Path(RemotePath):
     # Holder I/O — _read_mv / _write_mv / truncate / _clear
     # ==================================================================
 
-    def read_mv(self, size: int = -1, offset: int = 0) -> memoryview:
+    def read_mv(
+        self,
+        size: int = -1,
+        offset: int = 0,
+        *,
+        cursor: bool = False,
+    ) -> memoryview:
         """Range read with a whole-file fast path that skips the size probe.
 
         The base :meth:`Holder.read_mv` resolves a ``size < 0``
@@ -522,9 +528,14 @@ class S3Path(RemotePath):
         folds back into the cache. Partial / positional reads keep
         the base bounds check so out-of-range windows still raise.
         """
+        if cursor:
+            offset = self._pos
         if size < 0 and offset == 0:
-            return self._read_mv(-1, 0)
-        return super().read_mv(size, offset)
+            out = self._read_mv(-1, 0)
+            if cursor:
+                self._pos = len(out)
+            return out
+        return super().read_mv(size, offset, cursor=cursor)
 
     def _read_mv(self, n: int, pos: int) -> memoryview:
         """Range-based ``GetObject`` → :class:`memoryview` over bytes.

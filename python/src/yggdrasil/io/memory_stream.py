@@ -495,14 +495,24 @@ class MemoryStream(Holder):
             media_type=self.media_type,
         )
 
-    def read_mv(self, size: int = -1, offset: int = 0) -> memoryview:
+    def read_mv(
+        self,
+        size: int = -1,
+        offset: int = 0,
+        *,
+        cursor: bool = False,
+    ) -> memoryview:
         """Read ``size`` bytes at absolute ``offset``, pulling from source
         as needed. ``size < 0`` reads to EOF.
 
-        Reads are valid in ``[spill_start, size)`` — anything
-        behind :attr:`spill_start` has been evicted (truly dropped
-        from both memory and spill) and raises.
+        ``cursor=True`` reads from the holder's internal cursor and
+        advances it past the returned bytes. Reads are valid in
+        ``[spill_start, size)`` — anything behind :attr:`spill_start`
+        has been evicted (truly dropped from both memory and spill)
+        and raises.
         """
+        if cursor:
+            offset = self._pos
         # Resolve negative offsets against the *current* size first
         # so the SEEK_END idiom (``offset = -1, size = 0``) lands at
         # window_end without forcing a pull.
@@ -535,7 +545,10 @@ class MemoryStream(Holder):
                 f"Offset {offset} is past EOF (size {self.size})."
             )
 
-        return self._read_mv(size, offset)
+        out = self._read_mv(size, offset)
+        if cursor:
+            self._pos = offset + size
+        return out
 
     def _read_mv(self, n: int, pos: int) -> memoryview:
         if n == 0:
@@ -562,10 +575,12 @@ class MemoryStream(Holder):
         size: int = -1,
         overwrite: bool = False,
         update_stat: bool = True,
+        cursor: bool = False,
     ) -> int:
         """Splice bytes at ``offset``. Appends past current end extend the
         stream and may slide the window; in-window writes overwrite.
 
+        ``cursor=True`` writes at the internal cursor and advances it.
         ``size>=0`` slices the input buffer to at most ``size``
         bytes before the splice. ``overwrite=True`` truncates the
         tail past ``offset + len(data)`` after the splice (same
@@ -573,6 +588,8 @@ class MemoryStream(Holder):
         :attr:`window_start` raise — the target bytes have
         already been evicted.
         """
+        if cursor:
+            offset = self._pos
         if size >= 0 and len(data) > size:
             data = data[:size]
         total = self.size
@@ -612,6 +629,8 @@ class MemoryStream(Holder):
             self._slide_window()
             self._touch_stat(size=self.size)
             self.mark_dirty()
+        if cursor:
+            self._pos = offset + written
         return written
 
     def _write_mv(self, data: memoryview, pos: int) -> int:
