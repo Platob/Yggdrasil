@@ -25,6 +25,7 @@ workspace.
 from __future__ import annotations
 
 import concurrent.futures as cf
+import logging
 import os
 import secrets
 from typing import ClassVar
@@ -37,6 +38,9 @@ from yggdrasil.databricks.sql.engine import SQLEngine
 from yggdrasil.databricks.table.table import Table
 
 from .. import DatabricksIntegrationCase
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 __all__ = [
@@ -1023,7 +1027,16 @@ class TestSQLInsertFillMissingColumns(_SQLIntegrationBase):
         subset replacement must keep the wider target schema and fill
         the absent columns with NULL."""
         table = self._unique_table("fill_overwrite")
-        table.ensure_created(self._wide_schema())
+        wide = self._wide_schema()
+        LOGGER.debug(
+            "Creating wide target for overwrite test %r (schema_columns=%d, schema_names=%r)",
+            table, len(wide.names), wide.names,
+        )
+        table.ensure_created(wide)
+        LOGGER.debug(
+            "Created wide target for overwrite test %r (remote_columns=%r)",
+            table, table.schema.names,
+        )
 
         # Seed so the OVERWRITE actually replaces something.
         seed = pa.table(
@@ -1034,7 +1047,15 @@ class TestSQLInsertFillMissingColumns(_SQLIntegrationBase):
                 "active": pa.array([True, True], type=pa.bool_()),
             }
         )
+        LOGGER.debug(
+            "Seeding overwrite test %r (mode=OVERWRITE, rows=%d, source_names=%r)",
+            table, seed.num_rows, seed.schema.names,
+        )
         table.insert(seed, mode=Mode.OVERWRITE)
+        LOGGER.debug(
+            "Seeded overwrite test %r (remote_columns=%r, rows=%r)",
+            table, table.schema.names, self._read_rows(table),
+        )
 
         partial = pa.table(
             {
@@ -1042,7 +1063,16 @@ class TestSQLInsertFillMissingColumns(_SQLIntegrationBase):
                 "label": pa.array(["fresh-a", "fresh-b"], type=pa.string()),
             }
         )
+        LOGGER.debug(
+            "Overwriting with partial source %r (mode=OVERWRITE, rows=%d, source_names=%r, missing=%r)",
+            table, partial.num_rows, partial.schema.names,
+            [n for n in wide.names if n not in partial.schema.names],
+        )
         table.insert(partial, mode=Mode.OVERWRITE)
+        LOGGER.debug(
+            "Overwrote partial source %r (remote_columns=%r, rows=%r)",
+            table, table.schema.names, self._read_rows(table),
+        )
 
     # ------------------------------------------------------------------
     # UPSERT — match by key, missing source columns become NULL on the
