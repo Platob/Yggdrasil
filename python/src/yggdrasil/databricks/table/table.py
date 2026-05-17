@@ -3265,8 +3265,16 @@ class Table(DatabricksPath):
 
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
 
+        # For OVERWRITE without an explicit schema_mode, preserve the wider
+        # target schema: recreate from the existing schema so columns absent
+        # from the source are kept and filled with NULL rather than dropped.
+        _overwrite_preserve_schema = (
+            mode_enum == Mode.OVERWRITE and not match_by and schema_mode is None
+        )
+        definition = self.collect_schema() if _overwrite_preserve_schema and self.exists else data
+
         target = self.create(
-            data,
+            definition,
             mode=schema_mode,
             or_replace=(mode_enum == Mode.OVERWRITE and not match_by),
         )
@@ -3417,8 +3425,16 @@ class Table(DatabricksPath):
         # TODO: Fix async databricks notebook.
         wait = True if PyEnv.in_databricks() else wait
 
+        # For OVERWRITE without an explicit schema_mode, preserve the wider
+        # target schema: recreate from the existing schema so columns absent
+        # from the source are kept and filled with NULL rather than dropped.
+        _overwrite_preserve_schema = (
+            mode_enum == Mode.OVERWRITE and not match_by and schema_mode is None
+        )
+        definition = self.collect_schema() if _overwrite_preserve_schema and self.exists else data
+
         target = self.create(
-            data,
+            definition,
             mode=schema_mode,
             or_replace=(mode_enum == Mode.OVERWRITE and not match_by),
         )
