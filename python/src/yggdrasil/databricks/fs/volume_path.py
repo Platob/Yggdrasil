@@ -52,7 +52,7 @@ from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 from ..client import DatabricksClient
-from ..path import DatabricksPath
+from ..path import DatabricksPath, _looks_like_parent_missing
 
 if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
@@ -255,9 +255,16 @@ class VolumePath(DatabricksPath):
             )
         catalog, schema, volume_name = triple
         from yggdrasil.databricks.volume.volume import Volume
+        from yggdrasil.databricks.volume.volumes import Volumes
 
+        # Bind through a fresh ``Volumes`` over this path's
+        # :attr:`client` so the Volume sees the same workspace
+        # context — using ``self.client.volumes`` would resolve via
+        # whatever attribute the client exposes (a real
+        # :class:`Volumes`, or a test-side mock), which breaks
+        # workspace-client identity in mocked test setups.
         self._volume = Volume(
-            service=self.client.volumes,
+            service=Volumes(client=self.client),
             catalog_name=catalog,
             schema_name=schema,
             volume_name=volume_name,
@@ -423,19 +430,120 @@ class VolumePath(DatabricksPath):
             if recursive and is_directory:
                 yield from child._ls(recursive=True, singleton_ttl=singleton_ttl)
 
-    def _call_ensuring_parents(self, func: Any, *args: Any, **kwargs: Any) -> Any:
-        try:
-            return self._call(func, *args, **kwargs)
-        except NotFound as exc:
-            message = exc.args[0]
-            m = _VOLUME_DOTTED_NAME_RE.search(message)
-            if m is not None:
-                c, s, n = m["catalog"], m["schema"], m["volume"]
-                self.client.volumes.create(
-                    catalog_name=c,
-                    schema_name=s,
-                    volume_name=n,
+    # ``_call_ensuring_parents`` is inherited from :class:`DatabricksPath`
+    # — the volume-specific recovery lives on :meth:`_ensure_parents`
+    # below, which the base class invokes on NotFound.
+
+    def _ensure_parents(self, exc: "BaseException | None" = None) -> bool:
+        """Recovery hook for :meth:`_call_ensuring_parents`.
+
+        Cheap-path first: if *self* lives below the volume root,
+        ``files.create_directory`` on the parent fixes the common
+        case (only a sub-directory was missing). If that also
+        NotFounds — or if *exc* already named the volume as
+        missing — fall back to :meth:`_ensure_volume` and retry
+        the parent ``mkdir``. Blind creates swallow ``AlreadyExists``
+        so the idempotent path costs at most three SDK calls.
+        """
+        triple = self._split_volume()
+        if triple is None:
+            return False
+
+        parent = self.parent
+        pparts = [
+            p for p in (parent.url.path or "/").lstrip("/").split("/") if p
+        ]
+        has_subdir = len(pparts) > 3  # parent strictly below ``/cat/sch/vol``
+        volume_missing = exc is not None and _looks_like_volume_not_found(exc)
+
+        if has_subdir and not volume_missing:
+            try:
+                self._call(
+                    self.client.workspace_client().files.create_directory,
+                    parent.api_path,
                 )
+                return True
+            except Exception as inner:
+                if _looks_like_already_exists(inner):
+                    return True
+                if not _looks_like_not_found(inner):
+                    raise
+                # Parent missing because volume itself is missing —
+                # fall through to volume creation.
+
+        self._ensure_volume()
+
+        if has_subdir:
+            try:
+                self._call(
+                    self.client.workspace_client().files.create_directory,
+                    parent.api_path,
+                )
+            except Exception as inner:
+                if not _looks_like_already_exists(inner):
+                    raise
+        return True
+
+    def _ensure_volume(self) -> bool:
+        """Top-down create of the missing pieces of catalog / schema / volume.
+
+        Tries ``volumes.create`` first (the common case is that the
+        catalog + schema already exist and only the volume is
+        missing). If that NotFounds with "Schema …", create the
+        schema and retry the volume; if schema creation NotFounds
+        with "Catalog …", create the catalog, retry the schema,
+        retry the volume. ``AlreadyExists`` on any level is swallowed
+        — the desired state is reached either way.
+        """
+        triple = self._split_volume()
+        if triple is None:
+            return False
+        c, s, n = triple
+        ws = self.client.workspace_client()
+
+        try:
+            ws.volumes.create(
+                catalog_name=c, schema_name=s, name=n,
+                volume_type="MANAGED",
+            )
+            return True
+        except Exception as exc:
+            if _looks_like_already_exists(exc):
+                return True
+            if not _looks_like_not_found(exc):
+                raise
+            # Schema (or catalog) is missing — recurse down.
+
+        try:
+            ws.schemas.create(name=s, catalog_name=c)
+        except Exception as exc:
+            if _looks_like_already_exists(exc):
+                pass
+            elif _looks_like_not_found(exc):
+                # Catalog also missing.
+                try:
+                    ws.catalogs.create(name=c)
+                except Exception as inner:
+                    if not _looks_like_already_exists(inner):
+                        raise
+                try:
+                    ws.schemas.create(name=s, catalog_name=c)
+                except Exception as inner:
+                    if not _looks_like_already_exists(inner):
+                        raise
+            else:
+                raise
+
+        # Retry the volume now that catalog + schema exist.
+        try:
+            ws.volumes.create(
+                catalog_name=c, schema_name=s, name=n,
+                volume_type="MANAGED",
+            )
+        except Exception as exc:
+            if not _looks_like_already_exists(exc):
+                raise
+        return True
 
     # ==================================================================
     # Mutators

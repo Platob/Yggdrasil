@@ -28,18 +28,53 @@ share the same TTL-bounded :class:`VolumeInfo` snapshot.
 from __future__ import annotations
 
 import logging
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
 from databricks.sdk.service.catalog import VolumeInfo
 
 from yggdrasil.databricks.client import DatabricksService
 
-from .volume import Volume, _looks_like_not_found
+from .volume import Volume, _looks_like_already_exists, _looks_like_not_found
 
 __all__ = ["Volumes"]
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_parents_for(
+    workspace: Any,
+    *,
+    catalog_name: str,
+    schema_name: str,
+) -> None:
+    """Create the schema (and catalog if needed) for *workspace*.
+
+    Used by :meth:`Volumes.create` to materialise missing parents
+    after a volume-create NotFound. Idempotent: ``AlreadyExists`` on
+    either level is treated as success. If schema creation itself
+    NotFounds the catalog, the catalog is created first then the
+    schema retried.
+    """
+    try:
+        workspace.schemas.create(name=schema_name, catalog_name=catalog_name)
+        return
+    except Exception as exc:
+        if _looks_like_already_exists(exc):
+            return
+        if not _looks_like_not_found(exc):
+            raise
+
+    try:
+        workspace.catalogs.create(name=catalog_name)
+    except Exception as exc:
+        if not _looks_like_already_exists(exc):
+            raise
+    try:
+        workspace.schemas.create(name=schema_name, catalog_name=catalog_name)
+    except Exception as exc:
+        if not _looks_like_already_exists(exc):
+            raise
 
 
 class Volumes(DatabricksService):
@@ -228,6 +263,14 @@ class Volumes(DatabricksService):
         except Exception as exc:
             if not _looks_like_not_found(exc):
                 raise
+            # Schema (or catalog) is missing — create the parents
+            # directly (without recursing through ``volume.create``)
+            # and retry the volume create exactly once.
+            _ensure_parents_for(
+                self.client.workspace_client(),
+                catalog_name=volume.catalog_name,
+                schema_name=volume.schema_name,
+            )
         return volume.create(**create_kwargs, if_not_exists=True)
 
     # ── remote fetch ──────────────────────────────────────────────────────────

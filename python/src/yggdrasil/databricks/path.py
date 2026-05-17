@@ -557,6 +557,41 @@ class DatabricksPath(DatabricksResource, RemotePath):
             return retry_sdk_call(func, *args, sleep=self._retry_sleep, **kwargs)
         return retry_sdk_call(func, *args, **kwargs)
 
+    def _call_ensuring_parents(self, func, *args, **kwargs):
+        """Like :meth:`_call`, but auto-creates missing parents on NotFound.
+
+        Used by mutating ops (``upload``, ``mkdirs``, …) where the
+        request can fail purely because an intermediate directory —
+        or, for :class:`VolumePath`, the Unity Catalog volume itself
+        — does not exist yet. On the first NotFound-shaped failure
+        we hand off to :meth:`_ensure_parents` (subclass hook for
+        catalog / schema / volume creation, then a recursive parent
+        ``mkdir``) and retry exactly once. Other errors propagate.
+        """
+        try:
+            return self._call(func, *args, **kwargs)
+        except Exception as exc:
+            if not _looks_like_parent_missing(exc):
+                raise
+            if not self._ensure_parents(exc):
+                raise
+            return self._call(func, *args, **kwargs)
+
+    def _ensure_parents(self, exc: "BaseException | None" = None) -> bool:
+        """Default recovery: best-effort ``mkdir`` of the parent directory.
+
+        Subclasses (:class:`VolumePath`) override to handle missing
+        catalog / schema / volume cases first.
+        """
+        parent = self.parent
+        if parent is None or parent == self:
+            return False
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return False
+        return True
+
     # ==================================================================
     # Sibling paths inherit the same workspace client
     # ==================================================================
@@ -579,14 +614,14 @@ class DatabricksPath(DatabricksResource, RemotePath):
         # payload — same convention :class:`Singleton` enforces.
         return {
             k: v for k, v in self.__dict__.items()
-            if k not in self.TRANSIENT_STATE_ATTRS
+            if k not in self._TRANSIENT_STATE_ATTRS
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         if getattr(self, "_initialized", False):
             return
         self.__dict__.update(state)
-        for attr in self.TRANSIENT_STATE_ATTRS:
+        for attr in self._TRANSIENT_STATE_ATTRS:
             self.__dict__.setdefault(attr, None)
 
     # ==================================================================

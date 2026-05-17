@@ -1029,8 +1029,30 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
 
     @classmethod
     def from_url(cls, url: URL, **kwargs) -> "IO":
-        """Create a new IO from a URL."""
-        return cls(url=URL.from_(url), **kwargs)
+        """Create a new IO from a URL.
+
+        When *cls* is abstract (has subclasses but isn't itself
+        constructible — e.g. :class:`Path`), the URL scheme is
+        resolved through the :class:`URLBased` registry to a concrete
+        subclass; an unknown scheme raises :class:`ValueError`
+        instead of producing the obscure "Can't instantiate abstract
+        class" :class:`TypeError`.
+        """
+        u = URL.from_(url)
+        # Abstract dispatch: when ``cls`` has subclasses and its own
+        # ``scheme`` marker is empty, route via the URLBased registry.
+        if cls.__subclasses__() and not getattr(cls, "scheme", None):
+            scheme = u.scheme
+            if scheme:
+                try:
+                    target = URLBased.for_scheme(scheme)
+                except (ValueError, ImportError) as exc:
+                    raise ValueError(
+                        f"Unknown scheme {scheme!r} for "
+                        f"{cls.__name__}.from_url({url!r})."
+                    ) from exc
+                return target(url=u, **kwargs)
+        return cls(url=u, **kwargs)
 
     @classmethod
     def from_bytes(cls, data: bytes, **kwargs) -> "IO":

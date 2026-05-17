@@ -78,7 +78,7 @@ class Path(IO, os.PathLike, ABC):
     scheme: ClassVar[str] = ""
 
     STAT_CACHE_TTL: ClassVar["float | None"] = None
-    TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset()
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset()
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
