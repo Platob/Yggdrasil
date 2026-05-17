@@ -221,8 +221,12 @@ class TestWrite:
         # fresh PUT body per request from the same bytes object.
         assert kwargs["contents"] == b"abcdef"
 
-    def test_stream_input_rides_through_unbuffered(self, workspace, client) -> None:
+    def test_stream_input_routes_through_upload(self, workspace, client) -> None:
+        """Caller-supplied ``BinaryIO`` is coerced to a yggdrasil
+        :class:`IO[bytes]` and lands on one ``files.upload`` call."""
         import io
+
+        from yggdrasil.io.base import IO as _IO
 
         workspace.files.get_metadata.side_effect = NotFound()
         workspace.files.get_directory_metadata.side_effect = NotFound()
@@ -231,9 +235,10 @@ class TestWrite:
         p.write_bytes(stream)
 
         kwargs = workspace.files.upload.call_args.kwargs
-        # Caller-supplied stream reaches ``FilesExt.upload`` verbatim.
-        assert kwargs["contents"] is stream
-        assert stream.tell() == 0
+        # SDK sees the yggdrasil IO[bytes] wrapper; one upload, no
+        # chunked RMW loop.
+        assert isinstance(kwargs["contents"], _IO)
+        assert workspace.files.upload.call_count == 1
 
     def test_stream_input_seeks_to_origin_on_retry(self, workspace, client) -> None:
         """Transient ``files.upload`` failures must rewind a stream input."""

@@ -1169,23 +1169,42 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
                     remaining -= written
         return total
 
-    def write_stream(self, src: IO[bytes], *, offset: int = 0) -> int:
-        """Drain a binary file-like ``src`` into this holder at ``offset``.
+    def write_stream(self, src: Any, *, offset: int = 0) -> int:
+        """Drain a binary source into this holder at ``offset``.
 
-        Default: real chunked streaming — read :data:`_COPY_CHUNK`
-        bytes at a time from *src* and splice each chunk through
-        :meth:`write_bytes`, so multi-GB sources never materialise
-        as a single :class:`bytes` object in Python.
-
-        Backends with an atomic whole-object upload (Volumes
-        ``files.upload``, Workspace ``workspace.upload``, S3
-        ``PutObject``) override this to pass the live stream
-        straight to the backend in a single request instead of
-        N read-modify-rewrites — the chunked default is a strict
-        loss for those.
+        Public entry point: accepts a yggdrasil :class:`IO[bytes]`,
+        a stdlib :class:`typing.BinaryIO` (``io.BytesIO``,
+        ``open(..., "rb")``, urllib3 responses, …), or any file-like
+        carrying a ``.read``. Non-:class:`IO` sources are coerced
+        via :meth:`IO.from_` so subclass-side :meth:`_write_stream`
+        always receives a real :class:`IO[bytes]`.
         """
         if offset < 0:
             raise ValueError("write_stream offset must be >= 0")
+        from yggdrasil.io.base import IO as _IO
+        from yggdrasil.io.bytes_io import BytesIO as _YggBytesIO
+
+        io_src = src if isinstance(src, _IO) else _YggBytesIO.from_(src)
+        return self._write_stream(io_src, offset=offset)
+
+    def _write_stream(self, src: "IO[bytes]", *, offset: int) -> int:
+        """Splice ``src``'s bytes into this holder starting at ``offset``.
+
+        Default implementation: real chunked streaming — read
+        :data:`_COPY_CHUNK` bytes at a time and splice each chunk
+        through :meth:`write_bytes`, so multi-GB sources never
+        materialise as a single :class:`bytes` object in Python.
+
+        Subclass override hook: backends with an atomic
+        whole-object upload (Volumes ``files.upload``, Workspace
+        ``workspace.upload``, S3 ``PutObject``) replace this with
+        a single request that consumes *src* directly — the
+        chunked default is a strict loss for those.
+
+        *src* is always a real :class:`IO[bytes]`; the public
+        :meth:`write_stream` does the coercion so subclass code
+        gets a stable type.
+        """
         cursor = offset
         total = 0
         while True:

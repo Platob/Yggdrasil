@@ -308,31 +308,34 @@ class TestWriteStream:
         assert (tmp_path / "out.bin").read_bytes() == b"hello"
 
     def test_default_streams_in_chunks(self) -> None:
-        """Default :meth:`Holder.write_stream` is real chunked streaming.
+        """Default :meth:`Holder._write_stream` is real chunked streaming.
 
-        Multi-MB sources never materialise as a single Python
-        ``bytes`` object — :data:`_COPY_CHUNK` (1 MiB) bytes go
-        in per ``_write_mv`` call. Remote backends that prefer
-        a single atomic PUT (Volumes, Workspace, DBFS) override
-        :meth:`write_stream` to pass the stream straight to
-        their backend uploader; this test pins the default.
+        Multi-MB sources splice into the target through
+        :data:`_COPY_CHUNK`-sized (1 MiB) ``write_mv`` calls. Remote
+        backends that prefer a single atomic PUT (Volumes,
+        Workspace, DBFS) override :meth:`_write_stream` to pass
+        the IO straight to their backend uploader; this test pins
+        the default.
         """
         import io as _stdio
+        from unittest.mock import patch
+
         m = Memory()
         calls: list[int] = []
-        original = type(m)._write_mv
+        original = type(m).write_mv
 
-        def _spy(self, data, pos):
-            calls.append(len(data))
-            return original(self, data, pos)
+        def _spy(self, data, offset, *, update_stat=True):
+            if self is m:
+                calls.append(len(data))
+            return original(self, data, offset, update_stat=update_stat)
 
-        type(m)._write_mv = _spy
-        try:
+        with patch.object(type(m), "write_mv", _spy):
             m.write_stream(_stdio.BytesIO(b"x" * (4 * 1024 * 1024)))
-        finally:
-            type(m)._write_mv = original
 
-        # 4 MiB source, 1 MiB chunk → 4 round trips.
+        # 4 MiB source, 1 MiB chunk → 4 round trips to the target's
+        # ``write_mv``. (The coercion drain into a wrapper holder
+        # may issue additional smaller writes against a DIFFERENT
+        # Memory instance — ignored by the ``self is m`` filter.)
         assert calls == [1024 * 1024] * 4
 
     def test_empty_stream_is_noop(self) -> None:

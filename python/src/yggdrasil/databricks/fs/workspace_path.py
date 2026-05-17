@@ -313,12 +313,12 @@ class WorkspacePath(DatabricksPath):
             data = data[:n]
         return memoryview(data)
 
-    def write_stream(self, src: Any, *, offset: int = 0) -> int:
+    def _write_stream(self, src: Any, *, offset: int) -> int:
         """Override the base chunked stream — Workspace wants one PUT.
 
         The Workspace API has no positional / range write, so a
-        chunked :meth:`Holder.write_stream` would issue one RMW
-        per chunk. Hand the live stream straight to
+        chunked :meth:`Holder._write_stream` would issue one RMW
+        per chunk. Hand the live :class:`IO[bytes]` straight to
         :meth:`_upload`, which already seek-rewinds on retry and
         the SDK builds the multipart body lazily — multi-GB
         sources never materialise as a Python ``bytes`` object.
@@ -326,7 +326,7 @@ class WorkspacePath(DatabricksPath):
         because the API can't splice at a range.
         """
         if offset != 0:
-            return super().write_stream(src, offset=offset)
+            return super()._write_stream(src, offset=offset)
         return self._upload(src)
 
     def _write_mv(self, data: memoryview, pos: int) -> int:

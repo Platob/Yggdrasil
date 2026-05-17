@@ -131,10 +131,14 @@ class TestWrite:
         fmt = kwargs["format"]
         assert getattr(fmt, "name", str(fmt)).upper() == "AUTO"
 
-    def test_stream_input_rides_through_unbuffered(self, workspace, client) -> None:
-        """Caller-supplied ``BinaryIO`` is forwarded to the SDK, not
-        drained into a ``bytes`` buffer before the call."""
+    def test_stream_input_routes_through_upload(self, workspace, client) -> None:
+        """Caller-supplied ``BinaryIO`` is coerced to a yggdrasil
+        :class:`IO[bytes]` by the public :meth:`Holder.write_stream`
+        and lands on the single ``workspace.upload`` request via
+        :meth:`_write_stream`."""
         import io
+
+        from yggdrasil.io.base import IO as _IO
 
         workspace.workspace.get_status.side_effect = NotFound()
         stream = io.BytesIO(b"streamed-payload")
@@ -142,11 +146,11 @@ class TestWrite:
         p.write_bytes(stream)
 
         kwargs = workspace.workspace.upload.call_args.kwargs
-        # The same BytesIO the caller passed reaches the SDK.
-        assert kwargs["content"] is stream
-        # The closure ``seek(0)``s before each attempt — the cursor
-        # is back at the start by the time the SDK reads it.
-        assert stream.tell() == 0
+        # SDK sees the coerced yggdrasil IO[bytes] — that IS a
+        # BinaryIO, so ``workspace.upload`` happily consumes it.
+        assert isinstance(kwargs["content"], _IO)
+        # And only one upload call (no chunked RMW loop).
+        assert workspace.workspace.upload.call_count == 1
 
     def test_stream_input_seeks_to_origin_on_retry(self, workspace, client) -> None:
         """Transient failures must rewind a caller-supplied stream.

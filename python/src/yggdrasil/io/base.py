@@ -1151,15 +1151,14 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         return n
 
     def write_stream(self, src: Any) -> int:
-        """Drain a binary file-like *src* into self at the cursor.
+        """Drain a binary source into self at the cursor.
 
         Cursor-anchored wrapper around :meth:`Holder.write_stream` —
-        the holder reads *src* end-to-end and commits the payload
-        with a single :meth:`Holder.write_bytes`, so backends with
-        an atomic whole-object upload (``files.upload``,
-        ``workspace.upload``, S3 ``PutObject``) push one request
-        instead of chunked read-modify-rewrites. The cursor
-        advances by the number of bytes written.
+        the holder's public ``write_stream`` coerces *src* to a
+        real :class:`IO[bytes]` and dispatches to
+        :meth:`Holder._write_stream`; this thin wrapper just
+        advances the cursor by the bytes the holder reported
+        writing.
         """
         n = self._active().write_stream(src, offset=self._pos)
         self._pos += n
