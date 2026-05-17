@@ -132,8 +132,6 @@ class Catalogs(DatabricksService):
         if cached is not None:
             object.__setattr__(cat, "_infos", cached)
             object.__setattr__(cat, "_infos_fetched_at", time.time())
-        else:
-            logger.debug("No cached info for catalog %r — returning lazy handle", cat)
         return cat
 
     def schema(self, full_name: str) -> Schema:

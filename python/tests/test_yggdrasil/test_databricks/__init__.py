@@ -53,3 +53,9 @@ class DatabricksIntegrationCase(unittest.TestCase):
             )
         cls.client = DatabricksClient()
         cls.workspace = cls.client.workspace_client()
+
+        # Try spark
+        try:
+            _ = cls.client.spark()
+        except Exception:
+            pass
