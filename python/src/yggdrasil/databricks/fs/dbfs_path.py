@@ -241,6 +241,27 @@ class DBFSPath(DatabricksPath):
         )
         return memoryview(bytes(out))
 
+    def write_bytes(self, data: Any, pos: int = 0) -> int:
+        """Fast-path whole-blob write straight through :meth:`_stream_upload`.
+
+        DBFS has no positional-write API; a whole-file write is a
+        single ``dbfs.open(write=True)`` session that already
+        re-opens its stream per attempt inside :meth:`_stream_upload`.
+        Bypassing :meth:`Holder.write_mv` / :meth:`_write_mv` for
+        ``pos=0`` skips the resize + dirty-flag bookkeeping
+        :class:`Holder` adds for streaming backends. Non-zero
+        ``pos`` falls through to the base read-modify-rewrite path.
+        """
+        if pos != 0:
+            return super().write_bytes(data, pos=pos)
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        payload = bytes(data)
+        if not payload:
+            return 0
+        self._stream_upload(payload)
+        return len(payload)
+
     def _write_mv(self, data: memoryview, pos: int) -> int:
         """Splice via download → in-memory splice → re-upload.
 

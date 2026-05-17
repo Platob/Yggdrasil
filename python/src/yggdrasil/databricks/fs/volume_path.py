@@ -870,6 +870,29 @@ class VolumePath(DatabricksPath):
             data = data[:n]
         return memoryview(data)
 
+    def write_bytes(self, data: Any, pos: int = 0) -> int:
+        """Fast-path whole-blob write straight through :meth:`_upload`.
+
+        The Files API does whole-object PUTs only — no range writes —
+        so the common ``pos=0`` shape is a single
+        ``files.upload`` round trip. Bypassing :meth:`Holder.write_mv`
+        / :meth:`_write_mv` skips the resize + dirty-flag bookkeeping
+        :class:`Holder` adds for streaming backends and lets the
+        payload ride the seek-on-retry closure in :meth:`_upload`
+        directly. Non-zero ``pos`` still routes through the base
+        read-modify-rewrite path (pull existing object, splice,
+        re-upload).
+        """
+        if pos != 0:
+            return super().write_bytes(data, pos=pos)
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        payload = bytes(data)
+        if not payload:
+            return 0
+        self._upload(payload)
+        return len(payload)
+
     def _write_mv(self, data: memoryview, pos: int) -> int:
         n = len(data)
         if n == 0:
@@ -898,12 +921,20 @@ class VolumePath(DatabricksPath):
         logger.debug(
             "Uploading volume file %r (%d bytes)", self, size,
         )
-        self._call_ensuring_parents(
-            self.client.workspace_client().files.upload,
-            file_path=self.api_path,
-            contents=_stdio.BytesIO(payload),
-            overwrite=True,
-        )
+        # Same seek-on-retry shape as :meth:`WorkspacePath._upload`:
+        # ``FilesExt.upload`` forwards ``contents`` to a PUT body
+        # whose first read empties the cursor, so retries fired by
+        # :meth:`_call_ensuring_parents` / :func:`retry_sdk_call`
+        # would otherwise upload zero bytes.
+        contents = _stdio.BytesIO(payload)
+        upload = self.client.workspace_client().files.upload
+        api_path = self.api_path
+
+        def _do_upload() -> None:
+            contents.seek(0)
+            upload(file_path=api_path, contents=contents, overwrite=True)
+
+        self._call_ensuring_parents(_do_upload)
         logger.info("Wrote %r (%d bytes)", self, size)
         self._seed_stat_cache(IOStats(
             size=len(payload),

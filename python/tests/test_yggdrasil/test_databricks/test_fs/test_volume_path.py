@@ -221,6 +221,42 @@ class TestWrite:
         # payload we sent.
         assert kwargs["contents"].getvalue() == b"abcdef"
 
+    def test_upload_resends_full_payload_on_retry(self, workspace, client) -> None:
+        """Transient ``files.upload`` failures must rewind the stream.
+
+        ``FilesExt.upload`` forwards ``contents`` to a PUT body whose
+        first read empties the cursor. Without a per-attempt
+        :meth:`seek(0)` the second try (transient 5xx via
+        :func:`retry_sdk_call` or NotFound parent-recovery via
+        :meth:`_call_ensuring_parents`) would PUT zero bytes.
+        """
+        from unittest.mock import patch
+
+        from databricks.sdk.errors import InternalError
+
+        workspace.files.get_metadata.side_effect = NotFound()
+        workspace.files.get_directory_metadata.side_effect = NotFound()
+
+        seen: list[bytes] = []
+        calls = {"n": 0}
+
+        def upload_side_effect(**kwargs: object) -> None:
+            calls["n"] += 1
+            contents = kwargs["contents"]
+            contents.read()  # type: ignore[union-attr] — drain to EOF
+            if calls["n"] == 1:
+                raise InternalError("flaky")
+            contents.seek(0)
+            seen.append(contents.read())  # type: ignore[union-attr]
+
+        workspace.files.upload.side_effect = upload_side_effect
+
+        with patch("yggdrasil.io.path._retry.time.sleep"):
+            VolumePath("/Volumes/c/s/v/x", client=client).write_bytes(b"abcdef")
+
+        assert calls["n"] == 2
+        assert seen == [b"abcdef"]
+
     def test_pwrite_does_rmw(self, workspace, client) -> None:
         workspace.files.get_metadata.return_value = _file_meta(5)
         body = SimpleNamespace(read=lambda: b"abcde")

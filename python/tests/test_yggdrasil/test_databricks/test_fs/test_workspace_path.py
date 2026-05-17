@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -120,10 +120,9 @@ class TestWrite:
         kwargs = workspace.workspace.upload.call_args.kwargs
         assert kwargs["path"] == "/Workspace/x"
         assert kwargs["overwrite"] is True
-        # Raw bytes (not a pre-built BytesIO) — the SDK wraps them
-        # fresh on every request, so transient-error retries don't
-        # send an empty body from an exhausted stream.
-        assert kwargs["content"] == b"abcdef"
+        # Stream is rewound to origin per attempt so retries POST the
+        # full payload, not an empty tail.
+        assert kwargs["content"].getvalue() == b"abcdef"
         # ``format`` must be passed: the SDK default is ``SOURCE``,
         # which routes raw bytes through the notebook importer and
         # fails with ``BadRequest: The zip archive contains no items``.
@@ -134,23 +133,43 @@ class TestWrite:
     def test_upload_resends_full_payload_on_retry(self, workspace, client) -> None:
         """Transient failures must not exhaust the upload stream.
 
-        Pre-wrapping the payload in a single :class:`io.BytesIO`
-        (the previous shape) consumed the cursor on the first
-        attempt, so any retry after a 5xx / parent-recovery uploaded
-        an empty body — that's how staged workspace ``.py`` files
-        ended up empty in :meth:`Table.async_job`.
+        The previous shape pre-wrapped the payload in a single
+        :class:`io.BytesIO` and passed it to ``_call_ensuring_parents``
+        directly. After the first POST the cursor sat at EOF, so any
+        retry from :func:`retry_sdk_call` (transient 5xx) or the
+        parent-recovery path uploaded an empty body — that's how
+        staged workspace ``.py`` files ended up zero bytes in
+        :meth:`Table.async_job`. The seek-on-retry shape reads
+        every attempt's content from byte 0.
         """
         from databricks.sdk.errors import InternalError
 
+        seen: list[bytes] = []
+        calls = {"n": 0}
+
+        def upload_side_effect(**kwargs: object) -> None:
+            calls["n"] += 1
+            # First attempt: drain the stream to EOF (mimics what
+            # ``WorkspaceExt.upload`` does inside its multipart POST),
+            # then raise — retry must re-seek before re-reading.
+            content = kwargs["content"]
+            content.read()  # type: ignore[union-attr]
+            if calls["n"] == 1:
+                raise InternalError("flaky")
+            content.seek(0)
+            seen.append(content.read())  # type: ignore[union-attr]
+
         workspace.workspace.get_status.side_effect = NotFound()
-        workspace.workspace.upload.side_effect = [InternalError("flaky"), None]
+        workspace.workspace.upload.side_effect = upload_side_effect
 
-        p = WorkspacePath("/Workspace/y", client=client)
-        p.write_bytes(b"abcdef")
+        with patch("yggdrasil.io.path._retry.time.sleep"):
+            WorkspacePath("/Workspace/y", client=client).write_bytes(b"abcdef")
 
-        assert workspace.workspace.upload.call_count == 2
-        for call in workspace.workspace.upload.call_args_list:
-            assert call.kwargs["content"] == b"abcdef"
+        assert calls["n"] == 2
+        # Despite the first attempt draining the cursor, the second
+        # attempt POSTed the full payload because the closure
+        # ``seek(0)``s the shared stream on every call.
+        assert seen == [b"abcdef"]
 
 
 class TestMutators:
