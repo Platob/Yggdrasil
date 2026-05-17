@@ -169,7 +169,6 @@ nav:
       - IO & HTTP:
           - io: modules/io/README.md
           - io.http_: modules/io/http_/README.md
-          - requests: modules/requests/README.md
       - Databricks:
           - Overview: modules/databricks/README.md
           - sql: modules/databricks/sql/README.md
@@ -181,7 +180,7 @@ nav:
           - iam: modules/databricks/iam/README.md
           - jobs: modules/databricks/jobs/README.md
           - account: modules/databricks/account/README.md
-          - ai.genie: modules/databricks/ai/genie/README.md
+          - genie: modules/databricks/genie/README.md
       - Utilities:
           - pyutils: modules/pyutils/README.md
           - concurrent: modules/concurrent/README.md
