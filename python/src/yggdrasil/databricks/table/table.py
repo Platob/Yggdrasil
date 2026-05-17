@@ -2665,21 +2665,30 @@ class Table(DatabricksPath):
         *,
         wait: WaitingConfigArg = True,
         missing_ok: bool = False,
+        delete_staging: bool = True,
     ) -> "Table":
+        # ``delete_staging=False`` keeps the staging volume around for
+        # internal drop-and-recreate flows (OVERWRITE) where the very
+        # next step uploads a fresh parquet to the same volume — the
+        # background ``VolumesAPI.delete`` would otherwise race the
+        # upload and surface as PATH_NOT_FOUND on the warehouse INSERT.
         uc = self.client.workspace_client().tables
-        logger.debug("Deleting table %r (wait=%s)", self, bool(wait))
+        logger.debug(
+            "Deleting table %r (wait=%s, delete_staging=%s)",
+            self, bool(wait), delete_staging,
+        )
 
         if wait:
             try:
                 uc.delete(full_name=self.full_name())
 
-                if self._staging_volume:
+                if delete_staging and self._staging_volume:
                     self._staging_volume.delete(wait=False)
             except DatabricksError:
                 if not missing_ok:
                     raise
         else:
-            Job.make(self.delete).fire_and_forget()
+            Job.make(self.delete, delete_staging=delete_staging).fire_and_forget()
 
         self.invalidate_singleton(remove_global=True)
         logger.info("Deleted table %r", self)
@@ -3229,7 +3238,7 @@ class Table(DatabricksPath):
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
 
         if mode_enum == Mode.OVERWRITE and not match_by:
-            self.delete(wait=True, missing_ok=True)
+            self.delete(wait=True, missing_ok=True, delete_staging=False)
 
         target = self.create(data, mode=schema_mode)
         target_location = target.full_name(safe=True)
@@ -3380,7 +3389,7 @@ class Table(DatabricksPath):
         wait = True if PyEnv.in_databricks() else wait
 
         if mode_enum == Mode.OVERWRITE and not match_by:
-            self.delete(wait=True, missing_ok=True)
+            self.delete(wait=True, missing_ok=True, delete_staging=False)
 
         target = self.create(data, mode=schema_mode)
         target_location = target.full_name(safe=True)
@@ -3638,7 +3647,7 @@ class Table(DatabricksPath):
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
 
         if mode_enum == Mode.OVERWRITE and not match_by:
-            self.delete(wait=True, missing_ok=True)
+            self.delete(wait=True, missing_ok=True, delete_staging=False)
 
         if not self.exists:
             raise ValueError(
