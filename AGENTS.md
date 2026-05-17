@@ -42,8 +42,11 @@ Default to:
 - adding the converter to `data/cast/registry.py` (or the engine `cast.py` that registers on import) instead of writing a one-off conversion at the call site
 - adding a flag to `CastOptions` instead of inventing a new options object
 - adding a method to `DataField` / `Schema` / `DataTable` / `StatementResult` instead of writing a sibling helper module
+- routing lifecycle calls through the resource singleton's public methods (`Volume.create` / `Volume.delete` / `Volume.read_info` / `Schema.create` / `Catalog.create` / `Table.create` / `Table.read_info` / `Warehouse.start` / `Cluster.terminate` / `Job.run` …) instead of re-issuing the underlying SDK call (`ws.volumes.create(...)` / `ws.schemas.create(...)` / `ws.tables.create(...)`). The resource method is the integration point: it carries the project-level defaults (managed-volume-type, owner/comment normalization), warms the per-singleton metadata cache (`_store_infos`), normalises `AlreadyExists`/`NotFound` handling via `if_not_exists` / `missing_ok`, and is what tests, IDE inspection, and the public docs target. Anything that opens an SDK service and calls `.create` / `.read` / `.delete` directly is duplicating that contract — extend the resource's own method if it's missing a knob.
 - using `HTTPSession` / `PreparedRequest` / `Response` instead of bypassing the modern HTTP stack
 - using `lib.py` guards already in the subsystem instead of writing a new guard pattern
+
+Before writing a recovery helper, internal `_create_X` / `_ensure_X` lambda, or anywhere that needs to "create / get / delete X bottom-up": grep the resource class for an existing method first (`Volume`, `VolumePath`, `Schema`, `Table`, `Warehouse`, `Cluster`, `Job`, `Catalog`, `Secret`, `WorkspaceFile`, …). If `self.create(...)` / `self.delete(...)` / `self.read_info(...)` already wraps the SDK call, route through it — even from inside the resource class itself. Tiny duplications (one `volume_type` default here, one `_store_infos` warm-up there) drift over time; the singleton method is the single source of truth.
 
 Only create a new module, class, or abstraction when the existing surface genuinely cannot host the behavior — and when you do, wire it back into the existing surface so the next caller finds it through the canonical path.
 
@@ -54,6 +57,8 @@ Red flags that you are inventing instead of integrating:
 - conversion logic added at a call site that should have been a registered converter
 - a private utility that re-implements something already in `pyutils/` or `data/`
 - a "v2" of something with no migration path from "v1"
+- a private `_create_volume = lambda: ws.volumes.create(...)` (or `_create_schema`, `_create_table`, `_create_warehouse`, …) inside a recovery / `_ensure_X` path when `self.create(...)` on the resource class already wraps that exact SDK call with the right defaults and cache hooks
+- an `ensure_X` / `_ensure_X` that re-implements `if_not_exists=True` / `missing_ok=True` semantics already wired into the resource method — extend the existing `create(if_not_exists=...)` / `delete(missing_ok=...)` instead of branching at the call site
 
 ### Reach for `yggdrasil.data.enums` first
 
