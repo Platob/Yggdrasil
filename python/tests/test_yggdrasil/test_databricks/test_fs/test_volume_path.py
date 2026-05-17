@@ -468,9 +468,55 @@ class TestVolumeAutoCreate:
 
     def test_volume_missing_only_creates_volume(self, workspace, client) -> None:
         # Common case: catalog + schema already exist, only the volume
-        # is missing. After a NotFound on upload + create_directory,
-        # we should try ``volumes.create`` first and stop there.
-        uploads = [NotFound("Volume does not exist"), None]
+        # is missing. The upload's ``NotFound("Volume … does not exist")``
+        # message names the volume directly, so the recovery path skips
+        # its cheap ``files.create_directory`` probe and goes straight
+        # to ``volumes.create``. ``files.create_directory`` is only
+        # called once afterwards, to materialise the sub-directory.
+        uploads = [NotFound("Volume 'cat.sch.vol' does not exist"), None]
+
+        def upload(**_kwargs):
+            r = uploads.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        workspace.files.upload.side_effect = upload
+
+        p = VolumePath(
+            "/Volumes/cat/sch/vol/sub/file.bin", client=client,
+        )
+        p.write_bytes(b"payload")
+
+        workspace.catalogs.get.assert_not_called()
+        workspace.schemas.get.assert_not_called()
+        workspace.volumes.read.assert_not_called()
+
+        # Volume created first; catalog/schema untouched because volume
+        # create succeeded. The cheap-path probe was skipped — only the
+        # post-volume-create ``create_directory`` call should land.
+        workspace.catalogs.create.assert_not_called()
+        workspace.schemas.create.assert_not_called()
+        workspace.files.create_directory.assert_called_once_with(
+            "/Volumes/cat/sch/vol/sub",
+        )
+        vol_kwargs = workspace.volumes.create.call_args.kwargs
+        assert vol_kwargs["catalog_name"] == "cat"
+        assert vol_kwargs["schema_name"] == "sch"
+        assert vol_kwargs["name"] == "vol"
+        vt = vol_kwargs["volume_type"]
+        assert getattr(vt, "name", str(vt)).upper() == "MANAGED"
+
+    def test_generic_not_found_still_probes_create_directory(
+        self, workspace, client,
+    ) -> None:
+        # When the upload error doesn't name the volume (just a generic
+        # ``"does not exist"``), the recovery path still attempts the
+        # cheap ``files.create_directory`` probe first — the volume
+        # itself may well exist and only the sub-directory is missing.
+        # Only if that probe also NotFounds do we fall through to
+        # ``volumes.create``.
+        uploads = [NotFound("Path does not exist"), None]
         create_dirs = [NotFound("does not exist"), None]
 
         def upload(**_kwargs):
@@ -493,20 +539,10 @@ class TestVolumeAutoCreate:
         )
         p.write_bytes(b"payload")
 
-        workspace.catalogs.get.assert_not_called()
-        workspace.schemas.get.assert_not_called()
-        workspace.volumes.read.assert_not_called()
-
-        # Volume created first; catalog/schema untouched because volume
-        # create succeeded.
-        workspace.catalogs.create.assert_not_called()
-        workspace.schemas.create.assert_not_called()
-        vol_kwargs = workspace.volumes.create.call_args.kwargs
-        assert vol_kwargs["catalog_name"] == "cat"
-        assert vol_kwargs["schema_name"] == "sch"
-        assert vol_kwargs["name"] == "vol"
-        vt = vol_kwargs["volume_type"]
-        assert getattr(vt, "name", str(vt)).upper() == "MANAGED"
+        # Cheap probe attempted first (fails), then volume created,
+        # then probe retried (succeeds).
+        assert workspace.files.create_directory.call_count == 2
+        workspace.volumes.create.assert_called_once()
 
     def test_schema_missing_creates_schema_then_volume(
         self, workspace, client,
@@ -515,17 +551,10 @@ class TestVolumeAutoCreate:
         # NotFound, then ``schemas.create`` succeeds, then volume create
         # is retried. Catalog should not be touched.
         uploads = [NotFound("Volume does not exist"), None]
-        create_dirs = [NotFound("does not exist"), None]
         volume_creates = [NotFound("Schema does not exist"), None]
 
         def upload(**_kwargs):
             r = uploads.pop(0)
-            if isinstance(r, Exception):
-                raise r
-            return r
-
-        def create_directory(_path):
-            r = create_dirs.pop(0)
             if isinstance(r, Exception):
                 raise r
             return r
@@ -537,7 +566,6 @@ class TestVolumeAutoCreate:
             return r
 
         workspace.files.upload.side_effect = upload
-        workspace.files.create_directory.side_effect = create_directory
         workspace.volumes.create.side_effect = volumes_create
 
         p = VolumePath(
@@ -556,18 +584,11 @@ class TestVolumeAutoCreate:
         # schema.create both fail NotFound, falling through to catalog
         # → schema → volume creation.
         uploads = [NotFound("Volume does not exist"), None]
-        create_dirs = [NotFound("does not exist"), None]
         volume_creates = [NotFound("Schema does not exist"), None]
         schema_creates = [NotFound("Catalog does not exist"), None]
 
         def upload(**_kwargs):
             r = uploads.pop(0)
-            if isinstance(r, Exception):
-                raise r
-            return r
-
-        def create_directory(_path):
-            r = create_dirs.pop(0)
             if isinstance(r, Exception):
                 raise r
             return r
@@ -585,7 +606,6 @@ class TestVolumeAutoCreate:
             return r
 
         workspace.files.upload.side_effect = upload
-        workspace.files.create_directory.side_effect = create_directory
         workspace.volumes.create.side_effect = volumes_create
         workspace.schemas.create.side_effect = schemas_create
 
@@ -602,16 +622,9 @@ class TestVolumeAutoCreate:
         # Volume create races with another caller — ``AlreadyExists``
         # is treated as success, no retry storm.
         uploads = [NotFound("Volume does not exist"), None]
-        create_dirs = [NotFound("does not exist"), None]
 
         def upload(**_kwargs):
             r = uploads.pop(0)
-            if isinstance(r, Exception):
-                raise r
-            return r
-
-        def create_directory(_path):
-            r = create_dirs.pop(0)
             if isinstance(r, Exception):
                 raise r
             return r
@@ -620,7 +633,6 @@ class TestVolumeAutoCreate:
             pass
 
         workspace.files.upload.side_effect = upload
-        workspace.files.create_directory.side_effect = create_directory
         workspace.volumes.create.side_effect = AlreadyExists()
 
         p = VolumePath(
