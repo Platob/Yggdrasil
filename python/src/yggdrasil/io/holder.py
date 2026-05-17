@@ -859,6 +859,14 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         # still routes through write_local_path.
         if self._url_matches(url):
             return
+        # A cross-backend seed (e.g. Memory seeded from a local path)
+        # only has bytes to copy when the file actually exists. ``IO(data=
+        # str(tmp_path / "x.csv"))`` is the common "I'll write to this
+        # location later" pattern — the holder should land empty but
+        # carrying the URL + format dispatch from the suffix, not crash
+        # with ``FileNotFoundError`` inside ``write_local_path``.
+        if not os.path.exists(os.fspath(path)):
+            return
         self.write_local_path(path)
 
     def _init_from_pathlib(self, path: pathlib.PurePath) -> None:
