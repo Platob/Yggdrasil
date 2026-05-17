@@ -1,7 +1,14 @@
 """Helpers for running Databricks jobs and notebooks."""
 
 from .config import NotebookConfig, WidgetType
-from .inputs import get_dbutils, read_argv, read_job_parameters, read_widgets
+from .inputs import (
+    TaskParameters,
+    get_dbutils,
+    read_argv,
+    read_job_parameters,
+    read_widgets,
+    task_parameters,
+)
 from .introspect import (
     ModuleDependency,
     dependencies_to_pip_specs,
@@ -31,6 +38,7 @@ __all__ = [
     "ModuleDependency",
     "NotebookConfig",
     "PyPIPath",
+    "TaskParameters",
     "WidgetType",
     "WorkspacePyPI",
     "dependencies_to_pip_specs",
@@ -41,6 +49,7 @@ __all__ = [
     "resolve_module_dependency",
     "sniff_env_vars",
     "sniff_imports",
+    "task_parameters",
     "userinfo_email_notifications",
     "userinfo_git_source",
     "userinfo_job_settings",

@@ -405,7 +405,35 @@ class WorkspacePath(DatabricksPath):
                 # cursor state crosses retry attempts.
                 upload(path=api_path, content=content, format=fmt, overwrite=True)
 
-        self._call_ensuring_parents(_do_upload)
+        try:
+            self._call_ensuring_parents(_do_upload)
+        except Exception as exc:
+            # ``overwrite=True`` covers same-type re-uploads, but the
+            # Workspace import API still refuses to replace a node with
+            # one of a *different* type — e.g. a previously-staged
+            # SparkPythonTask source file at ``main-<digest>.py`` can't
+            # be overwritten by an AUTO upload of the same path when
+            # the content sniffs as a notebook (notebooks are stored
+            # at the extension-stripped stem). Delete the conflicting
+            # node and retry once so re-stagings that change task type
+            # — the ``async_job(force=True)`` after-upgrade scenario —
+            # don't leave the caller stuck on a stale workspace entry.
+            if not _looks_like_already_exists(exc):
+                raise
+            logger.warning(
+                "Workspace upload of %r hit %s despite overwrite=True — "
+                "deleting conflicting node and retrying",
+                self, type(exc).__name__,
+            )
+            try:
+                self._call(
+                    self.client.workspace_client().workspace.delete,
+                    api_path, recursive=False,
+                )
+            except Exception as del_exc:
+                if not _looks_like_not_found(del_exc):
+                    raise
+            self._call_ensuring_parents(_do_upload)
         if size >= 0:
             self._persist_stat_cache(IOStats(
                 size=size,

@@ -8,14 +8,17 @@ so the suite stays runnable outside a Databricks runtime.
 from __future__ import annotations
 
 import builtins
+import os
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from yggdrasil.databricks.jobs.inputs import (
+    TaskParameters,
     get_dbutils,
     read_argv,
     read_job_parameters,
     read_widgets,
+    task_parameters,
 )
 
 
@@ -146,6 +149,95 @@ class TestReadJobParameters(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 read_job_parameters()
             self.assertIn("getCurrentBindings()", str(ctx.exception))
+
+
+class TestTaskParameters(unittest.TestCase):
+    """Snapshot helper that rolls argv + bindings + env into one struct."""
+
+    def test_argv_splits_positional_and_named(self):
+        params = task_parameters(
+            argv=["positional", "--name=alice", "--count", "9", "--flag"],
+            env_prefix=(),
+        )
+        self.assertIsInstance(params, TaskParameters)
+        self.assertEqual(params.args, ("positional",))
+        self.assertEqual(
+            params.kwargs,
+            {"name": "alice", "count": "9", "flag": "true"},
+        )
+        self.assertEqual(params.env, {})
+
+    def test_kwargs_merge_bindings_under_argv(self):
+        # bindings provide the baseline, argv overrides on collision.
+        fake = _FakeDbutils(
+            mapping={"name": "widget"},
+            bindings={"name": "binding", "stage": "prod"},
+        )
+        with _DbutilsInBuiltins(fake):
+            params = task_parameters(
+                argv=["--name=cli"],
+                env_prefix=(),
+            )
+        self.assertEqual(params.args, ())
+        self.assertEqual(
+            params.kwargs,
+            {"name": "cli", "stage": "prod"},
+        )
+
+    def test_env_filtered_by_prefix(self):
+        with patch.dict(
+            os.environ,
+            {
+                "DATABRICKS_JOB_ID": "42",
+                "DATABRICKS_RUN_ID": "99",
+                "UNRELATED_VAR": "noise",
+                "MY_APP_TOKEN": "kept",
+            },
+            clear=True,
+        ):
+            params = task_parameters(
+                argv=[], env_prefix=("DATABRICKS_", "MY_APP_"),
+            )
+        self.assertEqual(
+            params.env,
+            {
+                "DATABRICKS_JOB_ID": "42",
+                "DATABRICKS_RUN_ID": "99",
+                "MY_APP_TOKEN": "kept",
+            },
+        )
+
+    def test_env_prefix_accepts_bare_string(self):
+        with patch.dict(
+            os.environ,
+            {"DATABRICKS_HOST": "https://x", "OTHER": "drop"},
+            clear=True,
+        ):
+            params = task_parameters(argv=[], env_prefix="DATABRICKS_")
+        self.assertEqual(params.env, {"DATABRICKS_HOST": "https://x"})
+
+    def test_no_dbutils_leaves_kwargs_argv_only(self):
+        # No dbutils on builtins — bindings layer silently empty.
+        params = task_parameters(
+            argv=["--key=value"], env_prefix=(),
+        )
+        self.assertEqual(params.kwargs, {"key": "value"})
+
+    def test_require_dbutils_raises_when_missing(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            task_parameters(argv=[], env_prefix=(), require_dbutils=True)
+        self.assertIn("dbutils is not available", str(ctx.exception))
+
+    def test_dbutils_without_notebook_entrypoint_falls_back(self):
+        # SparkPythonTask: dbutils is present but getCurrentBindings raises.
+        # We should still return a snapshot, not propagate the error.
+        fake = MagicMock()
+        fake.notebook.entry_point.getCurrentBindings.side_effect = (
+            RuntimeError("no notebook")
+        )
+        with _DbutilsInBuiltins(fake):
+            params = task_parameters(argv=["--key=value"], env_prefix=())
+        self.assertEqual(params.kwargs, {"key": "value"})
 
 
 if __name__ == "__main__":
