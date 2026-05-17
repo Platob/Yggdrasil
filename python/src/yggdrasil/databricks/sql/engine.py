@@ -5,7 +5,9 @@ A thin execution and table-management layer over two inner
 :class:`StatementExecutor` instances, composed via *has-a*:
 
 - :class:`SparkStatementExecutor` (held on ``spark``) — used when a
-  :class:`pyspark.sql.SparkSession` is reachable.
+  :class:`pyspark.sql.SparkSession` is reachable. Defaults to a
+  :class:`DatabricksSparkStatementExecutor` so a missing session is
+  built via :meth:`DatabricksClient.spark` (Databricks Connect).
 - :class:`SQLWarehouse` (resolved via :meth:`warehouse`) — the Databricks
   SQL warehouse API path.
 
@@ -64,6 +66,7 @@ from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
 from yggdrasil.data.enums import Mode
 from yggdrasil.spark.executor import SparkStatementExecutor
 from yggdrasil.spark.statement import SparkPreparedStatement, SparkStatementResult
+from .spark_executor import DatabricksSparkStatementExecutor
 from yggdrasil.databricks.catalog.catalogs import Catalogs
 from yggdrasil.databricks.schema.schemas import Schemas
 from yggdrasil.databricks.table.table import Table
@@ -241,7 +244,15 @@ class SQLEngine(DatabricksService, StatementExecutor):
         self.catalog_name = catalog_name
         self.schema_name = schema_name
         self.default_warehouse = default_warehouse
-        self.spark = spark if spark is not None else SparkStatementExecutor()
+        # Default to a Databricks Connect-backed executor so a missing
+        # session is built via ``client.spark()`` rather than PyEnv's
+        # local PySpark bootstrap. Callers that want a custom Spark
+        # backend keep passing ``spark=`` explicitly.
+        self.spark = (
+            spark
+            if spark is not None
+            else DatabricksSparkStatementExecutor(client=self.client)
+        )
         self._last_default_wh_check = 0.0
         self._initialized = True
 
