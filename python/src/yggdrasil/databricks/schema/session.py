@@ -1,32 +1,33 @@
-"""HTTP session backed by a Unity Catalog schema as remote response cache.
+"""HTTP session that uses a Unity Catalog schema as its remote response cache.
 
-:class:`SchemaSession` subclasses :class:`~yggdrasil.io.http_.HTTPSession`
-and routes every outbound request through a per-path Delta table that
-acts as the remote cache. Identical URLs collapse to the same table on
-the schema, so a warmed cache repays subsequent calls with a SQL lookup
-instead of a network round-trip.
+:class:`SchemaSession` is a thin :class:`HTTPSession` subclass that maps
+every outbound request's URL path to one Delta table inside a bound
+:class:`Schema`. The parent's ``_send`` pipeline already owns the local
+cache → remote cache → network → writeback flow; this subclass's only
+job is to stamp the per-path :class:`CacheConfig` onto the request so
+that pipeline knows *which* table backs the remote tier.
 
-Cache semantics, controlled by ``mode`` (default :attr:`Mode.APPEND`):
+Two cache modes (``mode`` constructor arg, default :attr:`Mode.APPEND`):
 
-* :attr:`Mode.APPEND` — check the cache table for a matching row first;
-  on miss, fetch from the API and append the new response. This is the
-  pure "read-through, write-once" path.
-* Any other mode (:attr:`Mode.UPSERT`, :attr:`Mode.OVERWRITE`, …) —
-  skip the cache lookup, fetch fresh from the API, then UPSERT / replace
-  the row in the table. Useful when the upstream API state may have
-  changed and the cache is being repaired.
+* :attr:`Mode.APPEND` — read-through, write-once. First call against a
+  given URL fetches from the wire and appends the response to the
+  per-path table; subsequent calls return the cached row without
+  hitting the network.
+* :attr:`Mode.UPSERT` — bypass the read. Every call goes to the wire
+  and replaces the row on the per-path table. Useful when the upstream
+  state may have changed and the cache needs to be repaired.
 
-The session is otherwise fully transparent: callers use ``get`` / ``post``
-/ ``send`` exactly as on the parent :class:`HTTPSession`; the cache is
-plumbed via the existing :class:`~yggdrasil.io.send_config.CacheConfig`
-remote-cache pipeline.
+Local on-disk cache (``local_cache`` constructor arg, default ``True``)
+runs in front of the remote tier — a single Arrow IPC file per response
+under ``~/.yggdrasil/cache/response/<host>/<path>/<hash>.arrow``. Pass
+``False`` to disable it (remote-only) or a path / :class:`CacheConfig`
+to override the location.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import logging
-import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Mapping, Optional, Union
 
@@ -34,7 +35,7 @@ from yggdrasil.dataclasses import ExpiringDict
 from yggdrasil.dataclasses.waiting import DEFAULT_WAITING_CONFIG, WaitingConfig
 from yggdrasil.data.enums import Mode
 from yggdrasil.data.enums.mode import ModeLike
-from yggdrasil.databricks.sql.sql_utils import MAX_TABLE_NAME_LEN, safe_table_name
+from yggdrasil.databricks.table.table import Table
 from yggdrasil.io.http_.session import HTTPSession
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.send_config import CacheConfig
@@ -42,8 +43,6 @@ from yggdrasil.io.url import URL
 
 if TYPE_CHECKING:
     from yggdrasil.databricks.schema.schema import Schema
-    from yggdrasil.databricks.schema.schemas import Schemas
-    from yggdrasil.databricks.table.table import Table
     from yggdrasil.io.authorization.base import Authorization
     from yggdrasil.io.headers import Headers
 
@@ -53,111 +52,59 @@ __all__ = ["SchemaSession"]
 
 LOGGER = logging.getLogger(__name__)
 
-
-# URL path → identifier: collapse anything outside ``[0-9A-Za-z]`` to ``_``.
-# Run once at module load so every per-request derivation is one ``re.sub``
-# call instead of allocating a fresh compiled pattern.
-_PATH_TO_IDENT_RE: re.Pattern[str] = re.compile(r"[^0-9A-Za-z]+")
-
-# Default per-path :class:`Table` cache TTL. One hour is long enough to
-# amortise the schema lookup across a typical batch / job, short enough
-# that a rename / drop upstream surfaces on the next refresh rather than
-# pinning a stale handle for the process lifetime.
+# Per-path Table handle cache TTL. One hour amortises the schema lookup
+# across a typical job while still surfacing upstream renames / drops
+# on the next refresh.
 _DEFAULT_TABLE_CACHE_TTL: dt.timedelta = dt.timedelta(hours=1)
 
 
 class SchemaSession(HTTPSession):
-    """HTTP session that uses a Databricks schema as its remote cache.
-
-    Every distinct URL path resolves to one Delta table on the bound
-    :class:`Schema`. The first call against a path lazily provisions the
-    table (the parent ``_load_remote_cached_response`` already creates
-    on ``TABLE_OR_VIEW_NOT_FOUND``); subsequent calls reuse it.
+    """HTTP session that caches responses in per-path Delta tables.
 
     Args:
-        schema:           The :class:`Schema` whose tables will back the
-                          per-path cache. ``None`` puts the session in
-                          *router mode*: each outbound request is
-                          dispatched to a per-host
-                          :class:`SchemaSession` singleton built
-                          lazily on first send. The parent
-                          ``Session.__new__`` already singletons
-                          children by ``(cls, base_url, key)``, so
-                          two requests against the same host collapse
-                          to the same child instance and the same
-                          cache schema.
-        base_url:         Forwarded to :class:`HTTPSession`. When set,
-                          the session is singleton-cached per
-                          ``(class, base_url, key)`` like any other.
-        mode:             Cache write disposition. :attr:`Mode.APPEND`
-                          (default) reads the cache first; anything
-                          else (:attr:`Mode.UPSERT`, …) always fetches
-                          from the API and writes back.
-        catalog_name:     Default catalog for router-mode child
-                          resolution. Ignored when *schema* is bound.
-                          ``None`` falls back to the active
-                          :class:`Schemas` service's default.
-        schemas:          :class:`Schemas` service used by router mode
-                          to resolve a child :class:`Schema` per host.
-                          ``None`` falls back to :meth:`Schemas.current`
-                          at first dispatch.
-        table_cache_ttl:  TTL on the in-process per-path :class:`Table`
-                          handle cache. Defaults to 1 hour.
-        local_cache:      On-disk fast-path cache control. ``True``
-                          (default) enables the local cache at the
-                          session's default folder
-                          (``~/.yggdrasil/cache/response/<host>/<path>``);
-                          a ``str`` / :class:`Path` sets an explicit
-                          directory; a :class:`CacheConfig` is used
-                          as-is; ``False`` / ``None`` disables the
-                          local layer (remote cache only).
+        schema: The :class:`Schema` whose tables back the cache.
+        base_url: Forwarded to :class:`HTTPSession`; participates in
+            the parent's ``(cls, base_url, key)`` singleton key.
+        mode: Cache write disposition. :attr:`Mode.APPEND` (default)
+            reads the cache first; :attr:`Mode.UPSERT` always fetches
+            fresh and replaces the cached row.
+        local_cache: ``True`` (default) enables the on-disk fast-path
+            cache at the session's default folder; ``str`` / :class:`Path`
+            picks an explicit directory; a :class:`CacheConfig` is used
+            as-is; ``False`` / ``None`` disables the local tier.
+        table_cache_ttl: TTL on the in-process per-path :class:`Table`
+            handle cache (1 hour by default).
+
+    Remaining keyword arguments forward to :class:`HTTPSession`.
     """
 
-    #: Default prefix prepended to the caller-supplied ``key`` before it
-    #: feeds the parent ``Session.__new__`` singleton cache. ``cls``
-    #: already disambiguates SchemaSession from a bare HTTPSession in
-    #: that cache, but the prefix makes the namespace explicit so a
-    #: future refactor (or a caller that materialises the cache key
-    #: by hand) can't accidentally collide a SchemaSession with an
-    #: unrelated HTTPSession instance sharing the same ``(base_url,
-    #: key)`` pair.
+    #: Namespace prefix on the parent's singleton key so a
+    #: ``SchemaSession`` never collides with a bare ``HTTPSession``
+    #: sharing the same ``(base_url, key)`` pair.
     KEY_PREFIX: ClassVar[str] = "yggdrasil.schema_session:"
 
     @classmethod
     def _prefixed_key(cls, key: str) -> str:
-        """Return *key* with :attr:`KEY_PREFIX` ensured at the front."""
         return key if key.startswith(cls.KEY_PREFIX) else f"{cls.KEY_PREFIX}{key}"
 
     def __new__(  # type: ignore[override]
         cls,
-        schema: "Schema | None" = None,
+        schema: "Schema",
         base_url: Optional[URL | str] = None,
         *args: Any,
         key: str = "",
         **kwargs: Any,
     ) -> "SchemaSession":
-        # The parent's singleton cache keys off ``(cls, base_url, key)``;
-        # forward ``base_url`` explicitly so SchemaSession's signature
-        # (``schema`` first) doesn't clash with the positional ``base_url``
-        # in :meth:`Session.__new__`. The ``schema`` arg is allowed to
-        # be ``None`` here so :meth:`__getnewargs_ex__` round-trips
-        # don't trip the type checker — the real ``__init__`` rejects
-        # a missing schema. ``key`` is prefixed with :attr:`KEY_PREFIX`
-        # so the resulting singleton slot is namespaced away from any
-        # bare :class:`HTTPSession` that happens to share the same
-        # ``(base_url, key)``.
         return super().__new__(cls, base_url, key=cls._prefixed_key(key))
 
     def __init__(
         self,
-        schema: "Schema | None" = None,
+        schema: "Schema",
         base_url: Optional[URL | str] = None,
         *,
         mode: ModeLike = Mode.APPEND,
-        catalog_name: str | None = None,
-        schemas: "Schemas | None" = None,
-        table_cache_ttl: "float | int | dt.timedelta | None" = _DEFAULT_TABLE_CACHE_TTL,
         local_cache: Union[bool, str, Path, CacheConfig, Mapping[str, Any], None] = True,
+        table_cache_ttl: "float | int | dt.timedelta | None" = _DEFAULT_TABLE_CACHE_TTL,
         verify: bool = True,
         pool_maxsize: int = 10,
         headers: "Headers | Mapping[str, str] | None" = None,
@@ -167,10 +114,11 @@ class SchemaSession(HTTPSession):
     ) -> None:
         if getattr(self, "_initialized", False):
             return
-        # Mirror the prefix applied in ``__new__`` so the stored
-        # ``self.key`` (used by ``__getnewargs_ex__`` for pickle
-        # round-trip and reflected in ``repr``) matches the live
-        # singleton-cache slot exactly.
+        if schema is None:
+            raise TypeError(
+                "SchemaSession requires a bound Schema; got None. Pass "
+                "the Schema whose tables should back the response cache."
+            )
         key = self._prefixed_key(key)
         super().__init__(
             base_url=base_url,
@@ -183,266 +131,29 @@ class SchemaSession(HTTPSession):
         )
         self._schema = schema
         self._mode = Mode.from_(mode, default=Mode.APPEND)
-        self._router_catalog_name = catalog_name
-        self._router_schemas = schemas
-        self._table_cache_ttl = table_cache_ttl
-        self._local_cache_arg = local_cache
         self._table_cache: ExpiringDict[str, "Table"] = ExpiringDict(
-            default_ttl=table_cache_ttl,
-            max_size=1024,
-        )
-        # Memoized ``CacheConfig`` per (table_name, mode). The remote
-        # cache config is purely a function of those two — caching the
-        # built dataclass turns a per-cold-request ``CacheConfig(...)``
-        # (≈9 µs: ``__post_init__`` runs request_by validation,
-        # WaitingConfig.from_, mode coercion, …) into a dict lookup.
-        # Bounded by ``max_size=1024`` so a runaway distinct-path
-        # session doesn't grow the dict unbounded; same TTL as the
-        # table cache.
-        self._remote_config_cache: ExpiringDict[tuple[int, Mode], CacheConfig] = ExpiringDict(
             default_ttl=table_cache_ttl,
             max_size=1024,
         )
         self._local_cache_template: Optional[CacheConfig] = self._build_local_template(
             local_cache,
         )
-        # Router-mode child cache. ``None`` when bound to a schema —
-        # the per-host singleton lookup costs nothing for the common
-        # bound case. Lazily allocated on the first router dispatch
-        # so a bound session pickles without it.
-        self._host_session_cache: Optional[
-            ExpiringDict[tuple[str, int | None], "SchemaSession"]
-        ] = None
 
-    # ``_table_cache`` is picklable (live entries only — see
-    # ``ExpiringDict.__getstate__``), so it stays out of the transient
-    # set. The parent's ``_lock`` / ``_job_pool`` / ``_http_pool`` are
-    # already covered.
+    # ``_table_cache`` pickles live entries via ``ExpiringDict.__getstate__``;
+    # ``_local_cache_template`` is a frozen dataclass — both round-trip cleanly.
     _TRANSIENT_STATE_ATTRS = HTTPSession._TRANSIENT_STATE_ATTRS
 
     def __getnewargs_ex__(self):
-        # Route unpickling through ``__new__`` with the schema as the
-        # first positional arg so the singleton cache key matches the
-        # original construction. ``schema`` is ``None`` in router mode.
         return (
             (self._schema, self.base_url),
             {"key": self.key, "mode": self._mode.value},
         )
 
-    # ── factory ────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def host_to_schema_name(base_url: URL | str) -> str:
-        """Derive a Unity-Catalog-safe schema name from a URL host.
-
-        Same sanitization as :meth:`path_to_table_name` (lowercase,
-        collapse non-alphanumeric runs to ``_``, strip surrounding
-        underscores, length-cap with :func:`safe_table_name`'s
-        split-and-hash strategy — the 255-char UC ceiling applies to
-        every identifier, schema names included). Non-default ports
-        are folded in so ``https://api.example.com:8443`` and
-        ``https://api.example.com`` route to different schemas; an
-        empty host falls back to ``"default"`` so the result is always
-        a legal identifier.
-        """
-        url = base_url if isinstance(base_url, URL) else URL.from_(base_url)
-        host = (url.host or "").lower()
-        port = getattr(url, "port", None)
-        token = f"{host}_{port}" if port else host
-        cleaned = _PATH_TO_IDENT_RE.sub("_", token).strip("_") or "default"
-        name = safe_table_name(cleaned)
-        assert name is not None and len(name) <= MAX_TABLE_NAME_LEN
-        return name
-
-    @classmethod
-    def from_(
-        cls,
-        obj: Any = None,
-        *,
-        catalog_name: str | None = None,
-        schema_name: str | None = None,
-        ensure_created: bool = True,
-        **kwargs: Any,
-    ) -> "SchemaSession":
-        """Build a :class:`SchemaSession` from one of the usual schema specs.
-
-        Polymorphic on *obj*:
-
-        * :class:`SchemaSession` — returned as-is (idempotent).
-        * :class:`Schema` — wrapped directly.
-        * :class:`Schemas` service — combined with *catalog_name* /
-          *schema_name* (or its own defaults) to resolve a Schema.
-        * :class:`DatabricksClient` — its ``schemas`` service is used.
-        * ``str`` — parsed as a one- or two-part ``"catalog.schema"``
-          name; missing parts come from the *catalog_name* /
-          *schema_name* kwargs.
-        * ``None`` — *catalog_name* / *schema_name* must be supplied;
-          the active :class:`Schemas` service is used (``Schemas.current()``
-          via :meth:`Schema` construction).
-
-        When *schema_name* is not supplied (and the caller did not hand
-        in a fully-resolved :class:`Schema`), the session's ``base_url``
-        host is used: ``https://api.example.com`` →
-        ``api_example_com``. This makes the default
-        "one cache schema per upstream host" — call sites pointed at
-        different APIs land in their own namespaces without ceremony.
-        See :meth:`host_to_schema_name` for the sanitization rules.
-
-        When *ensure_created* (default ``True``) is set, the resolved
-        :class:`Schema` is created if it does not already exist via
-        :meth:`Schema.ensure_created`. Set to ``False`` to skip the
-        existence probe (e.g. when the caller knows the schema is
-        present and wants to avoid the round-trip).
-
-        Extra keyword arguments are forwarded to :class:`SchemaSession`
-        (``base_url``, ``mode``, ``local_cache``, ``key``, …).
-        """
-        if isinstance(obj, cls):
-            return obj
-
-        from yggdrasil.databricks.client import DatabricksClient
-        from yggdrasil.databricks.schema.schema import Schema as _Schema
-        from yggdrasil.databricks.schema.schemas import Schemas as _Schemas
-
-        if isinstance(obj, _Schema):
-            schema = obj
-        else:
-            schemas: _Schemas
-            location: str | None = None
-            if obj is None:
-                schemas = _Schemas.current()
-            elif isinstance(obj, _Schemas):
-                schemas = obj
-            elif isinstance(obj, DatabricksClient):
-                schemas = obj.schemas
-            elif isinstance(obj, str):
-                schemas = _Schemas.current()
-                location = obj
-            else:
-                raise TypeError(
-                    f"SchemaSession.from_: cannot resolve a Schema from "
-                    f"{type(obj).__name__}: {obj!r}. Pass a Schema, "
-                    "SchemaSession, Schemas service, DatabricksClient, "
-                    "two-part 'catalog.schema' string, or None plus "
-                    "explicit catalog_name / schema_name."
-                )
-
-            # Default schema_name = ``base_url`` host. Skipped when the
-            # caller passed a ``location`` ('catalog.schema') string —
-            # the dotted form already carries the schema name.
-            if not schema_name and location is None:
-                base_url = kwargs.get("base_url")
-                if base_url is not None:
-                    schema_name = cls.host_to_schema_name(base_url)
-
-            schema = schemas.schema(
-                location=location,
-                catalog_name=catalog_name,
-                schema_name=schema_name,
-            )
-
-        if ensure_created:
-            schema.ensure_created()
-
-        return cls(schema, **kwargs)
-
-    # ── router-mode dispatch ────────────────────────────────────────────────
-
-    @property
-    def is_router(self) -> bool:
-        """``True`` when no :class:`Schema` is bound — sends are dispatched
-        to a per-host child :class:`SchemaSession` singleton built on demand."""
-        return self._schema is None
-
-    def for_host(
-        self,
-        url: URL | str,
-        *,
-        ensure_created: bool = True,
-    ) -> "SchemaSession":
-        """Return the child :class:`SchemaSession` bound to *url*'s host.
-
-        Used by router mode to resolve a real per-host session; safe to
-        call from caller code too when you want the resolved instance
-        explicitly (e.g. to introspect ``.schema`` before sending).
-        The result is memoized on this router by ``(host, port)`` so
-        repeated calls for the same host short-circuit. The parent
-        ``Session.__new__`` collapses two SchemaSessions with the same
-        ``(base_url, key)`` to one instance, so even if the router
-        cache misses (TTL expired, fresh process), the second build
-        for an already-live host still returns the same object.
-        """
-        parsed = url if isinstance(url, URL) else URL.from_(url)
-        host = (parsed.host or "").lower()
-        port = getattr(parsed, "port", None)
-        cache_key = (host, port)
-
-        if self._host_session_cache is None:
-            self._host_session_cache = ExpiringDict(
-                default_ttl=self._table_cache_ttl,
-                max_size=256,
-            )
-        cached = self._host_session_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        return self._host_session_cache.get_or_set(
-            cache_key,
-            lambda: self._build_child_for(parsed, ensure_created=ensure_created),
-        )
-
-    def _build_child_for(
-        self,
-        parsed: URL,
-        *,
-        ensure_created: bool,
-    ) -> "SchemaSession":
-        """Build a bound :class:`SchemaSession` for *parsed*'s host."""
-        from yggdrasil.databricks.schema.schemas import Schemas as _Schemas
-
-        schemas = self._router_schemas or _Schemas.current()
-        schema_name = self.host_to_schema_name(parsed)
-        schema = schemas.schema(
-            catalog_name=self._router_catalog_name,
-            schema_name=schema_name,
-        )
-        if ensure_created:
-            schema.ensure_created()
-
-        # Per-host base_url stripped of path/query so the parent
-        # Session singleton key (``scheme://host[:port]``) collapses
-        # all requests against this host into one child. Custom port
-        # rides through ``URL``'s string round-trip.
-        host_segment = parsed.host or ""
-        if getattr(parsed, "port", None):
-            host_segment = f"{host_segment}:{parsed.port}"
-        host_base = URL.from_(f"{parsed.scheme}://{host_segment}")
-
-        return SchemaSession(
-            schema,
-            base_url=host_base,
-            mode=self._mode,
-            catalog_name=self._router_catalog_name,
-            schemas=self._router_schemas,
-            table_cache_ttl=self._table_cache_ttl,
-            local_cache=self._local_cache_arg,
-            verify=self.verify,
-            pool_maxsize=self.pool_maxsize,
-            headers=self.headers,
-            waiting=self.waiting,
-            key=self.key,
-            auth=self._auth,
-        )
-
     # ── identity / introspection ───────────────────────────────────────────
 
     @property
-    def schema(self) -> "Schema | None":
-        """The bound :class:`Schema` whose tables back the cache.
-
-        ``None`` in router mode — see :attr:`is_router` and
-        :meth:`for_host` for the per-host dispatch.
-        """
+    def schema(self) -> "Schema":
+        """The bound :class:`Schema` whose tables back the cache."""
         return self._schema
 
     @property
@@ -457,105 +168,27 @@ class SchemaSession(HTTPSession):
             f"base_url={base!r}, mode={self._mode.value!r})"
         )
 
-    # ── path → table mapping ────────────────────────────────────────────────
-
-    def path_to_table_name(self, path: str | None) -> str:
-        """Derive a Unity-Catalog-safe table name from a URL path.
-
-        Pipeline:
-
-        1. Lowercase the path, collapse every run of non-alphanumeric
-           chars to a single ``_`` (so ``/``, ``.``, query-string
-           punctuation, and non-ASCII all fold to the same separator).
-        2. Strip surrounding underscores; substitute ``"root"`` for the
-           empty result so ``"/"`` still yields a legal identifier.
-        3. Hand off to :func:`safe_table_name`, which enforces Unity
-           Catalog's 255-char identifier ceiling by splitting on ``_``,
-           keeping as many leading tokens as fit, and BLAKE2b-hashing
-           the overflow tail into a 32-char suffix. Distinct overflows
-           still produce distinct digests, so two long paths that
-           agree only on a common prefix get separate cache tables.
-        4. Defensive assert that the result fits the limit — if a
-           future refactor breaks the contract, fail loudly at the
-           boundary rather than at the SQL layer with a generic
-           identifier-too-long error.
-
-        The result is deterministic, identifier-safe ASCII, and bounded
-        at :data:`MAX_TABLE_NAME_LEN` (255).
-        """
-        cleaned = _PATH_TO_IDENT_RE.sub("_", (path or "").lower()).strip("_")
-        if not cleaned:
-            cleaned = "root"
-        # ``safe_table_name`` never returns ``None`` for a non-empty input.
-        name = safe_table_name(cleaned)
-        assert name is not None and len(name) <= MAX_TABLE_NAME_LEN, (
-            f"SchemaSession.path_to_table_name: derived name {name!r} "
-            f"({len(name) if name else 0} chars) exceeds Unity Catalog's "
-            f"{MAX_TABLE_NAME_LEN}-char limit — safe_table_name contract broken."
-        )
-        return name
+    # ── path → table mapping ───────────────────────────────────────────────
 
     def table_for(self, request: PreparedRequest) -> "Table":
         """Return (caching) the :class:`Table` that backs *request*'s URL path.
 
-        Idempotent and thread-safe — multiple concurrent calls for the
-        same path collapse to one :meth:`Schema.table` lookup via the
-        :class:`ExpiringDict`'s ``get_or_set`` fast path.
+        The URL path is fed through :meth:`Table.safe_name` — the
+        centralized "raw string → Unity-Catalog-safe identifier"
+        builder — so the cache table name is derived the same way
+        for every caller that touches the codebase, and the warning
+        for non-trivial sanitization fires once per fresh path.
         """
-        name = self.path_to_table_name(request.url.path)
+        name = Table.safe_name(request.url.path)
         return self._table_cache.get_or_set(name, lambda: self._schema.table(name))
 
-    def cache_config_for(self, request: PreparedRequest) -> CacheConfig:
-        """Build the :class:`CacheConfig` that drives the remote cache for *request*.
-
-        Honors a per-request mode override (``request.mode``); falls back
-        to the session-level :attr:`mode` when the request didn't set one.
-
-        The result is memoized per ``(table_name, mode)`` on the
-        session — :class:`CacheConfig` construction runs a handful of
-        coercion + validation passes through ``__post_init__`` (≈9 µs
-        cold), and bursts against the same endpoint always rebuild the
-        same config. Cache TTL matches the per-path :class:`Table`
-        cache so a stale handle and its associated config age out
-        together.
-        """
-        table = self.table_for(request)
-        mode = request.mode if request.mode is not None else self._mode
-        # ``id(table)`` is stable for the lifetime of the cached Table
-        # handle (held by ``self._table_cache``) and avoids the
-        # ``full_name()`` join on every hot lookup. When the table
-        # entry expires the live config expires alongside it.
-        key = (id(table), mode)
-        return self._remote_config_cache.get_or_set(
-            key, lambda: CacheConfig(tabular=table, mode=mode),
-        )
-
-    def local_cache_config_for(self, request: PreparedRequest) -> Optional[CacheConfig]:
-        """Return the local cache :class:`CacheConfig` for *request*, or ``None``.
-
-        ``None`` means local caching is disabled on this session. When
-        enabled, the returned config inherits the session-level template
-        (path + cleanup TTL) and picks up any per-request
-        :attr:`PreparedRequest.mode` override.
-        """
-        tmpl = self._local_cache_template
-        if tmpl is None:
-            return None
-        mode = request.mode if request.mode is not None else self._mode
-        if tmpl.mode == mode:
-            return tmpl
-        return tmpl.merge(mode=mode)
+    # ── cache config attachment ────────────────────────────────────────────
 
     def _build_local_template(
         self,
         local_cache: Union[bool, str, Path, CacheConfig, Mapping[str, Any], None],
     ) -> Optional[CacheConfig]:
-        """Resolve the constructor's ``local_cache`` arg into a reusable template.
-
-        Done once at init so per-request attachment is a single
-        attribute read instead of a fresh :class:`CacheConfig` build.
-        Returns ``None`` when local caching is disabled.
-        """
+        """Resolve the constructor's ``local_cache`` arg into a reusable template."""
         if local_cache is False or local_cache is None:
             return None
         if local_cache is True:
@@ -563,40 +196,31 @@ class SchemaSession(HTTPSession):
             return base.merge(path=base.local_cache_path(session=self), mode=self._mode)
         cfg = CacheConfig.check_arg(local_cache)
         if not cfg.is_local:
-            # Ensure ``local_cache_enabled`` actually fires for a caller
-            # who passed a bare mapping or CacheConfig with no path —
-            # resolve to the session-default folder so the on-disk
-            # fast-path is reachable.
             cfg = cfg.merge(path=cfg.local_cache_path(session=self))
         return cfg if cfg.mode == self._mode else cfg.merge(mode=self._mode)
 
     def _attach_cache(self, request: PreparedRequest) -> PreparedRequest:
-        """Stamp the per-path :class:`CacheConfig`(s) onto *request* if missing.
+        """Stamp the per-path remote :class:`CacheConfig` (and local template,
+        when enabled) onto *request* unless the caller already supplied one.
 
-        Attaches both the remote (per-path Delta table) and — when
-        enabled — the local on-disk fast-path config. Per-request
-        ``*_cache_config`` overrides take precedence over the
-        session-level configs inside :meth:`Session._send`, so a
-        caller that explicitly passes ``remote_cache=...`` /
-        ``local_cache=...`` to ``send`` still wins. A per-request
-        :attr:`PreparedRequest.mode` override flows into both cache
-        configs automatically.
+        Per-request ``mode`` overrides ride into the remote config; the
+        local template carries the session-level mode and merges only if
+        the request asks for something different.
         """
         if request.remote_cache_config is None:
-            request.remote_cache_config = self.cache_config_for(request)
+            mode = request.mode if request.mode is not None else self._mode
+            request.remote_cache_config = CacheConfig(
+                tabular=self.table_for(request), mode=mode,
+            )
         if request.local_cache_config is None and self._local_cache_template is not None:
-            request.local_cache_config = self.local_cache_config_for(request)
+            tmpl = self._local_cache_template
+            mode = request.mode if request.mode is not None else self._mode
+            request.local_cache_config = tmpl if tmpl.mode == mode else tmpl.merge(mode=mode)
         return request
 
     # ── transport hooks ────────────────────────────────────────────────────
 
     def _send(self, request: PreparedRequest, config):  # type: ignore[override]
-        if self._schema is None:
-            # Router: resolve the per-host child session and let it
-            # do the cache attachment + actual send. The child's
-            # ``_send`` calls back into ``HTTPSession._send`` which
-            # carries the parent's local/remote cache pipeline.
-            return self.for_host(request.url)._send(request, config)
         return super()._send(self._attach_cache(request), config)
 
     def _send_many_batches(
@@ -604,33 +228,7 @@ class SchemaSession(HTTPSession):
         requests: Iterator[PreparedRequest],
         config: Any,
     ):  # type: ignore[override]
-        if self._schema is None:
-            # Router mode: group by host so each child session sees a
-            # contiguous batch instead of one request at a time. Each
-            # group reuses the same per-host child + its single
-            # ``send_many`` pipeline so the local/remote split
-            # benefits of batching aren't lost.
-            return self._send_many_batches_router(requests, config)
         return super()._send_many_batches(
             (self._attach_cache(r) for r in requests),
             config,
         )
-
-    def _send_many_batches_router(
-        self,
-        requests: Iterator[PreparedRequest],
-        config: Any,
-    ):
-        """Router-mode send_many: dispatch each request to its host's child.
-
-        Lazy per-request dispatch — we don't pre-materialise the
-        iterator (it could be infinite or expensive). Each request
-        is routed to its host's child :meth:`_send_many_batches`
-        through a generator-of-one shim so the child's own batching
-        logic still runs. Repeated requests against the same host
-        cost only one router lookup (memoized on
-        ``_host_session_cache``).
-        """
-        for request in requests:
-            child = self.for_host(request.url)
-            yield from child._send_many_batches(iter([request]), config)

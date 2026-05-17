@@ -48,6 +48,7 @@ from yggdrasil.databricks.client import DatabricksClient
 from yggdrasil.databricks.column.column import Column
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.databricks.sql.sql_utils import (
+    MAX_TABLE_NAME_LEN,
     quote_ident,
     quote_qualified_ident,
     safe_table_name,
@@ -150,6 +151,10 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 _INVALID_COL_CHARS = set(" ,;{}()\n\t=")
+
+# URL path / free-text → identifier: collapse anything outside ``[0-9A-Za-z]``
+# to ``_``. Compiled once so ``Table.safe_name`` is a single ``re.sub`` call.
+_PATH_TO_IDENT_RE: re.Pattern[str] = re.compile(r"[^0-9A-Za-z]+")
 
 
 def _needs_column_mapping(col_name: str) -> bool:
@@ -1040,6 +1045,53 @@ class Table(DatabricksPath):
     @classmethod
     def options_class(cls) -> type[CastOptions]:
         return CastOptions
+
+    @classmethod
+    def safe_name(cls, raw: str | None) -> str:
+        """Build a Unity-Catalog-safe table name from any raw string.
+
+        Centralized "raw string → table name" builder so every caller
+        (URL paths in :class:`SchemaSession`, free-text in user code,
+        composed names from upstream metadata) lands on the same
+        identifier without duplicating the sanitization logic.
+
+        Pipeline:
+
+        1. Lowercase the input, collapse every run of non-alphanumeric
+           characters to a single ``_`` (``/``, ``.``, query-string
+           punctuation, whitespace, non-ASCII all fold to the same
+           separator).
+        2. Strip surrounding ``_``; substitute ``"root"`` for the empty
+           result so ``"/"`` / ``""`` / ``None`` still yield a legal
+           identifier.
+        3. Hand off to :func:`safe_table_name` for the 255-char UC
+           ceiling — overflow tokens are joined and BLAKE2b-hashed
+           into a 32-char suffix so distinct overflows stay distinct.
+
+        When the returned name differs from *raw* (sanitization or
+        truncation kicked in), a :class:`logging.WARNING` is emitted
+        on this module's logger so the rewrite is visible in the wall
+        of logs that any pipeline already collects. An identifier
+        that's already safe round-trips silently — no warning churn
+        for the steady-state case.
+        """
+        original = raw or ""
+        cleaned = _PATH_TO_IDENT_RE.sub("_", original.lower()).strip("_")
+        if not cleaned:
+            cleaned = "root"
+        name = safe_table_name(cleaned)
+        assert name is not None and len(name) <= MAX_TABLE_NAME_LEN, (
+            f"Table.safe_name: derived name {name!r} "
+            f"({len(name) if name else 0} chars) exceeds Unity Catalog's "
+            f"{MAX_TABLE_NAME_LEN}-char limit — safe_table_name contract broken."
+        )
+        if original and name != original:
+            logger.warning(
+                "Sanitized table name %r -> %r (reason=%s)",
+                original, name,
+                "truncated" if len(original) > MAX_TABLE_NAME_LEN else "non-identifier-chars",
+            )
+        return name
 
     def __init__(
         self,
