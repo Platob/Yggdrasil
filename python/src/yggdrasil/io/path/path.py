@@ -124,14 +124,9 @@ class Path(Holder, os.PathLike, ABC):
             return LocalPath(url=url, **kwargs)
         return cls(url=url, **kwargs)
 
-    def _from_url(
-        self,
-        url: URL,
-        singleton_ttl: Any = ...,
-        **kwargs
-    ) -> "Path":
-        """Build a sibling :class:`Path` of the same concrete type."""
-        return type(self)(url=url, singleton_ttl=singleton_ttl, **kwargs)
+    # ``_from_url`` lives on :class:`Holder` — Path is a top-level
+    # storage (``_parent is None``), so the default ``type(self)(url=url)``
+    # branch fires here and the previous Path-local override is gone.
 
     # ==================================================================
     # Backing-shape predicates

@@ -467,30 +467,22 @@ class TestAcquireLifecycle:
 class TestFromUrl:
     """:meth:`Holder._from_url` builds a sibling Holder for *url*.
 
-    Cursor case: build at *url* directly. Top-level storage case:
-    build at ``url.parent`` (self is a container). :class:`Path`
-    overrides this — every Path addresses a specific URL.
+    Cursor case (``self._parent`` set): the new sibling shares the
+    same parent storage, just re-points the URL. Storage case
+    (``self._parent is None``): build a fresh sibling at *url*.
     """
 
-    def test_cursor_builds_at_url(self) -> None:
-        from yggdrasil.io.bytes_io import BytesIO
-        from yggdrasil.io.url import URL
-
-        cursor = BytesIO(holder=Memory(b"x"), owns_holder=False, mode="rb")
-        sibling = cursor._from_url(URL.from_("/foo/bar/data.parquet"))
-        # Cursor branch → URL passes through unchanged.
-        assert str(sibling.url).endswith("/foo/bar/data.parquet")
-
-    def test_storage_builds_at_url_parent(self) -> None:
+    def test_storage_builds_at_url(self) -> None:
         from yggdrasil.io.url import URL
 
         mem = Memory()
         sibling = mem._from_url(URL.from_("/foo/bar/data.parquet"))
-        # Top-level storage branch → URL.parent.
-        assert str(sibling.url).endswith("/foo/bar")
+        assert isinstance(sibling, Memory)
+        # Top-level storage: URL passes through unchanged.
+        assert sibling._parent is None
 
-    def test_local_path_override_keeps_url(self, tmp_path) -> None:
-        # Path overrides _from_url; LocalPath sibling at the requested URL.
+    def test_local_path_no_override_keeps_url(self, tmp_path) -> None:
+        # Path._from_url is gone — Holder default handles it.
         from yggdrasil.io.url import URL
 
         lp = LocalPath(str(tmp_path / "a.bin"))
@@ -498,6 +490,16 @@ class TestFromUrl:
         sibling = lp._from_url(target)
         assert isinstance(sibling, LocalPath)
         assert sibling.url == target
+
+    def test_cursor_reuses_parent_storage(self) -> None:
+        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.url import URL
+
+        mem = Memory(b"shared")
+        cursor = BytesIO(holder=mem, owns_holder=False, mode="rb")
+        sibling = cursor._from_url(URL.from_("/foo/bar/data.parquet"))
+        # Cursor branch: new sibling shares the SAME parent storage.
+        assert sibling._parent is mem
 
 
 # ---------------------------------------------------------------------------
