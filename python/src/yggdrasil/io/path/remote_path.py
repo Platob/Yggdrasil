@@ -102,7 +102,7 @@ class RemotePath(Path):
     def size_known(self) -> bool:
         """``True`` only when the stat cache carries a fresh entry.
 
-        Lets ``ParquetIO`` / ``CsvIO`` / ``ArrowIPCIO`` skip a probe
+        Lets ``ParquetFile`` / ``CSVFile`` / ``ArrowIPCFile`` skip a probe
         round trip just to short-circuit on ``size == 0``: when the
         cache is cold the format reader will trip its own EOF /
         empty-file error which the caller catches and translates to

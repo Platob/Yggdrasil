@@ -266,7 +266,7 @@ def _coerce_buffer(
     elif isinstance(obj, Holder):
         holder = obj
     elif isinstance(obj, IO):
-        holder = obj._holder
+        holder = obj._parent
     else:
         holder = Holder.from_(obj)
 
@@ -624,8 +624,8 @@ class Response(Tabular["ResponseOptions"]):
         """Open a fresh :class:`IO` cursor over the response's holder.
 
         Dispatches to the format-specific leaf via the holder's
-        media type (Parquet → :class:`ParquetIO`, CSV →
-        :class:`CsvIO`, …). The returned cursor is non-owning:
+        media type (Parquet → :class:`ParquetFile`, CSV →
+        :class:`CSVFile`, …). The returned cursor is non-owning:
         closing it does not close the underlying holder.
         """
         return self.buffer.open(mode=mode, owns_holder=False)
@@ -645,7 +645,8 @@ class Response(Tabular["ResponseOptions"]):
         # to the deterministic single-row metadata projection that
         # matches :data:`RESPONSE_ARROW_SCHEMA` (envelope mime
         # :attr:`MimeTypes.HTTP_RESPONSE`).
-        if options.parse and Tabular.class_for_media_type(
+        from yggdrasil.io.holder import Holder
+        if options.parse and Holder.class_for_media_type(
             self.media_type.mime_type, default=None,
         ) is not None:
             with self.open(mode="rb") as b:
@@ -663,7 +664,7 @@ class Response(Tabular["ResponseOptions"]):
             f"{type(self).__name__} is read-only. To persist a "
             "response row, call ``response.to_arrow_batch(parse=False)`` "
             "and write that batch through a writable Tabular sink "
-            "(ArrowTabular, ParquetIO, a Delta/SQL table, …)."
+            "(ArrowTabular, ParquetFile, a Delta/SQL table, …)."
         )
 
     @property

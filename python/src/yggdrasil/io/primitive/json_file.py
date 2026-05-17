@@ -1,9 +1,9 @@
 """JSON Tabular leaf over the new :class:`BytesIO` substrate.
 
-:class:`JsonIO` writes a single JSON document — either an array of
+:class:`JSONFile` writes a single JSON document — either an array of
 objects (``[{...}, {...}, …]``) or a single object — and reads
 either shape back. For the streamable line-per-record format use
-:class:`NDJsonIO`.
+:class:`NDJSONFile`.
 
 Reads accept three on-disk shapes:
 
@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     import pyarrow.dataset as pds
 
 
-__all__ = ["JsonIO", "JsonOptions"]
+__all__ = ["JSONFile", "JsonOptions"]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -58,7 +58,7 @@ class JsonOptions(CastOptions):
         return pa_json.ParseOptions()
 
 
-class JsonIO(IO[bytes, JsonOptions]):
+class JSONFile(IO[bytes, JsonOptions]):
     """:class:`Tabular` leaf for JSON documents."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.JSON
@@ -239,7 +239,7 @@ class JsonIO(IO[bytes, JsonOptions]):
 
     def _read_arrow_dataset(self, options: JsonOptions) -> "pds.Dataset":
         pds = pyarrow_dataset_module()
-        holder = self._holder
+        holder = self._parent
         if holder is not None and getattr(holder, "is_local_path", False):
             full_path = getattr(holder, "full_path", None)
             if full_path is not None:

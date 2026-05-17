@@ -356,7 +356,7 @@ class TestUpload:
 
     def test_upload_rejects_unsupported_source_type(self, tmp_path) -> None:
         dst = LocalPath(str(tmp_path / "dst.bin"))
-        with pytest.raises(TypeError, match="Holder, IO, str, or os.PathLike"):
+        with pytest.raises(TypeError, match="Cannot wrap int"):
             dst.upload(42)
 
 

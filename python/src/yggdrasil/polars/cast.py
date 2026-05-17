@@ -81,7 +81,7 @@ def any_to_polars_dataframe(
         return cast_polars_dataframe(obj.collect(), opts)
 
     # Path / URL / Tabular sources route through the Tabular fan-out so
-    # the format leaf (ParquetIO / CsvIO / …) gets to use its native
+    # the format leaf (ParquetFile / CSVFile / …) gets to use its native
     # scanner — and so polars-native readers (``pl.scan_parquet``,
     # ``pl.read_csv``) fire downstream of :meth:`Tabular.read_polars_frame`
     # when the leaf has a polars fast path. ``isinstance(Tabular)``

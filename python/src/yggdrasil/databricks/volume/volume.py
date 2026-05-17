@@ -387,13 +387,70 @@ class Volume(DatabricksResource, Singleton):
         Refreshes whenever the cached entry is past
         :attr:`DEFAULT_INFO_TTL` (5 minutes by default), or when
         ``refresh=True`` forces it. If the underlying ``volumes.read``
-        raises :class:`NotFound`
+        raises :class:`NotFound`, auto-creates the volume (and any
+        missing catalog / schema parents) and retries the read once.
         """
         if not refresh and self._is_fresh():
             return self._infos  # type: ignore[return-value]
 
-        info = self.client.workspace_client().volumes.read(self.full_name())
+        try:
+            info = self.client.workspace_client().volumes.read(self.full_name())
+        except Exception as exc:
+            if not _looks_like_not_found(exc):
+                raise
+            self._ensure_volume()
+            info = self.client.workspace_client().volumes.read(self.full_name())
         return self._store_infos(info)
+
+    def _ensure_volume(self) -> None:
+        """Create the volume (and any missing catalog / schema parents).
+
+        Idempotent — ``AlreadyExists`` on any level is treated as
+        success. Mirrors :meth:`VolumePath._ensure_volume`'s top-down
+        chain (try volume → schema → catalog) so a single missing
+        intermediate doesn't pay for unnecessary creates.
+        """
+        ws = self.client.workspace_client()
+        c, s, n = self.catalog_name, self.schema_name, self.volume_name
+        try:
+            ws.volumes.create(
+                catalog_name=c, schema_name=s, name=n,
+                volume_type="MANAGED",
+            )
+            return
+        except Exception as exc:
+            if _looks_like_already_exists(exc):
+                return
+            if not _looks_like_not_found(exc):
+                raise
+
+        try:
+            ws.schemas.create(name=s, catalog_name=c)
+        except Exception as exc:
+            if _looks_like_already_exists(exc):
+                pass
+            elif _looks_like_not_found(exc):
+                try:
+                    ws.catalogs.create(name=c)
+                except Exception as inner:
+                    if not _looks_like_already_exists(inner):
+                        raise
+                try:
+                    ws.schemas.create(name=s, catalog_name=c)
+                except Exception as inner:
+                    if not _looks_like_already_exists(inner):
+                        raise
+            else:
+                raise
+
+        try:
+            ws.volumes.create(
+                catalog_name=c, schema_name=s, name=n,
+                volume_type="MANAGED",
+            )
+        except Exception as exc:
+            if not _looks_like_already_exists(exc):
+                raise
 
     @property
     def exists(self) -> bool:

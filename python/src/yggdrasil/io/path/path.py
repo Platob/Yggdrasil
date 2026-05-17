@@ -42,7 +42,6 @@ from yggdrasil.data.enums import Mode
 from yggdrasil.dataclasses import WaitingConfigArg, WaitingConfig
 from yggdrasil.io.base import IO
 from yggdrasil.io.bytes_io import BytesIO
-from yggdrasil.io.holder import Holder
 from yggdrasil.io.io_stats import IOKind, IOStats, TimeLike
 from yggdrasil.io.url import URL
 
@@ -56,7 +55,7 @@ __all__ = ["Path"]
 TS_PATTERN = re.compile(r'-(\d+)-(\d+)-')
 
 
-class Path(Holder, os.PathLike, ABC):
+class Path(IO, os.PathLike, ABC):
     """Abstract URL-addressed byte holder with filesystem semantics.
 
     Two layers, no shared state between them:
@@ -79,7 +78,7 @@ class Path(Holder, os.PathLike, ABC):
     scheme: ClassVar[str] = ""
 
     STAT_CACHE_TTL: ClassVar["float | None"] = None
-    TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset()
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset()
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -124,14 +123,9 @@ class Path(Holder, os.PathLike, ABC):
             return LocalPath(url=url, **kwargs)
         return cls(url=url, **kwargs)
 
-    def _from_url(
-        self,
-        url: URL,
-        singleton_ttl: Any = ...,
-        **kwargs
-    ) -> "Path":
-        """Build a sibling :class:`Path` of the same concrete type."""
-        return type(self)(url=url, singleton_ttl=singleton_ttl, **kwargs)
+    # ``_from_url`` lives on :class:`Holder` — Path is a top-level
+    # storage (``_parent is None``), so the default ``type(self)(url=url)``
+    # branch fires here and the previous Path-local override is gone.
 
     # ==================================================================
     # Backing-shape predicates
@@ -658,21 +652,18 @@ class Path(Holder, os.PathLike, ABC):
             return importlib.import_module(resolved_name)
 
     def as_media(self, media_type: "Any" = None) -> "Any":
-        """Wrap this path in the :class:`Tabular` leaf for its media type.
+        """Wrap this path in the format leaf for its media type.
 
         Resolution: explicit ``media_type`` first, else the holder's
         :class:`MediaType` (path extension, magic-byte sniff, or
         content-type header). The resolved class is looked up in the
-        :class:`Tabular` registry and instantiated bound to this path.
+        :class:`Holder` format registry and instantiated bound to this
+        path.
 
         Raises :class:`KeyError` when the path's media type isn't
         registered as a tabular format.
         """
-        # Side-effect import: every primitive leaf registers its
-        # mime_type on import.
-        import yggdrasil.io.primitive  # noqa: F401
-        from yggdrasil.io.tabular.base import Tabular
-        return Tabular.for_holder(self, media_type=media_type)
+        return IO.for_holder(self, media_type=media_type)
 
     # ==================================================================
     # open(mode) — returns a BytesIO bound to self
@@ -692,8 +683,8 @@ class Path(Holder, os.PathLike, ABC):
         …) ride through to :meth:`Holder.open`.
         """
         if mode is None:
-            return Holder.open(self, **kwargs)
-        return Holder.open(self, mode=Mode.from_(mode).os_mode, **kwargs)
+            return IO.open(self, **kwargs)
+        return IO.open(self, mode=Mode.from_(mode).os_mode, **kwargs)
 
     # ==================================================================
     # Pure-path API — all delegated to URL
@@ -726,20 +717,15 @@ class Path(Holder, os.PathLike, ABC):
     def suffixes(self) -> List[str]:
         return ["." + e for e in self.url.extensions]
 
-    @property
-    def parent(self) -> "Path":
-        return self._from_url(self.url.parent)
-
-    @property
-    def parents(self) -> Iterator["Path"]:
-        return (self._from_url(u) for u in self.url.parents)
+    # ``parent`` / ``parents`` / ``joinpath`` / ``__truediv__`` all
+    # live on :class:`Holder` — Path inherits them unchanged. The
+    # URL-parent branch in :attr:`Holder.parent` matches Path's
+    # filesystem-navigation semantics; :class:`Memory` overrides
+    # :meth:`_url_parent` to opt out (its URLs are synthetic).
 
     @property
     def is_absolute(self) -> bool:
         return self.url.is_absolute
-
-    def joinpath(self, *segments: Any) -> "Path":
-        return self._from_url(self.url.joinpath(*segments))
 
     def with_name(self, name: str) -> "Path":
         if not name or "/" in name:
@@ -753,9 +739,6 @@ class Path(Holder, os.PathLike, ABC):
 
     def with_stem(self, stem: str) -> "Path":
         return self.with_name(stem + self.suffix)
-
-    def __truediv__(self, other: Any) -> "Path":
-        return self.joinpath(other)
 
     def __rtruediv__(self, other: Any) -> "Path":
         return Path.from_(other) / self

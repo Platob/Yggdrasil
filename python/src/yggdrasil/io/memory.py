@@ -56,7 +56,7 @@ from yggdrasil.data.enums import Scheme
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.io_stats import IOKind, IOStats
 
-from .holder import Holder
+from .holder import IO
 
 
 __all__ = ["Memory"]
@@ -69,7 +69,7 @@ __all__ = ["Memory"]
 _MIN_MMAP_BYTES = 1
 
 
-class Memory(Holder):
+class Memory(IO):
     """Fully memory-resident byte holder, with optional mmap auto-spill.
 
     Construction shapes (in addition to those inherited from
@@ -284,6 +284,14 @@ class Memory(Holder):
     @property
     def is_remote_path(self) -> bool:
         return False
+
+    def _url_parent(self) -> None:
+        # Memory's URL is a synthetic ``mem://vm/0x...`` identity
+        # token — it has no meaningful filesystem-style parent.
+        # Skip the URL-parent branch so :attr:`Holder.parent` returns
+        # ``None`` on a top-level Memory (only the cursor branch can
+        # surface a non-None parent for a Memory subclass).
+        return None
 
     @property
     def is_spilled(self) -> bool:

@@ -1,12 +1,12 @@
 """XLSX Tabular leaf with lazy per-sheet entries.
 
-:class:`XlsxIO` IS-A :class:`BytesIO` whose backing bytes are an
-xlsx workbook (a ZIP archive). Mirrors the :class:`ZipIO` shape:
+:class:`XLSXFile` IS-A :class:`BytesIO` whose backing bytes are an
+xlsx workbook (a ZIP archive). Mirrors the :class:`ZipFile` shape:
 
 1. **Byte surface** — inherited from :class:`BytesIO`. Read / write
    the raw workbook bytes.
 2. **Children surface** — :meth:`iter_children` walks every
-   worksheet as a :class:`XlsxSheetIO`. Sheets are **lazy**: rows
+   worksheet as a :class:`XLSXSheetFile`. Sheets are **lazy**: rows
    are pulled out of the parent workbook on first read.
 
 Reads use :func:`fastexcel.read_excel` (calamine-based, returns
@@ -41,7 +41,7 @@ from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.io.base import IO
 from yggdrasil.io.memory import Memory
 
-__all__ = ["XlsxIO", "XlsxOptions", "XlsxSheetIO"]
+__all__ = ["XLSXFile", "XlsxOptions", "XLSXSheetFile"]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -61,7 +61,7 @@ def _openpyxl():
         import openpyxl
     except ImportError as e:  # pragma: no cover
         raise ImportError(
-            "XlsxIO writes require openpyxl. Install with: pip install openpyxl"
+            "XLSXFile writes require openpyxl. Install with: pip install openpyxl"
         ) from e
     return openpyxl
 
@@ -72,7 +72,7 @@ def _fastexcel():
         import fastexcel
     except ImportError as e:  # pragma: no cover
         raise ImportError(
-            "XlsxIO reads require fastexcel. Install with: "
+            "XLSXFile reads require fastexcel. Install with: "
             "pip install 'ygg[excel]'"
         ) from e
     return fastexcel
@@ -140,11 +140,11 @@ def _write_sheet_rows(
 
 
 # ---------------------------------------------------------------------------
-# XlsxSheetIO — lazy per-sheet child
+# XLSXSheetFile — lazy per-sheet child
 # ---------------------------------------------------------------------------
 
 
-class XlsxSheetIO(IO[bytes, XlsxOptions]):
+class XLSXSheetFile(IO[bytes, XlsxOptions]):
     """:class:`BytesIO` over a single worksheet's rows.
 
     A sheet has no standalone byte representation — the workbook
@@ -164,12 +164,12 @@ class XlsxSheetIO(IO[bytes, XlsxOptions]):
         self,
         *,
         sheet_name: str,
-        xlsx_parent: "XlsxIO",
+        xlsx_parent: "XLSXFile",
         **kwargs: Any,
     ) -> None:
         super().__init__(holder=Memory(), owns_holder=True, **kwargs)
         self.sheet_name: str = sheet_name
-        self._xlsx_parent: "XlsxIO" = xlsx_parent
+        self._xlsx_parent: "XLSXFile" = xlsx_parent
         self._materialized: bool = False
 
     @classmethod
@@ -207,7 +207,7 @@ class XlsxSheetIO(IO[bytes, XlsxOptions]):
                 quoting_style="none", quoting_header="none",
             ),
         )
-        self._holder.write_bytes(sink.getvalue(), 0)
+        self._parent.write_bytes(sink.getvalue(), 0)
         self._materialized = True
 
     def _active(self):
@@ -219,7 +219,7 @@ class XlsxSheetIO(IO[bytes, XlsxOptions]):
     def size(self) -> int:
         if not self._materialized:
             self._materialize()
-        return self._holder.size
+        return self._parent.size
 
     # ==================================================================
     # Tabular hooks
@@ -312,7 +312,7 @@ class XlsxSheetIO(IO[bytes, XlsxOptions]):
             wb_out.close()
 
         self._materialized = False
-        self._holder.write_bytes(b"", 0)
+        self._parent.write_bytes(b"", 0)
 
     def __repr__(self) -> str:
         state = "materialized" if self._materialized else "lazy"
@@ -323,11 +323,11 @@ class XlsxSheetIO(IO[bytes, XlsxOptions]):
 
 
 # ---------------------------------------------------------------------------
-# XlsxIO — workbook-level surface
+# XLSXFile — workbook-level surface
 # ---------------------------------------------------------------------------
 
 
-class XlsxIO(IO[bytes, XlsxOptions]):
+class XLSXFile(IO[bytes, XlsxOptions]):
     """:class:`Tabular` leaf for xlsx workbooks (single- or multi-sheet)."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.XLSX
@@ -347,8 +347,8 @@ class XlsxIO(IO[bytes, XlsxOptions]):
         with self.arrow_input_stream() as v:
             return _list_sheet_names(v.read())
 
-    def iter_children(self) -> Iterator[XlsxSheetIO]:
-        """Yield every sheet as a lazy :class:`XlsxSheetIO`.
+    def iter_children(self) -> Iterator[XLSXSheetFile]:
+        """Yield every sheet as a lazy :class:`XLSXSheetFile`.
 
         The directory walk is one ``fastexcel.read_excel`` call;
         per-sheet rows are NOT pulled until the caller hits the
@@ -357,11 +357,11 @@ class XlsxIO(IO[bytes, XlsxOptions]):
         """
         for name in self.list_sheets():
             yield self.adopt_child(
-                XlsxSheetIO(sheet_name=name, xlsx_parent=self)
+                XLSXSheetFile(sheet_name=name, xlsx_parent=self)
             )
 
-    def child(self, sheet_name: str) -> XlsxSheetIO:
-        """Return a lazy :class:`XlsxSheetIO` for *sheet_name*.
+    def child(self, sheet_name: str) -> XLSXSheetFile:
+        """Return a lazy :class:`XLSXSheetFile` for *sheet_name*.
 
         Raises :class:`KeyError` when the workbook doesn't contain
         a sheet with that name.
@@ -373,7 +373,7 @@ class XlsxIO(IO[bytes, XlsxOptions]):
                 f"Available: {sheets!r}."
             )
         return self.adopt_child(
-            XlsxSheetIO(sheet_name=sheet_name, xlsx_parent=self)
+            XLSXSheetFile(sheet_name=sheet_name, xlsx_parent=self)
         )
 
     # ==================================================================
@@ -399,7 +399,7 @@ class XlsxIO(IO[bytes, XlsxOptions]):
         """Stream rows from the named sheet, batch them, yield.
 
         For multi-sheet walks use :meth:`iter_children` and call
-        :meth:`XlsxSheetIO.read_arrow_batches` per sheet — concatenating
+        :meth:`XLSXSheetFile.read_arrow_batches` per sheet — concatenating
         sheets with different shapes at this level would silently
         corrupt the schema.
         """
@@ -517,7 +517,7 @@ class XlsxIO(IO[bytes, XlsxOptions]):
         """Pack ``{name: arrow_table}`` into a fresh workbook.
 
         Convenience for the common multi-sheet write — equivalent to
-        looping :meth:`XlsxSheetIO._write_arrow_batches` once per
+        looping :meth:`XLSXSheetFile._write_arrow_batches` once per
         sheet but emits the whole workbook in a single openpyxl
         write-only pass.
         """

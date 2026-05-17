@@ -76,7 +76,7 @@ import pyarrow as pa
 
 from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.io.nested.folder_io import FolderIO, FolderOptions
-from yggdrasil.io.primitive.parquet_io import ParquetIO, ParquetOptions
+from yggdrasil.io.primitive.parquet_file import ParquetFile, ParquetOptions
 from yggdrasil.pickle import json as ygg_json
 
 from yggdrasil.io.nested.delta._names import format_commit_name
@@ -290,7 +290,7 @@ class DeltaIO(FolderIO):
         1. Resolve snapshot at ``options.version`` (HEAD by default).
         2. Filter active files via ``options.prune_values`` (partition
            pruning) before any parquet open.
-        3. Read each parquet through :class:`ParquetIO` so codec /
+        3. Read each parquet through :class:`ParquetFile` so codec /
            memory-map / native pushdown all work as usual.
         4. Mask rows with the file's :class:`DeletionVector` when one
            is present.
@@ -342,7 +342,7 @@ class DeltaIO(FolderIO):
         sidecar_cache: dict,
     ) -> Iterator[pa.RecordBatch]:
         file_path = snap.resolve(add)
-        leaf = ParquetIO(holder=file_path, owns_holder=False)
+        leaf = ParquetFile(holder=file_path, owns_holder=False)
 
         # Decode the file's DV once (shared sidecar cache amortizes
         # multiple files that point at the same sidecar window).
@@ -680,7 +680,7 @@ class DeltaIO(FolderIO):
                     continue
                 if survivors:
                     survivor_batches = self._read_indexed_batches(
-                        leaf=ParquetIO(holder=file_path, owns_holder=False),
+                        leaf=ParquetFile(holder=file_path, owns_holder=False),
                         indices=survivors,
                         partition_columns=partition_columns,
                         partition_values=dict(add.partition_values),
@@ -989,7 +989,7 @@ class DeltaIO(FolderIO):
                 stripped = sb.drop_columns(drop) if drop else sb
                 payload_batches.append(_reinterpret_unsigned_as_signed(stripped))
 
-            leaf = ParquetIO(holder=file_path, owns_holder=False)
+            leaf = ParquetFile(holder=file_path, owns_holder=False)
             with leaf as opened:
                 opened._write_arrow_batches(
                     payload_batches,
@@ -1145,7 +1145,7 @@ class DeltaIO(FolderIO):
 
         for add_path, add in list(snap.active_files.items()):
             file_path = snap.resolve(add)
-            leaf = ParquetIO(holder=file_path, owns_holder=False)
+            leaf = ParquetFile(holder=file_path, owns_holder=False)
             existing_dv = decode_deletion_vector(
                 add.deletion_vector,
                 table_root=self.path,
@@ -1272,7 +1272,7 @@ class DeltaIO(FolderIO):
     def _partition_file_rows(
         self,
         *,
-        leaf: ParquetIO,
+        leaf: ParquetFile,
         predicate: Any,
         existing_dv: "Optional[DeletionVector]",
     ) -> "tuple[list[int], list[int]]":
@@ -1365,7 +1365,7 @@ class DeltaIO(FolderIO):
         )
         already_masked = existing_dv.deleted_rows if existing_dv is not None else set()
 
-        leaf = ParquetIO(holder=file_path, owns_holder=False)
+        leaf = ParquetFile(holder=file_path, owns_holder=False)
         survivors: list[int] = []
         matched = False
         total = 0
@@ -1395,7 +1395,7 @@ class DeltaIO(FolderIO):
     def _read_indexed_batches(
         self,
         *,
-        leaf: ParquetIO,
+        leaf: ParquetFile,
         indices: "List[int]",
         partition_columns: "List[str]",
         partition_values: "dict[str, Optional[str]]",
@@ -1443,7 +1443,7 @@ class DeltaIO(FolderIO):
     # ==================================================================
 
     def iter_children(self) -> "Iterator":
-        """Yield one :class:`ParquetIO` per active file in the snapshot.
+        """Yield one :class:`ParquetFile` per active file in the snapshot.
 
         Override of :meth:`FolderIO.iter_children`: we never list the
         physical folder. The snapshot is the source of truth.
@@ -1451,7 +1451,7 @@ class DeltaIO(FolderIO):
         snap = self.snapshot()
         for add in snap.active_files.values():
             file_path = snap.resolve(add)
-            yield self.adopt_child(ParquetIO(holder=file_path, owns_holder=False))
+            yield self.adopt_child(ParquetFile(holder=file_path, owns_holder=False))
 
 
 # ---------------------------------------------------------------------------

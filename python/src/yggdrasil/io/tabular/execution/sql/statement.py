@@ -155,7 +155,7 @@ class SqlStatementResult(StatementResult[SqlPreparedStatement]):
     Lifecycle is synchronous: :meth:`start` runs the executor and
     stashes the materialized payload on ``_persisted_data`` (a
     :class:`ArrowTabular` for ``persist="memory"``, a
-    :class:`ParquetIO` folder for ``persist="path"``). Once
+    :class:`ParquetFile` folder for ``persist="path"``). Once
     started, every :class:`Tabular` read method on this object
     serves from the cache — ``read_arrow_table`` /
     ``read_polars_frame`` / ``read_pandas_frame`` /
@@ -332,7 +332,7 @@ class SqlStatementResult(StatementResult[SqlPreparedStatement]):
         raise NotImplementedError(
             "SqlStatementResult is read-only — it represents the output "
             "of a SQL query, not a writable target. Build a Tabular "
-            "(ArrowTabular, ParquetIO, ...) and pipe the result into "
+            "(ArrowTabular, ParquetFile, ...) and pipe the result into "
             "it via `result.read_arrow_batches()` if you need to land "
             "it somewhere new."
         )

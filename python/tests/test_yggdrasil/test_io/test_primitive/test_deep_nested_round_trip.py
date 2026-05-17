@@ -20,7 +20,7 @@ pandas, polars, and arrow. Each call binds a target schema on
 runs with a target schema, so that's the configuration that has to
 stay correct.
 
-``CsvIO`` / ``XlsxIO`` aren't included — they encode nested cells as
+``CSVFile`` / ``XLSXFile`` aren't included — they encode nested cells as
 opaque strings rather than preserving the schema, so a "round-trip"
 under their semantics is a string-equality test, not a schema-equality
 test. The columnar IOs below all preserve schema.
@@ -34,10 +34,10 @@ import pytest
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.io.primitive.arrow_ipc_io import ArrowIPCIO
-from yggdrasil.io.primitive.json_io import JsonIO
-from yggdrasil.io.primitive.ndjson_io import NDJsonIO
-from yggdrasil.io.primitive.parquet_io import ParquetIO
+from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
+from yggdrasil.io.primitive.json_file import JSONFile
+from yggdrasil.io.primitive.ndjson_file import NDJSONFile
+from yggdrasil.io.primitive.parquet_file import ParquetFile
 from yggdrasil.io.tabular import Tabular
 
 
@@ -139,7 +139,7 @@ def deep_table() -> pa.Table:
 # ---------------------------------------------------------------------------
 
 
-IO_CLASSES: list[type[Tabular]] = [ParquetIO, ArrowIPCIO, NDJsonIO, JsonIO]
+IO_CLASSES: list[type[Tabular]] = [ParquetFile, ArrowIPCFile, NDJSONFile, JSONFile]
 
 
 def _ids(items: list[Any]) -> list[str]:

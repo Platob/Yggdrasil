@@ -176,7 +176,7 @@ class TestRead:
 
     def test_parquet_read_arrow_table_one_sdk_call(self, workspace, client) -> None:
         # The tabular IO ↔ remote path interaction is the headline
-        # scenario: ``ParquetIO(VolumePath).read_arrow_table()`` must
+        # scenario: ``ParquetFile(VolumePath).read_arrow_table()`` must
         # bottom out in a single ``files.download`` call. Earlier
         # versions issued a ``get_metadata`` probe before the
         # download to short-circuit on empty buffers; that's now
@@ -186,7 +186,7 @@ class TestRead:
         import io as _io
         import pyarrow as pa
         import pyarrow.parquet as pq
-        from yggdrasil.io.primitive.parquet_io import ParquetIO
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
 
         sink = _io.BytesIO()
         pq.write_table(
@@ -202,7 +202,7 @@ class TestRead:
             last_modified="Mon, 01 Jan 2024 00:00:00 GMT",
         )
         p = VolumePath("/Volumes/c/s/v/x.parquet", client=client)
-        ParquetIO(holder=p).read_arrow_table()
+        ParquetFile(holder=p).read_arrow_table()
         workspace.files.get_metadata.assert_not_called()
         assert workspace.files.download.call_count == 1
 

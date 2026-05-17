@@ -1,6 +1,6 @@
 """Parquet Tabular leaf over the new :class:`BytesIO` substrate.
 
-:class:`ParquetIO` is a :class:`BytesIO` subclass that auto-registers
+:class:`ParquetFile` is a :class:`BytesIO` subclass that auto-registers
 under :data:`MimeTypes.PARQUET`. The Parquet file format is
 footer-indexed: readers parse the metadata block at the end of the
 file once and use it to plan column reads. Writes buffer row groups
@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     import pyarrow.dataset as pds
 
 
-__all__ = ["ParquetIO", "ParquetOptions"]
+__all__ = ["ParquetFile", "ParquetOptions"]
 
 
 #: Modes that read existing bytes, merge with the incoming stream,
@@ -66,7 +66,7 @@ class ParquetOptions(CastOptions):
     use_threads: bool = True
 
 
-class ParquetIO(IO[bytes, ParquetOptions]):
+class ParquetFile(IO[bytes, ParquetOptions]):
     """:class:`Tabular` leaf for Apache Parquet."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.PARQUET
@@ -89,7 +89,7 @@ class ParquetIO(IO[bytes, ParquetOptions]):
         ``None`` opts out and the caller routes through the
         file-like view path.
         """
-        holder = self._holder
+        holder = self._parent
         if holder is None:
             return None
         if not getattr(holder, "is_local_path", False):

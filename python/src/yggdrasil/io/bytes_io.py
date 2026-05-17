@@ -30,5 +30,5 @@ class BytesIO(IO[bytes, O]):
     (``BytesIO(b"..")``, ``BytesIO(path=...)``, ``BytesIO(holder=...)``,
     ``BytesIO(media_type=...)``) routes through :meth:`IO.__new__`'s
     format dispatch, so format-specific calls still land on the
-    registered leaf (:class:`ParquetIO`, :class:`CsvIO`, …) automatically.
+    registered leaf (:class:`ParquetFile`, :class:`CSVFile`, …) automatically.
     """

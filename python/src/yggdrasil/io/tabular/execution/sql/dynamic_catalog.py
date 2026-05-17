@@ -59,7 +59,7 @@ def coerce_to_tabular(obj: Any) -> Tabular:
     - ``list[dict]`` / ``dict[str, list]`` → :class:`pa.Table` →
       :class:`ArrowTabular`.
     - path-like (``str`` / ``bytes`` / ``__fspath__``) → open via
-      :class:`Path` and wrap with :class:`Tabular.for_holder`.
+      :class:`Path` and wrap with :meth:`Holder.for_holder`.
 
     The matching is duck-typed where practical so optional packages
     don't have to be imported just for the dispatch.
@@ -89,10 +89,11 @@ def coerce_to_tabular(obj: Any) -> Tabular:
         return ArrowTabular(pa.Table.from_pandas(obj))
     # Path-like — open and wrap.
     if isinstance(obj, (str, bytes)) or hasattr(obj, "__fspath__"):
+        from yggdrasil.io.holder import Holder
         from yggdrasil.io.path import Path
 
         path = Path.from_(obj)
-        return Tabular.for_holder(path)
+        return Holder.for_holder(path)
     raise TypeError(
         f"Cannot register {type(obj).__name__} as a SQL source. "
         "Pass a Tabular, pyarrow Table/RecordBatch, polars / pandas frame, "

@@ -301,7 +301,7 @@ def _coerce_request_buffer(obj: Any) -> Optional[Holder]:
     if isinstance(obj, Holder):
         return obj
     if isinstance(obj, IO):
-        return obj._holder
+        return obj._parent
     return Holder.from_(obj)
 
 
@@ -755,7 +755,7 @@ class PreparedRequest:
             ):
                 with BytesIO(holder=request_body, owns_holder=False) as src:
                     compressed = compress_codec.compress(src)
-                request_body = compressed._holder
+                request_body = compressed._parent
                 out_headers["Content-Encoding"] = compress_codec.name
 
         if request_body is not None:

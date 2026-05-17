@@ -26,7 +26,7 @@ Three things sit behind that one-liner:
    gets a chance.
 3. :class:`PlanNode.execute` walks the tree in Arrow, returning a
    :class:`Tabular` (an :class:`ArrowTabular` for in-memory results,
-   a :class:`ParquetIO` folder when ``persist="path"``).
+   a :class:`ParquetFile` folder when ``persist="path"``).
 
 The handle returned to the caller is a
 :class:`yggdrasil.sql.statement.SqlStatementResult` — already a

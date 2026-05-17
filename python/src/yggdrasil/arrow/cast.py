@@ -749,7 +749,7 @@ def any_to_arrow_table(
         table = _project(obj.read_all(), options)
 
     elif _is_tabular_source(obj):
-        # ``Tabular`` (Response, StatementResult, ParquetIO, …) owns
+        # ``Tabular`` (Response, StatementResult, ParquetFile, …) owns
         # its own engine fan-out — let it produce the table so format
         # leaves use their native scanners (Parquet predicate pushdown,
         # StatementResult's persisted-frame short-circuit) instead of
@@ -757,7 +757,7 @@ def any_to_arrow_table(
         # and ``os.PathLike`` inputs are coerced through
         # :meth:`Tabular.from_`, which wraps them in a :class:`Path`
         # holder and lets :meth:`Path.read_arrow_table` dispatch to
-        # the right format leaf (ParquetIO / CsvIO / …) via the
+        # the right format leaf (ParquetFile / CSVFile / …) via the
         # MediaType registry.
         from yggdrasil.io.tabular import Tabular
         tabular = obj if _is_yggdrasil_tabular(obj) else Tabular.from_(obj)
