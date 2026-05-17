@@ -33,6 +33,7 @@ from __future__ import annotations
 import importlib.metadata as ilm
 import logging
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -371,35 +372,70 @@ class PathPyPI:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _build_wheel(local_root: LocalPath) -> LocalPath:
-        """Build a wheel for *local_root* via ``pip wheel --no-deps``.
+        """Build a wheel for *local_root*.
 
-        Uses pip (always present alongside the active interpreter) so
-        we don't take a hard dependency on :mod:`build` / ``hatch``.
-        The wheel lands in a temp dir; the caller reads + uploads
-        immediately, after which the temp dir is reclaimed by the GC.
+        Tries ``python -m pip wheel --no-deps`` first (still the
+        common case), then falls back to ``uv build --wheel`` for
+        uv-managed venvs that don't ship pip. Neither is taken as
+        a hard dependency: as long as the active environment carries
+        one of them, the build goes through. The wheel lands in a
+        temp dir; the caller reads + uploads immediately, after which
+        the temp dir is reclaimed by the GC.
         """
         tmp = LocalPath(tempfile.mkdtemp(prefix="ygg-pypi-"))
-        cmd = [
+        errors: list[str] = []
+
+        # Builder 1: ``python -m pip wheel`` against the active
+        # interpreter. Standard for any pip-bootstrapped venv.
+        pip_cmd = [
             sys.executable, "-m", "pip", "wheel",
             "--no-deps", "--quiet",
             "--wheel-dir", str(tmp),
             str(local_root),
         ]
-        LOGGER.debug("Building wheel for %r via %s", local_root, " ".join(cmd))
+        LOGGER.debug("Building wheel for %r via %s", local_root, " ".join(pip_cmd))
         try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            subprocess.run(pip_cmd, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as exc:
-            raise RuntimeError(
-                f"Failed to build wheel for {local_root!r}: pip wheel exited "
-                f"{exc.returncode}.\nstdout: {exc.stdout}\nstderr: {exc.stderr}"
-            ) from exc
-        wheels = sorted(tmp.glob("*.whl"))
-        if not wheels:
-            raise RuntimeError(
-                f"pip wheel produced no .whl files under {tmp!r} for "
-                f"{local_root!r}; check the package metadata."
+            errors.append(
+                f"pip wheel exited {exc.returncode}: "
+                f"{(exc.stderr or exc.stdout or '').strip()}"
             )
-        return wheels[0]
+        except FileNotFoundError as exc:
+            errors.append(f"pip wheel not invokable: {exc}")
+
+        wheels = sorted(tmp.glob("*.whl"))
+        if wheels:
+            return wheels[0]
+
+        # Builder 2: ``uv build --wheel`` for uv-managed venvs where
+        # pip isn't installed (``uv venv`` doesn't ship pip).
+        uv_exe = shutil.which("uv")
+        if uv_exe is not None:
+            uv_cmd = [
+                uv_exe, "build", "--wheel",
+                "--out-dir", str(tmp),
+                "--python", sys.executable,
+                str(local_root),
+            ]
+            LOGGER.debug("Building wheel for %r via %s", local_root, " ".join(uv_cmd))
+            try:
+                subprocess.run(uv_cmd, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as exc:
+                errors.append(
+                    f"uv build exited {exc.returncode}: "
+                    f"{(exc.stderr or exc.stdout or '').strip()}"
+                )
+            wheels = sorted(tmp.glob("*.whl"))
+            if wheels:
+                return wheels[0]
+        else:
+            errors.append("uv build unavailable: ``uv`` not on PATH")
+
+        raise RuntimeError(
+            f"Failed to build wheel for {local_root!r}; tried pip wheel "
+            f"and uv build. Errors: " + " | ".join(errors)
+        )
 
 
 def _artefact_version_matches(filename: str, version: str) -> bool:
